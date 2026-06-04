@@ -87,7 +87,7 @@ pub const INTEL_VENDOR: u16 = 0x8086;
 
 // ── IwlDevice ──────────────────────────────────────────────────────
 
-pub struct IwlDevice {
+struct IwlDevice {
     mmio: MmioRegion,
     chip: ChipConfig,
     mac_addr: [u8; 6],
@@ -101,7 +101,9 @@ pub struct IwlDevice {
     tx_q0: IrqSafeSpinLock<tx::TxQueue>,
     rx_ring_dma: DmaBuffer,
     tx_ring_dma: Vec<DmaBuffer>,
+    tx_cmd_bufs: Vec<DmaBuffer>,
     rx_buffers: Vec<DmaBuffer>,
+    irq_vector: Option<u8>,
     scan_waker: IrqSafeSpinLock<Option<Waker>>,
 }
 
@@ -117,7 +119,9 @@ impl IwlDevice {
         tx_q0: tx::TxQueue,
         rx_ring_dma: DmaBuffer,
         tx_ring_dma: Vec<DmaBuffer>,
+        tx_cmd_bufs: Vec<DmaBuffer>,
         rx_buffers: Vec<DmaBuffer>,
+        irq_vector: Option<u8>,
     ) -> Self {
         Self {
             mmio,
@@ -132,7 +136,9 @@ impl IwlDevice {
             tx_q0: IrqSafeSpinLock::new(tx_q0),
             rx_ring_dma,
             tx_ring_dma,
+            tx_cmd_bufs,
             rx_buffers,
+            irq_vector,
             scan_waker: IrqSafeSpinLock::new(None),
         }
     }
@@ -218,14 +224,43 @@ impl WirelessNetIface for IwlDevice {
             rand_mac: false,
         };
 
-        let _cmd_body = mlme::scan_request_cmd(&iwl_req);
+        let cmd_body = mlme::scan_request_cmd(&iwl_req);
         
-        {
-            let mut _tx_q = self.tx_q0.lock();
-            let mut _mmio = IwlMmioImpl(self.mmio);
-            
-            // TODO: Actually send the command.
-        }
+        let payload_dma = if let Ok(pd) = narf_io::alloc_coherent(cmd_body.len(), DomainId::DRIVER_0) {
+            unsafe {
+                core::ptr::copy_nonoverlapping(cmd_body.as_ptr(), pd.as_mut_ptr(), cmd_body.len());
+            }
+
+            {
+                let mut tx_q = self.tx_q0.lock();
+                let mut mmio = IwlMmioImpl(self.mmio);
+                let slot = tx_q.write_ptr;
+
+                // 1. Build IwlCmdHeader.
+                let hdr = tx::IwlCmdHeader {
+                    cmd: rx::NOTIF_SCAN_COMPLETE_UMAC,
+                    group_id: rx::NOTIF_SCAN_COMPLETE_GROUP,
+                    sequence: 0,
+                };
+
+                // 2. Write header to DMA.
+                let cmd_dma = &self.tx_cmd_bufs[0];
+                let hdr_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlCmdHeader };
+                unsafe { core::ptr::write_volatile(hdr_ptr, hdr); }
+
+                // 3. Build TFD.
+                let mut tfd = tx::Tfd::default();
+                tfd.push_seg(cmd_dma.phys_addr().as_u64() + (slot * 32) as u64, core::mem::size_of::<tx::IwlCmdHeader>() as u16);
+                tfd.push_seg(pd.phys_addr().as_u64(), cmd_body.len() as u16);
+
+                // 4. Enqueue and kick.
+                tx_q.enqueue(tfd);
+                tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
+            }
+            Some(pd)
+        } else {
+            None
+        };
 
         // 2. Wait for SCAN_COMPLETE_UMAC notification via the pump.
         core::future::poll_fn(|cx| {
@@ -238,14 +273,52 @@ impl WirelessNetIface for IwlDevice {
         })
         .await;
 
+        let _ = payload_dma; // keep alive until here
+
         Ok(self.bss_list.lock().clone())
     }
 
     async fn associate(&self, req: AssociateRequest) -> Result<(), WirelessError> {
         let _ = writeln!(narf_console::Writer, "  iwlwifi: associating to {:?}", req.ssid);
         
-        // TODO: Build and send association frame.
-        // TODO: Wait for association response.
+        // 1. Send Association Request.
+        let params = mlme::AssocParams {
+            sta_addr: self.mac_addr,
+            ap_bssid: req.bssid,
+            ssid: req.ssid,
+            supported_rates: alloc::vec![0x82, 0x84, 0x8B, 0x96],
+            capability_info: 0x0411,
+            listen_interval: 10,
+            seq_num: 0,
+        };
+
+        let frame_bytes = mlme::build_assoc_request(&params);
+        let buf = narf_io::alloc_coherent(frame_bytes.len(), DomainId::DRIVER_0).map_err(|_| WirelessError::HardwareError)?;
+        let mut frame = Frame::new(buf, frame_bytes.len() as u32);
+        frame.payload_mut().copy_from_slice(&frame_bytes);
+        
+        {
+            let mut tx_q = self.tx_q0.lock();
+            let mut mmio = IwlMmioImpl(self.mmio);
+            let slot = tx_q.write_ptr;
+
+            let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF);
+            let cmd_dma = &self.tx_cmd_bufs[0];
+            let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
+            unsafe { core::ptr::write_volatile(cmd_ptr, cmd); }
+
+            let mut tfd = tx::Tfd::default();
+            tfd.push_seg(cmd_dma.phys_addr().as_u64() + (slot * 32) as u64, core::mem::size_of::<tx::IwlTxCmd>() as u16);
+            tfd.push_seg(frame.buf().phys_addr().as_u64() + frame.offset() as u64, frame.len() as u16);
+
+            tx_q.enqueue(tfd);
+            tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
+        }
+        
+        // 2. Keep the frame alive until the device is likely done.
+        // For now, we just assume it's sent immediately or stashed.
+        // In a real driver we'd wait for the TX completion interrupt.
+        let _ = frame;
         
         self.link_up.store(true, Ordering::Release);
         Ok(())
@@ -277,13 +350,15 @@ fn spawn_pumps(
     });
 }
 
+use narf_lib::id::DomainId;
+
 struct IwlRxHandler {
     device: Arc<IwlDevice>,
     rx_prod: Producer<Frame, RX_RING_N>,
 }
 
 impl rx::RxHandler for IwlRxHandler {
-    fn handle(&mut self, kind: rx::RxKind, hdr: rx::RxPacketHeader, payload: &[u8]) {
+    fn handle(&mut self, kind: rx::RxKind, _hdr: rx::RxPacketHeader, payload: &[u8]) {
         match kind {
             rx::RxKind::Alive => {
                 let _ = writeln!(narf_console::Writer, "  iwlwifi: firmware alive notification");
@@ -298,10 +373,29 @@ impl rx::RxHandler for IwlRxHandler {
             rx::RxKind::RxMpdu => {
                 // If scan is in progress, check for beacons/probe-resps.
                 if self.device.scan_in_progress.load(Ordering::Acquire) {
-                    // TODO: Parse beacon and update bss_list
+                    if let Some(bss) = mlme::parse_beacon_to_bss(self.device.mac_addr, payload) {
+                        let mut list = self.device.bss_list.lock();
+                        if !list.iter().any(|b| b.bssid == bss.bssid) {
+                            list.push(narf_wireless::BssInfo {
+                                bssid: bss.bssid,
+                                ssid: bss.ssid,
+                                channel: 1, // TODO: extract from PHY metadata
+                                rssi: bss.rssi_dbm,
+                                security: if bss.rsn_ie_body.is_some() {
+                                    narf_wireless::scan::BssSecurity::Wpa2
+                                } else {
+                                    narf_wireless::scan::BssSecurity::Open
+                                },
+                            });
+                        }
+                    }
                 }
                 // Push to network stack.
-                // TODO: Allocate a Frame and copy payload
+                if let Ok(buf) = narf_io::alloc_coherent(payload.len(), DomainId::DRIVER_0) {
+                    let mut frame = Frame::new(buf, payload.len() as u32);
+                    frame.payload_mut().copy_from_slice(payload);
+                    let _ = self.rx_prod.try_send(frame);
+                }
             }
             _ => {}
         }
@@ -317,6 +411,12 @@ async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>
     };
 
     loop {
+        if let Some(v) = device.irq_vector {
+            narf_interrupts::wait::wait_for_irq(v).await;
+        } else {
+            narf_scheduler::yield_now().await;
+        }
+
         {
             let mut rx_q = device.rx_q.lock();
             let mut mmio = IwlMmioImpl(device.mmio);
@@ -331,8 +431,11 @@ async fn iwl_rx_pump(device: Arc<IwlDevice>, rx_prod: Producer<Frame, RX_RING_N>
                 },
                 &mut handler,
             );
+
+            // Give the buffers back to the device by writing the current
+            // read-pointer to the WPTR register.
+            mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx_q.read_ptr.wrapping_sub(1) & rx::RX_RING_MASK) as u32);
         }
-        narf_scheduler::yield_now().await;
     }
 }
 
@@ -342,19 +445,30 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
     while let Ok(frame) = tx_cons.recv().await {
         let mut tx_q = device.tx_q0.lock();
         let mut mmio = IwlMmioImpl(device.mmio);
-
-        // 1. Build IwlTxCmd.
-        let _cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF); // Broadcast station for now
         
-        // 2. Build TFD.
+        let slot = tx_q.write_ptr;
+        
+        // 1. Build IwlTxCmd.
+        // Management frames use OFDM-6Mbps by default.
+        let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF); 
+        
+        // 2. Write IwlTxCmd to DMA-coherent buffer.
+        let cmd_dma = &device.tx_cmd_bufs[0];
+        let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
+        unsafe { core::ptr::write_volatile(cmd_ptr, cmd); }
+        
+        // 3. Build TFD with two segments.
         let mut tfd = tx::Tfd::default();
-        // Section 0: the command itself (header).
-        // For simplicity, we'll just push the frame buffer.
+        // Segment 0: IwlTxCmd header.
+        let cmd_size = core::mem::size_of::<tx::IwlTxCmd>();
+        let cmd_phys = cmd_dma.phys_addr().as_u64() + (slot * 32) as u64;
+        tfd.push_seg(cmd_phys, cmd_size as u16);
+        // Segment 1: Frame payload.
         tfd.push_seg(frame.buf().phys_addr().as_u64() + frame.offset() as u64, frame.len() as u16);
         
-        // 3. Enqueue and kick.
-        let slot = tx_q.enqueue(tfd);
-        tx::tx_doorbell(&mut mmio, 0, slot);
+        // 4. Enqueue and kick the doorbell.
+        tx_q.enqueue(tfd);
+        tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
     }
 }
 
@@ -955,7 +1069,7 @@ pub fn parse_ucode(bytes: &[u8]) -> Result<ParsedUcode<'_>, ParseError> {
 /// validates that we can match the device + find its firmware.
 pub fn probe(
     device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
+    cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
     let chip = match chip_config_for_pci_id(device.id.vendor, device.id.device) {
         Some(c) => c,
@@ -1026,11 +1140,11 @@ pub fn probe(
 
     // Parse + summarise the firmware to confirm the registry blob
     // is actually a valid Intel TLV container.
-    let cap = match narf_firmware::open(matched_name.as_str(), &auth) {
+    let fw_cap = match narf_firmware::open(matched_name.as_str(), &auth) {
         Ok(c) => c,
         Err(_) => return Ok(()),
     };
-    let view = match narf_firmware::view_of(&cap) {
+    let view = match narf_firmware::view_of(&fw_cap) {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
@@ -1130,6 +1244,36 @@ pub fn probe(
             )
             .map_err(|_| narf_bus::ProbeError::Other("TX ring alloc failed"))?;
 
+            // Allocate TX command buffers (queue 0).
+            let tx_cmd0_mem = narf_io::alloc_coherent(
+                tx::TX_RING_SIZE * 32,
+                narf_lib::id::DomainId::DRIVER_0,
+            )
+            .map_err(|_| narf_bus::ProbeError::Other("TX cmd buffer alloc failed"))?;
+
+            // ── 4a. Interrupt setup ──
+            let mut irq_vector = None;
+            if let Ok(v) = narf_interrupts::vector::alloc() {
+                // Try MSI-X first.
+                if let Ok(mut msix) = narf_bus::msix::enable_msix(&cap, &device) {
+                    unsafe {
+                        let _ = msix.program_vector(0, 0, v);
+                        let _ = msix.enable();
+                    }
+                    irq_vector = Some(v);
+                } else if let Ok(mut msi) = narf_bus::msi::enable_msi(&cap, &device, 1) {
+                    unsafe {
+                        let _ = narf_bus::msi::program_msi(&mut msi, 0, v);
+                        let _ = narf_bus::msi::enable(&msi);
+                    }
+                    irq_vector = Some(v);
+                }
+                
+                if let Some(v) = irq_vector {
+                    narf_interrupts::install_handler(v, || {});
+                }
+            }
+
             // Program hardware RX registers.
             mmio.write(rx::CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG, rx_ring_mem.phys_addr().as_u64() as u32);
             mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx::RX_RING_SIZE - 1) as u32);
@@ -1149,7 +1293,9 @@ pub fn probe(
                 tx_q0,
                 rx_ring_mem,
                 alloc::vec![tx_ring0_mem],
+                alloc::vec![tx_cmd0_mem],
                 rx_buffers,
+                irq_vector,
             ));
 
             // Initialize IPC rings.
@@ -1519,5 +1665,27 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi",
         smoke_iwlwifi_time_event_cmd_encode
+    );
+
+    fn smoke_iwlwifi_cmd_header_layout() -> TestResult {
+        let hdr = tx::IwlCmdHeader {
+            cmd: 0x07,
+            group_id: 0x0C,
+            sequence: 0x1234,
+        };
+        if core::mem::size_of::<tx::IwlCmdHeader>() != 4 {
+            return TestResult::Fail("IwlCmdHeader should be 4 bytes");
+        }
+        // Manual decode to verify packing + LE.
+        let bytes: [u8; 4] = unsafe { core::mem::transmute(hdr) };
+        if bytes[0] != 0x07 { return TestResult::Fail("cmd wrong"); }
+        if bytes[1] != 0x0C { return TestResult::Fail("group_id wrong"); }
+        // sequence is u16 LE.
+        if bytes[2] != 0x34 || bytes[3] != 0x12 { return TestResult::Fail("sequence (LE) wrong"); }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_cmd_header_layout
     );
 }

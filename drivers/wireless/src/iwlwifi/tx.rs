@@ -174,6 +174,16 @@ impl IwlTxCmd {
     }
 }
 
+/// `iwl_cmd_header` — header for firmware commands (H2C).
+/// Layout sourced from `fw/api/commands.h`.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct IwlCmdHeader {
+    pub cmd: u8,
+    pub group_id: u8,
+    pub sequence: u16,
+}
+
 // ── 802.11 MAC header builder ───────────────────────────────────────
 
 /// 802.11 frame control field constants.
