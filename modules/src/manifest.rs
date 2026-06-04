@@ -124,15 +124,14 @@ impl Manifest {
             "required_caps" => {
                 for spec in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     let mut parts = spec.splitn(2, ':');
-                    let kind_s = parts.next().ok_or_else(|| {
-                        ManifestError::BadCapSpec(spec.to_string())
-                    })?;
-                    let right_s = parts.next().ok_or_else(|| {
-                        ManifestError::BadCapSpec(spec.to_string())
-                    })?;
-                    let kind = parse_kind(kind_s).map_err(|_| {
-                        ManifestError::UnknownCap(kind_s.to_string())
-                    })?;
+                    let kind_s = parts
+                        .next()
+                        .ok_or_else(|| ManifestError::BadCapSpec(spec.to_string()))?;
+                    let right_s = parts
+                        .next()
+                        .ok_or_else(|| ManifestError::BadCapSpec(spec.to_string()))?;
+                    let kind = parse_kind(kind_s)
+                        .map_err(|_| ManifestError::UnknownCap(kind_s.to_string()))?;
                     let right = match right_s {
                         "Read" => 0b0_0001u32,
                         "Write" => 0b0_0010u32,

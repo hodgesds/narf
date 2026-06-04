@@ -63,8 +63,7 @@ static MODINFO_AUTHOR: [u8; 17] = *b"author=narf-test\0";
 
 #[used]
 #[link_section = ".modinfo"]
-static MODINFO_DESCRIPTION: [u8; 47] =
-    *b"description=NARF loader end-to-end test module\0";
+static MODINFO_DESCRIPTION: [u8; 47] = *b"description=NARF loader end-to-end test module\0";
 
 #[used]
 #[link_section = ".modinfo"]

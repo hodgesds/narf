@@ -31,10 +31,7 @@ pub fn install_module(module: &Arc<Module>) -> Arc<Kobject> {
     // The "module" class lives at /sys/module/<name>/.
     // We reuse class_register's get-or-create semantics.
     let class_module = class_register("module");
-    let kobj = narf_filesystem::sysfs::class_device_register(
-        class_module,
-        module.name(),
-    );
+    let kobj = narf_filesystem::sysfs::class_device_register(class_module, module.name());
 
     // ── Basic attributes ────────────────────────────────────────────
     let name = module.manifest.name.clone();
@@ -66,10 +63,7 @@ pub fn install_module(module: &Arc<Module>) -> Arc<Kobject> {
     kobject_add_attr(&kobj, "holders", || "\n".to_string());
 
     // ── Parameters ──────────────────────────────────────────────────
-    let params_kobj = narf_filesystem::sysfs::class_device_register(
-        kobj.clone(),
-        "parameters",
-    );
+    let params_kobj = narf_filesystem::sysfs::class_device_register(kobj.clone(), "parameters");
     // The cleanest writable-attr install needs a static lifetime for
     // the attr name. Since module-supplied parameter names are dynamic,
     // we currently leak the name into a static slot via Box::leak.
@@ -110,18 +104,13 @@ pub fn install_module(module: &Arc<Module>) -> Arc<Kobject> {
     }
 
     // ── Sections directory (addresses) ──────────────────────────────
-    let sections_kobj = narf_filesystem::sysfs::class_device_register(
-        kobj.clone(),
-        "sections",
-    );
+    let sections_kobj = narf_filesystem::sysfs::class_device_register(kobj.clone(), "sections");
     for p in &module.placements {
         // Name based on section index, since the loader doesn't
         // currently track section names alongside placements.
         let nm: &'static str = Box::leak(format!(".sec{}", p.section_idx).into_boxed_str());
         let addr = p.target_addr;
-        kobject_add_attr(&sections_kobj, nm, move || {
-            format!("0x{:016x}\n", addr)
-        });
+        kobject_add_attr(&sections_kobj, nm, move || format!("0x{:016x}\n", addr));
     }
 
     kobj

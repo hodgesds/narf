@@ -24,10 +24,9 @@ pub mod sections;
 pub mod symbols;
 
 pub use header::{
-    parse_header, parse_section, section_name, string_in_table, Elf64Header,
-    Elf64ProgramHeader, Elf64SectionHeader, HeaderError, EM_AARCH64, EM_X86_64, ET_REL,
-    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB,
-    SHT_SYMTAB,
+    parse_header, parse_section, section_name, string_in_table, Elf64Header, Elf64ProgramHeader,
+    Elf64SectionHeader, HeaderError, EM_AARCH64, EM_X86_64, ET_REL, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
 };
 pub use reloc::{apply_aarch64, apply_x86_64, parse_rela, Elf64Rela, RelocError};
 pub use sections::{classify, SectionKind, SECT_MODINFO, SECT_NARF_CAPS};

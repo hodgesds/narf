@@ -83,11 +83,7 @@ pub mod registry {
 
     /// Look up a module by name.
     pub fn lookup(name: &str) -> Option<Arc<Module>> {
-        MODULES
-            .lock()
-            .iter()
-            .find(|m| m.name() == name)
-            .cloned()
+        MODULES.lock().iter().find(|m| m.name() == name).cloned()
     }
 
     /// Insert a module. Caller verifies non-duplication beforehand.

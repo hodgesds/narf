@@ -249,5 +249,7 @@ fn read_u32_in(dest: &[u8], off: usize) -> Result<u32, RelocError> {
     if off + 4 > dest.len() {
         return Err(RelocError::OutOfBounds);
     }
-    Ok(u32::from_le_bytes(dest[off..off + 4].try_into().expect("len 4")))
+    Ok(u32::from_le_bytes(
+        dest[off..off + 4].try_into().expect("len 4"),
+    ))
 }

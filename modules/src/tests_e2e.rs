@@ -425,11 +425,7 @@ kernel_test_in!("modules/e2e", e2e_load_to_live);
 
 extern "C" fn smoke_init_with_export() -> i32 {
     INIT_RAN.store(true, Ordering::Release);
-    crate::symbols::export(
-        "test_module_alive",
-        smoke_alive as usize,
-        0xABCD_1234,
-    );
+    crate::symbols::export("test_module_alive", smoke_alive as usize, 0xABCD_1234);
     0
 }
 
@@ -447,11 +443,7 @@ fn e2e_symbol_export_visible() -> TestResult {
     }
 
     let manifest = crate::manifest::Manifest::default();
-    let resolved = match crate::symbols::resolve(
-        "test_module_alive",
-        None,
-        &manifest,
-    ) {
+    let resolved = match crate::symbols::resolve("test_module_alive", None, &manifest) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("test_module_alive not in ksymtab"),
     };
@@ -460,8 +452,7 @@ fn e2e_symbol_export_visible() -> TestResult {
     // round-trips. SAFETY: we just registered this address ourselves
     // pointing at `smoke_alive`, which is a kernel-resident extern
     // "C" fn returning u32.
-    let f: extern "C" fn() -> u32 =
-        unsafe { core::mem::transmute(resolved.addr) };
+    let f: extern "C" fn() -> u32 = unsafe { core::mem::transmute(resolved.addr) };
     if f() != TEST_MODULE_ALIVE_MAGIC {
         return TestResult::Fail("looked-up export returned wrong magic");
     }
@@ -486,9 +477,7 @@ fn e2e_refcount_blocks_unload() -> TestResult {
     // try_module_get — bump refcount.
     m.refcount.get();
     match sys_delete_module("e2e_busy") {
-        Err(ModuleSyscallError::ExitFailed(
-            crate::lifecycle::LifecycleError::Busy(1),
-        )) => {}
+        Err(ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::Busy(1))) => {}
         _ => return TestResult::Fail("delete with refcount=1 should fail Busy"),
     }
     if *m.state.lock() != crate::lifecycle::ModuleState::Live {
@@ -567,7 +556,11 @@ fn e2e_unload_cleans_proc_and_sys() -> TestResult {
     // been swept by sys_delete_module → unregister_exports_of(module.id).
     match crate::symbols::resolve("e2e_cleanup_alive", None, &manifest) {
         Err(crate::symbols::ResolveError::Unknown) => {}
-        Ok(_) => return TestResult::Fail("e2e_cleanup_alive still in ksymtab after unload (use-after-free risk)"),
+        Ok(_) => {
+            return TestResult::Fail(
+                "e2e_cleanup_alive still in ksymtab after unload (use-after-free risk)",
+            )
+        }
         Err(_) => return TestResult::Fail("unexpected resolve error after unload"),
     }
 
@@ -607,9 +600,8 @@ fn e2e_double_load_rejected() -> TestResult {
     }
     let second = sys_init_module(&elf);
     match &second {
-        Err(ModuleSyscallError::Load(crate::loader::LoadError::AlreadyLoaded(
-            name,
-        ))) if name == "e2e_dup" => {}
+        Err(ModuleSyscallError::Load(crate::loader::LoadError::AlreadyLoaded(name)))
+            if name == "e2e_dup" => {}
         Err(_) => {
             return TestResult::Fail("second load: wrong error variant");
         }
@@ -686,11 +678,7 @@ fn e2e_cap_gate_blocks_undeclared() -> TestResult {
     // Manifest that *doesn't* declare BlockDevice.
     let mut mf_no = crate::manifest::Manifest::default();
     mf_no.name = "e2e_cap_no".to_string();
-    let r = crate::symbols::resolve(
-        "narf_block_register_block_device",
-        None,
-        &mf_no,
-    );
+    let r = crate::symbols::resolve("narf_block_register_block_device", None, &mf_no);
     match r {
         Err(crate::symbols::ResolveError::CapMissing(CapKind::BlockDevice)) => {}
         _ => return TestResult::Fail("undeclared cap should produce CapMissing"),
@@ -705,11 +693,7 @@ fn e2e_cap_gate_blocks_undeclared() -> TestResult {
         }],
         ..Default::default()
     };
-    let r2 = crate::symbols::resolve(
-        "narf_block_register_block_device",
-        None,
-        &mf_yes,
-    );
+    let r2 = crate::symbols::resolve("narf_block_register_block_device", None, &mf_yes);
     if r2.is_err() {
         return TestResult::Fail("declared cap should resolve");
     }
@@ -719,11 +703,7 @@ fn e2e_cap_gate_blocks_undeclared() -> TestResult {
     // only fail at relocation time (no rela in the synthetic ELF
     // so this just confirms the symbol-table side of the gate).
     let elf = build_smoke_elf(&SmokeElfSpec {
-        modinfo: build_modinfo(
-            "e2e_cap_load",
-            abi,
-            Some("BlockDevice:Write"),
-        ),
+        modinfo: build_modinfo("e2e_cap_load", abi, Some("BlockDevice:Write")),
         init_addr: smoke_init as usize as u64,
         exit_addr: smoke_exit as usize as u64,
     });

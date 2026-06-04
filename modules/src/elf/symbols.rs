@@ -69,12 +69,12 @@ pub struct SymbolTable<'a> {
 }
 
 impl<'a> SymbolTable<'a> {
-    pub fn new(
-        bytes: &'a [u8],
-        symtab: Elf64SectionHeader,
-        strtab: Elf64SectionHeader,
-    ) -> Self {
-        Self { bytes, symtab, strtab }
+    pub fn new(bytes: &'a [u8], symtab: Elf64SectionHeader, strtab: Elf64SectionHeader) -> Self {
+        Self {
+            bytes,
+            symtab,
+            strtab,
+        }
     }
 
     pub fn len(&self) -> usize {

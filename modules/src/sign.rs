@@ -41,8 +41,7 @@ impl ModuleVerifier for AcceptAll {
 /// Locked verifier slot. The kernel boot installs the no-op
 /// default; a richer verifier (Ed25519, in-tree signing key) can
 /// take its place at any later point.
-static VERIFIER: IrqSafeSpinLock<Option<Box<dyn ModuleVerifier>>> =
-    IrqSafeSpinLock::new(None);
+static VERIFIER: IrqSafeSpinLock<Option<Box<dyn ModuleVerifier>>> = IrqSafeSpinLock::new(None);
 
 /// Install a verifier. Replaces any previous installation.
 pub fn install_verifier(v: Box<dyn ModuleVerifier>) {

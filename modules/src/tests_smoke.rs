@@ -16,12 +16,11 @@ use narf_capabilities::CapKind;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::elf::header::{
-    Elf64Header, EM_AARCH64, EM_X86_64, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
-    SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+    Elf64Header, EM_AARCH64, EM_X86_64, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS,
+    SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::elf::{
-    apply_aarch64, apply_x86_64, parse_header, parse_section, section_name,
-    RelocError,
+    apply_aarch64, apply_x86_64, parse_header, parse_section, section_name, RelocError,
 };
 use crate::lifecycle::ModuleState;
 use crate::manifest::{Manifest, ManifestError};
@@ -322,7 +321,7 @@ fn write_header(
     out[4] = 2; // ELFCLASS64
     out[5] = 1; // ELFDATA2LSB
     out[6] = 1; // EV_CURRENT
-    // e_type
+                // e_type
     out[0x10..0x12].copy_from_slice(&e_type.to_le_bytes());
     // e_machine
     out[0x12..0x14].copy_from_slice(&e_machine.to_le_bytes());
@@ -494,8 +493,15 @@ fn smoke_x86_pc32_roundtrip() -> TestResult {
     let target_addr = 0x1000u64;
     let sym = 0x2010u64;
     let addend = -4i64;
-    apply_x86_64(&mut buf, 0, target_addr, sym, addend, crate::elf::reloc::R_X86_64_PC32)
-        .expect("pc32 apply");
+    apply_x86_64(
+        &mut buf,
+        0,
+        target_addr,
+        sym,
+        addend,
+        crate::elf::reloc::R_X86_64_PC32,
+    )
+    .expect("pc32 apply");
     let decoded = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as i32;
     let want = (sym as i64 + addend - target_addr as i64) as i32;
     if decoded == want {
@@ -573,7 +579,10 @@ fn smoke_domain_placement_resolves_text_domain() -> TestResult {
         TestResult::Fail("net should map to DRIVER_0")
     }
 }
-kernel_test_in!("modules/domain", smoke_domain_placement_resolves_text_domain);
+kernel_test_in!(
+    "modules/domain",
+    smoke_domain_placement_resolves_text_domain
+);
 
 fn smoke_lifecycle_loading_to_live() -> TestResult {
     crate::registry::__reset_for_test();
@@ -632,7 +641,10 @@ fn smoke_lifecycle_rmmod_blocks_on_refcount() -> TestResult {
         _ => TestResult::Fail("exit must block on refcount > 0"),
     }
 }
-kernel_test_in!("modules/lifecycle", smoke_lifecycle_rmmod_blocks_on_refcount);
+kernel_test_in!(
+    "modules/lifecycle",
+    smoke_lifecycle_rmmod_blocks_on_refcount
+);
 
 fn smoke_proc_modules_format() -> TestResult {
     crate::registry::__reset_for_test();

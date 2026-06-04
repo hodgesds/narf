@@ -17,8 +17,8 @@
 use alloc::vec::Vec;
 
 use crate::elf::{
-    apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header,
-    EM_AARCH64, EM_X86_64, RelocError, SymbolTable,
+    apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header, RelocError,
+    SymbolTable, EM_AARCH64, EM_X86_64,
 };
 use crate::manifest::Manifest;
 use crate::symbols::{resolve, ResolveError};
@@ -75,9 +75,8 @@ pub fn apply_one_rela_section(
     placements: &mut [SectionPlacement],
     manifest: &Manifest,
 ) -> Result<usize, RelocatorError> {
-    let rela_shdr = parse_section(bytes, hdr, rela_idx).map_err(|_| {
-        RelocatorError::ApplyFailed(RelocError::OutOfBounds)
-    })?;
+    let rela_shdr = parse_section(bytes, hdr, rela_idx)
+        .map_err(|_| RelocatorError::ApplyFailed(RelocError::OutOfBounds))?;
     let target_section = rela_shdr.sh_info as usize;
     let entsize = rela_shdr.sh_entsize as usize;
     let count = if entsize == 0 {
@@ -178,7 +177,10 @@ pub fn apply_all_relas(
         }
         let name = section_name(bytes, hdr, &shdr);
         // Skip relas for sections we didn't load (e.g. debug).
-        if !placements.iter().any(|p| p.section_idx == shdr.sh_info as usize) {
+        if !placements
+            .iter()
+            .any(|p| p.section_idx == shdr.sh_info as usize)
+        {
             // Linux silently skips relas for unloaded sections too.
             let _ = name;
             continue;

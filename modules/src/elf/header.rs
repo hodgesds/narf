@@ -207,7 +207,11 @@ pub fn parse_section(
     let entsize = hdr.e_shentsize as usize;
     let off = hdr
         .e_shoff
-        .checked_add((idx as u64).checked_mul(entsize as u64).ok_or(HeaderError::BadOffset)?)
+        .checked_add(
+            (idx as u64)
+                .checked_mul(entsize as u64)
+                .ok_or(HeaderError::BadOffset)?,
+        )
         .ok_or(HeaderError::BadOffset)? as usize;
     if off + 64 > bytes.len() {
         return Err(HeaderError::BadOffset);
@@ -227,11 +231,7 @@ pub fn parse_section(
 }
 
 /// Resolve a section name from the `.shstrtab` section.
-pub fn section_name<'a>(
-    bytes: &'a [u8],
-    hdr: &Elf64Header,
-    shdr: &Elf64SectionHeader,
-) -> &'a str {
+pub fn section_name<'a>(bytes: &'a [u8], hdr: &Elf64Header, shdr: &Elf64SectionHeader) -> &'a str {
     if hdr.e_shstrndx as usize >= hdr.e_shnum as usize {
         return "";
     }
@@ -251,11 +251,7 @@ pub fn section_name<'a>(
 }
 
 /// Resolve a string from an arbitrary string-table section.
-pub fn string_in_table<'a>(
-    bytes: &'a [u8],
-    strtab: &Elf64SectionHeader,
-    name_off: u32,
-) -> &'a str {
+pub fn string_in_table<'a>(bytes: &'a [u8], strtab: &Elf64SectionHeader, name_off: u32) -> &'a str {
     let off = strtab.sh_offset as usize + name_off as usize;
     if off >= bytes.len() {
         return "";

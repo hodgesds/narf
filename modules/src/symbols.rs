@@ -205,10 +205,7 @@ pub fn resolve(
     drop(g);
     let entry = entry.ok_or(ResolveError::Unknown)?;
     if let Some(cap) = entry.required_cap {
-        let has = manifest
-            .required_caps
-            .iter()
-            .any(|rc| rc.kind == cap);
+        let has = manifest.required_caps.iter().any(|rc| rc.kind == cap);
         if !has {
             return Err(ResolveError::CapMissing(cap));
         }
@@ -278,12 +275,7 @@ pub fn export(name: &'static str, addr: usize, crc: u32) {
 }
 
 /// Cap-gated export. Owner attribution follows the same rule as `export`.
-pub fn export_with_cap(
-    name: &'static str,
-    addr: usize,
-    crc: u32,
-    required_cap: CapKind,
-) {
+pub fn export_with_cap(name: &'static str, addr: usize, crc: u32, required_cap: CapKind) {
     register_export(KernelExport {
         name,
         addr,

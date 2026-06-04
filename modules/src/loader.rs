@@ -13,8 +13,8 @@ use narf_lib::id::DomainId;
 use crate::domain;
 use crate::elf::{
     enumerate_sections, parse_header, parse_section, sections::SECT_MODINFO,
-    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB, SymbolTable,
+    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::lifecycle::{ModuleExitFn, ModuleInitFn, ModuleState};
 use crate::manifest::{Manifest, ManifestError};
@@ -266,7 +266,10 @@ fn section_data<'a>(bytes: &'a [u8], shdr: &crate::elf::Elf64SectionHeader) -> &
 fn find_symtab(
     bytes: &[u8],
     hdr: &Elf64Header,
-) -> Option<(crate::elf::Elf64SectionHeader, crate::elf::Elf64SectionHeader)> {
+) -> Option<(
+    crate::elf::Elf64SectionHeader,
+    crate::elf::Elf64SectionHeader,
+)> {
     let mut symtab = None;
     for i in 0..hdr.e_shnum as usize {
         let s = parse_section(bytes, hdr, i).ok()?;
