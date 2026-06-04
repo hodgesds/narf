@@ -1068,6 +1068,8 @@ fn workspace_root() -> Result<PathBuf> {
 fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(root)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTFLAGS")
         .arg("build")
         .arg("-p")
         .arg(&args.package)
