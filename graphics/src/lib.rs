@@ -201,14 +201,38 @@ impl Framebuffer {
             // stride ≥ width). Each offset is < stride * height.
             unsafe {
                 let row_base = base.offset(((y + row as u32) * stride + x) as isize);
-                ptr::write_volatile(row_base.offset(0), if byte & 0x80 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(1), if byte & 0x40 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(2), if byte & 0x20 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(3), if byte & 0x10 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(4), if byte & 0x08 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(5), if byte & 0x04 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(6), if byte & 0x02 != 0 { fg_raw } else { bg_raw });
-                ptr::write_volatile(row_base.offset(7), if byte & 0x01 != 0 { fg_raw } else { bg_raw });
+                ptr::write_volatile(
+                    row_base.offset(0),
+                    if byte & 0x80 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(1),
+                    if byte & 0x40 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(2),
+                    if byte & 0x20 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(3),
+                    if byte & 0x10 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(4),
+                    if byte & 0x08 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(5),
+                    if byte & 0x04 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(6),
+                    if byte & 0x02 != 0 { fg_raw } else { bg_raw },
+                );
+                ptr::write_volatile(
+                    row_base.offset(7),
+                    if byte & 0x01 != 0 { fg_raw } else { bg_raw },
+                );
             }
         }
     }
@@ -249,9 +273,9 @@ impl Framebuffer {
 }
 
 pub mod console;
+pub mod csi2;
 pub mod cursor;
 pub mod dp_aux;
-pub mod csi2;
 pub mod dp_psr;
 pub mod dsc;
 pub mod dsi;
