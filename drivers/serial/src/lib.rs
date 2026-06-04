@@ -25,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod intel_lpss;
 pub mod probe;
 pub mod registry;
 pub mod uart_8250;
@@ -36,6 +37,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "serial-8250", || {
         uart_8250::register_legacy_uarts();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "serial-lpss", || {
+        intel_lpss::probe_all();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "serial-acpi", || {

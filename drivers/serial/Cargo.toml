@@ -16,6 +16,8 @@ narf-lib          = { path = "../../lib" }
 narf-arch         = { path = "../../arch" }
 narf-bus          = { path = "../../bus" }
 narf-acpi         = { path = "../../acpi" }
+narf-aml          = { path = "../../aml" }
+narf-memory       = { path = "../../memory" }
 narf-init         = { path = "../../init" }
 narf-console      = { path = "../../console" }
 narf-interrupts   = { path = "../../interrupts" }

@@ -39,7 +39,18 @@
 
 extern crate alloc;
 
+use narf_memory::PhysAddr;
 use crate::registry;
+
+// ── UartBase ──────────────────────────────────────────────────────────
+
+/// UART register base address — either an I/O port (legacy x86) or
+/// a physical MMIO address.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UartBase {
+    Io(u16),
+    Mmio(PhysAddr),
+}
 
 // ── Legacy COM port addresses ─────────────────────────────────────────
 
@@ -132,35 +143,43 @@ pub const UART_CLOCK_HZ: u32 = 1_843_200;
 /// Compute the divisor for a given baud rate.
 /// Returns `None` for baud = 0 or rates too high for the clock.
 #[inline]
-pub fn baud_divisor(baud: u32) -> Option<u16> {
+pub fn baud_divisor(baud: u32, clock_hz: u32) -> Option<u16> {
     if baud == 0 {
         return None;
     }
-    let div = UART_CLOCK_HZ / (baud * 16);
+    let div = clock_hz / (baud * 16);
     if div == 0 || div > 0xFFFF {
         return None;
     }
     Some(div as u16)
 }
 
-// ── I/O port accessors ────────────────────────────────────────────────
+// ── Register accessors ────────────────────────────────────────────────
 
 /// Write a byte to a UART register.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn uart_write(base: u16, reg: u16, val: u8) {
-    // SAFETY: caller ensures base is a valid 8250 port, reg is within
-    // [0,7], and we are at CPL-0.
-    unsafe { narf_arch::x86_64::io_port::outb(base + reg, val) }
+unsafe fn uart_write(base: UartBase, shift: u8, reg: u16, val: u8) {
+    match base {
+        UartBase::Io(p) => unsafe { narf_arch::x86_64::io_port::outb(p + (reg << shift), val) },
+        UartBase::Mmio(a) => unsafe { narf_arch::mmio::write8(a.raw() + ((reg as u64) << shift), val) },
+    }
 }
 
 /// Read a byte from a UART register.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn uart_read(base: u16, reg: u16) -> u8 {
-    // SAFETY: same as uart_write.
-    unsafe { narf_arch::x86_64::io_port::inb(base + reg) }
+unsafe fn uart_read(base: UartBase, shift: u8, reg: u16) -> u8 {
+    match base {
+        UartBase::Io(p) => unsafe { narf_arch::x86_64::io_port::inb(p + (reg << shift)) },
+        UartBase::Mmio(a) => unsafe { narf_arch::mmio::read8(a.raw() + ((reg as u64) << shift)) },
+    }
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn uart_write(_base: UartBase, _shift: u8, _reg: u16, _val: u8) {}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn uart_read(_base: UartBase, _shift: u8, _reg: u16) -> u8 { 0 }
 
 // ── UART device ───────────────────────────────────────────────────────
 
@@ -182,9 +201,13 @@ pub enum UartType {
 /// A 8250/16550 UART port.
 #[derive(Debug)]
 pub struct Uart8250 {
-    /// I/O port base address.
-    pub base: u16,
-    /// ISA IRQ number, if assigned.
+    /// Register base address.
+    pub base: UartBase,
+    /// Register stride (log2). 0 = 1 byte, 2 = 4 bytes.
+    pub reg_shift: u8,
+    /// Input clock frequency in Hz.
+    pub clock_hz: u32,
+    /// ISA IRQ number or GSI, if assigned.
     pub irq: Option<u8>,
     /// Detected UART variant.
     pub uart_type: UartType,
@@ -193,11 +216,24 @@ pub struct Uart8250 {
 }
 
 impl Uart8250 {
-    /// Construct a new UART handle without probing or programming.
-    /// Call [`init`] or [`set_baud`] before any I/O.
+    /// Construct a new UART handle for an I/O port.
     pub fn new(base: u16, irq: Option<u8>) -> Self {
         Self {
-            base,
+            base: UartBase::Io(base),
+            reg_shift: 0,
+            clock_hz: UART_CLOCK_HZ,
+            irq,
+            uart_type: UartType::NotDetected,
+            baud: 0,
+        }
+    }
+
+    /// Construct a new handle for an MMIO-mapped 8250 port.
+    pub fn new_mmio(base_addr: PhysAddr, irq: Option<u8>, reg_shift: u8, clock_hz: u32) -> Self {
+        Self {
+            base: UartBase::Mmio(base_addr),
+            reg_shift,
+            clock_hz,
             irq,
             uart_type: UartType::NotDetected,
             baud: 0,
@@ -208,17 +244,12 @@ impl Uart8250 {
     /// test and the FIFO-presence test.
     ///
     /// Linux 8250_port.c `autoconfig` ~L780 and `autoconfig_16550a` ~L823.
-    ///
-    /// 1. Write a sentinel to SCR (+7), read back. If mismatch: not an
-    ///    8250-family chip (no scratch register).
-    /// 2. Enable FIFO via FCR; read IIR. If bits 7:6 = 11: 16550A.
-    /// 3. Otherwise: 16450 (if SCR matched) or 8250.
     #[cfg(target_arch = "x86_64")]
     pub fn detect(&mut self) -> UartType {
-        // SAFETY: all I/O to base..base+7, kernel context.
+        // SAFETY: all I/O to base registers, kernel context.
         let has_scratch = unsafe {
-            uart_write(self.base, REG_SCR, 0xAB);
-            let rb = uart_read(self.base, REG_SCR);
+            uart_write(self.base, self.reg_shift, REG_SCR, 0xAB);
+            let rb = uart_read(self.base, self.reg_shift, REG_SCR);
             rb == 0xAB
         };
         if !has_scratch {
@@ -229,10 +260,11 @@ impl Uart8250 {
         let has_fifo = unsafe {
             uart_write(
                 self.base,
+                self.reg_shift,
                 REG_FCR,
                 FCR_FIFO_ENABLE | FCR_CLEAR_RX | FCR_CLEAR_TX,
             );
-            let iir = uart_read(self.base, REG_IIR);
+            let iir = uart_read(self.base, self.reg_shift, REG_IIR);
             (iir & IIR_FIFO_ENABLED) == IIR_FIFO_ENABLED
         };
         self.uart_type = if has_fifo {
@@ -250,28 +282,18 @@ impl Uart8250 {
     }
 
     /// Program the UART to the given baud rate.
-    ///
-    /// Sets LCR.DLAB=1, writes DLL and DLM, then clears DLAB and
-    /// leaves the port in 8N1 configuration.
-    ///
-    /// Returns `false` if the divisor is out of range.
-    ///
-    /// Linux 8250_port.c `serial8250_do_set_divisor` ~L2100.
     #[cfg(target_arch = "x86_64")]
     pub fn set_baud(&mut self, baud: u32) -> bool {
-        let div = match baud_divisor(baud) {
+        let div = match baud_divisor(baud, self.clock_hz) {
             Some(d) => d,
             None => return false,
         };
-        // SAFETY: LCR.DLAB sequence followed immediately by DLL/DLM
-        // write, then DLAB cleared. No concurrent access assumed.
+        // SAFETY: LCR.DLAB sequence.
         unsafe {
-            // Set DLAB to access DLL/DLM.
-            uart_write(self.base, REG_LCR, LCR_DLAB);
-            uart_write(self.base, REG_DLL, (div & 0xFF) as u8);
-            uart_write(self.base, REG_DLM, ((div >> 8) & 0xFF) as u8);
-            // 8N1, clear DLAB.
-            uart_write(self.base, REG_LCR, LCR_8N1);
+            uart_write(self.base, self.reg_shift, REG_LCR, LCR_DLAB);
+            uart_write(self.base, self.reg_shift, REG_DLL, (div & 0xFF) as u8);
+            uart_write(self.base, self.reg_shift, REG_DLM, ((div >> 8) & 0xFF) as u8);
+            uart_write(self.base, self.reg_shift, REG_LCR, LCR_8N1);
         }
         self.baud = baud;
         true
@@ -282,34 +304,28 @@ impl Uart8250 {
         false
     }
 
-    /// Initialize the UART: detect chip, program 8N1 at `baud`,
-    /// enable and clear FIFOs (if 16550A), assert MCR.DTR | MCR.RTS |
-    /// MCR.OUT2 to enable the IRQ gate.
-    ///
-    /// Linux 8250_port.c `serial8250_init_port` ~L3220.
+    /// Initialize the UART: detect chip, program 8N1 at `baud`.
     #[cfg(target_arch = "x86_64")]
     pub fn init(&mut self, baud: u32) -> bool {
         self.detect();
         if self.uart_type == UartType::NotDetected {
             return false;
         }
-        // Disable all interrupts during init.
-        unsafe { uart_write(self.base, REG_IER, 0x00) };
+        unsafe { uart_write(self.base, self.reg_shift, REG_IER, 0x00) };
         if !self.set_baud(baud) {
             return false;
         }
-        // Enable FIFO on 16550A chips.
         if self.uart_type == UartType::Uart16550A {
             unsafe {
                 uart_write(
                     self.base,
+                    self.reg_shift,
                     REG_FCR,
                     FCR_FIFO_ENABLE | FCR_CLEAR_RX | FCR_CLEAR_TX | FCR_TRIGGER_14,
                 );
             }
         }
-        // Assert DTR + RTS + OUT2 (OUT2 gates the IRQ on most UARTs).
-        unsafe { uart_write(self.base, REG_MCR, MCR_DTR | MCR_RTS | MCR_OUT2) };
+        unsafe { uart_write(self.base, self.reg_shift, REG_MCR, MCR_DTR | MCR_RTS | MCR_OUT2) };
         true
     }
 
@@ -319,46 +335,35 @@ impl Uart8250 {
     }
 
     /// Enable receive-data-available interrupt.
-    ///
-    /// After init, call this to route received bytes to the IRQ handler.
     #[cfg(target_arch = "x86_64")]
     pub fn enable_rx_irq(&self) {
-        unsafe { uart_write(self.base, REG_IER, IER_RDA) };
+        unsafe { uart_write(self.base, self.reg_shift, REG_IER, IER_RDA) };
     }
 
-    /// Write a single byte, blocking until the Transmit Holding
-    /// Register is empty (LSR.THRE = 1).
-    ///
-    /// Linux 8250_port.c `wait_for_xmitr` + `serial_out` ~L1820.
+    /// Write a single byte, blocking until THRE = 1.
     #[cfg(target_arch = "x86_64")]
     pub fn write_byte(&self, byte: u8) {
-        // SAFETY: polling LSR.THRE and writing THR at CPL-0.
         unsafe {
-            // Spin until THRE. On a quiescent UART this takes < 10 µs.
             loop {
-                let lsr = uart_read(self.base, REG_LSR);
+                let lsr = uart_read(self.base, self.reg_shift, REG_LSR);
                 if lsr & LSR_THRE != 0 {
                     break;
                 }
             }
-            uart_write(self.base, REG_THR_RBR, byte);
+            uart_write(self.base, self.reg_shift, REG_THR_RBR, byte);
         }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
     pub fn write_byte(&self, _byte: u8) {}
 
-    /// Read a received byte if one is available (LSR.DR = 1).
-    /// Returns `None` if no byte is waiting.
-    ///
-    /// Linux 8250_port.c `serial_in` / `receive_chars` ~L1620.
+    /// Read a received byte if one is available.
     #[cfg(target_arch = "x86_64")]
     pub fn read_byte(&self) -> Option<u8> {
-        // SAFETY: reading LSR then RBR at CPL-0.
         unsafe {
-            let lsr = uart_read(self.base, REG_LSR);
+            let lsr = uart_read(self.base, self.reg_shift, REG_LSR);
             if lsr & LSR_DR != 0 {
-                Some(uart_read(self.base, REG_THR_RBR))
+                Some(uart_read(self.base, self.reg_shift, REG_THR_RBR))
             } else {
                 None
             }
@@ -370,17 +375,13 @@ impl Uart8250 {
         None
     }
 
-    /// Read LSR for diagnostic purposes (framing errors, etc.).
     #[cfg(target_arch = "x86_64")]
     pub fn read_lsr(&self) -> u8 {
-        // SAFETY: read-only, CPL-0.
-        unsafe { uart_read(self.base, REG_LSR) }
+        unsafe { uart_read(self.base, self.reg_shift, REG_LSR) }
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    pub fn read_lsr(&self) -> u8 {
-        0
-    }
+    pub fn read_lsr(&self) -> u8 { 0 }
 }
 
 // ── Legacy COM port registration ──────────────────────────────────────
@@ -392,8 +393,6 @@ static COM_PORTS: &[(&str, u16, u8)] = &[
     ("COM4", COM4_BASE, COM4_IRQ),
 ];
 
-/// Probe all legacy ISA COM ports and register those that are present.
-/// Called from Stage::Subsys initcall.
 pub fn register_legacy_uarts() {
     use core::fmt::Write as _;
     for &(name, base, irq) in COM_PORTS {
