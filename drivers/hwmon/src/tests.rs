@@ -263,8 +263,8 @@ kernel_test_in!("drivers/hwmon/registry", smoke_hwmon_registry);
 /// After registering a k10temp device and populating the hwmon class,
 /// `/sys/class/hwmon/hwmon0` appears with a `name` attribute.
 fn smoke_bridge_k10temp_hwmon0_enumerated() -> TestResult {
+    use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
     use alloc::sync::Arc;
-    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     let chip = match chip_info(AMD_RENOIR_NB) {
@@ -275,7 +275,8 @@ fn smoke_bridge_k10temp_hwmon0_enumerated() -> TestResult {
     crate::registry::register_device(Arc::new(dev));
     crate::sysfs_bridge::populate_hwmon_class();
     // /sys/class/hwmon/hwmon0 must exist.
-    let root = narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let root = narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
         .and_then(|h| h.get_child("hwmon0"));
     if root.is_none() {
@@ -283,12 +284,15 @@ fn smoke_bridge_k10temp_hwmon0_enumerated() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_k10temp_hwmon0_enumerated);
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_k10temp_hwmon0_enumerated
+);
 
 /// `hwmon0/name` returns the chip name (`"k10temp\n"`).
 fn smoke_bridge_name_attr_reads_k10temp() -> TestResult {
+    use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
     use alloc::sync::Arc;
-    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     let chip = match chip_info(AMD_RENOIR_NB) {
@@ -297,7 +301,8 @@ fn smoke_bridge_name_attr_reads_k10temp() -> TestResult {
     };
     crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
     crate::sysfs_bridge::populate_hwmon_class();
-    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let kobj = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
         .and_then(|h| h.get_child("hwmon0"))
     {
@@ -318,8 +323,8 @@ kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_name_attr_reads_k10temp);
 /// `temp1_input` attr exists and returns ASCII digits (the value may
 /// be 0 if no hardware is accessible in the test environment).
 fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
+    use crate::k10temp::{chip_info, K10temp, AMD_PHOENIX_NB};
     use alloc::sync::Arc;
-    use crate::k10temp::{K10temp, chip_info, AMD_PHOENIX_NB};
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     let chip = match chip_info(AMD_PHOENIX_NB) {
@@ -328,7 +333,8 @@ fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
     };
     crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
     crate::sysfs_bridge::populate_hwmon_class();
-    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let kobj = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
         .and_then(|h| h.get_child("hwmon0"))
     {
@@ -347,12 +353,15 @@ fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
         None => TestResult::Fail("temp1_input attr missing from hwmon0"),
     }
 }
-kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_temp1_input_returns_ascii);
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_temp1_input_returns_ascii
+);
 
 /// `temp1_label` returns the label string with a newline.
 fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
+    use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
     use alloc::sync::Arc;
-    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     let chip = match chip_info(AMD_RENOIR_NB) {
@@ -361,7 +370,8 @@ fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
     };
     crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
     crate::sysfs_bridge::populate_hwmon_class();
-    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let kobj = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
         .and_then(|h| h.get_child("hwmon0"))
     {
@@ -378,13 +388,16 @@ fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
         None => TestResult::Fail("temp1_label attr missing"),
     }
 }
-kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_temp1_label_returns_tctl);
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_temp1_label_returns_tctl
+);
 
 /// Two devices produce hwmon0 and hwmon1.
 fn smoke_bridge_multiple_devices_enumerated() -> TestResult {
-    use alloc::sync::Arc;
-    use crate::k10temp::{K10temp, chip_info, AMD_RENOIR_NB};
     use crate::coretemp::Coretemp;
+    use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
+    use alloc::sync::Arc;
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     let chip = match chip_info(AMD_RENOIR_NB) {
@@ -394,7 +407,8 @@ fn smoke_bridge_multiple_devices_enumerated() -> TestResult {
     crate::registry::register_device(Arc::new(K10temp::new(0, 0, 0, chip)));
     crate::registry::register_device(Arc::new(Coretemp::new(100, 0)));
     crate::sysfs_bridge::populate_hwmon_class();
-    let class_hwmon = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let class_hwmon = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
     {
         Some(k) => k,
@@ -409,18 +423,22 @@ fn smoke_bridge_multiple_devices_enumerated() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_multiple_devices_enumerated);
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_multiple_devices_enumerated
+);
 
 /// NCT6779D has 5 fans; bridge should expose fan1_input through fan5_input.
 fn smoke_bridge_nct6779d_five_fan_inputs() -> TestResult {
-    use alloc::sync::Arc;
     use crate::nct6775::{Nct6775, NctChip, NCT6779D_ID};
+    use alloc::sync::Arc;
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     let dev = Nct6775::new(NctChip::Nct6779D, NCT6779D_ID, 0x2E, 0x2F);
     crate::registry::register_device(Arc::new(dev));
     crate::sysfs_bridge::populate_hwmon_class();
-    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let kobj = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
         .and_then(|h| h.get_child("hwmon0"))
     {
@@ -435,17 +453,21 @@ fn smoke_bridge_nct6779d_five_fan_inputs() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_nct6779d_five_fan_inputs);
+kernel_test_in!(
+    "drivers/hwmon/bridge",
+    smoke_bridge_nct6779d_five_fan_inputs
+);
 
 /// `update_interval` attr exists and returns "1000\n".
 fn smoke_bridge_update_interval_attr() -> TestResult {
-    use alloc::sync::Arc;
     use crate::coretemp::Coretemp;
+    use alloc::sync::Arc;
     narf_filesystem::sysfs::__reset_for_test();
     crate::registry::__reset_devices_for_test();
     crate::registry::register_device(Arc::new(Coretemp::new(105, 0)));
     crate::sysfs_bridge::populate_hwmon_class();
-    let kobj = match narf_filesystem::sysfs::sysfs_root().get_child("class")
+    let kobj = match narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
         .and_then(|c| c.get_child("hwmon"))
         .and_then(|h| h.get_child("hwmon0"))
     {
@@ -459,3 +481,161 @@ fn smoke_bridge_update_interval_attr() -> TestResult {
     }
 }
 kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_update_interval_attr);
+
+
+// ── dell_smm ──────────────────────────────────────────────────────────
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod dell_smm_tests {
+    use crate::dell_smm::{DellSmm, SMM_MOCK};
+    use crate::HwmonDevice;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn mock_smm_call(cmd: u32, arg: u32) -> crate::dell_smm::SmmResult {
+        use crate::dell_smm::*;
+        match cmd {
+            SMM_GET_TEMP => {
+                if arg == 0 {
+                    SmmResult { eax: 45, edx: 0 }
+                } else if arg == 1 {
+                    SmmResult { eax: 55, edx: 0 }
+                } else {
+                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                }
+            }
+            SMM_GET_FAN_STATUS => {
+                if arg == 0 {
+                    SmmResult { eax: 2, edx: 0 }
+                } else if arg == 1 {
+                    SmmResult { eax: 1, edx: 0 }
+                } else {
+                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                }
+            }
+            SMM_GET_FAN_NOMINAL_RPM => {
+                if arg == 0 {
+                    SmmResult { eax: 100, edx: 0 }
+                } else if arg == 1 {
+                    SmmResult { eax: 80, edx: 0 }
+                } else {
+                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                }
+            }
+            SMM_SET_FAN => {
+                let fan_idx = arg & 0xFF;
+                let level = (arg >> 8) & 0xFF;
+                if fan_idx < 2 && level <= 3 {
+                    SmmResult { eax: 0, edx: 0 }
+                } else {
+                    SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 }
+                }
+            }
+            _ => SmmResult { eax: SMM_ERR_NOSUPPORT, edx: 0 },
+        }
+    }
+
+    /// Verify Dell SMM temp, fan read/write operations when mocked.
+    fn smoke_dell_smm_operations() -> TestResult {
+        *SMM_MOCK.lock() = Some(mock_smm_call);
+
+        let dev = DellSmm::new();
+
+        // Verify temp readings
+        if dev.read_temp("cpu") != Some(45_000) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected cpu temp 45_000 mC");
+        }
+        if dev.read_temp("gpu") != Some(55_000) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected gpu temp 55_000 mC");
+        }
+        if dev.read_temp("hdd").is_some() {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected hdd temp to be None (nosupport)");
+        }
+
+        // Verify fan readings (RPM = nominal * 30)
+        if dev.read_fan("fan1") != Some(3000) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected fan1 RPM to be 3000");
+        }
+        if dev.read_fan("fan2") != Some(2400) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected fan2 RPM to be 2400");
+        }
+
+        // Verify setting fan levels
+        if !dev.set_fan("fan1", 2) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected set_fan to succeed");
+        }
+        if dev.set_fan("fan1", 5) {
+            *SMM_MOCK.lock() = None;
+            return TestResult::Fail("Expected setting invalid level to fail");
+        }
+
+        *SMM_MOCK.lock() = None;
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_operations);
+
+    fn set_mock_system_manufacturer(mfr: &[u8]) {
+        let fixed_len: u8 = 25;
+        let mut buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        buf.push(1); // Type 1: System Info
+        buf.push(fixed_len);
+        buf.extend_from_slice(&0u16.to_le_bytes()); // Handle
+        buf.push(1); // Manufacturer str
+        buf.push(2); // Product str
+        buf.push(3); // Version str
+        buf.push(4); // Serial str
+        buf.extend_from_slice(&[0u8; 16]); // UUID
+        buf.push(0x06); // Wake-up type
+
+        buf.extend_from_slice(mfr);
+        buf.push(0);
+        buf.extend_from_slice(b"MockProduct\0");
+        buf.extend_from_slice(b"v1.0\0");
+        buf.extend_from_slice(b"SN-123\0");
+        buf.push(0); // End of strings
+
+        // Type 127 (End-of-table)
+        buf.push(127);
+        buf.push(4);
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.push(0);
+        buf.push(0);
+
+        narf_firmware_smbios::parse_stream(&buf);
+    }
+
+    /// Verify that non-Dell systems skip registering the dell_smm driver.
+    fn smoke_dell_smm_registration_skips_non_dell() -> TestResult {
+        crate::registry::__reset_devices_for_test();
+        set_mock_system_manufacturer(b"QEMU\0");
+
+        crate::dell_smm::register_smm_driver();
+
+        if crate::registry::device_count() != 0 {
+            return TestResult::Fail("Expected dell_smm driver to be skipped on non-Dell systems");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_registration_skips_non_dell);
+
+    /// Verify that Dell systems successfully register the dell_smm driver.
+    fn smoke_dell_smm_registration_accepts_dell() -> TestResult {
+        crate::registry::__reset_devices_for_test();
+        set_mock_system_manufacturer(b"Dell Inc.\0");
+
+        crate::dell_smm::register_smm_driver();
+
+        if crate::registry::device_count() != 1 {
+            return TestResult::Fail("Expected dell_smm driver to be registered on Dell systems");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/hwmon/dell_smm", smoke_dell_smm_registration_accepts_dell);
+}
+
+
