@@ -17,13 +17,17 @@ narf-arch        = { path = "../arch" }
 narf-kernel-test = { path = "../verification/kernel-test" }
 
 [features]
-# mprotect / madvise / brk extension needed by Linux-compat syscalls.
-# Stub for Waves 63-67.
+default = ["linux-compat"]
+
+# Linux-compat surfaces (mprotect with split/merge, madvise, etc.).
+# Enabled by default so modern allocators (jemalloc, mimalloc) and JIT
+# engines (V8) see the standard kernel behaviour rather than the
+# NARF-native subset.
 linux-compat = []
 
 # Per-namespace address-space tagging.  Orthogonal to linux-compat.
-# Stub for Waves 63-67.
 container = []
+
 
 [lints]
 workspace = true

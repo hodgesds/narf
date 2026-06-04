@@ -5354,3 +5354,177 @@ fn smoke_diag_phase_decode_clamps_unknown_to_firmware() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_diag_phase_decode_clamps_unknown_to_firmware);
+
+// ── Wave-66 — Linux-compat mprotect / madvise smokes ──────────────
+//
+// 1. `mprotect_range` splits a 3-page region cleanly when the middle
+//    page is protected — head + middle + tail come back as three
+//    distinct regions with disjoint phys slices and the middle gets
+//    the new perms.
+// 2. `mprotect_range` rejects WRITE | EXEC outright (W^X policy).
+// 3. `madvise_dontneed` releases backed frames + zeros the per-page
+//    phys list so the next access takes the demand-paging path.
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_memory_mprotect_splits_region() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+
+    // Three frames so the head/mid/tail each get a distinct phys.
+    let mut frames: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
+    for _ in 0..3 {
+        match crate::alloc_frame() {
+            Ok(f) => frames.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                for p in frames.iter() {
+                    crate::free_frame(crate::frame::PhysFrame::new(*p));
+                }
+                return TestResult::Skip("frame drained");
+            }
+        }
+    }
+    let v = VirtAddr::new(0x0000_0080_0001_0000);
+    a.map_region(Region {
+        base: v,
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: frames.clone(),
+    })
+    .expect("map");
+    let _ = unsafe { a.materialize() };
+
+    // Protect the middle page READ-only.
+    let mid = VirtAddr::new(v.as_u64() + 0x1000);
+    if a.mprotect_range(mid, 0x1000, RegionPerms::READ).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("mprotect_range middle slice failed");
+    }
+
+    let snap = a.regions_snapshot();
+    let head = snap.iter().find(|r| r.base.as_u64() == v.as_u64());
+    let middle = snap.iter().find(|r| r.base.as_u64() == v.as_u64() + 0x1000);
+    let tail = snap.iter().find(|r| r.base.as_u64() == v.as_u64() + 0x2000);
+    let ok = match (head, middle, tail) {
+        (Some(h), Some(m), Some(t)) => {
+            h.len == 0x1000
+                && m.len == 0x1000
+                && t.len == 0x1000
+                && h.perms.contains(RegionPerms::WRITE)
+                && !m.perms.contains(RegionPerms::WRITE)
+                && m.perms.contains(RegionPerms::READ)
+                && t.perms.contains(RegionPerms::WRITE)
+                && h.phys.len() == 1
+                && m.phys.len() == 1
+                && t.phys.len() == 1
+                && h.phys[0].raw() == frames[0].raw()
+                && m.phys[0].raw() == frames[1].raw()
+                && t.phys[0].raw() == frames[2].raw()
+        }
+        _ => false,
+    };
+    core::mem::forget(a);
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("split layout / perms / phys did not match expectation")
+    }
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("memory", smoke_memory_mprotect_splits_region);
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let target = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let v = VirtAddr::new(0x0000_0080_0002_0000);
+    a.map_region(Region {
+        base: v,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![target],
+    })
+    .expect("map");
+    let _ = unsafe { a.materialize() };
+
+    let wx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
+    let err = a.mprotect_range(v, 0x1000, wx);
+    core::mem::forget(a);
+    match err {
+        Err(crate::AddressSpaceError::AlignmentMismatch) => TestResult::Pass,
+        Ok(()) => TestResult::Fail("mprotect_range accepted WRITE|EXEC"),
+        Err(_) => TestResult::Fail("wrong error for WRITE|EXEC"),
+    }
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("memory", smoke_memory_mprotect_rejects_write_exec);
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let target = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let v = VirtAddr::new(0x0000_0080_0003_0000);
+    a.map_region(Region {
+        base: v,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![target],
+    })
+    .expect("map");
+    let _ = unsafe { a.materialize() };
+
+    // Stamp the page so we can confirm DONTNEED dropped the frame —
+    // the post-madvise demand-fault path would re-allocate a fresh
+    // zeroed frame on next access.
+    // SAFETY: identity-map covers the just-allocated frame.
+    unsafe {
+        core::ptr::write_bytes(target.raw() as *mut u8, 0xAB, 4096);
+    }
+
+    if a.madvise_dontneed(v, 0x1000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("madvise_dontneed returned err");
+    }
+
+    let cleared = {
+        let g = a.regions_snapshot();
+        g.iter()
+            .find(|r| r.base.as_u64() == v.as_u64())
+            .map(|r| r.phys.len() == 1 && r.phys[0] == PhysAddr::new(0))
+            .unwrap_or(false)
+    };
+    core::mem::forget(a);
+    if cleared {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("madvise didn't zero per-page phys slot")
+    }
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);

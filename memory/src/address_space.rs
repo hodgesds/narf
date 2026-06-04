@@ -797,6 +797,302 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Linux-compat `mprotect(base, len, new_perms)` — change
+    /// permissions on `[base, base + len)` with region split where
+    /// the range partially overlaps an existing region.
+    ///
+    /// Unlike [`change_perms_range`] (which is whole-region only),
+    /// this surface implements POSIX `mprotect(2)` semantics:
+    ///
+    /// 1. Walk the AS's region list and pick every region that
+    ///    intersects `[lo, hi)`.
+    /// 2. For each hit region `[rb, re)`, split it at the request
+    ///    boundaries:
+    ///    - `[rb, lo)` keeps the old perms (head fragment).
+    ///    - `[max(rb, lo), min(re, hi))` gets the new perms (middle).
+    ///    - `[hi, re)` keeps the old perms (tail fragment).
+    ///    Each fragment carries its own slice of the original
+    ///    region's `phys` Vec, so `Drop for AddressSpace` doesn't
+    ///    double-free.
+    /// 3. W^X check: reject if `new_perms` carries BOTH WRITE and
+    ///    EXEC. Same policy as [`wx::check_mmap_perms`] — JIT code
+    ///    must take RW → RX via the cap path, never directly.
+    /// 4. Re-materialise the affected (post-split) region's PTEs.
+    ///
+    /// `new_perms` is interpreted as a POSIX-prot mask only — any
+    /// internal flags (LOCKED, STACK_GUARD) in `new_perms.0` are
+    /// stripped before the assignment, so a stack-guard region
+    /// stays a stack guard even if user code mprotects across it.
+    /// The head and tail fragments preserve the original region's
+    /// full perms field including those flags.
+    ///
+    /// Returns:
+    /// - `Ok(())` on a successful change covering ≥ 1 page.
+    /// - `Err(Unmapped)` if no region intersects the request.
+    /// - `Err(AlignmentMismatch)` if `base` or `len` is not page-
+    ///   aligned, or if `new_perms` carries `WRITE | EXEC` (W^X).
+    #[cfg(feature = "linux-compat")]
+    pub fn mprotect_range(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        new_perms: RegionPerms,
+    ) -> Result<(), AddressSpaceError> {
+        // W^X: reject WRITE | EXEC outright. Used by sys_mprotect's
+        // cap-free fast path; CAP_JIT-gated RW→RX transitions go
+        // through a separate cap-checked entry.
+        let prot = new_perms.prot_only();
+        if prot.contains(RegionPerms::WRITE | RegionPerms::EXEC) {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        // Page-align the request. Linux mprotect(2) requires
+        // `addr` to be page-aligned; `len` is rounded up by the
+        // libc caller but we reject silently-misaligned lengths
+        // so callers learn early.
+        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        if len == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let lo = base.as_u64();
+        let hi = lo.saturating_add(len);
+
+        // Snapshot the region list under the lock, compute the
+        // new layout, then swap it in. The PTE rewrite happens
+        // after the lock is dropped so the post-split rebuild
+        // can't deadlock against concurrent map_region work on
+        // an unrelated region.
+        let touched: Vec<Region> = {
+            let mut g = self.regions.lock();
+
+            // Collect indices that intersect [lo, hi). Walk forward
+            // and split in place — we drain the original Vec into
+            // `new_list` so the bookkeeping stays consistent even
+            // if a region's head fragment is empty (drop entirely).
+            let originals: Vec<Region> = core::mem::take(&mut *g);
+            let mut new_list: Vec<Region> = Vec::with_capacity(originals.len() + 2);
+            let mut hits: Vec<Region> = Vec::new();
+            for r in originals.into_iter() {
+                let rb = r.base.as_u64();
+                let re = rb.saturating_add(r.len);
+                if rb >= hi || re <= lo {
+                    // No intersection — keep verbatim.
+                    new_list.push(r);
+                    continue;
+                }
+
+                // Intersection. Split into up to three pieces.
+                // The old region owns r.phys; we slice it
+                // disjointly into the new fragments so the Drop
+                // path's per-frame free doesn't double-fire.
+                let split_lo = lo.max(rb);
+                let split_hi = hi.min(re);
+                // Page indices in the original region's phys list.
+                let head_pages = ((split_lo - rb) >> 12) as usize;
+                let mid_pages = ((split_hi - split_lo) >> 12) as usize;
+
+                // Carry over the phys slices. We move out of r.phys
+                // by index into three owned Vecs so the original is
+                // dropped empty.
+                let mut phys_iter = r.phys.into_iter();
+                let head_phys: Vec<PhysAddr> = (&mut phys_iter).take(head_pages).collect();
+                let mid_phys:  Vec<PhysAddr> = (&mut phys_iter).take(mid_pages).collect();
+                let tail_phys: Vec<PhysAddr> = phys_iter.collect();
+
+                // Head fragment (preserves old perms & internal
+                // flags). May be empty when the request starts at
+                // or before the region's base.
+                if head_pages > 0 {
+                    new_list.push(Region {
+                        base: VirtAddr::new(rb),
+                        len: (head_pages as u64) << 12,
+                        perms: r.perms,
+                        phys: head_phys,
+                    });
+                }
+
+                // Middle fragment — the protected slice. The new
+                // perms replace the POSIX-prot bits; internal flags
+                // (LOCKED, STACK_GUARD) are preserved from the
+                // original region.
+                let preserved_flags = RegionPerms(r.perms.0 & !RegionPerms::PROT_MASK.0);
+                let mid_region = Region {
+                    base: VirtAddr::new(split_lo),
+                    len: (mid_pages as u64) << 12,
+                    perms: RegionPerms(prot.0 | preserved_flags.0),
+                    phys: mid_phys,
+                };
+                hits.push(mid_region.clone());
+                new_list.push(mid_region);
+
+                // Tail fragment (preserves old perms).
+                if tail_phys.len() > 0 {
+                    new_list.push(Region {
+                        base: VirtAddr::new(split_hi),
+                        len: (tail_phys.len() as u64) << 12,
+                        perms: r.perms,
+                        phys: tail_phys,
+                    });
+                }
+            }
+            *g = new_list;
+            hits
+        };
+
+        if touched.is_empty() {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // SAFETY: same identity-mapping precondition as
+        // `change_perms_range`. The middle fragments share their
+        // phys frames with the pre-split region; rewriting the PTE
+        // flags is safe because we hold the only reference to each
+        // post-split phys slot (the Drop path consults the new
+        // region table, not the old one).
+        unsafe { self.rewrite_perms_pages(&touched) };
+        Ok(())
+    }
+
+    /// Linux-compat `madvise(base, len, advice)` for MADV_DONTNEED
+    /// (4) and MADV_FREE (8). For every page in `[base, base + len)`
+    /// whose backing frame is non-zero, this routine:
+    ///
+    /// 1. Tears down the leaf PTE for that page (invlpg fires).
+    /// 2. Frees the underlying frame via `free_frame`, which honours
+    ///    the COW refcount table — a frame still shared with another
+    ///    address space stays live; only sole-owner frames return to
+    ///    the buddy allocator.
+    /// 3. Sets the per-page `phys[i]` slot back to the zero sentinel,
+    ///    so the next user-mode access takes the demand-paging path
+    ///    in `demand_alloc_page` and gets a freshly-zeroed frame.
+    ///
+    /// Behavioural difference from Linux:
+    /// - MADV_DONTNEED and MADV_FREE collapse to the same shape
+    ///   here (eager release + lazy zero-on-fault). The lazy-reclaim
+    ///   distinction Linux makes between the two requires a swap /
+    ///   page-aging path NARF doesn't have yet; both end up with
+    ///   "next access reads zero," which is what callers need.
+    /// - LOCKED regions silently keep their pages backed (madvise
+    ///   is a hint; an mlock'd page must stay resident). The region
+    ///   is treated as "touched" for the return value but no frames
+    ///   are released.
+    /// - STACK_GUARD pages stay guard pages — they were never
+    ///   backed, so there is nothing to release; the routine is a
+    ///   no-op for those.
+    ///
+    /// Returns:
+    /// - `Ok(())` on a successful pass over ≥ 1 region.
+    /// - `Err(Unmapped)` if no region intersects the request.
+    /// - `Err(AlignmentMismatch)` for misaligned `base` / `len`.
+    #[cfg(feature = "linux-compat")]
+    pub fn madvise_dontneed(
+        &self,
+        base: VirtAddr,
+        len: u64,
+    ) -> Result<(), AddressSpaceError> {
+        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        if len == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let lo = base.as_u64();
+        let hi = lo.saturating_add(len);
+
+        // Collect (vaddr, phys) pairs to free outside the lock. We
+        // also stamp `phys[i] = 0` while we hold it so a concurrent
+        // demand-fault sees the slot as unbacked rather than racing
+        // a half-freed frame.
+        let mut to_release: Vec<(VirtAddr, PhysAddr)> = Vec::new();
+        let mut touched = false;
+        {
+            let mut g = self.regions.lock();
+            for r in g.iter_mut() {
+                let rb = r.base.as_u64();
+                let re = rb.saturating_add(r.len);
+                if rb >= hi || re <= lo {
+                    continue;
+                }
+                touched = true;
+                // LOCKED region — hint is honoured as a no-op so
+                // mlock'd pages stay resident.
+                if r.perms.contains(RegionPerms::LOCKED) {
+                    continue;
+                }
+                let start_v = lo.max(rb);
+                let end_v   = hi.min(re);
+                let start_i = ((start_v - rb) >> 12) as usize;
+                let end_i   = ((end_v   - rb) >> 12) as usize;
+                for i in start_i..end_i {
+                    let p = r.phys[i];
+                    if p.raw() == 0 {
+                        continue;
+                    }
+                    let v = VirtAddr::new(rb + ((i as u64) << 12));
+                    to_release.push((v, p));
+                    r.phys[i] = PhysAddr::new(0);
+                }
+            }
+        }
+        if !touched {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // SAFETY: same identity-map invariant as change_perms_range
+        // and unmap_region_pages — the kernel runs with a high-half
+        // mapping and the user AS's leaf PTEs walk through self.root.
+        unsafe { self.madvise_release_pages(&to_release) };
+        Ok(())
+    }
+
+    /// PTE-walk helper for [`madvise_dontneed`]. Tear down the leaf
+    /// PTE for each `(vaddr, phys)` pair and return the frame to the
+    /// allocator. `free_frame` consults the COW refcount table, so a
+    /// frame still shared with another AS stays live until its last
+    /// owner releases it.
+    ///
+    /// # Safety
+    /// Identity-map invariant identical to `unmap_region_pages`.
+    /// Each `phys` must match the leaf the page table currently
+    /// resolves to — `madvise_dontneed` snapshots the per-page phys
+    /// list under the region lock so this contract holds.
+    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    unsafe fn madvise_release_pages(&self, pages: &[(VirtAddr, PhysAddr)]) {
+        use crate::frame::{free_frame, PhysFrame};
+        use crate::x86_64::paging::unmap_4kb;
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        for (v, p) in pages {
+            // SAFETY: identity-mapped; `v` came from a known
+            // bookkept region.
+            let _ = unsafe { unmap_4kb(self.root, *v) };
+            if crate::frame::__pagetable_is_registered(p.raw()) {
+                continue;
+            }
+            free_frame(PhysFrame::new(*p));
+        }
+    }
+
+    #[cfg(all(feature = "linux-compat", target_arch = "aarch64"))]
+    unsafe fn madvise_release_pages(&self, pages: &[(VirtAddr, PhysAddr)]) {
+        use crate::aarch64::paging::unmap_4kb;
+        use crate::frame::{free_frame, PhysFrame};
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        for (v, p) in pages {
+            // SAFETY: see x86_64 variant.
+            let _ = unsafe { unmap_4kb(self.root, *v) };
+            free_frame(PhysFrame::new(*p));
+        }
+    }
+
+    #[cfg(all(
+        feature = "linux-compat",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    unsafe fn madvise_release_pages(&self, _pages: &[(VirtAddr, PhysAddr)]) {}
+
     /// PTE-walk helper for `change_perms_range`. For each page in
     /// each region: unmap_4kb to recover the phys + clear the
     /// leaf PTE, then map_4kb with the new perms to reinstall.
