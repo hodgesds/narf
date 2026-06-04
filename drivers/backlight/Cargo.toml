@@ -23,6 +23,7 @@ narf-scheduler    = { path = "../../scheduler" }
 narf-time         = { path = "../../time" }
 narf-drivers-leds = { path = "../leds" }
 narf-filesystem   = { path = "../../filesystem" }
+narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 
 [features]
 kernel-test = ["narf-drivers-leds/kernel-test"]

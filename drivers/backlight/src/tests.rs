@@ -420,8 +420,6 @@ mod smokes {
     }
     kernel_test_in!("drivers/backlight", smoke_brightness_key_ignores_unknown);
 
-    // ── 14. ACPI video BacklightKind is Firmware ──────────────────
-
     fn smoke_backlight_kind_acpi_video() -> TestResult {
         __reset_all_for_test();
         av_reset();
@@ -437,4 +435,57 @@ mod smokes {
         TestResult::Pass
     }
     kernel_test_in!("drivers/backlight", smoke_backlight_kind_acpi_video);
+
+    // ── 15. Intel backlight PWM round-trip ─────────────────────────
+
+    fn smoke_intel_backlight_pwm_roundtrip() -> TestResult {
+        __reset_all_for_test();
+
+        // 1 KiB fake BAR0.
+        let buf: Box<[u8; 1024]> = Box::new([0u8; 1024]);
+        let raw = Box::leak(buf);
+        let phys = narf_memory::PhysAddr::new(raw.as_ptr() as u64);
+        let mmio = narf_driver_runtime::MmioRegion {
+            phys,
+            len: 1024,
+            kind: narf_driver_runtime::BarKind::Mmio32 { prefetchable: false },
+        };
+
+        // Seed BXT_BLC_PWM_FREQ1 (offset 0xC8254) with a period.
+        // 0xC8254 is byte offset; u32 index is 0xC8254 / 4.
+        unsafe {
+            core::ptr::write_volatile((raw.as_ptr() as *mut u32).add(0xC8254 / 4), 0x1000);
+        }
+
+        let dev = unsafe { crate::intel_bl::IntelBacklightDevice::new("intel_bl0", mmio) };
+
+        // 50% → duty 0x800.
+        dev.set_brightness(50);
+        let duty = unsafe {
+            core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8258 / 4))
+        };
+        if duty != 0x800 {
+            return TestResult::Fail("50% did not yield duty 0x800");
+        }
+
+        if dev.current_brightness() != 50 {
+            return TestResult::Fail("read-back percentage != 50");
+        }
+
+        // 0% → 0.
+        dev.set_brightness(0);
+        if dev.current_brightness() != 0 {
+            return TestResult::Fail("0% read-back != 0");
+        }
+
+        // 100% → 0x1000.
+        dev.set_brightness(100);
+        if dev.current_brightness() != 100 {
+            return TestResult::Fail("100% read-back != 100");
+        }
+
+        __reset_all_for_test();
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/backlight", smoke_intel_backlight_pwm_roundtrip);
 }

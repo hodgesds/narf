@@ -1,55 +1,80 @@
-//! Intel backlight scaffold.
+//! Intel integrated GPU backlight driver.
 //!
-//! The bring-up targets (Renoir / Phoenix) are AMD-only; this module
-//! ships a structural scaffold so the codebase compiles cleanly on
-//! Intel platforms and so Intel bring-up has a landing zone.
+//! This module implements direct PWM duty-cycle programming against the
+//! Intel display engine's PWM block.
 //!
-//! ## DEFERRED
-//!
-//! Full Intel PWM programming (BXT_BLC_PWM_FREQ1 / BXT_BLC_PWM_DUTY1
-//! register writes) is deferred until an Intel hardware bring-up
-//! target is added. The existing implementations in
-//! `drivers/gpu/src/backlight.rs` (`intel_set_pct`, `intel_get_pct`,
-//! `MmioWindow` trait) are the correct building blocks; the missing
-//! piece is the platform probe that maps the iGPU BAR and calls
-//! `activate_intel_blc`.
-//!
-//! ## References (GPL-2.0-or-later)
+//! ## References (GPL-2.0-or-later, direct citation allowed)
 //!
 //! - `drivers/gpu/drm/i915/display/intel_backlight.c` —
 //!   `bxt_set_backlight`, `pch_get_max_backlight`.
 //! - `drivers/gpu/drm/xe/display/xe_display.c` — Xe backlight ops.
+//! - Intel "Tiger Lake Platform Controller Hub EDS Vol 2" — PWM register
+//!   offsets and bit definitions.
 
 extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt::Write as FmtWrite;
-use core::sync::atomic::{AtomicU32, Ordering};
 
+use narf_driver_runtime::MmioRegion;
 use crate::{BacklightDevice, BacklightKind};
 
-// ── Scaffold device ────────────────────────────────────────────────
+// ── Intel BLC PWM Registers ──────────────────────────────────────
 
-/// Intel backlight scaffold device.
-///
-/// Registered as `"intel_backlight"` when an Intel GPU is detected.
-/// All `set_brightness` / `current_brightness` calls are no-ops until
-/// the PWM MMIO wiring is implemented (see module doc).
+/// `BLC_PWM_CTL` (legacy PCH path). High 16 bits = period, low 16
+/// bits = duty cycle. Used on Skylake PCH and earlier display
+/// engines.
+pub const BLC_PWM_CTL: u64 = 0xC8250;
+/// `SOUTH_CHICKEN1` — panel-power gating chicken bits. Bit 25
+/// (`PCH_LPC_PWM_SEL`) selects whether the LPC or the CPU drives
+/// the PWM. The activator clears this bit so the iGPU owns the PWM.
+pub const SOUTH_CHICKEN1: u64 = 0xC2000;
+/// `BXT_BLC_PWM_FREQ1` — period register, modern PCH path (BXT+).
+pub const BXT_BLC_PWM_FREQ1: u64 = 0xC8254;
+/// `BXT_BLC_PWM_DUTY1` — duty-cycle target, modern PCH path.
+pub const BXT_BLC_PWM_DUTY1: u64 = 0xC8258;
+
+// ── Intel Backlight Device ─────────────────────────────────────────
+
+/// Intel backlight device.
 #[derive(Debug)]
 pub struct IntelBacklightDevice {
     pub name: String,
-    cached: AtomicU32,
+    mmio: MmioRegion,
     max: u32,
 }
 
 impl IntelBacklightDevice {
-    pub fn new(name: &str, initial: u32, max: u32) -> Self {
+    /// Construct a new Intel backlight device.
+    ///
+    /// # Safety
+    /// `mmio` must be a valid mapping of the iGPU's BAR0 registers.
+    pub unsafe fn new(name: &str, mmio: MmioRegion) -> Self {
+        // Read period from BXT_BLC_PWM_FREQ1.
+        let max = unsafe { mmio.read32(BXT_BLC_PWM_FREQ1) };
         Self {
             name: name.to_string(),
-            cached: AtomicU32::new(initial),
+            mmio,
             max,
         }
+    }
+
+    /// Convert 0..100 percentage to duty count.
+    fn pct_to_duty(&self, pct: u32) -> u32 {
+        let p = self.max as u64;
+        let pct = pct.min(100) as u64;
+        ((p * pct) / 100) as u32
+    }
+
+    /// Convert duty count to 0..100 percentage.
+    fn duty_to_pct(&self, duty: u32) -> u32 {
+        if self.max == 0 {
+            return 0;
+        }
+        let p = self.max as u64;
+        let d = duty.min(self.max) as u64;
+        ((d * 100 + p / 2) / p) as u32
     }
 }
 
@@ -59,19 +84,23 @@ impl BacklightDevice for IntelBacklightDevice {
     }
 
     fn max_brightness(&self) -> u32 {
-        self.max
+        100 // We expose percentage to the subsystem
     }
 
     fn current_brightness(&self) -> u32 {
-        // Deferred: would read BXT_BLC_PWM_DUTY1 / BXT_BLC_PWM_FREQ1
-        // and scale to a step value. Returns cached write value for now.
-        self.cached.load(Ordering::Acquire)
+        if self.max == 0 {
+            return 0;
+        }
+        let duty = unsafe { self.mmio.read32(BXT_BLC_PWM_DUTY1) };
+        self.duty_to_pct(duty)
     }
 
     fn set_brightness(&self, level: u32) {
-        // Deferred: would write BXT_BLC_PWM_DUTY1 via MmioWindow.
-        let clamped = level.min(self.max);
-        self.cached.store(clamped, Ordering::Release);
+        if self.max == 0 {
+            return;
+        }
+        let duty = self.pct_to_duty(level);
+        unsafe { self.mmio.write32(BXT_BLC_PWM_DUTY1, duty) };
     }
 
     fn kind(&self) -> BacklightKind {
@@ -79,20 +108,28 @@ impl BacklightDevice for IntelBacklightDevice {
     }
 }
 
-// ── initcall stub ──────────────────────────────────────────────────
+// ── initcall / installation ─────────────────────────────────────────
 
-/// Stub initcall. On AMD-only platforms this is a no-op; on an Intel
-/// platform the bring-up code calls `install()` after the GPU BAR
-/// is mapped. Logs the deferred status so bring-up traces are clear.
+/// Stub initcall. The GPU driver calls `install()` once it has mapped
+/// the display BAR.
 pub fn init() {
-    let _ = writeln!(
-        narf_console::Writer,
-        "  intel-backlight: scaffold only — PWM programming deferred"
-    );
+    // No-op; registration happens from GPU probe.
 }
 
 /// Install an Intel backlight device. Called from Intel GPU bring-up
-/// code once the BAR is mapped and `BXT_BLC_PWM_FREQ1` is known.
-pub fn install(dev: Arc<IntelBacklightDevice>) {
-    crate::register_backlight(dev as Arc<dyn BacklightDevice>);
+/// code once the BAR is mapped.
+pub fn install(mmio: MmioRegion) {
+    // Ungate PWM: clear PCH_LPC_PWM_SEL (bit 25) so the iGPU owns the PWM.
+    unsafe {
+        let val = mmio.read32(SOUTH_CHICKEN1);
+        mmio.write32(SOUTH_CHICKEN1, val & !(1 << 25));
+    }
+
+    let dev = unsafe { IntelBacklightDevice::new("intel_backlight", mmio) };
+    let _ = writeln!(
+        narf_console::Writer,
+        "  intel-backlight: registered, max_duty={}",
+        dev.max
+    );
+    crate::register_backlight(Arc::new(dev));
 }

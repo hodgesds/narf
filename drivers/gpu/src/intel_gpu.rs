@@ -322,10 +322,7 @@ pub fn probe(
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    // Stage-0 announce. The Linux i915 driver prints an equivalent
-    // line from `intel_device_info_print_static` very early in
-    // probe; we surface the same flavour here so a real-HW bring-up
-    // log can show "intel-gpu was here" before any further IP work.
+    // Stage-0 announce.
     {
         use core::fmt::Write as _;
         let bar0_phys = dev.gtt_mmadr.phys.raw();
@@ -342,7 +339,16 @@ pub fn probe(
             region_count,
         );
     }
+
+    // Activate backlight PWM if this is a supported generation.
+    // Tiger Lake / Alder Lake / Raptor Lake all use the same BXT-style
+    // PWM registers.
+    if dev.chip.generation != Generation::MeteorLake {
+        narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr.clone());
+    }
+
     *CONTROLLER.lock() = Some(dev);
+
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),
         kind: narf_drivers::BoundKind::Graphics,
