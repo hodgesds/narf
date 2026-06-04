@@ -1391,6 +1391,13 @@ pub enum Syscall {
     /// Returns 0 on success, !0u64 on failure (target task has no
     /// such namespace, or unsupported nstype).
     Setns,
+
+    /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
+    /// `arg3 = flags`, `arg4 = mask`, `arg5 = statxbuf_ptr`.
+    /// Linux statx(2). Fills a 256-byte `struct statx` honouring
+    /// `mask` and `flags` (AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW,
+    /// AT_NO_AUTOMOUNT, AT_STATX_SYNC_*). Returns 0 / -1.
+    Statx,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1541,6 +1548,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRandom, 318),
     (Syscall::MemfdCreate, 319),
     (Syscall::CopyFileRange, 326),
+    (Syscall::Statx, 332),
     (Syscall::PidfdOpen, 434),
     // Loadable kernel modules — Linux x86_64 numbers.
     // init_module = 175, delete_module = 176, finit_module = 313.
@@ -1682,6 +1690,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRandom, 278),
     (Syscall::MemfdCreate, 279),
     (Syscall::CopyFileRange, 285),
+    (Syscall::Statx, 291),
     (Syscall::PidfdOpen, 434),
     (Syscall::Statfs, 43),
     (Syscall::Fstatfs, 44),

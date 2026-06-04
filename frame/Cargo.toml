@@ -171,6 +171,8 @@ narf-libc-validate = ["user-mode-e2e", "narf-verification/narf-libc-validate"]
 # `run_async_demo` boot path. On by default (see `default` above);
 # strip with `--no-default-features` for a minimal kernel.
 boot-init = ["dep:narf-verification", "narf-verification/boot-init"]
+# Linux ABI-shaped struct stat / statx for musl/glibc binaries.
+linux-compat = ["narf-userspace/linux-compat"]
 
 [lints]
 workspace = true
