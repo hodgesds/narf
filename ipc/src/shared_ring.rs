@@ -201,7 +201,10 @@ impl<T, const N: usize> SharedProducer<T, N> {
         // contract: the slot is a wire-format mailbox shared with
         // another execution context the compiler can't see.
         unsafe {
-            core::ptr::write_volatile(r.slots[idx].get() as *mut MaybeUninit<T>, MaybeUninit::new(msg));
+            core::ptr::write_volatile(
+                r.slots[idx].get() as *mut MaybeUninit<T>,
+                MaybeUninit::new(msg),
+            );
         }
         // Release: pairs with consumer's Acquire on `head` — slot
         // payload becomes visible before the consumer sees the new
@@ -263,8 +266,7 @@ impl<T, const N: usize> SharedConsumer<T, N> {
         // can't see, so non-volatile reads were eligible for
         // load forwarding from a stale "uninitialized" lattice.
         let msg = unsafe {
-            core::ptr::read_volatile(r.slots[idx].get() as *const MaybeUninit<T>)
-                .assume_init()
+            core::ptr::read_volatile(r.slots[idx].get() as *const MaybeUninit<T>).assume_init()
         };
         // Release: pairs with producer's Acquire on tail — frees
         // the slot for the producer to reuse.

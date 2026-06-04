@@ -400,8 +400,8 @@ kernel_test_in!("ipc", smoke_exit_gate_revoked_cap_rejected);
 // ── ipc/mpsc ───────────────────────────────────────────────────────
 
 fn smoke_ipc_mpsc_multi_producer_roundtrip() -> TestResult {
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::{mpsc_channel, MpscRecvError};
+    use core::sync::atomic::{AtomicU32, Ordering};
 
     narf_scheduler::__reset_queues_for_test();
     static DRAINED: AtomicU32 = AtomicU32::new(0);
@@ -856,8 +856,8 @@ kernel_test_in!("ipc", smoke_ipc_mpsc_try_recv_empty_open_is_ok_none);
 fn smoke_ipc_mpsc_recv_future_wakes_on_send() -> TestResult {
     // Consumer parks on empty; producer.try_send must wake it via
     // the consumer_waker slot.
-    use core::sync::atomic::{AtomicU32, Ordering};
     use crate::mpsc_channel;
+    use core::sync::atomic::{AtomicU32, Ordering};
     static GOT: AtomicU32 = AtomicU32::new(0);
 
     GOT.store(0, Ordering::Relaxed);
@@ -1054,7 +1054,10 @@ fn smoke_ipc_mpsc_ring_multi_producer_contention() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_multi_producer_contention);
+kernel_test_in!(
+    "ipc/mpsc_ring",
+    smoke_ipc_mpsc_ring_multi_producer_contention
+);
 
 fn smoke_ipc_mpsc_ring_drop_runs_payload_destructors() -> TestResult {
     use alloc::sync::Arc;
@@ -1073,7 +1076,10 @@ fn smoke_ipc_mpsc_ring_drop_runs_payload_destructors() -> TestResult {
         TestResult::Fail("MpscRing::drop didn't drop undelivered Arc payloads")
     }
 }
-kernel_test_in!("ipc/mpsc_ring", smoke_ipc_mpsc_ring_drop_runs_payload_destructors);
+kernel_test_in!(
+    "ipc/mpsc_ring",
+    smoke_ipc_mpsc_ring_drop_runs_payload_destructors
+);
 
 // ── ipc/spmc_ring (Vyukov lock-free SPMC) ─────────────────────────
 
@@ -1193,7 +1199,10 @@ fn smoke_ipc_spmc_ring_multi_consumer_contention() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_multi_consumer_contention);
+kernel_test_in!(
+    "ipc/spmc_ring",
+    smoke_ipc_spmc_ring_multi_consumer_contention
+);
 
 fn smoke_ipc_spmc_ring_drop_runs_payload_destructors() -> TestResult {
     use alloc::sync::Arc;
@@ -1210,7 +1219,10 @@ fn smoke_ipc_spmc_ring_drop_runs_payload_destructors() -> TestResult {
         TestResult::Fail("SpmcRing::drop didn't drop undelivered Arc payloads")
     }
 }
-kernel_test_in!("ipc/spmc_ring", smoke_ipc_spmc_ring_drop_runs_payload_destructors);
+kernel_test_in!(
+    "ipc/spmc_ring",
+    smoke_ipc_spmc_ring_drop_runs_payload_destructors
+);
 
 // ── retag-on-publish ──────────────────────────────────────────────
 

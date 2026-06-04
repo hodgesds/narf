@@ -464,4 +464,3 @@ impl<'a, T: Send + 'static + Retag, const N: usize> Future for RecvFuture<'a, T,
         }
     }
 }
-

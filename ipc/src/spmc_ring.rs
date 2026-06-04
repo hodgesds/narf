@@ -232,7 +232,10 @@ impl<'p, T: Send + 'static, const N: usize> Future for SpmcRingSendFuture<'p, T,
     type Output = Result<(), T>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let msg = this.slot.take().expect("send future polled after completion");
+        let msg = this
+            .slot
+            .take()
+            .expect("send future polled after completion");
         match this.producer.try_send(msg) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(SpmcRingSendError::Closed(m)) => Poll::Ready(Err(m)),
@@ -307,10 +310,7 @@ impl<T: Send + 'static, const N: usize> SpmcRingConsumer<T, N> {
                         // SAFETY: we are now the sole owner of this
                         // slot until we mark it reusable.
                         let msg = unsafe {
-                            let v = core::mem::replace(
-                                &mut *slot.val.get(),
-                                MaybeUninit::uninit(),
-                            );
+                            let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
                             v.assume_init()
                         };
                         // Release: pairs with the producer's Acquire

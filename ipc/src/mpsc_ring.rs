@@ -251,7 +251,10 @@ impl<'p, T: Send + 'static, const N: usize> Future for MpscRingSendFuture<'p, T,
     type Output = Result<(), T>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let msg = this.slot.take().expect("send future polled after completion");
+        let msg = this
+            .slot
+            .take()
+            .expect("send future polled after completion");
         match this.producer.try_send(msg) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(MpscRingSendError::Closed(m)) => Poll::Ready(Err(m)),
