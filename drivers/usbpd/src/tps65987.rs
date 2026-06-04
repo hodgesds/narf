@@ -211,8 +211,8 @@ impl Tps65987 {
         // status nibble in production, but for the structural surface
         // we report the canonical "Rp@default" when source-attached.
         let connected_state = match connection {
-            2 => CcState::Rd,         // partner is a sink (Rd)
-            3 => CcState::RpDefault,  // partner is a source (Rp default)
+            2 => CcState::Rd,        // partner is a sink (Rd)
+            3 => CcState::RpDefault, // partner is a source (Rp default)
             _ => CcState::Open,
         };
         match orientation {
@@ -278,7 +278,8 @@ impl Tcpc for Tps65987 {
         // "last received message" — sufficient for the TCPM's
         // Source_Capabilities consumer.
         let mut buf = alloc::vec![0u8; 32];
-        self.bus.read_burst(self.addr, REG_RX_SOURCE_CAPS, &mut buf)?;
+        self.bus
+            .read_burst(self.addr, REG_RX_SOURCE_CAPS, &mut buf)?;
         // Trim trailing zeros so a freshly-cleared register doesn't
         // surface as a 32-byte all-zero "message".
         if buf.iter().all(|b| *b == 0) {

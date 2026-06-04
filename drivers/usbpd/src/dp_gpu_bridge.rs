@@ -399,9 +399,7 @@ pub(crate) mod tests {
         super::register_bridge(first.clone());
         super::register_bridge(second.clone());
         if super::registered_bridges().len() != 1 {
-            return TestResult::Fail(
-                "second registration should replace, not stack",
-            );
+            return TestResult::Fail("second registration should replace, not stack");
         }
         super::__test_reset_bridges();
         TestResult::Pass

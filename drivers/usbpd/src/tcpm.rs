@@ -294,7 +294,9 @@ impl SourcePort {
             SourceState::VconnSwapWaitReply => self.step_vconn_swap_wait_reply(),
             SourceState::VconnSwapStart => self.step_vconn_swap_start(),
             SourceState::VconnSwapTurnOff => self.step_vconn_swap_turn_off(),
-            SourceState::BistCarrierMode => Ok(SourceStepOutcome::Idle(SourceState::BistCarrierMode)),
+            SourceState::BistCarrierMode => {
+                Ok(SourceStepOutcome::Idle(SourceState::BistCarrierMode))
+            }
         }
     }
 
@@ -318,7 +320,9 @@ impl SourcePort {
         let frame = encode_message(h, &objs);
         self.tcpc.transmit(&frame)?;
         self.set_state(SourceState::NegotiateCapability);
-        Ok(SourceStepOutcome::Advanced(SourceState::NegotiateCapability))
+        Ok(SourceStepOutcome::Advanced(
+            SourceState::NegotiateCapability,
+        ))
     }
 
     fn step_negotiate(&self) -> Result<SourceStepOutcome, SourceError> {
@@ -350,7 +354,12 @@ impl SourcePort {
             .policy
             .lock()
             .pdos
-            .get(position.checked_sub(1).map(|x| x as usize).unwrap_or(usize::MAX))
+            .get(
+                position
+                    .checked_sub(1)
+                    .map(|x| x as usize)
+                    .unwrap_or(usize::MAX),
+            )
             .copied();
         let is_pps = matches!(pdo, Some(SourcePdo::Augmented { .. }));
         let decision = if is_pps {
@@ -522,7 +531,9 @@ impl SourcePort {
         match CtrlMsg::from_u8(h.msg_type) {
             Some(CtrlMsg::Accept) => {
                 self.set_state(SourceState::PrSwapTransitionToOff);
-                Ok(SourceStepOutcome::Advanced(SourceState::PrSwapTransitionToOff))
+                Ok(SourceStepOutcome::Advanced(
+                    SourceState::PrSwapTransitionToOff,
+                ))
             }
             Some(CtrlMsg::Reject) | Some(CtrlMsg::Wait) => {
                 // Partner declined; stay sourcing.
@@ -574,7 +585,9 @@ impl SourcePort {
         if accept {
             self.send_control(CtrlMsg::Accept)?;
             self.set_state(SourceState::PrSwapTransitionToOff);
-            Ok(SourceStepOutcome::Advanced(SourceState::PrSwapTransitionToOff))
+            Ok(SourceStepOutcome::Advanced(
+                SourceState::PrSwapTransitionToOff,
+            ))
         } else {
             self.send_control(CtrlMsg::Reject)?;
             self.set_state(SourceState::Ready);
@@ -760,9 +773,13 @@ pub enum PortStepOutcome {
     /// (or vice-versa, once Stage-2's sink-side PR_Swap lands).
     RoleSwapped(PortState),
     /// Data role just flipped — UFP/DFP toggled.
-    DataRoleSwapped { now_dfp: bool },
+    DataRoleSwapped {
+        now_dfp: bool,
+    },
     /// VConn supplier just flipped.
-    VconnSwapped { now_supplying: bool },
+    VconnSwapped {
+        now_supplying: bool,
+    },
 }
 
 /// Top-level port driver: owns one chip + both engines, picks which
@@ -829,7 +846,8 @@ impl TcpmPort {
     pub fn contract_live(&self) -> bool {
         matches!(
             (self.state(), self.sink.state(), self.source.state()),
-            (PortState::AttachedSnk, SinkState::Ready, _) | (PortState::AttachedSrc, _, SourceState::Ready)
+            (PortState::AttachedSnk, SinkState::Ready, _)
+                | (PortState::AttachedSrc, _, SourceState::Ready)
         )
     }
 
@@ -872,9 +890,7 @@ impl TcpmPort {
                 }
                 let outcome = self.source.step(cap)?;
                 Ok(match outcome {
-                    SourceStepOutcome::Ready { contract } => {
-                        PortStepOutcome::SourceReady(contract)
-                    }
+                    SourceStepOutcome::Ready { contract } => PortStepOutcome::SourceReady(contract),
                     SourceStepOutcome::Advanced(_) => {
                         PortStepOutcome::Advanced(PortState::AttachedSrc)
                     }
@@ -1350,13 +1366,7 @@ pub(crate) mod tests {
     /// Build a partner-originated Control message frame (the "wire" a
     /// FakeChip would deliver to our SourcePort on `receive()`).
     fn partner_ctrl_frame(msg: CtrlMsg) -> Vec<u8> {
-        let h = Header::control(
-            msg,
-            DataRole::Ufp,
-            PowerRole::Sink,
-            SpecRev::R3_0,
-            0,
-        );
+        let h = Header::control(msg, DataRole::Ufp, PowerRole::Sink, SpecRev::R3_0, 0);
         encode_message(h, &[])
     }
 
@@ -1630,7 +1640,9 @@ pub(crate) mod tests {
         chip.enqueue_rx(partner_ctrl_frame(CtrlMsg::PsRdy));
         let outcome = port.step(&cap).unwrap();
         match outcome {
-            SourceStepOutcome::VconnSwapped { now_supplying: false } => {
+            SourceStepOutcome::VconnSwapped {
+                now_supplying: false,
+            } => {
                 if port.is_vconn_supplier() {
                     return TestResult::Fail("is_vconn_supplier should be false");
                 }
@@ -1715,7 +1727,10 @@ pub(crate) mod tests {
             SourceStepOutcome::Ready { contract } => contract,
             _ => return TestResult::Fail("expected Ready outcome"),
         };
-        if contract.voltage_mv != 9000 || contract.op_current_ma != 2000 || contract.object_position != 2 {
+        if contract.voltage_mv != 9000
+            || contract.op_current_ma != 2000
+            || contract.object_position != 2
+        {
             return TestResult::Fail("PPS contract drift");
         }
         TestResult::Pass
@@ -1796,10 +1811,7 @@ pub(crate) mod tests {
             _ => TestResult::Fail("expected BistEntered outcome"),
         }
     }
-    kernel_test_in!(
-        "drivers/usbpd/tcpm",
-        smoke_bist_inbound_carrier_mode2_parks
-    );
+    kernel_test_in!("drivers/usbpd/tcpm", smoke_bist_inbound_carrier_mode2_parks);
 
     fn smoke_bist_tcpmport_relays_outcome() -> TestResult {
         let chip = Arc::new(FakeChip::new(CcStatus {

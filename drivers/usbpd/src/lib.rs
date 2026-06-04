@@ -61,8 +61,7 @@ pub struct PortBinding {
 
 /// Global registry of detected TCPC ports. Populated by
 /// [`register_initcalls`]; consumed by the (future) TCPM step task.
-pub static PORTS: IrqSafeSpinLock<Vec<PortBinding>> =
-    IrqSafeSpinLock::new(Vec::new());
+pub static PORTS: IrqSafeSpinLock<Vec<PortBinding>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Stage::Late initcall: walk every registered I²C bus, probe known
 /// TCPC chips at their datasheet I²C addresses, and park any
@@ -119,7 +118,8 @@ fn probe_bus(bus: &Arc<dyn narf_drivers_i2c::I2cBus>) -> usize {
         let _ = writeln!(
             narf_console::Writer,
             "  usbpd: FUSB302 detected on bus '{}' addr 0x22 device_id=0x{:02x}",
-            bus_name, id
+            bus_name,
+            id
         );
         let chip: Arc<dyn Tcpc> = Arc::new(fusb);
         register_port(bus_name, fusb302::FUSB302_DEFAULT_I2C_ADDR, chip);
@@ -132,7 +132,9 @@ fn probe_bus(bus: &Arc<dyn narf_drivers_i2c::I2cBus>) -> usize {
         let _ = writeln!(
             narf_console::Writer,
             "  usbpd: TPS65987 detected on bus '{}' addr 0x38 vid=0x{:04x} did=0x{:04x}",
-            bus_name, vendor, device
+            bus_name,
+            vendor,
+            device
         );
         let chip: Arc<dyn Tcpc> = Arc::new(tps);
         register_port(bus_name, tps65987::TPS65987_DEFAULT_I2C_ADDR, chip);
@@ -200,7 +202,8 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     let _ = writeln!(
                         narf_console::Writer,
                         "  tcpm: {} step failed: {:?}",
-                        label, e
+                        label,
+                        e
                     );
                     if matches!(e, tcpm::SourceError::AuthorityRevoked) {
                         return;
@@ -214,7 +217,8 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                 let _ = writeln!(
                     narf_console::Writer,
                     "  tcpm: {} → {:?}",
-                    label, last_logged_state
+                    label,
+                    last_logged_state
                 );
                 if !matches!(
                     last_logged_state,
@@ -229,7 +233,10 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                         let _ = writeln!(
                             narf_console::Writer,
                             "  tcpm: {} contract: PDO#{} {} mV @ {} mA",
-                            label, c.object_position, c.voltage_mv, c.op_current_ma
+                            label,
+                            c.object_position,
+                            c.voltage_mv,
+                            c.op_current_ma
                         );
                         announced = true;
                     }
@@ -242,18 +249,15 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                     narf_scheduler::yield_now().await;
                 }
                 PortStepOutcome::BistEntered => {
-                    let _ = writeln!(
-                        narf_console::Writer,
-                        "  tcpm: {} entered BIST",
-                        label
-                    );
+                    let _ = writeln!(narf_console::Writer, "  tcpm: {} entered BIST", label);
                     SleepUntil::new(Deadline::after_ms(100).as_instant()).await;
                 }
                 PortStepOutcome::RoleSwapped(next) => {
                     let _ = writeln!(
                         narf_console::Writer,
                         "  tcpm: {} power role swapped → {:?}",
-                        label, next
+                        label,
+                        next
                     );
                     announced = false;
                     narf_scheduler::yield_now().await;
@@ -272,7 +276,11 @@ fn spawn_tcpm_task(port: Arc<tcpm::TcpmPort>, label: alloc::string::String) {
                         narf_console::Writer,
                         "  tcpm: {} VConn swapped → {}",
                         label,
-                        if now_supplying { "supplier" } else { "consumer" }
+                        if now_supplying {
+                            "supplier"
+                        } else {
+                            "consumer"
+                        }
                     );
                     narf_scheduler::yield_now().await;
                 }

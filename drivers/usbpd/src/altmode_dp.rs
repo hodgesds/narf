@@ -45,9 +45,7 @@ use narf_usbpd::message::{
     decode_message, encode_message, DataMsg, DataRole, Header, PowerRole, SpecRev,
 };
 use narf_usbpd::tcpc::TcpcError;
-use narf_usbpd::vdm::{
-    AltModeState, AltStepOutcome, DpAltModeDriver, DpConfigureVdo, VdmHeader,
-};
+use narf_usbpd::vdm::{AltModeState, AltStepOutcome, DpAltModeDriver, DpConfigureVdo, VdmHeader};
 use narf_usbpd::UsbPd;
 
 use crate::dp_gpu_bridge::{self, ConnectorId, DpLinkConfig};
@@ -353,7 +351,8 @@ pub fn spawn_discovery_task(p: Arc<DpAltModePort>, label: String) {
                     let _ = writeln!(
                         narf_console::Writer,
                         "  altmode-dp: {} step failed: {:?}",
-                        label, e
+                        label,
+                        e
                     );
                     if matches!(e, DpAltError::AuthorityRevoked) {
                         return;
@@ -646,7 +645,7 @@ pub(crate) mod tests {
         let alt = DpAltModePort::new(port, ConnectorId::from_index(0));
 
         let _ = alt.step(&cap).unwrap(); // kick Discover Identity
-                                          // Identity ACK.
+                                         // Identity ACK.
         let id_ack = alloc::vec![VdmHeader::structured(
             SVID_PD,
             VdmCommand::DiscoverIdentity,

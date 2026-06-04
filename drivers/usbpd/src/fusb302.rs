@@ -320,8 +320,7 @@ impl Fusb302 {
         // num_data_objects field (high 3 bits of byte 1), then drain
         // the rest including the 4-byte CRC the chip appends.
         let mut sop = [0u8; 1];
-        self.bus
-            .read_burst(self.addr, REG_FIFOS, &mut sop)?;
+        self.bus.read_burst(self.addr, REG_FIFOS, &mut sop)?;
         // sop[0] in {0xE0..=0xE3} per "RX FIFO Token" section: bit
         // pattern 111x_x000 with low bits encoding SOP/SOP'/SOP''.
         // We accept any and proceed.
@@ -356,10 +355,7 @@ impl Tcpc for Fusb302 {
 
     fn set_role(&self, role: PortRole) -> Result<(), TcpcError> {
         let mut sw0 = self.read(REG_SWITCHES0)?;
-        sw0 &= !(SWITCHES0_PDWN1
-            | SWITCHES0_PDWN2
-            | SWITCHES0_PU_EN1
-            | SWITCHES0_PU_EN2);
+        sw0 &= !(SWITCHES0_PDWN1 | SWITCHES0_PDWN2 | SWITCHES0_PU_EN1 | SWITCHES0_PU_EN2);
         match role {
             PortRole::Sink => sw0 |= SWITCHES0_PDWN1 | SWITCHES0_PDWN2,
             PortRole::Source => sw0 |= SWITCHES0_PU_EN1 | SWITCHES0_PU_EN2,
@@ -467,9 +463,7 @@ mod mock {
                 // Gated on the FUSB302 I²C address (0x22) so the same
                 // mock can also impersonate the TPS65987 (0x38) where
                 // 0x0C is part of the Data1 buffer, not a reset reg.
-                if addr == FUSB302_DEFAULT_I2C_ADDR
-                    && reg == REG_RESET
-                    && value & RESET_SW_RES != 0
+                if addr == FUSB302_DEFAULT_I2C_ADDR && reg == REG_RESET && value & RESET_SW_RES != 0
                 {
                     let dev_id = r[REG_DEVICE_ID as usize];
                     *r = [0u8; 256];

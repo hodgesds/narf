@@ -56,7 +56,10 @@ impl SinkSelection {
     /// Panics in debug builds if called on a PPS selection — use
     /// [`Self::to_programmable_rdo`] instead.
     pub fn to_rdo(self) -> FixedRdo {
-        debug_assert!(!self.is_pps, "to_rdo on PPS selection — use to_programmable_rdo");
+        debug_assert!(
+            !self.is_pps,
+            "to_rdo on PPS selection — use to_programmable_rdo"
+        );
         FixedRdo {
             object_position: self.object_position,
             op_current_ma: self.op_current_ma,
@@ -214,7 +217,11 @@ impl SinkPolicy {
         // to PDO #1 with the cap_mismatch bit set so the source knows
         // we're under-powered.
         if best.is_none() {
-            if let SourcePdo::Fixed { voltage_mv, max_current_ma } = caps[0] {
+            if let SourcePdo::Fixed {
+                voltage_mv,
+                max_current_ma,
+            } = caps[0]
+            {
                 return Some(SinkSelection {
                     object_position: 1,
                     voltage_mv,
@@ -295,7 +302,10 @@ impl SourcePolicy {
     pub fn from_pdos(pdos: Vec<SourcePdo>) -> Self {
         debug_assert!(matches!(
             pdos.first(),
-            Some(SourcePdo::Fixed { voltage_mv: 5000, .. })
+            Some(SourcePdo::Fixed {
+                voltage_mv: 5000,
+                ..
+            })
         ));
         Self {
             pdos,
@@ -405,7 +415,10 @@ pub(crate) mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/usbpd/policy", smoke_sink_policy_picks_5v_for_default);
+    kernel_test_in!(
+        "drivers/usbpd/policy",
+        smoke_sink_policy_picks_5v_for_default
+    );
 
     fn smoke_sink_policy_high_voltage_picks_15v() -> TestResult {
         let policy = SinkPolicy {

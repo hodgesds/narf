@@ -11,9 +11,9 @@ use alloc::sync::Arc;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::fusb302::{
-    Fusb302, MockBus, FUSB302_DEFAULT_I2C_ADDR, REG_DEVICE_ID, REG_RESET, REG_STATUS0,
-    REG_STATUS1, RESET_SW_RES, STATUS0_BC_LVL_MASK, STATUS1_RX_EMPTY, TX_TOKEN_PACKSYM_BASE,
-    TX_TOKEN_SYNC1, TX_TOKEN_SYNC2,
+    Fusb302, MockBus, FUSB302_DEFAULT_I2C_ADDR, REG_DEVICE_ID, REG_RESET, REG_STATUS0, REG_STATUS1,
+    RESET_SW_RES, STATUS0_BC_LVL_MASK, STATUS1_RX_EMPTY, TX_TOKEN_PACKSYM_BASE, TX_TOKEN_SYNC1,
+    TX_TOKEN_SYNC2,
 };
 
 fn smoke_fusb302_probe_device_id() -> TestResult {
@@ -48,7 +48,9 @@ fn smoke_fusb302_init_resets_chip() -> TestResult {
         return TestResult::Fail("CONTROL0 should be cleared after init");
     }
     // Confirm DEVICE_ID survived SW_RES (preserved by silicon).
-    let id = bus.read_reg(FUSB302_DEFAULT_I2C_ADDR, REG_DEVICE_ID).unwrap();
+    let id = bus
+        .read_reg(FUSB302_DEFAULT_I2C_ADDR, REG_DEVICE_ID)
+        .unwrap();
     if id == 0 {
         return TestResult::Fail("DEVICE_ID should not be zeroed by SW_RES");
     }
@@ -82,7 +84,10 @@ fn smoke_fusb302_set_role_writes_switches0() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usbpd/fusb302", smoke_fusb302_set_role_writes_switches0);
+kernel_test_in!(
+    "drivers/usbpd/fusb302",
+    smoke_fusb302_set_role_writes_switches0
+);
 
 fn smoke_fusb302_cc_status_decodes_bc_lvl() -> TestResult {
     use narf_usbpd::tcpc::{CcState, Tcpc};
@@ -234,10 +239,10 @@ fn smoke_tps65987_probe_validates_vendor() -> TestResult {
     let _ = bus.write_reg(TPS65987_DEFAULT_I2C_ADDR, 0x01, 0x04);
     bus.set_reg(0x00, 0x51); // VID low
     bus.set_reg(0x01, 0x04); // VID high (then DID register starts at 0x01 too —
-                              // we set it via set_reg sequencing below)
-    // Wait — the mock is a flat 256-register table, not a multi-byte
-    // register file. Lay out the four-byte VID at 0x00..=0x03 and the
-    // four-byte DID at 0x01..=0x04 — they overlap, so re-stamp DID.
+                             // we set it via set_reg sequencing below)
+                             // Wait — the mock is a flat 256-register table, not a multi-byte
+                             // register file. Lay out the four-byte VID at 0x00..=0x03 and the
+                             // four-byte DID at 0x01..=0x04 — they overlap, so re-stamp DID.
     bus.set_reg(0x00, 0x51);
     bus.set_reg(0x01, 0x04);
     bus.set_reg(0x02, 0x00);
@@ -284,7 +289,10 @@ fn smoke_tps65987_decode_cc_orientation() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/usbpd/tps65987", smoke_tps65987_decode_cc_orientation);
+kernel_test_in!(
+    "drivers/usbpd/tps65987",
+    smoke_tps65987_decode_cc_orientation
+);
 
 fn smoke_tps65987_issue_cmd_writes_cmd1_and_data1() -> TestResult {
     use crate::fusb302::I2cBus;
