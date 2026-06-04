@@ -61,6 +61,7 @@ device to the highest-specificity matching probe.
 | `narf-drivers-net` (rtl8139)     | 0x10EC : 0x8139                         | clean-room from public Realtek programming guide — CONFIG1 unlock + CR.RST + IDR0..5 MAC + 64 KiB RX ring + 4 × 2 KiB TX buffers + tx/rx + link status |
 | `narf-drivers-platform` (smbus)  | PCI class 0x0C, subclass 0x05 (any vendor) | Intel ICH SMBus — IO BAR4 + read/write byte data + read word data via host-controller PIO transactions per ICH9 datasheet |
 | `narf-drivers-platform` (tpm)    | MMIO 0xFED40000 (locality 0)            | TPM 2.0 — CRB (PC Client PTP) + TIS (legacy) auto-detect + `submit(cmd)` + `tpm2_get_random` per TCG public spec |
+| `narf-drivers-hwmon`             | Dell SMBIOS vendor (`dell_smm`) / CPUID + MSR (`coretemp`, `k10temp`) / Super-I/O port (`nct6775`) | Hardware monitoring: `coretemp` (Intel DTS) and `k10temp` (AMD Zen) temperature sensors, `dell_smm` Dell SMM fan/temp control, and `nct6775` Super-I/O sensors. |
 | `narf-drivers-usb` (Hub class)   | xHCI hot-plug, USB class 0x09           | GET_DESCRIPTOR(Hub) + SET_FEATURE(PORT_POWER) + per-port reset + GET_STATUS for downstream device enumeration |
 | `narf-drivers-usb` (xHCI)        | QEMU + AMD Phoenix VID/DIDs | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT |
 | `narf-drivers-usb` (HID kbd)     | xHCI hot-plug | Set Protocol(Boot) → interrupt-IN polling → Usage 0x07 → KeyCode press/release diff → `narf_input` |

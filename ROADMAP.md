@@ -95,6 +95,7 @@ on NARF and performs block and network I/O through capability-gated paths.
 - `drivers/nvme/` — block storage.
 - `drivers/net/` — network.
 - `drivers/gpu/` — graphics (may land partial in Stage 4, full later).
+- `drivers/hwmon/` — hardware monitoring: thermal/fan management (k10temp, coretemp, nct6775, dell_smm).
 - `verification/` — expanded fuzzing + integration matrix.
 - `tracing/` — HW trace integration (Intel PT / CoreSight ETM), userspace tracer tooling.
 - `observability/` — GDB remote stub, live-peek API, core-dump parser tooling.
@@ -132,6 +133,7 @@ on NARF and performs block and network I/O through capability-gated paths.
 | `drivers/nvme/`   |   |   |   | ● |
 | `drivers/net/`    |   |   |   | ● |
 | `drivers/gpu/`    |   |   |   | ◐ |
+| `drivers/hwmon/`  |   |   |   | ● |
 | `tracing/`        | ◐ | ◐ | ● | ◐ |
 | `observability/`  | ◐ | ◐ | ◐ | ● |
 | `crypto/`         | ○ | ● | ◐ | ● |

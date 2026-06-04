@@ -193,6 +193,10 @@ asks for. Updated when observable kernel behaviour changes.
 | xHCI USB host    | HCRST + DCBAA + Command/Event Rings + scratchpad + USBCMD.RS=1 + port reset + Enable Slot + Address Device + GET_DESCRIPTOR + Configure Endpoint + bulk/interrupt IN/OUT. |
 | USB HID keyboard | Hot-plug enumeration → Set Protocol(Boot) → interrupt-IN polling → HID Usage 0x07 → `narf_input::KeyCode` press/release diffing, 8-modifier tracking, roll-over filter, feeding the global `InputEvent` ring. |
 | fw_cfg (firmware) | QEMU `fw_cfg` interface (x86_64 PIO, selector 0x510 / data 0x511). Magic-string presence probe, file-directory parse (FW_CFG_FILE_DIR=0x0019), `find(name)` / `read(file, &mut buf)` / `read_string(name)` per `docs/specs/fw_cfg.rst`. Stage::Subsys initcall caches presence at boot. aarch64 MMIO TODO. Crate `narf-firmware-fw-cfg` at `firmware/fw_cfg/`. |
+| coretemp         | Intel Digital Thermal Sensor (DTS) temperature monitoring. Reads IA32_THERM_STATUS and IA32_PACKAGE_THERM_STATUS MSRs per CPU to report DTS temperatures. |
+| k10temp          | AMD Zen temperature monitoring. Reads temperature registers from Ryzen/Epyc F3 PCI configuration space (`PCI_REG_REPORTED_TEMP` etc.) to expose core temperatures. |
+| nct6775          | Nuvoton Super-I/O hardware monitor. Probes Super-I/O configuration ports (0x2E/0x4E) for NCT6775F/NCT6791D etc., and reads ISA MMIO registers for voltage, fan speed, and temperature monitoring. |
+| dell_smm         | Dell System Management Mode (SMM) driver. Performs BIOS SMM calls via outb to i8042 ports to read/write fan speed and query temperature sensors on Dell laptops. Gated by SMBIOS system vendor check. |
 
 Cross-driver integrations:
 - `block::registry` — unified `BlockDeviceSync` trait; NVMe +
@@ -268,6 +272,7 @@ $ cargo xtask test --arch=x86_64
 | `narf-scheduler`    | Cooperative executor: spawn, yield_now, run_until_empty. |
 | `narf-verification` | `#[kernel_test]` collector + runtime + 14 built-in tests.|
 | `narf-frame`        | Bin: `_start`, long-mode transition, IDT/GDT/TSS, demo.  |
+| `narf-drivers-hwmon` | Hardware monitoring drivers (coretemp, k10temp, nct6775, dell_smm) + sysfs bridge + testing. |
 | `xtask`             | `cargo xtask {build,run,test,image}` per arch.           |
 
 ## Stage 1 exit-gate status (closed)
