@@ -15,8 +15,7 @@
 //!   / Raptor Lake and earlier). Same DW core, different ACPI HIDs
 //!   (`INT3xxx` / `80860Fxx` / `808622xx`). Stage-0 skeleton:
 //!   discovery + MMIO mapping + IC_COMP_TYPE probe + bus
-//!   registration; `transfer()` returns `BadHardware` until Stage-1
-//!   ports the FCH transfer state machine.
+//!   registration + transfer state machine.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
