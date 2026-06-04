@@ -221,18 +221,16 @@ kernel_test_in!("drivers-i2c", smoke_amd_fch_transfer_refuses_when_disabled);
 
 // ── Intel LPSS smokes ────────────────────────────────────────────
 //
-// Stage-0: skeleton only. The smokes assert that
+// Stage-1: full driver. The smokes assert that
 //
 //   (1) the bring-up-target Tiger Lake / Alder Lake / Raptor Lake HIDs
 //       stay in the recognised list — guarding against a future trim
 //       that silently drops the laptop touchpad bus,
 //   (2) the IC_COMP_TYPE probe accepts a real DW magic value and
-//       rejects garbage, exactly as the FCH variant does (the LPSS
-//       wrapper holds the same DW core so the magic constant is the
-//       same), and
-//   (3) the Stage-0 `transfer()` stub returns BadHardware so client
-//       drivers reach a well-defined failure path rather than a
-//       half-working bus.
+//       rejects garbage, and
+//   (3) the LPSS-specific ungate sequence (FUNC + APB + IDMA reset
+//       de-assertion) writes the expected values to the private
+//       register window.
 
 fn smoke_lpss_i2c_recognises_modern_intel_hids() -> TestResult {
     // Tiger Lake / Alder Lake / Raptor Lake — the modern Intel laptop
@@ -254,10 +252,7 @@ fn smoke_lpss_i2c_recognises_modern_intel_hids() -> TestResult {
 kernel_test_in!("drivers-i2c", smoke_lpss_i2c_recognises_modern_intel_hids);
 
 fn smoke_lpss_i2c_probe_rejects_bad_mmio() -> TestResult {
-    // No COMP_TYPE seed -> probe must reject with BadHardware. Same
-    // "MMIO mapping points at the wrong device" guard as the FCH
-    // variant — only the LPSS wrapper differs and the DW core's
-    // probe path is identical.
+    // No COMP_TYPE seed -> probe must reject with BadHardware.
     let (phys, len) = make_synthetic_mmio(false);
     let drv = lpss_new_for_test("smoke-lpss-bad".to_string(), phys, len);
     match drv.probe_component_type() {
@@ -271,48 +266,44 @@ fn smoke_lpss_i2c_probe_rejects_bad_mmio() -> TestResult {
 }
 kernel_test_in!("drivers-i2c", smoke_lpss_i2c_probe_rejects_bad_mmio);
 
-fn smoke_lpss_i2c_probe_accepts_good_mmio() -> TestResult {
+fn smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates() -> TestResult {
     let (phys, len) = make_synthetic_mmio(true);
     let drv = lpss_new_for_test("smoke-lpss-good".to_string(), phys, len);
     match drv.probe_component_type() {
-        Ok(()) => TestResult::Pass,
+        Ok(()) => {
+            // Check that the ungate sequence touched the private regs.
+            // LPSS_PRIV_RESETS is at 0x204.
+            let base = phys.raw() as *const u32;
+            let resets = unsafe { core::ptr::read_volatile(base.add(0x204 / 4)) };
+            if resets != 0x7 {
+                return TestResult::Fail("LPSS ungate didn't set PRIV_RESETS to 0x7");
+            }
+            TestResult::Pass
+        }
         Err(_) => TestResult::Fail("LPSS probe_component_type rejected real DW magic"),
     }
 }
-kernel_test_in!("drivers-i2c", smoke_lpss_i2c_probe_accepts_good_mmio);
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates);
 
-fn smoke_lpss_i2c_transfer_stub_returns_bad_hardware() -> TestResult {
-    // Stage-0 stub contract: transfer() returns BadHardware regardless
-    // of state. Once Stage-1 lands the real transfer state machine
-    // this test gets reworked / deleted alongside the stub — hard
-    // cutover, no compat shim. The test exists in Stage-0 to lock the
-    // contract so we notice if the stub silently changes shape.
-    narf_scheduler::__reset_queues_for_test();
+fn smoke_lpss_i2c_enable_writes_expected_regs() -> TestResult {
     let (phys, len) = make_synthetic_mmio(true);
-    let drv = lpss_new_for_test("smoke-lpss-transfer".to_string(), phys, len);
-    let bus: Arc<dyn I2cBus> = Arc::new(drv);
-    let result = Arc::new(core::sync::atomic::AtomicI32::new(-1));
-    let r = result.clone();
-    narf_scheduler::spawn(async move {
-        let mut buf = [0u8; 4];
-        let mut ops = [I2cOp::Read(&mut buf)];
-        let outcome = bus.transfer(0x2c, &mut ops).await;
-        let code = match outcome {
-            Err(I2cError::BadHardware) => 0,
-            Err(_) => 1,
-            Ok(()) => 2,
-        };
-        r.store(code, core::sync::atomic::Ordering::SeqCst);
-    });
-    narf_scheduler::run_until_empty();
-    match result.load(core::sync::atomic::Ordering::SeqCst) {
-        0 => TestResult::Pass,
-        1 => TestResult::Fail("LPSS Stage-0 stub returned non-BadHardware error"),
-        2 => TestResult::Fail("LPSS Stage-0 stub claimed transfer succeeded"),
-        _ => TestResult::Fail("LPSS transfer task didn't run"),
+    let drv = lpss_new_for_test("smoke-lpss-enable".to_string(), phys, len);
+    if drv.enable().is_err() {
+        return TestResult::Fail("LPSS enable() failed unexpectedly");
     }
+    let base = phys.raw() as *const u32;
+    let ic_con = unsafe { core::ptr::read_volatile(base) };
+    let want = 1u32 | (0b10 << 1) | (1 << 6) | (1 << 5);
+    if ic_con != want {
+        return TestResult::Fail("LPSS IC_CON not programmed correctly");
+    }
+    let ic_enable = unsafe { core::ptr::read_volatile(base.add(0x6c / 4)) };
+    if ic_enable != 1 {
+        return TestResult::Fail("LPSS IC_ENABLE not 1 after enable()");
+    }
+    TestResult::Pass
 }
-kernel_test_in!("drivers-i2c", smoke_lpss_i2c_transfer_stub_returns_bad_hardware);
+kernel_test_in!("drivers-i2c", smoke_lpss_i2c_enable_writes_expected_regs);
 
 fn smoke_lpss_i2c_registers_into_shared_registry() -> TestResult {
     // The whole point of Stage-0 is that an LPSS driver instance,
