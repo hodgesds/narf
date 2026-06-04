@@ -45,7 +45,10 @@ pub enum SpmiError {
 /// Build an Extended Register Write (long form): writes `data` to
 /// the slave at 16-bit register `addr`. `data.len()` must be 1..=16.
 pub fn build_ext_write(sid: u8, addr: u16, data: &[u8]) -> Vec<u8> {
-    assert!((1..=16).contains(&data.len()), "ext write byte count 1..=16");
+    assert!(
+        (1..=16).contains(&data.len()),
+        "ext write byte count 1..=16"
+    );
     let mut buf = Vec::with_capacity(4 + data.len());
     buf.push(((sid & 0xF) << 4) | 0x00);
     let opcode = 0x10 | ((data.len() as u8 - 1) & 0x0F);

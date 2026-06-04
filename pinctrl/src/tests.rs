@@ -90,7 +90,10 @@ fn smoke_pinctrl_dwapb_make_set_output_drives_high() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_make_set_output_drives_high);
+kernel_test_in!(
+    "pinctrl/dwapb",
+    smoke_pinctrl_dwapb_make_set_output_drives_high
+);
 
 fn smoke_pinctrl_dwapb_bank_offsets_sanity() -> TestResult {
     use crate::dwapb::bank_offset;
@@ -122,7 +125,10 @@ fn smoke_pinctrl_qcom_pmic_mode_ctl_output_high() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/qcom-pmic", smoke_pinctrl_qcom_pmic_mode_ctl_output_high);
+kernel_test_in!(
+    "pinctrl/qcom-pmic",
+    smoke_pinctrl_qcom_pmic_mode_ctl_output_high
+);
 
 fn smoke_pinctrl_qcom_pmic_pushpull_writes_sequence() -> TestResult {
     use crate::qcom_pmic::{make_gpio_pushpull_output_writes, regs};
@@ -143,7 +149,10 @@ fn smoke_pinctrl_qcom_pmic_pushpull_writes_sequence() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/qcom-pmic", smoke_pinctrl_qcom_pmic_pushpull_writes_sequence);
+kernel_test_in!(
+    "pinctrl/qcom-pmic",
+    smoke_pinctrl_qcom_pmic_pushpull_writes_sequence
+);
 
 // ── deep pinctrl/dwapb coverage ───────────────────────────────────
 
@@ -201,7 +210,10 @@ fn smoke_pinctrl_dwapb_make_set_input_clears_ddr_bit() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_make_set_input_clears_ddr_bit);
+kernel_test_in!(
+    "pinctrl/dwapb",
+    smoke_pinctrl_dwapb_make_set_input_clears_ddr_bit
+);
 
 fn smoke_pinctrl_dwapb_pin_level_reads_ext_port_bit() -> TestResult {
     use crate::dwapb::pin_level;
@@ -216,7 +228,10 @@ fn smoke_pinctrl_dwapb_pin_level_reads_ext_port_bit() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_pin_level_reads_ext_port_bit);
+kernel_test_in!(
+    "pinctrl/dwapb",
+    smoke_pinctrl_dwapb_pin_level_reads_ext_port_bit
+);
 
 fn smoke_pinctrl_dwapb_interrupt_config_table() -> TestResult {
     use crate::dwapb::make_interrupt_config;
@@ -276,7 +291,10 @@ fn smoke_pinctrl_pinmux_enum_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_enum_variants_distinct);
+kernel_test_in!(
+    "pinctrl/pinmux",
+    smoke_pinctrl_pinmux_enum_variants_distinct
+);
 
 fn smoke_pinctrl_pinmux_default_config_is_safe() -> TestResult {
     use crate::pinmux::{PinConfig, PinDirection, PinDriveStrength, PinPull};
@@ -301,14 +319,19 @@ fn smoke_pinctrl_pinmux_default_config_is_safe() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_default_config_is_safe);
+kernel_test_in!(
+    "pinctrl/pinmux",
+    smoke_pinctrl_pinmux_default_config_is_safe
+);
 
 // ── deep pinctrl/pinmux ─────────────────────────────────────────
 
 fn smoke_pinctrl_pinmux_pull_repr_pinned() -> TestResult {
     use crate::pinmux::PinPull;
-    if PinPull::None as u8 != 0 || PinPull::Down as u8 != 1
-        || PinPull::Up as u8 != 2 || PinPull::Keeper as u8 != 3
+    if PinPull::None as u8 != 0
+        || PinPull::Down as u8 != 1
+        || PinPull::Up as u8 != 2
+        || PinPull::Keeper as u8 != 3
     {
         return TestResult::Fail("PinPull repr drifted");
     }
@@ -344,7 +367,10 @@ fn smoke_pinctrl_pinmux_drive_strength_walks_2ma_steps() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_drive_strength_walks_2ma_steps);
+kernel_test_in!(
+    "pinctrl/pinmux",
+    smoke_pinctrl_pinmux_drive_strength_walks_2ma_steps
+);
 
 fn smoke_pinctrl_pinmux_pack_bit_positions() -> TestResult {
     use crate::pinmux::{
@@ -420,7 +446,10 @@ fn smoke_pinctrl_pinmux_builder_helpers_shapes() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("pinctrl/pinmux", smoke_pinctrl_pinmux_builder_helpers_shapes);
+kernel_test_in!(
+    "pinctrl/pinmux",
+    smoke_pinctrl_pinmux_builder_helpers_shapes
+);
 
 // ── deep pinctrl/spmi ──────────────────────────────────────────
 
