@@ -85,22 +85,39 @@ impl VcnVersion {
     pub fn codec_caps(self) -> u32 {
         match self {
             VcnVersion::V2_0 => {
-                CodecBits::H264_DEC | CodecBits::H264_ENC | CodecBits::HEVC_DEC
-                    | CodecBits::HEVC_ENC | CodecBits::VP9_DEC | CodecBits::JPEG_DEC
+                CodecBits::H264_DEC
+                    | CodecBits::H264_ENC
+                    | CodecBits::HEVC_DEC
+                    | CodecBits::HEVC_ENC
+                    | CodecBits::VP9_DEC
+                    | CodecBits::JPEG_DEC
             }
             VcnVersion::V2_5 => {
-                CodecBits::H264_DEC | CodecBits::H264_ENC | CodecBits::HEVC_DEC
-                    | CodecBits::HEVC_ENC | CodecBits::VP9_DEC | CodecBits::JPEG_DEC
+                CodecBits::H264_DEC
+                    | CodecBits::H264_ENC
+                    | CodecBits::HEVC_DEC
+                    | CodecBits::HEVC_ENC
+                    | CodecBits::VP9_DEC
+                    | CodecBits::JPEG_DEC
             }
             VcnVersion::V3_0 => {
-                CodecBits::H264_DEC | CodecBits::H264_ENC | CodecBits::HEVC_DEC
-                    | CodecBits::HEVC_ENC | CodecBits::VP9_DEC | CodecBits::AV1_DEC
+                CodecBits::H264_DEC
+                    | CodecBits::H264_ENC
+                    | CodecBits::HEVC_DEC
+                    | CodecBits::HEVC_ENC
+                    | CodecBits::VP9_DEC
+                    | CodecBits::AV1_DEC
                     | CodecBits::JPEG_DEC
             }
             VcnVersion::V4_0_5 => {
-                CodecBits::H264_DEC | CodecBits::H264_ENC | CodecBits::HEVC_DEC
-                    | CodecBits::HEVC_ENC | CodecBits::VP9_DEC | CodecBits::AV1_DEC
-                    | CodecBits::AV1_ENC | CodecBits::JPEG_DEC
+                CodecBits::H264_DEC
+                    | CodecBits::H264_ENC
+                    | CodecBits::HEVC_DEC
+                    | CodecBits::HEVC_ENC
+                    | CodecBits::VP9_DEC
+                    | CodecBits::AV1_DEC
+                    | CodecBits::AV1_ENC
+                    | CodecBits::JPEG_DEC
             }
         }
     }
@@ -629,9 +646,7 @@ pub fn retire_encode(session: &mut EncodeSession, _seq: u64) {
 /// down the session so the firmware can release its per-session
 /// state. The packet is a minimal sentinel pointing at the
 /// session's handle + the op-destroy code.
-pub fn build_encode_destroy_msg(
-    session: &mut EncodeSession,
-) -> Result<EncodePacket, VideoError> {
+pub fn build_encode_destroy_msg(session: &mut EncodeSession) -> Result<EncodePacket, VideoError> {
     if !session.ip.supports_encode(session.codec) {
         return Err(VideoError::UnsupportedCodec);
     }
@@ -747,11 +762,7 @@ pub trait VcnEncMmio {
 /// + UVD_RB_SIZE so the firmware reads packets from the right
 /// place. Adapted from `vcn_v4_0.c::vcn_v4_0_pause_dpg_mode`
 /// register-init block (around line 1100-1108).
-pub fn setup_encode_ring_regs<M: VcnEncMmio>(
-    mmio: &mut M,
-    vcn_base: u32,
-    ring: &EncodeRing,
-) {
+pub fn setup_encode_ring_regs<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32, ring: &EncodeRing) {
     mmio.write(
         vcn_base + VCN_ENC_RING_BASE_LO_REL,
         ring.ring_base_phys as u32,
@@ -768,11 +779,7 @@ pub fn setup_encode_ring_regs<M: VcnEncMmio>(
 
 /// Commit the encode ring's wptr to silicon. Mirrors
 /// `vcn_v4_0.c::vcn_v4_0_unified_ring_set_wptr` (line 1785-1798).
-pub fn commit_encode_wptr<M: VcnEncMmio>(
-    mmio: &mut M,
-    vcn_base: u32,
-    ring: &EncodeRing,
-) {
+pub fn commit_encode_wptr<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32, ring: &EncodeRing) {
     mmio.write(vcn_base + VCN_ENC_RING_WPTR_REL, ring.wptr_dw);
 }
 
@@ -834,7 +841,12 @@ mod smoke_tests {
             return TestResult::Fail("VP9 enc not supported by VCN");
         }
         // H.264 dec everywhere.
-        for v in [VcnVersion::V2_0, VcnVersion::V2_5, VcnVersion::V3_0, VcnVersion::V4_0_5] {
+        for v in [
+            VcnVersion::V2_0,
+            VcnVersion::V2_5,
+            VcnVersion::V3_0,
+            VcnVersion::V4_0_5,
+        ] {
             if !v.supports_decode(Codec::H264) {
                 return TestResult::Fail("missing H.264 dec on a version");
             }
@@ -878,8 +890,12 @@ mod smoke_tests {
         }
         // Fill up DPB.
         for i in 0..(MAX_REF_FRAMES - 3) {
-            s.admit_ref(0x5000_0000 + (i as u64) * 0x1000_0000, (i + 10) as i32, false)
-                .expect("admit fill");
+            s.admit_ref(
+                0x5000_0000 + (i as u64) * 0x1000_0000,
+                (i + 10) as i32,
+                false,
+            )
+            .expect("admit fill");
         }
         if s.admit_ref(0xFFFF_F000, 100, false) != Err(VideoError::DpbFull) {
             return TestResult::Fail("DPB-full not flagged");
@@ -1009,8 +1025,8 @@ mod smoke_tests {
     fn smoke_build_encode_frame_packet_layout() -> TestResult {
         let mut s = EncodeSession::new(VcnVersion::V4_0_5, Codec::Hevc, 3840, 2160, 25_000_000, 7)
             .expect("session");
-        let p = build_encode_frame_packet(&mut s, 0xCAFE_0000, 0xBEEF_0000, 0x10_0000)
-            .expect("frame");
+        let p =
+            build_encode_frame_packet(&mut s, 0xCAFE_0000, 0xBEEF_0000, 0x10_0000).expect("frame");
         // dw[1] = handle, dw[2] = codec word, dw[3] = width, dw[4] = height.
         if p.dws[1] != 7 {
             return TestResult::Fail("handle wrong");
@@ -1093,7 +1109,9 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_encode_ring_full_rejects);
 
     fn smoke_setup_encode_ring_writes_regs() -> TestResult {
-        let mut m = MockVcnMmio { writes: alloc::vec![] };
+        let mut m = MockVcnMmio {
+            writes: alloc::vec![],
+        };
         let r = EncodeRing::new(0xDEAD_0000, 4096).expect("ring");
         setup_encode_ring_regs(&mut m, 0x100, &r);
         // 5 writes: BASE_LO, BASE_HI, SIZE, RPTR=0, WPTR=0.
@@ -1111,7 +1129,9 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_setup_encode_ring_writes_regs);
 
     fn smoke_commit_encode_wptr_writes_uvd_rb_wptr() -> TestResult {
-        let mut m = MockVcnMmio { writes: alloc::vec![] };
+        let mut m = MockVcnMmio {
+            writes: alloc::vec![],
+        };
         let mut r = EncodeRing::new(0xDEAD_0000, 4096).expect("ring");
         r.wptr_dw = 0x42;
         commit_encode_wptr(&mut m, 0x100, &r);

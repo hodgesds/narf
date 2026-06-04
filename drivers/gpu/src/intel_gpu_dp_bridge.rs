@@ -267,7 +267,7 @@ pub(crate) fn detailed_timing_to_mode(dt: &narf_graphics::edid::DetailedTiming) 
 fn stage1_placeholder_fb() -> Framebuffer {
     Framebuffer {
         phys_addr: 0x0010_0000, // page-aligned, otherwise unused
-        stride_bytes: 1920 * 4,  // 4-byte-per-pixel XRGB at 1920 wide
+        stride_bytes: 1920 * 4, // 4-byte-per-pixel XRGB at 1920 wide
         format: PixelFormat::Xrgb8888,
     }
 }

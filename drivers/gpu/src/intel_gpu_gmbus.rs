@@ -277,10 +277,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_gmbus",
-        smoke_pin_pair_round_trip
-    );
+    kernel_test_in!("drivers/gpu/intel_gpu_gmbus", smoke_pin_pair_round_trip);
 
     fn smoke_edid_read_program_layout() -> TestResult {
         let p = match build_edid_read(PinPair::DdiB, 128) {

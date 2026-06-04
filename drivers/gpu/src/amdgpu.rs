@@ -176,9 +176,9 @@ const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
 // that pre-relicense scaffold mislabelled LOAD_TA). Re-export
 // the names load_firmware uses inline below.
 use crate::amdgpu_psp::{
-    MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
-    PSP_CMD_AUTOLOAD_RLC, PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA,
-    PSP_CMD_LOAD_TOC, PSP_STATUS_CODE_MASK, PSP_STATUS_DONE_BIT,
+    MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL, PSP_CMD_AUTOLOAD_RLC,
+    PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC, PSP_STATUS_CODE_MASK,
+    PSP_STATUS_DONE_BIT,
 };
 
 // ── Chip-info table ────────────────────────────────────────────────
@@ -284,22 +284,42 @@ pub const SMU_LOAD_PMFW_MP1: u32 = 0xFF00_0001;
 
 impl FwEntry {
     const fn ip_fw(name: &'static str) -> Self {
-        Self { name, cmd: PSP_CMD_LOAD_IP_FW, optional: false }
+        Self {
+            name,
+            cmd: PSP_CMD_LOAD_IP_FW,
+            optional: false,
+        }
     }
     const fn ta(name: &'static str) -> Self {
-        Self { name, cmd: PSP_CMD_LOAD_TA, optional: false }
+        Self {
+            name,
+            cmd: PSP_CMD_LOAD_TA,
+            optional: false,
+        }
     }
     const fn asd(name: &'static str) -> Self {
-        Self { name, cmd: PSP_CMD_LOAD_ASD, optional: false }
+        Self {
+            name,
+            cmd: PSP_CMD_LOAD_ASD,
+            optional: false,
+        }
     }
     const fn toc(name: &'static str) -> Self {
-        Self { name, cmd: PSP_CMD_LOAD_TOC, optional: false }
+        Self {
+            name,
+            cmd: PSP_CMD_LOAD_TOC,
+            optional: false,
+        }
     }
     /// SMU PMFW via MP1 mailbox (Phoenix-class). The `cmd` field
     /// here is the SMU sentinel, NOT a PSP cmd id — the dispatch
     /// loop routes accordingly.
     const fn smu_pmfw(name: &'static str) -> Self {
-        Self { name, cmd: SMU_LOAD_PMFW_MP1, optional: false }
+        Self {
+            name,
+            cmd: SMU_LOAD_PMFW_MP1,
+            optional: false,
+        }
     }
     const fn optional(mut self) -> Self {
         self.optional = true;
@@ -405,11 +425,21 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
         PHOENIX_DISCRETE => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
         STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", STRIX_FW),
         RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
-        CEZANNE => (Family::Renoir, "cezanne", "amdgpu/cezanne.bin", GREEN_SARDINE_FW),
+        CEZANNE => (
+            Family::Renoir,
+            "cezanne",
+            "amdgpu/cezanne.bin",
+            GREEN_SARDINE_FW,
+        ),
         // Lucienne shares Renoir's GFX9 + DCN 2.0 IP set; same blobs.
         LUCIENNE => (Family::Renoir, "lucienne", "amdgpu/renoir.bin", RENOIR_FW),
         // Barcelo is Cezanne-refresh; green_sardine firmware.
-        BARCELO => (Family::Renoir, "barcelo", "amdgpu/green_sardine.bin", GREEN_SARDINE_FW),
+        BARCELO => (
+            Family::Renoir,
+            "barcelo",
+            "amdgpu/green_sardine.bin",
+            GREEN_SARDINE_FW,
+        ),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
         NAVI22 => (Family::Navi2, "navi22", "amdgpu/navi22.bin", UNAUDITED_FW),
         NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
@@ -586,8 +616,7 @@ impl AmdGpu {
     /// discovery is empty (older silicon, QEMU) or the requested
     /// `(hw_id, instance)` isn't present.
     pub fn ip_block_base(&self, hw_id: u16, instance: u8) -> Option<u32> {
-        amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance)
-            .map(|b| b.base_addrs[0])
+        amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance).map(|b| b.base_addrs[0])
     }
 
     pub fn chip_info(&self) -> ChipInfo {
@@ -807,8 +836,7 @@ impl AmdGpu {
             }
             Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
         };
-        let view = narf_firmware::view_of(&cap)
-            .map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
+        let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
         let phys = view.phys;
         let size = view.bytes.len() as u32;
         if size == 0 || size & 0xFF00_0000 != 0 {
@@ -822,7 +850,11 @@ impl AmdGpu {
         // are valid register-bus addresses for this family.
         unsafe {
             mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_67_REL, (phys >> 32) as u32);
+            mm_write(
+                &self.regs,
+                mp0_base + MP0_C2PMSG_67_REL,
+                (phys >> 32) as u32,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         let trigger = (entry.cmd & 0xFF) | (size << 8);
@@ -895,8 +927,7 @@ impl AmdGpu {
             }
             Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
         };
-        let view = narf_firmware::view_of(&cap)
-            .map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
+        let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
         let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
         let phys = view.phys;
         let size = view.bytes.len() as u32;
@@ -983,9 +1014,7 @@ impl AmdGpu {
         // RLC by MMIO kick instead, so we skip the call there.
         if matches!(self.chip.family, Family::Phoenix) {
             // SAFETY: caller-asserted exclusive BAR5.
-            let r = unsafe {
-                psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC)
-            };
+            let r = unsafe { psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC) };
             if r.is_err() {
                 // Non-fatal: log via the report. RLC autoload
                 // failure means the GFX ring won't come up, but
@@ -1212,9 +1241,7 @@ unsafe fn psp_send_control_command(
     }
     let _ = narf_scheduler::responsive_spin_until(
         // SAFETY: identity-mapped MMIO.
-        || unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) }
-            & PSP_STATUS_DONE_BIT
-            != 0,
+        || unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
         narf_time::Deadline::after_ms(500),
     );
     // SAFETY: identity-mapped MMIO.
@@ -1362,9 +1389,8 @@ unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock
     // Cap the read at whatever the aperture actually exposes
     // (BAR0 may be smaller than the visible VRAM on systems with
     // a resizable BAR turned off).
-    let max = amdgpu_discovery::DISCOVERY_TMR_SIZE.min(
-        amdgpu_discovery::DISCOVERY_TMR_OFFSET as usize,
-    );
+    let max =
+        amdgpu_discovery::DISCOVERY_TMR_SIZE.min(amdgpu_discovery::DISCOVERY_TMR_OFFSET as usize);
     let mut buf = alloc::vec![0u8; max];
     // Read in 4-byte chunks via the MMIO accessor. The BAR's
     // size guard is enforced by `MmioRegion::read32` (returns
@@ -1430,7 +1456,9 @@ unsafe fn read_vbios_version_from_rom(
     let probe_region = MmioRegion {
         phys: PhysAddr::new(rom_phys),
         len: 512,
-        kind: BarKind::Mmio32 { prefetchable: false },
+        kind: BarKind::Mmio32 {
+            prefetchable: false,
+        },
     };
 
     // Guard against unmapped / absent ROM (reads back 0xFF 0xFF).
@@ -1455,7 +1483,9 @@ unsafe fn read_vbios_version_from_rom(
     let region = MmioRegion {
         phys: PhysAddr::new(rom_phys),
         len: rom_size,
-        kind: BarKind::Mmio32 { prefetchable: false },
+        kind: BarKind::Mmio32 {
+            prefetchable: false,
+        },
     };
 
     // Slurp ROM bytes via 32-bit reads.

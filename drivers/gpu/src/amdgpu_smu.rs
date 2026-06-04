@@ -577,9 +577,8 @@ pub fn bring_up<M: SmuMmio>(
         .map_err(|e| BringUpError::Mailbox(e, BringUpStep::GetSmuVersion))?;
 
     // Step 3: GetDriverIfVersion and check.
-    let driver_if_version =
-        send_message_get(mmio, mp1_base, PPSMC_MSG_GET_DRIVER_IF_VERSION, 0)
-            .map_err(|e| BringUpError::Mailbox(e, BringUpStep::GetDriverIfVersion))?;
+    let driver_if_version = send_message_get(mmio, mp1_base, PPSMC_MSG_GET_DRIVER_IF_VERSION, 0)
+        .map_err(|e| BringUpError::Mailbox(e, BringUpStep::GetDriverIfVersion))?;
     if driver_if_version != expected_driver_if_version {
         return Err(BringUpError::DriverIfMismatch(
             driver_if_version,
@@ -723,10 +722,7 @@ impl SmuFwVersion {
 /// The caller is responsible for ensuring the SMU mailbox is alive
 /// (PSP has loaded the firmware) before calling this; use
 /// `bring_up` for a full handshake.
-pub fn detect_version<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Option<SmuVersion> {
+pub fn detect_version<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Option<SmuVersion> {
     let driver_if = send_message_get(mmio, mp1_base, PPSMC_MSG_GET_DRIVER_IF_VERSION, 0).ok()?;
     SmuVersion::from_driver_if(driver_if)
 }
@@ -776,10 +772,7 @@ pub fn get_fw_version<M: SmuMmio>(
 /// NOTE: this uses the existing raw `PPSMC_MSG_GET_CURRENT_TEMPERATURE`
 /// constant (0x36) which is stable across SMU12 and SMU13. If future
 /// silicon renumbers it, promote it into the per-version tables.
-pub fn get_temperature_milli_c<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Result<i32, SmuError> {
+pub fn get_temperature_milli_c<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Result<i32, SmuError> {
     read_gpu_temperature_millicelsius(mmio, mp1_base)
 }
 

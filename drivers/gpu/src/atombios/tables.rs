@@ -58,10 +58,7 @@ impl<'a> MasterDataTable<'a> {
     /// Returns `Err(OutOfBounds)` when `header.master_data_table_offset`
     /// is zero or points past the image end.
     /// Returns `Err(BadStructureSize)` when the size field is malformed.
-    pub fn parse(
-        image: &'a [u8],
-        header: &AtomRomHeader,
-    ) -> Result<Self, TableDirError> {
+    pub fn parse(image: &'a [u8], header: &AtomRomHeader) -> Result<Self, TableDirError> {
         let dir_off = header.master_data_table_offset as usize;
         if dir_off == 0 || dir_off + 4 > image.len() {
             return Err(TableDirError::OutOfBounds);

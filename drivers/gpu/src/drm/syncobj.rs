@@ -120,13 +120,17 @@ pub struct BinaryFence {
 impl BinaryFence {
     /// New unsignalled fence.
     pub fn new() -> Arc<Self> {
-        Arc::new(BinaryFence { signalled: AtomicBool::new(false) })
+        Arc::new(BinaryFence {
+            signalled: AtomicBool::new(false),
+        })
     }
 
     /// New already-signalled fence — for syncobjs created with
     /// `DRM_SYNCOBJ_CREATE_SIGNALED`.
     pub fn signalled() -> Arc<Self> {
-        Arc::new(BinaryFence { signalled: AtomicBool::new(true) })
+        Arc::new(BinaryFence {
+            signalled: AtomicBool::new(true),
+        })
     }
 }
 
@@ -186,7 +190,10 @@ impl SyncObj {
 
     /// Is this syncobj's fence signalled?  No-fence → unsignalled.
     pub fn is_signalled(&self) -> bool {
-        self.fence.as_ref().map(|f| f.is_signalled()).unwrap_or(false)
+        self.fence
+            .as_ref()
+            .map(|f| f.is_signalled())
+            .unwrap_or(false)
     }
 }
 
@@ -207,7 +214,10 @@ pub struct SyncObjTable {
 
 impl SyncObjTable {
     pub fn new() -> Self {
-        SyncObjTable { objs: Vec::new(), next: 1 }
+        SyncObjTable {
+            objs: Vec::new(),
+            next: 1,
+        }
     }
 
     /// Create a new syncobj.  If `flags & SYNCOBJ_CREATE_SIGNALED`, the
@@ -232,15 +242,15 @@ impl SyncObjTable {
 
     /// Create a syncobj from an existing fence.  Used by the scheduler
     /// to publish a job's output fence to userspace.
-    pub fn create_with_fence(
-        &mut self,
-        fence: Arc<dyn DmaFence>,
-    ) -> Result<u32, SyncError> {
+    pub fn create_with_fence(&mut self, fence: Arc<dyn DmaFence>) -> Result<u32, SyncError> {
         if self.objs.len() >= SYNCOBJ_TABLE_MAX {
             return Err(SyncError::Full);
         }
         let id = self.alloc_id();
-        self.objs.push(SyncObj { id, fence: Some(fence) });
+        self.objs.push(SyncObj {
+            id,
+            fence: Some(fence),
+        });
         Ok(id)
     }
 
@@ -248,7 +258,10 @@ impl SyncObjTable {
     ///
     /// Linux equivalent: `drm_syncobj_destroy_ioctl`.
     pub fn destroy(&mut self, id: u32) -> Result<(), SyncError> {
-        let pos = self.objs.iter().position(|o| o.id == id)
+        let pos = self
+            .objs
+            .iter()
+            .position(|o| o.id == id)
             .ok_or(SyncError::NotFound)?;
         self.objs.swap_remove(pos);
         Ok(())
@@ -256,12 +269,18 @@ impl SyncObjTable {
 
     /// Look up a syncobj by handle (read-only).
     pub fn get(&self, id: u32) -> Result<&SyncObj, SyncError> {
-        self.objs.iter().find(|o| o.id == id).ok_or(SyncError::NotFound)
+        self.objs
+            .iter()
+            .find(|o| o.id == id)
+            .ok_or(SyncError::NotFound)
     }
 
     /// Look up a syncobj by handle (mutable).
     pub fn get_mut(&mut self, id: u32) -> Result<&mut SyncObj, SyncError> {
-        self.objs.iter_mut().find(|o| o.id == id).ok_or(SyncError::NotFound)
+        self.objs
+            .iter_mut()
+            .find(|o| o.id == id)
+            .ok_or(SyncError::NotFound)
     }
 
     /// Wait on an array of syncobj handles.
@@ -275,12 +294,7 @@ impl SyncObjTable {
     /// EINVAL on count_handles == 0.
     ///
     /// Linux equivalent: `drm_syncobj_array_wait`.
-    pub fn wait_handles(
-        &self,
-        ids: &[u32],
-        timeout_ns: u64,
-        flags: u32,
-    ) -> Result<u32, SyncError> {
+    pub fn wait_handles(&self, ids: &[u32], timeout_ns: u64, flags: u32) -> Result<u32, SyncError> {
         if ids.is_empty() {
             return Err(SyncError::EmptyHandles);
         }
@@ -296,17 +310,23 @@ impl SyncObjTable {
         let first_signalled = || -> Option<u32> {
             for (i, f) in fences.iter().enumerate() {
                 if let Some(f) = f {
-                    if f.is_signalled() { return Some(ids[i]); }
+                    if f.is_signalled() {
+                        return Some(ids[i]);
+                    }
                 }
             }
             None
         };
         let all_signalled = || -> bool {
-            fences.iter().all(|f| f.as_ref().is_some_and(|f| f.is_signalled()))
+            fences
+                .iter()
+                .all(|f| f.as_ref().is_some_and(|f| f.is_signalled()))
         };
 
         if wait_all {
-            if all_signalled() { return Ok(ids[ids.len() - 1]); }
+            if all_signalled() {
+                return Ok(ids[ids.len() - 1]);
+            }
         } else if let Some(id) = first_signalled() {
             return Ok(id);
         }
@@ -386,7 +406,9 @@ impl SyncObjTable {
     fn alloc_id(&mut self) -> u32 {
         let mut candidate = self.next;
         loop {
-            if candidate == 0 { candidate = 1; }
+            if candidate == 0 {
+                candidate = 1;
+            }
             if !self.objs.iter().any(|o| o.id == candidate) {
                 self.next = candidate.wrapping_add(1).max(1);
                 return candidate;

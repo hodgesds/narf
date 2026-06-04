@@ -34,22 +34,22 @@ use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum IoctlCmd {
-    Version         = 0x00,
-    GetCap          = 0x0C,
+    Version = 0x00,
+    GetCap = 0x0C,
     PrimeHandleToFd = 0x2D,
     PrimeFdToHandle = 0x2E,
     ModeGetResources = 0xA0,
     ModeGetConnector = 0xA7,
-    ModeRmFb        = 0xA8,
-    ModeAddFb2      = 0xB8,
+    ModeRmFb = 0xA8,
+    ModeAddFb2 = 0xB8,
     ModeGetPlaneRes = 0xB5,
-    ModeAtomic      = 0xBC,
-    SyncobjCreate   = 0xBF,
-    SyncobjDestroy  = 0xC0,
-    SyncobjWait     = 0xC3,
-    SyncobjSignal   = 0xC5,
+    ModeAtomic = 0xBC,
+    SyncobjCreate = 0xBF,
+    SyncobjDestroy = 0xC0,
+    SyncobjWait = 0xC3,
+    SyncobjSignal = 0xC5,
     /// Unrecognised ioctl — returned as an error.
-    Unknown         = 0xFF,
+    Unknown = 0xFF,
 }
 
 impl IoctlCmd {
@@ -70,7 +70,7 @@ impl IoctlCmd {
             0xC0 => IoctlCmd::SyncobjDestroy,
             0xC3 => IoctlCmd::SyncobjWait,
             0xC5 => IoctlCmd::SyncobjSignal,
-            _    => IoctlCmd::Unknown,
+            _ => IoctlCmd::Unknown,
         }
     }
 }
@@ -148,7 +148,7 @@ pub struct DrmGetCap {
 ///
 /// Linux: `DRM_CAP_*` in `include/uapi/drm/drm.h`.
 pub mod drm_cap {
-    pub const DUMB_BUFFER:   u64 = 0x01;
+    pub const DUMB_BUFFER: u64 = 0x01;
     pub const VBLANK_HIGH_CRTC: u64 = 0x02;
     pub const DUMB_PREFERRED_DEPTH: u64 = 0x03;
     pub const DUMB_PREFER_SHADOW: u64 = 0x04;
@@ -292,11 +292,11 @@ pub fn dispatch(
     }
     match IoctlCmd::from_raw(cmd) {
         IoctlCmd::Version => handle_version(card),
-        IoctlCmd::GetCap  => handle_get_cap(arg),
+        IoctlCmd::GetCap => handle_get_cap(arg),
         IoctlCmd::ModeGetResources => handle_getresources(card),
         IoctlCmd::ModeGetConnector => handle_getconnector(card, arg),
         IoctlCmd::ModeAddFb2 => handle_addfb2(card, arg),
-        IoctlCmd::ModeRmFb   => handle_rmfb(card, arg),
+        IoctlCmd::ModeRmFb => handle_rmfb(card, arg),
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(card),
         // Atomic / syncobj / prime ioctls are dispatched via the
         // higher-level entry points in their own modules (the per-fd
@@ -333,19 +333,19 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
     }
     let capability = u64::from_le_bytes(arg[0..8].try_into().unwrap());
     let value = match capability {
-        drm_cap::DUMB_BUFFER          => 0u64,  // no dumb-buffer alloc yet
+        drm_cap::DUMB_BUFFER => 0u64, // no dumb-buffer alloc yet
         // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
         // supported via drm/prime.rs PrimeTable.
-        drm_cap::PRIME                => 3,
+        drm_cap::PRIME => 3,
         // SYNCOBJ (timeline=0) — drm/syncobj.rs implements binary
         // syncobjs; timelines are deferred.
-        drm_cap::SYNCOBJ              => 1,
-        drm_cap::SYNCOBJ_TIMELINE     => 0,
-        drm_cap::TIMESTAMP_MONOTONIC  => 1,
-        drm_cap::ADDFB2_MODIFIERS     => 0,     // no format modifiers yet
-        drm_cap::CURSOR_WIDTH         => 64,
-        drm_cap::CURSOR_HEIGHT        => 64,
-        _                             => 0,
+        drm_cap::SYNCOBJ => 1,
+        drm_cap::SYNCOBJ_TIMELINE => 0,
+        drm_cap::TIMESTAMP_MONOTONIC => 1,
+        drm_cap::ADDFB2_MODIFIERS => 0, // no format modifiers yet
+        drm_cap::CURSOR_WIDTH => 64,
+        drm_cap::CURSOR_HEIGHT => 64,
+        _ => 0,
     };
     Ok(DrmIoctlResult::GetCap(DrmGetCap { capability, value }))
 }
@@ -367,22 +367,17 @@ fn handle_getresources(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {
     Ok(DrmIoctlResult::GetResources(res))
 }
 
-fn handle_getconnector(
-    card: &Card,
-    arg: &[u8],
-) -> Result<DrmIoctlResult, DrmIoctlError> {
+fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
     if arg.len() < 4 {
         return Err(DrmIoctlError::BadSize);
     }
     let connector_id = u32::from_le_bytes(arg[0..4].try_into().unwrap());
-    let conn = card.connector(connector_id)
+    let conn = card
+        .connector(connector_id)
         .map_err(|_| DrmIoctlError::UnknownConnector)?;
 
-    let modes: alloc::vec::Vec<DrmModeModeInfo> = conn
-        .modes
-        .iter()
-        .map(|m| mode_to_wire(m))
-        .collect();
+    let modes: alloc::vec::Vec<DrmModeModeInfo> =
+        conn.modes.iter().map(|m| mode_to_wire(m)).collect();
 
     let info = DrmModeGetConnector {
         count_modes: modes.len() as u32,
@@ -401,32 +396,26 @@ fn handle_getconnector(
     Ok(DrmIoctlResult::GetConnector(info, modes))
 }
 
-fn handle_addfb2(
-    card: &mut Card,
-    arg: &[u8],
-) -> Result<DrmIoctlResult, DrmIoctlError> {
+fn handle_addfb2(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
     // struct drm_mode_fb_cmd2 is at least 68 bytes.
     if arg.len() < 68 {
         return Err(DrmIoctlError::BadSize);
     }
     // fb_id is at offset 0 (output) — skip; width at 4, height at 8.
-    let width        = u32::from_le_bytes(arg[4..8].try_into().unwrap());
-    let height       = u32::from_le_bytes(arg[8..12].try_into().unwrap());
+    let width = u32::from_le_bytes(arg[4..8].try_into().unwrap());
+    let height = u32::from_le_bytes(arg[8..12].try_into().unwrap());
     let pixel_format = u32::from_le_bytes(arg[12..16].try_into().unwrap());
     // flags at 16 (ignored for now).
     // handles[0] at 20.
-    let gem_handle   = u32::from_le_bytes(arg[20..24].try_into().unwrap());
+    let gem_handle = u32::from_le_bytes(arg[20..24].try_into().unwrap());
     // pitches[0] at 36.
-    let pitch        = u32::from_le_bytes(arg[36..40].try_into().unwrap());
+    let pitch = u32::from_le_bytes(arg[36..40].try_into().unwrap());
 
     let fb_id = card.addfb2(width, height, pixel_format, pitch, gem_handle)?;
     Ok(DrmIoctlResult::AddFb2(fb_id))
 }
 
-fn handle_rmfb(
-    card: &mut Card,
-    arg: &[u8],
-) -> Result<DrmIoctlResult, DrmIoctlError> {
+fn handle_rmfb(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
     if arg.len() < 4 {
         return Err(DrmIoctlError::BadSize);
     }
@@ -465,9 +454,9 @@ fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
     info.htotal = info.hdisplay + 160;
     info.vtotal = info.vdisplay + 45;
     info.hsync_start = info.hdisplay + 32;
-    info.hsync_end   = info.hdisplay + 64;
+    info.hsync_end = info.hdisplay + 64;
     info.vsync_start = info.vdisplay + 3;
-    info.vsync_end   = info.vdisplay + 8;
+    info.vsync_end = info.vdisplay + 8;
     // Approximate pixel clock: h × v × refresh / 1000 = kHz.
     let dot_clk_khz = (info.htotal as u32) * (info.vtotal as u32) * m.refresh_hz as u32;
     info.clock = dot_clk_khz / 1000;

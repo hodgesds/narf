@@ -232,10 +232,7 @@ pub fn build_sdma6_ring_init(
         sdma_base + SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
         doorbell_idx << 2,
     );
-    seq.push(
-        sdma_base + SDMA6_QUEUE0_DOORBELL_REL,
-        SDMA_DOORBELL_ENABLE,
-    );
+    seq.push(sdma_base + SDMA6_QUEUE0_DOORBELL_REL, SDMA_DOORBELL_ENABLE);
     seq.push(
         sdma_base + SDMA6_QUEUE0_RB_CNTL_REL,
         cntl_no_enable | SDMA_RB_ENABLE,
@@ -302,10 +299,7 @@ pub fn build_sdma4_ring_init(
     seq.push(sdma_base + SDMA_GFX_RB_CNTL_REL, cntl_no_enable);
 
     // Step 6: doorbell offset + enable.
-    seq.push(
-        sdma_base + SDMA_GFX_DOORBELL_OFFSET_REL,
-        doorbell_idx << 2,
-    );
+    seq.push(sdma_base + SDMA_GFX_DOORBELL_OFFSET_REL, doorbell_idx << 2);
     seq.push(sdma_base + SDMA_GFX_DOORBELL_REL, SDMA_DOORBELL_ENABLE);
 
     // Step 7: re-write CNTL with RB_ENABLE set — engine starts fetching.
@@ -383,12 +377,7 @@ impl<'a> SdmaBuilder<'a> {
     ///
     /// Packet shape (v4): 7 dwords (header + count + reserved +
     /// src lo/hi + dst lo/hi).
-    pub fn copy_linear(
-        &mut self,
-        src: u64,
-        dst: u64,
-        byte_count: u32,
-    ) -> Result<(), SdmaPktError> {
+    pub fn copy_linear(&mut self, src: u64, dst: u64, byte_count: u32) -> Result<(), SdmaPktError> {
         if byte_count == 0 {
             return Err(SdmaPktError::EmptyCopy);
         }

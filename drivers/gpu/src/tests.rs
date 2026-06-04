@@ -1386,7 +1386,7 @@ fn build_synthetic_discovery_blob() -> (alloc::vec::Vec<u8>, u32, u32) {
     blob[ip_off as usize + 6..ip_off as usize + 8].copy_from_slice(&ip_table_size.to_le_bytes());
     // id (4 bytes 8..12): leave 0
     blob[ip_off as usize + 12..ip_off as usize + 14].copy_from_slice(&1u16.to_le_bytes()); // num_dies
-                                                                                            // die_info[0]
+                                                                                           // die_info[0]
     blob[ip_off as usize + 14..ip_off as usize + 16].copy_from_slice(&0u16.to_le_bytes()); // die_id
     blob[ip_off as usize + 16..ip_off as usize + 18].copy_from_slice(&die_off.to_le_bytes());
     // die_info[1..16] and union (78..80): leave 0. base_addr_64_bit = 0.
@@ -1653,7 +1653,7 @@ fn smoke_amdgpu_atom_vm_add_into_ws() -> TestResult {
     // MOVE(WS=op3) WS[2] <- IMM 0xAA; ADD(WS=op45) WS[2] += 0x11; EOT.
     let code: &[u8] = &[
         3, 0x05, 2, 0xAA, 0, 0, 0, // MOVE WS[2] <- 0xAA
-        45, 0x05, 2, 0x11, 0, 0, 0, // ADD WS[2] += 0x11
+        45, 0x05, 2, 0x11, 0, 0, 0,  // ADD WS[2] += 0x11
         91, // EOT
     ];
     let mut state = AtomState::new(8, 4);
@@ -1685,7 +1685,7 @@ fn smoke_amdgpu_atom_vm_compare_jump_equal_taken() -> TestResult {
         61, 0x05, 0, 0x42, 0, 0, 0, // COMPARE PS[0] vs IMM 0x42
         68, 25, 0, // JUMP_EQUAL → local 19
         0x77, 0x77, // unreachable trap
-        91, // EOT
+        91,   // EOT
     ];
     let mut state = AtomState::new(8, 4);
     let mut ps: [u32; 1] = [0];
@@ -1724,8 +1724,8 @@ kernel_test_in!(
 fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
     use alloc::boxed::Box;
-    use alloc::vec::Vec;
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use core::cell::RefCell;
 
     // MOVE(REG=op1) REG[0x1234] <- IMM 0xDEADBEEF.
@@ -1737,7 +1737,7 @@ fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
     let code: &[u8] = &[
         1, 0x05, 0x34, 0x12, // MOVE REG[0x1234] ...
         0xEF, 0xBE, 0xAD, 0xDE, // ... <- 0xDEADBEEF
-        91, // EOT
+        91,   // EOT
     ];
 
     let writes: Arc<RefCell<Vec<(u32, u32)>>> = Arc::new(RefCell::new(Vec::new()));
@@ -1850,9 +1850,7 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_smu_handshake_timeout_when_resp_stays_busy() -> TestResult {
-    use crate::amdgpu_smu::{
-        send_message, MockSmu, SmuError, PPSMC_MSG_TEST_MESSAGE,
-    };
+    use crate::amdgpu_smu::{send_message, MockSmu, SmuError, PPSMC_MSG_TEST_MESSAGE};
     // Stage nothing — the mock returns 0 (busy) on every read.
     let mut m = MockSmu::new();
     match send_message(&mut m, 0x16000, PPSMC_MSG_TEST_MESSAGE, 0) {
@@ -1875,9 +1873,7 @@ kernel_test_in!(
 // everything up to the register-bus write boundary.
 
 fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
-    use crate::amdgpu_dcn::{
-        build_modeset_from_discovery, timing_for_mode,
-    };
+    use crate::amdgpu_dcn::{build_modeset_from_discovery, timing_for_mode};
     use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, MAX_BASE_ADDRS};
 
     let mut bases = [0u32; MAX_BASE_ADDRS];
@@ -1907,8 +1903,9 @@ fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
     // The very first write must blank HUBP — the DCN 2.0 prologue
     // requires disabling scanout before reprogramming.
     let first = seq[0];
-    let expected_blank =
-        0x0001_2000 + crate::amdgpu_dcn::DCN20_HUBP0_REL + crate::amdgpu_dcn::DCN20_HUBP_BLANK_EN_REL;
+    let expected_blank = 0x0001_2000
+        + crate::amdgpu_dcn::DCN20_HUBP0_REL
+        + crate::amdgpu_dcn::DCN20_HUBP_BLANK_EN_REL;
     if first.addr != expected_blank || first.value & crate::amdgpu_dcn::HUBP_BLANK_FORCE == 0 {
         return TestResult::Fail("prologue should force HUBP blank first");
     }
@@ -1968,7 +1965,13 @@ fn smoke_dcn20_set_mode_rejects_without_fw() -> TestResult {
         }
         // SAFETY: probe gave us BAR0+BAR5 ownership; set_mode bails
         // before any MMIO when fw_loaded is false.
-        Some(unsafe { d.set_mode(Mode { width: 1920, height: 1080, stride: 1920 }) })
+        Some(unsafe {
+            d.set_mode(Mode {
+                width: 1920,
+                height: 1080,
+                stride: 1920,
+            })
+        })
     });
     match outcome {
         Some(Some(Err(AmdgpuError::FirmwareLoadFailed))) => TestResult::Pass,
@@ -1988,9 +1991,9 @@ kernel_test_in!(
 
 fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
-        dcn20_modeset_sequence, timing_for_mode, DCN20_HUBP0_REL,
-        DCN20_HUBP_BLANK_EN_REL, DCN20_OTG0_REL, DCN20_OTG_CONTROL_REL,
-        DCN20_OTG_H_TOTAL_REL, HUBP_BLANK_FORCE, OTG_MASTER_EN,
+        dcn20_modeset_sequence, timing_for_mode, DCN20_HUBP0_REL, DCN20_HUBP_BLANK_EN_REL,
+        DCN20_OTG0_REL, DCN20_OTG_CONTROL_REL, DCN20_OTG_H_TOTAL_REL, HUBP_BLANK_FORCE,
+        OTG_MASTER_EN,
     };
     let timing = match timing_for_mode(1920, 1080, 60) {
         Some(t) => t,
@@ -2008,23 +2011,20 @@ fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     let blank_forced = seq
         .iter()
         .any(|w| w.addr == want_blank && w.value & HUBP_BLANK_FORCE != 0);
-    let blank_cleared = seq
-        .iter()
-        .any(|w| w.addr == want_blank && w.value == 0);
+    let blank_cleared = seq.iter().any(|w| w.addr == want_blank && w.value == 0);
     if !blank_forced || !blank_cleared {
         return TestResult::Fail("HUBP_BLANK_EN must be forced then cleared");
     }
     // OTG_H_TOTAL must appear with the value `h_total - 1`.
     let want_h = (timing.h_total - 1) as u32;
-    if !seq.iter().any(|w| w.addr == want_h_total && w.value == want_h) {
+    if !seq
+        .iter()
+        .any(|w| w.addr == want_h_total && w.value == want_h)
+    {
         return TestResult::Fail("OTG_H_TOTAL not programmed");
     }
     // OTG_MASTER_EN must be the last write to OTG_CONTROL.
-    let last_master = seq
-        .iter()
-        .rev()
-        .find(|w| w.addr == want_master)
-        .copied();
+    let last_master = seq.iter().rev().find(|w| w.addr == want_master).copied();
     match last_master {
         Some(w) if w.value & OTG_MASTER_EN != 0 => {}
         _ => return TestResult::Fail("OTG_MASTER_EN must be asserted last"),
@@ -2038,10 +2038,9 @@ kernel_test_in!(
 
 fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
-        dcn35_modeset_sequence, timing_for_mode, DCN35_HUBP0_REL,
-        DCN35_HUBP_BLANK_EN_REL, DCN35_OTG0_REL, DCN35_OTG_CONTROL_REL,
-        DCN35_OTG_H_TOTAL_REL, DCN35_OTG_V_BLANK_REL, HUBP_BLANK_FORCE,
-        OTG_MASTER_EN,
+        dcn35_modeset_sequence, timing_for_mode, DCN35_HUBP0_REL, DCN35_HUBP_BLANK_EN_REL,
+        DCN35_OTG0_REL, DCN35_OTG_CONTROL_REL, DCN35_OTG_H_TOTAL_REL, DCN35_OTG_V_BLANK_REL,
+        HUBP_BLANK_FORCE, OTG_MASTER_EN,
     };
     let timing = match timing_for_mode(1920, 1080, 60) {
         Some(t) => t,
@@ -2059,15 +2058,16 @@ fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     let blank_forced = seq
         .iter()
         .any(|w| w.addr == want_blank && w.value & HUBP_BLANK_FORCE != 0);
-    let blank_cleared = seq
-        .iter()
-        .any(|w| w.addr == want_blank && w.value == 0);
+    let blank_cleared = seq.iter().any(|w| w.addr == want_blank && w.value == 0);
     if !blank_forced || !blank_cleared {
         return TestResult::Fail("DCN35 HUBP_BLANK_EN must be forced then cleared");
     }
     // OTG_H_TOTAL = h_total - 1.
     let want_h = (timing.h_total - 1) as u32;
-    if !seq.iter().any(|w| w.addr == want_h_total && w.value == want_h) {
+    if !seq
+        .iter()
+        .any(|w| w.addr == want_h_total && w.value == want_h)
+    {
         return TestResult::Fail("DCN35 OTG_H_TOTAL not programmed");
     }
     // OTG_V_BLANK_START_END must use the DCN 3.5-shifted offset
@@ -2077,11 +2077,7 @@ fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
         return TestResult::Fail("DCN35 OTG_V_BLANK_START_END not programmed at shifted offset");
     }
     // OTG_MASTER_EN must be the last write to OTG_CONTROL.
-    let last_master = seq
-        .iter()
-        .rev()
-        .find(|w| w.addr == want_master)
-        .copied();
+    let last_master = seq.iter().rev().find(|w| w.addr == want_master).copied();
     match last_master {
         Some(w) if w.value & OTG_MASTER_EN != 0 => {}
         _ => return TestResult::Fail("DCN35 OTG_MASTER_EN must be asserted last"),
@@ -2104,9 +2100,8 @@ kernel_test_in!(
 
 fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
     use crate::amdgpu_dcn::{
-        DCN20_OTG_CONTROL_REL, DCN20_OTG_INTERRUPT_CONTROL_REL,
-        DCN20_OTG_V_BLANK_REL, DCN20_OTG_V_SYNC_A_REL,
-        DCN35_OTG_CONTROL_REL, DCN35_OTG_INTERRUPT_CONTROL_REL,
+        DCN20_OTG_CONTROL_REL, DCN20_OTG_INTERRUPT_CONTROL_REL, DCN20_OTG_V_BLANK_REL,
+        DCN20_OTG_V_SYNC_A_REL, DCN35_OTG_CONTROL_REL, DCN35_OTG_INTERRUPT_CONTROL_REL,
         DCN35_OTG_V_BLANK_REL, DCN35_OTG_V_SYNC_A_REL,
     };
     // Phoenix's DCN 3.5 shifted V_BLANK / V_SYNC / OTG_CONTROL /
@@ -2143,8 +2138,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_psp_send_command_drives_canonical_sequence() -> TestResult {
     use crate::amdgpu_psp::{
-        send_command, MockPsp, MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL,
-        MP0_C2PMSG_69_REL, PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+        send_command, MockPsp, MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
+        PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
     };
     let mp0_base = 0x000B_0000;
     let lo = mp0_base + MP0_C2PMSG_64_REL;
@@ -2192,8 +2187,7 @@ kernel_test_in!(
 
 fn smoke_amdgpu_psp_surfaces_rejection_status() -> TestResult {
     use crate::amdgpu_psp::{
-        send_command, MockPsp, PspError, MP0_C2PMSG_64_REL,
-        PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+        send_command, MockPsp, PspError, MP0_C2PMSG_64_REL, PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
     };
     let mp0_base = 0x000B_0000;
     let lo = mp0_base + MP0_C2PMSG_64_REL;
@@ -2240,7 +2234,13 @@ fn smoke_amdgpu_psp_rejects_empty_or_oversize_image() -> TestResult {
         Err(PspError::EmptyImage) => {}
         _ => return TestResult::Fail("zero-size image must be rejected"),
     }
-    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, PSP_MAX_IMAGE_SIZE + 1) {
+    match send_command(
+        &mut m,
+        0x000B_0000,
+        PSP_CMD_LOAD_IP_FW,
+        0x1000,
+        PSP_MAX_IMAGE_SIZE + 1,
+    ) {
         Err(PspError::ImageTooLarge) => {}
         _ => return TestResult::Fail("oversize image must be rejected"),
     }
@@ -2264,8 +2264,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_smu_bring_up_happy_path() -> TestResult {
     use crate::amdgpu_smu::{
-        bring_up, MockSmu, SMU12_DRIVER_IF_VERSION, MP1_C2PMSG_ARG_REL,
-        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+        bring_up, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU12_DRIVER_IF_VERSION,
+        SMU_RESP_OK,
     };
     let mp1_base = 0x16000;
     let resp = mp1_base + MP1_C2PMSG_RESP_REL;
@@ -2307,8 +2307,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_smu_bring_up_test_message_echo_mismatch() -> TestResult {
     use crate::amdgpu_smu::{
-        bring_up, BringUpError, MockSmu, SMU12_DRIVER_IF_VERSION,
-        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+        bring_up, BringUpError, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
+        SMU12_DRIVER_IF_VERSION, SMU_RESP_OK,
     };
     let mp1_base = 0x16000;
     let resp = mp1_base + MP1_C2PMSG_RESP_REL;
@@ -2340,8 +2340,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_smu_bring_up_driver_if_mismatch_rejected() -> TestResult {
     use crate::amdgpu_smu::{
-        bring_up, BringUpError, MockSmu, SMU12_DRIVER_IF_VERSION,
-        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+        bring_up, BringUpError, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
+        SMU12_DRIVER_IF_VERSION, SMU_RESP_OK,
     };
     let mp1_base = 0x16000;
     let resp = mp1_base + MP1_C2PMSG_RESP_REL;
@@ -2381,8 +2381,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_smu_bring_up_phoenix_driver_if_version() -> TestResult {
     use crate::amdgpu_smu::{
-        bring_up, MockSmu, SMU_13_0_4_DRIVER_IF_VERSION, MP1_C2PMSG_ARG_REL,
-        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+        bring_up, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_13_0_4_DRIVER_IF_VERSION,
+        SMU_RESP_OK,
     };
     let mp1_base = 0x16000;
     let resp = mp1_base + MP1_C2PMSG_RESP_REL;
@@ -2432,8 +2432,8 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
     use crate::amdgpu_gfx::{
         build_gfx9_ring_init, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_REL, CP_RB0_BASE_HI_REL,
         CP_RB0_BASE_REL, CP_RB0_CNTL_REL, CP_RB0_RPTR_ADDR_HI_REL, CP_RB0_RPTR_ADDR_REL,
-        CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL, CP_RB_DOORBELL_CONTROL_REL,
-        CP_RB_DOORBELL_EN, CP_RB_DOORBELL_OFFSET_SHIFT, CP_RB_DOORBELL_RANGE_LOWER_REL,
+        CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL, CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_EN,
+        CP_RB_DOORBELL_OFFSET_SHIFT, CP_RB_DOORBELL_RANGE_LOWER_REL,
         CP_RB_DOORBELL_RANGE_UPPER_REL, RPTR_WRITEBACK_COHERENT,
     };
     let gc_base: u32 = 0x0003_0000;
@@ -2454,8 +2454,7 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
 
     // First write must be CP halt (otherwise CP fetches against
     // an in-flux ring).
-    if w.first().map(|g| (g.addr, g.value))
-        != Some((gc_base + CP_ME_CNTL_REL, CP_ME_CNTL_HALT_ALL))
+    if w.first().map(|g| (g.addr, g.value)) != Some((gc_base + CP_ME_CNTL_REL, CP_ME_CNTL_HALT_ALL))
     {
         return TestResult::Fail("first write must halt CP via CP_ME_CNTL");
     }
@@ -2524,13 +2523,7 @@ kernel_test_in!(
 fn smoke_amdgpu_gfx9_ring_init_rejects_unaligned_ring_phys() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx9_ring_init, GfxError};
     // Ring base must be 256-byte aligned (low 8 bits zero).
-    let r = build_gfx9_ring_init(
-        0x0003_0000,
-        0x1_0000_00FF,
-        1024,
-        0,
-        0x2_0000_0000,
-    );
+    let r = build_gfx9_ring_init(0x0003_0000, 0x1_0000_00FF, 1024, 0, 0x2_0000_0000);
     match r {
         Err(GfxError::UnalignedRingPhys) => TestResult::Pass,
         _ => TestResult::Fail("unaligned ring phys must be rejected"),
@@ -2847,9 +2840,9 @@ kernel_test_in!(
 fn smoke_amdgpu_sdma4_ring_init_emits_canonical_order() -> TestResult {
     use crate::amdgpu_sdma::{
         build_sdma4_ring_init, SDMA_DOORBELL_ENABLE, SDMA_GFX_DOORBELL_OFFSET_REL,
-        SDMA_GFX_DOORBELL_REL, SDMA_GFX_RB_BASE_HI_REL, SDMA_GFX_RB_BASE_REL,
-        SDMA_GFX_RB_CNTL_REL, SDMA_GFX_RB_RPTR_ADDR_HI_REL, SDMA_GFX_RB_RPTR_ADDR_LO_REL,
-        SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE, SDMA_RB_SIZE_SHIFT,
+        SDMA_GFX_DOORBELL_REL, SDMA_GFX_RB_BASE_HI_REL, SDMA_GFX_RB_BASE_REL, SDMA_GFX_RB_CNTL_REL,
+        SDMA_GFX_RB_RPTR_ADDR_HI_REL, SDMA_GFX_RB_RPTR_ADDR_LO_REL, SDMA_RB_ENABLE,
+        SDMA_RB_RPTR_WRITEBACK_ENABLE, SDMA_RB_SIZE_SHIFT,
     };
     let sdma_base: u32 = 0x0006_0000;
     let ring_phys: u64 = 0x0000_0001_8000_0000; // 256-byte aligned
@@ -2857,14 +2850,14 @@ fn smoke_amdgpu_sdma4_ring_init_emits_canonical_order() -> TestResult {
     let doorbell_idx: u32 = 9;
     let rptr_phys: u64 = 0x0000_0002_BEEF_0000;
 
-    let seq = match build_sdma4_ring_init(sdma_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys)
-    {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = e;
-            return TestResult::Fail("build_sdma4_ring_init errored on valid inputs");
-        }
-    };
+    let seq =
+        match build_sdma4_ring_init(sdma_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = e;
+                return TestResult::Fail("build_sdma4_ring_init errored on valid inputs");
+            }
+        };
     let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
 
     // First write: CNTL = 0 (disable).
@@ -2882,16 +2875,16 @@ fn smoke_amdgpu_sdma4_ring_init_emits_canonical_order() -> TestResult {
     // Specific writes that must appear (in any order between disable/enable):
     let want = [
         (sdma_base + SDMA_GFX_RB_BASE_REL, (ring_phys >> 8) as u32),
-        (sdma_base + SDMA_GFX_RB_BASE_HI_REL, (ring_phys >> 40) as u32),
+        (
+            sdma_base + SDMA_GFX_RB_BASE_HI_REL,
+            (ring_phys >> 40) as u32,
+        ),
         (sdma_base + SDMA_GFX_RB_RPTR_ADDR_LO_REL, rptr_phys as u32),
         (
             sdma_base + SDMA_GFX_RB_RPTR_ADDR_HI_REL,
             (rptr_phys >> 32) as u32,
         ),
-        (
-            sdma_base + SDMA_GFX_DOORBELL_OFFSET_REL,
-            doorbell_idx << 2,
-        ),
+        (sdma_base + SDMA_GFX_DOORBELL_OFFSET_REL, doorbell_idx << 2),
         (sdma_base + SDMA_GFX_DOORBELL_REL, SDMA_DOORBELL_ENABLE),
     ];
     for (addr, value) in want {
@@ -2931,9 +2924,7 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma4_ring_init_enable_strictly_after_disable() -> TestResult {
-    use crate::amdgpu_sdma::{
-        build_sdma4_ring_init, SDMA_GFX_RB_CNTL_REL, SDMA_RB_ENABLE,
-    };
+    use crate::amdgpu_sdma::{build_sdma4_ring_init, SDMA_GFX_RB_CNTL_REL, SDMA_RB_ENABLE};
     let sdma_base: u32 = 0x0006_0000;
     let seq = match build_sdma4_ring_init(sdma_base, 0x1_0000_0000, 256, 3, 0x2_0000_0000) {
         Ok(s) => s,
@@ -2983,9 +2974,7 @@ kernel_test_in!(
 // degenerate inputs (empty / oversize copy).
 
 fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
-    use crate::amdgpu_sdma::{
-        SdmaBuilder, SDMA_OP_COPY, SDMA_SUBOP_COPY_LINEAR,
-    };
+    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_COPY, SDMA_SUBOP_COPY_LINEAR};
     let mut buf = [0u32; 7];
     let bytes_written = {
         let mut b = SdmaBuilder::new(&mut buf);
@@ -3127,7 +3116,9 @@ fn smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout() -> TestResult {
     {
         let mut b = Pm4Builder::new(&mut buf);
         // Acquire the entire memory range; full shader invalidate.
-        if b.acquire_mem(ACQUIRE_FULL_SHADER_INVALIDATE, 0, !0u64, 4).is_err() {
+        if b.acquire_mem(ACQUIRE_FULL_SHADER_INVALIDATE, 0, !0u64, 4)
+            .is_err()
+        {
             return TestResult::Fail("acquire_mem emit failed");
         }
     }
@@ -3239,9 +3230,9 @@ kernel_test_in!(
 fn smoke_amdgpu_ih4_ring_init_emits_canonical_order() -> TestResult {
     use crate::amdgpu_ih::{
         build_ih4_ring_init, IH_DOORBELL_ENABLE, IH_DOORBELL_RPTR_REL, IH_RB_BASE_HI_REL,
-        IH_RB_BASE_REL, IH_RB_CNTL_REL, IH_RB_ENABLE, IH_RB_GPU_TS_ENABLE,
-        IH_RB_OVERFLOW_CLEAR, IH_RB_SIZE_SHIFT, IH_RB_WPTR_ADDR_HI_REL,
-        IH_RB_WPTR_ADDR_LO_REL, IH_RB_WPTR_WRITEBACK_ENABLE,
+        IH_RB_BASE_REL, IH_RB_CNTL_REL, IH_RB_ENABLE, IH_RB_GPU_TS_ENABLE, IH_RB_OVERFLOW_CLEAR,
+        IH_RB_SIZE_SHIFT, IH_RB_WPTR_ADDR_HI_REL, IH_RB_WPTR_ADDR_LO_REL,
+        IH_RB_WPTR_WRITEBACK_ENABLE,
     };
     let ih_base: u32 = 0x0009_0000;
     let ring_phys: u64 = 0x0000_0001_4000_0000;
@@ -3249,11 +3240,10 @@ fn smoke_amdgpu_ih4_ring_init_emits_canonical_order() -> TestResult {
     let doorbell_idx: u32 = 6;
     let wptr_phys: u64 = 0x0000_0002_1234_0000;
 
-    let seq =
-        match build_ih4_ring_init(ih_base, ring_phys, ring_size_dw, doorbell_idx, wptr_phys) {
-            Ok(s) => s,
-            Err(_) => return TestResult::Fail("build_ih4_ring_init failed on valid input"),
-        };
+    let seq = match build_ih4_ring_init(ih_base, ring_phys, ring_size_dw, doorbell_idx, wptr_phys) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("build_ih4_ring_init failed on valid input"),
+    };
     let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
 
     if w.first().map(|x| (x.addr, x.value)) != Some((ih_base + IH_RB_CNTL_REL, 0)) {
@@ -3344,9 +3334,7 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_ih_enable_strictly_after_disable() -> TestResult {
-    use crate::amdgpu_ih::{
-        build_ih4_ring_init, IH_RB_CNTL_REL, IH_RB_ENABLE,
-    };
+    use crate::amdgpu_ih::{build_ih4_ring_init, IH_RB_CNTL_REL, IH_RB_ENABLE};
     let ih_base: u32 = 0x0009_0000;
     let seq = match build_ih4_ring_init(ih_base, 0x1_0000_0000, 256, 3, 0x2_0000_0000) {
         Ok(s) => s,
@@ -3445,9 +3433,7 @@ fn smoke_amdgpu_smu_set_clock_range_drives_two_messages() -> TestResult {
     if msgs.len() != 2 {
         return TestResult::Fail("expected 2 MSG-trigger writes");
     }
-    if msgs[0] != PPSMC_MSG_SET_SOFT_MIN_BY_FREQ
-        || msgs[1] != PPSMC_MSG_SET_SOFT_MAX_BY_FREQ
-    {
+    if msgs[0] != PPSMC_MSG_SET_SOFT_MIN_BY_FREQ || msgs[1] != PPSMC_MSG_SET_SOFT_MAX_BY_FREQ {
         return TestResult::Fail("MSG order should be SET_SOFT_MIN then SET_SOFT_MAX");
     }
     // ARG values: pack_clk_arg(GFXCLK, 400) then pack_clk_arg(GFXCLK, 1900).
@@ -3460,8 +3446,7 @@ fn smoke_amdgpu_smu_set_clock_range_drives_two_messages() -> TestResult {
     if args.len() != 2 {
         return TestResult::Fail("expected 2 ARG writes");
     }
-    if args[0] != pack_clk_arg(SMU_CLK_GFXCLK, 400)
-        || args[1] != pack_clk_arg(SMU_CLK_GFXCLK, 1900)
+    if args[0] != pack_clk_arg(SMU_CLK_GFXCLK, 400) || args[1] != pack_clk_arg(SMU_CLK_GFXCLK, 1900)
     {
         return TestResult::Fail("ARG values wrong order/encoding");
     }
@@ -3474,8 +3459,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_smu_get_max_dpm_freq_returns_arg() -> TestResult {
     use crate::amdgpu_smu::{
-        get_max_dpm_freq, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
-        SMU_CLK_DCEFCLK, SMU_RESP_OK,
+        get_max_dpm_freq, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL, SMU_CLK_DCEFCLK,
+        SMU_RESP_OK,
     };
     let mp1_base = 0x16000;
     let resp = mp1_base + MP1_C2PMSG_RESP_REL;
@@ -3504,8 +3489,7 @@ kernel_test_in!(
 
 fn smoke_amdgpu_gmc_gart_pte_round_trip() -> TestResult {
     use crate::amdgpu_gmc::{
-        make_pte_gfx9, parse_pte, pte_is_valid, GART_PTE_FLAGS_GTT_DEFAULT,
-        GART_PTE_PFN_SHIFT,
+        make_pte_gfx9, parse_pte, pte_is_valid, GART_PTE_FLAGS_GTT_DEFAULT, GART_PTE_PFN_SHIFT,
     };
     let phys: u64 = 0x0000_0000_5678_9000; // 4 KiB aligned, PFN fits 28 bits
     let pte = match make_pte_gfx9(phys, GART_PTE_FLAGS_GTT_DEFAULT) {
@@ -3557,14 +3541,11 @@ kernel_test_in!(
 
 fn smoke_amdgpu_gmc_gart_default_flags_compose_correctly() -> TestResult {
     use crate::amdgpu_gmc::{
-        GART_PTE_CACHEABLE, GART_PTE_FLAGS_GTT_DEFAULT, GART_PTE_SNOOP,
-        GART_PTE_SYSTEM, GART_PTE_VALID, GART_PTE_WRITABLE,
+        GART_PTE_CACHEABLE, GART_PTE_FLAGS_GTT_DEFAULT, GART_PTE_SNOOP, GART_PTE_SYSTEM,
+        GART_PTE_VALID, GART_PTE_WRITABLE,
     };
-    let want = GART_PTE_VALID
-        | GART_PTE_SYSTEM
-        | GART_PTE_CACHEABLE
-        | GART_PTE_WRITABLE
-        | GART_PTE_SNOOP;
+    let want =
+        GART_PTE_VALID | GART_PTE_SYSTEM | GART_PTE_CACHEABLE | GART_PTE_WRITABLE | GART_PTE_SNOOP;
     if GART_PTE_FLAGS_GTT_DEFAULT != want {
         return TestResult::Fail("GART_PTE_FLAGS_GTT_DEFAULT composition drifted");
     }
@@ -3585,8 +3566,7 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     use crate::amdgpu_sdma::{
         build_sdma6_ring_init, SDMA6_QUEUE0_DOORBELL_OFFSET_REL, SDMA6_QUEUE0_DOORBELL_REL,
         SDMA6_QUEUE0_RB_BASE_HI_REL, SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL,
-        SDMA_DOORBELL_ENABLE, SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE,
-        SDMA_RB_SIZE_SHIFT,
+        SDMA_DOORBELL_ENABLE, SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE, SDMA_RB_SIZE_SHIFT,
     };
     let sdma_base: u32 = 0x0007_0000;
     let ring_phys: u64 = 0x0000_0001_2000_0000;
@@ -3594,16 +3574,11 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     let doorbell_idx: u32 = 4;
     let rptr_phys: u64 = 0x0000_0002_3000_0000;
 
-    let seq = match build_sdma6_ring_init(
-        sdma_base,
-        ring_phys,
-        ring_size_dw,
-        doorbell_idx,
-        rptr_phys,
-    ) {
-        Ok(s) => s,
-        Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
-    };
+    let seq =
+        match build_sdma6_ring_init(sdma_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys) {
+            Ok(s) => s,
+            Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
+        };
     let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
     // First write: CNTL = 0.
     if w.first().map(|x| (x.addr, x.value)) != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, 0)) {
@@ -3620,7 +3595,10 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     }
     // Body writes hit the v6 QUEUE0_ namespace, NOT the v4 GFX_ namespace.
     let want = [
-        (sdma_base + SDMA6_QUEUE0_RB_BASE_REL, (ring_phys >> 8) as u32),
+        (
+            sdma_base + SDMA6_QUEUE0_RB_BASE_REL,
+            (ring_phys >> 8) as u32,
+        ),
         (
             sdma_base + SDMA6_QUEUE0_RB_BASE_HI_REL,
             (ring_phys >> 40) as u32,
@@ -3645,8 +3623,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_sdma6_uses_different_offsets_than_v4() -> TestResult {
     use crate::amdgpu_sdma::{
-        SDMA_GFX_RB_BASE_REL, SDMA_GFX_RB_CNTL_REL, SDMA6_QUEUE0_RB_BASE_REL,
-        SDMA6_QUEUE0_RB_CNTL_REL,
+        SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL, SDMA_GFX_RB_BASE_REL,
+        SDMA_GFX_RB_CNTL_REL,
     };
     // Ensure the Phoenix delta actually shifted offsets — if these
     // ever drift to match v4 numerically, smokes that exercise
@@ -3718,11 +3696,7 @@ impl crate::amdgpu_ddc::DdcTransport for MockEdidTransport {
         out[..n].copy_from_slice(&src[..n]);
         Ok(())
     }
-    fn write(
-        &mut self,
-        _slave_addr: u8,
-        _data: &[u8],
-    ) -> Result<(), crate::amdgpu_ddc::DdcError> {
+    fn write(&mut self, _slave_addr: u8, _data: &[u8]) -> Result<(), crate::amdgpu_ddc::DdcError> {
         Ok(())
     }
 }
@@ -3748,7 +3722,10 @@ fn smoke_read_edid_via_mock_transport_round_trips_block_0() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_via_mock_transport_round_trips_block_0);
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ddc",
+    smoke_read_edid_via_mock_transport_round_trips_block_0
+);
 
 fn smoke_read_edid_rejects_bad_checksum() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, DdcError};
@@ -3764,7 +3741,10 @@ fn smoke_read_edid_rejects_bad_checksum() -> TestResult {
         Err(_) => TestResult::Fail("read_edid returned wrong error kind for bad checksum"),
     }
 }
-kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_rejects_bad_checksum);
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ddc",
+    smoke_read_edid_rejects_bad_checksum
+);
 
 fn smoke_read_edid_handles_one_extension_block() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES};
@@ -3795,7 +3775,10 @@ fn smoke_read_edid_handles_one_extension_block() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_handles_one_extension_block);
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ddc",
+    smoke_read_edid_handles_one_extension_block
+);
 
 fn smoke_read_edid_caps_extension_blocks() -> TestResult {
     use crate::amdgpu_ddc::{read_edid, EDID_BLOCK_BYTES, MAX_EXT_BLOCKS};
@@ -3824,7 +3807,10 @@ fn smoke_read_edid_caps_extension_blocks() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_read_edid_caps_extension_blocks);
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ddc",
+    smoke_read_edid_caps_extension_blocks
+);
 
 fn smoke_gpio_ddc_bit_bang_sequences_start_address_stop() -> TestResult {
     // Exercise GpioDdcTransport against a closure that captures
@@ -3884,8 +3870,10 @@ fn smoke_gpio_ddc_bit_bang_sequences_start_address_stop() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/amdgpu/ddc", smoke_gpio_ddc_bit_bang_sequences_start_address_stop);
-
+kernel_test_in!(
+    "drivers/gpu/amdgpu/ddc",
+    smoke_gpio_ddc_bit_bang_sequences_start_address_stop
+);
 
 // ── Spec-aligned link-training smokes ───────────────────────────────
 //
@@ -4111,10 +4099,7 @@ fn smoke_dp_link_training_channel_eq_symbol_lock() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/gpu",
-    smoke_dp_link_training_channel_eq_symbol_lock
-);
+kernel_test_in!("drivers/gpu", smoke_dp_link_training_channel_eq_symbol_lock);
 
 fn smoke_dp_link_training_train_link_walks_fallback() -> TestResult {
     use crate::dp_aux::{AuxChannel, AuxCommand, AuxError, AuxRequest, AuxResponse, AuxStatus};
@@ -4257,11 +4242,17 @@ fn smoke_amdgpu_gfx11_ring_init_emits_canonical_order() -> TestResult {
         return TestResult::Fail("last write must unhalt CP_GFX_CNTL");
     }
     // Body writes must include base, size encoding, doorbell.
-    if !w.iter().any(|x| x.addr == gc_base + CP_RB0_BASE_REL && x.value == ring_phys as u32) {
+    if !w
+        .iter()
+        .any(|x| x.addr == gc_base + CP_RB0_BASE_REL && x.value == ring_phys as u32)
+    {
         return TestResult::Fail("ring base lo not programmed");
     }
     let expect_cntl = ring_size_dw.trailing_zeros() | (6u32 << 8);
-    if !w.iter().any(|x| x.addr == gc_base + CP_RB0_CNTL_REL && x.value == expect_cntl) {
+    if !w
+        .iter()
+        .any(|x| x.addr == gc_base + CP_RB0_CNTL_REL && x.value == expect_cntl)
+    {
         return TestResult::Fail("ring size encoding wrong");
     }
     if !w.iter().any(|x| {
@@ -4430,8 +4421,7 @@ fn smoke_amdgpu_backlight_init_sequence_locks_around_writes() -> TestResult {
         return TestResult::Fail("init must emit exactly 5 writes");
     }
     // First write: lock asserted.
-    if writes[0].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL
-        || writes[0].value != BL_PWM_GRP1_LOCK
+    if writes[0].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[0].value != BL_PWM_GRP1_LOCK
     {
         return TestResult::Fail("first write must assert GRP1 lock");
     }
@@ -4502,8 +4492,8 @@ kernel_test_in!(
 
 fn smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius() -> TestResult {
     use crate::amdgpu_smu::{
-        read_gpu_temperature_millicelsius, MockSmu, MP1_C2PMSG_ARG_REL,
-        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+        read_gpu_temperature_millicelsius, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
+        SMU_RESP_OK,
     };
     let mp1_base = 0x16000;
     let resp = mp1_base + MP1_C2PMSG_RESP_REL;
@@ -4553,10 +4543,16 @@ fn smoke_dmabuf_export_import_clone() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("export failed"),
     };
-    if buf.phys() != 0x1000_0000 { return TestResult::Fail("phys wrong"); }
-    if buf.len() != 4096 { return TestResult::Fail("len wrong"); }
+    if buf.phys() != 0x1000_0000 {
+        return TestResult::Fail("phys wrong");
+    }
+    if buf.len() != 4096 {
+        return TestResult::Fail("len wrong");
+    }
     let imp = import(&buf);
-    if imp.phys() != buf.phys() { return TestResult::Fail("import phys mismatch"); }
+    if imp.phys() != buf.phys() {
+        return TestResult::Fail("import phys mismatch");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_export_import_clone);
@@ -4567,15 +4563,29 @@ fn smoke_dmabuf_attach_detach_refcount() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("export failed"),
     };
-    if buf.attach_count() != 0 { return TestResult::Fail("initial count != 0"); }
-    if buf.attach(0xAAAA).is_err() { return TestResult::Fail("attach A failed"); }
-    if buf.attach_count() != 1 { return TestResult::Fail("count != 1 after A"); }
-    if buf.attach(0xBBBB).is_err() { return TestResult::Fail("attach B failed"); }
-    if buf.attach_count() != 2 { return TestResult::Fail("count != 2 after B"); }
+    if buf.attach_count() != 0 {
+        return TestResult::Fail("initial count != 0");
+    }
+    if buf.attach(0xAAAA).is_err() {
+        return TestResult::Fail("attach A failed");
+    }
+    if buf.attach_count() != 1 {
+        return TestResult::Fail("count != 1 after A");
+    }
+    if buf.attach(0xBBBB).is_err() {
+        return TestResult::Fail("attach B failed");
+    }
+    if buf.attach_count() != 2 {
+        return TestResult::Fail("count != 2 after B");
+    }
     buf.detach(0xAAAA);
-    if buf.attach_count() != 1 { return TestResult::Fail("count != 1 after detach A"); }
+    if buf.attach_count() != 1 {
+        return TestResult::Fail("count != 1 after detach A");
+    }
     buf.detach(0xBBBB);
-    if buf.attach_count() != 0 { return TestResult::Fail("count != 0 after both detach"); }
+    if buf.attach_count() != 0 {
+        return TestResult::Fail("count != 0 after both detach");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_attach_detach_refcount);
@@ -4597,10 +4607,16 @@ fn smoke_dmabuf_two_driver_export_import() -> TestResult {
         Err(_) => return TestResult::Fail("driver A export failed"),
     };
     let b = import(&a);
-    if b.attach(0xDEAD).is_err() { return TestResult::Fail("driver B attach failed"); }
-    if a.attach_count() != 1 { return TestResult::Fail("shared count not visible via A"); }
+    if b.attach(0xDEAD).is_err() {
+        return TestResult::Fail("driver B attach failed");
+    }
+    if a.attach_count() != 1 {
+        return TestResult::Fail("shared count not visible via A");
+    }
     b.detach(0xDEAD);
-    if a.attach_count() != 0 { return TestResult::Fail("shared count not decremented via B"); }
+    if a.attach_count() != 0 {
+        return TestResult::Fail("shared count not decremented via B");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/dmabuf", smoke_dmabuf_two_driver_export_import);
@@ -4618,12 +4634,20 @@ fn smoke_gem_alloc_free_roundtrip() -> TestResult {
         Ok(h) => h,
         Err(_) => return TestResult::Fail("second alloc failed"),
     };
-    if h1 == h2 { return TestResult::Fail("duplicate handles"); }
-    if t.len() != 2 { return TestResult::Fail("len != 2 after 2 allocs"); }
+    if h1 == h2 {
+        return TestResult::Fail("duplicate handles");
+    }
+    if t.len() != 2 {
+        return TestResult::Fail("len != 2 after 2 allocs");
+    }
     t.free(h1).unwrap();
-    if t.len() != 1 { return TestResult::Fail("len != 1 after one free"); }
+    if t.len() != 1 {
+        return TestResult::Fail("len != 1 after one free");
+    }
     t.free(h2).unwrap();
-    if !t.is_empty() { return TestResult::Fail("not empty after freeing both"); }
+    if !t.is_empty() {
+        return TestResult::Fail("not empty after freeing both");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_gem_alloc_free_roundtrip);
@@ -4638,12 +4662,18 @@ fn smoke_gem_lookup() -> TestResult {
     match t.lookup(h) {
         None => return TestResult::Fail("lookup None for live handle"),
         Some(obj) => {
-            if obj.phys != 0xDEAD_0000 { return TestResult::Fail("phys wrong"); }
-            if obj.size != 0x1000 { return TestResult::Fail("size wrong"); }
+            if obj.phys != 0xDEAD_0000 {
+                return TestResult::Fail("phys wrong");
+            }
+            if obj.size != 0x1000 {
+                return TestResult::Fail("size wrong");
+            }
         }
     }
     t.free(h).unwrap();
-    if t.lookup(h).is_some() { return TestResult::Fail("lookup Some after free"); }
+    if t.lookup(h).is_some() {
+        return TestResult::Fail("lookup Some after free");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_gem_lookup);
@@ -4709,10 +4739,18 @@ fn smoke_drm_ioctl_getresources_shape() -> TestResult {
     let ctx = DrmFileCtx::primary_master();
     match dispatch(&mut card, 0xA0, &[], &ctx) {
         Ok(DrmIoctlResult::GetResources(r)) => {
-            if r.count_crtcs != 1 { return TestResult::Fail("count_crtcs != 1"); }
-            if r.count_connectors != 1 { return TestResult::Fail("count_connectors != 1"); }
-            if r.count_encoders != 1 { return TestResult::Fail("count_encoders != 1"); }
-            if r.max_width < 1920 { return TestResult::Fail("max_width < 1920"); }
+            if r.count_crtcs != 1 {
+                return TestResult::Fail("count_crtcs != 1");
+            }
+            if r.count_connectors != 1 {
+                return TestResult::Fail("count_connectors != 1");
+            }
+            if r.count_encoders != 1 {
+                return TestResult::Fail("count_encoders != 1");
+            }
+            if r.max_width < 1920 {
+                return TestResult::Fail("max_width < 1920");
+            }
         }
         Ok(_) => return TestResult::Fail("wrong result for GETRESOURCES"),
         Err(_) => return TestResult::Fail("GETRESOURCES failed"),
@@ -4729,10 +4767,18 @@ fn smoke_drm_ioctl_getconnector_decode() -> TestResult {
     let arg = 1u32.to_le_bytes();
     match dispatch(&mut card, 0xA7, &arg, &ctx) {
         Ok(DrmIoctlResult::GetConnector(info, modes)) => {
-            if info.connector_id != 1 { return TestResult::Fail("connector_id not echoed"); }
-            if info.connector_type != 14 { return TestResult::Fail("type != eDP(14)"); }
-            if info.connection != 1 { return TestResult::Fail("not Connected"); }
-            if modes.len() != 1 { return TestResult::Fail("expected 1 mode"); }
+            if info.connector_id != 1 {
+                return TestResult::Fail("connector_id not echoed");
+            }
+            if info.connector_type != 14 {
+                return TestResult::Fail("type != eDP(14)");
+            }
+            if info.connection != 1 {
+                return TestResult::Fail("not Connected");
+            }
+            if modes.len() != 1 {
+                return TestResult::Fail("expected 1 mode");
+            }
             if modes[0].hdisplay != 1920 || modes[0].vdisplay != 1080 {
                 return TestResult::Fail("mode res wrong");
             }
@@ -4764,8 +4810,12 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
         Ok(_) => return TestResult::Fail("ADDFB2 wrong result type"),
         Err(_) => return TestResult::Fail("ADDFB2 failed"),
     };
-    if fb_id == 0 { return TestResult::Fail("fb_id is zero"); }
-    if card.framebuffers.len() != 1 { return TestResult::Fail("fb count != 1 after ADDFB2"); }
+    if fb_id == 0 {
+        return TestResult::Fail("fb_id is zero");
+    }
+    if card.framebuffers.len() != 1 {
+        return TestResult::Fail("fb count != 1 after ADDFB2");
+    }
     match card.framebuffer(fb_id) {
         Ok(fb) => {
             if fb.width != 1920 || fb.height != 1080 {
@@ -4796,7 +4846,9 @@ fn smoke_drm_getcap_shape() -> TestResult {
     arg[0..8].copy_from_slice(&drm_cap::TIMESTAMP_MONOTONIC.to_le_bytes());
     match dispatch(&mut card, 0x0C, &arg, &ctx) {
         Ok(DrmIoctlResult::GetCap(cap)) => {
-            if cap.value != 1 { return TestResult::Fail("TIMESTAMP_MONOTONIC != 1"); }
+            if cap.value != 1 {
+                return TestResult::Fail("TIMESTAMP_MONOTONIC != 1");
+            }
         }
         _ => return TestResult::Fail("GET_CAP TIMESTAMP_MONOTONIC failed"),
     }
@@ -4804,7 +4856,9 @@ fn smoke_drm_getcap_shape() -> TestResult {
     match dispatch(&mut card, 0x0C, &arg, &ctx) {
         Ok(DrmIoctlResult::GetCap(cap)) => {
             // EXPORT(1) | IMPORT(2) = 3 — both implemented via PrimeTable.
-            if cap.value != 3 { return TestResult::Fail("PRIME should be 3 (EXPORT|IMPORT)"); }
+            if cap.value != 3 {
+                return TestResult::Fail("PRIME should be 3 (EXPORT|IMPORT)");
+            }
         }
         _ => return TestResult::Fail("GET_CAP PRIME failed"),
     }
@@ -4819,17 +4873,31 @@ fn smoke_drm_render_node_devpath() -> TestResult {
     use crate::drm::render_node::MinorType;
     let primary = Card::primary_node(0);
     let render = Card::render_node(0);
-    if primary.kind != MinorType::Primary { return TestResult::Fail("primary kind"); }
-    if render.kind != MinorType::Render { return TestResult::Fail("render kind"); }
-    if primary.index != 0 { return TestResult::Fail("primary index != 0"); }
-    if render.index != 128 { return TestResult::Fail("render index != 128"); }
+    if primary.kind != MinorType::Primary {
+        return TestResult::Fail("primary kind");
+    }
+    if render.kind != MinorType::Render {
+        return TestResult::Fail("render kind");
+    }
+    if primary.index != 0 {
+        return TestResult::Fail("primary index != 0");
+    }
+    if render.index != 128 {
+        return TestResult::Fail("render index != 128");
+    }
     let (p_prefix, p_idx) = primary.dev_path_parts();
     let (r_prefix, r_idx) = render.dev_path_parts();
-    if p_prefix != "card" || p_idx != 0 { return TestResult::Fail("primary path"); }
-    if r_prefix != "renderD" || r_idx != 128 { return TestResult::Fail("render path"); }
+    if p_prefix != "card" || p_idx != 0 {
+        return TestResult::Fail("primary path");
+    }
+    if r_prefix != "renderD" || r_idx != 128 {
+        return TestResult::Fail("render path");
+    }
     // Card index 3 should give /dev/dri/card3 and /dev/dri/renderD131.
     let r3 = Card::render_node(3);
-    if r3.index != 131 { return TestResult::Fail("renderD131 for card3"); }
+    if r3.index != 131 {
+        return TestResult::Fail("renderD131 for card3");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_render_node_devpath);
@@ -4904,27 +4972,57 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_perm_master_only_blocks_authed);
 fn smoke_drm_syncobj_create_destroy_roundtrip() -> TestResult {
     use crate::drm::syncobj::{SyncObjTable, SYNCOBJ_CREATE_SIGNALED};
     let mut tbl = SyncObjTable::new();
-    let unsig = match tbl.create(0) { Ok(h) => h, Err(_) => return TestResult::Fail("create(0) failed") };
-    let sig   = match tbl.create(SYNCOBJ_CREATE_SIGNALED) { Ok(h) => h, Err(_) => return TestResult::Fail("create(SIG) failed") };
-    if unsig == sig { return TestResult::Fail("duplicate ids"); }
-    if tbl.len() != 2 { return TestResult::Fail("len != 2 after 2 creates"); }
-    let so = match tbl.get(unsig) { Ok(o) => o, Err(_) => return TestResult::Fail("get unsig") };
-    if so.is_signalled() { return TestResult::Fail("unsig should not be signalled"); }
-    let so = match tbl.get(sig) { Ok(o) => o, Err(_) => return TestResult::Fail("get sig") };
-    if !so.is_signalled() { return TestResult::Fail("sig should be signalled"); }
+    let unsig = match tbl.create(0) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("create(0) failed"),
+    };
+    let sig = match tbl.create(SYNCOBJ_CREATE_SIGNALED) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("create(SIG) failed"),
+    };
+    if unsig == sig {
+        return TestResult::Fail("duplicate ids");
+    }
+    if tbl.len() != 2 {
+        return TestResult::Fail("len != 2 after 2 creates");
+    }
+    let so = match tbl.get(unsig) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("get unsig"),
+    };
+    if so.is_signalled() {
+        return TestResult::Fail("unsig should not be signalled");
+    }
+    let so = match tbl.get(sig) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("get sig"),
+    };
+    if !so.is_signalled() {
+        return TestResult::Fail("sig should be signalled");
+    }
     tbl.destroy(unsig).unwrap();
     tbl.destroy(sig).unwrap();
-    if !tbl.is_empty() { return TestResult::Fail("not empty after destroying both"); }
-    if let Ok(_) = tbl.get(unsig) { return TestResult::Fail("get after destroy should fail"); }
+    if !tbl.is_empty() {
+        return TestResult::Fail("not empty after destroying both");
+    }
+    if let Ok(_) = tbl.get(unsig) {
+        return TestResult::Fail("get after destroy should fail");
+    }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_create_destroy_roundtrip);
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_syncobj_create_destroy_roundtrip
+);
 
 fn smoke_drm_syncobj_wait_timeout() -> TestResult {
     // An unsignalled syncobj must time out per Linux's -ETIME.
     use crate::drm::syncobj::{SyncError, SyncObjTable, SYNCOBJ_WAIT_FLAGS_WAIT_ALL};
     let mut tbl = SyncObjTable::new();
-    let h = match tbl.create(0) { Ok(h) => h, Err(_) => return TestResult::Fail("create") };
+    let h = match tbl.create(0) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("create"),
+    };
     // Bind a fresh (unsignalled) binary fence so wait can see it.
     let f = crate::drm::syncobj::BinaryFence::new();
     tbl.get_mut(h).unwrap().replace_fence(f);
@@ -4941,8 +5039,13 @@ fn smoke_drm_syncobj_signal_then_wait() -> TestResult {
     // Signal first, then wait should return Ok immediately.
     use crate::drm::syncobj::{SyncObjTable, SYNCOBJ_WAIT_FLAGS_WAIT_ALL};
     let mut tbl = SyncObjTable::new();
-    let h = match tbl.create(0) { Ok(h) => h, Err(_) => return TestResult::Fail("create") };
-    tbl.get_mut(h).unwrap().replace_fence(crate::drm::syncobj::BinaryFence::new());
+    let h = match tbl.create(0) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("create"),
+    };
+    tbl.get_mut(h)
+        .unwrap()
+        .replace_fence(crate::drm::syncobj::BinaryFence::new());
     let ids = [h];
     tbl.signal_handles(&ids).unwrap();
     if !tbl.get(h).unwrap().is_signalled() {
@@ -4964,7 +5067,9 @@ fn smoke_drm_syncobj_wait_first_vs_all() -> TestResult {
     let b = tbl.create(0).unwrap();
     let c = tbl.create(0).unwrap();
     for &h in &[a, b, c] {
-        tbl.get_mut(h).unwrap().replace_fence(crate::drm::syncobj::BinaryFence::new());
+        tbl.get_mut(h)
+            .unwrap()
+            .replace_fence(crate::drm::syncobj::BinaryFence::new());
     }
     tbl.signal_handles(&[b]).unwrap();
     let ids = [a, b, c];
@@ -4973,7 +5078,9 @@ fn smoke_drm_syncobj_wait_first_vs_all() -> TestResult {
         Ok(id) => id,
         Err(_) => return TestResult::Fail("wait_any should succeed when one is signalled"),
     };
-    if first != b { return TestResult::Fail("wait_any returned wrong id"); }
+    if first != b {
+        return TestResult::Fail("wait_any returned wrong id");
+    }
     // wait_all should time out since a,c are not signalled.
     match tbl.wait_handles(&ids, 1_000, 1 /* WAIT_ALL */) {
         Err(crate::drm::syncobj::SyncError::Timeout) => TestResult::Pass,
@@ -5001,7 +5108,10 @@ fn smoke_drm_syncobj_signal_unbound_attaches_fence() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_signal_unbound_attaches_fence);
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_syncobj_signal_unbound_attaches_fence
+);
 
 fn smoke_drm_syncobj_reset_clears_fence() -> TestResult {
     use crate::drm::syncobj::{SyncObjTable, SYNCOBJ_CREATE_SIGNALED};
@@ -5024,18 +5134,33 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_syncobj_reset_clears_fence);
 // ── DRM atomic modeset smokes ─────────────────────────────────────────
 
 fn make_test_card_for_atomic() -> crate::drm::card::Card {
-    use crate::drm::card::{Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType};
+    use crate::drm::card::{
+        Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+    };
     let mut card = Card::new("narf-test", "atomic", (0, 1, 0));
     card.connectors.push(Connector {
-        id: 1, connector_type: ConnectorType::Edp, connector_type_id: 0,
-        status: ConnectorStatus::Connected, encoder_id: Some(1),
+        id: 1,
+        connector_type: ConnectorType::Edp,
+        connector_type_id: 0,
+        status: ConnectorStatus::Connected,
+        encoder_id: Some(1),
         modes: alloc::vec![crate::Mode::FHD_60],
     });
     card.encoders.push(Encoder {
-        id: 1, encoder_type: EncoderType::Tmds,
-        possible_crtcs: 0x1, possible_clones: 0x0, crtc_id: Some(1),
+        id: 1,
+        encoder_type: EncoderType::Tmds,
+        possible_crtcs: 0x1,
+        possible_clones: 0x0,
+        crtc_id: Some(1),
     });
-    card.crtcs.push(Crtc { id: 1, mode: None, enabled: false, primary_fb: None, x: 0, y: 0 });
+    card.crtcs.push(Crtc {
+        id: 1,
+        mode: None,
+        enabled: false,
+        primary_fb: None,
+        x: 0,
+        y: 0,
+    });
     let gh = card.gem.alloc(0x4000_0000, 1920 * 1080 * 4).unwrap();
     card.addfb2(1920, 1080, 0x3438_5258, 1920 * 4, gh).unwrap();
     card
@@ -5044,9 +5169,27 @@ fn make_test_card_for_atomic() -> crate::drm::card::Card {
 fn smoke_drm_atomic_state_encode_decode() -> TestResult {
     use crate::drm::atomic::{AtomicState, ConnectorState, CrtcState, PlaneState};
     let mut st = AtomicState::default();
-    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
-    st.connectors.push(ConnectorState { id: 1, crtc_id: Some(1) });
-    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    st.crtcs.push(CrtcState {
+        id: 1,
+        enable: true,
+        mode: Some(crate::Mode::FHD_60),
+        mode_changed: true,
+        ..Default::default()
+    });
+    st.connectors.push(ConnectorState {
+        id: 1,
+        crtc_id: Some(1),
+    });
+    st.planes.push(PlaneState {
+        id: 1,
+        crtc_id: Some(1),
+        fb_id: Some(1),
+        crtc_w: 1920,
+        crtc_h: 1080,
+        src_w: 1920,
+        src_h: 1080,
+        ..Default::default()
+    });
     if st.crtcs.len() != 1 || st.connectors.len() != 1 || st.planes.len() != 1 {
         return TestResult::Fail("state shape");
     }
@@ -5062,22 +5205,46 @@ fn smoke_drm_atomic_state_encode_decode() -> TestResult {
 kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_state_encode_decode);
 
 fn smoke_drm_atomic_check_then_commit_happy() -> TestResult {
-    use crate::drm::atomic::{AtomicCheckPolicy, AtomicState, ConnectorState, CrtcState, PlaneState};
+    use crate::drm::atomic::{
+        AtomicCheckPolicy, AtomicState, ConnectorState, CrtcState, PlaneState,
+    };
     let mut card = make_test_card_for_atomic();
     let mut st = AtomicState::default();
     st.allow_modeset = true;
-    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
-    st.connectors.push(ConnectorState { id: 1, crtc_id: Some(1) });
-    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    st.crtcs.push(CrtcState {
+        id: 1,
+        enable: true,
+        mode: Some(crate::Mode::FHD_60),
+        mode_changed: true,
+        ..Default::default()
+    });
+    st.connectors.push(ConnectorState {
+        id: 1,
+        crtc_id: Some(1),
+    });
+    st.planes.push(PlaneState {
+        id: 1,
+        crtc_id: Some(1),
+        fb_id: Some(1),
+        crtc_w: 1920,
+        crtc_h: 1080,
+        src_w: 1920,
+        src_h: 1080,
+        ..Default::default()
+    });
     let policy = AtomicCheckPolicy::default();
     if st.core_check(&card, &policy).is_err() {
         return TestResult::Fail("core_check should pass");
     }
-    if !st.checked { return TestResult::Fail("state.checked not set after success"); }
+    if !st.checked {
+        return TestResult::Fail("state.checked not set after success");
+    }
     if st.core_commit(&mut card).is_err() {
         return TestResult::Fail("core_commit failed");
     }
-    if !card.crtcs[0].enabled { return TestResult::Fail("CRTC not enabled after commit"); }
+    if !card.crtcs[0].enabled {
+        return TestResult::Fail("CRTC not enabled after commit");
+    }
     if card.crtcs[0].primary_fb != Some(1) {
         return TestResult::Fail("primary_fb not bound after commit");
     }
@@ -5086,34 +5253,72 @@ fn smoke_drm_atomic_check_then_commit_happy() -> TestResult {
 kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_check_then_commit_happy);
 
 fn smoke_drm_atomic_check_rejects_overbandwidth() -> TestResult {
-    use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
+    use crate::drm::atomic::{
+        AtomicCheckPolicy, AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState,
+    };
     let card = make_test_card_for_atomic();
     let mut st = AtomicState::default();
     st.allow_modeset = true;
-    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
-    st.connectors.push(ConnectorState { id: 1, crtc_id: Some(1) });
-    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
-    st.planes.push(PlaneState { id: 2, crtc_id: Some(1), fb_id: Some(1), crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080, ..Default::default() });
+    st.crtcs.push(CrtcState {
+        id: 1,
+        enable: true,
+        mode: Some(crate::Mode::FHD_60),
+        mode_changed: true,
+        ..Default::default()
+    });
+    st.connectors.push(ConnectorState {
+        id: 1,
+        crtc_id: Some(1),
+    });
+    st.planes.push(PlaneState {
+        id: 1,
+        crtc_id: Some(1),
+        fb_id: Some(1),
+        crtc_w: 1920,
+        crtc_h: 1080,
+        src_w: 1920,
+        src_h: 1080,
+        ..Default::default()
+    });
+    st.planes.push(PlaneState {
+        id: 2,
+        crtc_id: Some(1),
+        fb_id: Some(1),
+        crtc_w: 1920,
+        crtc_h: 1080,
+        src_w: 1920,
+        src_h: 1080,
+        ..Default::default()
+    });
     let mut policy = AtomicCheckPolicy::default();
     policy.max_pixel_budget = 2_000_000;
     match st.core_check(&card, &policy) {
         Err(AtomicError::OverBandwidth) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("over-budget commit should be rejected"),
+        Ok(_) => TestResult::Fail("over-budget commit should be rejected"),
         Err(_) => TestResult::Fail("wrong error for over-budget"),
     }
 }
-kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_check_rejects_overbandwidth);
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_atomic_check_rejects_overbandwidth
+);
 
 fn smoke_drm_atomic_modeset_gate() -> TestResult {
     use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, CrtcState};
     let card = make_test_card_for_atomic();
     let mut st = AtomicState::default();
     st.allow_modeset = false;
-    st.crtcs.push(CrtcState { id: 1, enable: true, mode: Some(crate::Mode::FHD_60), mode_changed: true, ..Default::default() });
+    st.crtcs.push(CrtcState {
+        id: 1,
+        enable: true,
+        mode: Some(crate::Mode::FHD_60),
+        mode_changed: true,
+        ..Default::default()
+    });
     let policy = AtomicCheckPolicy::default();
     match st.core_check(&card, &policy) {
         Err(AtomicError::ModesetNotAllowed) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("page-flip modeset must be rejected"),
+        Ok(_) => TestResult::Fail("page-flip modeset must be rejected"),
         Err(_) => TestResult::Fail("wrong error for modeset-not-allowed"),
     }
 }
@@ -5124,11 +5329,18 @@ fn smoke_drm_atomic_plane_fb_crtc_pair() -> TestResult {
     let card = make_test_card_for_atomic();
     let mut st = AtomicState::default();
     st.allow_modeset = true;
-    st.planes.push(PlaneState { id: 1, crtc_id: Some(1), fb_id: None, crtc_w: 1920, crtc_h: 1080, ..Default::default() });
+    st.planes.push(PlaneState {
+        id: 1,
+        crtc_id: Some(1),
+        fb_id: None,
+        crtc_w: 1920,
+        crtc_h: 1080,
+        ..Default::default()
+    });
     let policy = AtomicCheckPolicy::default();
     match st.core_check(&card, &policy) {
         Err(AtomicError::PlaneFbCrtcMismatch) => TestResult::Pass,
-        Ok(_)  => TestResult::Fail("crtc-without-fb should be rejected"),
+        Ok(_) => TestResult::Fail("crtc-without-fb should be rejected"),
         Err(_) => TestResult::Fail("wrong error for fb/crtc mismatch"),
     }
 }
@@ -5152,16 +5364,24 @@ fn smoke_drm_sched_context_add_remove() -> TestResult {
     let mut sched = Sched::new();
     let a = sched.add_context(Priority::Normal);
     let b = sched.add_context(Priority::High);
-    if a == b { return TestResult::Fail("duplicate context ids"); }
-    if sched.contexts.len() != 2 { return TestResult::Fail("len != 2 after 2 adds"); }
+    if a == b {
+        return TestResult::Fail("duplicate context ids");
+    }
+    if sched.contexts.len() != 2 {
+        return TestResult::Fail("len != 2 after 2 adds");
+    }
     sched.remove_context(a).unwrap();
-    if sched.contexts.len() != 1 { return TestResult::Fail("len != 1 after one remove"); }
+    if sched.contexts.len() != 1 {
+        return TestResult::Fail("len != 1 after one remove");
+    }
     match sched.remove_context(a) {
         Err(SchedError::NoContext) => {}
         _ => return TestResult::Fail("removing missing ctx should err"),
     }
     sched.remove_context(b).unwrap();
-    if !sched.contexts.is_empty() { return TestResult::Fail("not empty after both"); }
+    if !sched.contexts.is_empty() {
+        return TestResult::Fail("not empty after both");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_context_add_remove);
@@ -5170,13 +5390,20 @@ fn smoke_drm_sched_submit_runs_payload() -> TestResult {
     use crate::drm::scheduler::{NoopPayload, Priority, Sched};
     let mut sched = Sched::new();
     let ctx = sched.add_context(Priority::Normal);
-    let fence = sched.submit(ctx, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload))
+    let fence = sched
+        .submit(
+            ctx,
+            alloc::vec::Vec::new(),
+            alloc::boxed::Box::new(NoopPayload),
+        )
         .expect("submit");
     if crate::drm::syncobj::DmaFence::is_signalled(fence.as_ref()) {
         return TestResult::Fail("job fence cannot be signalled before tick");
     }
     let ran = sched.tick().expect("tick");
-    if ran != ctx { return TestResult::Fail("wrong ctx ran"); }
+    if ran != ctx {
+        return TestResult::Fail("wrong ctx ran");
+    }
     if !crate::drm::syncobj::DmaFence::is_signalled(fence.as_ref()) {
         return TestResult::Fail("fence not signalled after tick");
     }
@@ -5189,14 +5416,26 @@ fn smoke_drm_sched_dependency_blocks_run() -> TestResult {
     use crate::drm::syncobj::DmaFence;
     let mut sched = Sched::new();
     let ctx = sched.add_context(Priority::Normal);
-    let f_a = sched.submit(ctx, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let f_a = sched
+        .submit(
+            ctx,
+            alloc::vec::Vec::new(),
+            alloc::boxed::Box::new(NoopPayload),
+        )
+        .unwrap();
     let dep: alloc::sync::Arc<dyn DmaFence> = f_a.clone();
-    let f_b = sched.submit(ctx, alloc::vec![dep], alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let f_b = sched
+        .submit(ctx, alloc::vec![dep], alloc::boxed::Box::new(NoopPayload))
+        .unwrap();
     // First tick: A runs (no deps). Once f_a signals, B becomes ready.
     sched.tick().expect("A should run");
-    if !DmaFence::is_signalled(f_a.as_ref()) { return TestResult::Fail("A not signalled"); }
+    if !DmaFence::is_signalled(f_a.as_ref()) {
+        return TestResult::Fail("A not signalled");
+    }
     sched.tick().expect("B should run");
-    if !DmaFence::is_signalled(f_b.as_ref()) { return TestResult::Fail("B not signalled"); }
+    if !DmaFence::is_signalled(f_b.as_ref()) {
+        return TestResult::Fail("B not signalled");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_sched_dependency_blocks_run);
@@ -5205,10 +5444,28 @@ fn smoke_drm_sched_priority_picks_high_first() -> TestResult {
     use crate::drm::scheduler::{NoopPayload, Priority, Sched};
     let mut sched = Sched::new();
     let low = sched.add_context(Priority::Low);
-    let hi  = sched.add_context(Priority::High);
-    let _f_low_1 = sched.submit(low, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
-    let _f_low_2 = sched.submit(low, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
-    let _f_hi    = sched.submit(hi,  alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap();
+    let hi = sched.add_context(Priority::High);
+    let _f_low_1 = sched
+        .submit(
+            low,
+            alloc::vec::Vec::new(),
+            alloc::boxed::Box::new(NoopPayload),
+        )
+        .unwrap();
+    let _f_low_2 = sched
+        .submit(
+            low,
+            alloc::vec::Vec::new(),
+            alloc::boxed::Box::new(NoopPayload),
+        )
+        .unwrap();
+    let _f_hi = sched
+        .submit(
+            hi,
+            alloc::vec::Vec::new(),
+            alloc::boxed::Box::new(NoopPayload),
+        )
+        .unwrap();
     let first = sched.tick().expect("tick 1");
     if first != hi {
         return TestResult::Fail("High-priority context should run first");
@@ -5223,11 +5480,23 @@ fn smoke_drm_sched_drain_runs_all() -> TestResult {
     let c = sched.add_context(Priority::Normal);
     let mut fences = alloc::vec::Vec::new();
     for _ in 0..5 {
-        fences.push(sched.submit(c, alloc::vec::Vec::new(), alloc::boxed::Box::new(NoopPayload)).unwrap());
+        fences.push(
+            sched
+                .submit(
+                    c,
+                    alloc::vec::Vec::new(),
+                    alloc::boxed::Box::new(NoopPayload),
+                )
+                .unwrap(),
+        );
     }
     let n = sched.drain();
-    if n != 5 { return TestResult::Fail("drain count wrong"); }
-    if sched.pending() != 0 { return TestResult::Fail("pending != 0 after drain"); }
+    if n != 5 {
+        return TestResult::Fail("drain count wrong");
+    }
+    if sched.pending() != 0 {
+        return TestResult::Fail("pending != 0 after drain");
+    }
     for f in &fences {
         if !crate::drm::syncobj::DmaFence::is_signalled(f.as_ref()) {
             return TestResult::Fail("not all fences signalled after drain");
@@ -5246,19 +5515,30 @@ fn smoke_drm_prime_handle_fd_handle_roundtrip() -> TestResult {
     let mut tbl = PrimeTable::new();
     let handle: u32 = 0x42;
     let fd = tbl.handle_to_fd(handle, buf.clone()).expect("handle_to_fd");
-    if fd < 4096 { return TestResult::Fail("fd should be >= 4096"); }
+    if fd < 4096 {
+        return TestResult::Fail("fd should be >= 4096");
+    }
     let recovered = tbl.fd_to_handle(fd).expect("fd_to_handle");
-    if recovered != handle { return TestResult::Fail("handle didn't round-trip"); }
+    if recovered != handle {
+        return TestResult::Fail("handle didn't round-trip");
+    }
     // Second export of the same handle reuses the fd (cache hit).
-    let fd2 = tbl.handle_to_fd(handle, buf.clone()).expect("handle_to_fd repeat");
-    if fd2 != fd { return TestResult::Fail("repeat handle_to_fd should reuse fd"); }
+    let fd2 = tbl
+        .handle_to_fd(handle, buf.clone())
+        .expect("handle_to_fd repeat");
+    if fd2 != fd {
+        return TestResult::Fail("repeat handle_to_fd should reuse fd");
+    }
     // Bad fd is rejected.
     if !matches!(tbl.fd_to_handle(123), Err(PrimeError::BadFd)) {
         return TestResult::Fail("fd < 4096 should be BadFd");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm", smoke_drm_prime_handle_fd_handle_roundtrip);
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_prime_handle_fd_handle_roundtrip
+);
 
 fn smoke_drm_prime_cross_table_import() -> TestResult {
     // Exporter (driver A) hands an fd to importer (driver B). Both
@@ -5276,7 +5556,9 @@ fn smoke_drm_prime_cross_table_import() -> TestResult {
     // table).
     let buf_b = tbl_a.fd_to_buf(fd).expect("recover buf").clone();
     let handle_b: u32 = 99;
-    tbl_b.import_binding(fd, handle_b, buf_b.clone()).expect("B import");
+    tbl_b
+        .import_binding(fd, handle_b, buf_b.clone())
+        .expect("B import");
     if tbl_b.fd_to_handle(fd).expect("B fd_to_handle") != handle_b {
         return TestResult::Fail("imported handle wrong");
     }
@@ -5293,16 +5575,23 @@ fn smoke_drm_prime_drop_handle_clears_binding() -> TestResult {
     let buf = export(0x6000_0000, 4096, &NULL_OPS).expect("export");
     let mut tbl = PrimeTable::new();
     let fd = tbl.handle_to_fd(1, buf.clone()).expect("export");
-    if tbl.len() != 1 { return TestResult::Fail("len after export"); }
+    if tbl.len() != 1 {
+        return TestResult::Fail("len after export");
+    }
     tbl.drop_handle(1).expect("drop");
-    if !tbl.is_empty() { return TestResult::Fail("table not empty after drop"); }
+    if !tbl.is_empty() {
+        return TestResult::Fail("table not empty after drop");
+    }
     // Subsequent fd lookup must miss.
     if !matches!(tbl.fd_to_handle(fd), Err(PrimeError::NotFound)) {
         return TestResult::Fail("fd should be NotFound after drop");
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm", smoke_drm_prime_drop_handle_clears_binding);
+kernel_test_in!(
+    "drivers/gpu/drm",
+    smoke_drm_prime_drop_handle_clears_binding
+);
 
 // ── amdgpu/smu v12+v13 opcode tables ───────────────────────────────
 //
@@ -5471,18 +5760,15 @@ fn smoke_amdgpu_smu_fw_version_decode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/gpu/amdgpu/smu",
-    smoke_amdgpu_smu_fw_version_decode
-);
+kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_smu_fw_version_decode);
 
 fn smoke_amdgpu_smu_get_clock_mhz_end_to_end() -> TestResult {
     // End-to-end mock: write msg → simulate response → read result.
     // Tests the `get_clock_mhz` public API via a FakeMmio that
     // scripts the exact canonical mailbox sequence.
     use crate::amdgpu_smu::{
-        get_clock_mhz, ClockDomain, MockSmu, SmuVersion,
-        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
+        get_clock_mhz, ClockDomain, MockSmu, SmuVersion, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL,
+        MP1_C2PMSG_RESP_REL, SMU_RESP_OK,
     };
     use crate::amdgpu_smu_v13::V13_MSG_GET_GFXCLK;
 
@@ -5492,9 +5778,9 @@ fn smoke_amdgpu_smu_get_clock_mhz_end_to_end() -> TestResult {
 
     // Script: handshake idle, response OK, ARG = 2400 MHz (GFXCLK).
     let mut m = MockSmu::new();
-    m.stage_read(resp_off, 1);           // step 1: RESP non-zero (idle)
+    m.stage_read(resp_off, 1); // step 1: RESP non-zero (idle)
     m.stage_read(resp_off, SMU_RESP_OK); // step 5: SMU responds OK
-    m.stage_read(arg_off, 2400);         // step 6: ARG holds frequency
+    m.stage_read(arg_off, 2400); // step 6: ARG holds frequency
 
     let mhz = match get_clock_mhz(&mut m, mp1_base, SmuVersion::V13, ClockDomain::Gfxclk) {
         Ok(v) => v,
@@ -5507,7 +5793,10 @@ fn smoke_amdgpu_smu_get_clock_mhz_end_to_end() -> TestResult {
         return TestResult::Fail("returned MHz != 2400");
     }
     // The MSG register must have been written with the V13 GFXCLK id.
-    let msg_write = m.writes.iter().find(|(off, _)| *off == mp1_base + MP1_C2PMSG_MSG_REL);
+    let msg_write = m
+        .writes
+        .iter()
+        .find(|(off, _)| *off == mp1_base + MP1_C2PMSG_MSG_REL);
     match msg_write {
         Some((_, id)) if *id == V13_MSG_GET_GFXCLK => {}
         Some((_, id)) => {

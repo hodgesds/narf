@@ -90,8 +90,7 @@ pub const CP_ME_CNTL_CE_HALT: u32 = 1 << 24;
 /// `CP_ME_CNTL` — halt the ME engine.
 pub const CP_ME_CNTL_ME_HALT: u32 = 1 << 28;
 /// Combined: halt all three CP engines.
-pub const CP_ME_CNTL_HALT_ALL: u32 =
-    CP_ME_CNTL_PFP_HALT | CP_ME_CNTL_CE_HALT | CP_ME_CNTL_ME_HALT;
+pub const CP_ME_CNTL_HALT_ALL: u32 = CP_ME_CNTL_PFP_HALT | CP_ME_CNTL_CE_HALT | CP_ME_CNTL_ME_HALT;
 
 /// `CP_RB0_RPTR_ADDR_HI` — gate the writeback DMA through the
 /// L2 cache (bit 0) and snoop coherent (bit 1). Linux ORs both.
@@ -286,10 +285,7 @@ pub fn build_gfx9_ring_init(
     // 256-byte (= 64-dword) block size — Linux default.
     let log2_size = ring_size_dw.trailing_zeros();
     let blksz: u32 = 6;
-    seq.push(
-        gc_base + CP_RB0_CNTL_REL,
-        log2_size | (blksz << 8),
-    );
+    seq.push(gc_base + CP_RB0_CNTL_REL, log2_size | (blksz << 8));
 
     // Step 6: doorbell window.
     seq.push(
@@ -364,8 +360,7 @@ impl GfxContext {
         // 8 bytes is enough — single u64 sequence number. Hardware
         // requires 8-byte alignment for the WRITE_DATA target
         // anyway, and DMA pages are 4-KiB aligned so this is fine.
-        let fence_buf =
-            alloc_coherent(8, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
+        let fence_buf = alloc_coherent(8, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
         // Zero the fence buffer so reads-before-completion return 0,
         // not garbage.
         // SAFETY: identity-mapped, exclusive owner.
@@ -418,7 +413,11 @@ impl GfxContext {
     /// must have been bound to the CP (`build_gfx9_ring_init`) and
     /// the CP unhalted; otherwise the doorbell write below has no
     /// effect (the packets sit in DRAM until bring-up).
-    pub unsafe fn submit_ib(&mut self, ib_phys: u64, ib_size_dw: u32) -> Result<Fence, SubmitError> {
+    pub unsafe fn submit_ib(
+        &mut self,
+        ib_phys: u64,
+        ib_size_dw: u32,
+    ) -> Result<Fence, SubmitError> {
         self.next_seq += 1;
         let seq = self.next_seq;
 
@@ -447,9 +446,8 @@ impl GfxContext {
     /// fences on the same queue (per CP ordering).
     pub fn fence_completed(&self, fence: &Fence) -> bool {
         // SAFETY: identity-mapped DMA backing, exclusive owner.
-        let observed: u32 = unsafe {
-            core::ptr::read_volatile(self.fence_buf.phys_addr().raw() as *const u32)
-        };
+        let observed: u32 =
+            unsafe { core::ptr::read_volatile(self.fence_buf.phys_addr().raw() as *const u32) };
         (observed as u64) >= fence.seq
     }
 

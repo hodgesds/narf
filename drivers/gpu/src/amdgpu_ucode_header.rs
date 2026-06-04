@@ -94,21 +94,12 @@ pub const GFX_HEADER_V10_BYTES: usize = COMMON_HEADER_BYTES + 12;
 #[derive(Copy, Clone, Debug)]
 pub enum HeaderParseError {
     /// Blob shorter than the smallest header.
-    TooShort {
-        needed: usize,
-        actual: usize,
-    },
+    TooShort { needed: usize, actual: usize },
     /// `header_size_bytes` field doesn't match what we expect for
     /// the variant being parsed.
-    BadHeaderSize {
-        declared: u32,
-        expected: usize,
-    },
+    BadHeaderSize { declared: u32, expected: usize },
     /// `ucode_array_offset_bytes` points outside the blob.
-    UcodeOffsetOutOfRange {
-        offset: u32,
-        blob_len: usize,
-    },
+    UcodeOffsetOutOfRange { offset: u32, blob_len: usize },
     /// jt_offset + jt_size would overrun the payload (GFX1.0
     /// only).
     JtOutOfRange {
@@ -273,11 +264,7 @@ pub mod tests {
     /// Helper: build a synthetic GFX v1.0 firmware blob with
     /// the given JT offset/size (in dwords) and a ucode payload
     /// of `ucode_bytes` bytes starting at offset 64.
-    fn build_gfx_v10_blob(
-        jt_offset_dwords: u32,
-        jt_size_dwords: u32,
-        ucode_bytes: u32,
-    ) -> Vec<u8> {
+    fn build_gfx_v10_blob(jt_offset_dwords: u32, jt_size_dwords: u32, ucode_bytes: u32) -> Vec<u8> {
         let mut buf = alloc::vec![0u8; 64 + ucode_bytes as usize];
         let total_size = buf.len() as u32;
         // Common header.
@@ -291,7 +278,7 @@ pub mod tests {
         buf[20..24].copy_from_slice(&ucode_bytes.to_le_bytes()); // ucode_size_bytes
         buf[24..28].copy_from_slice(&64u32.to_le_bytes()); // ucode_array_offset_bytes
         buf[28..32].copy_from_slice(&0u32.to_le_bytes()); // crc32 (unchecked)
-        // GFX1.0-specific tail.
+                                                          // GFX1.0-specific tail.
         buf[32..36].copy_from_slice(&7u32.to_le_bytes()); // feature version
         buf[36..40].copy_from_slice(&jt_offset_dwords.to_le_bytes());
         buf[40..44].copy_from_slice(&jt_size_dwords.to_le_bytes());
@@ -325,7 +312,10 @@ pub mod tests {
     fn smoke_amdgpu_common_header_too_short() -> TestResult {
         let buf = alloc::vec![0u8; 16];
         match parse_common(&buf) {
-            Err(HeaderParseError::TooShort { needed: 32, actual: 16 }) => TestResult::Pass,
+            Err(HeaderParseError::TooShort {
+                needed: 32,
+                actual: 16,
+            }) => TestResult::Pass,
             _ => TestResult::Fail("expected TooShort"),
         }
     }
@@ -358,7 +348,9 @@ pub mod tests {
         // size 0x40 dwords (= 0x100 bytes). ucode_array_offset
         // = 64. So file_offset should be 64 + 0x400 = 0x440.
         let blob = build_gfx_v10_blob(0x100, 0x40, 0x1000);
-        let jt = locate_mec1_jt(&blob).expect("locate ok").expect("Some(JtView)");
+        let jt = locate_mec1_jt(&blob)
+            .expect("locate ok")
+            .expect("Some(JtView)");
         if jt.file_offset != 0x440 {
             return TestResult::Fail("JT file_offset wrong");
         }

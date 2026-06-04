@@ -28,9 +28,7 @@ use narf_filesystem::FsError;
 
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
 use crate::drm::render_node::{DrmFileCtx, PermError};
-use crate::drm_uapi::{
-    self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmVersionUapi,
-};
+use crate::drm_uapi::{self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmVersionUapi};
 
 // ── Copy helpers ──────────────────────────────────────────────────────
 //
@@ -105,8 +103,7 @@ fn map_err(e: DrmIoctlError) -> FsError {
 pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Result<u64, FsError> {
     // 1. Resolve the card. Cards registered without mode_state return
     //    ENOTSUP — bring-up drivers haven't built a Card yet.
-    let mode_state = crate::drm_registry::mode_state(card_index)
-        .ok_or(FsError::Unsupported)?;
+    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::Unsupported)?;
 
     // 2. Build the per-fd ctx. Primary-node opens are treated as
     //    authenticated master so KMS ioctls reach the body. NARF
@@ -152,12 +149,9 @@ fn handle_version(
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
     // Read the user struct.
-    let bytes = unsafe {
-        copy_in(arg, core::mem::size_of::<DrmVersionUapi>())?
-    };
-    let mut req: DrmVersionUapi = unsafe {
-        core::ptr::read_unaligned(bytes.as_ptr() as *const DrmVersionUapi)
-    };
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmVersionUapi>())? };
+    let mut req: DrmVersionUapi =
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmVersionUapi) };
 
     // Run the generic dispatcher to get the filled in version struct.
     let v = {
@@ -179,17 +173,23 @@ fn handle_version(
     if req.name != 0 && req.name_len > 0 {
         let cap = req.name_len as usize;
         let n = name.len().min(cap);
-        unsafe { copy_out(req.name as usize, &name[..n])?; }
+        unsafe {
+            copy_out(req.name as usize, &name[..n])?;
+        }
     }
     if req.date != 0 && req.date_len > 0 {
         let cap = req.date_len as usize;
         let n = date.len().min(cap);
-        unsafe { copy_out(req.date as usize, &date[..n])?; }
+        unsafe {
+            copy_out(req.date as usize, &date[..n])?;
+        }
     }
     if req.desc != 0 && req.desc_len > 0 {
         let cap = req.desc_len as usize;
         let n = desc.len().min(cap);
-        unsafe { copy_out(req.desc as usize, &desc[..n])?; }
+        unsafe {
+            copy_out(req.desc as usize, &desc[..n])?;
+        }
     }
     req.name_len = name.len() as u64;
     req.date_len = date.len() as u64;
@@ -200,7 +200,9 @@ fn handle_version(
 
     let out_bytes: [u8; core::mem::size_of::<DrmVersionUapi>()] =
         unsafe { core::mem::transmute(req) };
-    unsafe { copy_out(arg, &out_bytes)?; }
+    unsafe {
+        copy_out(arg, &out_bytes)?;
+    }
     Ok(0)
 }
 
@@ -228,7 +230,11 @@ fn handle_getresources(
     // Helper to write an id array to user memory iff (a) the user
     // supplied a non-null ptr and (b) the user-supplied count is
     // greater than zero.
-    fn write_ids(uptr: u64, user_count: u32, ids: impl Iterator<Item = u32>) -> Result<(), FsError> {
+    fn write_ids(
+        uptr: u64,
+        user_count: u32,
+        ids: impl Iterator<Item = u32>,
+    ) -> Result<(), FsError> {
         if uptr == 0 || user_count == 0 {
             return Ok(());
         }
@@ -244,9 +250,17 @@ fn handle_getresources(
     }
 
     write_ids(req.crtc_id_ptr, req.count_crtcs, card.crtc_ids())?;
-    write_ids(req.connector_id_ptr, req.count_connectors, card.connector_ids())?;
+    write_ids(
+        req.connector_id_ptr,
+        req.count_connectors,
+        card.connector_ids(),
+    )?;
     write_ids(req.encoder_id_ptr, req.count_encoders, card.encoder_ids())?;
-    write_ids(req.fb_id_ptr, req.count_fbs, card.framebuffers.iter().map(|f| f.id))?;
+    write_ids(
+        req.fb_id_ptr,
+        req.count_fbs,
+        card.framebuffers.iter().map(|f| f.id),
+    )?;
 
     // Write back the canonical counts + dims.
     req.count_fbs = res.count_fbs;
@@ -261,7 +275,9 @@ fn handle_getresources(
 
     let out_bytes: [u8; core::mem::size_of::<DrmModeCardResUapi>()] =
         unsafe { core::mem::transmute(req) };
-    unsafe { copy_out(arg, &out_bytes)?; }
+    unsafe {
+        copy_out(arg, &out_bytes)?;
+    }
     Ok(0)
 }
 
@@ -286,9 +302,7 @@ fn handle_atomic(
     // the wire-format decode is deferred because it requires a per-
     // driver property table that doesn't ship yet for any backend.
     let mut state = crate::drm::atomic::AtomicState {
-        allow_modeset: (req.flags
-            & crate::drm::atomic::DRM_MODE_ATOMIC_ALLOW_MODESET)
-            != 0,
+        allow_modeset: (req.flags & crate::drm::atomic::DRM_MODE_ATOMIC_ALLOW_MODESET) != 0,
         ..Default::default()
     };
     let policy = crate::drm::atomic::AtomicCheckPolicy::default();

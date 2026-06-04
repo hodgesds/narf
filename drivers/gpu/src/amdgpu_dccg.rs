@@ -65,7 +65,11 @@ pub fn is_integer_related(a_khz: u32, b_khz: u32) -> bool {
     if a_khz == 0 || b_khz == 0 {
         return false;
     }
-    let (max, min) = if a_khz > b_khz { (a_khz, b_khz) } else { (b_khz, a_khz) };
+    let (max, min) = if a_khz > b_khz {
+        (a_khz, b_khz)
+    } else {
+        (b_khz, a_khz)
+    };
     max % min == 0
 }
 
@@ -208,8 +212,14 @@ mod smoke_tests {
     fn smoke_assign_plls_shared_when_integer_related() -> TestResult {
         // 4K@60 (594 MHz) + 1080p@120 (297 MHz, half) → share 1 PLL.
         let reqs = [
-            PixelClockRequest { pipe_idx: 0, pixel_clock_khz: 594_000 },
-            PixelClockRequest { pipe_idx: 1, pixel_clock_khz: 297_000 },
+            PixelClockRequest {
+                pipe_idx: 0,
+                pixel_clock_khz: 594_000,
+            },
+            PixelClockRequest {
+                pipe_idx: 1,
+                pixel_clock_khz: 297_000,
+            },
         ];
         let plls = assign_plls(&reqs).expect("assign");
         if plls.len() != 1 {
@@ -228,8 +238,14 @@ mod smoke_tests {
     fn smoke_assign_plls_separate_when_unrelated() -> TestResult {
         // 60 + 75 → 2 distinct PLLs.
         let reqs = [
-            PixelClockRequest { pipe_idx: 0, pixel_clock_khz: 148_500 },
-            PixelClockRequest { pipe_idx: 1, pixel_clock_khz: 162_000 },
+            PixelClockRequest {
+                pipe_idx: 0,
+                pixel_clock_khz: 148_500,
+            },
+            PixelClockRequest {
+                pipe_idx: 1,
+                pixel_clock_khz: 162_000,
+            },
         ];
         let plls = assign_plls(&reqs).expect("assign");
         if plls.len() != 2 {
@@ -242,18 +258,36 @@ mod smoke_tests {
     fn smoke_assign_plls_overflows_with_too_many_distinct() -> TestResult {
         // 5 distinct unrelated rates — N_DCCG_PLLS = 4 → overflow.
         let reqs = [
-            PixelClockRequest { pipe_idx: 0, pixel_clock_khz: 162_000 },
-            PixelClockRequest { pipe_idx: 1, pixel_clock_khz: 148_500 },
-            PixelClockRequest { pipe_idx: 2, pixel_clock_khz: 173_400 },
-            PixelClockRequest { pipe_idx: 3, pixel_clock_khz: 270_000 },
-            PixelClockRequest { pipe_idx: 4, pixel_clock_khz: 297_023 },
+            PixelClockRequest {
+                pipe_idx: 0,
+                pixel_clock_khz: 162_000,
+            },
+            PixelClockRequest {
+                pipe_idx: 1,
+                pixel_clock_khz: 148_500,
+            },
+            PixelClockRequest {
+                pipe_idx: 2,
+                pixel_clock_khz: 173_400,
+            },
+            PixelClockRequest {
+                pipe_idx: 3,
+                pixel_clock_khz: 270_000,
+            },
+            PixelClockRequest {
+                pipe_idx: 4,
+                pixel_clock_khz: 297_023,
+            },
         ];
         if assign_plls(&reqs) != Err(DccgError::NotEnoughPlls) {
             return TestResult::Fail("should overflow");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_assign_plls_overflows_with_too_many_distinct);
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_assign_plls_overflows_with_too_many_distinct
+    );
 
     fn smoke_compute_dto_pair_unity() -> TestResult {
         if compute_dto_pair(594_000, 297_000) != Some((297_000, 594_000)) {
@@ -294,13 +328,22 @@ mod smoke_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_program_pipe_dto_writes_module_then_phase);
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_program_pipe_dto_writes_module_then_phase
+    );
 
     fn smoke_program_assignments_writes_each_pipe() -> TestResult {
         let mut m = MockDccg { writes: Vec::new() };
         let reqs = [
-            PixelClockRequest { pipe_idx: 0, pixel_clock_khz: 594_000 },
-            PixelClockRequest { pipe_idx: 1, pixel_clock_khz: 297_000 },
+            PixelClockRequest {
+                pipe_idx: 0,
+                pixel_clock_khz: 594_000,
+            },
+            PixelClockRequest {
+                pipe_idx: 1,
+                pixel_clock_khz: 297_000,
+            },
         ];
         let plls = assign_plls(&reqs).expect("assign");
         program_assignments(&mut m, 0x10000, &reqs, &plls);

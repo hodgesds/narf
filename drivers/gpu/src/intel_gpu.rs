@@ -299,10 +299,7 @@ impl IntelGpu {
 
 static CONTROLLER: IrqSafeSpinLock<Option<IntelGpu>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }

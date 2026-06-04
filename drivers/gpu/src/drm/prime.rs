@@ -45,9 +45,9 @@
 //! - `drivers/gpu/drm/drm_prime.c::drm_prime_add_buf_handle`
 //! - `drivers/gpu/drm/drm_prime.c::drm_prime_lookup_buf_handle`
 
-use alloc::vec::Vec;
-use crate::dmabuf::DmaBuf;
 use super::gem::GemHandle;
+use crate::dmabuf::DmaBuf;
+use alloc::vec::Vec;
 
 // ── Errors ─────────────────────────────────────────────────────────────
 
@@ -100,12 +100,19 @@ pub struct PrimeTable {
 impl PrimeTable {
     /// New empty table.
     pub fn new() -> Self {
-        PrimeTable { bindings: Vec::new(), next_fd: PRIME_FD_BASE }
+        PrimeTable {
+            bindings: Vec::new(),
+            next_fd: PRIME_FD_BASE,
+        }
     }
 
     /// Number of live PRIME bindings.
-    pub fn len(&self) -> usize { self.bindings.len() }
-    pub fn is_empty(&self) -> bool { self.bindings.is_empty() }
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
 
     /// HANDLE_TO_FD — export a GEM handle as a dma-buf fd.
     ///
@@ -145,7 +152,10 @@ impl PrimeTable {
         if fd < PRIME_FD_BASE {
             return Err(PrimeError::BadFd);
         }
-        self.bindings.iter().find(|b| b.fd == fd).map(|b| b.handle)
+        self.bindings
+            .iter()
+            .find(|b| b.fd == fd)
+            .map(|b| b.handle)
             .ok_or(PrimeError::NotFound)
     }
 
@@ -156,7 +166,10 @@ impl PrimeTable {
         if fd < PRIME_FD_BASE {
             return Err(PrimeError::BadFd);
         }
-        self.bindings.iter().find(|b| b.fd == fd).map(|b| &b.buf)
+        self.bindings
+            .iter()
+            .find(|b| b.fd == fd)
+            .map(|b| &b.buf)
             .ok_or(PrimeError::NotFound)
     }
 
@@ -185,7 +198,11 @@ impl PrimeTable {
         if self.bindings.len() >= PRIME_TABLE_MAX {
             return Err(PrimeError::Full);
         }
-        self.bindings.push(PrimeBinding { handle: local_handle, fd, buf });
+        self.bindings.push(PrimeBinding {
+            handle: local_handle,
+            fd,
+            buf,
+        });
         Ok(())
     }
 
@@ -195,7 +212,10 @@ impl PrimeTable {
     /// was previously exported, `drm_prime_remove_buf_handle_locked`
     /// drops the dma_buf reference.
     pub fn drop_handle(&mut self, handle: GemHandle) -> Result<(), PrimeError> {
-        let pos = self.bindings.iter().position(|b| b.handle == handle)
+        let pos = self
+            .bindings
+            .iter()
+            .position(|b| b.handle == handle)
             .ok_or(PrimeError::NotFound)?;
         self.bindings.swap_remove(pos);
         Ok(())
@@ -204,7 +224,9 @@ impl PrimeTable {
     fn alloc_fd(&mut self) -> i32 {
         let mut candidate = self.next_fd;
         loop {
-            if candidate < PRIME_FD_BASE { candidate = PRIME_FD_BASE; }
+            if candidate < PRIME_FD_BASE {
+                candidate = PRIME_FD_BASE;
+            }
             if !self.bindings.iter().any(|b| b.fd == candidate) {
                 self.next_fd = candidate.wrapping_add(1).max(PRIME_FD_BASE);
                 return candidate;

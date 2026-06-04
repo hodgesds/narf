@@ -209,16 +209,12 @@ pub enum UnmapAction {
 }
 
 /// Build an UNMAP_QUEUES packet.
-pub fn build_unmap_queue(
-    ring_kind: RingKind,
-    doorbell_off: u32,
-    action: UnmapAction,
-) -> Vec<u32> {
+pub fn build_unmap_queue(ring_kind: RingKind, doorbell_off: u32, action: UnmapAction) -> Vec<u32> {
     let header = packet3(PACKET3_UNMAP_QUEUES, 4);
     let cfg = ((action as u32) << 0) // ACTION
         | (0u32 << 4)                // QUEUE_SEL
         | (ring_kind.engine_sel() << 26)
-        | (1u32 << 29);              // NUM_QUEUES
+        | (1u32 << 29); // NUM_QUEUES
     let dbell = (doorbell_off as u32) << 2;
     alloc::vec![header, cfg, dbell, 0, 0, 0]
 }
@@ -236,7 +232,12 @@ pub fn build_indirect_buffer(ib_phys: u64, size_dws: u32, vmid: u8) -> Vec<u32> 
     let hi = (ib_phys >> 32) as u32;
     let size_field = size_dws & 0xF_FFFF;
     let attr = size_field | (1u32 << 23) | ((vmid as u32) << 24);
-    alloc::vec![header, lo, hi | (lo & 0xC000_0000_u32.wrapping_shr(2)), attr]
+    alloc::vec![
+        header,
+        lo,
+        hi | (lo & 0xC000_0000_u32.wrapping_shr(2)),
+        attr
+    ]
 }
 
 // ── Compute queue state ──────────────────────────────────────────
@@ -350,7 +351,11 @@ impl KiqScheduler {
     /// Set a queue's priority. Affects [`next_queue_at_priority`]
     /// + [`build_set_priority`] (which produces the MES PM4 packet
     /// to push the new priority to the hardware scheduler).
-    pub fn set_priority(&mut self, idx: usize, priority: ComputePriority) -> Result<(), ComputeError> {
+    pub fn set_priority(
+        &mut self,
+        idx: usize,
+        priority: ComputePriority,
+    ) -> Result<(), ComputeError> {
         let q = self.queues.get_mut(idx).ok_or(ComputeError::NoSuchQueue)?;
         q.priority = priority;
         Ok(())
@@ -378,11 +383,7 @@ impl KiqScheduler {
     /// Pick the next queue to schedule under a round-robin policy
     /// among queues at the given priority level. Returns `None` if
     /// no mapped queue matches the priority.
-    pub fn next_queue_at_priority(
-        &self,
-        priority: ComputePriority,
-        start: usize,
-    ) -> Option<usize> {
+    pub fn next_queue_at_priority(&self, priority: ComputePriority, start: usize) -> Option<usize> {
         let n = self.queues.len();
         if n == 0 {
             return None;
@@ -726,7 +727,10 @@ mod smoke_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_cwsr_fields_rejects_undersized_save_area);
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_cwsr_fields_rejects_undersized_save_area
+    );
 
     fn smoke_cwsr_fields_layout_correct() -> TestResult {
         let f = build_cwsr_fields(0x10_0000, 0x10_0000, 0x4000).expect("cwsr");
@@ -749,9 +753,7 @@ mod smoke_tests {
     fn smoke_attach_cwsr_to_mapped_queue() -> TestResult {
         let mut sched = KiqScheduler::new();
         sched.mark_initialised(0xFF);
-        let idx = sched
-            .map_queue(1, 0, 1, 0x100, 0xCAFE_0000)
-            .expect("map");
+        let idx = sched.map_queue(1, 0, 1, 0x100, 0xCAFE_0000).expect("map");
         let fields = build_cwsr_fields(0x10_0000, 0x10_0000, 0x4000).expect("cwsr");
         sched.attach_cwsr(idx, fields).expect("attach");
         if sched.queues[idx].cwsr.is_none() {

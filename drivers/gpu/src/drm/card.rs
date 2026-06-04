@@ -19,8 +19,8 @@
 //! - `struct drm_connector` in `include/drm/drm_connector.h`.
 //! - `struct drm_crtc` in `include/drm/drm_crtc.h`.
 
-use alloc::vec::Vec;
 use super::gem::GemTable;
+use alloc::vec::Vec;
 
 // ── Connector ──────────────────────────────────────────────────────────
 
@@ -30,27 +30,27 @@ use super::gem::GemTable;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ConnectorType {
-    Unknown    = 0,
-    Vga        = 1,
-    Dvii       = 2,
-    Dvid       = 3,
-    Dvia       = 4,
-    Composite  = 5,
-    Svideo     = 6,
-    Lvds       = 7,
-    Component  = 8,
+    Unknown = 0,
+    Vga = 1,
+    Dvii = 2,
+    Dvid = 3,
+    Dvia = 4,
+    Composite = 5,
+    Svideo = 6,
+    Lvds = 7,
+    Component = 8,
     NinePinDin = 9,
     DisplayPort = 10,
-    HdmiA      = 11,
-    HdmiB      = 12,
-    Tv         = 13,
-    Edp        = 14,
-    Virtual    = 15,
-    Dsi        = 16,
-    Dpi        = 17,
-    Writeback  = 18,
-    Spi        = 19,
-    Usb        = 20,
+    HdmiA = 11,
+    HdmiB = 12,
+    Tv = 13,
+    Edp = 14,
+    Virtual = 15,
+    Dsi = 16,
+    Dpi = 17,
+    Writeback = 18,
+    Spi = 19,
+    Usb = 20,
 }
 
 /// Physical link status of a connector.
@@ -59,9 +59,9 @@ pub enum ConnectorType {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ConnectorStatus {
-    Connected    = 1,
+    Connected = 1,
     Disconnected = 2,
-    Unknown      = 3,
+    Unknown = 3,
 }
 
 /// A physical display output port.
@@ -91,15 +91,15 @@ pub struct Connector {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum EncoderType {
-    None  = 0,
-    Dac   = 1,
-    Tmds  = 2,
-    Lvds  = 3,
+    None = 0,
+    Dac = 1,
+    Tmds = 2,
+    Lvds = 3,
     Tvdac = 4,
     Virtual = 5,
-    Dsi   = 6,
+    Dsi = 6,
     Dpmst = 7,
-    Dpi   = 8,
+    Dpi = 8,
 }
 
 /// Signal-conversion block between a CRTC and a connector.
@@ -149,7 +149,7 @@ pub struct Crtc {
 pub enum PixelFormat {
     Xrgb8888 = 0x3438_5258, // "XR24" little-endian
     Argb8888 = 0x3438_3241, // "AR24"
-    Rgb565   = 0x3631_5247, // "RG16"
+    Rgb565 = 0x3631_5247,   // "RG16"
 }
 
 /// Kernel-side framebuffer descriptor (result of ADDFB2).

@@ -8,8 +8,8 @@
 //! Source: `/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu_v12_0_ppsmc.h`
 //! (GPL-2.0-or-later; NARF relicensed 2026-05-20).
 
-use crate::amdgpu_smu::{ClockDomain, PpsmcMsg, SmuError, SmuMmio};
 use crate::amdgpu_smu::{send_message_get, send_message_void};
+use crate::amdgpu_smu::{ClockDomain, PpsmcMsg, SmuError, SmuMmio};
 
 // ── SMU12 PPSMC_MSG_* opcode values ────────────────────────────────
 //
@@ -119,9 +119,7 @@ pub fn get_current_clk_msg(domain: ClockDomain) -> Option<u32> {
 /// Return the SMU12 message ids for setting soft min / soft max on
 /// `domain`. Renoir has per-domain dedicated messages rather than a
 /// generic (msg, clk_id_arg) pair.
-pub fn set_range_msgs(
-    domain: ClockDomain,
-) -> Option<(u32, u32)> {
+pub fn set_range_msgs(domain: ClockDomain) -> Option<(u32, u32)> {
     // Returns (set_soft_min_msg, set_soft_max_msg).
     match domain {
         ClockDomain::Gfxclk => {
@@ -142,18 +140,12 @@ pub fn set_range_msgs(
 // ── High-level wrappers ─────────────────────────────────────────────
 
 /// Read the current GFXCLK frequency in MHz on SMU12 hardware.
-pub fn get_gfxclk_mhz<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Result<u32, SmuError> {
+pub fn get_gfxclk_mhz<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Result<u32, SmuError> {
     send_message_get(mmio, mp1_base, V12_MSG_GET_GFXCLK, 0)
 }
 
 /// Read the current FCLK frequency in MHz on SMU12 hardware.
-pub fn get_fclk_mhz<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Result<u32, SmuError> {
+pub fn get_fclk_mhz<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Result<u32, SmuError> {
     send_message_get(mmio, mp1_base, V12_MSG_GET_FCLK, 0)
 }
 

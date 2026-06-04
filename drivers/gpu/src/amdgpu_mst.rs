@@ -101,7 +101,10 @@ impl PeerDeviceType {
     }
 
     pub fn is_sink(self) -> bool {
-        matches!(self, PeerDeviceType::Sink | PeerDeviceType::SinkOrBranch | PeerDeviceType::LegacyDevice)
+        matches!(
+            self,
+            PeerDeviceType::Sink | PeerDeviceType::SinkOrBranch | PeerDeviceType::LegacyDevice
+        )
     }
 
     pub fn is_branch(self) -> bool {
@@ -205,12 +208,7 @@ impl PayloadTable {
     }
 
     /// Allocate a fresh VCPI for `pbn` bandwidth at `(branch, port)`.
-    pub fn allocate(
-        &mut self,
-        branch_guid: Guid,
-        sink_port: u8,
-        pbn: u16,
-    ) -> Result<u8, MstError> {
+    pub fn allocate(&mut self, branch_guid: Guid, sink_port: u8, pbn: u16) -> Result<u8, MstError> {
         if self.allocations.len() >= 63 {
             return Err(MstError::NoFreeVcpi);
         }
@@ -307,10 +305,7 @@ impl Topology {
 
     /// Count of total sinks in the topology.
     pub fn sink_count(&self) -> usize {
-        self.branches
-            .iter()
-            .flat_map(|b| b.sink_ports())
-            .count()
+        self.branches.iter().flat_map(|b| b.sink_ports()).count()
     }
 }
 
@@ -391,10 +386,7 @@ pub fn commit_payload_to_sink<A: MstAux>(
         let s = aux.dpcd_read_u8(DPCD_PAYLOAD_TABLE_UPDATE_STATUS);
         if s & PAYLOAD_TABLE_UPDATED_BIT != 0 {
             // Clear the status bit by writing 1 back (W1C semantics).
-            aux.dpcd_write_u8(
-                DPCD_PAYLOAD_TABLE_UPDATE_STATUS,
-                PAYLOAD_TABLE_UPDATED_BIT,
-            );
+            aux.dpcd_write_u8(DPCD_PAYLOAD_TABLE_UPDATE_STATUS, PAYLOAD_TABLE_UPDATED_BIT);
             break;
         }
         i += 1;
@@ -529,9 +521,7 @@ mod smoke_tests {
             return TestResult::Fail("Branch.is_branch false");
         }
         // SinkOrBranch is both.
-        if !PeerDeviceType::SinkOrBranch.is_sink()
-            || !PeerDeviceType::SinkOrBranch.is_branch()
-        {
+        if !PeerDeviceType::SinkOrBranch.is_sink() || !PeerDeviceType::SinkOrBranch.is_branch() {
             return TestResult::Fail("SinkOrBranch not both");
         }
         TestResult::Pass
@@ -810,8 +800,8 @@ mod smoke_tests {
         };
         let mut table = PayloadTable::new(64);
         let guid = Guid([0xAA; 16]);
-        let vcpi = activate_stream(&mut aux, &mut table, guid, 2, &[0x11], 0, 32, 0)
-            .expect("activate");
+        let vcpi =
+            activate_stream(&mut aux, &mut table, guid, 2, &[0x11], 0, 32, 0).expect("activate");
         if vcpi == 0 {
             return TestResult::Fail("vcpi 0");
         }

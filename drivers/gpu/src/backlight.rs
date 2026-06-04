@@ -188,10 +188,7 @@ pub fn intel_duty_to_pct(period: u32, duty: u32) -> u8 {
 /// Caller is responsible for the SOUTH_CHICKEN1 gate; the modern
 /// PCH path doesn't need to re-gate per-set because the activator
 /// already did it.
-pub fn intel_set_pct<M: MmioWindow + ?Sized>(
-    mmio: &M,
-    pct: u8,
-) -> Result<u32, BacklightError> {
+pub fn intel_set_pct<M: MmioWindow + ?Sized>(mmio: &M, pct: u8) -> Result<u32, BacklightError> {
     let period = mmio.read32(BXT_BLC_PWM_FREQ1);
     if period == 0 {
         // Firmware didn't program the PWM — we can't pick a sane
@@ -243,9 +240,9 @@ pub fn intel_get_pct<M: MmioWindow + ?Sized>(mmio: &M) -> Result<u8, BacklightEr
 /// layout AML sees when the `_DSM` Buffer argument is decoded.
 pub const ATIF_GUID: [u8; 16] = [
     0xf8, 0x68, 0x31, 0xea, // ea3168f8 (LE)
-    0x3c, 0xce,             // ce3c     (LE)
-    0x12, 0x4c,             // 4c12     (LE)
-    0xae, 0xdd,             // aedd     (BE)
+    0x3c, 0xce, // ce3c     (LE)
+    0x12, 0x4c, // 4c12     (LE)
+    0xae, 0xdd, // aedd     (BE)
     0x69, 0xdd, 0x0e, 0x6b, 0xb5, 0x9b, // 69dd0e6bb59b (BE)
 ];
 
@@ -430,8 +427,7 @@ struct AcpiVideoDriver<I: AcpiVideoInvoke + 'static> {
 
 impl<I: AcpiVideoInvoke + 'static> Driver for AcpiVideoDriver<I> {
     fn set(&self, pct: u8) -> Result<(), BacklightError> {
-        let target =
-            snap_to_ladder(&self.levels, pct).ok_or(BacklightError::InvalidLevel)?;
+        let target = snap_to_ladder(&self.levels, pct).ok_or(BacklightError::InvalidLevel)?;
         if self.invoke.bcm(target) {
             Ok(())
         } else {
@@ -481,8 +477,7 @@ const EMPTY_LEVELS: &[u8] = &[];
 // requested; the `levels()` API returns `&'static [u8]` via a
 // stash to keep the trait signature ergonomic.
 static BACKEND: AtomicU8 = AtomicU8::new(Backend::None as u8);
-static DRIVER: IrqSafeSpinLock<Option<alloc::boxed::Box<dyn Driver>>> =
-    IrqSafeSpinLock::new(None);
+static DRIVER: IrqSafeSpinLock<Option<alloc::boxed::Box<dyn Driver>>> = IrqSafeSpinLock::new(None);
 
 // Stash for the levels() return slice. Refreshed on every
 // `activate_*` so the static lifetime is honoured.
@@ -785,8 +780,7 @@ pub mod tests {
 
     fn smoke_bcl_level_list_parse() -> TestResult {
         // Typical Lenovo _BCL: AC=80, BAT=40, ladder 0..=100 in steps of 10.
-        let pkg: alloc::vec::Vec<u32> =
-            vec![80, 40, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let pkg: alloc::vec::Vec<u32> = vec![80, 40, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let ladder = decode_bcl(&pkg);
         if ladder.len() != 11 {
             return TestResult::Fail("ladder len != 11");

@@ -38,13 +38,12 @@ use crate::drm::card::{
 use crate::drm_devfs_bridge::{BochsCard, DriCardFile, DriRenderFile};
 use crate::drm_ioctl_bridge::dispatch_card;
 use crate::drm_uapi::{
-    ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi,
-    DrmModeCardResUapi, DrmVersionUapi, DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE,
-    DRM_IOCTL_MODE_ATOMIC, DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_SETCRTC,
-    DRM_IOCTL_VERSION, IOC_READ, IOC_WRITE,
+    ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi, DrmModeCardResUapi,
+    DrmVersionUapi, DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_ATOMIC,
+    DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_VERSION, IOC_READ, IOC_WRITE,
 };
-use alloc::string::String;
 use alloc::format;
+use alloc::string::String;
 
 // ── Setup helpers ──────────────────────────────────────────────────────
 
@@ -98,10 +97,16 @@ fn register_test_card() -> u32 {
 #[allow(dead_code)]
 fn smoke_drm_ioc_macro_roundtrip() -> TestResult {
     // _IOC(READ|WRITE, 'd', 0xA0, sz_card_res) == DRM_IOCTL_MODE_GETRESOURCES.
-    let manual = ioc(IOC_READ | IOC_WRITE, DRM_IOCTL_BASE, 0xA0,
-                     core::mem::size_of::<DrmModeCardResUapi>() as u32);
+    let manual = ioc(
+        IOC_READ | IOC_WRITE,
+        DRM_IOCTL_BASE,
+        0xA0,
+        core::mem::size_of::<DrmModeCardResUapi>() as u32,
+    );
     if manual != DRM_IOCTL_MODE_GETRESOURCES {
-        return TestResult::Fail("ioc(READ|WRITE,'d',0xA0,sz_card_res) != DRM_IOCTL_MODE_GETRESOURCES");
+        return TestResult::Fail(
+            "ioc(READ|WRITE,'d',0xA0,sz_card_res) != DRM_IOCTL_MODE_GETRESOURCES",
+        );
     }
     // Decoders round-trip back to the inputs.
     if ioc_nr(DRM_IOCTL_MODE_GETRESOURCES) != 0xA0 {
@@ -143,7 +148,10 @@ fn smoke_drm_unknown_ioctl_returns_unsupported() -> TestResult {
         _ => TestResult::Fail("unknown ioctl did not surface Unsupported"),
     }
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_unknown_ioctl_returns_unsupported);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_unknown_ioctl_returns_unsupported
+);
 
 // ── 3. DRM_IOCTL_VERSION populates name buffer ─────────────────────────
 
@@ -187,7 +195,10 @@ fn smoke_drm_ioctl_version_writes_driver_name() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_version_writes_driver_name);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_version_writes_driver_name
+);
 
 // ── 4. DRM_IOCTL_MODE_GETRESOURCES returns CRTC count > 0 ──────────────
 
@@ -215,7 +226,10 @@ fn smoke_drm_ioctl_getresources_counts_crtcs() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_getresources_counts_crtcs);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_getresources_counts_crtcs
+);
 
 // ── 5. GETRESOURCES writes CRTC IDs when caller supplies array ─────────
 
@@ -243,7 +257,10 @@ fn smoke_drm_ioctl_getresources_populates_crtc_ids() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_getresources_populates_crtc_ids);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_getresources_populates_crtc_ids
+);
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
 
@@ -298,7 +315,10 @@ fn smoke_drm_render_fd_accepts_gem_close() -> TestResult {
         Err(_) => TestResult::Fail("GEM_CLOSE returned unexpected error"),
     }
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_render_fd_accepts_gem_close);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_render_fd_accepts_gem_close
+);
 
 // ── 8. DRM_IOCTL_MODE_ATOMIC succeeds on empty state ───────────────────
 
@@ -320,7 +340,10 @@ fn smoke_drm_ioctl_atomic_empty_commit_succeeds() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_ioctl_atomic_empty_commit_succeeds);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_atomic_empty_commit_succeeds
+);
 
 // ── 9. ENOTTY on a registered card for an unknown 'd'-type ioctl ───────
 
@@ -335,7 +358,10 @@ fn smoke_drm_unrecognised_drm_cmd_returns_unsupported() -> TestResult {
         _ => TestResult::Fail("unrecognised cmd did not return Unsupported"),
     }
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_unrecognised_drm_cmd_returns_unsupported);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_unrecognised_drm_cmd_returns_unsupported
+);
 
 // ── 10. Card with no mode_state attached returns Unsupported ───────────
 
@@ -350,7 +376,10 @@ fn smoke_drm_card_without_state_is_unsupported() -> TestResult {
         _ => TestResult::Fail("card without mode_state should return Unsupported"),
     }
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_card_without_state_is_unsupported);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_card_without_state_is_unsupported
+);
 
 // ── 11. FileOps::ioctl default returns Unsupported (proxy for ENOTTY) ──
 
@@ -385,7 +414,10 @@ fn smoke_fileops_ioctl_default_returns_unsupported() -> TestResult {
         _ => TestResult::Fail("default FileOps::ioctl should return Unsupported"),
     }
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_fileops_ioctl_default_returns_unsupported);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_fileops_ioctl_default_returns_unsupported
+);
 
 // ── 12. DriCardFile primary node delegates through dispatch_card ───────
 
@@ -401,10 +433,7 @@ fn smoke_dri_card_file_ioctl_routes_through_bridge() -> TestResult {
         None => return TestResult::Fail("DriDir::lookup failed"),
     };
     let mut req = DrmModeCardResUapi::default();
-    let r = f.ioctl(
-        DRM_IOCTL_MODE_GETRESOURCES,
-        &mut req as *mut _ as usize,
-    );
+    let r = f.ioctl(DRM_IOCTL_MODE_GETRESOURCES, &mut req as *mut _ as usize);
     if r.is_err() {
         return TestResult::Fail("DriCardFile::ioctl returned error");
     }
@@ -413,7 +442,10 @@ fn smoke_dri_card_file_ioctl_routes_through_bridge() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_dri_card_file_ioctl_routes_through_bridge);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_dri_card_file_ioctl_routes_through_bridge
+);
 
 // ── 13. DriRenderFile render node rejects SETCRTC ──────────────────────
 
@@ -434,7 +466,10 @@ fn smoke_dri_render_file_setcrtc_eacces() -> TestResult {
         Err(_) => TestResult::Fail("DriRenderFile SETCRTC wrong error variant"),
     }
 }
-kernel_test_in!("drivers/gpu/drm_ioctl", smoke_dri_render_file_setcrtc_eacces);
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_dri_render_file_setcrtc_eacces
+);
 
 // Anchor the kernel-test framework imports so the kernel-test feature
 // doesn't trip a "use never used" warning on cfg-out builds.

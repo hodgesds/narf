@@ -357,7 +357,10 @@ struct Frame<'b, 'c> {
 
 impl<'b, 'c> Frame<'b, 'c> {
     fn u8_at(&self, off: usize) -> Result<u8, AtomError> {
-        self.code.get(off).copied().ok_or(AtomError::BytecodeTruncated)
+        self.code
+            .get(off)
+            .copied()
+            .ok_or(AtomError::BytecodeTruncated)
     }
     fn u16_at(&self, off: usize) -> Result<u16, AtomError> {
         if off + 1 >= self.code.len() {
@@ -811,7 +814,12 @@ fn op_jump(
     Ok(())
 }
 
-fn op_delay(_state: &mut AtomState, frame: &Frame, _unit: u8, ptr: &mut usize) -> Result<(), AtomError> {
+fn op_delay(
+    _state: &mut AtomState,
+    frame: &Frame,
+    _unit: u8,
+    ptr: &mut usize,
+) -> Result<(), AtomError> {
     // Linux calls udelay/mdelay/msleep. In NARF kernel we'd hook
     // through `narf_time` here; for the Stage-9 cut we just step
     // past the operand byte. Real driver wires a sleep callback.
@@ -884,11 +892,7 @@ fn op_setfbbase(
     Ok(())
 }
 
-fn op_setdatablock(
-    state: &mut AtomState,
-    frame: &Frame,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
+fn op_setdatablock(state: &mut AtomState, frame: &Frame, ptr: &mut usize) -> Result<(), AtomError> {
     let idx = frame.u8_at(*ptr)?;
     *ptr += 1;
     if idx == 0 {
@@ -1040,11 +1044,7 @@ fn op_mask(
     put_dst(state, frame, arg, attr, &mut dptr, result, saved)
 }
 
-fn op_switch(
-    state: &mut AtomState,
-    frame: &mut Frame,
-    ptr: &mut usize,
-) -> Result<(), AtomError> {
+fn op_switch(state: &mut AtomState, frame: &mut Frame, ptr: &mut usize) -> Result<(), AtomError> {
     let attr = frame.u8_at(*ptr)?;
     *ptr += 1;
     let src = get_src(state, frame, attr, ptr)?;
@@ -1401,7 +1401,7 @@ mod inline_tests {
         // ADD(WS=op45) attr=0x05 dst idx byte = 2, imm = 0x11 0 0 0.
         let code = &[
             3, 0x05, 2, 0xAA, 0, 0, 0, // MOVE WS[2] <- 0xAA
-            45, 0x05, 2, 0x11, 0, 0, 0, // ADD WS[2] += 0x11
+            45, 0x05, 2, 0x11, 0, 0, 0,  // ADD WS[2] += 0x11
             91, // EOT
         ];
         let mut state = AtomState::new(8, 4);
@@ -1434,10 +1434,10 @@ mod inline_tests {
         let code = &[
             2, 0x05, 0, 0x42, 0, 0, 0, // MOVE PS[0] <- 0x42
             61, 0x05, 0, 0x42, 0, 0, 0, // COMPARE PS[0] vs IMM 0x42
-            68, 25, 0, // JUMP_EQUAL → local 19
+            68, 25, 0,    // JUMP_EQUAL → local 19
             0x77, // unreachable
             0x77, // unreachable
-            91, // EOT @ local 19
+            91,   // EOT @ local 19
         ];
         assert_eq!(code.len(), 20);
         let mut state = AtomState::new(8, 4);

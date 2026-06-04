@@ -112,9 +112,7 @@ pub enum MesPriority {
 ///   bits[19:12] = dwsize (incl. header)
 ///   bits[31:20] = reserved
 pub fn make_api_header(opcode: MesApiOpcode, dwsize: u32) -> u32 {
-    (MES_API_TYPE_SCHEDULER & 0xF)
-        | (((opcode as u32) & 0xFF) << 4)
-        | ((dwsize & 0xFF) << 12)
+    (MES_API_TYPE_SCHEDULER & 0xF) | (((opcode as u32) & 0xFF) << 4) | ((dwsize & 0xFF) << 12)
 }
 
 /// Decode header (for testing): `(type, opcode, dwsize)`.
@@ -160,7 +158,7 @@ pub fn build_set_hw_resources(
     dws.push(0); // hi
     dws.push(0); // api_completion_fence_value lo
     dws.push(0); // hi
-    // Resource bitmasks.
+                 // Resource bitmasks.
     dws.push(vmid_mask_mmhub);
     dws.push(vmid_mask_gfxhub);
     dws.push(compute_hqd_mask as u32);
@@ -331,7 +329,11 @@ pub enum MesError {
 }
 
 impl MesRing {
-    pub fn new(ring_base_phys: u64, ring_size_bytes: u32, doorbell_index: u32) -> Result<Self, MesError> {
+    pub fn new(
+        ring_base_phys: u64,
+        ring_size_bytes: u32,
+        doorbell_index: u32,
+    ) -> Result<Self, MesError> {
         if ring_base_phys & 0xFFF != 0 {
             return Err(MesError::BadRingAlignment);
         }
@@ -537,7 +539,7 @@ mod smoke_tests {
         let mut r2 = MesRing::new(0x10_0000, 128 * 4, 0x80).expect("ring");
         r2.push_frame(&pkt).expect("push 1");
         let _ = r2.push_frame(&pkt); // may succeed (free = mask - in_flight)
-        // 3rd must fail.
+                                     // 3rd must fail.
         match r2.push_frame(&pkt) {
             Err(MesError::RingFull) => {}
             Ok(_) => return TestResult::Fail("3rd push of 64 dws to 128-dw ring should fail"),

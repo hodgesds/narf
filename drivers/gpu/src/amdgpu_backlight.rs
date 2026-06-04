@@ -276,7 +276,11 @@ impl EdpPanelSequencer {
 
     /// Drive VideoValid → BacklightOn. Programs:
     ///   wait T4 → BL_EN on → wait T5 → PWM USER_LEVEL.
-    pub fn power_on_backlight<H: EdpPanelHw>(&mut self, hw: &mut H, user_level: u16) -> Result<(), PanelPowerError> {
+    pub fn power_on_backlight<H: EdpPanelHw>(
+        &mut self,
+        hw: &mut H,
+        user_level: u16,
+    ) -> Result<(), PanelPowerError> {
         if !matches!(self.state, EdpPanelState::VideoValid) {
             return Err(PanelPowerError::IllegalTransition);
         }
@@ -292,7 +296,10 @@ impl EdpPanelSequencer {
     /// Drive BacklightOn → BacklightOff. Programs:
     ///   PWM → 0 (start fading) → wait T7 → BL_EN off.
     /// State stays in BacklightOff until power_off_vdd advances it.
-    pub fn power_off_backlight<H: EdpPanelHw>(&mut self, hw: &mut H) -> Result<(), PanelPowerError> {
+    pub fn power_off_backlight<H: EdpPanelHw>(
+        &mut self,
+        hw: &mut H,
+    ) -> Result<(), PanelPowerError> {
         if !matches!(self.state, EdpPanelState::BacklightOn) {
             return Err(PanelPowerError::IllegalTransition);
         }
@@ -425,7 +432,8 @@ mod smoke_tests {
             return TestResult::Fail("not Off");
         }
         // Verify the recorded events have proper VDD on then off.
-        let vdd_events: Vec<&(&'static str, u32)> = hw.log.iter().filter(|e| e.0 == "vdd").collect();
+        let vdd_events: Vec<&(&'static str, u32)> =
+            hw.log.iter().filter(|e| e.0 == "vdd").collect();
         if vdd_events.len() != 2 {
             return TestResult::Fail("expected 2 VDD events");
         }

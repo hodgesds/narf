@@ -228,10 +228,7 @@ pub fn build_ih4_ring_init(
     seq.push(ih_base + IH_RB_BASE_HI_REL, (ring_phys >> 40) as u32);
 
     // Step 3: wptr writeback.
-    seq.push(
-        ih_base + IH_RB_WPTR_ADDR_LO_REL,
-        wptr_writeback_phys as u32,
-    );
+    seq.push(ih_base + IH_RB_WPTR_ADDR_LO_REL, wptr_writeback_phys as u32);
     seq.push(
         ih_base + IH_RB_WPTR_ADDR_HI_REL,
         (wptr_writeback_phys >> 32) as u32,
@@ -257,10 +254,7 @@ pub fn build_ih4_ring_init(
     );
 
     // Step 7: enable (LAST write).
-    seq.push(
-        ih_base + IH_RB_CNTL_REL,
-        cntl_no_enable | IH_RB_ENABLE,
-    );
+    seq.push(ih_base + IH_RB_CNTL_REL, cntl_no_enable | IH_RB_ENABLE);
 
     Ok(seq)
 }

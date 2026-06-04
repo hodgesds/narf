@@ -265,10 +265,7 @@ impl HpdMachine {
     /// glue between the HPD ISR and the KMS view. Returns the
     /// new status the KMS recorded (so caller can correlate
     /// with mode-set scheduling).
-    pub fn apply_to_kms(
-        kms: &mut KmsState,
-        outcome: HpdOutcome,
-    ) -> Option<ConnectorStatus> {
+    pub fn apply_to_kms(kms: &mut KmsState, outcome: HpdOutcome) -> Option<ConnectorStatus> {
         match outcome {
             HpdOutcome::Connected { connector_idx } => {
                 // Drop any stale status to ensure transition logic
@@ -464,10 +461,7 @@ mod smoke_tests {
             return TestResult::Fail("setup error: initial status");
         }
         // Connected outcome flips it.
-        let r = HpdMachine::apply_to_kms(
-            &mut kms,
-            HpdOutcome::Connected { connector_idx: 0 },
-        );
+        let r = HpdMachine::apply_to_kms(&mut kms, HpdOutcome::Connected { connector_idx: 0 });
         if r != Some(ConnectorStatus::Connected) {
             return TestResult::Fail("apply_to_kms didn't return Connected");
         }
@@ -485,11 +479,7 @@ mod smoke_tests {
 
     fn smoke_hpd_connector_capability() -> TestResult {
         // External connectors use HPD.
-        for k in [
-            ConnectorKind::Dp,
-            ConnectorKind::HdmiA,
-            ConnectorKind::DviI,
-        ] {
+        for k in [ConnectorKind::Dp, ConnectorKind::HdmiA, ConnectorKind::DviI] {
             if !HpdMachine::connector_uses_hpd(k) {
                 return TestResult::Fail("external should use HPD");
             }

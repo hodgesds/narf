@@ -172,10 +172,7 @@ pub trait ResetMmio {
 ///   1. Read GRBM_SOFT_RESET, OR in the engine's bit, write back.
 ///   2. Wait ~50 µs for the engine to halt.
 ///   3. Clear the bit (write back without it) — engine restarts.
-pub fn apply_soft_reset<M: ResetMmio>(
-    mmio: &mut M,
-    engine: ResetEngine,
-) {
+pub fn apply_soft_reset<M: ResetMmio>(mmio: &mut M, engine: ResetEngine) {
     let bit = soft_reset_bit(engine);
     let cur = mmio.read(GRBM_SOFT_RESET_OFFSET);
     mmio.write(GRBM_SOFT_RESET_OFFSET, cur | bit);

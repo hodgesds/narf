@@ -64,11 +64,8 @@ pub const GART_PTE_PFN_MASK: u64 = 0x0FFF_FFFF;
 
 /// Composite flag set for the typical "sysmem readable + writable
 /// cacheable + snoop" mapping the driver creates for GTT pages.
-pub const GART_PTE_FLAGS_GTT_DEFAULT: u64 = GART_PTE_VALID
-    | GART_PTE_SYSTEM
-    | GART_PTE_CACHEABLE
-    | GART_PTE_WRITABLE
-    | GART_PTE_SNOOP;
+pub const GART_PTE_FLAGS_GTT_DEFAULT: u64 =
+    GART_PTE_VALID | GART_PTE_SYSTEM | GART_PTE_CACHEABLE | GART_PTE_WRITABLE | GART_PTE_SNOOP;
 
 // ── PTE builder ────────────────────────────────────────────────────
 

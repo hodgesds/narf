@@ -61,10 +61,7 @@ pub const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
 /// `_IOC` in `include/uapi/asm-generic/ioctl.h`.
 #[inline]
 pub const fn ioc(dir: u32, type_: u32, nr: u32, size: u32) -> u32 {
-    (dir << IOC_DIRSHIFT)
-        | (type_ << IOC_TYPESHIFT)
-        | (nr << IOC_NRSHIFT)
-        | (size << IOC_SIZESHIFT)
+    (dir << IOC_DIRSHIFT) | (type_ << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT) | (size << IOC_SIZESHIFT)
 }
 
 /// `_IO(type, nr)` — no-arg ioctl.
@@ -130,26 +127,26 @@ pub const DRM_IOCTL_BASE: u32 = b'd' as u32;
 // DRM_IOCTL_* number. They match the Linux uapi struct layout
 // (#[repr(C)]) on x86_64.
 
-pub const SZ_DRM_VERSION: u32 = 64;            // drm_version
-pub const SZ_DRM_GET_CAP: u32 = 16;            // drm_get_cap
-pub const SZ_DRM_PRIME_HANDLE: u32 = 16;       // drm_prime_handle
-pub const SZ_DRM_MODE_CARD_RES: u32 = 64;      // drm_mode_card_res
-pub const SZ_DRM_MODE_CRTC: u32 = 104;         // drm_mode_crtc
-pub const SZ_DRM_MODE_GET_PLANE: u32 = 48;     // drm_mode_get_plane
+pub const SZ_DRM_VERSION: u32 = 64; // drm_version
+pub const SZ_DRM_GET_CAP: u32 = 16; // drm_get_cap
+pub const SZ_DRM_PRIME_HANDLE: u32 = 16; // drm_prime_handle
+pub const SZ_DRM_MODE_CARD_RES: u32 = 64; // drm_mode_card_res
+pub const SZ_DRM_MODE_CRTC: u32 = 104; // drm_mode_crtc
+pub const SZ_DRM_MODE_GET_PLANE: u32 = 48; // drm_mode_get_plane
 pub const SZ_DRM_MODE_GET_PLANE_RES: u32 = 16; // drm_mode_get_plane_res
-pub const SZ_DRM_MODE_GET_ENCODER: u32 = 20;   // drm_mode_get_encoder
+pub const SZ_DRM_MODE_GET_ENCODER: u32 = 20; // drm_mode_get_encoder
 pub const SZ_DRM_MODE_GET_CONNECTOR: u32 = 80; // drm_mode_get_connector
-pub const SZ_DRM_MODE_GET_PROPERTY: u32 = 64;  // drm_mode_get_property
-pub const SZ_DRM_MODE_FB_CMD2: u32 = 80;       // drm_mode_fb_cmd2
-pub const SZ_DRM_MODE_RMFB: u32 = 4;           // drm_mode_rmfb
-pub const SZ_DRM_MODE_ATOMIC: u32 = 56;        // drm_mode_atomic
-pub const SZ_DRM_MODE_CREATE_BLOB: u32 = 32;   // drm_mode_create_blob
-pub const SZ_DRM_MODE_DESTROY_BLOB: u32 = 4;   // drm_mode_destroy_blob
-pub const SZ_DRM_GEM_CLOSE: u32 = 16;          // drm_gem_close
-pub const SZ_DRM_SYNCOBJ_CREATE: u32 = 8;      // drm_syncobj_create
-pub const SZ_DRM_SYNCOBJ_DESTROY: u32 = 8;     // drm_syncobj_destroy
-pub const SZ_DRM_SYNCOBJ_WAIT: u32 = 32;       // drm_syncobj_wait
-pub const SZ_DRM_SYNCOBJ_HANDLE: u32 = 24;     // drm_syncobj_handle
+pub const SZ_DRM_MODE_GET_PROPERTY: u32 = 64; // drm_mode_get_property
+pub const SZ_DRM_MODE_FB_CMD2: u32 = 80; // drm_mode_fb_cmd2
+pub const SZ_DRM_MODE_RMFB: u32 = 4; // drm_mode_rmfb
+pub const SZ_DRM_MODE_ATOMIC: u32 = 56; // drm_mode_atomic
+pub const SZ_DRM_MODE_CREATE_BLOB: u32 = 32; // drm_mode_create_blob
+pub const SZ_DRM_MODE_DESTROY_BLOB: u32 = 4; // drm_mode_destroy_blob
+pub const SZ_DRM_GEM_CLOSE: u32 = 16; // drm_gem_close
+pub const SZ_DRM_SYNCOBJ_CREATE: u32 = 8; // drm_syncobj_create
+pub const SZ_DRM_SYNCOBJ_DESTROY: u32 = 8; // drm_syncobj_destroy
+pub const SZ_DRM_SYNCOBJ_WAIT: u32 = 32; // drm_syncobj_wait
+pub const SZ_DRM_SYNCOBJ_HANDLE: u32 = 24; // drm_syncobj_handle
 
 // ── DRM_IOCTL_* numbers ────────────────────────────────────────────────
 //
@@ -188,8 +185,7 @@ pub const DRM_IOCTL_MODE_SETCRTC: u32 = iowr(DRM_IOCTL_BASE, 0xA2, SZ_DRM_MODE_C
 pub const DRM_IOCTL_MODE_GETENCODER: u32 = iowr(DRM_IOCTL_BASE, 0xA6, SZ_DRM_MODE_GET_ENCODER);
 
 /// DRM_IOCTL_MODE_GETCONNECTOR = _IOWR('d', 0xa7, struct drm_mode_get_connector).
-pub const DRM_IOCTL_MODE_GETCONNECTOR: u32 =
-    iowr(DRM_IOCTL_BASE, 0xA7, SZ_DRM_MODE_GET_CONNECTOR);
+pub const DRM_IOCTL_MODE_GETCONNECTOR: u32 = iowr(DRM_IOCTL_BASE, 0xA7, SZ_DRM_MODE_GET_CONNECTOR);
 
 /// DRM_IOCTL_MODE_RMFB = _IOWR('d', 0xaf, struct drm_mode_rmfb).
 pub const DRM_IOCTL_MODE_RMFB: u32 = iowr(DRM_IOCTL_BASE, 0xAF, SZ_DRM_MODE_RMFB);
@@ -211,8 +207,7 @@ pub const DRM_IOCTL_MODE_ADDFB2: u32 = iowr(DRM_IOCTL_BASE, 0xB8, SZ_DRM_MODE_FB
 pub const DRM_IOCTL_MODE_ATOMIC: u32 = iowr(DRM_IOCTL_BASE, 0xBC, SZ_DRM_MODE_ATOMIC);
 
 /// DRM_IOCTL_MODE_CREATEPROPBLOB = _IOWR('d', 0xbd, struct drm_mode_create_blob).
-pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 =
-    iowr(DRM_IOCTL_BASE, 0xBD, SZ_DRM_MODE_CREATE_BLOB);
+pub const DRM_IOCTL_MODE_CREATEPROPBLOB: u32 = iowr(DRM_IOCTL_BASE, 0xBD, SZ_DRM_MODE_CREATE_BLOB);
 
 /// DRM_IOCTL_MODE_DESTROYPROPBLOB = _IOWR('d', 0xbe, struct drm_mode_destroy_blob).
 pub const DRM_IOCTL_MODE_DESTROYPROPBLOB: u32 =
@@ -225,12 +220,10 @@ pub const DRM_IOCTL_SYNCOBJ_CREATE: u32 = iowr(DRM_IOCTL_BASE, 0xBF, SZ_DRM_SYNC
 pub const DRM_IOCTL_SYNCOBJ_DESTROY: u32 = iowr(DRM_IOCTL_BASE, 0xC0, SZ_DRM_SYNCOBJ_DESTROY);
 
 /// DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD = _IOWR('d', 0xc1, struct drm_syncobj_handle).
-pub const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 =
-    iowr(DRM_IOCTL_BASE, 0xC1, SZ_DRM_SYNCOBJ_HANDLE);
+pub const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u32 = iowr(DRM_IOCTL_BASE, 0xC1, SZ_DRM_SYNCOBJ_HANDLE);
 
 /// DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE = _IOWR('d', 0xc2, struct drm_syncobj_handle).
-pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 =
-    iowr(DRM_IOCTL_BASE, 0xC2, SZ_DRM_SYNCOBJ_HANDLE);
+pub const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u32 = iowr(DRM_IOCTL_BASE, 0xC2, SZ_DRM_SYNCOBJ_HANDLE);
 
 /// DRM_IOCTL_SYNCOBJ_WAIT = _IOWR('d', 0xc3, struct drm_syncobj_wait).
 pub const DRM_IOCTL_SYNCOBJ_WAIT: u32 = iowr(DRM_IOCTL_BASE, 0xC3, SZ_DRM_SYNCOBJ_WAIT);
@@ -249,7 +242,7 @@ pub struct DrmVersionUapi {
     pub version_minor: i32,
     pub version_patchlevel: i32,
     /// In: capacity of `name`. Out: actual length (excluding NUL).
-    pub name_len: u64,   // __kernel_size_t — 8 bytes on LP64.
+    pub name_len: u64, // __kernel_size_t — 8 bytes on LP64.
     /// User-pointer to writable buffer for the driver name.
     pub name: u64,
     pub date_len: u64,
@@ -278,8 +271,7 @@ pub struct DrmModeCardResUapi {
     pub max_height: u32,
 }
 
-const _: () =
-    assert!(core::mem::size_of::<DrmModeCardResUapi>() == SZ_DRM_MODE_CARD_RES as usize);
+const _: () = assert!(core::mem::size_of::<DrmModeCardResUapi>() == SZ_DRM_MODE_CARD_RES as usize);
 
 /// `struct drm_mode_atomic` from `include/uapi/drm/drm_mode.h`.
 #[repr(C)]

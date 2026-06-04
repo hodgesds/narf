@@ -273,10 +273,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_regions",
-        smoke_gen12_has_all_kinds
-    );
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_gen12_has_all_kinds);
 
     fn smoke_regions_fit_in_bar0() -> TestResult {
         // BAR0 (GTTMMADR) on Gen12 is 16 MiB total: 8 MiB MMIO half
@@ -289,10 +286,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_regions",
-        smoke_regions_fit_in_bar0
-    );
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_regions_fit_in_bar0);
 
     fn smoke_display_contains_pipes() -> TestResult {
         // Pipe A base is `0x60000` per intel_gpu_pipes; it must
@@ -320,18 +314,14 @@ pub mod tests {
     );
 
     fn smoke_gtt_adr_second_half() -> TestResult {
-        let r = region_of(RegionGeneration::Gen12, RegionKind::GttAdr)
-            .expect("GTTADR present");
+        let r = region_of(RegionGeneration::Gen12, RegionKind::GttAdr).expect("GTTADR present");
         // Second half of a 16 MiB BAR.
         if r.offset != 0x0080_0000 || r.size != 0x0080_0000 {
             return TestResult::Fail("GTTADR should be the second 8 MiB of BAR0");
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_regions",
-        smoke_gtt_adr_second_half
-    );
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_gtt_adr_second_half);
 
     fn smoke_region_kind_roundtrip() -> TestResult {
         for kind in [
@@ -352,8 +342,5 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/intel_gpu_regions",
-        smoke_region_kind_roundtrip
-    );
+    kernel_test_in!("drivers/gpu/intel_gpu_regions", smoke_region_kind_roundtrip);
 }

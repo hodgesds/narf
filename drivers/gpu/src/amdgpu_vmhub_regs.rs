@@ -562,7 +562,11 @@ mod smoke_tests {
             return TestResult::Fail("tlb invalidate failed");
         }
         // One write to REQ should have happened.
-        if !m.writes.iter().any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2) {
+        if !m
+            .writes
+            .iter()
+            .any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2)
+        {
             return TestResult::Fail("REQ register not written");
         }
         TestResult::Pass
@@ -571,9 +575,7 @@ mod smoke_tests {
 
     fn smoke_invalidate_tlb_bad_vmid_rejected() -> TestResult {
         let mut m = MockVmHubMmio::new();
-        if write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 17, 0)
-            != Err(TlbInvalidateError::BadVmid)
-        {
+        if write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 17, 0) != Err(TlbInvalidateError::BadVmid) {
             return TestResult::Fail("VMID 17 should be rejected");
         }
         TestResult::Pass
@@ -587,10 +589,18 @@ mod smoke_tests {
         m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 5));
         broadcast_invalidate_tlb(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 5, 0)
             .expect("broadcast");
-        if !g.writes.iter().any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2) {
+        if !g
+            .writes
+            .iter()
+            .any(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2)
+        {
             return TestResult::Fail("GFX hub not written");
         }
-        if !m.writes.iter().any(|(off, _)| *off == MMHUB_V3_0.inv_eng0_req << 2) {
+        if !m
+            .writes
+            .iter()
+            .any(|(off, _)| *off == MMHUB_V3_0.inv_eng0_req << 2)
+        {
             return TestResult::Fail("MM hub not written");
         }
         TestResult::Pass
@@ -613,5 +623,8 @@ mod smoke_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_invalidate_vmid_full_uses_range_flush_type);
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_invalidate_vmid_full_uses_range_flush_type
+    );
 }

@@ -336,31 +336,19 @@ pub enum PipelineAction {
     },
     /// Stream `stream_idx` was removed. Caller disables the
     /// stream's pipe.
-    StreamRemoved {
-        crtc_idx: u8,
-    },
+    StreamRemoved { crtc_idx: u8 },
     /// Stream `stream_idx`'s primary surface address changed.
     /// Caller does a page-flip (HUBP_PRIMARY_SURFACE_ADDRESS_*
     /// rewrite).
-    PrimaryFlip {
-        stream_idx: u8,
-        new_phys: u64,
-    },
+    PrimaryFlip { stream_idx: u8, new_phys: u64 },
     /// Stream `stream_idx`'s timing changed — full modeset
     /// (cannot live-reprogram OTG).
-    TimingChanged {
-        stream_idx: u8,
-    },
+    TimingChanged { stream_idx: u8 },
     /// Stream `stream_idx`'s plane composition changed —
     /// reprogram MPC tree.
-    PlanesChanged {
-        stream_idx: u8,
-    },
+    PlanesChanged { stream_idx: u8 },
     /// Active flag flipped — write OPTC_MASTER_EN.
-    ActiveChanged {
-        stream_idx: u8,
-        active: bool,
-    },
+    ActiveChanged { stream_idx: u8, active: bool },
 }
 
 /// Diff old → new state and produce the action sequence the
@@ -554,7 +542,9 @@ mod smoke_tests {
             return TestResult::Fail("missing primary not caught");
         }
         // Restore + clobber timing.
-        s.streams[0].planes.push(make_primary(0x1000_0000, 1920, 1080));
+        s.streams[0]
+            .planes
+            .push(make_primary(0x1000_0000, 1920, 1080));
         s.streams[0].timing.h_active = 0;
         if validate_state(&s) != Err(DcError::InvalidTiming) {
             return TestResult::Fail("invalid timing not caught");
@@ -590,10 +580,18 @@ mod smoke_tests {
 
         let actions = diff_state(&old, &new);
         // Expect: remove crtc=1, flip stream 0, add stream new on CRTC 2.
-        let has_remove = actions.iter().any(|a| matches!(a, PipelineAction::StreamRemoved { crtc_idx: 1 }));
-        let has_flip = actions
+        let has_remove = actions
             .iter()
-            .any(|a| matches!(a, PipelineAction::PrimaryFlip { new_phys: 0x1500_0000, .. }));
+            .any(|a| matches!(a, PipelineAction::StreamRemoved { crtc_idx: 1 }));
+        let has_flip = actions.iter().any(|a| {
+            matches!(
+                a,
+                PipelineAction::PrimaryFlip {
+                    new_phys: 0x1500_0000,
+                    ..
+                }
+            )
+        });
         let has_add = actions
             .iter()
             .any(|a| matches!(a, PipelineAction::StreamAdded { crtc_idx: 2, .. }));
@@ -620,7 +618,9 @@ mod smoke_tests {
         new.add_stream(s).expect("a'");
 
         let actions = diff_state(&old, &new);
-        let has_timing = actions.iter().any(|a| matches!(a, PipelineAction::TimingChanged { .. }));
+        let has_timing = actions
+            .iter()
+            .any(|a| matches!(a, PipelineAction::TimingChanged { .. }));
         if !has_timing {
             return TestResult::Fail("diff missed TimingChanged");
         }

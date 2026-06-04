@@ -564,8 +564,14 @@ mod smoke_tests {
 
     fn smoke_dpm_apply_inputs_low() -> TestResult {
         let mut d = Dpm::new();
-        d.register_table(DpmTable::new(ClockDomain::Gfxclk, alloc::vec![100, 500, 1500]));
-        d.register_table(DpmTable::new(ClockDomain::Uclk, alloc::vec![800, 1200, 1600]));
+        d.register_table(DpmTable::new(
+            ClockDomain::Gfxclk,
+            alloc::vec![100, 500, 1500],
+        ));
+        d.register_table(DpmTable::new(
+            ClockDomain::Uclk,
+            alloc::vec![800, 1200, 1600],
+        ));
         d.set_level(PerfLevel::Low);
         let targets = d.apply_inputs(DpmInputs::default());
         if targets.len() != 2 {
@@ -582,8 +588,14 @@ mod smoke_tests {
 
     fn smoke_dpm_apply_inputs_game3d() -> TestResult {
         let mut d = Dpm::new();
-        d.register_table(DpmTable::new(ClockDomain::Gfxclk, alloc::vec![100, 500, 1500, 2400]));
-        d.register_table(DpmTable::new(ClockDomain::Uclk, alloc::vec![800, 1200, 1600]));
+        d.register_table(DpmTable::new(
+            ClockDomain::Gfxclk,
+            alloc::vec![100, 500, 1500, 2400],
+        ));
+        d.register_table(DpmTable::new(
+            ClockDomain::Uclk,
+            alloc::vec![800, 1200, 1600],
+        ));
         d.register_table(DpmTable::new(ClockDomain::Vclk, alloc::vec![300, 600, 900]));
         d.set_level(PerfLevel::Game3d);
         let targets = d.apply_inputs(DpmInputs {
@@ -591,15 +603,27 @@ mod smoke_tests {
             ..Default::default()
         });
         // GFX / UCLK at max, VCLK at mid.
-        let gfx = targets.iter().find(|(d, _)| *d == ClockDomain::Gfxclk).unwrap().1;
+        let gfx = targets
+            .iter()
+            .find(|(d, _)| *d == ClockDomain::Gfxclk)
+            .unwrap()
+            .1;
         if gfx != 3 {
             return TestResult::Fail("GFX not at max");
         }
-        let ucl = targets.iter().find(|(d, _)| *d == ClockDomain::Uclk).unwrap().1;
+        let ucl = targets
+            .iter()
+            .find(|(d, _)| *d == ClockDomain::Uclk)
+            .unwrap()
+            .1;
         if ucl != 2 {
             return TestResult::Fail("UCLK not at max");
         }
-        let vcl = targets.iter().find(|(d, _)| *d == ClockDomain::Vclk).unwrap().1;
+        let vcl = targets
+            .iter()
+            .find(|(d, _)| *d == ClockDomain::Vclk)
+            .unwrap()
+            .1;
         if vcl != 1 {
             return TestResult::Fail("VCLK not at mid");
         }
@@ -609,7 +633,10 @@ mod smoke_tests {
 
     fn smoke_dpm_apply_inputs_video() -> TestResult {
         let mut d = Dpm::new();
-        d.register_table(DpmTable::new(ClockDomain::Gfxclk, alloc::vec![100, 500, 1500]));
+        d.register_table(DpmTable::new(
+            ClockDomain::Gfxclk,
+            alloc::vec![100, 500, 1500],
+        ));
         d.register_table(DpmTable::new(ClockDomain::Vclk, alloc::vec![300, 600, 900]));
         d.register_table(DpmTable::new(ClockDomain::Dclk, alloc::vec![200, 400, 800]));
         d.set_level(PerfLevel::VideoEncode);
@@ -617,15 +644,27 @@ mod smoke_tests {
             vcn_decode_busy: true,
             ..Default::default()
         });
-        let gfx = targets.iter().find(|(d, _)| *d == ClockDomain::Gfxclk).unwrap().1;
+        let gfx = targets
+            .iter()
+            .find(|(d, _)| *d == ClockDomain::Gfxclk)
+            .unwrap()
+            .1;
         if gfx != 0 {
             return TestResult::Fail("GFX should be low for video");
         }
-        let vcl = targets.iter().find(|(d, _)| *d == ClockDomain::Vclk).unwrap().1;
+        let vcl = targets
+            .iter()
+            .find(|(d, _)| *d == ClockDomain::Vclk)
+            .unwrap()
+            .1;
         if vcl != 2 {
             return TestResult::Fail("VCLK should be max for video");
         }
-        let dcl = targets.iter().find(|(d, _)| *d == ClockDomain::Dclk).unwrap().1;
+        let dcl = targets
+            .iter()
+            .find(|(d, _)| *d == ClockDomain::Dclk)
+            .unwrap()
+            .1;
         if dcl != 2 {
             return TestResult::Fail("DCLK should be max for video");
         }
@@ -635,8 +674,14 @@ mod smoke_tests {
 
     fn smoke_dpm_auto_drifts_to_recommended() -> TestResult {
         let mut d = Dpm::new();
-        d.register_table(DpmTable::new(ClockDomain::Gfxclk, alloc::vec![100, 500, 1500, 2400]));
-        d.register_table(DpmTable::new(ClockDomain::Uclk, alloc::vec![800, 1200, 1600]));
+        d.register_table(DpmTable::new(
+            ClockDomain::Gfxclk,
+            alloc::vec![100, 500, 1500, 2400],
+        ));
+        d.register_table(DpmTable::new(
+            ClockDomain::Uclk,
+            alloc::vec![800, 1200, 1600],
+        ));
         // Start Auto + idle on battery — should drift to Low.
         d.set_level(PerfLevel::Auto);
         let _ = d.apply_inputs(DpmInputs {
@@ -734,9 +779,9 @@ mod smoke_tests {
             return TestResult::Fail("dispatch msg count off");
         }
         // GFX should be at level max=2 → 2400 MHz.
-        let gfx_msg = msgs.iter().find(|m| {
-            m.msg == PPSMC_MSG_SET_SOFT_MAX_BY_FREQ && m.param & 0xFF_FFFF == 2400
-        });
+        let gfx_msg = msgs
+            .iter()
+            .find(|m| m.msg == PPSMC_MSG_SET_SOFT_MAX_BY_FREQ && m.param & 0xFF_FFFF == 2400);
         if gfx_msg.is_none() {
             return TestResult::Fail("no SOFT_MAX for GFX at 2400");
         }

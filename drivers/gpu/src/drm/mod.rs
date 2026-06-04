@@ -27,24 +27,22 @@
 //! - AMD/NV-specific scheduler hardware integration (these slot in
 //!   under the [`scheduler::Sched`] front-end as JobPayload backends).
 
+pub mod atomic;
 pub mod card;
 pub mod gem;
 pub mod ioctl;
-pub mod render_node;
-pub mod atomic;
-pub mod syncobj;
-pub mod scheduler;
 pub mod prime;
+pub mod render_node;
+pub mod scheduler;
+pub mod syncobj;
 
+pub use atomic::{AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
 pub use card::{Card, CardError, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder};
 pub use gem::{GemError, GemHandle, GemObject};
 pub use ioctl::{dispatch, DrmIoctlError, IoctlCmd};
-pub use render_node::{
-    check_permission, DrmFileCtx, DrmMinor, IoctlFlags, MinorType, PermError,
-};
-pub use atomic::{AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState};
-pub use syncobj::{BinaryFence, DmaFence, SyncError, SyncObj, SyncObjTable};
+pub use prime::{DrmPrimeHandle, PrimeBinding, PrimeError, PrimeTable};
+pub use render_node::{check_permission, DrmFileCtx, DrmMinor, IoctlFlags, MinorType, PermError};
 pub use scheduler::{
     Job, JobFence, JobPayload, NoopPayload, Priority, Sched, SchedContext, SchedError,
 };
-pub use prime::{DrmPrimeHandle, PrimeBinding, PrimeError, PrimeTable};
+pub use syncobj::{BinaryFence, DmaFence, SyncError, SyncObj, SyncObjTable};

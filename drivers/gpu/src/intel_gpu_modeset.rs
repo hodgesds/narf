@@ -442,7 +442,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// Reference: Linux drivers/gpu/drm/i915/display/intel_pipe.c
     /// (`intel_disable_pipe`, `intel_disable_transcoder`).
     fn disable_pipeline(&mut self) {
-        use crate::intel_gpu_ddi::{DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET};
+        use crate::intel_gpu_ddi::{
+            DDI_BUF_CTL_ENABLE, DDI_BUF_CTL_IDLE_STATUS, DDI_BUF_CTL_OFFSET,
+        };
         use crate::intel_gpu_pipes::{
             Pipe as PipeIdx, Transcoder, PIPECONF_ENABLE, PIPECONF_OFFSET, PIPECONF_STATE,
             PLANE_CTL_ENABLE, PLANE_CTL_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SURF_OFFSET,
@@ -605,9 +607,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// the per-plane register writes in `skl_plane_update_*`).
     fn program_plane(&mut self, fb: &Framebuffer, mode: &Mode) {
         use crate::intel_gpu_pipes::{
-            build_primary_plane, Pipe as PipeIdx, PixelFormat as PipeFmt,
-            PLANE_CTL_OFFSET, PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET,
-            PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+            build_primary_plane, Pipe as PipeIdx, PixelFormat as PipeFmt, PLANE_CTL_OFFSET,
+            PLANE_OFFSET_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_SIZE_OFFSET, PLANE_STRIDE_OFFSET,
+            PLANE_SURF_OFFSET,
         };
         let pipe_fmt = match fb.format {
             // XRGB8888 → 8:8:8:8 ARGB encoding (alpha treated as
@@ -628,9 +630,11 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         // Per Linux skl_plane_update: program everything *except*
         // PLANE_CTL.ENABLE first, then the SURF register last —
         // writing SURF arms the plane on the next vblank.
-        self.mmio.write32(base + PLANE_STRIDE_OFFSET, prog.plane_stride);
+        self.mmio
+            .write32(base + PLANE_STRIDE_OFFSET, prog.plane_stride);
         self.mmio.write32(base + PLANE_SIZE_OFFSET, prog.plane_size);
-        self.mmio.write32(base + PLANE_OFFSET_OFFSET, prog.plane_offset);
+        self.mmio
+            .write32(base + PLANE_OFFSET_OFFSET, prog.plane_offset);
         // CTL with format + plane_enable; final flush via SURF.
         self.mmio.write32(base + PLANE_CTL_OFFSET, prog.plane_ctl);
         self.mmio.write32(base + PLANE_SURF_OFFSET, prog.plane_surf);
@@ -1028,8 +1032,7 @@ pub mod tests {
             v_sync_positive: true,
         };
         let t: DisplayTiming = super::mode_to_display_timing(&m);
-        if t.hactive != 1920 || t.htotal != 2200 || t.hblank_start != 1920 || t.hblank_end != 2200
-        {
+        if t.hactive != 1920 || t.htotal != 2200 || t.hblank_start != 1920 || t.hblank_end != 2200 {
             return TestResult::Fail("horizontal blank packing");
         }
         if t.hsync_start != 2008 || t.hsync_end != 2052 {
@@ -1203,7 +1206,8 @@ pub mod tests {
         ms.disable_pipeline();
 
         // Plane CTL write must clear ENABLE.
-        let plane_writes = mmio.writes_to(PipeIdx::A.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET);
+        let plane_writes =
+            mmio.writes_to(PipeIdx::A.base() + PLANE_PRIMARY_OFFSET + PLANE_CTL_OFFSET);
         if plane_writes.is_empty() || plane_writes.iter().any(|w| w & PLANE_CTL_ENABLE != 0) {
             return TestResult::Fail("plane CTL ENABLE not cleared");
         }

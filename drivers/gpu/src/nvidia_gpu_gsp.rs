@@ -232,9 +232,7 @@ pub mod tests {
     fn smoke_frame_alignment_zero_payload() -> TestResult {
         let frame = build_frame(FN_NOP, 0, &[]).expect("clean inputs");
         if frame.len() != HEADER_LEN {
-            return TestResult::Fail(
-                "zero-payload frame should be exactly the 32-byte header",
-            );
+            return TestResult::Fail("zero-payload frame should be exactly the 32-byte header");
         }
         TestResult::Pass
     }

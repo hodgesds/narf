@@ -126,10 +126,7 @@ pub fn build_method(
     if count > 0x1FFF {
         return Err(FifoError::TooManyParameters);
     }
-    let v = ((method as u32) >> 2)
-        | sub.encode()
-        | ((count as u32) << 16)
-        | mode.encode();
+    let v = ((method as u32) >> 2) | sub.encode() | ((count as u32) << 16) | mode.encode();
     Ok(v)
 }
 

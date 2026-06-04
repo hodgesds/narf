@@ -181,11 +181,7 @@ impl VmidPool {
     /// Bind a PASID to a VMID. If the PASID already has a VMID
     /// in this hub, bump its LRU tag and return it. Otherwise
     /// pick a free slot or evict the LRU.
-    pub fn bind(
-        &mut self,
-        pasid: Pasid,
-        page_table_root_phys: u64,
-    ) -> Result<u8, VmidError> {
+    pub fn bind(&mut self, pasid: Pasid, page_table_root_phys: u64) -> Result<u8, VmidError> {
         if pasid == 0 {
             return Err(VmidError::BadPasid);
         }
@@ -214,12 +210,7 @@ impl VmidPool {
     /// to LRU eviction.
     fn allocate_slot(&mut self) -> Result<u8, VmidError> {
         // Free slot wins.
-        for (i, s) in self
-            .slots
-            .iter()
-            .enumerate()
-            .skip(FIRST_USER_VMID as usize)
-        {
+        for (i, s) in self.slots.iter().enumerate().skip(FIRST_USER_VMID as usize) {
             if s.is_free() {
                 return Ok(i as u8);
             }
@@ -227,11 +218,7 @@ impl VmidPool {
         // No free slot — evict LRU.
         let victim = self.lru.pop_front().ok_or(VmidError::NoVictim)?;
         // Drop the evicted PASID's mapping.
-        if let Some(pos) = self
-            .pasid_to_vmid
-            .iter()
-            .position(|(_, v)| *v == victim)
-        {
+        if let Some(pos) = self.pasid_to_vmid.iter().position(|(_, v)| *v == victim) {
             self.pasid_to_vmid.swap_remove(pos);
         }
         self.slots[victim as usize] = VmidState::Free;
@@ -304,12 +291,7 @@ impl VmidPool {
         regs: &crate::amdgpu_vmhub_regs::VmHubRegs,
     ) -> Result<u8, VmidError> {
         let vmid = self.bind(pasid, page_table_root_phys)?;
-        crate::amdgpu_vmhub_regs::write_vmid_pt_base(
-            mmio,
-            regs,
-            vmid,
-            page_table_root_phys,
-        );
+        crate::amdgpu_vmhub_regs::write_vmid_pt_base(mmio, regs, vmid, page_table_root_phys);
         Ok(vmid)
     }
 
@@ -438,7 +420,8 @@ mod smoke_tests {
         let mut p = VmidPool::new(VmHub::Gfx);
         // Saturate: 15 user VMIDs (PASIDs 1..=15) → all taken.
         for pasid in 1..=15 {
-            p.bind(pasid as Pasid, (pasid as u64) << 12).expect("saturate");
+            p.bind(pasid as Pasid, (pasid as u64) << 12)
+                .expect("saturate");
         }
         if !p.is_saturated() {
             return TestResult::Fail("not saturated after 15 binds");
@@ -524,8 +507,8 @@ mod smoke_tests {
             return TestResult::Fail("expected 2 MMIO writes from bind+program");
         }
         // The lo register write should match the per-VMID stride.
-        let want_lo = (GFXHUB_V3_0.ctx0_pt_base_lo + (vmid as u32) * GFXHUB_V3_0.ctx_addr_distance)
-            << 2;
+        let want_lo =
+            (GFXHUB_V3_0.ctx0_pt_base_lo + (vmid as u32) * GFXHUB_V3_0.ctx_addr_distance) << 2;
         if mmio.writes[0].0 != want_lo {
             return TestResult::Fail("lo register offset wrong");
         }

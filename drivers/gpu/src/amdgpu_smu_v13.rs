@@ -20,8 +20,8 @@
 //! + `smu_v13_0_4_ppt.c::smu_v13_0_4_message_map`
 //! (GPL-2.0-or-later; NARF relicensed 2026-05-20).
 
-use crate::amdgpu_smu::{ClockDomain, PpsmcMsg, SmuError, SmuMmio};
 use crate::amdgpu_smu::{send_message_get, send_message_void};
+use crate::amdgpu_smu::{ClockDomain, PpsmcMsg, SmuError, SmuMmio};
 
 // ── SMU13.0.4 PPSMC_MSG_* opcode values ────────────────────────────
 
@@ -136,18 +136,12 @@ pub fn set_range_msgs(domain: ClockDomain) -> Option<(u32, u32)> {
 // ── High-level wrappers ─────────────────────────────────────────────
 
 /// Read the current GFXCLK frequency in MHz on SMU13.0.4 hardware.
-pub fn get_gfxclk_mhz<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Result<u32, SmuError> {
+pub fn get_gfxclk_mhz<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Result<u32, SmuError> {
     send_message_get(mmio, mp1_base, V13_MSG_GET_GFXCLK, 0)
 }
 
 /// Read the current FCLK frequency in MHz on SMU13.0.4 hardware.
-pub fn get_fclk_mhz<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Result<u32, SmuError> {
+pub fn get_fclk_mhz<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Result<u32, SmuError> {
     send_message_get(mmio, mp1_base, V13_MSG_GET_FCLK, 0)
 }
 

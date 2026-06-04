@@ -145,7 +145,8 @@ pub fn parse_rom_header(image: &[u8]) -> Result<AtomRomHeader, HeaderError> {
     }
 
     let hdr_off = read_u16(image, ROM_HEADER_PTR_OFFSET) as usize;
-    let end = hdr_off.checked_add(ROM_HEADER_MIN_SIZE)
+    let end = hdr_off
+        .checked_add(ROM_HEADER_MIN_SIZE)
         .ok_or(HeaderError::InvalidVbios2)?;
     if end > image.len() {
         return Err(HeaderError::InvalidVbios2);
@@ -165,19 +166,19 @@ pub fn parse_rom_header(image: &[u8]) -> Result<AtomRomHeader, HeaderError> {
     Ok(AtomRomHeader {
         atom_signature: sig,
         bios_runtime_segment_address: read_u16(image, hdr_off + 0x04),
-        protected_mode_info_offset:   read_u16(image, hdr_off + 0x06),
-        config_filename_offset:       read_u16(image, hdr_off + 0x08),
-        crc_block_offset:             read_u16(image, hdr_off + 0x0A),
-        bios_bootup_message_offset:   read_u16(image, hdr_off + 0x0C),
-        int10_offset:                 read_u16(image, hdr_off + 0x0E),
-        pci_bus_dev_init_code:        read_u16(image, hdr_off + 0x10),
-        io_base_address:              read_u16(image, hdr_off + 0x12),
-        subsystem_vendor_id:          read_u16(image, hdr_off + 0x14),
-        subsystem_id:                 read_u16(image, hdr_off + 0x16),
-        pci_info_offset:              read_u16(image, hdr_off + 0x18),
-        master_command_table_offset:  read_u16(image, hdr_off + 0x1A),
-        master_data_table_offset:     read_u16(image, hdr_off + 0x1C),
-        extended_function_code:       image[hdr_off + 0x1E],
-        reserved:                     image[hdr_off + 0x1F],
+        protected_mode_info_offset: read_u16(image, hdr_off + 0x06),
+        config_filename_offset: read_u16(image, hdr_off + 0x08),
+        crc_block_offset: read_u16(image, hdr_off + 0x0A),
+        bios_bootup_message_offset: read_u16(image, hdr_off + 0x0C),
+        int10_offset: read_u16(image, hdr_off + 0x0E),
+        pci_bus_dev_init_code: read_u16(image, hdr_off + 0x10),
+        io_base_address: read_u16(image, hdr_off + 0x12),
+        subsystem_vendor_id: read_u16(image, hdr_off + 0x14),
+        subsystem_id: read_u16(image, hdr_off + 0x16),
+        pci_info_offset: read_u16(image, hdr_off + 0x18),
+        master_command_table_offset: read_u16(image, hdr_off + 0x1A),
+        master_data_table_offset: read_u16(image, hdr_off + 0x1C),
+        extended_function_code: image[hdr_off + 0x1E],
+        reserved: image[hdr_off + 0x1F],
     })
 }

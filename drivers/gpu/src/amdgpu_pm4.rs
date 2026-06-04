@@ -231,11 +231,7 @@ impl<'a> Pm4Builder<'a> {
     /// draw setup to push shader state.
     ///
     /// Ring placement: 2 + N dwords (header + 1 setup + N values).
-    pub fn set_context_reg(
-        &mut self,
-        reg_offset: u16,
-        values: &[u32],
-    ) -> Result<(), Pm4Error> {
+    pub fn set_context_reg(&mut self, reg_offset: u16, values: &[u32]) -> Result<(), Pm4Error> {
         if values.is_empty() {
             return Err(Pm4Error::BadCount);
         }
@@ -250,11 +246,7 @@ impl<'a> Pm4Builder<'a> {
 
     /// `SET_CONFIG_REG` — same shape as `set_context_reg` but for
     /// chip-wide CONFIG registers (offset base 0x2000 on GFX9).
-    pub fn set_config_reg(
-        &mut self,
-        reg_offset: u16,
-        values: &[u32],
-    ) -> Result<(), Pm4Error> {
+    pub fn set_config_reg(&mut self, reg_offset: u16, values: &[u32]) -> Result<(), Pm4Error> {
         if values.is_empty() {
             return Err(Pm4Error::BadCount);
         }

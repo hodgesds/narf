@@ -108,7 +108,11 @@ static REGISTRY: IrqSafeSpinLock<Vec<DrmCardEntry>> = IrqSafeSpinLock::new(Vec::
 pub fn register_drm_card(card: Arc<dyn DrmCard>) -> u32 {
     let mut g = REGISTRY.lock();
     let index = g.len() as u32;
-    g.push(DrmCardEntry { index, card, mode_state: None });
+    g.push(DrmCardEntry {
+        index,
+        card,
+        mode_state: None,
+    });
     index
 }
 
@@ -148,7 +152,10 @@ pub fn attach_mode_state(index: u32, mode_state: crate::drm::card::Card) -> bool
 /// of an `Arc`; the caller holds the spin-lock only for the duration
 /// of one ioctl dispatch.
 pub fn mode_state(index: u32) -> Option<Arc<IrqSafeSpinLock<crate::drm::card::Card>>> {
-    REGISTRY.lock().get(index as usize).and_then(|e| e.mode_state.clone())
+    REGISTRY
+        .lock()
+        .get(index as usize)
+        .and_then(|e| e.mode_state.clone())
 }
 
 /// Return a snapshot of all registered cards (clones the Arc pointers;

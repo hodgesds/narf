@@ -226,10 +226,7 @@ impl NvidiaGpu {
 
 static CONTROLLER: IrqSafeSpinLock<Option<NvidiaGpu>> = IrqSafeSpinLock::new(None);
 
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if CONTROLLER.lock().is_some() {
         return Ok(());
     }
@@ -263,7 +260,11 @@ pub fn probe(
 pub fn register_pci_driver() {
     let exact: &[(&'static str, u16, u16)] = &[
         ("nvidia-tu102-2080ti", NVIDIA_VENDOR, TU102_RTX_2080_TI),
-        ("nvidia-tu102-2080ti-r", NVIDIA_VENDOR, TU102_RTX_2080_TI_REFRESH),
+        (
+            "nvidia-tu102-2080ti-r",
+            NVIDIA_VENDOR,
+            TU102_RTX_2080_TI_REFRESH,
+        ),
         ("nvidia-tu104-2080s", NVIDIA_VENDOR, TU104_RTX_2080_SUPER),
         ("nvidia-tu104-2080", NVIDIA_VENDOR, TU104_RTX_2080),
         ("nvidia-tu106-2070", NVIDIA_VENDOR, TU106_RTX_2070),

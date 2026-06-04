@@ -150,15 +150,14 @@ pub fn parse(image: &[u8]) -> Result<AtomBios, AtomBiosError> {
     // 3. Parse the master data table directory. A zero offset is
     //    valid (absent) — degrade gracefully. A non-zero but
     //    structurally invalid offset is a hard error.
-    let (n_data_tables, fmt_rev, content_rev) =
-        if hdr.master_data_table_offset == 0 {
-            (0u16, 0u8, 0u8)
-        } else {
-            match tables::MasterDataTable::parse(image, &hdr) {
-                Ok(dir) => (dir.n_tables, dir.format_revision, dir.content_revision),
-                Err(e) => return Err(AtomBiosError::from(e)),
-            }
-        };
+    let (n_data_tables, fmt_rev, content_rev) = if hdr.master_data_table_offset == 0 {
+        (0u16, 0u8, 0u8)
+    } else {
+        match tables::MasterDataTable::parse(image, &hdr) {
+            Ok(dir) => (dir.n_tables, dir.format_revision, dir.content_revision),
+            Err(e) => return Err(AtomBiosError::from(e)),
+        }
+    };
 
     Ok(AtomBios {
         version: ver,

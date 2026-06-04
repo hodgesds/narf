@@ -237,10 +237,7 @@ pub fn load_all_cp_fw<M: CpFwMmio>(
 /// Mirrors `gfx_v11_0_cp_gfx_enable` — write 0 to unhalt, poll the
 /// CP_STAT register's BUSY_STATUS bits to confirm engines are
 /// fetching. Linux uses a 50 ms timeout against a 1 µs udelay.
-pub fn cp_enable<M: CpFwMmio>(
-    mmio: &mut M,
-    gc_base: u32,
-) -> Result<(), CpFwError> {
+pub fn cp_enable<M: CpFwMmio>(mmio: &mut M, gc_base: u32) -> Result<(), CpFwError> {
     let cntl_addr = (gc_base + (crate::amdgpu_gfx::CP_GFX_CNTL_REL / 4)) << 2;
     mmio.write(cntl_addr, 0);
     // Linux polls regCP_STAT to confirm the engines are running but
@@ -340,8 +337,8 @@ mod smoke_tests {
         // Set up: op_cntl reads return INVALIDATE_COMPLETE | ICACHE_PRIMED
         // after a few polls.
         m.op_cntl_address = (CP_PFP_IC_OP_CNTL) << 2;
-        m.op_cntl_ack_value = IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT
-            | IC_OP_CNTL_ICACHE_PRIMED_BIT;
+        m.op_cntl_ack_value =
+            IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT | IC_OP_CNTL_ICACHE_PRIMED_BIT;
         let r = load_cp_engine_fw(&mut m, 0, CpEngine::Pfp, 0x10_0000);
         if r.is_err() {
             return TestResult::Fail("load failed");
@@ -380,8 +377,8 @@ mod smoke_tests {
         // hit the timeout path since we only mocked one address. We
         // verify that at least PFP succeeded.
         m.op_cntl_address = CP_PFP_IC_OP_CNTL << 2;
-        m.op_cntl_ack_value = IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT
-            | IC_OP_CNTL_ICACHE_PRIMED_BIT;
+        m.op_cntl_ack_value =
+            IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT | IC_OP_CNTL_ICACHE_PRIMED_BIT;
         let r = load_all_cp_fw(&mut m, 0, 0x10_0000, 0x20_0000, 0x30_0000);
         // ME polling will fail since mock only acks PFP's op_cntl.
         // That's the expected behaviour in this minimal mock setup

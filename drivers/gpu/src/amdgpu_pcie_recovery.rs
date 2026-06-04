@@ -124,7 +124,10 @@ mod smoke_tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_recovery_correctable_votes_can_recover() -> TestResult {
-        let r = Arc::new(AmdgpuRecovery::new(0, BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0))));
+        let r = Arc::new(AmdgpuRecovery::new(
+            0,
+            BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0)),
+        ));
         let res = r.error_detected(PciErrSeverity::Correctable);
         if res != PciErsResult::CanRecover {
             return TestResult::Fail("correctable should be CanRecover");
@@ -140,7 +143,10 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_recovery_correctable_votes_can_recover);
 
     fn smoke_recovery_fatal_votes_need_reset() -> TestResult {
-        let r = Arc::new(AmdgpuRecovery::new(0, BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0))));
+        let r = Arc::new(AmdgpuRecovery::new(
+            0,
+            BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0)),
+        ));
         let res = r.error_detected(PciErrSeverity::Fatal);
         if res != PciErsResult::NeedReset {
             return TestResult::Fail("fatal should NeedReset");
@@ -150,7 +156,10 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_recovery_fatal_votes_need_reset);
 
     fn smoke_recovery_slot_reset_bumps_count() -> TestResult {
-        let r = Arc::new(AmdgpuRecovery::new(0, BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0))));
+        let r = Arc::new(AmdgpuRecovery::new(
+            0,
+            BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0)),
+        ));
         let res = r.slot_reset();
         if res != PciErsResult::Recovered {
             return TestResult::Fail("slot_reset should Recovered");
@@ -163,7 +172,10 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_recovery_slot_reset_bumps_count);
 
     fn smoke_recovery_resume_bumps_count() -> TestResult {
-        let r = Arc::new(AmdgpuRecovery::new(0, BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0))));
+        let r = Arc::new(AmdgpuRecovery::new(
+            0,
+            BusAddr::Pcie(narf_bus::PcieAddr::new(0, 1, 0, 0)),
+        ));
         r.resume();
         r.resume();
         if r.resume_count.load(Ordering::SeqCst) != 2 {

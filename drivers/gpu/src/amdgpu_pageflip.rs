@@ -428,9 +428,15 @@ mod smoke_tests {
 
     fn smoke_flip_queue_lifecycle() -> TestResult {
         let mut q = FlipQueue::new(3);
-        let r1 = q.enqueue(0x1000_0000, PixelFormat::Xrgb8888, 7680).expect("e1");
-        let r2 = q.enqueue(0x2000_0000, PixelFormat::Xrgb8888, 7680).expect("e2");
-        let r3 = q.enqueue(0x3000_0000, PixelFormat::Xrgb8888, 7680).expect("e3");
+        let r1 = q
+            .enqueue(0x1000_0000, PixelFormat::Xrgb8888, 7680)
+            .expect("e1");
+        let r2 = q
+            .enqueue(0x2000_0000, PixelFormat::Xrgb8888, 7680)
+            .expect("e2");
+        let r3 = q
+            .enqueue(0x3000_0000, PixelFormat::Xrgb8888, 7680)
+            .expect("e3");
         if q.pending_len() != 3 {
             return TestResult::Fail("queue depth wrong after 3 enqueues");
         }
@@ -438,9 +444,7 @@ mod smoke_tests {
             return TestResult::Fail("queue should be full");
         }
         // 4th enqueue rejected.
-        if q.enqueue(0x4000_0000, PixelFormat::Xrgb8888, 7680)
-            != Err(FlipError::QueueFull)
-        {
+        if q.enqueue(0x4000_0000, PixelFormat::Xrgb8888, 7680) != Err(FlipError::QueueFull) {
             return TestResult::Fail("over-capacity enqueue not rejected");
         }
         // Retire in order; out-of-order retire is rejected.
@@ -469,8 +473,10 @@ mod smoke_tests {
 
     fn smoke_flip_queue_drain_resets() -> TestResult {
         let mut q = FlipQueue::new(3);
-        q.enqueue(0x1000_0000, PixelFormat::Xrgb8888, 7680).expect("e1");
-        q.enqueue(0x2000_0000, PixelFormat::Xrgb8888, 7680).expect("e2");
+        q.enqueue(0x1000_0000, PixelFormat::Xrgb8888, 7680)
+            .expect("e1");
+        q.enqueue(0x2000_0000, PixelFormat::Xrgb8888, 7680)
+            .expect("e2");
         q.drain();
         if q.pending_len() != 0 {
             return TestResult::Fail("drain didn't empty queue");
@@ -479,7 +485,9 @@ mod smoke_tests {
             return TestResult::Fail("drained queue not empty for capacity");
         }
         // Generation counter survives drain — wrap-protection.
-        let r = q.enqueue(0x3000_0000, PixelFormat::Xrgb8888, 7680).expect("e3");
+        let r = q
+            .enqueue(0x3000_0000, PixelFormat::Xrgb8888, 7680)
+            .expect("e3");
         if r.generation < 3 {
             return TestResult::Fail("generation counter reset on drain");
         }
@@ -512,17 +520,26 @@ mod smoke_tests {
             return TestResult::Fail("CONTROL missing format");
         }
         // POSITION encodes (Y << 16) | X.
-        let pos = w.iter().find(|w| w.addr == 0x6000 + DPP_CURSOR_POSITION_REL).unwrap();
+        let pos = w
+            .iter()
+            .find(|w| w.addr == 0x6000 + DPP_CURSOR_POSITION_REL)
+            .unwrap();
         if pos.value != (200 << 16) | 100 {
             return TestResult::Fail("position encoding wrong");
         }
         // SIZE encodes (H << 16) | W.
-        let sz = w.iter().find(|w| w.addr == 0x6000 + DPP_CURSOR_SIZE_REL).unwrap();
+        let sz = w
+            .iter()
+            .find(|w| w.addr == 0x6000 + DPP_CURSOR_SIZE_REL)
+            .unwrap();
         if sz.value != (64 << 16) | 64 {
             return TestResult::Fail("size encoding wrong");
         }
         // Disabled cursor → only CONTROL = 0.
-        let disabled = CursorState { enabled: false, ..st };
+        let disabled = CursorState {
+            enabled: false,
+            ..st
+        };
         let w = build_cursor(0x6000, &disabled).expect("build_cursor disabled");
         if w.len() != 1 {
             return TestResult::Fail("disabled should emit only 1 write");

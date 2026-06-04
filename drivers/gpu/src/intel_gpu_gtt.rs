@@ -165,7 +165,12 @@ pub mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_pat_slot_round_trip() -> TestResult {
-        for slot in [PatSlot::Slot0, PatSlot::Slot1, PatSlot::Slot2, PatSlot::Slot3] {
+        for slot in [
+            PatSlot::Slot0,
+            PatSlot::Slot1,
+            PatSlot::Slot2,
+            PatSlot::Slot3,
+        ] {
             let bits = slot.encode();
             if PatSlot::decode(bits) != slot {
                 return TestResult::Fail("PAT slot encode/decode round-trip");

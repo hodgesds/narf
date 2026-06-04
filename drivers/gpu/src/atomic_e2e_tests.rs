@@ -32,15 +32,17 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-use narf_kernel_test::{kernel_test_in, TestResult};
-use crate::drm::card::{Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType};
 use crate::drm::atomic::{
-    AtomicCheckPolicy, AtomicError, AtomicOps, AtomicState, ConnectorState, CrtcState, PlaneState,
-    atomic_check_and_commit,
+    atomic_check_and_commit, AtomicCheckPolicy, AtomicError, AtomicOps, AtomicState,
+    ConnectorState, CrtcState, PlaneState,
+};
+use crate::drm::card::{
+    Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
 };
 use crate::drm::syncobj::{BinaryFence, DmaFence, SyncObjTable, SYNCOBJ_WAIT_FLAGS_WAIT_ALL};
 use crate::Mode;
+use alloc::vec::Vec;
+use narf_kernel_test::{kernel_test_in, TestResult};
 
 // ── FakeMmio ─────────────────────────────────────────────────────────────────
 // Reused verbatim from Wave 30 e2e_tests.rs — models bochs VBE register window.
@@ -57,13 +59,17 @@ impl FakeMmio {
     }
 
     fn write16(&mut self, offset: usize, value: u16) {
-        if offset + 2 > self.data.len() { return; }
+        if offset + 2 > self.data.len() {
+            return;
+        }
         self.data[offset] = value as u8;
         self.data[offset + 1] = (value >> 8) as u8;
     }
 
     fn read16(&self, offset: usize) -> u16 {
-        if offset + 2 > self.data.len() { return 0; }
+        if offset + 2 > self.data.len() {
+            return 0;
+        }
         u16::from_le_bytes([self.data[offset], self.data[offset + 1]])
     }
 }
@@ -72,7 +78,7 @@ impl FakeMmio {
 const VBE_BASE: usize = 0x500;
 const VBE_XRES_OFF: usize = VBE_BASE + 0x02;
 const VBE_YRES_OFF: usize = VBE_BASE + 0x04;
-const VBE_BPP_OFF: usize  = VBE_BASE + 0x06;
+const VBE_BPP_OFF: usize = VBE_BASE + 0x06;
 
 // ── FakeAtomicOps ────────────────────────────────────────────────────────────
 // Records driver-side hook calls. Does not touch hardware.
@@ -104,14 +110,16 @@ impl AtomicOps for FakeAtomicOps {
         if self.fail_check {
             return Err(AtomicError::OverBandwidth);
         }
-        self.check_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.check_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
     fn atomic_commit(&self, _card: &mut Card, _state: &AtomicState) -> Result<(), AtomicError> {
         if self.fail_commit {
             return Err(AtomicError::OverBandwidth);
         }
-        self.commit_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.commit_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -153,8 +161,18 @@ fn make_card(n_crtcs: usize) -> Card {
 /// Returns `(gem_handle, fb_id)`.
 fn make_fb(card: &mut Card, width: u32, height: u32) -> (u32, u32) {
     let phys: u64 = 0x0800_0000 + (card.framebuffers.len() as u64) * 0x0100_0000;
-    let gem = card.gem.alloc(phys, (width * height * 4) as usize).expect("gem alloc");
-    let fb = card.addfb2(width, height, 0x3438_5258 /* XRGB8888 */, width * 4, gem)
+    let gem = card
+        .gem
+        .alloc(phys, (width * height * 4) as usize)
+        .expect("gem alloc");
+    let fb = card
+        .addfb2(
+            width,
+            height,
+            0x3438_5258, /* XRGB8888 */
+            width * 4,
+            gem,
+        )
         .expect("addfb2");
     (gem, fb)
 }
@@ -201,14 +219,15 @@ fn smoke_atomic_connector_edid_blob_prop() -> TestResult {
     edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
     edid[18] = 1;
     edid[19] = 4; // version 1.4
-    // Fix checksum.
+                  // Fix checksum.
     let s: u8 = edid[..127].iter().fold(0u8, |a, &b| a.wrapping_add(b));
     edid[127] = 0u8.wrapping_sub(s);
 
     // Register a blob property carrying this EDID.
-    let props: Vec<BlobProp> = alloc::vec![
-        BlobProp { name: "EDID", data: edid.to_vec() },
-    ];
+    let props: Vec<BlobProp> = alloc::vec![BlobProp {
+        name: "EDID",
+        data: edid.to_vec()
+    },];
 
     // Resolve by name.
     let found = props.iter().find(|p| p.name == "EDID");
@@ -236,7 +255,10 @@ fn smoke_atomic_connector_edid_blob_prop() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_connector_edid_blob_prop);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_connector_edid_blob_prop
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 3 — Plane with mandatory plane properties: verify that PlaneState
@@ -261,20 +283,43 @@ fn smoke_atomic_plane_has_required_props() -> TestResult {
         src_h: 480,
     };
 
-    if ps.fb_id != Some(7)       { return TestResult::Fail("FB_ID"); }
-    if ps.crtc_id != Some(0)     { return TestResult::Fail("CRTC_ID"); }
-    if ps.crtc_x != 10           { return TestResult::Fail("CRTC_X"); }
-    if ps.crtc_y != 20           { return TestResult::Fail("CRTC_Y"); }
-    if ps.crtc_w != 640          { return TestResult::Fail("CRTC_W"); }
-    if ps.crtc_h != 480          { return TestResult::Fail("CRTC_H"); }
-    if ps.src_x != 0             { return TestResult::Fail("SRC_X"); }
-    if ps.src_y != 0             { return TestResult::Fail("SRC_Y"); }
-    if ps.src_w != 640           { return TestResult::Fail("SRC_W"); }
-    if ps.src_h != 480           { return TestResult::Fail("SRC_H"); }
+    if ps.fb_id != Some(7) {
+        return TestResult::Fail("FB_ID");
+    }
+    if ps.crtc_id != Some(0) {
+        return TestResult::Fail("CRTC_ID");
+    }
+    if ps.crtc_x != 10 {
+        return TestResult::Fail("CRTC_X");
+    }
+    if ps.crtc_y != 20 {
+        return TestResult::Fail("CRTC_Y");
+    }
+    if ps.crtc_w != 640 {
+        return TestResult::Fail("CRTC_W");
+    }
+    if ps.crtc_h != 480 {
+        return TestResult::Fail("CRTC_H");
+    }
+    if ps.src_x != 0 {
+        return TestResult::Fail("SRC_X");
+    }
+    if ps.src_y != 0 {
+        return TestResult::Fail("SRC_Y");
+    }
+    if ps.src_w != 640 {
+        return TestResult::Fail("SRC_W");
+    }
+    if ps.src_h != 480 {
+        return TestResult::Fail("SRC_H");
+    }
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_plane_has_required_props);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_plane_has_required_props
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 4 — Build empty AtomicState
@@ -326,7 +371,10 @@ fn smoke_atomic_add_crtc_update_active() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_add_crtc_update_active);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_add_crtc_update_active
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 6 — Add plane update with FB attached
@@ -383,7 +431,10 @@ fn smoke_atomic_add_connector_with_crtc_binding() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_add_connector_with_crtc_binding);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_add_connector_with_crtc_binding
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 8 — check_only happy path: full state passes core_check, no HW change
@@ -410,13 +461,18 @@ fn smoke_atomic_check_only_happy_path() -> TestResult {
         mode_changed: true,
         connectors_changed: false,
     });
-    state.connectors.push(ConnectorState { id: 0, crtc_id: Some(0) });
+    state.connectors.push(ConnectorState {
+        id: 0,
+        crtc_id: Some(0),
+    });
     state.planes.push(PlaneState {
         id: 0,
         crtc_id: Some(0),
         fb_id: Some(fb_id),
-        crtc_w: 1024, crtc_h: 768,
-        src_w: 1024, src_h: 768,
+        crtc_w: 1024,
+        crtc_h: 768,
+        src_w: 1024,
+        src_h: 768,
         ..Default::default()
     });
 
@@ -460,7 +516,12 @@ fn smoke_atomic_check_only_rejects_invalid_mode() -> TestResult {
         id: 0,
         enable: true,
         active: true,
-        mode: Some(Mode { width: 9999, height: 9999, refresh_hz: 60, bpp: 32 }),
+        mode: Some(Mode {
+            width: 9999,
+            height: 9999,
+            refresh_hz: 60,
+            bpp: 32,
+        }),
         mode_changed: true,
         connectors_changed: false,
     });
@@ -468,8 +529,10 @@ fn smoke_atomic_check_only_rejects_invalid_mode() -> TestResult {
         id: 0,
         crtc_id: Some(0),
         fb_id: Some(fb_id),
-        crtc_w: 9999, crtc_h: 9999,
-        src_w: 9999,  src_h: 9999,  // exceeds FB 64×64
+        crtc_w: 9999,
+        crtc_h: 9999,
+        src_w: 9999,
+        src_h: 9999, // exceeds FB 64×64
         ..Default::default()
     });
 
@@ -484,7 +547,10 @@ fn smoke_atomic_check_only_rejects_invalid_mode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_check_only_rejects_invalid_mode);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_check_only_rejects_invalid_mode
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 10 — check_only rejects unattached plane (FB without CRTC)
@@ -504,8 +570,10 @@ fn smoke_atomic_check_only_rejects_unattached_plane() -> TestResult {
         id: 0,
         crtc_id: None,
         fb_id: Some(fb_id),
-        crtc_w: 640, crtc_h: 480,
-        src_w: 640, src_h: 480,
+        crtc_w: 640,
+        crtc_h: 480,
+        src_w: 640,
+        src_h: 480,
         ..Default::default()
     });
 
@@ -520,7 +588,10 @@ fn smoke_atomic_check_only_rejects_unattached_plane() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_check_only_rejects_unattached_plane);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_check_only_rejects_unattached_plane
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 11 — commit applies CRTC mode; bochs VBE MMIO updated
@@ -542,17 +613,27 @@ fn smoke_atomic_commit_applies_crtc_mode() -> TestResult {
         id: 0,
         enable: true,
         active: true,
-        mode: Some(Mode { width: 640, height: 480, refresh_hz: 60, bpp: 32 }),
+        mode: Some(Mode {
+            width: 640,
+            height: 480,
+            refresh_hz: 60,
+            bpp: 32,
+        }),
         mode_changed: true,
         connectors_changed: false,
     });
-    state.connectors.push(ConnectorState { id: 0, crtc_id: Some(0) });
+    state.connectors.push(ConnectorState {
+        id: 0,
+        crtc_id: Some(0),
+    });
     state.planes.push(PlaneState {
         id: 0,
         crtc_id: Some(0),
         fb_id: Some(fb_id),
-        crtc_w: 640, crtc_h: 480,
-        src_w: 640, src_h: 480,
+        crtc_w: 640,
+        crtc_h: 480,
+        src_w: 640,
+        src_h: 480,
         ..Default::default()
     });
 
@@ -603,7 +684,10 @@ fn smoke_atomic_commit_applies_crtc_mode() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_commit_applies_crtc_mode);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_commit_applies_crtc_mode
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 12 — commit + page-flip: new FB_ID in plane → crtc.primary_fb updated
@@ -616,15 +700,30 @@ fn smoke_atomic_commit_page_flip_updates_primary_fb() -> TestResult {
     // First modeset with fb_a.
     let (_gem_a, fb_a) = make_fb(&mut card, 1920, 1080);
     {
-        let mut state = AtomicState { allow_modeset: true, ..Default::default() };
+        let mut state = AtomicState {
+            allow_modeset: true,
+            ..Default::default()
+        };
         state.crtcs.push(CrtcState {
-            id: 0, enable: true, active: true,
-            mode: Some(Mode::FHD_60), mode_changed: true, connectors_changed: false,
+            id: 0,
+            enable: true,
+            active: true,
+            mode: Some(Mode::FHD_60),
+            mode_changed: true,
+            connectors_changed: false,
         });
-        state.connectors.push(ConnectorState { id: 0, crtc_id: Some(0) });
+        state.connectors.push(ConnectorState {
+            id: 0,
+            crtc_id: Some(0),
+        });
         state.planes.push(PlaneState {
-            id: 0, crtc_id: Some(0), fb_id: Some(fb_a),
-            crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080,
+            id: 0,
+            crtc_id: Some(0),
+            fb_id: Some(fb_a),
+            crtc_w: 1920,
+            crtc_h: 1080,
+            src_w: 1920,
+            src_h: 1080,
             ..Default::default()
         });
         let policy = AtomicCheckPolicy::default();
@@ -639,11 +738,19 @@ fn smoke_atomic_commit_page_flip_updates_primary_fb() -> TestResult {
     // Page-flip: swap to fb_b (no modeset flag needed for same-mode flip).
     let (_gem_b, fb_b) = make_fb(&mut card, 1920, 1080);
     {
-        let mut state = AtomicState { allow_modeset: false, ..Default::default() };
+        let mut state = AtomicState {
+            allow_modeset: false,
+            ..Default::default()
+        };
         // No CRTC mode change — just plane FB swap.
         state.planes.push(PlaneState {
-            id: 0, crtc_id: Some(0), fb_id: Some(fb_b),
-            crtc_w: 1920, crtc_h: 1080, src_w: 1920, src_h: 1080,
+            id: 0,
+            crtc_id: Some(0),
+            fb_id: Some(fb_b),
+            crtc_w: 1920,
+            crtc_h: 1080,
+            src_w: 1920,
+            src_h: 1080,
             ..Default::default()
         });
         let policy = AtomicCheckPolicy::default();
@@ -662,7 +769,10 @@ fn smoke_atomic_commit_page_flip_updates_primary_fb() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_commit_page_flip_updates_primary_fb);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_commit_page_flip_updates_primary_fb
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Smoke 13 — Property type Range: [0, 100]; set 50 OK; set 200 rejected
@@ -687,7 +797,11 @@ impl RangeProp {
 }
 
 fn smoke_atomic_property_range() -> TestResult {
-    let prop = RangeProp { name: "brightness", min: 0, max: 100 };
+    let prop = RangeProp {
+        name: "brightness",
+        min: 0,
+        max: 100,
+    };
 
     match prop.set(50) {
         Ok(v) if v == 50 => {}
@@ -838,16 +952,35 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
     }
 
     // Run an atomic commit.
-    let mut state = AtomicState { allow_modeset: true, ..Default::default() };
+    let mut state = AtomicState {
+        allow_modeset: true,
+        ..Default::default()
+    };
     state.crtcs.push(CrtcState {
-        id: 0, enable: true, active: true,
-        mode: Some(Mode { width: 640, height: 480, refresh_hz: 60, bpp: 32 }),
-        mode_changed: true, connectors_changed: false,
+        id: 0,
+        enable: true,
+        active: true,
+        mode: Some(Mode {
+            width: 640,
+            height: 480,
+            refresh_hz: 60,
+            bpp: 32,
+        }),
+        mode_changed: true,
+        connectors_changed: false,
     });
-    state.connectors.push(ConnectorState { id: 0, crtc_id: Some(0) });
+    state.connectors.push(ConnectorState {
+        id: 0,
+        crtc_id: Some(0),
+    });
     state.planes.push(PlaneState {
-        id: 0, crtc_id: Some(0), fb_id: Some(fb_id),
-        crtc_w: 640, crtc_h: 480, src_w: 640, src_h: 480,
+        id: 0,
+        crtc_id: Some(0),
+        fb_id: Some(fb_id),
+        crtc_w: 640,
+        crtc_h: 480,
+        src_w: 640,
+        src_h: 480,
         ..Default::default()
     });
     let ops = FakeAtomicOps::new();
@@ -889,7 +1022,10 @@ fn smoke_atomic_syncobj_signalled_after_commit() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_syncobj_signalled_after_commit);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_atomic_syncobj_signalled_after_commit
+);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Wave-37 subsystem-ID smokes
@@ -935,7 +1071,10 @@ fn smoke_subsystem_id_device_id_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_device_id_round_trip);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_subsystem_id_device_id_round_trip
+);
 
 // ── Smoke 18: PCI config-space subsystem ID parse ─────────────────────────
 // Synthesise a 64-byte type-0 header byte-slice with subsystem IDs at
@@ -970,7 +1109,10 @@ fn smoke_subsystem_id_config_space_parse() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_config_space_parse);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_subsystem_id_config_space_parse
+);
 
 // ── Smoke 19: sysfs subsystem_vendor attr format ──────────────────────────
 // AmdgpuCard::subsystem_vendor() returns the value; sysfs formats it as
@@ -1000,7 +1142,10 @@ fn smoke_subsystem_id_sysfs_vendor_format() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_sysfs_vendor_format);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_subsystem_id_sysfs_vendor_format
+);
 
 // ── Smoke 20: sysfs subsystem_device attr format ──────────────────────────
 
@@ -1027,7 +1172,10 @@ fn smoke_subsystem_id_sysfs_device_format() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_sysfs_device_format);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_subsystem_id_sysfs_device_format
+);
 
 // ── Smoke 21: bochs card subsystem IDs = (0x1AF4, 0x1100) ─────────────────
 
@@ -1057,7 +1205,10 @@ fn smoke_subsystem_id_bochs_qemu_values() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_bochs_qemu_values);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_subsystem_id_bochs_qemu_values
+);
 
 // ── Smoke 22: existing Wave-33 smokes — AmdgpuCard non-zero subsystem ──────
 // Verify that an AmdgpuCard constructed with real subsystem IDs doesn't
@@ -1070,10 +1221,10 @@ fn smoke_subsystem_id_amdgpu_nonzero_when_set() -> TestResult {
     // Simulate probe with a real subsystem vendor (ThinkPad OEM = Lenovo 0x17AA).
     let card = AmdgpuCard::new(
         "card0".into(),
-        0x1002,  // AMD
-        0x1900,  // Phoenix HawkPoint1
-        0x17AA,  // Lenovo
-        0x3813,  // Lenovo ThinkPad subsystem device
+        0x1002, // AMD
+        0x1900, // Phoenix HawkPoint1
+        0x17AA, // Lenovo
+        0x3813, // Lenovo ThinkPad subsystem device
         None,
     );
 
@@ -1088,4 +1239,7 @@ fn smoke_subsystem_id_amdgpu_nonzero_when_set() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/atomic_e2e", smoke_subsystem_id_amdgpu_nonzero_when_set);
+kernel_test_in!(
+    "drivers/gpu/atomic_e2e",
+    smoke_subsystem_id_amdgpu_nonzero_when_set
+);

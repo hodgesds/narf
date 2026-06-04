@@ -259,7 +259,7 @@ kernel_test_in!("drivers/gpu/e2e", smoke_bochs_unprobe_cleanup);
 // Verify the family + ASIC name + FW entry list is populated correctly.
 
 fn smoke_amdgpu_renoir_probe_identifies_family() -> TestResult {
-    use crate::amdgpu::{Family, RENOIR, AMD_VENDOR};
+    use crate::amdgpu::{Family, AMD_VENDOR, RENOIR};
 
     // RENOIR constant must match the published PCI ID.
     if RENOIR != 0x1636 {
@@ -296,7 +296,10 @@ fn smoke_amdgpu_renoir_probe_identifies_family() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_renoir_probe_identifies_family);
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_amdgpu_renoir_probe_identifies_family
+);
 
 // ── Smoke 6: AMDGPU GFX9 ring-init sequence — first 20 MMIO writes ───────
 //
@@ -311,9 +314,8 @@ kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_renoir_probe_identifies_family);
 
 fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
     use crate::amdgpu_gfx::{
-        build_gfx9_ring_init,
-        CP_ME_CNTL_REL, CP_RB0_WPTR_REL, CP_RB0_WPTR_HI_REL,
-        CP_ME_CNTL_HALT_ALL,
+        build_gfx9_ring_init, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_REL, CP_RB0_WPTR_HI_REL,
+        CP_RB0_WPTR_REL,
     };
 
     let gc_base: u32 = 0x0000_0000;
@@ -323,10 +325,11 @@ fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
     let doorbell_idx: u32 = 2;
     let rptr_wb_phys: u64 = 0x0000_2000;
 
-    let seq = match build_gfx9_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_wb_phys) {
-        Ok(s) => s,
-        Err(e) => return TestResult::Fail("build_gfx9_ring_init failed"),
-    };
+    let seq =
+        match build_gfx9_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_wb_phys) {
+            Ok(s) => s,
+            Err(e) => return TestResult::Fail("build_gfx9_ring_init failed"),
+        };
 
     if seq.is_empty() {
         return TestResult::Fail("GFX9 ring-init sequence is empty");
@@ -367,9 +370,15 @@ fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
     }
 
     // Ring-base write encodes ring_phys.
-    use crate::amdgpu_gfx::{CP_RB0_BASE_REL, CP_RB0_BASE_HI_REL};
-    let base_lo = seq.writes.iter().find(|w| w.addr == gc_base + CP_RB0_BASE_REL);
-    let base_hi = seq.writes.iter().find(|w| w.addr == gc_base + CP_RB0_BASE_HI_REL);
+    use crate::amdgpu_gfx::{CP_RB0_BASE_HI_REL, CP_RB0_BASE_REL};
+    let base_lo = seq
+        .writes
+        .iter()
+        .find(|w| w.addr == gc_base + CP_RB0_BASE_REL);
+    let base_hi = seq
+        .writes
+        .iter()
+        .find(|w| w.addr == gc_base + CP_RB0_BASE_HI_REL);
     match (base_lo, base_hi) {
         (Some(lo), Some(hi)) => {
             if lo.value != ring_phys as u32 {
@@ -393,20 +402,18 @@ kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_gfx9_ring_init_sequence);
 // in the first text row's scanline range [TOP_PX_OFFSET, TOP_PX_OFFSET+8).
 
 fn smoke_fb_console_writes_line_to_expected_scanline() -> TestResult {
-    use narf_graphics::{Framebuffer, Pixel32};
     use narf_graphics::console::FbConsole;
+    use narf_graphics::{Framebuffer, Pixel32};
 
     const W: u32 = 160; // 20 cols × 8 px
-    const H: u32 = 96;  // 12 rows × 8 px + 32 px beacon offset
+    const H: u32 = 96; // 12 rows × 8 px + 32 px beacon offset
     const TOP_PX_OFFSET: u32 = 32;
 
     // Allocate pixel buffer and wrap it in a Framebuffer.
     let mut pixels: alloc::vec::Vec<u32> = alloc::vec![0u32; (W * H) as usize];
     // SAFETY: pixels Vec<u32> owns the backing memory; the Framebuffer lives
     // entirely within this test's stack frame and will not outlive `pixels`.
-    let fb = unsafe {
-        Framebuffer::new(pixels.as_mut_ptr(), W, H, W)
-    };
+    let fb = unsafe { Framebuffer::new(pixels.as_mut_ptr(), W, H, W) };
 
     let fg = Pixel32::WHITE;
     let bg = Pixel32::BLACK;
@@ -459,7 +466,10 @@ fn smoke_fb_console_writes_line_to_expected_scanline() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/e2e", smoke_fb_console_writes_line_to_expected_scanline);
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_fb_console_writes_line_to_expected_scanline
+);
 
 // ── Smoke 8: DRM Card — invalid dimensions rejected by addfb2 ────────────
 //
@@ -555,8 +565,8 @@ fn smoke_edid_parse_640x480_preferred_timing() -> TestResult {
     edid[0x36] = pclk as u8;
     edid[0x37] = (pclk >> 8) as u8;
     // h_active=640, h_blanking=160.
-    edid[0x38] = (640 & 0xFF) as u8;           // h_active[7:0]
-    edid[0x39] = (160 & 0xFF) as u8;           // h_blanking[7:0]
+    edid[0x38] = (640 & 0xFF) as u8; // h_active[7:0]
+    edid[0x39] = (160 & 0xFF) as u8; // h_blanking[7:0]
     edid[0x3A] = (((640 >> 8) & 0xF) << 4 | ((160 >> 8) & 0xF)) as u8;
     // v_active=480, v_blanking=45.
     edid[0x3B] = (480 & 0xFF) as u8;
@@ -615,12 +625,10 @@ kernel_test_in!("drivers/gpu/e2e", smoke_edid_parse_640x480_preferred_timing);
 // confirm the plans reference distinct CRTCs.
 
 fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
-    use crate::amdgpu_modeset::{
-        commit_modeset_full, plan_modeset, KmsError, KmsState, CrtcState,
-    };
+    use crate::amdgpu::Family;
     use crate::amdgpu_atom_displayobj::ConnectorKind;
     use crate::amdgpu_atom_displayobj::DisplayPath;
-    use crate::amdgpu::Family;
+    use crate::amdgpu_modeset::{commit_modeset_full, plan_modeset, CrtcState, KmsError, KmsState};
 
     // Build KMS state with 4 pipes (APU-typical).
     let mut kms = KmsState::new(4);
@@ -665,14 +673,34 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
     let surface_a: u64 = 0x0001_0000;
     let surface_b: u64 = 0x0002_0000;
 
-    let plan_a = match plan_modeset(&kms, Family::Renoir, 0, 1920, 1080, 60, 1920, surface_a, dcn_base) {
+    let plan_a = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        0,
+        1920,
+        1080,
+        60,
+        1920,
+        surface_a,
+        dcn_base,
+    ) {
         Ok(p) => p,
         Err(KmsError::UnsupportedMode) => {
             return TestResult::Skip("1920x1080@60 not in timing table — deferred")
         }
         Err(_) => return TestResult::Fail("plan_modeset for eDP failed"),
     };
-    let plan_b = match plan_modeset(&kms, Family::Renoir, 1, 1280, 720, 60, 1280, surface_b, dcn_base) {
+    let plan_b = match plan_modeset(
+        &kms,
+        Family::Renoir,
+        1,
+        1280,
+        720,
+        60,
+        1280,
+        surface_b,
+        dcn_base,
+    ) {
         Ok(p) => p,
         Err(KmsError::UnsupportedMode) => {
             return TestResult::Skip("1280x720@60 not in timing table — deferred")
@@ -702,7 +730,9 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
     match (mode_a, mode_b) {
         (Some(ma), Some(mb)) => {
             if ma.width == mb.width && ma.height == mb.height {
-                return TestResult::Fail("both CRTCs have identical modes — surface_phys not independent");
+                return TestResult::Fail(
+                    "both CRTCs have identical modes — surface_phys not independent",
+                );
             }
             if ma.surface_phys != surface_a {
                 return TestResult::Fail("CRTC A surface_phys mismatch");
@@ -716,7 +746,10 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/e2e", smoke_drm_multi_monitor_enumerate_independent_modesets);
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_drm_multi_monitor_enumerate_independent_modesets
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DRM Registry + sysfs bridge + devfs bridge smoke tests
@@ -739,15 +772,33 @@ struct FakeDrmCard {
 }
 
 impl crate::drm_registry::DrmCard for FakeDrmCard {
-    fn name(&self) -> &str { &self.name_str }
-    fn driver(&self) -> &str { self.driver_str }
-    fn vendor_id(&self) -> u16 { self.vid }
-    fn device_id(&self) -> u16 { self.did }
-    fn subsystem_vendor(&self) -> u16 { 0x0000 }
-    fn subsystem_device(&self) -> u16 { 0x0000 }
-    fn vbios_version(&self) -> Option<&str> { Some("FAKE-BIOS-1.0") }
-    fn gpu_busy_percent(&self) -> Option<u32> { Some(42) }
-    fn power_state(&self) -> &str { "D0" }
+    fn name(&self) -> &str {
+        &self.name_str
+    }
+    fn driver(&self) -> &str {
+        self.driver_str
+    }
+    fn vendor_id(&self) -> u16 {
+        self.vid
+    }
+    fn device_id(&self) -> u16 {
+        self.did
+    }
+    fn subsystem_vendor(&self) -> u16 {
+        0x0000
+    }
+    fn subsystem_device(&self) -> u16 {
+        0x0000
+    }
+    fn vbios_version(&self) -> Option<&str> {
+        Some("FAKE-BIOS-1.0")
+    }
+    fn gpu_busy_percent(&self) -> Option<u32> {
+        Some(42)
+    }
+    fn power_state(&self) -> &str {
+        "D0"
+    }
 }
 
 impl core::fmt::Debug for FakeDrmCard {
@@ -846,7 +897,8 @@ fn smoke_drm_sysfs_dev_attr() -> TestResult {
     crate::drm_sysfs_bridge::populate_drm_class();
 
     let root = sysfs::sysfs_root();
-    let card0 = root.get_child("class")
+    let card0 = root
+        .get_child("class")
         .and_then(|c| c.get_child("drm"))
         .and_then(|d| d.get_child("card0"));
     let card0 = match card0 {
@@ -884,7 +936,8 @@ fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     crate::drm_sysfs_bridge::populate_drm_class();
 
     let root = sysfs::sysfs_root();
-    let device_kobj = root.get_child("class")
+    let device_kobj = root
+        .get_child("class")
         .and_then(|c| c.get_child("drm"))
         .and_then(|d| d.get_child("card0"))
         .and_then(|c| c.get_child("device"));
@@ -923,7 +976,8 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     crate::drm_sysfs_bridge::populate_drm_class();
 
     let root = sysfs::sysfs_root();
-    let device_kobj = root.get_child("class")
+    let device_kobj = root
+        .get_child("class")
         .and_then(|c| c.get_child("drm"))
         .and_then(|d| d.get_child("card0"))
         .and_then(|c| c.get_child("device"));
@@ -962,7 +1016,8 @@ fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     crate::drm_sysfs_bridge::populate_drm_class();
 
     let root = sysfs::sysfs_root();
-    let card0 = root.get_child("class")
+    let card0 = root
+        .get_child("class")
         .and_then(|c| c.get_child("drm"))
         .and_then(|d| d.get_child("card0"));
     let card0 = match card0 {
@@ -1001,7 +1056,8 @@ fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
     crate::drm_sysfs_bridge::populate_drm_class();
 
     let root = sysfs::sysfs_root();
-    let render128 = root.get_child("class")
+    let render128 = root
+        .get_child("class")
         .and_then(|c| c.get_child("drm"))
         .and_then(|d| d.get_child("renderD128"));
     let render128 = match render128 {
@@ -1024,8 +1080,8 @@ kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_render_node_dev_attr);
 // ── Smoke 18: /dev/dri/card0 resolves through DriDir ─────────────────────
 
 fn smoke_devdri_card0_resolves() -> TestResult {
-    use crate::drm_registry;
     use crate::drm_devfs_bridge::DriDir;
+    use crate::drm_registry;
     use narf_filesystem::DirOps;
 
     drm_registry::__reset_for_test();
@@ -1051,8 +1107,8 @@ kernel_test_in!("drivers/gpu/e2e", smoke_devdri_card0_resolves);
 // ── Smoke 19: /dev/dri/renderD128 resolves ────────────────────────────────
 
 fn smoke_devdri_render128_resolves() -> TestResult {
-    use crate::drm_registry;
     use crate::drm_devfs_bridge::DriDir;
+    use crate::drm_registry;
     use narf_filesystem::DirOps;
 
     drm_registry::__reset_for_test();
@@ -1116,9 +1172,9 @@ kernel_test_in!("drivers/gpu/e2e", smoke_bochs_probe_registers_drm_card);
 // ── Smoke 21: AMDGPU Renoir probe → AmdgpuCard with correct vendor/device ─
 
 fn smoke_amdgpu_renoir_registers_drm_card() -> TestResult {
-    use crate::drm_registry;
-    use crate::drm_devfs_bridge::AmdgpuCard;
     use crate::amdgpu::{AMD_VENDOR, RENOIR};
+    use crate::drm_devfs_bridge::AmdgpuCard;
+    use crate::drm_registry;
 
     let pre_count = drm_registry::count();
     let card_name = alloc::format!("card{}", pre_count);
@@ -1155,20 +1211,23 @@ kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_renoir_registers_drm_card);
 // ── Smoke 22: two cards → card0+card1 + renderD128+renderD129 in DriDir ───
 
 fn smoke_drm_two_cards_enumerate() -> TestResult {
-    use crate::drm_registry;
-    use crate::drm_devfs_bridge::{AmdgpuCard, BochsCard, DriDir};
-    use narf_filesystem::DirOps;
     use crate::amdgpu::{AMD_VENDOR, RENOIR};
+    use crate::drm_devfs_bridge::{AmdgpuCard, BochsCard, DriDir};
+    use crate::drm_registry;
+    use narf_filesystem::DirOps;
 
     drm_registry::__reset_for_test();
 
     // Register bochs as card0, AMDGPU as card1.
-    drm_registry::register_drm_card(alloc::sync::Arc::new(
-        BochsCard::new("card0".into())
-    ));
-    drm_registry::register_drm_card(alloc::sync::Arc::new(
-        AmdgpuCard::new("card1".into(), AMD_VENDOR, RENOIR, 0, 0, None)
-    ));
+    drm_registry::register_drm_card(alloc::sync::Arc::new(BochsCard::new("card0".into())));
+    drm_registry::register_drm_card(alloc::sync::Arc::new(AmdgpuCard::new(
+        "card1".into(),
+        AMD_VENDOR,
+        RENOIR,
+        0,
+        0,
+        None,
+    )));
 
     let dir = DriDir;
 

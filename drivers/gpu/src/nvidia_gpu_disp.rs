@@ -219,7 +219,10 @@ pub fn build_head_modeset(t: &DisplayTiming) -> Result<HeadModeset, DispError> {
     }
     Ok(HeadModeset {
         raster_size: (HEAD_SET_RASTER_SIZE, pack_h_v(t.h_total, t.v_total)),
-        raster_sync_end: (HEAD_SET_RASTER_SYNC_END, pack_h_v(t.h_sync_end, t.v_sync_end)),
+        raster_sync_end: (
+            HEAD_SET_RASTER_SYNC_END,
+            pack_h_v(t.h_sync_end, t.v_sync_end),
+        ),
         raster_blank_end: (
             HEAD_SET_RASTER_BLANK_END,
             pack_h_v(t.h_blank_end, t.v_blank_end),
@@ -228,10 +231,7 @@ pub fn build_head_modeset(t: &DisplayTiming) -> Result<HeadModeset, DispError> {
             HEAD_SET_RASTER_BLANK_START,
             pack_h_v(t.h_blank_start, t.v_blank_start),
         ),
-        viewport_size_out: (
-            HEAD_SET_VIEWPORT_SIZE_OUT,
-            pack_h_v(t.h_active, t.v_active),
-        ),
+        viewport_size_out: (HEAD_SET_VIEWPORT_SIZE_OUT, pack_h_v(t.h_active, t.v_active)),
         pixel_clock: (HEAD_SET_PIXEL_CLOCK, t.pixel_clock_khz),
     })
 }

@@ -184,10 +184,7 @@ pub const FALCON_IMEM_SIZE: u32 = 16 * 1024;
 ///
 /// Auto-increment is set on the first entry so subsequent IMEMD
 /// writes advance the staging pointer automatically.
-pub fn build_imem_load(
-    payload: &[u8],
-    out: &mut [ImemWrite],
-) -> Result<usize, FalconError> {
+pub fn build_imem_load(payload: &[u8], out: &mut [ImemWrite]) -> Result<usize, FalconError> {
     if payload.len() > FALCON_IMEM_SIZE as usize {
         return Err(FalconError::PayloadTooLarge);
     }
@@ -239,10 +236,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/nvidia_gpu_falcon",
-        smoke_imemc_field_layout
-    );
+    kernel_test_in!("drivers/gpu/nvidia_gpu_falcon", smoke_imemc_field_layout);
 
     fn smoke_imemc_secure_bit() -> TestResult {
         let v = imemc_secure(0x100, true);
@@ -280,10 +274,7 @@ pub mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "drivers/gpu/nvidia_gpu_falcon",
-        smoke_imem_load_round_trip
-    );
+    kernel_test_in!("drivers/gpu/nvidia_gpu_falcon", smoke_imem_load_round_trip);
 
     fn smoke_imem_load_rejects_unaligned() -> TestResult {
         let mut out = [ImemWrite {

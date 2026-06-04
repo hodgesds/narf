@@ -28,9 +28,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::{
-    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat,
-};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 // ── DriCardFile ────────────────────────────────────────────────────────────
 
@@ -197,7 +195,9 @@ pub struct BochsCard {
 
 impl BochsCard {
     pub fn new(card_name: String) -> Self {
-        BochsCard { name_str: card_name }
+        BochsCard {
+            name_str: card_name,
+        }
     }
 }
 

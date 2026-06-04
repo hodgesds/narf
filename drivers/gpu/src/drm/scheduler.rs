@@ -94,7 +94,9 @@ pub struct JobFence {
 impl JobFence {
     /// Construct an unsignalled job fence.
     pub fn pending() -> Arc<Self> {
-        Arc::new(JobFence { signalled: AtomicBool::new(false) })
+        Arc::new(JobFence {
+            signalled: AtomicBool::new(false),
+        })
     }
 }
 
@@ -181,7 +183,11 @@ pub struct SchedContext {
 impl SchedContext {
     /// New empty context with the given priority.
     pub fn new(id: u32, priority: Priority) -> Self {
-        SchedContext { id, priority, jobs: VecDeque::new() }
+        SchedContext {
+            id,
+            priority,
+            jobs: VecDeque::new(),
+        }
     }
 
     /// Front-of-queue job is ready to run?
@@ -190,7 +196,9 @@ impl SchedContext {
     }
 
     /// Number of queued jobs.
-    pub fn pending(&self) -> usize { self.jobs.len() }
+    pub fn pending(&self) -> usize {
+        self.jobs.len()
+    }
 }
 
 // ── Sched ──────────────────────────────────────────────────────────────
@@ -218,7 +226,12 @@ pub struct Sched {
 impl Sched {
     /// New scheduler.
     pub fn new() -> Self {
-        Sched { contexts: Vec::new(), queue_cap: 1024, next_ctx_id: 1, rr_cursor: 0 }
+        Sched {
+            contexts: Vec::new(),
+            queue_cap: 1024,
+            next_ctx_id: 1,
+            rr_cursor: 0,
+        }
     }
 
     /// Register a new context with the given priority.
@@ -236,7 +249,10 @@ impl Sched {
     /// `drm_sched_entity_fini` waits for drain; we expose drain
     /// separately so this matches a "force-fini").
     pub fn remove_context(&mut self, id: u32) -> Result<(), SchedError> {
-        let pos = self.contexts.iter().position(|c| c.id == id)
+        let pos = self
+            .contexts
+            .iter()
+            .position(|c| c.id == id)
             .ok_or(SchedError::NoContext)?;
         self.contexts.remove(pos);
         if self.rr_cursor >= self.contexts.len() && !self.contexts.is_empty() {
@@ -255,7 +271,10 @@ impl Sched {
         payload: Box<dyn JobPayload>,
     ) -> Result<Arc<JobFence>, SchedError> {
         let cap = self.queue_cap;
-        let ctx = self.contexts.iter_mut().find(|c| c.id == ctx_id)
+        let ctx = self
+            .contexts
+            .iter_mut()
+            .find(|c| c.id == ctx_id)
             .ok_or(SchedError::NoContext)?;
         if ctx.jobs.len() >= cap {
             return Err(SchedError::QueueFull);
@@ -292,12 +311,16 @@ impl Sched {
                 if chosen.is_none() || p < best_prio {
                     chosen = Some(idx);
                     best_prio = p;
-                    if p == Priority::High { break; } // can't beat High
+                    if p == Priority::High {
+                        break;
+                    } // can't beat High
                 }
             }
         }
         let idx = chosen.ok_or(SchedError::NotRunnable)?;
-        let mut job = self.contexts[idx].jobs.pop_front()
+        let mut job = self.contexts[idx]
+            .jobs
+            .pop_front()
             .expect("front_is_ready guarantees pop_front");
         // Advance the cursor past the chosen context so the next tick
         // is biased away from the same context (fairness).

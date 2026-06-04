@@ -718,7 +718,10 @@ fn smoke_amdgpu_fence_wait_timeout_then_ready() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_fence_wait_timeout_then_ready);
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_amdgpu_fence_wait_timeout_then_ready
+);
 
 // ─────────────────────────────────────────────────────────────────────
 // Smoke 8: BO create in VRAM — placed at a known offset, CPU-readable
@@ -800,7 +803,10 @@ fn smoke_amdgpu_cs_submit_with_bo_pattern_visible() -> TestResult {
 
     TestResult::Pass
 }
-kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_cs_submit_with_bo_pattern_visible);
+kernel_test_in!(
+    "drivers/gpu/e2e",
+    smoke_amdgpu_cs_submit_with_bo_pattern_visible
+);
 
 // ─────────────────────────────────────────────────────────────────────
 // Smoke 10: GFX11 ring-init register sequence (Phoenix) — golden trace
@@ -845,8 +851,14 @@ fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
     }
 
     // RING_BASE encodes ring_phys.
-    let base_lo = seq.writes.iter().find(|w| w.addr == gc_base + CP_RB0_BASE_REL);
-    let base_hi = seq.writes.iter().find(|w| w.addr == gc_base + CP_RB0_BASE_HI_REL);
+    let base_lo = seq
+        .writes
+        .iter()
+        .find(|w| w.addr == gc_base + CP_RB0_BASE_REL);
+    let base_hi = seq
+        .writes
+        .iter()
+        .find(|w| w.addr == gc_base + CP_RB0_BASE_HI_REL);
     match (base_lo, base_hi) {
         (Some(lo), Some(hi)) => {
             if lo.value != ring_phys as u32 {
@@ -870,7 +882,11 @@ fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
 
     // GFX11 must NOT touch the legacy CP_ME_CNTL register.
     use crate::amdgpu_gfx::CP_ME_CNTL_REL;
-    if seq.writes.iter().any(|w| w.addr == gc_base + CP_ME_CNTL_REL) {
+    if seq
+        .writes
+        .iter()
+        .any(|w| w.addr == gc_base + CP_ME_CNTL_REL)
+    {
         return TestResult::Fail("GFX11 sequence unexpectedly writes CP_ME_CNTL");
     }
 

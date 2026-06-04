@@ -91,19 +91,44 @@ pub struct IoctlFlags {
 
 impl IoctlFlags {
     pub const fn render_allow() -> Self {
-        IoctlFlags { auth: false, master: false, root_only: false, render_allow: true }
+        IoctlFlags {
+            auth: false,
+            master: false,
+            root_only: false,
+            render_allow: true,
+        }
     }
     pub const fn auth_only() -> Self {
-        IoctlFlags { auth: true, master: false, root_only: false, render_allow: false }
+        IoctlFlags {
+            auth: true,
+            master: false,
+            root_only: false,
+            render_allow: false,
+        }
     }
     pub const fn master_only() -> Self {
-        IoctlFlags { auth: false, master: true, root_only: false, render_allow: false }
+        IoctlFlags {
+            auth: false,
+            master: true,
+            root_only: false,
+            render_allow: false,
+        }
     }
     pub const fn root_only() -> Self {
-        IoctlFlags { auth: false, master: false, root_only: true, render_allow: false }
+        IoctlFlags {
+            auth: false,
+            master: false,
+            root_only: true,
+            render_allow: false,
+        }
     }
     pub const fn unrestricted() -> Self {
-        IoctlFlags { auth: false, master: false, root_only: false, render_allow: true }
+        IoctlFlags {
+            auth: false,
+            master: false,
+            root_only: false,
+            render_allow: true,
+        }
     }
 }
 
@@ -200,14 +225,22 @@ impl Card {
     ///
     /// Linux equivalent: `drm_minor_alloc(dev, DRM_MINOR_PRIMARY)`.
     pub fn primary_node(card_index: u32) -> DrmMinor {
-        DrmMinor { kind: MinorType::Primary, index: card_index, card_index }
+        DrmMinor {
+            kind: MinorType::Primary,
+            index: card_index,
+            card_index,
+        }
     }
 
     /// Compute the render node for a card at `card_index`.
     ///
     /// Linux equivalent: `drm_minor_alloc(dev, DRM_MINOR_RENDER)`.
     pub fn render_node(card_index: u32) -> DrmMinor {
-        DrmMinor { kind: MinorType::Render, index: 128 + card_index, card_index }
+        DrmMinor {
+            kind: MinorType::Render,
+            index: 128 + card_index,
+            card_index,
+        }
     }
 }
 

@@ -44,8 +44,8 @@
 //! - `drivers/gpu/drm/drm_atomic.c::drm_atomic_plane_check`
 //! - `drivers/gpu/drm/drm_atomic_uapi.c::drm_mode_atomic_ioctl`
 
-use alloc::vec::Vec;
 use super::card::Card;
+use alloc::vec::Vec;
 
 // ── Errors ─────────────────────────────────────────────────────────────
 
@@ -182,7 +182,10 @@ pub struct AtomicCheckPolicy {
 
 impl Default for AtomicCheckPolicy {
     fn default() -> Self {
-        AtomicCheckPolicy { plane_possible_crtcs: 0xFFFF_FFFF, max_pixel_budget: 0 }
+        AtomicCheckPolicy {
+            plane_possible_crtcs: 0xFFFF_FFFF,
+            max_pixel_budget: 0,
+        }
     }
 }
 
@@ -241,7 +244,10 @@ impl AtomicState {
                 _ => return Err(AtomicError::PlaneFbCrtcMismatch),
             }
             if let Some(crtc_id) = p.crtc_id {
-                let crtc_idx = card.crtcs.iter().position(|c| c.id == crtc_id)
+                let crtc_idx = card
+                    .crtcs
+                    .iter()
+                    .position(|c| c.id == crtc_id)
                     .ok_or(AtomicError::UnknownCrtc)? as u32;
                 let mask = 1u32 << crtc_idx;
                 if (policy.plane_possible_crtcs & mask) == 0 {
@@ -249,7 +255,9 @@ impl AtomicState {
                 }
             }
             if let Some(fb_id) = p.fb_id {
-                let fb = card.framebuffer(fb_id).map_err(|_| AtomicError::UnknownFb)?;
+                let fb = card
+                    .framebuffer(fb_id)
+                    .map_err(|_| AtomicError::UnknownFb)?;
                 // Source rect inside the FB.
                 let src_end_x = p.src_x.checked_add(p.src_w);
                 let src_end_y = p.src_y.checked_add(p.src_h);
@@ -297,7 +305,10 @@ impl AtomicState {
         }
         // CRTCs first — mode + enable.
         for cs in &self.crtcs {
-            let crtc = card.crtcs.iter_mut().find(|c| c.id == cs.id)
+            let crtc = card
+                .crtcs
+                .iter_mut()
+                .find(|c| c.id == cs.id)
                 .ok_or(AtomicError::UnknownCrtc)?;
             crtc.mode = cs.mode;
             crtc.enabled = cs.enable;
@@ -305,7 +316,10 @@ impl AtomicState {
         // Connectors — encoder binding.  Linux walks encoders too;
         // we keep encoder choice fixed (one encoder per connector).
         for cs in &self.connectors {
-            let conn = card.connectors.iter_mut().find(|c| c.id == cs.id)
+            let conn = card
+                .connectors
+                .iter_mut()
+                .find(|c| c.id == cs.id)
                 .ok_or(AtomicError::UnknownConnector)?;
             // No-op: we don't track which CRTC a connector is bound to
             // in `Card`; we just verify the binding is consistent.
@@ -315,7 +329,10 @@ impl AtomicState {
         // primary_fb so the legacy CRTC fbs reflect the atomic commit.
         for ps in &self.planes {
             if let (Some(crtc_id), Some(fb_id)) = (ps.crtc_id, ps.fb_id) {
-                let crtc = card.crtcs.iter_mut().find(|c| c.id == crtc_id)
+                let crtc = card
+                    .crtcs
+                    .iter_mut()
+                    .find(|c| c.id == crtc_id)
                     .ok_or(AtomicError::UnknownCrtc)?;
                 crtc.primary_fb = Some(fb_id);
                 crtc.x = ps.crtc_x.max(0) as u32;
@@ -366,8 +383,8 @@ pub struct DrmModeAtomic {
 /// `DRM_MODE_ATOMIC_ALLOW_MODESET` — caller permits modeset.
 pub const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 /// `DRM_MODE_ATOMIC_TEST_ONLY` — run `atomic_check` only, don't commit.
-pub const DRM_MODE_ATOMIC_TEST_ONLY: u32     = 0x0200;
+pub const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0200;
 /// `DRM_MODE_ATOMIC_NONBLOCK` — return without waiting for pageflip.
-pub const DRM_MODE_ATOMIC_NONBLOCK: u32      = 0x0100;
+pub const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0100;
 /// `DRM_MODE_PAGE_FLIP_EVENT` — emit a flip-complete event.
-pub const DRM_MODE_PAGE_FLIP_EVENT: u32      = 0x0001;
+pub const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x0001;

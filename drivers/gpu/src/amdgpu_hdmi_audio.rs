@@ -391,8 +391,8 @@ impl AudioEngine {
         if !self.negotiate_format(connector_idx, format, sample_rate_hz, channel_count) {
             return Err(AudioError::NoMatchingSad);
         }
-        let dto = compute_audio_dto(pixel_clock_khz, sample_rate_hz)
-            .ok_or(AudioError::BadPixelClock)?;
+        let dto =
+            compute_audio_dto(pixel_clock_khz, sample_rate_hz).ok_or(AudioError::BadPixelClock)?;
         let stream = ActiveAudioStream {
             crtc_idx,
             connector_idx,
@@ -416,10 +416,7 @@ impl AudioEngine {
     pub fn connector_supports_audio(kind: ConnectorKind) -> bool {
         matches!(
             kind,
-            ConnectorKind::HdmiA
-                | ConnectorKind::HdmiB
-                | ConnectorKind::Dp
-                | ConnectorKind::Edp
+            ConnectorKind::HdmiA | ConnectorKind::HdmiB | ConnectorKind::Dp | ConnectorKind::Edp
         )
     }
 }
@@ -532,10 +529,7 @@ pub fn write_azalia_verb<M: DcnAudioMmio>(
     verb_payload: u32,
 ) {
     let verb = encode_azalia_verb(cad, nid, verb_payload);
-    mmio.write(
-        az_base + AZ_F0_CODEC_FUNCTION_CONTROL_CODEC_DATA_REL,
-        verb,
-    );
+    mmio.write(az_base + AZ_F0_CODEC_FUNCTION_CONTROL_CODEC_DATA_REL, verb);
 }
 
 /// Bind a codec instance to a CRTC's stream via the DCIO routing
@@ -547,18 +541,13 @@ pub fn bind_codec_to_crtc<M: DcnAudioMmio>(
     crtc_idx: u8,
     connector_idx: u8,
 ) {
-    let val = (1u32 << 31)
-        | ((connector_idx as u32 & 0xF) << 8)
-        | (crtc_idx as u32 & 0xF);
+    let val = (1u32 << 31) | ((connector_idx as u32 & 0xF) << 8) | (crtc_idx as u32 & 0xF);
     mmio.write(dcio_base + DCIO_AUDIO_STREAM_CONTROL_REL, val);
 }
 
 /// Unbind any active codec stream from a CRTC (clears the
 /// stream-control enable bit). Idempotent.
-pub fn unbind_codec_from_crtc<M: DcnAudioMmio>(
-    mmio: &mut M,
-    dcio_base: u32,
-) {
+pub fn unbind_codec_from_crtc<M: DcnAudioMmio>(mmio: &mut M, dcio_base: u32) {
     mmio.write(dcio_base + DCIO_AUDIO_STREAM_CONTROL_REL, 0);
 }
 
@@ -619,11 +608,7 @@ pub fn encode_format_word(rate_hz: u32, bits_per_sample: u8, channel_count: u8) 
         _ => 1,
     };
     let chan_field = (channel_count as u32).saturating_sub(1) & 0xF;
-    (base << 14)
-        | ((mult & 0x7) << 11)
-        | ((div & 0x7) << 8)
-        | (bits_field << 4)
-        | chan_field
+    (base << 14) | ((mult & 0x7) << 11) | ((div & 0x7) << 8) | (bits_field << 4) | chan_field
 }
 
 // ── Smoke tests ──────────────────────────────────────────────────
@@ -853,7 +838,9 @@ mod smoke_tests {
     }
 
     fn smoke_program_audio_dto_writes_source_module_phase() -> TestResult {
-        let mut m = MockDcnAudioMmio { writes: alloc::vec![] };
+        let mut m = MockDcnAudioMmio {
+            writes: alloc::vec![],
+        };
         let s = ActiveAudioStream {
             crtc_idx: 0,
             connector_idx: 1,
@@ -878,7 +865,10 @@ mod smoke_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_program_audio_dto_writes_source_module_phase);
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_program_audio_dto_writes_source_module_phase
+    );
 
     fn smoke_azalia_verb_encoding() -> TestResult {
         // CAD=0, NID=4, verb_payload=0x2_0011.
@@ -895,7 +885,9 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_azalia_verb_encoding);
 
     fn smoke_bind_codec_to_crtc_writes_enable() -> TestResult {
-        let mut m = MockDcnAudioMmio { writes: alloc::vec![] };
+        let mut m = MockDcnAudioMmio {
+            writes: alloc::vec![],
+        };
         bind_codec_to_crtc(&mut m, 0x20000, 3, 2);
         if m.writes.len() != 1 {
             return TestResult::Fail("expected 1 write");
@@ -915,7 +907,9 @@ mod smoke_tests {
     kernel_test_in!("drivers/gpu", smoke_bind_codec_to_crtc_writes_enable);
 
     fn smoke_route_active_stream_three_phase() -> TestResult {
-        let mut m = MockDcnAudioMmio { writes: alloc::vec![] };
+        let mut m = MockDcnAudioMmio {
+            writes: alloc::vec![],
+        };
         let s = ActiveAudioStream {
             crtc_idx: 1,
             connector_idx: 2,
@@ -955,5 +949,8 @@ mod smoke_tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_encode_format_word_48khz_lpcm_stereo_16bit);
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_encode_format_word_48khz_lpcm_stereo_16bit
+    );
 }

@@ -37,7 +37,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_filesystem::sysfs::{class_register, class_device_register, kobject_add_attr};
+use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
 /// DRM major device number.
 ///
@@ -60,7 +60,10 @@ pub fn populate_drm_class() {
             // The registry stores cards in insertion order so the
             // position == index invariant holds.
             let cards = crate::drm_registry::cards();
-            cards.iter().position(|c| Arc::ptr_eq(c, &card)).unwrap_or(0) as u32
+            cards
+                .iter()
+                .position(|c| Arc::ptr_eq(c, &card))
+                .unwrap_or(0) as u32
         };
         populate_card_node(class_drm.clone(), card, idx);
     }
@@ -97,10 +100,7 @@ fn populate_card_node(
         let driver = String::from(card.driver());
         let idx_copy = idx;
         kobject_add_attr(&kobj, "uevent", move || {
-            format!(
-                "DEVTYPE=drm_minor\nDRIVER={}\nMINOR={}\n",
-                driver, idx_copy
-            )
+            format!("DEVTYPE=drm_minor\nDRIVER={}\nMINOR={}\n", driver, idx_copy)
         });
     }
 
@@ -146,9 +146,7 @@ fn populate_card_node(
     // Linux ref: amdgpu_sysfs.c::amdgpu_sysfs_vbios_version.
     if let Some(ver) = card.vbios_version() {
         let ver_owned = String::from(ver);
-        kobject_add_attr(&kobj, "vbios_version", move || {
-            format!("{}\n", ver_owned)
-        });
+        kobject_add_attr(&kobj, "vbios_version", move || format!("{}\n", ver_owned));
     }
 
     // `gpu_busy_percent` — 0..100.
