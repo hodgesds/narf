@@ -263,22 +263,32 @@ fn smoke_intel_lpss_acpi_hids() -> TestResult {
 kernel_test_in!("drivers/spi", smoke_intel_lpss_acpi_hids);
 
 // ─────────────────────────────────────────────────────────────────
-// Test 8 — LPSS stub error paths
+// Test 8 — LPSS data path smokes
 // ─────────────────────────────────────────────────────────────────
 
-fn smoke_intel_lpss_stub_returns_bad_hardware() -> TestResult {
+fn smoke_intel_lpss_data_path_smokes() -> TestResult {
     let (phys, len) = make_mmio();
-    let drv = lpss_new("lpss-stub".to_string(), phys, len);
-    let mut tx = [0u8; 4];
-    let mut rx = [0u8; 4];
-    match drv.transfer(&tx, &mut rx) {
-        Err(SpiError::BadHardware) => {}
-        _ => return TestResult::Fail("LPSS stage-0 transfer() should return BadHardware"),
+    let drv = lpss_new("lpss-real".to_string(), phys, len);
+
+    // init() should write the ungate and control registers.
+    if drv.init().is_err() {
+        return TestResult::Fail("LPSS init() failed unexpectedly");
     }
-    match drv.transfer_full_duplex(&mut tx, &mut rx) {
-        Err(SpiError::BadHardware) => {}
-        _ => return TestResult::Fail("LPSS stage-0 transfer_full_duplex() should return BadHardware"),
+
+    // Inspect synthetic MMIO.
+    let base = phys.raw() as *const u32;
+    // Clock gate @ 0x838 should be 0x3.
+    let gate = unsafe { core::ptr::read_volatile(base.add(0x838 / 4)) };
+    if gate != 0x3 {
+        return TestResult::Fail("LPSS clock gate not set to 0x3");
     }
+
+    // SSCR0 @ 0x00 should have SSE (1 << 7) and DSS_8BIT (0x7).
+    let cr0 = unsafe { core::ptr::read_volatile(base) };
+    if cr0 & 0x87 != 0x87 {
+        return TestResult::Fail("LPSS SSCR0 not programmed for 8-bit enable");
+    }
+
     // set_freq(0) must return FrequencyOutOfRange.
     match drv.set_freq(0) {
         Err(SpiError::FrequencyOutOfRange) => {}
@@ -289,9 +299,23 @@ fn smoke_intel_lpss_stub_returns_bad_hardware() -> TestResult {
         Err(SpiError::InvalidCs) => {}
         _ => return TestResult::Fail("LPSS set_cs(4) should return InvalidCs"),
     }
+
+    // transfer() will timeout on synthetic MMIO because TNF/RNE bits
+    // never clear in zeroed memory.
+    let tx = [0xAA];
+    let mut rx = [0u8; 1];
+    match drv.transfer(&tx, &mut rx) {
+        Err(SpiError::Timeout) => {}
+        Ok(()) => return TestResult::Fail("LPSS transfer should timeout on synthetic MMIO"),
+        Err(e) => {
+            let _ = e;
+            return TestResult::Fail("LPSS transfer returned unexpected error");
+        }
+    }
+
     TestResult::Pass
 }
-kernel_test_in!("drivers/spi", smoke_intel_lpss_stub_returns_bad_hardware);
+kernel_test_in!("drivers/spi", smoke_intel_lpss_data_path_smokes);
 
 // ─────────────────────────────────────────────────────────────────
 // Test 9 — AMD FCH set_cs rejects out-of-range
