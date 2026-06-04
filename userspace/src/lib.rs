@@ -105,11 +105,14 @@ pub use user_task::{
     EXIT_REASON_YIELDED,
 };
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_capabilities::{CapKind, CapType};
+
+use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Identifiers ─────────────────────────────────────────────────────
 
@@ -136,13 +139,103 @@ impl ThreadId {
     }
 }
 
-static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+// ── PID pool (Wave-61) ──────────────────────────────────────────────
+//
+// Linux maintains a bounded PID space: `kernel.pid_max` defaults to
+// 32768 on 32-bit systems and is the floor on x86_64 (raising it past
+// 4M needs a sysctl write). NARF uses the same default upper bound
+// here. ProcessIds 1..=PID_MAX are mintable; 0 is reserved for the
+// kernel. On `release_pid` the id returns to the pool — wired by
+// `on_child_exit` in handlers.rs so a `wait4`-reaped child's PID can
+// be reused by the next `fork`.
+//
+// Lowest-free policy: BTreeSet's first() is O(log n), and pid 1
+// stays sticky to init across its lifetime (it never exits). Linux
+// switched away from lowest-free in 2.4 for security-noise reasons
+// but the kernel-test surface here benefits from the predictability.
 
-/// Allocate a fresh `ProcessId`. Wraps are structurally impossible on
-/// a u64 at realistic exec rates.
+/// Upper bound on mintable PIDs. Matches Linux's 32-bit-default
+/// `pid_max`. Promotion to a larger ceiling needs no ABI change —
+/// just bump this and the existing pool re-fills lazily.
+pub const PID_MAX: u64 = 32768;
+
+/// Free-PID set. Lazily initialised on first `alloc_pid` /
+/// `release_pid` call so static-init ordering doesn't matter.
+static PID_POOL: IrqSafeSpinLock<Option<BTreeSet<u64>>> = IrqSafeSpinLock::new(None);
+
+/// Watermark for lazy initialisation — the smallest id NOT yet pulled
+/// into `PID_POOL` from the implicit 1..=PID_MAX universe. On alloc
+/// we either consume from the pool (a released id) or take the
+/// watermark and advance it.
+static PID_WATERMARK: AtomicU64 = AtomicU64::new(1);
+
+fn pid_pool_init_if_needed(g: &mut Option<BTreeSet<u64>>) {
+    if g.is_none() {
+        *g = Some(BTreeSet::new());
+    }
+}
+
+/// Allocate a fresh `ProcessId` — lowest free id in 1..=PID_MAX.
+/// Returns `ProcessId(0)` (kernel reserved) when the pool is fully
+/// exhausted — callers should treat that as ENOSPC-shaped failure.
 #[inline]
 pub fn alloc_pid() -> ProcessId {
-    ProcessId(NEXT_PID.fetch_add(1, Ordering::Relaxed))
+    let mut g = PID_POOL.lock();
+    pid_pool_init_if_needed(&mut g);
+    let pool = g.as_mut().expect("pool inited");
+    // Prefer a released id (smallest).
+    if let Some(&pid) = pool.iter().next() {
+        pool.remove(&pid);
+        return ProcessId(pid);
+    }
+    // Otherwise advance the watermark.
+    let next = PID_WATERMARK.fetch_add(1, Ordering::Relaxed);
+    if next == 0 || next > PID_MAX {
+        // Exhausted: roll back the watermark and report kernel-PID.
+        PID_WATERMARK.fetch_sub(1, Ordering::Relaxed);
+        return ProcessId::KERNEL;
+    }
+    ProcessId(next)
+}
+
+/// Return `pid` to the free pool. Idempotent: a double-release is a
+/// silent no-op (the BTreeSet absorbs duplicate inserts). `0`
+/// (kernel) is rejected — it was never allocated.
+#[inline]
+pub fn release_pid(pid: ProcessId) {
+    let raw = pid.raw();
+    if raw == 0 || raw > PID_MAX {
+        return;
+    }
+    let mut g = PID_POOL.lock();
+    pid_pool_init_if_needed(&mut g);
+    g.as_mut().expect("pool inited").insert(raw);
+}
+
+/// Test/reset hook — wipe the pool back to fresh-boot state. Lets
+/// independent kernel_test cases share state cleanly without leaking
+/// pids across runs.
+#[doc(hidden)]
+pub fn __test_reset_pid_pool() {
+    *PID_POOL.lock() = Some(BTreeSet::new());
+    PID_WATERMARK.store(1, Ordering::Relaxed);
+}
+
+/// Test-only: force the watermark to a specific value. Used by
+/// exhaustion smokes to skip 32k useless allocations.
+#[doc(hidden)]
+pub fn __test_set_pid_watermark(v: u64) {
+    PID_WATERMARK.store(v, Ordering::Relaxed);
+}
+
+/// Diagnostic: count of released-but-not-yet-reallocated pids.
+pub fn pid_pool_free_count() -> usize {
+    PID_POOL.lock().as_ref().map(|s| s.len()).unwrap_or(0)
+}
+
+/// Diagnostic: current watermark (smallest id never minted).
+pub fn pid_pool_watermark() -> u64 {
+    PID_WATERMARK.load(Ordering::Relaxed)
 }
 
 // ── Cap types ───────────────────────────────────────────────────────

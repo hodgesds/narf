@@ -3848,6 +3848,8 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
     if status_ptr != 0 {
         let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
     }
+    // Wave-61: PID pool — reaped child's PID returns to the free pool.
+    crate::release_pid(crate::ProcessId(child_pid));
     child_pid as i64
 }
 
@@ -3973,9 +3975,11 @@ fn on_child_exit(child_pid: u64) {
     let parent = match parent_of_get(child_pid) {
         Some(p) => p,
         None => {
-            // No registered parent — orphan. Still drain the
-            // staged status so a re-used pid doesn't see stale state.
+            // No registered parent — orphan. Drain the staged status
+            // so a re-used pid doesn't see stale state, and return the
+            // PID to the pool immediately since no one will reap it.
             let _ = take_pending_termination(child_pid);
+            crate::release_pid(crate::ProcessId(child_pid));
             return;
         }
     };
@@ -4043,6 +4047,8 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // Write i32 status under the SMAP bracket.
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
         }
+        // Wave-61: PID pool — reaped child's PID returns to the free pool.
+        crate::release_pid(crate::ProcessId(reaped));
         ctx.set_return(SyscallReturn::ok(reaped));
         return;
     }

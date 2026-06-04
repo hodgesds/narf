@@ -2234,7 +2234,11 @@ fn smoke_wave55_sigsegv_default_terminate_sets_wifsignaled() -> TestResult {
     // Drive the sync-signal hook for vector 14 (#PF). No handler
     // installed → POSIX default action for SIGSEGV is CoreDump.
     let mut ctx = signal_ctx_returning_to_user();
-    let handled = crate::default_sync_signal_delivery(&mut ctx, 14);
+    let handled = crate::default_sync_signal_delivery(
+        &mut ctx,
+        14,
+        crate::SyncFaultInfo::default(),
+    );
     if !handled {
         teardown_process_state();
         return TestResult::Fail("sync hook should report handled (default action terminates)");
@@ -2556,3 +2560,157 @@ kernel_test_in!(
     "userspace/process",
     smoke_wave55_self_sighup_default_terminate_sets_wifsignaled
 );
+// ── Wave-61 smokes: PID recycling ──────────────────────────────────
+//
+// Smoke 27: PID pool — released ids are recycled (lowest-free policy).
+// Smoke 28: PID pool — release of unallocated id (0 / out-of-range) is a no-op.
+// Smoke 29: PID pool — exhaustion returns ProcessId::KERNEL (sentinel).
+// Smoke 30: PID recycling through full fork+reap lifecycle.
+
+/// Smoke 27: spawn N pids, release them, then alloc again. The recycled
+/// pids must come back in lowest-free order.
+fn smoke_wave61_pid_pool_recycles() -> TestResult {
+    crate::__test_reset_pid_pool();
+
+    let a = crate::alloc_pid();
+    let b = crate::alloc_pid();
+    let c = crate::alloc_pid();
+    if a.raw() != 1 || b.raw() != 2 || c.raw() != 3 {
+        crate::__test_reset_pid_pool();
+        return TestResult::Fail("initial alloc did not produce 1,2,3");
+    }
+
+    crate::release_pid(b);
+    let reused = crate::alloc_pid();
+    if reused.raw() != 2 {
+        crate::__test_reset_pid_pool();
+        return TestResult::Fail("released pid 2 not reused");
+    }
+
+    crate::release_pid(a);
+    crate::release_pid(c);
+    let r1 = crate::alloc_pid();
+    let r2 = crate::alloc_pid();
+    if r1.raw() != 1 || r2.raw() != 3 {
+        crate::__test_reset_pid_pool();
+        return TestResult::Fail("recycled pids out of order");
+    }
+
+    crate::__test_reset_pid_pool();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pid_pool_recycles);
+
+/// Smoke 28: release of 0 / >PID_MAX is a structural no-op that does
+/// not poison the pool.
+fn smoke_wave61_pid_pool_release_bounds() -> TestResult {
+    crate::__test_reset_pid_pool();
+
+    crate::release_pid(crate::ProcessId(0));
+    crate::release_pid(crate::ProcessId(crate::PID_MAX + 1));
+    crate::release_pid(crate::ProcessId(u64::MAX));
+
+    if crate::pid_pool_free_count() != 0 {
+        crate::__test_reset_pid_pool();
+        return TestResult::Fail("out-of-range release inserted into pool");
+    }
+    if crate::pid_pool_watermark() != 1 {
+        crate::__test_reset_pid_pool();
+        return TestResult::Fail("watermark drifted on no-op release");
+    }
+
+    crate::__test_reset_pid_pool();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pid_pool_release_bounds);
+
+/// Smoke 29: exhausting the pool returns ProcessId::KERNEL (0) as the
+/// sentinel. Jams the watermark to avoid 32k iterations.
+fn smoke_wave61_pid_pool_exhaustion() -> TestResult {
+    crate::__test_reset_pid_pool();
+
+    crate::__test_set_pid_watermark(crate::PID_MAX + 1);
+
+    let exhausted = crate::alloc_pid();
+    let ok = exhausted == crate::ProcessId::KERNEL;
+
+    crate::__test_reset_pid_pool();
+    if !ok {
+        return TestResult::Fail("exhausted pool did not return KERNEL sentinel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pid_pool_exhaustion);
+
+/// Smoke 30: PID recycling through full fork+reap lifecycle. Spawn
+/// children that exit, reap them, observe their pids return to the
+/// pool. Verifies the on_child_exit + wait4 wiring releases pids.
+fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
+    use crate::handlers::{__test_inject_parent_of, __test_wait_reset, wait_init};
+    use crate::user_task::notify_task_exited;
+
+    crate::syscall::__test_clear_global();
+    crate::user_task::__test_clear_exit_observers();
+    __test_wait_reset();
+    wait_init();
+    crate::__test_reset_pid_pool();
+
+    const PARENT: u64 = 0xC0FE;
+
+    let c1 = crate::alloc_pid();
+    let c2 = crate::alloc_pid();
+    let c3 = crate::alloc_pid();
+    __test_inject_parent_of(c1.raw(), PARENT);
+    __test_inject_parent_of(c2.raw(), PARENT);
+    __test_inject_parent_of(c3.raw(), PARENT);
+
+    // Children exit — pids are NOT released yet (held until reap).
+    notify_task_exited(c1.raw());
+    notify_task_exited(c2.raw());
+    notify_task_exited(c3.raw());
+
+    if crate::pid_pool_free_count() != 0 {
+        crate::__test_reset_pid_pool();
+        __test_wait_reset();
+        crate::syscall::__test_clear_global();
+        crate::user_task::__test_clear_exit_observers();
+        return TestResult::Fail("pids released on exit, before reap");
+    }
+
+    // Reap them via the wait_child_check_fn path.
+    let r1 = crate::user_task::call_wait_child_check(PARENT, c1.raw() as i64, 0);
+    let r2 = crate::user_task::call_wait_child_check(PARENT, c2.raw() as i64, 0);
+    let r3 = crate::user_task::call_wait_child_check(PARENT, c3.raw() as i64, 0);
+
+    if r1 as u64 != c1.raw() || r2 as u64 != c2.raw() || r3 as u64 != c3.raw() {
+        crate::__test_reset_pid_pool();
+        __test_wait_reset();
+        crate::syscall::__test_clear_global();
+        crate::user_task::__test_clear_exit_observers();
+        return TestResult::Fail("reap did not return the expected child pids");
+    }
+
+    if crate::pid_pool_free_count() != 3 {
+        crate::__test_reset_pid_pool();
+        __test_wait_reset();
+        crate::syscall::__test_clear_global();
+        crate::user_task::__test_clear_exit_observers();
+        return TestResult::Fail("reaped pids not returned to pool");
+    }
+
+    let recycled = crate::alloc_pid();
+    if recycled != c1 {
+        crate::__test_reset_pid_pool();
+        __test_wait_reset();
+        crate::syscall::__test_clear_global();
+        crate::user_task::__test_clear_exit_observers();
+        return TestResult::Fail("recycled pid was not the smallest");
+    }
+
+    crate::__test_reset_pid_pool();
+    __test_wait_reset();
+    crate::syscall::__test_clear_global();
+    crate::user_task::__test_clear_exit_observers();
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_wave61_pid_recycled_after_reap);
