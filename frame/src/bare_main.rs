@@ -3198,6 +3198,35 @@ fn boot_userspace_init() {
     // laptop isn't delivering. Baked ELF goes straight in. Re-wire
     // disk-load once the storage IRQ path is healthy on Zen2 FCH.
     let _ = try_load_from_root; // keep symbol referenced
+
+    // Wave-49: mount a MemFs at /bin and seed it with the baked
+    // coreutil ELFs. The shell's fork+exec resolves /bin/<name>
+    // through libc::execve → posix_open(path, O_RDONLY) → kernel
+    // VFS, so this single mount is the whole story for shipping
+    // pwd / cat / ls / ps under `qemu -kernel` (no Limine
+    // initramfs CPIO module is delivered there).
+    {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        let fs = MemFs::with_seeds(
+            "bin",
+            &[
+                ("echo", narf_verification::NARF_COREUTIL_ECHO_ELF),
+                ("pwd",  narf_verification::NARF_COREUTIL_PWD_ELF),
+                ("cat",  narf_verification::NARF_COREUTIL_CAT_ELF),
+                ("ls",   narf_verification::NARF_COREUTIL_LS_ELF),
+                ("ps",   narf_verification::NARF_COREUTIL_PS_ELF),
+            ],
+        );
+        let count = fs.file_count();
+        let _ = registry().mount(&auth, "/bin", fs);
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: mounted /bin (memfs) with {} coreutils",
+            count,
+        );
+    }
+
     spawn_one("init", baked_init);
     spawn_one("shell", baked_shell);
 }
