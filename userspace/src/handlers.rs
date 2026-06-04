@@ -3217,6 +3217,47 @@ fn sys_mprotect(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Signal-induced termination ────────────────────────────────────
+//
+// Counterpart to `sys_exit_task`: stages a WIFSIGNALED-shaped wstatus
+// for the parent's wait4 to observe, then drives the same exit path
+// `sys_exit_task` uses. Called from `default_signal_delivery` and
+// `default_sync_signal_delivery` when a pending signal has no installed
+// user handler and the POSIX default action is Terminate / CoreDump.
+//
+// Behaviour:
+//   - When a UserTaskFuture is in flight (the normal user-mode case),
+//     save user state, mark EXIT_REASON_EXITED, tail-call the exit hook
+//     → longjmps back into UserTaskFuture::poll → fans out exit
+//     observers → on_child_exit drains the staged wstatus into the
+//     parent's pending-exits queue.
+//   - Without a polling future installed (kernel-only test contexts),
+//     the staged wstatus is still recorded and we mark the syscall's
+//     return as Ok(0); test harnesses fire `notify_task_exited`
+//     manually.
+fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, core_dumped: bool) {
+    stage_pending_termination(task, encode_signaled_status(signum, core_dumped));
+
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::exit_hook(),
+    ) {
+        // SAFETY: same contract as sys_exit_task — uctx is valid for
+        // the lifetime of the in-flight polling routine on this CPU,
+        // and the hook never returns.
+        unsafe {
+            let uc = &*uctx;
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+    // Test / no-polling-future path: caller (the signal hook) is
+    // responsible for not re-entering user mode. Smokes drive
+    // `notify_task_exited` directly to verify the status threading.
+}
+
 // ── ExitTask — redirect to a kernel-registered landing ─────────────
 
 fn sys_exit_task(ctx: &mut dyn TrapContext) {
@@ -3703,17 +3744,32 @@ static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// parent_pid → list of (child_pid, status) pairs not yet reaped.
-/// status is the POSIX-shaped 32-bit value: low 8 bits hold the
-/// signal that killed the child (or 0 for normal exit), bits
-/// 8..16 hold the exit code from sys_exit_task. Pre-fix, no
-/// signals are tracked; status == (exit_code << 8).
+/// status is the POSIX-shaped 32-bit value:
+///   - Normal exit (WIFEXITED): low 7 bits == 0, byte 1 holds the
+///     exit code → `status = exit_code << 8`.
+///   - Signal-killed (WIFSIGNALED): low 7 bits hold the signum
+///     (non-zero, not 0x7f), bit 7 is WCOREDUMP →
+///     `status = signum | (core ? 0x80 : 0)`.
 static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<
     Option<BTreeMap<u64, alloc::vec::Vec<(u64, i32)>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// task_pid → wstatus staged by the signal-delivery path when a
+/// signal with a Terminate/CoreDump default action is about to kill
+/// the task. The exit observer (`on_child_exit`) drains this and
+/// pushes the encoded status into PENDING_EXITS so wait4 sees
+/// `WIFSIGNALED + WTERMSIG(signum)`.
+///
+/// Absent entry → on_child_exit records `0` (normal exit), which is
+/// what sys_exit_task callers want today (exit-code threading is a
+/// separate follow-on).
+static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::register_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
@@ -3724,8 +3780,36 @@ pub fn wait_init() {
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::__test_wait_child_waker_reset();
+}
+
+/// Encode a POSIX wstatus for a signal-induced termination.
+/// Low 7 bits = signum, bit 7 = WCOREDUMP.
+#[inline]
+pub fn encode_signaled_status(signum: u32, core_dumped: bool) -> i32 {
+    let lo = (signum & 0x7f) as i32;
+    let core = if core_dumped { 0x80 } else { 0 };
+    lo | core
+}
+
+/// Stage a signal-induced termination status for `task`. The exit
+/// observer drains this when the task transitions to Exited and
+/// uses it as the wstatus reported to wait4. Idempotent: if a
+/// status is already staged (e.g. SIGSEGV racing SIGTERM), the
+/// first one wins — that's the signal that actually killed the
+/// task.
+pub fn stage_pending_termination(task: u64, status: i32) {
+    let mut g = PENDING_TERMINATION.lock();
+    if let Some(m) = g.as_mut() {
+        m.entry(task).or_insert(status);
+    }
+}
+
+fn take_pending_termination(task: u64) -> Option<i32> {
+    let mut g = PENDING_TERMINATION.lock();
+    g.as_mut().and_then(|m| m.remove(&task))
 }
 
 /// Callback invoked by `UserTaskFuture::poll` when `wait_child_pending`
@@ -3879,20 +3963,30 @@ pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
 ///      parent process."
 ///
 /// Status: the user-supplied exit code from sys_exit_task is not yet
-/// threaded through EXIT_REASON_EXITED to here — this records 0.
-/// Future fix: carry `arg0` through the UserTaskFuture polling loop.
+/// threaded through EXIT_REASON_EXITED to here — normal exits record
+/// 0 (WIFEXITED with WEXITSTATUS=0). Signal-induced exits go through
+/// `stage_pending_termination` (set by `default_signal_delivery` /
+/// `default_sync_signal_delivery` when no handler is installed and
+/// the default action is Terminate/CoreDump); we drain it here and
+/// publish the WIFSIGNALED-shaped wstatus to wait4.
 fn on_child_exit(child_pid: u64) {
     let parent = match parent_of_get(child_pid) {
         Some(p) => p,
-        None => return, // No registered parent — orphan; nothing to reap.
+        None => {
+            // No registered parent — orphan. Still drain the
+            // staged status so a re-used pid doesn't see stale state.
+            let _ = take_pending_termination(child_pid);
+            return;
+        }
     };
+    let status = take_pending_termination(child_pid).unwrap_or(0);
     // (1) Reap entry — for wait4.
     {
         let mut g = PENDING_EXITS.lock();
         if let Some(m) = g.as_mut() {
             m.entry(parent)
                 .or_insert_with(alloc::vec::Vec::new)
-                .push((child_pid, 0));
+                .push((child_pid, status));
         }
     }
     // (2) SIGCHLD delivery — for the parent's sigaction(SIGCHLD) handler.
@@ -7476,7 +7570,38 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) {
     let signum = deliverable.trailing_zeros();
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
-        None => return,
+        None => {
+            // No user handler installed → POSIX default action.
+            // Clear the pending bit before applying the action so a
+            // retry trap doesn't re-fire the same signal.
+            if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+                if let Some(slot) = map.get_mut(&task) {
+                    *slot &= !(1u32 << signum);
+                }
+            }
+            match default_signal_action(signum) {
+                DefaultAction::Ignore => {
+                    // Silently consumed (existing behaviour).
+                }
+                DefaultAction::Terminate => {
+                    terminate_current_task(ctx, task, signum, false);
+                    // unreachable when a UserTaskFuture is in flight.
+                }
+                DefaultAction::CoreDump => {
+                    terminate_current_task(ctx, task, signum, true);
+                    // unreachable when a UserTaskFuture is in flight.
+                }
+                DefaultAction::Stop | DefaultAction::Continue => {
+                    // Wave 51 scope. Restore the pending bit so a
+                    // future cut that wires job control can pick it up.
+                    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+                        let slot = map.entry(task).or_insert(0);
+                        *slot |= 1u32 << signum;
+                    }
+                }
+            }
+            return;
+        }
     };
     // Async signals: si_code = SI_USER (0), si_addr = 0.
     let params = build_delivery_params(task, action, signum, syscall_no, 0, 0);
@@ -7599,13 +7724,16 @@ pub fn sync_signal_hook() -> Option<SyncSignalHook> {
 ///
 /// Returns `false` (no rewrite) when:
 ///   - the vector has no signal mapping (e.g. #NMI)
-///   - no sigaction handler is registered for that signum
 ///   - the arch's `deliver_signal` rejects the rewrite
 ///
-/// In all three cases the caller falls through to the existing
-/// panic surface, which is the right behaviour: a userland that
-/// hasn't installed a handler for SIGSEGV genuinely deserves
-/// the kernel-side crash dump.
+/// Returns `true` when:
+///   - a sigaction handler was installed and the frame was rewritten
+///     to deliver it, OR
+///   - no handler was installed and the POSIX default action for the
+///     signal was Terminate / CoreDump — in which case the task is
+///     retired through the same exit hook `sys_exit_task` uses, with
+///     wstatus pre-staged so wait4 sees `WIFSIGNALED + WTERMSIG`.
+///     The trap dispatcher must NOT fall through to its panic path.
 ///
 /// SA_RESTART is intentionally a no-op on this path: a CPU
 /// exception is not a syscall trap (`restartable_syscall =
@@ -7643,7 +7771,24 @@ pub fn default_sync_signal_delivery(
     let task = current_task_id();
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
-        None => return false,
+        None => {
+            // No user handler → POSIX default action. CPU exceptions
+            // map to Terminate or CoreDump only; Ignore/Stop/Continue
+            // never appear in this table. Anything that's neither is
+            // a kernel bug — fall through to the panic surface.
+            match default_signal_action(signum) {
+                DefaultAction::Terminate => {
+                    terminate_current_task(ctx, task, signum, false);
+                    // Caller treats `true` as "we handled it, don't panic."
+                    return true;
+                }
+                DefaultAction::CoreDump => {
+                    terminate_current_task(ctx, task, signum, true);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
     };
     // Wave-58: arch trap forwards the faulting address (CR2 / FAR_EL1)
     // via `info.addr`. For #PF that becomes si_addr verbatim. For

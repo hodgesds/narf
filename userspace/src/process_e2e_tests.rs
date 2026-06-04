@@ -2178,3 +2178,381 @@ kernel_test_in!(
     "userspace/process",
     smoke_wave38_on_child_exit_with_mismatched_ids
 );
+
+// ── Wave-55: WIFSIGNALED end-to-end ──────────────────────────────────
+//
+// Wave-51 added `default_signal_action(signum) -> DefaultAction` but
+// did not wire it into actual task retirement: a SIGTERM / SIGSEGV /
+// SIGKILL delivered to a task with no installed user handler used to
+// be silently no-op'd, so wait4 never returned `WIFSIGNALED +
+// WTERMSIG`. Wave-55 wires it.
+//
+// These smokes drive the kernel handlers directly via StubCtx /
+// SignalCtx (the existing pattern in this file). The signal-delivery
+// path in `default_signal_delivery` / `default_sync_signal_delivery`
+// stages a wstatus via `stage_pending_termination`, then calls the
+// installed exit hook to longjmp the polling future. In test context
+// no polling future is in flight, so the exit hook is absent — the
+// smoke fires `notify_task_exited` manually to drive the same fan-out
+// the polling future would, and verifies `on_child_exit` drains the
+// staged status into the parent's pending-exits queue.
+//
+// Linux ref: kernel/signal.c::get_signal +
+//            kernel/exit.c::do_exit(signr | (core ? 0x80 : 0))
+//            kernel/exit.c::wait_task_zombie writes wstatus.
+
+/// `SignalCtx` whose `returning_to_user` reports `true`, used to drive
+/// `default_signal_delivery` on a synthetic trap return.
+fn signal_ctx_returning_to_user() -> SignalCtx {
+    SignalCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        going_to_user: true,
+        delivered: None,
+    }
+}
+
+// Smoke A: SIGSEGV via the synchronous-signal hook (CPU exception
+// path — `*NULL = 1` in user code lands here as vector 14).
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave55_sigsegv_default_terminate_sets_wifsignaled() -> TestResult {
+    const PARENT: u64 = 0xF0_55_01;
+    const CHILD: u64 = 0xC0_55_01;
+    const SIGSEGV: u32 = 11;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(CHILD);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Parent owns CHILD.
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Drive the sync-signal hook for vector 14 (#PF). No handler
+    // installed → POSIX default action for SIGSEGV is CoreDump.
+    let mut ctx = signal_ctx_returning_to_user();
+    let handled = crate::default_sync_signal_delivery(&mut ctx, 14);
+    if !handled {
+        teardown_process_state();
+        return TestResult::Fail("sync hook should report handled (default action terminates)");
+    }
+
+    // Fan out the observer (the polling future would do this after
+    // longjmping out of terminate_current_task).
+    crate::user_task::notify_task_exited(CHILD);
+
+    // Parent's wait4 should reap with WIFSIGNALED + WTERMSIG=SIGSEGV
+    // and WCOREDUMP=true (SIGSEGV default action is CoreDump).
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 1, // WNOHANG
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("wait4 did not return OK after SIGSEGV termination");
+        }
+    };
+    if reaped != CHILD {
+        teardown_process_state();
+        return TestResult::Fail("wait4 returned wrong child pid");
+    }
+    if status & 0x7f != SIGSEGV as i32 {
+        teardown_process_state();
+        return TestResult::Fail("WTERMSIG != SIGSEGV");
+    }
+    if status & 0x80 == 0 {
+        teardown_process_state();
+        return TestResult::Fail("WCOREDUMP not set for SIGSEGV (default action is CoreDump)");
+    }
+    // WIFSIGNALED: low 7 bits != 0 and != 0x7f.
+    let lo7 = status & 0x7f;
+    if lo7 == 0 || lo7 == 0x7f {
+        teardown_process_state();
+        return TestResult::Fail("WIFSIGNALED false (low 7 bits are 0 or 0x7f)");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave55_sigsegv_default_terminate_sets_wifsignaled
+);
+
+// Smoke B: kill(child, SIGTERM) → child has no handler, default
+// action is Terminate (no core), wait4 sees WIFSIGNALED.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave55_sigterm_default_terminate_sets_wifsignaled() -> TestResult {
+    const PARENT: u64 = 0xF0_55_02;
+    const CHILD: u64 = 0xC0_55_02;
+    const SIGTERM: u32 = 15;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(CHILD);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Parent's kill(CHILD, SIGTERM) sets the pending bit on CHILD.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: CHILD,
+            arg1: SIGTERM as u64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        teardown_process_state();
+        return TestResult::Fail("kill(child, SIGTERM) failed");
+    }
+
+    // Now child trap-returns to user mode → default_signal_delivery
+    // runs against CHILD's pending bitmap; with no handler installed,
+    // the Terminate default action retires the child.
+    LOOKUP_TASK.store(CHILD, Ordering::Relaxed);
+    let mut ctx = signal_ctx_returning_to_user();
+    crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+    crate::user_task::notify_task_exited(CHILD);
+
+    // Parent's wait4 sees WIFSIGNALED + WTERMSIG=SIGTERM, no core.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 1, // WNOHANG
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("wait4 did not return OK after SIGTERM");
+        }
+    };
+    if reaped != CHILD {
+        teardown_process_state();
+        return TestResult::Fail("wait4 returned wrong child pid for SIGTERM");
+    }
+    if status & 0x7f != SIGTERM as i32 {
+        teardown_process_state();
+        return TestResult::Fail("WTERMSIG != SIGTERM");
+    }
+    if status & 0x80 != 0 {
+        teardown_process_state();
+        return TestResult::Fail("WCOREDUMP set for SIGTERM (default action is Terminate only)");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave55_sigterm_default_terminate_sets_wifsignaled
+);
+
+// Smoke C: kill(child, SIGKILL) — uncatchable; even if the user had
+// a handler the default-action path should still apply. Here we
+// just verify the no-handler path.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave55_sigkill_default_terminate_sets_wifsignaled() -> TestResult {
+    const PARENT: u64 = 0xF0_55_03;
+    const CHILD: u64 = 0xC0_55_03;
+    const SIGKILL: u32 = 9;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(CHILD);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: CHILD,
+            arg1: SIGKILL as u64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        teardown_process_state();
+        return TestResult::Fail("kill(child, SIGKILL) failed");
+    }
+
+    LOOKUP_TASK.store(CHILD, Ordering::Relaxed);
+    let mut ctx = signal_ctx_returning_to_user();
+    crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+    crate::user_task::notify_task_exited(CHILD);
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("wait4 did not return OK after SIGKILL");
+        }
+    };
+    if reaped != CHILD {
+        teardown_process_state();
+        return TestResult::Fail("wait4 returned wrong child pid for SIGKILL");
+    }
+    if status & 0x7f != SIGKILL as i32 {
+        teardown_process_state();
+        return TestResult::Fail("WTERMSIG != SIGKILL");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave55_sigkill_default_terminate_sets_wifsignaled
+);
+
+// Smoke D: self-kill(SIGHUP) — task signals itself with SIGHUP, no
+// handler installed, default action is Terminate.
+#[cfg(target_arch = "x86_64")]
+fn smoke_wave55_self_sighup_default_terminate_sets_wifsignaled() -> TestResult {
+    const PARENT: u64 = 0xF0_55_04;
+    const CHILD: u64 = 0xC0_55_04;
+    const SIGHUP: u32 = 1;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(CHILD);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    crate::handlers::__test_inject_parent_of(CHILD, PARENT);
+
+    // Self-signal: CHILD calls kill(getpid(), SIGHUP).
+    LOOKUP_TASK.store(CHILD, Ordering::Relaxed);
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: CHILD,
+            arg1: SIGHUP as u64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        teardown_process_state();
+        return TestResult::Fail("kill(self, SIGHUP) failed");
+    }
+
+    let mut ctx = signal_ctx_returning_to_user();
+    crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+    crate::user_task::notify_task_exited(CHILD);
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+    let reaped = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("wait4 did not return OK after self-SIGHUP");
+        }
+    };
+    if reaped != CHILD {
+        teardown_process_state();
+        return TestResult::Fail("wait4 returned wrong child pid for self-SIGHUP");
+    }
+    if status & 0x7f != SIGHUP as i32 {
+        teardown_process_state();
+        return TestResult::Fail("WTERMSIG != SIGHUP");
+    }
+    if status & 0x80 != 0 {
+        teardown_process_state();
+        return TestResult::Fail("WCOREDUMP set for SIGHUP (default action is Terminate only)");
+    }
+
+    // Pending bit should have been cleared by default_signal_delivery
+    // (it consumes the bit before applying the default action).
+    let pending = signal_pending_of(CHILD);
+    if pending & (1 << SIGHUP) != 0 {
+        teardown_process_state();
+        return TestResult::Fail("SIGHUP pending bit not cleared after default terminate");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_wave55_self_sighup_default_terminate_sets_wifsignaled
+);
