@@ -75,7 +75,6 @@ pub struct BootInfo {
     /// to populate its staging static; subsequent consumers
     /// (`narf-firmware`'s scan, the userspace init-binary loader,
     /// …) borrow `&'static Initramfs` from `narf_initramfs::staged()`.
-
     pub initramfs: Option<MemRegion>,
     /// Optional framebuffer parameters provided by the bootloader.
     pub framebuffer: Option<FramebufferInfo>,

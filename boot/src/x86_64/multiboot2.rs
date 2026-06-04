@@ -138,9 +138,7 @@ pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: us
         }
         // SAFETY: tag bounded by total_size; we read the prefix and
         // then iterate entries up to (size - 16) / entry_size.
-        let prefix = unsafe {
-            ((payload - 8) as *const MmapTagPrefix).read_unaligned()
-        };
+        let prefix = unsafe { ((payload - 8) as *const MmapTagPrefix).read_unaligned() };
         if prefix.entry_size as usize == 0 {
             return 0;
         }
