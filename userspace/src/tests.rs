@@ -10241,6 +10241,327 @@ fn smoke_epoll_1000_fds_one_ready() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_1000_fds_one_ready);
 
+// ── Wave-64 eventfd / timerfd / event-loop integration smokes ────────
+//
+// These exercise the syscall surface for `eventfd2(2)`, `timerfd_create
+// /settime/gettime(2)`, and an end-to-end epoll-watching-eventfd loop.
+// The handlers themselves were wired earlier — these prove that
+// userspace can build a Linux-shaped event loop on top.
+
+/// Wave-64: eventfd2(0, 0) → fd. Write 8 bytes counter delta, read
+/// 8 bytes back; counter resets to 0 after a non-semaphore read.
+#[cfg(feature = "linux-compat")]
+fn smoke_wave64_eventfd_write_read_roundtrip() -> TestResult {
+    let task = setup_poll_test();
+    let r = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("eventfd2 syscall returned -1");
+    }
+    let efd = r.value as u32;
+    // Write 0x42 to the fd: get the EventFd Arc out of the fd table.
+    let ops = crate::fd::with_table(task, |t| t.get(efd).map(|e| e.ops.clone()))
+        .flatten()
+        .expect("eventfd fd not in table");
+    let write_buf = 0x42u64.to_le_bytes();
+    let read_buf_res = {
+        // Use the FileOps directly — we already proved sys_write
+        // routes through it via the OpenFile/Read tests upstream.
+        // Driving the future to completion under no_std requires
+        // the test poll_once helper which is present in this crate.
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        const NOOP: RawWaker = RawWaker::new(core::ptr::null(), &VT);
+        unsafe fn no_op(_: *const ()) {}
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            NOOP
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        let raw = NOOP;
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+
+        let mut wfut = ops.write(0, &write_buf);
+        let _ = match wfut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => {
+                crate::syscall::__test_clear_global();
+                return TestResult::Fail("eventfd write pending");
+            }
+        };
+        drop(wfut);
+
+        let mut rbuf = [0u8; 8];
+        {
+            let mut rfut = ops.read(0, &mut rbuf);
+            let _ = match rfut.as_mut().poll(&mut cx) {
+                Poll::Ready(r) => r,
+                Poll::Pending => {
+                    crate::syscall::__test_clear_global();
+                    return TestResult::Fail("eventfd read pending");
+                }
+            };
+        }
+        rbuf
+    };
+    crate::syscall::__test_clear_global();
+    let got = u64::from_le_bytes(read_buf_res);
+    if got != 0x42 {
+        return TestResult::Fail("eventfd round-trip value mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_wave64_eventfd_write_read_roundtrip);
+
+/// Wave-64: timerfd_create → settime (1 ms relative) → after the
+/// deadline passes, poll_readiness reports POLL_IN.
+#[cfg(feature = "linux-compat")]
+fn smoke_wave64_timerfd_create_settime_fires() -> TestResult {
+    let _task = setup_poll_test();
+    let r = call(
+        Syscall::TimerfdCreate,
+        SyscallArgs {
+            arg0: 1, // CLOCK_MONOTONIC (ignored)
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("timerfd_create returned -1");
+    }
+    let tfd = r.value as u32;
+    // itimerspec: interval=0 (one-shot); value=1us (so we don't
+    // have to wait long in a kernel-test fixture).
+    let mut buf = [0u8; 32];
+    // interval = 0 — bytes 0..16 stay zero.
+    let value_sec: i64 = 0;
+    let value_nsec: i64 = 1_000; // 1 μs
+    buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
+    buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+    let r = call(
+        Syscall::TimerfdSettime,
+        SyscallArgs {
+            arg0: tfd as u64,
+            arg1: 0,
+            arg2: buf.as_ptr() as u64,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("timerfd_settime returned !=0");
+    }
+    // Spin until monotonic_ns has moved past the deadline.
+    let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+    while narf_scheduler::narf_time::monotonic_ns() < deadline {
+        core::hint::spin_loop();
+    }
+    // poll_readiness should now report POLL_IN — fetch the
+    // TimerFd via the kernel-side arc map and call directly.
+    let ready = crate::fd::with_table(_task, |t| t.get(tfd).map(|e| e.ops.poll_readiness()))
+        .flatten()
+        .unwrap_or(0);
+    crate::syscall::__test_clear_global();
+    if (ready & narf_filesystem::POLL_IN) == 0 {
+        return TestResult::Fail("timerfd fd never became readable");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_wave64_timerfd_create_settime_fires);
+
+/// Wave-64: timerfd_gettime returns the configured interval and a
+/// value-remaining that drops toward zero. We arm with a 1 s
+/// one-shot, then gettime and check the remaining is ≤ 1 s.
+#[cfg(feature = "linux-compat")]
+fn smoke_wave64_timerfd_gettime_reports_remaining() -> TestResult {
+    let _task = setup_poll_test();
+    let r = call(
+        Syscall::TimerfdCreate,
+        SyscallArgs::default(),
+    );
+    if r.status != SyscallReturn::OK || r.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("timerfd_create -1");
+    }
+    let tfd = r.value as u32;
+    let mut new_value = [0u8; 32];
+    // interval = 500ms periodic
+    let interval_sec: i64 = 0;
+    let interval_nsec: i64 = 500_000_000;
+    let value_sec: i64 = 1;
+    let value_nsec: i64 = 0;
+    new_value[0..8].copy_from_slice(&interval_sec.to_le_bytes());
+    new_value[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
+    new_value[16..24].copy_from_slice(&value_sec.to_le_bytes());
+    new_value[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+    let r = call(
+        Syscall::TimerfdSettime,
+        SyscallArgs {
+            arg0: tfd as u64,
+            arg1: 0,
+            arg2: new_value.as_ptr() as u64,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("settime !=0");
+    }
+    let mut got = [0u8; 32];
+    let r = call(
+        Syscall::TimerfdGettime,
+        SyscallArgs {
+            arg0: tfd as u64,
+            arg1: got.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        return TestResult::Fail("gettime returned non-zero");
+    }
+    let interval_sec_r = i64::from_le_bytes(got[0..8].try_into().unwrap());
+    let interval_nsec_r = i64::from_le_bytes(got[8..16].try_into().unwrap());
+    let value_sec_r = i64::from_le_bytes(got[16..24].try_into().unwrap());
+    let value_nsec_r = i64::from_le_bytes(got[24..32].try_into().unwrap());
+    if interval_sec_r != 0 || interval_nsec_r != 500_000_000 {
+        return TestResult::Fail("gettime reported wrong interval");
+    }
+    // Remaining should be > 0 and ≤ 1 s.
+    let total_ns =
+        (value_sec_r as u64).saturating_mul(1_000_000_000) + value_nsec_r as u64;
+    if total_ns == 0 || total_ns > 1_000_000_000 {
+        return TestResult::Fail("gettime remaining out of range");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_wave64_timerfd_gettime_reports_remaining);
+
+/// Wave-64: end-to-end — register an eventfd in an epoll instance,
+/// write to it, and confirm epoll_wait returns the event with the
+/// userdata round-tripped intact. Level-triggered (the io_mux
+/// epoll variant).
+#[cfg(feature = "linux-compat")]
+fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
+    let task = setup_poll_test();
+    // 1. epoll_create1
+    let r = call(
+        Syscall::EpollCreate,
+        SyscallArgs::default(),
+    );
+    if r.status != SyscallReturn::OK || r.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("epoll_create -1");
+    }
+    let epfd = r.value as u32;
+    // 2. eventfd2 with initval = 0 — starts not-ready.
+    let r = call(
+        Syscall::Eventfd,
+        SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value == (-1i64 as u64) {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("eventfd -1");
+    }
+    let efd = r.value as u32;
+    // 3. epoll_ctl ADD efd with EPOLLIN + custom userdata.
+    const USERDATA: u64 = 0x1234_5678_ABCD_EF01;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_le_bytes());
+    ev[4..12].copy_from_slice(&USERDATA.to_le_bytes());
+    let r = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: efd as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("epoll_ctl ADD");
+    }
+    // 4. epoll_wait(timeout=0) — should return 0 (eventfd counter = 0).
+    let mut out = [0u8; 12];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("epoll_wait expected 0 events");
+    }
+    // 5. Poke the eventfd directly via its FileOps to bump the counter.
+    {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        unsafe fn no_op(_: *const ()) {}
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&waker);
+        let ops = crate::fd::with_table(task, |t| t.get(efd).map(|e| e.ops.clone()))
+            .flatten()
+            .expect("efd in table");
+        let buf = 7u64.to_le_bytes();
+        let mut fut = ops.write(0, &buf);
+        let _ = fut.as_mut().poll(&mut cx);
+    }
+    // 6. epoll_wait — now the eventfd reports POLLIN and userdata
+    //    round-trips.
+    let mut out = [0u8; 12];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail("epoll_wait expected 1 event after eventfd bump");
+    }
+    let got_events = u32::from_le_bytes(out[..4].try_into().unwrap());
+    let got_data = u64::from_le_bytes(out[4..12].try_into().unwrap());
+    if got_events & crate::epoll::EPOLLIN == 0 {
+        return TestResult::Fail("epoll_wait revents missing EPOLLIN");
+    }
+    if got_data != USERDATA {
+        return TestResult::Fail("epoll_wait userdata mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_wave64_epoll_watches_eventfd);
+
 // ── AF_INET socket smokes ────────────────────────────────────────────
 //
 // Exercise the `SocketFile::dispatch_op` surface directly — that's the
