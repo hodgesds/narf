@@ -184,6 +184,9 @@ pub enum AdminOpcode {
     AsyncEventRequest = 0x0C,
 }
 
+fn nvme_admin_irq() {}
+fn nvme_io_irq() {}
+
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -671,6 +674,22 @@ impl Controller {
         // ── 6. Wait for CSTS.RDY = 1 ──────────────────────────────
         wait_csts(&bar0, |s| (s & CSTS_RDY) != 0)?;
 
+        // ── 6a. Enable MSI-X ──────────────────────────────────────
+        let mut msix = narf_bus::msix::enable_msix(cap, &device).ok();
+        let mut irq_vector = None;
+        if let Some(table) = msix.as_mut() {
+            if let Ok(v) = narf_interrupts::vector::alloc() {
+                // Program MSI-X slot 0 for Admin queue.
+                // Target the BSP (apic_id=0) for now.
+                unsafe {
+                    let _ = table.program_vector(0, 0, v);
+                    let _ = table.enable();
+                }
+                irq_vector = Some(v);
+                narf_interrupts::install_handler(v, nvme_admin_irq);
+            }
+        }
+
         let mut admin = Queue {
             sq_buf,
             cq_buf,
@@ -724,6 +743,8 @@ impl Controller {
         self.nsze = nsze;
         self.admin = Some(admin);
         self.bar0_region = Some(bar0);
+        self.msix = msix;
+        self.irq_vector = irq_vector;
         Ok(())
     }
 
@@ -736,6 +757,23 @@ impl Controller {
     pub fn create_io_queue(&mut self) -> Result<(), NvmeError> {
         let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
         let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+
+        // Allocate IRQ vector if MSI-X is enabled.
+        let mut iv = 0u16;
+        let mut ien = 0u32;
+        let mut irq_vec = None;
+        if let Some(table) = self.msix.as_mut() {
+            if let Ok(v) = narf_interrupts::vector::alloc() {
+                // Use MSI-X slot 1 for the first I/O queue.
+                unsafe {
+                    let _ = table.program_vector(1, 0, v);
+                }
+                iv = 1;
+                ien = 1;
+                irq_vec = Some(v);
+                narf_interrupts::install_handler(v, nvme_io_irq);
+            }
+        }
 
         // Allocate IOSQ + IOCQ DMA pages — same shape as admin.
         let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
@@ -755,8 +793,8 @@ impl Controller {
         sqe.cdw0 = AdminOpcode::CreateCq as u32;
         sqe.prp1 = cq_phys;
         sqe.cdw10 = ((IO_Q_DEPTH as u32 - 1) << 16) | (IO_QID as u32);
-        sqe.cdw11 = 1; // PC=1, IEN=0 (polling), IV=0
-                       // SAFETY: queue + bar live; CQ buffer is fresh DMA.
+        sqe.cdw11 = ((iv as u32) << 16) | (ien << 1) | 1;
+        // SAFETY: queue + bar live; CQ buffer is fresh DMA.
         unsafe {
             admin.submit(bar0, sqe)?;
         }
@@ -780,6 +818,9 @@ impl Controller {
         self.io_queue_locks.clear();
         self.io_irq_vectors.clear();
         self.next_queue.store(0, Ordering::Relaxed);
+        if let Some(v) = irq_vec {
+            self.io_irq_vectors.push(v);
+        }
         self.io_queues.push(Queue {
             sq_buf,
             cq_buf,
