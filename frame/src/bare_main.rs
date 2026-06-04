@@ -2261,6 +2261,64 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::NotPresent
             });
 
+            // Wave-50: secondary mount at /mnt. Walks the block
+            // registry, skipping the device root-mount-auto already
+            // consumed (FAT-on-nvme0 in QEMU), and mounts the first
+            // ext-family filesystem it finds via the registered
+            // ext factory. Lets us demonstrate persistent ext2
+            // alongside the existing FAT root.
+            narf_init::register(narf_init::Stage::Late, "mnt-mount-ext2", || {
+                use narf_block::fs_detect::{detect_filesystem, FsType};
+                let auth = narf_filesystem::bootstrap_mount_authority();
+                let devices = narf_block::block_devices();
+                let mut mounted = false;
+                for entry in &devices {
+                    let dev = entry.dev.clone();
+                    let detect = match detect_filesystem(&dev) {
+                        Ok(Some(FsType::Ext)) => FsType::Ext,
+                        _ => continue,
+                    };
+                    let factory = match narf_filesystem::root_mount::lookup_factory(detect) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    let fs = match factory(dev) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-mount-ext2: factory failed on {}: {:?}",
+                                entry.name, e
+                            );
+                            continue;
+                        }
+                    };
+                    match narf_filesystem::registry().mount_arc(&auth, "/mnt", fs) {
+                        Ok(_) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-mount-ext2: ext on {} mounted at \"/mnt\"",
+                                entry.name
+                            );
+                            mounted = true;
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-mount-ext2: mount_arc(/mnt) failed: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+                if mounted {
+                    narf_init::InitResult::Ok
+                } else {
+                    narf_init::InitResult::NotPresent
+                }
+            });
+
             narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
                 use narf_graphics::Pixel32;
                 let painted = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
