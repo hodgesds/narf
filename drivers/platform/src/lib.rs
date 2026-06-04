@@ -43,6 +43,7 @@ pub mod backlight;
 pub mod amd_aoac;
 /// AMD ASF (Alert Standard Format) transport scaffold.
 pub mod amd_asf;
+pub mod intel_hid;
 /// Vendor WMI hotkey dispatch — Dell, HP, and Lenovo laptop Fn-key
 /// events delivered through ACPI WMI event GUIDs.
 /// Must init after `narf-aml` WMI GUID enumeration (Stage::Subsys,
@@ -149,6 +150,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "acpi-backlight", || {
         backlight::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "intel-hid", || {
+        intel_hid::init();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "amd-asf", || {
