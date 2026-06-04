@@ -475,12 +475,10 @@ fn smoke_dp_alt_mode_discovery_full_walk() -> TestResult {
     }
 
     // Identity ACK — single header, no VDOs needed for our walker.
-    let id_ack = alloc::vec![VdmHeader::structured(
-        SVID_PD,
-        VdmCommand::DiscoverIdentity,
-        CommandType::Ack
-    )
-    .encode()];
+    let id_ack =
+        alloc::vec![
+            VdmHeader::structured(SVID_PD, VdmCommand::DiscoverIdentity, CommandType::Ack).encode()
+        ];
     match drv.feed_response(&id_ack) {
         AltStepOutcome::Transmit(_) => {}
         _ => return TestResult::Fail("Identity ACK should kick Discover SVIDs"),
@@ -509,8 +507,12 @@ fn smoke_dp_alt_mode_discovery_full_walk() -> TestResult {
         | (0x1 << 2) // HBR3 signalling
         | ((1u32 << 3) << 8); // DFP_D pin assignment D
     let modes_ack = alloc::vec![
-        VdmHeader::structured(SVID_DISPLAYPORT, VdmCommand::DiscoverModes, CommandType::Ack)
-            .encode(),
+        VdmHeader::structured(
+            SVID_DISPLAYPORT,
+            VdmCommand::DiscoverModes,
+            CommandType::Ack
+        )
+        .encode(),
         caps,
     ];
     match drv.feed_response(&modes_ack) {
@@ -569,12 +571,10 @@ fn smoke_dp_alt_mode_nak_aborts() -> TestResult {
     };
     let mut drv = DpAltModeDriver::new();
     let _ = drv.start();
-    let nak = alloc::vec![VdmHeader::structured(
-        SVID_PD,
-        VdmCommand::DiscoverIdentity,
-        CommandType::Nak
-    )
-    .encode()];
+    let nak =
+        alloc::vec![
+            VdmHeader::structured(SVID_PD, VdmCommand::DiscoverIdentity, CommandType::Nak).encode()
+        ];
     match drv.feed_response(&nak) {
         AltStepOutcome::Failed => {}
         _ => return TestResult::Fail("NAK should fail discovery"),
@@ -624,9 +624,7 @@ fn smoke_sop_prime_target_constants() -> TestResult {
 kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_target_constants);
 
 fn smoke_sop_prime_id_header_round_trip() -> TestResult {
-    use crate::sop_prime::{
-        IdHeaderVdo, CABLE_PLUG_TYPE_PASSIVE_CABLE, CONNECTOR_PLUG,
-    };
+    use crate::sop_prime::{IdHeaderVdo, CABLE_PLUG_TYPE_PASSIVE_CABLE, CONNECTOR_PLUG};
     let v = IdHeaderVdo {
         usb_host_capable: false,
         usb_device_capable: false,
@@ -652,9 +650,7 @@ fn smoke_sop_prime_id_header_round_trip() -> TestResult {
 kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_id_header_round_trip);
 
 fn smoke_sop_prime_passive_cable_vdo_round_trip() -> TestResult {
-    use crate::sop_prime::{
-        PassiveCableVdo, USB_SS_SIGNALING_GEN2, VBUS_CURRENT_5A,
-    };
+    use crate::sop_prime::{PassiveCableVdo, USB_SS_SIGNALING_GEN2, VBUS_CURRENT_5A};
     let v = PassiveCableVdo {
         hw_version: 1,
         firmware_version: 2,
@@ -680,7 +676,10 @@ fn smoke_sop_prime_passive_cable_vdo_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_passive_cable_vdo_round_trip);
+kernel_test_in!(
+    "usbpd/sop-prime",
+    smoke_sop_prime_passive_cable_vdo_round_trip
+);
 
 fn smoke_sop_prime_active_cable_vdo1_round_trip() -> TestResult {
     use crate::sop_prime::{ActiveCableVdo1, USB_SS_SIGNALING_GEN3};
@@ -713,7 +712,10 @@ fn smoke_sop_prime_active_cable_vdo1_round_trip() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("usbpd/sop-prime", smoke_sop_prime_active_cable_vdo1_round_trip);
+kernel_test_in!(
+    "usbpd/sop-prime",
+    smoke_sop_prime_active_cable_vdo1_round_trip
+);
 
 fn smoke_sop_prime_discover_identity_request() -> TestResult {
     use crate::sop_prime::{discover_identity_request_objects, SOP_TARGET_CABLE_PLUG_NEAR};

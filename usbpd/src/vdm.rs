@@ -279,7 +279,7 @@ impl DpConfigureVdo {
     /// DFP and is driving an external monitor over USB-C).
     pub fn dfp_source(pin: DpPinAssignment) -> Self {
         Self {
-            dp_config: 1, // DFP_D
+            dp_config: 1,   // DFP_D
             signaling: 0x1, // HBR3 (the most universally-supported mode)
             dfp_d_pin: pin as u8,
             ufp_d_pin: 0,
@@ -292,32 +292,21 @@ impl DpConfigureVdo {
 /// Build a Discover Identity REQ — VDM header with no extra VDOs.
 /// Sent on SVID 0xFF00.
 pub fn build_discover_identity_req() -> Vec<u32> {
-    alloc::vec![VdmHeader::structured(
-        SVID_PD,
-        VdmCommand::DiscoverIdentity,
-        CommandType::Req
-    )
-    .encode()]
+    alloc::vec![
+        VdmHeader::structured(SVID_PD, VdmCommand::DiscoverIdentity, CommandType::Req).encode()
+    ]
 }
 
 /// Build a Discover SVIDs REQ.
 pub fn build_discover_svids_req() -> Vec<u32> {
-    alloc::vec![VdmHeader::structured(
-        SVID_PD,
-        VdmCommand::DiscoverSvids,
-        CommandType::Req
-    )
-    .encode()]
+    alloc::vec![
+        VdmHeader::structured(SVID_PD, VdmCommand::DiscoverSvids, CommandType::Req).encode()
+    ]
 }
 
 /// Build a Discover Modes REQ for `svid`.
 pub fn build_discover_modes_req(svid: u16) -> Vec<u32> {
-    alloc::vec![VdmHeader::structured(
-        svid,
-        VdmCommand::DiscoverModes,
-        CommandType::Req
-    )
-    .encode()]
+    alloc::vec![VdmHeader::structured(svid, VdmCommand::DiscoverModes, CommandType::Req).encode()]
 }
 
 /// Build an Enter Mode REQ for `svid` at `mode_position` (1..=6).

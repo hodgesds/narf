@@ -58,7 +58,9 @@ impl CcStatus {
     pub fn attached(&self) -> bool {
         !matches!(
             (self.cc1, self.cc2),
-            (CcState::Open, CcState::Open) | (CcState::Open, CcState::Ra) | (CcState::Ra, CcState::Open)
+            (CcState::Open, CcState::Open)
+                | (CcState::Open, CcState::Ra)
+                | (CcState::Ra, CcState::Open)
         )
     }
 }

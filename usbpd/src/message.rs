@@ -216,7 +216,10 @@ pub enum SourcePdo {
     /// stored as 5V * 50mV-step is documented separately — we keep the
     /// raw values per §6.4.1.2.3 table 6-9: voltage in 50 mV units,
     /// current in 10 mA units.
-    Fixed { voltage_mv: u32, max_current_ma: u32 },
+    Fixed {
+        voltage_mv: u32,
+        max_current_ma: u32,
+    },
     /// Variable Supply (Non-Battery). §6.4.1.2.4.
     Variable {
         max_voltage_mv: u32,
