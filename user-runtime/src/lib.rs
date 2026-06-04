@@ -163,6 +163,8 @@ mod arch_syscalls {
     pub const SYS_MADVISE: u64 = 28;
     pub const SYS_PRCTL: u64 = 157;
     pub const SYS_SETRLIMIT: u64 = 160;
+    pub const SYS_PIVOT_ROOT: u64 = 155;
+    pub const SYS_CHROOT: u64 = 161;
     pub const SYS_MOUNT: u64 = 165;
     pub const SYS_UMOUNT2: u64 = 166;
     pub const SYS_SETHOSTNAME: u64 = 170;
@@ -222,6 +224,8 @@ mod arch_syscalls {
     pub const SYS_RENAMEAT: u64 = 38;
     pub const SYS_UMOUNT2: u64 = 39;
     pub const SYS_MOUNT: u64 = 40;
+    pub const SYS_PIVOT_ROOT: u64 = 41;
+    pub const SYS_CHROOT: u64 = 51;
     pub const SYS_STATFS: u64 = 43;
     pub const SYS_FSTATFS: u64 = 44;
     pub const SYS_FALLOCATE: u64 = 47;
@@ -1465,25 +1469,84 @@ pub unsafe fn execve(
 /// backed by the block-device named `source`. Returns `Ok(())`
 /// on success, `Err(())` on failure.
 ///
-/// The kernel side (`Syscall::Mount = 182`) packs `fstype_ptr`
-/// and `fstype_len` into the upper / lower halves of arg4 to
-/// stay within the 5-arg syscall ABI.
+/// The kernel side packs `fstype_ptr` and `fstype_len` into the
+/// upper / lower halves of arg4 to stay within the 5-arg syscall
+/// ABI; arg5 carries the MS_* flag word.
 ///
 /// # Safety
-/// The four string slices must point at live, valid UTF-8 for
-/// the duration of the call.
+/// The string slices must point at live, valid UTF-8 for the
+/// duration of the call.
 #[inline]
 pub unsafe fn mount(source: &str, target: &str, fstype: &str) -> Result<(), ()> {
+    // SAFETY: forwards to the flag-aware variant with flags = 0.
+    unsafe { mount_with_flags(source, target, fstype, 0) }
+}
+
+/// `mount(source, target, fstype, flags, data)` — Linux-shaped
+/// mount with explicit `MS_*` flag word. Honoured flags today:
+/// MS_BIND (bind-mount path; ignores `fstype`).
+///
+/// # Safety
+/// See [`mount`].
+#[inline]
+pub unsafe fn mount_with_flags(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: u64,
+) -> Result<(), ()> {
     let packed_fstype = ((fstype.as_ptr() as u64) << 32) | (fstype.len() as u64 & 0xFFFF_FFFF);
-    // SAFETY: SYS_MOUNT 5-arg signature.
+    // SAFETY: SYS_MOUNT 6-arg shape (arg5 = MS_* flags).
     let r = unsafe {
-        syscall5(
+        syscall6(
             SYS_MOUNT,
             source.as_ptr() as u64,
             source.len() as u64,
             target.as_ptr() as u64,
             target.len() as u64,
             packed_fstype,
+            flags,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// `chroot(path)` — Linux 161 / 51 (aarch64). Rebinds the calling
+/// task's notion of `/` to `path`. Returns `Ok(())` on success.
+///
+/// # Safety
+/// `path` must be live valid UTF-8 for the duration of the call.
+#[inline]
+pub unsafe fn chroot(path: &str) -> Result<(), ()> {
+    // SAFETY: SYS_CHROOT 2-arg signature.
+    let r = unsafe { syscall2(SYS_CHROOT, path.as_ptr() as u64, path.len() as u64) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// `pivot_root(new_root, put_old)` — Linux 155 / 41 (aarch64).
+/// Atomically swap the calling task's root with `new_root`; the
+/// previous root becomes accessible at `put_old`.
+///
+/// # Safety
+/// Both slices must be live valid UTF-8 for the duration of the call.
+#[inline]
+pub unsafe fn pivot_root(new_root: &str, put_old: &str) -> Result<(), ()> {
+    // SAFETY: SYS_PIVOT_ROOT 4-arg signature.
+    let r = unsafe {
+        syscall4(
+            SYS_PIVOT_ROOT,
+            new_root.as_ptr() as u64,
+            new_root.len() as u64,
+            put_old.as_ptr() as u64,
+            put_old.len() as u64,
         )
     };
     if r == 0 {

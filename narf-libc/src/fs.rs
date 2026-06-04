@@ -171,8 +171,10 @@ pub struct statvfs {
 }
 
 /// `mount(source, target, fstype, flags, data)` — Linux-style
-/// `mount(2)`. Forwards to the kernel SYS_MOUNT. `flags` and
-/// `data` are accepted for ABI compatibility but ignored today.
+/// `mount(2)`. Forwards to the kernel SYS_MOUNT with the
+/// MS_* flag word in `flags`. `data` is accepted for ABI
+/// compatibility but not forwarded (per-FS options aren't wired
+/// at the kernel side yet).
 ///
 /// # Safety
 /// All three string arguments must be NUL-terminated C strings.
@@ -181,7 +183,7 @@ pub unsafe extern "C" fn mount(
     source: *const i8,
     target: *const i8,
     fstype: *const i8,
-    _flags: u64,
+    flags: u64,
     _data: *const u8,
 ) -> i32 {
     if source.is_null() || target.is_null() || fstype.is_null() {
@@ -193,7 +195,55 @@ pub unsafe extern "C" fn mount(
     let tgt = unsafe { crate::posix::cstr_to_str(target as *const _) };
     let typ = unsafe { crate::posix::cstr_to_str(fstype as *const _) };
     // SAFETY: forwarded with live &str.
-    match unsafe { narf_user_runtime::mount(src, tgt, typ) } {
+    match unsafe { narf_user_runtime::mount_with_flags(src, tgt, typ, flags) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}
+
+/// `chroot(path)` — POSIX-2001 / Linux `chroot(2)`. Rebinds the
+/// calling task's `/`. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// `path` must be a NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn chroot(path: *const i8) -> i32 {
+    if path.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    // SAFETY: caller-asserted NUL-terminator.
+    let p = unsafe { crate::posix::cstr_to_str(path as *const _) };
+    // SAFETY: forwarded.
+    match unsafe { narf_user_runtime::chroot(p) } {
+        Ok(()) => 0,
+        Err(()) => {
+            crate::errno::set_errno(crate::errno::EINVAL);
+            -1
+        }
+    }
+}
+
+/// `pivot_root(new_root, put_old)` — Linux `pivot_root(2)`. Used
+/// by container-init to swap the root before dropping the
+/// bootstrap image. Returns 0 on success, -1 on error.
+///
+/// # Safety
+/// Both arguments must be NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pivot_root(new_root: *const i8, put_old: *const i8) -> i32 {
+    if new_root.is_null() || put_old.is_null() {
+        crate::errno::set_errno(crate::errno::EINVAL);
+        return -1;
+    }
+    // SAFETY: caller-asserted NUL-terminators.
+    let nr = unsafe { crate::posix::cstr_to_str(new_root as *const _) };
+    let po = unsafe { crate::posix::cstr_to_str(put_old as *const _) };
+    // SAFETY: forwarded.
+    match unsafe { narf_user_runtime::pivot_root(nr, po) } {
         Ok(()) => 0,
         Err(()) => {
             crate::errno::set_errno(crate::errno::EINVAL);
