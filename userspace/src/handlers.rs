@@ -2346,23 +2346,30 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     };
 
     // Resolve to a DirOps. Empty path or root → use the FS root
-    // directly; otherwise descend through `lookup_dir`.
+    // directly; otherwise descend through `lookup_dir_async` so
+    // disk-backed FSes (FAT, ext2) that only implement the async side
+    // can serve subdirectory walks.
     let entries = narf_filesystem::registry()
         .resolve_absolute(&path, |fs, rel| {
             let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
                 fs.root()
             } else {
-                // Walk segment by segment so we follow `lookup_dir`.
+                // Walk segment by segment via the async lookup so
+                // disk-backed FSes (FAT, ext2) resolve correctly.
                 let mut cur = fs.root();
                 for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = cur.lookup_dir(seg)?;
+                    cur = poll_blocking(cur.lookup_dir_async(seg))
+                        .and_then(|r| r.ok())?;
                 }
                 cur
             };
-            // Bound the snapshot at usize::MAX entries — practically
-            // walks every entry, but `enumerate` already takes a `max`
-            // so the contract is in our hands.
-            Some(dir.enumerate(cursor, 1))
+            // Use enumerate_async so disk-backed FSes (FAT, ext2) that
+            // return Vec::new() from the sync enumerate() still work.
+            // poll_blocking drives the future to completion via the
+            // same internally-polled NVMe/virtio-blk driver path that
+            // sys_open and sys_read already rely on.
+            poll_blocking(dir.enumerate_async(cursor, 1))
+                .and_then(|r| r.ok())
         })
         .flatten();
 
@@ -2445,7 +2452,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     };
 
     // Resolve to a DirOps once. We iterate by re-issuing
-    // enumerate(cursor, 1) per entry — simpler than threading a
+    // enumerate_async(cursor, 1) per entry — simpler than threading a
     // batch enumerator through the closure-typed registry walker,
     // and the per-call cost is bounded by the small fan-out of a
     // typical directory in our test FSes.
@@ -2456,7 +2463,8 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
             } else {
                 let mut cur = fs.root();
                 for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = cur.lookup_dir(seg)?;
+                    cur = poll_blocking(cur.lookup_dir_async(seg))
+                        .and_then(|r| r.ok())?;
                 }
                 cur
             };
@@ -2473,10 +2481,12 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
 
     let mut written = 0usize;
     loop {
-        let mut entries = dir.enumerate(cursor, 1);
-        if entries.is_empty() {
-            break;
-        }
+        let mut entries = match poll_blocking(dir.enumerate_async(cursor, 1))
+            .and_then(|r| r.ok())
+        {
+            Some(v) if !v.is_empty() => v,
+            _ => break,
+        };
         let (name, ftype) = entries.pop().unwrap();
         let name_bytes = name.as_bytes();
         // 19-byte fixed header + name + NUL, padded up to 8 bytes.
