@@ -13171,3 +13171,470 @@ fn smoke_mount_ns_isolates_per_task_mounts() -> TestResult {
 }
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_mount_ns_isolates_per_task_mounts);
+// ── Wave-70 linux-compat: signalfd4 + memfd seals ──────────────────
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use crate::handlers::__test_signal_reset;
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+
+    __test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
+    __test_signal_reset();
+    crate::handlers::signal_init();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Mask = SIGUSR1 only (signum 10 = 1<<10).
+    let mask: u64 = 1u64 << 10;
+    let mask_bytes = mask.to_le_bytes();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: mask_bytes.as_ptr() as u64,
+            arg2: 8,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Signalfd.raw(), &mut ctx);
+    let sfd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
+        _ => {
+            __test_signal_reset();
+            __test_clear_global();
+            return TestResult::Fail("signalfd did not return a fd");
+        }
+    };
+
+    // Raise SIGUSR1 (10) on task 0 (the test task lookup is unset → 0).
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: 10,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+
+    // Read the 128-byte signalfd_siginfo.
+    let mut buf = [0u8; 128];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: sfd as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+    let nread = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => 0,
+    };
+
+    __test_signal_reset();
+    crate::fd::__test_reset();
+    __test_clear_global();
+
+    if nread != 128 {
+        return TestResult::Fail("signalfd read returned wrong length");
+    }
+    let ssi_signo = u32::from_le_bytes(buf[..4].try_into().unwrap());
+    if ssi_signo != 10 {
+        return TestResult::Fail("signalfd siginfo.ssi_signo != SIGUSR1");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_signalfd_reads_pending_siginfo);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use crate::handlers::__test_signal_reset;
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+
+    __test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
+    __test_signal_reset();
+    crate::handlers::signal_init();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Create signalfd watching SIGUSR2 (signum 12).
+    let mask: u64 = 1u64 << 12;
+    let mask_bytes = mask.to_le_bytes();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: (-1i64) as u64,
+            arg1: mask_bytes.as_ptr() as u64,
+            arg2: 8,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Signalfd.raw(), &mut ctx);
+    let sfd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
+        _ => {
+            __test_signal_reset();
+            __test_clear_global();
+            return TestResult::Fail("signalfd did not return a fd");
+        }
+    };
+
+    // Create epoll instance.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs { ..SyscallArgs::default() },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::EpollCreate.raw(), &mut ctx);
+    let epfd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
+        _ => {
+            __test_signal_reset();
+            __test_clear_global();
+            return TestResult::Fail("epoll_create failed");
+        }
+    };
+
+    // ADD signalfd with EPOLLIN=1.
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&1u32.to_le_bytes());
+    ev[4..].copy_from_slice(&0xC0FFEEu64.to_le_bytes());
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: epfd as u64,
+            arg1: 1, // EPOLL_CTL_ADD
+            arg2: sfd as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::EpollCtl.raw(), &mut ctx);
+
+    // Raise SIGUSR2.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: 12,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+
+    // epoll_wait timeout=0 → should immediately see 1 ready event.
+    let mut events = [0u8; 12 * 4];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: epfd as u64,
+            arg1: events.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::EpollWait.raw(), &mut ctx);
+    let nready = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value,
+        _ => 0,
+    };
+
+    let user_data = u64::from_le_bytes(events[4..12].try_into().unwrap());
+
+    __test_signal_reset();
+    crate::fd::__test_reset();
+    __test_clear_global();
+
+    if nready != 1 {
+        return TestResult::Fail("epoll_wait did not return 1 ready");
+    }
+    if user_data != 0xC0FFEE {
+        return TestResult::Fail("epoll_wait user_data not echoed");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_signalfd_epoll_wakes_on_signal);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use crate::linux_compat::{F_SEAL_WRITE, MFD_ALLOW_SEALING};
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+
+    __test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let name = "sealable";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: name.as_ptr() as u64,
+            arg1: name.len() as u64,
+            arg2: MFD_ALLOW_SEALING as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::MemfdCreate.raw(), &mut ctx);
+    let fd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
+        _ => return TestResult::Fail("memfd_create failed"),
+    };
+
+    // Write before sealing — must succeed.
+    let payload = b"hello";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
+    let w1 = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 5);
+    if !w1 {
+        crate::fd::__test_reset();
+        __test_clear_global();
+        return TestResult::Fail("pre-seal write rejected");
+    }
+
+    // F_GET_SEALS before sealing — should be 0.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: 1034, // F_GET_SEALS
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut ctx);
+    let pre_seals = match ctx.ret {
+        Some(r) => r.value as u32,
+        None => return TestResult::Fail("fcntl F_GET_SEALS no return"),
+    };
+
+    // F_ADD_SEALS F_SEAL_WRITE.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: 1033, // F_ADD_SEALS
+            arg2: F_SEAL_WRITE as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut ctx);
+    let add_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0);
+
+    // F_GET_SEALS post-add — F_SEAL_WRITE set.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: 1034,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut ctx);
+    let post_seals = match ctx.ret {
+        Some(r) => r.value as u32,
+        None => return TestResult::Fail("fcntl F_GET_SEALS no return (post)"),
+    };
+
+    // Write after sealing — must fail.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
+    let w2_rejected = matches!(
+        ctx.ret,
+        Some(r) if r.value == (-1i64) as u64 || r.status != SyscallReturn::OK
+    );
+
+    crate::fd::__test_reset();
+    __test_clear_global();
+
+    if pre_seals != 0 {
+        return TestResult::Fail("pre-seal F_GET_SEALS != 0");
+    }
+    if !add_ok {
+        return TestResult::Fail("F_ADD_SEALS rejected");
+    }
+    if post_seals & F_SEAL_WRITE == 0 {
+        return TestResult::Fail("F_SEAL_WRITE not visible after add");
+    }
+    if !w2_rejected {
+        return TestResult::Fail("post-seal write was not rejected");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_memfd_seal_write_rejects_write);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use crate::linux_compat::{F_SEAL_SEAL, F_SEAL_WRITE, MFD_ALLOW_SEALING};
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+
+    __test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    let name = "lockdown";
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: name.as_ptr() as u64,
+            arg1: name.len() as u64,
+            arg2: MFD_ALLOW_SEALING as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::MemfdCreate.raw(), &mut ctx);
+    let fd = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != (-1i64) as u64 => r.value as u32,
+        _ => return TestResult::Fail("memfd_create failed"),
+    };
+
+    // Seal with F_SEAL_SEAL.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: 1033,
+            arg2: F_SEAL_SEAL as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut ctx);
+    let seal_seal = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0);
+
+    // Now try to add F_SEAL_WRITE — must fail.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: fd as u64,
+            arg1: 1033,
+            arg2: F_SEAL_WRITE as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut ctx);
+    let further_rejected =
+        matches!(ctx.ret, Some(r) if r.value == (-1i64) as u64);
+
+    crate::fd::__test_reset();
+    __test_clear_global();
+
+    if !seal_seal {
+        return TestResult::Fail("F_SEAL_SEAL add failed");
+    }
+    if !further_rejected {
+        return TestResult::Fail("post F_SEAL_SEAL further add was accepted");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_memfd_seal_seal_blocks_further_seals);
