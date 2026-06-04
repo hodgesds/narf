@@ -76,12 +76,7 @@ impl<'a> PbBuilder<'a> {
 
     /// Write a header word + `data` payload with the given method
     /// space-walk type. Single call emits 4 + 4*data.len() bytes.
-    pub fn write(
-        &mut self,
-        method: u16,
-        data: &[u32],
-        pb_type: PbType,
-    ) -> Result<(), PbError> {
+    pub fn write(&mut self, method: u16, data: &[u32], pb_type: PbType) -> Result<(), PbError> {
         if data.len() > 0x1FFF {
             return Err(PbError::SizeTooLarge);
         }
@@ -125,9 +120,7 @@ pub fn append_fence_release(
     sem_phys: u64,
     seqno: u32,
 ) -> Result<(), PbError> {
-    use crate::fence::{
-        SEMAPHOREA, SEMAPHORED_RELEASE,
-    };
+    use crate::fence::{SEMAPHOREA, SEMAPHORED_RELEASE};
     // Inc-write block at method SEMAPHOREA, 4 words: high/low
     // address, payload, OPERATION = RELEASE.
     pb.write_inc(

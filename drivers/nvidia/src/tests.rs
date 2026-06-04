@@ -37,7 +37,9 @@ use crate::mc::{
     Boot0, IntrSource, PMC_BOOT_0, PMC_BOOT_0_ARCH_SHIFT, PMC_ENABLE, PMC_ENABLE_ALL,
     PMC_ENABLE_PDISP, PMC_ENABLE_PFIFO, PMC_INTR_0, PMC_INTR_EN_0,
 };
-use crate::mmu::{pde_encode_pt, pte_encode_4k, Aperture, PageSize, PTE_RO, PTE_VALID, PTE_VOLATILE};
+use crate::mmu::{
+    pde_encode_pt, pte_encode_4k, Aperture, PageSize, PTE_RO, PTE_VALID, PTE_VOLATILE,
+};
 use crate::pmu::{pmu_firmware_for, PMU_INIT_MAGIC};
 
 // ────────────────────────────────────────────────────────────────
@@ -71,7 +73,10 @@ fn smoke_nvidia_pci_table_covers_all_families() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/chip", smoke_nvidia_pci_table_covers_all_families);
+kernel_test_in!(
+    "drivers/nvidia/chip",
+    smoke_nvidia_pci_table_covers_all_families
+);
 
 fn smoke_nvidia_pci_rejects_non_nvidia_vendor() -> TestResult {
     if chip_info_for_pci_id(0x1002, GA102_RTX_3090).is_some() {
@@ -82,7 +87,10 @@ fn smoke_nvidia_pci_rejects_non_nvidia_vendor() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/chip", smoke_nvidia_pci_rejects_non_nvidia_vendor);
+kernel_test_in!(
+    "drivers/nvidia/chip",
+    smoke_nvidia_pci_rejects_non_nvidia_vendor
+);
 
 fn smoke_nvidia_chip_known_pci_ids_per_family() -> TestResult {
     // Spot-check one well-known board per family.
@@ -108,7 +116,10 @@ fn smoke_nvidia_chip_known_pci_ids_per_family() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/chip", smoke_nvidia_chip_known_pci_ids_per_family);
+kernel_test_in!(
+    "drivers/nvidia/chip",
+    smoke_nvidia_chip_known_pci_ids_per_family
+);
 
 // ────────────────────────────────────────────────────────────────
 // PMC_BOOT_0 decode
@@ -133,8 +144,7 @@ fn smoke_pmc_boot0_arch_tag_decode_per_family() -> TestResult {
         // Assemble a PMC_BOOT_0 with that arch field + some
         // implementation / revision noise: impl=0x123 (bits[19:8]),
         // major=0xA (bits[7:4]), minor=0x5 (bits[3:0]).
-        let raw =
-            ((arch_nibble & 0x1F) << PMC_BOOT_0_ARCH_SHIFT) | (0x123 << 8) | (0xA << 4) | 0x5;
+        let raw = ((arch_nibble & 0x1F) << PMC_BOOT_0_ARCH_SHIFT) | (0x123 << 8) | (0xA << 4) | 0x5;
         let b = Boot0::decode(raw);
         if b.family != fam {
             return TestResult::Fail("arch nibble misclassified by Boot0::decode");
@@ -159,7 +169,10 @@ fn smoke_pmc_boot0_arch_tag_decode_per_family() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mc", smoke_pmc_boot0_arch_tag_decode_per_family);
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_boot0_arch_tag_decode_per_family
+);
 
 fn smoke_pmc_register_offsets_match_open_gpu_doc() -> TestResult {
     // Stable cross-generation offsets per dev_pmc.ref.txt.
@@ -180,7 +193,10 @@ fn smoke_pmc_register_offsets_match_open_gpu_doc() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mc", smoke_pmc_register_offsets_match_open_gpu_doc);
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_register_offsets_match_open_gpu_doc
+);
 
 fn smoke_pmc_intr_source_bits_unique_and_set() -> TestResult {
     let sources = [
@@ -210,7 +226,10 @@ fn smoke_pmc_intr_source_bits_unique_and_set() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mc", smoke_pmc_intr_source_bits_unique_and_set);
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_pmc_intr_source_bits_unique_and_set
+);
 
 // ────────────────────────────────────────────────────────────────
 // Falcon
@@ -250,7 +269,10 @@ fn smoke_falcon_register_offsets_match_v4() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/falcon", smoke_falcon_register_offsets_match_v4);
+kernel_test_in!(
+    "drivers/nvidia/falcon",
+    smoke_falcon_register_offsets_match_v4
+);
 
 fn smoke_falcon_per_engine_base_addresses() -> TestResult {
     use crate::falcon::*;
@@ -265,7 +287,10 @@ fn smoke_falcon_per_engine_base_addresses() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/falcon", smoke_falcon_per_engine_base_addresses);
+kernel_test_in!(
+    "drivers/nvidia/falcon",
+    smoke_falcon_per_engine_base_addresses
+);
 
 fn smoke_falcon_cpuctl_bits_have_canonical_positions() -> TestResult {
     use crate::falcon::*;
@@ -286,7 +311,10 @@ fn smoke_falcon_cpuctl_bits_have_canonical_positions() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/falcon", smoke_falcon_cpuctl_bits_have_canonical_positions);
+kernel_test_in!(
+    "drivers/nvidia/falcon",
+    smoke_falcon_cpuctl_bits_have_canonical_positions
+);
 
 // ────────────────────────────────────────────────────────────────
 // PMU
@@ -332,7 +360,10 @@ fn smoke_mmu_pte_encode_valid_aperture_and_phys() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mmu", smoke_mmu_pte_encode_valid_aperture_and_phys);
+kernel_test_in!(
+    "drivers/nvidia/mmu",
+    smoke_mmu_pte_encode_valid_aperture_and_phys
+);
 
 fn smoke_mmu_pde_encode_points_at_vram_pt() -> TestResult {
     let pde = pde_encode_pt(0x2000_0000);
@@ -391,7 +422,10 @@ fn smoke_fb_ram_type_per_family_classification() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/fb", smoke_fb_ram_type_per_family_classification);
+kernel_test_in!(
+    "drivers/nvidia/fb",
+    smoke_fb_ram_type_per_family_classification
+);
 
 // ────────────────────────────────────────────────────────────────
 // BAR / PRAMIN window
@@ -449,7 +483,10 @@ fn smoke_disp_dcb_entry_decode_dp_over_sor0() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/disp", smoke_disp_dcb_entry_decode_dp_over_sor0);
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_dcb_entry_decode_dp_over_sor0
+);
 
 fn smoke_disp_dcb_no_output_sentinel_rejected() -> TestResult {
     let mut raw = [0u8; 8];
@@ -459,7 +496,10 @@ fn smoke_disp_dcb_no_output_sentinel_rejected() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/disp", smoke_disp_dcb_no_output_sentinel_rejected);
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_disp_dcb_no_output_sentinel_rejected
+);
 
 fn smoke_disp_dispclass_per_family() -> TestResult {
     if dispclass_for(ChipFamily::Maxwell) != Some(GM200_DISP) {
@@ -555,7 +595,10 @@ fn smoke_head_mode_field_encoders_pack_correctly() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/disp", smoke_head_mode_field_encoders_pack_correctly);
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_head_mode_field_encoders_pack_correctly
+);
 
 // ────────────────────────────────────────────────────────────────
 // DP AUX framing
@@ -576,7 +619,10 @@ fn smoke_dp_aux_command_codes_match_dp_spec() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/disp", smoke_dp_aux_command_codes_match_dp_spec);
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_dp_aux_command_codes_match_dp_spec
+);
 
 fn smoke_dp_aux_header_field_packing() -> TestResult {
     // Read DPCD register 0x000 (DPCD revision), 1 byte. Command =
@@ -660,7 +706,10 @@ fn smoke_fifo_channel_cap_reasonable_for_family() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/fifo", smoke_fifo_channel_cap_reasonable_for_family);
+kernel_test_in!(
+    "drivers/nvidia/fifo",
+    smoke_fifo_channel_cap_reasonable_for_family
+);
 
 // ────────────────────────────────────────────────────────────────
 // GR / CE class tables
@@ -717,15 +766,18 @@ fn smoke_ce_class_and_instance_count_per_family() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/ce", smoke_ce_class_and_instance_count_per_family);
+kernel_test_in!(
+    "drivers/nvidia/ce",
+    smoke_ce_class_and_instance_count_per_family
+);
 
 // ────────────────────────────────────────────────────────────────
 // VBIOS
 // ────────────────────────────────────────────────────────────────
 
 use crate::vbios::{
-    dcb_header, dcb_table_offset, find_nv_image, parse_image_at, DCB_V30_MAGIC, ROM_SIG_NV,
-    ROM_SIG_PCI, PCIR_TYPE_NV,
+    dcb_header, dcb_table_offset, find_nv_image, parse_image_at, DCB_V30_MAGIC, PCIR_TYPE_NV,
+    ROM_SIG_NV, ROM_SIG_PCI,
 };
 
 fn smoke_vbios_parse_pci_option_rom_header() -> TestResult {
@@ -769,7 +821,10 @@ fn smoke_vbios_parse_pci_option_rom_header() -> TestResult {
         None => TestResult::Fail("find_nv_image should return the only image"),
     }
 }
-kernel_test_in!("drivers/nvidia/vbios", smoke_vbios_parse_pci_option_rom_header);
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_parse_pci_option_rom_header
+);
 
 fn smoke_vbios_rejects_unknown_signature() -> TestResult {
     let mut rom = [0u8; 1024];
@@ -780,7 +835,10 @@ fn smoke_vbios_rejects_unknown_signature() -> TestResult {
         _ => TestResult::Fail("unknown ROM signature should be rejected"),
     }
 }
-kernel_test_in!("drivers/nvidia/vbios", smoke_vbios_rejects_unknown_signature);
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_rejects_unknown_signature
+);
 
 fn smoke_vbios_dcb_table_offset_and_header() -> TestResult {
     let mut image = [0u8; 256];
@@ -804,7 +862,10 @@ fn smoke_vbios_dcb_table_offset_and_header() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/vbios", smoke_vbios_dcb_table_offset_and_header);
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_dcb_table_offset_and_header
+);
 
 fn smoke_vbios_nv_modern_signature_accepted() -> TestResult {
     let mut rom = [0u8; 1024];
@@ -819,7 +880,10 @@ fn smoke_vbios_nv_modern_signature_accepted() -> TestResult {
         Err(_) => TestResult::Fail("NV-signature image must parse"),
     }
 }
-kernel_test_in!("drivers/nvidia/vbios", smoke_vbios_nv_modern_signature_accepted);
+kernel_test_in!(
+    "drivers/nvidia/vbios",
+    smoke_vbios_nv_modern_signature_accepted
+);
 
 // ────────────────────────────────────────────────────────────────
 // DCB v3.0 — Kepler / early Pascal / some Fermi
@@ -974,16 +1038,16 @@ kernel_test_in!("drivers/nvidia/kms", smoke_dcb_mixed_version_table_routing);
 use crate::dp::{
     link_rate_gbps_x10, LaneStatus, LinkStatus, LtMachine, LtPhase, DPCD_LANE_COUNT_SET,
     DPCD_LINK_BW_SET, DPCD_TRAINING_PATTERN_SET, LINK_BW_1_62, LINK_BW_2_7, LINK_BW_5_4,
-    LINK_BW_8_1, STATUS_CHANNEL_EQ_DONE, STATUS_CR_DONE, STATUS_SYMBOL_LOCKED,
-    TRAINING_PATTERN_1, TRAINING_PATTERN_2, TRAINING_PATTERN_4,
+    LINK_BW_8_1, STATUS_CHANNEL_EQ_DONE, STATUS_CR_DONE, STATUS_SYMBOL_LOCKED, TRAINING_PATTERN_1,
+    TRAINING_PATTERN_2, TRAINING_PATTERN_4,
 };
 
 fn smoke_dp_link_status_decodes_per_lane() -> TestResult {
     // Lane 0: CR + EQ + SYMBOL_LOCKED.
     // Lane 1: CR only.
     // Lane 2/3: nothing.
-    let b202 = (STATUS_CR_DONE | STATUS_CHANNEL_EQ_DONE | STATUS_SYMBOL_LOCKED)
-        | (STATUS_CR_DONE << 4);
+    let b202 =
+        (STATUS_CR_DONE | STATUS_CHANNEL_EQ_DONE | STATUS_SYMBOL_LOCKED) | (STATUS_CR_DONE << 4);
     let b203 = 0;
     let b204 = 0x01; // interlane_aligned
     let s = LinkStatus::decode(b202, b203, b204);
@@ -1039,7 +1103,10 @@ fn smoke_dp_lt_state_machine_cr_then_eq_succeeds() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/dp", smoke_dp_lt_state_machine_cr_then_eq_succeeds);
+kernel_test_in!(
+    "drivers/nvidia/dp",
+    smoke_dp_lt_state_machine_cr_then_eq_succeeds
+);
 
 fn smoke_dp_lt_voltage_bumps_until_failed() -> TestResult {
     // Sink never asserts CR_DONE. After 5 attempts at each
@@ -1047,7 +1114,7 @@ fn smoke_dp_lt_voltage_bumps_until_failed() -> TestResult {
     // be Failed.
     let mut m = LtMachine::new(LINK_BW_5_4, 4);
     m.step(LinkStatus::decode(0, 0, 0)); // CrStart → CrPoll
-    // 20 polls (5 per level, 4 levels) all show no CR.
+                                         // 20 polls (5 per level, 4 levels) all show no CR.
     for _ in 0..30 {
         m.step(LinkStatus::decode(0, 0, 0));
         if m.phase == LtPhase::Failed {
@@ -1080,7 +1147,10 @@ fn smoke_dp_link_rate_table_matches_dpcd_encoding() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/dp", smoke_dp_link_rate_table_matches_dpcd_encoding);
+kernel_test_in!(
+    "drivers/nvidia/dp",
+    smoke_dp_link_rate_table_matches_dpcd_encoding
+);
 
 fn smoke_dp_dpcd_address_constants_match_spec() -> TestResult {
     if DPCD_TRAINING_PATTERN_SET != 0x0102 {
@@ -1098,7 +1168,10 @@ fn smoke_dp_dpcd_address_constants_match_spec() -> TestResult {
     let _ = LaneStatus::decode(0);
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/dp", smoke_dp_dpcd_address_constants_match_spec);
+kernel_test_in!(
+    "drivers/nvidia/dp",
+    smoke_dp_dpcd_address_constants_match_spec
+);
 
 // ────────────────────────────────────────────────────────────────
 // HPD debouncer
@@ -1120,7 +1193,10 @@ fn smoke_hpd_idle_connect_starts_debouncing() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/hpd", smoke_hpd_idle_connect_starts_debouncing);
+kernel_test_in!(
+    "drivers/nvidia/hpd",
+    smoke_hpd_idle_connect_starts_debouncing
+);
 
 fn smoke_hpd_debounce_window_expires_to_connected() -> TestResult {
     let mut d = HpdDebouncer::new(HpdSource(1), 100);
@@ -1141,7 +1217,10 @@ fn smoke_hpd_debounce_window_expires_to_connected() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/hpd", smoke_hpd_debounce_window_expires_to_connected);
+kernel_test_in!(
+    "drivers/nvidia/hpd",
+    smoke_hpd_debounce_window_expires_to_connected
+);
 
 fn smoke_hpd_bouncy_connect_disconnect_drops_to_idle() -> TestResult {
     let mut d = HpdDebouncer::new(HpdSource(2), 100);
@@ -1259,7 +1338,10 @@ fn smoke_gsp_rpc_ring_empty_full_invariants() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_ring_empty_full_invariants);
+kernel_test_in!(
+    "drivers/nvidia/gsp",
+    smoke_gsp_rpc_ring_empty_full_invariants
+);
 
 // ────────────────────────────────────────────────────────────────
 // KMS — connector enumeration + CRTC picking
@@ -1463,7 +1545,10 @@ fn smoke_fence_seqno_allocates_monotonically() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/fence", smoke_fence_seqno_allocates_monotonically);
+kernel_test_in!(
+    "drivers/nvidia/fence",
+    smoke_fence_seqno_allocates_monotonically
+);
 
 fn smoke_fence_observe_signalled_monotonic_max() -> TestResult {
     let f = Fence::new(0);
@@ -1586,8 +1671,8 @@ kernel_test_in!(
 // ────────────────────────────────────────────────────────────────
 
 use crate::ce::{
-    CE_LINE_COUNT, CE_LINE_LENGTH_IN, CE_OFFSET_IN_LOWER, CE_OFFSET_IN_UPPER,
-    CE_OFFSET_OUT_LOWER, CE_OFFSET_OUT_UPPER,
+    CE_LINE_COUNT, CE_LINE_LENGTH_IN, CE_OFFSET_IN_LOWER, CE_OFFSET_IN_UPPER, CE_OFFSET_OUT_LOWER,
+    CE_OFFSET_OUT_UPPER,
 };
 use crate::pb::{append_fence_release, PbBuilder, PbError};
 
@@ -2084,7 +2169,10 @@ fn smoke_pmu_stage_error_variants_distinct() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/pmu", smoke_pmu_stage_error_variants_distinct);
+kernel_test_in!(
+    "drivers/nvidia/pmu",
+    smoke_pmu_stage_error_variants_distinct
+);
 
 fn smoke_pmu_ampere_ada_short_circuit_in_bringup() -> TestResult {
     // On Ampere/Ada the PMU is GSP-owned; bring_up is supposed to
@@ -2155,7 +2243,10 @@ fn smoke_gsp_rpc_function_ids_match_rpcfn_h() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_function_ids_match_rpcfn_h);
+kernel_test_in!(
+    "drivers/nvidia/gsp",
+    smoke_gsp_rpc_function_ids_match_rpcfn_h
+);
 
 fn smoke_gsp_rpc_header_pack_roundtrip() -> TestResult {
     let h = GspRpcHeader::new(GspRpcCmd::AllocRoot, 64);
@@ -2283,7 +2374,7 @@ use crate::hdcp::{
     HdcpContext, HdcpEvent, HdcpSec2SubCmd, HdcpState, HDCP_KM_LEN, HDCP_MSG_AKE_INIT,
     HDCP_MSG_AKE_NO_STORED_KM, HDCP_MSG_AKE_SEND_CERT, HDCP_MSG_AKE_SEND_H_PRIME,
     HDCP_MSG_AKE_STORED_KM, HDCP_MSG_LC_INIT, HDCP_MSG_LC_SEND_L_PRIME, HDCP_MSG_SKE_SEND_EKS,
-    HDCP_RRX_LEN, HDCP_RTX_LEN, HDCP_RN_LEN,
+    HDCP_RN_LEN, HDCP_RRX_LEN, HDCP_RTX_LEN,
 };
 
 fn smoke_hdcp_message_ids_match_dcp_spec() -> TestResult {
@@ -2496,7 +2587,10 @@ fn smoke_mst_dpcd_address_constants_match_dp_spec() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mst", smoke_mst_dpcd_address_constants_match_dp_spec);
+kernel_test_in!(
+    "drivers/nvidia/mst",
+    smoke_mst_dpcd_address_constants_match_dp_spec
+);
 
 fn smoke_mst_sideband_header_encoding_roundtrip() -> TestResult {
     // Simple 1-hop LINK_ADDRESS request at port 3.
@@ -2579,7 +2673,10 @@ fn smoke_mst_vcpi_table_allocate_and_release() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mst", smoke_mst_vcpi_table_allocate_and_release);
+kernel_test_in!(
+    "drivers/nvidia/mst",
+    smoke_mst_vcpi_table_allocate_and_release
+);
 
 fn smoke_mst_pbn_to_slot_conversion() -> TestResult {
     // 64 PBN → 1 slot (exact).
@@ -2740,7 +2837,10 @@ fn smoke_mc_intr_cookie_construct_carries_fields() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/mc", smoke_mc_intr_cookie_construct_carries_fields);
+kernel_test_in!(
+    "drivers/nvidia/mc",
+    smoke_mc_intr_cookie_construct_carries_fields
+);
 
 // ────────────────────────────────────────────────────────────────
 // NVDEC submission (item 3)
@@ -2748,8 +2848,8 @@ kernel_test_in!("drivers/nvidia/mc", smoke_mc_intr_cookie_construct_carries_fiel
 
 use crate::nvdec::{
     nvdec_class_for, nvdec_falcon_base, nvdec_firmware_for, nvdec_instance_count,
-    stage_nvdec_decode, stage_nvdec_semaphore_release, NvdecCodec, NVDEC_APPID_AV1, NVDEC_APPID_H264,
-    NVDEC_APPID_HEVC, NVDEC_APPID_VP9, NVDEC_CLASS_ADA_A, NVDEC_CLASS_AMPERE_A,
+    stage_nvdec_decode, stage_nvdec_semaphore_release, NvdecCodec, NVDEC_APPID_AV1,
+    NVDEC_APPID_H264, NVDEC_APPID_HEVC, NVDEC_APPID_VP9, NVDEC_CLASS_ADA_A, NVDEC_CLASS_AMPERE_A,
     NVDEC_CLASS_MAXWELL_A, NVDEC_CLASS_PASCAL_A, NVDEC_CLASS_TURING_A, NVDEC_CLASS_VOLTA_A,
     NVDEC_EXECUTE, NVDEC_EXECUTE_NOTIFY_ON, NVDEC_SEMAPHORE_A, NVDEC_SET_APPLICATION_ID,
     NVDEC_SET_CONTROL_PARAMS,
@@ -2797,7 +2897,10 @@ fn smoke_nvdec_class_table_unique_per_family() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/nvdec", smoke_nvdec_class_table_unique_per_family);
+kernel_test_in!(
+    "drivers/nvidia/nvdec",
+    smoke_nvdec_class_table_unique_per_family
+);
 
 fn smoke_nvdec_method_ids_and_appids_pinned() -> TestResult {
     if NVDEC_SET_APPLICATION_ID != 0x0100 {
@@ -2832,7 +2935,10 @@ fn smoke_nvdec_method_ids_and_appids_pinned() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/nvdec", smoke_nvdec_method_ids_and_appids_pinned);
+kernel_test_in!(
+    "drivers/nvidia/nvdec",
+    smoke_nvdec_method_ids_and_appids_pinned
+);
 
 fn smoke_nvdec_stage_decode_and_semaphore_bytes() -> TestResult {
     let mut buf = [0u8; 128];
@@ -2941,7 +3047,10 @@ fn smoke_nvenc_class_table_unique_per_family() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/nvenc", smoke_nvenc_class_table_unique_per_family);
+kernel_test_in!(
+    "drivers/nvidia/nvenc",
+    smoke_nvenc_class_table_unique_per_family
+);
 
 fn smoke_nvenc_method_ids_and_appids_pinned() -> TestResult {
     if NVENC_SET_APPLICATION_ID != 0x0100 {
@@ -2958,7 +3067,10 @@ fn smoke_nvenc_method_ids_and_appids_pinned() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/nvenc", smoke_nvenc_method_ids_and_appids_pinned);
+kernel_test_in!(
+    "drivers/nvidia/nvenc",
+    smoke_nvenc_method_ids_and_appids_pinned
+);
 
 fn smoke_nvenc_stage_encode_byte_count_and_class() -> TestResult {
     let mut buf = [0u8; 64];
@@ -3202,9 +3314,7 @@ kernel_test_in!(
 // Live AUX transfer loop (item 2)
 // ────────────────────────────────────────────────────────────────
 
-use crate::disp::nv50::{
-    aux_chan_regs, aux_ctrl_bits, AuxAction, AuxLoop, AuxReply,
-};
+use crate::disp::nv50::{aux_chan_regs, aux_ctrl_bits, AuxAction, AuxLoop, AuxReply};
 
 fn smoke_aux_reply_nibble_decode_matches_dp_spec() -> TestResult {
     // VESA DP 1.4 §3.4.1: reply codes 0/1/2 (native) and 4/5/6
@@ -3244,7 +3354,10 @@ fn smoke_aux_reply_nibble_decode_matches_dp_spec() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/disp", smoke_aux_reply_nibble_decode_matches_dp_spec);
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_aux_reply_nibble_decode_matches_dp_spec
+);
 
 fn smoke_aux_loop_retries_then_exhausts() -> TestResult {
     // 32 DEFER replies in a row → 32 backoffs, 33rd → ExhaustedRetries.
@@ -3311,7 +3424,10 @@ fn smoke_aux_chan_registers_match_g94_layout() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/nvidia/disp", smoke_aux_chan_registers_match_g94_layout);
+kernel_test_in!(
+    "drivers/nvidia/disp",
+    smoke_aux_chan_registers_match_g94_layout
+);
 
 // ────────────────────────────────────────────────────────────────
 // Live mode-set commit (item 1)
@@ -3625,9 +3741,12 @@ kernel_test_in!(
 );
 
 fn smoke_pcie_recovery_callback_vote_table() -> TestResult {
-    use narf_bus::pcie_recovery::{ErrorCallback, PciErrSeverity, PciErsResult};
     use crate::pcie_recovery::CardRecovery;
-    let r = CardRecovery::new(0, narf_bus::BusAddr::Pcie(narf_bus::addr::PcieAddr::new(0, 0, 0, 0)));
+    use narf_bus::pcie_recovery::{ErrorCallback, PciErrSeverity, PciErsResult};
+    let r = CardRecovery::new(
+        0,
+        narf_bus::BusAddr::Pcie(narf_bus::addr::PcieAddr::new(0, 0, 0, 0)),
+    );
     // Correctable + NonFatal vote CanRecover; Fatal needs reset.
     if r.error_detected(PciErrSeverity::Correctable) != PciErsResult::CanRecover {
         return TestResult::Fail("Correctable must yield CanRecover");
@@ -3639,7 +3758,10 @@ fn smoke_pcie_recovery_callback_vote_table() -> TestResult {
         return TestResult::Fail("Fatal must yield NeedReset");
     }
     // Three calls observed via the counter.
-    if r.error_detected_count.load(core::sync::atomic::Ordering::SeqCst) != 3 {
+    if r.error_detected_count
+        .load(core::sync::atomic::Ordering::SeqCst)
+        != 3
+    {
         return TestResult::Fail("error_detected counter must reach 3");
     }
     // slot_reset on a card-not-in-list returns Disconnect.

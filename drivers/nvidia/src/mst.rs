@@ -136,7 +136,7 @@ impl SidebandHeader {
 pub fn encode_sideband_header(h: &SidebandHeader) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(((h.lct & 0xF) << 4) | 0); // lcr count placeholder
-    // Each hop is 4 bits; pack two per byte.
+                                        // Each hop is 4 bits; pack two per byte.
     let mut byte = 0u8;
     let mut half = false;
     for i in 0..(h.lct as usize) {
@@ -260,10 +260,7 @@ impl VcpiTable {
 
     /// Current number of free slots (excluding slot 0).
     pub fn free_count(&self) -> u8 {
-        self.slots[1..]
-            .iter()
-            .filter(|s| **s == 0)
-            .count() as u8
+        self.slots[1..].iter().filter(|s| **s == 0).count() as u8
     }
 
     /// Iterate over the raw 64-byte table — useful for live DPCD
@@ -332,11 +329,7 @@ impl MstTopology {
     pub fn sink_count(&self) -> u32 {
         self.branches
             .iter()
-            .flat_map(|b| {
-                b.port_is_sink[..b.port_count as usize]
-                    .iter()
-                    .copied()
-            })
+            .flat_map(|b| b.port_is_sink[..b.port_count as usize].iter().copied())
             .filter(|s| *s)
             .count() as u32
     }

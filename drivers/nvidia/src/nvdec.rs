@@ -186,12 +186,7 @@ pub fn stage_nvdec_decode(
     // + SET_PICTURE_INDEX (4 consecutive words at 0x0108).
     pb.write_inc(
         NVDEC_SET_CONTROL_PARAMS,
-        &[
-            control_params,
-            (pic_setup_phys >> 8) as u32,
-            0,
-            pic_index,
-        ],
+        &[control_params, (pic_setup_phys >> 8) as u32, 0, pic_index],
     )?;
     // EXECUTE.
     pb.write_inc(NVDEC_EXECUTE, &[NVDEC_EXECUTE_NOTIFY_ON])?;
@@ -229,9 +224,6 @@ pub const fn nvdec_falcon_base(i: u8) -> u64 {
 
 /// Build a Falcon handle for NVDEC instance `i`. Caller drives the
 /// firmware load via `falcon::Falcon::bring_up`.
-pub fn nvdec_falcon<'a>(
-    bar0: &'a narf_driver_runtime::MmioRegion,
-    instance: u8,
-) -> Falcon<'a> {
+pub fn nvdec_falcon<'a>(bar0: &'a narf_driver_runtime::MmioRegion, instance: u8) -> Falcon<'a> {
     Falcon::new(bar0, nvdec_falcon_base(instance), "nvdec")
 }

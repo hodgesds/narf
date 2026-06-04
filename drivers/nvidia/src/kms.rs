@@ -24,8 +24,7 @@
 use alloc::vec::Vec;
 
 use crate::disp::{
-    decode_dcb_entry, decode_dcb_entry_versioned, ConnectorType, DcbEntry, DisplayPath,
-    EncoderType,
+    decode_dcb_entry, decode_dcb_entry_versioned, ConnectorType, DcbEntry, DisplayPath, EncoderType,
 };
 
 /// One enumerated display path — connector + encoder + the
@@ -158,11 +157,7 @@ pub fn lookup_connector_type(idx: u8) -> ConnectorType {
 /// `image` is the NVIDIA image inside the option ROM; `dcb_off` is
 /// the offset of the DCB table within that image (returned by
 /// `vbios::dcb_table_offset`).
-pub fn lookup_connector_type_from_bios(
-    image: &[u8],
-    dcb_off: u16,
-    idx: u8,
-) -> ConnectorType {
+pub fn lookup_connector_type_from_bios(image: &[u8], dcb_off: u16, idx: u8) -> ConnectorType {
     let conn_off = match crate::vbios::connector_table_offset(image, dcb_off) {
         Some(o) => o,
         None => return lookup_connector_type(idx),

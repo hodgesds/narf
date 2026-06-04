@@ -147,10 +147,7 @@ pub fn stage_flip(
 /// `put_byte_offset` is the byte position of the next free word
 /// in the channel pushbuffer (i.e. the value the host wants the
 /// hardware's GET pointer to chase up to).
-pub unsafe fn kick_flip(
-    chan_mmio: &narf_driver_runtime::MmioRegion,
-    put_byte_offset: u32,
-) {
+pub unsafe fn kick_flip(chan_mmio: &narf_driver_runtime::MmioRegion, put_byte_offset: u32) {
     // SAFETY: caller's responsibility.
     unsafe {
         crate::disp::nv50::doorbell_kick(chan_mmio, put_byte_offset);
@@ -210,11 +207,7 @@ impl FlipQueue {
     ///
     /// # Safety
     /// `bar0` is the BAR0 view; `head_offset` is the HEAD base.
-    pub unsafe fn enable_vblank(
-        &self,
-        bar0: &narf_driver_runtime::MmioRegion,
-        head_offset: u64,
-    ) {
+    pub unsafe fn enable_vblank(&self, bar0: &narf_driver_runtime::MmioRegion, head_offset: u64) {
         // SAFETY: caller's responsibility.
         unsafe {
             let en = bar0.read32(head_offset + HEAD_INTR_ENABLE);
@@ -226,11 +219,7 @@ impl FlipQueue {
     ///
     /// # Safety
     /// Same.
-    pub unsafe fn disable_vblank(
-        &self,
-        bar0: &narf_driver_runtime::MmioRegion,
-        head_offset: u64,
-    ) {
+    pub unsafe fn disable_vblank(&self, bar0: &narf_driver_runtime::MmioRegion, head_offset: u64) {
         // SAFETY: caller's responsibility.
         unsafe {
             let en = bar0.read32(head_offset + HEAD_INTR_ENABLE);

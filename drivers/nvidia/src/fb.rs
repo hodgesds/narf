@@ -105,9 +105,6 @@ impl FbConfig {
     pub const fn decode(pfb_cfg0_raw: u32, family: ChipFamily) -> Self {
         let vram_mib = (pfb_cfg0_raw >> 16) & 0xFFFF;
         let ram_type = ram_type_for_family(family);
-        Self {
-            vram_mib,
-            ram_type,
-        }
+        Self { vram_mib, ram_type }
     }
 }

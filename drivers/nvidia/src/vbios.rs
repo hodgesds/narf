@@ -183,12 +183,7 @@ pub fn dcb_header(image: &[u8], off: u16) -> Option<DcbHeader> {
         if p + 10 > image.len() {
             return None;
         }
-        let magic = u32::from_le_bytes([
-            image[p + 6],
-            image[p + 7],
-            image[p + 8],
-            image[p + 9],
-        ]);
+        let magic = u32::from_le_bytes([image[p + 6], image[p + 7], image[p + 8], image[p + 9]]);
         if magic != DCB_V30_MAGIC {
             return None;
         }
@@ -294,18 +289,13 @@ pub fn connector_table_header(image: &[u8], off: u16) -> Option<ConnTableHeader>
 /// the image.
 ///
 /// Cite `nvbios_connEp` — the bit-layout we mirror.
-pub fn connector_entry(
-    image: &[u8],
-    off: u16,
-    index: u8,
-) -> Option<ConnectorEntry> {
+pub fn connector_entry(image: &[u8], off: u16, index: u8) -> Option<ConnectorEntry> {
     let hdr = connector_table_header(image, off)?;
     if index >= hdr.entry_count {
         return None;
     }
-    let entry_start = off as usize
-        + hdr.header_len as usize
-        + (index as usize) * (hdr.entry_size as usize);
+    let entry_start =
+        off as usize + hdr.header_len as usize + (index as usize) * (hdr.entry_size as usize);
     if entry_start + hdr.entry_size as usize > image.len() {
         return None;
     }

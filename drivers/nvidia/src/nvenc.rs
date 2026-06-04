@@ -170,9 +170,6 @@ pub const fn nvenc_falcon_base(i: u8) -> u64 {
     FALCON_BASE_NVENC0 + (i as u64) * 0x4000
 }
 
-pub fn nvenc_falcon<'a>(
-    bar0: &'a narf_driver_runtime::MmioRegion,
-    instance: u8,
-) -> Falcon<'a> {
+pub fn nvenc_falcon<'a>(bar0: &'a narf_driver_runtime::MmioRegion, instance: u8) -> Falcon<'a> {
     Falcon::new(bar0, nvenc_falcon_base(instance), "nvenc")
 }

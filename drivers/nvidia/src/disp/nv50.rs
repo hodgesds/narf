@@ -343,10 +343,7 @@ pub const fn put_value(byte_offset: u32) -> u32 {
 /// `chan_mmio` is the channel's user-MMIO window (kernel-mapped via
 /// `MmioRegion`). `byte_offset` must be a multiple of 4 and lie
 /// within the pushbuffer the GPU is configured to read.
-pub unsafe fn doorbell_kick(
-    chan_mmio: &narf_driver_runtime::MmioRegion,
-    byte_offset: u32,
-) {
+pub unsafe fn doorbell_kick(chan_mmio: &narf_driver_runtime::MmioRegion, byte_offset: u32) {
     let v = put_value(byte_offset);
     // SAFETY: caller's responsibility.
     unsafe {
@@ -681,13 +678,10 @@ pub unsafe fn aux_xfer_retry(
     let mut lp = AuxLoop::new();
     loop {
         // SAFETY: caller's responsibility.
-        let reply = unsafe {
-            aux_transact_once(bar0, channel, cmd, addr, write_data, size)
-        };
+        let reply = unsafe { aux_transact_once(bar0, channel, cmd, addr, write_data, size) };
         match lp.step(reply) {
             AuxAction::Done => {
-                if matches!(cmd, AuxCommand::I2cRead | AuxCommand::DpcdRead)
-                    && !read_out.is_empty()
+                if matches!(cmd, AuxCommand::I2cRead | AuxCommand::DpcdRead) && !read_out.is_empty()
                 {
                     // SAFETY: same as above.
                     unsafe { aux_read_payload(bar0, channel, read_out) };
@@ -700,8 +694,7 @@ pub unsafe fn aux_xfer_retry(
                 // transaction immediately for tests.
                 continue;
             }
-            other @ (AuxAction::Timeout
-            | AuxAction::ExhaustedRetries) => {
+            other @ (AuxAction::Timeout | AuxAction::ExhaustedRetries) => {
                 return Err(other);
             }
         }

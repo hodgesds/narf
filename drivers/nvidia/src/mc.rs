@@ -303,10 +303,7 @@ pub unsafe fn read_live_intr0(
 /// # Safety
 /// `bar0` is the kernel-mapped BAR0 view; caller has exclusive
 /// access to the intr-enable register.
-pub unsafe fn mask_intr_source(
-    bar0: &narf_driver_runtime::MmioRegion,
-    source: IntrSource,
-) {
+pub unsafe fn mask_intr_source(bar0: &narf_driver_runtime::MmioRegion, source: IntrSource) {
     // SAFETY: caller's responsibility.
     unsafe {
         let cur = bar0.read32(PMC_INTR_EN_0);
@@ -318,10 +315,7 @@ pub unsafe fn mask_intr_source(
 ///
 /// # Safety
 /// Same.
-pub unsafe fn unmask_intr_source(
-    bar0: &narf_driver_runtime::MmioRegion,
-    source: IntrSource,
-) {
+pub unsafe fn unmask_intr_source(bar0: &narf_driver_runtime::MmioRegion, source: IntrSource) {
     // SAFETY: caller's responsibility.
     unsafe {
         let cur = bar0.read32(PMC_INTR_EN_0);

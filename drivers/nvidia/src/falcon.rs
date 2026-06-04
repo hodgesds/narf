@@ -177,10 +177,7 @@ impl<'a> Falcon<'a> {
         // SAFETY: caller's responsibility.
         unsafe {
             // Programme the IMEMC address latch with auto-incr.
-            self.wr32(
-                FALCON_IMEMC,
-                (dst & 0x0000_FFFF) | IMEMC_AINCR_WRITE,
-            );
+            self.wr32(FALCON_IMEMC, (dst & 0x0000_FFFF) | IMEMC_AINCR_WRITE);
             // Tag latches the IMEM physical-page tag (used for
             // signing and TLB lookups in secure mode).
             self.wr32(FALCON_IMEMT, tag as u32);
@@ -202,10 +199,7 @@ impl<'a> Falcon<'a> {
         }
         // SAFETY: caller's responsibility.
         unsafe {
-            self.wr32(
-                FALCON_DMEMC,
-                (dst & 0x0000_FFFF) | DMEMC_AINCR_WRITE,
-            );
+            self.wr32(FALCON_DMEMC, (dst & 0x0000_FFFF) | DMEMC_AINCR_WRITE);
             for chunk in img.chunks_exact(4) {
                 let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 self.wr32(FALCON_DMEMD, w);

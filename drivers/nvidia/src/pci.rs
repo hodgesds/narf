@@ -106,10 +106,8 @@ impl NvidiaDevice {
             .ok_or(ProbeError::UnknownAsic)?;
 
         // SAFETY: caller-asserted exclusive ownership of these BARs.
-        let regs = unsafe { map_bar(device, BAR_REGS) }
-            .map_err(|_| ProbeError::BarMapFailed)?;
-        let bar1 = unsafe { map_bar(device, BAR_BAR1) }
-            .map_err(|_| ProbeError::BarMapFailed)?;
+        let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| ProbeError::BarMapFailed)?;
+        let bar1 = unsafe { map_bar(device, BAR_BAR1) }.map_err(|_| ProbeError::BarMapFailed)?;
         // BAR3 is best-effort — older Maxwell/Pascal parts don't
         // expose a separate instance window via BAR3.
         // SAFETY: same.
@@ -173,10 +171,7 @@ static NEXT_CARD_INDEX: AtomicU32 = AtomicU32::new(0);
 /// `nvkm_device_pci_new` analogue. Called once per PCI match.
 /// Multi-card: every successful probe pushes a fresh card onto the
 /// global list.
-pub fn probe(
-    device: BusDevice,
-    cap: Cap<BusDeviceCap, Write>,
-) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     if device.id.vendor != NVIDIA_VENDOR {
         return Err(narf_bus::ProbeError::BadDevice);
     }
