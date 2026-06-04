@@ -31,25 +31,25 @@ fn smoke_smbus_class_match_registered() -> TestResult {
 }
 kernel_test_in!("drivers/platform/smbus", smoke_smbus_class_match_registered);
 
-    fn smoke_acpi_ec_discovery() -> TestResult {
+fn smoke_acpi_ec_discovery() -> TestResult {
     use crate::ec;
     if ec::with_ec(|_| {}).is_some() {
         TestResult::Pass
     } else {
         TestResult::Skip("ACPI EC not found (not a laptop config?)")
     }
-    }
-    kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_discovery);
+}
+kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_discovery);
 
-    fn smoke_acpi_thermal_discovery() -> TestResult {
-        use narf_power::thermal::zone_count;
-        if zone_count() >= 0 {
-            TestResult::Pass
-        } else {
-            TestResult::Fail("zone_count logic error")
-        }
+fn smoke_acpi_thermal_discovery() -> TestResult {
+    use narf_power::thermal::zone_count;
+    if zone_count() >= 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("zone_count logic error")
     }
-    kernel_test_in!("drivers/platform/thermal", smoke_acpi_thermal_discovery);
+}
+kernel_test_in!("drivers/platform/thermal", smoke_acpi_thermal_discovery);
 
 fn smoke_ec_sci_dispatch_notifies_subscribers() -> TestResult {
     use crate::ec;
@@ -187,10 +187,7 @@ fn smoke_ec_synthetic_gpe_block_walk() -> TestResult {
     // status[8] = 0b0000_1100 → bits 2 and 3 set in byte 8
     // → gpe_num = 0 + 8*8 + 2 = 0x42 and = 0x43. Both are
     // unclaimed in QEMU's stock DSDT (no \_GPE._L42/_E42 etc).
-    ec::__test_dispatch_synthetic_block(
-        0,
-        &[0, 0, 0, 0, 0, 0, 0, 0, 0b0000_1100],
-    );
+    ec::__test_dispatch_synthetic_block(0, &[0, 0, 0, 0, 0, 0, 0, 0, 0b0000_1100]);
     let g = seen.lock();
     if g.len() != 2 {
         return TestResult::Fail("expected 2 unclaimed-gpe events");
@@ -205,10 +202,7 @@ fn smoke_ec_synthetic_gpe_block_walk() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!(
-    "drivers/platform/ec",
-    smoke_ec_synthetic_gpe_block_walk
-);
+kernel_test_in!("drivers/platform/ec", smoke_ec_synthetic_gpe_block_walk);
 
 fn smoke_lid_subscriber_install_and_reset() -> TestResult {
     use crate::lid;
@@ -234,7 +228,10 @@ fn smoke_lid_subscriber_install_and_reset() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("drivers/platform/lid", smoke_lid_subscriber_install_and_reset);
+kernel_test_in!(
+    "drivers/platform/lid",
+    smoke_lid_subscriber_install_and_reset
+);
 
 fn smoke_buttons_inject_dispatches_to_subscribers() -> TestResult {
     use crate::buttons::{
@@ -427,10 +424,7 @@ fn smoke_aoac_ip_bit_positions() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/platform/amd_aoac",
-    smoke_aoac_ip_bit_positions
-);
+kernel_test_in!("drivers/platform/amd_aoac", smoke_aoac_ip_bit_positions);
 
 /// Exhaustive match over AoacIp variants — compile-time insurance
 /// that no arm is silently unreachable.
@@ -477,10 +471,7 @@ fn smoke_aoac_ip_enum_exhaustive() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/platform/amd_aoac",
-    smoke_aoac_ip_enum_exhaustive
-);
+kernel_test_in!("drivers/platform/amd_aoac", smoke_aoac_ip_enum_exhaustive);
 
 /// aoac_set_d3 writes the correct bit pattern for USB XHCI0.
 ///
@@ -561,10 +552,7 @@ fn smoke_aoac_fch_base_soc_detect() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/platform/amd_aoac",
-    smoke_aoac_fch_base_soc_detect
-);
+kernel_test_in!("drivers/platform/amd_aoac", smoke_aoac_fch_base_soc_detect);
 
 // ── AMD ASF ────────────────────────────────────────────────────────
 
@@ -598,10 +586,7 @@ fn smoke_asf_message_header_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/platform/amd_asf",
-    smoke_asf_message_header_encode
-);
+kernel_test_in!("drivers/platform/amd_asf", smoke_asf_message_header_encode);
 
 // ── WMI vendors ────────────────────────────────────────────────────
 
@@ -615,7 +600,7 @@ fn smoke_wmi_vendors_dell_event_decoder() -> TestResult {
     // Reference: dell-wmi-base.c `KE_KEY, 0x0109, { KEY_MUTE }`.
     // Layout: word[0]=len, word[1]=event_type, word[2]=code.
     let buf_mute: [u8; 6] = [
-        2, 0,       // word[0] = len=2 (2 extra words after this)
+        2, 0, // word[0] = len=2 (2 extra words after this)
         0x00, 0x00, // word[1] = event_type 0x0000
         0x09, 0x01, // word[2] = code 0x0109
     ];
@@ -630,8 +615,7 @@ fn smoke_wmi_vendors_dell_event_decoder() -> TestResult {
     // Mic-mute: code 0x0150 — always decoded as MicMute regardless of type.
     // Reference: dell-wmi-base.c `KE_KEY, 0x0150, { KEY_MICMUTE }`.
     let buf_micmute: [u8; 6] = [
-        2, 0,
-        0x10, 0x00, // event_type 0x0010
+        2, 0, 0x10, 0x00, // event_type 0x0010
         0x50, 0x01, // code 0x0150
     ];
     match decode_dell_event(&buf_micmute) {
@@ -642,8 +626,7 @@ fn smoke_wmi_vendors_dell_event_decoder() -> TestResult {
     // Brightness down: type=0x0010, code=0x0057.
     // Reference: dell-wmi-base.c `KE_KEY, 0x57, { KEY_BRIGHTNESSDOWN }`.
     let buf_bright: [u8; 6] = [
-        2, 0,
-        0x10, 0x00, // event_type 0x0010
+        2, 0, 0x10, 0x00, // event_type 0x0010
         0x57, 0x00, // code 0x0057
     ];
     match decode_dell_event(&buf_bright) {
@@ -654,7 +637,7 @@ fn smoke_wmi_vendors_dell_event_decoder() -> TestResult {
     // Tablet-mode: type=0x0011, code=0xe070.
     // Reference: dell-wmi-base.c line 447 — SW_TABLET_MODE, !buffer[0].
     let buf_tablet: [u8; 8] = [
-        3, 0,       // len=3
+        3, 0, // len=3
         0x11, 0x00, // event_type 0x0011
         0x70, 0xe0, // code 0xe070
         0x00, 0x00, // word[3] = 0 → entering tablet mode (on=true)
@@ -777,7 +760,9 @@ fn smoke_wmi_vendors_lenovo_tablet_mode() -> TestResult {
     let buf_unknown = 0xFFu32.to_le_bytes();
     match decode_lenovo_ymc_event(&buf_unknown) {
         Some(LenovoEvent::Unknown { raw: 0xFF }) => {}
-        _ => return TestResult::Fail("Lenovo YMC unknown code should produce LenovoEvent::Unknown"),
+        _ => {
+            return TestResult::Fail("Lenovo YMC unknown code should produce LenovoEvent::Unknown")
+        }
     }
 
     // Truncated.
@@ -942,7 +927,9 @@ kernel_test_in!(
 
 /// ThinkPad battery conservation set/get round-trip.
 fn smoke_thinkpad_battery_conservation_round_trip() -> TestResult {
-    use crate::thinkpad_acpi::{battery_conservation_enabled, set_battery_conservation, __test_reset};
+    use crate::thinkpad_acpi::{
+        __test_reset, battery_conservation_enabled, set_battery_conservation,
+    };
 
     __test_reset();
 
@@ -1004,10 +991,7 @@ fn smoke_dell_smbios_cmd_encode() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/platform/dell_laptop",
-    smoke_dell_smbios_cmd_encode
-);
+kernel_test_in!("drivers/platform/dell_laptop", smoke_dell_smbios_cmd_encode);
 
 /// Dell WMI event 0xE040 → KEY_KBDILLUMUP.
 /// Reference: dell-wmi-base.c `KE_KEY, 0xE040, { KEY_KBDILLUMUP }`.
@@ -1015,8 +999,7 @@ fn smoke_dell_wmi_event_0xe040_kbdillumup() -> TestResult {
     use crate::dell_laptop::{decode_dell_wmi_event, DellWmiEvent};
 
     let buf: [u8; 6] = [
-        2, 0,
-        0x10, 0x00, // event_type 0x0010
+        2, 0, 0x10, 0x00, // event_type 0x0010
         0x40, 0xE0, // code 0xE040 LE
     ];
     match decode_dell_wmi_event(&buf) {
@@ -1159,7 +1142,9 @@ kernel_test_in!(
 
 /// IdeaPad battery conservation toggle round-trip.
 fn smoke_ideapad_battery_conservation_toggle() -> TestResult {
-    use crate::ideapad_laptop::{battery_conservation_enabled, set_battery_conservation, __test_reset};
+    use crate::ideapad_laptop::{
+        __test_reset, battery_conservation_enabled, set_battery_conservation,
+    };
 
     __test_reset();
     if battery_conservation_enabled() {

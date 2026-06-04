@@ -253,8 +253,7 @@ pub enum AoacError {
 
 /// MMIO base actually used at runtime (allows unit tests to
 /// redirect to a fake register block without a real FCH).
-static MMIO_BASE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(FCH_MMIO_BASE);
+static MMIO_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(FCH_MMIO_BASE);
 
 /// Whether AOAC has been probed and is usable.
 static AOAC_READY: AtomicBool = AtomicBool::new(false);

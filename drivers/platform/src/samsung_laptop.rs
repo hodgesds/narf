@@ -146,11 +146,11 @@ pub fn set_usb_charge_sleep(enable: bool) {
 /// Reference: `samsung-laptop.c::samsung_keymap[]` sparse keymap (~line 730).
 pub fn samsung_keycode(code: u32) -> Option<KeyCode> {
     match code {
-        0xA8 => Some(KeyCode::WLan),          // Fn+F9 wireless toggle
+        0xA8 => Some(KeyCode::WLan),           // Fn+F9 wireless toggle
         0xA9 => Some(KeyCode::TouchpadToggle), // Fn+F5 touchpad
         0xAA => Some(KeyCode::BrightnessUp),
         0xAB => Some(KeyCode::BrightnessDown),
-        0xAC => Some(KeyCode::Sleep),          // Fn+F12
+        0xAC => Some(KeyCode::Sleep), // Fn+F12
         0xAD => Some(KeyCode::Mute),
         0xAE => Some(KeyCode::VolumeDown),
         0xAF => Some(KeyCode::VolumeUp),

@@ -25,9 +25,9 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::eval::evaluate_method;
-use narf_aml::{NameValue, NodeKind, Value, find_node, for_each_node_of_kind};
+use narf_aml::{find_node, for_each_node_of_kind, NameValue, NodeKind, Value};
 use narf_power::bootstrap_thermal_authority;
-use narf_power::thermal::{CoolingDevice, register_cooling_device};
+use narf_power::thermal::{register_cooling_device, CoolingDevice};
 use narf_pwm::{Polarity, PwmConfig, PwmDevice};
 
 // ── ACPI Fan (_HID = PNP0C0B) ───────────────────────────────────────
@@ -74,10 +74,7 @@ impl AcpiFan {
     }
 
     fn call_with(&self, method: &str, arg: u64) {
-        let _ = evaluate_method(
-            &format!("{}.{}", self.path, method),
-            &[Value::Integer(arg)],
-        );
+        let _ = evaluate_method(&format!("{}.{}", self.path, method), &[Value::Integer(arg)]);
     }
 }
 
@@ -228,19 +225,15 @@ impl CoolingDevice for PwmFan {
         // is held by an Arc kept alive by the fan registry; the
         // pointer outlives the worker as long as the registry
         // doesn't drop the fan, which only happens at shutdown.
-        let target_ptr =
-            (&self.target_level as *const core::sync::atomic::AtomicU8) as usize;
+        let target_ptr = (&self.target_level as *const core::sync::atomic::AtomicU8) as usize;
         let inflight_ptr =
             (&self.worker_inflight as *const core::sync::atomic::AtomicBool) as usize;
         narf_scheduler::spawn(async move {
             // SAFETY: pointers are to fields of an Arc-kept-alive
             // PwmFan; safe to dereference for the duration of
             // this task.
-            let target =
-                unsafe { &*(target_ptr as *const core::sync::atomic::AtomicU8) };
-            let inflight = unsafe {
-                &*(inflight_ptr as *const core::sync::atomic::AtomicBool)
-            };
+            let target = unsafe { &*(target_ptr as *const core::sync::atomic::AtomicU8) };
+            let inflight = unsafe { &*(inflight_ptr as *const core::sync::atomic::AtomicBool) };
             // Standard PC / Intel 4-wire fan: 25 kHz PWM.
             const FREQ: u32 = 25_000;
             const PERIOD_NS: u64 = 1_000_000_000u64 / FREQ as u64;
@@ -313,7 +306,9 @@ mod tests {
         // path is exercised in `narf-pwm`'s own smoke test. Building a
         // PwmFan would require spinning up the scheduler; this test
         // covers the trait surface that the cooling registry uses.
-        let fan = RecordingFan { last: AtomicU8::new(0) };
+        let fan = RecordingFan {
+            last: AtomicU8::new(0),
+        };
         fan.set_level(200);
         if fan.last.load(Ordering::SeqCst) == 200 {
             TestResult::Pass

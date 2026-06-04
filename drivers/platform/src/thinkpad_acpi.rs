@@ -147,10 +147,7 @@ pub fn fan_level() -> FanLevel {
 pub fn set_fan_level(level: FanLevel) {
     let lvl = level as u64;
     FAN_LEVEL.store(lvl as u32, Ordering::Release);
-    let _ = narf_aml::eval::evaluate_method(
-        r"\HFNF",
-        &[narf_aml::Value::Integer(lvl)],
-    );
+    let _ = narf_aml::eval::evaluate_method(r"\HFNF", &[narf_aml::Value::Integer(lvl)]);
 }
 
 // ── HKEY hotkey decoder ────────────────────────────────────────────────

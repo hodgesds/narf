@@ -180,14 +180,23 @@ pub fn decode_hp_event(data: &[u8]) -> Option<HpEvent> {
     let event_data = if data.len() >= 16 { u32le(8) } else { u32le(4) };
 
     Some(match HpEventId::from_u32(event_id) {
-        HpEventId::BezelButton => HpEvent::BezelButton { key_code: event_data },
+        HpEventId::BezelButton => HpEvent::BezelButton {
+            key_code: event_data,
+        },
         HpEventId::Wireless => HpEvent::WlanToggle,
         HpEventId::FnPHotkey => HpEvent::FnPHotkey,
-        HpEventId::OmenKey => HpEvent::OmenKey { key_code: event_data },
-        HpEventId::CameraToggle => HpEvent::CameraToggle { open: event_data == 0xfe },
+        HpEventId::OmenKey => HpEvent::OmenKey {
+            key_code: event_data,
+        },
+        HpEventId::CameraToggle => HpEvent::CameraToggle {
+            open: event_data == 0xfe,
+        },
         HpEventId::LidSwitch => HpEvent::LidSwitch,
         HpEventId::ScreenRotation => HpEvent::ScreenRotation,
-        _ => HpEvent::Other { event_id, event_data },
+        _ => HpEvent::Other {
+            event_id,
+            event_data,
+        },
     })
 }
 
@@ -197,7 +206,7 @@ pub fn hp_keycode(code: u32) -> Option<KeyCode> {
     match code {
         0x02 => Some(KeyCode::BrightnessUp),
         0x03 => Some(KeyCode::BrightnessDown),
-        0x270 => Some(KeyCode::Mute),  // KEY_MICMUTE
+        0x270 => Some(KeyCode::Mute), // KEY_MICMUTE
         0x21a9 | 0x121a9 => Some(KeyCode::TouchpadToggle),
         0x21a4 => None, // Win lock
         0x21a7 => None, // KEY_FN_ESC

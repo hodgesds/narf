@@ -68,7 +68,8 @@ fn intel_hid_notify(path: &str, value: u64) {
             let _ = writeln!(
                 narf_console::Writer,
                 "  intel-hid: {}: unknown notify code {:#x}",
-                path, value
+                path,
+                value
             );
             None
         }

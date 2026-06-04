@@ -34,8 +34,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 /// Per-query-byte translation table. `None` = unmapped (will push
 /// KeyCode::Unknown so the ring still reflects activity).
-static HOTKEY_MAP: IrqSafeSpinLock<[Option<KeyCode>; 256]> =
-    IrqSafeSpinLock::new([None; 256]);
+static HOTKEY_MAP: IrqSafeSpinLock<[Option<KeyCode>; 256]> = IrqSafeSpinLock::new([None; 256]);
 
 static FIRES: AtomicU64 = AtomicU64::new(0);
 static UNMAPPED: AtomicU64 = AtomicU64::new(0);

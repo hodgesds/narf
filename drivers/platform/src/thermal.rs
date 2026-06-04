@@ -12,9 +12,9 @@ use alloc::string::String;
 use core::fmt::Write;
 
 use narf_aml::eval::evaluate_method;
-use narf_aml::{NodeKind, for_each_node_of_kind};
-use narf_power::thermal::{register_zone, record_temp};
+use narf_aml::{for_each_node_of_kind, NodeKind};
 use narf_power::bootstrap_thermal_authority;
+use narf_power::thermal::{record_temp, register_zone};
 
 /// Converts ACPI deci-Kelvin to millidegrees Celsius.
 fn decik_to_millic(dk: u64) -> i32 {
@@ -28,13 +28,13 @@ pub fn init() {
 
     for_each_node_of_kind(NodeKind::ThermalZone, |node| {
         let path = &node.path;
-        
+
         // 1. Read trip points.
         // _CRT: Critical Temperature (mandatory for a zone to be useful).
         let crit_dk = evaluate_method(&format!("{}.{}", path, "_CRT"), &[])
             .map(|v| v.as_integer())
             .unwrap_or(3732); // 100C fallback
-        
+
         // _PSV: Passive Temperature (throttling start).
         let psv_dk = evaluate_method(&format!("{}.{}", path, "_PSV"), &[])
             .map(|v| v.as_integer())
@@ -64,7 +64,7 @@ pub fn init() {
                         let milli_c = decik_to_millic(v.as_integer());
                         let _ = record_temp(id, milli_c);
                     }
-                    
+
                     // Poll every 5 seconds (standard ACPI interval).
                     narf_time::sleep_cycles(5_000_000_000).await;
                 }

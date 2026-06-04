@@ -13,37 +13,37 @@
 
 extern crate alloc;
 
-pub mod smbus;
-pub mod tpm;
-/// EC uses x86 I/O ports (`narf_arch::x86_64::io_port`); not present
-/// on aarch64 platforms, where the embedded controller is reached
-/// through SoC-specific MMIO instead.
 #[cfg(target_arch = "x86_64")]
-pub mod ec;
+pub mod ac_adapter;
+/// AMD AOAC (Always-On / Modern-Standby D-state control), x86-64 only.
+#[cfg(target_arch = "x86_64")]
+pub mod amd_aoac;
+/// AMD ASF (Alert Standard Format) transport scaffold.
+pub mod amd_asf;
+pub mod backlight;
 /// Battery / lid / buttons all consume the EC's platform-event
 /// feed. On aarch64 the equivalent path goes through SoC-specific
 /// PMIC drivers (not yet ported) — gate these on x86_64 too.
 #[cfg(target_arch = "x86_64")]
 pub mod battery;
 #[cfg(target_arch = "x86_64")]
-pub mod ac_adapter;
-pub mod thermal;
-pub mod fan;
-#[cfg(target_arch = "x86_64")]
-pub mod lid;
-#[cfg(target_arch = "x86_64")]
 pub mod buttons;
+/// EC uses x86 I/O ports (`narf_arch::x86_64::io_port`); not present
+/// on aarch64 platforms, where the embedded controller is reached
+/// through SoC-specific MMIO instead.
+#[cfg(target_arch = "x86_64")]
+pub mod ec;
 /// EC hotkey → input-ring bridge. Lives next to the EC since
 /// it depends on the EC's `_Qxx` registry to land events.
 #[cfg(target_arch = "x86_64")]
 pub mod ec_hotkeys;
-pub mod backlight;
-/// AMD AOAC (Always-On / Modern-Standby D-state control), x86-64 only.
-#[cfg(target_arch = "x86_64")]
-pub mod amd_aoac;
-/// AMD ASF (Alert Standard Format) transport scaffold.
-pub mod amd_asf;
+pub mod fan;
 pub mod intel_hid;
+#[cfg(target_arch = "x86_64")]
+pub mod lid;
+pub mod smbus;
+pub mod thermal;
+pub mod tpm;
 /// Vendor WMI hotkey dispatch — Dell, HP, and Lenovo laptop Fn-key
 /// events delivered through ACPI WMI event GUIDs.
 /// Must init after `narf-aml` WMI GUID enumeration (Stage::Subsys,
@@ -184,4 +184,3 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
 }
-

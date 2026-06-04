@@ -219,9 +219,7 @@ pub fn decode_dell_event(data: &[u8]) -> Option<DellEvent> {
     if data.len() < 6 {
         return None;
     }
-    let word = |off: usize| -> u16 {
-        u16::from_le_bytes([data[off * 2], data[off * 2 + 1]])
-    };
+    let word = |off: usize| -> u16 { u16::from_le_bytes([data[off * 2], data[off * 2 + 1]]) };
     let _len = word(0); // frame length in extra words
     let event_type = word(1);
     let code = word(2);
@@ -288,12 +286,12 @@ fn on_dell_event(ev: &WmiEvent) {
 fn decode_dell_keycode(id: u16) -> Option<KeyCode> {
     // Reference: dell-wmi-base.c keymap arrays (GPL-2.0-or-later).
     match id {
-        0x0109 => Some(KeyCode::Mute),        // audio mute
-        0x0150 => Some(KeyCode::Mute),        // mic mute (re-used)
+        0x0109 => Some(KeyCode::Mute), // audio mute
+        0x0150 => Some(KeyCode::Mute), // mic mute (re-used)
         0xe005 => Some(KeyCode::BrightnessDown),
         0xe006 => Some(KeyCode::BrightnessUp),
-        0xe011 => Some(KeyCode::WLan),        // Wifi Catcher
-        0xe027 => None,                        // LCD Display On/Off (no code)
+        0xe011 => Some(KeyCode::WLan), // Wifi Catcher
+        0xe027 => None,                // LCD Display On/Off (no code)
         0xe02e => Some(KeyCode::VolumeDown),
         0xe030 => Some(KeyCode::VolumeUp),
         0xe033 => Some(KeyCode::KbdIlluminationUp),
@@ -384,11 +382,7 @@ pub fn decode_hp_event(data: &[u8]) -> Option<HpEvent> {
         u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
     };
     let event_id = u32le(0);
-    let event_data = if data.len() >= 16 {
-        u32le(8)
-    } else {
-        u32le(4)
-    };
+    let event_data = if data.len() >= 16 { u32le(8) } else { u32le(4) };
 
     let ev = match HpEventId::from_u32(event_id) {
         HpEventId::BezelButton => HpEvent::BezelButton {
@@ -424,10 +418,10 @@ fn decode_hp_bezel_keycode(code: u32) -> Option<KeyCode> {
         0x02 => Some(KeyCode::BrightnessUp),
         0x03 => Some(KeyCode::BrightnessDown),
         0x270 => Some(KeyCode::Mute), // KEY_MICMUTE
-        0x20e6 => None,                // KEY_PROG1
-        0x20e8 => None,                // KEY_MEDIA
-        0x21a4 => None,                // Win Lock On (ignore)
-        0x21a7 => None,                // KEY_FN_ESC
+        0x20e6 => None,               // KEY_PROG1
+        0x20e8 => None,               // KEY_MEDIA
+        0x21a4 => None,               // Win Lock On (ignore)
+        0x21a7 => None,               // KEY_FN_ESC
         0x21a9 => Some(KeyCode::TouchpadToggle),
         0x121a9 => Some(KeyCode::TouchpadToggle),
         _ => None,
@@ -493,7 +487,7 @@ pub fn decode_lenovo_ymc_event(data: &[u8]) -> Option<LenovoEvent> {
     }
     let code = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     let tablet = match code {
-        0x01 => false,         // laptop mode
+        0x01 => false,              // laptop mode
         0x02 | 0x03 | 0x04 => true, // tablet / tent / stand
         _ => return Some(LenovoEvent::Unknown { raw: code }),
     };
@@ -557,8 +551,8 @@ fn decode_lenovo_hotkey_keycode(id: u32) -> Option<KeyCode> {
         0x01 => Some(KeyCode::BrightnessUp),
         0x02 => Some(KeyCode::BrightnessDown),
         0x03 => Some(KeyCode::KbdIlluminationToggle),
-        0x04 => Some(KeyCode::Mute),       // volume mute
-        0x06 => Some(KeyCode::WLan),       // wireless toggle
+        0x04 => Some(KeyCode::Mute), // volume mute
+        0x06 => Some(KeyCode::WLan), // wireless toggle
         0x07 => Some(KeyCode::TouchpadToggle),
         0x0b => Some(KeyCode::RfKill),
         0x13 => Some(KeyCode::BrightnessUp),

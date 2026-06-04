@@ -149,7 +149,11 @@ pub fn init() {
     //   3. Standard 0x66/0x62 ports with no GPE (last-ditch, IBM PC AT
     //      convention; many laptops break this).
     let (ctrl, data, gpe) = if let Some(info) = narf_acpi::ecdt_info() {
-        (info.control_addr as u16, info.data_addr as u16, Some(info.gpe_bit as u32))
+        (
+            info.control_addr as u16,
+            info.data_addr as u16,
+            Some(info.gpe_bit as u32),
+        )
     } else if let Some(device) = narf_aml::find_device_by_hid("PNP0C09") {
         let (data_port, cmd_port) = match narf_aml::oregion::ec_ports() {
             Some(p) => p,
@@ -159,7 +163,10 @@ pub fn init() {
         let _ = writeln!(
             narf_console::Writer,
             "  acpi-ec: found {} via AML (data={:#x} cmd={:#x} gpe={:?})",
-            device.path, data_port, cmd_port, gpe_bit,
+            device.path,
+            data_port,
+            cmd_port,
+            gpe_bit,
         );
         (cmd_port, data_port, gpe_bit)
     } else {
@@ -294,9 +301,9 @@ pub fn ec_query_count() -> u64 {
 #[cfg(target_arch = "x86_64")]
 fn record_pm1_irq() {
     let s = narf_acpi::pm1_status_read();
-    let bits = (s & (narf_acpi::PM1_STS_PWRBTN
-        | narf_acpi::PM1_STS_SLPBTN
-        | narf_acpi::PM1_STS_RTC)) as u64;
+    let bits = (s
+        & (narf_acpi::PM1_STS_PWRBTN | narf_acpi::PM1_STS_SLPBTN | narf_acpi::PM1_STS_RTC))
+        as u64;
     if bits != 0 {
         // W1C-clear individual bits first so the level-triggered
         // line deasserts before we exit the ISR.

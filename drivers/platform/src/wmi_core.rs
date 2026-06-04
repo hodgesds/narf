@@ -88,11 +88,7 @@ pub fn encode_guid_arg(guid: &[u8; 16]) -> Vec<u8> {
 /// Reference: `wmi.c::wmi_method_call` — fixed three-argument layout.
 /// `instance` is almost always 0. `method_id` is the WBEM method ordinal
 /// defined by the OEM in their MOF file.
-pub fn build_wmi_args(
-    instance: u8,
-    method_id: u32,
-    guid: &[u8; 16],
-) -> [narf_aml::Value; 3] {
+pub fn build_wmi_args(instance: u8, method_id: u32, guid: &[u8; 16]) -> [narf_aml::Value; 3] {
     [
         narf_aml::Value::Integer(instance as u64),
         narf_aml::Value::Integer(method_id as u64),

@@ -123,9 +123,7 @@ pub fn decode_dell_wmi_event(data: &[u8]) -> Option<DellWmiEvent> {
     if data.len() < 6 {
         return None;
     }
-    let word = |off: usize| -> u16 {
-        u16::from_le_bytes([data[off * 2], data[off * 2 + 1]])
-    };
+    let word = |off: usize| -> u16 { u16::from_le_bytes([data[off * 2], data[off * 2 + 1]]) };
     let event_type = word(1);
     let code = word(2);
 
@@ -287,9 +285,7 @@ fn on_dell_event(ev: &narf_aml::wmi::WmiEvent) {
 /// Reference: `dell-wmi-base.c::dell_wmi_init()`.
 pub fn init() {
     let guids = narf_aml::wmi::list_guids();
-    let event_guid = crate::wmi_vendors::guid_str_to_bytes(
-        "9DBB5994-A997-11DA-B012-B622A1EF5492",
-    );
+    let event_guid = crate::wmi_vendors::guid_str_to_bytes("9DBB5994-A997-11DA-B012-B622A1EF5492");
     if let Some(eg) = event_guid {
         for g in &guids {
             if g.guid == eg {

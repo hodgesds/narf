@@ -192,8 +192,7 @@ pub fn probe_and_register() -> Result<OemVendor, RegistryError> {
 // ── Test helpers ──────────────────────────────────────────────────────
 
 #[cfg(test)]
-static TEST_MFR: IrqSafeSpinLock<Option<alloc::string::String>> =
-    IrqSafeSpinLock::new(None);
+static TEST_MFR: IrqSafeSpinLock<Option<alloc::string::String>> = IrqSafeSpinLock::new(None);
 
 /// Inject a synthetic manufacturer string for unit tests.
 #[doc(hidden)]

@@ -81,10 +81,8 @@ pub fn vpc_read(index: u8) -> Option<u32> {
         return None;
     }
     let method = alloc::format!("{}.VMCCMD", path_base);
-    let result = narf_aml::eval::evaluate_method(
-        &method,
-        &[narf_aml::Value::Integer(index as u64)],
-    );
+    let result =
+        narf_aml::eval::evaluate_method(&method, &[narf_aml::Value::Integer(index as u64)]);
     match result {
         Ok(narf_aml::Value::Integer(n)) => Some(n as u32),
         Ok(narf_aml::Value::Buffer(b)) if !b.is_empty() => Some(b[0] as u32),
@@ -292,9 +290,7 @@ pub fn init() {
 
     // Register Lenovo IdeaPad WMI hotkey handler.
     let guids = narf_aml::wmi::list_guids();
-    let event_bytes = crate::wmi_vendors::guid_str_to_bytes(
-        "21494638-4391-4287-94B2-DDF09FE4A7AA",
-    );
+    let event_bytes = crate::wmi_vendors::guid_str_to_bytes("21494638-4391-4287-94B2-DDF09FE4A7AA");
     if let Some(eg) = event_bytes {
         for g in &guids {
             if g.guid == eg {
