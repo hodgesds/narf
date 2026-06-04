@@ -11264,3 +11264,320 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_echo_hello_world_end_to_end);
+
+// ── Wave-51: terminal ioctls on the console fd ─────────────────────
+//
+// Real userspace (ls, bash, vi, less) probes TIOCGWINSZ / FIONREAD /
+// TIOCGPGRP to decide whether stdout is a tty and what dimensions
+// to draw to. Wave-51 wires these against ConsoleFile so the probes
+// stop returning ENOTTY. Each smoke runs the syscall path end-to-end
+// via sys_ioctl.
+
+fn smoke_console_ioctl_tiocgwinsz_default_80x24() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_1001);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let _ = fd::with_table(task, |_t| ());
+
+    // Kernel-stack buffer for the winsize copy-out. The ioctl arg
+    // pointer goes straight into the FileOps impl; copy_to_user's
+    // pointer check passes for canonical addresses regardless of
+    // half.
+    let mut ws = fd::Winsize::default();
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1, // stdout
+            arg1: fd::TIOCGWINSZ as u64,
+            arg2: &mut ws as *mut _ as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    __test_clear_global();
+
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {
+            if ws.ws_row == 24 && ws.ws_col == 80 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("TIOCGWINSZ default not 80x24")
+            }
+        }
+        _ => TestResult::Fail("TIOCGWINSZ did not return Ok(0)"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_ioctl_tiocgwinsz_default_80x24);
+
+fn smoke_console_ioctl_tiocswinsz_round_trip() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_1002);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let _ = fd::with_table(task, |_t| ());
+
+    let set = fd::Winsize { ws_row: 50, ws_col: 132, ws_xpixel: 0, ws_ypixel: 0 };
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: fd::TIOCSWINSZ as u64,
+            arg2: &set as *const _ as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+    let set_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0);
+
+    let mut got = fd::Winsize::default();
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: 1,
+            arg1: fd::TIOCGWINSZ as u64,
+            arg2: &mut got as *mut _ as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx2);
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    __test_clear_global();
+
+    if !set_ok {
+        return TestResult::Fail("TIOCSWINSZ did not return Ok(0)");
+    }
+    if got.ws_row == 50 && got.ws_col == 132 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TIOCSWINSZ value did not round-trip through TIOCGWINSZ")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_ioctl_tiocswinsz_round_trip);
+
+fn smoke_console_ioctl_fionread_empty_ring_returns_zero() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_1003);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let _ = fd::with_table(task, |_t| ());
+
+    let mut n: i32 = 0xAAAA;
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: fd::FIONREAD as u64,
+            arg2: &mut n as *mut _ as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    __test_clear_global();
+
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {
+            if n == 0 {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("FIONREAD on empty ring did not report 0")
+            }
+        }
+        _ => TestResult::Fail("FIONREAD did not return Ok(0)"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_ioctl_fionread_empty_ring_returns_zero);
+
+fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_1004);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let _ = fd::with_table(task, |_t| ());
+
+    // Set fg pgrp = 4242
+    let pgid_in: i32 = 4242;
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: fd::TIOCSPGRP as u64,
+            arg2: &pgid_in as *const _ as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+    let set_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0);
+
+    let mut pgid_out: i32 = -1;
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: fd::TIOCGPGRP as u64,
+            arg2: &mut pgid_out as *mut _ as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx2);
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    __test_clear_global();
+
+    if !set_ok {
+        return TestResult::Fail("TIOCSPGRP did not return Ok(0)");
+    }
+    if pgid_out == 4242 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("TIOCSPGRP value did not round-trip through TIOCGPGRP")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_ioctl_tiocspgrp_round_trip);
+
+fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_1005);
+    fn task_lookup() -> u64 { TASK_ID.load(Ordering::Relaxed) }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let _ = fd::with_table(task, |_t| ());
+
+    struct FakeCtx { args: SyscallArgs, ret: Option<SyscallReturn> }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs { &self.args }
+        fn set_return(&mut self, r: SyscallReturn) { self.ret = Some(r); }
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool { false }
+    }
+    let mut dummy = [0u8; 8];
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0,
+            arg1: 0xDEAD_BEEF,
+            arg2: dummy.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    __test_clear_global();
+
+    // ENOTTY = 25, returned as the negated value through SyscallReturn::ok.
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -25 => TestResult::Pass,
+        _ => TestResult::Fail("unknown ioctl cmd did not return -ENOTTY"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_ioctl_unknown_cmd_returns_enotty);

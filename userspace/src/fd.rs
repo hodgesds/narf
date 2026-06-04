@@ -16,8 +16,9 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
+use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Per-task fd table entry.
@@ -182,6 +183,84 @@ impl core::fmt::Debug for ConsoleFile {
     }
 }
 
+// ── Terminal ioctl numbers (Linux ABI) ─────────────────────────────
+//
+// The console serves as the system tty. Real userspace (ls, bash,
+// vi, less) probes these to decide whether stdout is a terminal,
+// what dimensions to draw to, and how many bytes are waiting to be
+// read. Returning a sensible default for each is enough to unblock
+// every "is this a tty" code path; the actual values can stay
+// 80x24/0/etc. until a real tty driver lands.
+
+/// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
+pub const TIOCGWINSZ: u32 = 0x5413;
+/// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
+pub const TIOCSWINSZ: u32 = 0x5414;
+/// `ioctl(fd, FIONREAD, &i32)` — bytes immediately readable.
+pub const FIONREAD: u32 = 0x541B;
+/// `ioctl(fd, TIOCGPGRP, &pid_t)` — foreground process group.
+pub const TIOCGPGRP: u32 = 0x540F;
+/// `ioctl(fd, TIOCSPGRP, &pid_t)` — set foreground process group.
+pub const TIOCSPGRP: u32 = 0x5410;
+
+/// POSIX `struct winsize` — row/col + pixel hints. Pixel fields
+/// stay zero (we don't model a pixel-aware terminal).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Winsize {
+    pub ws_row: u16,
+    pub ws_col: u16,
+    pub ws_xpixel: u16,
+    pub ws_ypixel: u16,
+}
+
+/// Default console dimensions. Override via TIOCSWINSZ; survives
+/// until reboot. 80x24 matches the historical VT default and is
+/// what every "$LINES not set" autocheck falls back to.
+static CONSOLE_WINSIZE: IrqSafeSpinLock<Winsize> = IrqSafeSpinLock::new(Winsize {
+    ws_row: 24,
+    ws_col: 80,
+    ws_xpixel: 0,
+    ws_ypixel: 0,
+});
+
+/// Foreground process group for the console tty. 0 = unset; a job-
+/// control shell calls `tcsetpgrp` (TIOCSPGRP) at startup with its
+/// own pgid so SIGINT routing works.
+static CONSOLE_FG_PGRP: AtomicU64 = AtomicU64::new(0);
+
+/// Query the current console window size. Test hook + introspection.
+pub fn console_winsize() -> Winsize {
+    *CONSOLE_WINSIZE.lock()
+}
+
+/// Override the console window size. Wired by `TIOCSWINSZ`.
+pub fn set_console_winsize(ws: Winsize) {
+    *CONSOLE_WINSIZE.lock() = ws;
+}
+
+/// Query the console's foreground process group (TIOCGPGRP).
+pub fn console_fg_pgrp() -> u64 {
+    CONSOLE_FG_PGRP.load(Ordering::Acquire)
+}
+
+/// Set the console's foreground process group (TIOCSPGRP).
+pub fn set_console_fg_pgrp(pgid: u64) {
+    CONSOLE_FG_PGRP.store(pgid, Ordering::Release);
+}
+
+/// Reset terminal state — test hook.
+#[doc(hidden)]
+pub fn __test_reset_tty() {
+    *CONSOLE_WINSIZE.lock() = Winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    CONSOLE_FG_PGRP.store(0, Ordering::Release);
+}
+
 impl FileOps for ConsoleFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Non-blocking raw-mode read. Drains whatever bytes are in the
@@ -223,6 +302,82 @@ impl FileOps for ConsoleFile {
             blocks: 0,
             mode: Mode::FILE_RW,
             mtime_cycles: 0,
+        }
+    }
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        // Terminal ioctls. All return Ok(0) on success; any
+        // user-pointer fault is reported as FsError::InvalidData
+        // (→ EINVAL at the syscall layer — close enough to EFAULT
+        // for ABI purposes since the wire shape is the same).
+        match cmd {
+            TIOCGWINSZ => {
+                let ws = console_winsize();
+                let bytes: [u8; 8] = unsafe { core::mem::transmute(ws) };
+                if unsafe {
+                    crate::handlers::copy_to_user(arg as u64, &bytes)
+                }
+                .is_err()
+                {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            TIOCSWINSZ => {
+                let mut bytes = [0u8; 8];
+                if unsafe {
+                    crate::handlers::copy_from_user(&mut bytes, arg as u64)
+                }
+                .is_err()
+                {
+                    return Err(FsError::InvalidData);
+                }
+                let ws: Winsize = unsafe { core::mem::transmute(bytes) };
+                set_console_winsize(ws);
+                Ok(0)
+            }
+            FIONREAD => {
+                // Best-effort: peek the input ring's current depth.
+                let n: i32 = narf_input::pending_bytes() as i32;
+                let bytes = n.to_le_bytes();
+                if unsafe {
+                    crate::handlers::copy_to_user(arg as u64, &bytes)
+                }
+                .is_err()
+                {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            TIOCGPGRP => {
+                // pid_t = i32 on Linux x86_64.
+                let pgrp = console_fg_pgrp() as i32;
+                let bytes = pgrp.to_le_bytes();
+                if unsafe {
+                    crate::handlers::copy_to_user(arg as u64, &bytes)
+                }
+                .is_err()
+                {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            TIOCSPGRP => {
+                let mut bytes = [0u8; 4];
+                if unsafe {
+                    crate::handlers::copy_from_user(&mut bytes, arg as u64)
+                }
+                .is_err()
+                {
+                    return Err(FsError::InvalidData);
+                }
+                let pgrp = i32::from_le_bytes(bytes);
+                if pgrp < 0 {
+                    return Err(FsError::InvalidData);
+                }
+                set_console_fg_pgrp(pgrp as u64);
+                Ok(0)
+            }
+            _ => Err(FsError::Unsupported),
         }
     }
 }

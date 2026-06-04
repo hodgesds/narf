@@ -1058,6 +1058,18 @@ pub fn pop_scroll() -> Option<ScrollEvent> {
     }
 }
 
+/// Number of ASCII bytes currently queued in the BYTE_RING. Best-
+/// effort snapshot; the count can change immediately. Surfaced for
+/// FIONREAD: userspace queries "how many bytes can I read without
+/// blocking?" and the right answer is what's in the ring right now.
+pub fn pending_bytes() -> usize {
+    BYTE_RING
+        .lock()
+        .as_ref()
+        .map(|r| r.len())
+        .unwrap_or(0)
+}
+
 /// Pop one raw byte from the AsciiByte stream.
 pub fn pop_ascii_byte() -> Option<u8> {
     let ev = BYTE_RING.lock().as_ref().and_then(|r| r.pop())?;

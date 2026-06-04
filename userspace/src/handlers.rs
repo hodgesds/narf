@@ -5798,7 +5798,7 @@ fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
 /// # Safety
 /// - The caller's address space must match the AS that mapped `src_uptr`.
 /// - Must not be called from IRQ context.
-unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(), u64> {
+pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(), u64> {
     validate_user_range(src_uptr, dst.len())?;
     let src = src_uptr as *const u8;
     // SAFETY: range-validated above; SMAP bracket guards the access.
@@ -5844,7 +5844,7 @@ unsafe fn copy_from_user_vec(src_uptr: u64, len: usize) -> Result<alloc::vec::Ve
 ///
 /// # Safety
 /// Same as `copy_from_user`.
-unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> {
+pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> {
     validate_user_range(dst_uptr, src.len())?;
     let dst = dst_uptr as *mut u8;
     // SAFETY: range-validated above; SMAP bracket guards the access.

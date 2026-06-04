@@ -762,6 +762,7 @@ dependencies = [
  "narf-input",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-scheduler",
  "narf-time",
 ]
