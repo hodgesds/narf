@@ -8,13 +8,13 @@ pub const EFI_UNSPECIFIED_TIMEZONE: i16 = 0x07FF;
 /// `EFI_TIME` — 16 bytes (UEFI 2.10 §8.3.1).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct EfiTime {
-    pub year: u16,         // 1900..=9999
-    pub month: u8,         // 1..=12
-    pub day: u8,           // 1..=31
-    pub hour: u8,          // 0..=23
-    pub minute: u8,        // 0..=59
-    pub second: u8,        // 0..=59 (no leap-second flag here)
-    pub nanosecond: u32,   // 0..=999_999_999
+    pub year: u16,       // 1900..=9999
+    pub month: u8,       // 1..=12
+    pub day: u8,         // 1..=31
+    pub hour: u8,        // 0..=23
+    pub minute: u8,      // 0..=59
+    pub second: u8,      // 0..=59 (no leap-second flag here)
+    pub nanosecond: u32, // 0..=999_999_999
     /// Minutes east of UTC (-1440..=1440), or `EFI_UNSPECIFIED_TIMEZONE`.
     pub time_zone: i16,
     /// Daylight-savings flags (UEFI 2.10 §8.3.1 EFI_TIME_DAYLIGHT_*).

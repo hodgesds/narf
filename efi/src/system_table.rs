@@ -69,11 +69,7 @@ impl TableHeader {
     /// Validate the header against an expected signature. Computes
     /// CRC32 over `whole_table` with the CRC field zeroed (per UEFI
     /// 2.10 §4.2.1) and compares.
-    pub fn verify(
-        &self,
-        expected_sig: u64,
-        whole_table: &[u8],
-    ) -> Result<(), TableHeaderError> {
+    pub fn verify(&self, expected_sig: u64, whole_table: &[u8]) -> Result<(), TableHeaderError> {
         if self.signature != expected_sig {
             return Err(TableHeaderError::BadSignature);
         }
@@ -133,12 +129,7 @@ pub fn decode_configuration_table(
                 buf[off + 23],
             ])
         } else {
-            u32::from_le_bytes([
-                buf[off + 16],
-                buf[off + 17],
-                buf[off + 18],
-                buf[off + 19],
-            ]) as u64
+            u32::from_le_bytes([buf[off + 16], buf[off + 17], buf[off + 18], buf[off + 19]]) as u64
         };
         out.push(ConfigurationTableEntry {
             vendor_guid: Guid(g),

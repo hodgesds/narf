@@ -55,9 +55,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::reset::EfiResetType;
 use crate::system_table::{signature, TableHeader, TableHeaderError};
 use crate::time::EfiTime;
-use crate::variable::{
-    encode_name, EFI_GLOBAL_VARIABLE, EFI_IMAGE_SECURITY_DATABASE_GUID,
-};
+use crate::variable::{encode_name, EFI_GLOBAL_VARIABLE, EFI_IMAGE_SECURITY_DATABASE_GUID};
 
 // ── EFI_STATUS ─────────────────────────────────────────────────────
 
@@ -153,7 +151,7 @@ pub struct EfiRuntimeServicesTable {
 
 /// `EFI_GET_TIME` — UEFI 2.10 §8.3.1.
 type EfiGetTimeFn = unsafe extern "efiapi" fn(
-    time: *mut [u8; 16],       // EFI_TIME
+    time: *mut [u8; 16],         // EFI_TIME
     capabilities: *mut [u8; 12], // EFI_TIME_CAPABILITIES, may be NULL
 ) -> EfiStatus;
 
@@ -261,7 +259,11 @@ pub fn is_available() -> bool {
 /// Return the installed table pointer, or None if not installed.
 fn table() -> Option<*const EfiRuntimeServicesTable> {
     let v = RT_TABLE_PTR.load(Ordering::Acquire);
-    if v == 0 { None } else { Some(v as *const EfiRuntimeServicesTable) }
+    if v == 0 {
+        None
+    } else {
+        Some(v as *const EfiRuntimeServicesTable)
+    }
 }
 
 // ── get_time ───────────────────────────────────────────────────────
@@ -309,10 +311,7 @@ pub unsafe fn get_time() -> Result<EfiTime, EfiStatus> {
 ///
 /// # Safety
 /// Same as `get_time`. Not interrupt-safe.
-pub unsafe fn get_variable(
-    name: &str,
-    guid: &EfiGuid,
-) -> Result<Vec<u8>, EfiStatus> {
+pub unsafe fn get_variable(name: &str, guid: &EfiGuid) -> Result<Vec<u8>, EfiStatus> {
     let rt = table().ok_or(EFI_NOT_FOUND)?;
     // SAFETY: validated in `install`.
     let fn_ptr_addr = unsafe { (*rt).get_variable };
@@ -356,15 +355,7 @@ pub unsafe fn get_variable(
     // Second call: retrieve the data.
     let mut buf = alloc::vec![0u8; size];
     // SAFETY: `buf` is `size` bytes; `gv` writes at most `size` bytes.
-    let status2 = unsafe {
-        gv(
-            name_ptr,
-            &guid.0,
-            &mut attrs,
-            &mut size,
-            buf.as_mut_ptr(),
-        )
-    };
+    let status2 = unsafe { gv(name_ptr, &guid.0, &mut attrs, &mut size, buf.as_mut_ptr()) };
     if efi_error(status2) {
         return Err(status2);
     }
@@ -404,16 +395,12 @@ pub unsafe fn set_variable(
 
     // SAFETY: `data` slice is caller-supplied; `sv` reads at most
     // `data.len()` bytes from `data.as_ptr()`.
-    let status = unsafe {
-        sv(
-            name_ptr,
-            &guid.0,
-            attrs,
-            data.len(),
-            data.as_ptr(),
-        )
-    };
-    if efi_error(status) { Err(status) } else { Ok(()) }
+    let status = unsafe { sv(name_ptr, &guid.0, attrs, data.len(), data.as_ptr()) };
+    if efi_error(status) {
+        Err(status)
+    } else {
+        Ok(())
+    }
 }
 
 // ── reset_system ───────────────────────────────────────────────────
@@ -439,7 +426,12 @@ pub unsafe fn reset_system(reset_type: EfiResetType) -> ! {
             // SAFETY: `rs` is a `!`-returning EFI function; `reset_type` is
             // a valid enum value; no data payload.
             unsafe {
-                rs(reset_type as u32, crate::reset::status::SUCCESS, 0, core::ptr::null())
+                rs(
+                    reset_type as u32,
+                    crate::reset::status::SUCCESS,
+                    0,
+                    core::ptr::null(),
+                )
             }
         }
     }
@@ -465,21 +457,13 @@ pub unsafe fn read_secure_boot_state() -> Option<(u8, u8, Vec<u8>, Vec<u8>)> {
     if !is_available() {
         return None;
     }
-    let sb_bytes = unsafe {
-        get_variable("SecureBoot", &EFI_GLOBAL_VARIABLE).ok()?
-    };
-    let sm_bytes = unsafe {
-        get_variable("SetupMode", &EFI_GLOBAL_VARIABLE).ok()?
-    };
+    let sb_bytes = unsafe { get_variable("SecureBoot", &EFI_GLOBAL_VARIABLE).ok()? };
+    let sm_bytes = unsafe { get_variable("SetupMode", &EFI_GLOBAL_VARIABLE).ok()? };
     let secure_boot = sb_bytes.first().copied().unwrap_or(0);
     let setup_mode = sm_bytes.first().copied().unwrap_or(0);
 
-    let db = unsafe {
-        get_variable("db", &EFI_IMAGE_SECURITY_DATABASE_GUID).unwrap_or_default()
-    };
-    let dbx = unsafe {
-        get_variable("dbx", &EFI_IMAGE_SECURITY_DATABASE_GUID).unwrap_or_default()
-    };
+    let db = unsafe { get_variable("db", &EFI_IMAGE_SECURITY_DATABASE_GUID).unwrap_or_default() };
+    let dbx = unsafe { get_variable("dbx", &EFI_IMAGE_SECURITY_DATABASE_GUID).unwrap_or_default() };
     Some((secure_boot, setup_mode, db, dbx))
 }
 
@@ -634,10 +618,7 @@ mod tests {
 
     fn smoke_efi_get_variable_fake_rt() -> TestResult {
         // Build a fake RT table with only get_variable populated.
-        let hdr = make_header(
-            signature::RUNTIME_SERVICES,
-            (1u32 << 16) | 0,
-        );
+        let hdr = make_header(signature::RUNTIME_SERVICES, (1u32 << 16) | 0);
         let mut t: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
         t.hdr.copy_from_slice(&hdr);
         t.get_variable = fake_get_variable as usize;

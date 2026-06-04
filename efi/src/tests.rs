@@ -186,7 +186,10 @@ fn smoke_table_header_verifies_signature_and_checksum() -> TestResult {
         _ => TestResult::Fail("tampered signature must fail"),
     }
 }
-kernel_test_in!("efi/system-table", smoke_table_header_verifies_signature_and_checksum);
+kernel_test_in!(
+    "efi/system-table",
+    smoke_table_header_verifies_signature_and_checksum
+);
 
 // ── deep efi/time + efi/reset coverage ────────────────────────────
 
@@ -201,11 +204,21 @@ kernel_test_in!("efi/time", smoke_efi_time_decode_rejects_short_buffer);
 
 fn smoke_efi_time_rejects_year_outside_range() -> TestResult {
     use crate::time::{EfiTime, TimeError};
-    let bad = EfiTime { year: 1800, month: 1, day: 1, ..EfiTime::default() };
+    let bad = EfiTime {
+        year: 1800,
+        month: 1,
+        day: 1,
+        ..EfiTime::default()
+    };
     if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
         return TestResult::Fail("year=1800 accepted");
     }
-    let bad = EfiTime { year: 10_000, month: 1, day: 1, ..EfiTime::default() };
+    let bad = EfiTime {
+        year: 10_000,
+        month: 1,
+        day: 1,
+        ..EfiTime::default()
+    };
     if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
         return TestResult::Fail("year=10000 accepted");
     }
@@ -215,7 +228,12 @@ kernel_test_in!("efi/time", smoke_efi_time_rejects_year_outside_range);
 
 fn smoke_efi_time_rejects_month_day_hour_minute() -> TestResult {
     use crate::time::{EfiTime, TimeError};
-    let base = EfiTime { year: 2025, month: 1, day: 1, ..EfiTime::default() };
+    let base = EfiTime {
+        year: 2025,
+        month: 1,
+        day: 1,
+        ..EfiTime::default()
+    };
     let bad = EfiTime { month: 0, ..base };
     if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
         return TestResult::Fail("month=0 accepted");
@@ -244,7 +262,10 @@ fn smoke_efi_time_rejects_month_day_hour_minute() -> TestResult {
     if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
         return TestResult::Fail("second=60 accepted");
     }
-    let bad = EfiTime { nanosecond: 1_000_000_000, ..base };
+    let bad = EfiTime {
+        nanosecond: 1_000_000_000,
+        ..base
+    };
     if EfiTime::decode(&bad.encode()) != Err(TimeError::OutOfRange) {
         return TestResult::Fail("nanosecond=10^9 accepted");
     }
