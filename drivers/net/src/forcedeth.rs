@@ -1116,7 +1116,7 @@ impl crate::HwNic for ForcedethHwNic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn model(&self) -> crate::NicModel {
-        crate::NicModel::IntelIgb // TODO: Add Forcedeth to NicModel
+        crate::NicModel::NvidiaForcedeth
     }
     fn caps(&self) -> crate::NicCaps {
         crate::NicCaps::NONE

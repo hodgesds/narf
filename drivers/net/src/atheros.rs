@@ -923,7 +923,7 @@ impl crate::HwNic for AtlHwNic {
         with_controller(|c| c.link_up).unwrap_or(false)
     }
     fn model(&self) -> crate::NicModel {
-        crate::NicModel::IntelIgb // TODO: Add Atheros to NicModel
+        crate::NicModel::AtherosAtl1c
     }
     fn caps(&self) -> crate::NicCaps {
         crate::NicCaps::NONE
