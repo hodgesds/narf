@@ -24,6 +24,7 @@ use crate::intel_pch::{
     __probe_community_for_test as intel_probe_community,
 };
 use crate::{registry, GpioController, GpioError, GpioIrqConfig, GpioPull};
+use narf_interrupts::IrqStatus;
 
 /// Allocate a 1 KiB zeroed MMIO backing buffer (256 pin registers).
 /// Leak it so the synthetic device outlives the smoke.

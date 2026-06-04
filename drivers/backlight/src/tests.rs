@@ -9,6 +9,7 @@
 mod smokes {
     extern crate alloc;
 
+    use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;

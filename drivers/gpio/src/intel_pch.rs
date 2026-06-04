@@ -371,6 +371,17 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
     })
 }
 
+/// Test hook: route around the AML probe so a synthetic MMIO
+/// backing can be exercised directly. Mirrors `probe_community`'s
+/// return shape.
+#[doc(hidden)]
+pub unsafe fn __probe_community_for_test(
+    mmio_base: PhysAddr,
+    mmio_len: u64,
+) -> Option<(u16, u32, bool, u16)> {
+    unsafe { probe_community(mmio_base, mmio_len) }
+}
+
 unsafe fn probe_community(
     mmio_base: PhysAddr,
     mmio_len: u64,

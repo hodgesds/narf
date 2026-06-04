@@ -55,7 +55,7 @@ compile_error!("narf-driver-runtime: enable one of `kernel` (default) or `usersp
 #[cfg(feature = "kernel")]
 mod kernel_rt {
     pub use narf_bus::pci;
-    pub use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};
+    pub use narf_bus::{map_bar, BarKind, BusDevice, BusDeviceCap, MmioRegion};
     pub use narf_capabilities::{Cap, Write};
     pub use narf_interrupts::wait_for_irq;
     pub use narf_io::{alloc_coherent, DmaBuffer};
