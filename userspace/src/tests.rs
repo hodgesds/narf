@@ -14654,3 +14654,72 @@ fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_clock_gettime_monotonic_raw_and_boottime);
+
+// ── Wave-76: controlling-tty hook ──────────────────────────────────
+//
+// PtySlave::ioctl(TIOCSCTTY) calls back into the userspace crate via
+// the function-pointer hook installed in `boot_init`. This smoke
+// pokes the hook directly (`set_controlling_tty(idx)`) and reads
+// the per-task table via `ctty_for(task)`. setsid() clears the slot.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
+    use crate::handlers::{
+        __test_ctty_reset, __test_pgid_reset, __test_sid_reset, ctty_for, current_task_id,
+        set_controlling_tty,
+    };
+    use crate::{
+        init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    __test_pgid_reset();
+    __test_sid_reset();
+    __test_ctty_reset();
+    init_per_task_state();
+
+    let task = current_task_id();
+
+    // The Wave-76 hook records the PTY index against the current task.
+    set_controlling_tty(7);
+    if ctty_for(task) != Some(7) {
+        __test_clear_global();
+        return TestResult::Fail("ctty_for did not see TIOCSCTTY hook write");
+    }
+
+    // setsid() must drop the controlling tty per POSIX.
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Setsid.raw(), &mut ctx);
+
+    if ctty_for(task).is_some() {
+        __test_clear_global();
+        return TestResult::Fail("setsid did not clear controlling_tty");
+    }
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_ctty_hook_roundtrip_and_setsid_clears);
