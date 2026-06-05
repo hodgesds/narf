@@ -344,6 +344,14 @@ pub fn init_per_task_state() {
     pgid_init();
     sid_init();
     wait_init();
+    #[cfg(feature = "linux-compat")]
+    {
+        ctty_init();
+        // Wave-76: route PtySlave::ioctl(TIOCSCTTY) into our per-task
+        // CTTY table. Hook is global; filesystem crate calls back through
+        // a fn pointer to avoid a userspace→filesystem dep cycle.
+        narf_filesystem::devfs_pty::set_controlling_tty_hook(set_controlling_tty);
+    }
 }
 
 /// Reset the registry — test hook; drops every per-task ring set.
@@ -1222,6 +1230,48 @@ fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Wave-76 special-case: TIOCGPTPEER allocates a fresh slave fd in
+    // the caller's table. The fd-allocation side lives here (not in the
+    // filesystem crate), so we hijack the dispatch before delegating.
+    #[cfg(feature = "linux-compat")]
+    if cmd == narf_filesystem::devfs_pty::TIOCGPTPEER {
+        let idx = match ops.as_pty_master_index() {
+            Some(i) => i,
+            None => {
+                // Not a master fd — ENOTTY (Linux semantics).
+                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                return;
+            }
+        };
+        let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
+            Some(Ok(s)) => s,
+            Some(Err(())) => {
+                // EIO: slave still locked.
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                return;
+            }
+            None => {
+                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                return;
+            }
+        };
+        let ops_dyn: Arc<dyn narf_filesystem::FileOps> = slave;
+        let new_fd = fd::with_table(task, |t| {
+            t.open(fd::FdEntry {
+                ops: ops_dyn,
+                offset: 0,
+                // `arg` carries open(2) flags from glibc (O_RDWR | O_NOCTTY |
+                // O_CLOEXEC). We mirror the CLOEXEC bit; the rest are no-ops.
+                flags: if (arg as u32) & 0o2000000 != 0 { 1 } else { 0 },
+                status_flags: arg as u32,
+            })
+        });
+        match new_fd {
+            Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
+            None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+        }
+        return;
+    }
     match ops.ioctl(cmd, arg) {
         Ok(rc) => ctx.set_return(SyscallReturn::ok(rc as u64)),
         Err(narf_filesystem::FsError::Unsupported) => {
@@ -5501,7 +5551,58 @@ fn sys_setsid(ctx: &mut dyn TrapContext) {
             m.insert(task, task);
         }
     }
+    // Wave-76: a new session leader has no controlling tty until it
+    // opens a tty without O_NOCTTY (or calls TIOCSCTTY). Drop any
+    // inherited reference here so the next open(tty) installs cleanly.
+    #[cfg(feature = "linux-compat")]
+    {
+        let mut g = CTTY_TABLE.lock();
+        if let Some(m) = g.as_mut() {
+            m.remove(&task);
+        }
+    }
     ctx.set_return(SyscallReturn::ok(task));
+}
+
+// ── Per-task controlling-tty table (Wave-76) ───────────────────────
+//
+// `TIOCSCTTY` on a PTY slave records the slave's PTY index here.
+// `setsid()` clears the slot (a new session has no controlling tty).
+// Close-of-master would normally deliver SIGHUP to every task in
+// the slave's session; that wiring is deferred — the slot is read
+// only by the controlling-tty smoke test for now.
+
+#[cfg(feature = "linux-compat")]
+static CTTY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(feature = "linux-compat")]
+pub fn ctty_init() {
+    *CTTY_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[cfg(feature = "linux-compat")]
+#[doc(hidden)]
+pub fn __test_ctty_reset() {
+    *CTTY_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Look up the controlling tty for `task`. Returns the PTY index or
+/// `None` if the task has no controlling tty.
+#[cfg(feature = "linux-compat")]
+pub fn ctty_for(task: u64) -> Option<u32> {
+    CTTY_TABLE.lock().as_ref().and_then(|m| m.get(&task).copied())
+}
+
+/// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can
+/// record the caller's controlling tty without depending on this crate.
+#[cfg(feature = "linux-compat")]
+pub fn set_controlling_tty(pty_index: u32) {
+    let task = current_task_id();
+    let mut g = CTTY_TABLE.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task, pty_index);
+    }
 }
 
 // ── Per-task uid/gid table ─────────────────────────────────────────
