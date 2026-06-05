@@ -101,6 +101,133 @@ pub const CP_RB_DOORBELL_EN: u32 = 1 << 30;
 /// `CP_RB_DOORBELL_CONTROL` — doorbell offset shift.
 pub const CP_RB_DOORBELL_OFFSET_SHIFT: u32 = 2;
 
+// ── GRBM (Graphics Register Bus Manager) — chip-identity surface ───
+//
+// GRBM is the per-shader-engine register-broadcast manager. Three
+// registers form the Foundations-wave read surface:
+//
+// - `mmGRBM_STATUS`     — busy bits for every CP/RLC/SE subengine.
+//                         Read-only. Ring/scheduler bring-up reads
+//                         it to confirm engines are idle before
+//                         programming CP_RB0_BASE et al.
+// - `mmGRBM_GFX_INDEX`  — per-SE / per-SH / per-CU broadcast mask.
+//                         RW. Subsequent waves write this to select
+//                         which shader-engine instance subsequent
+//                         indexed register accesses apply to.
+// - `mmCP_VERSION`      — CP firmware microcode version (the colloquial
+//                         "GFX_VERSION"). Read-only. Foundations
+//                         wave reads it as a chip presence-test
+//                         corroborator (non-FF, non-0).
+//
+// Per-family register dword indices from gc_9_0_offset.h /
+// gc_11_0_0_offset.h. Multiplied by 4 for byte offsets so the
+// constants directly compose with `mm_read(gc_base + REL)`.
+//
+//   GFX9  mmGRBM_STATUS    dword 0x0DA0   byte 0x3680
+//   GFX9  mmGRBM_GFX_INDEX dword 0x2A00   byte 0xA800
+//   GFX9  mmCP_VERSION     dword 0x0867   byte 0x219C
+//   GFX11 mmGRBM_STATUS    dword 0x1A40   byte 0x6900
+//   GFX11 mmGRBM_GFX_INDEX dword 0x2A00   byte 0xA800
+//   GFX11 mmCP_VERSION     dword 0x0C8C   byte 0x3230
+//
+// All offsets are relative to the GC IP block window
+// (`HW_ID_GC` instance 0 from discovery).
+
+/// GFX9 `mmGRBM_STATUS` byte offset — busy bitfield over CP/RLC/SE.
+pub const GRBM_STATUS_REL_GFX9: u32 = 0x0DA0 * 4;
+/// GFX11 `mmGRBM_STATUS` byte offset.
+pub const GRBM_STATUS_REL_GFX11: u32 = 0x1A40 * 4;
+/// `mmGRBM_GFX_INDEX` byte offset — SE/SH/CU broadcast mask.
+/// Identical dword index on both GFX9 and GFX11 per the public
+/// PPR tables (the register is part of the GFX hub block that
+/// didn't move between generations).
+pub const GRBM_GFX_INDEX_REL: u32 = 0x2A00 * 4;
+/// GFX9 `mmCP_VERSION` byte offset.
+pub const CP_VERSION_REL_GFX9: u32 = 0x0867 * 4;
+/// GFX11 `mmCP_VERSION` byte offset.
+pub const CP_VERSION_REL_GFX11: u32 = 0x0C8C * 4;
+
+// ── GRBM_STATUS bit decode ─────────────────────────────────────────
+//
+// Bits chosen by the rule "if Linux uses the same #define name
+// across both gen headers AND the bit position matches, it's stable
+// across GFX9 + GFX11".
+
+/// `GRBM_STATUS.GUI_ACTIVE` — any GFX engine busy.
+pub const GRBM_STATUS_GUI_ACTIVE: u32 = 1 << 31;
+/// `GRBM_STATUS.CP_BUSY` — CP front-end busy fetching/decoding.
+pub const GRBM_STATUS_CP_BUSY: u32 = 1 << 29;
+/// `GRBM_STATUS.CP_COHERENCY_BUSY` — CP cache-coherency unit busy.
+pub const GRBM_STATUS_CP_COHERENCY_BUSY: u32 = 1 << 28;
+/// `GRBM_STATUS.RLC_BUSY` — RLC microcontroller busy.
+pub const GRBM_STATUS_RLC_BUSY: u32 = 1 << 26;
+/// `GRBM_STATUS.GDS_BUSY` — Global Data Share busy.
+pub const GRBM_STATUS_GDS_BUSY: u32 = 1 << 15;
+
+/// Decoded view of `mmGRBM_STATUS`. Foundations wave uses this as
+/// a presence-test corroborator; later waves drive scheduler /
+/// ring bring-up off the same struct.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GrbmStatus {
+    pub raw: u32,
+}
+
+impl GrbmStatus {
+    /// Any GFX engine reports busy.
+    pub fn any_busy(&self) -> bool {
+        self.raw & GRBM_STATUS_GUI_ACTIVE != 0
+    }
+    /// CP front-end busy.
+    pub fn cp_busy(&self) -> bool {
+        self.raw & GRBM_STATUS_CP_BUSY != 0
+    }
+    /// RLC microcontroller busy.
+    pub fn rlc_busy(&self) -> bool {
+        self.raw & GRBM_STATUS_RLC_BUSY != 0
+    }
+    /// Every documented busy bit clear. Invariant the ring/scheduler
+    /// bring-up (Wave-81+) waits on before touching CP_RB0_BASE.
+    pub fn idle(&self) -> bool {
+        self.raw
+            & (GRBM_STATUS_GUI_ACTIVE
+                | GRBM_STATUS_CP_BUSY
+                | GRBM_STATUS_CP_COHERENCY_BUSY
+                | GRBM_STATUS_RLC_BUSY
+                | GRBM_STATUS_GDS_BUSY)
+            == 0
+    }
+    /// Register window read 0xFFFF_FFFF. Live silicon never reports
+    /// every bit set simultaneously; treat as device-gone.
+    pub fn is_sentinel(&self) -> bool {
+        self.raw == 0xFFFF_FFFF
+    }
+}
+
+// ── GRBM_GFX_INDEX field encoding ──────────────────────────────────
+//
+// Per gc_9_0_offset.h / gc_11_0_0_offset.h:
+//   [7:0]   INSTANCE_INDEX
+//   [15:8]  SH_INDEX
+//   [23:16] SE_INDEX
+//   [29]    SH_BROADCAST_WRITES         1 = broadcast to all SHs
+//   [30]    INSTANCE_BROADCAST_WRITES   1 = broadcast to all instances
+//   [31]    SE_BROADCAST_WRITES         1 = broadcast to all SEs
+
+/// `GRBM_GFX_INDEX` value broadcasting to every SE/SH/instance.
+/// Standard "no narrowing" mask the bring-up writes for CP/RLC
+/// registers that aren't shader-engine-private.
+pub const fn grbm_gfx_index_broadcast() -> u32 {
+    (1u32 << 31) | (1u32 << 30) | (1u32 << 29)
+}
+
+/// `GRBM_GFX_INDEX` value targeting one specific `(se, sh, instance)`
+/// triple. Caller keeps indices within the chip's SE/SH/CU counts
+/// (Renoir = 1 SE x 1 SH x 7 CU active; Phoenix = 1 SE x 2 SH x 6
+/// CU active per AMD public docs).
+pub const fn grbm_gfx_index_for(se: u8, sh: u8, instance: u8) -> u32 {
+    ((se as u32) << 16) | ((sh as u32) << 8) | (instance as u32)
+}
+
 // ── CP register offsets (GFX11 — Phoenix HawkPoint1 / Strix) ───────
 //
 // Values from gc/gc_11_0_0_offset.h. Most ring registers keep the

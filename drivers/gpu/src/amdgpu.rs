@@ -628,6 +628,127 @@ impl AmdGpu {
     pub fn is_ready(&self) -> bool {
         self.fw_loaded
     }
+
+    // ── Foundations-wave register surfaces ─────────────────────────
+    //
+    // GFX (GRBM_STATUS / GRBM_GFX_INDEX / CP_VERSION) and GMC
+    // (system aperture) read paths used by chip-identification +
+    // subsequent ring/scheduler bring-up. Pure reads — no engine
+    // programming. See `amdgpu_gfx.rs` and `amdgpu_gmc.rs` for the
+    // register-offset constants and pure decoders.
+
+    /// Per-family GFX `mmGRBM_STATUS` byte offset within the GC IP
+    /// block window. GFX9 (Renoir) and GFX11 (Phoenix) place the
+    /// register at distinct offsets.
+    fn grbm_status_offset(&self) -> u32 {
+        match self.chip.family {
+            Family::Phoenix => crate::amdgpu_gfx::GRBM_STATUS_REL_GFX11,
+            _ => crate::amdgpu_gfx::GRBM_STATUS_REL_GFX9,
+        }
+    }
+
+    /// Per-family GFX `mmCP_VERSION` byte offset.
+    fn cp_version_offset(&self) -> u32 {
+        match self.chip.family {
+            Family::Phoenix => crate::amdgpu_gfx::CP_VERSION_REL_GFX11,
+            _ => crate::amdgpu_gfx::CP_VERSION_REL_GFX9,
+        }
+    }
+
+    /// Resolve the GC IP block base from discovery. None on
+    /// pre-discovery silicon or when the discovery blob didn't
+    /// land a GC entry.
+    pub fn gc_base(&self) -> Option<u32> {
+        self.ip_block_base(amdgpu_discovery::HW_ID_GC, 0)
+    }
+
+    /// Read `mmGRBM_STATUS`. Returns None when the GC base isn't
+    /// resolvable (discovery missing) so the caller can fall back
+    /// to a chip-presence heuristic. On real silicon the value
+    /// is non-sentinel (not 0xFFFF_FFFF); QEMU returns 0 (idle).
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively (MM_INDEX / MM_DATA latch).
+    pub unsafe fn read_grbm_status(&self) -> Option<crate::amdgpu_gfx::GrbmStatus> {
+        let gc_base = self.gc_base()?;
+        let off = gc_base + self.grbm_status_offset();
+        // SAFETY: caller-asserted BAR5 ownership; mm_read uses the
+        // MM_INDEX/MM_DATA pair which is a r/w latch with no side
+        // effect on the addressed register.
+        let raw = unsafe { mm_read(&self.regs, off) };
+        Some(crate::amdgpu_gfx::GrbmStatus { raw })
+    }
+
+    /// Read `mmCP_VERSION`. None when GC base unresolvable. Real
+    /// silicon: a small non-zero value (CP microcode version,
+    /// e.g. 0x00BEEF12 once firmware loaded). Pre-firmware: any of
+    /// 0, the BIOS-loaded version, or sentinel 0xFFFF_FFFF — the
+    /// presence test in `bring_up` already filters sentinel.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub unsafe fn read_cp_version(&self) -> Option<u32> {
+        let gc_base = self.gc_base()?;
+        let off = gc_base + self.cp_version_offset();
+        // SAFETY: same as `read_grbm_status`.
+        Some(unsafe { mm_read(&self.regs, off) })
+    }
+
+    /// Write `mmGRBM_GFX_INDEX` to target a specific SE/SH/instance
+    /// (or broadcast). Subsequent indexed register reads against
+    /// the GC block hit the selected lane. Foundations wave
+    /// exposes the write so the scheduler bring-up wave can drive
+    /// it without re-deriving the offset.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively. The value SHOULD be one
+    /// produced by `grbm_gfx_index_broadcast()` /
+    /// `grbm_gfx_index_for()`; raw values that name nonexistent
+    /// SE/SH lanes leave the chip in a misconfigured indexing
+    /// state until the next broadcast write.
+    pub unsafe fn write_grbm_gfx_index(&self, value: u32) -> Option<()> {
+        let gc_base = self.gc_base()?;
+        let off = gc_base + crate::amdgpu_gfx::GRBM_GFX_INDEX_REL;
+        // SAFETY: caller-asserted BAR5 ownership.
+        unsafe {
+            mm_write(&self.regs, off, value);
+        }
+        Some(())
+    }
+
+    /// Read the full `ApertureLayout` (VRAM + system aperture)
+    /// through the MC register block. VRAM aperture mirrors what
+    /// `vram_info()` returns; system aperture is fresh from the
+    /// MC each call.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub unsafe fn read_aperture_layout(&self) -> crate::amdgpu_gmc::ApertureLayout {
+        // VRAM: use the cached probe-time read so the wave doesn't
+        // re-bounce through MM_INDEX for the canonical answer.
+        // SAFETY: caller-asserted BAR5 ownership.
+        let sys_low_field = unsafe {
+            mm_read(
+                &self.regs,
+                crate::amdgpu_gmc::MC_VM_SYSTEM_APERTURE_LOW_ADDR,
+            )
+        };
+        // SAFETY: same.
+        let sys_high_field = unsafe {
+            mm_read(
+                &self.regs,
+                crate::amdgpu_gmc::MC_VM_SYSTEM_APERTURE_HIGH_ADDR,
+            )
+        };
+        let (sys_low, sys_high) =
+            crate::amdgpu_gmc::decode_system_aperture(sys_low_field, sys_high_field);
+        crate::amdgpu_gmc::ApertureLayout {
+            vram_base: self.vram.base,
+            vram_size: self.vram.size,
+            system_low: sys_low,
+            system_high: sys_high,
+        }
+    }
     pub fn current_mode(&self) -> Option<Mode> {
         // If `set_mode` has run, return what it programmed.
         // Otherwise, fall back to whatever the firmware left
