@@ -391,6 +391,13 @@ pub trait FileOps: Send + Sync {
     fn ioctl(&self, _cmd: u32, _arg: usize) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
     }
+
+    /// Wave-76: if this file is a PTY master, return the slave index.
+    /// Used by `sys_ioctl(TIOCGPTPEER)` to open a fresh slave fd
+    /// without going through a downcast / Any dance. Default: `None`.
+    fn as_pty_master_index(&self) -> Option<u32> {
+        None
+    }
 }
 
 // ── POSIX poll(2) event bits ────────────────────────────────────

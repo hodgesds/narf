@@ -357,3 +357,164 @@ fn smoke_pty_slave_ctrl_d_eof() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/pty", smoke_pty_slave_ctrl_d_eof);
+
+// ── Wave-76: ioctls ───────────────────────────────────────────────────────────
+//
+// On the kernel-test path the "user pointer" is just a kernel-owned
+// scratch slot; `copy_in`/`copy_out` reduce to plain ptr ops.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_master_tiocgptn_returns_index() -> TestResult {
+    use crate::devfs_pty::TIOCGPTN;
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let mut scratch: u32 = 0xDEAD_BEEF;
+    let arg = &mut scratch as *mut u32 as usize;
+    if master.ioctl(TIOCGPTN, arg) != Ok(0) {
+        return TestResult::Fail("TIOCGPTN did not return Ok(0)");
+    }
+    if scratch != idx {
+        return TestResult::Fail("TIOCGPTN did not write the slave index");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_master_tiocgptn_returns_index);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
+    use crate::devfs_pty::TIOCSPTLCK;
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+
+    // Locked-by-default: DevPts::lookup must NOT return the slave.
+    let dir = DevPts;
+    let mut tmp = [0u8; 10];
+    let digits = {
+        let mut n = idx;
+        if n == 0 {
+            tmp[9] = b'0';
+            unsafe { core::str::from_utf8_unchecked(&tmp[9..]) }
+        } else {
+            let mut pos = 10;
+            while n > 0 {
+                pos -= 1;
+                tmp[pos] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            unsafe { core::str::from_utf8_unchecked(&tmp[pos..]) }
+        }
+    };
+    if dir.lookup(digits).is_some() {
+        return TestResult::Fail("locked slave appeared in DevPts::lookup");
+    }
+
+    // Clear lock.
+    let mut zero: i32 = 0;
+    let arg = &mut zero as *mut i32 as usize;
+    if master.ioctl(TIOCSPTLCK, arg) != Ok(0) {
+        return TestResult::Fail("TIOCSPTLCK(0) failed");
+    }
+    if dir.lookup(digits).is_none() {
+        return TestResult::Fail("slave still hidden after TIOCSPTLCK(0)");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_slave_locked_until_tiocsptlck_clear);
+
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_per_tty_fg_pgrp_isolated() -> TestResult {
+    use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
+    __reset_for_test();
+    let m1 = open_ptmx();
+    let m2 = open_ptmx();
+
+    let mut p1: i32 = 111;
+    let mut p2: i32 = 222;
+    if m1
+        .ioctl(TIOCSPGRP, &mut p1 as *mut i32 as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCSPGRP on m1 failed");
+    }
+    if m2
+        .ioctl(TIOCSPGRP, &mut p2 as *mut i32 as usize)
+        .is_err()
+    {
+        return TestResult::Fail("TIOCSPGRP on m2 failed");
+    }
+    let mut got1: i32 = 0;
+    let mut got2: i32 = 0;
+    let _ = m1.ioctl(TIOCGPGRP, &mut got1 as *mut i32 as usize);
+    let _ = m2.ioctl(TIOCGPGRP, &mut got2 as *mut i32 as usize);
+    if got1 != 111 || got2 != 222 {
+        return TestResult::Fail("per-tty fg_pgrp slots leaked across PTYs");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_per_tty_fg_pgrp_isolated);
+
+// Master fg_pgrp and slave fg_pgrp share the *same* `Pty.fg_pgrp` slot.
+// Setting from the master must be visible from the slave (and vice versa).
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_master_slave_share_fg_pgrp() -> TestResult {
+    use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    // Clear the lock so DevPts::lookup hands out the slave.
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(crate::devfs_pty::TIOCSPTLCK, &mut zero as *mut i32 as usize);
+
+    let slave_arc = pts_lookup(idx).expect("slave");
+    let slave = PtySlave::new(slave_arc);
+
+    let mut p: i32 = 9000;
+    if master
+        .ioctl(TIOCSPGRP, &mut p as *mut i32 as usize)
+        .is_err()
+    {
+        return TestResult::Fail("master TIOCSPGRP failed");
+    }
+    let mut got: i32 = 0;
+    if slave
+        .ioctl(TIOCGPGRP, &mut got as *mut i32 as usize)
+        .is_err()
+    {
+        return TestResult::Fail("slave TIOCGPGRP failed");
+    }
+    if got != 9000 {
+        return TestResult::Fail("slave did not see master's TIOCSPGRP");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_master_slave_share_fg_pgrp);
+
+// TIOCGPTPEER routes via `pts_open_peer`. Lock must gate the peer open.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_gptpeer_respects_lock() -> TestResult {
+    use crate::devfs_pty::{pts_open_peer, TIOCSPTLCK};
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+
+    // Default-locked: pts_open_peer returns Some(Err(())).
+    match pts_open_peer(idx) {
+        Some(Err(())) => {}
+        _ => return TestResult::Fail("locked PTY allowed pts_open_peer"),
+    }
+    // Unlock.
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(TIOCSPTLCK, &mut zero as *mut i32 as usize);
+    match pts_open_peer(idx) {
+        Some(Ok(_)) => TestResult::Pass,
+        _ => TestResult::Fail("unlocked PTY refused pts_open_peer"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_gptpeer_respects_lock);

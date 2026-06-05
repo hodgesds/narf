@@ -45,11 +45,31 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
+
+// ── Terminal ioctl numbers (Linux ABI) ────────────────────────────────────────
+//
+// Mirrors `userspace::fd` constants — duplicated here so the FS layer doesn't
+// need to import the kernel-userspace crate. The wire values are stable Linux
+// ABI; if these ever drift, sys_ioctl will route the wrong cmd word.
+
+/// `ioctl(fd, TIOCGPGRP, &pid_t)` — foreground process group.
+pub const TIOCGPGRP: u32 = 0x540F;
+/// `ioctl(fd, TIOCSPGRP, &pid_t)` — set foreground process group.
+pub const TIOCSPGRP: u32 = 0x5410;
+/// `ioctl(fd, TIOCSCTTY, 0)` — set this tty as the caller's controlling tty.
+pub const TIOCSCTTY: u32 = 0x540E;
+/// `ioctl(master_fd, TIOCGPTN, &u32)` — query the slave index N.
+pub const TIOCGPTN: u32 = 0x80045430;
+/// `ioctl(master_fd, TIOCSPTLCK, &i32)` — set (1) / clear (0) slave-lock.
+pub const TIOCSPTLCK: u32 = 0x40045431;
+/// `ioctl(master_fd, TIOCGPTPEER, flags)` — open a fresh slave fd. Handled
+/// by the syscall layer because fd allocation lives in userspace::fd.
+pub const TIOCGPTPEER: u32 = 0x40045441;
 
 // ── Ring buffer ───────────────────────────────────────────────────────────────
 
@@ -222,6 +242,17 @@ pub struct Pty {
 
     /// Allocation index; becomes the `/dev/pts/<N>` name.
     pub(crate) index: u32,
+
+    /// Wave-76: per-tty foreground process group (TIOCSPGRP/TIOCGPGRP).
+    /// Owned per pair so a write to a PTY master/slave does NOT clobber
+    /// the global console's fg_pgrp. 0 = unset; tcsetpgrp(3) installs.
+    pub(crate) fg_pgrp: AtomicU64,
+
+    /// Wave-76: slave-lock flag (TIOCSPTLCK). After ptmx_open the slave
+    /// is locked; userspace calls unlockpt() / TIOCSPTLCK(0) before
+    /// `open("/dev/pts/N")`. While locked, `DevPts::lookup` returns
+    /// `FsError::Io(...)` so the syscall layer surfaces -EIO.
+    pub(crate) locked: AtomicBool,
 }
 
 impl core::fmt::Debug for Pty {
@@ -240,6 +271,10 @@ impl Pty {
             sid: AtomicU32::new(0),
             pgid: AtomicU32::new(0),
             index,
+            fg_pgrp: AtomicU64::new(0),
+            // Linux: ptmx_open() starts with the slave locked. unlockpt()
+            // clears via TIOCSPTLCK(0) before the slave can be opened.
+            locked: AtomicBool::new(true),
         }
     }
 }
@@ -284,6 +319,51 @@ pub fn pts_lookup(index: u32) -> Option<Arc<Pty>> {
 /// Snapshot the current list of active PTY indices.
 pub fn pts_indices() -> Vec<u32> {
     PTY_TABLE.lock().iter().map(|(i, _)| *i).collect()
+}
+
+/// Wave-76: open a fresh slave by master index. Used by the syscall
+/// layer to satisfy `TIOCGPTPEER` (musl/glibc prefer this over
+/// `ptsname()+open()`). Returns `None` if the master is gone, or
+/// `Some(Err(()))` if the slave is still locked.
+#[cfg(feature = "linux-compat")]
+pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
+    let pty = pts_lookup(index)?;
+    if pty.locked.load(Ordering::Acquire) {
+        return Some(Err(()));
+    }
+    Some(Ok(Arc::new(PtySlave::new(pty))))
+}
+
+// ── User-pointer helpers ──────────────────────────────────────────────────────
+//
+// Raw memcpy across user/kernel — mirrors `drivers/gpu/src/drm_ioctl_bridge`
+// `copy_in`/`copy_out`. The SMAP/STAC bracket lives in the syscall trap
+// layer; this layer just sees an opaque usize and does a pointer load/store.
+
+#[cfg(feature = "linux-compat")]
+unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(unsafe { core::ptr::read_unaligned(uptr as *const i32) })
+}
+
+#[cfg(feature = "linux-compat")]
+unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    unsafe { core::ptr::write_unaligned(uptr as *mut i32, v) };
+    Ok(())
+}
+
+#[cfg(feature = "linux-compat")]
+unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    unsafe { core::ptr::write_unaligned(uptr as *mut u32, v) };
+    Ok(())
 }
 
 // ── PtyMaster FileOps ─────────────────────────────────────────────────────────
@@ -351,6 +431,53 @@ impl FileOps for PtyMaster {
                 perms: 0o620,
             },
             mtime_cycles: 0,
+        }
+    }
+
+    /// Wave-76: PtyMaster identifies itself via the FileOps hook so
+    /// `sys_ioctl(TIOCGPTPEER)` can allocate a fresh slave fd without
+    /// a `Any`-based downcast on `Arc<dyn FileOps>`.
+    #[cfg(feature = "linux-compat")]
+    fn as_pty_master_index(&self) -> Option<u32> {
+        Some(self.pty.index)
+    }
+
+    /// Wave-76: master-side ioctls.
+    ///
+    /// - `TIOCGPTN`     — write the slave number into *(u32*)arg
+    /// - `TIOCSPTLCK`   — set/clear the slave-lock flag from *(i32*)arg
+    /// - `TIOCSPGRP`    — set fg_pgrp from *(i32*)arg (per-tty slot)
+    /// - `TIOCGPGRP`    — read fg_pgrp into *(i32*)arg
+    /// - `TIOCGPTPEER`  — NOT handled here; the syscall layer special-cases
+    ///   it to allocate a fresh fd in the caller's table.
+    #[cfg(feature = "linux-compat")]
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        match cmd {
+            TIOCGPTN => {
+                unsafe { write_user_u32(arg, self.pty.index)? };
+                Ok(0)
+            }
+            TIOCSPTLCK => {
+                let v = unsafe { read_user_i32(arg)? };
+                self.pty.locked.store(v != 0, Ordering::Release);
+                Ok(0)
+            }
+            TIOCGPGRP => {
+                let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire) as i32;
+                unsafe { write_user_i32(arg, pgrp)? };
+                Ok(0)
+            }
+            TIOCSPGRP => {
+                let pgrp = unsafe { read_user_i32(arg)? };
+                if pgrp < 0 {
+                    return Err(FsError::InvalidData);
+                }
+                self.pty.fg_pgrp.store(pgrp as u64, Ordering::Release);
+                Ok(0)
+            }
+            // TIOCGPTPEER is dispatched by sys_ioctl directly; if it
+            // reaches here, fall through to Unsupported (→ -ENOTTY).
+            _ => Err(FsError::Unsupported),
         }
     }
 }
@@ -448,6 +575,67 @@ impl FileOps for PtySlave {
             mtime_cycles: 0,
         }
     }
+
+    /// Wave-76: slave-side ioctls.
+    ///
+    /// - `TIOCGPTN`   — returns this slave's index (Linux extension; harmless)
+    /// - `TIOCSPGRP`  — set the per-tty fg_pgrp (same slot as the master)
+    /// - `TIOCGPGRP`  — read the per-tty fg_pgrp
+    /// - `TIOCSCTTY`  — install this PTY as the caller's controlling tty
+    ///   via the userspace registry (see `set_controlling_tty_hook`).
+    #[cfg(feature = "linux-compat")]
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        match cmd {
+            TIOCGPTN => {
+                unsafe { write_user_u32(arg, self.pty.index)? };
+                Ok(0)
+            }
+            TIOCGPGRP => {
+                let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire) as i32;
+                unsafe { write_user_i32(arg, pgrp)? };
+                Ok(0)
+            }
+            TIOCSPGRP => {
+                let pgrp = unsafe { read_user_i32(arg)? };
+                if pgrp < 0 {
+                    return Err(FsError::InvalidData);
+                }
+                self.pty.fg_pgrp.store(pgrp as u64, Ordering::Release);
+                Ok(0)
+            }
+            TIOCSCTTY => {
+                // Hand off to whichever crate installed the hook. The
+                // filesystem layer can't reach the per-task session
+                // table directly — userspace::handlers wires it.
+                let _ = arg;
+                if let Some(hook) = CTTY_HOOK.lock().as_ref() {
+                    hook(self.pty.index);
+                }
+                Ok(0)
+            }
+            _ => Err(FsError::Unsupported),
+        }
+    }
+}
+
+// ── Controlling-tty hook ──────────────────────────────────────────────────────
+//
+// `TIOCSCTTY` and master-close-SIGHUP both need to reach the per-task
+// session table that lives in `userspace::handlers`. Rather than make
+// the filesystem crate depend on userspace, we expose a function-pointer
+// hook the userspace crate installs at boot.
+
+#[cfg(feature = "linux-compat")]
+type CttyHook = fn(pty_index: u32);
+
+#[cfg(feature = "linux-compat")]
+static CTTY_HOOK: IrqSafeSpinLock<Option<CttyHook>> = IrqSafeSpinLock::new(None);
+
+/// Install the hook called from `PtySlave::ioctl(TIOCSCTTY)`. Userspace
+/// uses this to record the caller's controlling tty.
+#[cfg(feature = "linux-compat")]
+pub fn set_controlling_tty_hook(hook: CttyHook) {
+    *CTTY_HOOK.lock() = Some(hook);
 }
 
 // ── DevPtmx FileOps ───────────────────────────────────────────────────────────
@@ -519,11 +707,27 @@ impl DirOps for DevPts {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let idx: u32 = name.parse().ok()?;
         let pty = pts_lookup(idx)?;
+        // Wave-76: a locked slave is invisible to `lookup()` — the
+        // async path surfaces this as EIO. We can't return Err from
+        // a sync `lookup`, so a locked PTY reports NotFound here.
+        // The async path below distinguishes locked vs absent.
+        #[cfg(feature = "linux-compat")]
+        if pty.locked.load(Ordering::Acquire) {
+            return None;
+        }
         Some(Arc::new(PtySlave::new(pty)) as Arc<dyn FileOps>)
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
+        Box::pin(async move {
+            let idx: u32 = name.parse().map_err(|_| FsError::NotFound)?;
+            let pty = pts_lookup(idx).ok_or(FsError::NotFound)?;
+            #[cfg(feature = "linux-compat")]
+            if pty.locked.load(Ordering::Acquire) {
+                return Err(FsError::Busy);
+            }
+            Ok(Arc::new(PtySlave::new(pty)) as Arc<dyn FileOps>)
+        })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
