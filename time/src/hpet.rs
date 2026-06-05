@@ -922,6 +922,10 @@ pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64>
     let _ = writeln!(narf_console::Writer, "  hx: t0={}", hpet_t0);
     let tsc_t0 = narf_arch::x86_64::tsc::rdtsc();
     let _ = writeln!(narf_console::Writer, "  hx: tsc_t0={}", tsc_t0);
+    let hpet_deadline_x = hpet_t0.wrapping_add(calibration_window_hpet_ticks);
+    let _ = writeln!(narf_console::Writer, "  hx: deadline_computed={}", hpet_deadline_x);
+    let now_first = unsafe { dev.read_counter() };
+    let _ = writeln!(narf_console::Writer, "  hx: loop1_now={}", now_first);
     let hpet_deadline = hpet_t0.wrapping_add(calibration_window_hpet_ticks);
     // Tight loop on HPET — RDTSC + an MMIO read per iteration is
     // fine for a one-shot boot-time calibration.
