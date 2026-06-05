@@ -74,6 +74,7 @@ pub mod format;
 pub mod hda;
 pub mod mixer;
 pub mod pcm;
+#[cfg(feature = "linux-compat")]
 pub mod procfs_bridge;
 pub mod sysfs_bridge;
 
@@ -455,6 +456,7 @@ pub fn supported_format(fmt: SampleFormat, rate: SampleRate, channels: ChannelCo
 pub fn sound_fs_initcall() {
     crate::sysfs_bridge::register_all_cards_sysfs();
     crate::devfs_bridge::register_devfs_snd();
+    #[cfg(feature = "linux-compat")]
     crate::procfs_bridge::register_procfs_asound();
 }
 

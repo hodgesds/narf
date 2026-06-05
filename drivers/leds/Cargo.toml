@@ -21,6 +21,7 @@ narf-filesystem   = { path = "../../filesystem" }
 async-trait       = "0.1"
 
 [features]
+linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = []
 
 [lints]

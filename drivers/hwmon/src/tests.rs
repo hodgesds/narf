@@ -262,6 +262,7 @@ kernel_test_in!("drivers/hwmon/registry", smoke_hwmon_registry);
 
 /// After registering a k10temp device and populating the hwmon class,
 /// `/sys/class/hwmon/hwmon0` appears with a `name` attribute.
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_k10temp_hwmon0_enumerated() -> TestResult {
     use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
     use alloc::sync::Arc;
@@ -284,12 +285,14 @@ fn smoke_bridge_k10temp_hwmon0_enumerated() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/hwmon/bridge",
     smoke_bridge_k10temp_hwmon0_enumerated
 );
 
 /// `hwmon0/name` returns the chip name (`"k10temp\n"`).
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_name_attr_reads_k10temp() -> TestResult {
     use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
     use alloc::sync::Arc;
@@ -318,10 +321,12 @@ fn smoke_bridge_name_attr_reads_k10temp() -> TestResult {
         None => TestResult::Fail("hwmon0/name attr missing"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_name_attr_reads_k10temp);
 
 /// `temp1_input` attr exists and returns ASCII digits (the value may
 /// be 0 if no hardware is accessible in the test environment).
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
     use crate::k10temp::{chip_info, K10temp, AMD_PHOENIX_NB};
     use alloc::sync::Arc;
@@ -353,12 +358,14 @@ fn smoke_bridge_temp1_input_returns_ascii() -> TestResult {
         None => TestResult::Fail("temp1_input attr missing from hwmon0"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/hwmon/bridge",
     smoke_bridge_temp1_input_returns_ascii
 );
 
 /// `temp1_label` returns the label string with a newline.
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
     use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
     use alloc::sync::Arc;
@@ -388,12 +395,14 @@ fn smoke_bridge_temp1_label_returns_tctl() -> TestResult {
         None => TestResult::Fail("temp1_label attr missing"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/hwmon/bridge",
     smoke_bridge_temp1_label_returns_tctl
 );
 
 /// Two devices produce hwmon0 and hwmon1.
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_multiple_devices_enumerated() -> TestResult {
     use crate::coretemp::Coretemp;
     use crate::k10temp::{chip_info, K10temp, AMD_RENOIR_NB};
@@ -423,12 +432,14 @@ fn smoke_bridge_multiple_devices_enumerated() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/hwmon/bridge",
     smoke_bridge_multiple_devices_enumerated
 );
 
 /// NCT6779D has 5 fans; bridge should expose fan1_input through fan5_input.
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_nct6779d_five_fan_inputs() -> TestResult {
     use crate::nct6775::{Nct6775, NctChip, NCT6779D_ID};
     use alloc::sync::Arc;
@@ -453,12 +464,14 @@ fn smoke_bridge_nct6779d_five_fan_inputs() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "drivers/hwmon/bridge",
     smoke_bridge_nct6779d_five_fan_inputs
 );
 
 /// `update_interval` attr exists and returns "1000\n".
+#[cfg(feature = "linux-compat")]
 fn smoke_bridge_update_interval_attr() -> TestResult {
     use crate::coretemp::Coretemp;
     use alloc::sync::Arc;
@@ -480,6 +493,7 @@ fn smoke_bridge_update_interval_attr() -> TestResult {
         None => TestResult::Fail("update_interval attr missing"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_update_interval_attr);
 
 // ── dell_smm ──────────────────────────────────────────────────────────

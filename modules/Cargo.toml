@@ -19,3 +19,6 @@ narf-filesystem   = { path = "../filesystem" }
 
 [lints]
 workspace = true
+
+[features]
+linux-compat = ["narf-filesystem/linux-compat"]

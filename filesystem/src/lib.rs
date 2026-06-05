@@ -69,9 +69,11 @@ pub mod devfs_pty;
 pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
+#[cfg(feature = "linux-compat")]
 pub mod procfs;
 pub mod root_mount;
 pub mod root_selector;
+#[cfg(feature = "linux-compat")]
 pub mod sysfs;
 pub mod uevent;
 
@@ -97,6 +99,7 @@ pub use fuse::{
 };
 pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
+#[cfg(feature = "linux-compat")]
 pub use sysfs::{
     class_device_register, class_register, install_net_snapshot_hook, kobject_add_attr,
     kobject_add_bin_attr, kobject_add_writable_attr, kobject_emit_uevent, sysfs_root, AttrShow,
@@ -1727,6 +1730,7 @@ pub fn register_initcalls() {
     // /proc — synthetic per-process and system-wide read-only views.
     // /sys — kobject hierarchy; replaces the old empty MemFs stub with
     //         the real SysFs and pre-populates block/net/kernel subtrees.
+    #[cfg(feature = "linux-compat")]
     narf_init::register(Stage::Fs, "procfs-mount", || {
         let auth = bootstrap_mount_authority();
         let _ = registry().mount(&auth, "/proc", procfs::ProcFs);

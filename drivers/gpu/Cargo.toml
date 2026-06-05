@@ -35,6 +35,7 @@ narf-filesystem      = { path = "../../filesystem" }
 narf-drivers-backlight = { path = "../backlight" }
 
 [features]
+linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = []
 
 [lints]

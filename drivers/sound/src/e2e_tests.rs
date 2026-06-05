@@ -24,6 +24,7 @@ use crate::format::{pack_sdfmt, ChannelCount, HwParams, SampleFormat, SampleRate
 use crate::hda::streams::{StreamDescriptor, SDCTL_RUN};
 use crate::mixer::{self, ControlKind, ControlValue};
 use crate::pcm::{PcmSubstream, SubstreamState};
+#[cfg(feature = "linux-compat")]
 use crate::sysfs_bridge::{render_card_id_attr, SNDRV_MAJOR};
 use crate::{list_cards, mixer as mixer_open, open_playback, register_card, SoundError};
 use alloc::vec;
@@ -773,6 +774,7 @@ kernel_test_in!("drivers/sound", e2e_smoke_jack_sense_unsolicited_response);
 // Linux ref: `Documentation/ABI/testing/sysfs-class-sound`
 //            `sound/core/init.c::snd_card_register` kobject population.
 
+#[cfg(feature = "linux-compat")]
 fn e2e_smoke_sysfs_card_id_reads_alc256() -> TestResult {
     crate::__reset_for_test();
     mixer::__reset_for_test();
@@ -792,6 +794,7 @@ fn e2e_smoke_sysfs_card_id_reads_alc256() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/sound", e2e_smoke_sysfs_card_id_reads_alc256);
 
 // ── Smoke #15: /proc/asound/cards format matches Linux ALSA ───────────────
@@ -804,6 +807,7 @@ kernel_test_in!("drivers/sound", e2e_smoke_sysfs_card_id_reads_alc256);
 //
 // Linux ref: `sound/core/init.c::snd_card_info_read`
 
+#[cfg(feature = "linux-compat")]
 fn e2e_smoke_procfs_asound_cards_format() -> TestResult {
     crate::__reset_for_test();
     mixer::__reset_for_test();
@@ -847,4 +851,5 @@ fn e2e_smoke_procfs_asound_cards_format() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/sound", e2e_smoke_procfs_asound_cards_format);

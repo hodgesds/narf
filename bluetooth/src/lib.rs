@@ -63,6 +63,7 @@ pub mod transport;
 pub mod usb_transport;
 
 pub mod devfs_bridge;
+#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 
 mod tests;
@@ -120,6 +121,7 @@ pub fn register_initcalls() {
     // Stage: register /sys/class/bluetooth/ class stub.
     // Linux ref: net/bluetooth/hci_sysfs.c:bt_sysfs_init().
     narf_init::register(Stage::Late, "bluetooth-sysfs", || {
+        #[cfg(feature = "linux-compat")]
         let _ = narf_filesystem::sysfs::class_register("bluetooth");
         InitResult::Ok
     });
