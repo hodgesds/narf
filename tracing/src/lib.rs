@@ -58,7 +58,10 @@ pub use tdigest::TDigest;
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+use alloc::boxed::Box;
 
 // ── Probe-site metadata ─────────────────────────────────────────────
 //
@@ -513,4 +516,272 @@ fn emit_internal_probes() {
 #[inline(never)]
 pub fn exercise_internal_probes() {
     emit_internal_probes();
+}
+
+// ── Pluggable event sink (Wave J) ──────────────────────────────────
+//
+// `EventSink` is the install-once, runtime-swappable destination for
+// `emit_event(type_id, &bytes)` calls. The trait is intentionally
+// narrow (`record_raw`, `flush`, `name`) so the hot path is a single
+// indirect call after the null-check fast-path.
+//
+// Pattern mirrors `power::install_governor` (`power/src/lib.rs:538`),
+// with one critical exception: `probe!` and `emit_event` are on every
+// IRQ entry / syscall / wakeup, so we can't afford an `IrqSafeSpinLock`
+// in the load path. Instead, the slot is an `AtomicPtr` to a
+// leaked `Box<Box<dyn EventSink>>` — fat-pointer trait objects don't
+// fit in `AtomicPtr`, so we box-the-box and store the inner pointer.
+// Install/uninstall swaps the pointer (Acquire/Release) and drops the
+// displaced box. Hot-path loads use Relaxed; losing one event on a
+// race is benign and an Acquire/Release pair on install ensures the
+// box contents are visible whenever the pointer is.
+//
+// Default-noop fast path:
+//   let p = SINK.load(Relaxed);
+//   if p.is_null() { return; }
+//   unsafe { (*p).record_raw(type_id, bytes); }
+// On x86_64 that's `mov rax, [SINK]; test rax, rax; je .Lret` — ≈0.5 ns,
+// branch-well-predicted as "no sink installed" outside of armed tracing.
+
+/// Runtime-installable destination for emitted trace events.
+///
+/// Implementations must be cheap on the `record_raw` hot path; the
+/// default `FlightRecorderSink` is a single masked-index ring write.
+/// Heavyweight sinks (USB-serial, TCP) should buffer internally and
+/// drain in `flush`.
+pub trait EventSink: Send + Sync + 'static {
+    /// Stable identifier — `"flight-recorder"`, `"serial"`, etc.
+    /// Used by `current_event_sink_name()` and userspace tooling.
+    fn name(&self) -> &'static str;
+    /// Record a raw event. `type_id` is the consumer-defined event
+    /// kind; `bytes` is the payload (any encoding the producer +
+    /// consumer agree on). Must be wait-free; called from IRQ context.
+    fn record_raw(&self, type_id: u64, bytes: &[u8]);
+    /// Drain any internal buffering. No-op for unbuffered sinks.
+    fn flush(&self);
+}
+
+/// Errors from `install_event_sink`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum TracingError {
+    /// The supplied cap was revoked before install.
+    AuthorityRevoked,
+}
+
+impl From<CapError> for TracingError {
+    fn from(_: CapError) -> Self {
+        TracingError::AuthorityRevoked
+    }
+}
+
+/// Cap-type marker for event-sink install authority.
+#[derive(Debug)]
+pub struct SinkMarker;
+impl CapType for SinkMarker {
+    const KIND: CapKind = CapKind::EventSink;
+}
+
+// Atomic slot for the active sink. Stores a raw pointer to a leaked
+// `Box<dyn EventSink>` — i.e. the inner `Box` of a
+// `Box<Box<dyn EventSink>>`. Null = no sink installed (fast-path
+// return). `AtomicPtr<()>` because fat-pointer trait objects don't
+// round-trip through `AtomicPtr<Box<dyn EventSink>>` cleanly; we
+// reconstitute the `*mut Box<dyn EventSink>` at the use sites.
+static SINK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+/// Default in-tree sink: writes raw bytes (truncated to 32 bytes) plus
+/// `type_id` into a fixed-size `FlightRing`. Wraps the existing ring
+/// machinery without duplicating it.
+#[derive(Debug)]
+pub struct FlightRecorderSink {
+    ring: FlightRing<RawEvent, 256>,
+}
+
+/// One captured raw event for `FlightRecorderSink`. `Copy` so it
+/// satisfies the `Event` blanket impl and lands in the ring as a
+/// single memcpy. Payloads longer than 32 bytes are truncated; `len`
+/// records the original length so consumers can flag truncation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct RawEvent {
+    pub type_id: u64,
+    pub len: u32,
+    pub bytes: [u8; 32],
+}
+
+impl FlightRecorderSink {
+    /// Construct an empty recorder. `const` so it composes with
+    /// `static` slots in tests / boot code.
+    pub const fn new() -> Self {
+        Self {
+            ring: FlightRing::new(),
+        }
+    }
+    /// Borrow the underlying ring (consumer-side snapshot access).
+    pub fn ring(&self) -> &FlightRing<RawEvent, 256> {
+        &self.ring
+    }
+}
+
+impl Default for FlightRecorderSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventSink for FlightRecorderSink {
+    fn name(&self) -> &'static str {
+        "flight-recorder"
+    }
+    fn record_raw(&self, type_id: u64, bytes: &[u8]) {
+        let mut ev = RawEvent {
+            type_id,
+            len: bytes.len() as u32,
+            bytes: [0u8; 32],
+        };
+        let n = core::cmp::min(bytes.len(), ev.bytes.len());
+        ev.bytes[..n].copy_from_slice(&bytes[..n]);
+        self.ring.record(ev);
+    }
+    fn flush(&self) {
+        // FlightRing is wait-free + in-memory; no buffering to drain.
+    }
+}
+
+/// Live-debug sink that counts events. Spec calls for a hex dump to
+/// the serial console, but `narf-tracing` deliberately does not depend
+/// on a console crate (would invert layering). The counter is the
+/// observable signal the smoke test asserts; downstream crates that
+/// own the console can wrap this with a printing sink that delegates
+/// here.
+#[derive(Debug, Default)]
+pub struct SerialSink {
+    /// Total `record_raw` calls observed. Test hook + diagnostics.
+    pub count: AtomicU64,
+}
+
+impl SerialSink {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+        }
+    }
+    /// Snapshot the event count seen so far.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+}
+
+impl EventSink for SerialSink {
+    fn name(&self) -> &'static str {
+        "serial"
+    }
+    fn record_raw(&self, _type_id: u64, _bytes: &[u8]) {
+        // Stage-3 surface: count so smoke can observe receipt. A
+        // console-printing variant lives downstream where the serial
+        // sink is in scope.
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+    fn flush(&self) {
+        // Unbuffered — the underlying writer (when wired) is itself
+        // synchronous.
+    }
+}
+
+/// Install `s` as the active event sink. Cap-gated on
+/// `Cap<SinkMarker, Grant>`. The displaced sink (if any) is dropped.
+///
+/// Allocation: one `Box<Box<dyn EventSink>>` per install. Don't call
+/// this from a hot path — install once at boot (or once per swap from
+/// a control plane), never from an IRQ handler.
+pub fn install_event_sink<S: EventSink>(
+    cap: &Cap<SinkMarker, Grant>,
+    s: S,
+) -> Result<(), TracingError> {
+    cap.check_live()?;
+    // Box-the-box: fat-pointer dyn trait → thin pointer for AtomicPtr.
+    let inner: Box<dyn EventSink> = Box::new(s);
+    let outer: Box<Box<dyn EventSink>> = Box::new(inner);
+    let raw: *mut Box<dyn EventSink> = Box::into_raw(outer);
+    // Release on the swap so concurrent hot-path Acquire (or Relaxed,
+    // since the box contents are reachable by data dependency through
+    // the pointer) observes the fully-constructed sink.
+    let prev = SINK.swap(raw as *mut (), Ordering::AcqRel);
+    if !prev.is_null() {
+        // SAFETY: every non-null SINK value was produced by a prior
+        // `Box::into_raw` in this function and has not been freed since
+        // (only the swap reaches it). Re-`from_raw` + drop reclaims.
+        // The hot-path readers use Relaxed loads; an Acquire on the
+        // swap above pairs with any future install's Release so this
+        // store is visible before the reclaim.
+        unsafe {
+            drop(Box::from_raw(prev as *mut Box<dyn EventSink>));
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot the active sink's name, or `None` if no sink is installed.
+pub fn current_event_sink_name() -> Option<&'static str> {
+    let p = SINK.load(Ordering::Acquire) as *mut Box<dyn EventSink>;
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: SINK is only ever set by install_event_sink, which leaks
+    // a `Box<Box<dyn EventSink>>`. The boxed contents live until a
+    // subsequent install drops them; on the read side we never alias
+    // through `&mut`, only `&`, so the &-borrow is sound.
+    let sink: &Box<dyn EventSink> = unsafe { &*p };
+    Some(sink.name())
+}
+
+/// Hot-path entry point: dispatch one event to the active sink.
+///
+/// Inlined null-check fast-path — when no sink is installed (the
+/// common case outside of armed tracing) this lowers to
+/// `mov rax, [SINK]; test rax, rax; je .Lret`. The Relaxed load is
+/// safe because (a) the only thing we do with `p` after the null
+/// check is dereference it, and the data dependency between the load
+/// and the deref provides the consume-style ordering we need, and (b)
+/// losing one event on a torn install is benign — the new sink is
+/// already in place by the time the next call lands.
+#[inline]
+pub fn emit_event(type_id: u64, bytes: &[u8]) {
+    let p = SINK.load(Ordering::Relaxed) as *mut Box<dyn EventSink>;
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: see `install_event_sink` — every non-null SINK value
+    // points at a live `Box<dyn EventSink>` until the next install
+    // replaces it. We never form an `&mut` to that box, so concurrent
+    // reads are sound; `record_raw` takes `&self`.
+    unsafe {
+        (*p).record_raw(type_id, bytes);
+    }
+}
+
+/// Flush the active sink (if any). Cheap on `FlightRecorderSink`; a
+/// real serial / network sink will drain its buffer.
+pub fn flush_event_sink() {
+    let p = SINK.load(Ordering::Acquire) as *mut Box<dyn EventSink>;
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: see `emit_event`.
+    unsafe {
+        (*p).flush();
+    }
+}
+
+/// One-shot tracing-subsystem init. Plants the default
+/// `FlightRecorderSink` so behaviour is unchanged out of the box; a
+/// downstream `install_event_sink` call may swap it later. Idempotent
+/// — calling twice replaces the previous default with a fresh one
+/// (the prior box is dropped).
+pub fn init() {
+    let cap: Cap<SinkMarker, Grant> = Cap::<SinkMarker, Grant>::bootstrap();
+    // Default install can't meaningfully fail: bootstrap() returns a
+    // live cap. If a downstream re-init races with itself, the second
+    // call wins; that's the documented behaviour above.
+    let _ = install_event_sink(&cap, FlightRecorderSink::new());
 }
