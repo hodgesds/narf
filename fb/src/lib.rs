@@ -300,12 +300,58 @@ impl FbScanout for AmdgpuScanout {
     }
 }
 
+// ── intel-gpu backend ───────────────────────────────────────────────
+
+#[derive(Debug)]
+struct IntelGpuScanout;
+
+impl FbScanout for IntelGpuScanout {
+    fn width(&self) -> u32 {
+        narf_drivers_gpu::intel_gpu::with_controller(|d| {
+            d.current_mode().map(|m| m.width).unwrap_or(0)
+        })
+        .unwrap_or(0)
+    }
+    fn height(&self) -> u32 {
+        narf_drivers_gpu::intel_gpu::with_controller(|d| {
+            d.current_mode().map(|m| m.height).unwrap_or(0)
+        })
+        .unwrap_or(0)
+    }
+    fn stride(&self) -> u32 {
+        narf_drivers_gpu::intel_gpu::with_controller(|d| {
+            d.current_mode().map(|m| m.stride_bytes / 4).unwrap_or(0)
+        })
+        .unwrap_or(0)
+    }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::XRGB8888
+    }
+    fn name(&self) -> &'static str {
+        "intel-gpu"
+    }
+    fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
+        // Direct-FB backend. No host-side flush needed.
+    }
+    unsafe fn framebuffer(&self) -> Framebuffer {
+        narf_drivers_gpu::intel_gpu::with_controller(|d| {
+            let mode = d.current_mode().expect("intel-gpu scanout without mode");
+            // GMADR is mapped in the CPU, we offset it by the active scanout offset.
+            let base = (d.gmadr.phys.as_u64() + mode.gtt_offset as u64) as *mut u32;
+            unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride_bytes / 4) }
+        })
+        .expect("intel-gpu scanout selected without controller")
+    }
+}
+
 // ── active-scanout picker ───────────────────────────────────────────
 
 static BOCHS: BochsScanout = BochsScanout;
 static VIRTIO_GPU: VirtioGpuScanout = VirtioGpuScanout;
 static AMDGPU: AmdgpuScanout = AmdgpuScanout;
+static INTEL_GPU: IntelGpuScanout = IntelGpuScanout;
 static GENERIC: GenericScanout = GenericScanout;
+
 
 /// Global registration for the bootloader-provided linear framebuffer.
 static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<
@@ -429,6 +475,13 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
         let ready = narf_drivers_virtio::gpu_pci::with_controller(|d| d.ready).unwrap_or(false);
         if ready {
             return Some(&VIRTIO_GPU);
+        }
+    }
+    if narf_drivers_gpu::intel_gpu::is_probed() {
+        let mode_ok = narf_drivers_gpu::intel_gpu::with_controller(|d| d.current_mode().is_some())
+            .unwrap_or(false);
+        if mode_ok {
+            return Some(&INTEL_GPU);
         }
     }
     None

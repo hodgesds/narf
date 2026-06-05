@@ -279,22 +279,25 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// step ordering; each step is mostly a thin wrapper around
     /// the codec module that knows the register encoding.
     ///
-    /// `mode_override`: when `Some(m)`, skip EDID readback and use
+    /// `fallback_mode`: when `Some(m)`, skip EDID readback and use
     /// `m` directly. Useful for `[VESA_1024X768_60]` boot fallback
     /// or for testing.
     pub fn modeset(
         &mut self,
-        fb: &Framebuffer,
-        mode_override: Option<&Mode>,
+        primary_fb: &Framebuffer,
+        fallback_mode: Option<&Mode>,
     ) -> Result<Mode, ModesetError> {
         // Step 0: validate inputs that don't require touching HW.
-        validate_framebuffer(fb)?;
+        validate_framebuffer(primary_fb)?;
 
         // Step 1: pick the mode. EDID readback over AUX, falling
-        // back to caller's override (Stage 1 default).
-        let mode = match mode_override {
-            Some(m) => *m,
-            None => self.read_preferred_mode_via_edid()?,
+        // back to caller's fallback mode.
+        let mode = match self.read_preferred_mode_via_edid() {
+            Ok(m) => m,
+            Err(_) => match fallback_mode {
+                Some(m) => *m,
+                None => return Err(ModesetError::EdidUnavailable),
+            },
         };
 
         // Step 2: enable PG1 (the always-required power well).
@@ -330,7 +333,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
 
         // Step 8: program primary plane — framebuffer pointer,
         // stride, format.
-        self.program_plane(fb, &mode);
+        self.program_plane(primary_fb, &mode);
 
         // Step 9: DP link training (eDP path). HDMI skips this.
         // For Stage 1 we expect AUX is available (the panel is
@@ -1249,4 +1252,52 @@ pub mod tests {
         "drivers/gpu/intel_gpu_modeset",
         smoke_disable_pipeline_writes_disables_in_order
     );
+}
+
+/// Attempt to take over the display from UEFI GOP without disrupting
+/// the existing framebuffer mapping.
+pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
+    use crate::intel_gpu_ddi::Ddi;
+    use crate::intel_gpu_pipes::{
+        Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET,
+        PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+    };
+    use crate::intel_gpu_aux::MmioWindow;
+    use narf_bus::bar::MmioRegion;
+
+    struct MmioAdapter<'a>(&'a MmioRegion);
+    impl<'a> MmioWindow for MmioAdapter<'a> {
+        fn read32(&self, off: u64) -> u32 {
+            unsafe { self.0.read32(off) }
+        }
+        fn write32(&self, off: u64, val: u32) {
+            unsafe { self.0.write32(off, val) }
+        }
+    }
+
+    let adapter = MmioAdapter(&gpu.gtt_mmadr);
+    let mut modeset = Modeset::new(&adapter, Ddi::A);
+
+    // Read the existing GOP framebuffer offset from Pipe A.
+    let pipe_a_base = Pipe::A.base();
+    let pipeconf = unsafe { gpu.gtt_mmadr.read32(pipe_a_base + PIPECONF_OFFSET) };
+    if pipeconf & PIPECONF_ENABLE == 0 {
+        // Pipe A not enabled by firmware; nothing to take over safely.
+        return None;
+    }
+
+    let plane_base = pipe_a_base + PLANE_PRIMARY_OFFSET;
+    let surf = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_SURF_OFFSET) };
+    let stride_val = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_STRIDE_OFFSET) };
+
+    let fb = Framebuffer {
+        phys_addr: (surf & !0xFFF) as u64,
+        stride_bytes: stride_val << 6,
+        format: PixelFormat::Xrgb8888,
+    };
+
+    let _ = modeset.modeset(&fb, None);
+    // Even if modeset fails (e.g. EDID not available), we can fall back
+    // to generic mode, but let's return what modeset gave us.
+    modeset.modeset(&fb, None).ok()
 }

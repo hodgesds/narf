@@ -312,3 +312,64 @@ impl crate::drm_registry::DrmCard for AmdgpuCard {
 pub fn install_dri_dir() {
     narf_filesystem::devfs::register_dri_dir(Arc::new(DriDir));
 }
+// ── IntelGpuCard ──────────────────────────────────────────────────────────
+
+/// `DrmCard` implementation for the intel-gpu driver.
+///
+/// Populated from `intel_gpu::probe` at probe success.
+#[derive(Debug)]
+pub struct IntelGpuCard {
+    pub name_str: String,
+    pub vid: u16,
+    pub did: u16,
+    pub subsystem_vid: u16,
+    pub subsystem_did: u16,
+}
+
+impl IntelGpuCard {
+    pub fn new(
+        card_name: String,
+        vid: u16,
+        did: u16,
+        subsystem_vid: u16,
+        subsystem_did: u16,
+    ) -> Self {
+        IntelGpuCard {
+            name_str: card_name,
+            vid,
+            did,
+            subsystem_vid,
+            subsystem_did,
+        }
+    }
+}
+
+impl crate::drm_registry::DrmCard for IntelGpuCard {
+    fn name(&self) -> &str {
+        &self.name_str
+    }
+    fn driver(&self) -> &str {
+        "intel-gpu"
+    }
+    fn vendor_id(&self) -> u16 {
+        self.vid
+    }
+    fn device_id(&self) -> u16 {
+        self.did
+    }
+    fn subsystem_vendor(&self) -> u16 {
+        self.subsystem_vid
+    }
+    fn subsystem_device(&self) -> u16 {
+        self.subsystem_did
+    }
+    fn vbios_version(&self) -> Option<&str> {
+        None
+    }
+    fn gpu_busy_percent(&self) -> Option<u32> {
+        None
+    }
+    fn power_state(&self) -> &str {
+        "D0"
+    }
+}

@@ -115,6 +115,8 @@ pub enum GttError {
     /// Phys address has bits set outside the documented 39-bit
     /// physical-address space.
     PhysOutOfRange,
+    /// Physical allocation failed.
+    OutOfMemory,
 }
 
 /// Build a present, read-only PTE for a scanout page.
@@ -157,6 +159,72 @@ pub fn pte_phys(pte: u64) -> u64 {
 /// `true` iff the PTE has `PRESENT` set.
 pub fn pte_present(pte: u64) -> bool {
     pte & PTE_PRESENT != 0
+}
+
+/// Write a sequence of PTEs into the GGTT window to map a contiguous
+/// block of physical memory for scanout.
+/// Returns the GTT offset (in bytes) where the mapping begins.
+pub fn map_contiguous_scanout(
+    gtt_mmadr: &narf_bus::bar::MmioRegion,
+    start_phys: u64,
+    size_bytes: u64,
+) -> Result<u32, GttError> {
+    // The GGTT array lives at offset 8 MiB in BAR0 (GTTMMADR).
+    const GGTT_BASE: u64 = 0x80_0000;
+    // We arbitrarily pick a GTT offset of 16 MiB (0x1000000) for our scanout
+    // to avoid colliding with whatever the UEFI GOP mapped lower down (often at 0).
+    const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
+    
+    let pages = (size_bytes + GTT_PAGE_SIZE - 1) / GTT_PAGE_SIZE;
+    for i in 0..pages {
+        let phys = start_phys + i * GTT_PAGE_SIZE;
+        let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
+        
+        let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
+        let pte_offset = GGTT_BASE + pte_index * 8;
+        
+        // Write 64-bit PTE (as two 32-bit writes)
+        unsafe {
+            gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
+            gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
+        }
+    }
+    
+    Ok(SCANOUT_GTT_OFFSET as u32)
+}
+
+/// Allocate `size_bytes` worth of 4 KiB frames and map them consecutively
+/// into the GGTT, creating a contiguous GPU virtual address. Returns the 
+/// GTT offset and the first physical frame allocated.
+pub fn alloc_coherent_scanout(
+    gtt_mmadr: &narf_bus::bar::MmioRegion,
+    size_bytes: u64,
+) -> Result<(u32, alloc::vec::Vec<narf_memory::frame::PhysFrame>), GttError> {
+    const GGTT_BASE: u64 = 0x80_0000;
+    const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
+    
+    let pages = (size_bytes + GTT_PAGE_SIZE - 1) / GTT_PAGE_SIZE;
+    let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
+
+    for i in 0..pages {
+        // Allocate a single 4 KiB frame.
+        let frame = narf_memory::frame::alloc_frame().map_err(|_| GttError::OutOfMemory)?;
+        frames.push(frame);
+
+        let phys = frame.start_address().raw();
+        let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
+        
+        let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
+        let pte_offset = GGTT_BASE + pte_index * 8;
+        
+        // Write 64-bit PTE (as two 32-bit writes)
+        unsafe {
+            gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
+            gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
+        }
+    }
+    
+    Ok((SCANOUT_GTT_OFFSET as u32, frames))
 }
 
 #[cfg(any(test, feature = "kernel-test"))]

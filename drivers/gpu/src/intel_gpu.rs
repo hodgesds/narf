@@ -201,6 +201,15 @@ pub struct IntelGpu {
     pub chip: ChipInfo,
     /// `GMD_ID` value captured at probe time.
     pub gmd_id: u32,
+    pub active_scanout: narf_lib::sync::IrqSafeSpinLock<Option<ActiveScanout>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveScanout {
+    pub width: u32,
+    pub height: u32,
+    pub stride_bytes: u32,
+    pub gtt_offset: u32,
 }
 
 impl core::fmt::Debug for IntelGpu {
@@ -252,7 +261,12 @@ impl IntelGpu {
             gmadr,
             chip,
             gmd_id,
+            active_scanout: narf_lib::sync::IrqSafeSpinLock::new(None),
         })
+    }
+
+    pub fn current_mode(&self) -> Option<ActiveScanout> {
+        self.active_scanout.lock().clone()
     }
 
     pub fn chip_info(&self) -> ChipInfo {
@@ -344,7 +358,57 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr.clone());
     }
 
+    // Stage 3: Wire up the modeset orchestrator to take over from UEFI GOP.
+    let mode_opt = crate::intel_gpu_modeset::takeover_display(&dev);
+
+    // Stage 4: Frame buffer + KMS. 
+    // Allocate a scanout buffer utilizing the map_contiguous_scanout wrapper.
+    let width_u16 = mode_opt.as_ref().map(|m| m.h_active).unwrap_or(1024);
+    let height_u16 = mode_opt.as_ref().map(|m| m.v_active).unwrap_or(768);
+    let width = width_u16 as u32;
+    let height = height_u16 as u32;
+    let stride_bytes = width * 4;
+    let size_bytes = (stride_bytes * height) as u64;
+
+    if let Ok((gtt_offset, _frames)) = crate::intel_gpu_gtt::alloc_coherent_scanout(&dev.gtt_mmadr, size_bytes) {
+        *dev.active_scanout.lock() = Some(ActiveScanout {
+            width,
+            height,
+            stride_bytes,
+            gtt_offset,
+        });
+        
+        let prog = crate::intel_gpu_pipes::build_primary_plane(
+            width_u16,
+            height_u16,
+            stride_bytes,
+            gtt_offset,
+            crate::intel_gpu_pipes::PixelFormat::Argb8888,
+        ).expect("failed to build primary plane");
+        let plane_base = crate::intel_gpu_pipes::Pipe::A.base() + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
+        unsafe {
+            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET, prog.plane_stride);
+            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET, prog.plane_size);
+            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET, prog.plane_offset);
+            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET, prog.plane_ctl);
+            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET, prog.plane_surf);
+        }
+    }
+
     *CONTROLLER.lock() = Some(dev);
+
+    // Register with drm_registry
+    let drm_count = crate::drm_registry::count() as u32;
+    let card_name = alloc::format!("card{}", drm_count);
+    let intel_card = crate::drm_devfs_bridge::IntelGpuCard::new(
+        card_name,
+        device.id.vendor,
+        device.id.device,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+    );
+    crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
+
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),
