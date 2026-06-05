@@ -269,8 +269,12 @@ pub unsafe fn load_user_process_with(
     // arch hwrng path. fill_key_32 writes 32 bytes; we only need 16
     // but using the same call keeps the entropy source uniform with
     // the rest of NARF's seed-material code.
+    //
+    // Only emitted when an interpreter was actually loaded — the
+    // NARF-native (no-interpreter) path keeps the all-zero top-of-
+    // stack contract that the smoke tests assert against.
     #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-    let (stack_top_v, at_random_vaddr) = {
+    let (stack_top_v, at_random_vaddr) = if interp_loaded {
         let entropy_va = stack_top_v - 16;
         let mut key = [0u8; 32];
         let _src = narf_arch::x86_64::hwrng::fill_key_32(&mut key);
@@ -285,6 +289,8 @@ pub unsafe fn load_user_process_with(
             }
         }
         (entropy_va, Some(entropy_va))
+    } else {
+        (stack_top_v, None)
     };
     #[cfg(not(all(feature = "linux-compat", target_arch = "x86_64")))]
     let (stack_top_v, at_random_vaddr): (u64, Option<u64>) = (stack_top_v, None);
