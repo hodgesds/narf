@@ -55,6 +55,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod fw_loader;
+pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
 pub mod regs;
@@ -1286,14 +1287,35 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     .map_err(|_| narf_bus::ProbeError::Other("TX cmd buffer alloc failed"))?;
 
             // ── 4a. Interrupt setup ──
+            //
+            // iwlwifi exposes up to 32 MSI-X vectors with per-cause
+            // routing. The bring-up path uses three causes (RX/ALIVE,
+            // TX completion, fatal errors); see `iwl_msix.rs`.
+            // PCI-side: allocate three CPU vectors and program the
+            // first three MSI-X table entries. BAR0-side: program the
+            // per-cause IVAR bytes via `iwl_msix::program_default_causes`.
             let mut irq_vector = None;
             if let Ok(v) = narf_interrupts::vector::alloc() {
-                // Try MSI-X first.
                 if let Ok(mut msix) = narf_bus::msix::enable_msix(&cap, &device) {
                     unsafe {
-                        let _ = msix.program_vector(0, 0, v);
+                        let _ = msix.program_vector(
+                            iwl_msix::VECTOR_RX_ALIVE as u16, 0, v);
+                        // Try to allocate two more CPU vectors for TX
+                        // and ERR; fall through if we can't get them.
+                        if let Ok(v_tx) = narf_interrupts::vector::alloc() {
+                            let _ = msix.program_vector(
+                                iwl_msix::VECTOR_TX as u16, 0, v_tx);
+                            narf_interrupts::install_handler(v_tx, || {});
+                        }
+                        if let Ok(v_err) = narf_interrupts::vector::alloc() {
+                            let _ = msix.program_vector(
+                                iwl_msix::VECTOR_ERR as u16, 0, v_err);
+                            narf_interrupts::install_handler(v_err, || {});
+                        }
                         let _ = msix.enable();
                     }
+                    // Program the per-cause IVAR bytes via BAR0.
+                    iwl_msix::program_default_causes(&mut mmio);
                     irq_vector = Some(v);
                 } else if let Ok(mut msi) = narf_bus::msi::enable_msi(&cap, &device, 1) {
                     unsafe {
