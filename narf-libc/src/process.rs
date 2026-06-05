@@ -133,12 +133,12 @@ pub unsafe extern "C" fn gettid() -> i32 {
 
 // ── prctl ───────────────────────────────────────────────────────────
 
-pub const PR_SET_NAME:        i32 = 15;
-pub const PR_GET_NAME:        i32 = 16;
-pub const PR_SET_DUMPABLE:    i32 = 4;
-pub const PR_GET_DUMPABLE:    i32 = 3;
-pub const PR_SET_NO_NEW_PRIVS:i32 = 38;
-pub const PR_GET_NO_NEW_PRIVS:i32 = 39;
+pub const PR_SET_NAME: i32 = 15;
+pub const PR_GET_NAME: i32 = 16;
+pub const PR_SET_DUMPABLE: i32 = 4;
+pub const PR_GET_DUMPABLE: i32 = 3;
+pub const PR_SET_NO_NEW_PRIVS: i32 = 38;
+pub const PR_GET_NO_NEW_PRIVS: i32 = 39;
 
 /// `prctl(op, arg2, arg3, arg4, arg5)` — Linux signature. We
 /// honour the most-reached-for subops; everything else returns
@@ -152,7 +152,9 @@ pub const PR_GET_NO_NEW_PRIVS:i32 = 39;
 /// valid 16-byte buffer (read or write per direction).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prctl(op: i32, arg2: u64, arg3: u64) -> i32 {
-    if op < 0 { return -1; }
+    if op < 0 {
+        return -1;
+    }
     let r = narf_user_runtime::prctl(op as u32, arg2, arg3);
     if r == -1 {
         crate::errno::set_errno(22); // EINVAL
@@ -492,11 +494,7 @@ impl OwnedBuf {
         }
         // SAFETY: dest range fits in [self.ptr+len, self.ptr+cap).
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.ptr.add(self.len),
-                bytes.len(),
-            );
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
         }
         self.len += bytes.len();
         true
@@ -511,7 +509,9 @@ impl Drop for OwnedBuf {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // SAFETY: ptr came from our malloc / realloc.
-            unsafe { crate::heap::free(self.ptr); }
+            unsafe {
+                crate::heap::free(self.ptr);
+            }
         }
     }
 }
@@ -679,8 +679,8 @@ pub unsafe extern "C" fn setgid(gid: u32) -> i32 {
 /// [`setpriority`]. NARF only honours `PRIO_PROCESS`; the others
 /// return -1 with errno = EINVAL.
 pub const PRIO_PROCESS: i32 = 0;
-pub const PRIO_PGRP:    i32 = 1;
-pub const PRIO_USER:    i32 = 2;
+pub const PRIO_PGRP: i32 = 1;
+pub const PRIO_USER: i32 = 2;
 
 /// `getpriority(which, who)` — read the nice value (-20..=19) of
 /// the target task. POSIX returns the value directly; on error
@@ -692,7 +692,9 @@ pub const PRIO_USER:    i32 = 2;
 /// Pure value math.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getpriority(which: i32, who: u32) -> i32 {
-    if which < 0 { return -1; }
+    if which < 0 {
+        return -1;
+    }
     let r = narf_user_runtime::getpriority(which as u32, who);
     if r == -1 {
         crate::errno::set_errno(22); // EINVAL
@@ -704,7 +706,9 @@ pub unsafe extern "C" fn getpriority(which: i32, who: u32) -> i32 {
 /// `setpriority(which, who, prio)` — record a new nice value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setpriority(which: i32, who: u32, prio: i32) -> i32 {
-    if which < 0 { return -1; }
+    if which < 0 {
+        return -1;
+    }
     narf_user_runtime::setpriority(which as u32, who, prio)
 }
 
@@ -715,7 +719,11 @@ pub unsafe extern "C" fn nice(inc: i32) -> i32 {
     let cur = narf_user_runtime::getpriority(0, 0) as i32;
     let new = (cur + inc).clamp(-20, 19);
     let r = narf_user_runtime::setpriority(0, 0, new);
-    if r == 0 { new } else { -1 }
+    if r == 0 {
+        new
+    } else {
+        -1
+    }
 }
 
 /// `getgid()` — always 0 (matches getuid).
@@ -784,14 +792,8 @@ pub unsafe extern "C" fn wait4(
     options: i32,
     rusage: *mut crate::sys::rusage,
 ) -> i32 {
-    let r = unsafe {
-        narf_user_runtime::wait4(
-            pid as i64,
-            status,
-            options as u32,
-            rusage as *mut _,
-        )
-    };
+    let r =
+        unsafe { narf_user_runtime::wait4(pid as i64, status, options as u32, rusage as *mut _) };
     match r {
         Ok(reaped) => reaped as i32,
         Err(()) => {
@@ -805,7 +807,9 @@ pub unsafe extern "C" fn wait4(
 /// Forwards to the kernel SYS_TGKILL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tgkill(tgid: i32, tid: i32, signum: i32) -> i32 {
-    if signum < 0 { return -1; }
+    if signum < 0 {
+        return -1;
+    }
     let r = narf_user_runtime::tgkill(tgid as i64, tid as u64, signum as u32);
     if r != 0 {
         crate::errno::set_errno(crate::errno::EINVAL);

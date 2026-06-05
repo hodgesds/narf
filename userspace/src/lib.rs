@@ -38,10 +38,10 @@
 
 extern crate alloc;
 
-#[cfg(feature = "linux-compat")]
-pub mod linux_compat;
 #[cfg(feature = "container")]
 pub mod container;
+#[cfg(feature = "linux-compat")]
+pub mod linux_compat;
 
 pub mod elf;
 pub mod ephemeral_port;
@@ -54,9 +54,9 @@ pub mod io_mux;
 pub mod loader;
 #[cfg(feature = "container")]
 pub mod namespaces;
-pub mod pidfd;
 #[cfg(feature = "container")]
 pub mod pid_ns;
+pub mod pidfd;
 pub mod pipe;
 pub mod poll;
 #[cfg(feature = "linux-compat")]

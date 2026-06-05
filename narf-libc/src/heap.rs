@@ -140,10 +140,14 @@ unsafe fn push_free(chunk: *mut Chunk) {
                     FREE_LIST.store(cur_next, Ordering::Release);
                 } else {
                     // SAFETY: prev was deref'd already.
-                    unsafe { (*prev).next = cur_next; }
+                    unsafe {
+                        (*prev).next = cur_next;
+                    }
                 }
                 // SAFETY: chunk is caller-owned.
-                unsafe { (*chunk).size = chunk_size + cur_size; }
+                unsafe {
+                    (*chunk).size = chunk_size + cur_size;
+                }
                 // Rescan: chunk grew and might now coalesce with
                 // another neighbour further along the list.
                 continue 'outer;
@@ -155,12 +159,16 @@ unsafe fn push_free(chunk: *mut Chunk) {
                 // part of cur. Detach cur from the list so the next
                 // pass treats it as the fresh chunk.
                 // SAFETY: cur was deref'd already.
-                unsafe { (*cur).size = cur_size + chunk_size; }
+                unsafe {
+                    (*cur).size = cur_size + chunk_size;
+                }
                 if prev.is_null() {
                     FREE_LIST.store(cur_next, Ordering::Release);
                 } else {
                     // SAFETY: prev was deref'd already.
-                    unsafe { (*prev).next = cur_next; }
+                    unsafe {
+                        (*prev).next = cur_next;
+                    }
                 }
                 chunk = cur;
                 continue 'outer;
@@ -175,7 +183,9 @@ unsafe fn push_free(chunk: *mut Chunk) {
         loop {
             let head = FREE_LIST.load(Ordering::Acquire);
             // SAFETY: `chunk` is caller-owned; writing `next` is fine.
-            unsafe { (*chunk).next = head; }
+            unsafe {
+                (*chunk).next = head;
+            }
             if FREE_LIST
                 .compare_exchange(head, chunk, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -212,7 +222,9 @@ unsafe fn pop_fit(need: usize) -> *mut Chunk {
             } else {
                 // SAFETY: `prev` came from a prior loop iteration
                 // where we already deref'd it.
-                unsafe { (*prev).next = cur_next; }
+                unsafe {
+                    (*prev).next = cur_next;
+                }
             }
             return cur;
         }
@@ -239,7 +251,9 @@ unsafe fn grow_heap(min_bytes: usize) -> *mut Chunk {
     // region of `want` bytes. We don't write `next` here — the
     // caller pushes onto the free list (or uses the chunk directly)
     // which sets it.
-    unsafe { (*chunk).size = want; }
+    unsafe {
+        (*chunk).size = want;
+    }
     chunk
 }
 
@@ -339,7 +353,9 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
     // SAFETY: per the function-level contract, `chunk` is a valid
     // header recoverable by header-subtraction from a previously
     // returned pointer.
-    unsafe { push_free(chunk); }
+    unsafe {
+        push_free(chunk);
+    }
 }
 
 /// Resize a block. Conformant with POSIX realloc(3) edge cases:
@@ -360,7 +376,9 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     }
     if new_size == 0 {
         // SAFETY: forwarding to free.
-        unsafe { free(ptr); }
+        unsafe {
+            free(ptr);
+        }
         return ptr::null_mut();
     }
 
@@ -457,12 +475,10 @@ const EINVAL: i32 = 22;
 /// # Safety
 /// `memptr` must be a writable pointer-to-pointer slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn posix_memalign(
-    memptr: *mut *mut u8,
-    align:  usize,
-    size:   usize,
-) -> i32 {
-    if memptr.is_null() { return EINVAL; }
+pub unsafe extern "C" fn posix_memalign(memptr: *mut *mut u8, align: usize, size: usize) -> i32 {
+    if memptr.is_null() {
+        return EINVAL;
+    }
     if align == 0 || (align & (align - 1)) != 0 || align % core::mem::size_of::<usize>() != 0 {
         return EINVAL;
     }
@@ -476,7 +492,9 @@ pub unsafe extern "C" fn posix_memalign(
         return 12; // ENOMEM
     }
     // SAFETY: caller-supplied writable slot.
-    unsafe { *memptr = p; }
+    unsafe {
+        *memptr = p;
+    }
     0
 }
 
@@ -497,4 +515,3 @@ pub unsafe extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut u8 {
     // SAFETY: forwarded.
     unsafe { malloc(size) }
 }
-

@@ -36,7 +36,9 @@ pub struct sem_t {
 }
 
 impl Default for sem_t {
-    fn default() -> Self { Self { _opaque: [0; 32] } }
+    fn default() -> Self {
+        Self { _opaque: [0; 32] }
+    }
 }
 
 fn sem_counter_ptr(sem: *mut sem_t) -> *mut u32 {
@@ -51,8 +53,12 @@ fn sem_counter_ptr(sem: *mut sem_t) -> *mut u32 {
 /// `sem` must be a writable `sem_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sem_init(sem: *mut sem_t, _pshared: c_int, value: u32) -> c_int {
-    if sem.is_null() { return -1; }
-    unsafe { *sem = sem_t::default(); }
+    if sem.is_null() {
+        return -1;
+    }
+    unsafe {
+        *sem = sem_t::default();
+    }
     let counter = sem_counter_ptr(sem);
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     atomic.store(value, Ordering::Release);
@@ -69,7 +75,9 @@ pub unsafe extern "C" fn sem_destroy(_sem: *mut sem_t) -> c_int {
 /// `sem_post(sem)` — increment + wake one waiter.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sem_post(sem: *mut sem_t) -> c_int {
-    if sem.is_null() { return -1; }
+    if sem.is_null() {
+        return -1;
+    }
     let counter = sem_counter_ptr(sem);
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     atomic.fetch_add(1, Ordering::AcqRel);
@@ -81,7 +89,9 @@ pub unsafe extern "C" fn sem_post(sem: *mut sem_t) -> c_int {
 /// decrement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sem_wait(sem: *mut sem_t) -> c_int {
-    if sem.is_null() { return -1; }
+    if sem.is_null() {
+        return -1;
+    }
     let counter = sem_counter_ptr(sem);
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     loop {
@@ -104,7 +114,9 @@ pub unsafe extern "C" fn sem_wait(sem: *mut sem_t) -> c_int {
 /// success, -1 with errno=EAGAIN if the counter is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sem_trywait(sem: *mut sem_t) -> c_int {
-    if sem.is_null() { return -1; }
+    if sem.is_null() {
+        return -1;
+    }
     let counter = sem_counter_ptr(sem);
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     let cur = atomic.load(Ordering::Acquire);
@@ -126,11 +138,15 @@ pub unsafe extern "C" fn sem_trywait(sem: *mut sem_t) -> c_int {
 /// `sem_getvalue(sem, *sval)` — read the counter.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sem_getvalue(sem: *mut sem_t, sval: *mut c_int) -> c_int {
-    if sem.is_null() || sval.is_null() { return -1; }
+    if sem.is_null() || sval.is_null() {
+        return -1;
+    }
     let counter = sem_counter_ptr(sem);
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     let v = atomic.load(Ordering::Acquire) as c_int;
-    unsafe { *sval = v; }
+    unsafe {
+        *sval = v;
+    }
     0
 }
 
@@ -143,11 +159,7 @@ pub unsafe extern "C" fn sem_getvalue(sem: *mut sem_t, sval: *mut c_int) -> c_in
 /// # Safety
 /// `name` must be a NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn shm_open(
-    name:  *const i8,
-    oflag: c_int,
-    mode:  u32,
-) -> c_int {
+pub unsafe extern "C" fn shm_open(name: *const i8, oflag: c_int, mode: u32) -> c_int {
     if name.is_null() {
         crate::errno::set_errno(22);
         return -1;
@@ -156,7 +168,10 @@ pub unsafe extern "C" fn shm_open(
     let mut path = [0u8; 256];
     let prefix = b"/dev/shm/";
     let mut pos = 0;
-    for &b in prefix { path[pos] = b; pos += 1; }
+    for &b in prefix {
+        path[pos] = b;
+        pos += 1;
+    }
     // POSIX requires the name to start with '/' — strip it before
     // appending so we don't end up with "/dev/shm//foo".
     let n_ptr = if unsafe { *name } == b'/' as i8 {
@@ -168,7 +183,9 @@ pub unsafe extern "C" fn shm_open(
     while pos < path.len() - 1 {
         // SAFETY: caller-supplied NUL-terminated string.
         let b = unsafe { *n_ptr.offset(i) } as u8;
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         path[pos] = b;
         pos += 1;
         i += 1;
@@ -191,7 +208,10 @@ pub unsafe extern "C" fn shm_unlink(name: *const i8) -> c_int {
     let mut path = [0u8; 256];
     let prefix = b"/dev/shm/";
     let mut pos = 0;
-    for &b in prefix { path[pos] = b; pos += 1; }
+    for &b in prefix {
+        path[pos] = b;
+        pos += 1;
+    }
     let n_ptr = if unsafe { *name } == b'/' as i8 {
         unsafe { name.add(1) }
     } else {
@@ -200,7 +220,9 @@ pub unsafe extern "C" fn shm_unlink(name: *const i8) -> c_int {
     let mut i = 0isize;
     while pos < path.len() - 1 {
         let b = unsafe { *n_ptr.offset(i) } as u8;
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         path[pos] = b;
         pos += 1;
         i += 1;
@@ -220,7 +242,9 @@ pub unsafe extern "C" fn shmget_real(key: i32, _size: usize, flag: c_int) -> c_i
     let mut name = [0u8; 24];
     // "/sysv-shm-<hex>"
     let prefix = b"/sysv-shm-";
-    for (i, &b) in prefix.iter().enumerate() { name[i] = b; }
+    for (i, &b) in prefix.iter().enumerate() {
+        name[i] = b;
+    }
     let hex = b"0123456789abcdef";
     let kraw = key as u32;
     for i in 0..8 {
@@ -228,7 +252,13 @@ pub unsafe extern "C" fn shmget_real(key: i32, _size: usize, flag: c_int) -> c_i
     }
     name[18] = 0;
     let mode = 0o600;
-    unsafe { shm_open(name.as_ptr() as *const i8, flag | crate::posix::O_RDWR, mode) }
+    unsafe {
+        shm_open(
+            name.as_ptr() as *const i8,
+            flag | crate::posix::O_RDWR,
+            mode,
+        )
+    }
 }
 
 /// `semget(key, nsems, flag)` — Sys-V counter array, atomically
@@ -273,11 +303,11 @@ pub type mqd_t = i32;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct mq_attr {
-    pub mq_flags:   i64,
-    pub mq_maxmsg:  i64,
+    pub mq_flags: i64,
+    pub mq_maxmsg: i64,
     pub mq_msgsize: i64,
     pub mq_curmsgs: i64,
-    pub _pad:       [i64; 4],
+    pub _pad: [i64; 4],
 }
 
 fn mq_lookup(name_bytes: &[u8]) -> Option<usize> {
@@ -295,10 +325,10 @@ fn mq_lookup(name_bytes: &[u8]) -> Option<usize> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mq_open(
-    name:   *const i8,
-    oflag:  c_int,
-    _mode:  u32,
-    attr:   *const mq_attr,
+    name: *const i8,
+    oflag: c_int,
+    _mode: u32,
+    attr: *const mq_attr,
 ) -> mqd_t {
     if name.is_null() {
         crate::errno::set_errno(22);
@@ -308,7 +338,9 @@ pub unsafe extern "C" fn mq_open(
     let mut nlen = 0usize;
     while nlen < MQ_NAME_MAX {
         let b = unsafe { *name.add(nlen) } as u8;
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         nb[nlen] = b;
         nlen += 1;
     }
@@ -341,21 +373,29 @@ pub unsafe extern "C" fn mq_open(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mq_close(_mqd: mqd_t) -> c_int { 0 }
+pub unsafe extern "C" fn mq_close(_mqd: mqd_t) -> c_int {
+    0
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mq_unlink(name: *const i8) -> c_int {
-    if name.is_null() { return -1; }
+    if name.is_null() {
+        return -1;
+    }
     let mut nb = [0u8; MQ_NAME_MAX];
     let mut nlen = 0;
     while nlen < MQ_NAME_MAX {
         let b = unsafe { *name.add(nlen) } as u8;
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         nb[nlen] = b;
         nlen += 1;
     }
     if let Some(idx) = mq_lookup(&nb[..nlen]) {
-        unsafe { MQ_TABLE[idx] = None; }
+        unsafe {
+            MQ_TABLE[idx] = None;
+        }
         0
     } else {
         crate::errno::set_errno(2);
@@ -364,12 +404,7 @@ pub unsafe extern "C" fn mq_unlink(name: *const i8) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mq_send(
-    mqd:  mqd_t,
-    msg:  *const i8,
-    len:  usize,
-    _prio: u32,
-) -> c_int {
+pub unsafe extern "C" fn mq_send(mqd: mqd_t, msg: *const i8, len: usize, _prio: u32) -> c_int {
     if mqd < 0 || (mqd as usize) >= MQ_MAX || msg.is_null() {
         return -1;
     }
@@ -380,7 +415,10 @@ pub unsafe extern "C" fn mq_send(
     unsafe {
         let entry = match &mut MQ_TABLE[mqd as usize] {
             Some(e) => e,
-            None => { crate::errno::set_errno(9); return -1; }
+            None => {
+                crate::errno::set_errno(9);
+                return -1;
+            }
         };
         if entry.count as usize >= MQ_RECORDS_PER_QUEUE {
             crate::errno::set_errno(11);
@@ -397,19 +435,17 @@ pub unsafe extern "C" fn mq_send(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mq_receive(
-    mqd:  mqd_t,
-    msg:  *mut i8,
-    len:  usize,
-    prio: *mut u32,
-) -> isize {
+pub unsafe extern "C" fn mq_receive(mqd: mqd_t, msg: *mut i8, len: usize, prio: *mut u32) -> isize {
     if mqd < 0 || (mqd as usize) >= MQ_MAX || msg.is_null() {
         return -1;
     }
     unsafe {
         let entry = match &mut MQ_TABLE[mqd as usize] {
             Some(e) => e,
-            None => { crate::errno::set_errno(9); return -1; }
+            None => {
+                crate::errno::set_errno(9);
+                return -1;
+            }
         };
         if entry.count == 0 {
             crate::errno::set_errno(11);
@@ -426,7 +462,9 @@ pub unsafe extern "C" fn mq_receive(
         }
         entry.head = (entry.head + 1) % MQ_RECORDS_PER_QUEUE as u32;
         entry.count -= 1;
-        if !prio.is_null() { *prio = 0; }
+        if !prio.is_null() {
+            *prio = 0;
+        }
         rec_len as isize
     }
 }
@@ -435,11 +473,13 @@ pub unsafe extern "C" fn mq_receive(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkfifo(path: *const i8, mode: u32) -> c_int {
-    if path.is_null() { return -1; }
-    let fd = unsafe {
-        crate::posix::open(path, 0o100 | 0o2, mode)
-    };
-    if fd < 0 { return -1; }
+    if path.is_null() {
+        return -1;
+    }
+    let fd = unsafe { crate::posix::open(path, 0o100 | 0o2, mode) };
+    if fd < 0 {
+        return -1;
+    }
     let _ = unsafe { crate::posix::close(fd) };
     0
 }
@@ -452,9 +492,13 @@ pub unsafe extern "C" fn mknod(path: *const i8, mode: u32, _dev: u64) -> c_int {
     match mode & S_IFMT {
         S_IFIFO => unsafe { mkfifo(path, mode & 0o7777) },
         S_IFREG | 0 => {
-            if path.is_null() { return -1; }
+            if path.is_null() {
+                return -1;
+            }
             let fd = unsafe { crate::posix::open(path, 0o100, mode & 0o7777) };
-            if fd < 0 { return -1; }
+            if fd < 0 {
+                return -1;
+            }
             let _ = unsafe { crate::posix::close(fd) };
             0
         }
@@ -482,11 +526,7 @@ pub unsafe extern "C" fn inotify_init() -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn inotify_add_watch(
-    _fd:   c_int,
-    _path: *const i8,
-    _mask: u32,
-) -> c_int {
+pub unsafe extern "C" fn inotify_add_watch(_fd: c_int, _path: *const i8, _mask: u32) -> c_int {
     static WATCH_NEXT: AtomicU32 = AtomicU32::new(1);
     WATCH_NEXT.fetch_add(1, Ordering::Relaxed) as c_int
 }

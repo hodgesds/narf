@@ -106,7 +106,11 @@ fn timespec_to_ns(sec: i64, nsec: i64) -> Option<u64> {
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
         return None;
     }
-    Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
+    Some(
+        (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64),
+    )
 }
 
 fn ns_to_timespec(ns: u64) -> (i64, i64) {
@@ -318,7 +322,11 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let remaining = if next == 0 { 0 } else { next.saturating_sub(now) };
+    let remaining = if next == 0 {
+        0
+    } else {
+        next.saturating_sub(now)
+    };
     let mut out = [0u8; 32];
     let (is, in_) = ns_to_timespec(interval);
     let (vs, vn) = ns_to_timespec(remaining);
@@ -444,13 +452,23 @@ fn posix_timer_pump() {
 /// Diagnostic for the smokes — peek the overrun counter.
 #[doc(hidden)]
 pub fn overrun_of(task: u64, id: u32) -> Option<u32> {
-    with_table(|m| m.get(&task).and_then(|t| t.by_id.get(&id)).map(|t| t.overrun)).flatten()
+    with_table(|m| {
+        m.get(&task)
+            .and_then(|t| t.by_id.get(&id))
+            .map(|t| t.overrun)
+    })
+    .flatten()
 }
 
 /// Diagnostic for the smokes — peek the next-fire deadline.
 #[doc(hidden)]
 pub fn next_fire_of(task: u64, id: u32) -> Option<u64> {
-    with_table(|m| m.get(&task).and_then(|t| t.by_id.get(&id)).map(|t| t.next_fire_ns)).flatten()
+    with_table(|m| {
+        m.get(&task)
+            .and_then(|t| t.by_id.get(&id))
+            .map(|t| t.next_fire_ns)
+    })
+    .flatten()
 }
 
 /// Force the pump to run — for tests that don't have a real

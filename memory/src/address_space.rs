@@ -897,7 +897,7 @@ impl AddressSpace {
                 // dropped empty.
                 let mut phys_iter = r.phys.into_iter();
                 let head_phys: Vec<PhysAddr> = (&mut phys_iter).take(head_pages).collect();
-                let mid_phys:  Vec<PhysAddr> = (&mut phys_iter).take(mid_pages).collect();
+                let mid_phys: Vec<PhysAddr> = (&mut phys_iter).take(mid_pages).collect();
                 let tail_phys: Vec<PhysAddr> = phys_iter.collect();
 
                 // Head fragment (preserves old perms & internal
@@ -985,11 +985,7 @@ impl AddressSpace {
     /// - `Err(Unmapped)` if no region intersects the request.
     /// - `Err(AlignmentMismatch)` for misaligned `base` / `len`.
     #[cfg(feature = "linux-compat")]
-    pub fn madvise_dontneed(
-        &self,
-        base: VirtAddr,
-        len: u64,
-    ) -> Result<(), AddressSpaceError> {
+    pub fn madvise_dontneed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
         if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
@@ -1020,9 +1016,9 @@ impl AddressSpace {
                     continue;
                 }
                 let start_v = lo.max(rb);
-                let end_v   = hi.min(re);
+                let end_v = hi.min(re);
                 let start_i = ((start_v - rb) >> 12) as usize;
-                let end_i   = ((end_v   - rb) >> 12) as usize;
+                let end_i = ((end_v - rb) >> 12) as usize;
                 for i in start_i..end_i {
                     let p = r.phys[i];
                     if p.raw() == 0 {

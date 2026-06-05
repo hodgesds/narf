@@ -1416,7 +1416,6 @@ pub enum Syscall {
     /// such namespace, or unsupported nstype).
     Setns,
 
-
     /// `arg0 = dirfd`, `arg1 = path_ptr`, `arg2 = path_len`,
     /// `arg3 = flags`, `arg4 = mask`, `arg5 = statxbuf_ptr`.
     /// Linux statx(2). Fills a 256-byte `struct statx` honouring

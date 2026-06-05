@@ -36,16 +36,16 @@ pub unsafe extern "C" fn fabsf(x: f32) -> f32 {
 /// `copysign(x, y)` — magnitude of `x`, sign of `y`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copysign(x: f64, y: f64) -> f64 {
-    let mag  = x.to_bits() & !(1u64 << 63);
-    let sign = y.to_bits() &  (1u64 << 63);
+    let mag = x.to_bits() & !(1u64 << 63);
+    let sign = y.to_bits() & (1u64 << 63);
     f64::from_bits(mag | sign)
 }
 
 /// `copysignf(x, y)` — single-precision sign copy.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copysignf(x: f32, y: f32) -> f32 {
-    let mag  = x.to_bits() & !(1u32 << 31);
-    let sign = y.to_bits() &  (1u32 << 31);
+    let mag = x.to_bits() & !(1u32 << 31);
+    let sign = y.to_bits() & (1u32 << 31);
     f32::from_bits(mag | sign)
 }
 
@@ -61,8 +61,8 @@ pub unsafe extern "C" fn signbit(x: f64) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isnan(x: f64) -> i32 {
     let bits = x.to_bits();
-    let exp  = (bits >> 52) & 0x7FF;
-    let frac =  bits        & ((1u64 << 52) - 1);
+    let exp = (bits >> 52) & 0x7FF;
+    let frac = bits & ((1u64 << 52) - 1);
     (exp == 0x7FF && frac != 0) as i32
 }
 
@@ -72,10 +72,14 @@ pub unsafe extern "C" fn isnan(x: f64) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isinf(x: f64) -> i32 {
     let bits = x.to_bits();
-    let exp  = (bits >> 52) & 0x7FF;
-    let frac =  bits        & ((1u64 << 52) - 1);
+    let exp = (bits >> 52) & 0x7FF;
+    let frac = bits & ((1u64 << 52) - 1);
     if exp == 0x7FF && frac == 0 {
-        if (bits >> 63) & 1 == 1 { -1 } else { 1 }
+        if (bits >> 63) & 1 == 1 {
+            -1
+        } else {
+            1
+        }
     } else {
         0
     }
@@ -98,7 +102,7 @@ pub unsafe extern "C" fn isfinite(x: f64) -> i32 {
 
 fn trunc_f64(x: f64) -> f64 {
     let bits = x.to_bits();
-    let exp  = ((bits >> 52) & 0x7FF) as i32 - 1023;
+    let exp = ((bits >> 52) & 0x7FF) as i32 - 1023;
     if exp < 0 {
         // |x| < 1 → round toward zero is just ±0.0.
         f64::from_bits(bits & (1u64 << 63))
@@ -112,7 +116,7 @@ fn trunc_f64(x: f64) -> f64 {
 
 fn trunc_f32(x: f32) -> f32 {
     let bits = x.to_bits();
-    let exp  = ((bits >> 23) & 0xFF) as i32 - 127;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127;
     if exp < 0 {
         f32::from_bits(bits & (1u32 << 31))
     } else if exp >= 23 {
@@ -125,38 +129,58 @@ fn trunc_f32(x: f32) -> f32 {
 
 /// `trunc(x)` — round toward zero.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn trunc(x: f64) -> f64 { trunc_f64(x) }
+pub unsafe extern "C" fn trunc(x: f64) -> f64 {
+    trunc_f64(x)
+}
 
 /// `truncf(x)` — single-precision trunc.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn truncf(x: f32) -> f32 { trunc_f32(x) }
+pub unsafe extern "C" fn truncf(x: f32) -> f32 {
+    trunc_f32(x)
+}
 
 /// `floor(x)` — round toward `-inf`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn floor(x: f64) -> f64 {
     let t = trunc_f64(x);
-    if t == x || x >= 0.0 { t } else { t - 1.0 }
+    if t == x || x >= 0.0 {
+        t
+    } else {
+        t - 1.0
+    }
 }
 
 /// `floorf(x)` — single-precision floor.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn floorf(x: f32) -> f32 {
     let t = trunc_f32(x);
-    if t == x || x >= 0.0 { t } else { t - 1.0 }
+    if t == x || x >= 0.0 {
+        t
+    } else {
+        t - 1.0
+    }
 }
 
 /// `ceil(x)` — round toward `+inf`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ceil(x: f64) -> f64 {
     let t = trunc_f64(x);
-    if t == x || x <= 0.0 { t } else { t + 1.0 }
+    if t == x || x <= 0.0 {
+        t
+    } else {
+        t + 1.0
+    }
 }
 
 /// `ceilf(x)` — single-precision ceil.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ceilf(x: f32) -> f32 {
     let t = trunc_f32(x);
-    if t == x || x <= 0.0 { t } else { t + 1.0 }
+    if t == x || x <= 0.0 {
+        t
+    } else {
+        t + 1.0
+    }
 }
 
 /// `round(x)` — round half away from zero (C99).
@@ -180,31 +204,57 @@ pub unsafe extern "C" fn roundf(x: f32) -> f32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fmin(x: f64, y: f64) -> f64 {
     // SAFETY: pure value math.
-    if unsafe { isnan(x) != 0 } { y }
-    else if unsafe { isnan(y) != 0 } { x }
-    else if x < y { x } else { y }
+    if unsafe { isnan(x) != 0 } {
+        y
+    } else if unsafe { isnan(y) != 0 } {
+        x
+    } else if x < y {
+        x
+    } else {
+        y
+    }
 }
 
 /// `fmax(x, y)` — IEEE 754-2008 maxNum.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fmax(x: f64, y: f64) -> f64 {
     // SAFETY: pure value math.
-    if unsafe { isnan(x) != 0 } { y }
-    else if unsafe { isnan(y) != 0 } { x }
-    else if x > y { x } else { y }
+    if unsafe { isnan(x) != 0 } {
+        y
+    } else if unsafe { isnan(y) != 0 } {
+        x
+    } else if x > y {
+        x
+    } else {
+        y
+    }
 }
 
 /// `fminf` / `fmaxf` — single-precision twins.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fminf(x: f32, y: f32) -> f32 {
-    if x.is_nan() { y } else if y.is_nan() { x }
-    else if x < y { x } else { y }
+    if x.is_nan() {
+        y
+    } else if y.is_nan() {
+        x
+    } else if x < y {
+        x
+    } else {
+        y
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fmaxf(x: f32, y: f32) -> f32 {
-    if x.is_nan() { y } else if y.is_nan() { x }
-    else if x > y { x } else { y }
+    if x.is_nan() {
+        y
+    } else if y.is_nan() {
+        x
+    } else if x > y {
+        x
+    } else {
+        y
+    }
 }
 
 /// `fmod(x, y)` — IEEE remainder via repeated subtraction of scaled
@@ -214,9 +264,15 @@ pub unsafe extern "C" fn fmaxf(x: f32, y: f32) -> f32 {
 pub unsafe extern "C" fn fmod(x: f64, y: f64) -> f64 {
     // SAFETY: pure value math; helpers are no-mangle wrappers.
     let nan = f64::from_bits(0x7FF8_0000_0000_0000);
-    if unsafe { isnan(x) != 0 || isnan(y) != 0 } { return nan; }
-    if y == 0.0 || unsafe { isinf(x) != 0 } { return nan; }
-    if unsafe { isinf(y) != 0 } { return x; }
+    if unsafe { isnan(x) != 0 || isnan(y) != 0 } {
+        return nan;
+    }
+    if y == 0.0 || unsafe { isinf(x) != 0 } {
+        return nan;
+    }
+    if unsafe { isinf(y) != 0 } {
+        return x;
+    }
     let neg = x < 0.0;
     let mut a = unsafe { fabs(x) };
     let b = unsafe { fabs(y) };
@@ -232,7 +288,11 @@ pub unsafe extern "C" fn fmod(x: f64, y: f64) -> f64 {
         }
         a -= t;
     }
-    if neg { -a } else { a }
+    if neg {
+        -a
+    } else {
+        a
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -272,8 +332,12 @@ fn sqrt_initial_guess(x: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqrt(x: f64) -> f64 {
     let nan = f64::from_bits(0x7FF8_0000_0000_0000);
-    if x < 0.0 { return nan; }
-    if x == 0.0 || !x.is_finite() { return x; }
+    if x < 0.0 {
+        return nan;
+    }
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
     let mut g = sqrt_initial_guess(x);
     // 16 iterations is overkill — 6 typically suffices for f64 —
     // but keeps the worst-case-input bound generous.
@@ -309,12 +373,12 @@ pub unsafe extern "C" fn sqrtf(x: f32) -> f32 {
 // the Elementary Functions" (1980), and Hart, "Computer
 // Approximations" (1968).
 
-const PI: f64       = 3.141_592_653_589_793_2;
-const TWO_PI: f64   = 6.283_185_307_179_586_5;
-const HALF_PI: f64  = 1.570_796_326_794_896_6;
+const PI: f64 = 3.141_592_653_589_793_2;
+const TWO_PI: f64 = 6.283_185_307_179_586_5;
+const HALF_PI: f64 = 1.570_796_326_794_896_6;
 const QUARTER_PI: f64 = 0.785_398_163_397_448_3;
-const LN2: f64      = 0.693_147_180_559_945_3;
-const LOG2E: f64    = 1.442_695_040_888_963_4; // 1 / ln 2
+const LN2: f64 = 0.693_147_180_559_945_3;
+const LOG2E: f64 = 1.442_695_040_888_963_4; // 1 / ln 2
 
 // ── exp / expf ─────────────────────────────────────────────────────
 //
@@ -370,9 +434,15 @@ fn exp_kernel(r: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn exp(x: f64) -> f64 {
     // SAFETY: pure value math; isnan/isinf use bitfields only.
-    if unsafe { isnan(x) != 0 } { return x; }
-    if x > 709.782_712_893_4 { return f64::INFINITY; }
-    if x < -745.133_219_101_9 { return 0.0; }
+    if unsafe { isnan(x) != 0 } {
+        return x;
+    }
+    if x > 709.782_712_893_4 {
+        return f64::INFINITY;
+    }
+    if x < -745.133_219_101_9 {
+        return 0.0;
+    }
     let k = (x * LOG2E + if x >= 0.0 { 0.5 } else { -0.5 }) as i32 as f64;
     let r = x - k * LN2;
     let kr = exp_kernel(r);
@@ -413,10 +483,18 @@ fn log_kernel(m: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn log(x: f64) -> f64 {
     let nan = f64::from_bits(0x7FF8_0000_0000_0000);
-    if x.is_nan() { return x; }
-    if x < 0.0 { return nan; }
-    if x == 0.0 { return f64::NEG_INFINITY; }
-    if x.is_infinite() { return x; }
+    if x.is_nan() {
+        return x;
+    }
+    if x < 0.0 {
+        return nan;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x.is_infinite() {
+        return x;
+    }
     let bits = x.to_bits();
     let exp_field = ((bits >> 52) & 0x7FF) as i32 - 1023;
     // Force the mantissa into [1.0, 2.0) by clearing the exponent.
@@ -475,7 +553,9 @@ fn is_integer(y: f64) -> bool {
 
 #[inline]
 fn is_odd_integer(y: f64) -> bool {
-    if !is_integer(y) { return false; }
+    if !is_integer(y) {
+        return false;
+    }
     // |y| might exceed i64 range; for very large values the parity
     // is irrelevant (the result is 0 or inf anyway). Use the low bit
     // of the truncated mantissa.
@@ -495,11 +575,19 @@ fn is_odd_integer(y: f64) -> bool {
 pub unsafe extern "C" fn pow(x: f64, y: f64) -> f64 {
     let nan = f64::from_bits(0x7FF8_0000_0000_0000);
     // Trivial cases first — avoid log(1) = 0 round-off.
-    if y == 0.0 { return 1.0; }
-    if x == 1.0 { return 1.0; }
-    if x.is_nan() || y.is_nan() { return nan; }
+    if y == 0.0 {
+        return 1.0;
+    }
+    if x == 1.0 {
+        return 1.0;
+    }
+    if x.is_nan() || y.is_nan() {
+        return nan;
+    }
     if x == 0.0 {
-        if y > 0.0 { return 0.0; }
+        if y > 0.0 {
+            return 0.0;
+        }
         return if is_odd_integer(y) && y < 0.0 {
             f64::INFINITY
         } else {
@@ -507,7 +595,9 @@ pub unsafe extern "C" fn pow(x: f64, y: f64) -> f64 {
         };
     }
     if x < 0.0 {
-        if !is_integer(y) { return nan; }
+        if !is_integer(y) {
+            return nan;
+        }
         // SAFETY: forwarded to the positive path.
         let mag = unsafe { pow(-x, y) };
         return if is_odd_integer(y) { -mag } else { mag };
@@ -538,10 +628,7 @@ fn sin_kernel(x: f64) -> f64 {
     let x9 = x7 * x2;
     let x11 = x9 * x2;
     let x13 = x11 * x2;
-    x - x3 * (1.0 / 6.0)
-        + x5 * (1.0 / 120.0)
-        - x7 * (1.0 / 5040.0)
-        + x9 * (1.0 / 362880.0)
+    x - x3 * (1.0 / 6.0) + x5 * (1.0 / 120.0) - x7 * (1.0 / 5040.0) + x9 * (1.0 / 362880.0)
         - x11 * (1.0 / 39916800.0)
         + x13 * (1.0 / 6227020800.0)
 }
@@ -554,11 +641,7 @@ fn cos_kernel(x: f64) -> f64 {
     let x8 = x4 * x4;
     let x10 = x8 * x2;
     let x12 = x10 * x2;
-    1.0
-        - x2 * 0.5
-        + x4 * (1.0 / 24.0)
-        - x6 * (1.0 / 720.0)
-        + x8 * (1.0 / 40320.0)
+    1.0 - x2 * 0.5 + x4 * (1.0 / 24.0) - x6 * (1.0 / 720.0) + x8 * (1.0 / 40320.0)
         - x10 * (1.0 / 3628800.0)
         + x12 * (1.0 / 479001600.0)
 }
@@ -569,14 +652,25 @@ fn reduce_pi_over_2(x: f64) -> (i32, f64) {
     // Modulo 2π first.
     // SAFETY: fmod is pure value math.
     let mut a = unsafe { fmod(x, TWO_PI) };
-    if a > PI { a -= TWO_PI; }
-    else if a < -PI { a += TWO_PI; }
+    if a > PI {
+        a -= TWO_PI;
+    } else if a < -PI {
+        a += TWO_PI;
+    }
     // Now a ∈ [-π, π]. Pick a quadrant.
-    if a > HALF_PI { return (1, a - PI); }   // shifts to [-π/2, π/2]
-    if a < -HALF_PI { return (3, a + PI); }
+    if a > HALF_PI {
+        return (1, a - PI);
+    } // shifts to [-π/2, π/2]
+    if a < -HALF_PI {
+        return (3, a + PI);
+    }
     // a ∈ [-π/2, π/2]. If |a| > π/4, push into quadrant 2 / 0 split.
-    if a > QUARTER_PI { return (1, a - HALF_PI); }
-    if a < -QUARTER_PI { return (3, a + HALF_PI); }
+    if a > QUARTER_PI {
+        return (1, a - HALF_PI);
+    }
+    if a < -QUARTER_PI {
+        return (3, a + HALF_PI);
+    }
     (0, a)
 }
 
@@ -657,10 +751,7 @@ fn atan_kernel_small(t: f64) -> f64 {
     let t7 = t5 * t2;
     let t9 = t7 * t2;
     let t11 = t9 * t2;
-    t - t3 * (1.0 / 3.0)
-        + t5 * (1.0 / 5.0)
-        - t7 * (1.0 / 7.0)
-        + t9 * (1.0 / 9.0)
+    t - t3 * (1.0 / 3.0) + t5 * (1.0 / 5.0) - t7 * (1.0 / 7.0) + t9 * (1.0 / 9.0)
         - t11 * (1.0 / 11.0)
 }
 
@@ -690,7 +781,11 @@ pub unsafe extern "C" fn atan(x: f64) -> f64 {
     } else {
         atan_pos(ax)
     };
-    if neg { -r } else { r }
+    if neg {
+        -r
+    } else {
+        r
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -706,7 +801,9 @@ pub unsafe extern "C" fn atan2(y: f64, x: f64) -> f64 {
     if x.is_nan() || y.is_nan() {
         return f64::from_bits(0x7FF8_0000_0000_0000);
     }
-    if x == 0.0 && y == 0.0 { return 0.0; }
+    if x == 0.0 && y == 0.0 {
+        return 0.0;
+    }
     if x > 0.0 {
         // SAFETY: forwarded.
         return unsafe { atan(y / x) };
@@ -720,7 +817,11 @@ pub unsafe extern "C" fn atan2(y: f64, x: f64) -> f64 {
         return unsafe { atan(y / x) } - PI;
     }
     // x == 0.
-    if y > 0.0 { HALF_PI } else { -HALF_PI }
+    if y > 0.0 {
+        HALF_PI
+    } else {
+        -HALF_PI
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -739,7 +840,9 @@ pub unsafe extern "C" fn atan2f(y: f32, x: f32) -> f32 {
 /// f64 representable range.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ldexp(x: f64, exp: i32) -> f64 {
-    if x == 0.0 || x.is_nan() || x.is_infinite() { return x; }
+    if x == 0.0 || x.is_nan() || x.is_infinite() {
+        return x;
+    }
     ldexp_f64(x, exp)
 }
 
@@ -757,10 +860,14 @@ pub unsafe extern "C" fn ldexpf(x: f32, exp: i32) -> f32 {
 /// `exp` must be a writable `*mut i32`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn frexp(x: f64, exp: *mut i32) -> f64 {
-    if exp.is_null() { return x; }
+    if exp.is_null() {
+        return x;
+    }
     if x == 0.0 || x.is_nan() || x.is_infinite() {
         // SAFETY: caller-supplied writable slot.
-        unsafe { *exp = 0; }
+        unsafe {
+            *exp = 0;
+        }
         return x;
     }
     let bits = x.to_bits();
@@ -769,7 +876,9 @@ pub unsafe extern "C" fn frexp(x: f64, exp: *mut i32) -> f64 {
     // Clear and set the exponent so the result is in [0.5, 1.0).
     let mantissa_bits = (bits & !((0x7FFu64) << 52)) | (1022u64 << 52);
     // SAFETY: caller-supplied writable slot.
-    unsafe { *exp = e; }
+    unsafe {
+        *exp = e;
+    }
     f64::from_bits(mantissa_bits)
 }
 
@@ -788,12 +897,18 @@ pub unsafe extern "C" fn frexpf(x: f32, exp: *mut i32) -> f32 {
 /// `iptr` must be a writable `*mut f64`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
-    if iptr.is_null() { return x; }
+    if iptr.is_null() {
+        return x;
+    }
     // SAFETY: trunc is no-mangle wrapper around our own bit-twiddler.
     let int_part = unsafe { trunc(x) };
     // SAFETY: caller-supplied writable slot.
-    unsafe { *iptr = int_part; }
-    if x.is_nan() { return x; }
+    unsafe {
+        *iptr = int_part;
+    }
+    if x.is_nan() {
+        return x;
+    }
     if x.is_infinite() {
         // POSIX: modf(inf, iptr) writes ±inf to iptr and returns ±0.
         return if x > 0.0 { 0.0 } else { -0.0 };
@@ -803,11 +918,15 @@ pub unsafe extern "C" fn modf(x: f64, iptr: *mut f64) -> f64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn modff(x: f32, iptr: *mut f32) -> f32 {
-    if iptr.is_null() { return x; }
+    if iptr.is_null() {
+        return x;
+    }
     let mut int64: f64 = 0.0;
     // SAFETY: forwarded; modf writes through our local slot.
     let frac = unsafe { modf(x as f64, &mut int64) };
     // SAFETY: caller-supplied writable slot.
-    unsafe { *iptr = int64 as f32; }
+    unsafe {
+        *iptr = int64 as f32;
+    }
     frac as f32
 }

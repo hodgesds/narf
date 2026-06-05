@@ -27,32 +27,32 @@ pub type gid_t = u32;
 /// lives in `/etc/shadow` and we don't ship a shadow DB.
 #[repr(C)]
 pub struct passwd {
-    pub pw_name:   *mut c_char,
+    pub pw_name: *mut c_char,
     pub pw_passwd: *mut c_char,
-    pub pw_uid:    uid_t,
-    pub pw_gid:    gid_t,
-    pub pw_gecos:  *mut c_char,
-    pub pw_dir:    *mut c_char,
-    pub pw_shell:  *mut c_char,
+    pub pw_uid: uid_t,
+    pub pw_gid: gid_t,
+    pub pw_gecos: *mut c_char,
+    pub pw_dir: *mut c_char,
+    pub pw_shell: *mut c_char,
 }
 
-static PW_NAME:   [u8; 5]  = *b"narf\0";
-static PW_PASSWD: [u8; 2]  = *b"x\0";
-static PW_GECOS:  [u8; 5]  = *b"NARF\0";
-static PW_DIR:    [u8; 6]  = *b"/root\0";
-static PW_SHELL:  [u8; 10] = *b"/bin/sh\0\0\0";
+static PW_NAME: [u8; 5] = *b"narf\0";
+static PW_PASSWD: [u8; 2] = *b"x\0";
+static PW_GECOS: [u8; 5] = *b"NARF\0";
+static PW_DIR: [u8; 6] = *b"/root\0";
+static PW_SHELL: [u8; 10] = *b"/bin/sh\0\0\0";
 
 // SAFETY: the static fields below alias `'static` byte arrays. The
 // `passwd` struct is read-only from the caller's perspective; we
 // never hand out a writable view.
 static mut PW_ENTRY: passwd = passwd {
-    pw_name:   PW_NAME.as_ptr()   as *mut c_char,
+    pw_name: PW_NAME.as_ptr() as *mut c_char,
     pw_passwd: PW_PASSWD.as_ptr() as *mut c_char,
-    pw_uid:    0,
-    pw_gid:    0,
-    pw_gecos:  PW_GECOS.as_ptr()  as *mut c_char,
-    pw_dir:    PW_DIR.as_ptr()    as *mut c_char,
-    pw_shell:  PW_SHELL.as_ptr()  as *mut c_char,
+    pw_uid: 0,
+    pw_gid: 0,
+    pw_gecos: PW_GECOS.as_ptr() as *mut c_char,
+    pw_dir: PW_DIR.as_ptr() as *mut c_char,
+    pw_shell: PW_SHELL.as_ptr() as *mut c_char,
 };
 
 #[inline]
@@ -111,13 +111,17 @@ static mut PW_ITER_DONE: bool = false;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setpwent() {
     // SAFETY: single-threaded user mode; no concurrent observer.
-    unsafe { PW_ITER_DONE = false; }
+    unsafe {
+        PW_ITER_DONE = false;
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn endpwent() {
     // SAFETY: same.
-    unsafe { PW_ITER_DONE = true; }
+    unsafe {
+        PW_ITER_DONE = true;
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -139,30 +143,27 @@ pub unsafe extern "C" fn getpwent() -> *mut passwd {
 /// `["narf", NULL]` array so iterators terminate cleanly.
 #[repr(C)]
 pub struct group {
-    pub gr_name:   *mut c_char,
+    pub gr_name: *mut c_char,
     pub gr_passwd: *mut c_char,
-    pub gr_gid:    gid_t,
-    pub gr_mem:    *mut *mut c_char,
+    pub gr_gid: gid_t,
+    pub gr_mem: *mut *mut c_char,
 }
 
-static GR_NAME:   [u8; 5]  = *b"narf\0";
-static GR_PASSWD: [u8; 2]  = *b"x\0";
+static GR_NAME: [u8; 5] = *b"narf\0";
+static GR_PASSWD: [u8; 2] = *b"x\0";
 
 // `gr_mem` points at a static `[member, NULL]` array. We need it
 // mutable-ish for the C ABI; use a raw `static mut`.
-static mut GR_MEMBERS: [*mut c_char; 2] = [
-    GR_NAME.as_ptr() as *mut c_char,
-    core::ptr::null_mut(),
-];
+static mut GR_MEMBERS: [*mut c_char; 2] = [GR_NAME.as_ptr() as *mut c_char, core::ptr::null_mut()];
 
 static mut GR_ENTRY: group = group {
-    gr_name:   GR_NAME.as_ptr()   as *mut c_char,
+    gr_name: GR_NAME.as_ptr() as *mut c_char,
     gr_passwd: GR_PASSWD.as_ptr() as *mut c_char,
-    gr_gid:    0,
+    gr_gid: 0,
     // Late-initialised in `getgrgid` etc. — we can't take a `&raw mut`
     // of another `static mut` in const context here, so the initial
     // value is NULL and we patch it on first call.
-    gr_mem:    core::ptr::null_mut(),
+    gr_mem: core::ptr::null_mut(),
 };
 
 #[inline]
@@ -182,7 +183,9 @@ pub unsafe extern "C" fn getgrgid(gid: gid_t) -> *mut group {
         return core::ptr::null_mut();
     }
     // SAFETY: see ensure_grmem.
-    unsafe { ensure_grmem(); }
+    unsafe {
+        ensure_grmem();
+    }
     &raw mut GR_ENTRY
 }
 
@@ -197,7 +200,9 @@ pub unsafe extern "C" fn getgrnam(name: *const c_char) -> *mut group {
         return core::ptr::null_mut();
     }
     // SAFETY: see ensure_grmem.
-    unsafe { ensure_grmem(); }
+    unsafe {
+        ensure_grmem();
+    }
     &raw mut GR_ENTRY
 }
 
@@ -206,13 +211,17 @@ static mut GR_ITER_DONE: bool = false;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setgrent() {
     // SAFETY: single-threaded.
-    unsafe { GR_ITER_DONE = false; }
+    unsafe {
+        GR_ITER_DONE = false;
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn endgrent() {
     // SAFETY: same.
-    unsafe { GR_ITER_DONE = true; }
+    unsafe {
+        GR_ITER_DONE = true;
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -239,10 +248,10 @@ pub unsafe extern "C" fn getgrent() -> *mut group {
 /// `ngroups` is non-null; `user` must be a valid NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrouplist(
-    _user:    *const c_char,
-    group:    gid_t,
-    groups:   *mut gid_t,
-    ngroups:  *mut c_int,
+    _user: *const c_char,
+    group: gid_t,
+    groups: *mut gid_t,
+    ngroups: *mut c_int,
 ) -> c_int {
     if ngroups.is_null() {
         return -1;

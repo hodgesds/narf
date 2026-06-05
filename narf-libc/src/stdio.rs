@@ -43,8 +43,8 @@
 
 use core::ptr::{addr_of_mut, null_mut};
 
-use crate::heap::{free, malloc};
 use crate::errno::set_errno;
+use crate::heap::{free, malloc};
 
 /// Stream EOF / error sentinel. Matches the POSIX `EOF` macro.
 pub const EOF: i32 = -1;
@@ -57,9 +57,9 @@ const BUF_CAP: usize = 4096;
 /// errno-shaped error codes we surface from the FILE* layer. Real
 /// values are placeholders — they line up with the Linux numbers
 /// for compatibility but we don't import a full `errno.h` here.
-const EBADF:  i32 = 9;
+const EBADF: i32 = 9;
 const ENOMEM: i32 = 12;
-const EIO:    i32 = 5;
+const EIO: i32 = 5;
 
 /// Buffered file stream. Opaque to callers, accessed through a raw
 /// pointer per POSIX (`FILE*`). `#[repr(C)]` keeps the layout stable
@@ -252,13 +252,20 @@ pub unsafe fn fopen(path: *const u8, path_len: usize, mode: &str) -> *mut File {
     // at least `size_of::<File>()` bytes; writing the initialiser
     // into it is well-defined.
     unsafe {
-        core::ptr::write(f, File {
-            fd,
-            rbuf: None, rbuf_pos: 0, rbuf_end: 0,
-            wbuf: None, wbuf_len: 0,
-            eof: false, err: 0,
-            owns_fd: true,
-        });
+        core::ptr::write(
+            f,
+            File {
+                fd,
+                rbuf: None,
+                rbuf_pos: 0,
+                rbuf_end: 0,
+                wbuf: None,
+                wbuf_len: 0,
+                eof: false,
+                err: 0,
+                owns_fd: true,
+            },
+        );
     }
     f
 }
@@ -292,11 +299,15 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
     if let Some(p) = file.rbuf.take() {
         // SAFETY: pointer came from `malloc` via `ensure_rbuf` —
         // matched alloc/free pair through the freelist allocator.
-        unsafe { free(p); }
+        unsafe {
+            free(p);
+        }
     }
     if let Some(p) = file.wbuf.take() {
         // SAFETY: as above for the write buffer (`ensure_wbuf`).
-        unsafe { free(p); }
+        unsafe {
+            free(p);
+        }
     }
 
     if file.owns_fd {
@@ -311,7 +322,9 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
         // and live in `.bss`, so we leave them alone.)
         // SAFETY: matched alloc/free pair through the freelist
         // allocator's C-ABI.
-        unsafe { free(f as *mut u8); }
+        unsafe {
+            free(f as *mut u8);
+        }
     }
     rc
 }
@@ -321,7 +334,9 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
 /// Lazily allocate the read buffer. Returns the slice or `None` if
 /// allocation failed (in which case `f.err` is stamped with ENOMEM).
 fn ensure_rbuf(f: &mut File) -> Option<*mut u8> {
-    if let Some(p) = f.rbuf { return Some(p); }
+    if let Some(p) = f.rbuf {
+        return Some(p);
+    }
     // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
     // the only contract.
     let p = unsafe { malloc(BUF_CAP) };
@@ -336,7 +351,9 @@ fn ensure_rbuf(f: &mut File) -> Option<*mut u8> {
 
 /// Lazily allocate the write buffer; mirrors [`ensure_rbuf`].
 fn ensure_wbuf(f: &mut File) -> Option<*mut u8> {
-    if let Some(p) = f.wbuf { return Some(p); }
+    if let Some(p) = f.wbuf {
+        return Some(p);
+    }
     // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
     // the only contract.
     let p = unsafe { malloc(BUF_CAP) };
@@ -395,7 +412,10 @@ pub unsafe fn fread(buf: *mut u8, size: usize, count: usize, f: *mut File) -> us
 
     let total_bytes = match size.checked_mul(count) {
         Some(n) => n,
-        None => { file.err = EIO; return 0; }
+        None => {
+            file.err = EIO;
+            return 0;
+        }
     };
 
     let mut written = 0usize;
@@ -403,8 +423,8 @@ pub unsafe fn fread(buf: *mut u8, size: usize, count: usize, f: *mut File) -> us
         // Drain whatever's already in the buffer first.
         if file.rbuf_pos < file.rbuf_end {
             let avail = file.rbuf_end - file.rbuf_pos;
-            let want  = total_bytes - written;
-            let n     = if avail < want { avail } else { want };
+            let want = total_bytes - written;
+            let n = if avail < want { avail } else { want };
             // SAFETY: rbuf is a `BUF_CAP`-byte allocation; positions
             // are bounded by `rbuf_end <= BUF_CAP`. `buf + written`
             // stays within the caller's slice by construction.
@@ -414,7 +434,7 @@ pub unsafe fn fread(buf: *mut u8, size: usize, count: usize, f: *mut File) -> us
                 core::ptr::copy_nonoverlapping(src, dst, n);
             }
             file.rbuf_pos += n;
-            written       += n;
+            written += n;
             continue;
         }
         // Buffer empty — refill. EOF or error breaks the loop.
@@ -445,7 +465,10 @@ pub unsafe fn fwrite(buf: *const u8, size: usize, count: usize, f: *mut File) ->
 
     let total = match size.checked_mul(count) {
         Some(n) => n,
-        None => { file.err = EIO; return 0; }
+        None => {
+            file.err = EIO;
+            return 0;
+        }
     };
     let line_buf = is_line_buffered(file.fd);
 
@@ -485,7 +508,7 @@ pub unsafe fn fwrite(buf: *const u8, size: usize, count: usize, f: *mut File) ->
             core::ptr::copy_nonoverlapping(src, dst, n);
         }
         file.wbuf_len += n;
-        copied        += n;
+        copied += n;
 
         // Trigger a flush if we hit the brim or — for line-buffered
         // streams — if we just landed a `\n`. We flush only if the
@@ -494,9 +517,7 @@ pub unsafe fn fwrite(buf: *const u8, size: usize, count: usize, f: *mut File) ->
         let mut should_flush = file.wbuf_len == BUF_CAP;
         if line_buf && !should_flush {
             // SAFETY: scanning the just-copied region for '\n'.
-            let just = unsafe {
-                core::slice::from_raw_parts(wbuf_ptr.add(file.wbuf_len - n), n)
-            };
+            let just = unsafe { core::slice::from_raw_parts(wbuf_ptr.add(file.wbuf_len - n), n) };
             if just.contains(&b'\n') {
                 should_flush = true;
             }
@@ -527,7 +548,11 @@ pub unsafe fn fputs(s: *const u8, s_len: usize, f: *mut File) -> i32 {
     }
     // SAFETY: forwarded to `fwrite` under the same contract.
     let n = unsafe { fwrite(s, 1, s_len, f) };
-    if n == s_len { 0 } else { EOF }
+    if n == s_len {
+        0
+    } else {
+        EOF
+    }
 }
 
 /// `fgets`: read up to `max_len - 1` bytes (or until `\n` inclusive),
@@ -550,8 +575,12 @@ pub unsafe fn fgets(buf: *mut u8, max_len: usize, f: *mut File) -> *mut u8 {
 
     while written < cap {
         if file.rbuf_pos >= file.rbuf_end {
-            if file.eof || file.err != 0 { break; }
-            if refill(file) == 0 { break; }
+            if file.eof || file.err != 0 {
+                break;
+            }
+            if refill(file) == 0 {
+                break;
+            }
         }
         // SAFETY: rbuf is non-null because refill() succeeded; the
         // slice [rbuf_pos..rbuf_end] is the valid unread region.
@@ -559,9 +588,13 @@ pub unsafe fn fgets(buf: *mut u8, max_len: usize, f: *mut File) -> *mut u8 {
         file.rbuf_pos += 1;
         // SAFETY: written < cap < max_len, so buf+written is in
         // bounds; caller-supplied buffer is writable by contract.
-        unsafe { *buf.add(written) = byte; }
+        unsafe {
+            *buf.add(written) = byte;
+        }
         written += 1;
-        if byte == b'\n' { break; }
+        if byte == b'\n' {
+            break;
+        }
     }
 
     if written == 0 {
@@ -572,7 +605,9 @@ pub unsafe fn fgets(buf: *mut u8, max_len: usize, f: *mut File) -> *mut u8 {
     }
     // SAFETY: written <= cap < max_len so buf+written is within
     // the caller's region; we promised a NUL terminator.
-    unsafe { *buf.add(written) = 0; }
+    unsafe {
+        *buf.add(written) = 0;
+    }
     buf
 }
 
@@ -583,9 +618,15 @@ pub unsafe fn fgets(buf: *mut u8, max_len: usize, f: *mut File) -> *mut u8 {
 /// # Safety
 /// `f` must be valid.
 pub unsafe fn feof(f: *mut File) -> i32 {
-    if f.is_null() { return 0; }
+    if f.is_null() {
+        return 0;
+    }
     // SAFETY: caller asserts.
-    if unsafe { (*f).eof } { 1 } else { 0 }
+    if unsafe { (*f).eof } {
+        1
+    } else {
+        0
+    }
 }
 
 /// `ferror`: return the latched error code (0 if none).
@@ -593,7 +634,9 @@ pub unsafe fn feof(f: *mut File) -> i32 {
 /// # Safety
 /// `f` must be valid.
 pub unsafe fn ferror(f: *mut File) -> i32 {
-    if f.is_null() { return 0; }
+    if f.is_null() {
+        return 0;
+    }
     // SAFETY: caller asserts.
     unsafe { (*f).err }
 }
@@ -603,7 +646,9 @@ pub unsafe fn ferror(f: *mut File) -> i32 {
 /// # Safety
 /// `f` must be valid.
 pub unsafe fn clearerr(f: *mut File) {
-    if f.is_null() { return; }
+    if f.is_null() {
+        return;
+    }
     // SAFETY: caller asserts.
     unsafe {
         (*f).eof = false;
@@ -636,7 +681,10 @@ pub unsafe fn fflush(f: *mut File) -> i32 {
         Some(p) => p,
         // wbuf_len > 0 with no buffer is an inconsistency — treat
         // as a soft error, not UB.
-        None => { file.err = EIO; return EOF; }
+        None => {
+            file.err = EIO;
+            return EOF;
+        }
     };
     // SAFETY: wbuf is a BUF_CAP-byte alloc; wbuf_len <= BUF_CAP.
     let slice = unsafe { core::slice::from_raw_parts(p, file.wbuf_len) };
@@ -677,7 +725,9 @@ pub const _IONBF: i32 = 2;
 /// # Safety
 /// `stream` must be a valid `*mut File`.
 pub unsafe fn setbuf(stream: *mut File, _buf: *mut u8) {
-    if stream.is_null() { return; }
+    if stream.is_null() {
+        return;
+    }
     // SAFETY: forwarded under the same caller contract.
     unsafe {
         let _ = setvbuf(stream, core::ptr::null_mut(), _IOFBF, 4096);
@@ -691,7 +741,9 @@ pub unsafe fn setbuf(stream: *mut File, _buf: *mut u8) {
 /// # Safety
 /// `stream` must be a valid `*mut File`.
 pub unsafe fn setvbuf(stream: *mut File, _buf: *mut u8, mode: i32, _size: usize) -> i32 {
-    if stream.is_null() { return -1; }
+    if stream.is_null() {
+        return -1;
+    }
     if mode == _IONBF {
         // SAFETY: stream pointer asserted by caller.
         return unsafe { fflush(stream) };
@@ -712,7 +764,9 @@ pub unsafe fn setvbuf(stream: *mut File, _buf: *mut u8, mode: i32, _size: usize)
 /// # Safety
 /// `stream` must be a valid `*mut File`.
 pub unsafe fn ungetc(c: i32, stream: *mut File) -> i32 {
-    if stream.is_null() || c == EOF { return EOF; }
+    if stream.is_null() || c == EOF {
+        return EOF;
+    }
     let byte = c as u8;
     // SAFETY: caller asserts the pointer.
     let file = unsafe { &mut *stream };
@@ -721,7 +775,9 @@ pub unsafe fn ungetc(c: i32, stream: *mut File) -> i32 {
             file.rbuf_pos -= 1;
             // SAFETY: rbuf is a BUF_CAP-byte alloc; rbuf_pos was just
             // bounded by BUF_CAP via the prior subtraction.
-            unsafe { *p.add(file.rbuf_pos) = byte; }
+            unsafe {
+                *p.add(file.rbuf_pos) = byte;
+            }
             file.eof = false;
             return c & 0xFF;
         }
@@ -731,7 +787,9 @@ pub unsafe fn ungetc(c: i32, stream: *mut File) -> i32 {
     if file.rbuf.is_none() {
         // SAFETY: malloc is `unsafe extern "C"` with size > 0.
         let p = unsafe { ext_malloc(BUF_CAP) };
-        if p.is_null() { return EOF; }
+        if p.is_null() {
+            return EOF;
+        }
         file.rbuf = Some(p);
         file.rbuf_pos = 0;
         file.rbuf_end = 0;
@@ -769,7 +827,9 @@ pub unsafe fn perror(s: *const u8) {
         // SAFETY: caller asserts NUL-termination.
         let mut len = 0usize;
         unsafe {
-            while *s.add(len) != 0 { len += 1; }
+            while *s.add(len) != 0 {
+                len += 1;
+            }
         }
         // SAFETY: stable static stream; len-bounded readable region.
         unsafe {
@@ -782,7 +842,9 @@ pub unsafe fn perror(s: *const u8) {
     let mut mlen = 0usize;
     // SAFETY: NUL terminator is guaranteed by the static table.
     unsafe {
-        while *msg.add(mlen) != 0 { mlen += 1; }
+        while *msg.add(mlen) != 0 {
+            mlen += 1;
+        }
         let _ = fwrite(msg, 1, mlen, stream);
         let _ = fwrite(b"\n".as_ptr(), 1, 1, stream);
         let _ = fflush(stream);
@@ -825,10 +887,14 @@ fn drain_for_seek(file: &mut File, f_raw: *mut File) -> i32 {
 /// # Safety
 /// `f` must point at a valid `File`.
 pub unsafe fn fseek(f: *mut File, offset: i64, whence: i32) -> i32 {
-    if f.is_null() { return -1; }
+    if f.is_null() {
+        return -1;
+    }
     if !(whence == SEEK_SET || whence == SEEK_CUR || whence == SEEK_END) {
         // SAFETY: caller asserts.
-        unsafe { (*f).err = EIO; }
+        unsafe {
+            (*f).err = EIO;
+        }
         set_errno(EIO);
         return -1;
     }
@@ -858,7 +924,9 @@ pub unsafe fn fseek(f: *mut File, offset: i64, whence: i32) -> i32 {
 /// # Safety
 /// `f` must point at a valid `File`.
 pub unsafe fn ftell(f: *mut File) -> i64 {
-    if f.is_null() { return -1; }
+    if f.is_null() {
+        return -1;
+    }
     // SAFETY: caller asserts.
     let file = unsafe { &mut *f };
     let here = narf_user_runtime::lseek(file.fd, 0, SEEK_CUR as u32);
@@ -879,7 +947,9 @@ pub unsafe fn ftell(f: *mut File) -> i64 {
 /// # Safety
 /// `f` must point at a valid `File`.
 pub unsafe fn rewind(f: *mut File) {
-    if f.is_null() { return; }
+    if f.is_null() {
+        return;
+    }
     // SAFETY: forwarded under the same caller contract.
     unsafe {
         let _ = fseek(f, 0, SEEK_SET);
@@ -897,12 +967,18 @@ pub unsafe fn rewind(f: *mut File) {
 /// # Safety
 /// `f` must point at a valid `File`.
 pub unsafe fn fputc(c: i32, f: *mut File) -> i32 {
-    if f.is_null() { return EOF; }
+    if f.is_null() {
+        return EOF;
+    }
     let byte = c as u8;
     // SAFETY: a single stack-local byte; `fwrite` honours `&buf` for
     // exactly one byte.
     let n = unsafe { fwrite(&byte as *const u8, 1, 1, f) };
-    if n == 1 { (byte as i32) & 0xFF } else { EOF }
+    if n == 1 {
+        (byte as i32) & 0xFF
+    } else {
+        EOF
+    }
 }
 
 /// `fgetc(f)`: read a single byte from `f`. Returns the byte
@@ -912,11 +988,17 @@ pub unsafe fn fputc(c: i32, f: *mut File) -> i32 {
 /// # Safety
 /// `f` must point at a valid `File`.
 pub unsafe fn fgetc(f: *mut File) -> i32 {
-    if f.is_null() { return EOF; }
+    if f.is_null() {
+        return EOF;
+    }
     let mut byte: u8 = 0;
     // SAFETY: a single writable stack byte.
     let n = unsafe { fread(&mut byte as *mut u8, 1, 1, f) };
-    if n == 1 { (byte as i32) & 0xFF } else { EOF }
+    if n == 1 {
+        (byte as i32) & 0xFF
+    } else {
+        EOF
+    }
 }
 
 /// `getc(f)` — alias for [`fgetc`]. Real libc allows `getc` to be a
@@ -958,7 +1040,9 @@ pub fn putchar(c: i32) -> i32 {
 /// # Safety
 /// `s` must be a valid NUL-terminated C string.
 pub unsafe fn puts(s: *const u8) -> i32 {
-    if s.is_null() { return EOF; }
+    if s.is_null() {
+        return EOF;
+    }
     // Walk to NUL to find the length without depending on `strlen`'s
     // re-export — keeps this function self-contained.
     let mut len = 0usize;
@@ -970,9 +1054,15 @@ pub unsafe fn puts(s: *const u8) -> i32 {
     // SAFETY: `out` is a stable static `*mut File`; `s` is `len`
     // readable bytes per the walk above.
     let n = unsafe { fwrite(s, 1, len, out) };
-    if n != len { return EOF; }
+    if n != len {
+        return EOF;
+    }
     let nl: u8 = b'\n';
     // SAFETY: stack-local byte.
     let m = unsafe { fwrite(&nl as *const u8, 1, 1, out) };
-    if m == 1 { 0 } else { EOF }
+    if m == 1 {
+        0
+    } else {
+        EOF
+    }
 }

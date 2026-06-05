@@ -227,11 +227,15 @@ fn parse_spec(bytes: &[u8]) -> Option<(FmtSpec, u8, usize)> {
     match bytes.get(i) {
         Some(&b'h') => {
             i += 1;
-            if bytes.get(i) == Some(&b'h') { i += 1; }
+            if bytes.get(i) == Some(&b'h') {
+                i += 1;
+            }
         }
         Some(&b'l') => {
             i += 1;
-            if bytes.get(i) == Some(&b'l') { i += 1; }
+            if bytes.get(i) == Some(&b'l') {
+                i += 1;
+            }
         }
         Some(&b'j') | Some(&b'z') | Some(&b't') | Some(&b'L') => i += 1,
         _ => {}
@@ -334,9 +338,7 @@ fn emit_int(sink: &mut Sink<'_>, spec: &FmtSpec, v: i64) -> usize {
     // explicit precision, the pad goes between the sign and the
     // digits (so `%05d` of -3 -> "-0003"). With an explicit
     // precision, `0` is ignored per C99.
-    let zero_inside = spec.zero_pad
-        && !spec.left_justify
-        && spec.precision.is_none();
+    let zero_inside = spec.zero_pad && !spec.left_justify && spec.precision.is_none();
 
     let mut emitted = 0usize;
     if !spec.left_justify {
@@ -438,9 +440,7 @@ fn emit_uint_base(sink: &mut Sink<'_>, spec: &FmtSpec, v: u64, base: u32) -> usi
     let width = spec.width.unwrap_or(0);
     let pad_len = width.saturating_sub(content_len);
 
-    let zero_inside = spec.zero_pad
-        && !spec.left_justify
-        && spec.precision.is_none();
+    let zero_inside = spec.zero_pad && !spec.left_justify && spec.precision.is_none();
 
     let mut emitted = 0usize;
     if !spec.left_justify {
@@ -490,11 +490,18 @@ fn emit_ptr(sink: &mut Sink<'_>, spec: &FmtSpec, p: *const u8) -> usize {
 /// conventional impl, though it's a non-standard combination).
 fn emit_str(sink: &mut Sink<'_>, spec: &FmtSpec, s: &str) -> usize {
     let bytes = s.as_bytes();
-    let take = spec.precision.map(|p| p.min(bytes.len())).unwrap_or(bytes.len());
+    let take = spec
+        .precision
+        .map(|p| p.min(bytes.len()))
+        .unwrap_or(bytes.len());
     let slice = &bytes[..take];
     let width = spec.width.unwrap_or(0);
     let pad_len = width.saturating_sub(take);
-    let pad_byte = if spec.zero_pad && !spec.left_justify { b'0' } else { b' ' };
+    let pad_byte = if spec.zero_pad && !spec.left_justify {
+        b'0'
+    } else {
+        b' '
+    };
     let mut emitted = 0usize;
     if spec.left_justify {
         emitted += sink.write(slice);
@@ -748,11 +755,15 @@ use crate::posix::c_char;
 /// Walk a NUL-terminated C string and build a `&str` slice. Returns
 /// "" if the bytes aren't valid UTF-8.
 unsafe fn cstr_to_str_io<'a>(p: *const c_char) -> &'a str {
-    if p.is_null() { return ""; }
+    if p.is_null() {
+        return "";
+    }
     let mut len = 0usize;
     // SAFETY: caller-asserted NUL terminator.
     unsafe {
-        while *p.add(len) != 0 { len += 1; }
+        while *p.add(len) != 0 {
+            len += 1;
+        }
         let bytes = core::slice::from_raw_parts(p as *const u8, len);
         core::str::from_utf8(bytes).unwrap_or("")
     }
@@ -768,12 +779,14 @@ unsafe fn cstr_to_str_io<'a>(p: *const c_char) -> &'a str {
 /// point to `n` valid `Arg` entries.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sprintf_c(
-    buf:  *mut c_char,
-    fmt:  *const c_char,
+    buf: *mut c_char,
+    fmt: *const c_char,
     args: *const Arg<'_>,
-    n:    usize,
+    n: usize,
 ) -> i32 {
-    if buf.is_null() || fmt.is_null() { return -1; }
+    if buf.is_null() || fmt.is_null() {
+        return -1;
+    }
     // SAFETY: caller-asserted NUL-termination on fmt.
     let fmt_str = unsafe { cstr_to_str_io(fmt) };
     // SAFETY: caller-supplied args slice of length n.
@@ -810,13 +823,15 @@ pub unsafe extern "C" fn sprintf_c(
 /// NUL-terminated C string; `args` must point to `n` valid `Arg`s.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn snprintf_c(
-    buf:  *mut c_char,
+    buf: *mut c_char,
     size: usize,
-    fmt:  *const c_char,
+    fmt: *const c_char,
     args: *const Arg<'_>,
-    n:    usize,
+    n: usize,
 ) -> i32 {
-    if buf.is_null() || size == 0 || fmt.is_null() { return -1; }
+    if buf.is_null() || size == 0 || fmt.is_null() {
+        return -1;
+    }
     // SAFETY: caller contracts.
     let fmt_str = unsafe { cstr_to_str_io(fmt) };
     let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
@@ -840,12 +855,14 @@ pub unsafe extern "C" fn snprintf_c(
 /// `args` per [`snprintf_c`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asprintf_c(
-    out:  *mut *mut c_char,
-    fmt:  *const c_char,
+    out: *mut *mut c_char,
+    fmt: *const c_char,
     args: *const Arg<'_>,
-    n:    usize,
+    n: usize,
 ) -> i32 {
-    if out.is_null() || fmt.is_null() { return -1; }
+    if out.is_null() || fmt.is_null() {
+        return -1;
+    }
     // SAFETY: caller contracts.
     let fmt_str = unsafe { cstr_to_str_io(fmt) };
     let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
@@ -861,14 +878,18 @@ pub unsafe extern "C" fn asprintf_c(
     let buf = unsafe { crate::heap::malloc(len + 1) };
     if buf.is_null() {
         // SAFETY: caller-supplied writable slot — write null on failure.
-        unsafe { *out = core::ptr::null_mut(); }
+        unsafe {
+            *out = core::ptr::null_mut();
+        }
         return -1;
     }
     // SAFETY: malloc returned a (len + 1)-byte writable region.
     let dst = unsafe { core::slice::from_raw_parts_mut(buf, len + 1) };
     let _ = snprintf_str(dst, fmt_str, arg_slice);
     // SAFETY: caller-supplied writable slot.
-    unsafe { *out = buf as *mut c_char; }
+    unsafe {
+        *out = buf as *mut c_char;
+    }
     len as i32
 }
 
@@ -898,4 +919,3 @@ impl core::fmt::Write for FdWriter {
         Ok(())
     }
 }
-

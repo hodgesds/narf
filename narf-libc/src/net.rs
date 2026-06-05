@@ -52,11 +52,15 @@ fn parse_octet(s: &[u8]) -> Option<(u32, usize)> {
     let mut acc: u32 = 0;
     let mut n = 0usize;
     while n < s.len() && s[n].is_ascii_digit() {
-        if n >= 3 { return None; }
+        if n >= 3 {
+            return None;
+        }
         acc = acc * 10 + (s[n] - b'0') as u32;
         n += 1;
     }
-    if n == 0 || acc > 255 { return None; }
+    if n == 0 || acc > 255 {
+        return None;
+    }
     Some((acc, n))
 }
 
@@ -75,11 +79,15 @@ fn parse_octet(s: &[u8]) -> Option<(u32, usize)> {
 /// parse-success indicator).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inet_aton(cp: *const c_char, inp: *mut in_addr_t) -> c_int {
-    if cp.is_null() { return 0; }
+    if cp.is_null() {
+        return 0;
+    }
     // SAFETY: caller-supplied NUL-terminated C string.
     let mut len = 0usize;
     unsafe {
-        while *cp.add(len) != 0 { len += 1; }
+        while *cp.add(len) != 0 {
+            len += 1;
+        }
     }
     // SAFETY: NUL-bounded length + caller's pointer.
     let bytes = unsafe { core::slice::from_raw_parts(cp as *const u8, len) };
@@ -90,27 +98,35 @@ pub unsafe extern "C" fn inet_aton(cp: *const c_char, inp: *mut in_addr_t) -> c_
     while i < bytes.len() {
         let (v, consumed) = match parse_octet(&bytes[i..]) {
             Some(p) => p,
-            None    => return 0,
+            None => return 0,
         };
-        if idx >= 4 { return 0; }
+        if idx >= 4 {
+            return 0;
+        }
         octets[idx] = v as u8;
         idx += 1;
         i += consumed;
         if i == bytes.len() {
             break;
         }
-        if bytes[i] != b'.' || idx == 4 { return 0; }
+        if bytes[i] != b'.' || idx == 4 {
+            return 0;
+        }
         i += 1; // consume the dot
     }
-    if idx != 4 { return 0; }
+    if idx != 4 {
+        return 0;
+    }
     // Big-endian packed (a.b.c.d → 0x abcd in network order).
     let packed: u32 = ((octets[0] as u32) << 24)
         | ((octets[1] as u32) << 16)
         | ((octets[2] as u32) << 8)
-        |  (octets[3] as u32);
+        | (octets[3] as u32);
     if !inp.is_null() {
         // SAFETY: caller-supplied writable slot.
-        unsafe { *inp = packed.swap_bytes(); } // store as network-order bytes
+        unsafe {
+            *inp = packed.swap_bytes();
+        } // store as network-order bytes
     }
     1
 }
@@ -124,7 +140,11 @@ pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
     let mut out: in_addr_t = 0;
     // SAFETY: forwarded under the same caller contract.
     let rc = unsafe { inet_aton(cp, &mut out) };
-    if rc == 1 { out } else { INADDR_NONE }
+    if rc == 1 {
+        out
+    } else {
+        INADDR_NONE
+    }
 }
 
 /// `inet_pton(af, src, dst)` — strict address-family-aware parse.
@@ -143,13 +163,19 @@ pub unsafe extern "C" fn inet_pton(
     src: *const c_char,
     dst: *mut core::ffi::c_void,
 ) -> c_int {
-    if af != AF_INET { return -1; }
-    if src.is_null() || dst.is_null() { return 0; }
+    if af != AF_INET {
+        return -1;
+    }
+    if src.is_null() || dst.is_null() {
+        return 0;
+    }
     let mut packed: in_addr_t = 0;
     // SAFETY: forwarded under the same caller contract; we own the
     // local slot we hand to inet_aton.
     let rc = unsafe { inet_aton(src, &mut packed) };
-    if rc != 1 { return 0; }
+    if rc != 1 {
+        return 0;
+    }
     // `inet_pton` writes the network-order bytes verbatim — same
     // shape inet_aton already produced.
     // SAFETY: caller asserts `dst` is at least sizeof(u32) writable.
@@ -175,33 +201,33 @@ pub type sa_family_t = u16;
 pub type in_port_t = u16;
 
 pub const SOCK_STREAM: c_int = 1;
-pub const SOCK_DGRAM:  c_int = 2;
-pub const SOCK_RAW:    c_int = 3;
+pub const SOCK_DGRAM: c_int = 2;
+pub const SOCK_RAW: c_int = 3;
 
 pub const AF_UNSPEC: c_int = 0;
-pub const AF_UNIX:   c_int = 1;
-pub const AF_INET6:  c_int = 10;
+pub const AF_UNIX: c_int = 1;
+pub const AF_INET6: c_int = 10;
 
-pub const IPPROTO_IP:   c_int = 0;
-pub const IPPROTO_TCP:  c_int = 6;
-pub const IPPROTO_UDP:  c_int = 17;
+pub const IPPROTO_IP: c_int = 0;
+pub const IPPROTO_TCP: c_int = 6;
+pub const IPPROTO_UDP: c_int = 17;
 
-pub const SOL_SOCKET:   c_int = 1;
+pub const SOL_SOCKET: c_int = 1;
 pub const SO_REUSEADDR: c_int = 2;
 pub const SO_KEEPALIVE: c_int = 9;
-pub const SO_LINGER:    c_int = 13;
-pub const SO_RCVBUF:    c_int = 8;
-pub const SO_SNDBUF:    c_int = 7;
+pub const SO_LINGER: c_int = 13;
+pub const SO_RCVBUF: c_int = 8;
+pub const SO_SNDBUF: c_int = 7;
 
-pub const SHUT_RD:   c_int = 0;
-pub const SHUT_WR:   c_int = 1;
+pub const SHUT_RD: c_int = 0;
+pub const SHUT_WR: c_int = 1;
 pub const SHUT_RDWR: c_int = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct sockaddr {
     pub sa_family: sa_family_t,
-    pub sa_data:   [c_char; 14],
+    pub sa_data: [c_char; 14],
 }
 
 #[repr(C)]
@@ -214,36 +240,36 @@ pub struct in_addr {
 #[derive(Copy, Clone, Debug)]
 pub struct sockaddr_in {
     pub sin_family: sa_family_t,
-    pub sin_port:   in_port_t,
-    pub sin_addr:   in_addr,
-    pub sin_zero:   [u8; 8],
+    pub sin_port: in_port_t,
+    pub sin_addr: in_addr,
+    pub sin_zero: [u8; 8],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct sockaddr_in6 {
-    pub sin6_family:   sa_family_t,
-    pub sin6_port:     in_port_t,
+    pub sin6_family: sa_family_t,
+    pub sin6_port: in_port_t,
     pub sin6_flowinfo: u32,
-    pub sin6_addr:     [u8; 16],
+    pub sin6_addr: [u8; 16],
     pub sin6_scope_id: u32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct addrinfo {
-    pub ai_flags:    c_int,
-    pub ai_family:   c_int,
+    pub ai_flags: c_int,
+    pub ai_family: c_int,
     pub ai_socktype: c_int,
     pub ai_protocol: c_int,
-    pub ai_addrlen:  socklen_t,
-    pub ai_addr:     *mut sockaddr,
-    pub ai_canonname:*mut c_char,
-    pub ai_next:     *mut addrinfo,
+    pub ai_addrlen: socklen_t,
+    pub ai_addr: *mut sockaddr,
+    pub ai_canonname: *mut c_char,
+    pub ai_next: *mut addrinfo,
 }
 
 pub const EAI_NONAME: c_int = -2;
-pub const EAI_FAIL:   c_int = -4;
+pub const EAI_FAIL: c_int = -4;
 
 #[inline]
 unsafe fn enosys_minus_one() -> c_int {
@@ -269,11 +295,7 @@ pub unsafe extern "C" fn socket(domain: c_int, kind: c_int, protocol: c_int) -> 
 /// # Safety
 /// `addr` must point at a sockaddr-shaped struct of `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bind(
-    fd:   c_int,
-    addr: *const sockaddr,
-    len:  socklen_t,
-) -> c_int {
+pub unsafe extern "C" fn bind(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     let r = narf_user_runtime::bind(fd, addr as *const u8, len);
     if r < 0 {
         crate::errno::set_errno(crate::errno::EINVAL);
@@ -286,11 +308,7 @@ pub unsafe extern "C" fn bind(
 /// # Safety
 /// `addr` must point at a sockaddr-shaped struct of `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn connect(
-    fd:   c_int,
-    addr: *const sockaddr,
-    len:  socklen_t,
-) -> c_int {
+pub unsafe extern "C" fn connect(fd: c_int, addr: *const sockaddr, len: socklen_t) -> c_int {
     let r = narf_user_runtime::connect(fd, addr as *const u8, len);
     if r < 0 {
         crate::errno::set_errno(crate::errno::EINVAL);
@@ -316,11 +334,7 @@ pub unsafe extern "C" fn listen(fd: c_int, backlog: c_int) -> c_int {
 /// `addr` and `len` may be NULL; if non-null they must point at
 /// writable sockaddr-shaped storage.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn accept(
-    fd:   c_int,
-    addr: *mut sockaddr,
-    len:  *mut socklen_t,
-) -> c_int {
+pub unsafe extern "C" fn accept(fd: c_int, addr: *mut sockaddr, len: *mut socklen_t) -> c_int {
     loop {
         let r = narf_user_runtime::accept(fd, addr as *mut u8, len);
         if r >= 0 {
@@ -353,9 +367,9 @@ pub unsafe extern "C" fn shutdown(fd: c_int, how: c_int) -> c_int {
 /// As [`accept`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn accept4(
-    fd:    c_int,
-    addr:  *mut sockaddr,
-    len:   *mut socklen_t,
+    fd: c_int,
+    addr: *mut sockaddr,
+    len: *mut socklen_t,
     _flags: c_int,
 ) -> c_int {
     // SAFETY: forwarded.
@@ -368,14 +382,12 @@ pub unsafe extern "C" fn accept4(
 /// `buf` must point at `len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn send(
-    fd:    c_int,
-    buf:   *const core::ffi::c_void,
-    len:   usize,
+    fd: c_int,
+    buf: *const core::ffi::c_void,
+    len: usize,
     flags: c_int,
 ) -> isize {
-    unsafe {
-        sendto(fd, buf, len, flags, core::ptr::null(), 0)
-    }
+    unsafe { sendto(fd, buf, len, flags, core::ptr::null(), 0) }
 }
 
 /// `recv(fd, *buf, len, flags)` — `recvfrom(fd, buf, len, flags, NULL, NULL)`.
@@ -384,13 +396,20 @@ pub unsafe extern "C" fn send(
 /// `buf` must point at `len` writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn recv(
-    fd:    c_int,
-    buf:   *mut core::ffi::c_void,
-    len:   usize,
+    fd: c_int,
+    buf: *mut core::ffi::c_void,
+    len: usize,
     flags: c_int,
 ) -> isize {
     unsafe {
-        recvfrom(fd, buf, len, flags, core::ptr::null_mut(), core::ptr::null_mut())
+        recvfrom(
+            fd,
+            buf,
+            len,
+            flags,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
     }
 }
 
@@ -401,12 +420,12 @@ pub unsafe extern "C" fn recv(
 /// NULL/0 or a sockaddr-shaped (ptr, len) pair.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sendto(
-    fd:    c_int,
-    buf:   *const core::ffi::c_void,
-    len:   usize,
+    fd: c_int,
+    buf: *const core::ffi::c_void,
+    len: usize,
     flags: c_int,
-    addr:  *const sockaddr,
-    alen:  socklen_t,
+    addr: *const sockaddr,
+    alen: socklen_t,
 ) -> isize {
     let r = narf_user_runtime::sendto(
         fd,
@@ -430,12 +449,12 @@ pub unsafe extern "C" fn sendto(
 /// `buf` must be writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn recvfrom(
-    fd:    c_int,
-    buf:   *mut core::ffi::c_void,
-    len:   usize,
+    fd: c_int,
+    buf: *mut core::ffi::c_void,
+    len: usize,
     flags: c_int,
-    addr:  *mut sockaddr,
-    alen:  *mut socklen_t,
+    addr: *mut sockaddr,
+    alen: *mut socklen_t,
 ) -> isize {
     if len == 0 {
         return 0;
@@ -469,11 +488,11 @@ pub unsafe extern "C" fn recvfrom(
 /// `getsockopt(fd, level, name, *val, *vlen)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getsockopt(
-    _fd:    c_int,
+    _fd: c_int,
     _level: c_int,
-    _name:  c_int,
-    _val:   *mut core::ffi::c_void,
-    vlen:   *mut socklen_t,
+    _name: c_int,
+    _val: *mut core::ffi::c_void,
+    vlen: *mut socklen_t,
 ) -> c_int {
     if !vlen.is_null() {
         unsafe { *vlen = 0 };
@@ -484,11 +503,11 @@ pub unsafe extern "C" fn getsockopt(
 /// `setsockopt(fd, level, name, *val, vlen)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setsockopt(
-    _fd:    c_int,
+    _fd: c_int,
     _level: c_int,
-    _name:  c_int,
-    _val:   *const core::ffi::c_void,
-    _vlen:  socklen_t,
+    _name: c_int,
+    _val: *const core::ffi::c_void,
+    _vlen: socklen_t,
 ) -> c_int {
     0
 }
@@ -502,14 +521,16 @@ pub unsafe extern "C" fn setsockopt(
 /// `result` must be a writable `*mut *mut addrinfo`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getaddrinfo(
-    _host:    *const c_char,
+    _host: *const c_char,
     _service: *const c_char,
-    _hints:   *const addrinfo,
-    result:   *mut *mut addrinfo,
+    _hints: *const addrinfo,
+    result: *mut *mut addrinfo,
 ) -> c_int {
     if !result.is_null() {
         // SAFETY: caller-supplied writable slot.
-        unsafe { *result = core::ptr::null_mut(); }
+        unsafe {
+            *result = core::ptr::null_mut();
+        }
     }
     EAI_NONAME
 }
@@ -522,14 +543,14 @@ pub unsafe extern "C" fn freeaddrinfo(_p: *mut addrinfo) {}
 /// `EAI_*` error code.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gai_strerror(err: c_int) -> *const c_char {
-    static NONAME: [u8; 33]  = *b"Name or service not known\0\0\0\0\0\0\0\0";
-    static FAILURE:[u8; 33]  = *b"Non-recoverable failure in name r";
-    static OK:     [u8; 8]   = *b"Success\0";
+    static NONAME: [u8; 33] = *b"Name or service not known\0\0\0\0\0\0\0\0";
+    static FAILURE: [u8; 33] = *b"Non-recoverable failure in name r";
+    static OK: [u8; 8] = *b"Success\0";
     let p: *const u8 = match err {
-        0          => OK.as_ptr(),
+        0 => OK.as_ptr(),
         EAI_NONAME => NONAME.as_ptr(),
-        EAI_FAIL   => FAILURE.as_ptr(),
-        _          => OK.as_ptr(),
+        EAI_FAIL => FAILURE.as_ptr(),
+        _ => OK.as_ptr(),
     };
     p as *const c_char
 }
@@ -548,9 +569,15 @@ pub unsafe extern "C" fn inet_ntop(
     dst: *mut c_char,
     size: usize,
 ) -> *const c_char {
-    if af != AF_INET { return core::ptr::null(); }
-    if src.is_null() || dst.is_null() { return core::ptr::null(); }
-    if size < INET_ADDRSTRLEN { return core::ptr::null(); }
+    if af != AF_INET {
+        return core::ptr::null();
+    }
+    if src.is_null() || dst.is_null() {
+        return core::ptr::null();
+    }
+    if size < INET_ADDRSTRLEN {
+        return core::ptr::null();
+    }
     // SAFETY: caller asserts `src` is at least 4 bytes readable.
     let packed: u32 = unsafe { core::ptr::read_unaligned(src as *const u32) };
     let a = (packed & 0xFF) as u8;
@@ -564,9 +591,18 @@ pub unsafe extern "C" fn inet_ntop(
     let out = unsafe { core::slice::from_raw_parts_mut(dst as *mut u8, size) };
     let mut pos = 0usize;
     for (i, oct) in [a, b, c, d].iter().enumerate() {
-        if i > 0 { out[pos] = b'.'; pos += 1; }
-        if *oct >= 100 { out[pos] = b'0' + (*oct / 100); pos += 1; }
-        if *oct >= 10  { out[pos] = b'0' + ((*oct / 10) % 10); pos += 1; }
+        if i > 0 {
+            out[pos] = b'.';
+            pos += 1;
+        }
+        if *oct >= 100 {
+            out[pos] = b'0' + (*oct / 100);
+            pos += 1;
+        }
+        if *oct >= 10 {
+            out[pos] = b'0' + ((*oct / 10) % 10);
+            pos += 1;
+        }
         out[pos] = b'0' + (*oct % 10);
         pos += 1;
     }

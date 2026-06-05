@@ -14,16 +14,16 @@ use crate::posix::c_int;
 
 // ── <fenv.h> — rounding modes + exception flags ─────────────────────
 
-pub const FE_TONEAREST:  c_int = 0;
-pub const FE_DOWNWARD:   c_int = 1;
-pub const FE_UPWARD:     c_int = 2;
+pub const FE_TONEAREST: c_int = 0;
+pub const FE_DOWNWARD: c_int = 1;
+pub const FE_UPWARD: c_int = 2;
 pub const FE_TOWARDZERO: c_int = 3;
 
-pub const FE_INVALID:    c_int = 0x01;
-pub const FE_DIVBYZERO:  c_int = 0x04;
-pub const FE_OVERFLOW:   c_int = 0x08;
-pub const FE_UNDERFLOW:  c_int = 0x10;
-pub const FE_INEXACT:    c_int = 0x20;
+pub const FE_INVALID: c_int = 0x01;
+pub const FE_DIVBYZERO: c_int = 0x04;
+pub const FE_OVERFLOW: c_int = 0x08;
+pub const FE_UNDERFLOW: c_int = 0x10;
+pub const FE_INEXACT: c_int = 0x20;
 pub const FE_ALL_EXCEPT: c_int = 0x3D;
 
 pub type fexcept_t = u32;
@@ -35,7 +35,9 @@ pub struct fenv_t {
 }
 
 impl Default for fenv_t {
-    fn default() -> Self { Self { _opaque: [0; 32] } }
+    fn default() -> Self {
+        Self { _opaque: [0; 32] }
+    }
 }
 
 /// `fegetround()` — always reports `FE_TONEAREST`.
@@ -49,34 +51,50 @@ pub unsafe extern "C" fn fegetround() -> c_int {
 /// non-zero per the C99 contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fesetround(mode: c_int) -> c_int {
-    if mode == FE_TONEAREST { 0 } else { -1 }
+    if mode == FE_TONEAREST {
+        0
+    } else {
+        -1
+    }
 }
 
 /// `feclearexcept(excepts)` — no-op (we don't track raised flags).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn feclearexcept(_excepts: c_int) -> c_int { 0 }
+pub unsafe extern "C" fn feclearexcept(_excepts: c_int) -> c_int {
+    0
+}
 
 /// `feraiseexcept(excepts)` — no-op.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn feraiseexcept(_excepts: c_int) -> c_int { 0 }
+pub unsafe extern "C" fn feraiseexcept(_excepts: c_int) -> c_int {
+    0
+}
 
 /// `fetestexcept(excepts)` — always reports zero raised flags.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fetestexcept(_excepts: c_int) -> c_int { 0 }
+pub unsafe extern "C" fn fetestexcept(_excepts: c_int) -> c_int {
+    0
+}
 
 /// `fegetenv(env)` — zero the supplied env. We have no live state
 /// to record.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fegetenv(env: *mut fenv_t) -> c_int {
-    if env.is_null() { return -1; }
+    if env.is_null() {
+        return -1;
+    }
     // SAFETY: caller-asserted writable struct.
-    unsafe { *env = fenv_t::default(); }
+    unsafe {
+        *env = fenv_t::default();
+    }
     0
 }
 
 /// `fesetenv(env)` — no-op success.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fesetenv(_env: *const fenv_t) -> c_int { 0 }
+pub unsafe extern "C" fn fesetenv(_env: *const fenv_t) -> c_int {
+    0
+}
 
 // ── <complex.h> — C99 _Complex shape + algebra ──────────────────────
 //
@@ -108,16 +126,23 @@ pub struct complex_float {
 
 /// `creal(z)` — real part.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn creal(z: complex_double) -> f64 { z.real }
+pub unsafe extern "C" fn creal(z: complex_double) -> f64 {
+    z.real
+}
 
 /// `cimag(z)` — imaginary part.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn cimag(z: complex_double) -> f64 { z.imag }
+pub unsafe extern "C" fn cimag(z: complex_double) -> f64 {
+    z.imag
+}
 
 /// `conj(z)` — complex conjugate.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn conj(z: complex_double) -> complex_double {
-    complex_double { real: z.real, imag: -z.imag }
+    complex_double {
+        real: z.real,
+        imag: -z.imag,
+    }
 }
 
 /// `cabs(z)` — Euclidean magnitude. Computed via the existing
@@ -132,13 +157,19 @@ pub unsafe extern "C" fn cabs(z: complex_double) -> f64 {
 /// Complex addition.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cadd(a: complex_double, b: complex_double) -> complex_double {
-    complex_double { real: a.real + b.real, imag: a.imag + b.imag }
+    complex_double {
+        real: a.real + b.real,
+        imag: a.imag + b.imag,
+    }
 }
 
 /// Complex subtraction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn csub(a: complex_double, b: complex_double) -> complex_double {
-    complex_double { real: a.real - b.real, imag: a.imag - b.imag }
+    complex_double {
+        real: a.real - b.real,
+        imag: a.imag - b.imag,
+    }
 }
 
 /// Complex multiplication.
@@ -157,7 +188,10 @@ pub unsafe extern "C" fn cdiv(a: complex_double, b: complex_double) -> complex_d
     let denom = b.real * b.real + b.imag * b.imag;
     if denom == 0.0 {
         let nan = f64::from_bits(0x7FF8_0000_0000_0000);
-        return complex_double { real: nan, imag: nan };
+        return complex_double {
+            real: nan,
+            imag: nan,
+        };
     }
     complex_double {
         real: (a.real * b.real + a.imag * b.imag) / denom,

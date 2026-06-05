@@ -22,7 +22,7 @@ use crate::posix::{c_int, c_void, ssize_t};
 // ── getrandom ───────────────────────────────────────────────────────
 
 pub const GRND_NONBLOCK: c_int = 1 << 0;
-pub const GRND_RANDOM:   c_int = 1 << 1;
+pub const GRND_RANDOM: c_int = 1 << 1;
 pub const GRND_INSECURE: c_int = 1 << 2;
 
 // SAFETY: see callers — every PRNG_STATE access is documented at
@@ -69,11 +69,7 @@ unsafe fn xorshift64(state: *mut u64) -> u64 {
 /// `buf` must point to at least `buflen` writable bytes when
 /// `buflen > 0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getrandom(
-    buf:    *mut c_void,
-    buflen: usize,
-    _flags: c_int,
-) -> ssize_t {
+pub unsafe extern "C" fn getrandom(buf: *mut c_void, buflen: usize, _flags: c_int) -> ssize_t {
     if buf.is_null() && buflen != 0 {
         return -1;
     }
@@ -112,7 +108,11 @@ pub unsafe extern "C" fn getentropy(buf: *mut c_void, buflen: usize) -> c_int {
     }
     // SAFETY: forwarded.
     let n = unsafe { getrandom(buf, buflen, 0) };
-    if n < 0 { -1 } else { 0 }
+    if n < 0 {
+        -1
+    } else {
+        0
+    }
 }
 
 // ── readv / writev ──────────────────────────────────────────────────
@@ -123,7 +123,7 @@ pub unsafe extern "C" fn getentropy(buf: *mut c_void, buflen: usize) -> c_int {
 #[derive(Copy, Clone)]
 pub struct iovec {
     pub iov_base: *mut c_void,
-    pub iov_len:  usize,
+    pub iov_len: usize,
 }
 
 /// `readv(fd, iov, iovcnt)` — gather-read. Walks the iovec array
@@ -135,11 +135,7 @@ pub struct iovec {
 /// `iov` must point to `iovcnt` valid `iovec` entries; each
 /// `iov_base` must be writable for `iov_len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn readv(
-    fd:     c_int,
-    iov:    *const iovec,
-    iovcnt: c_int,
-) -> ssize_t {
+pub unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
     if iov.is_null() || iovcnt < 0 {
         return -1;
     }
@@ -170,11 +166,7 @@ pub unsafe extern "C" fn readv(
 /// `iov` must point to `iovcnt` valid `iovec` entries; each
 /// `iov_base` must be readable for `iov_len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn writev(
-    fd:     c_int,
-    iov:    *const iovec,
-    iovcnt: c_int,
-) -> ssize_t {
+pub unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
     if iov.is_null() || iovcnt < 0 {
         return -1;
     }

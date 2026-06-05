@@ -2234,11 +2234,8 @@ fn smoke_wave55_sigsegv_default_terminate_sets_wifsignaled() -> TestResult {
     // Drive the sync-signal hook for vector 14 (#PF). No handler
     // installed → POSIX default action for SIGSEGV is CoreDump.
     let mut ctx = signal_ctx_returning_to_user();
-    let handled = crate::default_sync_signal_delivery(
-        &mut ctx,
-        14,
-        crate::SyncFaultInfo::default(),
-    );
+    let handled =
+        crate::default_sync_signal_delivery(&mut ctx, 14, crate::SyncFaultInfo::default());
     if !handled {
         teardown_process_state();
         return TestResult::Fail("sync hook should report handled (default action terminates)");

@@ -40,7 +40,11 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
     }
 
     let (argc, argv, envp) = if rsp_at_entry == 0 {
-        (0i32, core::ptr::null::<*const u8>(), core::ptr::null::<*const u8>())
+        (
+            0i32,
+            core::ptr::null::<*const u8>(),
+            core::ptr::null::<*const u8>(),
+        )
     } else {
         // SAFETY: trusting `rsp_at_entry` per the function-level
         // contract. The kernel's stack initialiser writes a

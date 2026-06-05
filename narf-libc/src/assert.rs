@@ -34,7 +34,12 @@ pub unsafe extern "C" fn __assert_fail(
     crate::fprintf_str(
         2,
         "narf-libc: %s:%u: %s: Assertion `%s' failed.\n",
-        &[Arg::Str(f), Arg::Uint(line as u64), Arg::Str(n), Arg::Str(e)],
+        &[
+            Arg::Str(f),
+            Arg::Uint(line as u64),
+            Arg::Str(n),
+            Arg::Str(e),
+        ],
     );
     // SAFETY: abort never returns; pure delegate.
     unsafe { crate::abort() }

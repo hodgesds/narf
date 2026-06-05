@@ -177,17 +177,17 @@ unsafe fn optstring_find(optstring: *const c_char, byte: c_char) -> Option<(usiz
 //   - No abbreviated long matches (caller must spell it in full).
 //   - `longindex` is honoured.
 
-pub const NO_ARGUMENT:       c_int = 0;
+pub const NO_ARGUMENT: c_int = 0;
 pub const REQUIRED_ARGUMENT: c_int = 1;
 pub const OPTIONAL_ARGUMENT: c_int = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct option {
-    pub name:    *const c_char,
+    pub name: *const c_char,
     pub has_arg: c_int,
-    pub flag:    *mut c_int,
-    pub val:     c_int,
+    pub flag: *mut c_int,
+    pub val: c_int,
 }
 
 unsafe fn cstr_eq(a: *const c_char, b: &[u8]) -> bool {
@@ -197,7 +197,9 @@ unsafe fn cstr_eq(a: *const c_char, b: &[u8]) -> bool {
     unsafe {
         for (i, &bx) in b.iter().enumerate() {
             let ax = *a.add(i) as u8;
-            if ax != bx { return false; }
+            if ax != bx {
+                return false;
+            }
         }
         *a.add(b.len()) == 0
     }
@@ -249,16 +251,11 @@ pub unsafe extern "C" fn getopt_long(
         let name_start = cur.add(2);
         // Find `=` (if any) within the name.
         let mut nlen = 0usize;
-        while *name_start.add(nlen) != 0
-            && *name_start.add(nlen) != b'=' as c_char
-        {
+        while *name_start.add(nlen) != 0 && *name_start.add(nlen) != b'=' as c_char {
             nlen += 1;
         }
         let has_eq = *name_start.add(nlen) == b'=' as c_char;
-        let name_bytes = core::slice::from_raw_parts(
-            name_start as *const u8,
-            nlen,
-        );
+        let name_bytes = core::slice::from_raw_parts(name_start as *const u8, nlen);
         // Walk the longopts table.
         let mut idx = 0i32;
         loop {
@@ -290,7 +287,11 @@ pub unsafe extern "C" fn getopt_long(
                     }
                     got_arg = *argv.offset(optind as isize);
                 }
-                optarg = if needs_arg { got_arg } else { core::ptr::null_mut() };
+                optarg = if needs_arg {
+                    got_arg
+                } else {
+                    core::ptr::null_mut()
+                };
                 optind += 1;
                 // flag handling: if entry.flag is non-null, set
                 // *flag = val and return 0; else return val directly.
@@ -326,11 +327,8 @@ unsafe fn emit_diag(argv: *const *mut c_char, msg: &str, opt: u8) {
             while *prog_ptr.add(n) != 0 {
                 n += 1;
             }
-            core::str::from_utf8(core::slice::from_raw_parts(
-                prog_ptr as *const u8,
-                n,
-            ))
-            .unwrap_or("narf-libc")
+            core::str::from_utf8(core::slice::from_raw_parts(prog_ptr as *const u8, n))
+                .unwrap_or("narf-libc")
         };
         crate::fprintf_str(
             2,

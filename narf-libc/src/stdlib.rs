@@ -16,7 +16,7 @@
 
 use crate::posix::{c_char, c_int, c_void};
 
-pub type c_long  = i64;
+pub type c_long = i64;
 pub type c_ulong = u64;
 
 /// Whitespace per C99 isspace: space, \t, \n, \v, \f, \r.
@@ -35,7 +35,11 @@ fn digit_value(b: u8, base: u32) -> Option<u32> {
         b'A'..=b'Z' => 10 + (b - b'A') as u32,
         _ => return None,
     };
-    if v < base { Some(v) } else { None }
+    if v < base {
+        Some(v)
+    } else {
+        None
+    }
 }
 
 /// Walk a NUL-terminated C string, skipping leading whitespace and
@@ -47,10 +51,7 @@ fn digit_value(b: u8, base: u32) -> Option<u32> {
 ///
 /// # Safety
 /// `s` must point at a valid NUL-terminated C string.
-unsafe fn parse_prefix(
-    s: *const c_char,
-    base: c_int,
-) -> (*const c_char, i64, u32) {
+unsafe fn parse_prefix(s: *const c_char, base: c_int) -> (*const c_char, i64, u32) {
     let mut p = s;
     // Skip whitespace.
     // SAFETY: caller contract.
@@ -60,8 +61,14 @@ unsafe fn parse_prefix(
     }
     // Sign.
     let sign: i64 = match unsafe { *p } as u8 {
-        b'+' => { p = unsafe { p.add(1) }; 1 }
-        b'-' => { p = unsafe { p.add(1) }; -1 }
+        b'+' => {
+            p = unsafe { p.add(1) };
+            1
+        }
+        b'-' => {
+            p = unsafe { p.add(1) };
+            -1
+        }
         _ => 1,
     };
     // Base inference + 0x prefix consume.
@@ -113,7 +120,7 @@ pub unsafe extern "C" fn strtol(
         }
         let d = match digit_value(b as u8, base) {
             Some(v) => v as i64,
-            None    => break,
+            None => break,
         };
         // Saturate on overflow.
         let next = acc
@@ -121,9 +128,13 @@ pub unsafe extern "C" fn strtol(
             .and_then(|x| x.checked_add(if sign < 0 { -d } else { d }));
         acc = match next {
             Some(v) => v,
-            None    => {
+            None => {
                 overflowed = true;
-                if sign < 0 { i64::MIN } else { i64::MAX }
+                if sign < 0 {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
             }
         };
         consumed = true;
@@ -180,7 +191,7 @@ pub unsafe extern "C" fn strtoul(
         }
         let d = match digit_value(b as u8, base) {
             Some(v) => v as u64,
-            None    => break,
+            None => break,
         };
         acc = acc.saturating_mul(base as u64).saturating_add(d);
         consumed = true;
@@ -246,9 +257,9 @@ pub unsafe extern "C" fn atoll(nptr: *const c_char) -> i64 {
 /// See [`strtol`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strtoll(
-    nptr:   *const c_char,
+    nptr: *const c_char,
     endptr: *mut *mut c_char,
-    base:   c_int,
+    base: c_int,
 ) -> i64 {
     // SAFETY: forwarded.
     unsafe { strtol(nptr, endptr, base) }
@@ -261,9 +272,9 @@ pub unsafe extern "C" fn strtoll(
 /// See [`strtoul`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strtoull(
-    nptr:   *const c_char,
+    nptr: *const c_char,
     endptr: *mut *mut c_char,
-    base:   c_int,
+    base: c_int,
 ) -> u64 {
     // SAFETY: forwarded.
     unsafe { strtoul(nptr, endptr, base) }
@@ -284,11 +295,10 @@ pub unsafe extern "C" fn strtoull(
 /// `nptr` must be a valid NUL-terminated C string. `endptr`, when
 /// non-null, must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn strtod(
-    nptr:   *const c_char,
-    endptr: *mut *mut c_char,
-) -> f64 {
-    if nptr.is_null() { return 0.0; }
+pub unsafe extern "C" fn strtod(nptr: *const c_char, endptr: *mut *mut c_char) -> f64 {
+    if nptr.is_null() {
+        return 0.0;
+    }
     // SAFETY: caller contract — walk bytes until invalid.
     let mut p = nptr as *const u8;
     // Skip whitespace.
@@ -299,8 +309,18 @@ pub unsafe extern "C" fn strtod(
     }
     // Sign.
     let sign: f64 = match unsafe { *p } {
-        b'+' => { unsafe { p = p.add(1); } 1.0 }
-        b'-' => { unsafe { p = p.add(1); } -1.0 }
+        b'+' => {
+            unsafe {
+                p = p.add(1);
+            }
+            1.0
+        }
+        b'-' => {
+            unsafe {
+                p = p.add(1);
+            }
+            -1.0
+        }
         _ => 1.0,
     };
     let mut value = 0.0f64;
@@ -327,27 +347,45 @@ pub unsafe extern "C" fn strtod(
         if any && (*p == b'e' || *p == b'E') {
             p = p.add(1);
             let esign: i32 = match *p {
-                b'+' => { p = p.add(1); 1 }
-                b'-' => { p = p.add(1); -1 }
+                b'+' => {
+                    p = p.add(1);
+                    1
+                }
+                b'-' => {
+                    p = p.add(1);
+                    -1
+                }
                 _ => 1,
             };
             let mut exp_val = 0i32;
             while *p >= b'0' && *p <= b'9' {
-                exp_val = exp_val.saturating_mul(10).saturating_add((*p - b'0') as i32);
+                exp_val = exp_val
+                    .saturating_mul(10)
+                    .saturating_add((*p - b'0') as i32);
                 p = p.add(1);
             }
             let exp_val = esign * exp_val;
             let mut mult = 1.0f64;
             let abs_e = exp_val.unsigned_abs();
-            for _ in 0..abs_e { mult *= 10.0; }
-            if exp_val < 0 { value /= mult; } else { value *= mult; }
+            for _ in 0..abs_e {
+                mult *= 10.0;
+            }
+            if exp_val < 0 {
+                value /= mult;
+            } else {
+                value *= mult;
+            }
         }
     }
     if !endptr.is_null() {
         // SAFETY: caller-asserted writable.
-        unsafe { *endptr = p as *mut c_char; }
+        unsafe {
+            *endptr = p as *mut c_char;
+        }
     }
-    if !any { return 0.0; }
+    if !any {
+        return 0.0;
+    }
     sign * value
 }
 
@@ -357,10 +395,7 @@ pub unsafe extern "C" fn strtod(
 /// # Safety
 /// See [`strtod`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn strtof(
-    nptr:   *const c_char,
-    endptr: *mut *mut c_char,
-) -> f32 {
+pub unsafe extern "C" fn strtof(nptr: *const c_char, endptr: *mut *mut c_char) -> f32 {
     // SAFETY: forwarded.
     unsafe { strtod(nptr, endptr) as f32 }
 }
@@ -393,12 +428,7 @@ unsafe fn swap_bytes(a: *mut u8, b: *mut u8, size: usize) {
 /// `base` must point to `nmemb * size` writable bytes; `cmp` must
 /// be a valid C-shaped comparator that doesn't unwind.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qsort(
-    base: *mut c_void,
-    nmemb: usize,
-    size: usize,
-    cmp: cmp_fn,
-) {
+pub unsafe extern "C" fn qsort(base: *mut c_void, nmemb: usize, size: usize, cmp: cmp_fn) {
     if nmemb < 2 || size == 0 {
         return;
     }
@@ -416,7 +446,9 @@ pub unsafe extern "C" fn qsort(
                 break;
             }
             // SAFETY: a and b are disjoint (j != j-1) regions of `size` bytes.
-            unsafe { swap_bytes(a, b, size); }
+            unsafe {
+                swap_bytes(a, b, size);
+            }
             j -= 1;
         }
     }
@@ -435,7 +467,7 @@ pub unsafe extern "C" fn qsort(
 #[derive(Copy, Clone, Debug, Default)]
 pub struct div_t {
     pub quot: c_int,
-    pub rem:  c_int,
+    pub rem: c_int,
 }
 
 /// `<stdlib.h>` `ldiv_t` shape. Two `long` fields per C99 §7.20.6.2.
@@ -443,7 +475,7 @@ pub struct div_t {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ldiv_t {
     pub quot: c_long,
-    pub rem:  c_long,
+    pub rem: c_long,
 }
 
 /// `abs(j)` — magnitude of a C `int`. `INT_MIN` is wrapped (returns
@@ -471,7 +503,7 @@ pub unsafe extern "C" fn div(num: c_int, denom: c_int) -> div_t {
     }
     div_t {
         quot: num.wrapping_div(denom),
-        rem:  num.wrapping_rem(denom),
+        rem: num.wrapping_rem(denom),
     }
 }
 
@@ -484,7 +516,7 @@ pub unsafe extern "C" fn ldiv(num: c_long, denom: c_long) -> ldiv_t {
     }
     ldiv_t {
         quot: num.wrapping_div(denom),
-        rem:  num.wrapping_rem(denom),
+        rem: num.wrapping_rem(denom),
     }
 }
 
@@ -512,7 +544,9 @@ pub unsafe extern "C" fn srand(seed: u32) {
     let s = if seed == 0 { 1 } else { seed & 0x7FFF_FFFF };
     // SAFETY: single-threaded user-mode invariant; access is
     // serialised by execution order.
-    unsafe { RAND_STATE = if s == 0 { 1 } else { s }; }
+    unsafe {
+        RAND_STATE = if s == 0 { 1 } else { s };
+    }
 }
 
 /// `rand()` — Park-Miller minimal standard LCG. Returns the next
@@ -548,7 +582,9 @@ pub unsafe extern "C" fn rand() -> c_int {
 /// `s` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: &mut [i64]) -> usize {
-    if s.is_null() || out.is_empty() { return 0; }
+    if s.is_null() || out.is_empty() {
+        return 0;
+    }
     let mut p = s;
     let mut n = 0usize;
     while n < out.len() {
@@ -558,7 +594,9 @@ pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: &mut [i64]) -> usize
             while *p != 0 && is_space(*p as u8) {
                 p = p.add(1);
             }
-            if *p == 0 { break; }
+            if *p == 0 {
+                break;
+            }
         }
         // Detect optional sign + base prefix; reuse parse_prefix.
         // SAFETY: `p` still in the caller's NUL-terminated string.
@@ -575,7 +613,7 @@ pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: &mut [i64]) -> usize
             let b = unsafe { *q } as u8;
             let d = match digit_value(b, base) {
                 Some(v) => v as i64,
-                None    => break,
+                None => break,
             };
             let signed_d = if sign < 0 { -d } else { d };
             acc = acc

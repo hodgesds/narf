@@ -30,19 +30,19 @@ unsafe fn enosys_minus_one() -> c_int {
 
 pub type nfds_t = u64;
 
-pub const POLLIN:    i16 = 0x0001;
-pub const POLLPRI:   i16 = 0x0002;
-pub const POLLOUT:   i16 = 0x0004;
-pub const POLLERR:   i16 = 0x0008;
-pub const POLLHUP:   i16 = 0x0010;
-pub const POLLNVAL:  i16 = 0x0020;
+pub const POLLIN: i16 = 0x0001;
+pub const POLLPRI: i16 = 0x0002;
+pub const POLLOUT: i16 = 0x0004;
+pub const POLLERR: i16 = 0x0008;
+pub const POLLHUP: i16 = 0x0010;
+pub const POLLNVAL: i16 = 0x0020;
 pub const POLLRDHUP: i16 = 0x2000;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct pollfd {
-    pub fd:      c_int,
-    pub events:  i16,
+    pub fd: c_int,
+    pub events: i16,
     pub revents: i16,
 }
 
@@ -56,20 +56,22 @@ pub struct pollfd {
 /// # Safety
 /// `fds` must point at a writable array of `nfds` `pollfd` records.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn poll(
-    fds:     *mut pollfd,
-    nfds:    nfds_t,
-    timeout: c_int,
-) -> c_int {
+pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
     if fds.is_null() && nfds != 0 {
         crate::errno::set_errno(22 /* EINVAL */);
         return -1;
     }
     // Compute an absolute deadline if a positive timeout was given;
     // -1 = block forever, 0 = single non-blocking poll, > 0 = ms.
-    let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
-    let _ = unsafe { crate::time::clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts as *mut _) };
-    let now_ns = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+    let mut ts = crate::time::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let _ = unsafe {
+        crate::time::clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts as *mut _)
+    };
+    let now_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
     let deadline_ns: Option<u64> = match timeout {
         n if n < 0 => None,
@@ -91,9 +93,13 @@ pub unsafe extern "C" fn poll(
         }
         // r == 0: nothing ready. Check the user-side timeout.
         if let Some(dl) = deadline_ns {
-            let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+            let mut ts = crate::time::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
             let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
-            let now = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+            let now = (ts.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
                 .saturating_add(ts.tv_nsec as u64);
             if now >= dl {
                 return 0;
@@ -120,42 +126,60 @@ pub struct fd_set {
 }
 
 impl Default for fd_set {
-    fn default() -> Self { Self { fds_bits: [0; FDS_BITS_LEN] } }
+    fn default() -> Self {
+        Self {
+            fds_bits: [0; FDS_BITS_LEN],
+        }
+    }
 }
 
 /// `FD_ZERO(set)` — clear every bit. C macros aren't an option
 /// across the FFI boundary; we ship as no_mangle fns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn FD_ZERO(set: *mut fd_set) {
-    if set.is_null() { return; }
+    if set.is_null() {
+        return;
+    }
     // SAFETY: caller-supplied writable struct.
-    unsafe { *set = fd_set::default(); }
+    unsafe {
+        *set = fd_set::default();
+    }
 }
 
 /// `FD_SET(fd, set)` — set bit `fd`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn FD_SET(fd: c_int, set: *mut fd_set) {
-    if set.is_null() || fd < 0 || fd as usize >= FD_SETSIZE { return; }
+    if set.is_null() || fd < 0 || fd as usize >= FD_SETSIZE {
+        return;
+    }
     let i = (fd as usize) / 64;
     let b = (fd as usize) % 64;
     // SAFETY: caller-supplied writable struct; index in-range.
-    unsafe { (*set).fds_bits[i] |= 1u64 << b; }
+    unsafe {
+        (*set).fds_bits[i] |= 1u64 << b;
+    }
 }
 
 /// `FD_CLR(fd, set)` — clear bit `fd`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn FD_CLR(fd: c_int, set: *mut fd_set) {
-    if set.is_null() || fd < 0 || fd as usize >= FD_SETSIZE { return; }
+    if set.is_null() || fd < 0 || fd as usize >= FD_SETSIZE {
+        return;
+    }
     let i = (fd as usize) / 64;
     let b = (fd as usize) % 64;
     // SAFETY: caller-supplied writable struct.
-    unsafe { (*set).fds_bits[i] &= !(1u64 << b); }
+    unsafe {
+        (*set).fds_bits[i] &= !(1u64 << b);
+    }
 }
 
 /// `FD_ISSET(fd, set)` — non-zero iff bit `fd` is set.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn FD_ISSET(fd: c_int, set: *const fd_set) -> c_int {
-    if set.is_null() || fd < 0 || fd as usize >= FD_SETSIZE { return 0; }
+    if set.is_null() || fd < 0 || fd as usize >= FD_SETSIZE {
+        return 0;
+    }
     let i = (fd as usize) / 64;
     let b = (fd as usize) % 64;
     // SAFETY: caller-supplied readable struct.
@@ -166,7 +190,7 @@ pub unsafe extern "C" fn FD_ISSET(fd: c_int, set: *const fd_set) -> c_int {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct timeval_select {
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     pub tv_usec: i64,
 }
 
@@ -180,11 +204,11 @@ pub struct timeval_select {
 /// declared shape.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn select(
-    nfds:      c_int,
-    readfds:   *mut fd_set,
-    writefds:  *mut fd_set,
+    nfds: c_int,
+    readfds: *mut fd_set,
+    writefds: *mut fd_set,
     exceptfds: *mut fd_set,
-    timeout:   *mut timeval_select,
+    timeout: *mut timeval_select,
 ) -> c_int {
     if nfds < 0 || nfds as usize > FD_SETSIZE {
         crate::errno::set_errno(22 /* EINVAL */);
@@ -192,18 +216,34 @@ pub unsafe extern "C" fn select(
     }
     let n = nfds as usize;
     // Build pollfd[].
-    let mut pf = [pollfd { fd: 0, events: 0, revents: 0 }; FD_SETSIZE];
+    let mut pf = [pollfd {
+        fd: 0,
+        events: 0,
+        revents: 0,
+    }; FD_SETSIZE];
     let mut count: usize = 0;
     for fd in 0..n {
         let want_r = !readfds.is_null() && unsafe { FD_ISSET(fd as c_int, readfds) } != 0;
         let want_w = !writefds.is_null() && unsafe { FD_ISSET(fd as c_int, writefds) } != 0;
         let want_e = !exceptfds.is_null() && unsafe { FD_ISSET(fd as c_int, exceptfds) } != 0;
-        if !want_r && !want_w && !want_e { continue; }
+        if !want_r && !want_w && !want_e {
+            continue;
+        }
         let mut events = 0i16;
-        if want_r { events |= POLLIN; }
-        if want_w { events |= POLLOUT; }
-        if want_e { events |= POLLPRI; }
-        pf[count] = pollfd { fd: fd as c_int, events, revents: 0 };
+        if want_r {
+            events |= POLLIN;
+        }
+        if want_w {
+            events |= POLLOUT;
+        }
+        if want_e {
+            events |= POLLPRI;
+        }
+        pf[count] = pollfd {
+            fd: fd as c_int,
+            events,
+            revents: 0,
+        };
         count += 1;
     }
     let timeout_ms: c_int = if timeout.is_null() {
@@ -220,21 +260,41 @@ pub unsafe extern "C" fn select(
         return -1;
     }
     // Clear the user fd_sets and re-populate from revents.
-    if !readfds.is_null() { unsafe { FD_ZERO(readfds); } }
-    if !writefds.is_null() { unsafe { FD_ZERO(writefds); } }
-    if !exceptfds.is_null() { unsafe { FD_ZERO(exceptfds); } }
+    if !readfds.is_null() {
+        unsafe {
+            FD_ZERO(readfds);
+        }
+    }
+    if !writefds.is_null() {
+        unsafe {
+            FD_ZERO(writefds);
+        }
+    }
+    if !exceptfds.is_null() {
+        unsafe {
+            FD_ZERO(exceptfds);
+        }
+    }
     let mut hits = 0;
     for i in 0..count {
         let p = pf[i];
-        if p.revents == 0 { continue; }
+        if p.revents == 0 {
+            continue;
+        }
         if (p.revents & POLLIN) != 0 && !readfds.is_null() {
-            unsafe { FD_SET(p.fd, readfds); }
+            unsafe {
+                FD_SET(p.fd, readfds);
+            }
         }
         if (p.revents & POLLOUT) != 0 && !writefds.is_null() {
-            unsafe { FD_SET(p.fd, writefds); }
+            unsafe {
+                FD_SET(p.fd, writefds);
+            }
         }
         if (p.revents & POLLPRI) != 0 && !exceptfds.is_null() {
-            unsafe { FD_SET(p.fd, exceptfds); }
+            unsafe {
+                FD_SET(p.fd, exceptfds);
+            }
         }
         hits += 1;
     }
@@ -247,7 +307,7 @@ pub const EPOLL_CTL_ADD: c_int = 1;
 pub const EPOLL_CTL_DEL: c_int = 2;
 pub const EPOLL_CTL_MOD: c_int = 3;
 
-pub const EPOLLIN:  u32 = 0x0001;
+pub const EPOLLIN: u32 = 0x0001;
 pub const EPOLLOUT: u32 = 0x0004;
 pub const EPOLLERR: u32 = 0x0008;
 pub const EPOLLHUP: u32 = 0x0010;
@@ -262,7 +322,7 @@ pub struct epoll_data {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct epoll_event {
     pub events: u32,
-    pub data:   epoll_data,
+    pub data: epoll_data,
 }
 
 /// `epoll_create(size)` — `size` is ignored per Linux 2.6.8+;
@@ -281,13 +341,15 @@ pub unsafe extern "C" fn epoll_create1(flags: c_int) -> c_int {
 /// `epoll_ctl(epfd, op, fd, *event)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_ctl(
-    epfd:  c_int,
-    op:    c_int,
-    fd:    c_int,
+    epfd: c_int,
+    op: c_int,
+    fd: c_int,
     event: *mut epoll_event,
 ) -> c_int {
     let r = narf_user_runtime::epoll_ctl(epfd, op as u32, fd, event as *const u8);
-    if r < 0 { crate::errno::set_errno(22); }
+    if r < 0 {
+        crate::errno::set_errno(22);
+    }
     r
 }
 
@@ -296,14 +358,18 @@ pub unsafe extern "C" fn epoll_ctl(
 /// `poll()` does.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn epoll_wait(
-    epfd:      c_int,
-    events:    *mut epoll_event,
+    epfd: c_int,
+    events: *mut epoll_event,
     maxevents: c_int,
-    timeout:   c_int,
+    timeout: c_int,
 ) -> c_int {
-    let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = crate::time::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
-    let now_ns = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+    let now_ns = (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64);
     let deadline_ns: Option<u64> = match timeout {
         n if n < 0 => None,
@@ -312,14 +378,25 @@ pub unsafe extern "C" fn epoll_wait(
     };
     loop {
         let r = narf_user_runtime::epoll_wait(epfd, events as *mut u8, maxevents, 0);
-        if r > 0 { return r; }
-        if r < 0 { crate::errno::set_errno(22); return -1; }
+        if r > 0 {
+            return r;
+        }
+        if r < 0 {
+            crate::errno::set_errno(22);
+            return -1;
+        }
         if let Some(dl) = deadline_ns {
-            let mut ts = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
+            let mut ts = crate::time::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
             let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
-            let now = (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+            let now = (ts.tv_sec as u64)
+                .saturating_mul(1_000_000_000)
                 .saturating_add(ts.tv_nsec as u64);
-            if now >= dl { return 0; }
+            if now >= dl {
+                return 0;
+            }
         }
         let _ = unsafe { crate::process::usleep(1000) };
     }
@@ -343,24 +420,21 @@ pub unsafe extern "C" fn timerfd_create(clockid: c_int, flags: c_int) -> c_int {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct itimerspec {
     pub it_interval: crate::time::timespec,
-    pub it_value:    crate::time::timespec,
+    pub it_value: crate::time::timespec,
 }
 
 /// `timerfd_settime(fd, flags, *new, *old)` — arm the timer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timerfd_settime(
-    fd:    c_int,
+    fd: c_int,
     flags: c_int,
-    new:   *const itimerspec,
-    old:   *mut itimerspec,
+    new: *const itimerspec,
+    old: *mut itimerspec,
 ) -> c_int {
-    let r = narf_user_runtime::timerfd_settime(
-        fd,
-        flags as u32,
-        new as *const u8,
-        old as *mut u8,
-    );
-    if r < 0 { crate::errno::set_errno(22); }
+    let r = narf_user_runtime::timerfd_settime(fd, flags as u32, new as *const u8, old as *mut u8);
+    if r < 0 {
+        crate::errno::set_errno(22);
+    }
     r
 }
 
@@ -374,18 +448,11 @@ pub unsafe extern "C" fn timerfd_gettime(_fd: c_int, _cur: *mut itimerspec) -> c
 /// `signalfd(fd, *mask, flags)` — receive signals via an fd.
 /// `mask` is a `sigset_t`-shaped 8-byte bitmask.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn signalfd(
-    fd:    c_int,
-    mask:  *const c_void,
-    flags: c_int,
-) -> c_int {
-    let r = narf_user_runtime::signalfd(
-        fd,
-        mask as *const u64,
-        8,
-        flags as u32,
-    );
-    if r < 0 { crate::errno::set_errno(22); }
+pub unsafe extern "C" fn signalfd(fd: c_int, mask: *const c_void, flags: c_int) -> c_int {
+    let r = narf_user_runtime::signalfd(fd, mask as *const u64, 8, flags as u32);
+    if r < 0 {
+        crate::errno::set_errno(22);
+    }
     r
 }
 
@@ -397,18 +464,15 @@ pub unsafe extern "C" fn signalfd(
 /// Reference: musl `src/signal/signalfd.c`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn signalfd4(
-    fd:       c_int,
-    mask:     *const c_void,
+    fd: c_int,
+    mask: *const c_void,
     sizemask: usize,
-    flags:    c_int,
+    flags: c_int,
 ) -> c_int {
-    let r = narf_user_runtime::signalfd(
-        fd,
-        mask as *const u64,
-        sizemask,
-        flags as u32,
-    );
-    if r < 0 { crate::errno::set_errno(22); }
+    let r = narf_user_runtime::signalfd(fd, mask as *const u64, sizemask, flags as u32);
+    if r < 0 {
+        crate::errno::set_errno(22);
+    }
     r
 }
 
@@ -438,28 +502,30 @@ pub union sigval {
 }
 
 impl Default for sigval {
-    fn default() -> Self { Self { sival_int: 0 } }
+    fn default() -> Self {
+        Self { sival_int: 0 }
+    }
 }
 
 /// `<signal.h>` `struct sigevent` — describes how the timer
 /// notifies the process on expiry.
 #[repr(C)]
 pub struct sigevent {
-    pub sigev_value:    sigval,
-    pub sigev_signo:    c_int,
-    pub sigev_notify:   c_int,
-    pub sigev_pad:      [u8; 52],
+    pub sigev_value: sigval,
+    pub sigev_signo: c_int,
+    pub sigev_notify: c_int,
+    pub sigev_pad: [u8; 52],
 }
 
 pub const SIGEV_SIGNAL: c_int = 0;
-pub const SIGEV_NONE:   c_int = 1;
+pub const SIGEV_NONE: c_int = 1;
 pub const SIGEV_THREAD: c_int = 2;
 
 /// Per-process timer table. Each slot holds the kernel timerfd
 /// + the signum to deliver on expiry (or 0 for SIGEV_NONE).
 struct PosixTimer {
     timerfd: c_int,
-    signum:  c_int,
+    signum: c_int,
 }
 
 const MAX_POSIX_TIMERS: usize = 32;
@@ -474,7 +540,7 @@ static mut POSIX_TIMERS: [Option<PosixTimer>; MAX_POSIX_TIMERS] =
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_create(
     clockid: c_int,
-    evp:     *const sigevent,
+    evp: *const sigevent,
     timerid: *mut timer_t,
 ) -> c_int {
     if timerid.is_null() {
@@ -502,7 +568,10 @@ pub unsafe extern "C" fn timer_create(
         let mut found: Option<usize> = None;
         for i in 0..MAX_POSIX_TIMERS {
             if POSIX_TIMERS[i].is_none() {
-                POSIX_TIMERS[i] = Some(PosixTimer { timerfd: tfd, signum });
+                POSIX_TIMERS[i] = Some(PosixTimer {
+                    timerfd: tfd,
+                    signum,
+                });
                 found = Some(i);
                 break;
             }
@@ -516,7 +585,9 @@ pub unsafe extern "C" fn timer_create(
             return -1;
         }
     };
-    unsafe { *timerid = id; }
+    unsafe {
+        *timerid = id;
+    }
     0
 }
 
@@ -524,7 +595,7 @@ pub unsafe extern "C" fn timer_create(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_settime(
     timerid: timer_t,
-    flags:   c_int,
+    flags: c_int,
     new_value: *const itimerspec,
     old_value: *mut itimerspec,
 ) -> c_int {
@@ -548,12 +619,13 @@ pub unsafe extern "C" fn timer_settime(
 /// `timer_gettime(timerid, cur)` — query remaining time. Stage-1
 /// returns zeros (the kernel doesn't yet expose timerfd_gettime).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn timer_gettime(
-    _timerid: timer_t,
-    cur:      *mut itimerspec,
-) -> c_int {
-    if cur.is_null() { return -1; }
-    unsafe { *cur = itimerspec::default(); }
+pub unsafe extern "C" fn timer_gettime(_timerid: timer_t, cur: *mut itimerspec) -> c_int {
+    if cur.is_null() {
+        return -1;
+    }
+    unsafe {
+        *cur = itimerspec::default();
+    }
     0
 }
 

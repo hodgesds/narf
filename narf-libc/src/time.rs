@@ -7,20 +7,20 @@
 
 #![allow(non_camel_case_types)]
 
-pub type time_t      = i64;
+pub type time_t = i64;
 pub type suseconds_t = i64;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct timespec {
-    pub tv_sec:  time_t,
+    pub tv_sec: time_t,
     pub tv_nsec: i64,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct timeval {
-    pub tv_sec:  time_t,
+    pub tv_sec: time_t,
     pub tv_usec: suseconds_t,
 }
 
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec) -> i32 {
     let (sec, nsec) = narf_user_runtime::clock_gettime(clk_id as u32);
     // SAFETY: caller supplies a writable timespec; we write one.
     unsafe {
-        (*tp).tv_sec  = sec;
+        (*tp).tv_sec = sec;
         (*tp).tv_nsec = nsec;
     }
     0
@@ -48,7 +48,9 @@ pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec) -> i32 {
 /// `tp` must be a valid `*const timespec`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clock_settime(clk_id: i32, tp: *const timespec) -> i32 {
-    if tp.is_null() { return -1; }
+    if tp.is_null() {
+        return -1;
+    }
     // SAFETY: caller-asserted readable timespec.
     let ts = unsafe { *tp };
     narf_user_runtime::clock_settime(clk_id as u32, ts.tv_sec, ts.tv_nsec)
@@ -60,11 +62,10 @@ pub unsafe extern "C" fn clock_settime(clk_id: i32, tp: *const timespec) -> i32 
 /// # Safety
 /// `tv`, when non-null, must be a valid `*const timeval`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn settimeofday(
-    tv: *const timeval,
-    _tz: *mut core::ffi::c_void,
-) -> i32 {
-    if tv.is_null() { return -1; }
+pub unsafe extern "C" fn settimeofday(tv: *const timeval, _tz: *mut core::ffi::c_void) -> i32 {
+    if tv.is_null() {
+        return -1;
+    }
     // SAFETY: caller-asserted readable timeval.
     let v = unsafe { *tv };
     narf_user_runtime::clock_settime(0, v.tv_sec, v.tv_usec * 1_000)
@@ -77,7 +78,9 @@ pub unsafe extern "C" fn time(t: *mut time_t) -> time_t {
     let (sec, _nsec) = narf_user_runtime::clock_gettime(0);
     if !t.is_null() {
         // SAFETY: caller-supplied writable `time_t`.
-        unsafe { *t = sec; }
+        unsafe {
+            *t = sec;
+        }
     }
     sec
 }
@@ -103,14 +106,14 @@ pub unsafe extern "C" fn time(t: *mut time_t) -> time_t {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct tm {
-    pub tm_sec:   i32,
-    pub tm_min:   i32,
-    pub tm_hour:  i32,
-    pub tm_mday:  i32,
-    pub tm_mon:   i32,
-    pub tm_year:  i32,
-    pub tm_wday:  i32,
-    pub tm_yday:  i32,
+    pub tm_sec: i32,
+    pub tm_min: i32,
+    pub tm_hour: i32,
+    pub tm_mday: i32,
+    pub tm_mon: i32,
+    pub tm_year: i32,
+    pub tm_wday: i32,
+    pub tm_yday: i32,
     pub tm_isdst: i32,
 }
 
@@ -121,8 +124,7 @@ fn days_from_civil(mut y: i64, m: u32, d: u32) -> i64 {
     y -= (m <= 2) as i64;
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5
-        + d as u64 - 1;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe as i64 - 719468
 }
@@ -133,11 +135,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y   = yoe as i64 + era * 400;
+    let y = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let d   = doy - (153 * mp + 2) / 5 + 1;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
     (y + (m <= 2) as i64, m as u32, d as u32)
 }
 
@@ -154,8 +156,11 @@ pub unsafe extern "C" fn gmtime_r(timep: *const time_t, result: *mut tm) -> *mut
     // SAFETY: caller-supplied valid pointer.
     let secs = unsafe { *timep };
     let mut days = secs.div_euclid(86_400);
-    let mut tod  = secs.rem_euclid(86_400);
-    if tod < 0 { tod += 86_400; days -= 1; }
+    let mut tod = secs.rem_euclid(86_400);
+    if tod < 0 {
+        tod += 86_400;
+        days -= 1;
+    }
     let (y, m, d) = civil_from_days(days);
     // tm_wday: 1970-01-01 was a Thursday (=4). days % 7 (with euclid
     // remainder) gives 0..=6 starting at Sunday because we offset.
@@ -168,14 +173,14 @@ pub unsafe extern "C" fn gmtime_r(timep: *const time_t, result: *mut tm) -> *mut
     let s = (tod % 60) as i32;
     // SAFETY: `result` is a writable `tm`.
     unsafe {
-        (*result).tm_sec   = s;
-        (*result).tm_min   = mn;
-        (*result).tm_hour  = h;
-        (*result).tm_mday  = d as i32;
-        (*result).tm_mon   = (m as i32) - 1;
-        (*result).tm_year  = (y - 1900) as i32;
-        (*result).tm_wday  = wday;
-        (*result).tm_yday  = yday;
+        (*result).tm_sec = s;
+        (*result).tm_min = mn;
+        (*result).tm_hour = h;
+        (*result).tm_mday = d as i32;
+        (*result).tm_mon = (m as i32) - 1;
+        (*result).tm_year = (y - 1900) as i32;
+        (*result).tm_wday = wday;
+        (*result).tm_yday = yday;
         (*result).tm_isdst = 0;
     }
     result
@@ -193,8 +198,15 @@ pub unsafe extern "C" fn localtime_r(timep: *const time_t, result: *mut tm) -> *
 /// Static fallback used by `gmtime`/`localtime`. Single-threaded
 /// user-mode means no race; when threads land, swap to TLS.
 static mut TM_STATIC: tm = tm {
-    tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0,
-    tm_year: 0, tm_wday: 0, tm_yday: 0, tm_isdst: 0,
+    tm_sec: 0,
+    tm_min: 0,
+    tm_hour: 0,
+    tm_mday: 0,
+    tm_mon: 0,
+    tm_year: 0,
+    tm_wday: 0,
+    tm_yday: 0,
+    tm_isdst: 0,
 };
 
 /// `gmtime(time)` — non-reentrant variant returning a pointer to a
@@ -244,13 +256,12 @@ pub unsafe extern "C" fn mktime(t: *mut tm) -> time_t {
     let mon = v.tm_mon.rem_euclid(12) + 1;
     let year = (v.tm_year + 1900) as i64 + extra_years as i64;
     let days = days_from_civil(year, mon as u32, v.tm_mday as u32);
-    let secs = days * 86_400
-        + v.tm_hour as i64 * 3600
-        + v.tm_min  as i64 * 60
-        + v.tm_sec  as i64;
+    let secs = days * 86_400 + v.tm_hour as i64 * 3600 + v.tm_min as i64 * 60 + v.tm_sec as i64;
     // Normalise wday / yday by round-tripping.
     // SAFETY: caller-supplied writable `tm`.
-    unsafe { let _ = gmtime_r(&secs as *const time_t, t); }
+    unsafe {
+        let _ = gmtime_r(&secs as *const time_t, t);
+    }
     secs
 }
 
@@ -279,27 +290,41 @@ pub unsafe extern "C" fn difftime(end: time_t, beg: time_t) -> f64 {
 //   %p  AM/PM
 //   %%  literal %
 
-const WDAY_SHORT: [&[u8]; 7] = [
-    b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat",
-];
+const WDAY_SHORT: [&[u8]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
 const WDAY_LONG: [&[u8]; 7] = [
-    b"Sunday", b"Monday", b"Tuesday", b"Wednesday",
-    b"Thursday", b"Friday", b"Saturday",
+    b"Sunday",
+    b"Monday",
+    b"Tuesday",
+    b"Wednesday",
+    b"Thursday",
+    b"Friday",
+    b"Saturday",
 ];
 const MON_SHORT: [&[u8]; 12] = [
-    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun",
-    b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
 ];
 const MON_LONG: [&[u8]; 12] = [
-    b"January", b"February", b"March", b"April", b"May", b"June",
-    b"July", b"August", b"September", b"October", b"November", b"December",
+    b"January",
+    b"February",
+    b"March",
+    b"April",
+    b"May",
+    b"June",
+    b"July",
+    b"August",
+    b"September",
+    b"October",
+    b"November",
+    b"December",
 ];
 
 /// Helper: emit `bytes` into `out` at `*pos`, capped at `out.len()`.
 /// Returns the number of bytes written.
 fn emit(out: &mut [u8], pos: &mut usize, bytes: &[u8]) -> usize {
     let cap = out.len();
-    if *pos >= cap { return 0; }
+    if *pos >= cap {
+        return 0;
+    }
     let room = cap - *pos;
     let n = bytes.len().min(room);
     out[*pos..*pos + n].copy_from_slice(&bytes[..n]);
@@ -368,12 +393,7 @@ fn emit_pad_space(out: &mut [u8], pos: &mut usize, v: u64, w: usize) -> usize {
 /// `buf` must point to `max` writable bytes; `fmt` must be a
 /// NUL-terminated C string; `tm` must be a valid `*const tm`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn strftime(
-    buf: *mut u8,
-    max: usize,
-    fmt: *const u8,
-    t: *const tm,
-) -> usize {
+pub unsafe extern "C" fn strftime(buf: *mut u8, max: usize, fmt: *const u8, t: *const tm) -> usize {
     if buf.is_null() || fmt.is_null() || t.is_null() || max == 0 {
         return 0;
     }
@@ -388,7 +408,9 @@ pub unsafe extern "C" fn strftime(
     loop {
         // SAFETY: NUL-terminated per caller.
         let b = unsafe { *fmt.add(fi) };
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         if b == b'%' {
             // SAFETY: same.
             let conv = unsafe { *fmt.add(fi + 1) };
@@ -397,15 +419,33 @@ pub unsafe extern "C" fn strftime(
                 break;
             }
             match conv {
-                b'Y' => { emit_pad_uint(out, &mut pos, (tm_v.tm_year + 1900) as u64, 4); }
-                b'y' => { emit_pad_uint(out, &mut pos, ((tm_v.tm_year + 1900) % 100) as u64, 2); }
-                b'm' => { emit_pad_uint(out, &mut pos, (tm_v.tm_mon + 1) as u64, 2); }
-                b'd' => { emit_pad_uint(out, &mut pos, tm_v.tm_mday as u64, 2); }
-                b'e' => { emit_pad_space(out, &mut pos, tm_v.tm_mday as u64, 2); }
-                b'H' => { emit_pad_uint(out, &mut pos, tm_v.tm_hour as u64, 2); }
-                b'M' => { emit_pad_uint(out, &mut pos, tm_v.tm_min as u64, 2); }
-                b'S' => { emit_pad_uint(out, &mut pos, tm_v.tm_sec as u64, 2); }
-                b'j' => { emit_pad_uint(out, &mut pos, (tm_v.tm_yday + 1) as u64, 3); }
+                b'Y' => {
+                    emit_pad_uint(out, &mut pos, (tm_v.tm_year + 1900) as u64, 4);
+                }
+                b'y' => {
+                    emit_pad_uint(out, &mut pos, ((tm_v.tm_year + 1900) % 100) as u64, 2);
+                }
+                b'm' => {
+                    emit_pad_uint(out, &mut pos, (tm_v.tm_mon + 1) as u64, 2);
+                }
+                b'd' => {
+                    emit_pad_uint(out, &mut pos, tm_v.tm_mday as u64, 2);
+                }
+                b'e' => {
+                    emit_pad_space(out, &mut pos, tm_v.tm_mday as u64, 2);
+                }
+                b'H' => {
+                    emit_pad_uint(out, &mut pos, tm_v.tm_hour as u64, 2);
+                }
+                b'M' => {
+                    emit_pad_uint(out, &mut pos, tm_v.tm_min as u64, 2);
+                }
+                b'S' => {
+                    emit_pad_uint(out, &mut pos, tm_v.tm_sec as u64, 2);
+                }
+                b'j' => {
+                    emit_pad_uint(out, &mut pos, (tm_v.tm_yday + 1) as u64, 3);
+                }
                 b'a' => {
                     let i = (tm_v.tm_wday.rem_euclid(7)) as usize;
                     emit(out, &mut pos, WDAY_SHORT[i]);
@@ -425,7 +465,9 @@ pub unsafe extern "C" fn strftime(
                 b'p' => {
                     emit(out, &mut pos, if tm_v.tm_hour < 12 { b"AM" } else { b"PM" });
                 }
-                b'%' => { emit(out, &mut pos, b"%"); }
+                b'%' => {
+                    emit(out, &mut pos, b"%");
+                }
                 other => {
                     // Unknown conversion — emit %X verbatim.
                     let tmp = [b'%', other];
@@ -490,8 +532,8 @@ pub unsafe extern "C" fn ctime(timep: *const time_t) -> *mut u8 {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct tms {
-    pub tms_utime:  i64,
-    pub tms_stime:  i64,
+    pub tms_utime: i64,
+    pub tms_stime: i64,
     pub tms_cutime: i64,
     pub tms_cstime: i64,
 }
@@ -513,8 +555,8 @@ pub unsafe extern "C" fn times(buf: *mut tms) -> i64 {
     let wall = narf_user_runtime::times(&mut tmp);
     // SAFETY: caller-supplied writable struct.
     unsafe {
-        (*buf).tms_utime  = tmp[0];
-        (*buf).tms_stime  = tmp[1];
+        (*buf).tms_utime = tmp[0];
+        (*buf).tms_stime = tmp[1];
         (*buf).tms_cutime = tmp[2];
         (*buf).tms_cstime = tmp[3];
     }
@@ -535,17 +577,14 @@ pub unsafe extern "C" fn clock() -> i64 {
 /// the legacy `struct timezone *` — POSIX deprecated it; we ignore
 /// it. Returns 0 on success, -1 if `tv` is null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn gettimeofday(
-    tv: *mut timeval,
-    _tz: *mut core::ffi::c_void,
-) -> i32 {
+pub unsafe extern "C" fn gettimeofday(tv: *mut timeval, _tz: *mut core::ffi::c_void) -> i32 {
     if tv.is_null() {
         return -1;
     }
     let (sec, nsec) = narf_user_runtime::clock_gettime(0);
     // SAFETY: caller supplies a writable timeval.
     unsafe {
-        (*tv).tv_sec  = sec;
+        (*tv).tv_sec = sec;
         (*tv).tv_usec = nsec / 1_000;
     }
     0
@@ -563,7 +602,9 @@ pub unsafe extern "C" fn gettimeofday(
 /// must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> i32 {
-    if req.is_null() { return -1; }
+    if req.is_null() {
+        return -1;
+    }
     // SAFETY: caller asserts `req` is readable.
     let r = unsafe { *req };
     if r.tv_sec < 0 || r.tv_nsec < 0 || r.tv_nsec >= 1_000_000_000 {
@@ -576,7 +617,12 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
     let res = narf_user_runtime::nanosleep(ns);
     if !rem.is_null() {
         // SAFETY: caller-asserted writable.
-        unsafe { *rem = timespec { tv_sec: 0, tv_nsec: 0 }; }
+        unsafe {
+            *rem = timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+        }
     }
     res
 }
@@ -608,7 +654,12 @@ pub const CLOCK_BOOTTIME: i32 = 7;
 pub unsafe extern "C" fn clock_getres(_clk_id: i32, res: *mut timespec) -> i32 {
     if !res.is_null() {
         // SAFETY: caller-asserted writable.
-        unsafe { *res = timespec { tv_sec: 0, tv_nsec: 1 }; }
+        unsafe {
+            *res = timespec {
+                tv_sec: 0,
+                tv_nsec: 1,
+            };
+        }
     }
     0
 }
@@ -624,11 +675,13 @@ pub unsafe extern "C" fn clock_getres(_clk_id: i32, res: *mut timespec) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn clock_nanosleep(
     clk_id: i32,
-    flags:  i32,
-    req:    *const timespec,
-    rem:    *mut timespec,
+    flags: i32,
+    req: *const timespec,
+    rem: *mut timespec,
 ) -> i32 {
-    if req.is_null() { return 22; }
+    if req.is_null() {
+        return 22;
+    }
     // SAFETY: caller-asserted readable timespec.
     let r = unsafe { *req };
     if r.tv_sec < 0 || r.tv_nsec < 0 || r.tv_nsec >= 1_000_000_000 {
@@ -677,8 +730,8 @@ pub struct sigval {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct sigevent {
-    pub sigev_value:  sigval,
-    pub sigev_signo:  i32,
+    pub sigev_value: sigval,
+    pub sigev_signo: i32,
     pub sigev_notify: i32,
     /// Padding to match the Linux `struct sigevent` size (64 bytes).
     pub _pad: [u8; 48],
@@ -687,8 +740,8 @@ pub struct sigevent {
 impl Default for sigevent {
     fn default() -> Self {
         Self {
-            sigev_value:  sigval::default(),
-            sigev_signo:  0,
+            sigev_value: sigval::default(),
+            sigev_signo: 0,
             sigev_notify: 0,
             _pad: [0u8; 48],
         }
@@ -701,7 +754,7 @@ impl Default for sigevent {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct itimerspec {
     pub it_interval: timespec,
-    pub it_value:    timespec,
+    pub it_value: timespec,
 }
 
 /// `timer_create(clockid, sevp, timerid)` — register a POSIX per-task
@@ -715,10 +768,12 @@ pub struct itimerspec {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_create(
     clockid: i32,
-    sevp:    *const sigevent,
+    sevp: *const sigevent,
     timerid: *mut timer_t,
 ) -> i32 {
-    if timerid.is_null() { return -1; }
+    if timerid.is_null() {
+        return -1;
+    }
     let mut raw_id: u64 = 0;
     let r = narf_user_runtime::timer_create(
         clockid as u32,
@@ -727,7 +782,9 @@ pub unsafe extern "C" fn timer_create(
     );
     if r == 0 {
         // SAFETY: caller-asserted writable `*mut timer_t`.
-        unsafe { *timerid = raw_id as timer_t; }
+        unsafe {
+            *timerid = raw_id as timer_t;
+        }
         0
     } else {
         -1
@@ -745,17 +802,23 @@ pub unsafe extern "C" fn timer_create(
 /// non-null, must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn timer_settime(
-    timerid:   timer_t,
-    flags:     i32,
+    timerid: timer_t,
+    flags: i32,
     new_value: *const itimerspec,
     old_value: *mut itimerspec,
 ) -> i32 {
-    if new_value.is_null() { return -1; }
+    if new_value.is_null() {
+        return -1;
+    }
     narf_user_runtime::timer_settime(
         timerid as u32,
         flags as u32,
         new_value as u64,
-        if old_value.is_null() { 0 } else { old_value as u64 },
+        if old_value.is_null() {
+            0
+        } else {
+            old_value as u64
+        },
     )
 }
 
@@ -766,11 +829,10 @@ pub unsafe extern "C" fn timer_settime(
 /// # Safety
 /// `curr_value` must be a writable `*mut itimerspec`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn timer_gettime(
-    timerid:    timer_t,
-    curr_value: *mut itimerspec,
-) -> i32 {
-    if curr_value.is_null() { return -1; }
+pub unsafe extern "C" fn timer_gettime(timerid: timer_t, curr_value: *mut itimerspec) -> i32 {
+    if curr_value.is_null() {
+        return -1;
+    }
     narf_user_runtime::timer_gettime(timerid as u32, curr_value as u64)
 }
 

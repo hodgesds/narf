@@ -36,8 +36,8 @@ type CmpFn = unsafe extern "C" fn(*const c_void, *const c_void) -> c_int;
 
 #[repr(C)]
 struct TNode {
-    key:   *const c_void,
-    left:  *mut TNode,
+    key: *const c_void,
+    left: *mut TNode,
     right: *mut TNode,
 }
 
@@ -65,8 +65,8 @@ unsafe fn tnode_alloc(key: *const c_void) -> *mut TNode {
 /// `compar` must be a valid `CmpFn`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tsearch(
-    key:    *const c_void,
-    rootp:  *mut *mut c_void,
+    key: *const c_void,
+    rootp: *mut *mut c_void,
     compar: CmpFn,
 ) -> *mut c_void {
     if rootp.is_null() {
@@ -104,8 +104,8 @@ pub unsafe extern "C" fn tsearch(
 /// `rootp` must point to a readable `*mut TNode`-shaped slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tfind(
-    key:    *const c_void,
-    rootp:  *const *mut c_void,
+    key: *const c_void,
+    rootp: *const *mut c_void,
     compar: CmpFn,
 ) -> *mut c_void {
     if rootp.is_null() {
@@ -136,8 +136,8 @@ pub unsafe extern "C" fn tfind(
 /// Same as `tsearch`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tdelete(
-    key:    *const c_void,
-    rootp:  *mut *mut c_void,
+    key: *const c_void,
+    rootp: *mut *mut c_void,
     compar: CmpFn,
 ) -> *mut c_void {
     if rootp.is_null() {
@@ -159,8 +159,7 @@ pub unsafe extern "C" fn tdelete(
                 } else {
                     // Find inorder successor (leftmost of right
                     // subtree), unlink it, and patch in.
-                    let mut succ_parent: *mut *mut TNode =
-                        &mut (*n).right as *mut *mut TNode;
+                    let mut succ_parent: *mut *mut TNode = &mut (*n).right as *mut *mut TNode;
                     while !(**succ_parent).left.is_null() {
                         succ_parent = &mut (**succ_parent).left as *mut *mut TNode;
                     }
@@ -189,10 +188,10 @@ pub unsafe extern "C" fn tdelete(
 }
 
 /// VISIT enumeration for `twalk`. Numeric values per SUSv4 `<search.h>`.
-pub const PREORDER:  c_int = 0;
+pub const PREORDER: c_int = 0;
 pub const POSTORDER: c_int = 1;
-pub const ENDORDER:  c_int = 2;
-pub const LEAF:      c_int = 3;
+pub const ENDORDER: c_int = 2;
+pub const LEAF: c_int = 3;
 
 type WalkAction = unsafe extern "C" fn(*const c_void, c_int, c_int);
 
@@ -226,7 +225,9 @@ unsafe fn twalk_recurse(node: *const TNode, depth: c_int, action: WalkAction) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn twalk(root: *const c_void, action: WalkAction) {
     // SAFETY: forwarded.
-    unsafe { twalk_recurse(root as *const TNode, 0, action); }
+    unsafe {
+        twalk_recurse(root as *const TNode, 0, action);
+    }
 }
 
 // ── utmp ────────────────────────────────────────────────────────────
@@ -236,17 +237,17 @@ pub unsafe extern "C" fn twalk(root: *const c_void, action: WalkAction) {
 /// fields most callers touch.
 #[repr(C)]
 pub struct utmp {
-    pub ut_type:    i16,
-    pub ut_pid:     i32,
-    pub ut_line:    [c_char; 32],
-    pub ut_id:      [c_char; 4],
-    pub ut_user:    [c_char; 32],
-    pub ut_host:    [c_char; 256],
-    pub ut_exit:    [i32; 2],
+    pub ut_type: i16,
+    pub ut_pid: i32,
+    pub ut_line: [c_char; 32],
+    pub ut_id: [c_char; 4],
+    pub ut_user: [c_char; 32],
+    pub ut_host: [c_char; 256],
+    pub ut_exit: [i32; 2],
     pub ut_session: i32,
-    pub ut_tv:      [i32; 2],
+    pub ut_tv: [i32; 2],
     pub ut_addr_v6: [i32; 4],
-    pub __unused:   [c_char; 20],
+    pub __unused: [c_char; 20],
 }
 
 /// `setutent()` — rewind the utmp iterator. No-op.
@@ -293,15 +294,15 @@ pub unsafe extern "C" fn utmpname(_file: *const c_char) -> c_int {
 /// `sizeof(struct crypt_data)` lines up.
 #[repr(C)]
 pub struct crypt_data {
-    pub keysched:    [c_char; 16 * 8],
-    pub sb0:         [c_char; 32768],
-    pub sb1:         [c_char; 32768],
-    pub sb2:         [c_char; 32768],
-    pub sb3:         [c_char; 32768],
+    pub keysched: [c_char; 16 * 8],
+    pub sb0: [c_char; 32768],
+    pub sb1: [c_char; 32768],
+    pub sb2: [c_char; 32768],
+    pub sb3: [c_char; 32768],
     pub crypt_3_buf: [c_char; 14],
-    pub current_salt:[c_char; 2],
+    pub current_salt: [c_char; 2],
     pub current_saltbits: i64,
-    pub direction:   c_int,
+    pub direction: c_int,
     pub initialized: c_int,
 }
 
@@ -324,7 +325,7 @@ pub unsafe extern "C" fn crypt(_key: *const c_char, _salt: *const c_char) -> *mu
 /// we don't touch it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn crypt_r(
-    _key:  *const c_char,
+    _key: *const c_char,
     _salt: *const c_char,
     _data: *mut crypt_data,
 ) -> *mut c_char {

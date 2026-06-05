@@ -29,12 +29,12 @@ pub const SIG_IGN_RAW: usize = 1;
 
 /// POSIX signal numbers we expose. The kernel's vector→signum
 /// mapping in `sys_signal_dispatch` already uses these values.
-pub const SIGHUP:  c_int = 1;
-pub const SIGINT:  c_int = 2;
+pub const SIGHUP: c_int = 1;
+pub const SIGINT: c_int = 2;
 pub const SIGQUIT: c_int = 3;
-pub const SIGILL:  c_int = 4;
+pub const SIGILL: c_int = 4;
 pub const SIGABRT: c_int = 6;
-pub const SIGFPE:  c_int = 8;
+pub const SIGFPE: c_int = 8;
 pub const SIGKILL: c_int = 9;
 pub const SIGSEGV: c_int = 11;
 pub const SIGPIPE: c_int = 13;
@@ -135,9 +135,7 @@ pub unsafe extern "C" fn signal(signum: c_int, handler: usize) -> usize {
     // kernel returns is the previously-registered trampoline addr,
     // which is uninteresting to the caller — we hand back our own
     // tracked prior instead.
-    let _kprior = unsafe {
-        narf_user_runtime::sigaction(signum as u32, kernel_handler)
-    };
+    let _kprior = unsafe { narf_user_runtime::sigaction(signum as u32, kernel_handler) };
     prior
 }
 
@@ -183,8 +181,8 @@ pub struct sigset_t {
 pub struct siginfo_t {
     pub si_signo: c_int,
     pub si_errno: c_int,
-    pub si_code:  c_int,
-    pub _pad:     [u8; 116], // matches glibc's 128-byte total
+    pub si_code: c_int,
+    pub _pad: [u8; 116], // matches glibc's 128-byte total
 }
 
 impl Default for siginfo_t {
@@ -201,41 +199,63 @@ impl Default for siginfo_t {
 /// `sigemptyset(set)` — clear all bits.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigemptyset(set: *mut sigset_t) -> c_int {
-    if set.is_null() { return -1; }
-    unsafe { (*set).bits = 0; }
+    if set.is_null() {
+        return -1;
+    }
+    unsafe {
+        (*set).bits = 0;
+    }
     0
 }
 
 /// `sigfillset(set)` — set all bits 1..=63.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigfillset(set: *mut sigset_t) -> c_int {
-    if set.is_null() { return -1; }
-    unsafe { (*set).bits = !0u64 & !1; } // bit 0 reserved
+    if set.is_null() {
+        return -1;
+    }
+    unsafe {
+        (*set).bits = !0u64 & !1;
+    } // bit 0 reserved
     0
 }
 
 /// `sigaddset(set, sig)` — bit-set.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, sig: c_int) -> c_int {
-    if set.is_null() || sig < 0 || sig > 63 { return -1; }
-    unsafe { (*set).bits |= 1u64 << sig; }
+    if set.is_null() || sig < 0 || sig > 63 {
+        return -1;
+    }
+    unsafe {
+        (*set).bits |= 1u64 << sig;
+    }
     0
 }
 
 /// `sigdelset(set, sig)` — bit-clear.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigdelset(set: *mut sigset_t, sig: c_int) -> c_int {
-    if set.is_null() || sig < 0 || sig > 63 { return -1; }
-    unsafe { (*set).bits &= !(1u64 << sig); }
+    if set.is_null() || sig < 0 || sig > 63 {
+        return -1;
+    }
+    unsafe {
+        (*set).bits &= !(1u64 << sig);
+    }
     0
 }
 
 /// `sigismember(set, sig)` — bit-test.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigismember(set: *const sigset_t, sig: c_int) -> c_int {
-    if set.is_null() || sig < 0 || sig > 63 { return -1; }
+    if set.is_null() || sig < 0 || sig > 63 {
+        return -1;
+    }
     unsafe {
-        if ((*set).bits >> sig) & 1 != 0 { 1 } else { 0 }
+        if ((*set).bits >> sig) & 1 != 0 {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -313,7 +333,9 @@ pub unsafe extern "C" fn sigwait(set: *const sigset_t, signo: *mut c_int) -> c_i
     if r < 0 {
         return crate::errno::errno();
     }
-    unsafe { *signo = r; }
+    unsafe {
+        *signo = r;
+    }
     0
 }
 
@@ -321,8 +343,8 @@ pub unsafe extern "C" fn sigwait(set: *const sigset_t, signo: *mut c_int) -> c_i
 /// an absolute timeout. EAGAIN on timeout.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigtimedwait(
-    set:    *const sigset_t,
-    info:   *mut siginfo_t,
+    set: *const sigset_t,
+    info: *mut siginfo_t,
     _timeout: *const crate::time::timespec,
 ) -> c_int {
     // Stage-1 simplification: forward to sigwaitinfo (the kernel
@@ -334,14 +356,20 @@ pub unsafe extern "C" fn sigtimedwait(
 /// `sigprocmask(how, set, oldset)` — POSIX-2017 signature.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigprocmask(
-    how:    c_int,
-    set:    *const sigset_t,
+    how: c_int,
+    set: *const sigset_t,
     oldset: *mut sigset_t,
 ) -> c_int {
-    let new_bits = if set.is_null() { 0u32 } else { unsafe { (*set).bits as u32 } };
+    let new_bits = if set.is_null() {
+        0u32
+    } else {
+        unsafe { (*set).bits as u32 }
+    };
     let prior = narf_user_runtime::sigprocmask(how as u32, new_bits);
     if !oldset.is_null() {
-        unsafe { (*oldset).bits = prior as u64; }
+        unsafe {
+            (*oldset).bits = prior as u64;
+        }
     }
     0
 }
@@ -363,7 +391,7 @@ pub unsafe extern "C" fn sigprocmask(
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct sigaction {
-    pub sa_handler: usize,   // SIG_DFL=0, SIG_IGN=1, or fn ptr
+    pub sa_handler: usize, // SIG_DFL=0, SIG_IGN=1, or fn ptr
     pub sa_flags: c_int,
     pub sa_restorer: usize,
     pub sa_mask: sigset_t,
@@ -383,10 +411,10 @@ impl Default for sigaction {
 /// SA_* flag bits (subset NARF surfaces).
 pub const SA_NOCLDSTOP: c_int = 1;
 pub const SA_NOCLDWAIT: c_int = 2;
-pub const SA_SIGINFO:   c_int = 4;
-pub const SA_ONSTACK:   c_int = 0x08000000;
-pub const SA_RESTART:   c_int = 0x10000000;
-pub const SA_NODEFER:   c_int = 0x40000000;
+pub const SA_SIGINFO: c_int = 4;
+pub const SA_ONSTACK: c_int = 0x08000000;
+pub const SA_RESTART: c_int = 0x10000000;
+pub const SA_NODEFER: c_int = 0x40000000;
 pub const SA_RESETHAND: c_int = 0x80000000u32 as c_int;
 
 /// `sigaction(signum, act, oldact)` — POSIX-2017 shape. Returns 0
@@ -400,7 +428,7 @@ pub const SA_RESETHAND: c_int = 0x80000000u32 as c_int;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigaction(
     signum: c_int,
-    act:    *const sigaction,
+    act: *const sigaction,
     oldact: *mut sigaction,
 ) -> c_int {
     if signum < 0 || (signum as usize) >= NSIG {
@@ -424,7 +452,9 @@ pub unsafe extern "C" fn sigaction(
     // SAFETY: caller-asserted readable.
     let new = unsafe { &*act };
     // SAFETY: single-threaded user mode.
-    unsafe { HANDLERS[s] = new.sa_handler; }
+    unsafe {
+        HANDLERS[s] = new.sa_handler;
+    }
     let kernel_handler = if new.sa_handler == SIG_DFL_RAW {
         0usize
     } else if new.sa_handler == SIG_IGN_RAW {
@@ -442,8 +472,12 @@ pub unsafe extern "C" fn sigaction(
 /// the empty mask (no signals queued from the user side).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigpending(set: *mut sigset_t) -> c_int {
-    if set.is_null() { return -1; }
-    unsafe { (*set).bits = 0; }
+    if set.is_null() {
+        return -1;
+    }
+    unsafe {
+        (*set).bits = 0;
+    }
     0
 }
 
@@ -451,15 +485,15 @@ pub unsafe extern "C" fn sigpending(set: *mut sigset_t) -> c_int {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct stack_t {
-    pub ss_sp:    *mut core::ffi::c_void,
+    pub ss_sp: *mut core::ffi::c_void,
     pub ss_flags: c_int,
-    pub ss_size:  usize,
+    pub ss_size: usize,
 }
 
-pub const SS_ONSTACK:    c_int = 1;
-pub const SS_DISABLE:    c_int = 2;
-pub const MINSIGSTKSZ:   usize = 2048;
-pub const SIGSTKSZ:      usize = 8192;
+pub const SS_ONSTACK: c_int = 1;
+pub const SS_DISABLE: c_int = 2;
+pub const MINSIGSTKSZ: usize = 2048;
+pub const SIGSTKSZ: usize = 8192;
 
 /// `sigaltstack(ss, old_ss)` — register an alternate signal stack.
 /// The kernel-side trampoline runs on the regular stack today;
@@ -475,7 +509,9 @@ pub unsafe extern "C" fn sigaltstack(ss: *const stack_t, old_ss: *mut stack_t) -
         ss_size: 0,
     };
     if !old_ss.is_null() {
-        unsafe { (*old_ss) = CURRENT; }
+        unsafe {
+            (*old_ss) = CURRENT;
+        }
     }
     if !ss.is_null() {
         unsafe {
@@ -517,18 +553,24 @@ pub unsafe extern "C" fn pause() -> c_int {
 /// to kill().
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_kill(thread: u64, signum: c_int) -> c_int {
-    if signum < 0 { return 22; }
+    if signum < 0 {
+        return 22;
+    }
     // SAFETY: same shape as kill; just a thread-typed pid.
     let r = unsafe { kill(thread as i64, signum) };
-    if r == 0 { 0 } else { 3 } // ESRCH
+    if r == 0 {
+        0
+    } else {
+        3
+    } // ESRCH
 }
 
 /// `pthread_sigmask(how, set, oldset)` — per-thread mask shape.
 /// NARF user mode is single-threaded today; alias of sigprocmask.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_sigmask(
-    how:    c_int,
-    set:    *const sigset_t,
+    how: c_int,
+    set: *const sigset_t,
     oldset: *mut sigset_t,
 ) -> c_int {
     // SAFETY: forwarded.

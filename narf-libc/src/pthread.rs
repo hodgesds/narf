@@ -51,8 +51,8 @@ pub const MAIN_THREAD: pthread_t = 1;
 #[derive(Copy, Clone, Debug, Default)]
 pub struct pthread_mutex_t {
     pub locked: u32,
-    pub _pad:   u32,
-    pub owner:  u64,
+    pub _pad: u32,
+    pub owner: u64,
 }
 
 #[repr(C)]
@@ -68,7 +68,9 @@ pub struct pthread_attr_t {
 }
 
 impl Default for pthread_attr_t {
-    fn default() -> Self { Self { _opaque: [0; 56] } }
+    fn default() -> Self {
+        Self { _opaque: [0; 56] }
+    }
 }
 
 #[repr(C)]
@@ -78,7 +80,9 @@ pub struct pthread_cond_t {
 }
 
 impl Default for pthread_cond_t {
-    fn default() -> Self { Self { _opaque: [0; 48] } }
+    fn default() -> Self {
+        Self { _opaque: [0; 48] }
+    }
 }
 
 #[repr(C)]
@@ -94,7 +98,9 @@ pub struct pthread_rwlock_t {
 }
 
 impl Default for pthread_rwlock_t {
-    fn default() -> Self { Self { _opaque: [0; 56] } }
+    fn default() -> Self {
+        Self { _opaque: [0; 56] }
+    }
 }
 
 #[repr(C)]
@@ -113,7 +119,7 @@ pub type pthread_key_t = u32;
 
 const MAX_KEYS: usize = 32;
 static mut TLS_VALUES: [usize; MAX_KEYS] = [0; MAX_KEYS];
-static mut TLS_USED:   [bool; MAX_KEYS]  = [false; MAX_KEYS];
+static mut TLS_USED: [bool; MAX_KEYS] = [false; MAX_KEYS];
 
 // ── thread identity ─────────────────────────────────────────────────
 
@@ -206,10 +212,10 @@ unsafe extern "C" fn __libc_thread_trampoline(ctl: *mut ThreadCtl) -> ! {
 /// be a valid SysV-shaped function pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_create(
-    thread:    *mut pthread_t,
-    _attr:     *const pthread_attr_t,
+    thread: *mut pthread_t,
+    _attr: *const pthread_attr_t,
     start_rtn: extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
-    arg:       *mut core::ffi::c_void,
+    arg: *mut core::ffi::c_void,
 ) -> c_int {
     if thread.is_null() {
         return EAGAIN;
@@ -217,7 +223,9 @@ pub unsafe extern "C" fn pthread_create(
     // Allocate stack + ctl in a single mmap (stack at the top, ctl
     // just below). 1 MiB stack + 32 B ctl, page-aligned.
     let total = THREAD_STACK_BYTES + 4096;
-    let base = unsafe { narf_user_runtime::mmap(0, total, 0x20 /* MAP_ANON */) };
+    let base = unsafe {
+        narf_user_runtime::mmap(0, total, 0x20 /* MAP_ANON */)
+    };
     if base.is_null() || base as usize == !0usize {
         return EAGAIN;
     }
@@ -226,13 +234,16 @@ pub unsafe extern "C" fn pthread_create(
     let ctl_ptr = base as *mut ThreadCtl;
     // SAFETY: just-mmap'd region, exclusive ownership.
     unsafe {
-        core::ptr::write(ctl_ptr, ThreadCtl {
-            start: start_rtn as usize,
-            arg,
-            retval: core::ptr::null_mut(),
-            done: 0,
-            _pad: 0,
-        });
+        core::ptr::write(
+            ctl_ptr,
+            ThreadCtl {
+                start: start_rtn as usize,
+                arg,
+                retval: core::ptr::null_mut(),
+                done: 0,
+                _pad: 0,
+            },
+        );
     }
     let stack_top = base + total as u64;
     // SAFETY: kernel-side clone validates entry/stack pointers.
@@ -293,7 +304,9 @@ pub unsafe extern "C" fn pthread_join(
     }
     if !retval.is_null() {
         // SAFETY: ctl is alive; trampoline stored retval before done=1.
-        unsafe { *retval = (*ctl_ptr).retval; }
+        unsafe {
+            *retval = (*ctl_ptr).retval;
+        }
     }
     0
 }
@@ -312,9 +325,13 @@ pub unsafe extern "C" fn pthread_detach(_thread: pthread_t) -> c_int {
 /// `attr` must be a writable pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_attr_init(attr: *mut pthread_attr_t) -> c_int {
-    if attr.is_null() { return -1; }
+    if attr.is_null() {
+        return -1;
+    }
     // SAFETY: caller-supplied.
-    unsafe { *attr = pthread_attr_t::default(); }
+    unsafe {
+        *attr = pthread_attr_t::default();
+    }
     0
 }
 
@@ -335,9 +352,13 @@ pub unsafe extern "C" fn pthread_mutex_init(
     mutex: *mut pthread_mutex_t,
     _attr: *const pthread_mutexattr_t,
 ) -> c_int {
-    if mutex.is_null() { return -1; }
+    if mutex.is_null() {
+        return -1;
+    }
     // SAFETY: caller-supplied.
-    unsafe { *mutex = pthread_mutex_t::default(); }
+    unsafe {
+        *mutex = pthread_mutex_t::default();
+    }
     0
 }
 
@@ -363,19 +384,24 @@ pub unsafe extern "C" fn pthread_mutex_destroy(_mutex: *mut pthread_mutex_t) -> 
 /// `mutex` must be a valid writable `*mut pthread_mutex_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_int {
-    if mutex.is_null() { return -1; }
+    if mutex.is_null() {
+        return -1;
+    }
     let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
     // Fast path: try uncontended acquire.
     let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
     if atomic
         .compare_exchange(
-            0, 1,
+            0,
+            1,
             core::sync::atomic::Ordering::Acquire,
             core::sync::atomic::Ordering::Relaxed,
         )
         .is_ok()
     {
-        unsafe { (*mutex).owner = pthread_self(); }
+        unsafe {
+            (*mutex).owner = pthread_self();
+        }
         return 0;
     }
     // Slow path: announce ourselves as a waiter, then park.
@@ -383,7 +409,9 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
         // Set state to "locked + waiters" (2). swap returns old.
         let old = atomic.swap(2, core::sync::atomic::Ordering::AcqRel);
         if old == 0 {
-            unsafe { (*mutex).owner = pthread_self(); }
+            unsafe {
+                (*mutex).owner = pthread_self();
+            }
             return 0;
         }
         // Park until *locked changes (the unlocker swaps it to 0).
@@ -398,16 +426,21 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
 /// 0 on success, EBUSY (16) if already locked.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c_int {
-    if mutex.is_null() { return -1; }
+    if mutex.is_null() {
+        return -1;
+    }
     let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
     let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
     match atomic.compare_exchange(
-        0, 1,
+        0,
+        1,
         core::sync::atomic::Ordering::Acquire,
         core::sync::atomic::Ordering::Relaxed,
     ) {
         Ok(_) => {
-            unsafe { (*mutex).owner = pthread_self(); }
+            unsafe {
+                (*mutex).owner = pthread_self();
+            }
             0
         }
         Err(_) => 16, // EBUSY
@@ -418,13 +451,17 @@ pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c
 /// (state was 2), wake one to retry the acquire.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_int {
-    if mutex.is_null() { return -1; }
+    if mutex.is_null() {
+        return -1;
+    }
     let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
     let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
     // Clear ownership before releasing — between the swap and
     // the wake any waiter that wins the race must see a clean
     // owner field.
-    unsafe { (*mutex).owner = 0; }
+    unsafe {
+        (*mutex).owner = 0;
+    }
     let old = atomic.swap(0, core::sync::atomic::Ordering::Release);
     if old == 2 {
         // There were waiters — wake one.
@@ -445,10 +482,12 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_
 /// must be a callable `extern "C" fn()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_once(
-    control:      *mut pthread_once_t,
+    control: *mut pthread_once_t,
     init_routine: extern "C" fn(),
 ) -> c_int {
-    if control.is_null() { return -1; }
+    if control.is_null() {
+        return -1;
+    }
     // SAFETY: caller-supplied valid pointer.
     unsafe {
         if (*control).state == 0 {
@@ -469,10 +508,12 @@ pub unsafe extern "C" fn pthread_once(
 /// `key` must be a writable `*mut pthread_key_t`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_key_create(
-    key:        *mut pthread_key_t,
-    _destructor:Option<extern "C" fn(*mut core::ffi::c_void)>,
+    key: *mut pthread_key_t,
+    _destructor: Option<extern "C" fn(*mut core::ffi::c_void)>,
 ) -> c_int {
-    if key.is_null() { return -1; }
+    if key.is_null() {
+        return -1;
+    }
     // SAFETY: single-threaded user mode.
     unsafe {
         for i in 0..MAX_KEYS {
@@ -491,7 +532,9 @@ pub unsafe extern "C" fn pthread_key_create(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_key_delete(key: pthread_key_t) -> c_int {
     let i = key as usize;
-    if i >= MAX_KEYS { return -1; }
+    if i >= MAX_KEYS {
+        return -1;
+    }
     // SAFETY: single-threaded.
     unsafe {
         TLS_USED[i] = false;
@@ -503,14 +546,18 @@ pub unsafe extern "C" fn pthread_key_delete(key: pthread_key_t) -> c_int {
 /// `pthread_setspecific(key, value)` — store `value` in the slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_setspecific(
-    key:   pthread_key_t,
+    key: pthread_key_t,
     value: *const core::ffi::c_void,
 ) -> c_int {
     let i = key as usize;
-    if i >= MAX_KEYS { return -1; }
+    if i >= MAX_KEYS {
+        return -1;
+    }
     // SAFETY: single-threaded.
     unsafe {
-        if !TLS_USED[i] { return -1; }
+        if !TLS_USED[i] {
+            return -1;
+        }
         TLS_VALUES[i] = value as usize;
     }
     0
@@ -521,10 +568,14 @@ pub unsafe extern "C" fn pthread_setspecific(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_getspecific(key: pthread_key_t) -> *mut core::ffi::c_void {
     let i = key as usize;
-    if i >= MAX_KEYS { return core::ptr::null_mut(); }
+    if i >= MAX_KEYS {
+        return core::ptr::null_mut();
+    }
     // SAFETY: single-threaded.
     unsafe {
-        if !TLS_USED[i] { return core::ptr::null_mut(); }
+        if !TLS_USED[i] {
+            return core::ptr::null_mut();
+        }
         TLS_VALUES[i] as *mut core::ffi::c_void
     }
 }
@@ -547,8 +598,12 @@ pub unsafe extern "C" fn pthread_cond_init(
     cond: *mut pthread_cond_t,
     _attr: *const pthread_condattr_t,
 ) -> c_int {
-    if cond.is_null() { return -1; }
-    unsafe { *cond = pthread_cond_t::default(); }
+    if cond.is_null() {
+        return -1;
+    }
+    unsafe {
+        *cond = pthread_cond_t::default();
+    }
     0
 }
 
@@ -562,10 +617,12 @@ pub unsafe extern "C" fn pthread_cond_destroy(_cond: *mut pthread_cond_t) -> c_i
 /// wait for a signal/broadcast on `cond`, re-acquire `mutex`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_wait(
-    cond:  *mut pthread_cond_t,
+    cond: *mut pthread_cond_t,
     mutex: *mut pthread_mutex_t,
 ) -> c_int {
-    if cond.is_null() || mutex.is_null() { return -1; }
+    if cond.is_null() || mutex.is_null() {
+        return -1;
+    }
     let seq_ptr = cond_seq_ptr(cond);
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     let seq = atomic.load(core::sync::atomic::Ordering::Acquire);
@@ -588,8 +645,8 @@ pub unsafe extern "C" fn pthread_cond_wait(
 /// `abstime` must point at a `timespec`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_timedwait(
-    cond:    *mut pthread_cond_t,
-    mutex:   *mut pthread_mutex_t,
+    cond: *mut pthread_cond_t,
+    mutex: *mut pthread_mutex_t,
     abstime: *const crate::time::timespec,
 ) -> c_int {
     if cond.is_null() || mutex.is_null() || abstime.is_null() {
@@ -600,23 +657,36 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
     let seq = atomic.load(core::sync::atomic::Ordering::Acquire);
     let _ = unsafe { pthread_mutex_unlock(mutex) };
     // Compute relative-ns timeout from the abstime (CLOCK_REALTIME).
-    let mut now = crate::time::timespec { tv_sec: 0, tv_nsec: 0 };
-    let _ = unsafe { crate::time::clock_gettime(0 /* REALTIME */, &mut now) };
+    let mut now = crate::time::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let _ = unsafe {
+        crate::time::clock_gettime(0 /* REALTIME */, &mut now)
+    };
     let abs = unsafe { *abstime };
-    let now_ns = (now.tv_sec as i64).saturating_mul(1_000_000_000)
+    let now_ns = (now.tv_sec as i64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(now.tv_nsec as i64);
-    let abs_ns = (abs.tv_sec as i64).saturating_mul(1_000_000_000)
+    let abs_ns = (abs.tv_sec as i64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(abs.tv_nsec as i64);
     let rel_ns = (abs_ns - now_ns).max(0) as u64;
     let r = narf_user_runtime::futex_wait(seq_ptr as u64, seq, rel_ns);
     let _ = unsafe { pthread_mutex_lock(mutex) };
-    if r < 0 { 110 /* ETIMEDOUT */ } else { 0 }
+    if r < 0 {
+        110 /* ETIMEDOUT */
+    } else {
+        0
+    }
 }
 
 /// `pthread_cond_signal(cond)` — wake one waiter.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int {
-    if cond.is_null() { return -1; }
+    if cond.is_null() {
+        return -1;
+    }
     let seq_ptr = cond_seq_ptr(cond);
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -627,7 +697,9 @@ pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int
 /// `pthread_cond_broadcast(cond)` — wake all waiters.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut pthread_cond_t) -> c_int {
-    if cond.is_null() { return -1; }
+    if cond.is_null() {
+        return -1;
+    }
     let seq_ptr = cond_seq_ptr(cond);
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -656,11 +728,15 @@ fn rwlock_state_ptr(rw: *mut pthread_rwlock_t) -> *mut u32 {
 /// `pthread_rwlock_init(rw, attr)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_init(
-    rw:    *mut pthread_rwlock_t,
+    rw: *mut pthread_rwlock_t,
     _attr: *const core::ffi::c_void,
 ) -> c_int {
-    if rw.is_null() { return -1; }
-    unsafe { *rw = pthread_rwlock_t::default(); }
+    if rw.is_null() {
+        return -1;
+    }
+    unsafe {
+        *rw = pthread_rwlock_t::default();
+    }
     0
 }
 
@@ -673,7 +749,9 @@ pub unsafe extern "C" fn pthread_rwlock_destroy(_rw: *mut pthread_rwlock_t) -> c
 /// `pthread_rwlock_rdlock(rw)` — acquire a reader slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_rdlock(rw: *mut pthread_rwlock_t) -> c_int {
-    if rw.is_null() { return -1; }
+    if rw.is_null() {
+        return -1;
+    }
     let p = rwlock_state_ptr(rw);
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     loop {
@@ -685,7 +763,8 @@ pub unsafe extern "C" fn pthread_rwlock_rdlock(rw: *mut pthread_rwlock_t) -> c_i
         }
         if atomic
             .compare_exchange(
-                cur, cur + 1,
+                cur,
+                cur + 1,
                 core::sync::atomic::Ordering::Acquire,
                 core::sync::atomic::Ordering::Relaxed,
             )
@@ -699,13 +778,16 @@ pub unsafe extern "C" fn pthread_rwlock_rdlock(rw: *mut pthread_rwlock_t) -> c_i
 /// `pthread_rwlock_wrlock(rw)` — acquire exclusive.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_wrlock(rw: *mut pthread_rwlock_t) -> c_int {
-    if rw.is_null() { return -1; }
+    if rw.is_null() {
+        return -1;
+    }
     let p = rwlock_state_ptr(rw);
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     loop {
         if atomic
             .compare_exchange(
-                0, WRLOCK_SENTINEL,
+                0,
+                WRLOCK_SENTINEL,
                 core::sync::atomic::Ordering::Acquire,
                 core::sync::atomic::Ordering::Relaxed,
             )
@@ -714,7 +796,9 @@ pub unsafe extern "C" fn pthread_rwlock_wrlock(rw: *mut pthread_rwlock_t) -> c_i
             return 0;
         }
         let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
-        if cur == 0 { continue; } // raced; retry cmpxchg
+        if cur == 0 {
+            continue;
+        } // raced; retry cmpxchg
         let _ = narf_user_runtime::futex_wait(p as u64, cur, 0);
     }
 }
@@ -722,13 +806,18 @@ pub unsafe extern "C" fn pthread_rwlock_wrlock(rw: *mut pthread_rwlock_t) -> c_i
 /// `pthread_rwlock_tryrdlock(rw)` — non-blocking reader acquire.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_tryrdlock(rw: *mut pthread_rwlock_t) -> c_int {
-    if rw.is_null() { return -1; }
+    if rw.is_null() {
+        return -1;
+    }
     let p = rwlock_state_ptr(rw);
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
-    if cur >= WRLOCK_SENTINEL - 1 { return 16; /* EBUSY */ }
+    if cur >= WRLOCK_SENTINEL - 1 {
+        return 16; /* EBUSY */
+    }
     match atomic.compare_exchange(
-        cur, cur + 1,
+        cur,
+        cur + 1,
         core::sync::atomic::Ordering::Acquire,
         core::sync::atomic::Ordering::Relaxed,
     ) {
@@ -740,11 +829,14 @@ pub unsafe extern "C" fn pthread_rwlock_tryrdlock(rw: *mut pthread_rwlock_t) -> 
 /// `pthread_rwlock_trywrlock(rw)` — non-blocking writer acquire.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_trywrlock(rw: *mut pthread_rwlock_t) -> c_int {
-    if rw.is_null() { return -1; }
+    if rw.is_null() {
+        return -1;
+    }
     let p = rwlock_state_ptr(rw);
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     match atomic.compare_exchange(
-        0, WRLOCK_SENTINEL,
+        0,
+        WRLOCK_SENTINEL,
         core::sync::atomic::Ordering::Acquire,
         core::sync::atomic::Ordering::Relaxed,
     ) {
@@ -757,15 +849,22 @@ pub unsafe extern "C" fn pthread_rwlock_trywrlock(rw: *mut pthread_rwlock_t) -> 
 /// or the last reader, wake everyone so they can re-race.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_rwlock_unlock(rw: *mut pthread_rwlock_t) -> c_int {
-    if rw.is_null() { return -1; }
+    if rw.is_null() {
+        return -1;
+    }
     let p = rwlock_state_ptr(rw);
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     loop {
         let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
-        let next = if cur == WRLOCK_SENTINEL { 0 } else { cur.saturating_sub(1) };
+        let next = if cur == WRLOCK_SENTINEL {
+            0
+        } else {
+            cur.saturating_sub(1)
+        };
         if atomic
             .compare_exchange(
-                cur, next,
+                cur,
+                next,
                 core::sync::atomic::Ordering::Release,
                 core::sync::atomic::Ordering::Relaxed,
             )
@@ -804,11 +903,13 @@ pub struct pthread_barrierattr_t {
 /// `pthread_barrier_init(bar, attr, count)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_barrier_init(
-    bar:   *mut pthread_barrier_t,
+    bar: *mut pthread_barrier_t,
     _attr: *const pthread_barrierattr_t,
     count: u32,
 ) -> c_int {
-    if bar.is_null() || count == 0 { return -1; }
+    if bar.is_null() || count == 0 {
+        return -1;
+    }
     unsafe {
         *bar = pthread_barrier_t {
             count: 0,
@@ -833,7 +934,9 @@ pub const PTHREAD_BARRIER_SERIAL_THREAD: c_int = -1;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_barrier_wait(bar: *mut pthread_barrier_t) -> c_int {
-    if bar.is_null() { return -1; }
+    if bar.is_null() {
+        return -1;
+    }
     let count_ptr = unsafe { &raw mut (*bar).count } as *mut u32;
     let gen_ptr = unsafe { &raw mut (*bar).generation } as *mut u32;
     let count_atomic = unsafe { &*(count_ptr as *const core::sync::atomic::AtomicU32) };
@@ -851,7 +954,9 @@ pub unsafe extern "C" fn pthread_barrier_wait(bar: *mut pthread_barrier_t) -> c_
         // Wait until generation advances.
         loop {
             let cur = gen_atomic.load(core::sync::atomic::Ordering::Acquire);
-            if cur != my_gen { return 0; }
+            if cur != my_gen {
+                return 0;
+            }
             let _ = narf_user_runtime::futex_wait(gen_ptr as u64, my_gen, 0);
         }
     }

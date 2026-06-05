@@ -164,10 +164,8 @@ pub unsafe fn load_user_process_with(
     let interp_fs_owned: Option<alloc::vec::Vec<u8>> = None;
 
     if let Some(name) = image.interp.as_deref() {
-        let registered: Option<&[u8]> =
-            interp::lookup_interpreter(name).map(|s| s as &[u8]);
-        let interp_bytes_opt: Option<&[u8]> =
-            registered.or_else(|| interp_fs_owned.as_deref());
+        let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
+        let interp_bytes_opt: Option<&[u8]> = registered.or_else(|| interp_fs_owned.as_deref());
         if let Some(interp_bytes) = interp_bytes_opt {
             let interp_entry =
                 unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
@@ -694,8 +692,8 @@ fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
     let mut buf = alloc::vec![0u8; size as usize];
     let mut filled: u64 = 0;
     while filled < size {
-        let n = poll_blocking(file.read(filled, &mut buf[filled as usize..]))
-            .and_then(|r| r.ok())?;
+        let n =
+            poll_blocking(file.read(filled, &mut buf[filled as usize..])).and_then(|r| r.ok())?;
         if n == 0 {
             // EOF before we hit `size` — truncate to what we got.
             buf.truncate(filled as usize);

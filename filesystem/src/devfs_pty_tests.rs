@@ -423,7 +423,10 @@ fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!("filesystem/pty", smoke_pty_slave_locked_until_tiocsptlck_clear);
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_slave_locked_until_tiocsptlck_clear
+);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_pty_per_tty_fg_pgrp_isolated() -> TestResult {
@@ -434,16 +437,10 @@ fn smoke_pty_per_tty_fg_pgrp_isolated() -> TestResult {
 
     let mut p1: i32 = 111;
     let mut p2: i32 = 222;
-    if m1
-        .ioctl(TIOCSPGRP, &mut p1 as *mut i32 as usize)
-        .is_err()
-    {
+    if m1.ioctl(TIOCSPGRP, &mut p1 as *mut i32 as usize).is_err() {
         return TestResult::Fail("TIOCSPGRP on m1 failed");
     }
-    if m2
-        .ioctl(TIOCSPGRP, &mut p2 as *mut i32 as usize)
-        .is_err()
-    {
+    if m2.ioctl(TIOCSPGRP, &mut p2 as *mut i32 as usize).is_err() {
         return TestResult::Fail("TIOCSPGRP on m2 failed");
     }
     let mut got1: i32 = 0;

@@ -17,8 +17,8 @@
 use crate::errno::set_errno;
 
 pub use narf_user_runtime::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_RDLCK, F_SETFD, F_SETFL, F_SETLK,
-    F_SETLKW, F_UNLCK, F_WRLCK, FD_CLOEXEC, O_APPEND, O_CLOEXEC, O_DIRECT, O_NONBLOCK, StatBuf,
+    StatBuf, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_RDLCK, F_SETFD,
+    F_SETFL, F_SETLK, F_SETLKW, F_UNLCK, F_WRLCK, O_APPEND, O_CLOEXEC, O_DIRECT, O_NONBLOCK,
 };
 
 /// Sentinel errno: bad fd. Matches Linux's EBADF so consumers that
@@ -38,7 +38,10 @@ pub unsafe fn dup(fd: i32) -> i32 {
     }
     match narf_user_runtime::dup(fd as u32) {
         Some(n) => n as i32,
-        None    => { set_errno(EBADF); -1 }
+        None => {
+            set_errno(EBADF);
+            -1
+        }
     }
 }
 
@@ -54,7 +57,10 @@ pub unsafe fn dup2(oldfd: i32, newfd: i32) -> i32 {
     }
     match narf_user_runtime::dup2(oldfd as u32, newfd as u32) {
         Some(n) => n as i32,
-        None    => { set_errno(EBADF); -1 }
+        None => {
+            set_errno(EBADF);
+            -1
+        }
     }
 }
 
@@ -93,12 +99,15 @@ pub unsafe fn pipe(pipefd: *mut i32) -> i32 {
         Some((r, w)) => {
             // SAFETY: caller asserts pipefd has room for two i32s.
             unsafe {
-                *pipefd         = r as i32;
+                *pipefd = r as i32;
                 *pipefd.add(1) = w as i32;
             }
             0
         }
-        None => { set_errno(EBADF); -1 }
+        None => {
+            set_errno(EBADF);
+            -1
+        }
     }
 }
 
@@ -110,11 +119,15 @@ pub unsafe fn pipe(pipefd: *mut i32) -> i32 {
 /// `name` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memfd_create(name: *const i8, flags: u32) -> i32 {
-    if name.is_null() { return -1; }
+    if name.is_null() {
+        return -1;
+    }
     // SAFETY: caller-asserted NUL-terminator. Walk to find length.
     let mut len = 0usize;
     unsafe {
-        while *name.add(len) != 0 { len += 1; }
+        while *name.add(len) != 0 {
+            len += 1;
+        }
     }
     // SAFETY: in-bounds `len` per the walk above.
     let bytes = unsafe { core::slice::from_raw_parts(name as *const u8, len) };
@@ -141,12 +154,15 @@ pub unsafe extern "C" fn pipe2(pipefd: *mut i32, flags: i32) -> i32 {
         Some((r, w)) => {
             // SAFETY: caller asserts pipefd has room for two i32s.
             unsafe {
-                *pipefd         = r as i32;
+                *pipefd = r as i32;
                 *pipefd.add(1) = w as i32;
             }
             0
         }
-        None => { set_errno(EBADF); -1 }
+        None => {
+            set_errno(EBADF);
+            -1
+        }
     }
 }
 
@@ -167,13 +183,18 @@ pub unsafe fn stat(path: *const u8, out: *mut StatBuf) -> i32 {
     // Bound the walk at 4 KiB so a missing NUL doesn't read into
     // unmapped territory; longer absolute paths are vanishingly rare.
     while len < 4096 {
-        if unsafe { *path.add(len) } == 0 { break; }
+        if unsafe { *path.add(len) } == 0 {
+            break;
+        }
         len += 1;
     }
     let path_bytes = unsafe { core::slice::from_raw_parts(path, len) };
     let path_str = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { set_errno(EBADF); return -1; }
+        Err(_) => {
+            set_errno(EBADF);
+            return -1;
+        }
     };
     // SAFETY: caller asserts `out` is writable.
     let out_ref = unsafe { &mut *out };
@@ -194,8 +215,8 @@ pub unsafe fn stat(path: *const u8, out: *mut StatBuf) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fstatat(
     dirfd: i32,
-    path:  *const u8,
-    out:   *mut StatBuf,
+    path: *const u8,
+    out: *mut StatBuf,
     flags: i32,
 ) -> i32 {
     if path.is_null() || out.is_null() {
@@ -205,13 +226,18 @@ pub unsafe extern "C" fn fstatat(
     // Walk path NUL-bounded, capped at 4 KiB.
     let mut len = 0usize;
     while len < 4096 {
-        if unsafe { *path.add(len) } == 0 { break; }
+        if unsafe { *path.add(len) } == 0 {
+            break;
+        }
         len += 1;
     }
     let bytes = unsafe { core::slice::from_raw_parts(path, len) };
     let s = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => { set_errno(EBADF); return -1; }
+        Err(_) => {
+            set_errno(EBADF);
+            return -1;
+        }
     };
     let out_ref = unsafe { &mut *out };
     if narf_user_runtime::fstatat(dirfd, s, out_ref, flags) == 0 {
@@ -235,13 +261,18 @@ pub unsafe extern "C" fn lstat(path: *const u8, out: *mut StatBuf) -> i32 {
     }
     let mut len = 0usize;
     while len < 4096 {
-        if unsafe { *path.add(len) } == 0 { break; }
+        if unsafe { *path.add(len) } == 0 {
+            break;
+        }
         len += 1;
     }
     let path_bytes = unsafe { core::slice::from_raw_parts(path, len) };
     let path_str = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
-        Err(_) => { set_errno(EBADF); return -1; }
+        Err(_) => {
+            set_errno(EBADF);
+            return -1;
+        }
     };
     let out_ref = unsafe { &mut *out };
     if narf_user_runtime::lstat(path_str, out_ref) == 0 {

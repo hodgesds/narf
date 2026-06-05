@@ -18,27 +18,27 @@ use crate::posix::{c_char, c_int};
 
 // Compile / exec flags (numeric values per the SUSv4 `<regex.h>` ABI).
 pub const REG_EXTENDED: c_int = 0o00001;
-pub const REG_ICASE:    c_int = 0o00002;
-pub const REG_NOSUB:    c_int = 0o00004;
-pub const REG_NEWLINE:  c_int = 0o00010;
-pub const REG_NOTBOL:   c_int = 0o00001;
-pub const REG_NOTEOL:   c_int = 0o00002;
+pub const REG_ICASE: c_int = 0o00002;
+pub const REG_NOSUB: c_int = 0o00004;
+pub const REG_NEWLINE: c_int = 0o00010;
+pub const REG_NOTBOL: c_int = 0o00001;
+pub const REG_NOTEOL: c_int = 0o00002;
 
 // Error codes.
-pub const REG_NOERROR:    c_int = 0;
-pub const REG_NOMATCH:    c_int = 1;
-pub const REG_BADPAT:     c_int = 2;
-pub const REG_ECOLLATE:   c_int = 3;
-pub const REG_ECTYPE:     c_int = 4;
-pub const REG_EESCAPE:    c_int = 5;
-pub const REG_ESUBREG:    c_int = 6;
-pub const REG_EBRACK:     c_int = 7;
-pub const REG_EPAREN:     c_int = 8;
-pub const REG_EBRACE:     c_int = 9;
-pub const REG_BADBR:      c_int = 10;
-pub const REG_ERANGE:     c_int = 11;
-pub const REG_ESPACE:     c_int = 12;
-pub const REG_BADRPT:     c_int = 13;
+pub const REG_NOERROR: c_int = 0;
+pub const REG_NOMATCH: c_int = 1;
+pub const REG_BADPAT: c_int = 2;
+pub const REG_ECOLLATE: c_int = 3;
+pub const REG_ECTYPE: c_int = 4;
+pub const REG_EESCAPE: c_int = 5;
+pub const REG_ESUBREG: c_int = 6;
+pub const REG_EBRACK: c_int = 7;
+pub const REG_EPAREN: c_int = 8;
+pub const REG_EBRACE: c_int = 9;
+pub const REG_BADBR: c_int = 10;
+pub const REG_ERANGE: c_int = 11;
+pub const REG_ESPACE: c_int = 12;
+pub const REG_BADRPT: c_int = 13;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -46,14 +46,14 @@ pub struct regex_t {
     /// Internal buffer pointer. We never allocate; the field is
     /// retained for ABI compatibility with code that copies the
     /// struct around.
-    pub buffer:    usize,
+    pub buffer: usize,
     pub allocated: usize,
-    pub used:      usize,
-    pub syntax:    u64,
-    pub fastmap:   usize,
+    pub used: usize,
+    pub syntax: u64,
+    pub fastmap: usize,
     pub translate: usize,
-    pub re_nsub:   usize,
-    pub flags:     u32,
+    pub re_nsub: usize,
+    pub flags: u32,
 }
 
 #[repr(C)]
@@ -72,11 +72,13 @@ pub struct regmatch_t {
 /// valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regcomp(
-    preg:    *mut regex_t,
-    _pattern:*const c_char,
-    cflags:  c_int,
+    preg: *mut regex_t,
+    _pattern: *const c_char,
+    cflags: c_int,
 ) -> c_int {
-    if preg.is_null() { return REG_BADPAT; }
+    if preg.is_null() {
+        return REG_BADPAT;
+    }
     // SAFETY: caller-supplied writable buffer.
     unsafe {
         *preg = regex_t::default();
@@ -95,17 +97,20 @@ pub unsafe extern "C" fn regcomp(
 /// `nmatch` entries.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regexec(
-    _preg:    *const regex_t,
-    _string:  *const c_char,
-    nmatch:   usize,
-    pmatch:   *mut regmatch_t,
-    _eflags:  c_int,
+    _preg: *const regex_t,
+    _string: *const c_char,
+    nmatch: usize,
+    pmatch: *mut regmatch_t,
+    _eflags: c_int,
 ) -> c_int {
     if !pmatch.is_null() && nmatch > 0 {
         // SAFETY: caller-asserted writable region.
         unsafe {
             for i in 0..nmatch {
-                *pmatch.add(i) = regmatch_t { rm_so: -1, rm_eo: -1 };
+                *pmatch.add(i) = regmatch_t {
+                    rm_so: -1,
+                    rm_eo: -1,
+                };
             }
         }
     }
@@ -121,16 +126,16 @@ pub unsafe extern "C" fn regexec(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regerror(
     errcode: c_int,
-    _preg:   *const regex_t,
-    errbuf:  *mut c_char,
-    size:    usize,
+    _preg: *const regex_t,
+    errbuf: *mut c_char,
+    size: usize,
 ) -> usize {
     let msg: &[u8] = match errcode {
-        REG_NOERROR  => b"Success",
-        REG_NOMATCH  => b"No match",
-        REG_BADPAT   => b"Invalid regular expression",
-        REG_ESPACE   => b"Out of memory",
-        _            => b"Regex error",
+        REG_NOERROR => b"Success",
+        REG_NOMATCH => b"No match",
+        REG_BADPAT => b"Invalid regular expression",
+        REG_ESPACE => b"Out of memory",
+        _ => b"Regex error",
     };
     if !errbuf.is_null() && size > 0 {
         // SAFETY: caller-asserted writable region.

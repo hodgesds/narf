@@ -29,12 +29,18 @@ use crate::stdio::File;
 /// Both pointers must be valid NUL-terminated C strings.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut File {
-    if path.is_null() || mode.is_null() { return core::ptr::null_mut(); }
+    if path.is_null() || mode.is_null() {
+        return core::ptr::null_mut();
+    }
     // SAFETY: caller asserts NUL-terminated; walk to compute length.
     let mut plen = 0usize;
-    while unsafe { *path.add(plen) } != 0 { plen += 1; }
+    while unsafe { *path.add(plen) } != 0 {
+        plen += 1;
+    }
     let mut mlen = 0usize;
-    while unsafe { *mode.add(mlen) } != 0 { mlen += 1; }
+    while unsafe { *mode.add(mlen) } != 0 {
+        mlen += 1;
+    }
     // SAFETY: caller asserts the bytes are valid for `plen`/`mlen`.
     let mbytes = unsafe { core::slice::from_raw_parts(mode as *const u8, mlen) };
     let mode_str = match core::str::from_utf8(mbytes) {
@@ -53,11 +59,15 @@ pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut
 /// `mode` must be NUL-terminated; `fd` must be a valid open fd.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut File {
-    if fd < 0 || mode.is_null() { return core::ptr::null_mut(); }
+    if fd < 0 || mode.is_null() {
+        return core::ptr::null_mut();
+    }
     // Allocate a File on the heap and wrap the fd.
     // SAFETY: malloc with the right size.
     let f = unsafe { crate::heap::malloc(core::mem::size_of::<File>()) } as *mut File;
-    if f.is_null() { return core::ptr::null_mut(); }
+    if f.is_null() {
+        return core::ptr::null_mut();
+    }
     // SAFETY: f is malloc-aligned for File; we own the slot.
     unsafe {
         core::ptr::write(f, File::for_owned_fd(fd as u32));
@@ -74,12 +84,7 @@ pub unsafe extern "C" fn fclose(f: *mut File) -> c_int {
 
 /// `fread(buf, size, count, *mut File)` — C-ABI shape.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fread(
-    buf:   *mut c_void,
-    size:  usize,
-    count: usize,
-    f:     *mut File,
-) -> usize {
+pub unsafe extern "C" fn fread(buf: *mut c_void, size: usize, count: usize, f: *mut File) -> usize {
     // SAFETY: forwarded.
     unsafe { crate::stdio::fread(buf as *mut u8, size, count, f) }
 }
@@ -87,10 +92,10 @@ pub unsafe extern "C" fn fread(
 /// `fwrite(buf, size, count, *mut File)` — C-ABI shape.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fwrite(
-    buf:   *const c_void,
-    size:  usize,
+    buf: *const c_void,
+    size: usize,
     count: usize,
-    f:     *mut File,
+    f: *mut File,
 ) -> usize {
     // SAFETY: forwarded.
     unsafe { crate::stdio::fwrite(buf as *const u8, size, count, f) }
@@ -99,9 +104,13 @@ pub unsafe extern "C" fn fwrite(
 /// `fputs(s, *mut File)` — POSIX shape. Walks `s` for length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fputs(s: *const c_char, f: *mut File) -> c_int {
-    if s.is_null() { return -1; }
+    if s.is_null() {
+        return -1;
+    }
     let mut len = 0usize;
-    while unsafe { *s.add(len) } != 0 { len += 1; }
+    while unsafe { *s.add(len) } != 0 {
+        len += 1;
+    }
     // SAFETY: forwarded.
     unsafe { crate::stdio::fputs(s as *const u8, len, f) }
 }
@@ -109,7 +118,9 @@ pub unsafe extern "C" fn fputs(s: *const c_char, f: *mut File) -> c_int {
 /// `fgets(buf, max_len, *mut File)` — POSIX shape.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fgets(buf: *mut c_char, max_len: c_int, f: *mut File) -> *mut c_char {
-    if buf.is_null() || max_len <= 0 { return core::ptr::null_mut(); }
+    if buf.is_null() || max_len <= 0 {
+        return core::ptr::null_mut();
+    }
     // SAFETY: forwarded.
     let r = unsafe { crate::stdio::fgets(buf as *mut u8, max_len as usize, f) };
     r as *mut c_char
@@ -201,9 +212,9 @@ pub unsafe extern "C" fn setbuf(stream: *mut File, buf: *mut c_char) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setvbuf(
     stream: *mut File,
-    buf:    *mut c_char,
-    mode:   c_int,
-    size:   usize,
+    buf: *mut c_char,
+    mode: c_int,
+    size: usize,
 ) -> c_int {
     // SAFETY: forwarded.
     unsafe { crate::stdio::setvbuf(stream, buf as *mut u8, mode, size) }
@@ -250,7 +261,9 @@ pub unsafe extern "C" fn perror(s: *const c_char) {
 /// `f` must be a valid `*mut File` or NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fileno(f: *mut File) -> c_int {
-    if f.is_null() { return -1; }
+    if f.is_null() {
+        return -1;
+    }
     // SAFETY: caller asserts validity of `f`.
     unsafe { (*f).fd as c_int }
 }
@@ -265,9 +278,13 @@ pub unsafe extern "C" fn fileno(f: *mut File) -> c_int {
 /// `fmt` must be a NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn printf(fmt: *const c_char) -> c_int {
-    if fmt.is_null() { return -1; }
+    if fmt.is_null() {
+        return -1;
+    }
     let mut len = 0usize;
-    while unsafe { *fmt.add(len) } != 0 { len += 1; }
+    while unsafe { *fmt.add(len) } != 0 {
+        len += 1;
+    }
     let n = narf_user_runtime::write(1, unsafe {
         core::slice::from_raw_parts(fmt as *const u8, len)
     });
@@ -281,9 +298,13 @@ pub unsafe extern "C" fn printf(fmt: *const c_char) -> c_int {
 /// `fmt` must be NUL-terminated; `stream` must be a valid FILE*.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fprintf(stream: *mut File, fmt: *const c_char) -> c_int {
-    if stream.is_null() || fmt.is_null() { return -1; }
+    if stream.is_null() || fmt.is_null() {
+        return -1;
+    }
     let mut len = 0usize;
-    while unsafe { *fmt.add(len) } != 0 { len += 1; }
+    while unsafe { *fmt.add(len) } != 0 {
+        len += 1;
+    }
     // SAFETY: forwarded.
     unsafe {
         let n = crate::stdio::fwrite(fmt as *const u8, 1, len, stream);
@@ -299,9 +320,13 @@ pub unsafe extern "C" fn fprintf(stream: *mut File, fmt: *const c_char) -> c_int
 /// `fmt` must be NUL-terminated.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sprintf(buf: *mut c_char, fmt: *const c_char) -> c_int {
-    if buf.is_null() || fmt.is_null() { return -1; }
+    if buf.is_null() || fmt.is_null() {
+        return -1;
+    }
     let mut len = 0usize;
-    while unsafe { *fmt.add(len) } != 0 { len += 1; }
+    while unsafe { *fmt.add(len) } != 0 {
+        len += 1;
+    }
     // SAFETY: caller-asserted writable region with room for len+1.
     unsafe {
         core::ptr::copy_nonoverlapping(fmt as *const u8, buf as *mut u8, len);
@@ -316,14 +341,14 @@ pub unsafe extern "C" fn sprintf(buf: *mut c_char, fmt: *const c_char) -> c_int 
 /// `buf` must be writable for `n` bytes; `fmt` must be NUL-
 /// terminated.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn snprintf(
-    buf: *mut c_char,
-    n:   usize,
-    fmt: *const c_char,
-) -> c_int {
-    if buf.is_null() || n == 0 || fmt.is_null() { return -1; }
+pub unsafe extern "C" fn snprintf(buf: *mut c_char, n: usize, fmt: *const c_char) -> c_int {
+    if buf.is_null() || n == 0 || fmt.is_null() {
+        return -1;
+    }
     let mut len = 0usize;
-    while unsafe { *fmt.add(len) } != 0 { len += 1; }
+    while unsafe { *fmt.add(len) } != 0 {
+        len += 1;
+    }
     let copy = if len + 1 > n { n - 1 } else { len };
     // SAFETY: caller-asserted writable region of `n` bytes; copy
     // bounded by `copy < n`.
@@ -346,7 +371,7 @@ pub unsafe extern "C" fn snprintf(
 // The actual initialisation runs in `startup::__libc_start_main`
 // once the TLS slot is staged. Until then these are NULL.
 #[unsafe(no_mangle)]
-pub static mut __libc_stdin:  *mut File = core::ptr::null_mut();
+pub static mut __libc_stdin: *mut File = core::ptr::null_mut();
 #[unsafe(no_mangle)]
 pub static mut __libc_stdout: *mut File = core::ptr::null_mut();
 #[unsafe(no_mangle)]

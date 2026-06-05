@@ -36,7 +36,11 @@ pub struct jmp_buf {
 }
 
 impl Default for jmp_buf {
-    fn default() -> Self { Self { slots: [0; JMP_BUF_LEN] } }
+    fn default() -> Self {
+        Self {
+            slots: [0; JMP_BUF_LEN],
+        }
+    }
 }
 
 impl core::fmt::Debug for jmp_buf {
@@ -82,7 +86,6 @@ core::arch::global_asm!(
     "    mov [rdi + 0x38], rax",
     "    xor eax, eax",
     "    ret",
-
     // longjmp(rdi = *mut jmp_buf, esi = val) -> !
     //
     // Restore callee-saved, set rsp to the saved value, push the
@@ -137,7 +140,6 @@ core::arch::global_asm!(
     "    stp d14, d15, [x0, #0x98]",
     "    mov w0, wzr",
     "    ret",
-
     "longjmp:",
     "    ldp x19, x20, [x0, #0x00]",
     "    ldp x21, x22, [x0, #0x10]",

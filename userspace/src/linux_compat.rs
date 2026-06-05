@@ -195,8 +195,7 @@ impl MemFdFile {
         if (cur & F_SEAL_SEAL) != 0 {
             return Err(());
         }
-        self.seals
-            .store(cur | new_seals, Ordering::Release);
+        self.seals.store(cur | new_seals, Ordering::Release);
         Ok(())
     }
 }

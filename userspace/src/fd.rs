@@ -522,8 +522,7 @@ pub mod locks {
         }
     }
 
-    static TABLE: IrqSafeSpinLock<Option<BTreeMap<usize, Vec<Lock>>>> =
-        IrqSafeSpinLock::new(None);
+    static TABLE: IrqSafeSpinLock<Option<BTreeMap<usize, Vec<Lock>>>> = IrqSafeSpinLock::new(None);
 
     fn ensure() {
         let mut g = TABLE.lock();

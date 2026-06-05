@@ -27,12 +27,15 @@ pub const ENOSYS: c_int = 38;
 #[derive(Copy, Clone)]
 pub struct sockaddr_un {
     pub sun_family: sa_family_t,
-    pub sun_path:   [c_char; 108],
+    pub sun_path: [c_char; 108],
 }
 
 impl Default for sockaddr_un {
     fn default() -> Self {
-        Self { sun_family: 0, sun_path: [0; 108] }
+        Self {
+            sun_family: 0,
+            sun_path: [0; 108],
+        }
     }
 }
 
@@ -42,13 +45,13 @@ impl Default for sockaddr_un {
 /// descriptor. Field layout per SUSv4.
 #[repr(C)]
 pub struct msghdr {
-    pub msg_name:        *mut c_void,
-    pub msg_namelen:     socklen_t,
-    pub msg_iov:         *mut iovec,
-    pub msg_iovlen:      usize,
-    pub msg_control:     *mut c_void,
-    pub msg_controllen:  usize,
-    pub msg_flags:       c_int,
+    pub msg_name: *mut c_void,
+    pub msg_namelen: socklen_t,
+    pub msg_iov: *mut iovec,
+    pub msg_iovlen: usize,
+    pub msg_control: *mut c_void,
+    pub msg_controllen: usize,
+    pub msg_flags: c_int,
 }
 
 /// `<sys/socket.h>` `struct cmsghdr` — control-message header.
@@ -58,25 +61,25 @@ pub struct msghdr {
 /// header-side and don't compile to a symbol here.
 #[repr(C)]
 pub struct cmsghdr {
-    pub cmsg_len:    usize,
-    pub cmsg_level:  c_int,
-    pub cmsg_type:   c_int,
+    pub cmsg_len: usize,
+    pub cmsg_level: c_int,
+    pub cmsg_type: c_int,
 }
 
 // MSG_* flag constants — values match Linux.
-pub const MSG_OOB:       c_int = 0x0001;
-pub const MSG_PEEK:      c_int = 0x0002;
+pub const MSG_OOB: c_int = 0x0001;
+pub const MSG_PEEK: c_int = 0x0002;
 pub const MSG_DONTROUTE: c_int = 0x0004;
-pub const MSG_CTRUNC:    c_int = 0x0008;
-pub const MSG_TRUNC:     c_int = 0x0020;
-pub const MSG_DONTWAIT:  c_int = 0x0040;
-pub const MSG_EOR:       c_int = 0x0080;
-pub const MSG_WAITALL:   c_int = 0x0100;
-pub const MSG_NOSIGNAL:  c_int = 0x4000;
+pub const MSG_CTRUNC: c_int = 0x0008;
+pub const MSG_TRUNC: c_int = 0x0020;
+pub const MSG_DONTWAIT: c_int = 0x0040;
+pub const MSG_EOR: c_int = 0x0080;
+pub const MSG_WAITALL: c_int = 0x0100;
+pub const MSG_NOSIGNAL: c_int = 0x4000;
 pub const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000_u32 as c_int;
 
 // SCM_* / SOL_* level constants.
-pub const SCM_RIGHTS:      c_int = 0x01;
+pub const SCM_RIGHTS: c_int = 0x01;
 pub const SCM_CREDENTIALS: c_int = 0x02;
 
 // ── sendmsg / recvmsg / socketpair / sockatmark ─────────────────────
@@ -97,11 +100,7 @@ fn enosys_minus_one() -> ssize_t {
 /// Caller-supplied `msg`, when non-null, must point at a valid
 /// `msghdr`. We don't read it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sendmsg(
-    _sockfd: c_int,
-    _msg:    *const msghdr,
-    _flags:  c_int,
-) -> ssize_t {
+pub unsafe extern "C" fn sendmsg(_sockfd: c_int, _msg: *const msghdr, _flags: c_int) -> ssize_t {
     enosys_minus_one()
 }
 
@@ -111,11 +110,7 @@ pub unsafe extern "C" fn sendmsg(
 /// `msg`, when non-null, must point at a writable `msghdr`. We don't
 /// touch it.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn recvmsg(
-    _sockfd: c_int,
-    _msg:    *mut msghdr,
-    _flags:  c_int,
-) -> ssize_t {
+pub unsafe extern "C" fn recvmsg(_sockfd: c_int, _msg: *mut msghdr, _flags: c_int) -> ssize_t {
     enosys_minus_one()
 }
 
@@ -123,10 +118,10 @@ pub unsafe extern "C" fn recvmsg(
 /// untouched.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn socketpair(
-    _domain:   c_int,
-    _type:     c_int,
+    _domain: c_int,
+    _type: c_int,
     _protocol: c_int,
-    _sv:       *mut c_int,
+    _sv: *mut c_int,
 ) -> c_int {
     crate::errno::set_errno(ENOSYS);
     -1
@@ -146,8 +141,8 @@ pub unsafe extern "C" fn sockatmark(_sockfd: c_int) -> c_int {
 /// matching the C signature. We don't touch them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getpeername(
-    _sockfd:  c_int,
-    _addr:    *mut crate::net::sockaddr,
+    _sockfd: c_int,
+    _addr: *mut crate::net::sockaddr,
     _addrlen: *mut socklen_t,
 ) -> c_int {
     crate::errno::set_errno(ENOSYS);
@@ -157,8 +152,8 @@ pub unsafe extern "C" fn getpeername(
 /// `getsockname(sockfd, addr, addrlen)` — stub. Mirrors `getpeername`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getsockname(
-    _sockfd:  c_int,
-    _addr:    *mut crate::net::sockaddr,
+    _sockfd: c_int,
+    _addr: *mut crate::net::sockaddr,
     _addrlen: *mut socklen_t,
 ) -> c_int {
     crate::errno::set_errno(ENOSYS);

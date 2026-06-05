@@ -409,7 +409,9 @@ pub unsafe extern "C" fn memchr(s: *const u8, c: i32, n: usize) -> *mut u8 {
 /// readable for the full `max` bytes".
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strnlen(s: *const u8, max: usize) -> usize {
-    if s.is_null() { return 0; }
+    if s.is_null() {
+        return 0;
+    }
     let mut n = 0usize;
     // SAFETY: per the function-level contract.
     unsafe {
@@ -427,7 +429,9 @@ pub unsafe extern "C" fn strnlen(s: *const u8, max: usize) -> usize {
 /// `s` must satisfy [`strnlen`]'s contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strndup(s: *const u8, max: usize) -> *mut u8 {
-    if s.is_null() { return core::ptr::null_mut(); }
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
     // SAFETY: caller contract.
     let len = unsafe { strnlen(s, max) };
     // SAFETY: malloc is `unsafe extern "C"`; size > 0.
@@ -459,9 +463,9 @@ pub unsafe extern "C" fn strndup(s: *const u8, max: usize) -> *mut u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memmem(
     haystack: *const u8,
-    hlen:     usize,
-    needle:   *const u8,
-    nlen:     usize,
+    hlen: usize,
+    needle: *const u8,
+    nlen: usize,
 ) -> *mut u8 {
     if needle.is_null() || nlen == 0 {
         // POSIX-ish: a zero-length needle matches at start.
@@ -491,7 +495,11 @@ pub unsafe extern "C" fn memmem(
 /// Lowercase byte fold for ASCII a-z; passes other bytes through.
 #[inline]
 fn ascii_to_lower(b: u8) -> u8 {
-    if (b'A'..=b'Z').contains(&b) { b + 32 } else { b }
+    if (b'A'..=b'Z').contains(&b) {
+        b + 32
+    } else {
+        b
+    }
 }
 
 /// `strcasecmp(a, b)` — case-insensitive compare for ASCII; non-
@@ -507,8 +515,12 @@ pub unsafe extern "C" fn strcasecmp(a: *const u8, b: *const u8) -> i32 {
         loop {
             let av = ascii_to_lower(*a.add(i));
             let bv = ascii_to_lower(*b.add(i));
-            if av != bv { return (av as i32) - (bv as i32); }
-            if av == 0  { return 0; }
+            if av != bv {
+                return (av as i32) - (bv as i32);
+            }
+            if av == 0 {
+                return 0;
+            }
             i += 1;
         }
     }
@@ -525,8 +537,12 @@ pub unsafe extern "C" fn strncasecmp(a: *const u8, b: *const u8, n: usize) -> i3
         for i in 0..n {
             let av = ascii_to_lower(*a.add(i));
             let bv = ascii_to_lower(*b.add(i));
-            if av != bv { return (av as i32) - (bv as i32); }
-            if av == 0  { return 0; }
+            if av != bv {
+                return (av as i32) - (bv as i32);
+            }
+            if av == 0 {
+                return 0;
+            }
         }
     }
     0
@@ -552,7 +568,9 @@ pub unsafe extern "C" fn strcoll(a: *const u8, b: *const u8) -> i32 {
 /// bytes (or NULL when `n == 0`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strxfrm(dest: *mut u8, src: *const u8, n: usize) -> usize {
-    if src.is_null() { return 0; }
+    if src.is_null() {
+        return 0;
+    }
     // SAFETY: caller-asserted NUL-termination.
     let len = unsafe { strlen(src) };
     if !dest.is_null() && n > 0 {
@@ -591,14 +609,16 @@ pub unsafe extern "C" fn strxfrm(dest: *mut u8, src: *const u8, n: usize) -> usi
 /// the unsafe block doesn't silently overflow.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __memcpy_chk(
-    dest:    *mut u8,
-    src:     *const u8,
-    len:     usize,
+    dest: *mut u8,
+    src: *const u8,
+    len: usize,
     destlen: usize,
 ) -> *mut u8 {
     if len > destlen {
         // SAFETY: abort never returns.
-        unsafe { crate::process::abort(); }
+        unsafe {
+            crate::process::abort();
+        }
     }
     // SAFETY: caller-asserted via memcpy contract.
     unsafe { memcpy(dest, src, len) }
@@ -609,14 +629,16 @@ pub unsafe extern "C" fn __memcpy_chk(
 /// As [`memmove`] plus `destlen >= len`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __memmove_chk(
-    dest:    *mut u8,
-    src:     *const u8,
-    len:     usize,
+    dest: *mut u8,
+    src: *const u8,
+    len: usize,
     destlen: usize,
 ) -> *mut u8 {
     if len > destlen {
         // SAFETY: abort never returns.
-        unsafe { crate::process::abort(); }
+        unsafe {
+            crate::process::abort();
+        }
     }
     // SAFETY: caller-asserted via memmove contract.
     unsafe { memmove(dest, src, len) }
@@ -627,14 +649,16 @@ pub unsafe extern "C" fn __memmove_chk(
 /// As [`memset`] plus `destlen >= len`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __memset_chk(
-    dest:    *mut u8,
-    byte:    i32,
-    len:     usize,
+    dest: *mut u8,
+    byte: i32,
+    len: usize,
     destlen: usize,
 ) -> *mut u8 {
     if len > destlen {
         // SAFETY: abort never returns.
-        unsafe { crate::process::abort(); }
+        unsafe {
+            crate::process::abort();
+        }
     }
     // SAFETY: caller-asserted via memset contract.
     unsafe { memset(dest, byte, len) }
@@ -644,16 +668,14 @@ pub unsafe extern "C" fn __memset_chk(
 /// # Safety
 /// As [`strcpy`] plus `strlen(src) < destlen`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __strcpy_chk(
-    dest:    *mut u8,
-    src:     *const u8,
-    destlen: usize,
-) -> *mut u8 {
+pub unsafe extern "C" fn __strcpy_chk(dest: *mut u8, src: *const u8, destlen: usize) -> *mut u8 {
     // SAFETY: caller-asserted NUL-termination.
     let len = unsafe { strlen(src) };
     if len + 1 > destlen {
         // SAFETY: abort never returns.
-        unsafe { crate::process::abort(); }
+        unsafe {
+            crate::process::abort();
+        }
     }
     // SAFETY: forwarded.
     unsafe { strcpy(dest, src) }
@@ -671,8 +693,12 @@ unsafe fn byte_in_set(b: u8, set: *const u8) -> bool {
         let mut i = 0usize;
         loop {
             let v = *set.add(i);
-            if v == 0 { return false; }
-            if v == b { return true; }
+            if v == 0 {
+                return false;
+            }
+            if v == b {
+                return true;
+            }
             i += 1;
         }
     }
@@ -730,7 +756,9 @@ pub unsafe extern "C" fn strpbrk(s: *const u8, accept: *const u8) -> *mut u8 {
         let mut i = 0usize;
         loop {
             let b = *s.add(i);
-            if b == 0 { return core::ptr::null_mut(); }
+            if b == 0 {
+                return core::ptr::null_mut();
+            }
             if byte_in_set(b, accept) {
                 return s.add(i) as *mut u8;
             }
@@ -756,19 +784,15 @@ pub unsafe extern "C" fn strpbrk(s: *const u8, accept: *const u8) -> *mut u8 {
 /// `delim` must be NUL-terminated; `saveptr` must be a writable
 /// pointer-to-pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn strtok_r(
-    s: *mut u8,
-    delim: *const u8,
-    saveptr: *mut *mut u8,
-) -> *mut u8 {
-    if saveptr.is_null() { return core::ptr::null_mut(); }
+pub unsafe extern "C" fn strtok_r(s: *mut u8, delim: *const u8, saveptr: *mut *mut u8) -> *mut u8 {
+    if saveptr.is_null() {
+        return core::ptr::null_mut();
+    }
     // SAFETY: caller-supplied `saveptr` is a writable slot.
-    let mut p = if s.is_null() {
-        unsafe { *saveptr }
-    } else {
-        s
-    };
-    if p.is_null() { return core::ptr::null_mut(); }
+    let mut p = if s.is_null() { unsafe { *saveptr } } else { s };
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
 
     // Skip leading delimiters.
     // SAFETY: `p` points into the original NUL-terminated input;
@@ -838,11 +862,15 @@ pub unsafe extern "C" fn strncat(dst: *mut u8, src: *const u8, n: usize) -> *mut
     unsafe {
         // Walk to dst's NUL.
         let mut d = 0usize;
-        while *dst.add(d) != 0 { d += 1; }
+        while *dst.add(d) != 0 {
+            d += 1;
+        }
         let mut i = 0usize;
         while i < n {
             let c = *src.add(i);
-            if c == 0 { break; }
+            if c == 0 {
+                break;
+            }
             *dst.add(d + i) = c;
             i += 1;
         }
@@ -861,13 +889,17 @@ pub unsafe extern "C" fn strncat(dst: *mut u8, src: *const u8, n: usize) -> *mut
 /// `buf` must be writable for `buflen` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strerror_r(errnum: i32, buf: *mut u8, buflen: usize) -> i32 {
-    if buf.is_null() || buflen == 0 { return 22; } // EINVAL
-    // SAFETY: forwarded to crate::errno::strerror — returns a
-    // pointer to a static NUL-terminated byte array.
+    if buf.is_null() || buflen == 0 {
+        return 22;
+    } // EINVAL
+      // SAFETY: forwarded to crate::errno::strerror — returns a
+      // pointer to a static NUL-terminated byte array.
     let src = unsafe { crate::errno::strerror(errnum) };
     // Walk to find length.
     let mut len = 0usize;
-    while unsafe { *src.add(len) } != 0 { len += 1; }
+    while unsafe { *src.add(len) } != 0 {
+        len += 1;
+    }
     // Need len + 1 for NUL.
     if len + 1 > buflen {
         // Copy what fits, NUL-terminate, return ERANGE.

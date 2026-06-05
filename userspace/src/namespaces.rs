@@ -160,7 +160,9 @@ impl NetNamespace {
             prefix_len: 8,
         };
         Arc::new(Self {
-            inner: IrqSafeSpinLock::new(NetInner { ifaces: alloc::vec![lo] }),
+            inner: IrqSafeSpinLock::new(NetInner {
+                ifaces: alloc::vec![lo],
+            }),
         })
     }
 

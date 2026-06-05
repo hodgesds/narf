@@ -122,7 +122,9 @@ static mut OWNED_ENV_ACTIVE: bool = false;
 unsafe fn ensure_owned() {
     // SAFETY: single-threaded; the flag is set after the copy
     // completes so re-entrance is harmless.
-    if unsafe { OWNED_ENV_ACTIVE } { return; }
+    if unsafe { OWNED_ENV_ACTIVE } {
+        return;
+    }
     let mut src = unsafe { ENVIRON };
     let mut n = 0usize;
     if !src.is_null() {
@@ -131,13 +133,19 @@ unsafe fn ensure_owned() {
         unsafe {
             while n < OWNED_ENV_CAP - 1 {
                 let entry = *src;
-                if entry.is_null() { break; }
+                if entry.is_null() {
+                    break;
+                }
                 // Walk to NUL to get the length.
                 let mut len = 0usize;
-                while *entry.add(len) != 0 { len += 1; }
+                while *entry.add(len) != 0 {
+                    len += 1;
+                }
                 // Allocate + copy.
                 let owned = crate::heap::malloc(len + 1);
-                if owned.is_null() { break; }
+                if owned.is_null() {
+                    break;
+                }
                 core::ptr::copy_nonoverlapping(entry, owned, len);
                 *owned.add(len) = 0;
                 OWNED_ENV[n] = owned as *const u8;
@@ -165,7 +173,9 @@ unsafe fn find_owned(name: *const u8, name_len: usize) -> Option<usize> {
     unsafe {
         for i in 0..OWNED_ENV_LEN {
             let entry = OWNED_ENV[i];
-            if entry.is_null() { return None; }
+            if entry.is_null() {
+                return None;
+            }
             let mut matches = true;
             for j in 0..name_len {
                 if *entry.add(j) != *name.add(j) {
@@ -296,17 +306,17 @@ pub unsafe fn unsetenv_raw(name: *const u8, name_len: usize) -> i32 {
 /// # Safety
 /// `name` / `value` must be NUL-terminated C strings.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn setenv(
-    name: *const u8,
-    value: *const u8,
-    overwrite: i32,
-) -> i32 {
+pub unsafe extern "C" fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32 {
     if name.is_null() {
         set_errno(crate::errno::EINVAL);
         return -1;
     }
     let nlen = unsafe { strlen(name) };
-    let vlen = if value.is_null() { 0 } else { unsafe { strlen(value) } };
+    let vlen = if value.is_null() {
+        0
+    } else {
+        unsafe { strlen(value) }
+    };
     let vp = if value.is_null() { b"".as_ptr() } else { value };
     // SAFETY: forwarded; caller-asserted NUL-terminated inputs.
     unsafe { setenv_raw(name, nlen, vp, vlen, overwrite) }
@@ -366,7 +376,5 @@ pub unsafe extern "C" fn putenv(s: *const u8) -> i32 {
         return -1;
     }
     // SAFETY: `eq < len`, so name + value slices are in-bounds.
-    unsafe {
-        setenv_raw(s, eq, s.add(eq + 1), len - eq - 1, 1)
-    }
+    unsafe { setenv_raw(s, eq, s.add(eq + 1), len - eq - 1, 1) }
 }

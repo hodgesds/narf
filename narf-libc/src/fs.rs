@@ -81,14 +81,14 @@ pub unsafe extern "C" fn getcwd(buf: *mut u8, size: usize) -> *mut u8 {
 // Numeric values match Linux's `<sys/stat.h>` so a libc consumer
 // can `#include <sys/stat.h>` and get the same bits.
 
-pub const S_IFMT:   u32 = 0o170000;
-pub const S_IFREG:  u32 = 0o100000;
-pub const S_IFDIR:  u32 = 0o040000;
-pub const S_IFCHR:  u32 = 0o020000;
-pub const S_IFIFO:  u32 = 0o010000;
-pub const S_IFLNK:  u32 = 0o120000;
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFSOCK: u32 = 0o140000;
-pub const S_IFBLK:  u32 = 0o060000;
+pub const S_IFBLK: u32 = 0o060000;
 
 /// `S_ISREG(mode)` — non-zero if mode names a regular file.
 #[unsafe(no_mangle)]
@@ -138,7 +138,9 @@ pub unsafe extern "C" fn S_ISLNK(mode: u32) -> i32 {
 /// `path` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chmod(path: *const i8, mode: u32) -> i32 {
-    if path.is_null() { return -1; }
+    if path.is_null() {
+        return -1;
+    }
     // SAFETY: caller-asserted NUL-terminator.
     let s = unsafe { crate::posix::cstr_to_str(path as *const _) };
     narf_user_runtime::chmod(s, mode)

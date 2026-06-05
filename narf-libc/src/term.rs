@@ -18,8 +18,8 @@ pub const ENOTTY: c_int = 25;
 // ── termios shapes ──────────────────────────────────────────────────
 
 pub type tcflag_t = u32;
-pub type cc_t     = u8;
-pub type speed_t  = u32;
+pub type cc_t = u8;
+pub type speed_t = u32;
 
 /// Number of c_cc[] slots — matches glibc's NCCS.
 pub const NCCS: usize = 32;
@@ -34,8 +34,8 @@ pub struct termios {
     pub c_oflag: tcflag_t,
     pub c_cflag: tcflag_t,
     pub c_lflag: tcflag_t,
-    pub c_line:  cc_t,
-    pub c_cc:    [cc_t; NCCS],
+    pub c_line: cc_t,
+    pub c_cc: [cc_t; NCCS],
     pub c_ispeed: speed_t,
     pub c_ospeed: speed_t,
 }
@@ -43,15 +43,20 @@ pub struct termios {
 impl Default for termios {
     fn default() -> Self {
         Self {
-            c_iflag: 0, c_oflag: 0, c_cflag: 0, c_lflag: 0,
-            c_line: 0, c_cc: [0; NCCS],
-            c_ispeed: 0, c_ospeed: 0,
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; NCCS],
+            c_ispeed: 0,
+            c_ospeed: 0,
         }
     }
 }
 
 // optional_actions for tcsetattr
-pub const TCSANOW:   c_int = 0;
+pub const TCSANOW: c_int = 0;
 pub const TCSADRAIN: c_int = 1;
 pub const TCSAFLUSH: c_int = 2;
 
@@ -63,7 +68,9 @@ pub const TCSAFLUSH: c_int = 2;
 /// `t` must be a writable `*mut termios` if non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
-    if t.is_null() { return -1; }
+    if t.is_null() {
+        return -1;
+    }
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
@@ -71,10 +78,12 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
     // SAFETY: kernel writes the 60-byte KTermios shape into the
     // user buffer. The libc `termios` struct matches the same
     // layout (4*tcflag + line + 32 cc + 2 speed).
-    let r = unsafe {
-        narf_user_runtime::syscall2_raw(218, fd as u64, t as u64)
-    };
-    if (r as i64) < 0 { -1 } else { 0 }
+    let r = unsafe { narf_user_runtime::syscall2_raw(218, fd as u64, t as u64) };
+    if (r as i64) < 0 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `tcsetattr(fd, action, *t)` — write terminal attributes.
@@ -82,20 +91,20 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
 /// # Safety
 /// `t` must be a valid `*const termios` if non-null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tcsetattr(
-    fd:      c_int,
-    action:  c_int,
-    t:       *const termios,
-) -> c_int {
+pub unsafe extern "C" fn tcsetattr(fd: c_int, action: c_int, t: *const termios) -> c_int {
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
     }
-    if t.is_null() { return -1; }
-    let r = unsafe {
-        narf_user_runtime::syscall3_raw(219, fd as u64, action as u64, t as u64)
-    };
-    if (r as i64) < 0 { -1 } else { 0 }
+    if t.is_null() {
+        return -1;
+    }
+    let r = unsafe { narf_user_runtime::syscall3_raw(219, fd as u64, action as u64, t as u64) };
+    if (r as i64) < 0 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `tcflush(fd, what)` — accept-and-ignore drain request.
@@ -134,11 +143,7 @@ pub unsafe extern "C" fn tcdrain(fd: c_int) -> c_int {
 /// # Safety
 /// Pointer arguments are not dereferenced.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ioctl(
-    _fd:      c_int,
-    _request: u64,
-    _arg:     *mut core::ffi::c_void,
-) -> c_int {
+pub unsafe extern "C" fn ioctl(_fd: c_int, _request: u64, _arg: *mut core::ffi::c_void) -> c_int {
     crate::errno::set_errno(ENOTTY);
     -1
 }
@@ -160,9 +165,7 @@ pub const LOCK_UN: c_int = 8;
 /// `fd` is taken at face value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flock(fd: c_int, op: c_int) -> c_int {
-    let r = unsafe {
-        narf_user_runtime::syscall2_raw(235, fd as u64, op as u64)
-    };
+    let r = unsafe { narf_user_runtime::syscall2_raw(235, fd as u64, op as u64) };
     r as c_int
 }
 
@@ -171,7 +174,7 @@ pub unsafe extern "C" fn flock(fd: c_int, op: c_int) -> c_int {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct utimbuf {
-    pub actime:  i64,
+    pub actime: i64,
     pub modtime: i64,
 }
 
@@ -190,7 +193,7 @@ pub unsafe extern "C" fn utime(path: *const c_char, _buf: *const utimbuf) -> c_i
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct timeval64 {
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     pub tv_usec: i64,
 }
 
@@ -201,10 +204,7 @@ pub struct timeval64 {
 /// `path` must be a valid NUL-terminated C string. `times`, when
 /// non-null, must be a `[timeval64; 2]`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn utimes(
-    path:   *const c_char,
-    _times: *const timeval64,
-) -> c_int {
+pub unsafe extern "C" fn utimes(path: *const c_char, _times: *const timeval64) -> c_int {
     // SAFETY: forwarded.
     unsafe { crate::posix::access(path, 0) }
 }

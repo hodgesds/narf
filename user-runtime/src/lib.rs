@@ -2045,7 +2045,11 @@ pub fn timer_create(clockid: u32, evp_ptr: u64, timerid_out: *mut u64) -> i32 {
             timerid_out as u64,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `timer_settime(timerid, flags, new, old)` — arm or disarm. `new_ptr`
@@ -2063,7 +2067,11 @@ pub fn timer_settime(timerid: u32, flags: u32, new_ptr: u64, old_ptr: u64) -> i3
             old_ptr,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `timer_gettime(timerid, cur_ptr)` — read the remaining time +
@@ -2073,7 +2081,11 @@ pub fn timer_settime(timerid: u32, flags: u32, new_ptr: u64, old_ptr: u64) -> i3
 pub fn timer_gettime(timerid: u32, cur_ptr: u64) -> i32 {
     // SAFETY: SYS_TIMER_GETTIME signature: (id, out_ptr).
     let r = unsafe { syscall2(SYS_TIMER_GETTIME, timerid as u64, cur_ptr) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `timer_delete(timerid)` — destroy the timer. Returns 0 on success,
@@ -2082,7 +2094,11 @@ pub fn timer_gettime(timerid: u32, cur_ptr: u64) -> i32 {
 pub fn timer_delete(timerid: u32) -> i32 {
     // SAFETY: SYS_TIMER_DELETE signature: (id).
     let r = unsafe { syscall1(SYS_TIMER_DELETE, timerid as u64) };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `clock_nanosleep(clockid, flags, req_ptr, rem_ptr)` — timed sleep on
@@ -2101,7 +2117,11 @@ pub fn clock_nanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) -> 
             rem_ptr,
         )
     };
-    if r as i64 == -1 { -1 } else { 0 }
+    if r as i64 == -1 {
+        -1
+    } else {
+        0
+    }
 }
 
 // ── VFS ────────────────────────────────────────────────────────────

@@ -72,10 +72,7 @@ pub unsafe extern "C" fn isblank(c: c_int) -> c_int {
 /// \v, \f, \r). Locale-independent.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn isspace(c: c_int) -> c_int {
-    matches!(
-        c as u8,
-        b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r'
-    ) as c_int
+    matches!(c as u8, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r') as c_int
 }
 
 /// Returns non-zero iff `c` is a printable non-space char (0x21..=0x7E).
