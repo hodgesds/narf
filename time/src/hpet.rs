@@ -951,22 +951,19 @@ pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64>
     let _ = writeln!(narf_console::Writer, "  hx: tsc_t1={}", tsc_t1);
     let _ = writeln!(narf_console::Writer, "  hx: dropping lock");
     drop(g);
-    let _ = writeln!(narf_console::Writer, "  hx: dropped lock");
     let d_hpet = hpet_t1.wrapping_sub(hpet_t0);
     let d_tsc = tsc_t1.wrapping_sub(tsc_t0);
-    let _ = writeln!(narf_console::Writer, "  hx: d_hpet={} d_tsc={}", d_hpet, d_tsc);
     if d_hpet == 0 {
         return None;
     }
-    // tsc_hz = d_tsc * hpet_hz / d_hpet — widen to u128 to keep
-    // the multiply from overflowing for fast TSCs (~5 GHz × ~14 MHz
-    // hpet_hz × ~1.4M ticks ≈ 10^17, fits in u128 trivially).
-    let _ = writeln!(narf_console::Writer, "  hx: u128_mul_start");
-    let prod128 = (d_tsc as u128) * (hpet_hz as u128);
-    let _ = writeln!(narf_console::Writer, "  hx: u128_mul_done prod_lo={:x}", prod128 as u64);
-    let div128 = prod128 / (d_hpet as u128);
-    let _ = writeln!(narf_console::Writer, "  hx: u128_div_done div_lo={:x}", div128 as u64);
-    let hz = div128 as u64;
+    // tsc_hz = d_tsc * hpet_hz / d_hpet — stay in u64. Worst case
+    // 5 GHz TSC × ~100 MHz HPET × 100 ms window ≈ 5e16, comfortably
+    // below u64::MAX (1.8e19). The previous u128-widened form lowered
+    // to a `__udivti3` call in compiler-builtins that thin LTO failed
+    // to relocate correctly — non-canonical RIP, #GP. Plain u64
+    // arithmetic produces the same result inline.
+    let prod = d_tsc.saturating_mul(hpet_hz);
+    let hz = prod / d_hpet;
     if hz == 0 {
         None
     } else {
