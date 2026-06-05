@@ -190,11 +190,21 @@ pub unsafe fn load_user_process_with(
         stack_phys_list.push(phys);
     }
 
+    let mut stack_perms = RegionPerms::READ | RegionPerms::WRITE;
+    if let Some(flags) = image.stack_flags {
+        if flags.contains(crate::SegmentFlags::EXEC) {
+            stack_perms = stack_perms | RegionPerms::EXEC;
+        }
+    } else {
+        // SysV ABI historical default is executable stack if no PT_GNU_STACK.
+        stack_perms = stack_perms | RegionPerms::EXEC;
+    }
+
     address_space
         .map_region(Region {
             base: VirtAddr::new(DEFAULT_USER_STACK_BASE),
             len: pages * 4096,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms: stack_perms,
             phys: stack_phys_list,
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;

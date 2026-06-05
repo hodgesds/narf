@@ -357,6 +357,7 @@ pub struct ExecImage {
     /// the loader's own TCB, which is described via DT_* tags rather
     /// than PT_TLS).
     pub tls: Option<TlsTemplate>,
+    pub stack_flags: Option<SegmentFlags>,
     pub argv: Vec<String>,
     pub envp: Vec<String>,
     pub aux: Vec<AuxEntry>,
@@ -371,6 +372,7 @@ impl ExecImage {
             segments: Vec::new(),
             dynamic: Vec::new(),
             tls: None,
+            stack_flags: None,
             argv: Vec::new(),
             envp: Vec::new(),
             aux: Vec::new(),

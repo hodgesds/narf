@@ -47,7 +47,9 @@ const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
+const PT_NOTE: u32 = 4;
 const PT_TLS: u32 = 7;
+const PT_GNU_STACK: u32 = 0x6474e551;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
@@ -133,6 +135,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
     let mut interp: Option<String> = None;
     let mut dynamic: Vec<DynEntry> = Vec::new();
     let mut tls: Option<TlsTemplate> = None;
+    let mut stack_flags: Option<SegmentFlags> = None;
 
     for i in 0..phnum {
         let off = phoff + i * entsize;
@@ -239,6 +242,22 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
                 };
                 interp = core::str::from_utf8(trimmed).ok().map(String::from);
             }
+            PT_GNU_STACK => {
+                let mut flags = SegmentFlags::default();
+                if p_flags & PF_R != 0 {
+                    flags = flags | SegmentFlags::READ;
+                }
+                if p_flags & PF_W != 0 {
+                    flags = flags | SegmentFlags::WRITE;
+                }
+                if p_flags & PF_X != 0 {
+                    flags = flags | SegmentFlags::EXEC;
+                }
+                stack_flags = Some(flags);
+            }
+            PT_NOTE => {
+                // Not fully implemented, just parsed.
+            }
             _ => { /* other PT_* ignored at this tier */ }
         }
     }
@@ -250,6 +269,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
         segments,
         dynamic,
         tls,
+        stack_flags,
         argv: Vec::new(),
         envp: Vec::new(),
         aux: Vec::new(),
