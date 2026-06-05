@@ -359,10 +359,25 @@ const ELF64_SYM_SIZE: u64 = 24;
 const SHN_UNDEF: u16 = 0;
 
 // x86_64 relocation type codes (low 32 bits of `r_info`).
+// AMD64 SysV ABI psABI v1.0 §4.4.1 "Relocation Types".
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
 const R_X86_64_RELATIVE: u32 = 8;
+// TLS relocations. ld-musl uses these to relocate the program's
+// PT_TLS template at interpreter startup.
+//   DTPMOD64 — module ID for general-dynamic / local-dynamic TLS.
+//     With a single TLS module (static-tls model — our only mode),
+//     the resolved value is always 1.
+//   DTPOFF64 — symbol offset within the TLS template image.
+//   TPOFF64  — initial-exec offset from the thread pointer (FS_BASE).
+//     For a static-tls layout this is `S - tls_block_size + A` so
+//     `mov rax, fs:[offset]` reaches the variable's storage at
+//     NEGATIVE offsets from FS_BASE (matches `tls.rs::stage_tls`'s
+//     `[ TLS image | TCB ]` layout with `fs_base = image_end`).
+const R_X86_64_DTPMOD64: u32 = 16;
+const R_X86_64_DTPOFF64: u32 = 17;
+const R_X86_64_TPOFF64: u32 = 18;
 
 /// Lookup helper — return the value paired with the *first*
 /// occurrence of `tag` in `dynamic`. PT_DYNAMIC duplicates would
@@ -563,6 +578,51 @@ fn resolve_symbol_name(bytes: &[u8], image: &ExecImage, sym_idx: u32) -> [u8; 32
     empty
 }
 
+/// Read an `Elf64_Sym`'s `st_value` field for a TLS relocation.
+///
+/// TLS-relocation `S` operands name an offset inside the program's
+/// PT_TLS template image, not a load-time virtual address. We mirror
+/// `resolve_symbol`'s arithmetic (DT_SYMTAB-relative entry walk) but
+/// return `st_value` raw — no `vaddr_bias`, no defined/undefined
+/// gating. An undefined symbol returns 0 (the conventional template
+/// base), matching how ld-musl emits TPOFF64 with `sym_ix == 0` for
+/// the program's own TLS template.
+fn resolve_tls_symbol_offset(
+    bytes: &[u8],
+    image: &ExecImage,
+    sym_idx: u32,
+) -> Result<u64, LoadBytesError> {
+    let symtab_addr =
+        dt_lookup(&image.dynamic, DT_SYMTAB).ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let entry_addr = symtab_addr
+        .checked_add(
+            (sym_idx as u64)
+                .checked_mul(ELF64_SYM_SIZE)
+                .ok_or(LoadBytesError::SymtabOutOfBounds)?,
+        )
+        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    let slice = resolve_dt_pointer(bytes, image, entry_addr, ELF64_SYM_SIZE)
+        .ok_or(LoadBytesError::SymtabOutOfBounds)?;
+    Ok(read_u64_le(&slice[8..16]))
+}
+
+/// Compute the TLS block size used by TPOFF64. The block size is
+/// `template.mem_size` rounded up to `template.align` — matches
+/// `tls.rs::stage_tls`'s `mem_size_aligned` so the negative-offset
+/// arithmetic agrees with where the kernel actually places the image.
+/// Returns 0 when the image has no PT_TLS — TPOFF64 against a binary
+/// without TLS is degenerate but should not abort relocation.
+fn tls_block_size(image: &ExecImage) -> u64 {
+    match &image.tls {
+        Some(t) => {
+            let align = if t.align == 0 { 1 } else { t.align };
+            let mask = align - 1;
+            (t.mem_size + mask) & !mask
+        }
+        None => 0,
+    }
+}
+
 /// Walk DT_RELA + DT_JMPREL and patch each entry.
 ///
 /// `vaddr_bias` is the load offset applied to PT_LOAD vaddrs and
@@ -698,6 +758,42 @@ unsafe fn process_rela_array(
                 // S — bare symbol address. The addend slot is reserved
                 // by the ABI for these two types; ignore it.
                 resolve_symbol(bytes, image, sym_ix, vaddr_bias)?
+            }
+            R_X86_64_DTPMOD64 => {
+                // Module ID. The static-tls model has exactly one TLS
+                // module (the program's PT_TLS template), so the value
+                // is always 1 regardless of sym_ix. Addend is reserved.
+                1
+            }
+            R_X86_64_DTPOFF64 => {
+                // Offset of `sym` within its TLS template image, plus
+                // addend. sym_ix == 0 is the common "anonymous" form
+                // emitted for the TLS template itself; we treat that
+                // as offset 0 so the result is just `A`.
+                let s = if sym_ix == 0 {
+                    0
+                } else {
+                    resolve_tls_symbol_offset(bytes, image, sym_ix)?
+                };
+                s.wrapping_add(r_addend as u64)
+            }
+            R_X86_64_TPOFF64 => {
+                // Initial-exec TLS offset from `fs_base`. The NARF TLS
+                // layout (tls.rs::stage_tls) places the TLS image
+                // immediately below the TCB and points fs_base at the
+                // TCB start, so a variable at template offset `s` lives
+                // at `fs_base - tls_block_size + s`. The runtime patch
+                // site is reached via `mov fs:[disp]`, so the value we
+                // write is the signed displacement `s - tls_block_size + A`.
+                let s = if sym_ix == 0 {
+                    0
+                } else {
+                    resolve_tls_symbol_offset(bytes, image, sym_ix)?
+                };
+                let tls_size = tls_block_size(image);
+                (s as i64)
+                    .wrapping_sub(tls_size as i64)
+                    .wrapping_add(r_addend) as u64
             }
             _ => return Err(LoadBytesError::UnsupportedRelocation),
         };
