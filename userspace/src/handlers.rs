@@ -785,11 +785,15 @@ fn sys_write(ctx: &mut dyn TrapContext) {
             None => return Err(()),
         };
         let off = entry.offset;
-        let written = poll_blocking(entry.ops.write(off, &kbuf))
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        entry.offset = off.saturating_add(written as u64);
-        Ok(written)
+        let res = poll_blocking(entry.ops.write(off, &kbuf))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
+        match res {
+            Ok(written) => {
+                entry.offset = off.saturating_add(written as u64);
+                Ok(written)
+            }
+            Err(_) => Err(()),
+        }
     });
     match outcome {
         Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
@@ -829,11 +833,15 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             None => return Err(()),
         };
         let off = entry.offset;
-        let n = poll_blocking(entry.ops.read(off, &mut kbuf))
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        entry.offset = off.saturating_add(n as u64);
-        Ok(n)
+        let res = poll_blocking(entry.ops.read(off, &mut kbuf))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
+        match res {
+            Ok(n) => {
+                entry.offset = off.saturating_add(n as u64);
+                Ok(n)
+            }
+            Err(_) => Err(()),
+        }
     });
     match outcome {
         Some(Ok(n)) => {
@@ -1465,10 +1473,12 @@ fn sys_pread64(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
-        let n = poll_blocking(ops.read(offset, &mut kbuf))
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        Some(n)
+        let res = poll_blocking(ops.read(offset, &mut kbuf))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
+        match res {
+            Ok(n) => Some(n),
+            Err(_) => None,
+        }
     });
     match outcome {
         Some(Some(n)) => {
@@ -1508,10 +1518,12 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
-        let n = poll_blocking(ops.write(offset, &kbuf))
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        Some(n)
+        let res = poll_blocking(ops.write(offset, &kbuf))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
+        match res {
+            Ok(n) => Some(n),
+            Err(_) => None,
+        }
     });
     match outcome {
         Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
@@ -7559,10 +7571,11 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     } else {
         source.clone()
     };
-    // arg4 packs (fstype_ptr<<32 | fstype_len) — fstype is short
-    // (< 32 chars in practice) so 32 bits each is plenty.
-    let fstype_ptr = (args.arg4 >> 32) as *const u8;
-    let fstype_len = (args.arg4 & 0xFFFF_FFFF) as usize;
+    // Wave-71: ABI fix — 64-bit pointers cannot be packed with lengths.
+    // arg4 is the full fstype_ptr. arg5 packs fstype_len in the top
+    // 32 bits and MS_* flags in the bottom 32 bits.
+    let fstype_ptr = args.arg4 as *const u8;
+    let fstype_len = (args.arg5 >> 32) as usize;
     let fstype = match copy_user_str(fstype_ptr, fstype_len, 32) {
         Ok(s) => s,
         Err(()) => {
@@ -7571,7 +7584,7 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
         }
     };
     // arg5 carries the MS_* flag word.
-    let flags = args.arg5;
+    let flags = args.arg5 & 0xFFFF_FFFF;
     // Silence-the-warning swallow for option bits we accept but
     // don't yet act on; they're documented above.
     let _ =

@@ -1507,8 +1507,8 @@ pub unsafe fn mount_with_flags(
     fstype: &str,
     flags: u64,
 ) -> Result<(), ()> {
-    let packed_fstype = ((fstype.as_ptr() as u64) << 32) | (fstype.len() as u64 & 0xFFFF_FFFF);
-    // SAFETY: SYS_MOUNT 6-arg shape (arg5 = MS_* flags).
+    let packed_flags = ((fstype.len() as u64) << 32) | (flags & 0xFFFF_FFFF);
+    // SAFETY: SYS_MOUNT 6-arg shape.
     let r = unsafe {
         syscall6(
             SYS_MOUNT,
@@ -1516,8 +1516,8 @@ pub unsafe fn mount_with_flags(
             source.len() as u64,
             target.as_ptr() as u64,
             target.len() as u64,
-            packed_fstype,
-            flags,
+            fstype.as_ptr() as u64,
+            packed_flags,
         )
     };
     if r == 0 {

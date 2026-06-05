@@ -821,10 +821,7 @@ fn smoke_e2e_sysfs_hci_address_after_bringup() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
-kernel_test_in!(
-    "bluetooth/e2e",
-    smoke_e2e_sysfs_hci_address_after_bringup
-);
+kernel_test_in!("bluetooth/e2e", smoke_e2e_sysfs_hci_address_after_bringup);
 
 // ── 17. A2DP source — SBC encode + sync word at frame start ────────
 

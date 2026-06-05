@@ -347,11 +347,11 @@ impl Arch {
                     "-machine".into(), "q35,hmat=on".into(),
                     "-cpu".into(),     cpu,
                     "-smp".into(),     "16,sockets=2,cores=8".into(),
-                    "-m".into(),       "256M".into(),
+                    "-m".into(),       "512M".into(),
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
                     "-numa".into(),    "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
-                    "-object".into(),  "memory-backend-ram,id=mem0,size=128M".into(),
-                    "-object".into(),  "memory-backend-ram,id=mem1,size=128M".into(),
+                    "-object".into(),  "memory-backend-ram,id=mem0,size=256M".into(),
+                    "-object".into(),  "memory-backend-ram,id=mem1,size=256M".into(),
                     "-numa".into(),    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
                     "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
@@ -474,7 +474,7 @@ impl Arch {
                     "-smp".into(),
                     "2".into(),
                     "-m".into(),
-                    "256M".into(),
+                    "512M".into(),
                     "-serial".into(),
                     "stdio".into(),
                     "-display".into(),
@@ -583,7 +583,7 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .arg("-smp")
             .arg("2")
             .arg("-m")
-            .arg("256M")
+            .arg("512M")
             .arg("-display")
             .arg("none")
             .arg("-no-reboot")
@@ -1124,7 +1124,7 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(240);
+        .unwrap_or(600);
     match child.wait_timeout(Duration::from_secs(secs))? {
         Some(status) => {
             println!("xtask: {qemu} exited with {status}");

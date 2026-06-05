@@ -1,4 +1,3 @@
-#![cfg(feature = "linux-compat")]
 //! End-to-end smoke tests for NARF's random/entropy subsystem.
 //!
 //! ## CSPRNG implementation

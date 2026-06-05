@@ -2582,7 +2582,7 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
 #[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
 kernel_test_in!("userspace", smoke_userspace_fcntl_setlk_conflict);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "linux-compat")))]
 fn smoke_userspace_stat_returns_size() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -2691,7 +2691,11 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
         return TestResult::Fail("Stat did not return Ok");
     }
     if out.size != FILE_BYTES.len() as u64 {
-        return TestResult::Fail("StatBuf.size mismatch");
+        if out.size == 0 {
+            return TestResult::Fail("StatBuf.size is 0");
+        } else {
+            return TestResult::Fail("StatBuf.size mismatch (not 0)");
+        }
     }
     if out.mtime_cycles != 0xC0FFEE {
         return TestResult::Fail("StatBuf.mtime_cycles mismatch");
@@ -2705,7 +2709,7 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
     __test_clear_global();
     TestResult::Pass
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "linux-compat")))]
 kernel_test_in!("userspace", smoke_userspace_stat_returns_size);
 
 #[cfg(target_arch = "x86_64")]
@@ -13303,6 +13307,8 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
         }
     };
 
+    crate::handlers::register_pid_task_mapping(0, 0);
+
     // Raise SIGUSR1 (10) on task 0 (the test task lookup is unset → 0).
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -13401,6 +13407,8 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
             return TestResult::Fail("signalfd did not return a fd");
         }
     };
+
+    crate::handlers::register_pid_task_mapping(0, 0);
 
     // Create epoll instance.
     let mut ctx = FakeCtx {

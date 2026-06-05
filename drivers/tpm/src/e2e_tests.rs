@@ -1091,7 +1091,7 @@ mod smokes {
     // Smoke 8: /sys/class/tpm/tpm0/pcrs format after extends
     // ═════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
+    #[cfg(feature = "linux-compat")]
     fn e2e_smoke_sysfs_pcrs_format() -> TestResult {
         let fake = Arc::new(FakeTpmTransport::new());
         // Extend PCR-0 so the sysfs output shows a non-trivial value.
@@ -1128,7 +1128,7 @@ mod smokes {
         }
         TestResult::Pass
     }
-#[cfg(feature = "linux-compat")]
+    #[cfg(feature = "linux-compat")]
     kernel_test_in!("drivers/tpm/e2e", e2e_smoke_sysfs_pcrs_format);
 
     // ═════════════════════════════════════════════════════════════════════

@@ -57,15 +57,15 @@ fn set_task(id: u64) {
 
 // Build a SyscallArgs for sys_mount with all three strings.
 // arg0/arg1: source ptr/len; arg2/arg3: target ptr/len;
-// arg4: packed (fstype_ptr<<32 | fstype_len); arg5: flags.
+// arg4: fstype_ptr; arg5: (fstype_len << 32) | flags.
 fn mount_args(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> SyscallArgs {
     SyscallArgs {
         arg0: source.as_ptr() as u64,
         arg1: source.len() as u64,
         arg2: target.as_ptr() as u64,
         arg3: target.len() as u64,
-        arg4: ((fstype.as_ptr() as u64) << 32) | (fstype.len() as u64 & 0xFFFF_FFFF),
-        arg5: flags,
+        arg4: fstype.as_ptr() as u64,
+        arg5: ((fstype.len() as u64) << 32) | (flags & 0xFFFF_FFFF),
     }
 }
 
