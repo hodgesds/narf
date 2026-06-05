@@ -1349,6 +1349,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-crypto",
  "narf-driver-runtime",
  "narf-drivers",
  "narf-drivers-sdio",
