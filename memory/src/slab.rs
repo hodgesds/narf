@@ -58,7 +58,7 @@ use narf_lib::percpu::{current_cpu, MAX_CPUS};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::buddy::MAX_ORDER;
-use crate::frame::{alloc_frame, alloc_pages_on, free_frame, free_pages, PhysFrame};
+use crate::frame::{alloc_frame, alloc_pages_on, free_pages, PhysFrame};
 use crate::PAGE_SIZE;
 
 /// Local `usize` view of `PAGE_SIZE` (which the rest of the crate

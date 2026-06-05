@@ -532,6 +532,7 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
     }
 
     let auth = bootstrap_mount_authority();
+    crate::csprng::init_csprng();
     let _ = registry().mount(&auth, "/dev", DevFs::new());
 
     // Each of /dev/random and /dev/urandom must (a) succeed reading

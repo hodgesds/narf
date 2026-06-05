@@ -23,6 +23,7 @@ narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
 
 [features]
+linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = []
 
 [lints]

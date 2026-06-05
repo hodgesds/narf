@@ -837,6 +837,7 @@ kernel_test_in!("drivers/gpu/e2e", smoke_drm_registry_register_one_card);
 
 // ── Smoke 12: /sys/class/drm/card0/name → "card0\n" ─────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_name_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -877,10 +878,12 @@ fn smoke_drm_sysfs_name_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_name_attr);
 
 // ── Smoke 13: /sys/class/drm/card0/dev → "226:0\n" ───────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_dev_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -916,10 +919,12 @@ fn smoke_drm_sysfs_dev_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_dev_attr);
 
 // ── Smoke 14: /sys/class/drm/card0/device/vendor → "0x1002\n" ────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -956,10 +961,12 @@ fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_vendor_attr);
 
 // ── Smoke 15: /sys/class/drm/card0/device/device → "0x1636\n" for Renoir ─
 
+#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -996,10 +1003,12 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_device_id_attr);
 
 // ── Smoke 16: vbios_version attr readable ─────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1036,10 +1045,12 @@ fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_vbios_version_attr);
 
 // ── Smoke 17: renderD128/dev → "226:128\n" ────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
     use crate::drm_registry;
     use narf_filesystem::sysfs;
@@ -1075,6 +1086,7 @@ fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
     sysfs::__reset_for_test();
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_sysfs_render_node_dev_attr);
 
 // ── Smoke 18: /dev/dri/card0 resolves through DriDir ─────────────────────

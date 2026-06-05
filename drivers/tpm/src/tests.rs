@@ -898,6 +898,7 @@ mod smokes {
         }
     }
 
+    #[cfg(feature = "linux-compat")]
     fn smoke_sysfs_tpm_version_major() -> TestResult {
         use crate::devfs_bridge::TpmTransport;
         use alloc::sync::Arc;
@@ -922,6 +923,7 @@ mod smokes {
         }
         TestResult::Pass
     }
+    #[cfg(feature = "linux-compat")]
     kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_tpm_version_major);
 
     /// PCR transport: returns a canned PCR_Read response with 20-byte
@@ -1001,6 +1003,7 @@ mod smokes {
         }
     }
 
+    #[cfg(feature = "linux-compat")]
     fn smoke_sysfs_pcrs_format() -> TestResult {
         use crate::devfs_bridge::TpmTransport;
         use alloc::sync::Arc;
@@ -1027,6 +1030,7 @@ mod smokes {
         }
         TestResult::Pass
     }
+    #[cfg(feature = "linux-compat")]
     kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_pcrs_format);
 
     /// Manufacturer transport: returns 0x494E4643 ("INFC") for PT_MANUFACTURER.
@@ -1088,6 +1092,7 @@ mod smokes {
         }
     }
 
+    #[cfg(feature = "linux-compat")]
     fn smoke_sysfs_manufacturer_ascii() -> TestResult {
         use crate::devfs_bridge::TpmTransport;
         use alloc::sync::Arc;
@@ -1119,5 +1124,6 @@ mod smokes {
         }
         TestResult::Pass
     }
+    #[cfg(feature = "linux-compat")]
     kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_manufacturer_ascii);
 }

@@ -877,7 +877,7 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
     use core::future::Future;
     use core::pin::Pin;
     use core::sync::atomic::{AtomicBool, Ordering};
-    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 
     static WOKEN: AtomicBool = AtomicBool::new(false);
     fn noop_clone(p: *const ()) -> RawWaker {

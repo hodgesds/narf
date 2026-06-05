@@ -531,8 +531,12 @@ pub mod tests {
     // ── Smoke: TxQueue enqueue advances write_ptr ──────────────────
 
     fn smoke_iwlwifi_tx_queue_enqueue_advances_wptr() -> TestResult {
-        let mut ring: alloc::vec::Vec<Tfd> = (0..TX_RING_SIZE).map(|_| Tfd::default()).collect();
-        let mut q = TxQueue::new(0, ring.as_mut_ptr());
+        // Allocate raw bytes to bypass global allocator alignment bugs for align > 16.
+        let mut raw =
+            alloc::vec::Vec::<u8>::with_capacity(TX_RING_SIZE * core::mem::size_of::<Tfd>() + 64);
+        // Ensure the pointer is 64-byte aligned.
+        let ptr = (raw.as_mut_ptr() as usize + 63) & !63;
+        let mut q = TxQueue::new(0, ptr as *mut Tfd);
         let tfd = Tfd::default();
         let slot = q.enqueue(tfd);
         if slot != 0 {

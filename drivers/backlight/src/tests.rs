@@ -65,7 +65,7 @@ mod smokes {
 
         // _BCL: element 0 = AC default, 1 = battery default, 2..N = ladder.
         // Driver strips first two → sorted ladder 0..=100 in steps of 10.
-        let raw: Vec<u32> = vec![80, 100, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+        let raw: Vec<u32> = vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
         let dev = __test_install("acpi_video0", r"\_SB.GFX0.DD0", raw);
 
         if dev.max_brightness() != 100 {

@@ -889,7 +889,7 @@ fn _stub_oom_adj_set(_pid: u64, _val: i16) -> Result<(), FsError> {
     Ok(())
 }
 fn _stub_coredump_get(_pid: u64) -> u32 {
-    0
+    0x33
 }
 fn _stub_coredump_set(_pid: u64, _val: u32) -> Result<(), FsError> {
     Ok(())

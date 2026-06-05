@@ -821,6 +821,7 @@ kernel_test_in!("drivers/sound", smoke_devfs_pcm_playback_node);
 
 // ── #30: /sys/class/sound/card0/id contains codec name ───────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_card_id_attr() -> TestResult {
     crate::__reset_for_test();
     register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
@@ -836,10 +837,12 @@ fn smoke_sysfs_card_id_attr() -> TestResult {
         TestResult::Fail("card id attr does not contain codec name")
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/sound", smoke_sysfs_card_id_attr);
 
 // ── #31: /sys/class/sound/pcmC0D0p/dev starts with "116:" ────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_pcm_dev_attr_format() -> TestResult {
     crate::__reset_for_test();
     register_card("hda-amd", "HDA AMD", "HDA AMD Renoir", 0, 2, 1);
@@ -850,6 +853,7 @@ fn smoke_sysfs_pcm_dev_attr_format() -> TestResult {
         TestResult::Fail("pcmC0D0p dev attr does not start with '116:'")
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/sound", smoke_sysfs_pcm_dev_attr_format);
 
 // ── #32: PCM playback write 4096 bytes succeeds ──────────────────────
@@ -881,6 +885,7 @@ kernel_test_in!("drivers/sound", smoke_devfs_pcm_write_4096);
 
 // ── #33: /proc/asound/cards format is correct ────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_procfs_cards_format() -> TestResult {
     crate::__reset_for_test();
     register_card("hda-intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
@@ -892,10 +897,12 @@ fn smoke_procfs_cards_format() -> TestResult {
         TestResult::Fail("procfs cards list format incorrect")
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/sound", smoke_procfs_cards_format);
 
 // ── #34: /proc/asound/version contains ALSA header ───────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_procfs_version_alsa_header() -> TestResult {
     let text = crate::procfs_bridge::render_version();
     if text.contains("Advanced Linux Sound Architecture") {
@@ -904,6 +911,7 @@ fn smoke_procfs_version_alsa_header() -> TestResult {
         TestResult::Fail("procfs version text missing ALSA header")
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/sound", smoke_procfs_version_alsa_header);
 
 // ── #35: 2 cards → card0 + card1 both enumerate in /dev/snd ──────────

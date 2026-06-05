@@ -27,6 +27,7 @@ narf-driver-runtime = { path = "../runtime", default-features = false, features 
 narf-memory       = { path = "../../memory" }
 
 [features]
+linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = ["narf-drivers-leds/kernel-test"]
 
 [lints]

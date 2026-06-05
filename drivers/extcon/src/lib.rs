@@ -52,6 +52,7 @@ extern crate alloc;
 
 pub mod cable;
 pub mod class;
+#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 pub mod typec;
 pub mod typec_class;

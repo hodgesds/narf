@@ -1,3 +1,4 @@
+#![cfg(feature = "linux-compat")]
 //! Smoke tests for `sysfs` (kobject hierarchy) and `uevent` (hotplug).
 //!
 //! Covers:
@@ -20,6 +21,7 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[cfg(feature = "linux-compat")]
 use crate::sysfs::{
     class_device_register, class_register, kobject_add_attr, kobject_emit_uevent, Kobject, SysFs,
 };
@@ -100,6 +102,7 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 
 // ── Test 1: Kobject create with parent ────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_create_with_parent() -> TestResult {
     crate::sysfs::__reset_for_test();
     let parent = Kobject::new_root("testroot");
@@ -112,10 +115,12 @@ fn smoke_sysfs_kobject_create_with_parent() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_create_with_parent);
 
 // ── Test 2: Kobject attr show ──────────────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_attr_show() -> TestResult {
     crate::sysfs::__reset_for_test();
     let kobj = Kobject::new_root("foo");
@@ -126,10 +131,12 @@ fn smoke_sysfs_kobject_attr_show() -> TestResult {
         None => TestResult::Fail("attr_show returned None"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_attr_show);
 
 // ── Test 3: Kobject path ──────────────────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_path() -> TestResult {
     crate::sysfs::__reset_for_test();
     let root = Kobject::new_root("class");
@@ -141,10 +148,12 @@ fn smoke_sysfs_kobject_path() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_path);
 
 // ── Test 4: SysFs VFS lookup ──────────────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_vfs_lookup() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -193,10 +202,12 @@ fn smoke_sysfs_vfs_lookup() -> TestResult {
         _ => TestResult::Fail("read attr returned 0 or error"),
     }
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_vfs_lookup);
 
 // ── Test 5: SysFs enumerate class/net ─────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_enumerate_class_net() -> TestResult {
     crate::sysfs::__reset_for_test();
 
@@ -227,6 +238,7 @@ fn smoke_sysfs_enumerate_class_net() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_enumerate_class_net);
 
 // ── Test 6: Uevent ring FIFO order ────────────────────────────────────
@@ -314,6 +326,7 @@ kernel_test_in!("filesystem", smoke_uevent_format_required_keys);
 
 // ── Test 8: Block-device class auto-population ────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_block_class_auto_populate() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -360,10 +373,12 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
 
 // ── Test 9: kobject_emit_uevent helper ────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_emit_uevent() -> TestResult {
     crate::sysfs::__reset_for_test();
     uevent::__reset_for_test();
@@ -386,4 +401,5 @@ fn smoke_sysfs_kobject_emit_uevent() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_emit_uevent);

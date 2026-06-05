@@ -369,6 +369,7 @@ fn standard_test_elf(name: &str, abi: u32) -> Vec<u8> {
 
 // ── Smoke 1: load → live ────────────────────────────────────────────
 
+#[cfg(feature = "linux-compat")]
 fn e2e_load_to_live() -> TestResult {
     let abi = fresh_abi();
     fresh_state(abi);
@@ -412,6 +413,7 @@ fn e2e_load_to_live() -> TestResult {
     let _ = sys_delete_module("e2e_load_to_live");
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("modules/e2e", e2e_load_to_live);
 
 // ── Smoke 2: module-published export visible ────────────────────────
@@ -517,6 +519,7 @@ extern "C" fn smoke_init_cleanup() -> i32 {
     0
 }
 
+#[cfg(feature = "linux-compat")]
 fn e2e_unload_cleans_proc_and_sys() -> TestResult {
     let abi = fresh_abi();
     fresh_state(abi);
@@ -586,6 +589,7 @@ fn e2e_unload_cleans_proc_and_sys() -> TestResult {
 
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("modules/e2e", e2e_unload_cleans_proc_and_sys);
 
 // ── Smoke 5: load-load same module → reject ─────────────────────────

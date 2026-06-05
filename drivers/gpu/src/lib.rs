@@ -164,6 +164,7 @@ pub mod drm;
 pub mod drm_devfs_bridge;
 pub mod drm_ioctl_bridge;
 pub mod drm_registry;
+#[cfg(feature = "linux-compat")]
 pub mod drm_sysfs_bridge;
 pub mod drm_uapi;
 pub mod intel_gpu;
@@ -245,6 +246,7 @@ pub fn register_initcalls() {
     // DRM sysfs bridge: populate /sys/class/drm/.
     // Linux ref: drm_sysfs.c::dev_show.
     narf_init::register(Stage::Late, "drm-sysfs-bridge", || {
+        #[cfg(feature = "linux-compat")]
         drm_sysfs_bridge::populate_drm_class();
         InitResult::Ok
     });

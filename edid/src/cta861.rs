@@ -232,7 +232,7 @@ impl CtaExtension {
         // dtd_offset == 0, no DBC and no DTDs. If dtd_offset == 4,
         // empty DBC (DTDs start immediately).
         let mut data_blocks = Vec::new();
-        if dtd_offset >= 4 && dtd_offset <= 127 {
+        if (4..=127).contains(&dtd_offset) {
             let mut p = 4;
             while p < dtd_offset {
                 let header = buf[p];
@@ -288,7 +288,7 @@ impl CtaExtension {
         // Each is 18 bytes; an all-zero descriptor terminates the list
         // (per §3.10.2 of E-EDID).
         let mut detailed_timings = Vec::new();
-        if dtd_offset >= 4 && dtd_offset <= 126 {
+        if (4..=126).contains(&dtd_offset) {
             let mut p = dtd_offset;
             while p + 18 <= 127 {
                 let slice: [u8; 18] = buf[p..p + 18].try_into().expect("len");

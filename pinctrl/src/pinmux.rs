@@ -17,7 +17,9 @@ extern crate alloc;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum PinDirection {
+    #[default]
     Input = 0,
     Output = 1,
 }
@@ -86,12 +88,6 @@ pub struct PinDriveOpt(pub PinDriveStrength);
 impl Default for PinDriveOpt {
     fn default() -> Self {
         Self(PinDriveStrength::Strength2mA)
-    }
-}
-
-impl Default for PinDirection {
-    fn default() -> Self {
-        Self::Input
     }
 }
 

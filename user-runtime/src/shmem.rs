@@ -56,7 +56,7 @@ impl Shmem {
         // The kernel rounds len up to a page; the user-side wrapper
         // exposes the rounded length so `as_mut_slice()` covers
         // the full mapping.
-        let pages = (len + 4095) / 4096;
+        let pages = len.div_ceil(4096);
         let mapped_len = pages * 4096;
         Ok(Self {
             handle,
