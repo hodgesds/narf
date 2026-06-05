@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+jobs:
+  boot-smoke:
+    name: boot-smoke / ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins nightly-2025-09-14 with rust-src + llvm-tools
+        # + clippy + rustfmt; rustup honors it automatically on first cargo invocation.
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview clippy rustfmt
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-system-arm \
+            cpio \
+            mtools \
+            dosfstools \
+            e2fsprogs \
+            ovmf
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: cargo xtask boot-smoke
+        run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
+
+  feature-matrix:
+    name: feature-check / ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "linux-compat"
+          - "container"
+          - "linux-compat,container"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: featurecheck-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: featurecheck-${{ runner.os }}-
+
+      - name: cargo check (features = "${{ matrix.features }}")
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo check -p narf-userspace --no-default-features
+          else
+            cargo check -p narf-userspace --no-default-features --features '${{ matrix.features }}'
+          fi
