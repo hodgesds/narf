@@ -765,13 +765,28 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         // trampoline reads ucontext.uc_mcontext when restoring.
         let fallback_return = self.frame.rip;
         let want_siginfo = (params.flags & SA_SIGINFO) != 0;
+        let want_altstack = (params.flags & SA_ONSTACK) != 0 && params.altstack_sp != 0;
+        // Naive handlers (no SA_SIGINFO, no SA_ONSTACK) don't have
+        // a libc trampoline to call sigreturn — they `ret` directly
+        // and the kernel must arrange for that `ret` to land at the
+        // resumption RIP with RSP within the SysV red zone of the
+        // original user RSP. Use a minimal 16-byte `[saved_rip,
+        // signum]` push; handler ret pops saved_rip, RSP ends at
+        // orig_rsp - 8 (red-zone safe). Wave-79: full SigContext
+        // layout shifted RSP by ~300 B which broke any post-handler
+        // stack-relative access in the trapped code.
+        let minimal_push = !want_siginfo && !want_altstack;
 
-        // Frame size depends on SA_SIGINFO: rt_sigframe vs classic.
+        // Frame size depends on layout choice.
         let frame_size = if want_siginfo {
             // 8 (fallback) + 128 (siginfo) + size_of::<UContext>().
             8 + 128 + (core::mem::size_of::<UContext>() as u64)
+        } else if minimal_push {
+            // [saved_rip, signum] only — naive-handler-safe.
+            16
         } else {
-            // 8 (fallback) + size_of::<SigContext>().
+            // SA_ONSTACK w/o SA_SIGINFO — libc trampoline reads
+            // SigContext via RSI and calls sigreturn at end.
             8 + (core::mem::size_of::<SigContext>() as u64)
         };
 
@@ -779,7 +794,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         // configured, else user RSP (SysV red zone 128 B respected).
         // Linux `sigsp` in arch/x86/kernel/signal.c.
         const SYSV_RED_ZONE: u64 = 128;
-        let stack_top = if (params.flags & SA_ONSTACK) != 0 && params.altstack_sp != 0 {
+        let stack_top = if want_altstack {
             // Altstack grows down from `sp + size`. No red-zone
             // skipping — the altstack is a dedicated region and
             // the caller's data isn't living above its top.
@@ -854,25 +869,27 @@ impl<'a> TrapContext for X86TrapContext<'a> {
 
             // SAFETY: user stack is mapped under the active CR3
             // (we're at CPL=0 holding the trap on behalf of the
-            // trapping task). Writes to fresh pages cross the
-            // demand-paging branch if needed.
+            // trapping task). SMAP bracket required — supervisor
+            // writes to USER pages fault with EFLAGS.AC=0.
             unsafe {
-                core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
-                // siginfo_t: zero 128 bytes, then write si_signo,
-                // si_errno, si_code prefix. Layout per Linux
-                // include/uapi/asm-generic/siginfo.h.
-                let info_p = siginfo_vaddr as *mut u8;
-                core::ptr::write_bytes(info_p, 0, 128);
-                (info_p as *mut i32).write_unaligned(params.signum as i32);
-                (info_p.add(4) as *mut i32).write_unaligned(0);
-                (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
-                // For SIGSEGV / SIGBUS / SIGFPE / SIGILL, si_addr
-                // lives at offset 16 in the SI_FAULT union shape.
-                // Writing it unconditionally is safe: async signals
-                // pass 0 here and the field is well-defined as
-                // "address associated with signal".
-                (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
-                core::ptr::write_volatile(uctx_vaddr as *mut UContext, uctx);
+                narf_arch::x86_64::smap::with_user_access(|| {
+                    core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
+                    // siginfo_t: zero 128 bytes, then write si_signo,
+                    // si_errno, si_code prefix. Layout per Linux
+                    // include/uapi/asm-generic/siginfo.h.
+                    let info_p = siginfo_vaddr as *mut u8;
+                    core::ptr::write_bytes(info_p, 0, 128);
+                    (info_p as *mut i32).write_unaligned(params.signum as i32);
+                    (info_p.add(4) as *mut i32).write_unaligned(0);
+                    (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
+                    // For SIGSEGV / SIGBUS / SIGFPE / SIGILL, si_addr
+                    // lives at offset 16 in the SI_FAULT union shape.
+                    // Writing it unconditionally is safe: async signals
+                    // pass 0 here and the field is well-defined as
+                    // "address associated with signal".
+                    (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
+                    core::ptr::write_volatile(uctx_vaddr as *mut UContext, uctx);
+                });
             }
 
             self.frame.rsp = new_rsp;
@@ -881,8 +898,34 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             self.frame.rdx = uctx_vaddr;
             self.frame.rip = params.handler;
             true
+        } else if minimal_push {
+            // Naive-handler path: [saved_rip, signum] only. Handler
+            // ret pops saved_rip, RSP lands within the SysV red zone
+            // of orig_rsp so the trapped code resumes cleanly without
+            // calling sigreturn.
+            //
+            // SAFETY: user stack is mapped under the active CR3 and
+            // we hold the trap frame for the calling task. SMAP
+            // bracket required for supervisor-mode write to USER pages.
+            unsafe {
+                narf_arch::x86_64::smap::with_user_access(|| {
+                    core::ptr::write_volatile(new_rsp as *mut u64, saved_rip);
+                    core::ptr::write_volatile((new_rsp + 8) as *mut u64, params.signum as u64);
+                });
+            }
+            self.frame.rsp = new_rsp;
+            self.frame.rdi = params.signum as u64;
+            // No SigContext laid down — RSI is set to new_rsp+8
+            // (the signum slot) only so a future trampoline-aware
+            // handler that inspects RSI sees a defined value rather
+            // than a stale register.
+            self.frame.rsi = new_rsp + 8;
+            self.frame.rip = params.handler;
+            true
         } else {
-            // Classic 1-arg path: [fallback_return][SigContext].
+            // SA_ONSTACK trampoline path: [fallback_return][SigContext].
+            // The libc trampoline reads SigContext via RSI and calls
+            // sigreturn to restore the trapped register state.
             let ctx_vaddr = new_rsp + 8;
             let ctx = SigContext {
                 r15: self.frame.r15,
@@ -909,8 +952,10 @@ impl<'a> TrapContext for X86TrapContext<'a> {
 
             // SAFETY: see SA_SIGINFO branch.
             unsafe {
-                core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
-                core::ptr::write_volatile(ctx_vaddr as *mut SigContext, ctx);
+                narf_arch::x86_64::smap::with_user_access(|| {
+                    core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
+                    core::ptr::write_volatile(ctx_vaddr as *mut SigContext, ctx);
+                });
             }
 
             self.frame.rsp = new_rsp;
@@ -1044,8 +1089,13 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         return false;
     }
     // SAFETY: user-supplied vaddr; the read goes through the active
-    // user AS. A bogus addr faults user-side.
-    let sc = unsafe { core::ptr::read_volatile(sc_vaddr as *const SigContext) };
+    // user AS. A bogus addr faults user-side. SMAP bracket required
+    // for supervisor read of a USER page.
+    let sc = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::read_volatile(sc_vaddr as *const SigContext)
+        })
+    };
     use core::fmt::Write as _;
     ctx.frame.r15 = sc.r15;
     ctx.frame.r14 = sc.r14;
@@ -1181,14 +1231,15 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
         return TestResult::Fail("deliver_signal returned false");
     }
 
-    // The sigframe sits at frame.rsp + 8. SAVED rip is the `rip`
-    // field of the SigContext at offset offset_of!(SigContext, rip).
+    // Wave-79: naive-handler-safe minimal push. The saved RIP the
+    // handler's `ret` will pop sits at [frame.rsp + 0]; no
+    // SigContext is laid down (SA_RESTART without SA_SIGINFO /
+    // SA_ONSTACK).
     let new_rsp = frame.rsp;
-    let sigctx_vaddr = new_rsp + 8;
-    // SAFETY: arch wrote a SigContext to this aligned vaddr just
+    // SAFETY: arch wrote a u64 saved_rip to this aligned vaddr just
     // above; reading it back from the same process is sound.
-    let sc = unsafe { core::ptr::read_volatile(sigctx_vaddr as *const SigContext) };
-    if sc.rip != POST_TRAP_RIP.wrapping_sub(2) {
+    let saved_rip = unsafe { core::ptr::read_volatile(new_rsp as *const u64) };
+    if saved_rip != POST_TRAP_RIP.wrapping_sub(2) {
         return TestResult::Fail("SA_RESTART did not rewind saved RIP by 2");
     }
     // RDI must carry the signum for the 1-arg handler call.
@@ -1224,10 +1275,10 @@ fn smoke_x86_64_sa_restart_clear_does_not_rewind() -> TestResult {
     let mut ctx = X86TrapContext::from_int80(&mut frame);
     let _ = ctx.deliver_signal(&params);
     let new_rsp = frame.rsp;
-    let sigctx_vaddr = new_rsp + 8;
+    // Wave-79: minimal-push layout — saved RIP at new_rsp + 0.
     // SAFETY: see SA_RESTART smoke.
-    let sc = unsafe { core::ptr::read_volatile(sigctx_vaddr as *const SigContext) };
-    if sc.rip != POST_TRAP_RIP {
+    let saved_rip = unsafe { core::ptr::read_volatile(new_rsp as *const u64) };
+    if saved_rip != POST_TRAP_RIP {
         return TestResult::Fail("saved RIP rewound despite SA_RESTART clear");
     }
     TestResult::Pass
@@ -1260,10 +1311,10 @@ fn smoke_x86_64_sa_restart_non_restartable_syscall() -> TestResult {
     let mut ctx = X86TrapContext::from_int80(&mut frame);
     let _ = ctx.deliver_signal(&params);
     let new_rsp = frame.rsp;
-    let sigctx_vaddr = new_rsp + 8;
+    // Wave-79: minimal-push layout — saved RIP at new_rsp + 0.
     // SAFETY: see SA_RESTART smoke.
-    let sc = unsafe { core::ptr::read_volatile(sigctx_vaddr as *const SigContext) };
-    if sc.rip != POST_TRAP_RIP {
+    let saved_rip = unsafe { core::ptr::read_volatile(new_rsp as *const u64) };
+    if saved_rip != POST_TRAP_RIP {
         return TestResult::Fail("saved RIP rewound for a non-restartable syscall");
     }
     TestResult::Pass
