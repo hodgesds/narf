@@ -8680,6 +8680,7 @@ pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
 }
 
 /// /proc/[pid]/* metadata accessor.
+#[cfg(feature = "linux-compat")]
 pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo> {
     use narf_filesystem::procfs::ProcTaskInfo;
     // Don't gate on "is on a ready queue" — the currently-running
@@ -8906,6 +8907,7 @@ pub fn signal_mask_of(task: u64) -> u32 {
 
 fn sys_kill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    #[allow(unused_mut)]
     let mut target = args.arg0;
     let signum = args.arg1 as u32;
     if signum >= 32 {

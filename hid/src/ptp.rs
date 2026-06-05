@@ -223,12 +223,7 @@ pub fn detect(d: &ReportDescriptor) -> Option<PtpProfile> {
     if contacts.is_empty() {
         return None;
     }
-    if contact_count.is_none() {
-        // Microsoft PTP spec mandates Contact Count. Without it we
-        // can't tell how many of the per-contact slots in the report
-        // are valid, so we refuse to bind.
-        return None;
-    }
+    contact_count.as_ref()?;
 
     // Configuration TLC: locate Device Mode Feature (Digitizer page,
     // usage 0x60). Distinct report id from the input report — that's
@@ -373,7 +368,7 @@ pub fn build_mode_feature_report(p: &PtpProfile, mode: u8) -> Option<Vec<u8>> {
     let report_id = f.report_id;
     // Total body bits for *every* Feature field on this report id.
     let body_bits = body_bits_for(p, report_id, FieldKind::Feature);
-    let body_bytes = (body_bits as usize + 7) / 8;
+    let body_bytes = (body_bits as usize).div_ceil(8);
     let mut buf = alloc::vec![0u8; 1 + body_bytes];
     buf[0] = report_id;
     let _ = crate::report::pack(f, &mut buf[1..], &[mode as i32]);

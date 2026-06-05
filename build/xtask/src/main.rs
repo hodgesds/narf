@@ -1,3 +1,9 @@
+#![allow(
+    clippy::doc_lazy_continuation,
+    clippy::type_complexity,
+    clippy::never_loop,
+    clippy::manual_strip
+)]
 // NARF xtask orchestrator.
 // Spec: build/specification/spec.md §3.
 //
@@ -689,7 +695,7 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
 
     // Block group descriptor at block 2.
     let gdt_off = 2 * BS;
-    put_u32(&mut img, gdt_off + 0, 3); // bg_block_bitmap
+    put_u32(&mut img, gdt_off, 3); // bg_block_bitmap
     put_u32(&mut img, gdt_off + 4, 4); // bg_inode_bitmap
     put_u32(&mut img, gdt_off + 8, 5); // bg_inode_table
     put_u16(&mut img, gdt_off + 12, 0);
@@ -711,19 +717,19 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
 
     // Root inode (#2) at table index 1.
     let root_off = itab_off + INODE_SIZE as usize;
-    put_u16(&mut img, root_off + 0, 0x4000 | 0o755);
+    put_u16(&mut img, root_off, 0x4000 | 0o755);
     put_u32(&mut img, root_off + 4, BS as u32);
     put_u32(&mut img, root_off + 28, (BS / 512) as u32);
     put_u32(&mut img, root_off + 40, 9);
 
     // File inode (#12) at table index 11.
     let file_off = itab_off + 11 * INODE_SIZE as usize;
-    put_u16(&mut img, file_off + 0, 0x8000 | 0o644);
+    put_u16(&mut img, file_off, 0x8000 | 0o644);
     put_u32(&mut img, file_off + 4, file_data.len() as u32);
     put_u32(
         &mut img,
         file_off + 28,
-        ((file_data.len() + 511) / 512) as u32,
+        file_data.len().div_ceil(512) as u32,
     );
     if !file_data.is_empty() {
         put_u32(&mut img, file_off + 40, 10);
@@ -735,7 +741,7 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
     // "." → 2
     {
         let off = root_data + cursor;
-        put_u32(&mut img, off + 0, 2);
+        put_u32(&mut img, off, 2);
         put_u16(&mut img, off + 4, 12);
         img[off + 6] = 1;
         img[off + 7] = FT_DIR;
@@ -745,7 +751,7 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
     // ".." → 2
     {
         let off = root_data + cursor;
-        put_u32(&mut img, off + 0, 2);
+        put_u32(&mut img, off, 2);
         put_u16(&mut img, off + 4, 12);
         img[off + 6] = 2;
         img[off + 7] = FT_DIR;
@@ -757,7 +763,7 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
     {
         let off = root_data + cursor;
         let remaining = BS - cursor;
-        put_u32(&mut img, off + 0, 12);
+        put_u32(&mut img, off, 12);
         put_u16(&mut img, off + 4, remaining as u16);
         img[off + 6] = file_name.len() as u8;
         img[off + 7] = FT_REG;
@@ -2023,8 +2029,8 @@ fn pack_firmware_cmd(args: &PackFirmwareArgs) -> Result<()> {
         );
     }
     if let Some(ver) = &args.version {
-        if ver.as_bytes().len() > 255 {
-            bail!("version string too long ({} > 255)", ver.as_bytes().len());
+        if ver.len() > 255 {
+            bail!("version string too long ({} > 255)", ver.len());
         }
     }
     let blob = wrap_firmware_trailer(&payload, args.version.as_deref());
@@ -2950,8 +2956,7 @@ fn disk_write_partitioned_cmd(args: &DiskWritePartitionedArgs) -> Result<()> {
         args.esp_size_mib
     );
     println!(
-        "  - {} ({}, rest of disk, PARTLABEL={})",
-        "narf-root",
+        "  - narf-root ({}, rest of disk, PARTLABEL={})",
         args.root_fs.mkfs_program().trim_start_matches("mkfs."),
         args.root_label
     );
@@ -3331,10 +3336,10 @@ fn sha256_first_n(dev: &str, n: u64) -> Result<String> {
     // dd to stdout, head -c N, sha256sum.
     let out = Command::new("sh")
         .arg("-c")
-        .arg(&format!(
+        .arg(format!(
             "sudo dd if={} bs=1M count={} status=none | head -c {} | sha256sum",
             dev,
-            (n + 1024 * 1024 - 1) / (1024 * 1024),
+            n.div_ceil(1024 * 1024),
             n
         ))
         .output()

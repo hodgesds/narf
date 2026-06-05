@@ -147,7 +147,7 @@ pub fn decode_configuration_table(
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
-        let mut c = (crc & 0xFF) as u32 ^ b as u32;
+        let mut c = (crc & 0xFF) ^ b as u32;
         for _ in 0..8 {
             c = if c & 1 != 0 {
                 (c >> 1) ^ 0xEDB8_8320

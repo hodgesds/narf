@@ -17,7 +17,9 @@ extern crate alloc;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum PinDirection {
+    #[default]
     Input = 0,
     Output = 1,
 }
@@ -89,11 +91,6 @@ impl Default for PinDriveOpt {
     }
 }
 
-impl Default for PinDirection {
-    fn default() -> Self {
-        Self::Input
-    }
-}
 
 impl PinConfig {
     /// Pack into the 32-bit canonical word.

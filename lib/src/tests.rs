@@ -1,3 +1,8 @@
+#![allow(
+    clippy::partialeq_to_none,
+    clippy::redundant_guards,
+    clippy::nonminimal_bool
+)]
 //! Subsystem smokes for `narf-lib`.
 //!
 //! Migrated from `narf-verification` so the primitives validate
@@ -353,13 +358,13 @@ fn smoke_bitmap_set_clear_toggle() -> TestResult {
     if b.count_ones() != 2 {
         return TestResult::Fail("count_ones didn't decrement on clear");
     }
-    if b.toggle(64) != true {
+    if !b.toggle(64) {
         return TestResult::Fail("toggle of a set bit didn't return true");
     }
     if b.get(64) {
         return TestResult::Fail("toggle didn't flip set bit");
     }
-    if b.toggle(64) != false {
+    if b.toggle(64) {
         return TestResult::Fail("toggle of newly-cleared bit didn't return false");
     }
     if !b.get(64) {

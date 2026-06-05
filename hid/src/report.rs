@@ -86,7 +86,7 @@ fn read_bits(body: &[u8], bit: u64, n: usize, signed: bool) -> Result<i32, Repor
     let start_byte = (bit / 8) as usize;
     let start_off = (bit % 8) as usize;
     let total_bits_to_load = start_off + n;
-    let bytes_to_load = (total_bits_to_load + 7) / 8;
+    let bytes_to_load = total_bits_to_load.div_ceil(8);
     for k in 0..bytes_to_load {
         acc |= (body[start_byte + k] as u64) << (8 * k);
     }
@@ -119,7 +119,7 @@ fn write_bits(body: &mut [u8], bit: u64, n: usize, value: i32) -> Result<(), Rep
     // Splat into a working u64 view, clear the field, write, then
     // store back byte-by-byte.
     let total_bits = start_off + n;
-    let bytes = (total_bits + 7) / 8;
+    let bytes = total_bits.div_ceil(8);
     let mut acc: u64 = 0;
     for k in 0..bytes {
         acc |= (body[start_byte + k] as u64) << (8 * k);
