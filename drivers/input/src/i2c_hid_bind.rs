@@ -561,14 +561,16 @@ fn push_ptp_pointer(
 /// expects (mixed-endian Microsoft GUID): the first 4-byte group is
 /// little-endian, the next two 2-byte groups are little-endian, and
 /// the trailing 8 bytes are big-endian. Source UUID:
-/// 4F1C8DA2-D5A0-4C7B-8169-3D2DBFCA3C03 (Microsoft HID-over-I2C
-/// spec §3.1).
+/// 3CDFF6F7-4267-4555-AD05-B30A3D8938DE — the UUID real-HW DSDTs
+/// publish for HID-over-I2C (matches Linux
+/// `drivers/hid/i2c-hid/i2c-hid-acpi.c::i2c_hid_acpi_dsm_uuid`,
+/// referenced here post-relicense for the byte order only).
 const HID_OVER_I2C_DSM_UUID: [u8; 16] = [
-    0xA2, 0x8D, 0x1C, 0x4F, // 4F1C8DA2 (LE)
-    0xA0, 0xD5, // D5A0      (LE)
-    0x7B, 0x4C, // 4C7B      (LE)
-    0x81, 0x69, // 8169      (BE)
-    0x3D, 0x2D, 0xBF, 0xCA, 0x3C, 0x03, // 3D2DBFCA3C03 (BE)
+    0xF7, 0xF6, 0xDF, 0x3C, // 3CDFF6F7 (LE)
+    0x67, 0x42, // 4267      (LE)
+    0x55, 0x45, // 4555      (LE)
+    0xAD, 0x05, // AD05      (BE)
+    0xB3, 0x0A, 0x3D, 0x89, 0x38, 0xDE, // B30A3D8938DE (BE)
 ];
 
 /// Function index for "return the HID descriptor register address",
