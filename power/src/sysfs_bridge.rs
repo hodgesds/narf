@@ -515,6 +515,55 @@ pub fn register_cooling_device_sysfs(dev: CoolingDeviceNode, index: u32) -> Cool
     dev
 }
 
+// ── EC class (debug surface) ──────────────────────────────────────────
+
+/// Register `/sys/class/ec/ec0/` — debug surface for the ACPI EC.
+///
+/// Exposes:
+///   - `state`     — comma-separated `data_port,cmd_port,status_byte_hex`.
+///                   Linux exposes `/sys/kernel/debug/ec/ec0/{gpe,io,state}`;
+///                   we collapse into a single `state` attr since NARF
+///                   has no debugfs split.
+///   - `gpe`       — EC GPE bit (decimal), `unknown` when not bound.
+///   - `address`   — `data,cmd` ports in hex (read-only convenience).
+///
+/// Linux ref: `drivers/acpi/ec_sysfs.c` (`gpe_show`, `state_show`).
+pub fn register_ec_sysfs() {
+    if !narf_aml::ec::enabled() {
+        return;
+    }
+    let class = class_register("ec");
+    let kobj = class_device_register(class, "ec0");
+
+    kobject_add_attr(&kobj, "state", || match narf_aml::ec::ports() {
+        Some((data, cmd)) => match narf_aml::ec::status() {
+            Ok(s) => format!("{:#06x},{:#06x},{:#04x}\n", data, cmd, s),
+            Err(_) => format!("{:#06x},{:#06x},??\n", data, cmd),
+        },
+        None => "unbound\n".to_string(),
+    });
+
+    kobject_add_attr(&kobj, "address", || match narf_aml::ec::ports() {
+        Some((data, cmd)) => format!("{:#06x},{:#06x}\n", data, cmd),
+        None => "unbound\n".to_string(),
+    });
+
+    kobject_add_attr(&kobj, "gpe", || {
+        // ACPI EC `_GPE` bit. The platform driver caches it; we
+        // re-read via the AML namespace for the sysfs attribute.
+        match narf_aml::find_device_by_hid("PNP0C09") {
+            Some(d) => {
+                let path = format!("{}._GPE", d.path);
+                match narf_aml::eval::evaluate_method(&path, &[]) {
+                    Ok(v) => format!("{}\n", v.as_integer()),
+                    Err(_) => "unknown\n".to_string(),
+                }
+            }
+            None => "unknown\n".to_string(),
+        }
+    });
+}
+
 // ── Top-level populate ────────────────────────────────────────────────
 
 /// Discover and register all ACPI batteries, AC adapters, and thermal
@@ -540,6 +589,9 @@ pub fn populate_power_supply_and_thermal() {
     for (i, zone) in crate::acpi_thermal::enumerate().into_iter().enumerate() {
         register_thermal_zone_sysfs(zone, i as u32);
     }
+
+    // EC debug surface: /sys/class/ec/ec0/
+    register_ec_sysfs();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -969,4 +1021,41 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("power/sysfs_bridge", smoke_sysfs_trip_point_ordering);
+
+    // ── Smoke 15: EC sysfs class state attr round-trip ───────────────
+    //
+    // register_ec_sysfs() short-circuits when no EC was discovered.
+    // Build the kobject manually with the same attr show-fns so the
+    // smoke is hermetic regardless of whether boot found PNP0C09.
+    fn smoke_sysfs_ec_state_attr_format() -> TestResult {
+        __reset_for_test();
+        let class = class_register("ec");
+        let kobj = class_device_register(class, "ec0-format-test");
+
+        // Mirror the real register_ec_sysfs() state attr but with
+        // fixed inputs so the assertion stays stable.
+        let data: u16 = 0x62;
+        let cmd: u16 = 0x66;
+        let status: u8 = 0x20; // SCI_EVT set
+        kobject_add_attr(&kobj, "state", move || {
+            format!("{:#06x},{:#06x},{:#04x}\n", data, cmd, status)
+        });
+        kobject_add_attr(&kobj, "address", move || {
+            format!("{:#06x},{:#06x}\n", data, cmd)
+        });
+
+        match read_attr(&kobj, "state").as_deref() {
+            Some("0x0062,0x0066,0x20") => {}
+            Some(s) => {
+                let _ = s;
+                return TestResult::Fail("ec state attr format mismatch");
+            }
+            None => return TestResult::Fail("ec state attr missing"),
+        }
+        match read_attr(&kobj, "address").as_deref() {
+            Some("0x0062,0x0066") => TestResult::Pass,
+            _ => TestResult::Fail("ec address attr format mismatch"),
+        }
+    }
+    kernel_test_in!("power/sysfs_bridge", smoke_sysfs_ec_state_attr_format);
 }
