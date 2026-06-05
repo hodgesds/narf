@@ -260,6 +260,10 @@ fn spawn_supervisor_task() {
         /// PORTSC.PLS shift (bits 5..8 — xHCI 1.2 §5.4.8 Table 5-27).
         const PORTSC_PLS_SHIFT: u32 = 5;
         const PORTSC_PLS_MASK: u32 = 0xF << PORTSC_PLS_SHIFT;
+        // xHCI 1.2 §5.4.8 PLS values. Only the ones we care about
+        // for the supervisor's hot-plug-vs-our-reset disambiguation.
+        const PORTSC_PLS_DISABLED: u8 = 0x4;
+        const PORTSC_PLS_RXDETECT: u8 = 0x5;
         /// PORTSC.PLS encoding for U0 — link active, ready to transfer.
         const PORTSC_PLS_U0: u32 = 0x0;
         let mut irq_vector: Option<u8> = None;
@@ -323,19 +327,27 @@ fn spawn_supervisor_task() {
                 if let Some(v) = c.portsc(p) {
                     let pls = ((v & PORTSC_PLS_MASK) >> PORTSC_PLS_SHIFT) as u8;
                     let prev = last_pls[pi];
+                    // Reset the per-port retry counter ONLY when the
+                    // port has gone through a real hot-plug cycle —
+                    // that is, the previous PLS was Disabled (4) or
+                    // RxDetect (5), the two states a disconnected
+                    // port sits in. Polling → U0 transitions also
+                    // hit U0, but those are produced by our own
+                    // `try_attach_root` calling `port_reset`; if we
+                    // cleared the counter there, a device like a
+                    // USB-HID tablet that legitimately fails
+                    // `find_boot_kbd` would retry forever and burn
+                    // CPU on a sub-1s loop.
                     if prev != 0xFF
                         && prev != pls
                         && pls == PORTSC_PLS_U0 as u8
+                        && (prev == PORTSC_PLS_DISABLED || prev == PORTSC_PLS_RXDETECT)
                         && root_fail_count[pi] != 0
                     {
-                        // Port just came alive after being stuck.
-                        // Wipe the fail counter so the enumeration
-                        // retry loop picks it up again. Log so a
-                        // real-HW boot makes the recovery visible.
                         use core::fmt::Write as _;
                         let _ = writeln!(
                             narf_console::Writer,
-                            "  usb-supervisor: port {} PLS {:x}→U0, retry budget reset",
+                            "  usb-supervisor: port {} PLS {:x}→U0 (hot-plug), retry budget reset",
                             p,
                             prev
                         );
