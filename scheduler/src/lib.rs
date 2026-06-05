@@ -67,6 +67,7 @@ extern crate alloc;
 pub mod affinity;
 pub mod budget;
 pub mod cpu_lifecycle;
+pub mod policy;
 pub mod priority;
 pub mod stackful;
 
@@ -76,6 +77,10 @@ pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 pub use cpu_lifecycle::{
     cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,
+};
+pub use policy::{
+    current_scheduler_name, install_scheduler, FifoScheduler, PriorityScheduler, RunQueue,
+    SchedPolicy, Scheduler, SchedulerError, TaskHandle, TaskMeta,
 };
 pub use priority::{Priority, SchedClass, SmtSharePolicy};
 
@@ -225,7 +230,7 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     ACTIVE_USER_AS.lock().clone()
 }
 
-struct TaskSlot {
+pub(crate) struct TaskSlot {
     task: BoxedTask,
     // Per-task "needs-repoll" flag set by the waker. The slot owns one
     // `Arc<AtomicBool>`; each handed-out `Waker` owns another clone, so
@@ -235,12 +240,15 @@ struct TaskSlot {
     // on subsequent rounds until a waker flips it back to `true`.
     awake: Arc<AtomicBool>,
     /// Monotonic identifier stamped at spawn time so `donate_to` has
-    /// a stable handle into the ready queue.
-    id: TaskId,
+    /// a stable handle into the ready queue. `pub(crate)` so the
+    /// `policy` module's `RunQueue` projection can read it.
+    pub(crate) id: TaskId,
     /// Stage-3 §3.3/§3.4 per-task metadata: affinity, CPU budget, the
     /// `Cap<CpuBudget, Spend>` that gates scheduling, and the running
-    /// `BudgetAccount`.
-    spec: TaskSpec,
+    /// `BudgetAccount`. `pub(crate)` so the `policy` module's
+    /// `RunQueue` projection can read its `priority`/`class`/
+    /// `affinity` fields.
+    pub(crate) spec: TaskSpec,
     account: BudgetAccount,
     /// Optional per-process address space (Stage 4). `None` for
     /// kernel-only tasks; `Some` for a user-mode task that shares
@@ -402,6 +410,10 @@ pub fn init() {
     for q in READY.iter() {
         *q.lock() = Some(VecDeque::new());
     }
+    // Wave D: wire the default `FifoScheduler` into the policy slot
+    // before any `run_until_empty` call dispatches. Idempotent — if a
+    // smoke installed an alternative impl ahead of init, leave it.
+    policy::install_default_if_unset();
 }
 
 /// Test-only hook: clear every ready queue without re-running
@@ -1147,11 +1159,20 @@ pub fn run_until_empty() {
         let mut ready_this_round: usize = 0;
 
         for _ in 0..round_len {
-            // Pop; if empty, break (can happen if a task was cancelled).
+            // Wave D: the pluggable `Scheduler` policy decides which
+            // slot to dispatch next. Default is `FifoScheduler` — its
+            // `pick_next` is pop_front, so this branch behaves
+            // byte-for-byte like the pre-Wave-D inline pop. The
+            // policy is consulted under the per-CPU queue lock; impls
+            // must not allocate or re-enter the scheduler (see the
+            // trait-level hot-path constraint comment in
+            // `policy.rs`).
+            let cpu_id = crate::affinity::CpuId(cpu as u32);
             let mut slot = {
                 let mut q = READY[cpu].lock();
-                match q.as_mut().unwrap().pop_front() {
-                    Some(t) => t,
+                let dq = q.as_mut().unwrap();
+                match policy::pick_next_slot(cpu_id, dq) {
+                    Some((_h, slot)) => slot,
                     None => break,
                 }
             };
