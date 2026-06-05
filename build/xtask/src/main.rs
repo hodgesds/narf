@@ -2151,6 +2151,39 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     let fw_dir = root.join("target").join("firmware");
     let (fw_initramfs, fw_rootfs) = collect_firmware_blobs(&fw_dir, &args.initramfs_firmware)?;
 
+    // Optional ld-musl staging for Linux-compat PT_INTERP. When
+    // $LDMUSL_PATH is set (or /lib/ld-musl-x86_64.so.1 is present on
+    // the host), copy the host interpreter into the initramfs CPIO at
+    // the canonical Linux path. The kernel's FS-backed PT_INTERP
+    // lookup (Wave-75, userspace/process.rs::read_path_from_vfs)
+    // resolves `/lib/ld-musl-x86_64.so.1` against the initramfs mount
+    // and runs the interpreter for dynamically-linked Linux ELFs.
+    //
+    // Absent on a non-musl host: skip with a warning. The image still
+    // builds; programs needing the interpreter just don't get one.
+    let ld_musl_bytes: Option<Vec<u8>> = {
+        let host_path = std::env::var("LDMUSL_PATH")
+            .ok()
+            .unwrap_or_else(|| "/lib/ld-musl-x86_64.so.1".into());
+        match std::fs::read(&host_path) {
+            Ok(b) => {
+                println!(
+                    "xtask image: ld-musl staged from {} ({} bytes) → lib/ld-musl-x86_64.so.1",
+                    host_path,
+                    b.len()
+                );
+                Some(b)
+            }
+            Err(e) => {
+                println!(
+                    "xtask image: no ld-musl at {} ({}); skipping dynamic-linker stage",
+                    host_path, e
+                );
+                None
+            }
+        }
+    };
+
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
     cpio_entries.push(("init", &init_bytes));
     cpio_entries.push(("shell", &shell_bytes));
@@ -2158,6 +2191,9 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     // PATH resolution resolves them after the initramfs is mounted.
     for (path, bytes) in &coreutil_bytes {
         cpio_entries.push((path.as_str(), bytes.as_slice()));
+    }
+    if let Some(ref b) = ld_musl_bytes {
+        cpio_entries.push(("lib/ld-musl-x86_64.so.1", b.as_slice()));
     }
     for (path, bytes) in &fw_initramfs {
         cpio_entries.push((path.as_str(), bytes.as_slice()));
