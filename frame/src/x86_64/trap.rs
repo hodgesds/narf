@@ -334,14 +334,24 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 }
             }
         }
-        // COW write-fault recovery: P+W+U → split on write.
-        if (ec & (PF_P | PF_W | PF_U)) == (PF_P | PF_W | PF_U) {
+        // COW write-fault recovery: P+W on a present-RO user page.
+        // The U/S bit distinguishes user-mode vs supervisor-mode
+        // writes — both need recovery. User-mode writes happen when
+        // the user task itself stores into a CoW-shared page;
+        // supervisor-mode writes happen when the kernel is acting on
+        // behalf of a user task (deliver_signal pushing a frame onto
+        // the user stack, copy_to_user, etc.). We require cr2 to lie
+        // in the user canonical-low half so the kernel can't
+        // accidentally COW-resolve a fault on its own pages.
+        const USER_CANONICAL_END: u64 = 0x0000_8000_0000_0000;
+        let cr2_is_user = cr2 < USER_CANONICAL_END;
+        if (ec & (PF_P | PF_W)) == (PF_P | PF_W) && cr2_is_user {
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
                 // SAFETY: low-4-GiB identity map is live, frame
                 // allocator + COW refcount table are
-                // initialised at boot. AS is the active user AS
-                // by construction (we just probed CPL=3).
+                // initialised at boot. AS is the active user AS by
+                // construction (cr2 in user half + active_user_as).
                 let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
                 if split_ok {
                     // SAFETY: same identity-map argument; the
