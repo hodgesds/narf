@@ -102,18 +102,42 @@ pub struct CauseMap {
 /// Canonical bring-up cause table for single-queue operation.
 pub const DEFAULT_CAUSE_TABLE: &[CauseMap] = &[
     // FH causes — written into IVAR_AD_REG[0..32].
-    CauseMap { cause: CAUSE_FH_RX_Q0, vector: VECTOR_RX_ALIVE },
-    CauseMap { cause: CAUSE_FH_TX, vector: VECTOR_TX },
+    CauseMap {
+        cause: CAUSE_FH_RX_Q0,
+        vector: VECTOR_RX_ALIVE,
+    },
+    CauseMap {
+        cause: CAUSE_FH_TX,
+        vector: VECTOR_TX,
+    },
 ];
 
 /// HW causes table (separate sub-table; offsets above IVAR_AD_REG).
 pub const DEFAULT_HW_CAUSE_TABLE: &[CauseMap] = &[
-    CauseMap { cause: CAUSE_HW_ALIVE, vector: VECTOR_RX_ALIVE },
-    CauseMap { cause: CAUSE_HW_WAKEUP, vector: VECTOR_RX_ALIVE },
-    CauseMap { cause: CAUSE_HW_RF_KILL, vector: VECTOR_ERR },
-    CauseMap { cause: CAUSE_HW_CT_KILL, vector: VECTOR_ERR },
-    CauseMap { cause: CAUSE_HW_SW_ERR, vector: VECTOR_ERR },
-    CauseMap { cause: CAUSE_HW_HW_ERR, vector: VECTOR_ERR },
+    CauseMap {
+        cause: CAUSE_HW_ALIVE,
+        vector: VECTOR_RX_ALIVE,
+    },
+    CauseMap {
+        cause: CAUSE_HW_WAKEUP,
+        vector: VECTOR_RX_ALIVE,
+    },
+    CauseMap {
+        cause: CAUSE_HW_RF_KILL,
+        vector: VECTOR_ERR,
+    },
+    CauseMap {
+        cause: CAUSE_HW_CT_KILL,
+        vector: VECTOR_ERR,
+    },
+    CauseMap {
+        cause: CAUSE_HW_SW_ERR,
+        vector: VECTOR_ERR,
+    },
+    CauseMap {
+        cause: CAUSE_HW_HW_ERR,
+        vector: VECTOR_ERR,
+    },
 ];
 
 // ── Programming helpers ────────────────────────────────────────────

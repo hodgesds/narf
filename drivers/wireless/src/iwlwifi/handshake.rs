@@ -30,7 +30,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use narf_wireless::eapol::{KeyFrame, Ptk, Supplicant, FourWayError, FourWayState};
+use narf_wireless::eapol::{FourWayError, FourWayState, KeyFrame, Ptk, Supplicant};
 
 use super::wpa::HmacSha1;
 
@@ -103,7 +103,9 @@ impl Wpa2Handshake {
     /// or `None` if the supplicant is idle / done.
     pub fn process(&mut self, rx: &KeyFrame) -> Result<Option<KeyFrame>, FourWayError> {
         let prev_state = self.supplicant.state;
-        let maybe_reply = self.supplicant.handle(&HmacSha1, &self.pmk, CCMP_TK_LEN, rx)?;
+        let maybe_reply = self
+            .supplicant
+            .handle(&HmacSha1, &self.pmk, CCMP_TK_LEN, rx)?;
 
         // If the supplicant emitted M2 or M4, MIC it.
         let mut out = maybe_reply;
@@ -184,8 +186,8 @@ pub mod tests {
         let body = b"Hi There";
         let mic = compute_mic(&kck, body);
         let expected: [u8; 16] = [
-            0xB6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64,
-            0xE2, 0x8B, 0xC0, 0xB6, 0xFB, 0x37, 0x8C, 0x8E,
+            0xB6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xE2, 0x8B, 0xC0, 0xB6, 0xFB, 0x37,
+            0x8C, 0x8E,
         ];
         if mic != expected {
             return TestResult::Fail("compute_mic vector mismatch");
@@ -226,10 +228,11 @@ pub mod tests {
         // (must match what we recorded in M1).
         let mut m3 = KeyFrame::empty(AKM_SHA1_MIC_LEN);
         m3.descriptor_type = KEY_DESCRIPTOR_RSN;
-        m3.key_information = KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_KEY_MIC | KI_INSTALL | KI_SECURE;
+        m3.key_information =
+            KI_KEY_TYPE_PAIRWISE | KI_KEY_ACK | KI_KEY_MIC | KI_INSTALL | KI_SECURE;
         m3.replay_counter = 2;
         m3.key_nonce = [0xAAu8; 32]; // same as M1 ANonce
-        // (MIC bytes themselves not validated by handshake driver.)
+                                     // (MIC bytes themselves not validated by handshake driver.)
 
         let m4 = match h.process(&m3) {
             Ok(Some(m4)) => m4,

@@ -123,11 +123,11 @@ impl IwlDevice {
         let body = mlme::build_open_auth_body();
         let pkt = tx::TxPacket::management(
             tx::fc::SUBTYPE_AUTH,
-            bssid,            // addr1: DA = AP
-            self.mac_addr,    // addr2: SA = us
-            bssid,            // addr3: BSSID = AP
-            1,                // seq num
-            0xFF,             // BCAST station id (pre-association)
+            bssid,         // addr1: DA = AP
+            self.mac_addr, // addr2: SA = us
+            bssid,         // addr3: BSSID = AP
+            1,             // seq num
+            0xFF,          // BCAST station id (pre-association)
             &body,
         );
 
@@ -136,11 +136,7 @@ impl IwlDevice {
         let buf = narf_io::alloc_coherent(total, DomainId::DRIVER_0)
             .map_err(|_| WirelessError::HardwareError)?;
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                pkt.mac_hdr.as_ptr(),
-                buf.as_mut_ptr(),
-                pkt.mac_hdr_len,
-            );
+            core::ptr::copy_nonoverlapping(pkt.mac_hdr.as_ptr(), buf.as_mut_ptr(), pkt.mac_hdr_len);
             core::ptr::copy_nonoverlapping(
                 pkt.payload.as_ptr(),
                 buf.as_mut_ptr().add(pkt.mac_hdr_len),
@@ -156,7 +152,9 @@ impl IwlDevice {
         let cmd = tx::IwlTxCmd::for_management(frame_len, 0xFF);
         let cmd_dma = &self.tx_cmd_bufs[0];
         let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
-        unsafe { core::ptr::write_volatile(cmd_ptr, cmd); }
+        unsafe {
+            core::ptr::write_volatile(cmd_ptr, cmd);
+        }
 
         let mut tfd = tx::Tfd::default();
         tfd.push_seg(
@@ -1381,18 +1379,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             if let Ok(v) = narf_interrupts::vector::alloc() {
                 if let Ok(mut msix) = narf_bus::msix::enable_msix(&cap, &device) {
                     unsafe {
-                        let _ = msix.program_vector(
-                            iwl_msix::VECTOR_RX_ALIVE as u16, 0, v);
+                        let _ = msix.program_vector(iwl_msix::VECTOR_RX_ALIVE as u16, 0, v);
                         // Try to allocate two more CPU vectors for TX
                         // and ERR; fall through if we can't get them.
                         if let Ok(v_tx) = narf_interrupts::vector::alloc() {
-                            let _ = msix.program_vector(
-                                iwl_msix::VECTOR_TX as u16, 0, v_tx);
+                            let _ = msix.program_vector(iwl_msix::VECTOR_TX as u16, 0, v_tx);
                             narf_interrupts::install_handler(v_tx, || {});
                         }
                         if let Ok(v_err) = narf_interrupts::vector::alloc() {
-                            let _ = msix.program_vector(
-                                iwl_msix::VECTOR_ERR as u16, 0, v_err);
+                            let _ = msix.program_vector(iwl_msix::VECTOR_ERR as u16, 0, v_err);
                             narf_interrupts::install_handler(v_err, || {});
                         }
                         let _ = msix.enable();
