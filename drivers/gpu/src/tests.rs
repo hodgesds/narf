@@ -5861,3 +5861,301 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_v12_v13_opcodes_differ_where_expected
 );
+
+// ── Foundations wave — bring-up target PCI ID coverage ─────────────
+//
+// The bring-up matrix is two laptops:
+//   - Renoir family — 1002:1636 (Renoir Vega8/9, DCN 2.0) and
+//                     1002:1638 (Cezanne, DCN 2.1) — both routed to
+//                     Family::Renoir (GFX9 / SMU 12.0 / PSP 12.0).
+//   - Phoenix HawkPoint1 — 1002:1900 (DCN 3.5, GFX 11.5, SMU 14).
+// Lock the three explicit PCI IDs in so an accidental rename or
+// table edit surfaces immediately.
+
+fn smoke_amdgpu_foundations_bringup_target_pci_ids() -> TestResult {
+    use crate::amdgpu;
+    if amdgpu::RENOIR != 0x1636 {
+        return TestResult::Fail("RENOIR constant drifted from 0x1636");
+    }
+    if amdgpu::CEZANNE != 0x1638 {
+        return TestResult::Fail("CEZANNE constant drifted from 0x1638");
+    }
+    if amdgpu::PHOENIX_HAWKPOINT1 != 0x1900 {
+        return TestResult::Fail("PHOENIX_HAWKPOINT1 constant drifted from 0x1900");
+    }
+    if amdgpu::AMD_VENDOR != 0x1002 {
+        return TestResult::Fail("AMD_VENDOR constant drifted from 0x1002");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_bringup_target_pci_ids
+);
+
+// ── Foundations wave — GFX register surface ────────────────────────
+
+fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
+    use crate::amdgpu_gfx::GrbmStatus;
+    // All zeros → idle.
+    let s = GrbmStatus { raw: 0 };
+    if !s.idle() {
+        return TestResult::Fail("raw=0 must decode as idle");
+    }
+    if s.any_busy() || s.cp_busy() || s.rlc_busy() {
+        return TestResult::Fail("raw=0 must not be busy");
+    }
+    if s.is_sentinel() {
+        return TestResult::Fail("raw=0 is not the device-gone sentinel");
+    }
+    // GUI_ACTIVE set → busy + not idle.
+    let s2 = GrbmStatus {
+        raw: crate::amdgpu_gfx::GRBM_STATUS_GUI_ACTIVE,
+    };
+    if !s2.any_busy() || s2.idle() {
+        return TestResult::Fail("GUI_ACTIVE bit must trip any_busy");
+    }
+    // Sentinel.
+    let s3 = GrbmStatus { raw: 0xFFFF_FFFF };
+    if !s3.is_sentinel() {
+        return TestResult::Fail("0xFFFFFFFF must be sentinel");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_grbm_status_idle_decode
+);
+
+fn smoke_amdgpu_foundations_grbm_gfx_index_encoding() -> TestResult {
+    use crate::amdgpu_gfx::{grbm_gfx_index_broadcast, grbm_gfx_index_for};
+    // Broadcast must light all three top bits.
+    let b = grbm_gfx_index_broadcast();
+    if b & (1 << 31) == 0 || b & (1 << 30) == 0 || b & (1 << 29) == 0 {
+        return TestResult::Fail("broadcast must light bits 29/30/31");
+    }
+    // Low 24 bits must be zero on a broadcast (no narrowing).
+    if b & 0x00FF_FFFF != 0 {
+        return TestResult::Fail("broadcast must leave narrowing fields zero");
+    }
+    // Targeted index encodes (se, sh, instance) in the three byte lanes.
+    let v = grbm_gfx_index_for(2, 1, 3);
+    if v & 0xFF != 3 {
+        return TestResult::Fail("instance not in lane 0");
+    }
+    if (v >> 8) & 0xFF != 1 {
+        return TestResult::Fail("sh not in lane 1");
+    }
+    if (v >> 16) & 0xFF != 2 {
+        return TestResult::Fail("se not in lane 2");
+    }
+    // Broadcast bits must be clear on a targeted value.
+    if v & 0xE000_0000 != 0 {
+        return TestResult::Fail("targeted value must not set broadcast bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_grbm_gfx_index_encoding
+);
+
+fn smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct() -> TestResult {
+    // GFX9 (Renoir, Cezanne) and GFX11 (Phoenix HawkPoint1, Strix)
+    // place GRBM_STATUS and CP_VERSION at different byte offsets;
+    // confirm so the per-family branch in
+    // `AmdGpu::grbm_status_offset` / `cp_version_offset` actually
+    // does work.
+    use crate::amdgpu_gfx::{
+        CP_VERSION_REL_GFX11, CP_VERSION_REL_GFX9, GRBM_STATUS_REL_GFX11, GRBM_STATUS_REL_GFX9,
+    };
+    if GRBM_STATUS_REL_GFX9 == GRBM_STATUS_REL_GFX11 {
+        return TestResult::Fail("GRBM_STATUS offsets must differ GFX9 vs GFX11");
+    }
+    if CP_VERSION_REL_GFX9 == CP_VERSION_REL_GFX11 {
+        return TestResult::Fail("CP_VERSION offsets must differ GFX9 vs GFX11");
+    }
+    // GFX9 values must match the documented gc_9_0_offset.h dwords
+    // (byte addr = dword index * 4):
+    //   mmGRBM_STATUS = 0x0DA0  -> byte 0x3680
+    //   mmCP_VERSION  = 0x0867  -> byte 0x219C
+    if GRBM_STATUS_REL_GFX9 != 0x0DA0 * 4 {
+        return TestResult::Fail("GFX9 GRBM_STATUS byte offset must be 0x0DA0*4");
+    }
+    if CP_VERSION_REL_GFX9 != 0x0867 * 4 {
+        return TestResult::Fail("GFX9 CP_VERSION byte offset must be 0x0867*4");
+    }
+    // All four register byte offsets must be 4-aligned.
+    if GRBM_STATUS_REL_GFX9 & 0x3 != 0
+        || GRBM_STATUS_REL_GFX11 & 0x3 != 0
+        || CP_VERSION_REL_GFX9 & 0x3 != 0
+        || CP_VERSION_REL_GFX11 & 0x3 != 0
+    {
+        return TestResult::Fail("register byte offsets must be 4-aligned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct
+);
+
+// ── Foundations wave — GMC aperture decode ─────────────────────────
+
+fn smoke_amdgpu_foundations_vram_aperture_decode_renoir_uma() -> TestResult {
+    use crate::amdgpu_gmc::decode_vram_aperture;
+    // Renoir UMA carve-out example: base = 0x100, top = 0x1FF →
+    // 0x100..0x200 in 16-MiB units → [0x1_0000_0000, 0x2_0000_0000)
+    // = 4 GiB aperture starting at 4 GiB.
+    let (base, size) = decode_vram_aperture(0x0000_0100, 0x0000_01FF);
+    if base != 0x1_0000_0000 {
+        return TestResult::Fail("decoded VRAM base wrong");
+    }
+    if size != 0x1_0000_0000 {
+        return TestResult::Fail("decoded VRAM size wrong");
+    }
+    // Reserved bits in upper byte must be masked off.
+    let (base2, _) = decode_vram_aperture(0xFF00_0100, 0x0000_01FF);
+    if base2 != 0x1_0000_0000 {
+        return TestResult::Fail("upper-byte reserved bits must be masked");
+    }
+    // Degenerate (top < base) decodes to size 0.
+    let (_, size_zero) = decode_vram_aperture(0x0000_0200, 0x0000_0100);
+    if size_zero != 0 {
+        return TestResult::Fail("top<base must yield size 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_vram_aperture_decode_renoir_uma
+);
+
+fn smoke_amdgpu_foundations_system_aperture_decode_in_4kib_units() -> TestResult {
+    use crate::amdgpu_gmc::decode_system_aperture;
+    // 4 KiB units: low=0x100000 -> 4 GiB, high=0x200000 -> 8 GiB.
+    let (low, high) = decode_system_aperture(0x0010_0000, 0x0020_0000);
+    if low != 0x1_0000_0000 {
+        return TestResult::Fail("decoded system low wrong");
+    }
+    if high != 0x2_0000_0000 {
+        return TestResult::Fail("decoded system high wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_system_aperture_decode_in_4kib_units
+);
+
+fn smoke_amdgpu_foundations_aperture_layout_predicates() -> TestResult {
+    use crate::amdgpu_gmc::ApertureLayout;
+    let empty = ApertureLayout::default();
+    if empty.has_vram() || empty.has_system() {
+        return TestResult::Fail("default ApertureLayout must report no apertures");
+    }
+    let populated = ApertureLayout {
+        vram_base: 0x1_0000_0000,
+        vram_size: 0x1_0000_0000,
+        system_low: 0,
+        system_high: 0x4_0000_0000,
+    };
+    if !populated.has_vram() {
+        return TestResult::Fail("non-zero vram_size must report has_vram");
+    }
+    if !populated.has_system() {
+        return TestResult::Fail("high>low must report has_system");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_aperture_layout_predicates
+);
+
+// ── Foundations wave — register-surface offsets stable ─────────────
+
+fn smoke_amdgpu_foundations_mc_register_offsets_stable() -> TestResult {
+    // Lock the MC register dword indices so an accidental rename
+    // doesn't drift them silently — these are facts about the
+    // silicon, not creative choices.
+    use crate::amdgpu_gmc::{
+        MC_SHARED_CHMAP, MC_VM_AGP_BASE, MC_VM_FB_LOCATION_BASE, MC_VM_FB_LOCATION_TOP,
+        MC_VM_SYSTEM_APERTURE_HIGH_ADDR, MC_VM_SYSTEM_APERTURE_LOW_ADDR,
+    };
+    if MC_VM_FB_LOCATION_BASE != 0x6B0F {
+        return TestResult::Fail("MC_VM_FB_LOCATION_BASE drift");
+    }
+    if MC_VM_FB_LOCATION_TOP != 0x6B10 {
+        return TestResult::Fail("MC_VM_FB_LOCATION_TOP drift");
+    }
+    if MC_VM_AGP_BASE != 0x6B0C {
+        return TestResult::Fail("MC_VM_AGP_BASE drift");
+    }
+    if MC_VM_SYSTEM_APERTURE_LOW_ADDR != 0x6B17 {
+        return TestResult::Fail("MC_VM_SYSTEM_APERTURE_LOW_ADDR drift");
+    }
+    if MC_VM_SYSTEM_APERTURE_HIGH_ADDR != 0x6B18 {
+        return TestResult::Fail("MC_VM_SYSTEM_APERTURE_HIGH_ADDR drift");
+    }
+    if MC_SHARED_CHMAP != 0x2004 {
+        return TestResult::Fail("MC_SHARED_CHMAP drift");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_mc_register_offsets_stable
+);
+
+// ── Foundations wave — IP discovery handles a Phoenix-style blob ───
+//
+// `smoke_amdgpu_discovery_parse_synthetic_blob` already drives the
+// parser against a hand-built blob; this Foundations-specific
+// smoke verifies the parser specifically resolves the Phoenix
+// bring-up's load-bearing IPs — MP0, MP1, GC, DCN — out of the
+// returned `Vec<IpBlock>`. Same synthetic blob helper.
+
+fn smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks() -> TestResult {
+    // Foundations wave needs the discovery parser to surface at
+    // least the GC IP block (for `AmdGpu::gc_base` → GRBM/CP
+    // register window) and the MP0 IP block (for PSP firmware
+    // load in the next wave). The shared synthetic blob populates
+    // exactly these two on a single die; verify both round-trip
+    // out of `parse_discovery` at the expected base offsets, and
+    // that the IP version fields (major/minor/revision) survive.
+    use crate::amdgpu_discovery::{find_ip, parse_discovery, HW_ID_GC, HW_ID_MP0};
+    let (blob, expected_mp0_base, expected_gc_base) = build_synthetic_discovery_blob();
+    let blocks = match parse_discovery(&blob) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("synthetic discovery blob must parse"),
+    };
+    let gc = match find_ip(&blocks, HW_ID_GC, 0) {
+        Some(b) => b,
+        None => return TestResult::Fail("GC instance 0 must surface"),
+    };
+    if gc.base_addrs[0] != expected_gc_base {
+        return TestResult::Fail("GC base from discovery doesn't match builder");
+    }
+    if gc.major != 11 {
+        return TestResult::Fail("GC major version lost across parse");
+    }
+    let mp0 = match find_ip(&blocks, HW_ID_MP0, 0) {
+        Some(b) => b,
+        None => return TestResult::Fail("MP0 instance 0 must surface"),
+    };
+    if mp0.base_addrs[0] != expected_mp0_base {
+        return TestResult::Fail("MP0 base from discovery doesn't match builder");
+    }
+    if mp0.num_bases != 2 {
+        return TestResult::Fail("MP0 should expose 2 base addrs in this blob");
+    }
+    if mp0.major != 13 || mp0.revision != 4 {
+        return TestResult::Fail("MP0 v13.0.4 version fields lost across parse");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks
+);

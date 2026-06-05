@@ -133,3 +133,125 @@ pub const VM_PTE_FRAGMENT_SHIFT: u64 = 59;
 /// is one big contiguous array; this constant lets callers compute
 /// the GART backing-store size).
 pub const GART_PTES_PER_PAGE: usize = 4096 / 8;
+
+// ── MC IP block register offsets ───────────────────────────────────
+//
+// The MC (Memory Controller) block holds VRAM aperture + system
+// aperture geometry. On the bring-up targets (Renoir GFX9 + Phoenix
+// GFX11) these registers sit in the register-bus address space at
+// fixed dword offsets — old enough to predate IP discovery's MC
+// base on Renoir; on Phoenix the MC block ID isn't published in
+// discovery (the aperture registers move to MMHUB / GFXHUB
+// contexts). The Foundations wave exposes the offsets; bring-up
+// uses MM_INDEX / MM_DATA in `amdgpu::mm_read` to fetch them.
+//
+// Reference: AMD MC IP public docs + Linux
+// `drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_0_offset.h` for
+// the MC_VM_* / MC_SHARED_* names.
+
+/// `mmMC_VM_FB_LOCATION_BASE` — visible-VRAM aperture base, in
+/// 16-MiB units. Bits[23:0] are the field; aperture covers
+/// `[base << 24, (top + 1) << 24)`. Already consumed by
+/// `read_vram_info` in `amdgpu.rs` via the duplicate constant
+/// there; this is the canonical home.
+pub const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_6B0F;
+/// `mmMC_VM_FB_LOCATION_TOP` — visible-VRAM aperture top (inclusive
+/// 16-MiB unit).
+pub const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
+
+/// `mmMC_VM_FB_OFFSET` — offset added to GPU-virtual frame-buffer
+/// references before they hit the MC. Zero on most bring-up configs.
+pub const MC_VM_FB_OFFSET: u32 = 0x0000_6B11;
+
+/// `mmMC_VM_AGP_BASE` — base of the AGP aperture (legacy GART
+/// alternative). On modern chips this is the bottom of the
+/// GPU-virtual-address window the host can map. 16-MiB units.
+pub const MC_VM_AGP_BASE: u32 = 0x0000_6B0C;
+/// `mmMC_VM_AGP_BOT` — bottom of AGP aperture; 16-MiB units.
+pub const MC_VM_AGP_BOT: u32 = 0x0000_6B0D;
+/// `mmMC_VM_AGP_TOP` — top of AGP aperture; 16-MiB units.
+pub const MC_VM_AGP_TOP: u32 = 0x0000_6B0E;
+
+/// `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR` — low bound of the system
+/// memory aperture (where the MC translates GPU accesses to PCIe
+/// host reads). Stored in 4-KiB units; on x86 this covers all host
+/// DRAM the GPU is allowed to touch.
+pub const MC_VM_SYSTEM_APERTURE_LOW_ADDR: u32 = 0x0000_6B17;
+/// `mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR` — high bound (inclusive),
+/// 4-KiB units.
+pub const MC_VM_SYSTEM_APERTURE_HIGH_ADDR: u32 = 0x0000_6B18;
+/// `mmMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB` — low 32 bits of the
+/// phys address the MC uses when a GPU access falls outside both
+/// VRAM and system apertures. Pre-firmware this is the GART
+/// scratch page; post-firmware a per-VM unmapped-fault handler.
+pub const MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB: u32 = 0x0000_6B19;
+/// `mmMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB` — high 32 bits, same.
+pub const MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB: u32 = 0x0000_6B1A;
+
+/// `mmMC_SHARED_CHMAP` — chip-shared "channel map" describing the
+/// memory controller's channel ↔ HBM/DDR-stack interleave.
+/// Foundations wave reads it as part of chip-ID corroboration
+/// (channel count corroborates VRAM family) and hands it to the
+/// memory bring-up wave for interleave programming.
+pub const MC_SHARED_CHMAP: u32 = 0x0000_2004;
+/// `mmMC_SHARED_CHREMAP` — companion remap table for CHMAP.
+pub const MC_SHARED_CHREMAP: u32 = 0x0000_2005;
+
+// ── Aperture decode ────────────────────────────────────────────────
+
+/// Scale factor: MC_VM_FB_LOCATION_* registers are 16-MiB units.
+pub const FB_LOCATION_UNIT_SHIFT: u64 = 24;
+/// Scale factor: MC_VM_SYSTEM_APERTURE_* registers are 4-KiB units.
+pub const SYSTEM_APERTURE_UNIT_SHIFT: u64 = 12;
+/// Mask of bits[23:0] in an FB_LOCATION register field.
+pub const FB_LOCATION_FIELD_MASK: u32 = 0x00FF_FFFF;
+
+/// Decoded GPU memory aperture geometry. Holds both the VRAM
+/// aperture (FB_LOCATION_BASE/TOP) and the system aperture
+/// (SYSTEM_APERTURE_LOW/HIGH); both are consumed by the GMC
+/// bring-up wave when populating VM hub registers.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApertureLayout {
+    /// VRAM aperture base, in bytes.
+    pub vram_base: u64,
+    /// VRAM aperture size, in bytes.
+    pub vram_size: u64,
+    /// System memory aperture low bound, in bytes. Zero on chips
+    /// where the system aperture hasn't been programmed yet by
+    /// firmware.
+    pub system_low: u64,
+    /// System memory aperture high bound, in bytes (inclusive).
+    pub system_high: u64,
+}
+
+impl ApertureLayout {
+    /// VRAM aperture spans non-zero bytes.
+    pub fn has_vram(&self) -> bool {
+        self.vram_size > 0
+    }
+    /// System aperture range is non-degenerate.
+    pub fn has_system(&self) -> bool {
+        self.system_high > self.system_low
+    }
+}
+
+/// Decode VRAM aperture from raw `(MC_VM_FB_LOCATION_BASE,
+/// MC_VM_FB_LOCATION_TOP)` register dwords. Pure helper.
+pub fn decode_vram_aperture(base_field: u32, top_field: u32) -> (u64, u64) {
+    let base = (base_field as u64 & FB_LOCATION_FIELD_MASK as u64) << FB_LOCATION_UNIT_SHIFT;
+    let top = (top_field as u64 & FB_LOCATION_FIELD_MASK as u64) << FB_LOCATION_UNIT_SHIFT;
+    let size = if top >= base {
+        top - base + (1u64 << FB_LOCATION_UNIT_SHIFT)
+    } else {
+        0
+    };
+    (base, size)
+}
+
+/// Decode system aperture range from raw `(SYSTEM_APERTURE_LOW,
+/// SYSTEM_APERTURE_HIGH)` register dwords. Pure helper.
+pub fn decode_system_aperture(low_field: u32, high_field: u32) -> (u64, u64) {
+    let low = (low_field as u64) << SYSTEM_APERTURE_UNIT_SHIFT;
+    let high = (high_field as u64) << SYSTEM_APERTURE_UNIT_SHIFT;
+    (low, high)
+}
