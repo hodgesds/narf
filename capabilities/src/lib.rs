@@ -481,6 +481,23 @@ pub enum CapKind {
     TopicRegistry = 0x0100,
     EventPublisher = 0x0101,
     EventSubscriber = 0x0102,
+
+    // Pluggable-policy install authorities. Each marker gates a
+    // `install_<policy>` entry point that swaps the runtime backend
+    // for a core subsystem (frame allocator, heap, pager, scheduler
+    // policy, donation policy, work-stealing strategy, block I/O
+    // scheduler, TCP congestion control, idle governor, tracing
+    // sink). See `docs/PLUGGABILITY.md`.
+    MemAlloc = 0x0200,
+    HeapBackend = 0x0201,
+    Pager = 0x0202,
+    SchedPolicy = 0x0203,
+    DonationPolicy = 0x0204,
+    StealStrategy = 0x0205,
+    IoScheduler = 0x0206,
+    CongestionControl = 0x0207,
+    IdleGovernor = 0x0208,
+    EventSink = 0x0209,
 }
 
 pub trait CapType: 'static {
@@ -569,6 +586,16 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("TopicRegistry", CapKind::TopicRegistry),
     ("EventPublisher", CapKind::EventPublisher),
     ("EventSubscriber", CapKind::EventSubscriber),
+    ("MemAlloc", CapKind::MemAlloc),
+    ("HeapBackend", CapKind::HeapBackend),
+    ("Pager", CapKind::Pager),
+    ("SchedPolicy", CapKind::SchedPolicy),
+    ("DonationPolicy", CapKind::DonationPolicy),
+    ("StealStrategy", CapKind::StealStrategy),
+    ("IoScheduler", CapKind::IoScheduler),
+    ("CongestionControl", CapKind::CongestionControl),
+    ("IdleGovernor", CapKind::IdleGovernor),
+    ("EventSink", CapKind::EventSink),
 ];
 
 // ── Badge ───────────────────────────────────────────────────────────
