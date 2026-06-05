@@ -904,52 +904,30 @@ pub fn __reset_for_test() {
 /// enough to keep boot snappy.
 #[cfg(target_arch = "x86_64")]
 pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64> {
-    use core::fmt::Write as _;
-    let _ = writeln!(narf_console::Writer, "  hx: enter window={}", calibration_window_hpet_ticks);
     let hpet_hz = frequency_hz();
-    let _ = writeln!(narf_console::Writer, "  hx: hz={}", hpet_hz);
     if hpet_hz == 0 || calibration_window_hpet_ticks == 0 {
         return None;
     }
-    let _ = writeln!(narf_console::Writer, "  hx: locking");
     let g = HPET.lock();
-    let _ = writeln!(narf_console::Writer, "  hx: locked");
     let dev = g.as_ref()?;
-    let _ = writeln!(narf_console::Writer, "  hx: got dev, t0 next");
     // SAFETY: HPET singleton is alive for the lock scope; the
     // window read is volatile + naturally aligned.
     let hpet_t0 = unsafe { dev.read_counter() };
-    let _ = writeln!(narf_console::Writer, "  hx: t0={}", hpet_t0);
     let tsc_t0 = narf_arch::x86_64::tsc::rdtsc();
-    let _ = writeln!(narf_console::Writer, "  hx: tsc_t0={}", tsc_t0);
-    let hpet_deadline_x = hpet_t0.wrapping_add(calibration_window_hpet_ticks);
-    let _ = writeln!(narf_console::Writer, "  hx: deadline_computed={}", hpet_deadline_x);
-    let now_first = unsafe { dev.read_counter() };
-    let _ = writeln!(narf_console::Writer, "  hx: loop1_now={}", now_first);
     let hpet_deadline = hpet_t0.wrapping_add(calibration_window_hpet_ticks);
-    let _ = writeln!(narf_console::Writer, "  hx: loop entering");
     // Tight loop on HPET — RDTSC + an MMIO read per iteration is
     // fine for a one-shot boot-time calibration.
-    let mut iters: u64 = 0;
     loop {
         // SAFETY: same as above.
         let now = unsafe { dev.read_counter() };
         if now.wrapping_sub(hpet_t0) >= calibration_window_hpet_ticks || now == hpet_deadline {
             break;
         }
-        iters = iters.wrapping_add(1);
-        if iters & 0xFFFFF == 0 {
-            let _ = writeln!(narf_console::Writer, "  hx: loop iter={} now={}", iters, now);
-        }
         core::hint::spin_loop();
     }
-    let _ = writeln!(narf_console::Writer, "  hx: loop exit iters={}", iters);
     // SAFETY: same.
     let hpet_t1 = unsafe { dev.read_counter() };
-    let _ = writeln!(narf_console::Writer, "  hx: t1={}", hpet_t1);
     let tsc_t1 = narf_arch::x86_64::tsc::rdtsc();
-    let _ = writeln!(narf_console::Writer, "  hx: tsc_t1={}", tsc_t1);
-    let _ = writeln!(narf_console::Writer, "  hx: dropping lock");
     drop(g);
     let d_hpet = hpet_t1.wrapping_sub(hpet_t0);
     let d_tsc = tsc_t1.wrapping_sub(tsc_t0);

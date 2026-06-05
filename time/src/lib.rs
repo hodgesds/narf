@@ -440,29 +440,22 @@ pub fn calibrate_clocks() -> u64 {
 /// `1` and `Deadline::after_ms` will fire late rather than early.
 #[cfg(target_arch = "x86_64")]
 pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
-    use core::fmt::Write as _;
-    let _ = writeln!(narf_console::Writer, "  cal: entered");
     let cached = narf_arch::x86_64::tsc::frequency_hz();
     if cached != 0 {
-        let _ = writeln!(narf_console::Writer, "  cal: cached={}", cached);
         return (cached, CalibrationSource::Cached);
     }
     // 1. Intel CPUID 0x15. When the leaf populates a non-zero
     //    crystal-Hz this is the most accurate source we have.
-    let _ = writeln!(narf_console::Writer, "  cal: try cpuid15h");
     let hz_15h = narf_arch::x86_64::tsc::__from_cpuid_15h();
     if let Some(hz) = hz_15h {
-        let _ = writeln!(narf_console::Writer, "  cal: cpuid15h={}", hz);
         narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
         apply_cycles_per_ns(hz);
         return (hz, CalibrationSource::CpuId15h);
     }
     // 2. Intel CPUID 0x16 (processor base frequency MHz). Coarser
     //    but available when 0x15's crystal is zero.
-    let _ = writeln!(narf_console::Writer, "  cal: try cpuid16h");
     let hz_16h = narf_arch::x86_64::tsc::__from_cpuid_16h();
     if let Some(hz) = hz_16h {
-        let _ = writeln!(narf_console::Writer, "  cal: cpuid16h={}", hz);
         narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
         apply_cycles_per_ns(hz);
         return (hz, CalibrationSource::CpuId16h);
@@ -473,10 +466,8 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     //    non-turbo ratio here. Vendor-gated to Intel — AMD has no
     //    MSR at that index, and the inner check short-circuits
     //    before issuing the rdmsr.
-    let _ = writeln!(narf_console::Writer, "  cal: try intel-pi");
     let hz_msr_pi = narf_arch::x86_64::tsc::__from_msr_platform_info();
     if let Some(hz) = hz_msr_pi {
-        let _ = writeln!(narf_console::Writer, "  cal: intel-pi={}", hz);
         narf_arch::x86_64::tsc::set_hz_via_hpet(hz);
         apply_cycles_per_ns(hz);
         return (hz, CalibrationSource::IntelPlatformInfo);
@@ -484,15 +475,12 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     // 4. AMD MSR_PSTATE0. Family 0x17+ doesn't populate the
     //    Intel CPUID leaves; the P-state-0 MSR has the boost
     //    clock, which the invariant TSC matches.
-    let _ = writeln!(narf_console::Writer, "  cal: try amd-pstate0");
     let hz_amd = narf_arch::x86_64::tsc::calibrate_via_amd_pstate0();
-    let _ = writeln!(narf_console::Writer, "  cal: amd-pstate0={}", hz_amd);
     if hz_amd != 0 {
         narf_arch::x86_64::tsc::set_hz_via_hpet(hz_amd);
         apply_cycles_per_ns(hz_amd);
         return (hz_amd, CalibrationSource::AmdPstate0);
     }
-    let _ = writeln!(narf_console::Writer, "  cal: try hpet-xcheck");
     // 5. HPET cross-check. A 100 ms window at the ~14.318 MHz
     //    HPET found on every x86_64 chipset since ICH = ~1.43M
     //    ticks; bumps to whatever the actual HPET reports if
