@@ -1239,15 +1239,26 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     if let Some(p) = panic_line {
         bail!("xtask boot-smoke: kernel panic during boot — '{}'", p);
     }
-    // `isa-debug-exit` exits QEMU with `(code << 1) | 1`. Kernel
-    // passes 0 on success → QEMU exit code 1.
-    if !matches!(status.code(), Some(1)) {
+    // Clean-exit status is arch-dependent:
+    //  * x86_64 uses `isa-debug-exit` (port I/O), which encodes
+    //    `(code << 1) | 1` into QEMU's exit status — so a kernel
+    //    exit code of 0 yields QEMU status 1.
+    //  * aarch64 has no `isa-debug-exit`; the kernel shuts down via
+    //    PSCI or semihosting `SYS_EXIT`, and QEMU exits naturally
+    //    with status 0.
+    let expected = match args.arch {
+        Arch::X86_64 => Some(1),
+        Arch::Aarch64 => Some(0),
+    };
+    if status.code() != expected {
         bail!(
-            "xtask boot-smoke: QEMU exited with non-success status {:?} (expected 1 from isa-debug-exit code=0)",
-            status.code()
+            "xtask boot-smoke: QEMU exited with non-success status {:?} (expected {:?} on {})",
+            status.code(),
+            expected,
+            args.arch.triple(),
         );
     }
-    println!("xtask boot-smoke: kernel cleanly exited via isa-debug-exit, no panic markers");
+    println!("xtask boot-smoke: kernel cleanly exited, no panic markers");
     Ok(())
 }
 
