@@ -31,12 +31,29 @@ No Cargo feature flag is required.  This is what you get with a plain
 
 Adds a Linux-shaped syscall surface on top of `posix-core`:
 
-- `epoll_create1` / `epoll_ctl` / `epoll_wait`
+- `epoll_create1` / `epoll_ctl` / `epoll_wait` / `epoll_pwait`
 - `eventfd` / `eventfd2`
 - `timerfd_create` / `timerfd_settime` / `timerfd_gettime`
-- `clone3` with full task + address-space flag set
-- `mprotect` / `madvise`
-- Dynamic-linker (`PT_INTERP`) plumbing in the ELF loader
+- `signalfd4`
+- `memfd_create` + `F_ADD_SEALS` / `F_GET_SEALS`
+- `clone3` with `CLONE_VM` / `CLONE_THREAD` / `CLONE_SIGHAND` /
+  `CLONE_FS` / `CLONE_FILES` / `CLONE_PARENT_SETTID` /
+  `CLONE_CHILD_CLEARTID` / `CLONE_SETTLS`, plus `set_tid_address`
+- `mprotect` (with split/merge of `AddressSpace` regions) +
+  `madvise(DONTNEED|FREE)`
+- `fcntl(2)` extensions: `F_DUPFD` / `F_DUPFD_CLOEXEC`,
+  `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_GETLK`/`F_SETLK`
+- `statx(2)` + Linux-ABI `struct stat`
+- `mount(2)` / `umount2(2)` / `chroot(2)` / `pivot_root(2)`
+- POSIX per-process timers (`timer_create` / `timer_settime` /
+  `timer_gettime` / `timer_delete`) + `clock_nanosleep` with
+  `TIMER_ABSTIME`
+- Dynamic-linker (`PT_INTERP`) plumbing in the ELF loader,
+  including FS-backed lookup of `/lib/ld-musl-x86_64.so.1` and
+  TLS relocations (`R_X86_64_DTPMOD64` / `DTPOFF64` / `TPOFF64`)
+- Default-action signal lookup wired into the scheduler retire
+  path so uncaught `Terminate` / `CoreDump` signals stamp
+  `WIFSIGNALED + WTERMSIG` observable by `wait4`
 
 Enable with:
 
@@ -62,12 +79,23 @@ cargo build --features linux-compat
 
 Adds namespace isolation on top of `posix-core`:
 
-- PID namespace (`CLONE_NEWPID`, `pid_ns_init`)
-- Mount namespace (`CLONE_NEWNS`, `pivot_root`, mount propagation)
-- Network namespace (`CLONE_NEWNET`, veth pairs)
-- UTS namespace (`CLONE_NEWUTS`, `sethostname`)
-- IPC namespace (`CLONE_NEWIPC`)
-- User namespace (`CLONE_NEWUSER`, uid/gid maps)
+- PID namespace (`CLONE_NEWPID`) — inner pid 1 semantics,
+  per-namespace bounded id pool, kill-by-outer-pid still works
+- Mount namespace (`CLONE_NEWNS`) — per-task `MountNamespace`
+  with copy-on-write of the global mount table at fork
+- Network namespace (`CLONE_NEWNET`) — per-namespace iface table
+  seeded with synthetic `lo`
+- UTS namespace (`CLONE_NEWUTS`) — per-namespace hostname +
+  domainname; `gethostname` / `sethostname` / `uname` /
+  `setdomainname` route through the calling task's UTS NS
+- IPC namespace (`CLONE_NEWIPC`) — per-namespace SysV IPC
+  (`shmget` / `semget` / `msgget`) + POSIX mqueue keyspaces
+- `unshare(2)` for any combination of the above
+- `setns(2)` (Linux number 308) — accepts a target task and
+  `nstype` mask; `/proc/[pid]/ns/<type>` symlinks are a
+  follow-up
+- User namespace (`CLONE_NEWUSER`) is reserved but not yet
+  implemented
 
 `container` is **orthogonal** to `linux-compat`.  A native NARF container
 runtime can use namespaces without the full Linux syscall surface.
@@ -90,8 +118,27 @@ runtime (runc, crun, containerd-shim) on top of NARF.
 
 ## Implementation status
 
-Both `linux-compat` and `container` are **stub features** as of Wave 62.
-The stub modules (`userspace/src/linux_compat.rs`,
-`userspace/src/container.rs`) exist as sign-posts for Waves 63-67 where
-the real syscall implementations will land.  Enabling either feature today
-compiles cleanly but adds no runtime behaviour.
+Both features are **live** as of Wave 77.  The implementation landed
+across Waves 62–77 (per `STATUS.md` "Stage 5 / personality features"
+section):
+
+- Wave 62 established the feature flags and stub modules.
+- Wave 63 — dyn-linker aux vector (`AT_PHDR` / `AT_PHENT` / `AT_PHNUM`
+  / `AT_RANDOM`).
+- Wave 64 — `epoll` / `eventfd` / `timerfd_*`.
+- Wave 65 — `clone3` + per-thread TLS via `set_tid_address`.
+- Wave 66 — `mprotect` (region split) + `madvise(DONTNEED|FREE)`.
+- Wave 67 — `CLONE_NEWPID` + `CLONE_NEWNS`.
+- Wave 68 — `fcntl(2)` extensions.
+- Wave 69 — `statx(2)` + Linux ABI `struct stat`.
+- Wave 70 — `signalfd4` + `memfd_create` with seals.
+- Wave 71 — `mount` / `umount2` / `chroot` / `pivot_root`.
+- Wave 72 — `CLONE_NEWUTS` + `CLONE_NEWNET` + `CLONE_NEWIPC`.
+- Wave 73 — POSIX timers + `clock_nanosleep` ABSTIME.
+- Wave 74 — smoke coverage for statx + POSIX timer paths.
+- Wave 75 — real ld-musl interpreter loading + TLS relocations.
+- Wave 77 — narf-libc POSIX timer wrappers.
+
+Each wave landed on a feature branch and merged via PR.  Feature
+combinations (`linux-compat`, `container`, both, neither) all build
+clean in CI.

@@ -9,11 +9,12 @@ Everything here is terse by design. Follow links for depth.
   domains (PKS on x86_64, MTE on aarch64).
 - **Async-first** executor, zero-copy Narf-Ring IPC, capability-typed
   access control, no root user.
-- **Status:** Stages 1 + 2 closed; Stage 3 composition landed (caps/
-  epoch, Narf-Ring SPSC, abi, drivers framework, io DMA, rcu, tracing,
-  bus, virtio-mmio skeleton) — `smoke_exit_gate_*` green on both
-  arches. Stage 4 "Compatibility" (real PKS/MTE enforcement on buffer
-  pages, real virtio device I/O, IOMMU, user-mode consumer) is next.
+- **Status:** Stages 1–4 closed. Stage 4 exit gate met for the
+  in-tree shell + coreutils (`cargo xtask run-interactive` types
+  `echo hello world` over serial; full IRQ-4 → byte ring → fd 0 →
+  shell → fd 1 → UART chain). `cargo xtask test` runs 5022+ smokes
+  / 0 fail / 73 skip on x86_64 + aarch64. Stage 5 "Silicon" — boot
+  on AMD Zen2 Renoir + Phoenix HawkPoint1 laptops — is in progress.
 
 ## Canonical docs (read when relevant, not always)
 
@@ -81,7 +82,8 @@ When modifying a subsystem interface, update §3 **in the same PR**.
 | 1     | Skeleton       | boot, console, frame, memory (basic), scheduler (basic), arch (partial), build, verification (harness), tracing (USDT infra), observability (PMU basics + crash), crypto (SHA-256 + BLAKE3), time (monotonic + basic timers), rcu (API surface + stub), lib (minimum primitives) |
 | 2     | Barrier        | memory (PKS/MTE), interrupts (UIPI), arch (full), security-model v0.5, drivers (framework), tracing (tracer domain), crypto (AEAD + manifest verify), time (hrtimers + SMP sync), scheduler (SMP + topology + hot-plug up), rcu (QSBR + epoch), bus (PCIe + MMIO scan), power (C-states), lib (SeqLock + intrusive collections) |
 | 3     | Flow           | ipc, capabilities, io, abi, drivers/virtio, scheduler (donation + affinity + budgets), tracing (dynamic probes + FnTime), crypto (SecureRing + per-task RNG), block (core trait), filesystem (VFS + initramfs), rcu (hazard + sleepable), net (contract + loopback), bus (hot-plug + MSI-X), power (DVFS governor + runtime PM) |
-| 4     | Compatibility  | userspace, drivers/{nvme,net,gpu}, verification (expanded), observability (GDB + peek), tracing (HW trace), crypto (TPM / measured boot), block (multi-queue + discard), filesystem (virtiofs + persistent FS), time (NTP/PTP hooks), net (userspace stack-daemon protocol), power (suspend/resume + thermal) |
+| 4     | Compatibility  | userspace (Linux-compat syscall surface, dyn-linker, /dev/pts), drivers/{nvme,net,gpu,usb,input,hwmon}, verification (expanded), observability (GDB + peek + FB status-panel), tracing (HW trace), crypto (TPM / measured boot), block (multi-queue + discard), filesystem (virtiofs + persistent FS + ext2 + devpts), time (POSIX timers + NTP/PTP hooks), net (userspace stack-daemon protocol + iface::for_dst per-flow routing), power (suspend/resume + thermal) |
+| 5     | Silicon        | drivers/gpu (AMDGPU DCN 2.0 / 3.5 modeset), drivers/platform (EC), drivers/input (I²C-HID touchpad), drivers/wireless (iwlwifi data path + WPA2-PSK), time (AMD MSR_PSTATE0 calibration), fb (status panel), power (S3 suspend + thermal via EC) |
 
 ## TCB definition (matters for review bar)
 

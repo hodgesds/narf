@@ -89,61 +89,131 @@ invocations, with no copy and no Ring-0 trap on the fast path.
 **Exit criterion:** A standard Rust binary compiled against `relibc` runs
 on NARF and performs block and network I/O through capability-gated paths.
 
+**Status:** Exit gate met for the in-tree shell + coreutils, with end-to-end
+`echo hello world` working through the IRQ-4 → BYTE_RING → fd 0 → shell →
+fd 1 → UART chain (the in-kernel `smoke_echo_hello_world_end_to_end` plus
+the interactive `cargo xtask run-interactive` harness both verify it).
+`cargo xtask test` runs 5022+ smokes / 0 fail / 73 skip.  Linux-compat
+syscalls (epoll, eventfd, timerfd, clone3, mprotect, madvise, statx,
+signalfd, memfd, mount/umount/chroot/pivot_root, POSIX timers, namespaces)
+land behind the `linux-compat` / `container` Cargo features —
+see [`docs/PERSONAS.md`](docs/PERSONAS.md).
+
 **Subsystems:**
 
-- `userspace/` — process model, ELF loader, relibc integration.
+- `userspace/` — process model, ELF loader, relibc integration,
+  Linux-shaped syscall surface, dynamic linker (PT_INTERP +
+  ld-musl), `/dev/pts` PTY plumbing.
 - `drivers/nvme/` — block storage.
 - `drivers/net/` — network.
 - `drivers/gpu/` — graphics (may land partial in Stage 4, full later).
 - `drivers/hwmon/` — hardware monitoring: thermal/fan management (k10temp, coretemp, nct6775, dell_smm).
+- `drivers/usb/` — xHCI host controller + HID keyboard/mouse class
+  + USB hub class; first USB device flows IRQ → BYTE_RING → fd 0.
 - `verification/` — expanded fuzzing + integration matrix.
 - `tracing/` — HW trace integration (Intel PT / CoreSight ETM), userspace tracer tooling.
-- `observability/` — GDB remote stub, live-peek API, core-dump parser tooling.
+- `observability/` — GDB remote stub, live-peek API, core-dump parser tooling, FB status-panel for
+  bare-metal diagnostics.
 - `crypto/` — TPM 2.0 integration, measured-boot chain, post-quantum algorithm plan, FIPS-mode decision.
 - `time/` — NTP/PTP userspace hooks, leap-second smear.
 - `block/` — Multi-queue dispatch, discard/TRIM, write-zeroes, NVMe backing.
-- `filesystem/` — virtiofs driver, simple persistent FS, unified page cache.
+- `filesystem/` — virtiofs driver, simple persistent FS, unified page cache, ext2 mount, devpts.
 - `scheduler/` — CPU take-offline for suspend/resume, SMT-aware placement, deadline class.
 - `rcu/` — batched reclamation tuning, per-domain pacing, NUMA-aware queues, expanded consumers.
-- `net/` — Userspace stack-daemon attach protocol, Admin cap flow, hardware-NIC integration via `drivers/net/`.
+- `net/` — Userspace stack-daemon attach protocol, Admin cap flow, hardware-NIC integration via `drivers/net/`,
+  `iface::for_dst` per-flow routing across TCP/UDP/ICMP/ARP send paths.
 - `bus/` — Thunderbolt / PCIe switch awareness, virtio-mmio runtime injection, ACPI notify integration.
 - `power/` — Suspend-to-RAM (S3 / PSCI), thermal zones + throttling, EnergyAware governor coupled to `scheduler/`.
 
+## Stage 5 — The Silicon
+
+**Theme:** Boot and run on real consumer laptop silicon.
+
+**Exit criterion:** Boot on a Zen2 Renoir or Phoenix HawkPoint1 laptop
+from USB, display via native AMDGPU modeset (not UEFI GOP fallback),
+type into the keyboard / touchpad, connect to WiFi, persist files on
+an NVMe partition through ext2/ext4.
+
+**Bring-up targets:** two AMD laptops are the canonical test silicon:
+- **Zen2 Renoir / Lucienne** (Family 0x17 0x30–0xAF) — Vega8 iGPU,
+  DCN 2.0.
+- **Phoenix HawkPoint1** (Zen4) — RDNA3.5 iGPU (1002:1900), DCN 3.5.
+
+**Subsystems:**
+
+- `drivers/gpu/` (AMDGPU) — PCI match + MMIO BAR map + ATOMBIOS
+  + IP Discovery (Phoenix) + GMC/GFX register surfaces + PSP MP0
+  mailbox + SMU MP1 + DCN 2.0 / 3.5 modeset sequences + GFX9/GFX11
+  CP ring init + PM4 / Ring / Fence + DRM card registration.
+  Foundation landed (Wave 80); full bare-metal modeset is the
+  next major lift.
+- `drivers/platform/` — ACPI Embedded Controller (PNP0C09) for
+  battery / AC / fan / lid / thermal; AML `_QXX` event dispatch
+  via SCI.  Sysfs surface for `/sys/class/power_supply` +
+  `/sys/class/thermal`.
+- `drivers/input/i2c_hid/` — I²C-HID touchpad over AMD FCH I²C;
+  PNP0C50 enumeration + HID Descriptor Register read + Reset
+  sequence + Report Descriptor parse + INT pin via GPIO; events
+  feed `narf_input`.
+- `drivers/wireless/iwlwifi/` — Intel iwlwifi data path: MSI-X cause
+  routing, firmware load to ALIVE, BCAST flush, RX/TX TFD rings,
+  WPA2-PSK 4-way handshake, CCMP key install.
+- `drivers/wireless/rtw89/` / `rtl8xxxu/` — Realtek WiFi for
+  laptops shipping Realtek chipsets; firmware download + RX/TX
+  bring-up.
+- `drivers/usb/xhci/` — already running on QEMU; real-silicon
+  bring-up needs the Zen2 Renoir VID/DID in the explicit match
+  table (currently relying on the class catch-all).
+- `time/` — TSC calibration via AMD MSR_PSTATE0 (Family 0x17+
+  P-state-0 register decoding) + HPET cross-check fallback; LAPIC
+  timer InitialCount calibration against the worst-case slow bus.
+- `fb/` — FB status-panel diagnostic slot for bare-metal boots
+  where serial isn't reachable; pinned boot-phase + last-IRQ-vector
+  + CR2-on-#PF + panic-marker indicators.
+- `power/` — Suspend-to-RAM (S3) tested on real silicon; battery
+  reporting via EC `_BIF`/`_BST`; thermal throttling via EC
+  `_TMP` methods and AMD RAPL.
+
 ## Stage × subsystem matrix
 
-| Subsystem         | 1 | 2 | 3 | 4 |
-| ----------------- |:-:|:-:|:-:|:-:|
-| `boot/`           | ● |   |   |   |
-| `console/`        | ● |   |   |   |
-| `frame/`          | ● | ◐ |   |   |
-| `memory/`         | ◐ | ● |   |   |
-| `scheduler/`      | ◐ |   | ● |   |
-| `arch/`           | ◐ | ● |   |   |
-| `build/`          | ● | ◐ | ◐ | ◐ |
-| `verification/`   | ◐ | ◐ | ◐ | ● |
-| `interrupts/`     |   | ● |   |   |
-| `drivers/` (fw)   |   | ● |   |   |
-| `security-model/` |   | ◐ | ● | ◐ |
-| `ipc/`            |   |   | ● |   |
-| `capabilities/`   | ○ |   | ● |   |
-| `io/`             |   |   | ● |   |
-| `abi/`            |   |   | ● |   |
-| `drivers/virtio/` |   |   | ● |   |
-| `userspace/`      |   |   |   | ● |
-| `drivers/nvme/`   |   |   |   | ● |
-| `drivers/net/`    |   |   |   | ● |
-| `drivers/gpu/`    |   |   |   | ◐ |
-| `drivers/hwmon/`  |   |   |   | ● |
-| `tracing/`        | ◐ | ◐ | ● | ◐ |
-| `observability/`  | ◐ | ◐ | ◐ | ● |
-| `crypto/`         | ○ | ● | ◐ | ● |
-| `time/`           | ● | ● | ◐ | ◐ |
-| `rcu/`            | ○ | ● | ● | ◐ |
-| `block/`          |   |   | ● | ◐ |
-| `filesystem/`     |   |   | ● | ● |
-| `net/`            |   |   | ● | ● |
-| `bus/`            |   | ● | ● | ◐ |
-| `power/`          |   | ● | ● | ● |
-| `lib/`            | ● | ● | ◐ | ◐ |
+| Subsystem         | 1 | 2 | 3 | 4 | 5 |
+| ----------------- |:-:|:-:|:-:|:-:|:-:|
+| `boot/`           | ● |   |   |   |   |
+| `console/`        | ● |   |   |   |   |
+| `frame/`          | ● | ◐ |   |   | ◐ |
+| `memory/`         | ◐ | ● |   |   |   |
+| `scheduler/`      | ◐ |   | ● |   |   |
+| `arch/`           | ◐ | ● |   |   |   |
+| `build/`          | ● | ◐ | ◐ | ◐ | ◐ |
+| `verification/`   | ◐ | ◐ | ◐ | ● |   |
+| `interrupts/`     |   | ● |   |   |   |
+| `drivers/` (fw)   |   | ● |   |   |   |
+| `security-model/` |   | ◐ | ● | ◐ |   |
+| `ipc/`            |   |   | ● |   |   |
+| `capabilities/`   | ○ |   | ● |   |   |
+| `io/`             |   |   | ● |   |   |
+| `abi/`            |   |   | ● |   |   |
+| `drivers/virtio/` |   |   | ● |   |   |
+| `userspace/`      |   |   |   | ● | ◐ |
+| `drivers/nvme/`   |   |   |   | ● |   |
+| `drivers/net/`    |   |   |   | ● |   |
+| `drivers/gpu/`    |   |   |   | ◐ | ● |
+| `drivers/hwmon/`  |   |   |   | ● | ◐ |
+| `drivers/usb/`    |   |   |   | ● | ◐ |
+| `drivers/input/`  |   |   |   | ◐ | ● |
+| `drivers/platform/` (EC) |   |   |   |   | ● |
+| `drivers/wireless/` |   |   |   | ◐ | ● |
+| `tracing/`        | ◐ | ◐ | ● | ◐ |   |
+| `observability/`  | ◐ | ◐ | ◐ | ● | ◐ |
+| `crypto/`         | ○ | ● | ◐ | ● |   |
+| `time/`           | ● | ● | ◐ | ◐ | ◐ |
+| `rcu/`            | ○ | ● | ● | ◐ |   |
+| `block/`          |   |   | ● | ◐ |   |
+| `filesystem/`     |   |   | ● | ● | ◐ |
+| `net/`            |   |   | ● | ● |   |
+| `bus/`            |   | ● | ● | ◐ |   |
+| `power/`          |   | ● | ● | ● | ◐ |
+| `fb/`             | ◐ |   |   | ◐ | ● |
+| `lib/`            | ● | ● | ◐ | ◐ |   |
 
 Legend: ● primary work, ◐ partial / iterated, ○ design sketch only.
