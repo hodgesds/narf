@@ -680,7 +680,12 @@ impl narf_block::registry::BlockDeviceSync for SdhciBlockDevice {
         self.capacity_blocks
     }
 
-    fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), narf_block::registry::BlockIoError> {
+    fn read(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        out: &mut [u8],
+    ) -> Result<(), narf_block::registry::BlockIoError> {
         if n_blocks == 0 {
             return Ok(());
         }
@@ -702,7 +707,8 @@ impl narf_block::registry::BlockDeviceSync for SdhciBlockDevice {
                 };
                 let offset = i as usize * 512;
                 let mut buf = [0u8; 512];
-                ctrl.read_block(block_addr, &mut buf).map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
+                ctrl.read_block(block_addr, &mut buf)
+                    .map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
                 out[offset..offset + 512].copy_from_slice(&buf);
             }
             Ok(())
@@ -710,7 +716,12 @@ impl narf_block::registry::BlockDeviceSync for SdhciBlockDevice {
         .unwrap_or(Err(narf_block::registry::BlockIoError::DriverError))
     }
 
-    fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::registry::BlockIoError> {
+    fn write(
+        &self,
+        lba: u64,
+        n_blocks: u16,
+        data: &[u8],
+    ) -> Result<(), narf_block::registry::BlockIoError> {
         if n_blocks == 0 {
             return Ok(());
         }
@@ -733,7 +744,8 @@ impl narf_block::registry::BlockDeviceSync for SdhciBlockDevice {
                 let offset = i as usize * 512;
                 let mut buf = [0u8; 512];
                 buf.copy_from_slice(&data[offset..offset + 512]);
-                ctrl.write_block(block_addr, &buf).map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
+                ctrl.write_block(block_addr, &buf)
+                    .map_err(|_| narf_block::registry::BlockIoError::DriverError)?;
             }
             Ok(())
         })

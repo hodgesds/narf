@@ -361,7 +361,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Stage 3: Wire up the modeset orchestrator to take over from UEFI GOP.
     let mode_opt = crate::intel_gpu_modeset::takeover_display(&dev);
 
-    // Stage 4: Frame buffer + KMS. 
+    // Stage 4: Frame buffer + KMS.
     // Allocate a scanout buffer utilizing the map_contiguous_scanout wrapper.
     let width_u16 = mode_opt.as_ref().map(|m| m.h_active).unwrap_or(1024);
     let height_u16 = mode_opt.as_ref().map(|m| m.v_active).unwrap_or(768);
@@ -370,28 +370,47 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let stride_bytes = width * 4;
     let size_bytes = (stride_bytes * height) as u64;
 
-    if let Ok((gtt_offset, _frames)) = crate::intel_gpu_gtt::alloc_coherent_scanout(&dev.gtt_mmadr, size_bytes) {
+    if let Ok((gtt_offset, _frames)) =
+        crate::intel_gpu_gtt::alloc_coherent_scanout(&dev.gtt_mmadr, size_bytes)
+    {
         *dev.active_scanout.lock() = Some(ActiveScanout {
             width,
             height,
             stride_bytes,
             gtt_offset,
         });
-        
+
         let prog = crate::intel_gpu_pipes::build_primary_plane(
             width_u16,
             height_u16,
             stride_bytes,
             gtt_offset,
             crate::intel_gpu_pipes::PixelFormat::Argb8888,
-        ).expect("failed to build primary plane");
-        let plane_base = crate::intel_gpu_pipes::Pipe::A.base() + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
+        )
+        .expect("failed to build primary plane");
+        let plane_base =
+            crate::intel_gpu_pipes::Pipe::A.base() + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
         unsafe {
-            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET, prog.plane_stride);
-            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET, prog.plane_size);
-            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET, prog.plane_offset);
-            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET, prog.plane_ctl);
-            dev.gtt_mmadr.write32(plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET, prog.plane_surf);
+            dev.gtt_mmadr.write32(
+                plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,
+                prog.plane_stride,
+            );
+            dev.gtt_mmadr.write32(
+                plane_base + crate::intel_gpu_pipes::PLANE_SIZE_OFFSET,
+                prog.plane_size,
+            );
+            dev.gtt_mmadr.write32(
+                plane_base + crate::intel_gpu_pipes::PLANE_OFFSET_OFFSET,
+                prog.plane_offset,
+            );
+            dev.gtt_mmadr.write32(
+                plane_base + crate::intel_gpu_pipes::PLANE_CTL_OFFSET,
+                prog.plane_ctl,
+            );
+            dev.gtt_mmadr.write32(
+                plane_base + crate::intel_gpu_pipes::PLANE_SURF_OFFSET,
+                prog.plane_surf,
+            );
         }
     }
 
@@ -408,7 +427,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         device.id.subsystem_id,
     );
     crate::drm_registry::register_drm_card(alloc::sync::Arc::new(intel_card));
-
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("intel-gpu"),

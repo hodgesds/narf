@@ -369,7 +369,9 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
         let edid = crate::dp_edid::read_panel_edid(&mut aux, &mut edid_buf)
             .map_err(|_| ModesetError::EdidUnavailable)?;
 
-        let d = edid.preferred_timing().map_err(|_| ModesetError::EdidUnavailable)?;
+        let d = edid
+            .preferred_timing()
+            .map_err(|_| ModesetError::EdidUnavailable)?;
 
         Ok(Mode {
             pixel_clock_khz: d.pixel_clock_khz,
@@ -1257,12 +1259,12 @@ pub mod tests {
 /// Attempt to take over the display from UEFI GOP without disrupting
 /// the existing framebuffer mapping.
 pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
+    use crate::intel_gpu_aux::MmioWindow;
     use crate::intel_gpu_ddi::Ddi;
     use crate::intel_gpu_pipes::{
-        Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET,
-        PLANE_STRIDE_OFFSET, PLANE_SURF_OFFSET,
+        Pipe, PIPECONF_ENABLE, PIPECONF_OFFSET, PLANE_PRIMARY_OFFSET, PLANE_STRIDE_OFFSET,
+        PLANE_SURF_OFFSET,
     };
-    use crate::intel_gpu_aux::MmioWindow;
     use narf_bus::bar::MmioRegion;
 
     struct MmioAdapter<'a>(&'a MmioRegion);

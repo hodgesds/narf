@@ -174,27 +174,27 @@ pub fn map_contiguous_scanout(
     // We arbitrarily pick a GTT offset of 16 MiB (0x1000000) for our scanout
     // to avoid colliding with whatever the UEFI GOP mapped lower down (often at 0).
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
-    
+
     let pages = (size_bytes + GTT_PAGE_SIZE - 1) / GTT_PAGE_SIZE;
     for i in 0..pages {
         let phys = start_phys + i * GTT_PAGE_SIZE;
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
-        
+
         let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
         let pte_offset = GGTT_BASE + pte_index * 8;
-        
+
         // Write 64-bit PTE (as two 32-bit writes)
         unsafe {
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
         }
     }
-    
+
     Ok(SCANOUT_GTT_OFFSET as u32)
 }
 
 /// Allocate `size_bytes` worth of 4 KiB frames and map them consecutively
-/// into the GGTT, creating a contiguous GPU virtual address. Returns the 
+/// into the GGTT, creating a contiguous GPU virtual address. Returns the
 /// GTT offset and the first physical frame allocated.
 pub fn alloc_coherent_scanout(
     gtt_mmadr: &narf_bus::bar::MmioRegion,
@@ -202,7 +202,7 @@ pub fn alloc_coherent_scanout(
 ) -> Result<(u32, alloc::vec::Vec<narf_memory::frame::PhysFrame>), GttError> {
     const GGTT_BASE: u64 = 0x80_0000;
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
-    
+
     let pages = (size_bytes + GTT_PAGE_SIZE - 1) / GTT_PAGE_SIZE;
     let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
 
@@ -213,17 +213,17 @@ pub fn alloc_coherent_scanout(
 
         let phys = frame.start_address().raw();
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
-        
+
         let pte_index = (SCANOUT_GTT_OFFSET / GTT_PAGE_SIZE) + i;
         let pte_offset = GGTT_BASE + pte_index * 8;
-        
+
         // Write 64-bit PTE (as two 32-bit writes)
         unsafe {
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
         }
     }
-    
+
     Ok((SCANOUT_GTT_OFFSET as u32, frames))
 }
 

@@ -352,7 +352,6 @@ static AMDGPU: AmdgpuScanout = AmdgpuScanout;
 static INTEL_GPU: IntelGpuScanout = IntelGpuScanout;
 static GENERIC: GenericScanout = GenericScanout;
 
-
 /// Global registration for the bootloader-provided linear framebuffer.
 static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<
     Option<narf_graphics_driver::generic::GenericFb>,
