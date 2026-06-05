@@ -144,13 +144,18 @@ undocumented_unsafe_blocks = "warn"
 # LTO is aggressive and will happily reorder across inline asm without them.
 [profile.release]
 opt-level       = 3
-# `thin` instead of `fat` — fat LTO funnels every crate's IR through
-# one LLVM process serially, easily peaking 10+ GiB RAM and OOMing
-# 16 GiB laptops mid-build. Thin LTO parallelises across crates and
-# captures ~95% of the inlining benefit at a fraction of the working
-# set.
-lto             = "thin"
-codegen-units   = 1
+# LTO off + codegen-units=16 for release.
+#
+# History: fat LTO single-threaded ~60-crate workspace through LLVM
+# and peaked 10+ GiB RAM, OOMing 16 GiB build hosts. Thin LTO ran
+# without OOMing but mis-relocated compiler-builtins calls
+# (__udivti3, __multi3, ...) — release builds crashed with #GP at
+# non-canonical RIPs throughout boot. Disabling LTO entirely +
+# bumping codegen-units gets a buildable, runnable release.
+# Re-investigate fat / thin LTO once we understand the relocation
+# break (likely interaction with code-model=kernel + plt=no).
+lto             = false
+codegen-units   = 16
 panic           = "abort"
 strip           = "none"        # keep symbols — observability/ needs them
 debug           = 2
