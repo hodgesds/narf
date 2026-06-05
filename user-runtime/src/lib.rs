@@ -203,6 +203,12 @@ mod arch_syscalls {
     pub const SYS_GETRANDOM: u64 = 318;
     pub const SYS_MEMFD_CREATE: u64 = 319;
     pub const SYS_COPY_FILE_RANGE: u64 = 326;
+    // Wave-73 POSIX timers + clock_nanosleep.
+    pub const SYS_TIMER_CREATE: u64 = 222;
+    pub const SYS_TIMER_SETTIME: u64 = 223;
+    pub const SYS_TIMER_GETTIME: u64 = 224;
+    pub const SYS_TIMER_DELETE: u64 = 226;
+    pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 }
 
 // ── aarch64 Generic-ABI ──────────────────────────────────────────
@@ -338,6 +344,12 @@ mod arch_syscalls {
     pub const SYS_CHOWN: u64 = 54; // legacy chown → fchownat
     pub const SYS_TRUNCATE: u64 = 45; // aarch64 has truncate at 45
     pub const SYS_FTRUNCATE: u64 = 46;
+    // Wave-73 POSIX timers + clock_nanosleep.
+    pub const SYS_TIMER_CREATE: u64 = 107;
+    pub const SYS_TIMER_SETTIME: u64 = 110;
+    pub const SYS_TIMER_GETTIME: u64 = 108;
+    pub const SYS_TIMER_DELETE: u64 = 111;
+    pub const SYS_CLOCK_NANOSLEEP: u64 = 115;
 }
 
 // Re-export per-arch numbers so the rest of this crate can refer
@@ -2013,6 +2025,83 @@ pub fn nanosleep(ns: u64) -> i32 {
     } else {
         -1
     }
+}
+
+// ── POSIX per-process timers (Wave-73) ────────────────────────────
+
+/// `timer_create(clockid, sigevent, timerid_out)` — register a POSIX
+/// per-task timer. `evp_ptr` is the user-space `*sigevent` or 0 for
+/// the SIGALRM default. `timerid_out` receives the new `timer_t` (u64
+/// zero-extended from the kernel-side u32). Returns 0 on success, -1
+/// on failure.
+#[inline]
+pub fn timer_create(clockid: u32, evp_ptr: u64, timerid_out: *mut u64) -> i32 {
+    // SAFETY: SYS_TIMER_CREATE signature: (clockid, evp, out_ptr).
+    let r = unsafe {
+        syscall3(
+            SYS_TIMER_CREATE,
+            clockid as u64,
+            evp_ptr,
+            timerid_out as u64,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `timer_settime(timerid, flags, new, old)` — arm or disarm. `new_ptr`
+/// points at a `struct itimerspec` (32 bytes: interval + value as two
+/// `timespec`s). `old_ptr` may be 0. Returns 0 on success, -1 on failure.
+#[inline]
+pub fn timer_settime(timerid: u32, flags: u32, new_ptr: u64, old_ptr: u64) -> i32 {
+    // SAFETY: SYS_TIMER_SETTIME signature: (id, flags, new_ptr, old_ptr).
+    let r = unsafe {
+        syscall4(
+            SYS_TIMER_SETTIME,
+            timerid as u64,
+            flags as u64,
+            new_ptr,
+            old_ptr,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `timer_gettime(timerid, cur_ptr)` — read the remaining time +
+/// interval into a `struct itimerspec` at `cur_ptr`. Returns 0 on
+/// success, -1 on failure.
+#[inline]
+pub fn timer_gettime(timerid: u32, cur_ptr: u64) -> i32 {
+    // SAFETY: SYS_TIMER_GETTIME signature: (id, out_ptr).
+    let r = unsafe { syscall2(SYS_TIMER_GETTIME, timerid as u64, cur_ptr) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `timer_delete(timerid)` — destroy the timer. Returns 0 on success,
+/// -1 when the id is unknown.
+#[inline]
+pub fn timer_delete(timerid: u32) -> i32 {
+    // SAFETY: SYS_TIMER_DELETE signature: (id).
+    let r = unsafe { syscall1(SYS_TIMER_DELETE, timerid as u64) };
+    if r as i64 == -1 { -1 } else { 0 }
+}
+
+/// `clock_nanosleep(clockid, flags, req_ptr, rem_ptr)` — timed sleep on
+/// a named clock. `flags = 1` (TIMER_ABSTIME) treats `req_ptr` as an
+/// absolute deadline; `flags = 0` is a relative interval. `rem_ptr`
+/// may be 0. Returns 0 on success.
+#[inline]
+pub fn clock_nanosleep(clockid: u32, flags: u32, req_ptr: u64, rem_ptr: u64) -> i32 {
+    // SAFETY: SYS_CLOCK_NANOSLEEP signature: (clockid, flags, req, rem).
+    let r = unsafe {
+        syscall4(
+            SYS_CLOCK_NANOSLEEP,
+            clockid as u64,
+            flags as u64,
+            req_ptr,
+            rem_ptr,
+        )
+    };
+    if r as i64 == -1 { -1 } else { 0 }
 }
 
 // ── VFS ────────────────────────────────────────────────────────────

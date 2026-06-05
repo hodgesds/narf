@@ -1,9 +1,9 @@
-//! Time surface: `clock_gettime` / `time` / `gettimeofday`.
+//! Time surface: `clock_gettime` / `time` / `gettimeofday` /
+//! POSIX per-process timers (Wave-73).
 //!
-//! All three resolve to the same kernel monotonic clock today. Stage-4
-//! has no realtime / wall-clock distinction — the kernel only exposes
-//! a single nanosecond counter — so `clock_id` is accepted and ignored.
-//! When a real RT clock lands the dispatch will fan out per id.
+//! Clocks: CLOCK_REALTIME=0, CLOCK_MONOTONIC=1, CLOCK_MONOTONIC_RAW=4,
+//! CLOCK_BOOTTIME=7. The kernel currently exposes a single nanosecond
+//! counter; `clock_id` is forwarded to the kernel for future fanout.
 
 #![allow(non_camel_case_types)]
 
@@ -581,6 +581,22 @@ pub unsafe extern "C" fn nanosleep(req: *const timespec, rem: *mut timespec) -> 
     res
 }
 
+// ── Clock-id constants ───────────────────────────────────────────────
+//
+// POSIX / Linux canonical values. CLOCK_REALTIME and CLOCK_MONOTONIC
+// are already the implicit default on every clock_gettime path; the
+// two additions below (RAW + BOOTTIME) are the only Wave-73 additions
+// not covered by prior waves.
+
+/// POSIX CLOCK_REALTIME (0) — wall clock.
+pub const CLOCK_REALTIME: i32 = 0;
+/// POSIX CLOCK_MONOTONIC (1) — monotonic; doesn't jump on NTP.
+pub const CLOCK_MONOTONIC: i32 = 1;
+/// Linux CLOCK_MONOTONIC_RAW (4) — monotonic; unaffected by NTP slew.
+pub const CLOCK_MONOTONIC_RAW: i32 = 4;
+/// Linux CLOCK_BOOTTIME (7) — like CLOCK_MONOTONIC but includes suspend.
+pub const CLOCK_BOOTTIME: i32 = 7;
+
 /// `clock_getres(clk_id, *mut timespec)` — POSIX. Reports the
 /// resolution of the named clock. NARF clocks advance per the TSC
 /// frequency; we report 1 ns as the nominal resolution (the
@@ -598,9 +614,8 @@ pub unsafe extern "C" fn clock_getres(_clk_id: i32, res: *mut timespec) -> i32 {
 }
 
 /// `clock_nanosleep(clk_id, flags, *req, *rem)` — POSIX absolute /
-/// relative sleep on a named clock. Today we honour the relative
-/// form (flags == 0) and forward to nanosleep; the absolute form
-/// (`TIMER_ABSTIME = 1`) is computed as `(req - now)`.
+/// relative sleep on a named clock. Forwards through
+/// `narf_user_runtime::clock_nanosleep` (Wave-73 syscall).
 ///
 /// Reference: musl `src/time/clock_nanosleep.c`.
 ///
@@ -619,24 +634,149 @@ pub unsafe extern "C" fn clock_nanosleep(
     if r.tv_sec < 0 || r.tv_nsec < 0 || r.tv_nsec >= 1_000_000_000 {
         return 22; // EINVAL
     }
-    let target_ns = (r.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(r.tv_nsec as u64);
-    let sleep_ns = if flags == 1 {
-        // TIMER_ABSTIME — compute the delta against the current
-        // clock reading.
-        let (sec, nsec) = narf_user_runtime::clock_gettime(clk_id as u32);
-        let now = (sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(nsec as u64);
-        target_ns.saturating_sub(now)
-    } else {
-        target_ns
-    };
-    let res = narf_user_runtime::nanosleep(sleep_ns);
-    if !rem.is_null() {
-        // SAFETY: caller-asserted writable.
-        unsafe { *rem = timespec { tv_sec: 0, tv_nsec: 0 }; }
+    narf_user_runtime::clock_nanosleep(
+        clk_id as u32,
+        flags as u32,
+        req as u64,
+        if rem.is_null() { 0 } else { rem as u64 },
+    )
+}
+
+// ── POSIX per-process timers (Wave-73) ───────────────────────────────
+//
+// Wire: timer_t is an opaque u32 zero-extended to pointer-width on the
+// wire (the kernel always writes a u64 little-endian; callers treat
+// only the low 32 bits as meaningful).
+//
+// struct sigevent (Linux layout, first 16 bytes):
+//   sigev_value  [0..8]   — union sigval (u64)
+//   sigev_signo  [8..12]  — i32 signal number
+//   sigev_notify [12..16] — i32 (SIGEV_SIGNAL=0, SIGEV_NONE=1)
+//   rest: ignored by the kernel
+//
+// struct itimerspec (32 bytes):
+//   it_interval [0..16]  — struct timespec (i64 sec + i64 nsec)
+//   it_value    [16..32] — struct timespec
+//
+// Both layouts match Linux/glibc exactly.
+
+/// `timer_t` — opaque POSIX timer handle (kernel-side u32 on NARF).
+pub type timer_t = usize; // pointer-width; only the low 32 bits are meaningful
+
+/// `sigval` — POSIX signal value union (we expose the integer member).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct sigval {
+    pub sival_ptr: usize,
+}
+
+/// `sigevent` — POSIX signal-event descriptor for `timer_create`.
+/// Only the first 16 bytes are read by the kernel; the remaining
+/// union/padding fields exist to satisfy ABI consumers that size-of
+/// the struct.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct sigevent {
+    pub sigev_value:  sigval,
+    pub sigev_signo:  i32,
+    pub sigev_notify: i32,
+    /// Padding to match the Linux `struct sigevent` size (64 bytes).
+    pub _pad: [u8; 48],
+}
+
+impl Default for sigevent {
+    fn default() -> Self {
+        Self {
+            sigev_value:  sigval::default(),
+            sigev_signo:  0,
+            sigev_notify: 0,
+            _pad: [0u8; 48],
+        }
     }
-    if res == 0 { 0 } else { 4 } // EINTR on interrupt
+}
+
+/// `itimerspec` — interval timer specification used by `timer_settime`
+/// and `timer_gettime`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct itimerspec {
+    pub it_interval: timespec,
+    pub it_value:    timespec,
+}
+
+/// `timer_create(clockid, sevp, timerid)` — register a POSIX per-task
+/// timer. `sevp`, when non-null, configures the delivery event;
+/// null defaults to SIGALRM. On success writes the new `timer_t` to
+/// `*timerid` and returns 0. Returns -1 on failure.
+///
+/// # Safety
+/// `sevp`, when non-null, must be a valid `*const sigevent`. `timerid`
+/// must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_create(
+    clockid: i32,
+    sevp:    *const sigevent,
+    timerid: *mut timer_t,
+) -> i32 {
+    if timerid.is_null() { return -1; }
+    let mut raw_id: u64 = 0;
+    let r = narf_user_runtime::timer_create(
+        clockid as u32,
+        if sevp.is_null() { 0 } else { sevp as u64 },
+        &mut raw_id as *mut u64,
+    );
+    if r == 0 {
+        // SAFETY: caller-asserted writable `*mut timer_t`.
+        unsafe { *timerid = raw_id as timer_t; }
+        0
+    } else {
+        -1
+    }
+}
+
+/// `timer_settime(timerid, flags, new_value, old_value)` — arm or
+/// disarm a timer. `flags = 1` (TIMER_ABSTIME) treats `new_value->it_value`
+/// as an absolute deadline; `flags = 0` is a relative interval.
+/// `old_value`, when non-null, receives the prior setting. Returns 0
+/// on success, -1 on failure.
+///
+/// # Safety
+/// `new_value` must be a valid `*const itimerspec`. `old_value`, when
+/// non-null, must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_settime(
+    timerid:   timer_t,
+    flags:     i32,
+    new_value: *const itimerspec,
+    old_value: *mut itimerspec,
+) -> i32 {
+    if new_value.is_null() { return -1; }
+    narf_user_runtime::timer_settime(
+        timerid as u32,
+        flags as u32,
+        new_value as u64,
+        if old_value.is_null() { 0 } else { old_value as u64 },
+    )
+}
+
+/// `timer_gettime(timerid, curr_value)` — read the remaining time and
+/// interval of `timerid` into `*curr_value`. Returns 0 on success, -1
+/// on failure.
+///
+/// # Safety
+/// `curr_value` must be a writable `*mut itimerspec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_gettime(
+    timerid:    timer_t,
+    curr_value: *mut itimerspec,
+) -> i32 {
+    if curr_value.is_null() { return -1; }
+    narf_user_runtime::timer_gettime(timerid as u32, curr_value as u64)
+}
+
+/// `timer_delete(timerid)` — destroy the timer. Returns 0 on success,
+/// -1 when the id is unknown.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn timer_delete(timerid: timer_t) -> i32 {
+    narf_user_runtime::timer_delete(timerid as u32)
 }
