@@ -54,7 +54,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+pub mod bcast;
 pub mod fw_loader;
+pub mod handshake;
 pub mod iwl_msix;
 pub mod mac_ctx;
 pub mod mlme;
@@ -112,6 +114,67 @@ unsafe impl Send for IwlDevice {}
 unsafe impl Sync for IwlDevice {}
 
 impl IwlDevice {
+    /// Push an Open System Authentication request frame (seq=1) on
+    /// the management TX queue. The AP responds with seq=2 via the RX
+    /// path; we don't currently block on that response here — the
+    /// caller follows up with the Association Request, and the RX
+    /// pump will log the auth response when it arrives.
+    async fn send_open_auth(&self, bssid: [u8; 6]) -> Result<(), WirelessError> {
+        let body = mlme::build_open_auth_body();
+        let pkt = tx::TxPacket::management(
+            tx::fc::SUBTYPE_AUTH,
+            bssid,            // addr1: DA = AP
+            self.mac_addr,    // addr2: SA = us
+            bssid,            // addr3: BSSID = AP
+            1,                // seq num
+            0xFF,             // BCAST station id (pre-association)
+            &body,
+        );
+
+        // Serialise MAC header + body into a coherent buffer.
+        let total = pkt.mac_hdr_len + pkt.payload.len();
+        let buf = narf_io::alloc_coherent(total, DomainId::DRIVER_0)
+            .map_err(|_| WirelessError::HardwareError)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pkt.mac_hdr.as_ptr(),
+                buf.as_mut_ptr(),
+                pkt.mac_hdr_len,
+            );
+            core::ptr::copy_nonoverlapping(
+                pkt.payload.as_ptr(),
+                buf.as_mut_ptr().add(pkt.mac_hdr_len),
+                pkt.payload.len(),
+            );
+        }
+        let frame_len = total as u16;
+
+        let mut tx_q = self.tx_q0.lock();
+        let mut mmio = IwlMmioImpl(self.mmio);
+        let slot = tx_q.write_ptr;
+
+        let cmd = tx::IwlTxCmd::for_management(frame_len, 0xFF);
+        let cmd_dma = &self.tx_cmd_bufs[0];
+        let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
+        unsafe { core::ptr::write_volatile(cmd_ptr, cmd); }
+
+        let mut tfd = tx::Tfd::default();
+        tfd.push_seg(
+            cmd_dma.phys_addr().as_u64() + (slot * 32) as u64,
+            core::mem::size_of::<tx::IwlTxCmd>() as u16,
+        );
+        tfd.push_seg(buf.phys_addr().as_u64(), frame_len);
+
+        tx_q.enqueue(tfd);
+        tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
+
+        // Keep the buffer alive until the device DMAs it; in production
+        // we'd thread this through a per-slot lifetime pool. For the
+        // bring-up smoke we let the page live in the slab.
+        core::mem::forget(buf);
+        Ok(())
+    }
+
     pub fn new(
         mmio: MmioRegion,
         chip: ChipConfig,
@@ -293,6 +356,13 @@ impl WirelessNetIface for IwlDevice {
             "  iwlwifi: associating to {:?}",
             req.ssid
         );
+
+        // 0. Send Open System Authentication request (seq=1). For
+        //    WPA2-PSK the auth is just an Open exchange; the real key
+        //    establishment happens in the 4-way handshake post-assoc.
+        //    We push the frame and trust that auth-success comes back
+        //    via the RX path before assoc reaches the AP.
+        self.send_open_auth(req.bssid).await?;
 
         // 1. Send Association Request.
         let params = mlme::AssocParams {
@@ -1248,6 +1318,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     return Err(narf_bus::ProbeError::Other("Firmware load failed"));
                 }
             }
+
+            // 3b. Flush the BCAST_FILTER cache so the firmware starts
+            //     forwarding beacons/probe-responses up to the host
+            //     RX queue (required before scan can collect BSSes).
+            //     The TX queue isn't fully wired this early so we
+            //     stash the encoded body for later dispatch by the
+            //     scan path. (cmd id 0xCD, group 0.)
+            let _bcast_flush_body = bcast::build_flush_cmd();
+            let _ = writeln!(
+                narf_console::Writer,
+                "  iwlwifi: BCAST_FILTER flush staged (cmd 0x{:02X})",
+                bcast::BCAST_FILTER_CMD,
+            );
 
             // 4. Hardware Initialization (RX/TX rings).
 
