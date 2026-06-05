@@ -1829,9 +1829,7 @@ kernel_test_in!(
 
 /// Smoke 23: Direct mapping table insert + bidirectional lookup.
 fn smoke_wave38_pid_task_mapping_roundtrip() -> TestResult {
-    use crate::handlers::{
-        pid_to_task_raw, register_pid_task_mapping, task_to_pid_raw, wait_init,
-    };
+    use crate::handlers::{pid_to_task_raw, register_pid_task_mapping, task_to_pid_raw, wait_init};
 
     crate::syscall::__test_clear_global();
     crate::handlers::__test_wait_reset();
@@ -2078,8 +2076,8 @@ kernel_test_in!(
 /// into the mapping table, bypassing fork's counter alignment).
 fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     use crate::handlers::{
-        __test_inject_parent_of, pid_to_task_raw, register_pid_task_mapping,
-        signal_pending_of, wait_init,
+        __test_inject_parent_of, pid_to_task_raw, register_pid_task_mapping, signal_pending_of,
+        wait_init,
     };
 
     const PARENT_TASK: u64 = 0xAA01; // parent's "TaskId" (current_task_id() value)

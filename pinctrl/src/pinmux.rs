@@ -91,7 +91,6 @@ impl Default for PinDriveOpt {
     }
 }
 
-
 impl PinConfig {
     /// Pack into the 32-bit canonical word.
     pub fn pack(self) -> u32 {
