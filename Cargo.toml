@@ -144,7 +144,12 @@ undocumented_unsafe_blocks = "warn"
 # LTO is aggressive and will happily reorder across inline asm without them.
 [profile.release]
 opt-level       = 3
-lto             = "fat"
+# `thin` instead of `fat` — fat LTO funnels every crate's IR through
+# one LLVM process serially, easily peaking 10+ GiB RAM and OOMing
+# 16 GiB laptops mid-build. Thin LTO parallelises across crates and
+# captures ~95% of the inlining benefit at a fraction of the working
+# set.
+lto             = "thin"
 codegen-units   = 1
 panic           = "abort"
 strip           = "none"        # keep symbols — observability/ needs them
