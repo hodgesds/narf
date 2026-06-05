@@ -11,7 +11,7 @@
 //!   <https://www.usb.org/sites/default/files/hid1_11.pdf>
 //! - Microsoft "Plug and Play Support and Power Management for HID
 //!   over I2C Devices" — the `_DSM` UUID
-//!   (4F1C8DA2-D5A0-4C7B-8169-3D2DBFCA3C03) that surfaces
+//!   (3CDFF6F7-4267-4555-AD05-B30A3D8938DE) that surfaces
 //!   `wHIDDescRegister` in ACPI.
 //!   <https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/plug-and-play-support-and-power-management>
 //!
