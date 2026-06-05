@@ -24,6 +24,7 @@ fn smoke_power_cstate_register() -> TestResult {
         id: 200,
         exit_latency_us: 50,
         power_draw_mw: 100,
+        target_residency_us: 100,
         entry: || { /* test stub */ },
     };
     if let Err(e) = register_cstate(&cap, synth) {
@@ -82,6 +83,72 @@ fn smoke_power_governor_swap() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("power", smoke_power_governor_swap);
+
+fn smoke_pluggable_idle_governor() -> TestResult {
+    use crate::{
+        bootstrap_idle_governor_authority, bootstrap_power_authority, current_idle_governor_name,
+        init, install_idle_governor, register_cstate, select_idle_state, CState, LinearScan,
+        MenuGovernor,
+    };
+
+    init();
+    if current_idle_governor_name() != Some("linear-scan") {
+        return TestResult::Fail("default idle governor is not 'linear-scan'");
+    }
+
+    // Register a deep state with a multi-microsecond exit latency and
+    // a non-trivial target residency. init() already registered C0
+    // (latency 0, residency 0) and C1 (latency 1, residency 2).
+    let power = bootstrap_power_authority();
+    let _ = register_cstate(
+        &power,
+        CState {
+            id: 6,
+            exit_latency_us: 50,
+            power_draw_mw: 200,
+            target_residency_us: 200,
+            entry: || { /* stub */ },
+        },
+    );
+
+    let cap = bootstrap_idle_governor_authority();
+    if install_idle_governor(&cap, MenuGovernor).is_err() {
+        return TestResult::Fail("install_idle_governor(MenuGovernor) failed on a live cap");
+    }
+    if current_idle_governor_name() != Some("menu") {
+        return TestResult::Fail("idle governor name did not update after install");
+    }
+
+    // Under Menu: long predicted idle (1_000 us) and a generous
+    // latency budget should pick the deep C6 state (id 6).
+    // STAGE3_DEADLINE_BUDGET_US (1_000) is used by the free fn.
+    let chosen = match select_idle_state() {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("select_idle_state under Menu returned an error"),
+    };
+    if chosen.id != 6 {
+        return TestResult::Fail("Menu did not pick deepest fitting state");
+    }
+
+    // Reinstall LinearScan; under the 1_000us budget it should also
+    // pick C6 because exit_latency 50 <= 1_000. This verifies the
+    // dispatch path swaps cleanly.
+    if install_idle_governor(&cap, LinearScan).is_err() {
+        return TestResult::Fail("re-install of LinearScan failed");
+    }
+    if current_idle_governor_name() != Some("linear-scan") {
+        return TestResult::Fail("idle governor name did not revert");
+    }
+    let chosen2 = match select_idle_state() {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("select_idle_state under LinearScan errored"),
+    };
+    if chosen2.id != 6 {
+        return TestResult::Fail("LinearScan did not pick deepest fitting state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("power", smoke_pluggable_idle_governor);
 
 fn smoke_power_device_pm_lifecycle() -> TestResult {
     use crate::{
