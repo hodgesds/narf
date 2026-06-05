@@ -1152,7 +1152,6 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // re-enter and deadlock if called from inside `with_table`.
     let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
 
-
     let outcome = fd::with_table(task, |t| {
         let entry = t.get_mut(fd)?;
         Some(match cmd {
@@ -2320,8 +2319,7 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
             return;
         }
         let task = current_task_id();
-        fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.stat()))
-            .flatten()
+        fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.stat())).flatten()
     } else {
         let path_owned = match copy_user_path(path_ptr, path_len) {
             Some(s) => s,
@@ -2393,7 +2391,12 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         | STATX_BLOCKS
         | STATX_MTIME
         | STATX_CTIME;
-    out.stx_mask = filled & if mask == 0 { filled } else { mask | STATX_BASIC_STATS & filled };
+    out.stx_mask = filled
+        & if mask == 0 {
+            filled
+        } else {
+            mask | STATX_BASIC_STATS & filled
+        };
 
     // SAFETY: Statx is repr(C) POD; bytes are valid for read.
     let bytes: &[u8] = unsafe {
@@ -2563,6 +2566,7 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
                 ops,
                 offset: 0,
                 flags: 0,
+                status_flags: 0,
             })
         });
         match fd {
@@ -3056,8 +3060,7 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
                 // disk-backed FSes (FAT, ext2) resolve correctly.
                 let mut cur = fs.root();
                 for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = poll_blocking(cur.lookup_dir_async(seg))
-                        .and_then(|r| r.ok())?;
+                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
                 }
                 cur
             };
@@ -3066,8 +3069,7 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
             // poll_blocking drives the future to completion via the
             // same internally-polled NVMe/virtio-blk driver path that
             // sys_open and sys_read already rely on.
-            poll_blocking(dir.enumerate_async(cursor, 1))
-                .and_then(|r| r.ok())
+            poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok())
         })
         .flatten();
 
@@ -3161,8 +3163,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
             } else {
                 let mut cur = fs.root();
                 for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = poll_blocking(cur.lookup_dir_async(seg))
-                        .and_then(|r| r.ok())?;
+                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
                 }
                 cur
             };
@@ -3179,9 +3180,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
 
     let mut written = 0usize;
     loop {
-        let mut entries = match poll_blocking(dir.enumerate_async(cursor, 1))
-            .and_then(|r| r.ok())
-        {
+        let mut entries = match poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok()) {
             Some(v) if !v.is_empty() => v,
             _ => break,
         };
@@ -5591,7 +5590,10 @@ pub fn __test_ctty_reset() {
 /// `None` if the task has no controlling tty.
 #[cfg(feature = "linux-compat")]
 pub fn ctty_for(task: u64) -> Option<u32> {
-    CTTY_TABLE.lock().as_ref().and_then(|m| m.get(&task).copied())
+    CTTY_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
 }
 
 /// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can
@@ -6593,8 +6595,7 @@ fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::I
     // stable id space even for tasks that never unshared. Matches the
     // shape Linux uses (every task is always in some IPC NS).
     crate::namespaces::unshare_ipc(task);
-    crate::namespaces::current_ipc_ns(task)
-        .expect("unshare_ipc just installed an entry")
+    crate::namespaces::current_ipc_ns(task).expect("unshare_ipc just installed an entry")
 }
 
 #[cfg(feature = "container")]
@@ -7573,14 +7574,8 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     let flags = args.arg5;
     // Silence-the-warning swallow for option bits we accept but
     // don't yet act on; they're documented above.
-    let _ = flags
-        & (MS_RDONLY
-            | MS_NOSUID
-            | MS_NODEV
-            | MS_NOEXEC
-            | MS_REMOUNT
-            | MS_REC
-            | MS_RELATIME);
+    let _ =
+        flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
 
     let auth = narf_filesystem::bootstrap_mount_authority();
     let domain = narf_lib::id::DomainId::DRIVER_0;
@@ -11452,6 +11447,7 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
                 ops: sfd,
                 offset: 0,
                 flags: 0,
+                status_flags: 0,
             })
         }) {
             Some(n) => n,
@@ -11470,7 +11466,9 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
 // `dyn FileOps` we stored in the fd table.
 #[cfg(feature = "linux-compat")]
 static SIGNALFD_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::SignalFdFile>>>,
+    Option<
+        alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::linux_compat::SignalFdFile>>,
+    >,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 #[cfg(feature = "linux-compat")]
@@ -11740,7 +11738,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
     table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
     table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
-    table.install_raw(Syscall::Newfstatat, "newfstatat", RawFnHandler(sys_newfstatat));
+    table.install_raw(
+        Syscall::Newfstatat,
+        "newfstatat",
+        RawFnHandler(sys_newfstatat),
+    );
     table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
