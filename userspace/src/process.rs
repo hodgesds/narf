@@ -145,8 +145,30 @@ pub unsafe fn load_user_process_with(
         unsafe { apply_relocations(bytes, &image, &address_space, 0) }?;
     }
 
+    // FS-backed PT_INTERP fallback: when the in-memory `interp::`
+    // registry misses, read the path through the VFS. The mount the
+    // path lives under is whatever `registry().resolve_absolute`
+    // finds — initramfs at "/" handles `/lib/ld-musl-...` once the
+    // CPIO stages the interpreter there. The FS API is async; we
+    // wrap with `poll_blocking` (same pattern Wave-59 used for
+    // `sys_listdir`). Bytes are owned for the duration of this
+    // function; `load_elf_into_at` copies them into freshly-mapped
+    // user pages so a borrowed slice is sufficient.
+    #[cfg(feature = "linux-compat")]
+    let interp_fs_owned: Option<alloc::vec::Vec<u8>> = image
+        .interp
+        .as_deref()
+        .filter(|name| interp::lookup_interpreter(name).is_none())
+        .and_then(|name| read_path_from_vfs(name));
+    #[cfg(not(feature = "linux-compat"))]
+    let interp_fs_owned: Option<alloc::vec::Vec<u8>> = None;
+
     if let Some(name) = image.interp.as_deref() {
-        if let Some(interp_bytes) = interp::lookup_interpreter(name) {
+        let registered: Option<&[u8]> =
+            interp::lookup_interpreter(name).map(|s| s as &[u8]);
+        let interp_bytes_opt: Option<&[u8]> =
+            registered.or_else(|| interp_fs_owned.as_deref());
+        if let Some(interp_bytes) = interp_bytes_opt {
             let interp_entry =
                 unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
@@ -237,6 +259,36 @@ pub unsafe fn load_user_process_with(
     let stack_bytes = pages * 4096;
     let stack_top_v = DEFAULT_USER_STACK_BASE + stack_bytes;
 
+    // AT_RANDOM: 16 bytes of CSPRNG-grade entropy living at the top
+    // of the user stack. musl's __init_libc reads these for ASLR
+    // cookies + stack canaries. We carve the entropy off the top
+    // and shrink `stack_top_v` so init_sysv_stack lays argv strings
+    // BELOW the entropy block (no overwrite).
+    //
+    // Source preference: RDSEED → RDRAND → TSC fallback, via the
+    // arch hwrng path. fill_key_32 writes 32 bytes; we only need 16
+    // but using the same call keeps the entropy source uniform with
+    // the rest of NARF's seed-material code.
+    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    let (stack_top_v, at_random_vaddr) = {
+        let entropy_va = stack_top_v - 16;
+        let mut key = [0u8; 32];
+        let _src = narf_arch::x86_64::hwrng::fill_key_32(&mut key);
+        let root = address_space.root;
+        for (i, &byte) in key[..16].iter().enumerate() {
+            if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
+                // SAFETY: stack region is mapped+materialised R+W
+                // above; identity-mapped low 4 GiB.
+                unsafe {
+                    *(phys as *mut u8) = byte;
+                }
+            }
+        }
+        (entropy_va, Some(entropy_va))
+    };
+    #[cfg(not(all(feature = "linux-compat", target_arch = "x86_64")))]
+    let (stack_top_v, at_random_vaddr): (u64, Option<u64>) = (stack_top_v, None);
+
     // Build the final aux vector: caller-supplied entries take
     // precedence; we append interp-related defaults (AT_ENTRY,
     // AT_BASE, AT_PAGESZ) only when the caller didn't already set
@@ -252,6 +304,14 @@ pub unsafe fn load_user_process_with(
             let tag = default.tag();
             if !v.iter().any(|e| e.tag() == tag) {
                 v.push(default);
+            }
+        }
+        // Linux-compat AT_RANDOM stamp. Only emitted when the entropy
+        // block was actually written (x86_64 + linux-compat feature).
+        if let Some(va) = at_random_vaddr {
+            let tag = AuxEntry::Random(0).tag();
+            if !v.iter().any(|e| e.tag() == tag) {
+                v.push(AuxEntry::Random(va));
             }
         }
         v
@@ -552,4 +612,90 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
         }
     };
     (key, val)
+}
+
+// ── FS-backed PT_INTERP lookup ──────────────────────────────────────
+//
+// When the in-memory `interp::` registry misses, we read the
+// interpreter from the VFS. The mount the path lives under is
+// whatever `registry().resolve_absolute` finds — initramfs at "/"
+// covers `/lib/ld-musl-x86_64.so.1` once the CPIO stages it there.
+//
+// The narf-filesystem API is async; we spin-pump each future to
+// completion with the same shape `handlers::poll_blocking` uses —
+// in-memory FSes (initramfs / memfs) return Ready on the first poll,
+// and the disk-backed FSes (ext2 / FAT) drive their own block I/O
+// to completion. A bounded poll loop prevents wedging on a broken
+// future; on overrun the caller falls through to its no-interpreter
+// path (the program runs without one, which is the right failure
+// mode for a missing-interpreter ld-musl-style ELF).
+
+#[cfg(feature = "linux-compat")]
+fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn raw_waker() -> RawWaker {
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+
+    // SAFETY: vtable is null-pointer-clean; waker is never woken.
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut ctx = Context::from_waker(&waker);
+    // SAFETY: own `fut` by value; pin to stack temporary.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..65_536 {
+        match pinned.as_mut().poll(&mut ctx) {
+            Poll::Ready(v) => return Some(v),
+            Poll::Pending => continue,
+        }
+    }
+    None
+}
+
+/// Read `abs_path` (a POSIX-style absolute path like
+/// `/lib/ld-musl-x86_64.so.1`) through the VFS into an owned byte
+/// vector. Returns `None` when the path doesn't resolve, the file
+/// is empty, the read exceeds 64 MiB (defensive cap — a sane ld-musl
+/// is <200 KiB), or any read short-circuits with `FsError`.
+#[cfg(feature = "linux-compat")]
+fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
+    use narf_filesystem::{registry, resolve_async};
+
+    // 1. Walk the VFS to a FileOps for `abs_path`.
+    let file = registry()
+        .resolve_absolute(abs_path, |fs, rel| {
+            poll_blocking(resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+        })
+        .flatten()?;
+
+    // 2. stat() to size the read; cap at 64 MiB.
+    const MAX_INTERP_BYTES: u64 = 64 * 1024 * 1024;
+    let stat = poll_blocking(file.stat_async()).and_then(|r| r.ok())?;
+    let size = stat.size;
+    if size == 0 || size > MAX_INTERP_BYTES {
+        return None;
+    }
+
+    // 3. Read in one shot. Most FSes (initramfs / memfs / FAT /
+    //    ext2 file read) honour a full-length read; we loop on
+    //    short reads defensively.
+    let mut buf = alloc::vec![0u8; size as usize];
+    let mut filled: u64 = 0;
+    while filled < size {
+        let n = poll_blocking(file.read(filled, &mut buf[filled as usize..]))
+            .and_then(|r| r.ok())?;
+        if n == 0 {
+            // EOF before we hit `size` — truncate to what we got.
+            buf.truncate(filled as usize);
+            break;
+        }
+        filled = filled.saturating_add(n as u64);
+    }
+    Some(buf)
 }
