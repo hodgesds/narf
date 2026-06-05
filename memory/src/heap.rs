@@ -36,7 +36,7 @@ use crate::slab;
 /// comes up. 16 MiB gives ~8× headroom over the QEMU steady state
 /// while still costing only 16 MiB of `.bss` on a kernel that's
 /// already 50+ MiB.
-pub const BOOTSTRAP_CAPACITY: usize = 16 << 20;
+pub const BOOTSTRAP_CAPACITY: usize = 4 << 20;
 
 /// Byte storage for the bootstrap bump arena. Lives in `.bss`,
 /// 16-byte aligned for any alignment ≤ 16 to be trivially satisfiable.
