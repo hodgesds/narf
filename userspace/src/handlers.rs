@@ -9199,6 +9199,14 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+/// `ptrace(request, pid, addr, data)`
+/// Currently a stub returning ENOSYS (-38) since the GDB stub
+/// (observability) is not fully wired to the userspace process
+/// table yet.
+fn sys_ptrace(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok((-38i64) as u64));
+}
+
 /// `rt_sigpending(set_out, sigsetsize)` — Linux `rt_sigpending(2)`.
 /// Write the (pending & mask) set to `*set_out` so the caller sees
 /// which signals were delivered while blocked.
@@ -11628,6 +11636,10 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Write, "write", RawFnHandler(sys_write));
     table.install_raw(Syscall::Read, "read", RawFnHandler(sys_read));
     table.install_raw(Syscall::Close, "close", RawFnHandler(sys_close));
+    table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
+    table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
+    table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
+    table.install_raw(Syscall::Newfstatat, "newfstatat", RawFnHandler(sys_newfstatat));
     table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
@@ -11931,6 +11943,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Kill, "kill", RawFnHandler(sys_kill));
     table.install_raw(Syscall::Tgkill, "tgkill", RawFnHandler(sys_tgkill));
     table.install_raw(Syscall::Tkill, "tkill", RawFnHandler(sys_tkill));
+    table.install_raw(Syscall::Ptrace, "ptrace", RawFnHandler(sys_ptrace));
     table.install_raw(Syscall::Futex, "futex", RawFnHandler(sys_futex));
     table.install_raw(
         Syscall::Sigprocmask,

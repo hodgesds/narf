@@ -590,6 +590,12 @@ pub enum Syscall {
     /// contiguous.
     Sigreturn,
 
+    /// `ptrace(request, pid, addr, data)` — POSIX ptrace(2). Used
+    /// by debuggers to observe and control the execution of another
+    /// process (the "tracee"), and examine and change the tracee's
+    /// memory and registers.
+    Ptrace,
+
     // ── Sockets (197-209) ─────────────────────────────────────────
     //
     // The kernel exposes BOTH a POSIX-shaped surface (one syscall
@@ -1552,6 +1558,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getrlimit, 97),
     (Syscall::Getrusage, 98),
     (Syscall::Times, 100),
+    (Syscall::Ptrace, 101),
     (Syscall::GetUid, 102),
     (Syscall::GetGid, 104),
     (Syscall::SetUid, 105),
@@ -1724,6 +1731,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Sleep, 101), // nanosleep
     (Syscall::ClockSetTime, 112),
     (Syscall::ClockGetTime, 113),
+    (Syscall::Ptrace, 117),
     (Syscall::SchedSetparam, 118),
     (Syscall::SchedGetparam, 121),
     (Syscall::SchedSetaffinity, 122),
