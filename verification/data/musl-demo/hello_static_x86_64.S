@@ -7,9 +7,17 @@
 //
 // Syscall numbers are the Linux x86_64 ABI per
 // `arch/x86/entry/syscalls/syscall_64.tbl` — exactly what NARF's
-// linux-compat surface translates. The whole binary exists to prove
-// NARF correctly speaks that ABI for a binary built with stock
-// binutils, not against narf-libc.
+// linux-compat surface translates.
+//
+// IMPORTANT — gate selection: NARF uses `int 0x80` as the user
+// gate, not the modern `syscall` instruction. `user-runtime/src/
+// lib.rs:16` documents the choice; narf-libc's syscall wrappers
+// all expand to `int 0x80`. A binary using the raw `syscall`
+// instruction either misroutes through an uninitialised
+// IA32_LSTAR or returns no-op (the kernel-side handler expects
+// the int-0x80 frame layout, not the syscall regs). So this
+// binary uses `int 0x80` too — it remains a stock-binutils ELF,
+// no narf-libc dependency, but speaks the right kernel gate.
 //
 // Rebuild via REGEN.sh in this directory.
 
@@ -23,15 +31,14 @@ _start:
     mov     rdi, 1
     lea     rsi, [rip + msg]
     mov     rdx, 6
-    syscall
+    int     0x80
 
     # exit(0) — Linux SYS_exit = 60. NARF's `Syscall::ExitTask`
     # maps to 60 (userspace/src/syscall.rs:1535). exit_group (231)
-    # is not yet in the linux-compat table; using exit avoids a
-    # spurious ENOSYS + ud2 trap before the parent reaps.
+    # is not yet in the linux-compat table.
     mov     rax, 60
     xor     rdi, rdi
-    syscall
+    int     0x80
 
     # Unreachable; trap just in case.
     ud2
