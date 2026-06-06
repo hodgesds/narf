@@ -790,10 +790,18 @@ impl core::future::Future for UserTaskFuture {
             }
         }
 
-        // Snapshot kernel CR3 once, on the first poll. Subsequent
-        // polls re-activate the user AS, so we always land back on
-        // the kernel root via the trap-back / cleanup path.
-        if this.saved_cr3.get().is_none() {
+        // Snapshot kernel CR3 EVERY poll, not once. The kernel
+        // root can shift between polls — when the page allocator
+        // hands out a phys-frame that was previously a PML4 page
+        // (e.g. a freed init/shell user-AS root) for a fresh user
+        // mmap, the OLD PML4 page contents get overwritten and
+        // restoring to that phys triple-faults. The scheduler
+        // already does a per-poll save/restore around the call
+        // (`scheduler/src/lib.rs:1357`), so the CR3 we read here
+        // is whatever it just handed us — guaranteed live for at
+        // least the duration of this poll body. Cache it in
+        // `saved_cr3` for the post-trap-back restore.
+        {
             let cr3: u64;
             // SAFETY: reading CR3 has no side effects.
             unsafe {

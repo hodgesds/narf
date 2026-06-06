@@ -4319,109 +4319,6 @@ fn sys_gettid(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(current_task_id()));
 }
 
-// ── clone(2): minimal-viable thread spawn ──────────────────────────
-//
-// See the Syscall::Clone doc-comment for the four-argument shape.
-// The handler resolves the caller's address space through the
-// installed AS lookup (the same one `current_address_space` uses
-// for fd handlers), clones the `Arc<AddressSpace>`, and spawns a
-// new `UserTaskFuture` that begins execution at the user-supplied
-// (entry_pc, stack_top) pair. The child's TaskId is returned to
-// the parent; the child observes a fresh TaskId via `gettid`.
-
-fn sys_clone(ctx: &mut dyn TrapContext) {
-    use crate::process::DEFAULT_USER_STACK_BYTES;
-
-    let args = *ctx.args();
-    let entry_pc = args.arg0;
-    let stack_top = args.arg1;
-    let entry_arg = args.arg2; // delivered as RDI to the new thread
-    let fs_base_arg = args.arg3;
-
-    // Reject obviously-bad inputs early. Zero entry/stack means
-    // the user didn't bother to fill in their args; reject.
-    if entry_pc == 0 || stack_top == 0 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-
-    // Resolve the parent's address space. If no AS lookup has been
-    // installed, this is being called outside a real userspace boot
-    // (e.g. a unit test that forgot the wiring) — fail loudly.
-    let parent_as = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-
-    // Build a UserProcess that shares `address_space` with the
-    // parent. Each thread still gets its own PID for now (the
-    // scheduler tracks tasks individually; thread-group / `getpid`-
-    // returns-tgid semantics will land alongside futex / clone3).
-    let proc = crate::UserProcess {
-        pid: crate::alloc_pid(),
-        address_space: parent_as.clone(),
-        entry: crate::EntryPoint(narf_memory::VirtAddr::new(entry_pc)),
-        stack_top: narf_memory::VirtAddr::new(stack_top),
-        fs_base: if fs_base_arg != 0 {
-            Some(fs_base_arg)
-        } else {
-            // Inherit parent's FS_BASE. The current task's
-            // `UserProcess.fs_base` isn't directly reachable from
-            // the trap path, but the IA32_FS_BASE MSR holds the
-            // active value at this moment — the user_task poll
-            // wrote it. Reading it back is x86_64-specific.
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                use core::arch::asm;
-                let lo: u32;
-                let hi: u32;
-                const IA32_FS_BASE: u32 = 0xC000_0100;
-                asm!(
-                    "rdmsr",
-                    in("ecx") IA32_FS_BASE,
-                    out("eax") lo,
-                    out("edx") hi,
-                    options(nostack, preserves_flags),
-                );
-                let v = (lo as u64) | ((hi as u64) << 32);
-                if v == 0 {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            None
-        },
-        entry_arg: Some(entry_arg),
-    };
-    let _ = DEFAULT_USER_STACK_BYTES;
-
-    // Spawn the child on the scheduler. The same address-space Arc
-    // is attached so `address_space_of(child_tid)` returns it; the
-    // child's first poll will MOV CR3 to the shared root and iretq
-    // to (entry_pc, stack_top).
-    let address_space = proc.address_space.clone();
-    #[cfg(target_arch = "x86_64")]
-    {
-        let child_tid = narf_scheduler::spawn_user(
-            crate::user_task::UserTaskFuture::new(proc),
-            narf_scheduler::TaskSpec::unthrottled(),
-            address_space,
-        );
-        ctx.set_return(SyscallReturn::ok(child_tid.raw()));
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // aarch64 user_task::UserTaskFuture is x86_64-gated today.
-        let _ = (proc, address_space);
-        ctx.set_return(SyscallReturn::invalid_op());
-    }
-}
-
 // ── clone3(2) + set_tid_address — pthread bring-up surface ─────────
 //
 // Wave-65. Gated behind the `linux-compat` crate feature so non-
@@ -4647,8 +4544,6 @@ const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 fn sys_clone3(ctx: &mut dyn TrapContext) {
-    use crate::process::DEFAULT_USER_STACK_BYTES;
-
     let args = *ctx.args();
     let uargs = args.arg0;
     let size = args.arg1 as usize;
@@ -4672,7 +4567,41 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     // (u8 array can be transmuted to a struct-of-u64 because we
     // only read it).
     let ca: CloneArgs = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const CloneArgs) };
+    do_clone3(ctx, ca);
+}
 
+/// Linux `clone(2)` — same semantics as `clone3(2)` but the
+/// arguments are passed in registers (x86_64 syscall ABI:
+/// flags, stack-TOP, ptid, tls, ctid) instead of via a
+/// `clone_args` user struct. musl's `__clone` x86_64 asm wrapper
+/// uses this entry, including for `pthread_create`. The
+/// passed-in `stack` is the **top** of the new thread's stack;
+/// `clone3` instead takes a `(base, size)` pair. We synthesize a
+/// `CloneArgs` with `stack_size = 0` so `do_clone3`'s
+/// `rsp = stack + stack_size` arithmetic recovers the original
+/// top.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn sys_clone(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ca = CloneArgs {
+        flags: args.arg0,
+        stack: args.arg1,
+        // Linux's clone() takes the stack TOP directly; encode as
+        // (top, size=0) so `rsp = stack + stack_size` lands at the
+        // top, matching the clone3 path.
+        stack_size: 0,
+        parent_tid: args.arg2,
+        tls: args.arg3,
+        child_tid: args.arg4,
+        pidfd: 0,
+        exit_signal: 0,
+    };
+    do_clone3(ctx, ca);
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
+    use crate::process::DEFAULT_USER_STACK_BYTES;
     let flags = ca.flags;
     let parent_as = match current_address_space() {
         Some(a) => a,
@@ -4728,11 +4657,15 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
         alloc::sync::Arc::new(dup)
     };
 
-    // Stack: clone_args.stack points at the LOW end of the user-
-    // provided stack region; the child's initial RSP is
-    // `stack + stack_size`. Linux requires stack != 0 + stack_size
-    // != 0 (otherwise the kernel rejects with EINVAL).
-    if ca.stack == 0 || ca.stack_size == 0 {
+    // Stack: for `clone3(2)`, `ca.stack` points at the LOW end
+    // of the user-provided stack region and `ca.stack_size` is
+    // the byte length; the child's initial RSP is the top
+    // (`stack + stack_size`). For the legacy `clone(2)` syscall
+    // (sys_clone synthesises a CloneArgs), `ca.stack` is ALREADY
+    // the top and `ca.stack_size` is 0 — `stack + 0` recovers
+    // the top. The combined check is therefore just "stack
+    // pointer is non-zero".
+    if ca.stack == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }

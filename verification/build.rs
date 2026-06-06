@@ -219,6 +219,18 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_HELLO_MUSL_DYN_ELF_AARCH64=/dev/null");
 
+    // pthread demo binary — exercises clone3 + futex + per-thread
+    // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
+    // with -pthread (pulls libpthread, on musl that's libc itself).
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_pthread_x86_64.c");
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_pthread_x86_64");
+    let hello_pthread = manifest_dir.join("data/musl-demo/hello_pthread_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_HELLO_PTHREAD_ELF_X86_64={}",
+        hello_pthread.display()
+    );
+    println!("cargo:rustc-env=NARF_HELLO_PTHREAD_ELF_AARCH64=/dev/null");
+
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
     // image uses). If absent on the host, point at /dev/null so

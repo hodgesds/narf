@@ -83,81 +83,97 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov gs:[0], rsp",
         "mov rsp, gs:[8]",
 
-        // Save the registers `sysretq` consumes on return:
-        // rcx (user RIP) and r11 (user RFLAGS).
-        "push r11",
-        "push rcx",
+        // Build a full `UserState` snapshot on the kernel stack.
+        // Layout (low addr → high addr) from
+        // `narf_arch::x86_64::user_mode::UserState`:
+        //   0: r15  8: r14   16: r13  24: r12  32: r11  40: r10
+        //  48: r9  56: r8    64: rbp  72: rdi  80: rsi  88: rdx
+        //  96: rcx 104: rbx 112: rax 120: rip 128: rflags 136: rsp
+        // 144: valid (total 152 bytes).
+        // Push runs high→low, so we push in REVERSE field order:
+        // valid first, then rsp/rflags/rip/rax/rbx/rcx/.../r15.
+        //
+        // The user `RCX` and `R11` slots are stored as 0 because
+        // the `syscall` instruction clobbered the user's original
+        // values with the saved RIP / RFLAGS before we got here
+        // (Linux's syscall ABI mandates exactly that, so musl-
+        // built code knows not to expect those preserved).
+        //
+        // The user's RAX held the syscall number on entry; we
+        // stash it in the rax slot so the dispatcher can read it
+        // from the state, and the handler's `set_return` writes
+        // the SyscallReturn back into the same slot.
+        "push 1",                              // valid
+        "push qword ptr gs:[0]",               // rsp (user)
+        "push r11",                            // rflags (user)
+        "push rcx",                            // rip (user)
+        "push rax",                            // rax (= syscall num)
+        "push rbx",                            // rbx
+        "push 0",                              // rcx (lost)
+        "push rdx",                            // rdx (= arg2)
+        "push rsi",                            // rsi (= arg1)
+        "push rdi",                            // rdi (= arg0)
+        "push rbp",                            // rbp
+        "push r8",                             // r8  (= arg4)
+        "push r9",                             // r9  (= arg5)
+        "push r10",                            // r10 (= arg3)
+        "push 0",                              // r11 (lost)
+        "push r12",                            // r12
+        "push r13",                            // r13
+        "push r14",                            // r14
+        "push r15",                            // r15
 
-        // Build a SyscallArgs struct in-place on the kernel
-        // stack from rdi/rsi/rdx/r10/r8/r9 (the user-side
-        // syscall arg registers — note r10 substitutes for rcx
-        // because the syscall instruction clobbered rcx with
-        // the user RIP). SyscallArgs is `#[repr(C)]` so the
-        // declaration order { arg0, arg1, ..., arg5 } is the
-        // memory order, matching this push sequence (reverse
-        // order so &SyscallArgs = current rsp lays out arg0
-        // at offset 0).
-        "push r9",        // arg5
-        "push r8",        // arg4
-        "push r10",       // arg3
-        "push rdx",       // arg2
-        "push rsi",       // arg1
-        "push rdi",       // arg0
+        // SysV calling convention for
+        // `dispatch_syscall(num, &state)`:
+        // arg0 (num) → rdi, arg1 (&state) → rsi.
+        // Read syscall num from the rax slot at offset 112.
+        "mov edi, dword ptr [rsp + 112]",      // syscall number (low 32 of rax slot)
+        "mov rsi, rsp",                        // &UserState
 
-        // SysV calling convention for `dispatch_syscall(num, &args)`:
-        // arg0 (num) → rdi, arg1 (&args) → rsi.
-        "mov edi, eax",   // syscall number
-        "mov rsi, rsp",   // &SyscallArgs
-
-        // Pre-call rsp = kernel_stack_top - 16 (r11+rcx) - 48
-        // (six 8-byte arg pushes) = -64, which is 16-aligned ✓.
-        // The call's return-address push lands at -72, which is
-        // 16k+8 — exactly what SysV requires inside the callee.
+        // Pre-call rsp = kernel_stack_top - 152 = -152, which is
+        // 8-aligned; the call's push lands at -160 = 16-aligned,
+        // which is what SysV requires inside the callee.
         "call {dispatch}",
 
-        // Linux's syscall ABI requires the kernel to preserve
-        // every GPR EXCEPT `rax` (return), `rcx` (used by sysretq
-        // for user RIP), and `r11` (used by sysretq for user
-        // RFLAGS). The C-ABI `dispatch_syscall` call freely
-        // clobbers rdi/rsi/rdx/r8/r9/r10 as caller-saved, so we
-        // MUST restore them from the SyscallArgs push scratch on
-        // the stack before sysretq.
+        // After dispatch:
+        //   rax = SyscallReturn.status (low 32 of struct return)
+        //   rdx = SyscallReturn.value
+        // The user state on the stack is intact unless the
+        // handler wrote back into it via `set_return` /
+        // `save_user_state`. The handler's `set_return` modifies
+        // the rax slot at [rsp + 112].
         //
-        // Bug pre-fix: a bare `add rsp, 48` left these holding
-        // C-frame trash. Symptom: musl's `__stdout_write` saves
-        // stdout in r8 BEFORE `ioctl(TIOCGWINSZ)` and restores
-        // from r8 AFTER; the trashed r8 became the FILE* fed to
-        // `__stdio_write` which #PFed reading `f->wpos` at a
-        // truncated address (`cr2=0x1e8848, rip=0x...62d9a`).
-        //
-        // Stash the dispatcher's rax/rdx into rcx/r11 — those
-        // two registers are about to be reloaded from the stack
-        // for sysretq anyway, so we can borrow them as scratch.
-        "mov rcx, rax",   // stash dispatcher status (low 32 of SyscallReturn) in rcx
-        "mov r11, rdx",   // stash dispatcher value (high 64 of SyscallReturn) in r11
+        // Stash dispatcher rax/rdx into rcx/r11 — those will be
+        // overwritten anyway when we load user rcx (RIP) and r11
+        // (RFLAGS) below.
+        "mov rcx, rax",
+        "mov r11, rdx",
 
         // Restore the six user-side arg registers from the
-        // SyscallArgs scratch (in reverse push order so each
-        // register lands back where the user had it).
-        "pop rdi",        // arg0
-        "pop rsi",        // arg1
-        "pop rdx",        // arg2
-        "pop r10",        // arg3
-        "pop r8",         // arg4
-        "pop r9",         // arg5
+        // UserState slots. SysV says the C dispatcher freely
+        // clobbers these as caller-saved, so they need to be
+        // reloaded; Linux's syscall ABI mandates we preserve them
+        // across the syscall.
+        "mov rdi, [rsp + 72]",   // rdi
+        "mov rsi, [rsp + 80]",   // rsi
+        "mov rdx, [rsp + 88]",   // rdx
+        "mov r10, [rsp + 40]",   // r10
+        "mov r8,  [rsp + 56]",   // r8
+        "mov r9,  [rsp + 48]",   // r9
 
-        // SyscallReturn final convention (matches the int 0x80
-        // path's `frame.rax = value, frame.rdx = status` in
-        // trap.rs, so user-side wrappers see the same layout
-        // regardless of entry instruction): rax = value,
-        // rdx = status.
-        "mov rax, r11",   // rax = dispatcher value
-        "mov rdx, rcx",   // rdx = dispatcher status
+        // Reload user RIP, RFLAGS from saved slots for sysretq.
+        // Stash dispatcher's value (still in r11) into rax for
+        // the final SyscallReturn convention (rax = value,
+        // rdx = status). Note: we already saved status to rcx
+        // and value to r11 above, but we'll overwrite rcx and
+        // r11 with user RIP / RFLAGS, so move them now.
+        "mov rax, r11",                        // rax = dispatcher value
+        "mov rdx, rcx",                        // rdx = dispatcher status
+        "mov rcx, [rsp + 120]",                // user RIP
+        "mov r11, [rsp + 128]",                // user RFLAGS
 
-        // Restore user rcx (RIP) and r11 (RFLAGS) from the slots
-        // we pushed at entry.
-        "pop rcx",
-        "pop r11",
+        // Drop the UserState scratch.
+        "add rsp, 152",
 
         // Restore user RSP from the per-CPU scratch slot, swap
         // back to user GS, and return to user mode. `sysretq`
@@ -170,18 +186,28 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
     )
 }
 
-/// C-ABI dispatcher invoked from the naked asm. Marshals into
-/// the existing `narf_userspace::kernel_syscall_entry_plain`
-/// machinery so the int 0x80 path and the SYSCALL path share
-/// dispatch logic. `args` is a borrow of the 6-u64 struct the
-/// asm built directly on the kernel stack — `SyscallArgs` is
-/// `#[repr(C)]` so the asm's push order matches the field
-/// layout exactly.
+/// C-ABI dispatcher invoked from the naked asm. The state
+/// pointer references a full `UserState` snapshot the asm built
+/// directly on the kernel stack: the SyscallArgs view is just
+/// the first six GPR slots (rdi/rsi/rdx/r10/r8/r9 at offsets
+/// 72/80/88/40/56/48 of `UserState`, NOT a contiguous prefix —
+/// see the comment in `narf_userspace::SyscallArgs` for the
+/// reshape). Handlers that need to save full user state for
+/// resume (e.g. `sys_futex`'s park path) borrow the same
+/// pointer through `ArgsOnlyCtx::with_state`.
 extern "C" fn dispatch_syscall(
     num: u32,
-    args: &narf_userspace::SyscallArgs,
+    state: &mut narf_arch::x86_64::user_mode::UserState,
 ) -> narf_userspace::SyscallReturn {
-    narf_userspace::kernel_syscall_entry_plain(num, args)
+    let args = narf_userspace::SyscallArgs {
+        arg0: state.rdi,
+        arg1: state.rsi,
+        arg2: state.rdx,
+        arg3: state.r10,
+        arg4: state.r8,
+        arg5: state.r9,
+    };
+    narf_userspace::kernel_syscall_entry_plain_with_state(num, &args, state as *mut _ as *mut u8)
 }
 
 /// Program the SYSCALL MSRs and enable EFER.SCE. After this
