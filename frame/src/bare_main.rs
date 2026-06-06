@@ -450,6 +450,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 smap::enable();
             }
         }
+        // SSE / FXSR — required for SSE2 instruction execution. SSE2
+        // is architectural on x86_64 so no CPUID gate; the OS opt-in
+        // (CR4.OSFXSR | CR4.OSXMMEXCPT) is what's not on by default.
+        // Without these, a musl-static binary's TLS init memcpy
+        // (`movq %rbx, %xmm0`) raises #UD and the task dies with
+        // SIGILL before reaching main.
+        // SAFETY: CPL=0; SSE2 is architectural.
+        unsafe {
+            narf_arch::x86_64::sse::enable();
+        }
         // KPTI detect — Renoir + Phoenix come back Posture::Native and
         // we skip the dual-CR3 dance entirely. Log the decision once.
         let pti = kpti::detect();

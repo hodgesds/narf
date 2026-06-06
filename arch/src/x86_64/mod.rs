@@ -62,6 +62,7 @@ pub mod smca;
 pub mod smep;
 pub mod smp;
 pub mod spec_ctrl;
+pub mod sse;
 pub mod svm;
 pub mod tme;
 pub mod topology;
