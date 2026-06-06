@@ -1403,3 +1403,104 @@ kernel_test_in!(
     "block/sync_to_async",
     smoke_sync_block_reports_geometry_from_inner
 );
+
+// ── Wave G: pluggable I/O scheduler ────────────────────────────────
+
+fn smoke_pluggable_io_scheduler() -> TestResult {
+    use crate::{
+        bootstrap_io_scheduler_authority, current_io_scheduler_name, enqueue_on,
+        install_io_scheduler, pick_next_on, reserve_io_scheduler_slot, BlockOp, DeadlineScheduler,
+        NoopScheduler,
+    };
+
+    // 1) Reserve a slot for a synthetic device id — defaults to
+    //    DeadlineScheduler.
+    const DEV: &str = "wave-g-pluggable";
+    reserve_io_scheduler_slot(DEV);
+    if current_io_scheduler_name(DEV) != Some("deadline") {
+        return TestResult::Fail("default scheduler was not 'deadline'");
+    }
+
+    // 2) Install NoopScheduler under bootstrap cap.
+    let cap = bootstrap_io_scheduler_authority();
+    if install_io_scheduler(&cap, DEV, NoopScheduler::new()).is_err() {
+        return TestResult::Fail("install_io_scheduler(NoopScheduler) failed on a live cap");
+    }
+    if current_io_scheduler_name(DEV) != Some("noop") {
+        return TestResult::Fail("scheduler name did not switch to 'noop' after install");
+    }
+
+    // 3) Enqueue a write then a read; NoopScheduler is pure FIFO so
+    //    they come back in submission order. Deadline would have
+    //    promoted the read.
+    let _t_write = enqueue_on(DEV, make_block_request(BlockOp::Write { fua: false }, 0xAA));
+    let _t_read = enqueue_on(DEV, make_block_request(BlockOp::Read, 0xBB));
+
+    let first = match pick_next_on(DEV) {
+        Some(r) => r,
+        None => return TestResult::Fail("NoopScheduler dropped enqueued request"),
+    };
+    if first.user_tag != 0xAA {
+        return TestResult::Fail("NoopScheduler did not return write first (FIFO violation)");
+    }
+    let second = match pick_next_on(DEV) {
+        Some(r) => r,
+        None => return TestResult::Fail("NoopScheduler missing second entry"),
+    };
+    if second.user_tag != 0xBB {
+        return TestResult::Fail("NoopScheduler did not return read second");
+    }
+    if pick_next_on(DEV).is_some() {
+        return TestResult::Fail("NoopScheduler still has entries after drain");
+    }
+
+    // 4) Reinstall Deadline for hygiene.
+    if install_io_scheduler(&cap, DEV, DeadlineScheduler::new()).is_err() {
+        return TestResult::Fail("re-install of DeadlineScheduler failed");
+    }
+    if current_io_scheduler_name(DEV) != Some("deadline") {
+        return TestResult::Fail("scheduler name did not revert to 'deadline'");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("block/io_scheduler", smoke_pluggable_io_scheduler);
+
+fn smoke_pluggable_io_scheduler_unknown_device() -> TestResult {
+    use crate::{
+        bootstrap_io_scheduler_authority, install_io_scheduler, IoSchedError, NoopScheduler,
+    };
+
+    let cap = bootstrap_io_scheduler_authority();
+    match install_io_scheduler(&cap, "nonexistent-wave-g-device", NoopScheduler::new()) {
+        Err(IoSchedError::UnknownDevice) => TestResult::Pass,
+        Err(_) => TestResult::Fail("install on unknown device returned wrong error variant"),
+        Ok(_) => TestResult::Fail("install on unknown device unexpectedly succeeded"),
+    }
+}
+kernel_test_in!(
+    "block/io_scheduler",
+    smoke_pluggable_io_scheduler_unknown_device
+);
+
+fn smoke_pluggable_io_scheduler_revoked_cap() -> TestResult {
+    use crate::{
+        bootstrap_io_scheduler_authority, install_io_scheduler, reserve_io_scheduler_slot,
+        IoSchedError, NoopScheduler,
+    };
+
+    const DEV: &str = "wave-g-revoked";
+    reserve_io_scheduler_slot(DEV);
+
+    let cap = bootstrap_io_scheduler_authority();
+    cap.revoke();
+    match install_io_scheduler(&cap, DEV, NoopScheduler::new()) {
+        Err(IoSchedError::AuthorityRevoked) => TestResult::Pass,
+        Err(_) => TestResult::Fail("revoked install returned wrong error variant"),
+        Ok(_) => TestResult::Fail("install_io_scheduler accepted a revoked cap"),
+    }
+}
+kernel_test_in!(
+    "block/io_scheduler",
+    smoke_pluggable_io_scheduler_revoked_cap
+);
