@@ -73,6 +73,53 @@ jobs:
       - name: cargo xtask boot-smoke
         run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
 
+  musl-demo:
+    name: musl-demo (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview rustfmt
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            cpio \
+            mtools \
+            dosfstools \
+            e2fsprogs \
+            ovmf
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-x86_64-musl-demo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-x86_64-
+
+      # Boots QEMU twice — once to assert `/bin/hello` (hand-rolled
+      # int 0x80 asm) prints `hello`, once to assert `/bin/hello_musl`
+      # (real musl-static) prints `hello from musl`. Regressions in
+      # the loader (unaligned PT_LOAD), ABI dispatch (syscall
+      # instruction → raw handler), arch_prctl wiring, or CR4.OSFXSR
+      # init all surface here.
+      - name: cargo xtask musl-demo
+        run: cargo xtask musl-demo --arch=x86_64
+
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
     runs-on: ubuntu-latest
