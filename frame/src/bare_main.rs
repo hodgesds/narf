@@ -3260,6 +3260,16 @@ fn boot_userspace_init() {
                 // execve and the binary issues raw Linux x86_64
                 // syscalls (write=1, exit_group=231).
                 ("hello", narf_verification::NARF_HELLO_STATIC_ELF),
+                // Wave-78 follow-up 2: real musl-static binary built
+                // with musl-gcc. Exercises the actual musl init path
+                // (set_tid_address / rt_sigaction / brk / ...). Caveat:
+                // musl uses the `syscall` instruction internally, and
+                // NARF's current `syscall` dispatch doesn't reach the
+                // raw handlers (see verification/data/musl-demo/
+                // hello_musl_x86_64.c). The binary loads + enters
+                // user mode cleanly; whether `write` prints depends
+                // on the syscall-dispatch convergence sub-wave.
+                ("hello_musl", narf_verification::NARF_HELLO_MUSL_ELF),
             ],
         );
         let count = fs.file_count();

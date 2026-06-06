@@ -191,6 +191,19 @@ fn main() {
     // resolves under cross-arch builds.
     println!("cargo:rustc-env=NARF_HELLO_STATIC_ELF_AARCH64=/dev/null");
 
+    // Wave-78 follow-up 2: real musl-static demo binary. Built via
+    // `data/musl-demo/REGEN_musl.sh` (requires musl-gcc); the
+    // prebuilt artefact is checked in so the kernel build doesn't
+    // need musl on the host.
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_musl_x86_64.c");
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_musl_x86_64");
+    let hello_musl = manifest_dir.join("data/musl-demo/hello_musl_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_HELLO_MUSL_ELF_X86_64={}",
+        hello_musl.display()
+    );
+    println!("cargo:rustc-env=NARF_HELLO_MUSL_ELF_AARCH64=/dev/null");
+
     let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
     if libc_validate_enabled {
         let validate_dir = workspace.join("narf-libc").join("validate");
