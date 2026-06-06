@@ -655,6 +655,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-busybox"
+version = "0.0.0"
+
+[[package]]
 name = "narf-capabilities"
 version = "0.0.0"
 dependencies = [
@@ -1986,6 +1990,7 @@ dependencies = [
  "narf-block",
  "narf-boot",
  "narf-bus",
+ "narf-busybox",
  "narf-capabilities",
  "narf-compat-win",
  "narf-console",

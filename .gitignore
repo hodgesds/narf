@@ -36,3 +36,8 @@ qemu.log
 # `xtask import-firmware --out`), already covered by `target/`
 # above. The workspace `firmware/` dir is the narf-firmware crate
 # itself and stays tracked.
+
+# BusyBox demo: the build is owned by `verification/busybox`'s
+# build.rs. All artefacts (source tarball, unpacked tree, built
+# ELF) live in `target/.../build/narf-busybox-*/out/` and are
+# covered by the `/target/` rule above. Nothing extra needed.
