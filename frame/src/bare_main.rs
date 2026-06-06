@@ -3317,6 +3317,13 @@ fn boot_userspace_init() {
                 // DTPOFF64 / GLOB_DAT / JUMP_SLOT relocation
                 // processing end-to-end.
                 ("hello_musl_dyn", narf_verification::NARF_HELLO_MUSL_DYN_ELF),
+                // Wave-79: BusyBox static, built at workspace
+                // build time by `verification/busybox/build.rs`.
+                // Empty slice when the host lacked musl-gcc — the
+                // resulting zero-byte /bin/busybox file is harmless
+                // (exec fails on an empty ELF) and the demo just
+                // doesn't work until musl is installed.
+                ("busybox", narf_verification::NARF_BUSYBOX),
             ],
         );
         let count = fs.file_count();

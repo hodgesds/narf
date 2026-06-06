@@ -323,9 +323,23 @@ pub unsafe fn load_elf_bytes(
     let addr_space = unsafe { AddressSpace::new_for_user() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
+    // Bias selection. ET_EXEC binaries name their absolute load
+    // addresses in PT_LOAD vaddrs (NARF expects those in PML4[1] —
+    // see `init.ld` / `hello_static_x86_64.S`); bias is 0. ET_DYN
+    // binaries (PIE) declare segments at vaddr 0 and expect the
+    // loader to pick a real base. PML4[0] is kernel-shared with
+    // U=0, so vaddr=0 + bias=0 is unmapped from user mode; bias
+    // them by `PROGRAM_DYN_BASE` to land in PML4[1].
+    // PML4[1] base (bit 39 set, bit 47 clear → user range).
+    const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
+    let image = crate::parse_elf(bytes)?;
+    let bias = match image.kind {
+        crate::ExecKind::Elf64Dyn => PROGRAM_DYN_BASE,
+        _ => 0,
+    };
     // SAFETY: forwarding the caller's identity-map + allocator
-    // contract; bias 0 keeps historical behaviour for ET_EXEC.
-    let entry = unsafe { load_elf_into_at(bytes, &addr_space, 0) }?;
+    // contract; bias derived from the ELF type above.
+    let entry = unsafe { load_elf_into_at(bytes, &addr_space, bias) }?;
 
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed

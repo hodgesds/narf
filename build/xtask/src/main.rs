@@ -1318,6 +1318,30 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("hello", "hello"),
         ("hello_musl", "hello from musl"),
         ("hello_musl_dyn", "hello from musl dyn"),
+        // BusyBox demo cases. Each applet exercises a different
+        // chunk of the linux-compat surface:
+        //   * `echo hello` — raw `write(2)` only; the lightest
+        //     possible musl-dyn end-to-end (PT_INTERP, ld-musl
+        //     reloc, narf_libc syscall stub).
+        //   * `pwd` — stdio path: musl's `puts(buf)` triggers
+        //     `__stdout_write` → `ioctl(TIOCGWINSZ)` → `writev`.
+        //     This is the case that surfaced the syscall-entry
+        //     register-preservation bug; if a future change
+        //     re-introduces the r8/r9/r10/rdi/rsi/rdx clobber
+        //     across `syscall` instruction, this case will
+        //     #PF inside ld-musl long before reaching writev.
+        //   * `uname -a` — exercises the `uname(2)` syscall and
+        //     stdio together.
+        ("busybox echo hello", "hello"),
+        ("busybox pwd", "/"),
+        // `busybox uname -a` prints
+        // `NARF narf 0.1 narf x86_64 GNU/Linux\n`. The
+        // run-interactive matcher requires the needle to be
+        // followed by `\r`/`\n`, so we anchor on `Linux` (the
+        // last token before the newline) rather than `narf`
+        // (which is followed by ` ` mid-line, or `>` if the
+        // shell prompt redraws first).
+        ("busybox uname -a", "Linux"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

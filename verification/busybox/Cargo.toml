@@ -1,0 +1,12 @@
+[package]
+name        = "narf-busybox"
+version     = "0.0.0"
+edition     = "2024"
+description = "Downloads + builds a static busybox at NARF's PML4[1] user vaddr and exposes the bytes via include_bytes!. Used by the linux-compat demo."
+publish     = false
+build       = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

@@ -98,7 +98,8 @@ jobs:
             dosfstools \
             e2fsprogs \
             ovmf \
-            musl-tools
+            musl-tools \
+            linux-libc-dev
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4
@@ -116,15 +117,23 @@ jobs:
           key: target-${{ runner.os }}-x86_64-musl-demo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: target-${{ runner.os }}-x86_64-
 
-      # Boots QEMU three times — `/bin/hello` (hand-rolled int 0x80
-      # asm) prints `hello`, `/bin/hello_musl` (real musl-static)
-      # prints `hello from musl`, `/bin/hello_musl_dyn` (real musl-
-      # dynamic via PT_INTERP → ld-musl) prints `hello from musl dyn`.
-      # Regressions in the loader (unaligned PT_LOAD), ABI dispatch
-      # (syscall instruction → raw handler), arch_prctl wiring,
-      # CR4.OSFXSR, SyscallReturn struct layout, brk shrink-bound,
-      # AT_PHDR/PhEnt/PhNum auxv, or apply_relocations PT_INTERP
-      # gating all surface here.
+      # Boots QEMU six times — three musl smokes plus three
+      # busybox applets:
+      #   * `/bin/hello` (hand-rolled int 0x80 asm) → `hello`
+      #   * `/bin/hello_musl` (musl-static) → `hello from musl`
+      #   * `/bin/hello_musl_dyn` (musl-dyn via PT_INTERP →
+      #     ld-musl) → `hello from musl dyn`
+      #   * `busybox echo hello` → `hello`
+      #   * `busybox pwd` → `/`
+      #   * `busybox uname -a` → `Linux` (matches the trailing
+      #     `GNU/Linux\n` in `NARF narf 0.1 narf x86_64 GNU/Linux`)
+      # Regressions in the loader (unaligned PT_LOAD), ABI
+      # dispatch (syscall instruction → raw handler),
+      # arch_prctl wiring, CR4.OSFXSR, SyscallReturn struct
+      # layout, brk shrink-bound, AT_PHDR/PhEnt/PhNum auxv,
+      # apply_relocations PT_INTERP gating, syscall-entry user
+      # arg-register preservation, or `writev(2)` handling all
+      # surface here.
       #
       # `musl-tools` (apt) supplies ld-musl-x86_64.so.1 (as
       # `/usr/lib/x86_64-linux-musl/libc.so` — verification/build.rs

@@ -3688,6 +3688,15 @@ pub const NARF_LD_MUSL: &[u8] = include_bytes!(env!("NARF_LD_MUSL_X86_64"));
 ))]
 pub const NARF_LD_MUSL: &[u8] = include_bytes!(env!("NARF_LD_MUSL_AARCH64"));
 
+// Wave-79: BusyBox built from upstream source by
+// `verification/busybox/build.rs`. Static against musl, linked
+// at `0x8000001000` (PML4[1]). Seeded at /bin/busybox so
+// `narf> busybox echo hello` exercises a real-world workload
+// against NARF's linux-compat surface. Empty slice when musl-gcc
+// isn't on the host (build skips gracefully).
+#[cfg(feature = "boot-init")]
+pub use narf_busybox::NARF_BUSYBOX;
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
 fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Load the real Rust no_std binary `narf-testbin` into a fresh

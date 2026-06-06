@@ -260,6 +260,13 @@ impl core::fmt::Debug for ConsoleFile {
 // every "is this a tty" code path; the actual values can stay
 // 80x24/0/etc. until a real tty driver lands.
 
+/// `ioctl(fd, TCGETS, &termios)` — read termios state. musl's
+/// `isatty(fd)` calls `tcgetattr(fd, ...)` → `ioctl(fd, TCGETS, ...)`
+/// and treats success as "this fd is a tty". Without it, libc
+/// thinks stdio isn't a tty → switches to block-buffered mode →
+/// `puts` / `printf` output never flushes on \n and a short-lived
+/// program (busybox pwd, uname, etc.) exits before fflush runs.
+pub const TCGETS: u32 = 0x5401;
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
@@ -363,6 +370,19 @@ impl FileOps for ConsoleFile {
         // (→ EINVAL at the syscall layer — close enough to EFAULT
         // for ABI purposes since the wire shape is the same).
         match cmd {
+            TCGETS => {
+                // Return a zeroed `struct termios`. We're not a
+                // real tty, but musl's isatty just checks success;
+                // the actual termios fields aren't consulted by
+                // anything that runs inside this kernel. Buffer
+                // is 60 bytes on Linux x86_64 — overshoot to 64
+                // for safety.
+                let zero = [0u8; 64];
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &zero) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
             TIOCGWINSZ => {
                 let ws = console_winsize();
                 let bytes: [u8; 8] = unsafe { core::mem::transmute(ws) };
