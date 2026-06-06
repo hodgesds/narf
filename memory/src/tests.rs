@@ -2955,6 +2955,9 @@ fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
         Err(FrameAllocError::Uninitialised) => {
             TestResult::Skip("frame allocator not initialised in this flavour")
         }
+        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+            TestResult::Fail("unexpected error variant for oversize order")
+        }
         Ok(_) => TestResult::Fail("oversize order should fail, not succeed"),
     }
 }
@@ -3549,6 +3552,9 @@ fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
             TestResult::Skip("frame allocator not up in this flavour")
         }
         Err(FrameAllocError::Exhausted) => TestResult::Skip("buddy exhausted on this test image"),
+        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+            TestResult::Fail("unexpected error variant from alloc_pages_on")
+        }
     }
 }
 kernel_test_in!("memory/buddy", smoke_buddy_alloc_pages_on_order_round_trip);
@@ -3565,6 +3571,9 @@ fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
             TestResult::Pass
         }
         Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
+        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+            TestResult::Fail("unexpected error variant at MAX_ORDER boundary")
+        }
     }
 }
 kernel_test_in!(
@@ -5528,3 +5537,79 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
 }
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
+
+// ── Wave-A pluggable FrameAlloc smoke ───────────────────────────────
+//
+// Verifies the seam: install a `BumpFrameAlloc` under a Grant cap,
+// confirm `current_frame_alloc_name` flips, drive `alloc_frame_anywhere`
+// through it, and confirm the returned frame's phys lies inside the
+// bump region (i.e. dispatch actually crossed the trait object — not
+// the buddy). Reinstalls `BUDDY_FRAME_ALLOC` on the way out so the
+// rest of the smoke suite runs against the production allocator.
+fn smoke_pluggable_frame_alloc() -> TestResult {
+    use crate::frame::{
+        current_frame_alloc_name, install_frame_alloc, BumpFrameAlloc, MemAlloc, BUDDY_FRAME_ALLOC,
+        PAGE_SIZE,
+    };
+    use crate::{alloc_frame_anywhere, PhysAddr};
+    use narf_capabilities::{Cap, Grant};
+
+    // Default install. `init_from_map` ran earlier in the boot path
+    // (the frame allocator is alive — every other smoke in this file
+    // relies on that) so the buddy must be the active impl.
+    if current_frame_alloc_name() != "buddy" {
+        return TestResult::Fail("default FrameAlloc is not 'buddy' at smoke start");
+    }
+
+    // Synthetic phys region for the bump. We never dereference the
+    // returned frame — the smoke only verifies dispatch lands in the
+    // expected address window. We deliberately pick a window high
+    // above the buddy's donated ranges so a collision is impossible.
+    const BUMP_START: u64 = 0x0000_FFFF_0000_0000;
+    const BUMP_END: u64 = 0x0000_FFFF_0000_8000; // 8 frames
+    static BUMP: BumpFrameAlloc =
+        BumpFrameAlloc::new_const(PhysAddr::new(BUMP_START), PhysAddr::new(BUMP_END));
+
+    // Hygiene: a previous run of this smoke could have advanced the
+    // cursor. Reset before installing.
+    BUMP.__test_reset();
+
+    let cap: Cap<MemAlloc, Grant> = Cap::<MemAlloc, Grant>::bootstrap();
+    if install_frame_alloc(&cap, &BUMP).is_err() {
+        return TestResult::Fail("install_frame_alloc(bump) failed");
+    }
+    if current_frame_alloc_name() != "bump" {
+        // Restore default before bailing.
+        let _ = install_frame_alloc(&cap, &BUDDY_FRAME_ALLOC);
+        return TestResult::Fail("install didn't flip current_frame_alloc_name");
+    }
+
+    let frame = match alloc_frame_anywhere() {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = install_frame_alloc(&cap, &BUDDY_FRAME_ALLOC);
+            return TestResult::Fail("alloc_frame_anywhere via bump returned Err");
+        }
+    };
+    let phys = frame.start_address().raw();
+    let in_window = phys >= BUMP_START && phys < BUMP_END;
+    let page_aligned = phys & (PAGE_SIZE - 1) == 0;
+
+    // Reinstall the buddy default so subsequent smokes see a sane
+    // allocator. This must run even if the asserts below fail.
+    if install_frame_alloc(&cap, &BUDDY_FRAME_ALLOC).is_err() {
+        return TestResult::Fail("could not reinstall BUDDY_FRAME_ALLOC for cleanup");
+    }
+    if current_frame_alloc_name() != "buddy" {
+        return TestResult::Fail("post-cleanup name is not 'buddy'");
+    }
+
+    if !in_window {
+        return TestResult::Fail("bump-allocated frame fell outside the bump window");
+    }
+    if !page_aligned {
+        return TestResult::Fail("bump-allocated frame is not page-aligned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_pluggable_frame_alloc);

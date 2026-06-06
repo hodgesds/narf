@@ -38,6 +38,12 @@ impl From<FrameAllocError> for MmuError {
         match e {
             FrameAllocError::Exhausted => MmuError::FramesExhausted,
             FrameAllocError::Uninitialised => MmuError::AllocatorUninitialised,
+            // `NotSupported` (e.g. bump-impl free) and `AuthorityRevoked`
+            // (Cap::check_live failure on install) shouldn't reach the
+            // MMU alloc path — collapse to the closest existing error.
+            FrameAllocError::NotSupported | FrameAllocError::AuthorityRevoked => {
+                MmuError::AllocatorUninitialised
+            }
         }
     }
 }
