@@ -451,11 +451,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
         }
         // SSE / FXSR — required for SSE2 instruction execution. SSE2
-        // is architectural on x86_64 so no CPUID gate; the OS opt-in
-        // (CR4.OSFXSR | CR4.OSXMMEXCPT) is what's not on by default.
-        // Without these, a musl-static binary's TLS init memcpy
+        // is architectural on x86_64 so no CPUID gate; CR4.OSFXSR
+        // (bit 9) is the OS opt-in that makes `movq %xmm0` etc.
+        // legal. Without it, a musl-static binary's TLS init memcpy
         // (`movq %rbx, %xmm0`) raises #UD and the task dies with
-        // SIGILL before reaching main.
+        // SIGILL before reaching main. CR4.OSXMMEXCPT (bit 10) is
+        // intentionally NOT flipped — it requires a #XF (vec 19)
+        // IDT handler which NARF doesn't have, and an unhandled
+        // SIMD-FP exception cascades into #DF (observed in CI's
+        // TCG emulation, masked on KVM-accelerated hosts). The
+        // #XF handler + OSXMMEXCPT flip land together.
         // SAFETY: CPL=0; SSE2 is architectural.
         unsafe {
             narf_arch::x86_64::sse::enable();
