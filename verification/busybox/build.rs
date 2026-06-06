@@ -173,7 +173,16 @@ fn main() {
             // 0x80_0001_a8848. musl libc.so is PIC so it doesn't
             // need the flag; only busybox's own translation
             // units do.
-            "EXTRA_CFLAGS=-idirafter /usr/include -mcmodel=large",
+            // The `-idirafter /usr/include/x86_64-linux-gnu` is
+            // for Ubuntu's multiarch layout: linux-libc-dev puts
+            // `asm/types.h` under `/usr/include/x86_64-linux-gnu/`
+            // rather than `/usr/include/`. Without it, busybox's
+            // `console-tools/kbd_mode.c` → `<linux/kd.h>` →
+            // `<linux/types.h>` → `<asm/types.h>` chain fails to
+            // build on GHA's `ubuntu-latest`. The path is silently
+            // ignored on Arch (no such directory) so this doesn't
+            // break the local build.
+            "EXTRA_CFLAGS=-idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu -mcmodel=large",
             // PIE LD. Don't pass `-no-pie` or `-Ttext-segment` —
             // both override `-pie` and force ET_EXEC. With true
             // PIE the binary is ET_DYN and the kernel + ld-musl
