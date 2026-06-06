@@ -91,6 +91,25 @@ fn paint_hex_u64_text(px_y: u32, value: u64, fg: u32, bg: u32) {
     }
 }
 
+/// Walk CR3 to translate `user_vaddr` → phys → identity-mapped
+/// kernel pointer, then read 8 bytes. Returns `None` when the
+/// vaddr isn't mapped. Used by the busybox-stdio truncation diag
+/// in the user-mode #PF path to dump the live value at busybox's
+/// GOT slot for `stdout` at the moment of the fault.
+fn read_user_u64(user_vaddr: u64) -> Option<u64> {
+    let cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+            options(nostack, preserves_flags));
+    }
+    let pml4 = narf_memory::PhysAddr::new(cr3 & 0x000F_FFFF_FFFF_F000);
+    let virt = narf_memory::VirtAddr::new(user_vaddr);
+    let phys = unsafe { narf_memory::x86_64::paging::translate(pml4, virt) }?;
+    let page_off = user_vaddr & 0xFFF;
+    let kptr = (phys.as_u64() + page_off) as *const u64;
+    Some(unsafe { core::ptr::read_unaligned(kptr) })
+}
+
 fn vector_name(v: u64) -> &'static str {
     match v {
         0 => "#DE  divide-by-zero",
@@ -396,6 +415,60 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             } else {
                 frame.rip
             };
+            // Bringup-diag for the busybox-stdio truncation hunt:
+            // on every user-mode #PF, dump CR2/RIP and the GOT
+            // slot for `stdout` (busybox file-offset 0x163ed0,
+            // runtime vaddr 0x80_0000_163ed0 with the ET_DYN bias).
+            // Keep this in until busybox stdio applets stop
+            // truncating — it's the only window we have into what
+            // ld-musl wrote into the program's GOT.
+            if vector == 14 {
+                use core::fmt::Write as _;
+                // busybox is ET_DYN (PIE), loaded at
+                // `PROGRAM_DYN_BASE = 0x80_0000_0000` (PML4[1]).
+                // GOT slots come from `readelf -r | grep std[ioe]`:
+                // each slot's declared offset + the bias is the
+                // runtime vaddr. Each slot holds the address of
+                // libc.so's `std{in,out,err}` POINTER variable; the
+                // value AT that address is the actual `FILE *`.
+                // Both are dumped — if the pointer-var address is
+                // sane but the stored FILE* is truncated, the bug
+                // is in libc.so's startup initialisation of stdio.
+                const BUSYBOX_GOT_STDOUT: u64 = 0x0000_0080_0016_3ed0;
+                const BUSYBOX_GOT_STDIN: u64 = 0x0000_0080_0016_3f58;
+                const BUSYBOX_GOT_STDERR: u64 = 0x0000_0080_0016_3f90;
+                let got_out = read_user_u64(BUSYBOX_GOT_STDOUT);
+                let got_in = read_user_u64(BUSYBOX_GOT_STDIN);
+                let got_err = read_user_u64(BUSYBOX_GOT_STDERR);
+                let val_out = got_out.and_then(read_user_u64);
+                let val_in = got_in.and_then(read_user_u64);
+                let val_err = got_err.and_then(read_user_u64);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "#PF user: cr2={:x} rip={:x} err={:x}",
+                    addr,
+                    frame.rip,
+                    frame.error_code
+                );
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  stdout: got={:?} *file={:?}",
+                    got_out,
+                    val_out
+                );
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  stdin:  got={:?} *file={:?}",
+                    got_in,
+                    val_in
+                );
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  stderr: got={:?} *file={:?}",
+                    got_err,
+                    val_err
+                );
+            }
             let info = narf_userspace::SyncFaultInfo { addr };
             let mut ctx = X86TrapContext::from_int80(frame);
             if hook(&mut ctx, vector, info) {

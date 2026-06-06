@@ -3360,6 +3360,22 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Bringup-diag for the busybox-stdio truncation hunt: trace
+    // every mmap return so we can correlate which vaddr ld-musl
+    // landed libc.so at, against the truncated FILE* observed at
+    // the crash site. Keep until busybox stdio applets stop
+    // truncating.
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "mmap: hint={:x} len={:x} flags={:x} -> base={:x}",
+            hint,
+            len,
+            flags,
+            base
+        );
+    }
     ctx.set_return(SyscallReturn::ok(base));
 }
 
