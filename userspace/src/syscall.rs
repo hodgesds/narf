@@ -2439,9 +2439,24 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     table.dispatch_ctx_versioned(n, version, ctx);
 }
 
-/// Legacy plain entry retained for the existing
-/// `smoke_userspace_syscall_dispatch_via_global` test and any
-/// caller that has `SyscallArgs` in hand but not a `TrapContext`.
+/// Plain entry: arch syscall-instruction asm (no IDT frame in
+/// hand, just SyscallArgs in registers) calls through here. Walks
+/// the same priority order as `kernel_syscall_entry`:
+///
+///   1. raw handler under a synthesized `ArgsOnlyCtx`
+///   2. plain handler (legacy `(args) -> SyscallReturn` shape)
+///   3. `SyscallReturn::invalid_op`
+///
+/// The raw-handler path lets `syscall`-instruction binaries reach
+/// the same per-syscall logic as `int 0x80`. The synthesized
+/// `ArgsOnlyCtx` answers `args()` + `set_return()` faithfully and
+/// returns `false` for every richer hook (`redirect_to_kernel`,
+/// `save_user_state`, `deliver_signal`, ...) — raw handlers that
+/// need those (e.g. `sys_execve`'s longjmp into the polling
+/// future) gracefully bail with `invalid_op` instead of corrupting
+/// state. Binaries that hit those handlers via the syscall
+/// instruction surface as ENOSYS until the dispatch path is
+/// upgraded to ferry a full TrapContext.
 #[inline]
 pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn {
     let n = match Syscall::from_raw(num) {
@@ -2454,7 +2469,54 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
     }
     // SAFETY: see `kernel_syscall_entry`.
     let table: &SyscallTable = unsafe { &*p };
-    table
-        .dispatch(n, args)
-        .unwrap_or_else(SyscallReturn::invalid_op)
+    let slot = match table.entries.iter().find(|e| e.number == n) {
+        Some(s) => s,
+        None => return SyscallReturn::invalid_op(),
+    };
+    if let Some(h) = slot.raw_handler.as_ref() {
+        let mut ctx = ArgsOnlyCtx::new(*args);
+        h.invoke(&mut ctx);
+        return ctx.ret;
+    }
+    if let Some(h) = slot.handler.as_ref() {
+        return h.invoke(args);
+    }
+    SyscallReturn::invalid_op()
+}
+
+/// Minimal `TrapContext` synthesised from a `SyscallArgs` for the
+/// syscall-instruction dispatch path. Implements only the two
+/// methods every handler relies on (`args` + `set_return`); the
+/// richer hooks (`redirect_to_kernel` / `save_user_state` /
+/// `deliver_signal` / `redirect_to_user`) inherit the trait's
+/// `false`/no-op defaults so handlers that need them surface a
+/// clean `invalid_op` instead of silently corrupting state.
+struct ArgsOnlyCtx {
+    args: SyscallArgs,
+    ret: SyscallReturn,
+}
+
+impl ArgsOnlyCtx {
+    #[inline]
+    fn new(args: SyscallArgs) -> Self {
+        Self {
+            args,
+            ret: SyscallReturn::invalid_op(),
+        }
+    }
+}
+
+impl TrapContext for ArgsOnlyCtx {
+    #[inline]
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    #[inline]
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.ret = ret;
+    }
+    #[inline]
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
 }
