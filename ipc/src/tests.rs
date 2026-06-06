@@ -1420,3 +1420,42 @@ fn smoke_ipc_consumer_diagnostic_accessor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("ipc", smoke_ipc_consumer_diagnostic_accessor);
+
+// ── Wave K: pluggable ring transport ──────────────────────────────
+
+fn smoke_pluggable_ring_transport() -> TestResult {
+    // Build a VecRing and a Ring, push/pop the same sequence through
+    // both, assert FIFO order. Two paths exercise the same trait —
+    // the spinlock-backed VecDeque baseline and the cache-line SPSC
+    // ring — proving the trait compiles + dispatches against both.
+    use crate::{Ring, RingTransport, VecRing};
+    let vr: VecRing<u32> = VecRing::new(16);
+    let r: Ring<u32, 16> = Ring::new();
+    for x in 0..8u32 {
+        if vr.try_push(x).is_err() {
+            return TestResult::Fail("VecRing rejected push within capacity");
+        }
+        if r.try_push(x).is_err() {
+            return TestResult::Fail("Ring rejected push within capacity");
+        }
+    }
+    if vr.len() != 8 || r.len() != 8 {
+        return TestResult::Fail("len() did not track 8 pushes");
+    }
+    for x in 0..8u32 {
+        if vr.try_pop() != Some(x) {
+            return TestResult::Fail("VecRing FIFO order violated");
+        }
+        if r.try_pop() != Some(x) {
+            return TestResult::Fail("Ring FIFO order violated");
+        }
+    }
+    if !vr.is_empty() || !r.is_empty() {
+        return TestResult::Fail("ring not empty after draining");
+    }
+    if vr.try_pop().is_some() || r.try_pop().is_some() {
+        return TestResult::Fail("pop on empty returned Some");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("ipc", smoke_pluggable_ring_transport);
