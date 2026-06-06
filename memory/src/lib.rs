@@ -22,6 +22,7 @@ pub mod context;
 pub mod diag;
 pub mod frame;
 pub mod heap;
+pub mod heap_backend;
 pub mod hugepage;
 pub mod kaslr;
 pub mod per_domain_root;
@@ -69,10 +70,15 @@ pub const KERNEL_PHYS_OFFSET: u64 = 0xFFFF_FF80_0000_0000;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const KERNEL_PHYS_OFFSET: u64 = 0;
 pub use frame::{
-    alloc_frame, alloc_frame_anywhere, alloc_frame_on, free_frame, init_from_map, is_numa_aware,
-    node_free, rebalance_to_topology, release_early_ceiling, reserve_for_slab_promotion,
-    stats as frame_stats, validate_no_overlap as frame_validate_no_overlap, FrameAllocError,
-    FrameStats, PhysFrame, UsableRegion, MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT,
-    PAGE_SIZE,
+    alloc_frame, alloc_frame_anywhere, alloc_frame_on, current_frame_alloc_name, free_frame,
+    init_from_map, install_frame_alloc, is_numa_aware, node_free, rebalance_to_topology,
+    release_early_ceiling, reserve_for_slab_promotion, stats as frame_stats,
+    validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc, BumpFrameAlloc, FrameAlloc,
+    FrameAllocError, FrameStats, MemAlloc, PhysFrame, UsableRegion, BUDDY_FRAME_ALLOC,
+    MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use heap::BumpAllocator;
+pub use heap_backend::{
+    current_heap_backend_name, install_heap_backend, BumpBackend, HeapAuthority, HeapBackend,
+    HeapError, SlabBackend, BUMP_BACKEND, SLAB_BACKEND,
+};

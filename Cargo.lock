@@ -1740,6 +1740,7 @@ name = "narf-memory"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-capabilities",
  "narf-kernel-test",
  "narf-lib",
 ]

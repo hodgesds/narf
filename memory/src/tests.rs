@@ -2955,6 +2955,9 @@ fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
         Err(FrameAllocError::Uninitialised) => {
             TestResult::Skip("frame allocator not initialised in this flavour")
         }
+        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+            TestResult::Fail("unexpected error variant for oversize order")
+        }
         Ok(_) => TestResult::Fail("oversize order should fail, not succeed"),
     }
 }
@@ -3549,6 +3552,9 @@ fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
             TestResult::Skip("frame allocator not up in this flavour")
         }
         Err(FrameAllocError::Exhausted) => TestResult::Skip("buddy exhausted on this test image"),
+        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+            TestResult::Fail("unexpected error variant from alloc_pages_on")
+        }
     }
 }
 kernel_test_in!("memory/buddy", smoke_buddy_alloc_pages_on_order_round_trip);
@@ -3565,6 +3571,9 @@ fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
             TestResult::Pass
         }
         Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
+        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+            TestResult::Fail("unexpected error variant at MAX_ORDER boundary")
+        }
     }
 }
 kernel_test_in!(
@@ -5528,3 +5537,195 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
 }
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
+
+// ── Wave-A pluggable FrameAlloc smoke ───────────────────────────────
+//
+// Verifies the seam: install a `BumpFrameAlloc` under a Grant cap,
+// confirm `current_frame_alloc_name` flips, drive `alloc_frame_anywhere`
+// through it, and confirm the returned frame's phys lies inside the
+// bump region (i.e. dispatch actually crossed the trait object — not
+// the buddy). Reinstalls `BUDDY_FRAME_ALLOC` on the way out so the
+// rest of the smoke suite runs against the production allocator.
+fn smoke_pluggable_frame_alloc() -> TestResult {
+    use crate::frame::{
+        current_frame_alloc_name, install_frame_alloc, BumpFrameAlloc, MemAlloc, BUDDY_FRAME_ALLOC,
+        PAGE_SIZE,
+    };
+    use crate::{alloc_frame_anywhere, PhysAddr};
+    use narf_capabilities::{Cap, Grant};
+
+    // Default install. `init_from_map` ran earlier in the boot path
+    // (the frame allocator is alive — every other smoke in this file
+    // relies on that) so the buddy must be the active impl.
+    if current_frame_alloc_name() != "buddy" {
+        return TestResult::Fail("default FrameAlloc is not 'buddy' at smoke start");
+    }
+
+    // Synthetic phys region for the bump. We never dereference the
+    // returned frame — the smoke only verifies dispatch lands in the
+    // expected address window. We deliberately pick a window high
+    // above the buddy's donated ranges so a collision is impossible.
+    const BUMP_START: u64 = 0x0000_FFFF_0000_0000;
+    const BUMP_END: u64 = 0x0000_FFFF_0000_8000; // 8 frames
+    static BUMP: BumpFrameAlloc =
+        BumpFrameAlloc::new_const(PhysAddr::new(BUMP_START), PhysAddr::new(BUMP_END));
+
+    // Hygiene: a previous run of this smoke could have advanced the
+    // cursor. Reset before installing.
+    BUMP.__test_reset();
+
+    let cap: Cap<MemAlloc, Grant> = Cap::<MemAlloc, Grant>::bootstrap();
+    if install_frame_alloc(&cap, &BUMP).is_err() {
+        return TestResult::Fail("install_frame_alloc(bump) failed");
+    }
+    if current_frame_alloc_name() != "bump" {
+        // Restore default before bailing.
+        let _ = install_frame_alloc(&cap, &BUDDY_FRAME_ALLOC);
+        return TestResult::Fail("install didn't flip current_frame_alloc_name");
+    }
+
+    let frame = match alloc_frame_anywhere() {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = install_frame_alloc(&cap, &BUDDY_FRAME_ALLOC);
+            return TestResult::Fail("alloc_frame_anywhere via bump returned Err");
+        }
+    };
+    let phys = frame.start_address().raw();
+    let in_window = phys >= BUMP_START && phys < BUMP_END;
+    let page_aligned = phys & (PAGE_SIZE - 1) == 0;
+
+    // Reinstall the buddy default so subsequent smokes see a sane
+    // allocator. This must run even if the asserts below fail.
+    if install_frame_alloc(&cap, &BUDDY_FRAME_ALLOC).is_err() {
+        return TestResult::Fail("could not reinstall BUDDY_FRAME_ALLOC for cleanup");
+    }
+    if current_frame_alloc_name() != "buddy" {
+        return TestResult::Fail("post-cleanup name is not 'buddy'");
+    }
+
+    if !in_window {
+        return TestResult::Fail("bump-allocated frame fell outside the bump window");
+    }
+    if !page_aligned {
+        return TestResult::Fail("bump-allocated frame is not page-aligned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_pluggable_frame_alloc);
+
+// ── Wave-B pluggable HeapBackend smoke ──────────────────────────────
+//
+// Verifies the heap-backend seam: install a counting backend under a
+// Grant cap that delegates to the production slab, drive a real
+// `Vec` allocation through `#[global_allocator]`, and confirm the
+// counter advanced. Reinstalls `SLAB_BACKEND` on the way out so the
+// rest of the smoke suite runs against the production backend.
+//
+// `CountingHeapBackend` only delegates to `crate::slab` directly
+// (rather than to `SLAB_BACKEND`) so the counting indirection is
+// the only thing the active backend slot sees during the test.
+
+#[derive(Debug)]
+struct CountingHeapBackend {
+    allocs: core::sync::atomic::AtomicU64,
+    deallocs: core::sync::atomic::AtomicU64,
+}
+
+impl CountingHeapBackend {
+    const fn new() -> Self {
+        Self {
+            allocs: core::sync::atomic::AtomicU64::new(0),
+            deallocs: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    fn alloc_count(&self) -> u64 {
+        self.allocs.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    fn dealloc_count(&self) -> u64 {
+        self.deallocs.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::heap_backend::HeapBackend for CountingHeapBackend {
+    fn name(&self) -> &'static str {
+        "counting"
+    }
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        self.allocs
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match crate::slab::alloc(layout) {
+            Ok(p) => p.as_ptr(),
+            Err(_) => core::ptr::null_mut(),
+        }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        self.deallocs
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if let Some(nn) = core::ptr::NonNull::new(ptr) {
+            // SAFETY: caller asserts matching layout from a prior
+            // `alloc` on this backend — which means it came from
+            // `crate::slab::alloc`.
+            unsafe { crate::slab::dealloc(nn, layout) };
+        }
+    }
+}
+
+fn smoke_pluggable_heap_backend() -> TestResult {
+    use crate::heap_backend::{
+        current_heap_backend_name, install_heap_backend, HeapAuthority, SLAB_BACKEND,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    // By the time the smoke suite runs, `promote_to_slab` has flipped
+    // the active backend to the slab — every other smoke in this file
+    // relies on that.
+    if current_heap_backend_name() != Some("slab") {
+        return TestResult::Fail("default HeapBackend is not 'slab' at smoke start");
+    }
+
+    static COUNTER: CountingHeapBackend = CountingHeapBackend::new();
+    let allocs_before = COUNTER.alloc_count();
+    let deallocs_before = COUNTER.dealloc_count();
+
+    let cap: Cap<HeapAuthority, Grant> = Cap::<HeapAuthority, Grant>::bootstrap();
+    if install_heap_backend(&cap, &COUNTER).is_err() {
+        return TestResult::Fail("install_heap_backend(counting) failed");
+    }
+    if current_heap_backend_name() != Some("counting") {
+        let _ = install_heap_backend(&cap, &SLAB_BACKEND);
+        return TestResult::Fail("install didn't flip current_heap_backend_name");
+    }
+
+    // Drive a real allocation through `#[global_allocator]`. A
+    // 64-byte `Vec` falls into the slab's 64-byte class — well
+    // inside the production code path. Drop it inside the
+    // counting window so the dealloc counter advances too.
+    {
+        let v: alloc::vec::Vec<u8> = alloc::vec![0u8; 64];
+        // Touch a byte so the optimiser can't fold the alloc away.
+        core::hint::black_box(&v);
+    }
+
+    let allocs_after = COUNTER.alloc_count();
+    let deallocs_after = COUNTER.dealloc_count();
+
+    // Cleanup: reinstall the slab default before bailing on any
+    // assertion, otherwise later smokes run under `CountingBackend`
+    // and immediately segfault when it's dropped at end-of-test.
+    if install_heap_backend(&cap, &SLAB_BACKEND).is_err() {
+        return TestResult::Fail("could not reinstall SLAB_BACKEND for cleanup");
+    }
+    if current_heap_backend_name() != Some("slab") {
+        return TestResult::Fail("post-cleanup name is not 'slab'");
+    }
+
+    if allocs_after <= allocs_before {
+        return TestResult::Fail("counting backend's alloc counter didn't advance");
+    }
+    if deallocs_after <= deallocs_before {
+        return TestResult::Fail("counting backend's dealloc counter didn't advance");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_pluggable_heap_backend);

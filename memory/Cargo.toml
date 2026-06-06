@@ -12,9 +12,10 @@ name = "narf_memory"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib         = { path = "../lib" }
-narf-arch        = { path = "../arch" }
-narf-kernel-test = { path = "../verification/kernel-test" }
+narf-lib          = { path = "../lib" }
+narf-arch         = { path = "../arch" }
+narf-capabilities = { path = "../capabilities" }
+narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
 default = ["linux-compat"]

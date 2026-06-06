@@ -23,8 +23,10 @@
 //! `#[no_mangle]` definitions calling into narf-acpi at boot.
 
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::vec::Vec;
+use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::buddy::{self, BuddyZone, MAX_ORDER};
@@ -89,6 +91,18 @@ pub enum FrameAllocError {
     Exhausted,
     /// Allocator not initialised yet (`init_from_map` hasn't run).
     Uninitialised,
+    /// The currently-installed `FrameAlloc` impl does not support
+    /// this operation (e.g. `BumpFrameAlloc::free_frame`).
+    NotSupported,
+    /// `install_frame_alloc` was called with an authority cap whose
+    /// epoch has been revoked.
+    AuthorityRevoked,
+}
+
+impl From<CapError> for FrameAllocError {
+    fn from(_: CapError) -> Self {
+        FrameAllocError::AuthorityRevoked
+    }
 }
 
 /// Per-node buddy zone. Index 0 holds everything pre-
@@ -173,6 +187,11 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     guard.total_frames = total;
     guard.reserved_frames = reserved;
     guard.numa_aware = false;
+    // Drop the guard before installing the default `FrameAlloc` —
+    // `install_frame_alloc_default` takes its own lock and we don't
+    // want to risk an unrelated future reentrancy regression.
+    drop(guard);
+    install_frame_alloc_default();
     // NOTE: we deliberately do NOT promote the global allocator to
     // the slab here, and we do not pre-reserve buddy Vec capacity
     // until after `rebalance_to_topology` has redistributed frames
@@ -296,7 +315,7 @@ pub fn rebalance_to_topology() {
 
 /// Allocate one 4 KiB frame. NUMA-aware: prefers the current CPU's
 /// node, falls back round-robin to other nodes when the local bin
-/// is empty.
+/// is empty. Dispatches through the installed `FrameAlloc`.
 pub fn alloc_frame() -> Result<PhysFrame, FrameAllocError> {
     let preferred = current_cpu_node();
     alloc_frame_on(preferred)
@@ -339,9 +358,24 @@ fn alloc_below_ceiling(zone: &mut BuddyZone) -> Option<PhysFrame> {
     Some(buddy::frame_from_no(frame_no))
 }
 
-/// Allocate one 4 KiB frame, preferring `node`'s zone. Falls back
-/// to other nodes when `node`'s zone is empty.
+/// Allocate one 4 KiB frame, preferring `node`'s zone. Dispatches
+/// through the installed `FrameAlloc` impl — see `install_frame_alloc`.
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    with_installed(|a| a.alloc_frame_on(node))
+}
+
+/// Allocate a frame from any node. Useful for boot-time allocations
+/// that don't care about locality. Dispatches through the installed
+/// `FrameAlloc` impl.
+pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
+    with_installed(|a| a.alloc_frame_anywhere())
+}
+
+/// Buddy-backed implementation of `alloc_frame_on`. The default
+/// `BuddyFrameAlloc::alloc_frame_on` delegates here; alternative
+/// `FrameAlloc` impls (e.g. `BumpFrameAlloc`) own their own paths
+/// and never touch the buddy.
+fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
@@ -367,9 +401,8 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     Err(FrameAllocError::Exhausted)
 }
 
-/// Allocate a frame from any node. Useful for boot-time allocations
-/// that don't care about locality.
-pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
+/// Buddy-backed implementation of `alloc_frame_anywhere`.
+fn buddy_alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
@@ -441,8 +474,18 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
     g.zones[zone_idx].free(buddy::frame_no(frame), order);
 }
 
-/// Return a previously-allocated frame to the pool. The frame's
-/// physical address selects which node bin it goes back into.
+/// Return a previously-allocated frame to the pool. Dispatches
+/// through the installed `FrameAlloc`. The default buddy impl
+/// routes the frame to its NUMA node's zone; alternative impls
+/// (e.g. `BumpFrameAlloc`) may treat this as a no-op or return
+/// `NotSupported` via their `try_*` variant.
+pub fn free_frame(f: PhysFrame) {
+    if let Some(a) = current_alloc() {
+        a.free_frame(f);
+    }
+}
+
+/// Buddy-backed implementation of `free_frame`.
 ///
 /// COW interaction: if the frame has a refcount > 1 (multiple
 /// `Arc<AddressSpace>`s share it via `clone_for_fork`), this call
@@ -450,7 +493,7 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
 /// last reference drops. Frames that were never refcounted
 /// (default for everything outside the COW path) are returned
 /// immediately as before.
-pub fn free_frame(f: PhysFrame) {
+fn buddy_free_frame(f: PhysFrame) {
     // Refuse low-mem phys before any state mutation. Frames below
     // `LOW_RESERVED_BYTES` are never legitimately donated to the
     // buddy (see `donate_range`), so any caller handing one to
@@ -617,8 +660,19 @@ pub mod cow {
     }
 }
 
-/// Snapshot of allocator usage (aggregate across nodes).
+/// Snapshot of allocator usage. Dispatches through the installed
+/// `FrameAlloc`. Returns a zeroed `FrameStats` if no allocator
+/// has been installed yet (pre-init).
 pub fn stats() -> FrameStats {
+    current_alloc().map(|a| a.stats()).unwrap_or(FrameStats {
+        total: 0,
+        free: 0,
+        reserved: 0,
+    })
+}
+
+/// Buddy-backed implementation of `stats`.
+fn buddy_stats() -> FrameStats {
     let g = ALLOC.lock();
     let free: usize = g.zones.iter().map(|z| z.free_frame_count()).sum();
     FrameStats {
@@ -703,5 +757,213 @@ fn current_cpu_node() -> usize {
         n
     } else {
         0
+    }
+}
+
+// ── Pluggable FrameAlloc framework ─────────────────────────────────
+//
+// Wave-A of the pluggable-policy pass. Mirrors `power::install_governor`
+// (`power/src/lib.rs::538`) shape-for-shape, with one principled
+// deviation: the frame allocator lives *below* the heap on some
+// boot paths (the bootstrap-bump arena is in `.bss`, but a future
+// no-bootstrap-heap build would init frames before `Box`). The slot
+// therefore stores a `&'static dyn FrameAlloc` rather than a
+// `Box<dyn FrameAlloc>`. Installation is cap-gated on
+// `Cap<MemAlloc, Grant>`.
+
+/// A pluggable frame allocator. Owns the single-frame allocation
+/// surface; multi-frame buddy ops (`alloc_pages_on`, `free_pages`)
+/// stay on the concrete buddy and are not part of the trait.
+pub trait FrameAlloc: Send + Sync {
+    /// Stable identifier (e.g. `"buddy"`, `"bump"`).
+    fn name(&self) -> &'static str;
+    /// Allocate one 4 KiB frame, preferring `node`'s zone.
+    fn alloc_frame_on(&self, node: usize) -> Result<PhysFrame, FrameAllocError>;
+    /// Allocate one 4 KiB frame from any node.
+    fn alloc_frame_anywhere(&self) -> Result<PhysFrame, FrameAllocError>;
+    /// Return a frame to the pool. Impls that don't support freeing
+    /// (e.g. `BumpFrameAlloc`) may treat this as a no-op.
+    fn free_frame(&self, frame: PhysFrame);
+    /// Snapshot of allocator usage.
+    fn stats(&self) -> FrameStats;
+}
+
+/// Cap-marker for `install_frame_alloc`. The runtime kind variant
+/// is reserved at `CapKind::MemAlloc = 0x0200` (see Wave 0).
+#[derive(Copy, Clone, Debug)]
+pub struct MemAlloc;
+impl CapType for MemAlloc {
+    const KIND: CapKind = CapKind::MemAlloc;
+}
+
+/// The default, today's per-NUMA buddy allocator wrapped behind the
+/// `FrameAlloc` seam. Zero-sized: the actual state lives in the
+/// module-private `ALLOC` lock + per-zone `BuddyZone` arrays.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BuddyFrameAlloc;
+
+impl FrameAlloc for BuddyFrameAlloc {
+    fn name(&self) -> &'static str {
+        "buddy"
+    }
+    fn alloc_frame_on(&self, node: usize) -> Result<PhysFrame, FrameAllocError> {
+        buddy_alloc_frame_on(node)
+    }
+    fn alloc_frame_anywhere(&self) -> Result<PhysFrame, FrameAllocError> {
+        buddy_alloc_frame_anywhere()
+    }
+    fn free_frame(&self, frame: PhysFrame) {
+        buddy_free_frame(frame);
+    }
+    fn stats(&self) -> FrameStats {
+        buddy_stats()
+    }
+}
+
+/// The shipped `FrameAlloc` default. Installed by
+/// `install_frame_alloc_default` during `init_from_map`.
+pub static BUDDY_FRAME_ALLOC: BuddyFrameAlloc = BuddyFrameAlloc;
+
+/// Linear-cursor frame allocator over a pre-reserved region. Useful
+/// for early-boot diagnostics and as the seam-exercising alternative
+/// to `BuddyFrameAlloc`. `free_frame` is unsupported; the cursor
+/// advances and never rewinds.
+#[derive(Debug)]
+pub struct BumpFrameAlloc {
+    start: u64,
+    end: u64,
+    next: AtomicU64,
+}
+
+impl BumpFrameAlloc {
+    /// Const-construct a bump allocator over `[start, end)`. The
+    /// caller is responsible for ensuring the region is genuinely
+    /// reserved (e.g. excluded from the buddy donation list) — this
+    /// type performs no overlap check with the buddy zones.
+    pub const fn new_const(start: PhysAddr, end: PhysAddr) -> Self {
+        Self {
+            start: start.raw(),
+            end: end.raw(),
+            next: AtomicU64::new(start.raw()),
+        }
+    }
+
+    /// Total bytes managed by this bump (`end - start`).
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.end - self.start
+    }
+
+    /// Reset the cursor to `start`. Test/diagnostic hook — there's
+    /// no safe way to reset a bump allocator whose frames are still
+    /// referenced, so callers must guarantee no live frames exist.
+    #[doc(hidden)]
+    pub fn __test_reset(&self) {
+        self.next.store(self.start, Ordering::SeqCst);
+    }
+}
+
+impl FrameAlloc for BumpFrameAlloc {
+    fn name(&self) -> &'static str {
+        "bump"
+    }
+    fn alloc_frame_on(&self, _node: usize) -> Result<PhysFrame, FrameAllocError> {
+        self.alloc_frame_anywhere()
+    }
+    fn alloc_frame_anywhere(&self) -> Result<PhysFrame, FrameAllocError> {
+        // Bump cursor by PAGE_SIZE, fail when we'd cross `end`.
+        let mut cur = self.next.load(Ordering::Acquire);
+        loop {
+            if cur >= self.end || self.end - cur < PAGE_SIZE {
+                return Err(FrameAllocError::Exhausted);
+            }
+            let next = cur + PAGE_SIZE;
+            match self
+                .next
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(PhysFrame::new(PhysAddr::new(cur))),
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+    fn free_frame(&self, _frame: PhysFrame) {
+        // Bump allocators don't free. No-op; explicit-failure callers
+        // should use a typed wrapper that returns `NotSupported`.
+    }
+    fn stats(&self) -> FrameStats {
+        let used = self.next.load(Ordering::Acquire).saturating_sub(self.start);
+        let total = (self.end - self.start) / PAGE_SIZE;
+        let used_frames = used / PAGE_SIZE;
+        FrameStats {
+            total: total as usize,
+            free: (total - used_frames) as usize,
+            reserved: 0,
+        }
+    }
+}
+
+// `&'static dyn FrameAlloc` is a fat pointer (data + vtable). An
+// `AtomicPtr` can only hold one word; we therefore park the trait
+// object behind an `IrqSafeSpinLock<Option<…>>`. The lock is taken
+// for the entire duration of a dispatched call, which keeps the
+// vtable load + the indirect call atomic with respect to a swap.
+// The cost is one uncontended lock per frame alloc; on the hot
+// alloc path this is the same cost the buddy was already paying
+// for `ALLOC.lock()`.
+static FRAME_ALLOC_SLOT: IrqSafeSpinLock<Option<&'static dyn FrameAlloc>> =
+    IrqSafeSpinLock::new(None);
+
+/// Install a `FrameAlloc` impl. Cap-gated on `Cap<MemAlloc, Grant>`.
+/// The previous installed allocator is replaced; callers are
+/// responsible for ensuring no frames allocated under the old impl
+/// will be freed under the new one (the buddy and the bump don't
+/// share a free-list).
+pub fn install_frame_alloc(
+    cap: &Cap<MemAlloc, Grant>,
+    alloc: &'static dyn FrameAlloc,
+) -> Result<(), FrameAllocError> {
+    cap.check_live()?;
+    *FRAME_ALLOC_SLOT.lock() = Some(alloc);
+    Ok(())
+}
+
+/// Internal: install `BUDDY_FRAME_ALLOC` without a cap check. Called
+/// once at the end of `init_from_map` to plant the default before
+/// any allocation. There is no public uncap'd install.
+fn install_frame_alloc_default() {
+    let mut slot = FRAME_ALLOC_SLOT.lock();
+    if slot.is_none() {
+        *slot = Some(&BUDDY_FRAME_ALLOC);
+    }
+}
+
+/// Snapshot the active `FrameAlloc`'s `name()`. Returns `"none"`
+/// when no allocator has been installed yet (`init_from_map`
+/// hasn't run).
+pub fn current_frame_alloc_name() -> &'static str {
+    FRAME_ALLOC_SLOT
+        .lock()
+        .as_ref()
+        .map(|a| a.name())
+        .unwrap_or("none")
+}
+
+/// Snapshot the currently-installed `FrameAlloc`. Returns `None`
+/// pre-init.
+#[inline]
+fn current_alloc() -> Option<&'static dyn FrameAlloc> {
+    *FRAME_ALLOC_SLOT.lock()
+}
+
+/// Dispatch helper: thread the installed allocator into `f` or
+/// return `Uninitialised` if none is live.
+#[inline]
+fn with_installed<R, F>(f: F) -> Result<R, FrameAllocError>
+where
+    F: FnOnce(&'static dyn FrameAlloc) -> Result<R, FrameAllocError>,
+{
+    match current_alloc() {
+        Some(a) => f(a),
+        None => Err(FrameAllocError::Uninitialised),
     }
 }
