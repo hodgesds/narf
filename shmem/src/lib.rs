@@ -307,7 +307,7 @@ pub fn register_initcalls() {
     });
     // Process-exit observer: reap any shmem the dying process held.
     narf_init::register(Stage::Subsys, "shmem-exit-observer", || {
-        narf_userspace::user_task::register_exit_observer(|pid| {
+        narf_userspace::user_task::register_exit_observer(|pid, _tid| {
             let _ = destroy_all_for_pid(pid);
         });
         InitResult::Ok

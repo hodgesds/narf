@@ -4383,8 +4383,18 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 // the kernel records the same TaskId on both sides so the lookup
 // from exit-side `pid_raw` to "is there a clear_child_tid?" works
 // uniformly.
+/// Per-task clear_child_tid entry: (uaddr, address-space root
+/// phys). Stashing the root phys at registration time means the
+/// exit-observer can write the futex word even after the
+/// scheduler has already reaped the task's slot.
+#[derive(Copy, Clone)]
+struct ClearChildTidEntry {
+    uaddr: u64,
+    as_root: narf_memory::PhysAddr,
+}
+
 #[cfg(feature = "linux-compat")]
-static CLEAR_CHILD_TID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+static CLEAR_CHILD_TID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ClearChildTidEntry>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Initialise the clear_child_tid table. Called once at boot
@@ -4399,6 +4409,11 @@ pub fn clear_child_tid_init() {
 
 #[cfg(feature = "linux-compat")]
 fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
+    set_clear_child_tid_with_as(task_id_raw, uaddr, narf_memory::PhysAddr::new(0));
+}
+
+#[cfg(feature = "linux-compat")]
+fn set_clear_child_tid_with_as(task_id_raw: u64, uaddr: u64, as_root: narf_memory::PhysAddr) {
     let mut g = CLEAR_CHILD_TID.lock();
     if g.is_none() {
         *g = Some(BTreeMap::new());
@@ -4407,24 +4422,26 @@ fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
         if uaddr == 0 {
             m.remove(&task_id_raw);
         } else {
-            m.insert(task_id_raw, uaddr);
+            m.insert(task_id_raw, ClearChildTidEntry { uaddr, as_root });
         }
     }
 }
 
 #[cfg(feature = "linux-compat")]
-fn take_clear_child_tid(task_id_raw: u64) -> Option<u64> {
+fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
     let mut g = CLEAR_CHILD_TID.lock();
     g.as_mut().and_then(|m| m.remove(&task_id_raw))
 }
 
 /// Diagnostic / test-only — inspect a task's clear_child_tid slot
-/// without consuming it.
+/// without consuming it. Returns just the uaddr; AS root is
+/// internal bookkeeping.
 #[cfg(feature = "linux-compat")]
 #[doc(hidden)]
 pub fn __test_peek_clear_child_tid(task_id_raw: u64) -> Option<u64> {
     let g = CLEAR_CHILD_TID.lock();
-    g.as_ref().and_then(|m| m.get(&task_id_raw).copied())
+    g.as_ref()
+        .and_then(|m| m.get(&task_id_raw).map(|e| e.uaddr))
 }
 
 /// Force-clear the entire clear_child_tid table for test isolation.
@@ -4450,11 +4467,17 @@ pub fn __test_reset_clear_child_tid() {
 /// kernel CR3 before reaching us; we don't want to bounce CR3 again
 /// just for one qword write).
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-fn fire_clear_child_tid_on_exit(pid_raw: u64) {
-    let uaddr = match take_clear_child_tid(pid_raw) {
-        Some(a) if a != 0 => a,
+fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
+    // The clear_child_tid table is keyed by TaskId (= tid_raw),
+    // NOT by visible pid. For CLONE_THREAD children, pid_raw is
+    // the parent's pid (shared via the thread group) while tid_raw
+    // is the child's unique scheduler TaskId — which is what
+    // `set_clear_child_tid_with_as` recorded.
+    let entry = match take_clear_child_tid(tid_raw) {
+        Some(e) if e.uaddr != 0 => e,
         _ => return,
     };
+    let uaddr = entry.uaddr;
     // Resolve the dying task's address space. For CLONE_THREAD
     // children this is the same Arc as the parent; for non-thread
     // forks it's the child's own AS. `address_space_of` consults
@@ -4468,20 +4491,13 @@ fn fire_clear_child_tid_on_exit(pid_raw: u64) {
     // bumps so any waiter using the same uaddr observes the wake.
     futex_bump_counter(uaddr);
 
-    // Resolve the dying task's address space. For CLONE_THREAD
-    // children this is the same Arc as the parent; for non-thread
-    // forks it's the child's own AS. `address_space_of` consults
-    // the scheduler's task table — works because we run during the
-    // exit-observer fan-out, before the scheduler reaps the slot.
-    let task_id = narf_scheduler::TaskId(pid_raw);
-    let as_arc = match narf_scheduler::address_space_of(task_id) {
-        Some(a) => a,
-        None => return,
-    };
-    // Write zero into *uaddr via the AS's page tables. The
-    // identity map covers the resulting phys, so a translate+
-    // raw-pointer write is safe.
-    let root = as_arc.root;
+    // Write zero into *uaddr via the page tables of the AS the
+    // task ran in. We stashed the PML4 phys at clone time, so this
+    // works even after the scheduler reaps the task's slot.
+    let root = entry.as_root;
+    if root.as_u64() == 0 {
+        return;
+    }
     let page = uaddr & !0xFFFu64;
     let off = uaddr & 0xFFFu64;
     if off + 4 > 4096 {
@@ -4505,7 +4521,7 @@ fn fire_clear_child_tid_on_exit(pid_raw: u64) {
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-fn fire_clear_child_tid_on_exit(_pid_raw: u64) {
+fn fire_clear_child_tid_on_exit(_pid_raw: u64, _tid_raw: u64) {
     // aarch64 / other arches: clone3 path is x86_64-gated below;
     // the table never gets populated, so this is a no-op.
 }
@@ -4591,8 +4607,20 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
         // top, matching the clone3 path.
         stack_size: 0,
         parent_tid: args.arg2,
-        tls: args.arg3,
-        child_tid: args.arg4,
+        // x86_64 clone(2) syscall ABI: arg3 = ctid, arg4 = tls.
+        // (Only x86_32 — CONFIG_CLONE_BACKWARDS — flips these.)
+        // musl's `__clone` x86_64 asm matches the default order:
+        //     mov %r9, %r8        ; tls  -> syscall arg4 (r8)
+        //     mov 8(%rsp), %r10   ; ctid -> syscall arg3 (r10)
+        // We previously had these swapped (tls=arg3, ctid=arg4),
+        // which made `pthread_create` set the child's FS_BASE to
+        // `&__thread_list_lock` (in libc.so .bss, where ctid
+        // pointed) instead of the real per-thread TP. The worker
+        // then #PFed on `mov %fs:0,%rbx; movzbl 0x40(%rbx),%r11d`
+        // because `%fs:0` read the lock word (`0x10`-ish), not
+        // the self-pointer the TCB layout promises.
+        tls: args.arg4,
+        child_tid: args.arg3,
         pidfd: 0,
         exit_signal: 0,
     };
@@ -4752,6 +4780,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
         None => crate::user_task::UserTaskFuture::new(proc),
     };
+    // Snapshot the AS root phys before the Arc is moved into the
+    // scheduler — needed by the exit-observer to write the
+    // clear_child_tid futex word after the slot is reaped.
+    let child_as_root = child_as.root;
     let child_tid =
         narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::unthrottled(), child_as);
 
@@ -4798,8 +4830,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     }
 
     // CLONE_CHILD_CLEARTID: stash for the exit-observer to consume.
+    // Pass the child's AS root phys so the observer can write the
+    // futex word even after the scheduler reaps the slot — by then
+    // `address_space_of` returns None, but the Arc we hold in
+    // `child_as` keeps the page tables alive.
     if (flags & CLONE_CHILD_CLEARTID) != 0 && ca.child_tid != 0 {
-        set_clear_child_tid(child_tid.raw(), ca.child_tid);
+        set_clear_child_tid_with_as(child_tid.raw(), ca.child_tid, child_as_root);
     }
 
     // Parent-of bookkeeping for wait4 — process-style only. A
@@ -5392,7 +5428,7 @@ pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
 /// `default_sync_signal_delivery` when no handler is installed and
 /// the default action is Terminate/CoreDump); we drain it here and
 /// publish the WIFSIGNALED-shaped wstatus to wait4.
-fn on_child_exit(child_pid: u64) {
+fn on_child_exit(child_pid: u64, _child_tid: u64) {
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
     crate::pidfd::notify_exit(child_pid);

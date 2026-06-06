@@ -873,7 +873,7 @@ fn smoke_shell_fork_wait4_exit_status() -> TestResult {
     // (2) Simulate the child calling sys_exit_task (the exit observer
     //     fires `notify_task_exited` which enqueues the child in the
     //     wait table).
-    crate::user_task::notify_task_exited(child_tid);
+    crate::user_task::notify_task_exited(child_tid, child_tid);
 
     // (3) wait4(-1, &wstatus, WNOHANG) — child already exited so
     //     WNOHANG must reap immediately and return the child tid.

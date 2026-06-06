@@ -844,7 +844,7 @@ pub fn register_initcalls() {
     // process held. Without this, a crashed userspace leaks ring
     // pages + handle entries until reboot.
     narf_init::register(Stage::Subsys, "fb-exit-observer", || {
-        narf_userspace::user_task::register_exit_observer(|pid| {
+        narf_userspace::user_task::register_exit_observer(|pid, _tid| {
             let _ = registry::disconnect_all_for_pid(pid);
         });
         InitResult::Ok

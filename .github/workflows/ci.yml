@@ -127,6 +127,10 @@ jobs:
       #   * `busybox pwd` → `/`
       #   * `busybox uname -a` → `Linux` (matches the trailing
       #     `GNU/Linux\n` in `NARF narf 0.1 narf x86_64 GNU/Linux`)
+      #   * `hello_pthread` → `joined` — pthread_create + join
+      #     end-to-end. Catches regressions in clone(2) ABI,
+      #     syscall save-state, per-thread TLS programming, and
+      #     the CLONE_CHILD_CLEARTID exit-observer chain.
       # Regressions in the loader (unaligned PT_LOAD), ABI
       # dispatch (syscall instruction → raw handler),
       # arch_prctl wiring, CR4.OSFXSR, SyscallReturn struct
