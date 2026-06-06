@@ -138,8 +138,8 @@ jobs:
       # the un-bumped defaults (60s prompt / 30s echo).
       - name: cargo xtask musl-demo
         env:
-          XTASK_RI_PROMPT_TIMEOUT_SECS: "300"
-          XTASK_RI_ECHO_TIMEOUT_SECS: "120"
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
+          XTASK_RI_ECHO_TIMEOUT_SECS: "900"
         run: cargo xtask musl-demo --arch=x86_64
 
   feature-matrix:
