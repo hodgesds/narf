@@ -2423,12 +2423,16 @@ pub fn readlink(path: &str, buf: &mut [u8]) -> isize {
     if path.is_empty() || buf.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_READLINK signature: (path_ptr, path_len, buf_ptr, buf_len).
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_READLINK linux signature: (path_cstr, buf, bufsiz).
     let r = unsafe {
-        syscall4(
+        syscall3(
             SYS_READLINK,
-            path.as_ptr() as u64,
-            path.len() as u64,
+            pbuf.as_ptr() as u64,
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )
@@ -2590,13 +2594,17 @@ pub fn unlinkat(dirfd: i32, path: &str, flags: i32) -> i32 {
     if path.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_UNLINKAT signature: (dirfd, path_ptr, path_len, flags).
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_UNLINKAT linux signature: (dirfd, path_cstr, flags).
     let r = unsafe {
-        syscall4(
+        syscall3(
             SYS_UNLINKAT,
             dirfd as u64,
-            path.as_ptr() as u64,
-            path.len() as u64,
+            pbuf.as_ptr() as u64,
             flags as u64,
         )
     };
@@ -2613,16 +2621,13 @@ pub fn mkdirat(dirfd: i32, path: &str, mode: u32) -> i32 {
     if path.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_MKDIRAT signature: (dirfd, path_ptr, path_len, mode).
-    let r = unsafe {
-        syscall4(
-            SYS_MKDIRAT,
-            dirfd as u64,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            mode as u64,
-        )
-    };
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_MKDIRAT linux signature: (dirfd, path_cstr, mode).
+    let r = unsafe { syscall3(SYS_MKDIRAT, dirfd as u64, pbuf.as_ptr() as u64, mode as u64) };
     if r as i64 == -1 {
         -1
     } else {
@@ -2636,17 +2641,22 @@ pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
     if old.is_empty() || new.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_RENAMEAT signature: (old_dirfd, old_ptr, old_len,
-    // new_dirfd, new_ptr, new_len).
+    let mut obuf = [0u8; 4096];
+    let mut nbuf = [0u8; 4096];
+    if old.len() >= obuf.len() || new.len() >= nbuf.len() {
+        return -1;
+    }
+    obuf[..old.len()].copy_from_slice(old.as_bytes());
+    nbuf[..new.len()].copy_from_slice(new.as_bytes());
+    // SAFETY: SYS_RENAMEAT linux signature: (old_dirfd, old_cstr,
+    // new_dirfd, new_cstr).
     let r = unsafe {
-        syscall6(
+        syscall4(
             SYS_RENAMEAT,
             old_dirfd as u64,
-            old.as_ptr() as u64,
-            old.len() as u64,
+            obuf.as_ptr() as u64,
             new_dirfd as u64,
-            new.as_ptr() as u64,
-            new.len() as u64,
+            nbuf.as_ptr() as u64,
         )
     };
     if r as i64 == -1 {
@@ -2665,15 +2675,13 @@ pub fn access(path: &str, mode: i32) -> i32 {
     if path.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_ACCESS signature: (path_ptr, path_len, mode).
-    let r = unsafe {
-        syscall3(
-            SYS_ACCESS,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            mode as u64,
-        )
-    };
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_ACCESS linux signature: (path_cstr, mode).
+    let r = unsafe { syscall2(SYS_ACCESS, pbuf.as_ptr() as u64, mode as u64) };
     if r as i64 == -1 {
         -1
     } else {
@@ -2689,15 +2697,13 @@ pub fn chmod(path: &str, mode: u32) -> i32 {
     if path.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_CHMOD signature: (path_ptr, path_len, mode).
-    let r = unsafe {
-        syscall3(
-            SYS_CHMOD,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            mode as u64,
-        )
-    };
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_CHMOD linux signature: (path_cstr, mode).
+    let r = unsafe { syscall2(SYS_CHMOD, pbuf.as_ptr() as u64, mode as u64) };
     if r as i64 == -1 {
         -1
     } else {
@@ -2714,16 +2720,13 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> i32 {
     if path.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_CHOWN signature: (path_ptr, path_len, uid, gid).
-    let r = unsafe {
-        syscall4(
-            SYS_CHOWN,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            uid as u64,
-            gid as u64,
-        )
-    };
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_CHOWN linux signature: (path_cstr, uid, gid).
+    let r = unsafe { syscall3(SYS_CHOWN, pbuf.as_ptr() as u64, uid as u64, gid as u64) };
     if r as i64 == -1 {
         -1
     } else {
@@ -2766,14 +2769,18 @@ pub fn readlinkat(dirfd: i32, path: &str, buf: &mut [u8]) -> isize {
     if path.is_empty() || buf.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_READLINKAT signature: (dirfd, path_ptr, path_len,
-    // buf_ptr, buf_len).
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_READLINKAT linux signature: (dirfd, path_cstr,
+    // buf, bufsiz).
     let r = unsafe {
-        syscall5(
+        syscall4(
             SYS_READLINKAT,
             dirfd as u64,
-            path.as_ptr() as u64,
-            path.len() as u64,
+            pbuf.as_ptr() as u64,
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )
@@ -2788,14 +2795,18 @@ pub fn fstatat(dirfd: i32, path: &str, out: &mut StatBuf, flags: i32) -> i32 {
     if path.is_empty() {
         return -1;
     }
-    // SAFETY: SYS_NEWFSTATAT signature: (dirfd, path_ptr, path_len,
-    // stat_out, flags).
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return -1;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_NEWFSTATAT linux signature: (dirfd, path_cstr,
+    // statbuf, flags).
     let r = unsafe {
-        syscall5(
+        syscall4(
             SYS_NEWFSTATAT,
             dirfd as u64,
-            path.as_ptr() as u64,
-            path.len() as u64,
+            pbuf.as_ptr() as u64,
             out as *mut StatBuf as u64,
             flags as u64,
         )
@@ -2815,13 +2826,17 @@ pub fn openat(dirfd: i32, path: &str, flags: u64, mode: u32) -> Option<u32> {
     if path.is_empty() {
         return None;
     }
-    // SAFETY: SYS_OPENAT signature: (dirfd, path_ptr, path_len, flags, mode).
+    let mut pbuf = [0u8; 4096];
+    if path.len() >= pbuf.len() {
+        return None;
+    }
+    pbuf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_OPENAT linux signature: (dirfd, path_cstr, flags, mode).
     let r = unsafe {
-        syscall5(
+        syscall4(
             SYS_OPENAT,
             dirfd as u64,
-            path.as_ptr() as u64,
-            path.len() as u64,
+            pbuf.as_ptr() as u64,
             flags,
             mode as u64,
         )
