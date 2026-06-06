@@ -379,6 +379,16 @@ impl CapType for Governor {
     const KIND: CapKind = CapKind::Governor;
 }
 
+/// Authority to install an idle governor (pluggable C-state selector).
+/// Separate from `Governor` so the DVFS-install cap and the idle-policy
+/// install cap can be granted independently. `Governor` already exists
+/// in this crate for DVFS — the `IdleGov` name disambiguates.
+#[derive(Copy, Clone, Debug)]
+pub struct IdleGov;
+impl CapType for IdleGov {
+    const KIND: CapKind = CapKind::IdleGovernor;
+}
+
 /// Authority to register a per-driver runtime-PM handler.
 #[derive(Copy, Clone, Debug)]
 pub struct DevicePm;
@@ -429,6 +439,11 @@ pub struct CState {
     /// Lower is deeper. Stage-3 doesn't act on this beyond ordering;
     /// `EnergyAware` (Stage 4) will.
     pub power_draw_mw: u32,
+    /// Minimum residency (microseconds) for entering this state to
+    /// "pay back" the wake-up cost. The `MenuGovernor` refuses to
+    /// pick a state whose `target_residency_us` exceeds the predicted
+    /// idle duration. Stage-3 default `LinearScan` ignores this.
+    pub target_residency_us: u32,
     /// Arch-specific entry sequence. Called by `idle_loop` (Stage 4).
     /// The function MUST return only after a wake event (IRQ / SEV /
     /// MWAIT-monitor write); `select_idle_state` never picks a state
@@ -442,6 +457,7 @@ impl core::fmt::Debug for CState {
             .field("id", &self.id)
             .field("exit_latency_us", &self.exit_latency_us)
             .field("power_draw_mw", &self.power_draw_mw)
+            .field("target_residency_us", &self.target_residency_us)
             .finish_non_exhaustive()
     }
 }
@@ -500,19 +516,118 @@ fn cstate_c1_entry() {
 /// deeper state with multi-millisecond exit latency.
 const STAGE3_DEADLINE_BUDGET_US: u32 = 1_000;
 
-/// Idle-governor selection. Stage-3 algorithm: scan ascending-by-id,
-/// keep the deepest state whose `exit_latency_us` is <= the next-tick
-/// deadline budget. C0 always satisfies the constraint (latency = 0)
-/// and is the fallback if nothing else fits.
-pub fn select_idle_state() -> Result<CState, PowerError> {
-    let t = CSTATES.lock();
-    let mut best: Option<CState> = None;
-    for s in t.iter() {
-        if s.exit_latency_us <= STAGE3_DEADLINE_BUDGET_US {
-            best = Some(*s);
-        }
+/// Wrapper around a chosen C-state `id`. The pluggable `IdleGovernor`
+/// returns one of these; the free `select_idle_state` then resolves it
+/// against the live `CSTATES` table to hand back a full `CState`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CStateIdx(pub u8);
+
+/// Pluggable idle-state selection policy. Mirrors `GovernorPolicy`
+/// exactly — `name()` for tooling, `select_idle_state` for the hot
+/// path. The installed impl reads the live C-state registry; the free
+/// `select_idle_state` below dispatches through whatever is in the
+/// `IDLE_GOVERNOR` slot.
+///
+/// `latency_budget_us` bounds the worst-case wake latency the caller
+/// is willing to tolerate (e.g. next-tick deadline). `predicted_idle_us`
+/// is the caller's best guess at how long the CPU will actually idle
+/// before the next wake event — the `MenuGovernor` keys off this to
+/// refuse states whose `target_residency_us` exceeds it.
+pub trait IdleGovernor: Send + Sync + 'static {
+    fn name(&self) -> &'static str;
+    fn select_idle_state(&self, latency_budget_us: u64, predicted_idle_us: u64) -> CStateIdx;
+}
+
+/// Stage-3 default. Scan ascending-by-id, keep the deepest state whose
+/// `exit_latency_us` is <= the latency budget. Ignores predicted idle
+/// time; this is the algorithm the inline `select_idle_state` used
+/// before the trait was extracted.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct LinearScan;
+impl IdleGovernor for LinearScan {
+    fn name(&self) -> &'static str {
+        "linear-scan"
     }
-    best.ok_or(PowerError::NoMatchingState)
+    fn select_idle_state(&self, latency_budget_us: u64, _predicted_idle_us: u64) -> CStateIdx {
+        let t = CSTATES.lock();
+        let mut best: u8 = 0;
+        for s in t.iter() {
+            if (s.exit_latency_us as u64) <= latency_budget_us {
+                best = s.id;
+            }
+        }
+        CStateIdx(best)
+    }
+}
+
+/// Tiny Linux-`menu`-style heuristic. If the predicted idle time is
+/// shorter than the shallowest non-C0 state's `target_residency_us`,
+/// pick C0; otherwise pick the deepest state whose `exit_latency_us`
+/// fits the budget AND whose `target_residency_us` is still shorter
+/// than the prediction. Distinct from `LinearScan` because the
+/// `target_residency_us` filter rejects "too deep for too short an
+/// idle" picks, which is the whole point of the real menu governor.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MenuGovernor;
+impl IdleGovernor for MenuGovernor {
+    fn name(&self) -> &'static str {
+        "menu"
+    }
+    fn select_idle_state(&self, latency_budget_us: u64, predicted_idle_us: u64) -> CStateIdx {
+        let t = CSTATES.lock();
+        // Find the shallowest non-C0 state (smallest id > 0). If
+        // predicted idle is shorter than its target residency, the
+        // wake-up cost won't be paid back; stay in C0.
+        let shallow_target = t
+            .iter()
+            .filter(|s| s.id != 0)
+            .map(|s| s.target_residency_us as u64)
+            .min();
+        if let Some(min_residency) = shallow_target {
+            if predicted_idle_us < min_residency {
+                return CStateIdx(0);
+            }
+        } else {
+            // Only C0 registered; nothing else to pick.
+            return CStateIdx(0);
+        }
+        // Deepest state that (a) fits the latency budget and (b) has
+        // a target residency shorter than the prediction.
+        let mut best: u8 = 0;
+        for s in t.iter() {
+            if (s.exit_latency_us as u64) < latency_budget_us
+                && (s.target_residency_us as u64) < predicted_idle_us
+            {
+                best = s.id;
+            }
+        }
+        CStateIdx(best)
+    }
+}
+
+/// `Box<dyn IdleGovernor>` slot. Mirrors `GOVERNOR`; `init()` installs
+/// `LinearScan` and `install_idle_governor` swaps it.
+static IDLE_GOVERNOR: IrqSafeSpinLock<Option<Box<dyn IdleGovernor>>> = IrqSafeSpinLock::new(None);
+
+/// Idle-governor selection. Asks the installed `IdleGovernor` for an
+/// index and resolves it against the live C-state table. C0 always
+/// satisfies the constraint (latency = 0) and is the fallback if the
+/// returned index doesn't match a registered state.
+pub fn select_idle_state() -> Result<CState, PowerError> {
+    let idx = {
+        let slot = IDLE_GOVERNOR.lock();
+        slot.as_ref()
+            .ok_or(PowerError::GovernorMissing)?
+            .select_idle_state(
+                STAGE3_DEADLINE_BUDGET_US as u64,
+                STAGE3_DEADLINE_BUDGET_US as u64,
+            )
+    };
+    let t = CSTATES.lock();
+    t.iter()
+        .find(|s| s.id == idx.0)
+        .copied()
+        .ok_or(PowerError::NoMatchingState)
 }
 
 /// Stage-4 successor to `scheduler::halt_until_irq`. Walks the C-state
@@ -651,6 +766,26 @@ pub fn select_freq(load_permille: u16) -> Result<FreqHint, PowerError> {
     slot.as_ref()
         .map(|g| g.select_freq(load_permille))
         .ok_or(PowerError::GovernorMissing)
+}
+
+/// Install an idle governor. Cap-gated on `Cap<IdleGov, Grant>`.
+/// Replaces the previous active idle governor; the displaced `Box` is
+/// dropped. Mirrors `install_governor` exactly.
+pub fn install_idle_governor<G: IdleGovernor>(
+    cap: &Cap<IdleGov, Grant>,
+    g: G,
+) -> Result<(), PowerError> {
+    cap.check_live()?;
+    let mut slot = IDLE_GOVERNOR.lock();
+    *slot = Some(Box::new(g));
+    Ok(())
+}
+
+/// Snapshot the active idle governor's name. Returns `None` if `init()`
+/// hasn't run yet. Mirrors `current_governor_name`.
+pub fn current_idle_governor_name() -> Option<&'static str> {
+    let slot = IDLE_GOVERNOR.lock();
+    slot.as_ref().map(|g| g.name())
 }
 
 // ── D-states (PCIe Power Management Capability §7.5.2) ─────────────
@@ -856,6 +991,11 @@ pub fn bootstrap_device_pm_authority() -> Cap<DevicePm, Grant> {
     Cap::<DevicePm, Grant>::bootstrap()
 }
 
+/// Mint a `Cap<IdleGov, Grant>`. TCB-only entry path.
+pub fn bootstrap_idle_governor_authority() -> Cap<IdleGov, Grant> {
+    Cap::<IdleGov, Grant>::bootstrap()
+}
+
 /// Mint a `Cap<Thermal, Grant>`. TCB-only entry path.
 pub fn bootstrap_thermal_authority() -> Cap<Thermal, Grant> {
     Cap::<Thermal, Grant>::bootstrap()
@@ -876,6 +1016,7 @@ pub fn init() {
             id: 0,
             exit_latency_us: 0,
             power_draw_mw: 50_000,
+            target_residency_us: 0,
             entry: cstate_c0_entry,
         },
     );
@@ -885,6 +1026,7 @@ pub fn init() {
             id: 1,
             exit_latency_us: 1,
             power_draw_mw: 5_000,
+            target_residency_us: 2,
             entry: cstate_c1_entry,
         },
     );
@@ -893,4 +1035,9 @@ pub fn init() {
     // for this install; the cap is dropped at the end of `init()`.
     let g = bootstrap_governor_authority();
     let _ = install_governor(&g, Performance);
+
+    // Default idle governor: LinearScan — preserves Stage-3
+    // pre-trait-extraction behaviour.
+    let ig = bootstrap_idle_governor_authority();
+    let _ = install_idle_governor(&ig, LinearScan);
 }
