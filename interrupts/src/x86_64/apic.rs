@@ -85,9 +85,10 @@ pub static X2APIC_ACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 pub unsafe fn init_bsp() {
-    // SAFETY: caller confirmed x2APIC support via CPUID.
-    // Two-step enable (some AMD silicon won't accept EN+EXTD in
-    // a single WRMSR — needs APIC enabled first, then EXTD).
+    // SAFETY: CPL=0; rdmsr/wrmsr against IA32_APIC_BASE are
+    // unconditional on long-mode x86_64. The EXTD write below is
+    // CPUID-gated because CPUs without x2APIC support raise #GP
+    // on that bit.
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
     if base & APIC_BASE_EN == 0 {
         // SAFETY: enabling APIC is always safe at CPL=0.
@@ -105,15 +106,26 @@ pub unsafe fn init_bsp() {
         outb(0xA1, 0xFF);
     }
 
-    let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
-    // SAFETY: separately set EXTD (x2APIC mode).
-    unsafe {
-        wrmsr(IA32_APIC_BASE, after_en | APIC_BASE_EXTD);
+    // x2APIC enable — gated on CPUID.x2APIC support. Writing the
+    // EXTD bit on a CPU that doesn't advertise x2APIC raises #GP
+    // (observed on QEMU TCG with the default `-cpu` model). The
+    // two-step (EN first, then EXTD) sequence is needed because
+    // some AMD silicon refuses EN+EXTD in a single WRMSR.
+    // SAFETY: CPUID is unconditional at CPL=0.
+    let feats = unsafe { narf_arch::x86_64::Features::probe() };
+    if feats.x2apic {
+        let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
+        // SAFETY: CPUID-gated above; CPU supports the EXTD bit.
+        unsafe {
+            wrmsr(IA32_APIC_BASE, after_en | APIC_BASE_EXTD);
+        }
     }
-    // Verify x2APIC actually came up. If not, fall back to xAPIC
-    // MMIO mode — sufficient for SMP startup (INIT/SIPI), IPIs
-    // (TLB shootdown), and IRQ delivery. Used under QEMU TCG and
-    // any host whose firmware refuses the EXTD bit.
+    // Verify x2APIC actually came up. If CPUID didn't advertise
+    // it OR firmware refused the EXTD bit (BIOS lock), fall back
+    // to xAPIC MMIO mode — sufficient for SMP startup (INIT/SIPI),
+    // IPIs (TLB shootdown), and IRQ delivery. Used under QEMU TCG
+    // without `+x2apic` and any host whose firmware refuses the
+    // EXTD bit.
     let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
     if confirm & APIC_BASE_EXTD == 0 {
         // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
@@ -147,8 +159,28 @@ pub unsafe fn init_bsp() {
 }
 
 /// xAPIC MMIO initialisation: program SIVR (software-enable +
-/// spurious vector), mask LVT_TIMER, and program LVT_ERROR. Used
-/// by both init_bsp and init_ap when x2APIC isn't live.
+/// spurious vector), mask every LVT entry the LAPIC ships with,
+/// then program LVT_ERROR. Used by both init_bsp and init_ap when
+/// x2APIC isn't live.
+///
+/// Masking every LVT is critical: BIOS firmware commonly leaves
+/// LVT_LINT0 / LVT_LINT1 / LVT_THERMAL / LVT_PMC programmed with
+/// stale vectors pointing at IDT entries the kernel hasn't
+/// installed handlers for. The first `sti` after this routine
+/// would then deliver those stale-vector IRQs and trigger a
+/// cascading #DF when the trap path tries to dispatch them. The
+/// x2APIC path doesn't trip because QEMU's x2APIC emulation
+/// implicitly zeroes the LVTs on x2APIC-enable; xAPIC + TCG does
+/// not, so the masks have to be programmed explicitly.
+///
+/// LVT register offsets (Intel SDM Vol 3 §10.5.1, AMD APM Vol 2
+/// §16.4.6 — layout identical):
+///   0x320  LVT Timer
+///   0x330  LVT Thermal Monitor
+///   0x340  LVT Performance Counter
+///   0x350  LVT LINT0
+///   0x360  LVT LINT1
+///   0x370  LVT Error
 ///
 /// # Safety
 /// - LAPIC MMIO base must be identity-mapped + accessible.
@@ -156,14 +188,30 @@ pub unsafe fn init_bsp() {
 unsafe fn init_lapic_xapic() {
     let sivr = (XAPIC_MMIO_BASE + 0x0F0) as *mut u32;
     let lvt_timer = (XAPIC_MMIO_BASE + 0x320) as *mut u32;
+    let lvt_thermal = (XAPIC_MMIO_BASE + 0x330) as *mut u32;
+    let lvt_perf = (XAPIC_MMIO_BASE + 0x340) as *mut u32;
+    let lvt_lint0 = (XAPIC_MMIO_BASE + 0x350) as *mut u32;
+    let lvt_lint1 = (XAPIC_MMIO_BASE + 0x360) as *mut u32;
     let lvt_error = (XAPIC_MMIO_BASE + 0x370) as *mut u32;
-    // SAFETY: caller upholds MMIO + EN preconditions.
+    // SAFETY: caller upholds MMIO + EN preconditions. Each write
+    // is an aligned 32-bit write to an architected LVT register.
     unsafe {
         core::ptr::write_volatile(
             sivr,
             (SIVR_ENABLE as u32) | (super::super::VECTOR_SPURIOUS as u32),
         );
+        // Mask every LVT entry that could deliver a stale-vector
+        // IRQ on the first `sti`. LVT_TIMER stays masked until
+        // `start_timer` arms it; the others stay masked for the
+        // lifetime of the boot (NARF doesn't route LINT / PMC /
+        // thermal yet).
         core::ptr::write_volatile(lvt_timer, LVT_MASKED as u32);
+        core::ptr::write_volatile(lvt_thermal, LVT_MASKED as u32);
+        core::ptr::write_volatile(lvt_perf, LVT_MASKED as u32);
+        core::ptr::write_volatile(lvt_lint0, LVT_MASKED as u32);
+        core::ptr::write_volatile(lvt_lint1, LVT_MASKED as u32);
+        // LVT_ERROR: program vector + leave unmasked. The handler
+        // reads ESR for diagnostics.
         core::ptr::write_volatile(lvt_error, super::super::VECTOR_APIC_ERROR as u32);
     }
 }

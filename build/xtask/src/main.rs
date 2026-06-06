@@ -46,6 +46,15 @@ enum Cmd {
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
+    /// Wave-78 — boot under QEMU and verify both linux-compat demo
+    /// binaries (`/bin/hello` and `/bin/hello_musl`) print their
+    /// expected output through the real shell + execve + ELF
+    /// loader + syscall-instruction dispatch + SSE init path. Two
+    /// `run-interactive` invocations under the hood; fails CI if
+    /// either binary regresses. x86_64 only — `hello_musl` is a
+    /// stock-musl-built ELF that requires `int 0x80` / `syscall`
+    /// dual dispatch + CR4.OSFXSR.
+    MuslDemo(BuildArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
     /// Build the bootable Limine ISO and boot it under QEMU + OVMF.
@@ -1284,6 +1293,41 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
 /// Success criteria: `narf> ` prompt observed within `prompt_secs`,
 /// then `hello world\n` observed within `echo_secs` after typing.
 /// Failure: any panic marker, OR either deadline missed.
+/// Wave-78 — boot both `/bin/hello` (hand-rolled int 0x80 asm)
+/// and `/bin/hello_musl` (real musl-static) through the live
+/// shell + execve + ELF loader + syscall-instruction path. Each
+/// binary is a separate QEMU run since `run-interactive` types one
+/// command and exits on first match — driving two distinct
+/// commands in a single boot would race against the shell's
+/// prompt re-emission.
+///
+/// Failure on either binary is failure for the whole smoke.
+/// x86_64 only: `hello_musl` is a stock musl-built ELF and the
+/// CR4.OSFXSR / arch_prctl / int 0x80-vs-syscall plumbing is all
+/// x86-specific; the aarch64 mirror is a separate sub-wave.
+fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("musl-demo is x86_64 only (hello_musl is not built for aarch64)");
+    }
+
+    // Two `run-interactive` invocations, sharing the same build
+    // args. The boot itself is the slow part (~30-60s on CI); each
+    // invocation re-builds nothing because Cargo's incremental build
+    // is warm after the first.
+    let cases: &[(&str, &str)] = &[("hello", "hello"), ("hello_musl", "hello from musl")];
+    for (cmd, expect) in cases {
+        eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);
+        run_interactive_cmd(&RunInteractiveArgs {
+            build: args.clone(),
+            cmd: (*cmd).into(),
+            expect: (*expect).into(),
+        })
+        .with_context(|| format!("musl-demo: `{}` failed", cmd))?;
+    }
+    eprintln!("\nmusl-demo: all cases passed");
+    Ok(())
+}
+
 fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     use std::io::Write;
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -3379,6 +3423,7 @@ fn main() -> Result<()> {
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
+        Cmd::MuslDemo(args) => musl_demo_cmd(&args),
         Cmd::Image(mut args) => {
             // Default-on boot-init for parity with `iso-boot`. An
             // image without it boots to the async-demo loop and
