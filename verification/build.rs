@@ -225,12 +225,41 @@ fn main() {
     // include_bytes!() resolves to an empty slice — the consumer
     // skips the /lib mount when the slice is empty.
     println!("cargo:rerun-if-env-changed=LDMUSL_PATH");
-    let ld_musl_path =
-        env::var("LDMUSL_PATH").unwrap_or_else(|_| "/lib/ld-musl-x86_64.so.1".into());
-    let ld_musl_canonical = std::fs::canonicalize(&ld_musl_path)
-        .ok()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "/dev/null".into());
+    // Try `$LDMUSL_PATH` first, then a list of common distro
+    // locations. Arch puts the dynamic linker at `/lib/ld-musl-*.so.1`;
+    // Ubuntu's `musl-tools` package ships the same file at
+    // `/usr/lib/x86_64-linux-musl/libc.so` (libc.so IS the dynamic
+    // linker for musl) and at `/lib/x86_64-linux-musl/libc.so.1`. The
+    // first path that canonicalises wins; we fall back to /dev/null
+    // (empty NARF_LD_MUSL slice → /lib mount skipped → dyn binaries
+    // fail to exec).
+    let ld_musl_candidates: Vec<String> = {
+        let mut v = Vec::new();
+        if let Ok(env_path) = env::var("LDMUSL_PATH") {
+            v.push(env_path);
+        }
+        v.extend(
+            [
+                "/lib/ld-musl-x86_64.so.1",
+                "/usr/lib/ld-musl-x86_64.so.1",
+                "/usr/lib/x86_64-linux-musl/libc.so",
+                "/lib/x86_64-linux-musl/libc.so.1",
+                "/lib/x86_64-linux-musl/libc.so",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        v
+    };
+    let (ld_musl_canonical, ld_musl_source) = ld_musl_candidates
+        .iter()
+        .find_map(|p| {
+            std::fs::canonicalize(p)
+                .ok()
+                .map(|c| (c.display().to_string(), p.clone()))
+        })
+        .unwrap_or_else(|| ("/dev/null".into(), "/dev/null".into()));
+    let ld_musl_path = ld_musl_source;
     println!(
         "cargo:rerun-if-changed={}",
         if ld_musl_canonical == "/dev/null" {
