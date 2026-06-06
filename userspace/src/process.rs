@@ -150,8 +150,18 @@ pub unsafe fn load_user_process_with(
     // own relocation pass first would `UnresolvedSymbol`-fail on
     // those externals — they're defined inside libc.so, which
     // ld-musl hasn't mapped yet at this point.
+    // Must match the bias `loader::load_elf_bytes` picked. PIE
+    // (ET_DYN) binaries get `PROGRAM_DYN_BASE`; ET_EXEC stays
+    // at 0.
+    // PML4[1] base. Bit 39 set, bit 47 clear → user range, NOT
+    // the kernel high half.
+    const PROGRAM_DYN_BASE: u64 = 0x0000_0080_0000_0000;
+    let program_bias = match image.kind {
+        crate::ExecKind::Elf64Dyn => PROGRAM_DYN_BASE,
+        _ => 0,
+    };
     if !image.dynamic.is_empty() && image.interp.is_none() {
-        unsafe { apply_relocations(bytes, &image, &address_space, 0) }?;
+        unsafe { apply_relocations(bytes, &image, &address_space, program_bias) }?;
     }
 
     // FS-backed PT_INTERP fallback: when the in-memory `interp::`
@@ -324,8 +334,16 @@ pub unsafe fn load_user_process_with(
         let e_phentsize = u16::from_le_bytes(bytes[0x36..0x38].try_into().unwrap_or([0; 2]));
         let e_phnum = u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap_or([0; 2]));
         let first_load = image.segments.first();
+        // ET_DYN binaries' PT_LOAD vaddrs are 0-relative; bias them
+        // by `program_bias` so AT_PHDR points at the actual
+        // runtime mapping. ET_EXEC stays at the declared vaddr.
         let at_phdr = first_load
-            .map(|s| s.vaddr.wrapping_sub(s.file_off).wrapping_add(e_phoff))
+            .map(|s| {
+                s.vaddr
+                    .wrapping_sub(s.file_off)
+                    .wrapping_add(e_phoff)
+                    .wrapping_add(program_bias)
+            })
             .unwrap_or(0);
         for default in [
             AuxEntry::Pagesz(4096),

@@ -105,17 +105,23 @@ fn main() {
     // make defconfig — produces a reasonable .config to start.
     run_make(&src, &["defconfig"]);
 
-    // Force static linking. defconfig is dynamic-by-default; we
-    // can't use dynamic-musl on the kernel-side seed because the
-    // dyn-linker path is per-target (works for hello_musl_dyn via
-    // /lib MemFs, but busybox is a single static demo).
-    enable_config(&src.join(".config"), "CONFIG_STATIC", "y");
-    // The default CONFIG_TC=y enables `tc` which references kernel
-    // headers not always present on host build systems; the rest
-    // of busybox builds without it.
+    // Disable applets that need kernel headers that aren't on
+    // every host (or that need root to be useful). `make
+    // oldconfig` after our edits canonicalises dependencies but
+    // PRESERVES already-set values, so our overrides win.
+    enable_config(&src.join(".config"), "CONFIG_STATIC", "n");
+    enable_config(&src.join(".config"), "CONFIG_PIE", "y");
     enable_config(&src.join(".config"), "CONFIG_TC", "n");
-    // Re-resolve config (resolves any dependencies we toggled).
     run_make(&src, &["oldconfig"]);
+
+    // Verify the critical settings stuck (busybox's Kconfig
+    // dependencies sometimes drop options silently). PIE
+    // depends on `!STATIC && !FEATURE_PREFER_APPLETS && !BUILD_LIBBUSYBOX`;
+    // if it's still unset after oldconfig, we'll see truncated
+    // 32-bit address loads when the binary runs at NARF's
+    // PML4[1] base and crash with #PF at low addresses.
+    assert_config(&src.join(".config"), "CONFIG_PIE", "y");
+    assert_config(&src.join(".config"), "CONFIG_STATIC", "n");
 
     // The big one — actually build. `EXTRA_LDFLAGS` lands the
     // binary at 0x8000001000 (NARF's PML4[1] user range, matching
@@ -143,9 +149,39 @@ fn main() {
             // still finds musl's, but `#include <linux/kd.h>`
             // (which musl doesn't ship) falls through to the
             // system path.
-            "EXTRA_CFLAGS=-idirafter /usr/include",
-            "EXTRA_LDFLAGS=-Wl,-L/usr/lib -Wl,-Ttext-segment=0x8000001000 \
-             -Wl,--defsym=_DYNAMIC=0x8000001000",
+            //
+            // -mcmodel=large is load-bearing: GCC's default
+            // (-mcmodel=small) assumes every symbol is within
+            // ±2 GiB of RIP, so the compiler may emit 32-bit
+            // moves on 64-bit pointers and the upper bits get
+            // truncated when the binary loads at NARF's
+            // 0x80_0000_xxxx PML4[1] base. Symptom: busybox
+            // applets that touch musl's locale / stdio tables
+            // (anything other than raw write()) #PF at the
+            // truncated address (e.g. crash at 0x1a8848 instead
+            // of 0x80_0000_1a8848).
+            // -mcmodel=large is load-bearing for busybox's own
+            // code: GCC's default -mcmodel=small assumes every
+            // symbol is within ±2 GiB of RIP. NARF loads user
+            // binaries at 0x80_0000_xxxx (PML4[1] base, ~140 TiB
+            // up), so a 32-bit-immediate `mov $addr, %eax` zero-
+            // extends to a truncated low-32-bits address that
+            // points back into unmapped PML4[0]. Symptom: any
+            // applet that touches a static table (stdio's
+            // _stdout, locale, etc.) #PFs at the truncated
+            // address — observed as 0x1a8848 instead of
+            // 0x80_0001_a8848. musl libc.so is PIC so it doesn't
+            // need the flag; only busybox's own translation
+            // units do.
+            "EXTRA_CFLAGS=-idirafter /usr/include -mcmodel=large",
+            // PIE LD. Don't pass `-no-pie` or `-Ttext-segment` —
+            // both override `-pie` and force ET_EXEC. With true
+            // PIE the binary is ET_DYN and the kernel + ld-musl
+            // load it wherever (NARF picks via INTERP_BIAS which
+            // is well inside PML4[1]); every reference is
+            // RIP-relative so vaddr doesn't matter for
+            // correctness.
+            "EXTRA_LDFLAGS=-Wl,-L/usr/lib",
         ],
     );
 
@@ -242,6 +278,22 @@ fn run_make(src: &Path, args: &[&str]) {
         .expect("spawn make");
     if !status.success() {
         panic!("narf-busybox: make {} → exit {}", args.join(" "), status);
+    }
+}
+
+fn assert_config(config: &Path, key: &str, value: &str) {
+    let body = std::fs::read_to_string(config).expect("read .config");
+    let want = if value == "n" {
+        format!("# {} is not set", key)
+    } else {
+        format!("{}={}", key, value)
+    };
+    if !body.lines().any(|l| l == want) {
+        panic!(
+            "narf-busybox: expected `{}` in .config; busybox's Kconfig \
+             dropped the setting. Check feature dependencies.",
+            want
+        );
     }
 }
 
