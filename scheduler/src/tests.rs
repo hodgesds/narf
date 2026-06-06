@@ -1940,3 +1940,93 @@ fn smoke_pluggable_scheduler_policy() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_pluggable_scheduler_policy);
+
+fn smoke_pluggable_donation_policy() -> TestResult {
+    // Wave E: validate the `DonationPolicy` seam.
+    //
+    // 1) Default install ("head-queue") is wired by `init()`.
+    // 2) Spawn donor + donee + a witness task; `donate_to` with
+    //    HeadQueueDonation pushes donee ahead of the witness.
+    // 3) Install `BackQueueDonation`; re-run; donee now lands behind
+    //    the witness.
+    // 4) Reinstall `HeadQueueDonation` for hygiene.
+    use crate::{
+        current_donation_policy_name, donate_to, install_donation_policy, spawn, BackQueueDonation,
+        Donation, HeadQueueDonation, Task,
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Grant, Invoke};
+
+    if current_donation_policy_name() != Some("head-queue") {
+        return TestResult::Fail("default donation policy is not 'head-queue'");
+    }
+
+    let donation_cap: Cap<Donation, Grant> = Cap::bootstrap();
+    let invoke_cap: Cap<Task, Invoke> = Cap::bootstrap();
+
+    // ── Round 1: HeadQueueDonation (default) ─────────────────
+    static FIRST_TAG: AtomicU32 = AtomicU32::new(0);
+    FIRST_TAG.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let _witness = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xAAAA, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    let donee = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xBBBB, Ordering::Relaxed, Ordering::Relaxed);
+    });
+
+    if donate_to(donee, &invoke_cap).is_err() {
+        return TestResult::Fail("donate_to (head-queue) returned Err on live cap");
+    }
+    crate::run_until_empty();
+
+    if FIRST_TAG.load(Ordering::Relaxed) != 0xBBBB {
+        return TestResult::Fail("head-queue donation did not place donee at front");
+    }
+
+    // ── Round 2: BackQueueDonation ───────────────────────────
+    if install_donation_policy(&donation_cap, BackQueueDonation).is_err() {
+        return TestResult::Fail("install_donation_policy(Back) failed");
+    }
+    if current_donation_policy_name() != Some("back-queue") {
+        let _ = install_donation_policy(&donation_cap, HeadQueueDonation);
+        return TestResult::Fail("current_donation_policy_name did not reflect Back install");
+    }
+
+    FIRST_TAG.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let _witness2 = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xAAAA, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    let donee2 = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xBBBB, Ordering::Relaxed, Ordering::Relaxed);
+    });
+
+    if donate_to(donee2, &invoke_cap).is_err() {
+        let _ = install_donation_policy(&donation_cap, HeadQueueDonation);
+        return TestResult::Fail("donate_to (back-queue) returned Err on live cap");
+    }
+    crate::run_until_empty();
+
+    let back_order_ok = FIRST_TAG.load(Ordering::Relaxed) == 0xAAAA;
+
+    // ── Hygiene: restore default ─────────────────────────────
+    if install_donation_policy(&donation_cap, HeadQueueDonation).is_err() {
+        return TestResult::Fail("re-install_donation_policy(Head) failed");
+    }
+    if current_donation_policy_name() != Some("head-queue") {
+        return TestResult::Fail("donation policy did not revert to head-queue");
+    }
+
+    if !back_order_ok {
+        return TestResult::Fail(
+            "BackQueueDonation did not place donee behind pre-spawned witness",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_pluggable_donation_policy);

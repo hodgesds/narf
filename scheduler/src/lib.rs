@@ -67,6 +67,7 @@ extern crate alloc;
 pub mod affinity;
 pub mod budget;
 pub mod cpu_lifecycle;
+pub mod donation;
 pub mod policy;
 pub mod priority;
 pub mod stackful;
@@ -77,6 +78,10 @@ pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 pub use cpu_lifecycle::{
     cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,
+};
+pub use donation::{
+    current_donation_policy_name, install_donation_policy, BackQueueDonation, Donation,
+    DonationError, DonationPolicy, EnqueueDonee, HeadQueueDonation,
 };
 pub use policy::{
     current_scheduler_name, install_scheduler, FifoScheduler, PriorityScheduler, RunQueue,
@@ -258,7 +263,7 @@ pub(crate) struct TaskSlot {
     /// Pending time-slice donation (§3.3). Set by `donate_to` so the
     /// next pop either consumes the credit (cap live) or refunds
     /// the donor (cap revoked). `None` outside an active donation.
-    donation: Option<Donation>,
+    donation: Option<DonationClaim>,
     /// Saved IA32_PKRS (Intel SDM Vol 3 §4.6.2.4). Snapshotted
     /// after a `Poll::Pending` so the next poll of this slot
     /// restores the task's protection-key rights view. `None`
@@ -274,15 +279,20 @@ pub(crate) struct TaskSlot {
 /// (cap still live) or reverts both sides (cap revoked → refund
 /// donor + revert donee's credit). Stored on the donee so the
 /// executor resolves revocation O(1) at pop time.
-struct Donation {
+struct DonationClaim {
     donor: TaskId,
+    /// Snapshot of the donor's `TaskMeta` at donation time. Passed
+    /// to `DonationPolicy::on_revoke` if the donation is cancelled
+    /// between donate and settle, so the policy can attribute the
+    /// refund without re-walking the ready queues.
+    donor_meta: crate::policy::TaskMeta,
     cycles: u64,
     cap: Cap<Task, Invoke>,
 }
 
-impl core::fmt::Debug for Donation {
+impl core::fmt::Debug for DonationClaim {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Donation")
+        f.debug_struct("DonationClaim")
             .field("donor", &self.donor)
             .field("cycles", &self.cycles)
             .finish_non_exhaustive()
@@ -414,6 +424,11 @@ pub fn init() {
     // before any `run_until_empty` call dispatches. Idempotent — if a
     // smoke installed an alternative impl ahead of init, leave it.
     policy::install_default_if_unset();
+    // Wave E: wire the default `HeadQueueDonation` so `donate_to`'s
+    // policy-driven placement and cycle-ceiling lookups return the
+    // pre-Wave-E hardcoded behaviour byte-for-byte. Idempotent for the
+    // same reason `policy::install_default_if_unset` is.
+    donation::install_default_if_unset();
 }
 
 /// Test-only hook: clear every ready queue without re-running
@@ -721,6 +736,10 @@ pub enum DonateError {
     TargetNotFound,
     /// Scheduler is not initialised.
     NotReady,
+    /// The installed donation policy returned
+    /// `EnqueueDonee::Refuse`. The donor's budget has been
+    /// restored; the donee is unchanged.
+    PolicyRefused,
 }
 
 /// Pending donor-side debit table for donations whose donor is
@@ -820,19 +839,11 @@ pub fn __reset_donations_for_test() {
 /// `revert_debit` if findable, otherwise cancels the pending
 /// debit). The donee continues without the boost.
 pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateError> {
-    /// Hard ceiling on a single donation. 1M cycles is a few
-    /// hundred µs at multi-GHz: large enough to be a real boost,
-    /// small enough that an unthrottled donor's
-    /// `u64::MAX - cycles_spent` doesn't transfer the universe.
-    const MAX_DONATION_CYCLES: u64 = 1_000_000;
-
     cap.check_live()
         .map_err(|_| DonateError::AuthorityRevoked)?;
 
     let donor_id = current_task_id();
     let mut any_initialised = false;
-    let mut donor_remaining: u64 = 0;
-    let mut donor_debited_inline = false;
 
     for q in READY.iter() {
         let mut g = q.lock();
@@ -842,28 +853,97 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
         };
         any_initialised = true;
         if let Some(pos) = ready.iter().position(|s| s.id == target) {
+            // Build a donor-meta snapshot. If the donor is on the
+            // same queue, lift its real `TaskMeta`; if not, synthesise
+            // a placeholder carrying just the donor id so the policy
+            // can still log/decide. Either way `donor_meta` is what
+            // the policy sees for both `cycle_ceiling` and
+            // `enqueue_donee`.
+            let (donor_meta, donor_on_queue) = if donor_id != TaskId::NONE {
+                if let Some(d) = ready.iter().find(|s| s.id == donor_id) {
+                    (
+                        crate::policy::TaskMeta {
+                            id: d.id,
+                            priority: d.spec.priority,
+                            class: d.spec.class,
+                            affinity: d.spec.affinity,
+                        },
+                        true,
+                    )
+                } else {
+                    (
+                        crate::policy::TaskMeta {
+                            id: donor_id,
+                            priority: crate::priority::Priority::NORMAL,
+                            class: crate::priority::SchedClass::Normal,
+                            affinity: crate::affinity::Affinity::any(),
+                        },
+                        false,
+                    )
+                }
+            } else {
+                (
+                    crate::policy::TaskMeta {
+                        id: TaskId::NONE,
+                        priority: crate::priority::Priority::NORMAL,
+                        class: crate::priority::SchedClass::Normal,
+                        affinity: crate::affinity::Affinity::any(),
+                    },
+                    false,
+                )
+            };
+
+            // Consult the donation policy for placement intent and
+            // cycle ceiling. The helper acquires `DONATION`, reads,
+            // and drops the lock before returning so the queue lock
+            // we still hold here is never nested under it.
+            let donee_handle = crate::policy::TaskHandle::from_id(target);
+            let mut rq = crate::policy::RunQueue::projected(ready);
+            let (placement, ceiling) =
+                crate::donation::placement_and_ceiling(&mut rq, &donor_meta, donee_handle);
+            // `rq` is a borrow of `ready`; drop it before mutating
+            // `ready` further so the borrow checker sees the lifetime
+            // ended (no `take_picked` was called — the projection is
+            // read-only for this path).
+            drop(rq);
+
+            // Refuse short-circuit: no budget changes, no enqueue
+            // mutation; donee stays where it is.
+            if matches!(placement, crate::donation::EnqueueDonee::Refuse) {
+                return Err(DonateError::PolicyRefused);
+            }
+
+            // Compute the actual cycles to transfer. When the donor
+            // is on-queue we cap by its remaining burst quantum (the
+            // pre-Wave-E behaviour); otherwise the ceiling is the
+            // full policy budget (debit staged for next pop).
+            let mut donor_remaining: u64 = 0;
+            let mut donor_debited_inline = false;
             if donor_id != TaskId::NONE {
-                if let Some(d) = ready.iter_mut().find(|s| s.id == donor_id) {
-                    let rem = d
-                        .spec
-                        .budget
-                        .burst_cycles
-                        .saturating_sub(d.account.cycles_spent);
-                    donor_remaining = rem.min(MAX_DONATION_CYCLES);
-                    if donor_remaining > 0 {
-                        d.account.add_debit(donor_remaining);
-                        donor_debited_inline = true;
+                if donor_on_queue {
+                    if let Some(d) = ready.iter_mut().find(|s| s.id == donor_id) {
+                        let rem = d
+                            .spec
+                            .budget
+                            .burst_cycles
+                            .saturating_sub(d.account.cycles_spent);
+                        donor_remaining = rem.min(ceiling);
+                        if donor_remaining > 0 {
+                            d.account.add_debit(donor_remaining);
+                            donor_debited_inline = true;
+                        }
                     }
+                } else {
+                    donor_remaining = ceiling;
                 }
             }
+
             let mut slot = ready.remove(pos).unwrap();
-            if !donor_debited_inline && donor_id != TaskId::NONE {
-                donor_remaining = MAX_DONATION_CYCLES;
-            }
             if donor_remaining > 0 {
                 slot.account.add_credit(donor_remaining);
-                slot.donation = Some(Donation {
+                slot.donation = Some(DonationClaim {
                     donor: donor_id,
+                    donor_meta,
                     cycles: donor_remaining,
                     cap: *cap,
                 });
@@ -872,7 +952,12 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                 }
             }
             slot.awake.store(true, Ordering::Release);
-            ready.push_front(slot);
+            match placement {
+                crate::donation::EnqueueDonee::HeadOfQueue => ready.push_front(slot),
+                crate::donation::EnqueueDonee::BackOfQueue => ready.push_back(slot),
+                // Refuse handled above.
+                crate::donation::EnqueueDonee::Refuse => unreachable!(),
+            }
             return Ok(());
         }
     }
@@ -893,6 +978,14 @@ fn settle_donation(slot: &mut TaskSlot) {
         if d.cap.check_live().is_err() {
             slot.account.revert_credit(d.cycles);
             refund_donor(d.donor, d.cycles);
+            // Inform the active donation policy that the donation
+            // was revoked. The structural refund above is the
+            // load-bearing side effect; this hook is informational
+            // for policy-level accounting / telemetry. Done after
+            // the structural work so an impl that re-enters
+            // `current_donation_policy_name`-style observers sees
+            // consistent state.
+            crate::donation::notify_revoke(&d.donor_meta, d.cycles);
         }
     }
 }
