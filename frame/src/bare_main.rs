@@ -714,15 +714,39 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
         }
 
-        // x2APIC + LAPIC timer. Gated on CPUID.x2APIC; absence leaves
-        // the scheduler in its Stage-1 busy-poll mode, which still
-        // works, just without timer IRQs.
-        if feats.x2apic {
-            // SAFETY: CPUID confirmed x2APIC.
-            unsafe {
-                narf_interrupts::x86_64::apic::init_bsp();
-            }
-            let _ = writeln!(console::Writer, "  apic: x2APIC enabled, 8259 PICs masked");
+        // LAPIC init — always runs. `init_bsp` first tries x2APIC
+        // mode (MSR-based access); on platforms where the BIOS
+        // refuses the IA32_APIC_BASE.EXTD bit (some AMD silicon,
+        // QEMU TCG without explicit `+x2apic`) it falls back to
+        // xAPIC MMIO mode. Either path leaves the LAPIC in a known
+        // state with SIVR enabled, every LVT masked except
+        // LVT_ERROR, and the diagnostic handlers installed — all
+        // load-bearing for the first `sti` not delivering a
+        // BIOS-time stale-vector IRQ into an unhandled slot and
+        // cascading into #DF.
+        //
+        // The previous gate (`if feats.x2apic`) skipped the entire
+        // block on TCG / non-x2APIC hosts, leaving the LAPIC in
+        // its BIOS-default state — CI's #DF after `tsc: calibrated`
+        // was the consequence.
+        //
+        // SAFETY: CPL=0; LAPIC is always present on long-mode
+        // x86_64 silicon; init_bsp handles both x2APIC and xAPIC
+        // paths internally.
+        unsafe {
+            narf_interrupts::x86_64::apic::init_bsp();
+        }
+        let x2apic_active = narf_interrupts::x86_64::apic::X2APIC_ACTIVE
+            .load(core::sync::atomic::Ordering::Acquire);
+        let _ = writeln!(
+            console::Writer,
+            "  apic: {} active, 8259 PICs masked",
+            if x2apic_active { "x2APIC" } else { "xAPIC" }
+        );
+        // TLB-shootdown IPI fan-out — requires x2APIC for ICR MSR
+        // writes. Skipped under xAPIC fallback; cross-CPU
+        // invalidation falls back to the per-CPU INVLPG only.
+        if x2apic_active {
             // Install the TLB-shootdown IPI handler now — APs may
             // call shoot_va once they come up, and the handler must
             // be live before the first IPI lands.
