@@ -682,6 +682,17 @@ impl core::future::Future for UserTaskFuture {
         // SAFETY: we don't move out of the Pin; we only project &mut
         // to fields whose address stability we own.
         let this = unsafe { self.get_unchecked_mut() };
+        {
+            use core::fmt::Write as _;
+            let tid = crate::handlers::current_task_id();
+            let _ = writeln!(
+                narf_console::Writer,
+                "poll: tid={} pid={} state={:?}",
+                tid,
+                this.process.pid.raw(),
+                this.state as u32
+            );
+        }
 
         if this.state == TaskState::Exited {
             // Defensive — the executor drops Ready slots, so this
