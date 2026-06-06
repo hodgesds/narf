@@ -25,8 +25,11 @@ _start:
     mov     rdx, 6
     syscall
 
-    # exit_group(0)
-    mov     rax, 231
+    # exit(0) — Linux SYS_exit = 60. NARF's `Syscall::ExitTask`
+    # maps to 60 (userspace/src/syscall.rs:1535). exit_group (231)
+    # is not yet in the linux-compat table; using exit avoids a
+    # spurious ENOSYS + ud2 trap before the parent reaps.
+    mov     rax, 60
     xor     rdi, rdi
     syscall
 
