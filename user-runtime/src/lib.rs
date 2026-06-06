@@ -1444,31 +1444,21 @@ pub unsafe fn wait4(pid: i64, status: *mut i32, options: u32, rusage: *mut u8) -
 /// image and observes the error).
 ///
 /// # Safety
-/// `elf_bytes` and the argv/envp packs must reference live,
-/// readable bytes in the calling task's address space for the
-/// duration of the call.
+/// `path` must be a NUL-terminated C string. `argv` and `envp`
+/// must be NULL-terminated arrays of NUL-terminated C strings.
+/// All pointers must be live, readable in the calling task's
+/// address space for the duration of the call.
 #[inline]
 pub unsafe fn execve(
-    elf_bytes: *const u8,
-    elf_len: usize,
-    argv_pack: *const u8,
-    argv_len: usize,
-    envp_pack: *const u8,
-    envp_len: usize,
+    path: *const u8,
+    argv: *const *const u8,
+    envp: *const *const u8,
 ) -> Result<(), ()> {
-    // SAFETY: SYS_EXECVE 6-arg signature; the new-image side never
-    // returns through here.
-    let r = unsafe {
-        syscall6(
-            SYS_EXECVE,
-            elf_bytes as u64,
-            elf_len as u64,
-            argv_pack as u64,
-            argv_len as u64,
-            envp_pack as u64,
-            envp_len as u64,
-        )
-    };
+    // Linux ABI: `int execve(const char *pathname,
+    // char *const argv[], char *const envp[])`. The kernel
+    // resolves the path through the VFS, reads the ELF file
+    // server-side, and never returns to the caller on success.
+    let r = unsafe { syscall3(SYS_EXECVE, path as u64, argv as u64, envp as u64) };
     if r == 0 {
         Ok(())
     } else {
@@ -2285,17 +2275,20 @@ pub struct StatBuf {
 
 /// `stat(path, &mut out)` — write the stat result for the file at
 /// the given absolute path. Returns 0 on success, -1 on failure.
+///
+/// Wrapper around Linux's 2-arg `stat(2)` syscall. Copies `path`
+/// into a stack-allocated NUL-terminated buffer before invoking
+/// the kernel.
 #[inline]
 pub fn stat(path: &str, out: &mut StatBuf) -> i32 {
-    // SAFETY: SYS_STAT signature: (path_ptr, path_len, out_ptr).
-    let r = unsafe {
-        syscall3(
-            SYS_STAT,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            out as *mut StatBuf as u64,
-        )
-    };
+    let mut buf = [0u8; 4096];
+    if path.len() >= buf.len() {
+        return -1;
+    }
+    buf[..path.len()].copy_from_slice(path.as_bytes());
+    // buf[path.len()] is already 0 (zeroed array).
+    // SAFETY: SYS_STAT linux signature: (pathname_cstr, statbuf).
+    let r = unsafe { syscall2(SYS_STAT, buf.as_ptr() as u64, out as *mut StatBuf as u64) };
     if r == 0 {
         0
     } else {
@@ -2308,15 +2301,13 @@ pub fn stat(path: &str, out: &mut StatBuf) -> i32 {
 /// identical to `stat`.
 #[inline]
 pub fn lstat(path: &str, out: &mut StatBuf) -> i32 {
-    // SAFETY: SYS_LSTAT signature mirrors SYS_STAT.
-    let r = unsafe {
-        syscall3(
-            SYS_LSTAT,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            out as *mut StatBuf as u64,
-        )
-    };
+    let mut buf = [0u8; 4096];
+    if path.len() >= buf.len() {
+        return -1;
+    }
+    buf[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: SYS_LSTAT linux signature mirrors SYS_STAT.
+    let r = unsafe { syscall2(SYS_LSTAT, buf.as_ptr() as u64, out as *mut StatBuf as u64) };
     if r == 0 {
         0
     } else {

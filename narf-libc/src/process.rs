@@ -296,59 +296,22 @@ pub unsafe extern "C" fn execve(
         crate::errno::set_errno(crate::errno::EINVAL);
         return -1;
     }
-    let path_str = match unsafe { c_str_to_str(path) } {
-        Some(s) => s,
-        None => {
-            crate::errno::set_errno(crate::errno::EINVAL);
-            return -1;
-        }
-    };
-    // Read the program file into a buffer.
-    let elf = match unsafe { read_file_to_vec(path_str) } {
-        Some(v) => v,
-        None => {
-            crate::errno::set_errno(2); // ENOENT
-            return -1;
-        }
-    };
-    // Pack argv + envp.
-    let argv_pack = match unsafe { pack_cstr_array(argv) } {
-        Some(b) => b,
-        None => {
-            crate::errno::set_errno(crate::errno::EINVAL);
-            return -1;
-        }
-    };
-    let envp_pack = match unsafe { pack_cstr_array(envp) } {
-        Some(b) => b,
-        None => {
-            crate::errno::set_errno(crate::errno::EINVAL);
-            return -1;
-        }
-    };
-
-    let elf_slice = elf.as_slice();
-    let argv_slice = argv_pack.as_slice();
-    let envp_slice = envp_pack.as_slice();
-
-    // SAFETY: pointers + lengths come from heap-owned buffers we
-    // built above; the runtime call doesn't return on success.
+    // Linux ABI cutover: hand the user's path / argv / envp
+    // pointers straight to the kernel. The kernel resolves the
+    // path through the VFS and reads the ELF bytes server-side,
+    // so we don't need the old user-side `read_file_to_vec` +
+    // argv/envp pack step. Empty argv (NULL ptr) and empty envp
+    // (NULL ptr) are both legal — execve handles them.
     match unsafe {
         narf_user_runtime::execve(
-            elf_slice.as_ptr(),
-            elf_slice.len(),
-            argv_slice.as_ptr(),
-            argv_slice.len(),
-            envp_slice.as_ptr(),
-            envp_slice.len(),
+            path as *const u8,
+            argv as *const *const u8,
+            envp as *const *const u8,
         )
     } {
         Ok(()) => {
             // Unreachable on success — kernel resumes new image
-            // directly. If we get here, the new image returned
-            // immediately (which is itself a defensible state for
-            // a buggy / instant-exit program). Surface as -1 +
-            // ENOEXEC.
+            // directly. If we get here, surface ENOEXEC.
             crate::errno::set_errno(8); // ENOEXEC
             -1
         }

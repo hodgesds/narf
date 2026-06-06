@@ -1362,6 +1362,16 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // every forked child #PF'd at CR2=0x98. Fix is to return
         // -EINVAL in rax on error and preserve rdx.
         ("busybox sh -c 'echo a; echo b'", "b"),
+        // Pipes through fork+exec. busybox sh's pipeline
+        // implementation forks two children, dup2's the pipe ends
+        // to stdin/stdout, then `execve(2)`s into the named
+        // binary. The Linux ABI cutover for execve (path, argv,
+        // envp) — previously NARF-native (elf_ptr, elf_len, ...)
+        // — plus the `stat(2)` cutover (NUL-terminated path
+        // instead of (ptr, len)) get this end-to-end. Without
+        // either, busybox sh's PATH search hits the
+        // `Operation not permitted` (EPERM) wall every time.
+        ("busybox sh -c 'echo hi | busybox cat'", "hi"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

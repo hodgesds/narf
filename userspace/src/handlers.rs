@@ -1424,9 +1424,16 @@ impl StatBuf {
 
 fn sys_stat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`.
+    // Two args, path is NUL-terminated. (NARF-native callers used
+    // the explicit-length triplet (path_ptr, path_len, out_ptr); we
+    // cut over to the Linux shape so musl-built binaries can do PATH
+    // search via stat — busybox sh's pipeline children stat their
+    // way through `:`-separated $PATH looking for the binary, and
+    // an EINVAL/EPERM return there masquerades as "Operation not
+    // permitted", silently failing every `cat`/`tr`/`head` etc.)
     let path_ptr = args.arg0;
-    let path_len = args.arg1 as usize;
-    let out_ptr = args.arg2 as *mut StatBuf;
+    let out_ptr = args.arg1 as *mut StatBuf;
     // POSIX-shaped failure sentinel. The user-runtime asm wrapper
     // observes only the `value` register, so we mirror libc and
     // return -1 on failure to disambiguate from a 0-valued success.
@@ -1437,13 +1444,14 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let path_owned = match copy_user_path(path_ptr, path_len) {
+    let path_owned = match copy_user_cstr(path_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
+    let path_owned = apply_chroot(&path_owned);
     let path: &str = &path_owned;
     let ops = narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
@@ -2269,21 +2277,31 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat) -> linux_compat::Stat {
 #[cfg(feature = "linux-compat")]
 fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`
+    // — two args, path is NUL-terminated. The previous shape
+    // matched NARF's `(path_ptr, path_len, out_ptr)` triplet which
+    // is unreachable from musl: musl passes the statbuf in arg1,
+    // we read it as `path_len`, copy_from_user bails on the
+    // "huge length", every stat returns -1, errno = EPERM,
+    // busybox sh prints "Operation not permitted" for every
+    // PATH-search candidate, and every pipeline that touches an
+    // exec dies.
     let path_ptr = args.arg0;
-    let path_len = args.arg1 as usize;
-    let out_ptr = args.arg2 as *mut linux_compat::Stat;
+    let out_ptr = args.arg1 as *mut linux_compat::Stat;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
         ctx.set_return(fail);
         return;
     }
-    let path_owned = match copy_user_path(path_ptr, path_len) {
+    let raw = match copy_user_cstr(path_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
+    let path_owned = apply_chroot(&raw);
+    let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     let ops = narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
@@ -7335,47 +7353,88 @@ pub fn __test_brk_reset() {
 
 fn sys_execve(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let elf_ptr = args.arg0 as u64;
-    let elf_len = args.arg1 as usize;
-    let argv_ptr = args.arg2 as *const u8;
-    let argv_len = args.arg3 as usize;
-    let envp_ptr = args.arg4 as *const u8;
-    let envp_len = args.arg5 as usize;
+    // Linux ABI: `int execve(const char *pathname, char *const argv[],
+    // char *const envp[])`. Register mapping on x86_64:
+    //   rdi = pathname (NUL-terminated C string)
+    //   rsi = argv     (NULL-terminated array of `char *`)
+    //   rdx = envp     (NULL-terminated array of `char *`)
+    let path_uptr = args.arg0;
+    let argv_uptr = args.arg1;
+    let envp_uptr = args.arg2;
 
-    // Reject obvious bad args. ELF must be at least Elf64 header
-    // (64 bytes) and < 64 MiB (defensive cap; real images are
-    // far smaller).
-    if elf_ptr == 0 || elf_len < 64 || elf_len > 64 * 1024 * 1024 {
+    if path_uptr == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
 
-    // Step 2: copy ELF bytes from user memory into a kernel Vec
-    // under the SMAP bracket while the calling AS is still active.
-    // The copied bytes live in a kernel Vec that survives across the AS swap.
-    let mut elf_buf = alloc::vec![0u8; elf_len];
-    if unsafe { copy_from_user(&mut elf_buf, elf_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-
-    // Step 3: copy + parse argv + envp packs.
-    let argv_strs = match copy_user_pack(argv_ptr, argv_len) {
-        Ok(v) => v,
-        Err(()) => {
+    // Step 1: copy the pathname from user memory under SMAP.
+    let path_owned = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
     };
-    let envp_strs = match copy_user_pack(envp_ptr, envp_len) {
-        Ok(v) => v,
-        Err(()) => {
+    let path: &str = &path_owned;
+
+    // Step 2: copy argv + envp — each a NUL-terminated array of
+    // user-mode `char *`, walked until the first null pointer.
+    let argv_strs = match copy_user_strarr(argv_uptr, 1024) {
+        Some(v) => v,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let envp_strs = match copy_user_strarr(envp_uptr, 4096) {
+        Some(v) => v,
+        None => {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
     };
     let argv_refs: alloc::vec::Vec<&str> = argv_strs.iter().map(|s| s.as_str()).collect();
     let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
+
+    // Step 3: resolve the path through the VFS and read the
+    // ELF bytes into a kernel-owned buffer. The buffer survives
+    // the AS swap below.
+    let ops = match narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+        })
+        .flatten()
+    {
+        Some(o) => o,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // Stat for file size, then read everything.
+    let stat = ops.stat();
+    let file_size = stat.size as usize;
+    if file_size < 64 || file_size > 64 * 1024 * 1024 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let mut elf_buf = alloc::vec![0u8; file_size];
+    let mut off = 0usize;
+    while off < file_size {
+        match poll_blocking(ops.read(off as u64, &mut elf_buf[off..])) {
+            Some(Ok(0)) => break, // short read at EOF
+            Some(Ok(n)) => off += n,
+            _ => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+        }
+    }
+    if off < 64 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    elf_buf.truncate(off);
 
     // Step 4: load the new image. SAFETY: load_user_process_with's
     // contract — identity-mapped low 4 GiB, frame allocator
@@ -7539,6 +7598,76 @@ fn copy_user_str(ptr: *const u8, len: usize, cap: usize) -> Result<alloc::string
 fn copy_user_path(ptr: u64, len: usize) -> Option<alloc::string::String> {
     let raw = copy_user_path_raw(ptr, len)?;
     Some(apply_chroot(&raw))
+}
+
+/// Copy a NUL-terminated C string from user memory. Reads up to
+/// `max_len` bytes (defensive cap) and stops at the first NUL.
+/// Returns `None` on any of: null ptr, copy fault, non-UTF-8,
+/// no NUL within `max_len`.
+///
+/// Used by execve(2), stat(2), and friends — Linux-shape syscalls
+/// whose path arg is just a bare user pointer with no length, and
+/// the kernel finds the end at the NUL.
+fn copy_user_cstr(ptr: u64, max_len: usize) -> Option<alloc::string::String> {
+    if ptr == 0 || max_len == 0 || max_len > 65536 {
+        return None;
+    }
+    // Bulk-reading `max_len` blindly would walk past the NUL into
+    // pages that may not be mapped (a path string that ends near a
+    // page boundary). Read in page-sized chunks until we find the
+    // NUL or hit `max_len`.
+    let mut out = alloc::vec::Vec::with_capacity(64);
+    let mut cursor = ptr;
+    let end_cap = ptr.saturating_add(max_len as u64);
+    while cursor < end_cap {
+        // Read up to the next page boundary, capped at the remaining
+        // budget.
+        let next_page = (cursor + 0x1000) & !0xFFF;
+        let chunk_end = next_page.min(end_cap);
+        let chunk_len = (chunk_end - cursor) as usize;
+        let mut chunk = alloc::vec![0u8; chunk_len];
+        // SAFETY: SMAP bracket inside copy_from_user; pointer
+        // validated against canonical range there.
+        unsafe { copy_from_user(&mut chunk, cursor) }.ok()?;
+        if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..nul_pos]);
+            return alloc::string::String::from_utf8(out).ok();
+        }
+        out.extend_from_slice(&chunk);
+        cursor = chunk_end;
+    }
+    // Never found NUL within max_len.
+    None
+}
+
+/// Walk a NULL-terminated user array of `char *` (e.g. argv or
+/// envp). Each element points to a C string copied via
+/// [`copy_user_cstr`]. Returns `None` on any copy fault or if
+/// the array doesn't terminate within `max_entries`.
+fn copy_user_strarr(
+    arr_ptr: u64,
+    max_entries: usize,
+) -> Option<alloc::vec::Vec<alloc::string::String>> {
+    if arr_ptr == 0 {
+        // POSIX permits argv=NULL to mean "no args"; envp=NULL
+        // similarly. Treat as empty rather than rejecting.
+        return Some(alloc::vec::Vec::new());
+    }
+    let mut out = alloc::vec::Vec::new();
+    for i in 0..max_entries {
+        let slot_ptr = arr_ptr.checked_add((i as u64) * 8)?;
+        let mut slot_bytes = [0u8; 8];
+        // SAFETY: SMAP bracket inside copy_from_user.
+        unsafe { copy_from_user(&mut slot_bytes, slot_ptr) }.ok()?;
+        let element_ptr = u64::from_le_bytes(slot_bytes);
+        if element_ptr == 0 {
+            // NULL terminator → end of array.
+            return Some(out);
+        }
+        out.push(copy_user_cstr(element_ptr, 4096)?);
+    }
+    // Array didn't terminate — reject rather than truncate silently.
+    None
 }
 
 /// Like `copy_user_path` but never applies the chroot rewrite. Used
