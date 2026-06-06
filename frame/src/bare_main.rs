@@ -450,6 +450,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 smap::enable();
             }
         }
+        // SSE / FXSR — required for SSE2 instruction execution. SSE2
+        // is architectural on x86_64 so no CPUID gate; the OS opt-in
+        // (CR4.OSFXSR | CR4.OSXMMEXCPT) is what's not on by default.
+        // Without these, a musl-static binary's TLS init memcpy
+        // (`movq %rbx, %xmm0`) raises #UD and the task dies with
+        // SIGILL before reaching main.
+        // SAFETY: CPL=0; SSE2 is architectural.
+        unsafe {
+            narf_arch::x86_64::sse::enable();
+        }
         // KPTI detect — Renoir + Phoenix come back Posture::Native and
         // we skip the dual-CR3 dance entirely. Log the decision once.
         let pti = kpti::detect();
@@ -3253,6 +3263,23 @@ fn boot_userspace_init() {
                 ("cat", narf_verification::NARF_COREUTIL_CAT_ELF),
                 ("ls", narf_verification::NARF_COREUTIL_LS_ELF),
                 ("ps", narf_verification::NARF_COREUTIL_PS_ELF),
+                // Wave-78: linux-compat demo binary. Direct-syscall
+                // hello-world built with stock binutils (no libc, no
+                // PT_INTERP). Type `hello` at the `narf>` shell
+                // prompt; the exec path goes through posix_open +
+                // execve and the binary issues raw Linux x86_64
+                // syscalls (write=1, exit_group=231).
+                ("hello", narf_verification::NARF_HELLO_STATIC_ELF),
+                // Wave-78 follow-up 2: real musl-static binary built
+                // with musl-gcc. Exercises the actual musl init path
+                // (set_tid_address / rt_sigaction / brk / ...). Caveat:
+                // musl uses the `syscall` instruction internally, and
+                // NARF's current `syscall` dispatch doesn't reach the
+                // raw handlers (see verification/data/musl-demo/
+                // hello_musl_x86_64.c). The binary loads + enters
+                // user mode cleanly; whether `write` prints depends
+                // on the syscall-dispatch convergence sub-wave.
+                ("hello_musl", narf_verification::NARF_HELLO_MUSL_ELF),
             ],
         );
         let count = fs.file_count();

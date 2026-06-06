@@ -4820,6 +4820,88 @@ fn sys_set_tid_address(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(me));
 }
 
+// ── arch_prctl(2) — x86_64 thread-pointer install ──────────────────
+//
+// musl's `__init_libc` calls `arch_prctl(ARCH_SET_FS, tls_self_ptr)`
+// near the top of process startup; without a real handler it returns
+// ENOSYS, musl `a_crash()`es via `ud2`, and the binary dies before
+// `main`. Sub-codes per `arch/x86/include/uapi/asm/prctl.h`:
+//
+//   ARCH_SET_GS = 0x1001    (not yet wired — return EINVAL)
+//   ARCH_SET_FS = 0x1002    (WRMSR IA32_FS_BASE)
+//   ARCH_GET_FS = 0x1003    (RDMSR + copy_to_user the u64)
+//   ARCH_GET_GS = 0x1004    (not yet wired — return EINVAL)
+//
+// SET_FS persistence across preemption: this writes the live MSR
+// only. The polling future at `user_task.rs:815` re-asserts
+// `process.fs_base` on every `Initial`-state poll, so a task that
+// gets preempted across timer ticks would have its arch_prctl-set
+// FS_BASE clobbered. For a short-lived binary (hello_musl) this
+// isn't observable; a longer-running one needs a per-task slot the
+// poll path consults — wired alongside thread support.
+
+#[cfg(target_arch = "x86_64")]
+fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
+    const ARCH_SET_GS: u64 = 0x1001;
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    const ARCH_GET_GS: u64 = 0x1004;
+    const EINVAL: i64 = 22;
+    const EFAULT: i64 = 14;
+
+    let args = *ctx.args();
+    let code = args.arg0;
+    let addr = args.arg1;
+
+    match code {
+        ARCH_SET_FS => {
+            // SAFETY: `addr` is treated as an opaque u64 the user
+            // owns — the MSR write is unconditional at CPL=0 and
+            // any canonical-vaddr invariant is the user task's
+            // responsibility (Linux behaves the same way).
+            unsafe {
+                narf_scheduler::set_user_fs_base(addr);
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        ARCH_GET_FS => {
+            // Read the live FS_BASE, copy it as a u64 to `addr`.
+            let fs_base: u64;
+            unsafe {
+                use core::arch::asm;
+                let lo: u32;
+                let hi: u32;
+                const IA32_FS_BASE: u32 = 0xC000_0100;
+                asm!(
+                    "rdmsr",
+                    in("ecx") IA32_FS_BASE,
+                    out("eax") lo,
+                    out("edx") hi,
+                    options(nostack, preserves_flags),
+                );
+                fs_base = (lo as u64) | ((hi as u64) << 32);
+            }
+            // SAFETY: copy_to_user does the SMAP bracket and
+            // bounds the write to a u64; addr is the user-supplied
+            // destination.
+            let buf = fs_base.to_le_bytes();
+            if unsafe { copy_to_user(addr, &buf) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        ARCH_SET_GS | ARCH_GET_GS => {
+            // Not yet wired; GS is reserved for the kernel
+            // per-CPU pointer via swapgs.
+            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        }
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        }
+    }
+}
+
 // ── fork(2) — duplicate-process counterpart to sys_clone ───────────
 //
 // Where sys_clone shares the parent's `Arc<AddressSpace>` so a new
@@ -11934,6 +12016,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::SetTidAddress,
             "set_tid_address",
             RawFnHandler(sys_set_tid_address),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        table.install_raw(
+            Syscall::ArchPrctl,
+            "arch_prctl",
+            RawFnHandler(sys_arch_prctl),
         );
     }
     table.install_raw(Syscall::GetUid, "getuid", RawFnHandler(sys_getuid));

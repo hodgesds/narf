@@ -1097,6 +1097,20 @@ pub enum Syscall {
     /// (POSIX: returns the calling thread's TID).
     SetTidAddress,
 
+    /// Linux arch_prctl(2) (x86_64 only — wire 158). musl's
+    /// `__init_libc` calls this near the top of process startup
+    /// to install its TLS thread pointer:
+    ///   `arch_prctl(ARCH_SET_FS, tls_self_ptr)`.
+    /// Without it musl bails via `a_crash()` and the process #UDs
+    /// before reaching `main`. Sub-codes:
+    ///   `ARCH_SET_GS = 0x1001`
+    ///   `ARCH_SET_FS = 0x1002`  ← the one musl actually emits
+    ///   `ARCH_GET_FS = 0x1003`
+    ///   `ARCH_GET_GS = 0x1004`
+    /// `arg0 = code`, `arg1 = addr` (for SET) or user-pointer to
+    /// receive the value (for GET).
+    ArchPrctl,
+
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific
     /// thread within a process group. NARF is single-threaded per
     /// process — tgkill aliases sys_kill. `arg0 = tgid` (-1 = any),
@@ -1623,6 +1637,18 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdGettime, 287),
     (Syscall::EpollWait, 232), // epoll_wait
     (Syscall::EpollCtl, 233),
+    (Syscall::ArchPrctl, 158), // arch_prctl (x86_64 only)
+    // Linux 231 = exit_group. Glibc/musl emit exit_group out of
+    // __libc_start_main's exit path; mapping it to the same
+    // handler as plain exit (60 → ExitTask) lets a real
+    // musl-static binary terminate cleanly. NARF doesn't have
+    // thread groups yet, so exit_group ≡ exit for a single-thread
+    // task; once clone(CLONE_THREAD) lands, exit_group will need
+    // to fan out to siblings — that's a follow-up.
+    // Placed AFTER (ExitTask, 60) so `Syscall::ExitTask.raw()`
+    // (which returns the first match) still resolves to 60 for
+    // in-tree callers; only `from_raw(231)` finds this row.
+    (Syscall::ExitTask, 231), // exit_group
     (Syscall::Pipe2, 293),
     (Syscall::Dup3, 292),
     (Syscall::Prlimit64, 302),
@@ -1723,6 +1749,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdSettime, 86),
     (Syscall::TimerfdGettime, 87),
     (Syscall::ExitTask, 93), // exit
+    // Linux aarch64 94 = exit_group. See x86_64 commentary above
+    // the (ExitTask, 231) row for rationale. `raw(ExitTask)` still
+    // returns 93 since this row sits after the 93 row.
+    (Syscall::ExitTask, 94), // exit_group
     (Syscall::Unshare, 97),
     // Wave-67 — Linux aarch64 setns = 268.
     (Syscall::Setns, 268),
@@ -2424,9 +2454,24 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     table.dispatch_ctx_versioned(n, version, ctx);
 }
 
-/// Legacy plain entry retained for the existing
-/// `smoke_userspace_syscall_dispatch_via_global` test and any
-/// caller that has `SyscallArgs` in hand but not a `TrapContext`.
+/// Plain entry: arch syscall-instruction asm (no IDT frame in
+/// hand, just SyscallArgs in registers) calls through here. Walks
+/// the same priority order as `kernel_syscall_entry`:
+///
+///   1. raw handler under a synthesized `ArgsOnlyCtx`
+///   2. plain handler (legacy `(args) -> SyscallReturn` shape)
+///   3. `SyscallReturn::invalid_op`
+///
+/// The raw-handler path lets `syscall`-instruction binaries reach
+/// the same per-syscall logic as `int 0x80`. The synthesized
+/// `ArgsOnlyCtx` answers `args()` + `set_return()` faithfully and
+/// returns `false` for every richer hook (`redirect_to_kernel`,
+/// `save_user_state`, `deliver_signal`, ...) — raw handlers that
+/// need those (e.g. `sys_execve`'s longjmp into the polling
+/// future) gracefully bail with `invalid_op` instead of corrupting
+/// state. Binaries that hit those handlers via the syscall
+/// instruction surface as ENOSYS until the dispatch path is
+/// upgraded to ferry a full TrapContext.
 #[inline]
 pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn {
     let n = match Syscall::from_raw(num) {
@@ -2439,7 +2484,54 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
     }
     // SAFETY: see `kernel_syscall_entry`.
     let table: &SyscallTable = unsafe { &*p };
-    table
-        .dispatch(n, args)
-        .unwrap_or_else(SyscallReturn::invalid_op)
+    let slot = match table.entries.iter().find(|e| e.number == n) {
+        Some(s) => s,
+        None => return SyscallReturn::invalid_op(),
+    };
+    if let Some(h) = slot.raw_handler.as_ref() {
+        let mut ctx = ArgsOnlyCtx::new(*args);
+        h.invoke(&mut ctx);
+        return ctx.ret;
+    }
+    if let Some(h) = slot.handler.as_ref() {
+        return h.invoke(args);
+    }
+    SyscallReturn::invalid_op()
+}
+
+/// Minimal `TrapContext` synthesised from a `SyscallArgs` for the
+/// syscall-instruction dispatch path. Implements only the two
+/// methods every handler relies on (`args` + `set_return`); the
+/// richer hooks (`redirect_to_kernel` / `save_user_state` /
+/// `deliver_signal` / `redirect_to_user`) inherit the trait's
+/// `false`/no-op defaults so handlers that need them surface a
+/// clean `invalid_op` instead of silently corrupting state.
+struct ArgsOnlyCtx {
+    args: SyscallArgs,
+    ret: SyscallReturn,
+}
+
+impl ArgsOnlyCtx {
+    #[inline]
+    fn new(args: SyscallArgs) -> Self {
+        Self {
+            args,
+            ret: SyscallReturn::invalid_op(),
+        }
+    }
+}
+
+impl TrapContext for ArgsOnlyCtx {
+    #[inline]
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    #[inline]
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.ret = ret;
+    }
+    #[inline]
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
 }
