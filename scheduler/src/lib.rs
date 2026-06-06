@@ -71,6 +71,7 @@ pub mod donation;
 pub mod policy;
 pub mod priority;
 pub mod stackful;
+pub mod steal;
 
 mod tests;
 
@@ -88,6 +89,10 @@ pub use policy::{
     SchedPolicy, Scheduler, SchedulerError, TaskHandle, TaskMeta,
 };
 pub use priority::{Priority, SchedClass, SmtSharePolicy};
+pub use steal::{
+    current_steal_strategy_name, install_steal_strategy, NumaAwareSteal, RandomSteal, Steal,
+    StealError, StealStrategy,
+};
 
 // re-export the Invoke rights marker for callers who need to type a
 // donation cap — saves one import line at every call site.
@@ -429,6 +434,12 @@ pub fn init() {
     // pre-Wave-E hardcoded behaviour byte-for-byte. Idempotent for the
     // same reason `policy::install_default_if_unset` is.
     donation::install_default_if_unset();
+    // Wave F: wire the default `NumaAwareSteal` so `try_steal_one`'s
+    // policy-driven victim-ordering and per-task allow_steal checks
+    // return the pre-Wave-F two-phase same-node-first behaviour
+    // byte-for-byte. Idempotent for the same reason the wave D/E
+    // installs are.
+    steal::install_default_if_unset();
 }
 
 /// Test-only hook: clear every ready queue without re-running
@@ -1705,11 +1716,19 @@ pub fn local_node() -> Option<u32> {
 /// Try to steal one task from another CPU's queue. Returns `true` if
 /// a slot was moved onto `cpu`'s queue.
 ///
-/// Search order: same-NUMA-node victims first (when ACPI SRAT
-/// provided topology), then cross-node victims, then a flat
-/// round-robin fallback. The same-node pass is what makes the SRAT
-/// data load-bearing — stealing a task from the same NUMA node
-/// keeps cache-warm working sets local.
+/// Victim ordering and per-task eligibility are delegated to the
+/// installed `steal::StealStrategy` (Wave F). The default
+/// `NumaAwareSteal` reproduces the pre-Wave-F two-phase
+/// same-NUMA-node-first / cross-node round-robin scan byte-for-byte;
+/// alternative strategies (e.g. `RandomSteal`) can be installed under
+/// a `Cap<Steal, Grant>`.
+///
+/// **Lock order**: snapshot the `Arc<dyn StealStrategy>` out of
+/// `steal::STEAL` first, drop that lock, then walk victims. Calling
+/// the strategy is allowed while the `READY[victim]` lock is held
+/// (for the `allow_steal` check) because the strategy is a *cloned-
+/// out* Arc — STEAL itself is not held during the queue walk, so
+/// there is no STEAL → READY[victim] inversion.
 ///
 /// No-op when `STEAL_ENABLED` is false (boot default). Callers in the
 /// idle path treat a `false` return as "nothing to do, return".
@@ -1717,61 +1736,61 @@ fn try_steal_one(cpu: usize) -> bool {
     if !STEAL_ENABLED.load(Ordering::Acquire) {
         return false;
     }
-    let max = narf_lib::percpu::MAX_CPUS;
-    let my_node = narf_acpi::cpu_node(cpu as u32);
+    let strategy = match crate::steal::snapshot() {
+        Some(s) => s,
+        // No strategy installed (pre-`init` very early boot). The
+        // idle path treats this as "no steal", same as STEAL_ENABLED
+        // being false.
+        None => return false,
+    };
 
-    // Phase 1: same-NUMA-node victims. Skipped when topology is
-    // unknown — falls through to flat round-robin.
-    if my_node.is_some() {
-        for i in 1..max {
-            let victim = (cpu + i) % max;
-            if victim == cpu {
-                continue;
-            }
-            if narf_acpi::cpu_node(victim as u32) != my_node {
-                continue;
-            }
-            if try_steal_from(victim, cpu) {
-                return true;
-            }
+    // Build the online-minus-thief set the strategy will permute.
+    let max = narf_lib::percpu::MAX_CPUS;
+    let mut online: alloc::vec::Vec<crate::affinity::CpuId> = alloc::vec::Vec::with_capacity(max);
+    for v in 0..max {
+        if v == cpu {
+            continue;
         }
+        if !narf_lib::smp::is_online(v as u32) {
+            continue;
+        }
+        online.push(crate::affinity::CpuId(v as u32));
     }
 
-    // Phase 2: cross-node victims (or every victim if topology is
-    // unknown). Round-robin starting at cpu+1.
-    for i in 1..max {
-        let victim = (cpu + i) % max;
-        if victim == cpu {
-            continue;
-        }
-        // Skip same-node victims — phase 1 already covered them.
-        if my_node.is_some() && narf_acpi::cpu_node(victim as u32) == my_node {
-            continue;
-        }
-        if try_steal_from(victim, cpu) {
+    let thief = crate::affinity::CpuId(cpu as u32);
+    let victims = strategy.order_victims(thief, &online);
+    for v in victims {
+        if try_steal_from(v.0 as usize, cpu, strategy.as_ref()) {
             return true;
         }
     }
     false
 }
 
-/// Inner helper: try to move one affinity-allowed slot from
+/// Inner helper: try to move one strategy-permitted slot from
 /// `victim`'s queue onto `cpu`'s queue. Returns `true` on success.
-fn try_steal_from(victim: usize, cpu: usize) -> bool {
+/// The `strategy` reference is the snapshot-out Arc from
+/// `try_steal_one`; it's safe to call `allow_steal` here because the
+/// STEAL slot lock is no longer held.
+fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealStrategy) -> bool {
+    let thief = crate::affinity::CpuId(cpu as u32);
     let stolen = {
         let mut g = READY[victim].lock();
         let q = match g.as_mut() {
             Some(q) => q,
             None => return false,
         };
-        // Linear scan for the first slot we're allowed to take.
-        // Stealing a pinned task to the wrong CPU would defeat
-        // the pin — respect `allowed`.
+        // Linear scan for the first slot the strategy permits. The
+        // default impl respects `affinity.allowed`; custom impls may
+        // refuse on class/priority/id.
         let pos = q.iter().position(|s| {
-            s.spec
-                .affinity
-                .allowed
-                .contains(crate::affinity::CpuId(cpu as u32))
+            let meta = crate::policy::TaskMeta {
+                id: s.id,
+                priority: s.spec.priority,
+                class: s.spec.class,
+                affinity: s.spec.affinity,
+            };
+            strategy.allow_steal(thief, &meta)
         });
         match pos {
             Some(p) => q.remove(p),
