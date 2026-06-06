@@ -515,3 +515,198 @@ fn smoke_pty_gptpeer_respects_lock() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem/pty", smoke_pty_gptpeer_respects_lock);
+
+// `DevPtmx` is the singleton FileOps that `DevDir::lookup("ptmx")`
+// returns. `sys_open` checks `is_ptmx_clone()` and, when true,
+// allocates a fresh `Pty` pair via `open_ptmx()` and installs the
+// master in the caller's fd table instead. The singleton itself is
+// never the fd's FileOps; this test pins the bit so a future refactor
+// of `DevDir::lookup` doesn't silently break musl's `open("/dev/ptmx")`.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_devptmx_is_ptmx_clone() -> TestResult {
+    use crate::devfs_pty::DevPtmx;
+    let p = DevPtmx;
+    if !p.is_ptmx_clone() {
+        return TestResult::Fail("DevPtmx::is_ptmx_clone() returned false");
+    }
+    // Fresh open via the public helper. The two indices MUST differ
+    // (clone-on-open semantics); same as `posix_openpt()` twice.
+    __reset_for_test();
+    let m1 = open_ptmx();
+    let m2 = open_ptmx();
+    if m1.index() == m2.index() {
+        return TestResult::Fail("open_ptmx() handed out duplicate index");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_devptmx_is_ptmx_clone);
+
+// TIOCGWINSZ / TIOCSWINSZ round-trip on a master fd. The window
+// state is per-pair (master + slave share one `WinSize` slot), so
+// a set via the master must be visible through the same master.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_winsize_round_trip() -> TestResult {
+    use crate::devfs_pty::{TIOCGWINSZ, TIOCSWINSZ};
+    __reset_for_test();
+    let master = open_ptmx();
+    // struct winsize { u16 row; u16 col; u16 xpix; u16 ypix; }
+    let mut set_ws: [u16; 4] = [50, 132, 800, 600];
+    let arg = set_ws.as_mut_ptr() as usize;
+    if master.ioctl(TIOCSWINSZ, arg) != Ok(0) {
+        return TestResult::Fail("TIOCSWINSZ failed");
+    }
+    let mut got_ws: [u16; 4] = [0; 4];
+    let arg2 = got_ws.as_mut_ptr() as usize;
+    if master.ioctl(TIOCGWINSZ, arg2) != Ok(0) {
+        return TestResult::Fail("TIOCGWINSZ failed");
+    }
+    if got_ws[0] != 50 || got_ws[1] != 132 {
+        return TestResult::Fail("winsize row/col did not round-trip");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_winsize_round_trip);
+
+// Master and slave share one window-size slot. A TIOCSWINSZ on the
+// master must be visible through TIOCGWINSZ on the slave (and vice
+// versa) — `stty rows N cols M` typically writes via the master fd
+// while the child reads via the slave.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_winsize_shared_master_slave() -> TestResult {
+    use crate::devfs_pty::{TIOCGWINSZ, TIOCSWINSZ};
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    // Unlock so DevPts::lookup hands the slave out.
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(crate::devfs_pty::TIOCSPTLCK, &mut zero as *mut i32 as usize);
+    let slave_arc = pts_lookup(idx).expect("slave");
+    let slave = PtySlave::new(slave_arc);
+
+    let mut set_ws: [u16; 4] = [40, 100, 0, 0];
+    let arg = set_ws.as_mut_ptr() as usize;
+    if master.ioctl(TIOCSWINSZ, arg) != Ok(0) {
+        return TestResult::Fail("master TIOCSWINSZ failed");
+    }
+    let mut got_ws: [u16; 4] = [0; 4];
+    let arg2 = got_ws.as_mut_ptr() as usize;
+    if slave.ioctl(TIOCGWINSZ, arg2) != Ok(0) {
+        return TestResult::Fail("slave TIOCGWINSZ failed");
+    }
+    if got_ws[0] != 40 || got_ws[1] != 100 {
+        return TestResult::Fail("slave did not see master's winsize");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_winsize_shared_master_slave);
+
+// FIONREAD on a master fd reports the count of slave-written bytes
+// available to read. On a slave fd, it reports master-written bytes.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_fionread_reports_ring_depth() -> TestResult {
+    use crate::devfs_pty::FIONREAD;
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(crate::devfs_pty::TIOCSPTLCK, &mut zero as *mut i32 as usize);
+    let slave_arc = pts_lookup(idx).expect("slave");
+    let slave = PtySlave::new(slave_arc);
+
+    // Slave writes 5 bytes; master FIONREAD should see 5.
+    poll_once(slave.write(0, b"hello"));
+    let mut got: i32 = 0;
+    let _ = master.ioctl(FIONREAD, &mut got as *mut i32 as usize);
+    if got != 5 {
+        return TestResult::Fail("master FIONREAD wrong count");
+    }
+
+    // Master writes 4 bytes; slave FIONREAD should see 4.
+    poll_once(master.write(0, b"hiya"));
+    let mut got2: i32 = 0;
+    let _ = slave.ioctl(FIONREAD, &mut got2 as *mut i32 as usize);
+    if got2 != 4 {
+        return TestResult::Fail("slave FIONREAD wrong count");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_fionread_reports_ring_depth);
+
+// TCGETS on master/slave must not error — musl's `isatty(3)` /
+// `tcgetattr(3)` only check for success (not the actual termios
+// fields), so returning `Ok(0)` with zeroed termios memory is
+// enough for `pty_smoke` and `script(1)`-style programs to see
+// the fd as a tty.
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_tcgets_ok_on_both_ends() -> TestResult {
+    use crate::devfs_pty::TCGETS;
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(crate::devfs_pty::TIOCSPTLCK, &mut zero as *mut i32 as usize);
+    let slave_arc = pts_lookup(idx).expect("slave");
+    let slave = PtySlave::new(slave_arc);
+
+    let mut termios = [0u8; 60];
+    if master.ioctl(TCGETS, termios.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("master TCGETS failed");
+    }
+    if slave.ioctl(TCGETS, termios.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("slave TCGETS failed");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_tcgets_ok_on_both_ends);
+
+// poll_readiness — master sees POLLIN only when the slave has
+// written bytes; slave sees POLLIN only when the master has
+// written bytes. POLLOUT is always set (the rings have a fixed
+// 4 KiB capacity but never report blocking writes in v1).
+#[cfg(feature = "linux-compat")]
+fn smoke_pty_poll_readiness_tracks_ring_depth() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(crate::devfs_pty::TIOCSPTLCK, &mut zero as *mut i32 as usize);
+    let slave_arc = pts_lookup(idx).expect("slave");
+    let slave = PtySlave::new(slave_arc);
+
+    // Empty: only POLLOUT.
+    let m_mask = master.poll_readiness();
+    let s_mask = slave.poll_readiness();
+    if (m_mask & crate::POLL_IN) != 0 {
+        return TestResult::Fail("master POLLIN set on empty ring");
+    }
+    if (s_mask & crate::POLL_IN) != 0 {
+        return TestResult::Fail("slave POLLIN set on empty ring");
+    }
+    if (m_mask & crate::POLL_OUT) == 0 || (s_mask & crate::POLL_OUT) == 0 {
+        return TestResult::Fail("POLLOUT not set");
+    }
+
+    // Slave writes → master POLLIN set; slave POLLIN still clear.
+    poll_once(slave.write(0, b"x"));
+    if (master.poll_readiness() & crate::POLL_IN) == 0 {
+        return TestResult::Fail("master POLLIN not set after slave write");
+    }
+    if (slave.poll_readiness() & crate::POLL_IN) != 0 {
+        return TestResult::Fail("slave POLLIN set after slave write (own data)");
+    }
+
+    // Master drains; master POLLIN clears again.
+    let mut buf = [0u8; 4];
+    poll_once(master.read(0, &mut buf));
+    if (master.poll_readiness() & crate::POLL_IN) != 0 {
+        return TestResult::Fail("master POLLIN still set after drain");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem/pty", smoke_pty_poll_readiness_tracks_ring_depth);

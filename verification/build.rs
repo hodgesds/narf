@@ -231,6 +231,20 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_HELLO_PTHREAD_ELF_AARCH64=/dev/null");
 
+    // Wave-PTY: PTY smoke demo source + REGEN script live in
+    // `data/musl-demo/` and document the musl-side flow
+    // (open /dev/ptmx → TIOCSPTLCK → TIOCGPTN → open /dev/pts/N →
+    // round-trip). The binary is NOT wired into the build today —
+    // musl's `open()` issues a Linux-ABI `(cstr, flags, mode)`
+    // syscall but NARF's `sys_open` still uses the legacy
+    // `(ptr, len, mnt_ptr, mnt_len, flags)` shape (mirror of the
+    // execve(2)/stat(2) cutover that already landed). Once
+    // `sys_open` is cut to Linux ABI, re-add the env line below
+    // and the corresponding seeding in `bare_main.rs` + the
+    // musl-demo case in xtask. Until then the demo lives as a
+    // documented C source so the integration story is clear.
+    println!("cargo:rerun-if-changed=data/musl-demo/pty_smoke_x86_64.c");
+
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
     // image uses). If absent on the host, point at /dev/null so

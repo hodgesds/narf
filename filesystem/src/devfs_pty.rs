@@ -70,6 +70,20 @@ pub const TIOCSPTLCK: u32 = 0x40045431;
 /// `ioctl(master_fd, TIOCGPTPEER, flags)` — open a fresh slave fd. Handled
 /// by the syscall layer because fd allocation lives in userspace::fd.
 pub const TIOCGPTPEER: u32 = 0x40045441;
+/// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
+pub const TIOCGWINSZ: u32 = 0x5413;
+/// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
+pub const TIOCSWINSZ: u32 = 0x5414;
+/// `ioctl(fd, TCGETS, &termios)` — get terminal attributes.
+pub const TCGETS: u32 = 0x5401;
+/// `ioctl(fd, TCSETS, &termios)` — set terminal attributes (immediate).
+pub const TCSETS: u32 = 0x5402;
+/// `ioctl(fd, TCSETSW, &termios)` — set terminal attributes (drain output).
+pub const TCSETSW: u32 = 0x5403;
+/// `ioctl(fd, TCSETSF, &termios)` — set terminal attributes (drain + flush).
+pub const TCSETSF: u32 = 0x5404;
+/// `ioctl(fd, FIONREAD, &i32)` — bytes immediately readable.
+pub const FIONREAD: u32 = 0x541B;
 
 // ── Ring buffer ───────────────────────────────────────────────────────────────
 
@@ -366,6 +380,50 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     Ok(())
 }
 
+/// POSIX `struct winsize` — mirrors `userspace::fd::Winsize` so the FS
+/// crate can satisfy `TIOCGWINSZ`/`TIOCSWINSZ` without depending on it.
+#[cfg(feature = "linux-compat")]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct WireWinsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+#[cfg(feature = "linux-compat")]
+unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(unsafe { core::ptr::read_unaligned(uptr as *const WireWinsize) })
+}
+
+#[cfg(feature = "linux-compat")]
+unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    unsafe { core::ptr::write_unaligned(uptr as *mut WireWinsize, v) };
+    Ok(())
+}
+
+/// Zero-fill an opaque 60-byte `struct termios` into user memory.
+/// musl's `isatty()` and similar checks only care that `tcgetattr`
+/// succeeds; the field contents aren't consulted by anything inside
+/// this kernel. Linux's `struct termios` is 60 bytes on x86_64
+/// (c_iflag/c_oflag/c_cflag/c_lflag/c_line/c_cc[19]/c_ispeed/c_ospeed).
+#[cfg(feature = "linux-compat")]
+unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let zero = [0u8; 60];
+    unsafe { core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60) };
+    Ok(())
+}
+
 // ── PtyMaster FileOps ─────────────────────────────────────────────────────────
 
 /// `/dev/ptmx` open result — the master half of a PTY pair.
@@ -475,10 +533,55 @@ impl FileOps for PtyMaster {
                 self.pty.fg_pgrp.store(pgrp as u64, Ordering::Release);
                 Ok(0)
             }
+            TIOCGWINSZ => {
+                let w = *self.pty.window.lock();
+                let ws = WireWinsize {
+                    ws_row: w.rows,
+                    ws_col: w.cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe { write_user_winsize(arg, ws)? };
+                Ok(0)
+            }
+            TIOCSWINSZ => {
+                let ws = unsafe { read_user_winsize(arg)? };
+                let mut w = self.pty.window.lock();
+                w.rows = ws.ws_row;
+                w.cols = ws.ws_col;
+                Ok(0)
+            }
+            TCGETS => {
+                unsafe { write_user_termios_zero(arg)? };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                // Accept any termios write — we don't model the full
+                // line discipline, so the caller's settings are
+                // recorded as a no-op. Linux semantics: success.
+                let _ = arg;
+                Ok(0)
+            }
+            FIONREAD => {
+                // Bytes the master can read = bytes slave has written.
+                let n = self.pty.slave_tx_to_master.len() as i32;
+                unsafe { write_user_i32(arg, n)? };
+                Ok(0)
+            }
             // TIOCGPTPEER is dispatched by sys_ioctl directly; if it
             // reaches here, fall through to Unsupported (→ -ENOTTY).
             _ => Err(FsError::Unsupported),
         }
+    }
+
+    /// POLLIN when the master's input queue (slave_tx_to_master) has
+    /// at least one byte; POLLOUT always.
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = crate::POLL_OUT;
+        if self.pty.slave_tx_to_master.len() > 0 {
+            mask |= crate::POLL_IN;
+        }
+        mask
     }
 }
 
@@ -613,8 +716,52 @@ impl FileOps for PtySlave {
                 }
                 Ok(0)
             }
+            TIOCGWINSZ => {
+                let w = *self.pty.window.lock();
+                let ws = WireWinsize {
+                    ws_row: w.rows,
+                    ws_col: w.cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe { write_user_winsize(arg, ws)? };
+                Ok(0)
+            }
+            TIOCSWINSZ => {
+                let ws = unsafe { read_user_winsize(arg)? };
+                let mut w = self.pty.window.lock();
+                w.rows = ws.ws_row;
+                w.cols = ws.ws_col;
+                Ok(0)
+            }
+            TCGETS => {
+                unsafe { write_user_termios_zero(arg)? };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                let _ = arg;
+                Ok(0)
+            }
+            FIONREAD => {
+                // Bytes the slave can read = bytes master has written.
+                let n = self.pty.master_tx_to_slave.len() as i32;
+                unsafe { write_user_i32(arg, n)? };
+                Ok(0)
+            }
             _ => Err(FsError::Unsupported),
         }
+    }
+
+    /// POLLIN when the slave's input queue (master_tx_to_slave) has
+    /// at least one byte; POLLOUT always. Mirrors the ConsoleFile
+    /// pattern but reads from the per-PTY ring instead of the global
+    /// input ring.
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = crate::POLL_OUT;
+        if self.pty.master_tx_to_slave.len() > 0 {
+            mask |= crate::POLL_IN;
+        }
+        mask
     }
 }
 
@@ -676,6 +823,14 @@ impl FileOps for DevPtmx {
             },
             mtime_cycles: 0,
         }
+    }
+
+    /// Mark this FileOps as the ptmx clone-on-open node. `sys_open`
+    /// allocates a fresh `Pty` pair via [`open_ptmx`] and installs
+    /// the master FileOps in the caller's fd table instead of this
+    /// singleton. Linux: `drivers/tty/pty.c::ptmx_open`.
+    fn is_ptmx_clone(&self) -> bool {
+        true
     }
 }
 

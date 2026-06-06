@@ -728,6 +728,18 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // PTY clone-on-open: `/dev/ptmx` is a singleton FileOps that exists
+    // only to be a lookup target; each `open()` allocates a fresh `Pty`
+    // pair via `open_ptmx()` and installs the master here. Linux:
+    // `drivers/tty/pty.c::ptmx_open`. The `is_ptmx_clone()` trait hook
+    // keeps the filesystem crate free of any fd-table awareness.
+    let ops = if ops.is_ptmx_clone() {
+        let master = narf_filesystem::devfs_pty::open_ptmx();
+        master as Arc<dyn narf_filesystem::FileOps>
+    } else {
+        ops
+    };
+
     let new_fd = match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops,

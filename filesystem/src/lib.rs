@@ -401,6 +401,15 @@ pub trait FileOps: Send + Sync {
     fn as_pty_master_index(&self) -> Option<u32> {
         None
     }
+
+    /// PTY-layer: true on the `/dev/ptmx` clone-on-open file. When
+    /// `sys_open` sees this it allocates a fresh `Pty` pair and
+    /// installs the master in the caller's fd table instead of the
+    /// singleton FileOps that DevDir::lookup returned. Linux calls
+    /// the equivalent path `ptmx_open` in `drivers/tty/pty.c`.
+    fn is_ptmx_clone(&self) -> bool {
+        false
+    }
 }
 
 // ── POSIX poll(2) event bits ────────────────────────────────────
