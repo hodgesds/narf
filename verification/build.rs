@@ -204,6 +204,73 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_HELLO_MUSL_ELF_AARCH64=/dev/null");
 
+    // Wave-78 follow-up 3: dynamic-linked musl demo binary + the
+    // ld-musl interpreter it depends on. The binary's PT_INTERP
+    // points at `/lib/ld-musl-x86_64.so.1`; NARF stages ld-musl
+    // into a kernel-side MemFs mounted at /lib so the loader's
+    // VFS-backed PT_INTERP lookup (Wave-75) resolves at exec
+    // time.
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_musl_dyn_x86_64.c");
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_musl_dyn_x86_64");
+    let hello_musl_dyn = manifest_dir.join("data/musl-demo/hello_musl_dyn_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_HELLO_MUSL_DYN_ELF_X86_64={}",
+        hello_musl_dyn.display()
+    );
+    println!("cargo:rustc-env=NARF_HELLO_MUSL_DYN_ELF_AARCH64=/dev/null");
+
+    // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
+    // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
+    // image uses). If absent on the host, point at /dev/null so
+    // include_bytes!() resolves to an empty slice — the consumer
+    // skips the /lib mount when the slice is empty.
+    println!("cargo:rerun-if-env-changed=LDMUSL_PATH");
+    // Try `$LDMUSL_PATH` first, then a list of common distro
+    // locations. Arch puts the dynamic linker at `/lib/ld-musl-*.so.1`;
+    // Ubuntu's `musl-tools` package ships the same file at
+    // `/usr/lib/x86_64-linux-musl/libc.so` (libc.so IS the dynamic
+    // linker for musl) and at `/lib/x86_64-linux-musl/libc.so.1`. The
+    // first path that canonicalises wins; we fall back to /dev/null
+    // (empty NARF_LD_MUSL slice → /lib mount skipped → dyn binaries
+    // fail to exec).
+    let ld_musl_candidates: Vec<String> = {
+        let mut v = Vec::new();
+        if let Ok(env_path) = env::var("LDMUSL_PATH") {
+            v.push(env_path);
+        }
+        v.extend(
+            [
+                "/lib/ld-musl-x86_64.so.1",
+                "/usr/lib/ld-musl-x86_64.so.1",
+                "/usr/lib/x86_64-linux-musl/libc.so",
+                "/lib/x86_64-linux-musl/libc.so.1",
+                "/lib/x86_64-linux-musl/libc.so",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        v
+    };
+    let (ld_musl_canonical, ld_musl_source) = ld_musl_candidates
+        .iter()
+        .find_map(|p| {
+            std::fs::canonicalize(p)
+                .ok()
+                .map(|c| (c.display().to_string(), p.clone()))
+        })
+        .unwrap_or_else(|| ("/dev/null".into(), "/dev/null".into()));
+    let ld_musl_path = ld_musl_source;
+    println!(
+        "cargo:rerun-if-changed={}",
+        if ld_musl_canonical == "/dev/null" {
+            ld_musl_path.as_str()
+        } else {
+            ld_musl_canonical.as_str()
+        }
+    );
+    println!("cargo:rustc-env=NARF_LD_MUSL_X86_64={}", ld_musl_canonical);
+    println!("cargo:rustc-env=NARF_LD_MUSL_AARCH64=/dev/null");
+
     let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
     if libc_validate_enabled {
         let validate_dir = workspace.join("narf-libc").join("validate");

@@ -3661,6 +3661,33 @@ pub const NARF_HELLO_MUSL_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_MUSL_ELF_
 ))]
 pub const NARF_HELLO_MUSL_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_MUSL_ELF_AARCH64"));
 
+// Wave-78 follow-up 3: dynamic-linked musl binary + the ld-musl
+// interpreter it depends on. Seeded at /bin/hello_musl_dyn and
+// /lib/ld-musl-x86_64.so.1. PT_INTERP resolution in
+// `userspace::process::load_user_process_with` reads the FS path
+// at exec time and loads ld-musl at INTERP_BIAS = 0x4000_0000_0000.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_HELLO_MUSL_DYN_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_MUSL_DYN_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_HELLO_MUSL_DYN_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_MUSL_DYN_ELF_AARCH64"));
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_LD_MUSL: &[u8] = include_bytes!(env!("NARF_LD_MUSL_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_LD_MUSL: &[u8] = include_bytes!(env!("NARF_LD_MUSL_AARCH64"));
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
 fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Load the real Rust no_std binary `narf-testbin` into a fresh

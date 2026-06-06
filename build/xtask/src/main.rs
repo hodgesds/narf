@@ -1314,7 +1314,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
     // args. The boot itself is the slow part (~30-60s on CI); each
     // invocation re-builds nothing because Cargo's incremental build
     // is warm after the first.
-    let cases: &[(&str, &str)] = &[("hello", "hello"), ("hello_musl", "hello from musl")];
+    let cases: &[(&str, &str)] = &[
+        ("hello", "hello"),
+        ("hello_musl", "hello from musl"),
+        ("hello_musl_dyn", "hello from musl dyn"),
+    ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);
         run_interactive_cmd(&RunInteractiveArgs {
@@ -1602,6 +1606,33 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
             }
             Ok(Ev::Prompt) => {}
             Ok(Ev::Eof) => {
+                // QEMU stdout closed. Before treating it as a hard
+                // failure, sweep the captured buffer one more time
+                // for the expect needle — the kernel might have
+                // printed the expected output AND then halted/exited
+                // (e.g. clean Wave-78+3 dynamic-musl exit through
+                // `exit_group` racing with the reader loop). If the
+                // needle's there with a terminator, count it as
+                // success.
+                if let Ok(g) = captured.lock() {
+                    if g.len() > pre_type_pos {
+                        let tail = &g[pre_type_pos..];
+                        let mut idx = 0usize;
+                        while idx + needle.len() < tail.len() {
+                            if &tail[idx..idx + needle.len()] == needle.as_slice() {
+                                let next = tail[idx + needle.len()];
+                                if next == b'\r' || next == b'\n' {
+                                    got_echo = true;
+                                    break;
+                                }
+                            }
+                            idx += 1;
+                        }
+                    }
+                }
+                if got_echo {
+                    break;
+                }
                 let _ = child.wait();
                 let _ = reader_handle.join();
                 bail!("xtask run-interactive: QEMU stdout EOF before echo reply");

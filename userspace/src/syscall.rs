@@ -1975,7 +1975,18 @@ pub struct SyscallArgs {
 /// - `3` = CancelRequested
 /// - `4` = CapRevoked
 /// ... (see `abi::NarfStatus`).
+///
+/// `#[repr(C)]` is load-bearing: the x86_64 syscall-instruction
+/// asm in `frame/src/x86_64/syscall.rs` returns this 16-byte
+/// struct via the SysV C-ABI (status in rax low 32 bits, value
+/// in rdx), then `xchg rax, rdx` so the user sees rax = value.
+/// Default Rust layout is free to reorder fields; if `value`
+/// landed at offset 0 (the natural choice given alignment), the
+/// xchg would swap value INTO rdx and leave rax = status_word —
+/// every syscall return value would come back to user as 0
+/// (OK), silently losing the actual return.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct SyscallReturn {
     pub status: u32,
     pub value: u64,

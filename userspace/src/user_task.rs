@@ -101,6 +101,17 @@ pub struct UserTaskCtx {
     /// Reset to null on consumption.
     pub pending_exec: AtomicPtr<ExecRequest>,
 
+    /// Set by `sys_arch_prctl(ARCH_SET_FS, value)` — the user-side
+    /// FS_BASE override that should survive across preemption.
+    /// The polling future restores FS_BASE on every poll from
+    /// `process.fs_base`; without this override, an arch_prctl
+    /// call would only stick until the first timer-driven trap +
+    /// re-poll, then revert to NARF's synthetic-TLS FS_BASE and
+    /// musl's TCB pointer reads would land on stale memory and
+    /// SIGSEGV. `u64::MAX` sentinel = unset (real fs_base could
+    /// legitimately be 0).
+    pub pending_fs_base: AtomicU64,
+
     // ── wait4 cooperative parking ───────────────────────────────────
     //
     // When `sys_wait4` needs to block (no child has exited yet and
@@ -152,6 +163,7 @@ impl UserTaskCtx {
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
+            pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
             wait_child_want_pid: AtomicI64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
@@ -812,11 +824,23 @@ impl core::future::Future for UserTaskFuture {
         // PT_TLS (`fs_base = None`), in which case the previous
         // task's FS base is left in place; the user code wouldn't
         // dereference `fs:` if its image declared no TLS.
-        if let Some(fs_base) = this.process.fs_base {
+        // arch_prctl-set override takes precedence over the
+        // load-time process.fs_base. Without this, a user-mode
+        // `arch_prctl(ARCH_SET_FS, ...)` would only stick until
+        // the next preempting trap re-entered the poll body —
+        // ld-musl, which does ARCH_SET_FS early in
+        // `__init_libc`, would then read a stale FS_BASE and
+        // SIGSEGV on the next TCB-pointer access.
+        let override_fs = this.ctx.pending_fs_base.load(Ordering::Acquire);
+        let effective_fs = if override_fs != u64::MAX {
+            Some(override_fs)
+        } else {
+            this.process.fs_base
+        };
+        if let Some(fs_base) = effective_fs {
             // SAFETY: writing IA32_FS_BASE is unconditional at
             // CPL=0 long-mode; `fs_base` is a canonical user vaddr
-            // (came from `stage_tls` which mapped a region in the
-            // low-half user range).
+            // (came from `stage_tls` or arch_prctl).
             unsafe {
                 narf_scheduler::set_user_fs_base(fs_base);
             }

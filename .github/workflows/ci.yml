@@ -76,6 +76,10 @@ jobs:
   musl-demo:
     name: musl-demo (x86_64)
     runs-on: ubuntu-latest
+    # Generous job-level timeout: a cold-cache cargo build of the
+    # kernel + verification crates takes ~10-15 min on GHA's free
+    # runners, plus two TCG QEMU boots at ~30-60s each.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -93,7 +97,8 @@ jobs:
             mtools \
             dosfstools \
             e2fsprogs \
-            ovmf
+            ovmf \
+            musl-tools
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4
@@ -111,13 +116,30 @@ jobs:
           key: target-${{ runner.os }}-x86_64-musl-demo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
           restore-keys: target-${{ runner.os }}-x86_64-
 
-      # Boots QEMU twice — once to assert `/bin/hello` (hand-rolled
-      # int 0x80 asm) prints `hello`, once to assert `/bin/hello_musl`
-      # (real musl-static) prints `hello from musl`. Regressions in
-      # the loader (unaligned PT_LOAD), ABI dispatch (syscall
-      # instruction → raw handler), arch_prctl wiring, or CR4.OSFXSR
-      # init all surface here.
+      # Boots QEMU three times — `/bin/hello` (hand-rolled int 0x80
+      # asm) prints `hello`, `/bin/hello_musl` (real musl-static)
+      # prints `hello from musl`, `/bin/hello_musl_dyn` (real musl-
+      # dynamic via PT_INTERP → ld-musl) prints `hello from musl dyn`.
+      # Regressions in the loader (unaligned PT_LOAD), ABI dispatch
+      # (syscall instruction → raw handler), arch_prctl wiring,
+      # CR4.OSFXSR, SyscallReturn struct layout, brk shrink-bound,
+      # AT_PHDR/PhEnt/PhNum auxv, or apply_relocations PT_INTERP
+      # gating all surface here.
+      #
+      # `musl-tools` (apt) supplies ld-musl-x86_64.so.1 (as
+      # `/usr/lib/x86_64-linux-musl/libc.so` — verification/build.rs
+      # walks a candidate list including Ubuntu's path). Without it
+      # `NARF_LD_MUSL` is empty, the kernel skips the /lib mount, and
+      # `hello_musl_dyn` fails to exec.
+      #
+      # GHA's TCG QEMU is ~5-10x slower than KVM-accelerated local
+      # runs; bump the per-boot prompt/echo timeouts so a slow cold
+      # boot under load doesn't fail the smoke. Local fast runs use
+      # the un-bumped defaults (60s prompt / 30s echo).
       - name: cargo xtask musl-demo
+        env:
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
+          XTASK_RI_ECHO_TIMEOUT_SECS: "900"
         run: cargo xtask musl-demo --arch=x86_64
 
   feature-matrix:
