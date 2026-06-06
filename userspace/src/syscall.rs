@@ -1623,6 +1623,17 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdGettime, 287),
     (Syscall::EpollWait, 232), // epoll_wait
     (Syscall::EpollCtl, 233),
+    // Linux 231 = exit_group. Glibc/musl emit exit_group out of
+    // __libc_start_main's exit path; mapping it to the same
+    // handler as plain exit (60 → ExitTask) lets a real
+    // musl-static binary terminate cleanly. NARF doesn't have
+    // thread groups yet, so exit_group ≡ exit for a single-thread
+    // task; once clone(CLONE_THREAD) lands, exit_group will need
+    // to fan out to siblings — that's a follow-up.
+    // Placed AFTER (ExitTask, 60) so `Syscall::ExitTask.raw()`
+    // (which returns the first match) still resolves to 60 for
+    // in-tree callers; only `from_raw(231)` finds this row.
+    (Syscall::ExitTask, 231), // exit_group
     (Syscall::Pipe2, 293),
     (Syscall::Dup3, 292),
     (Syscall::Prlimit64, 302),
@@ -1723,6 +1734,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdSettime, 86),
     (Syscall::TimerfdGettime, 87),
     (Syscall::ExitTask, 93), // exit
+    // Linux aarch64 94 = exit_group. See x86_64 commentary above
+    // the (ExitTask, 231) row for rationale. `raw(ExitTask)` still
+    // returns 93 since this row sits after the 93 row.
+    (Syscall::ExitTask, 94), // exit_group
     (Syscall::Unshare, 97),
     // Wave-67 — Linux aarch64 setns = 268.
     (Syscall::Setns, 268),
