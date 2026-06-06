@@ -6619,19 +6619,15 @@ fn sys_sethostname(ctx: &mut dyn TrapContext) {
 // per Linux. Total 390 bytes. NARF cap matches Linux __NEW_UTS_LEN=64
 // plus the trailing NUL byte → 65.
 
-#[cfg(feature = "container")]
 const UTSNAME_FIELD_LEN: usize = 65;
-#[cfg(feature = "container")]
 const UTSNAME_STRUCT_LEN: usize = UTSNAME_FIELD_LEN * 6;
 
-#[cfg(feature = "container")]
 fn pack_utsname_field(dst: &mut [u8], src: &str) {
     let n = core::cmp::min(src.len(), UTSNAME_FIELD_LEN - 1);
     dst[..n].copy_from_slice(&src.as_bytes()[..n]);
     // remaining bytes already zeroed by caller
 }
 
-#[cfg(feature = "container")]
 fn sys_uname(ctx: &mut dyn TrapContext) {
     let buf = ctx.args().arg0 as u64;
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -6639,10 +6635,19 @@ fn sys_uname(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let task = current_task_id();
-    let ns = crate::namespaces::current_uts_ns(task);
-    let hostname = ns.hostname();
-    let domainname = ns.domainname();
+    // Per-task UTS namespace lives behind the `container` feature.
+    // Without it the hostname / domainname are flat global strings.
+    #[cfg(feature = "container")]
+    let (hostname, domainname) = {
+        let task = current_task_id();
+        let ns = crate::namespaces::current_uts_ns(task);
+        (ns.hostname(), ns.domainname())
+    };
+    #[cfg(not(feature = "container"))]
+    let (hostname, domainname): (alloc::string::String, alloc::string::String) = (
+        alloc::string::String::from("narf"),
+        alloc::string::String::new(),
+    );
     let mut kbuf = alloc::vec![0u8; UTSNAME_STRUCT_LEN];
     let mut off = 0usize;
     // sysname / nodename / release / version / machine / domainname.
@@ -12067,9 +12072,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "sethostname",
         RawFnHandler(sys_sethostname),
     );
+    // POSIX uname(2) — always present. Reads the UTS struct only;
+    // doesn't depend on per-task UTS-namespace infrastructure.
+    table.install_raw(Syscall::Uname, "uname", RawFnHandler(sys_uname));
     #[cfg(feature = "container")]
     {
-        table.install_raw(Syscall::Uname, "uname", RawFnHandler(sys_uname));
         table.install_raw(
             Syscall::Setdomainname,
             "setdomainname",

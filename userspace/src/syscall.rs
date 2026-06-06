@@ -1663,9 +1663,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::InitModule, 175),
     (Syscall::DeleteModule, 176),
     (Syscall::FinitModule, 313),
-    // Wave-72 — UTS/IPC syscalls (gated `container`).
-    #[cfg(feature = "container")]
+    // POSIX uname(2) — always present. UTS-namespace mutation
+    // (sethostname / setdomainname) is gated `container` because
+    // it requires the per-task NS infrastructure; reading the
+    // uts struct works on every NARF build.
     (Syscall::Uname, 63),
+    // Wave-72 — UTS-mutating syscalls (gated `container`).
     #[cfg(feature = "container")]
     (Syscall::Setdomainname, 171),
     #[cfg(feature = "container")]
