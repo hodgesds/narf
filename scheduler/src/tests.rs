@@ -2030,3 +2030,83 @@ fn smoke_pluggable_donation_policy() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("scheduler", smoke_pluggable_donation_policy);
+
+fn smoke_pluggable_steal_strategy() -> TestResult {
+    // Wave F: validate the `StealStrategy` seam.
+    //
+    // 1) Default install ("numa-aware") is wired by `init()`.
+    // 2) Installing `RandomSteal` flips `current_steal_strategy_name`
+    //    to "random".
+    // 3) Trait-call witness: invoking `order_victims` on the installed
+    //    strategy returns a permutation of `online`, and across two
+    //    calls produces a non-strict-NUMA ordering at least once.
+    //    Work-stealing is opt-in and requires a multi-CPU executor,
+    //    so a full end-to-end migration witness is left to the SMP
+    //    bring-up smokes; trait-call witness is sufficient here.
+    // 4) Reinstall `NumaAwareSteal` for hygiene.
+    use crate::{
+        affinity::CpuId, current_steal_strategy_name, install_steal_strategy, NumaAwareSteal,
+        RandomSteal, Steal, StealStrategy,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    if current_steal_strategy_name() != Some("numa-aware") {
+        return TestResult::Fail("default steal strategy is not 'numa-aware'");
+    }
+
+    let cap: Cap<Steal, Grant> = Cap::bootstrap();
+
+    // ── Round 1: install RandomSteal ─────────────────────────
+    if install_steal_strategy(&cap, RandomSteal::new()).is_err() {
+        return TestResult::Fail("install_steal_strategy(Random) failed");
+    }
+    if current_steal_strategy_name() != Some("random") {
+        let _ = install_steal_strategy(&cap, NumaAwareSteal);
+        return TestResult::Fail("current_steal_strategy_name did not reflect Random install");
+    }
+
+    // ── Trait-call witness on RandomSteal ────────────────────
+    // Drive `order_victims` directly so the test doesn't depend on a
+    // multi-CPU executor. The permutation must contain every input
+    // and at least one of two trials should differ from the strict
+    // ascending order [1, 2, 3, 4, 5] (which is what NumaAwareSteal
+    // would produce when topology is unknown / single-node).
+    let strategy = RandomSteal::new();
+    let online = [CpuId(1), CpuId(2), CpuId(3), CpuId(4), CpuId(5)];
+    let a = strategy.order_victims(CpuId(0), &online);
+    let b = strategy.order_victims(CpuId(0), &online);
+    let a_is_perm = a.len() == online.len() && online.iter().all(|c| a.contains(c));
+    let b_is_perm = b.len() == online.len() && online.iter().all(|c| b.contains(c));
+    let strict = [CpuId(1), CpuId(2), CpuId(3), CpuId(4), CpuId(5)];
+    let non_strict_at_least_once = a.as_slice() != strict || b.as_slice() != strict;
+
+    // ── NumaAwareSteal: same input must be deterministic ─────
+    let numa = NumaAwareSteal;
+    let n1 = numa.order_victims(CpuId(0), &online);
+    let n2 = numa.order_victims(CpuId(0), &online);
+    let numa_deterministic = n1 == n2;
+    let numa_is_perm = n1.len() == online.len() && online.iter().all(|c| n1.contains(c));
+
+    // ── Hygiene: restore default ─────────────────────────────
+    if install_steal_strategy(&cap, NumaAwareSteal).is_err() {
+        return TestResult::Fail("re-install_steal_strategy(NumaAware) failed");
+    }
+    if current_steal_strategy_name() != Some("numa-aware") {
+        return TestResult::Fail("steal strategy did not revert to numa-aware");
+    }
+
+    if !a_is_perm || !b_is_perm {
+        return TestResult::Fail("RandomSteal::order_victims did not return a permutation");
+    }
+    if !non_strict_at_least_once {
+        return TestResult::Fail("RandomSteal produced strict NUMA ordering on both trials");
+    }
+    if !numa_deterministic {
+        return TestResult::Fail("NumaAwareSteal::order_victims was non-deterministic");
+    }
+    if !numa_is_perm {
+        return TestResult::Fail("NumaAwareSteal::order_victims did not return a permutation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_pluggable_steal_strategy);
