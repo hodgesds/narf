@@ -745,6 +745,53 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
 
+/// Linux ABI variant of `open(2)`: `int open(const char *pathname,
+/// int flags, mode_t mode)`. Forwards to [`sys_open`] after
+/// measuring the path length via [`copy_user_cstr`] (musl's open
+/// call passes flags in arg1, not the NARF-native path_len).
+fn sys_open_linux(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_uptr = args.arg0;
+    let flags = args.arg1;
+    let _mode = args.arg2;
+    let fail = SyscallReturn::ok(!0u64);
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args: SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.inner.set_return(r);
+        }
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: flags,
+        arg5: 0,
+    };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_open(&mut proxy);
+}
+
 // ── Write — arg0=fd, arg1=buf, arg2=len ────────────────────────────
 //
 // fd 1 / fd 2: console (stdout/stderr) — direct path so user code
@@ -1837,10 +1884,18 @@ const AT_REMOVEDIR: u64 = 0x200;
 
 fn sys_unlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int unlinkat(int dirfd, const char *pathname,
+    // int flags)`. arg2 is flags, not path_len.
     let _dirfd = args.arg0;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2;
-    let flags = args.arg3;
+    let path_uptr = args.arg1;
+    let flags = args.arg2;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -1857,8 +1912,8 @@ fn sys_unlinkat(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr,
-        arg1: path_len,
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
         arg2: 0,
         arg3: 0,
         arg4: 0,
@@ -1877,10 +1932,18 @@ fn sys_unlinkat(ctx: &mut dyn TrapContext) {
 
 fn sys_mkdirat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int mkdirat(int dirfd, const char *pathname,
+    // mode_t mode)`. arg2 is mode, not path_len.
     let _dirfd = args.arg0;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2;
-    let mode = args.arg3;
+    let path_uptr = args.arg1;
+    let mode = args.arg2;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -1897,8 +1960,8 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr,
-        arg1: path_len,
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
         arg2: mode,
         arg3: 0,
         arg4: 0,
@@ -1914,11 +1977,25 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
 fn sys_renameat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _old_dirfd = args.arg0;
-    let old_ptr = args.arg1;
-    let old_len = args.arg2;
-    let _new_dirfd = args.arg3;
-    let new_ptr = args.arg4;
-    let new_len = args.arg5;
+    // Linux ABI: `int renameat(int olddirfd, const char *oldpath,
+    // int newdirfd, const char *newpath)`. Two cstrs, no lengths.
+    let old_uptr = args.arg1;
+    let _new_dirfd = args.arg2;
+    let new_uptr = args.arg3;
+    let old_str = match copy_user_cstr(old_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    let new_str = match copy_user_cstr(new_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -1935,10 +2012,10 @@ fn sys_renameat(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: old_ptr,
-        arg1: old_len,
-        arg2: new_ptr,
-        arg3: new_len,
+        arg0: old_uptr,
+        arg1: old_str.len() as u64,
+        arg2: new_uptr,
+        arg3: new_str.len() as u64,
         arg4: 0,
         arg5: 0,
     };
@@ -1995,11 +2072,19 @@ fn sys_symlinkat(ctx: &mut dyn TrapContext) {
 
 fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `ssize_t readlinkat(int dirfd, const char *path,
+    // char *buf, size_t bufsiz)`.
     let _dirfd = args.arg0;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2;
-    let buf_ptr = args.arg3;
-    let buf_len = args.arg4;
+    let path_uptr = args.arg1;
+    let buf_ptr = args.arg2;
+    let buf_len = args.arg3;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -2016,8 +2101,8 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr,
-        arg1: path_len,
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
         arg2: buf_ptr,
         arg3: buf_len,
         arg4: 0,
@@ -2041,8 +2126,23 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
 
 fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let path_ptr = args.arg0;
-    let path_len = args.arg1;
+    // Linux ABI for the three legacy entries:
+    //   access(path, mode)      — arg1 = mode
+    //   chmod(path, mode)       — arg1 = mode
+    //   chown(path, uid, gid)   — arg1 = uid, arg2 = gid
+    // All take an absolute path as a NUL-terminated cstr; the body
+    // forwards to `sys_fchmodat_or_fchownat` which only enforces
+    // the structural "path must be absolute" contract — we drop
+    // the mode/uid/gid in the proxy so the underlying path-len
+    // shape lines up.
+    let path_uptr = args.arg0;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -2060,8 +2160,8 @@ fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
     }
     let proxy_args = SyscallArgs {
         arg0: 0, // dirfd = AT_FDCWD (ignored anyway).
-        arg1: path_ptr,
-        arg2: path_len,
+        arg1: path_uptr,
+        arg2: path_str.len() as u64,
         arg3: 0,
         arg4: 0,
         arg5: 0,
@@ -2082,11 +2182,20 @@ fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
 
 fn sys_newfstatat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int fstatat(int dirfd, const char *pathname,
+    // struct stat *statbuf, int flags)`. arg2 is statbuf, not
+    // path_len.
     let _dirfd = args.arg0;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2;
-    let stat_out = args.arg3;
-    let _flags = args.arg4;
+    let path_uptr = args.arg1;
+    let stat_out = args.arg2;
+    let _flags = args.arg3;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -2103,8 +2212,8 @@ fn sys_newfstatat(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr,
-        arg1: path_len,
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
         arg2: stat_out,
         arg3: 0,
         arg4: 0,
@@ -2303,19 +2412,33 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     let path_owned = apply_chroot(&raw);
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
-    let ops = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
-            narf_filesystem::resolve(fs.root(), rel).ok()
-        })
-        .flatten();
-    let ops = match ops {
-        Some(o) => o,
+    // `resolve_absolute` splits an absolute path into (mount, rel).
+    // For a path that IS the mount point itself (`/bin`, `/dev`,
+    // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
+    // InvalidPath. busybox `ls /bin` lands here, so synthesise a
+    // directory-shaped stat for the mount root.
+    let stat = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        if rel.is_empty() {
+            Some(narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::DIR_RW,
+                mtime_cycles: 0,
+            })
+        } else {
+            narf_filesystem::resolve(fs.root(), rel)
+                .ok()
+                .map(|ops| ops.stat())
+        }
+    });
+    let s = match stat.flatten() {
+        Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let out = linux_stat_from_fs(ops.stat());
+    let out = linux_stat_from_fs(s);
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &out as *const linux_compat::Stat as *const u8,
@@ -2366,11 +2489,15 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
 #[cfg(feature = "linux-compat")]
 fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int fstatat(int dirfd, const char *pathname,
+    // struct stat *statbuf, int flags)`. The body forwards to
+    // `sys_stat_linux` which now expects (path_cstr_ptr,
+    // statbuf_ptr) — same 2-arg shape, so the proxy is a
+    // straight slot-rename.
     let _dirfd = args.arg0;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2;
-    let stat_out = args.arg3;
-    let _flags = args.arg4;
+    let path_uptr = args.arg1;
+    let stat_out = args.arg2;
+    let _flags = args.arg3;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -2389,9 +2516,9 @@ fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
     let mut proxy = Reshape {
         inner: ctx,
         args: SyscallArgs {
-            arg0: path_ptr,
-            arg1: path_len,
-            arg2: stat_out,
+            arg0: path_uptr,
+            arg1: stat_out,
+            arg2: 0,
             arg3: 0,
             arg4: 0,
             arg5: 0,
@@ -2404,12 +2531,16 @@ fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
 fn sys_statx(ctx: &mut dyn TrapContext) {
     use linux_compat::*;
     let args = *ctx.args();
+    // Linux ABI: `int statx(int dirfd, const char *path, int flags,
+    // unsigned int mask, struct statx *buf)`. arg2/3/4/5 shift left
+    // by one slot now that arg2 is `flags` (not the old NARF-native
+    // `path_len`).
     let dirfd = args.arg0 as i32;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2 as usize;
-    let flags = args.arg3 as u32;
-    let mask = args.arg4 as u32;
-    let out_ptr = args.arg5 as *mut Statx;
+    let path_uptr = args.arg1;
+    let flags = args.arg2 as u32;
+    let mask = args.arg3 as u32;
+    let out_ptr = args.arg4 as *mut Statx;
+    let _ = mask;
 
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
@@ -2417,8 +2548,13 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // AT_EMPTY_PATH + path_len == 0 → operate on dirfd directly.
-    let empty = (flags & AT_EMPTY_PATH) != 0 && path_len == 0;
+    // AT_EMPTY_PATH + empty path string → operate on dirfd directly.
+    // We can detect "empty path" cheaply by reading just the first
+    // byte; if it's NUL, no need to call copy_user_cstr.
+    let mut first = [0u8; 1];
+    let empty = (flags & AT_EMPTY_PATH) != 0
+        && unsafe { copy_from_user(&mut first, path_uptr) }.is_ok()
+        && first[0] == 0;
 
     // Resolve to a FileOps. Three cases:
     //   1. empty + dirfd >= 0       → look up fd
@@ -2436,13 +2572,14 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.stat())).flatten()
     } else {
-        let path_owned = match copy_user_path(path_ptr, path_len) {
+        let raw = match copy_user_cstr(path_uptr, 4096) {
             Some(s) => s,
             None => {
                 ctx.set_return(fail);
                 return;
             }
         };
+        let path_owned = apply_chroot(&raw);
         if !path_owned.starts_with('/') {
             // NARF has no per-task cwd; only absolute paths resolve.
             ctx.set_return(fail);
@@ -2538,15 +2675,26 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
 
 fn sys_openat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `int openat(int dirfd, const char *pathname,
+    // int flags, mode_t mode)`. Two-arg path-as-cstr.
+    // (Previously arg2 was a NARF-native path_len, which made
+    // musl's `openat(AT_FDCWD, "...", O_RDONLY, 0)` hit our
+    // handler with arg2 = O_RDONLY = 0 → zero-length path →
+    // EINVAL on every open. See [[project_narf_native_vs_linux_abis]].)
     let _dirfd = args.arg0;
-    let path_ptr = args.arg1;
-    let path_len = args.arg2;
-    let flags = args.arg3;
-    let _mode = args.arg4;
-    // Reshape into a SYS_OPEN-compatible context: arg0 = path_ptr,
-    // arg1 = path_len, arg2 = 0 (mount_ptr), arg3 = 0 (mount_len),
-    // arg4 = flags. We can't construct a fresh TrapContext here —
-    // we wrap in an inline struct that proxies the args.
+    let path_uptr = args.arg1;
+    let flags = args.arg2;
+    let _mode = args.arg3;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
+    };
+    // Reshape into a sys_open call: (path_ptr, path_len, mount_ptr,
+    // mount_len, flags). sys_open re-reads the path from the
+    // original user pointer with our measured length.
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -2563,8 +2711,8 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
         }
     }
     let proxy_args = SyscallArgs {
-        arg0: path_ptr,
-        arg1: path_len,
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
         arg2: 0,
         arg3: 0,
         arg4: flags,
@@ -3026,22 +3174,25 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
 
 fn sys_readlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux ABI: `ssize_t readlink(const char *pathname, char *buf,
+    // size_t bufsiz)`. arg1 is buf, arg2 is bufsiz. The previous
+    // NARF-native shape used arg1 as path_len.
     let path_ptr = args.arg0 as u64;
-    let path_len = args.arg1 as usize;
-    let buf_ptr = args.arg2 as *mut u8;
-    let buf_len = args.arg3 as usize;
+    let buf_ptr = args.arg1 as *mut u8;
+    let buf_len = args.arg2 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf_ptr.is_null() || buf_len == 0 {
         ctx.set_return(fail);
         return;
     }
-    let path = match copy_user_path(path_ptr, path_len) {
+    let raw = match copy_user_cstr(path_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
+    let path = apply_chroot(&raw);
     // resolve_parent_absolute returns Option<Option<Arc<dyn FileOps>>>:
     // outer None = no mount covers the path, inner None = parent walk
     // hit a missing component or the leaf is absent. Flatten both
@@ -12431,6 +12582,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat_linux));
         table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat_linux));
         table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat_linux));
+        table.install_raw(Syscall::OpenFile, "open", RawFnHandler(sys_open_linux));
     }
     table.install_raw(Syscall::Pipe, "pipe", RawFnHandler(sys_pipe));
     table.install_raw(Syscall::Ftruncate, "ftruncate", RawFnHandler(sys_ftruncate));
