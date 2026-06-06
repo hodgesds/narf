@@ -192,10 +192,27 @@ pub unsafe fn load_elf_into_at(
         return Err(LoadBytesError::Load(LoadError::BadEntry));
     }
 
+    // Per-segment page count, accounting for an in-page vaddr
+    // offset. A PT_LOAD whose biased vaddr isn't 4 KiB-aligned
+    // (musl's RW data segment merges .init_array/.got/.data/.bss
+    // and lands at the same in-page offset as the file image —
+    // 0xf78 in the canonical layout) needs the rounding handled
+    // here, otherwise `(mem_size+0xFFF)>>12` undercounts and
+    // `map_region` rejects the misaligned base with
+    // `AlignmentMismatch`.
+    let page_counts: alloc::vec::Vec<usize> = image
+        .segments
+        .iter()
+        .map(|seg| {
+            let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
+            let in_page = (vaddr & 0xFFF) as usize;
+            ((in_page + seg.mem_size as usize + 0xFFF) >> 12).max(1)
+        })
+        .collect();
+
     // Allocate all needed frames up front, chunk by chunk.
     let mut allocated: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
-    for seg in &image.segments {
-        let pages = (seg.mem_size + 0xFFF) >> 12;
+    for &pages in &page_counts {
         for _ in 0..pages {
             let f = narf_memory::alloc_frame().map_err(|_| LoadBytesError::NoFrame)?;
             allocated.push(f.start_address());
@@ -203,7 +220,8 @@ pub unsafe fn load_elf_into_at(
     }
 
     // Zero every allocated frame before we copy into it (so the
-    // `mem_size > file_size` BSS tail is naturally zero).
+    // `mem_size > file_size` BSS tail is naturally zero, and the
+    // padding before the in-page-offset copy start is zero too).
     for &p in &allocated {
         // SAFETY: identity-mapped in low 4 GiB.
         unsafe {
@@ -211,12 +229,11 @@ pub unsafe fn load_elf_into_at(
         }
     }
 
-    // Push regions, mirroring `load_into` but with the bias applied
-    // to each segment's base vaddr. Each segment owns its own slice
-    // of the upfront-allocated frames as a per-page scatter list.
+    // Push regions. Each region's base is the segment vaddr rounded
+    // down to a page boundary; `len` covers every page the segment
+    // touches.
     let mut cursor: usize = 0;
-    for seg in &image.segments {
-        let pages = ((seg.mem_size + 0xFFF) >> 12) as usize;
+    for (seg, &pages) in image.segments.iter().zip(page_counts.iter()) {
         let end = cursor.checked_add(pages).ok_or(LoadBytesError::NoFrame)?;
         if end > allocated.len() {
             return Err(LoadBytesError::NoFrame);
@@ -224,9 +241,12 @@ pub unsafe fn load_elf_into_at(
         let phys: alloc::vec::Vec<PhysAddr> = allocated[cursor..end].to_vec();
         cursor = end;
 
+        let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
+        let region_base = vaddr & !0xFFF;
+
         addr_space
             .map_region(Region {
-                base: VirtAddr::new(seg.vaddr.wrapping_add(vaddr_bias)),
+                base: VirtAddr::new(region_base),
                 len: (pages as u64) << 12,
                 perms: perms_of(seg.flags),
                 phys,
@@ -236,12 +256,13 @@ pub unsafe fn load_elf_into_at(
 
     // Copy segment data. The frames may not be physically contiguous
     // (alloc_frame is a freelist), so we have to copy page by page,
-    // routing each 4 KiB chunk into its own backing frame. Pages
-    // past file_size stay zero (BSS) since the upfront zero pass
-    // covered the whole allocation.
+    // routing each 4 KiB chunk into its own backing frame. The
+    // first frame's destination offset matches the segment's
+    // in-page vaddr offset (zero for page-aligned segments, 0xf78
+    // for musl's RW chunk). Pages past file_size stay zero (BSS)
+    // since the upfront zero pass covered the whole allocation.
     let mut cursor: usize = 0;
-    for seg in &image.segments {
-        let pages = ((seg.mem_size + 0xFFF) >> 12) as usize;
+    for (seg, &pages) in image.segments.iter().zip(page_counts.iter()) {
         let frames = &allocated[cursor..cursor + pages];
         cursor += pages;
 
@@ -254,18 +275,22 @@ pub unsafe fn load_elf_into_at(
         }
         let src = &bytes[start..end];
 
+        let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
+        let in_page = (vaddr & 0xFFF) as usize;
+
         let mut written: usize = 0;
-        for &frame in frames.iter() {
+        for (i, &frame) in frames.iter().enumerate() {
             if written >= src.len() {
                 break;
             }
-            let chunk = core::cmp::min(4096, src.len() - written);
+            let dst_off = if i == 0 { in_page } else { 0 };
+            let chunk = core::cmp::min(4096 - dst_off, src.len() - written);
             // SAFETY: `frame` is an identity-mapped freshly-allocated
-            // 4 KiB phys frame; chunk <= 4 KiB.
+            // 4 KiB phys frame; chunk + dst_off <= 4 KiB.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr().add(written),
-                    frame.raw() as *mut u8,
+                    (frame.raw() as *mut u8).add(dst_off),
                     chunk,
                 );
             }
