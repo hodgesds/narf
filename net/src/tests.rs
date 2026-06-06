@@ -6351,8 +6351,8 @@ fn smoke_tcp_rto_gives_up_after_seven() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_rto_gives_up_after_seven);
 
 fn smoke_tcp_cong_starts_with_iw10() -> TestResult {
-    use crate::tcp::congestion::{CongAlg, CongestionState};
-    let c = CongestionState::new(CongAlg::Cubic, 1460);
+    use crate::tcp::congestion::CcState;
+    let c = CcState::new(1460);
     if c.cwnd != 14_600 {
         return TestResult::Fail("IW10 initial cwnd should be 10 x MSS");
     }
@@ -6364,11 +6364,12 @@ fn smoke_tcp_cong_starts_with_iw10() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_cong_starts_with_iw10);
 
 fn smoke_tcp_cong_slow_start_grows_per_ack() -> TestResult {
-    use crate::tcp::congestion::{CongAlg, CongestionState};
-    let mut c = CongestionState::new(CongAlg::Reno, 1000);
+    use crate::tcp::congestion::{CcState, CongestionControl, Reno};
+    let mut c = CcState::new(1000);
     c.cwnd = 1000;
-    c.on_ack(1000, 0);
-    c.on_ack(1000, 0);
+    let cc = Reno;
+    cc.on_ack(&mut c, 1000, 0);
+    cc.on_ack(&mut c, 1000, 0);
     if c.cwnd != 3000 {
         return TestResult::Fail("slow-start should grow cwnd by MSS per ACK");
     }
@@ -6377,11 +6378,18 @@ fn smoke_tcp_cong_slow_start_grows_per_ack() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_cong_slow_start_grows_per_ack);
 
 fn smoke_tcp_cong_fast_recovery_halves_cwnd() -> TestResult {
-    use crate::tcp::congestion::{CongAlg, CongestionState};
-    let mut c = CongestionState::new(CongAlg::Reno, 1000);
+    use crate::tcp::congestion::{CcState, CongestionControl, LossEvent, Reno};
+    let mut c = CcState::new(1000);
     c.cwnd = 10_000;
     c.ssthresh = u32::MAX;
-    c.enter_fast_recovery(50_000, 0, 1);
+    Reno.on_loss(
+        &mut c,
+        LossEvent::FastRetransmit {
+            snd_nxt: 50_000,
+            now_cycles: 0,
+            cycles_per_ns: 1,
+        },
+    );
     if c.ssthresh != 5000 {
         return TestResult::Fail("ssthresh should be cwnd/2 = 5000");
     }
@@ -6396,8 +6404,8 @@ fn smoke_tcp_cong_fast_recovery_halves_cwnd() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_cong_fast_recovery_halves_cwnd);
 
 fn smoke_tcp_cong_three_dup_acks_trigger_retransmit() -> TestResult {
-    use crate::tcp::congestion::{CongAlg, CongestionState};
-    let mut c = CongestionState::new(CongAlg::Reno, 1000);
+    use crate::tcp::congestion::CcState;
+    let mut c = CcState::new(1000);
     if c.on_dup_ack() {
         return TestResult::Fail("1st dup ack should not trigger");
     }
@@ -6412,10 +6420,10 @@ fn smoke_tcp_cong_three_dup_acks_trigger_retransmit() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_cong_three_dup_acks_trigger_retransmit);
 
 fn smoke_tcp_cong_rto_resets_cwnd() -> TestResult {
-    use crate::tcp::congestion::{CongAlg, CongestionState};
-    let mut c = CongestionState::new(CongAlg::Cubic, 1000);
+    use crate::tcp::congestion::{CcState, CongestionControl, Cubic};
+    let mut c = CcState::new(1000);
     c.cwnd = 20_000;
-    c.enter_rto(20_000, 0, 1);
+    Cubic.on_rto(&mut c, 20_000, 0, 1);
     if c.cwnd != 1000 {
         return TestResult::Fail("RTO should reset cwnd to 1 MSS");
     }
@@ -6427,16 +6435,25 @@ fn smoke_tcp_cong_rto_resets_cwnd() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_cong_rto_resets_cwnd);
 
 fn smoke_tcp_cubic_grows_after_loss() -> TestResult {
-    use crate::tcp::congestion::{CongAlg, CongestionState};
-    let mut c = CongestionState::new(CongAlg::Cubic, 1000);
+    use crate::tcp::congestion::{CcState, CongestionControl, Cubic, LossEvent};
+    let mut c = CcState::new(1000);
     c.cwnd = 10_000;
     c.ssthresh = 5_000;
-    c.enter_fast_recovery(100_000, 0, 1);
+    let cc = Cubic;
+    cc.on_loss(
+        &mut c,
+        LossEvent::FastRetransmit {
+            snd_nxt: 100_000,
+            now_cycles: 0,
+            cycles_per_ns: 1,
+        },
+    );
     c.in_recovery = false;
     c.cwnd = c.ssthresh;
     let initial = c.cwnd;
+    let mss = c.mss;
     for i in 0..50 {
-        c.on_ack(c.mss, i * 100_000_000);
+        cc.on_ack(&mut c, mss, i * 100_000_000);
     }
     if c.cwnd < initial {
         return TestResult::Fail("CUBIC should grow cwnd above ssthresh");
@@ -6444,6 +6461,71 @@ fn smoke_tcp_cubic_grows_after_loss() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/tcp", smoke_tcp_cubic_grows_after_loss);
+
+fn smoke_pluggable_tcp_cc() -> TestResult {
+    use crate::tcp::congestion::{install, Cc, CcState, Cubic, LossEvent, Reno};
+    use narf_capabilities::{Cap, Grant};
+
+    // Default is Cubic.
+    let default = crate::tcp::congestion::default_cc();
+    if default.name() != "cubic" {
+        return TestResult::Fail("default cc should be cubic");
+    }
+
+    // Cap-gated swap to Reno.
+    let cap = Cap::<Cc, Grant>::bootstrap();
+    let reno = match install(&cap, Reno) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("install(Reno) failed on a fresh cap"),
+    };
+    if reno.name() != "reno" {
+        return TestResult::Fail("installed Reno but name() != \"reno\"");
+    }
+
+    // Reno math: slow-start adds 1 MSS per ack; loss halves cwnd.
+    let mss = 1000u32;
+    let mut s = CcState::new(mss);
+    s.cwnd = mss; // 1 MSS, well below ssthresh
+    reno.on_ack(&mut s, mss, 0);
+    if s.cwnd != 2 * mss {
+        return TestResult::Fail("Reno slow-start: 1 ack of MSS bytes should add 1 MSS");
+    }
+    reno.on_ack(&mut s, mss, 0);
+    if s.cwnd != 3 * mss {
+        return TestResult::Fail("Reno slow-start: cumulative cwnd should track ack count");
+    }
+    // Loss: ssthresh ← cwnd/2; cwnd ← ssthresh + 3*MSS.
+    s.cwnd = 10_000;
+    s.ssthresh = u32::MAX;
+    reno.on_loss(
+        &mut s,
+        LossEvent::FastRetransmit {
+            snd_nxt: 50_000,
+            now_cycles: 0,
+            cycles_per_ns: 1,
+        },
+    );
+    if s.ssthresh != 5_000 {
+        return TestResult::Fail("Reno on_loss: ssthresh should be cwnd/2");
+    }
+    if s.cwnd != 8_000 {
+        return TestResult::Fail("Reno on_loss: cwnd should be ssthresh + 3*MSS");
+    }
+    if !s.in_recovery {
+        return TestResult::Fail("Reno on_loss: should mark in_recovery");
+    }
+
+    // Swap back to Cubic — verify name surfaces the swap.
+    let cubic = match install(&cap, Cubic) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("install(Cubic) failed"),
+    };
+    if cubic.name() != "cubic" {
+        return TestResult::Fail("installed Cubic but name() != \"cubic\"");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_pluggable_tcp_cc);
 
 fn smoke_tcp_sack_encode_decode_round_trip() -> TestResult {
     use crate::tcp::sack::{decode_blocks, encode_blocks, SackBlock};

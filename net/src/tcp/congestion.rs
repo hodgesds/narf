@@ -1,11 +1,23 @@
-//! Congestion control — CUBIC (RFC 9438) with NewReno (RFC 5681)
-//! fallback.
+//! Congestion control — pluggable policy trait, with CUBIC (RFC 9438)
+//! and NewReno (RFC 5681) implementations shipped in tree.
+//!
+//! ## Architecture
+//!
+//! The per-TCB state (cwnd, ssthresh, recovery flag, CUBIC curve
+//! parameters) lives in [`CcState`] — purely data, algorithm-agnostic.
+//! The decision logic (how to grow cwnd on an ACK, how to shrink it on
+//! loss) lives behind the [`CongestionControl`] trait. The TCB stores
+//! a `Box<dyn CongestionControl>` and routes ACK / loss / RTO callbacks
+//! through it. Install a different algorithm per-socket via
+//! [`install`] — cap-gated on `Cap<Cc, Grant>`.
 //!
 //! ## Slow start (RFC 5681 §3.1)
 //!
 //! `cwnd < ssthresh`: on each ACK that newly acks bytes,
 //! `cwnd += min(N, SMSS)` where N is the number of bytes ack'd.
-//! Doubles cwnd per RTT until ssthresh is hit.
+//! Doubles cwnd per RTT until ssthresh is hit. This branch is shared
+//! by every concrete algorithm; only the congestion-avoidance step
+//! differs.
 //!
 //! ## Congestion avoidance — NewReno (RFC 5681 §3.1)
 //!
@@ -48,27 +60,49 @@
 
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
+use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
+
 /// Default segment size — keep in sync with the MTU/option path
 /// that negotiates this on the SYN. We don't need it precise here;
 /// CUBIC math operates in bytes and rescales naturally.
 pub const DEFAULT_MSS: u32 = 1460;
 
-/// Congestion control algorithm selector. Surfaced through
-/// `TCP_CONGESTION` setsockopt.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum CongAlg {
-    /// CUBIC (RFC 9438) — default.
-    Cubic,
-    /// NewReno (RFC 5681) — fallback for compatibility tests.
-    Reno,
+// ── Cap marker ──────────────────────────────────────────────────────
+
+/// Authority to install a per-socket congestion-control algorithm.
+/// Cap-gated install mirrors `power::Governor` (DVFS) and lives at
+/// `CapKind::CongestionControl` (0x0207).
+#[derive(Copy, Clone, Debug)]
+pub struct Cc;
+impl CapType for Cc {
+    const KIND: CapKind = CapKind::CongestionControl;
 }
+
+/// Error returned by [`install`] when the install cap has been
+/// revoked. Mirrors `PowerError::AuthorityRevoked`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CcError {
+    AuthorityRevoked,
+}
+
+impl From<CapError> for CcError {
+    fn from(_: CapError) -> Self {
+        CcError::AuthorityRevoked
+    }
+}
+
+// ── State ──────────────────────────────────────────────────────────
 
 /// Congestion-control state machine. Holds the AIMD knobs (cwnd,
 /// ssthresh, recovery flag) and, when in CUBIC mode, the cubic
 /// curve parameters (W_max, K, epoch start). One per TCB.
+///
+/// This struct is pure data — the algorithm-specific logic lives
+/// behind the [`CongestionControl`] trait. Both Reno and CUBIC share
+/// the slow-start / fast-recovery / RTO accounting fields here.
 #[derive(Copy, Clone, Debug)]
-pub struct CongestionState {
-    pub alg: CongAlg,
+pub struct CcState {
     /// Sender-side congestion window in bytes.
     pub cwnd: u32,
     /// Slow-start threshold in bytes.
@@ -90,7 +124,7 @@ pub struct CongestionState {
     /// W_max at the most recent loss event (bytes).
     pub w_max: u32,
     /// Cube-root inflection time K (milliseconds) — set by
-    /// `set_w_max_on_loss`.
+    /// `note_loss_epoch`.
     pub k_ms: u32,
     /// `narf_time::now_cycles()` at the start of the current
     /// CUBIC epoch (set on each loss event).
@@ -101,19 +135,18 @@ pub struct CongestionState {
     pub cycles_per_ns: u64,
 }
 
-impl Default for CongestionState {
+impl Default for CcState {
     fn default() -> Self {
-        Self::new(CongAlg::Cubic, DEFAULT_MSS)
+        Self::new(DEFAULT_MSS)
     }
 }
 
-impl CongestionState {
+impl CcState {
     /// Initial state: cwnd = 10*MSS (RFC 6928 IW10), ssthresh
     /// unbounded, no recovery.
-    pub fn new(alg: CongAlg, mss: u32) -> Self {
+    pub fn new(mss: u32) -> Self {
         let mss = mss.max(536); // RFC 9293 §3.7.1 floor
         Self {
-            alg,
             cwnd: mss.saturating_mul(10),
             ssthresh: u32::MAX,
             bytes_acked_in_window: 0,
@@ -128,114 +161,10 @@ impl CongestionState {
         }
     }
 
-    /// Reset to fresh state on connection close.
-    pub fn reset(&mut self) {
-        *self = Self::new(self.alg, self.mss);
-    }
-
-    /// Switch the algorithm (e.g. via `TCP_CONGESTION` setsockopt).
-    /// Resets CUBIC state but preserves cwnd/ssthresh.
-    pub fn set_alg(&mut self, alg: CongAlg) {
-        self.alg = alg;
-        self.w_max = 0;
-        self.k_ms = 0;
-        self.epoch_start_cycles = 0;
-    }
-
     /// Update MSS — called when the SYN handshake settles on the
     /// negotiated value. Doesn't disturb cwnd/ssthresh.
     pub fn set_mss(&mut self, mss: u32) {
         self.mss = mss.max(536);
-    }
-
-    /// Receive an ACK that newly acks `bytes_acked` bytes. Drives
-    /// either slow-start, NewReno-CA, or CUBIC depending on cwnd
-    /// vs ssthresh and the configured `alg`.
-    pub fn on_ack(&mut self, bytes_acked: u32, now_cycles: u64) {
-        if bytes_acked == 0 {
-            return;
-        }
-        // Exit fast recovery if snd_una advanced past the recover
-        // point. Caller updates that prior to invoking on_ack.
-        if self.in_recovery {
-            // Caller is expected to call `clear_recovery_if_passed`
-            // after updating snd_una. We don't grow cwnd while in
-            // recovery — that prevents the inflation-then-deflate
-            // toggle that confuses CUBIC's epoch math.
-            return;
-        }
-        if self.cwnd < self.ssthresh {
-            // Slow start: cwnd += min(bytes_acked, MSS).
-            let inc = core::cmp::min(bytes_acked, self.mss);
-            self.cwnd = self.cwnd.saturating_add(inc);
-        } else {
-            // Congestion avoidance.
-            match self.alg {
-                CongAlg::Reno => self.reno_ca_step(bytes_acked),
-                CongAlg::Cubic => self.cubic_ca_step(bytes_acked, now_cycles),
-            }
-        }
-    }
-
-    /// NewReno additive-increase: bump cwnd by one MSS per RTT.
-    /// We accumulate ack'd bytes; when the counter passes cwnd,
-    /// add one MSS and subtract cwnd from the counter.
-    fn reno_ca_step(&mut self, bytes_acked: u32) {
-        self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_add(bytes_acked);
-        while self.bytes_acked_in_window >= self.cwnd {
-            self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_sub(self.cwnd);
-            self.cwnd = self.cwnd.saturating_add(self.mss);
-        }
-    }
-
-    /// CUBIC step (RFC 9438 §4). Evaluates `W_cubic(t)` and
-    /// `W_est(t)` and moves cwnd one step toward the max.
-    fn cubic_ca_step(&mut self, bytes_acked: u32, now_cycles: u64) {
-        // Elapsed milliseconds since epoch start.
-        let t_ms = self.cycles_to_ms(now_cycles.wrapping_sub(self.epoch_start_cycles));
-        // W_cubic(t) = C * (t - K)^3 + W_max, with C ≈ 0.4 MSS/sec^3.
-        // Fixed-point: scale time to ms, compute (t-K)^3, multiply
-        // by C_NUM / C_DEN, scale back to bytes via MSS.
-        const C_NUM: i64 = 4; // 0.4 numerator
-        const C_DEN: i64 = 10; // 0.4 denominator
-        let dt_ms = (t_ms as i64) - (self.k_ms as i64);
-        let dt3 = dt_ms.saturating_mul(dt_ms).saturating_mul(dt_ms);
-        // Time is in ms, but the CUBIC reference uses seconds. We
-        // compensate by dividing the cube by 1_000_000_000 (ms^3 →
-        // s^3) — i.e. shift right by 30 in fixed point. Use
-        // saturating to keep the math finite.
-        let increment_bytes = (C_NUM * dt3 / C_DEN) / 1_000_000_000;
-        let target = (self.w_max as i64).saturating_add(increment_bytes);
-        let target = target.clamp(self.mss as i64, u32::MAX as i64) as u32;
-
-        // W_est(t) = W_max * beta + 3*(1-beta)/(1+beta) * t/RTT.
-        // We approximate the second term against the AIMD step
-        // we'd take in Reno (one MSS per cwnd bytes acked) and
-        // pick the more conservative target. This is the standard
-        // "TCP friendliness" path of RFC 9438 §4.2.
-        self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_add(bytes_acked);
-        let reno_target = if self.bytes_acked_in_window >= self.cwnd {
-            self.bytes_acked_in_window = self.bytes_acked_in_window.saturating_sub(self.cwnd);
-            self.cwnd.saturating_add(self.mss)
-        } else {
-            self.cwnd
-        };
-
-        self.cwnd = core::cmp::max(target, reno_target);
-    }
-
-    /// Translate a cycles delta into milliseconds. `cycles_per_ns`
-    /// is cached at epoch start; if it's zero (uncalibrated), the
-    /// fallback divisor leaves the curve flat which degrades to a
-    /// no-op increment — Reno still drives growth via the W_est
-    /// branch.
-    fn cycles_to_ms(&self, delta_cycles: u64) -> u64 {
-        let cpn = if self.cycles_per_ns == 0 {
-            1
-        } else {
-            self.cycles_per_ns
-        };
-        delta_cycles / cpn / 1_000_000
     }
 
     /// Record a duplicate-ACK. Returns true on the *third* dup-ACK,
@@ -255,51 +184,6 @@ impl CongestionState {
         self.dup_ack_count = 0;
     }
 
-    /// Fast retransmit: ssthresh ← cwnd/2, cwnd ← ssthresh + 3*MSS.
-    /// Enter fast recovery with the current snd_nxt as the high
-    /// water mark.
-    pub fn enter_fast_recovery(&mut self, snd_nxt: u32, now_cycles: u64, cycles_per_ns: u64) {
-        self.set_w_max_on_loss(now_cycles, cycles_per_ns);
-        self.ssthresh = core::cmp::max(self.cwnd / 2, 2 * self.mss);
-        self.cwnd = self.ssthresh.saturating_add(3 * self.mss);
-        self.in_recovery = true;
-        self.recover_point = snd_nxt;
-    }
-
-    /// On RTO: ssthresh ← max(FlightSize/2, 2*MSS), cwnd ← 1 MSS,
-    /// reset cubic epoch. `in_flight` is the caller's measurement
-    /// of unacked bytes at the moment of timeout.
-    pub fn enter_rto(&mut self, in_flight: u32, now_cycles: u64, cycles_per_ns: u64) {
-        self.set_w_max_on_loss(now_cycles, cycles_per_ns);
-        self.ssthresh = core::cmp::max(in_flight / 2, 2 * self.mss);
-        self.cwnd = self.mss;
-        self.in_recovery = false;
-        self.dup_ack_count = 0;
-    }
-
-    /// Set W_max to the cwnd at the moment of loss, derive `K_ms`,
-    /// and stamp the epoch start so subsequent CUBIC math has a
-    /// fresh reference point. RFC 9438 §4.4.
-    fn set_w_max_on_loss(&mut self, now_cycles: u64, cycles_per_ns: u64) {
-        self.w_max = self.cwnd;
-        // K = cbrt(W_max * (1 - beta_cubic) / C); beta_cubic = 0.7.
-        // K_ms ≈ cbrt(W_max * 0.3 / 0.4) * 1000.
-        // Approx in fixed-point: factor = W_max * 3 / 4 (≈ 0.75).
-        let factor = (self.w_max as u64).saturating_mul(3) / 4;
-        // Cube root via Newton's method, two iterations.
-        let mut x = 1u64.max(factor / 1000);
-        for _ in 0..6 {
-            if x == 0 {
-                x = 1;
-            }
-            x = (2 * x + factor / (x * x)) / 3;
-        }
-        // Scale to ms.
-        self.k_ms = (x.saturating_mul(1000)).min(u32::MAX as u64) as u32;
-        self.epoch_start_cycles = now_cycles;
-        self.cycles_per_ns = if cycles_per_ns == 0 { 1 } else { cycles_per_ns };
-    }
-
     /// Caller-driven hook: after updating snd_una, this checks
     /// whether `in_recovery` should clear (snd_una passed the
     /// recover-point high-water mark).
@@ -307,7 +191,6 @@ impl CongestionState {
         if !self.in_recovery {
             return;
         }
-        // Use sequence-space compare.
         if seq_geq(snd_una, self.recover_point) {
             self.in_recovery = false;
             // cwnd ← ssthresh ("deflate" exit).
@@ -323,7 +206,270 @@ impl CongestionState {
     pub fn effective_cwnd(&self) -> u32 {
         self.cwnd
     }
+
+    /// Stamp the CUBIC epoch and derive `K_ms` from the current cwnd.
+    /// Called from `on_loss` / `on_rto` so the cubic curve gets a
+    /// fresh reference point after every loss event. Algorithms that
+    /// don't use the CUBIC curve still keep this bookkeeping correct —
+    /// `w_max` doubles as "cwnd at last loss" for any later swap to
+    /// CUBIC.
+    pub fn note_loss_epoch(&mut self, now_cycles: u64, cycles_per_ns: u64) {
+        self.w_max = self.cwnd;
+        // K = cbrt(W_max * (1 - beta_cubic) / C); beta_cubic = 0.7.
+        // K_ms ≈ cbrt(W_max * 0.3 / 0.4) * 1000.
+        // Approx in fixed-point: factor = W_max * 3 / 4 (≈ 0.75).
+        let factor = (self.w_max as u64).saturating_mul(3) / 4;
+        // Cube root via Newton's method.
+        let mut x = 1u64.max(factor / 1000);
+        for _ in 0..6 {
+            if x == 0 {
+                x = 1;
+            }
+            x = (2 * x + factor / (x * x)) / 3;
+        }
+        self.k_ms = (x.saturating_mul(1000)).min(u32::MAX as u64) as u32;
+        self.epoch_start_cycles = now_cycles;
+        self.cycles_per_ns = if cycles_per_ns == 0 { 1 } else { cycles_per_ns };
+    }
+
+    /// Translate a cycles delta into milliseconds. `cycles_per_ns`
+    /// is cached at epoch start; if it's zero (uncalibrated), the
+    /// fallback divisor leaves the curve flat which degrades to a
+    /// no-op increment — Reno still drives growth via the W_est
+    /// branch.
+    pub fn cycles_to_ms(&self, delta_cycles: u64) -> u64 {
+        let cpn = if self.cycles_per_ns == 0 {
+            1
+        } else {
+            self.cycles_per_ns
+        };
+        delta_cycles / cpn / 1_000_000
+    }
 }
+
+// ── LossEvent ──────────────────────────────────────────────────────
+
+/// What kind of loss the caller is signalling. The cc trait dispatches
+/// off this to choose the right backoff. RTO is split into its own
+/// trait method (`on_rto`) because the caller's measurement of in-flight
+/// bytes is most natural at the call site.
+#[derive(Copy, Clone, Debug)]
+pub enum LossEvent {
+    /// Three duplicate ACKs — RFC 5681 fast retransmit.
+    FastRetransmit {
+        /// snd_nxt at the time the third dup-ACK arrived; becomes the
+        /// "recover point" for fast-recovery exit.
+        snd_nxt: u32,
+        /// Cycles at the moment of loss (for the CUBIC epoch).
+        now_cycles: u64,
+        /// `narf_time::cycles_per_ns()` at the moment of loss.
+        cycles_per_ns: u64,
+    },
+}
+
+// ── CongestionControl trait ────────────────────────────────────────
+
+/// Per-socket congestion-control policy. Each TCB carries a boxed
+/// implementor; the ACK / loss / RTO entry points on the TCB route
+/// through these methods.
+///
+/// `Send + Sync + 'static` matches the other pluggable-policy traits
+/// (`power::GovernorPolicy`, `sched::Policy`, …) and lets the box live
+/// inside a `Tcb` that's stored behind an `IrqSafeSpinLock`.
+pub trait CongestionControl: Send + Sync + 'static {
+    /// Stable identifier surfaced through `TCP_CONGESTION` getsockopt.
+    fn name(&self) -> &'static str;
+
+    /// A cumulative ACK newly acked `acked_bytes` bytes. The implementor
+    /// updates `state.cwnd` (slow-start vs congestion-avoidance branch
+    /// is the implementor's responsibility). `now_cycles` carries the
+    /// CUBIC epoch clock — Reno ignores it.
+    fn on_ack(&self, state: &mut CcState, acked_bytes: u32, now_cycles: u64);
+
+    /// A loss event was observed (currently only fast-retransmit). The
+    /// implementor halves cwnd / sets ssthresh / enters recovery per its
+    /// own AIMD scheme.
+    fn on_loss(&self, state: &mut CcState, ev: LossEvent);
+
+    /// RTO fired. Standard behaviour is `ssthresh ← max(in_flight/2, 2*MSS)`,
+    /// `cwnd ← MSS`, exit recovery.
+    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ns: u64);
+
+    /// Snapshot the current congestion window.
+    fn cwnd(&self, state: &CcState) -> u32 {
+        state.cwnd
+    }
+
+    /// Reset the state to a fresh connection (called on close).
+    fn reset(&self, state: &mut CcState) {
+        *state = CcState::new(state.mss);
+    }
+}
+
+// ── Reno ───────────────────────────────────────────────────────────
+
+/// NewReno (RFC 5681). Textbook AIMD: +1 MSS per RTT in
+/// congestion-avoidance, halve cwnd on loss.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Reno;
+
+impl Reno {
+    fn ca_step(state: &mut CcState, bytes_acked: u32) {
+        state.bytes_acked_in_window = state.bytes_acked_in_window.saturating_add(bytes_acked);
+        while state.bytes_acked_in_window >= state.cwnd {
+            state.bytes_acked_in_window = state.bytes_acked_in_window.saturating_sub(state.cwnd);
+            state.cwnd = state.cwnd.saturating_add(state.mss);
+        }
+    }
+}
+
+impl CongestionControl for Reno {
+    fn name(&self) -> &'static str {
+        "reno"
+    }
+
+    fn on_ack(&self, state: &mut CcState, acked_bytes: u32, _now_cycles: u64) {
+        if acked_bytes == 0 {
+            return;
+        }
+        if state.in_recovery {
+            return;
+        }
+        if state.cwnd < state.ssthresh {
+            let inc = core::cmp::min(acked_bytes, state.mss);
+            state.cwnd = state.cwnd.saturating_add(inc);
+        } else {
+            Self::ca_step(state, acked_bytes);
+        }
+    }
+
+    fn on_loss(&self, state: &mut CcState, ev: LossEvent) {
+        match ev {
+            LossEvent::FastRetransmit {
+                snd_nxt,
+                now_cycles,
+                cycles_per_ns,
+            } => {
+                state.note_loss_epoch(now_cycles, cycles_per_ns);
+                state.ssthresh = core::cmp::max(state.cwnd / 2, 2 * state.mss);
+                state.cwnd = state.ssthresh.saturating_add(3 * state.mss);
+                state.in_recovery = true;
+                state.recover_point = snd_nxt;
+            }
+        }
+    }
+
+    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ns: u64) {
+        state.note_loss_epoch(now_cycles, cycles_per_ns);
+        state.ssthresh = core::cmp::max(in_flight / 2, 2 * state.mss);
+        state.cwnd = state.mss;
+        state.in_recovery = false;
+        state.dup_ack_count = 0;
+    }
+}
+
+// ── Cubic ──────────────────────────────────────────────────────────
+
+/// CUBIC (RFC 9438). Default for NARF TCB instances; mirrors the
+/// Linux default.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Cubic;
+
+impl Cubic {
+    /// CUBIC CA step — evaluates `W_cubic(t)` and the W_est ("TCP
+    /// friendliness") parallel, picks the larger.
+    fn ca_step(state: &mut CcState, bytes_acked: u32, now_cycles: u64) {
+        // Elapsed milliseconds since epoch start.
+        let t_ms = state.cycles_to_ms(now_cycles.wrapping_sub(state.epoch_start_cycles));
+        // W_cubic(t) = C * (t - K)^3 + W_max, with C ≈ 0.4 MSS/sec^3.
+        const C_NUM: i64 = 4; // 0.4 numerator
+        const C_DEN: i64 = 10; // 0.4 denominator
+        let dt_ms = (t_ms as i64) - (state.k_ms as i64);
+        let dt3 = dt_ms.saturating_mul(dt_ms).saturating_mul(dt_ms);
+        // Time is in ms, but the CUBIC reference uses seconds. Divide
+        // the cube by 1e9 (ms^3 → s^3). Saturating to keep finite.
+        let increment_bytes = (C_NUM * dt3 / C_DEN) / 1_000_000_000;
+        let target = (state.w_max as i64).saturating_add(increment_bytes);
+        let target = target.clamp(state.mss as i64, u32::MAX as i64) as u32;
+
+        // W_est ≈ AIMD step (one MSS per cwnd bytes acked). RFC 9438
+        // §4.2 "TCP friendliness": use max(W_cubic, W_est).
+        state.bytes_acked_in_window = state.bytes_acked_in_window.saturating_add(bytes_acked);
+        let reno_target = if state.bytes_acked_in_window >= state.cwnd {
+            state.bytes_acked_in_window = state.bytes_acked_in_window.saturating_sub(state.cwnd);
+            state.cwnd.saturating_add(state.mss)
+        } else {
+            state.cwnd
+        };
+
+        state.cwnd = core::cmp::max(target, reno_target);
+    }
+}
+
+impl CongestionControl for Cubic {
+    fn name(&self) -> &'static str {
+        "cubic"
+    }
+
+    fn on_ack(&self, state: &mut CcState, acked_bytes: u32, now_cycles: u64) {
+        if acked_bytes == 0 {
+            return;
+        }
+        if state.in_recovery {
+            return;
+        }
+        if state.cwnd < state.ssthresh {
+            let inc = core::cmp::min(acked_bytes, state.mss);
+            state.cwnd = state.cwnd.saturating_add(inc);
+        } else {
+            Self::ca_step(state, acked_bytes, now_cycles);
+        }
+    }
+
+    fn on_loss(&self, state: &mut CcState, ev: LossEvent) {
+        match ev {
+            LossEvent::FastRetransmit {
+                snd_nxt,
+                now_cycles,
+                cycles_per_ns,
+            } => {
+                state.note_loss_epoch(now_cycles, cycles_per_ns);
+                state.ssthresh = core::cmp::max(state.cwnd / 2, 2 * state.mss);
+                state.cwnd = state.ssthresh.saturating_add(3 * state.mss);
+                state.in_recovery = true;
+                state.recover_point = snd_nxt;
+            }
+        }
+    }
+
+    fn on_rto(&self, state: &mut CcState, in_flight: u32, now_cycles: u64, cycles_per_ns: u64) {
+        state.note_loss_epoch(now_cycles, cycles_per_ns);
+        state.ssthresh = core::cmp::max(in_flight / 2, 2 * state.mss);
+        state.cwnd = state.mss;
+        state.in_recovery = false;
+        state.dup_ack_count = 0;
+    }
+}
+
+// ── Install helper ─────────────────────────────────────────────────
+
+/// Cap-gated install of a boxed congestion-control policy. The TCB's
+/// `set_congestion_control` thin-wraps this; callers that already hold
+/// a `Box<dyn CongestionControl>` can swap it directly.
+pub fn install<C: CongestionControl>(
+    cap: &Cap<Cc, Grant>,
+    cc: C,
+) -> Result<Box<dyn CongestionControl>, CcError> {
+    cap.check_live()?;
+    Ok(Box::new(cc))
+}
+
+/// Default policy for a fresh TCB. Matches the Linux default.
+pub fn default_cc() -> Box<dyn CongestionControl> {
+    Box::new(Cubic)
+}
+
+// ── Sequence-space helpers ─────────────────────────────────────────
 
 /// 32-bit sequence-space compare: `a >= b` modulo 2^32.
 #[inline]
@@ -355,7 +501,7 @@ mod tests {
 
     #[test]
     fn fresh_state_starts_in_slow_start() {
-        let c = CongestionState::new(CongAlg::Cubic, 1460);
+        let c = CcState::new(1460);
         // IW10 init.
         assert_eq!(c.cwnd, 14_600);
         assert_eq!(c.ssthresh, u32::MAX);
@@ -363,65 +509,87 @@ mod tests {
     }
 
     #[test]
-    fn slow_start_doubles_per_rtt() {
-        let mut c = CongestionState::new(CongAlg::Reno, 1000);
-        c.cwnd = 1000;
-        c.on_ack(1000, 0);
-        c.on_ack(1000, 0);
-        c.on_ack(1000, 0);
+    fn reno_slow_start_doubles_per_rtt() {
+        let mut s = CcState::new(1000);
+        s.cwnd = 1000;
+        let cc = Reno;
+        cc.on_ack(&mut s, 1000, 0);
+        cc.on_ack(&mut s, 1000, 0);
+        cc.on_ack(&mut s, 1000, 0);
         // Three acks of 1 MSS each: cwnd grows by 3 MSS.
-        assert_eq!(c.cwnd, 4000);
+        assert_eq!(s.cwnd, 4000);
     }
 
     #[test]
-    fn fast_recovery_halves_cwnd() {
-        let mut c = CongestionState::new(CongAlg::Reno, 1000);
-        c.cwnd = 10_000;
-        c.ssthresh = u32::MAX;
-        c.enter_fast_recovery(50_000, 0, 1);
-        // ssthresh ← cwnd/2 = 5000; cwnd ← ssthresh + 3*MSS = 8000.
-        assert_eq!(c.ssthresh, 5000);
-        assert_eq!(c.cwnd, 8000);
-        assert!(c.in_recovery);
+    fn reno_fast_recovery_halves_cwnd() {
+        let mut s = CcState::new(1000);
+        s.cwnd = 10_000;
+        s.ssthresh = u32::MAX;
+        let cc = Reno;
+        cc.on_loss(
+            &mut s,
+            LossEvent::FastRetransmit {
+                snd_nxt: 50_000,
+                now_cycles: 0,
+                cycles_per_ns: 1,
+            },
+        );
+        assert_eq!(s.ssthresh, 5000);
+        assert_eq!(s.cwnd, 8000);
+        assert!(s.in_recovery);
     }
 
     #[test]
-    fn rto_resets_cwnd_to_one_mss() {
-        let mut c = CongestionState::new(CongAlg::Cubic, 1000);
-        c.cwnd = 20_000;
-        c.enter_rto(20_000, 0, 1);
-        assert_eq!(c.cwnd, 1000);
-        assert!(c.ssthresh >= 2000);
+    fn cubic_rto_resets_cwnd_to_one_mss() {
+        let mut s = CcState::new(1000);
+        s.cwnd = 20_000;
+        Cubic.on_rto(&mut s, 20_000, 0, 1);
+        assert_eq!(s.cwnd, 1000);
+        assert!(s.ssthresh >= 2000);
     }
 
     #[test]
     fn three_dup_acks_trigger_fast_retransmit() {
-        let mut c = CongestionState::new(CongAlg::Reno, 1000);
-        assert!(!c.on_dup_ack());
-        assert!(!c.on_dup_ack());
-        assert!(c.on_dup_ack());
-        assert!(!c.on_dup_ack()); // already past
+        let mut s = CcState::new(1000);
+        assert!(!s.on_dup_ack());
+        assert!(!s.on_dup_ack());
+        assert!(s.on_dup_ack());
+        assert!(!s.on_dup_ack());
     }
 
     #[test]
     fn cubic_grows_after_loss() {
-        let mut c = CongestionState::new(CongAlg::Cubic, 1000);
-        c.cwnd = 10_000;
-        c.ssthresh = 5_000;
-        c.enter_fast_recovery(100_000, 0, 1);
-        c.in_recovery = false;
-        c.cwnd = c.ssthresh; // post-recovery start
-                             // Advance time and ack — cwnd should not shrink.
-        let initial = c.cwnd;
-        c.on_ack(c.mss, 1_000_000_000);
-        assert!(c.cwnd >= initial);
+        let mut s = CcState::new(1000);
+        s.cwnd = 10_000;
+        s.ssthresh = 5_000;
+        let cc = Cubic;
+        cc.on_loss(
+            &mut s,
+            LossEvent::FastRetransmit {
+                snd_nxt: 100_000,
+                now_cycles: 0,
+                cycles_per_ns: 1,
+            },
+        );
+        s.in_recovery = false;
+        s.cwnd = s.ssthresh;
+        let initial = s.cwnd;
+        let mss = s.mss;
+        cc.on_ack(&mut s, mss, 1_000_000_000);
+        assert!(s.cwnd >= initial);
     }
 
     #[test]
     fn seq_compare_handles_wrap() {
-        // 0xFFFFFFF0 < 0x00000010 in wrap-aware comparison.
         assert!(seq_lt(0xFFFFFFF0, 0x00000010));
         assert!(seq_gt(0x00000010, 0xFFFFFFF0));
         assert!(seq_geq(0x00000010, 0xFFFFFFF0));
+    }
+
+    #[test]
+    fn install_requires_live_cap() {
+        let cap = Cap::<Cc, Grant>::bootstrap();
+        let boxed = install(&cap, Reno).expect("live cap installs");
+        assert_eq!(boxed.name(), "reno");
     }
 }
