@@ -437,6 +437,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 const BUSYBOX_GOT_STDOUT: u64 = 0x0000_0080_0016_3ed0;
                 const BUSYBOX_GOT_STDIN: u64 = 0x0000_0080_0016_3f58;
                 const BUSYBOX_GOT_STDERR: u64 = 0x0000_0080_0016_3f90;
+                const BUSYBOX_GOT_PUTS: u64 = 0x0000_0080_0016_4258;
                 let got_out = read_user_u64(BUSYBOX_GOT_STDOUT);
                 let got_in = read_user_u64(BUSYBOX_GOT_STDIN);
                 let got_err = read_user_u64(BUSYBOX_GOT_STDERR);
@@ -468,6 +469,58 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                     got_err,
                     val_err
                 );
+                // PLT-target diag: busybox's `puts@plt` jumps via
+                // `*(0x80_0016_4258)`. Dump the GOT slot value
+                // (should be libc.so's `puts`, in 0x4000_xxxx range)
+                // to confirm the PLT resolution survived ld-musl.
+                let got_puts = read_user_u64(BUSYBOX_GOT_PUTS);
+                let _ = writeln!(narf_console::Writer, "  puts:   got={:?}", got_puts);
+                // Stack walking — the fault site is inside an
+                // inlined `__overflow` helper at `0x62d86` whose
+                // prologue pushes r15/r14/r13/r12/rbp/rbx then
+                // `sub $0x48,%rsp`. So at fault RIP=0x62d9a:
+                //   [rsp+0x48] = saved rbx (= input FILE*)
+                //   [rsp+0x50] = saved rbp
+                //   [rsp+0x58] = saved r12
+                //   [rsp+0x60] = saved r13
+                //   [rsp+0x68] = saved r14
+                //   [rsp+0x70] = saved r15
+                //   [rsp+0x78] = return address into outer caller
+                // Plus dump current RDI/RBP/RSP/RBX and FS_BASE
+                // (TLS bug check). Read MSR_FS_BASE via rdmsr.
+                let fs_base: u64;
+                unsafe {
+                    let lo: u32;
+                    let hi: u32;
+                    core::arch::asm!(
+                        "rdmsr",
+                        in("ecx") 0xC000_0100_u32,
+                        out("eax") lo,
+                        out("edx") hi,
+                        options(nostack, preserves_flags),
+                    );
+                    fs_base = ((hi as u64) << 32) | (lo as u64);
+                }
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  regs: rdi={:x} rbp={:x} rsp={:x} fs_base={:x}",
+                    frame.rdi,
+                    frame.rbp,
+                    frame.rsp,
+                    fs_base
+                );
+                // Walk the stack — print every 8-byte slot from
+                // rsp upwards for 0x100 bytes. The fault is inside
+                // an inner helper; somewhere in this window are
+                // saved retaddrs that take us back to the original
+                // caller (the code path that built the truncated
+                // FILE*).
+                for off in (0..0x100u64).step_by(8) {
+                    let v = read_user_u64(frame.rsp.wrapping_add(off));
+                    if let Some(v) = v {
+                        let _ = writeln!(narf_console::Writer, "  stk[rsp+{:02x}]={:x}", off, v);
+                    }
+                }
             }
             let info = narf_userspace::SyncFaultInfo { addr };
             let mut ctx = X86TrapContext::from_int80(frame);
