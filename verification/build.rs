@@ -173,6 +173,24 @@ fn main() {
         }
     }
 
+    // Wave-78: pre-built linux-compat demo binary. Direct-syscall
+    // hello-world built from `data/musl-demo/hello_static_x86_64.S`
+    // with stock binutils — no Rust crate, no cargo build, no libc.
+    // The bytes are always available (checked into the tree); the
+    // kernel-side include is gated on the same boot-init feature
+    // that gates init/shell/coreutils so non-boot kernel builds
+    // don't pay the include cost.
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_static_x86_64.S");
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_static_x86_64");
+    let hello_static = manifest_dir.join("data/musl-demo/hello_static_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_HELLO_STATIC_ELF_X86_64={}",
+        hello_static.display()
+    );
+    // aarch64 demo binary not built yet; placeholder so include_bytes
+    // resolves under cross-arch builds.
+    println!("cargo:rustc-env=NARF_HELLO_STATIC_ELF_AARCH64=/dev/null");
+
     let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
     if libc_validate_enabled {
         let validate_dir = workspace.join("narf-libc").join("validate");

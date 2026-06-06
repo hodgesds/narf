@@ -3623,6 +3623,25 @@ pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_EL
 ))]
 pub const NARF_COREUTIL_PS_ELF: &[u8] = include_bytes!(env!("NARF_COREUTIL_PS_ELF_AARCH64"));
 
+// Wave-78: pre-built direct-syscall hello-world for the linux-compat
+// demo. Source + REGEN.sh live in `verification/data/musl-demo/`.
+// The binary uses Linux x86_64 syscall numbers (write=1,
+// exit_group=231) and is built with stock binutils — no libc, no
+// PT_INTERP, no PT_TLS. Seeded at /bin/hello so `cargo xtask
+// run-interactive` → `hello` at the shell prompt exercises NARF's
+// linux-compat ABI translation against a binary built outside this
+// tree's toolchain.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_HELLO_STATIC_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_STATIC_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_HELLO_STATIC_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_STATIC_ELF_AARCH64"));
+
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
 fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // Load the real Rust no_std binary `narf-testbin` into a fresh

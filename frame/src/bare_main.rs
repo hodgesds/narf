@@ -3253,6 +3253,13 @@ fn boot_userspace_init() {
                 ("cat", narf_verification::NARF_COREUTIL_CAT_ELF),
                 ("ls", narf_verification::NARF_COREUTIL_LS_ELF),
                 ("ps", narf_verification::NARF_COREUTIL_PS_ELF),
+                // Wave-78: linux-compat demo binary. Direct-syscall
+                // hello-world built with stock binutils (no libc, no
+                // PT_INTERP). Type `hello` at the `narf>` shell
+                // prompt; the exec path goes through posix_open +
+                // execve and the binary issues raw Linux x86_64
+                // syscalls (write=1, exit_group=231).
+                ("hello", narf_verification::NARF_HELLO_STATIC_ELF),
             ],
         );
         let count = fs.file_count();
