@@ -4862,6 +4862,14 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::invalid_op());
 }
 
+/// Linux `clone(2)` — same semantics as `clone3(2)` but the
+/// arguments are passed in registers. Falls back to InvalidOp
+/// on non-x86_64 / non-linux-compat builds.
+#[cfg(any(not(feature = "linux-compat"), not(target_arch = "x86_64")))]
+fn sys_clone(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::invalid_op());
+}
+
 #[cfg(feature = "linux-compat")]
 fn sys_set_tid_address(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
