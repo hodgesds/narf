@@ -5729,3 +5729,58 @@ fn smoke_pluggable_heap_backend() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_pluggable_heap_backend);
+
+fn smoke_pluggable_pager() -> TestResult {
+    use crate::pager::{
+        current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, ZpoolPager,
+    };
+    use crate::reclaim::PageFlags;
+    use crate::PhysAddr;
+    use narf_capabilities::{Cap, Grant};
+
+    // Default after boot: NoopPager.
+    if current_pager_name() != Some("noop") {
+        return TestResult::Fail("default pager is not 'noop'");
+    }
+
+    let cap: Cap<PagerAuthority, Grant> = Cap::<PagerAuthority, Grant>::bootstrap();
+
+    // Swap to the (stub) ZpoolPager. Dispatch witness: name flips.
+    if install_pager(&cap, ZpoolPager).is_err() {
+        return TestResult::Fail("install_pager(zpool) failed");
+    }
+    if current_pager_name() != Some("zpool") {
+        let _ = install_pager(&cap, NoopPager);
+        return TestResult::Fail("install didn't flip current_pager_name to zpool");
+    }
+
+    // ZpoolPager ships as a stub for Wave C — `page_out` must
+    // return `Err(NoBacking)`, proving trait dispatch reached the
+    // alternative impl (and not the noop fallback, which would
+    // have returned the same error but via a different vtable —
+    // hence the name check above).
+    let res = ZpoolPager.page_out(PhysAddr::new(0x4000), PageFlags::empty());
+    if res != Err(PagerError::NoBacking) {
+        let _ = install_pager(&cap, NoopPager);
+        return TestResult::Fail("ZpoolPager stub did not return NoBacking");
+    }
+
+    // LOCKED flag must short-circuit to BadFlags (real impl will
+    // need this invariant; the stub honours it pre-emptively).
+    let res_locked = ZpoolPager.page_out(PhysAddr::new(0x4000), PageFlags::LOCKED);
+    if res_locked != Err(PagerError::BadFlags) {
+        let _ = install_pager(&cap, NoopPager);
+        return TestResult::Fail("ZpoolPager did not reject LOCKED with BadFlags");
+    }
+
+    // Restore default before next smoke.
+    if install_pager(&cap, NoopPager).is_err() {
+        return TestResult::Fail("could not reinstall NoopPager for cleanup");
+    }
+    if current_pager_name() != Some("noop") {
+        return TestResult::Fail("post-cleanup pager name is not 'noop'");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_pluggable_pager);
