@@ -364,6 +364,20 @@ impl FileOps for ConsoleFile {
             mtime_cycles: 0,
         }
     }
+    /// `poll(2)` readiness — POLLIN only when at least one ASCII
+    /// byte is queued in the input ring, POLLOUT always (the
+    /// kernel console writer never blocks). Returning POLLIN
+    /// unconditionally — the default — breaks interactive shells:
+    /// busybox sh's read-loop does `poll(stdin, POLLIN, -1)`,
+    /// reads zero bytes when the ring is empty, interprets that
+    /// as EOF and exits the moment the user gets to a prompt.
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = narf_filesystem::POLL_OUT;
+        if narf_input::pending_bytes() > 0 {
+            mask |= narf_filesystem::POLL_IN;
+        }
+        mask
+    }
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         // Terminal ioctls. All return Ok(0) on success; any
         // user-pointer fault is reported as FsError::InvalidData
@@ -411,8 +425,40 @@ impl FileOps for ConsoleFile {
             }
             TIOCGPGRP => {
                 // pid_t = i32 on Linux x86_64.
-                let pgrp = self.fg_pgrp.load(Ordering::Acquire) as i32;
-                let bytes = pgrp.to_le_bytes();
+                //
+                // POSIX `tcgetpgrp(3)` returns the foreground process
+                // group ID of the controlling terminal. NARF boots
+                // straight into a single console without going through
+                // a getty/login that would `setsid` + `TIOCSCTTY` +
+                // `tcsetpgrp` — so the first caller to ask for the
+                // foreground pgid arrives with `fg_pgrp == 0`. Return
+                // a real pgid in that case by auto-installing the
+                // caller's pgrp, mirroring how a session leader
+                // implicitly acquires the controlling tty.
+                //
+                // Without this, busybox `sh`'s job-control init loop
+                // (`while tcgetpgrp(0) != getpgrp() { raise(SIGTTIN); }`)
+                // spins forever because tcgetpgrp returns 0 and
+                // getpgrp returns the shell's tid.
+                let mut pgrp = self.fg_pgrp.load(Ordering::Acquire);
+                if pgrp == 0 {
+                    let caller_pgrp = crate::handlers::current_task_pgid();
+                    if caller_pgrp != 0 {
+                        // CAS so two concurrent first-callers can't
+                        // race-install different pgrps; the loser
+                        // observes the winner's pgrp.
+                        match self.fg_pgrp.compare_exchange(
+                            0,
+                            caller_pgrp,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => pgrp = caller_pgrp,
+                            Err(observed) => pgrp = observed,
+                        }
+                    }
+                }
+                let bytes = (pgrp as i32).to_le_bytes();
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }

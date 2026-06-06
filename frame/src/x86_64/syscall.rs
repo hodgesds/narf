@@ -143,11 +143,27 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // `save_user_state`. The handler's `set_return` modifies
         // the rax slot at [rsp + 112].
         //
-        // Stash dispatcher rax/rdx into rcx/r11 — those will be
-        // overwritten anyway when we load user rcx (RIP) and r11
-        // (RFLAGS) below.
-        "mov rcx, rax",
-        "mov r11, rdx",
+        // Linux's syscall ABI returns a single signed value in
+        // rax: positive on success, negative-errno on failure.
+        // rdx, rdi, rsi, r10, r8, r9 must all be PRESERVED. The
+        // previous "rax = value, rdx = status" convention worked
+        // for narf-libc callers that read both registers, but it
+        // breaks every musl-built binary — musl emits patterns
+        // like `mov %fs:0, %rdx; syscall; movq $0, 0x98(%rdx)`
+        // around `__init_tp`'s `set_tid_address` call, expecting
+        // rdx to survive the syscall. When we clobbered rdx with
+        // the status word (0 for OK), every forked child #PF'd at
+        // CR2=0x98 inside `__init_tp` because rdx → 0.
+        //
+        // Fold: if status != OK, set rax = -EINVAL (-22) so
+        // userspace sees a negative-errno error per Linux
+        // semantics. Otherwise rax = value.
+        "mov rcx, rax",                        // status → rcx (scratch — about to reload)
+        "test ecx, ecx",                       // status == 0 (OK)?
+        "mov rax, rdx",                        // rax = value (assumed-success path)
+        "jz 2f",                               // status == OK: keep rax = value
+        "mov rax, -22",                        // status != OK: rax = -EINVAL
+        "2:",
 
         // Restore the six user-side arg registers from the
         // UserState slots. SysV says the C dispatcher freely
@@ -162,13 +178,6 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov r9,  [rsp + 48]",   // r9
 
         // Reload user RIP, RFLAGS from saved slots for sysretq.
-        // Stash dispatcher's value (still in r11) into rax for
-        // the final SyscallReturn convention (rax = value,
-        // rdx = status). Note: we already saved status to rcx
-        // and value to r11 above, but we'll overwrite rcx and
-        // r11 with user RIP / RFLAGS, so move them now.
-        "mov rax, r11",                        // rax = dispatcher value
-        "mov rdx, rcx",                        // rdx = dispatcher status
         "mov rcx, [rsp + 120]",                // user RIP
         "mov r11, [rsp + 128]",                // user RFLAGS
 
