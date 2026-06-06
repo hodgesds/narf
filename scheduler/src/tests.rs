@@ -1844,3 +1844,189 @@ kernel_test_in!(
     "scheduler",
     smoke_scheduler_charge_outcome_variants_distinct
 );
+
+fn smoke_pluggable_scheduler_policy() -> TestResult {
+    // Wave D: validate the `Scheduler` policy seam.
+    //
+    // 1) Default install ("fifo") is wired by `init()` — confirmed
+    //    via `current_scheduler_name`.
+    // 2) Install `PriorityScheduler` under a `Cap<SchedPolicy, Grant>`
+    //    minted from `Cap::bootstrap()`; spawn one HIGH and one LOW
+    //    priority task and drive one round. With priority enabled,
+    //    the HIGH-priority task polls first.
+    // 3) Reinstall `FifoScheduler` so subsequent smokes start clean.
+    use crate::{
+        current_scheduler_name, install_scheduler, spawn_with_spec, FifoScheduler, Priority,
+        PriorityScheduler, SchedPolicy, TaskSpec,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    // Default install — `init()` always plants Fifo. Re-run a fresh
+    // `init()` is gated, but the slot is already set from boot, so
+    // the name is observable right here.
+    let default_name = current_scheduler_name();
+    if default_name != Some("fifo") {
+        return TestResult::Fail("default scheduler is not 'fifo'");
+    }
+
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, PriorityScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(Priority) failed");
+    }
+    if current_scheduler_name() != Some("priority") {
+        // Restore default before bailing so we don't leak the
+        // wrong-policy install into the next smoke.
+        let _ = install_scheduler(&cap, FifoScheduler);
+        return TestResult::Fail("current_scheduler_name did not reflect Priority install");
+    }
+
+    // Order-of-poll witness: each task records the round-tick at
+    // which it first polled. With Priority installed, HIGH polls
+    // before LOW even though LOW is enqueued first. With Fifo the
+    // ordering would be reversed.
+    static TICK: AtomicUsize = AtomicUsize::new(0);
+    static LOW_FIRST_POLL: AtomicUsize = AtomicUsize::new(0);
+    static HIGH_FIRST_POLL: AtomicUsize = AtomicUsize::new(0);
+    TICK.store(0, Ordering::Relaxed);
+    LOW_FIRST_POLL.store(0, Ordering::Relaxed);
+    HIGH_FIRST_POLL.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+
+    let mut low_spec = TaskSpec::unthrottled();
+    low_spec.priority = Priority::LOW;
+    let mut high_spec = TaskSpec::unthrottled();
+    high_spec.priority = Priority::HIGH;
+
+    // Enqueue LOW first so a naive FIFO would poll LOW before HIGH;
+    // Priority must reverse the order.
+    spawn_with_spec(
+        async {
+            let t = TICK.fetch_add(1, Ordering::Relaxed) + 1;
+            LOW_FIRST_POLL.store(t, Ordering::Relaxed);
+        },
+        low_spec,
+    );
+    spawn_with_spec(
+        async {
+            let t = TICK.fetch_add(1, Ordering::Relaxed) + 1;
+            HIGH_FIRST_POLL.store(t, Ordering::Relaxed);
+        },
+        high_spec,
+    );
+
+    crate::run_until_empty();
+
+    let low = LOW_FIRST_POLL.load(Ordering::Relaxed);
+    let high = HIGH_FIRST_POLL.load(Ordering::Relaxed);
+    let order_ok = high > 0 && low > 0 && high < low;
+
+    // Always reinstall the default before returning so subsequent
+    // smokes (and the rest of the kernel) see fifo.
+    if install_scheduler(&cap, FifoScheduler).is_err() {
+        return TestResult::Fail("re-install_scheduler(Fifo) failed");
+    }
+    if current_scheduler_name() != Some("fifo") {
+        return TestResult::Fail("scheduler did not revert to fifo");
+    }
+
+    if !order_ok {
+        return TestResult::Fail(
+            "PriorityScheduler did not poll HIGH before LOW \
+             (tick witness)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_pluggable_scheduler_policy);
+
+fn smoke_pluggable_donation_policy() -> TestResult {
+    // Wave E: validate the `DonationPolicy` seam.
+    //
+    // 1) Default install ("head-queue") is wired by `init()`.
+    // 2) Spawn donor + donee + a witness task; `donate_to` with
+    //    HeadQueueDonation pushes donee ahead of the witness.
+    // 3) Install `BackQueueDonation`; re-run; donee now lands behind
+    //    the witness.
+    // 4) Reinstall `HeadQueueDonation` for hygiene.
+    use crate::{
+        current_donation_policy_name, donate_to, install_donation_policy, spawn, BackQueueDonation,
+        Donation, HeadQueueDonation, Task,
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_capabilities::{Cap, Grant, Invoke};
+
+    if current_donation_policy_name() != Some("head-queue") {
+        return TestResult::Fail("default donation policy is not 'head-queue'");
+    }
+
+    let donation_cap: Cap<Donation, Grant> = Cap::bootstrap();
+    let invoke_cap: Cap<Task, Invoke> = Cap::bootstrap();
+
+    // ── Round 1: HeadQueueDonation (default) ─────────────────
+    static FIRST_TAG: AtomicU32 = AtomicU32::new(0);
+    FIRST_TAG.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let _witness = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xAAAA, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    let donee = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xBBBB, Ordering::Relaxed, Ordering::Relaxed);
+    });
+
+    if donate_to(donee, &invoke_cap).is_err() {
+        return TestResult::Fail("donate_to (head-queue) returned Err on live cap");
+    }
+    crate::run_until_empty();
+
+    if FIRST_TAG.load(Ordering::Relaxed) != 0xBBBB {
+        return TestResult::Fail("head-queue donation did not place donee at front");
+    }
+
+    // ── Round 2: BackQueueDonation ───────────────────────────
+    if install_donation_policy(&donation_cap, BackQueueDonation).is_err() {
+        return TestResult::Fail("install_donation_policy(Back) failed");
+    }
+    if current_donation_policy_name() != Some("back-queue") {
+        let _ = install_donation_policy(&donation_cap, HeadQueueDonation);
+        return TestResult::Fail("current_donation_policy_name did not reflect Back install");
+    }
+
+    FIRST_TAG.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    crate::__reset_donations_for_test();
+
+    let _witness2 = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xAAAA, Ordering::Relaxed, Ordering::Relaxed);
+    });
+    let donee2 = spawn(async {
+        let _ = FIRST_TAG.compare_exchange(0, 0xBBBB, Ordering::Relaxed, Ordering::Relaxed);
+    });
+
+    if donate_to(donee2, &invoke_cap).is_err() {
+        let _ = install_donation_policy(&donation_cap, HeadQueueDonation);
+        return TestResult::Fail("donate_to (back-queue) returned Err on live cap");
+    }
+    crate::run_until_empty();
+
+    let back_order_ok = FIRST_TAG.load(Ordering::Relaxed) == 0xAAAA;
+
+    // ── Hygiene: restore default ─────────────────────────────
+    if install_donation_policy(&donation_cap, HeadQueueDonation).is_err() {
+        return TestResult::Fail("re-install_donation_policy(Head) failed");
+    }
+    if current_donation_policy_name() != Some("head-queue") {
+        return TestResult::Fail("donation policy did not revert to head-queue");
+    }
+
+    if !back_order_ok {
+        return TestResult::Fail(
+            "BackQueueDonation did not place donee behind pre-spawned witness",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_pluggable_donation_policy);
