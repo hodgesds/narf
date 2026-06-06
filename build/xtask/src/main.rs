@@ -1342,6 +1342,16 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // (which is followed by ` ` mid-line, or `>` if the
         // shell prompt redraws first).
         ("busybox uname -a", "Linux"),
+        // Threading smoke. `hello_pthread` spawns one pthread, both
+        // threads `write(2)` to fd 1, parent `pthread_join`s. End-
+        // to-end exercises Linux's x86_64 clone(2) ABI
+        // (arg3=ctid, arg4=tls — NOT the x86_32 CLONE_BACKWARDS
+        // ordering), the full UserState snapshot in the syscall-
+        // instruction fast path (needed so `sys_futex` can park
+        // and resume cleanly), per-thread TLS (FS_BASE), and the
+        // CLONE_CHILD_CLEARTID + futex_wake exit-observer chain
+        // that wakes `pthread_join`.
+        ("hello_pthread", "joined"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

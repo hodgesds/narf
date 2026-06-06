@@ -290,13 +290,19 @@ pub fn install_execve_hook(hook: ExitHook) {
 // Observers are append-only — there's no unregister. The intent is
 // boot-time wiring, not runtime hot-swap.
 
-pub type ExitObserver = fn(pid: u64);
+pub type ExitObserver = fn(pid: u64, tid: u64);
 
 static EXIT_OBSERVERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<ExitObserver>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 /// Register a callback to fire when a polled user task transitions
-/// to Exited. Invoked exactly once per task with the task's pid.
+/// to Exited. Invoked exactly once per task with `(pid, tid)`:
+///   * `pid` — the user-visible process group id. For
+///     `CLONE_THREAD` children this equals the parent's pid, so
+///     thread-aware bookkeeping (clear_child_tid, futex wait
+///     queues) must key on `tid` instead.
+///   * `tid` — the scheduler's `TaskId.raw()` for the exited
+///     task. Always distinct from sibling threads.
 pub fn register_exit_observer(o: ExitObserver) {
     EXIT_OBSERVERS.lock().push(o);
 }
@@ -305,10 +311,10 @@ pub fn register_exit_observer(o: ExitObserver) {
 /// when it sees `EXIT_REASON_EXITED`. Also exposed for test
 /// harnesses that want to drive the observer fan-out without
 /// running a full polling future.
-pub fn notify_task_exited(pid: u64) {
+pub fn notify_task_exited(pid: u64, tid: u64) {
     let observers = EXIT_OBSERVERS.lock().clone();
     for o in observers.iter() {
-        o(pid);
+        o(pid, tid);
     }
 }
 
@@ -790,10 +796,18 @@ impl core::future::Future for UserTaskFuture {
             }
         }
 
-        // Snapshot kernel CR3 once, on the first poll. Subsequent
-        // polls re-activate the user AS, so we always land back on
-        // the kernel root via the trap-back / cleanup path.
-        if this.saved_cr3.get().is_none() {
+        // Snapshot kernel CR3 EVERY poll, not once. The kernel
+        // root can shift between polls — when the page allocator
+        // hands out a phys-frame that was previously a PML4 page
+        // (e.g. a freed init/shell user-AS root) for a fresh user
+        // mmap, the OLD PML4 page contents get overwritten and
+        // restoring to that phys triple-faults. The scheduler
+        // already does a per-poll save/restore around the call
+        // (`scheduler/src/lib.rs:1357`), so the CR3 we read here
+        // is whatever it just handed us — guaranteed live for at
+        // least the duration of this poll body. Cache it in
+        // `saved_cr3` for the post-trap-back restore.
+        {
             let cr3: u64;
             // SAFETY: reading CR3 has no side effects.
             unsafe {
@@ -943,7 +957,7 @@ impl core::future::Future for UserTaskFuture {
             // tables, future ipc rings) before flipping state so
             // any subsystem that wants to inspect the live process
             // sees it pre-teardown.
-            notify_task_exited(this.process.pid.raw());
+            notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             core::task::Poll::Ready(())
         } else if reason == EXIT_REASON_EXECVE {
@@ -1163,7 +1177,7 @@ impl core::future::Future for UserTaskFuture {
         if this.process.address_space.activate().is_err() {
             // No state change — the task essentially never ran
             // user code. Fan out the exit observers and resolve.
-            notify_task_exited(this.process.pid.raw());
+            notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             return core::task::Poll::Ready(());
         }
@@ -1252,7 +1266,7 @@ impl core::future::Future for UserTaskFuture {
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
-            notify_task_exited(this.process.pid.raw());
+            notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             core::task::Poll::Ready(())
         } else {

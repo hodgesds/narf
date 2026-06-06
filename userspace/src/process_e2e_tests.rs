@@ -199,7 +199,7 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
     // (3) fire the exit observer manually (simulates child calling
     //     sys_exit_task) and verify wait4 reaps it. notify_task_exited
     //     takes a ProcessId per Wave-38.
-    crate::user_task::notify_task_exited(child_pid);
+    crate::user_task::notify_task_exited(child_pid, child_pid);
 
     // (4) wait4(-1, &status, 0) from the parent should return child_tid
     let mut status: i32 = -1;
@@ -355,7 +355,7 @@ fn smoke_process_wait4_wnohang() -> TestResult {
     }
 
     // (B) Simulate child exit
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // (C) WNOHANG after exit — must return child pid
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
@@ -408,8 +408,8 @@ fn smoke_process_wait4_specific_child() -> TestResult {
     crate::handlers::__test_inject_parent_of(CHILD_B, PARENT);
 
     // Both children exit.
-    crate::user_task::notify_task_exited(CHILD_A);
-    crate::user_task::notify_task_exited(CHILD_B);
+    crate::user_task::notify_task_exited(CHILD_A, CHILD_A);
+    crate::user_task::notify_task_exited(CHILD_B, CHILD_B);
 
     // wait4(CHILD_A) — should reap only CHILD_A
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
@@ -507,7 +507,7 @@ fn smoke_process_sigchld_on_child_exit() -> TestResult {
 
     // Wire the parent-of relationship and fire the exit.
     crate::handlers::__test_inject_parent_of(CHILD, PARENT);
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // SIGCHLD bit (17) should be pending on the parent.
     let pending = signal_pending_of(PARENT);
@@ -1497,7 +1497,7 @@ fn smoke_wave35_waitpid_wnohang_before_after() -> TestResult {
     }
 
     // (B) Fire child exit, then WNOHANG — must return child pid.
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     let mut ctx = StubCtx {
         args: SyscallArgs {
@@ -1553,7 +1553,7 @@ fn smoke_wave37_blocking_wait4_fallback_exit_before_wait() -> TestResult {
     crate::handlers::__test_inject_parent_of(CHILD, PARENT);
 
     // Fire child exit BEFORE the blocking wait4 call.
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // Blocking wait4(-1, &status, 0) — no WNOHANG.
     // In test context (no yield hook), the fallback busy-spin exits
@@ -1628,7 +1628,7 @@ fn smoke_wave37_wait_child_check_fn_contract() -> TestResult {
     }
 
     // Populate the queue.
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // (B) Queue has entry → returns child pid.
     let r1 = crate::user_task::call_wait_child_check(PARENT, -1, 0);
@@ -1706,7 +1706,7 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
 
     // Fire child exit — this should call wake_wait_child(PARENT)
     // which consumes the waker we stored and calls w.wake().
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     if !WOKE.load(Ord::Acquire) {
         teardown_process_state();
@@ -1746,9 +1746,9 @@ fn smoke_wave37_three_children_sequential_reap() -> TestResult {
     crate::handlers::__test_inject_parent_of(C2, PARENT);
     crate::handlers::__test_inject_parent_of(C3, PARENT);
 
-    crate::user_task::notify_task_exited(C1);
-    crate::user_task::notify_task_exited(C2);
-    crate::user_task::notify_task_exited(C3);
+    crate::user_task::notify_task_exited(C1, C1);
+    crate::user_task::notify_task_exited(C2, C2);
+    crate::user_task::notify_task_exited(C3, C3);
 
     let mut reaped_set = [0u64; 3];
 
@@ -2020,7 +2020,7 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
     let ids_differ = child_pid != child_task_raw;
 
     // Simulate child exit via notify_task_exited(ProcessId).
-    crate::user_task::notify_task_exited(child_pid);
+    crate::user_task::notify_task_exited(child_pid, child_pid);
 
     // wait4 by the parent should return the child's ProcessId.
     let mut status: i32 = -1;
@@ -2110,7 +2110,7 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     }
 
     // Fire the exit observer with the child's ProcessId.
-    crate::user_task::notify_task_exited(CHILD_PID);
+    crate::user_task::notify_task_exited(CHILD_PID, CHILD_PID);
 
     // on_child_exit must have pushed (CHILD_PID, status) into
     // PENDING_EXITS[PARENT_TASK] and set SIGCHLD pending on PARENT_TASK.
@@ -2241,7 +2241,7 @@ fn smoke_wave55_sigsegv_default_terminate_sets_wifsignaled() -> TestResult {
 
     // Fan out the observer (the polling future would do this after
     // longjmping out of terminate_current_task).
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // Parent's wait4 should reap with WIFSIGNALED + WTERMSIG=SIGSEGV
     // and WCOREDUMP=true (SIGSEGV default action is CoreDump).
@@ -2337,7 +2337,7 @@ fn smoke_wave55_sigterm_default_terminate_sets_wifsignaled() -> TestResult {
     LOOKUP_TASK.store(CHILD, Ordering::Relaxed);
     let mut ctx = signal_ctx_returning_to_user();
     crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // Parent's wait4 sees WIFSIGNALED + WTERMSIG=SIGTERM, no core.
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
@@ -2423,7 +2423,7 @@ fn smoke_wave55_sigkill_default_terminate_sets_wifsignaled() -> TestResult {
     LOOKUP_TASK.store(CHILD, Ordering::Relaxed);
     let mut ctx = signal_ctx_returning_to_user();
     crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
     let mut status: i32 = -1;
@@ -2503,7 +2503,7 @@ fn smoke_wave55_self_sighup_default_terminate_sets_wifsignaled() -> TestResult {
 
     let mut ctx = signal_ctx_returning_to_user();
     crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
-    crate::user_task::notify_task_exited(CHILD);
+    crate::user_task::notify_task_exited(CHILD, CHILD);
 
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
     let mut status: i32 = -1;
@@ -2660,9 +2660,9 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
     __test_inject_parent_of(c3.raw(), PARENT);
 
     // Children exit — pids are NOT released yet (held until reap).
-    notify_task_exited(c1.raw());
-    notify_task_exited(c2.raw());
-    notify_task_exited(c3.raw());
+    notify_task_exited(c1.raw(), c1.raw());
+    notify_task_exited(c2.raw(), c2.raw());
+    notify_task_exited(c3.raw(), c3.raw());
 
     if crate::pid_pool_free_count() != 0 {
         crate::__test_reset_pid_pool();
@@ -3092,7 +3092,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
     // ca.child_tid.
-    crate::user_task::notify_task_exited(child_tid_raw);
+    crate::user_task::notify_task_exited(child_tid_raw, child_tid_raw);
 
     let post = crate::handlers::__test_futex_wake_counter(ca.child_tid);
     if post <= pre {

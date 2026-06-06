@@ -103,11 +103,11 @@ pub use process::{
     UserProcess, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
 };
 pub use syscall::{
-    install_global, kernel_syscall_entry, kernel_syscall_entry_plain, syscall_number, syscall_pack,
-    syscall_version, FnHandler, RawFnHandler, RawSyscallHandler, SigDeliveryParams, Syscall,
-    SyscallArgs, SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext,
-    SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_SIGINFO, SYS_NUMBER_MASK,
-    SYS_VERSION_MASK, SYS_VERSION_SHIFT,
+    install_global, kernel_syscall_entry, kernel_syscall_entry_plain,
+    kernel_syscall_entry_plain_with_state, syscall_number, syscall_pack, syscall_version,
+    FnHandler, RawFnHandler, RawSyscallHandler, SigDeliveryParams, Syscall, SyscallArgs,
+    SyscallEntry, SyscallHandler, SyscallReturn, SyscallTable, TrapContext, SA_NODEFER, SA_ONSTACK,
+    SA_RESETHAND, SA_RESTART, SA_SIGINFO, SYS_NUMBER_MASK, SYS_VERSION_MASK, SYS_VERSION_SHIFT,
 };
 #[cfg(target_arch = "x86_64")]
 pub use tls::{stage_tls, TlsError, TLS_REGION_BASE};

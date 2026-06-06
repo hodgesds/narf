@@ -549,7 +549,7 @@ fn smoke_fb_exit_observer_reaps_handles() -> TestResult {
 
     // Register the FB exit observer (boot-time wiring; the
     // verification harness re-applies it here).
-    register_exit_observer(|pid| {
+    register_exit_observer(|pid, _tid| {
         let _ = disconnect_all_for_pid(pid);
     });
 
@@ -563,14 +563,14 @@ fn smoke_fb_exit_observer_reaps_handles() -> TestResult {
         return TestResult::Fail("setup");
     }
 
-    notify_task_exited(pid_dies);
+    notify_task_exited(pid_dies, pid_dies);
 
     if count() != 1 {
         clear_test_scanout();
         return TestResult::Fail("observer didn't reap dying pid's handles");
     }
 
-    notify_task_exited(pid_keeps);
+    notify_task_exited(pid_keeps, pid_keeps);
     if count() != 0 {
         clear_test_scanout();
         return TestResult::Fail("second notify didn't reap survivor");

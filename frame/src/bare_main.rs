@@ -3317,6 +3317,11 @@ fn boot_userspace_init() {
                 // DTPOFF64 / GLOB_DAT / JUMP_SLOT relocation
                 // processing end-to-end.
                 ("hello_musl_dyn", narf_verification::NARF_HELLO_MUSL_DYN_ELF),
+                // pthread demo — exercises clone3 +
+                // CLONE_THREAD/VM/SETTLS, per-thread TLS, futex
+                // FUTEX_WAIT/WAKE for pthread_join, and stdio
+                // from both threads.
+                ("hello_pthread", narf_verification::NARF_HELLO_PTHREAD_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

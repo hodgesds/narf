@@ -2497,6 +2497,23 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
 /// upgraded to ferry a full TrapContext.
 #[inline]
 pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn {
+    kernel_syscall_entry_plain_with_state(num, args, core::ptr::null_mut())
+}
+
+/// Same as [`kernel_syscall_entry_plain`] but carries a pointer
+/// to the kernel-stack `UserState` snapshot the syscall-instruction
+/// asm built. Handlers that park-and-yield via the user_task
+/// hook (`sys_futex`, `sys_sleep`) read this snapshot through
+/// `TrapContext::save_user_state` so the resume goes back to the
+/// right user RIP / RSP / GPRs. When called from the int 0x80
+/// path the pointer is null and `save_user_state` falls back to
+/// the int-style TrapFrame the trap stub built — handlers don't
+/// need to know which path they came from.
+pub fn kernel_syscall_entry_plain_with_state(
+    num: u32,
+    args: &SyscallArgs,
+    user_state: *mut u8,
+) -> SyscallReturn {
     let n = match Syscall::from_raw(num) {
         Some(v) => v,
         None => return SyscallReturn::invalid_op(),
@@ -2512,7 +2529,7 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
         None => return SyscallReturn::invalid_op(),
     };
     if let Some(h) = slot.raw_handler.as_ref() {
-        let mut ctx = ArgsOnlyCtx::new(*args);
+        let mut ctx = ArgsOnlyCtx::new(*args, user_state);
         h.invoke(&mut ctx);
         return ctx.ret;
     }
@@ -2532,14 +2549,22 @@ pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn
 struct ArgsOnlyCtx {
     args: SyscallArgs,
     ret: SyscallReturn,
+    /// Pointer to the kernel-stack `UserState` snapshot the asm
+    /// built before calling the dispatcher. Null when invoked
+    /// from a path that doesn't carry one (the legacy `int 0x80`
+    /// path uses a richer `X86TrapContext` and never calls this).
+    /// Non-null when set, the layout matches
+    /// `narf_arch::x86_64::user_mode::UserState` (152 bytes).
+    user_state: *mut u8,
 }
 
 impl ArgsOnlyCtx {
     #[inline]
-    fn new(args: SyscallArgs) -> Self {
+    fn new(args: SyscallArgs, user_state: *mut u8) -> Self {
         Self {
             args,
             ret: SyscallReturn::invalid_op(),
+            user_state,
         }
     }
 }
@@ -2556,5 +2581,34 @@ impl TrapContext for ArgsOnlyCtx {
     #[inline]
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
+    }
+    /// Copy the kernel-stack `UserState` snapshot into the
+    /// caller's buffer so a `sys_futex` / `sys_sleep` park can
+    /// longjmp back to the polling future and later resume via
+    /// `enter_user_mode_resume`.
+    ///
+    /// # Safety
+    /// `out` must point at a writable region of at least
+    /// `size_of::<UserState>()` bytes (152 on x86_64) and be
+    /// aligned for u64 reads.
+    unsafe fn save_user_state(&self, out: *mut u8) -> bool {
+        if self.user_state.is_null() || out.is_null() {
+            return false;
+        }
+        // SAFETY: caller asserts `out` is the right size. The
+        // syscall-instruction asm sized the source at 152 bytes
+        // (see `frame/src/x86_64/syscall.rs`).
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.user_state, out, 152);
+            // The `set_return` value lands in the rax slot at
+            // offset 112 so the user's `rax` on resume reflects
+            // the syscall return value, not the original syscall
+            // number. Also write the resolved value into the
+            // copied state.
+            let out_state = out as *mut u64;
+            // SyscallReturn convention: rax = value.
+            *out_state.add(14) = self.ret.value;
+        }
+        true
     }
 }

@@ -152,7 +152,7 @@ fn smoke_shmem_exit_observer_reaps_handles() -> TestResult {
     };
     __reset_for_test();
     __test_clear_exit_observers();
-    register_exit_observer(|pid| {
+    register_exit_observer(|pid, _tid| {
         let _ = destroy_all_for_pid(pid);
     });
     let pid_dies = 9101u64;
@@ -163,11 +163,11 @@ fn smoke_shmem_exit_observer_reaps_handles() -> TestResult {
     if count() != 3 {
         return TestResult::Fail("setup");
     }
-    notify_task_exited(pid_dies);
+    notify_task_exited(pid_dies, pid_dies);
     if count() != 1 {
         return TestResult::Fail("observer didn't reap dying pid's shmem");
     }
-    notify_task_exited(pid_keeps);
+    notify_task_exited(pid_keeps, pid_keeps);
     if count() != 0 {
         return TestResult::Fail("survivor not reaped on its own exit");
     }
