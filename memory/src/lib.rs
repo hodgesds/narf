@@ -25,6 +25,7 @@ pub mod heap;
 pub mod heap_backend;
 pub mod hugepage;
 pub mod kaslr;
+pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
 pub mod ro_after_init;
@@ -81,4 +82,8 @@ pub use heap::BumpAllocator;
 pub use heap_backend::{
     current_heap_backend_name, install_heap_backend, BumpBackend, HeapAuthority, HeapBackend,
     HeapError, SlabBackend, BUMP_BACKEND, SLAB_BACKEND,
+};
+pub use pager::{
+    current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, SwapSlot,
+    ZpoolPager,
 };

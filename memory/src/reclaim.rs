@@ -122,6 +122,19 @@ pub enum ReclaimOutcome {
     /// the list — a pin is presumed transient and a later sweep
     /// will retry.
     Locked,
+    /// Owner can't free the page directly but is willing to have
+    /// the kernel hand it to the installed `Pager` for paging-out.
+    /// Wave C of the pluggable-policy pass: the reclaim loop calls
+    /// `pager::page_out_via_installed(phys, flags)`; on `Ok` the
+    /// page is considered handed off. See `crate::pager` for the
+    /// trait contract.
+    ///
+    /// Wave C ships with the *seam*: the loop logs the page-out
+    /// result for diagnostics but does **not** yet free the frame
+    /// or maintain a `(owner, phys) → SwapSlot` side-table. Full
+    /// integration (frame-free on success + side-table for
+    /// `page_in` discovery) is a Wave C+1 follow-up.
+    DeferToPager,
 }
 
 /// Signature of a page-reclaim handler. Receives the page's
@@ -566,10 +579,10 @@ pub fn reclaim_target_pages(n: usize) -> usize {
 
     while freed < n {
         // Pull a batch of candidates from the tail.
-        let batch: Vec<(PageHandle, PhysAddr, ReclaimFn, bool)> = {
+        let batch: Vec<(PageHandle, PhysAddr, PageFlags, ReclaimFn, bool)> = {
             let mut state = STATE.lock();
             let take = core::cmp::min(BATCH, n - freed);
-            let mut out: Vec<(PageHandle, PhysAddr, ReclaimFn, bool)> = Vec::new();
+            let mut out: Vec<(PageHandle, PhysAddr, PageFlags, ReclaimFn, bool)> = Vec::new();
             // Pop from the back (oldest cold pages). We re-queue
             // any survivors after the lock is dropped + handlers
             // have run.
@@ -584,7 +597,7 @@ pub fn reclaim_target_pages(n: usize) -> usize {
                 };
                 let entry = state.slots[idx].entry;
                 let locked = entry.flags.contains(PageFlags::LOCKED);
-                out.push((handle, entry.phys, entry.reclaim_fn, locked));
+                out.push((handle, entry.phys, entry.flags, entry.reclaim_fn, locked));
             }
             out
         };
@@ -594,20 +607,51 @@ pub fn reclaim_target_pages(n: usize) -> usize {
         }
 
         // Outside the lock — invoke handlers.
-        let mut results: Vec<(PageHandle, ReclaimOutcome)> = Vec::with_capacity(batch.len());
-        for (handle, phys, reclaim_fn, locked) in batch {
+        let mut results: Vec<(PageHandle, PhysAddr, PageFlags, ReclaimOutcome)> =
+            Vec::with_capacity(batch.len());
+        for (handle, phys, flags, reclaim_fn, locked) in batch {
             if locked {
-                results.push((handle, ReclaimOutcome::Locked));
+                results.push((handle, phys, flags, ReclaimOutcome::Locked));
                 continue;
             }
             let outcome = reclaim_fn(phys);
-            results.push((handle, outcome));
+            results.push((handle, phys, flags, outcome));
+        }
+
+        // Pager dispatch happens *outside* the state lock — the
+        // pager impl may take its own locks / allocate / touch the
+        // heap. Collect the page-out results here, then apply
+        // bookkeeping under the state lock below.
+        //
+        // Wave C scope note: a successful `page_out` does **not**
+        // yet free the physical frame or maintain a reverse-mapping
+        // side-table mapping `(handle, phys) → SwapSlot`. Owners
+        // currently have no way to recover the page via `page_in`;
+        // the deliverable for this wave is the *seam*, not a live
+        // swap. Wave C+1 will:
+        //   1. free the frame on `Ok(slot)`,
+        //   2. record the slot in a side-table keyed by handle,
+        //   3. surface the slot to the owner so it can call
+        //      `pager::page_in` on demand.
+        // Until then we treat `DeferToPager → Ok(_)` as a no-op
+        // bookkeeping-wise (keep the page tracked, same as
+        // `Locked`) so the system stays correct.
+        let mut pager_dispositions: Vec<(
+            PageHandle,
+            Result<crate::pager::SwapSlot, crate::pager::PagerError>,
+        )> = Vec::new();
+        for (handle, phys, flags, outcome) in &results {
+            if matches!(outcome, ReclaimOutcome::DeferToPager) {
+                let res = crate::pager::page_out_via_installed(*phys, *flags);
+                pager_dispositions.push((*handle, res));
+            }
         }
 
         // Apply outcomes under the lock.
         {
             let mut state = STATE.lock();
-            for (handle, outcome) in results {
+            let mut pager_iter = pager_dispositions.into_iter();
+            for (handle, _phys, _flags, outcome) in results {
                 state.reclaim_attempts = state.reclaim_attempts.wrapping_add(1);
                 match outcome {
                     ReclaimOutcome::Freed => {
@@ -633,6 +677,19 @@ pub fn reclaim_target_pages(n: usize) -> usize {
                             state.slots[idx].entry.flags =
                                 state.slots[idx].entry.flags.union(PageFlags::LOCKED);
                         }
+                        state.inactive.push_front(handle);
+                    }
+                    ReclaimOutcome::DeferToPager => {
+                        // Pull the matching pager result. The pre-
+                        // pass above pushed one entry per
+                        // `DeferToPager` outcome in iteration order,
+                        // so the head of the iterator is ours.
+                        let _ = pager_iter.next();
+                        // TODO(wave-C+1): on Ok(slot), free the
+                        // frame and stash the slot in a side-table.
+                        // For now, leave the page tracked on
+                        // inactive — same disposition as Locked —
+                        // so subsequent reclaim passes can retry.
                         state.inactive.push_front(handle);
                     }
                 }
