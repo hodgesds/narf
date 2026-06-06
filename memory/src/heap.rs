@@ -17,13 +17,29 @@
 //! (typical bump semantics); otherwise it's a slab object and gets
 //! freed properly.
 //!
+//! ## Wave-B pluggability
+//!
+//! `BumpAllocator` is still the workspace's `#[global_allocator]`
+//! type — its identity is load-bearing for downstream
+//! `static GLOBAL_ALLOC: BumpAllocator = BumpAllocator;` declarations
+//! (notably `frame::bare_main`). Its `GlobalAlloc::alloc` /
+//! `dealloc` body no longer branches on `SLAB_LIVE` directly;
+//! instead it dispatches through `heap_backend::current_backend()`,
+//! the seam introduced in `memory/src/heap_backend.rs`. The two
+//! shipped backends (`BumpBackend`, `SlabBackend`) wrap the same
+//! `HEAP` bump arena + `crate::slab` they used to inline. The
+//! `bump_alloc` shim below is the canonical entry point those
+//! backends call into; the `in_bootstrap` predicate is what makes
+//! cross-backend `dealloc` (slab routing past a stranded bump
+//! pointer) still safe.
+//!
 //! See `memory/specification/heap-migration.md` for the full plan.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::slab;
+use crate::heap_backend::{self, current_backend, install_default_if_unset, SLAB_BACKEND};
 
 /// Bootstrap arena size. Has to cover every allocation up to the
 /// point `promote_to_slab()` is called. Pre-promotion includes
@@ -47,22 +63,32 @@ unsafe impl Sync for HeapBacking {}
 static HEAP: HeapBacking = HeapBacking(UnsafeCell::new([0; BOOTSTRAP_CAPACITY]));
 static OFFSET: AtomicUsize = AtomicUsize::new(0);
 
-/// True once the slab is initialized and ready to serve allocations.
-/// Flipped by `promote_to_slab()` after `init_from_map`.
-static SLAB_LIVE: AtomicBool = AtomicBool::new(false);
-
 /// Promote the global allocator from bootstrap-bump to slab. Call
 /// exactly once, after `init_from_map` has populated the buddy.
 /// Allocations made before this point stay in the bootstrap arena
 /// (and stay leaked, per bump semantics); allocations after route
 /// to the slab.
+///
+/// Implementation: installs `&SLAB_BACKEND` into the heap-backend
+/// slot, replacing whatever was there (typically `&BUMP_BACKEND`
+/// planted lazily on first allocation). The bump arena's
+/// `in_bootstrap` predicate ensures stranded bump pointers still
+/// land on the no-op `dealloc` path even after the slab is the
+/// active backend.
 pub fn promote_to_slab() {
-    SLAB_LIVE.store(true, Ordering::Release);
+    // The cap-gated install surface (`install_heap_backend`) is the
+    // public path; this internal route exists because `promote_to_slab`
+    // is the canonical, kernel-internal promotion point and existed
+    // before the trait seam. `install_uncapped` is crate-private to
+    // ensure no external code can side-step the cap check.
+    heap_backend::install_uncapped(&SLAB_BACKEND);
 }
 
 /// The hybrid global allocator. Pre-promotion: bump arena.
 /// Post-promotion: slab routes to size-class central + per-CPU
-/// magazines.
+/// magazines. Wave B: the routing decision moved into
+/// `heap_backend::current_backend()` — this type is now the shell
+/// the workspace's `#[global_allocator]` declarations bind to.
 pub struct BumpAllocator;
 
 impl core::fmt::Debug for BumpAllocator {
@@ -70,65 +96,91 @@ impl core::fmt::Debug for BumpAllocator {
         f.debug_struct("BumpAllocator")
             .field("bootstrap_used", &OFFSET.load(Ordering::Relaxed))
             .field("bootstrap_capacity", &BOOTSTRAP_CAPACITY)
-            .field("slab_live", &SLAB_LIVE.load(Ordering::Relaxed))
+            .field(
+                "backend",
+                &heap_backend::current_heap_backend_name().unwrap_or("none"),
+            )
             .finish()
     }
 }
 
 /// Returns true iff `ptr` lies inside the bootstrap arena's bytes.
-/// Used by `dealloc` to route freeing to the right path.
-fn in_bootstrap(ptr: *mut u8) -> bool {
+/// Used by `dealloc` to route freeing to the right path —
+/// stranded bump-era pointers survive the bump→slab promotion and
+/// must NOT be handed to `slab::dealloc`.
+pub(crate) fn in_bootstrap(ptr: *mut u8) -> bool {
     let base = HEAP.0.get() as *mut u8 as usize;
     let end = base + BOOTSTRAP_CAPACITY;
     let p = ptr as usize;
     p >= base && p < end
 }
 
+/// Bump-arena `alloc` implementation. Public to the crate so
+/// `heap_backend::BumpBackend` can call into it without
+/// re-implementing the CAS loop. Returns null on overflow,
+/// matching `GlobalAlloc::alloc`.
+pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
+    let align = layout.align().max(1);
+    let size = layout.size();
+    loop {
+        let cur = OFFSET.load(Ordering::Relaxed);
+        let aligned = (cur + align - 1) & !(align - 1);
+        let end = match aligned.checked_add(size) {
+            Some(e) if e <= BOOTSTRAP_CAPACITY => e,
+            _ => return core::ptr::null_mut(),
+        };
+        if OFFSET
+            .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // SAFETY: `aligned..end` lies inside HEAP.0.
+            let base = HEAP.0.get() as *mut u8;
+            return unsafe { base.add(aligned) };
+        }
+    }
+}
+
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Slab path — only available post-promotion.
-        if SLAB_LIVE.load(Ordering::Acquire) {
-            match slab::alloc(layout) {
-                Ok(p) => return p.as_ptr(),
-                Err(_) => return core::ptr::null_mut(),
-            }
-        }
-        // Bootstrap bump fast path.
-        let align = layout.align().max(1);
-        let size = layout.size();
-        loop {
-            let cur = OFFSET.load(Ordering::Relaxed);
-            let aligned = (cur + align - 1) & !(align - 1);
-            let end = match aligned.checked_add(size) {
-                Some(e) if e <= BOOTSTRAP_CAPACITY => e,
-                _ => return core::ptr::null_mut(),
-            };
-            if OFFSET
-                .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                // SAFETY: `aligned..end` lies inside HEAP.0.
-                let base = HEAP.0.get() as *mut u8;
-                return unsafe { base.add(aligned) };
-            }
-        }
+        // First-allocation lazy default: if no backend is installed
+        // yet, plant `&BUMP_BACKEND` so the very first allocation
+        // (which fires before `init_from_map` runs) succeeds.
+        // Idempotent — subsequent `promote_to_slab` overwrites it.
+        install_default_if_unset();
+        let backend = match current_backend() {
+            Some(b) => b,
+            // Defensive: `install_default_if_unset` above means
+            // this branch is structurally unreachable, but a null
+            // return is safer than a panic if a future caller
+            // skips initialization.
+            None => return core::ptr::null_mut(),
+        };
+        // SAFETY: caller upholds `GlobalAlloc::alloc` contract,
+        // which is the same contract `HeapBackend::alloc`
+        // forwards.
+        unsafe { backend.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // Pointers from the bootstrap arena can't be freed (bump
-        // doesn't track sizes per slot). Skipping is correct —
-        // those bytes stay leaked, but the arena is small + bounded.
+        // doesn't track sizes per slot). Route them away from
+        // whatever backend is currently installed — once the slab
+        // takes over, handing a bump-era pointer to `slab::dealloc`
+        // would corrupt the slab's free-list.
         if in_bootstrap(ptr) {
             return;
         }
+        let backend = match current_backend() {
+            Some(b) => b,
+            // No backend + non-bump pointer is a logic bug, but a
+            // silent leak is the least-bad outcome.
+            None => return,
+        };
         // SAFETY: caller asserts the pointer/layout pair came from
-        // a prior `alloc` call. By construction, anything not in the
-        // bootstrap arena came from the slab.
-        if let Some(nn) = core::ptr::NonNull::new(ptr) {
-            unsafe {
-                slab::dealloc(nn, layout);
-            }
-        }
+        // a prior `alloc`. The `in_bootstrap` check above
+        // guarantees `ptr` is NOT a stranded bump-era pointer, so
+        // it's safe to hand to the current backend.
+        unsafe { backend.dealloc(ptr, layout) }
     }
 }
 

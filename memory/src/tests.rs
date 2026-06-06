@@ -5613,3 +5613,119 @@ fn smoke_pluggable_frame_alloc() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_pluggable_frame_alloc);
+
+// ── Wave-B pluggable HeapBackend smoke ──────────────────────────────
+//
+// Verifies the heap-backend seam: install a counting backend under a
+// Grant cap that delegates to the production slab, drive a real
+// `Vec` allocation through `#[global_allocator]`, and confirm the
+// counter advanced. Reinstalls `SLAB_BACKEND` on the way out so the
+// rest of the smoke suite runs against the production backend.
+//
+// `CountingHeapBackend` only delegates to `crate::slab` directly
+// (rather than to `SLAB_BACKEND`) so the counting indirection is
+// the only thing the active backend slot sees during the test.
+
+#[derive(Debug)]
+struct CountingHeapBackend {
+    allocs: core::sync::atomic::AtomicU64,
+    deallocs: core::sync::atomic::AtomicU64,
+}
+
+impl CountingHeapBackend {
+    const fn new() -> Self {
+        Self {
+            allocs: core::sync::atomic::AtomicU64::new(0),
+            deallocs: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    fn alloc_count(&self) -> u64 {
+        self.allocs.load(core::sync::atomic::Ordering::Relaxed)
+    }
+    fn dealloc_count(&self) -> u64 {
+        self.deallocs.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::heap_backend::HeapBackend for CountingHeapBackend {
+    fn name(&self) -> &'static str {
+        "counting"
+    }
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        self.allocs
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        match crate::slab::alloc(layout) {
+            Ok(p) => p.as_ptr(),
+            Err(_) => core::ptr::null_mut(),
+        }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        self.deallocs
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if let Some(nn) = core::ptr::NonNull::new(ptr) {
+            // SAFETY: caller asserts matching layout from a prior
+            // `alloc` on this backend — which means it came from
+            // `crate::slab::alloc`.
+            unsafe { crate::slab::dealloc(nn, layout) };
+        }
+    }
+}
+
+fn smoke_pluggable_heap_backend() -> TestResult {
+    use crate::heap_backend::{
+        current_heap_backend_name, install_heap_backend, HeapAuthority, SLAB_BACKEND,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    // By the time the smoke suite runs, `promote_to_slab` has flipped
+    // the active backend to the slab — every other smoke in this file
+    // relies on that.
+    if current_heap_backend_name() != Some("slab") {
+        return TestResult::Fail("default HeapBackend is not 'slab' at smoke start");
+    }
+
+    static COUNTER: CountingHeapBackend = CountingHeapBackend::new();
+    let allocs_before = COUNTER.alloc_count();
+    let deallocs_before = COUNTER.dealloc_count();
+
+    let cap: Cap<HeapAuthority, Grant> = Cap::<HeapAuthority, Grant>::bootstrap();
+    if install_heap_backend(&cap, &COUNTER).is_err() {
+        return TestResult::Fail("install_heap_backend(counting) failed");
+    }
+    if current_heap_backend_name() != Some("counting") {
+        let _ = install_heap_backend(&cap, &SLAB_BACKEND);
+        return TestResult::Fail("install didn't flip current_heap_backend_name");
+    }
+
+    // Drive a real allocation through `#[global_allocator]`. A
+    // 64-byte `Vec` falls into the slab's 64-byte class — well
+    // inside the production code path. Drop it inside the
+    // counting window so the dealloc counter advances too.
+    {
+        let v: alloc::vec::Vec<u8> = alloc::vec![0u8; 64];
+        // Touch a byte so the optimiser can't fold the alloc away.
+        core::hint::black_box(&v);
+    }
+
+    let allocs_after = COUNTER.alloc_count();
+    let deallocs_after = COUNTER.dealloc_count();
+
+    // Cleanup: reinstall the slab default before bailing on any
+    // assertion, otherwise later smokes run under `CountingBackend`
+    // and immediately segfault when it's dropped at end-of-test.
+    if install_heap_backend(&cap, &SLAB_BACKEND).is_err() {
+        return TestResult::Fail("could not reinstall SLAB_BACKEND for cleanup");
+    }
+    if current_heap_backend_name() != Some("slab") {
+        return TestResult::Fail("post-cleanup name is not 'slab'");
+    }
+
+    if allocs_after <= allocs_before {
+        return TestResult::Fail("counting backend's alloc counter didn't advance");
+    }
+    if deallocs_after <= deallocs_before {
+        return TestResult::Fail("counting backend's dealloc counter didn't advance");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_pluggable_heap_backend);

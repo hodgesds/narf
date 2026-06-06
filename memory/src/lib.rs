@@ -22,6 +22,7 @@ pub mod context;
 pub mod diag;
 pub mod frame;
 pub mod heap;
+pub mod heap_backend;
 pub mod hugepage;
 pub mod kaslr;
 pub mod per_domain_root;
@@ -77,3 +78,7 @@ pub use frame::{
     MAX_NUMA_NODES as FRAME_MAX_NUMA_NODES, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use heap::BumpAllocator;
+pub use heap_backend::{
+    current_heap_backend_name, install_heap_backend, BumpBackend, HeapAuthority, HeapBackend,
+    HeapError, SlabBackend, BUMP_BACKEND, SLAB_BACKEND,
+};
