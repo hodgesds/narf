@@ -1097,6 +1097,20 @@ pub enum Syscall {
     /// (POSIX: returns the calling thread's TID).
     SetTidAddress,
 
+    /// Linux arch_prctl(2) (x86_64 only — wire 158). musl's
+    /// `__init_libc` calls this near the top of process startup
+    /// to install its TLS thread pointer:
+    ///   `arch_prctl(ARCH_SET_FS, tls_self_ptr)`.
+    /// Without it musl bails via `a_crash()` and the process #UDs
+    /// before reaching `main`. Sub-codes:
+    ///   `ARCH_SET_GS = 0x1001`
+    ///   `ARCH_SET_FS = 0x1002`  ← the one musl actually emits
+    ///   `ARCH_GET_FS = 0x1003`
+    ///   `ARCH_GET_GS = 0x1004`
+    /// `arg0 = code`, `arg1 = addr` (for SET) or user-pointer to
+    /// receive the value (for GET).
+    ArchPrctl,
+
     /// Linux tkill(2) / tgkill(2): like kill but targets a specific
     /// thread within a process group. NARF is single-threaded per
     /// process — tgkill aliases sys_kill. `arg0 = tgid` (-1 = any),
@@ -1623,6 +1637,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdGettime, 287),
     (Syscall::EpollWait, 232), // epoll_wait
     (Syscall::EpollCtl, 233),
+    (Syscall::ArchPrctl, 158), // arch_prctl (x86_64 only)
     // Linux 231 = exit_group. Glibc/musl emit exit_group out of
     // __libc_start_main's exit path; mapping it to the same
     // handler as plain exit (60 → ExitTask) lets a real
