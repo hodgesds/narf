@@ -666,7 +666,30 @@ pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, A
             // Always lookup as file first. Even an "intermediate"
             // segment may be a symlink-to-directory, which is reached
             // through the file-shape lookup.
-            let f = current_dir.lookup_async(&seg).await?;
+            //
+            // Carve-out for nested subdirs that are dir-only (no
+            // FileOps shape) — e.g. `/dev/pts` exists only as a
+            // `lookup_dir` target on the parent. `lookup_async`
+            // returns `NotFound` for those, but they're legitimate
+            // intermediate components, so swallow the NotFound and
+            // fall through to the lookup_dir_async branch below.
+            let f_result = current_dir.lookup_async(&seg).await;
+            let f = match f_result {
+                Ok(f) => f,
+                Err(FsError::NotFound) if !is_final => {
+                    let next = match current_dir.lookup_dir_async(&seg).await {
+                        Ok(d) => d,
+                        Err(FsError::Unsupported) => {
+                            current_dir.lookup_dir(&seg).ok_or(FsError::NotFound)?
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    parent_chain.push(current_dir);
+                    current_dir = next;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let kind = f.stat_async().await?.mode.file_type;
 
             if kind == FileType::Symlink {

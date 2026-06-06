@@ -354,7 +354,53 @@ pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
 // `copy_in`/`copy_out`. The SMAP/STAC bracket lives in the syscall trap
 // layer; this layer just sees an opaque usize and does a pointer load/store.
 
-#[cfg(feature = "linux-compat")]
+// SMAP gotcha — every load/store to user memory below has to sit
+// inside a `with_user_access` window. A bare `mov` from a user-only
+// PTE at CPL=0 faults with #PF (CR2 = user vaddr) once CR4.SMAP=1,
+// which is the case on every CPU NARF boots. See
+// `[[project_user_cstr_page_safety]]` for the broader pattern.
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let v = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const i32))
+    };
+    Ok(v)
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::write_unaligned(uptr as *mut i32, v);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::write_unaligned(uptr as *mut u32, v);
+        });
+    }
+    Ok(())
+}
+
+// Non-x86_64 fallback — no SMAP, just raw pointer ops (aarch64 has
+// its own MTE/PAN dance but the FS layer here is still x86_64-only
+// in practice).
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
 unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -362,7 +408,7 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const i32) })
 }
 
-#[cfg(feature = "linux-compat")]
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
 unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -371,7 +417,7 @@ unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     Ok(())
 }
 
-#[cfg(feature = "linux-compat")]
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
 unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -392,7 +438,33 @@ struct WireWinsize {
     ws_ypixel: u16,
 }
 
-#[cfg(feature = "linux-compat")]
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let v = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::read_unaligned(uptr as *const WireWinsize)
+        })
+    };
+    Ok(v)
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::write_unaligned(uptr as *mut WireWinsize, v);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
 unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -400,7 +472,7 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const WireWinsize) })
 }
 
-#[cfg(feature = "linux-compat")]
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
 unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -414,7 +486,21 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
 /// succeeds; the field contents aren't consulted by anything inside
 /// this kernel. Linux's `struct termios` is 60 bytes on x86_64
 /// (c_iflag/c_oflag/c_cflag/c_lflag/c_line/c_cc[19]/c_ispeed/c_ospeed).
-#[cfg(feature = "linux-compat")]
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let zero = [0u8; 60];
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
 unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
