@@ -36,12 +36,14 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use narf_capabilities::{Cap, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::iface;
@@ -53,7 +55,10 @@ use crate::pkt_tcp::{
     ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_PSH, FLAG_RST, FLAG_SYN, TCP_HDR_MIN,
 };
 
-use super::congestion::{seq_geq, seq_leq, seq_lt, CongAlg, CongestionState};
+use super::congestion::{
+    default_cc, install as install_cc, seq_geq, seq_leq, seq_lt, Cc, CcError, CcState,
+    CongestionControl, Cubic, LossEvent, Reno,
+};
 use super::options::{
     encode_data_options, encode_syn_options, OptionsState, ParsedOptions, DEFAULT_WSCALE, MIN_MSS,
 };
@@ -148,7 +153,12 @@ pub struct Tcb {
     pub rto_count: u32,
 
     // ── Congestion control ──
-    pub cong: CongestionState,
+    /// Per-socket cc state (cwnd, ssthresh, CUBIC curve params).
+    /// Algorithm-agnostic data; the policy lives in `cc`.
+    pub cong: CcState,
+    /// Pluggable cc algorithm. Defaults to CUBIC for fresh TCBs;
+    /// swap via `set_congestion_control` (cap-gated on `Cap<Cc, Grant>`).
+    pub cc: Box<dyn CongestionControl>,
     /// Bytes the sender thinks are in flight (for cwnd math).
     pub flightsize: u32,
     /// Sender-side SACK scoreboard.
@@ -261,7 +271,8 @@ impl Tcb {
             retx_queue: VecDeque::new(),
             retx_deadline_cycles: 0,
             rto_count: 0,
-            cong: CongestionState::default(),
+            cong: CcState::default(),
+            cc: default_cc(),
             flightsize: 0,
             scoreboard: SenderScoreboard::new(),
             sack_book: SackBook::new(),
@@ -636,12 +647,18 @@ pub fn setsockopt_str(id: u32, opt: i32, val: &str) -> Result<(), ()> {
     let mut t = arc.lock();
     match opt {
         TCP_CONGESTION => {
-            let alg = match val {
-                "cubic" => CongAlg::Cubic,
-                "reno" => CongAlg::Reno,
+            // `TCP_CONGESTION` is a name-keyed install. The Linux
+            // surface is uncapped; we bootstrap an authority here so
+            // the cap-gated install path runs on every setsockopt.
+            // Userspace gating happens at the syscall boundary (a
+            // future Wave-I will pass an explicit cap through).
+            let cap = Cap::<Cc, Grant>::bootstrap();
+            let boxed: Box<dyn CongestionControl> = match val {
+                "cubic" => install_cc(&cap, Cubic).map_err(|_| ())?,
+                "reno" => install_cc(&cap, Reno).map_err(|_| ())?,
                 _ => return Err(()),
             };
-            t.cong.set_alg(alg);
+            t.cc = boxed;
             Ok(())
         }
         _ => Err(()),
@@ -669,10 +686,22 @@ pub fn getsockopt_int(id: u32, opt: i32) -> Result<i32, ()> {
 pub fn getsockopt_cong(id: u32) -> Result<&'static str, ()> {
     let arc = lookup_tcb(id).ok_or(())?;
     let t = arc.lock();
-    Ok(match t.cong.alg {
-        CongAlg::Cubic => "cubic",
-        CongAlg::Reno => "reno",
-    })
+    Ok(t.cc.name())
+}
+
+/// Cap-gated, per-socket cc install. Replaces the boxed policy on the
+/// named TCB. `cap` is checked for liveness; revoking the install
+/// cap disables further swaps on every TCB.
+pub fn set_congestion_control<C: CongestionControl>(
+    id: u32,
+    cap: &Cap<Cc, Grant>,
+    cc: C,
+) -> Result<(), CcError> {
+    let arc = lookup_tcb(id).ok_or(CcError::AuthorityRevoked)?;
+    let boxed = install_cc(cap, cc)?;
+    let mut t = arc.lock();
+    t.cc = boxed;
+    Ok(())
 }
 
 // ── Segment build / send ────────────────────────────────────────────
@@ -1003,7 +1032,14 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             let now = narf_scheduler::narf_time::now_cycles();
             let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
             let flight = t.flightsize;
-            t.cong.enter_rto(flight, now, cpn);
+            // Split-borrow the guard: `cc` is `&Box<dyn …>` (immutable
+            // self) while `cong` is the `&mut CcState` target. Going
+            // through a `&mut Tcb` lets the compiler see the two fields
+            // as disjoint borrows.
+            {
+                let tcb: &mut Tcb = &mut t;
+                tcb.cc.on_rto(&mut tcb.cong, flight, now, cpn);
+            }
             // Mark every outstanding segment as retransmitted —
             // Karn's algorithm.
             for s in t.retx_queue.iter_mut() {
@@ -1849,7 +1885,10 @@ fn handle_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedO
             }
         }
         t.cong.clear_dup_acks();
-        t.cong.on_ack(bytes_acked, now);
+        {
+            let tcb: &mut Tcb = &mut t;
+            tcb.cc.on_ack(&mut tcb.cong, bytes_acked, now);
+        }
         t.cong.clear_recovery_if_passed(ack);
         t.rto_count = 0;
         t.keepalive_probes_sent = 0;
@@ -1870,7 +1909,17 @@ fn handle_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedO
             let now = narf_scheduler::narf_time::now_cycles();
             let cpn = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
             let nxt = t.snd_nxt;
-            t.cong.enter_fast_recovery(nxt, now, cpn);
+            {
+                let tcb: &mut Tcb = &mut t;
+                tcb.cc.on_loss(
+                    &mut tcb.cong,
+                    LossEvent::FastRetransmit {
+                        snd_nxt: nxt,
+                        now_cycles: now,
+                        cycles_per_ns: cpn,
+                    },
+                );
+            }
             drop(t);
             fast_retransmit(arc);
             return;

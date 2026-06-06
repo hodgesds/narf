@@ -64,7 +64,7 @@ use crate::pkt::{
 };
 use crate::pkt_tcp::{ipv4_pseudo_checksum, TcpHeader, FLAG_ACK, FLAG_FIN, FLAG_SYN, TCP_HDR_MIN};
 use crate::route;
-use crate::tcp::congestion::{CongAlg, CongestionState};
+use crate::tcp::congestion::{CcState, CongestionControl, Cubic, LossEvent, Reno};
 use crate::tcp::core::{
     self, __with_tcb, __with_tcb_mut, accept, close, handle_segment, listen, lookup_tcb, send,
     shutdown, tick_retransmit, KEEPALIVE_IDLE_NS, PERSIST_INITIAL_NS, PERSIST_MAX_NS,
@@ -670,14 +670,15 @@ kernel_test_in!("net/tcp/timer", smoke_seven_strike_give_up);
 
 fn smoke_slow_start_cwnd_growth() -> TestResult {
     let mss = 1460u32;
-    let mut c = CongestionState::new(CongAlg::Reno, mss);
+    let mut c = CcState::new(mss);
     // Start below ssthresh (ssthresh = MAX initially → always slow start).
     c.cwnd = mss; // 1 MSS
 
+    let cc = Reno;
     let initial = c.cwnd;
     // Feed 3 ACKs of 1 MSS each — cwnd should grow by 3 MSS.
     for _ in 0..3 {
-        c.on_ack(mss, 0);
+        cc.on_ack(&mut c, mss, 0);
     }
     if c.cwnd != initial + 3 * mss {
         return TestResult::Fail("slow start: cwnd did not grow by 3 MSS after 3 ACKs");
@@ -694,13 +695,20 @@ kernel_test_in!("net/tcp/timer", smoke_slow_start_cwnd_growth);
 
 fn smoke_ssthresh_halves_on_loss() -> TestResult {
     let mss = 1460u32;
-    let mut c = CongestionState::new(CongAlg::Reno, mss);
+    let mut c = CcState::new(mss);
     c.cwnd = 20 * mss; // well above ssthresh
     c.ssthresh = u32::MAX;
 
     // Trigger fast retransmit (loss).
     let snd_nxt: u32 = 100_000;
-    c.enter_fast_recovery(snd_nxt, 0, 1);
+    Reno.on_loss(
+        &mut c,
+        LossEvent::FastRetransmit {
+            snd_nxt,
+            now_cycles: 0,
+            cycles_per_ns: 1,
+        },
+    );
 
     // ssthresh ← cwnd / 2 = 10 MSS.
     let expected_ssth = 10 * mss;
@@ -728,11 +736,19 @@ kernel_test_in!("net/tcp/timer", smoke_ssthresh_halves_on_loss);
 
 fn smoke_cubic_curve_grows_after_loss() -> TestResult {
     let mss = 1460u32;
-    let mut c = CongestionState::new(CongAlg::Cubic, mss);
+    let mut c = CcState::new(mss);
+    let cc = Cubic;
     c.cwnd = 50 * mss;
     c.ssthresh = 25 * mss;
     // Record a loss event at t=0 with cycles_per_ns=1.
-    c.enter_fast_recovery(200_000u32, 1_000_000, 1);
+    cc.on_loss(
+        &mut c,
+        LossEvent::FastRetransmit {
+            snd_nxt: 200_000u32,
+            now_cycles: 1_000_000,
+            cycles_per_ns: 1,
+        },
+    );
     c.in_recovery = false; // manually exit recovery to test CA path
     c.cwnd = c.ssthresh;
 
@@ -740,7 +756,7 @@ fn smoke_cubic_curve_grows_after_loss() -> TestResult {
     // Advance time in 1-billion-cycle steps (= 1 second with cpn=1).
     for i in 1..=5 {
         let now = (i as u64) * 1_000_000_000u64 + 1_000_000;
-        c.on_ack(mss, now);
+        cc.on_ack(&mut c, mss, now);
         // cwnd must be non-decreasing in CUBIC CA.
         if c.cwnd < prev_cwnd {
             return TestResult::Fail("CUBIC cwnd decreased during congestion avoidance");
@@ -849,11 +865,18 @@ kernel_test_in!("net/tcp/timer", smoke_three_dup_acks_fast_retransmit);
 
 fn smoke_fast_recovery_exit_on_ack_above_recover_point() -> TestResult {
     let mss = 1460u32;
-    let mut c = CongestionState::new(CongAlg::Reno, mss);
+    let mut c = CcState::new(mss);
     c.cwnd = 10 * mss;
     let recover_snd_nxt: u32 = 50_000;
 
-    c.enter_fast_recovery(recover_snd_nxt, 0, 1);
+    Reno.on_loss(
+        &mut c,
+        LossEvent::FastRetransmit {
+            snd_nxt: recover_snd_nxt,
+            now_cycles: 0,
+            cycles_per_ns: 1,
+        },
+    );
     if !c.in_recovery {
         return TestResult::Fail("not in recovery after enter_fast_recovery");
     }
