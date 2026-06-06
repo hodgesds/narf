@@ -109,6 +109,98 @@ impl<T, const N: usize> SpmcRing<T, N> {
     }
 }
 
+// ── RingTransport impl (Wave K) ─────────────────────────────────────
+//
+// SPMC: consumer side already operates against `&self` (multiple
+// consumers race via CAS on `head`). The producer's inherent
+// `try_send` takes `&mut self` on the producer wrapper to enforce
+// single-producer at the type level — but the ring's push logic
+// itself only needs `&self`. Trait callers are responsible for
+// upholding the single-producer invariant when they push through the
+// trait.
+impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for SpmcRing<T, N> {
+    fn try_push(&self, val: T) -> Result<(), T> {
+        if self.consumers.load(Ordering::Acquire) == 0 {
+            return Err(val);
+        }
+        let pos = self.tail.0.load(Ordering::Relaxed);
+        let slot_ptr = self.slots.0.get();
+        // SAFETY: slot array lives for the ring's lifetime.
+        let slot = unsafe { &(*slot_ptr)[(pos & Self::MASK) as usize] };
+        let seq = slot.seq.load(Ordering::Acquire);
+        let diff = seq.wrapping_sub(pos) as i64;
+        if diff != 0 {
+            // <0: slot still occupied; >0: shouldn't happen with a
+            // single producer — both collapse to "can't push".
+            return Err(val);
+        }
+        // SAFETY: caller upholds single-producer invariant; the slot
+        // is exclusively ours until our release-store of `seq` below.
+        unsafe {
+            (*slot.val.get()).write(val);
+        }
+        self.tail.0.store(pos.wrapping_add(1), Ordering::Relaxed);
+        slot.seq.store(pos.wrapping_add(1), Ordering::Release);
+        if let Some(w) = self.consumer_waker.lock().take() {
+            w.wake();
+        }
+        Ok(())
+    }
+
+    fn try_pop(&self) -> Option<T> {
+        // Mirror `SpmcRingConsumer::try_recv`: CAS-claim on `head`
+        // (multiple consumers race).
+        loop {
+            let pos = self.head.0.load(Ordering::Relaxed);
+            let slot_ptr = self.slots.0.get();
+            // SAFETY: slot array lives for the ring's lifetime.
+            let slot = unsafe { &(*slot_ptr)[(pos & Self::MASK) as usize] };
+            let seq = slot.seq.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(pos.wrapping_add(1)) as i64;
+            if diff < 0 {
+                return None;
+            }
+            if diff > 0 {
+                // Another consumer raced ahead; re-read head.
+                continue;
+            }
+            match self.head.0.compare_exchange_weak(
+                pos,
+                pos.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // SAFETY: we won the claim CAS; we are the sole
+                    // consumer of this slot until our release-store
+                    // of `seq` below.
+                    let msg = unsafe {
+                        let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
+                        v.assume_init()
+                    };
+                    slot.seq
+                        .store(pos.wrapping_add(N as u64), Ordering::Release);
+                    if let Some(w) = self.producer_waker.lock().take() {
+                        w.wake();
+                    }
+                    return Some(msg);
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        let tail = self.tail.0.load(Ordering::Acquire);
+        let head = self.head.0.load(Ordering::Acquire);
+        tail.wrapping_sub(head) as usize
+    }
+
+    fn capacity(&self) -> usize {
+        N
+    }
+}
+
 impl<T, const N: usize> Drop for SpmcRing<T, N> {
     fn drop(&mut self) {
         let head = *self.head.0.get_mut();

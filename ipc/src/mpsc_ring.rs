@@ -110,6 +110,103 @@ impl<T, const N: usize> MpscRing<T, N> {
     }
 }
 
+// ── RingTransport impl (Wave K) ─────────────────────────────────────
+//
+// MPSC: producer side already takes `&self` (multi-producer). The
+// consumer-side inherent method on `MpscRingConsumer` takes `&mut
+// self` on the consumer wrapper to enforce single-consumer at the
+// type level — but the ring's pop logic itself only needs `&self`.
+// Trait callers are responsible for upholding the single-consumer
+// invariant when they pop through the trait. Both `Full` and `Closed`
+// from the inherent `try_send` collapse to `Err(val)` here; callers
+// that want the distinction use `MpscRingProducer::try_send` directly.
+impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for MpscRing<T, N> {
+    fn try_push(&self, val: T) -> Result<(), T> {
+        if self.consumer_gone.load(Ordering::Acquire) {
+            return Err(val);
+        }
+        let mut pos = self.tail.0.load(Ordering::Relaxed);
+        let slot_ptr = self.slots.0.get();
+        let mut msg = Some(val);
+        loop {
+            // SAFETY: slots array lives for the ring's lifetime; we
+            // only touch `seq` (atomic) and, after a successful CAS,
+            // our own slot's value cell.
+            let slot = unsafe { &(*slot_ptr)[(pos & Self::MASK) as usize] };
+            let seq = slot.seq.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(pos) as i64;
+            if diff == 0 {
+                match self.tail.0.compare_exchange_weak(
+                    pos,
+                    pos.wrapping_add(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let payload = msg.take().expect("payload consumed in lost-CAS path");
+                        // SAFETY: we now exclusively own this slot
+                        // until our release-store of `seq` below.
+                        unsafe {
+                            (*slot.val.get()).write(payload);
+                        }
+                        slot.seq.store(pos.wrapping_add(1), Ordering::Release);
+                        if let Some(w) = self.consumer_waker.lock().take() {
+                            w.wake();
+                        }
+                        return Ok(());
+                    }
+                    Err(observed) => {
+                        pos = observed;
+                        continue;
+                    }
+                }
+            } else if diff < 0 {
+                // Slot still holds an unread value — ring is full.
+                return Err(msg.take().expect("payload still owned on Full path"));
+            } else {
+                // Another producer raced ahead; re-read tail.
+                pos = self.tail.0.load(Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn try_pop(&self) -> Option<T> {
+        let pos = self.head.0.load(Ordering::Relaxed);
+        let slot_ptr = self.slots.0.get();
+        // SAFETY: slot array lives for the ring's lifetime.
+        let slot = unsafe { &(*slot_ptr)[(pos & Self::MASK) as usize] };
+        let seq = slot.seq.load(Ordering::Acquire);
+        let diff = seq.wrapping_sub(pos.wrapping_add(1)) as i64;
+        if diff != 0 {
+            return None;
+        }
+        // SAFETY: producer published payload before its release-store
+        // of `seq`; our acquire-load above pairs with that release.
+        // Caller upholds single-consumer invariant for the trait.
+        let msg = unsafe {
+            let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
+            v.assume_init()
+        };
+        self.head.0.store(pos.wrapping_add(1), Ordering::Relaxed);
+        slot.seq
+            .store(pos.wrapping_add(N as u64), Ordering::Release);
+        if let Some(w) = self.producer_waker.lock().take() {
+            w.wake();
+        }
+        Some(msg)
+    }
+
+    fn len(&self) -> usize {
+        let tail = self.tail.0.load(Ordering::Acquire);
+        let head = self.head.0.load(Ordering::Acquire);
+        tail.wrapping_sub(head) as usize
+    }
+
+    fn capacity(&self) -> usize {
+        N
+    }
+}
+
 impl<T, const N: usize> Drop for MpscRing<T, N> {
     fn drop(&mut self) {
         let head = *self.head.0.get_mut();

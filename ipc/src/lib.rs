@@ -63,6 +63,9 @@ pub use shared_ring::{
     TrySendError as SharedTrySendError,
 };
 
+pub mod transport;
+pub use transport::{RingTransport, VecRing};
+
 mod tests;
 
 use alloc::sync::Arc;
@@ -163,6 +166,78 @@ impl<T, const N: usize> Ring<T, N> {
 
 impl<T: 'static, const N: usize> CapType for Ring<T, N> {
     const KIND: CapKind = CapKind::Ring;
+}
+
+// ── RingTransport impl (Wave K) ─────────────────────────────────────
+//
+// The SPSC ring's inherent push/pop logic lives on the Producer /
+// Consumer wrappers (`Producer::try_send`, `Consumer::try_recv`), not
+// on `Ring` itself, because the wrappers enforce the single-producer
+// / single-consumer invariant via `!Sync`. The trait impl below
+// replicates that algorithm directly against the ring.
+//
+// **The caller is responsible for upholding the SPSC invariant when
+// using the trait** — same as if they wired up their own producer
+// half. The wake paths are preserved so a caller that mixes trait
+// calls with Producer/Consumer-half use still gets correct
+// back-pressure wake behaviour.
+impl<T: Send + 'static + Retag, const N: usize> transport::RingTransport<T> for Ring<T, N> {
+    fn try_push(&self, val: T) -> Result<(), T> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(val);
+        }
+        let head = self.head.0.load(Ordering::Relaxed);
+        let tail = self.tail.0.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= N as u64 {
+            return Err(val);
+        }
+        let idx = (head & Self::MASK) as usize;
+        // SAFETY: caller upholds the SPSC invariant. The slot at `idx`
+        // is exclusively ours until the release-store of `head` below
+        // publishes it; the consumer cannot observe the slot before
+        // that store. `retag_on_publish` is identity for types whose
+        // `Retag` impl is the blanket default.
+        unsafe {
+            let slots = &mut *self.slots.get();
+            slots[idx].write(retag::retag_on_publish(val));
+        }
+        self.head.0.store(head.wrapping_add(1), Ordering::Release);
+        if let Some(w) = self.consumer_waker.lock().take() {
+            w.wake();
+        }
+        Ok(())
+    }
+
+    fn try_pop(&self) -> Option<T> {
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        let head = self.head.0.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+        let idx = (tail & Self::MASK) as usize;
+        // SAFETY: caller upholds the SPSC invariant. The slot at `idx`
+        // was published by a release-store of `head` observed by our
+        // acquire-load above.
+        let msg = unsafe {
+            let slots = &mut *self.slots.get();
+            core::mem::replace(&mut slots[idx], MaybeUninit::uninit()).assume_init()
+        };
+        self.tail.0.store(tail.wrapping_add(1), Ordering::Release);
+        if let Some(w) = self.producer_waker.lock(IrqsEnabled).take() {
+            w.wake();
+        }
+        Some(msg)
+    }
+
+    fn len(&self) -> usize {
+        let head = self.head.0.load(Ordering::Acquire);
+        let tail = self.tail.0.load(Ordering::Acquire);
+        head.wrapping_sub(tail) as usize
+    }
+
+    fn capacity(&self) -> usize {
+        N
+    }
 }
 
 impl<T, const N: usize> Drop for Ring<T, N> {
