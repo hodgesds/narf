@@ -1372,6 +1372,12 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // either, busybox sh's PATH search hits the
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
+        // PTY smoke. Opens /dev/ptmx, clears TIOCSPTLCK,
+        // reads TIOCGPTN, opens /dev/pts/N, round-trips
+        // "ping" master→slave and "pong" slave→master, then
+        // prints "pty-ok". Exercises the clone-on-open ptmx
+        // path + the new linux-ABI sys_open.
+        ("pty_smoke", "pty-ok"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

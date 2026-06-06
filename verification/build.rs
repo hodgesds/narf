@@ -231,6 +231,20 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_HELLO_PTHREAD_ELF_AARCH64=/dev/null");
 
+    // Wave-PTY: PTY smoke. Exercises /dev/ptmx open + TIOCSPTLCK
+    // + TIOCGPTN + open(/dev/pts/N) + master↔slave round-trip.
+    // The `sys_open` Linux-ABI cutover landed in PR #26, so this
+    // now wires into the boot-init seed table like the other
+    // musl-demo binaries.
+    println!("cargo:rerun-if-changed=data/musl-demo/pty_smoke_x86_64.c");
+    println!("cargo:rerun-if-changed=data/musl-demo/pty_smoke_x86_64");
+    let pty_smoke = manifest_dir.join("data/musl-demo/pty_smoke_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_PTY_SMOKE_ELF_X86_64={}",
+        pty_smoke.display()
+    );
+    println!("cargo:rustc-env=NARF_PTY_SMOKE_ELF_AARCH64=/dev/null");
+
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
     // image uses). If absent on the host, point at /dev/null so

@@ -3322,6 +3322,11 @@ fn boot_userspace_init() {
                 // FUTEX_WAIT/WAKE for pthread_join, and stdio
                 // from both threads.
                 ("hello_pthread", narf_verification::NARF_HELLO_PTHREAD_ELF),
+                // Wave-PTY: PTY smoke — open /dev/ptmx, allocate
+                // a slave via TIOCSPTLCK + TIOCGPTN, open
+                // /dev/pts/N, round-trip "ping" / "pong" across
+                // the master/slave pair. Success token "pty-ok".
+                ("pty_smoke", narf_verification::NARF_PTY_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
