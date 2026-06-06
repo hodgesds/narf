@@ -97,17 +97,27 @@ pub fn register_block_device_with_meta(
     dev: Arc<dyn BlockDeviceSync>,
     partition: Option<PartitionMetadata>,
 ) {
-    let mut g = REGISTRY.lock();
-    let entry = RegisteredBlockDevice {
-        name,
-        dev,
-        partition,
-    };
-    if let Some(pos) = g.iter().position(|e| e.name == name) {
-        g[pos] = entry;
-    } else {
-        g.push(entry);
+    {
+        let mut g = REGISTRY.lock();
+        let entry = RegisteredBlockDevice {
+            name,
+            dev,
+            partition,
+        };
+        if let Some(pos) = g.iter().position(|e| e.name == name) {
+            g[pos] = entry;
+        } else {
+            g.push(entry);
+        }
     }
+    // Wave G: pair every registered device with a default
+    // `IoScheduler` slot (boxed `DeadlineScheduler`). Reservation is
+    // idempotent on `name` — a second `register_block_device` for
+    // the same name resets the policy to the default, matching the
+    // entry-replace semantics above. A driver that installed a
+    // non-default policy must re-`install_io_scheduler` after
+    // re-bring-up.
+    crate::io_scheduler::reserve_io_scheduler_slot(name);
 }
 
 /// Snapshot of currently-registered block devices.

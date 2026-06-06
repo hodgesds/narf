@@ -30,7 +30,9 @@ extern crate alloc;
 pub mod deadline;
 pub mod encrypted;
 pub mod fs_detect;
+pub mod io_scheduler;
 pub mod mq;
+pub mod noop;
 pub mod opal;
 pub mod partition;
 pub mod ram;
@@ -41,7 +43,12 @@ mod e2e_tests;
 mod tests;
 
 pub use deadline::{DeadlineScheduler, Lane, STARVE_BOUND};
+pub use io_scheduler::{
+    bootstrap_io_scheduler_authority, current_io_scheduler_name, enqueue_on, install_io_scheduler,
+    pick_next_on, reserve_io_scheduler_slot, BlockDeviceId, IoSched, IoSchedError, IoScheduler,
+};
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
+pub use noop::NoopScheduler;
 pub use registry::{
     block_device_count, block_devices, find_block_device, register_block_device,
     unregister_block_device, BlockDeviceSync, BlockIoError, RegisteredBlockDevice, SyncBlock,
