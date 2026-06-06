@@ -204,6 +204,44 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_HELLO_MUSL_ELF_AARCH64=/dev/null");
 
+    // Wave-78 follow-up 3: dynamic-linked musl demo binary + the
+    // ld-musl interpreter it depends on. The binary's PT_INTERP
+    // points at `/lib/ld-musl-x86_64.so.1`; NARF stages ld-musl
+    // into a kernel-side MemFs mounted at /lib so the loader's
+    // VFS-backed PT_INTERP lookup (Wave-75) resolves at exec
+    // time.
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_musl_dyn_x86_64.c");
+    println!("cargo:rerun-if-changed=data/musl-demo/hello_musl_dyn_x86_64");
+    let hello_musl_dyn = manifest_dir.join("data/musl-demo/hello_musl_dyn_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_HELLO_MUSL_DYN_ELF_X86_64={}",
+        hello_musl_dyn.display()
+    );
+    println!("cargo:rustc-env=NARF_HELLO_MUSL_DYN_ELF_AARCH64=/dev/null");
+
+    // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
+    // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
+    // image uses). If absent on the host, point at /dev/null so
+    // include_bytes!() resolves to an empty slice — the consumer
+    // skips the /lib mount when the slice is empty.
+    println!("cargo:rerun-if-env-changed=LDMUSL_PATH");
+    let ld_musl_path =
+        env::var("LDMUSL_PATH").unwrap_or_else(|_| "/lib/ld-musl-x86_64.so.1".into());
+    let ld_musl_canonical = std::fs::canonicalize(&ld_musl_path)
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/dev/null".into());
+    println!(
+        "cargo:rerun-if-changed={}",
+        if ld_musl_canonical == "/dev/null" {
+            ld_musl_path.as_str()
+        } else {
+            ld_musl_canonical.as_str()
+        }
+    );
+    println!("cargo:rustc-env=NARF_LD_MUSL_X86_64={}", ld_musl_canonical);
+    println!("cargo:rustc-env=NARF_LD_MUSL_AARCH64=/dev/null");
+
     let libc_validate_enabled = env::var_os("CARGO_FEATURE_NARF_LIBC_VALIDATE").is_some();
     if libc_validate_enabled {
         let validate_dir = workspace.join("narf-libc").join("validate");

@@ -3309,6 +3309,14 @@ fn boot_userspace_init() {
                 // user mode cleanly; whether `write` prints depends
                 // on the syscall-dispatch convergence sub-wave.
                 ("hello_musl", narf_verification::NARF_HELLO_MUSL_ELF),
+                // Wave-78 follow-up 3: dynamic-linked musl-static
+                // binary. PT_INTERP points at
+                // `/lib/ld-musl-x86_64.so.1`, which we stage as a
+                // sibling MemFs below. Exercises Wave-75's
+                // FS-backed PT_INTERP + R_X86_64_TPOFF64 /
+                // DTPOFF64 / GLOB_DAT / JUMP_SLOT relocation
+                // processing end-to-end.
+                ("hello_musl_dyn", narf_verification::NARF_HELLO_MUSL_DYN_ELF),
             ],
         );
         let count = fs.file_count();
@@ -3318,6 +3326,33 @@ fn boot_userspace_init() {
             "  boot-init: mounted /bin (memfs) with {} coreutils",
             count,
         );
+
+        // Wave-78 follow-up 3: /lib MemFs carrying the ld-musl
+        // interpreter. NARF_LD_MUSL is empty (0 bytes) when the
+        // host build didn't have musl installed — in that case
+        // skip the mount so the loader's PT_INTERP lookup falls
+        // through to its existing error path instead of seeding
+        // /lib/ with a zero-byte file the user might try to exec.
+        if !narf_verification::NARF_LD_MUSL.is_empty() {
+            let lib_fs = MemFs::with_seeds(
+                "lib",
+                &[("ld-musl-x86_64.so.1", narf_verification::NARF_LD_MUSL)],
+            );
+            let lib_count = lib_fs.file_count();
+            let _ = registry().mount(&auth, "/lib", lib_fs);
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: mounted /lib (memfs) with {} interpreter ({} bytes)",
+                lib_count,
+                narf_verification::NARF_LD_MUSL.len(),
+            );
+        } else {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: /lib mount skipped (no ld-musl at build time; \
+                 dynamic-linked binaries will fail to exec)"
+            );
+        }
     }
 
     spawn_one("init", baked_init);
