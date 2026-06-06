@@ -4862,6 +4862,20 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
             unsafe {
                 narf_scheduler::set_user_fs_base(addr);
             }
+            // Publish to the polling-future override so a
+            // subsequent timer-driven re-poll restores THIS
+            // FS_BASE, not the load-time synthetic-TLS value
+            // from `process.fs_base`.
+            if let Some(uctx) = crate::user_task::current_user_task() {
+                // SAFETY: pending_fs_base is an AtomicU64 owned by
+                // the live UserTaskCtx pinned for the duration of
+                // this syscall.
+                unsafe {
+                    (*uctx)
+                        .pending_fs_base
+                        .store(addr, core::sync::atomic::Ordering::Release);
+                }
+            }
             ctx.set_return(SyscallReturn::ok(0));
         }
         ARCH_GET_FS => {
