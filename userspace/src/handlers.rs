@@ -8321,7 +8321,16 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
             let mut bases_to_unmap: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
             for r in as_ref.regions_snapshot().iter() {
                 let rb = r.base.as_u64();
-                if rb >= BRK_DEFAULT_BASE && rb >= new_aligned {
+                // Brk-grow regions live in `[BRK_DEFAULT_BASE, cur)`
+                // — bounded above by the OLD break. Without the
+                // `rb < cur` upper bound, any region above
+                // `BRK_DEFAULT_BASE` matches and gets unmapped,
+                // which on a fresh process (where cur ==
+                // BRK_DEFAULT_BASE) silently nukes the user stack
+                // at 0x7FFF_FFFC_0000 the next time the caller
+                // does `brk(small_value)`. ld-musl's
+                // `__init_libc` does exactly that early in init.
+                if rb >= BRK_DEFAULT_BASE && rb < cur && rb >= new_aligned {
                     bases_to_unmap.push(rb);
                 }
             }

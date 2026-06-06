@@ -76,6 +76,10 @@ jobs:
   musl-demo:
     name: musl-demo (x86_64)
     runs-on: ubuntu-latest
+    # Generous job-level timeout: a cold-cache cargo build of the
+    # kernel + verification crates takes ~10-15 min on GHA's free
+    # runners, plus two TCG QEMU boots at ~30-60s each.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -117,7 +121,15 @@ jobs:
       # the loader (unaligned PT_LOAD), ABI dispatch (syscall
       # instruction → raw handler), arch_prctl wiring, or CR4.OSFXSR
       # init all surface here.
+      #
+      # GHA's TCG QEMU is ~5-10x slower than KVM-accelerated local
+      # runs; bump the per-boot prompt/echo timeouts so a slow cold
+      # boot under load doesn't fail the smoke. Local fast runs use
+      # the un-bumped defaults (60s prompt / 30s echo).
       - name: cargo xtask musl-demo
+        env:
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "300"
+          XTASK_RI_ECHO_TIMEOUT_SECS: "120"
         run: cargo xtask musl-demo --arch=x86_64
 
   feature-matrix:

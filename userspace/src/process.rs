@@ -141,7 +141,16 @@ pub unsafe fn load_user_process_with(
     // convention so the bias passed in is 0. Materialize already
     // happened inside `load_elf_bytes`, so the patch sites are
     // walkable through `paging::translate`.
-    if !image.dynamic.is_empty() {
+    //
+    // ONLY apply when there's no PT_INTERP. When the binary names a
+    // dynamic linker, ld-musl resolves every program relocation
+    // (including symbol-bound R_X86_64_GLOB_DAT / JUMP_SLOT against
+    // `write`, `__libc_start_main`, `__cxa_finalize`, …) after the
+    // kernel hands control to its entry point. Running the kernel's
+    // own relocation pass first would `UnresolvedSymbol`-fail on
+    // those externals — they're defined inside libc.so, which
+    // ld-musl hasn't mapped yet at this point.
+    if !image.dynamic.is_empty() && image.interp.is_none() {
         unsafe { apply_relocations(bytes, &image, &address_space, 0) }?;
     }
 
@@ -300,10 +309,31 @@ pub unsafe fn load_user_process_with(
     // find the program after the interpreter starts.
     let final_aux: alloc::vec::Vec<AuxEntry> = if interp_loaded {
         let mut v: alloc::vec::Vec<AuxEntry> = aux.iter().copied().collect();
+        // AT_PHDR / AT_PHENT / AT_PHNUM let the dynamic linker walk
+        // the program's program-header table at runtime. ld-musl
+        // needs these to find PT_DYNAMIC (and from there the
+        // .dynsym / .dynstr / .rela.* tables) so it can patch the
+        // program's relocations. Without them ld-musl loads an
+        // uninitialised pointer from the auxv block, dereferences
+        // it, and SIGSEGVs at vaddr 0 before reaching its symbol
+        // resolver. Computed from the ELF header + the first
+        // PT_LOAD segment: the phdr table sits at file-offset
+        // e_phoff, which the first PT_LOAD maps into memory at
+        // (first_load.vaddr - first_load.file_off + e_phoff).
+        let e_phoff = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap_or([0; 8]));
+        let e_phentsize = u16::from_le_bytes(bytes[0x36..0x38].try_into().unwrap_or([0; 2]));
+        let e_phnum = u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap_or([0; 2]));
+        let first_load = image.segments.first();
+        let at_phdr = first_load
+            .map(|s| s.vaddr.wrapping_sub(s.file_off).wrapping_add(e_phoff))
+            .unwrap_or(0);
         for default in [
             AuxEntry::Pagesz(4096),
             AuxEntry::Entry(program_entry.0.as_u64()),
             AuxEntry::Base(INTERP_BIAS),
+            AuxEntry::Phdr(at_phdr),
+            AuxEntry::PhEnt(e_phentsize as u32),
+            AuxEntry::PhNum(e_phnum as u32),
         ] {
             let tag = default.tag();
             if !v.iter().any(|e| e.tag() == tag) {
