@@ -1352,6 +1352,16 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // CLONE_CHILD_CLEARTID + futex_wake exit-observer chain
         // that wakes `pthread_join`.
         ("hello_pthread", "joined"),
+        // sh smoke — `busybox sh -c '<script>'` runs sequential
+        // commands. End-to-end exercises fork(2), waitpid(2),
+        // and the rdx-preserving syscall ABI: Linux requires rdx
+        // to survive `syscall`, but the previous NARF convention
+        // returned `(rax=value, rdx=status)` which clobbered rdx
+        // with 0 on success. musl's `__init_tp` emits
+        // `mov %fs:0, %rdx; syscall; movq $0, 0x98(%rdx)` and
+        // every forked child #PF'd at CR2=0x98. Fix is to return
+        // -EINVAL in rax on error and preserve rdx.
+        ("busybox sh -c 'echo a; echo b'", "b"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

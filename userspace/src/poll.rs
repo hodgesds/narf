@@ -120,6 +120,28 @@ pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> 
         return None;
     }
     let mut out = Vec::with_capacity(nfds);
+    // SMAP bracket — bare `read_unaligned` from a kernel-mode CPL=0
+    // through a user-only PTE faults with SMAP on (CR4.SMAP=1, the
+    // default on every CPU we boot). Open the user-access window
+    // for the duration of the parse, then close it once we've
+    // staged the values into the kernel-owned `out` vec.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: caller guarantees `nfds * 8` readable user bytes from `ptr`.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            for i in 0..nfds {
+                let base = ptr.add(i * 8);
+                let fd_val = core::ptr::read_unaligned(base as *const i32);
+                let ev_val = core::ptr::read_unaligned(base.add(4) as *const u16);
+                out.push(PollFd {
+                    fd: fd_val,
+                    events: ev_val,
+                    revents: 0,
+                });
+            }
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     for i in 0..nfds {
         // SAFETY: caller guarantees `nfds * 8` readable bytes from `ptr`.
         let base = unsafe { ptr.add(i * 8) };
@@ -139,6 +161,19 @@ pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> 
 /// # Safety
 /// Same pointer-validity contract as `parse_pollfds`.
 pub unsafe fn write_pollfds(ptr: *mut u8, fds: &[PollFd]) {
+    // Same SMAP rationale as `parse_pollfds`: a CPL=0 write to a
+    // user-only PTE faults without STAC.
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: caller guarantees `nfds * 8` writable user bytes.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            for (i, item) in fds.iter().enumerate() {
+                let base = ptr.add(i * 8).add(6) as *mut u16;
+                core::ptr::write_unaligned(base, item.revents);
+            }
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     for (i, item) in fds.iter().enumerate() {
         // SAFETY: caller guarantees `nfds * 8` writable bytes from `ptr`.
         let base = unsafe { ptr.add(i * 8).add(6) as *mut u16 };

@@ -5647,6 +5647,19 @@ fn read_pgid(target: u64) -> u64 {
         .unwrap_or(target) // default: pgid == pid
 }
 
+/// Process-group id of the currently-polling task. Returns the
+/// task's own TaskId when no explicit `setpgid` mapping exists
+/// (Linux semantics: a process's pgid defaults to its pid until
+/// the process or its parent calls `setpgid`). Returns 0 only
+/// when no task is currently scheduled (boot / kernel context).
+pub fn current_task_pgid() -> u64 {
+    let me = current_task_id();
+    if me == 0 {
+        return 0;
+    }
+    read_pgid(me)
+}
+
 fn sys_getpgid(ctx: &mut dyn TrapContext) {
     let pid = ctx.args().arg0;
     let target = if pid == 0 { current_task_id() } else { pid };
