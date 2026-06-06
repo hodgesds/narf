@@ -267,6 +267,13 @@ pub enum Syscall {
     /// Linux `write` (x86_64=1, aarch64=64).
     Write,
 
+    /// Gather-write `arg2` iovecs at `arg1` to file `arg0`. Each
+    /// iovec is `{ void *iov_base; size_t iov_len; }` (16 bytes).
+    /// Returns total bytes written, or a negative errno on error.
+    /// Linux `writev` (x86_64=20, aarch64=66). musl's
+    /// `__stdio_write` calls this for every buffered-stdio flush.
+    Writev,
+
     /// Close file `arg0`. Linux `close` (x86_64=3, aarch64=57).
     Close,
 
@@ -1520,6 +1527,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Ioctl, 16),
     (Syscall::Pread64, 17),
     (Syscall::Pwrite64, 18),
+    (Syscall::Writev, 20),
     (Syscall::Access, 21),
     (Syscall::Pipe, 22),
     (Syscall::Yield, 24), // sched_yield
@@ -1738,6 +1746,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Lseek, 62),
     (Syscall::Read, 63),
     (Syscall::Write, 64),
+    (Syscall::Writev, 66),
     (Syscall::Pread64, 67),
     (Syscall::Pwrite64, 68),
     (Syscall::Signalfd, 74), // signalfd4

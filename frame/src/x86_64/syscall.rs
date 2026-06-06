@@ -115,18 +115,44 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // 16k+8 — exactly what SysV requires inside the callee.
         "call {dispatch}",
 
-        // Drop the SyscallArgs scratch (6 × 8 bytes).
-        "add rsp, 48",
-
-        // SyscallReturn is a 16-byte struct: status:u32 + padding,
-        // then value:u64. SysV returns it in rax + rdx; rax holds
-        // status (low 32 bits zero-extended), rdx holds value.
+        // Linux's syscall ABI requires the kernel to preserve
+        // every GPR EXCEPT `rax` (return), `rcx` (used by sysretq
+        // for user RIP), and `r11` (used by sysretq for user
+        // RFLAGS). The C-ABI `dispatch_syscall` call freely
+        // clobbers rdi/rsi/rdx/r8/r9/r10 as caller-saved, so we
+        // MUST restore them from the SyscallArgs push scratch on
+        // the stack before sysretq.
         //
-        // Match the int 0x80 path's userland-visible convention
-        // (set_return in trap.rs: frame.rax = value, frame.rdx =
-        // status), so user-runtime's syscall wrappers see the same
-        // register layout regardless of which entry path was used.
-        "xchg rax, rdx",
+        // Bug pre-fix: a bare `add rsp, 48` left these holding
+        // C-frame trash. Symptom: musl's `__stdout_write` saves
+        // stdout in r8 BEFORE `ioctl(TIOCGWINSZ)` and restores
+        // from r8 AFTER; the trashed r8 became the FILE* fed to
+        // `__stdio_write` which #PFed reading `f->wpos` at a
+        // truncated address (`cr2=0x1e8848, rip=0x...62d9a`).
+        //
+        // Stash the dispatcher's rax/rdx into rcx/r11 — those
+        // two registers are about to be reloaded from the stack
+        // for sysretq anyway, so we can borrow them as scratch.
+        "mov rcx, rax",   // stash dispatcher status (low 32 of SyscallReturn) in rcx
+        "mov r11, rdx",   // stash dispatcher value (high 64 of SyscallReturn) in r11
+
+        // Restore the six user-side arg registers from the
+        // SyscallArgs scratch (in reverse push order so each
+        // register lands back where the user had it).
+        "pop rdi",        // arg0
+        "pop rsi",        // arg1
+        "pop rdx",        // arg2
+        "pop r10",        // arg3
+        "pop r8",         // arg4
+        "pop r9",         // arg5
+
+        // SyscallReturn final convention (matches the int 0x80
+        // path's `frame.rax = value, frame.rdx = status` in
+        // trap.rs, so user-side wrappers see the same layout
+        // regardless of entry instruction): rax = value,
+        // rdx = status.
+        "mov rax, r11",   // rax = dispatcher value
+        "mov rdx, rcx",   // rdx = dispatcher status
 
         // Restore user rcx (RIP) and r11 (RFLAGS) from the slots
         // we pushed at entry.
