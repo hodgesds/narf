@@ -3703,6 +3703,28 @@ pub const NARF_PTY_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_PTY_SMOKE_ELF_AA
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")
 ))]
+pub const NARF_NET_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_NET_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_NET_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_NET_SMOKE_ELF_AARCH64"));
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_VIM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_VIM_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_VIM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_VIM_SMOKE_ELF_AARCH64"));
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_LD_MUSL: &[u8] = include_bytes!(env!("NARF_LD_MUSL_X86_64"));
 #[cfg(all(
     target_arch = "aarch64",
