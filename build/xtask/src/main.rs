@@ -1380,6 +1380,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("pty_smoke", "pty-ok"),
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
+        ("unix_smoke", "unix-ok"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

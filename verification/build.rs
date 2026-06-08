@@ -261,6 +261,14 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_NET6_SMOKE_ELF_AARCH64=/dev/null");
 
+    println!("cargo:rerun-if-changed=data/musl-demo/unix_smoke_x86_64");
+    let unix_smoke = manifest_dir.join("data/musl-demo/unix_smoke_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_UNIX_SMOKE_ELF_X86_64={}",
+        unix_smoke.display()
+    );
+    println!("cargo:rustc-env=NARF_UNIX_SMOKE_ELF_AARCH64=/dev/null");
+
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
     // image uses). If absent on the host, point at /dev/null so
