@@ -33,39 +33,18 @@ pub const FD_SETSIZE: usize = 1024;
 /// Size of an fd_set in bytes.
 pub const FD_SET_BYTES: usize = FD_SETSIZE / 8; // 128
 
-/// Test whether bit `fd` is set in the fd_set at `ptr`.
-///
-/// # Safety
-/// `ptr` must point to at least `FD_SET_BYTES` bytes of valid
-/// memory in the current address space.
-unsafe fn fd_isset(ptr: *const u8, fd: usize) -> bool {
+fn fd_isset(set: &[u8; FD_SET_BYTES], fd: usize) -> bool {
     if fd >= FD_SETSIZE {
         return false;
     }
-    // SAFETY: caller guarantees FD_SET_BYTES readable bytes.
-    let byte = unsafe { *ptr.add(fd / 8) };
+    let byte = set[fd / 8];
     (byte >> (fd & 7)) & 1 != 0
 }
 
-/// Set bit `fd` in the fd_set at `ptr`.
-///
-/// # Safety
-/// `ptr` must point to at least `FD_SET_BYTES` writable bytes.
-unsafe fn fd_set(ptr: *mut u8, fd: usize) {
+fn fd_set_bit(set: &mut [u8; FD_SET_BYTES], fd: usize) {
     if fd < FD_SETSIZE {
-        // SAFETY: caller guarantees FD_SET_BYTES writable bytes.
-        let slot = unsafe { &mut *ptr.add(fd / 8) };
-        *slot |= 1 << (fd & 7);
+        set[fd / 8] |= 1 << (fd & 7);
     }
-}
-
-/// Zero an fd_set at `ptr`.
-///
-/// # Safety
-/// `ptr` must point to at least `FD_SET_BYTES` writable bytes.
-unsafe fn fd_zero(ptr: *mut u8) {
-    // SAFETY: caller guarantees FD_SET_BYTES writable bytes.
-    unsafe { core::ptr::write_bytes(ptr, 0, FD_SET_BYTES) };
 }
 
 /// Core `select` body. `nfds` is the highest fd + 1 to check.
@@ -85,15 +64,32 @@ pub fn do_select(
     exceptfds: Option<*mut u8>,
     timeout_ms: i64,
 ) -> usize {
-    // Build a poll array from the three fd_set bitmaps.
-    // Each fd appears at most once; we OR together events from all
-    // three sets so a single poll pass covers them.
+    let mut local_r = [0u8; FD_SET_BYTES];
+    let mut local_w = [0u8; FD_SET_BYTES];
+    let mut local_e = [0u8; FD_SET_BYTES];
+
+    if let Some(p) = readfds {
+        if unsafe { crate::handlers::copy_from_user(&mut local_r, p as u64) }.is_err() {
+            return usize::MAX;
+        }
+    }
+    if let Some(p) = writefds {
+        if unsafe { crate::handlers::copy_from_user(&mut local_w, p as u64) }.is_err() {
+            return usize::MAX;
+        }
+    }
+    if let Some(p) = exceptfds {
+        if unsafe { crate::handlers::copy_from_user(&mut local_e, p as u64) }.is_err() {
+            return usize::MAX;
+        }
+    }
+
     let nfds = nfds.min(FD_SETSIZE);
     let mut items: Vec<PollFd> = Vec::new();
     for fd in 0..nfds {
-        let want_r = readfds.map_or(false, |p| unsafe { fd_isset(p, fd) });
-        let want_w = writefds.map_or(false, |p| unsafe { fd_isset(p, fd) });
-        let want_e = exceptfds.map_or(false, |p| unsafe { fd_isset(p, fd) });
+        let want_r = readfds.is_some() && fd_isset(&local_r, fd);
+        let want_w = writefds.is_some() && fd_isset(&local_w, fd);
+        let want_e = exceptfds.is_some() && fd_isset(&local_e, fd);
         if want_r || want_w || want_e {
             let mut events: u16 = 0;
             if want_r {
@@ -114,7 +110,6 @@ pub fn do_select(
     }
 
     if items.is_empty() {
-        // No fds to watch — behave as a pure sleep.
         if timeout_ms > 0 {
             let deadline = narf_scheduler::narf_time::monotonic_ns()
                 .saturating_add((timeout_ms as u64) * 1_000_000);
@@ -123,38 +118,40 @@ pub fn do_select(
                 core::hint::spin_loop();
             }
         }
-        // Zero the sets so the caller sees them clean on return.
+        let zeros = [0u8; FD_SET_BYTES];
         if let Some(p) = readfds {
-            unsafe { fd_zero(p) };
+            let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
         }
         if let Some(p) = writefds {
-            unsafe { fd_zero(p) };
+            let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
         }
         if let Some(p) = exceptfds {
-            unsafe { fd_zero(p) };
+            let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
         }
         return 0;
     }
 
-    // Run poll.
     let n = do_poll(task_id, &mut items, timeout_ms);
 
-    // Clear the fd_set outputs before writing new bits.
+    let zeros = [0u8; FD_SET_BYTES];
     if let Some(p) = readfds {
-        unsafe { fd_zero(p) };
+        let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
     }
     if let Some(p) = writefds {
-        unsafe { fd_zero(p) };
+        let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
     }
     if let Some(p) = exceptfds {
-        unsafe { fd_zero(p) };
+        let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
     }
 
     if n == 0 {
-        return 0; // timeout
+        return 0;
     }
 
-    // Scatter ready bits back into the three fd_set outputs.
+    let mut out_r = [0u8; FD_SET_BYTES];
+    let mut out_w = [0u8; FD_SET_BYTES];
+    let mut out_e = [0u8; FD_SET_BYTES];
+
     let mut count = 0usize;
     for item in &items {
         let fd = item.fd as usize;
@@ -167,29 +164,33 @@ pub fn do_select(
         let e_ready = (rev & (POLL_ERR | POLL_HUP) as u16) != 0;
 
         let mut set_any = false;
-        if r_ready {
-            if let Some(p) = readfds {
-                // SAFETY: p was validated by the caller to be writable.
-                unsafe { fd_set(p, fd) };
-                set_any = true;
-            }
+        if r_ready && readfds.is_some() {
+            fd_set_bit(&mut out_r, fd);
+            set_any = true;
         }
-        if w_ready {
-            if let Some(p) = writefds {
-                unsafe { fd_set(p, fd) };
-                set_any = true;
-            }
+        if w_ready && writefds.is_some() {
+            fd_set_bit(&mut out_w, fd);
+            set_any = true;
         }
-        if e_ready {
-            if let Some(p) = exceptfds {
-                unsafe { fd_set(p, fd) };
-                set_any = true;
-            }
+        if e_ready && exceptfds.is_some() {
+            fd_set_bit(&mut out_e, fd);
+            set_any = true;
         }
         if set_any {
             count += 1;
         }
     }
+
+    if let Some(p) = readfds {
+        let _ = unsafe { crate::handlers::copy_to_user(p as u64, &out_r) };
+    }
+    if let Some(p) = writefds {
+        let _ = unsafe { crate::handlers::copy_to_user(p as u64, &out_w) };
+    }
+    if let Some(p) = exceptfds {
+        let _ = unsafe { crate::handlers::copy_to_user(p as u64, &out_e) };
+    }
+
     count
 }
 
@@ -306,9 +307,13 @@ pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
     let timeout_ms: i64 = if ts_ptr.is_null() {
         -1 // block forever
     } else {
-        // SAFETY: user pointer; 16-byte access.
-        let sec = unsafe { core::ptr::read_unaligned(ts_ptr as *const i64) };
-        let nsec = unsafe { core::ptr::read_unaligned(ts_ptr.add(8) as *const i64) };
+        let mut buf = [0u8; 16];
+        if unsafe { crate::handlers::copy_from_user(&mut buf, ts_ptr as u64) }.is_err() {
+            ctx.set_return(fail);
+            return;
+        }
+        let sec = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let nsec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
         if sec < 0 || nsec < 0 {
             ctx.set_return(fail);
             return;

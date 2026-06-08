@@ -9721,29 +9721,26 @@ fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
     // even if the *ss_in install fails, the query result is the
     // pre-install state).
     if ss_out != 0 {
-        // SAFETY: caller-supplied pointer; we trust the user mode
-        // ABI here as elsewhere in this file. A bad pointer faults
-        // and the kernel's fault handler turns it into a kill —
-        // user error.
-        unsafe {
-            let p = ss_out as *mut u8;
-            (p as *mut u64).write_unaligned(current.sp);
-            (p.add(8) as *mut u32).write_unaligned(current.flags);
-            (p.add(12) as *mut u32).write_unaligned(0);
-            (p.add(16) as *mut u64).write_unaligned(current.size);
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&current.sp.to_ne_bytes());
+        buf[8..12].copy_from_slice(&current.flags.to_ne_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
+        buf[16..24].copy_from_slice(&current.size.to_ne_bytes());
+        if unsafe { copy_to_user(ss_out, &buf) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
         }
     }
 
     if ss_in != 0 {
-        // SAFETY: same.
-        let (sp, flags, size) = unsafe {
-            let p = ss_in as *const u8;
-            (
-                (p as *const u64).read_unaligned(),
-                (p.add(8) as *const u32).read_unaligned(),
-                (p.add(16) as *const u64).read_unaligned(),
-            )
-        };
+        let mut buf = [0u8; 24];
+        if unsafe { copy_from_user(&mut buf, ss_in) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+        let sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let flags = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let size = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
         // Validate: flags must be a subset of {SS_DISABLE, SS_ONSTACK},
         // and if not SS_DISABLE the size must meet MIN_SIGSTKSZ.
         if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 {
