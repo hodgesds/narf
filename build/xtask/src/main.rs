@@ -1379,7 +1379,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // path + the new linux-ABI sys_open.
         ("pty_smoke", "pty-ok"),
         ("net_smoke", "net-ok"),
-        ("vim_smoke", "vim_smoke: all cases passed"),
+        ("net6_smoke", "net6-ok"),
     ];
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);

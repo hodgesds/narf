@@ -3328,7 +3328,7 @@ fn boot_userspace_init() {
                 // the master/slave pair. Success token "pty-ok".
                 ("pty_smoke", narf_verification::NARF_PTY_SMOKE_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
-                ("vim_smoke", narf_verification::NARF_VIM_SMOKE_ELF),
+                ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

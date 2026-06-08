@@ -253,13 +253,13 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_NET_SMOKE_ELF_AARCH64=/dev/null");
 
-    println!("cargo:rerun-if-changed=data/musl-demo/vim_smoke_x86_64");
-    let vim_smoke = manifest_dir.join("data/musl-demo/vim_smoke_x86_64");
+    println!("cargo:rerun-if-changed=data/musl-demo/net6_smoke_x86_64");
+    let net6_smoke = manifest_dir.join("data/musl-demo/net6_smoke_x86_64");
     println!(
-        "cargo:rustc-env=NARF_VIM_SMOKE_ELF_X86_64={}",
-        vim_smoke.display()
+        "cargo:rustc-env=NARF_NET6_SMOKE_ELF_X86_64={}",
+        net6_smoke.display()
     );
-    println!("cargo:rustc-env=NARF_VIM_SMOKE_ELF_AARCH64=/dev/null");
+    println!("cargo:rustc-env=NARF_NET6_SMOKE_ELF_AARCH64=/dev/null");
 
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
