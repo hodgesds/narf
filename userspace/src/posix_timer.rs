@@ -401,6 +401,10 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
     ) {
+        if let Some(h) = crate::signal_delivery_hook() {
+            h(ctx, crate::Syscall::ClockNanosleep.raw());
+        }
+
         ctx.set_return(SyscallReturn::ok(0));
         unsafe {
             let uc = &*uctx;

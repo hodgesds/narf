@@ -1372,26 +1372,35 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // either, busybox sh's PATH search hits the
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
-        // PTY smoke. Opens /dev/ptmx, clears TIOCSPTLCK,
-        // reads TIOCGPTN, opens /dev/pts/N, round-trips
-        // "ping" master→slave and "pong" slave→master, then
-        // prints "pty-ok". Exercises the clone-on-open ptmx
-        // path + the new linux-ABI sys_open.
+        ("signal_smoke", "signal-ok"),
+        ("fs_smoke", "fs-ok"),
+        ("fork_pipe_smoke", "fork-ok"),
         ("pty_smoke", "pty-ok"),
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
+        ("epoll_smoke", "epoll-ok"),
     ];
+    let mut passed = 0;
+    let mut failed = 0;
     for (cmd, expect) in cases {
         eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);
-        run_interactive_cmd(&RunInteractiveArgs {
+        let res = run_interactive_cmd(&RunInteractiveArgs {
             build: args.clone(),
             cmd: (*cmd).into(),
             expect: (*expect).into(),
-        })
-        .with_context(|| format!("musl-demo: `{}` failed", cmd))?;
+        });
+        if let Err(e) = res {
+            eprintln!("musl-demo: `{}` failed: {:?}", cmd, e);
+            failed += 1;
+        } else {
+            passed += 1;
+        }
     }
-    eprintln!("\nmusl-demo: all cases passed");
+    eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
+    if failed > 0 {
+        bail!("musl-demo failed ({} errors)", failed);
+    }
     Ok(())
 }
 

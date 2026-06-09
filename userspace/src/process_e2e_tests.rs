@@ -65,6 +65,13 @@ impl TrapContext for StubCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
@@ -85,6 +92,13 @@ impl TrapContext for SignalCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
@@ -1322,7 +1336,7 @@ kernel_test_in!("userspace/process", smoke_wave35_dup2_rewires_descriptor);
 // Linux ref: kernel/sys.c::sys_getpid; musl src/process/getpid.c.
 
 fn smoke_wave35_getpid_nonzero() -> TestResult {
-    const TASK: u64 = 0xF0_16;
+    const TASK: u64 = 0xF016;
     crate::syscall::__test_clear_global();
     setup_process_state(TASK);
 

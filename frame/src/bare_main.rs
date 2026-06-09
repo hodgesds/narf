@@ -3187,6 +3187,9 @@ fn boot_userspace_init() {
             narf_scheduler::TaskSpec::unthrottled(),
             addr_space,
         );
+        // Register PID <-> TID mapping so syscalls like kill(pid) work.
+        narf_userspace::handlers::register_pid_task_mapping(pid.raw(), tid.raw());
+
         // /proc/[pid]/cmdline + comm seed for the boot-spawned
         // process. argv = ["init"] / ["shell"] is the convention
         // load_user_process_with uses above.
@@ -3330,6 +3333,13 @@ fn boot_userspace_init() {
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),
+                (
+                    "fork_pipe_smoke",
+                    narf_verification::NARF_FORK_PIPE_SMOKE_ELF,
+                ),
+                ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
+                ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
+                ("fs_smoke", narf_verification::NARF_FS_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

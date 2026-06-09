@@ -269,6 +269,20 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_UNIX_SMOKE_ELF_AARCH64=/dev/null");
 
+    for test in ["fork_pipe_smoke", "epoll_smoke", "signal_smoke", "fs_smoke"] {
+        println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
+        let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));
+        println!(
+            "cargo:rustc-env=NARF_{}_ELF_X86_64={}",
+            test.to_uppercase(),
+            path.display()
+        );
+        println!(
+            "cargo:rustc-env=NARF_{}_ELF_AARCH64=/dev/null",
+            test.to_uppercase()
+        );
+    }
+
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
     // image uses). If absent on the host, point at /dev/null so

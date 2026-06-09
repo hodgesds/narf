@@ -26,6 +26,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, Ordering};
+use narf_abi as abi;
 
 // ── TrapContext trait ───────────────────────────────────────────────
 //
@@ -48,6 +49,15 @@ pub trait TrapContext {
     /// in the arch's return registers.
     fn set_return(&mut self, ret: SyscallReturn);
 
+    /// Get the current user stack pointer (RSP on x86_64).
+    fn user_rsp(&self) -> u64;
+
+    /// Get the current user instruction pointer (RIP on x86_64).
+    fn rip(&self) -> u64;
+
+    /// Set the user instruction pointer.
+    fn set_rip(&mut self, rip: u64);
+
     /// Redirect the upcoming return so it lands at `rip` on `rsp`
     /// in kernel mode with kernel selectors, instead of iretq-ing
     /// back to user. Returns `true` when the arch supports this
@@ -55,6 +65,11 @@ pub trait TrapContext {
     /// path can't yet rewrite the EL/CPL target. Callers should
     /// check the return and fall back to `set_return` if `false`.
     fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool;
+
+    /// Redirect to a fresh user-mode image (execve path).
+    fn redirect_to_user(&mut self, _entry_rip: u64, _entry_rsp: u64) -> bool {
+        false
+    }
 
     /// Save the trapping user-mode CPU state (GPRs, RIP, RSP,
     /// RFLAGS) to `out` so a later resume path can re-enter user
@@ -70,65 +85,84 @@ pub trait TrapContext {
         false
     }
 
-    /// Rewrite the trap frame to deliver the signal described by
-    /// `params` to user mode. The arch pushes a frame (SigContext
-    /// for 1-arg handlers, `siginfo_t + ucontext_t` for SA_SIGINFO
-    /// handlers) onto the user stack (or altstack if SA_ONSTACK +
-    /// a non-disabled altstack is supplied), sets the SysV
-    /// integer-arg registers (RDI = signum always; RSI = &siginfo,
-    /// RDX = &ucontext for SA_SIGINFO), and points the trap
-    /// frame's instruction pointer at `params.handler`.
-    ///
-    /// SA_RESTART: when `params.flags & SA_RESTART != 0` AND the
-    /// outer trap is a restartable syscall (caller signals this
-    /// via `params.restartable_syscall`), the arch rewinds the
-    /// SAVED RIP (the one that sigreturn restores, not the live
-    /// `frame.rip` which gets overwritten with the handler) by
-    /// the architecturally-defined syscall-instruction length —
-    /// 2 bytes on x86_64 (both `int 0x80` (`CD 80`) and `syscall`
-    /// (`0F 05`)) — so that on handler return, the syscall
-    /// re-executes.
-    ///
-    /// Default: returns `false` — arches without a delivery
-    /// implementation skip the rewrite, leaving the frame
-    /// untouched. x86_64 overrides.
-    fn deliver_signal(&mut self, _params: &SigDeliveryParams) -> bool {
-        false
-    }
-
-    /// Pop a SigContext frame at the user vaddr `sc_vaddr` (passed
-    /// explicitly because the libc trampoline's intervening call
-    /// frames shift RSP between deliver_signal and sigreturn) and
-    /// restore the live trap context from it. Inverse of
-    /// `deliver_signal`. Returns true if the restore succeeded;
-    /// false if the arch hasn't implemented sigreturn (in which
-    /// case `sys_sigreturn` surfaces InvalidOp).
-    fn perform_sigreturn(&mut self, _sc_vaddr: u64) -> bool {
-        false
-    }
-
-    /// Whether the trap is about to return to user mode. The
-    /// signal-delivery hook only fires on user-bound returns;
-    /// kernel-bound returns (e.g. from a `redirect_to_kernel`
-    /// raw handler) skip delivery so we don't synthesize a
-    /// signal frame onto a kernel stack. Default: `false`
-    /// (treat as kernel-bound) so non-x86_64 arches without a
-    /// CPL/EL accessor behave conservatively.
+    /// True if the context is returning to user mode (CPL=3).
     fn returning_to_user(&self) -> bool {
         false
     }
 
-    /// Rewrite the trap frame so the upcoming return lands in
-    /// user mode at `entry_rip` with stack `entry_rsp`. Used by
-    /// `execve` to discard the post-syscall continuation in the
-    /// caller's old image and resume in the freshly-loaded
-    /// program. Sets CS=UCODE, SS=UDATA, RFLAGS to a clean user-
-    /// mode value (interrupts enabled, no flags set), and zeros
-    /// the GPR file so the new program doesn't observe stale
-    /// register values from the caller. Returns `true` when the
-    /// arch supports the rewrite (x86_64 today); `false`
-    /// elsewhere.
-    fn redirect_to_user(&mut self, _entry_rip: u64, _entry_rsp: u64) -> bool {
+    /// Lay down a signal delivery frame (Classic or SA_SIGINFO) on
+    /// the user stack and rewrite the context's RIP/RSP to land
+    /// at the handler entry. Returns true on success.
+    fn deliver_signal(&mut self, _params: &SigDeliveryParams) -> bool {
+        false
+    }
+
+    /// Restore register state from a SigContext / ucontext_t frame
+    /// on the user stack. Returns true on success.
+    fn perform_sigreturn(&mut self, _sc_vaddr: u64) -> bool {
+        false
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub struct UserStateCtx<'a> {
+    pub state: &'a mut narf_scheduler::UserState,
+    pub args: SyscallArgs,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl<'a> core::fmt::Debug for UserStateCtx<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UserStateCtx")
+            .field("args", &self.args)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl<'a> TrapContext for UserStateCtx<'a> {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, ret: SyscallReturn) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.state.rax = ret.value;
+            self.state.rdx = ret.status as u64;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.state.x[0] = ret.value;
+            self.state.x[1] = ret.status as u64;
+        }
+    }
+    fn user_rsp(&self) -> u64 {
+        self.state.rsp
+    }
+    fn rip(&self) -> u64 {
+        self.state.rip
+    }
+    fn set_rip(&mut self, rip: u64) {
+        self.state.rip = rip;
+    }
+    fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        false
+    }
+    fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
+        self.state.rip = entry_rip;
+        self.state.rsp = entry_rsp;
+        true
+    }
+    unsafe fn save_user_state(&self, _out: *mut u8) -> bool {
+        false
+    }
+    fn returning_to_user(&self) -> bool {
+        true
+    }
+    fn deliver_signal(&mut self, _params: &SigDeliveryParams) -> bool {
+        false
+    }
+    fn perform_sigreturn(&mut self, _sc_vaddr: u64) -> bool {
         false
     }
 }
@@ -168,6 +202,8 @@ pub struct SigDeliveryParams {
     /// `void(int, siginfo_t *, void *)` shape; otherwise the
     /// classical 1-arg `void(int)` shape.
     pub handler: u64,
+    /// User vaddr of the restorer trampoline (for Linux ABI).
+    pub restorer: u64,
     /// Signal number (`SIGSEGV`, `SIGUSR1`, ...). Delivered as the
     /// SysV first integer arg (RDI on x86_64).
     pub signum: u32,
@@ -533,6 +569,9 @@ pub enum Syscall {
     /// on no-children / timeout.
     Wait4,
 
+    /// `pause()` — block until a signal is delivered.
+    Pause,
+
     /// `mount(source, target, fstype, flags, data)` — mount the
     /// filesystem named by `fstype` (a packed string like "fat" or
     /// "ext2") at the absolute path `target`, backed by the
@@ -729,6 +768,9 @@ pub enum Syscall {
     /// arg0 = epfd, arg1 = events_out ptr, arg2 = max,
     /// arg3 = timeout_ms.
     EpollWait,
+
+    /// Linux `epoll_pwait`.
+    EpollPwait,
 
     /// `eventfd2(initval, flags)` — semaphore-shaped fd.
     /// arg0 = initial counter value, arg1 = flags.
@@ -1190,6 +1232,9 @@ pub enum Syscall {
     /// later.
     Kill,
 
+    /// Linux `rt_sigaction` surface (pointer-to-struct).
+    RtSigaction,
+
     /// Update the calling task's signal-block mask.
     /// `arg0 = how` (0 = BLOCK, 1 = UNBLOCK, 2 = SETMASK),
     /// `arg1 = set` (32-bit bitmap). Returns the **previous**
@@ -1521,7 +1566,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MProtect, 10),
     (Syscall::Munmap, 11),
     (Syscall::Brk, 12),
-    (Syscall::Sigaction, 13),   // rt_sigaction
+    (Syscall::RtSigaction, 13), // rt_sigaction
     (Syscall::Sigprocmask, 14), // rt_sigprocmask
     (Syscall::Sigreturn, 15),   // rt_sigreturn
     (Syscall::Ioctl, 16),
@@ -1533,6 +1578,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Yield, 24), // sched_yield
     (Syscall::Dup, 32),
     (Syscall::Dup2, 33),
+    (Syscall::Pause, 34), // pause
     (Syscall::Sleep, 35), // nanosleep
     (Syscall::GetPid, 39),
     (Syscall::SocketOpen, 41), // socket
@@ -1644,8 +1690,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdSettime, 286),
     (Syscall::TimerfdGettime, 287),
     (Syscall::EpollWait, 232), // epoll_wait
+    (Syscall::EpollPwait, 281),
     (Syscall::EpollCtl, 233),
-    (Syscall::ArchPrctl, 158), // arch_prctl (x86_64 only)
+    (Syscall::ArchPrctl, 158),   // arch_prctl (x86_64 only)
+    (Syscall::EpollCreate, 291), // epoll_create1
     // Linux 231 = exit_group. Glibc/musl emit exit_group out of
     // __libc_start_main's exit path; mapping it to the same
     // handler as plain exit (60 → ExitTask) lets a real
@@ -1785,7 +1833,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Tgkill, 131),
     (Syscall::Sigaltstack, 132),
     (Syscall::RtSigsuspend, 133),
-    (Syscall::Sigaction, 134),   // rt_sigaction
+    (Syscall::RtSigaction, 134), // rt_sigaction
     (Syscall::Sigprocmask, 135), // rt_sigprocmask
     (Syscall::RtSigpending, 136),
     (Syscall::RtSigtimedwait, 137),
@@ -1930,18 +1978,13 @@ impl Syscall {
             }
             j += 1;
         }
-        // A variant with no table row is a build-time programmer
-        // error — every Syscall variant must appear in either
-        // LINUX_TABLE or NARF_EXTENSION_TABLE on every arch. We use
-        // an out-of-range sentinel so a future static_assert can
-        // catch this at compile time once Rust permits panicking
-        // const fns more freely.
-        u32::MAX
+        panic!("Syscall missing from both LINUX and NARF tables");
     }
 
-    /// Parse a raw wire number back into a `Syscall`. Returns
-    /// `None` for numbers without a registered handler on this
-    /// arch.
+    /// Reverse lookup: return the canonical `Syscall` variant for
+    /// the arch-specific wire number `n`. Returns `None` if `n` is
+    /// not mapped (surfaces InvalidOp to the user).
+    #[inline]
     pub const fn from_raw(n: u32) -> Option<Self> {
         let mut i = 0;
         while i < LINUX_TABLE.len() {
@@ -1961,554 +2004,31 @@ impl Syscall {
     }
 }
 
-// ── Args + Return ───────────────────────────────────────────────────
+// ── Shared entry point (called by frame/ after trap entry) ──────────
 
-/// Syscall arguments in register-passing order. Six arguments
-/// matches the x86_64 syscall convention (rdi/rsi/rdx/r10/r8/r9)
-/// and is wide enough for aarch64 (x0..=x5).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct SyscallArgs {
-    pub arg0: u64,
-    pub arg1: u64,
-    pub arg2: u64,
-    pub arg3: u64,
-    pub arg4: u64,
-    pub arg5: u64,
-}
-
-/// Return value for a syscall. Mirrors `abi::NarfStatus` + one
-/// `u64` payload register.
-///
-/// `status` values match `abi::NarfStatus` wire tags so downstream
-/// tooling shares a vocabulary:
-/// - `0` = Ok
-/// - `1` = InvalidOp
-/// - `2` = Cancelled
-/// - `3` = CancelRequested
-/// - `4` = CapRevoked
-/// ... (see `abi::NarfStatus`).
-///
-/// `#[repr(C)]` is load-bearing: the x86_64 syscall-instruction
-/// asm in `frame/src/x86_64/syscall.rs` returns this 16-byte
-/// struct via the SysV C-ABI (status in rax low 32 bits, value
-/// in rdx), then `xchg rax, rdx` so the user sees rax = value.
-/// Default Rust layout is free to reorder fields; if `value`
-/// landed at offset 0 (the natural choice given alignment), the
-/// xchg would swap value INTO rdx and leave rax = status_word —
-/// every syscall return value would come back to user as 0
-/// (OK), silently losing the actual return.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct SyscallReturn {
-    pub status: u32,
-    pub value: u64,
-}
-
-impl SyscallReturn {
-    pub const OK: u32 = 0;
-    pub const INVALID_OP: u32 = 1;
-
-    #[inline]
-    pub const fn ok(value: u64) -> Self {
-        Self {
-            status: Self::OK,
-            value,
-        }
-    }
-
-    #[inline]
-    pub const fn invalid_op() -> Self {
-        Self {
-            status: Self::INVALID_OP,
-            value: 0,
-        }
-    }
-}
-
-// ── Handler + table ─────────────────────────────────────────────────
-
-/// Dispatch target for a single syscall. Kernel subsystems
-/// implement this and register themselves with a `SyscallTable`
-/// at boot.
-pub trait SyscallHandler: Send + Sync + 'static {
-    fn invoke(&self, args: &SyscallArgs) -> SyscallReturn;
-}
-
-/// Raw variant of `SyscallHandler`. Receives the full
-/// `TrapContext`, can read args + set return, and additionally can
-/// call `redirect_to_kernel` to unwind into kernel state instead
-/// of returning to the caller's user context.
-///
-/// Use for syscalls that need direct control over the return path
-/// (exit, fork, exec, longjmp-style unwinds); use plain
-/// `SyscallHandler` for everything else.
-pub trait RawSyscallHandler: Send + Sync + 'static {
-    fn invoke(&self, ctx: &mut dyn TrapContext);
-}
-
-/// Convenience wrapper so `impl Fn(&SyscallArgs) -> SyscallReturn`
-/// works as a handler without a manual struct.
-pub struct FnHandler<F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static>(pub F);
-
-impl<F> core::fmt::Debug for FnHandler<F>
-where
-    F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("FnHandler").finish_non_exhaustive()
-    }
-}
-
-impl<F> SyscallHandler for FnHandler<F>
-where
-    F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
-{
-    fn invoke(&self, args: &SyscallArgs) -> SyscallReturn {
-        (self.0)(args)
-    }
-}
-
-/// One table slot: the diagnostic name + zero/one handler of each
-/// kind. Raw handler wins when both are installed.
-///
-/// **Versioning.** The Linux "don't break userspace" principle is
-/// load-bearing once a syscall lands in narf-libc. To extend
-/// semantics without minting a new number, callers can pack a
-/// version into the **upper 8 bits** of the 32-bit syscall number
-/// (see `SYS_VERSION_SHIFT`). Version 0 is the canonical wire ABI;
-/// versions 1..255 land as overrides in `versioned`. Old binaries
-/// always encode `version=0` implicitly, so they keep dispatching
-/// to the v0 handler forever even after a v1 override is added.
-pub struct SyscallEntry {
-    pub number: Syscall,
-    pub name: &'static str,
-    pub handler: Option<Box<dyn SyscallHandler>>,
-    pub raw_handler: Option<Box<dyn RawSyscallHandler>>,
-    /// `(version, raw_handler)` pairs for non-zero versions. Probed
-    /// before falling through to `raw_handler` / `handler`.
-    pub versioned: Vec<(u8, Box<dyn RawSyscallHandler>)>,
-}
-
-impl core::fmt::Debug for SyscallEntry {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SyscallEntry")
-            .field("number", &self.number)
-            .field("name", &self.name)
-            .field("has_handler", &self.handler.is_some())
-            .field("has_raw", &self.raw_handler.is_some())
-            .field("versions", &self.versioned.len())
-            .finish()
-    }
-}
-
-// ── Syscall versioning ──────────────────────────────────────────────
-//
-// Wire format: the bottom 24 bits of the u32 syscall number are the
-// canonical syscall id (room for 16M numbers — far past the ~234 we
-// have). The top 8 bits are a version field. Userspace that knows
-// nothing about versions encodes 0 implicitly — the upper bits stay
-// zero — so it always reaches the canonical v0 handler.
-//
-// Adding a v1 of an existing syscall is a `install_raw_versioned`
-// call in the kernel + a recompile of the libc that wants to use it
-// with `(1 << SYS_VERSION_SHIFT) | SYS_FOO` at the call site. The v0
-// handler stays alive for old binaries indefinitely.
-
-/// Bit shift for the version field in a raw syscall number.
-pub const SYS_VERSION_SHIFT: u32 = 24;
-/// Mask isolating the version field.
-pub const SYS_VERSION_MASK: u32 = 0xFF00_0000;
-/// Mask isolating the canonical syscall number (low 24 bits).
-pub const SYS_NUMBER_MASK: u32 = 0x00FF_FFFF;
-
-/// Pull the version (0..=255) out of a raw syscall number.
-#[inline]
-pub const fn syscall_version(raw: u32) -> u8 {
-    ((raw & SYS_VERSION_MASK) >> SYS_VERSION_SHIFT) as u8
-}
-
-/// Pull the canonical syscall number out of a raw syscall number.
-#[inline]
-pub const fn syscall_number(raw: u32) -> u32 {
-    raw & SYS_NUMBER_MASK
-}
-
-/// Pack a `(version, syscall)` pair into the wire-format u32.
-#[inline]
-pub const fn syscall_pack(version: u8, n: Syscall) -> u32 {
-    ((version as u32) << SYS_VERSION_SHIFT) | (n.raw() & SYS_NUMBER_MASK)
-}
-
-/// In-kernel syscall table. Constructed at boot, handed to
-/// `install_global` once every subsystem has registered.
-#[derive(Debug)]
-pub struct SyscallTable {
-    entries: Vec<SyscallEntry>,
-}
-
-impl SyscallTable {
-    pub const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Register a diagnostic name against a syscall number (no
-    /// handler body). Useful when a subsystem wants the name to
-    /// show up in tracing while implementation is pending.
-    pub fn register(&mut self, n: Syscall, name: &'static str) {
-        self.entries.push(SyscallEntry {
-            number: n,
-            name,
-            handler: None,
-            raw_handler: None,
-            versioned: Vec::new(),
-        });
-    }
-
-    /// Register a live plain handler for `n`. Replaces any prior
-    /// plain handler for the same number so Stage-4 subsystems can
-    /// take over stubs landed earlier. A raw handler registered
-    /// separately still wins on dispatch.
-    pub fn install<H: SyscallHandler + 'static>(
-        &mut self,
-        n: Syscall,
-        name: &'static str,
-        handler: H,
-    ) {
-        self.install_slot(
-            n,
-            name,
-            Some(Box::new(handler) as Box<dyn SyscallHandler>),
-            None,
-        );
-    }
-
-    /// Register a raw handler for `n`. A raw handler receives the
-    /// full `TrapContext` (args + return setter + redirect-to-
-    /// kernel) and is chosen over a plain handler when both are
-    /// installed.
-    pub fn install_raw<H: RawSyscallHandler + 'static>(
-        &mut self,
-        n: Syscall,
-        name: &'static str,
-        handler: H,
-    ) {
-        self.install_slot(
-            n,
-            name,
-            None,
-            Some(Box::new(handler) as Box<dyn RawSyscallHandler>),
-        );
-    }
-
-    fn install_slot(
-        &mut self,
-        n: Syscall,
-        name: &'static str,
-        plain: Option<Box<dyn SyscallHandler>>,
-        raw: Option<Box<dyn RawSyscallHandler>>,
-    ) {
-        if let Some(slot) = self.entries.iter_mut().find(|e| e.number == n) {
-            slot.name = name;
-            if plain.is_some() {
-                slot.handler = plain;
-            }
-            if raw.is_some() {
-                slot.raw_handler = raw;
-            }
-        } else {
-            self.entries.push(SyscallEntry {
-                number: n,
-                name,
-                handler: plain,
-                raw_handler: raw,
-                versioned: Vec::new(),
-            });
-        }
-    }
-
-    /// Register a raw handler for `(syscall, version)`. `version=0`
-    /// is reserved for the canonical wire ABI — register that with
-    /// `install_raw` instead. Re-registering the same `(n, version)`
-    /// pair replaces the prior handler.
-    pub fn install_raw_versioned<H: RawSyscallHandler + 'static>(
-        &mut self,
-        n: Syscall,
-        version: u8,
-        handler: H,
-    ) {
-        assert!(
-            version != 0,
-            "version=0 is the canonical ABI; use install_raw"
-        );
-        let boxed = Box::new(handler) as Box<dyn RawSyscallHandler>;
-        let slot = if let Some(s) = self.entries.iter_mut().find(|e| e.number == n) {
-            s
-        } else {
-            self.entries.push(SyscallEntry {
-                number: n,
-                name: "<versioned-only>",
-                handler: None,
-                raw_handler: None,
-                versioned: Vec::new(),
-            });
-            self.entries.last_mut().expect("just pushed")
-        };
-        if let Some(pos) = slot.versioned.iter().position(|(v, _)| *v == version) {
-            slot.versioned[pos] = (version, boxed);
-        } else {
-            slot.versioned.push((version, boxed));
-        }
-    }
-
-    /// Shorthand: install a closure as a plain handler.
-    pub fn install_fn<F>(&mut self, n: Syscall, name: &'static str, f: F)
-    where
-        F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
-    {
-        self.install(n, name, FnHandler(f));
-    }
-
-    /// Shorthand: install a closure as a raw handler.
-    pub fn install_raw_fn<F>(&mut self, n: Syscall, name: &'static str, f: F)
-    where
-        F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
-    {
-        self.install_raw(n, name, RawFnHandler(f));
-    }
-
-    /// Look up the diagnostic name for `n`.
-    pub fn name_of(&self, n: Syscall) -> Option<&'static str> {
-        self.entries.iter().find(|e| e.number == n).map(|e| e.name)
-    }
-
-    /// Legacy dispatch: fires only plain handlers, returns
-    /// `None` if no plain handler is installed. Kept for the
-    /// existing tests; the arch trap path uses `dispatch_ctx` so
-    /// it can honour raw handlers.
-    pub fn dispatch(&self, n: Syscall, args: &SyscallArgs) -> Option<SyscallReturn> {
-        let slot = self.entries.iter().find(|e| e.number == n)?;
-        let h = slot.handler.as_ref()?;
-        Some(h.invoke(args))
-    }
-
-    /// Raw-aware dispatch (canonical, version=0). If a raw handler is
-    /// installed, call it with `ctx` (it's responsible for
-    /// `set_return` / `redirect_to_kernel`). Otherwise fall back to
-    /// the plain handler. Absence of both means
-    /// `SyscallReturn::invalid_op`.
-    pub fn dispatch_ctx(&self, n: Syscall, ctx: &mut dyn TrapContext) {
-        self.dispatch_ctx_versioned(n, 0, ctx)
-    }
-
-    /// Raw-aware dispatch with a version. Lookup order:
-    /// 1. If `version != 0` and the slot has a matching versioned
-    ///    handler, invoke it.
-    /// 2. Else fall through to the v0 raw handler.
-    /// 3. Else fall through to the v0 plain handler.
-    /// 4. Else `SyscallReturn::invalid_op`.
-    ///
-    /// This makes a v1 caller of an as-yet-unversioned syscall fall
-    /// back to v0 transparently — the right answer when v0 is the
-    /// canonical wire ABI.
-    pub fn dispatch_ctx_versioned(&self, n: Syscall, version: u8, ctx: &mut dyn TrapContext) {
-        if let Some(slot) = self.entries.iter().find(|e| e.number == n) {
-            if version != 0 {
-                if let Some((_, h)) = slot.versioned.iter().find(|(v, _)| *v == version) {
-                    h.invoke(ctx);
-                    return;
-                }
-                // Versioned handler not installed; fall through to v0.
-            }
-            if let Some(h) = slot.raw_handler.as_ref() {
-                h.invoke(ctx);
-                return;
-            }
-            if let Some(h) = slot.handler.as_ref() {
-                let ret = h.invoke(ctx.args());
-                ctx.set_return(ret);
-                return;
-            }
-        }
-        ctx.set_return(SyscallReturn::invalid_op());
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-/// Closure-backed raw handler shim.
-pub struct RawFnHandler<F: Fn(&mut dyn TrapContext) + Send + Sync + 'static>(pub F);
-
-impl<F> core::fmt::Debug for RawFnHandler<F>
-where
-    F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("RawFnHandler").finish_non_exhaustive()
-    }
-}
-
-impl<F> RawSyscallHandler for RawFnHandler<F>
-where
-    F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
-{
-    fn invoke(&self, ctx: &mut dyn TrapContext) {
-        (self.0)(ctx);
-    }
-}
-
-impl Default for SyscallTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Global install + dispatch ───────────────────────────────────────
-//
-// The published table sits behind an `AtomicPtr<SyscallTable>` rather
-// than a lock. Read-side dispatch (the trap path) loads the pointer,
-// dereferences it, and runs the handler — without holding any lock
-// across the handler call. This is load-bearing for the polling-
-// future path: a raw handler can `longjmp` out of the trap without
-// returning, and any lock guard live across the call would leak.
-// Switching to AtomicPtr lets the trap return via longjmp without
-// dropping a lock.
-//
-// `install_global` swaps the pointer atomically and **leaks** the
-// prior table — Stage-4 boot installs once and never re-installs at
-// runtime, and during tests `__test_clear_global` is the only caller
-// that nulls the slot (no concurrent dispatch is possible there).
-// The leak is therefore bounded to test resets and is the price of
-// long-jmp-safe dispatch. The test reset path drops the prior table
-// because no concurrent dispatch is possible during test setup.
-
-static GLOBAL: AtomicPtr<SyscallTable> = AtomicPtr::new(core::ptr::null_mut());
-
-/// Publish `table` as the kernel-wide dispatch table. Replaces any
-/// prior installation; the prior `Box<SyscallTable>` is leaked since
-/// in-flight dispatchers may still hold references to it (the trap
-/// path takes a snapshot of the pointer at entry and doesn't hold a
-/// lock across the handler call). Stage-4 boot calls this once.
-pub fn install_global(table: SyscallTable) {
-    let new_ptr = Box::into_raw(Box::new(table));
-    let _prev = GLOBAL.swap(new_ptr, Ordering::AcqRel);
-    // Deliberately leak `_prev`: a raw handler in flight under the
-    // prior pointer could be unwinding via longjmp; freeing here
-    // would race with the read side. Re-installs are extremely rare
-    // (one per boot), so the leak is a one-time cost.
-}
-
-/// Read-only access: is a global table installed?
-pub fn global_installed() -> bool {
-    !GLOBAL.load(Ordering::Acquire).is_null()
-}
-
-/// Clear the global table — test hook. Drops the prior `Box`. Safe
-/// to call only when no syscall dispatch is in flight (test setup
-/// boundary).
-#[doc(hidden)]
-pub fn __test_clear_global() {
-    let prev = GLOBAL.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if !prev.is_null() {
-        // SAFETY: caller guarantees no dispatch is in flight against
-        // `prev`; this is the test reset boundary.
-        unsafe {
-            drop(Box::from_raw(prev));
-        }
-    }
-}
-
-/// Entry point the arch trap stub calls after saving the user
-/// register file.  `num` is the raw wire number (not pre-validated
-/// against the `Syscall` enum); unknown numbers or missing handlers
-/// surface `SyscallReturn::invalid_op()`.
-///
-/// A `None` global (no `install_global` yet) also returns
-/// `invalid_op` — the arch stub shouldn't be running before boot
-/// finishes, but a safe fallback beats an unwrap.
-///
-/// Arch trap code has two choices:
-/// - **Plain path**: call `kernel_syscall_entry_plain(num, &args)`
-///   which only fires plain handlers and returns a `SyscallReturn`
-///   the caller writes into registers manually.
-/// - **Raw-aware path**: call `kernel_syscall_entry(num, &mut ctx)`
-///   so raw handlers can call `redirect_to_kernel` directly.
-/// The arch trap path in this tree uses the raw-aware form.
-#[inline]
+/// Look up and execute the handler for syscall `num` with `args`.
+/// If `num` is unknown, returns `NarfStatus::InvalidOp`.
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
-    // Slot 18: syscall entry heartbeat. Toggles on every user
-    // syscall. If 17 (UserTaskFuture::poll) toggles but 18 stays
-    // static, user code is running in user-mode but never
-    // syscalls (infinite loop, immediate crash on entry, etc).
-    // (No beacon here — this handler runs with the calling user
-    // task's CR3 active, which lacks the FB phys low-half map. A
-    // beacon write would page-fault. The scheduler paints slot 17
-    // before activate() to prove user-task slots are reached.)
-    // Split `num` into version (top 8 bits) + canonical syscall
-    // number (low 24 bits). v0 callers encode 0 in the upper bits
-    // implicitly, so pre-versioning binaries dispatch to v0 forever.
-    let version = syscall_version(num);
-    let raw_n = syscall_number(num);
-    let n = match Syscall::from_raw(raw_n) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let p = GLOBAL.load(Ordering::Acquire);
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
-    // SAFETY: `install_global` published `p` via `Box::into_raw`; the
-    // pointer is valid for the lifetime of the kernel (or until
-    // `__test_clear_global` runs at a test boundary, with no
-    // dispatch in flight). The table is read-only post-publication,
-    // so a `&` borrow is safe even if a raw handler unwinds via
-    // longjmp — no lock guard survives the call.
-    let table: &SyscallTable = unsafe { &*p };
-    table.dispatch_ctx_versioned(n, version, ctx);
+    let table = unsafe { &*p };
+    let version = syscall_version(num);
+    let raw_n = syscall_number(num);
+    if let Some(variant) = Syscall::from_raw(raw_n) {
+        table.dispatch_ctx_versioned(variant, version, ctx);
+    } else {
+        ctx.set_return(SyscallReturn::invalid_op());
+    }
 }
 
-/// Plain entry: arch syscall-instruction asm (no IDT frame in
-/// hand, just SyscallArgs in registers) calls through here. Walks
-/// the same priority order as `kernel_syscall_entry`:
-///
-///   1. raw handler under a synthesized `ArgsOnlyCtx`
-///   2. plain handler (legacy `(args) -> SyscallReturn` shape)
-///   3. `SyscallReturn::invalid_op`
-///
-/// The raw-handler path lets `syscall`-instruction binaries reach
-/// the same per-syscall logic as `int 0x80`. The synthesized
-/// `ArgsOnlyCtx` answers `args()` + `set_return()` faithfully and
-/// returns `false` for every richer hook (`redirect_to_kernel`,
-/// `save_user_state`, `deliver_signal`, ...) — raw handlers that
-/// need those (e.g. `sys_execve`'s longjmp into the polling
-/// future) gracefully bail with `invalid_op` instead of corrupting
-/// state. Binaries that hit those handlers via the syscall
-/// instruction surface as ENOSYS until the dispatch path is
-/// upgraded to ferry a full TrapContext.
 #[inline]
 pub fn kernel_syscall_entry_plain(num: u32, args: &SyscallArgs) -> SyscallReturn {
     kernel_syscall_entry_plain_with_state(num, args, core::ptr::null_mut())
 }
 
-/// Same as [`kernel_syscall_entry_plain`] but carries a pointer
-/// to the kernel-stack `UserState` snapshot the syscall-instruction
-/// asm built. Handlers that park-and-yield via the user_task
-/// hook (`sys_futex`, `sys_sleep`) read this snapshot through
-/// `TrapContext::save_user_state` so the resume goes back to the
-/// right user RIP / RSP / GPRs. When called from the int 0x80
-/// path the pointer is null and `save_user_state` falls back to
-/// the int-style TrapFrame the trap stub built — handlers don't
-/// need to know which path they came from.
 pub fn kernel_syscall_entry_plain_with_state(
     num: u32,
     args: &SyscallArgs,
@@ -2518,45 +2038,35 @@ pub fn kernel_syscall_entry_plain_with_state(
         Some(v) => v,
         None => return SyscallReturn::invalid_op(),
     };
-    let p = GLOBAL.load(Ordering::Acquire);
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
         return SyscallReturn::invalid_op();
     }
-    // SAFETY: see `kernel_syscall_entry`.
-    let table: &SyscallTable = unsafe { &*p };
-    let slot = match table.entries.iter().find(|e| e.number == n) {
-        Some(s) => s,
-        None => return SyscallReturn::invalid_op(),
-    };
-    if let Some(h) = slot.raw_handler.as_ref() {
-        let mut ctx = ArgsOnlyCtx::new(*args, user_state);
-        h.invoke(&mut ctx);
-        return ctx.ret;
-    }
-    if let Some(h) = slot.handler.as_ref() {
-        return h.invoke(args);
-    }
-    SyscallReturn::invalid_op()
+    let table = unsafe { &*p };
+    let mut ctx = ArgsOnlyCtx::new(*args, user_state);
+    table.dispatch(n, &mut ctx);
+    ctx.ret
 }
 
-/// Minimal `TrapContext` synthesised from a `SyscallArgs` for the
-/// syscall-instruction dispatch path. Implements only the two
-/// methods every handler relies on (`args` + `set_return`); the
-/// richer hooks (`redirect_to_kernel` / `save_user_state` /
-/// `deliver_signal` / `redirect_to_user`) inherit the trait's
-/// `false`/no-op defaults so handlers that need them surface a
-/// clean `invalid_op` instead of silently corrupting state.
 struct ArgsOnlyCtx {
     args: SyscallArgs,
     ret: SyscallReturn,
-    /// Pointer to the kernel-stack `UserState` snapshot the asm
-    /// built before calling the dispatcher. Null when invoked
-    /// from a path that doesn't carry one (the legacy `int 0x80`
-    /// path uses a richer `X86TrapContext` and never calls this).
-    /// Non-null when set, the layout matches
-    /// `narf_arch::x86_64::user_mode::UserState` (152 bytes).
     user_state: *mut u8,
 }
+
+// `ArgsOnlyCtx`'s register accessors index the kernel-stack
+// `UserState` snapshot by u64 slot: rax@14, rip@15, rsp@17. The
+// syscall-instruction exit asm in `frame/src/x86_64/syscall.rs`
+// reloads RIP from `[rsp+120]` and RSP from `[rsp+136]` using the
+// same offsets. Guard them so a `UserState` field reshuffle fails the
+// build here rather than silently steering `sysretq` to the wrong PC.
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    use narf_scheduler::UserState;
+    assert!(core::mem::offset_of!(UserState, rax) == 14 * 8);
+    assert!(core::mem::offset_of!(UserState, rip) == 15 * 8);
+    assert!(core::mem::offset_of!(UserState, rsp) == 17 * 8);
+};
 
 impl ArgsOnlyCtx {
     #[inline]
@@ -2577,38 +2087,631 @@ impl TrapContext for ArgsOnlyCtx {
     #[inline]
     fn set_return(&mut self, ret: SyscallReturn) {
         self.ret = ret;
+        // Mirror the return value into the snapshot's rax slot
+        // (index 14). For an ordinary syscall the exit asm overrides
+        // rax via the status fold so this is inert, but for a
+        // park-and-resume handler (sys_sleep) the resume path
+        // re-enters user mode straight from this snapshot, so the
+        // return value must live in the saved rax. Handlers that
+        // park to *re-execute* the syscall (epoll_wait rewinding RIP)
+        // deliberately never call `set_return`, leaving the original
+        // syscall number in rax so the re-run dispatches correctly.
+        if !self.user_state.is_null() {
+            unsafe { *(self.user_state as *mut u64).add(14) = ret.value }
+        }
+    }
+    // The kernel-stack `UserState` snapshot the syscall-instruction
+    // asm built is `[u64; 19]` in field order (see
+    // `narf_arch::x86_64::user_mode::UserState`): rax@14, rip@15,
+    // rflags@16, rsp@17. The exit asm reloads RIP/RSP/regs from these
+    // slots, so writing them here steers where `sysretq` lands —
+    // load-bearing for the polling-syscall park/resume + signal paths.
+    #[inline]
+    fn user_rsp(&self) -> u64 {
+        if self.user_state.is_null() {
+            return 0;
+        }
+        unsafe { *(self.user_state as *const u64).add(17) }
+    }
+    #[inline]
+    fn rip(&self) -> u64 {
+        if self.user_state.is_null() {
+            return 0;
+        }
+        unsafe { *(self.user_state as *const u64).add(15) }
+    }
+    #[inline]
+    fn set_rip(&mut self, rip: u64) {
+        if self.user_state.is_null() {
+            return;
+        }
+        unsafe { *(self.user_state as *mut u64).add(15) = rip }
+    }
+    #[inline]
+    fn returning_to_user(&self) -> bool {
+        !self.user_state.is_null()
     }
     #[inline]
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
-    /// Copy the kernel-stack `UserState` snapshot into the
-    /// caller's buffer so a `sys_futex` / `sys_sleep` park can
-    /// longjmp back to the polling future and later resume via
-    /// `enter_user_mode_resume`.
-    ///
-    /// # Safety
-    /// `out` must point at a writable region of at least
-    /// `size_of::<UserState>()` bytes (152 on x86_64) and be
-    /// aligned for u64 reads.
     unsafe fn save_user_state(&self, out: *mut u8) -> bool {
         if self.user_state.is_null() || out.is_null() {
             return false;
         }
-        // SAFETY: caller asserts `out` is the right size. The
-        // syscall-instruction asm sized the source at 152 bytes
-        // (see `frame/src/x86_64/syscall.rs`).
         unsafe {
+            // Copy the snapshot verbatim. The rax slot already holds
+            // the right value: `set_return` mirrors a return value
+            // into it, and a park-to-re-execute handler leaves the
+            // original syscall number there (needed so the rewound
+            // RIP re-dispatches the same syscall).
             core::ptr::copy_nonoverlapping(self.user_state, out, 152);
-            // The `set_return` value lands in the rax slot at
-            // offset 112 so the user's `rax` on resume reflects
-            // the syscall return value, not the original syscall
-            // number. Also write the resolved value into the
-            // copied state.
-            let out_state = out as *mut u64;
-            // SyscallReturn convention: rax = value.
-            *out_state.add(14) = self.ret.value;
         }
         true
+    }
+
+    // Signal delivery on the `syscall`-instruction path. Unlike the
+    // `int 0x80` trap path (which owns a live `TrapFrame`), here we
+    // rewrite the kernel-stack `UserState` snapshot that the exit asm
+    // reloads — so a handler entry / sigreturn takes effect on the
+    // `sysretq`. Musl tasks reach signals only through this path.
+    #[cfg(target_arch = "x86_64")]
+    fn deliver_signal(&mut self, params: &SigDeliveryParams) -> bool {
+        if self.user_state.is_null() {
+            return false;
+        }
+        // SAFETY: snapshot is a valid `[u64; 19]` UserState on the
+        // kernel stack for the duration of this syscall.
+        let state = unsafe { &mut *(self.user_state as *mut narf_scheduler::UserState) };
+        sigframe::deliver_signal_into_state(state, params)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn perform_sigreturn(&mut self, sc_vaddr: u64) -> bool {
+        if self.user_state.is_null() {
+            return false;
+        }
+        // SAFETY: as above.
+        let state = unsafe { &mut *(self.user_state as *mut narf_scheduler::UserState) };
+        match sigframe::perform_sigreturn_from_state(state, sc_vaddr) {
+            Some(restored_rax) => {
+                // The exit asm derives the user-visible RAX from the
+                // dispatcher return value (the status fold), not the
+                // snapshot slot, so surface the restored RAX as the
+                // syscall's "return" too.
+                self.ret = SyscallReturn::ok(restored_rax);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// x86_64 signal-frame construction/teardown that operates on a
+/// [`narf_scheduler::UserState`] snapshot rather than a live trap
+/// frame. Mirrors the `rt_sigframe` layout in
+/// `frame/src/x86_64/trap.rs` so a frame delivered on either path can
+/// be torn down on either path.
+#[cfg(target_arch = "x86_64")]
+mod sigframe {
+    use super::SigDeliveryParams;
+    use narf_scheduler::UserState;
+
+    const SA_SIGINFO: u32 = 0x00_00_00_04;
+    const SA_ONSTACK: u32 = 0x08_00_00_00;
+    const SA_RESTART: u32 = 0x10_00_00_00;
+    const SYSV_RED_ZONE: u64 = 128;
+    /// IF | TF | CF — the only RFLAGS bits a sigreturn may restore.
+    const SAFE_RFLAGS: u64 = (1 << 9) | (1 << 8) | (1 << 0);
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct McContext {
+        r8: u64,
+        r9: u64,
+        r10: u64,
+        r11: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rdi: u64,
+        rsi: u64,
+        rbp: u64,
+        rbx: u64,
+        rdx: u64,
+        rax: u64,
+        rcx: u64,
+        rsp: u64,
+        rip: u64,
+        rflags: u64,
+        cs: u16,
+        gs: u16,
+        fs: u16,
+        ss: u16,
+        err: u64,
+        trapno: u64,
+        oldmask: u64,
+        cr2: u64,
+        fpstate: u64,
+        reserved: [u64; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct UContext {
+        uc_flags: u64,
+        uc_link: u64,
+        uc_stack_sp: u64,
+        uc_stack_flags: i32,
+        uc_stack_size: u64,
+        uc_mcontext: McContext,
+        uc_sigmask: u64,
+    }
+
+    // `uc_mcontext` sits 40 bytes into `UContext`; the siginfo block
+    // is 128 bytes and precedes the ucontext. `rt_sigreturn` is
+    // entered with RSP pointing at the siginfo (the handler's `ret`
+    // popped the 8-byte restorer cookie), so mcontext = RSP + 168.
+    const SIGINFO_BYTES: u64 = 128;
+    const MCONTEXT_FROM_SIGINFO: u64 = SIGINFO_BYTES + 40;
+
+    // Guard the layout this offset arithmetic assumes against silent
+    // struct drift. Must stay in lockstep with the `rt_sigframe`
+    // layout the `int 0x80` path builds in `frame/src/x86_64/trap.rs`,
+    // so a frame delivered on one path tears down correctly on the
+    // other.
+    const _: () = {
+        assert!(core::mem::offset_of!(UContext, uc_mcontext) == 40);
+        assert!(MCONTEXT_FROM_SIGINFO == 168);
+    };
+
+    unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
+        unsafe {
+            core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>())
+        }
+    }
+
+    /// Lay an `rt_sigframe` on the user stack and rewrite `state` to
+    /// enter the handler. Returns false if the frame couldn't be
+    /// written to user memory.
+    pub fn deliver_signal_into_state(state: &mut UserState, params: &SigDeliveryParams) -> bool {
+        let want_siginfo = (params.flags & SA_SIGINFO) != 0;
+        let want_altstack = (params.flags & SA_ONSTACK) != 0 && params.altstack_sp != 0;
+        let force_rt = params.restorer != 0;
+
+        let fallback_return = if params.restorer != 0 {
+            params.restorer
+        } else {
+            state.rip
+        };
+        let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
+            state.rip.wrapping_sub(2)
+        } else {
+            state.rip
+        };
+
+        let stack_top = if want_altstack {
+            params.altstack_sp.wrapping_add(params.altstack_size)
+        } else {
+            state.rsp.wrapping_sub(SYSV_RED_ZONE)
+        };
+
+        if want_siginfo || force_rt {
+            let frame_size = 8 + 128 + core::mem::size_of::<UContext>() as u64;
+            let raw_rsp = stack_top.wrapping_sub(frame_size);
+            let new_rsp = (raw_rsp & !0xFu64) | 0x8;
+            let siginfo_vaddr = new_rsp + 8;
+            let uctx_vaddr = siginfo_vaddr + 128;
+
+            let uctx = UContext {
+                uc_flags: 0,
+                uc_link: 0,
+                uc_stack_sp: params.altstack_sp,
+                uc_stack_flags: if want_altstack { 1 } else { 0 },
+                uc_stack_size: params.altstack_size,
+                uc_mcontext: McContext {
+                    r8: state.r8,
+                    r9: state.r9,
+                    r10: state.r10,
+                    r11: state.r11,
+                    r12: state.r12,
+                    r13: state.r13,
+                    r14: state.r14,
+                    r15: state.r15,
+                    rdi: state.rdi,
+                    rsi: state.rsi,
+                    rbp: state.rbp,
+                    rbx: state.rbx,
+                    rdx: state.rdx,
+                    rax: state.rax,
+                    rcx: state.rcx,
+                    rsp: state.rsp,
+                    rip: saved_rip,
+                    rflags: state.rflags,
+                    cs: 0,
+                    gs: 0,
+                    fs: 0,
+                    ss: 0,
+                    err: 0,
+                    trapno: 0,
+                    oldmask: 0,
+                    cr2: params.si_addr,
+                    fpstate: 0,
+                    reserved: [0; 8],
+                },
+                uc_sigmask: 0,
+            };
+
+            let mut siginfo = [0u8; 128];
+            siginfo[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
+            siginfo[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
+            siginfo[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
+
+            // SAFETY: the active CR3 is the trapping task's; copy_to_user
+            // brackets the writes with SMAP and faults user-side on a
+            // bad address.
+            let ok = unsafe {
+                crate::handlers::copy_to_user(new_rsp, &fallback_return.to_ne_bytes()).is_ok()
+                    && crate::handlers::copy_to_user(siginfo_vaddr, &siginfo).is_ok()
+                    && crate::handlers::copy_to_user(uctx_vaddr, as_bytes(&uctx)).is_ok()
+            };
+            if !ok {
+                return false;
+            }
+
+            state.rsp = new_rsp;
+            state.rdi = params.signum as u64;
+            state.rsi = siginfo_vaddr;
+            state.rdx = uctx_vaddr;
+            state.rip = params.handler;
+            true
+        } else {
+            // Naive handler (no SA_SIGINFO, no restorer): minimal
+            // `[saved_rip, signum]` push; the handler `ret`s straight
+            // back to `saved_rip` without calling sigreturn.
+            let raw_rsp = stack_top.wrapping_sub(16);
+            let new_rsp = (raw_rsp & !0xFu64) | 0x8;
+            let ok = unsafe {
+                crate::handlers::copy_to_user(new_rsp, &saved_rip.to_ne_bytes()).is_ok()
+                    && crate::handlers::copy_to_user(
+                        new_rsp + 8,
+                        &(params.signum as u64).to_ne_bytes(),
+                    )
+                    .is_ok()
+            };
+            if !ok {
+                return false;
+            }
+            state.rsp = new_rsp;
+            state.rdi = params.signum as u64;
+            state.rip = params.handler;
+            true
+        }
+    }
+
+    /// Restore `state` from an `rt_sigframe` at `sc_vaddr` (the value
+    /// of RSP on entry to `rt_sigreturn`). Returns the restored RAX so
+    /// the caller can surface it as the syscall return, or None if the
+    /// frame couldn't be read.
+    pub fn perform_sigreturn_from_state(state: &mut UserState, sc_vaddr: u64) -> Option<u64> {
+        if sc_vaddr == 0 {
+            return None;
+        }
+        let mut mc = McContext::default();
+        let mc_vaddr = sc_vaddr + MCONTEXT_FROM_SIGINFO;
+        // SAFETY: user-supplied vaddr; copy_from_user brackets SMAP
+        // and faults user-side on a bad address.
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut mc as *mut McContext as *mut u8,
+                core::mem::size_of::<McContext>(),
+            )
+        };
+        if unsafe { crate::handlers::copy_from_user(dst, mc_vaddr) }.is_err() {
+            return None;
+        }
+
+        state.r8 = mc.r8;
+        state.r9 = mc.r9;
+        state.r10 = mc.r10;
+        state.r11 = mc.r11;
+        state.r12 = mc.r12;
+        state.r13 = mc.r13;
+        state.r14 = mc.r14;
+        state.r15 = mc.r15;
+        state.rdi = mc.rdi;
+        state.rsi = mc.rsi;
+        state.rbp = mc.rbp;
+        state.rbx = mc.rbx;
+        state.rdx = mc.rdx;
+        state.rcx = mc.rcx;
+        state.rax = mc.rax;
+        state.rsp = mc.rsp;
+        state.rip = mc.rip;
+        // Restore only the safe RFLAGS bits; keep the rest of the
+        // snapshot's flags (kernel-controlled).
+        state.rflags = (mc.rflags & SAFE_RFLAGS) | (state.rflags & !SAFE_RFLAGS);
+        Some(mc.rax)
+    }
+}
+
+pub const SYS_VERSION_SHIFT: u32 = 24;
+pub const SYS_NUMBER_MASK: u32 = 0x00FF_FFFF;
+pub const SYS_VERSION_MASK: u32 = 0xFF00_0000;
+
+#[inline]
+pub const fn syscall_pack(version: u8, num: Syscall) -> u32 {
+    ((version as u32) << SYS_VERSION_SHIFT) | (num.raw() & SYS_NUMBER_MASK)
+}
+
+#[inline]
+pub const fn syscall_version(raw: u32) -> u8 {
+    ((raw & SYS_VERSION_MASK) >> SYS_VERSION_SHIFT) as u8
+}
+
+#[inline]
+pub const fn syscall_number(raw: u32) -> u32 {
+    raw & SYS_NUMBER_MASK
+}
+
+// ── Wire-stable argument and return shapes ──────────────────────────
+
+/// In-register arguments for a single syscall. Carries exactly what
+/// the CPU provided at trap entry.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SyscallArgs {
+    pub arg0: u64,
+    pub arg1: u64,
+    pub arg2: u64,
+    pub arg3: u64,
+    pub arg4: u64,
+    pub arg5: u64,
+}
+
+/// The two-register return result from any syscall.
+/// `value` lands in RAX/X0, `status` in RDX/X1.
+/// status=0 => success, status=1 => invalid operation, etc.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SyscallReturn {
+    pub value: u64,
+    pub status: abi::NarfStatus,
+}
+
+impl SyscallReturn {
+    pub const OK: abi::NarfStatus = abi::NarfStatus::Ok;
+    pub const INVALID_OP: abi::NarfStatus = abi::NarfStatus::InvalidOp;
+
+    pub const fn ok(value: u64) -> Self {
+        Self {
+            value,
+            status: abi::NarfStatus::Ok,
+        }
+    }
+    pub const fn invalid_op() -> Self {
+        Self {
+            value: 0,
+            status: abi::NarfStatus::InvalidOp,
+        }
+    }
+    pub const fn oom() -> Self {
+        Self {
+            value: 0,
+            status: abi::NarfStatus::Unsupported,
+        }
+    }
+}
+
+impl From<SyscallReturn> for u64 {
+    fn from(r: SyscallReturn) -> Self {
+        r.value
+    }
+}
+
+// ── Wire-ABI layout guard ───────────────────────────────────────────
+//
+// `SyscallReturn` is returned from the C dispatcher as a SysV 16-byte
+// struct: the first eightbyte (offset 0) lands in RAX, the second
+// (offset 8) in RDX. The hand-written `syscall`-instruction return
+// asm in `frame/src/x86_64/syscall.rs` reads those registers directly
+// — it folds `RDX` (status) and keeps `RAX` (value). If this layout
+// ever drifts (field reorder, or `status` growing past 8 bytes), that
+// asm silently mangles every syscall return for `syscall`-instruction
+// binaries (musl). Static binaries can mask it because their output is
+// a side effect of the handler, but dynamic (ld-musl) binaries break.
+// These const asserts fail the build at the source of the dependency.
+const _: () = {
+    assert!(core::mem::offset_of!(SyscallReturn, value) == 0);
+    assert!(core::mem::offset_of!(SyscallReturn, status) == 8);
+    assert!(core::mem::size_of::<SyscallReturn>() == 16);
+};
+
+// ── Dispatcher ──────────────────────────────────────────────────────
+
+/// The global syscall table. Stored as an AtomicPtr for fast
+/// lock-free lookup during traps. `install_global` takes ownership
+/// of a Box'd table and publishes it.
+static GLOBAL_TABLE: AtomicPtr<SyscallTable> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Initialize and publish the global syscall table.
+pub fn install_global(table: SyscallTable) {
+    let ptr = Box::into_raw(Box::new(table));
+    GLOBAL_TABLE.store(ptr, Ordering::Release);
+}
+
+#[derive(Debug)]
+pub struct SyscallEntry {
+    pub number: Syscall,
+    pub name: &'static str,
+}
+
+/// A collection of registered syscall handlers.
+pub struct SyscallTable {
+    handlers: Vec<Option<Box<dyn SyscallHandler>>>,
+    versioned_handlers: Vec<(Syscall, u8, Box<dyn SyscallHandler>)>,
+    names: Vec<(Syscall, &'static str)>,
+}
+
+impl core::fmt::Debug for SyscallTable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SyscallTable")
+            .field("names", &self.names)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SyscallTable {
+    pub fn new() -> Self {
+        Self {
+            handlers: Vec::new(),
+            versioned_handlers: Vec::new(),
+            names: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, variant: Syscall, name: &'static str) {
+        self.names.retain(|&(v, _)| v != variant);
+        self.names.push((variant, name));
+    }
+
+    pub fn name_of(&self, variant: Syscall) -> Option<&'static str> {
+        self.names
+            .iter()
+            .find(|&&(v, _)| v == variant)
+            .map(|&(_, name)| name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Register `handler` for `variant`. If `variant` already has a
+    /// handler, it is replaced.
+    pub fn install(&mut self, variant: Syscall, handler: Box<dyn SyscallHandler>) {
+        let idx = variant as usize;
+        if idx >= self.handlers.len() {
+            self.handlers.resize_with(idx + 1, || None);
+        }
+        self.handlers[idx] = Some(handler);
+    }
+
+    pub fn install_raw<H: SyscallHandler + 'static>(
+        &mut self,
+        variant: Syscall,
+        name: &'static str,
+        handler: H,
+    ) {
+        self.register(variant, name);
+        self.install(variant, Box::new(handler));
+    }
+
+    pub fn install_raw_fn<F>(&mut self, variant: Syscall, name: &'static str, f: F)
+    where
+        F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
+    {
+        self.install_raw(variant, name, RawFnHandler(f));
+    }
+
+    pub fn install_fn<F>(&mut self, variant: Syscall, name: &'static str, f: F)
+    where
+        F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
+    {
+        self.register(variant, name);
+        self.install(variant, Box::new(FnHandler(f)));
+    }
+
+    pub fn install_raw_versioned<H: SyscallHandler + 'static>(
+        &mut self,
+        variant: Syscall,
+        version: u8,
+        handler: H,
+    ) {
+        if version == 0 {
+            self.install(variant, Box::new(handler));
+        } else {
+            self.versioned_handlers
+                .retain(|&(v, ver, _)| v != variant || ver != version);
+            self.versioned_handlers
+                .push((variant, version, Box::new(handler)));
+        }
+    }
+
+    /// Lookup and execute handler for `variant`.
+    pub fn dispatch(&self, variant: Syscall, ctx: &mut dyn TrapContext) {
+        self.dispatch_ctx_versioned(variant, 0, ctx);
+    }
+
+    pub fn dispatch_ctx_versioned(&self, variant: Syscall, version: u8, ctx: &mut dyn TrapContext) {
+        if version != 0 {
+            if let Some((_, _, handler)) = self
+                .versioned_handlers
+                .iter()
+                .find(|&&(v, ver, _)| v == variant && ver == version)
+            {
+                handler.handle(ctx);
+                return;
+            }
+        }
+        let idx = variant as usize;
+        if let Some(Some(handler)) = self.handlers.get(idx) {
+            handler.handle(ctx);
+        } else {
+            ctx.set_return(SyscallReturn::invalid_op());
+        }
+    }
+}
+
+/// Trait for syscall implementations.
+pub trait SyscallHandler: Send + Sync {
+    fn handle(&self, ctx: &mut dyn TrapContext);
+}
+
+pub trait RawSyscallHandler: SyscallHandler {}
+impl<T: SyscallHandler> RawSyscallHandler for T {}
+
+pub struct RawFnHandler<F>(pub F);
+
+impl<F> core::fmt::Debug for RawFnHandler<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RawFnHandler").finish_non_exhaustive()
+    }
+}
+
+impl<F> SyscallHandler for RawFnHandler<F>
+where
+    F: Fn(&mut dyn TrapContext) + Send + Sync + 'static,
+{
+    fn handle(&self, ctx: &mut dyn TrapContext) {
+        (self.0)(ctx);
+    }
+}
+
+pub struct FnHandler<F>(pub F);
+
+impl<F> core::fmt::Debug for FnHandler<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FnHandler").finish_non_exhaustive()
+    }
+}
+
+impl<F> SyscallHandler for FnHandler<F>
+where
+    F: Fn(&SyscallArgs) -> SyscallReturn + Send + Sync + 'static,
+{
+    fn handle(&self, ctx: &mut dyn TrapContext) {
+        let r = (self.0)(ctx.args());
+        ctx.set_return(r);
+    }
+}
+
+// ── Test stubs ──────────────────────────────────────────────────────
+
+#[doc(hidden)]
+pub fn __test_clear_global() {
+    let ptr = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if !ptr.is_null() {
+        unsafe { drop(Box::from_raw(ptr)) };
     }
 }

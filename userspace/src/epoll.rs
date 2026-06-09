@@ -4,49 +4,13 @@
 //! Linux refs:
 //!   `fs/eventpoll.c`:ep_insert / ep_modify / ep_remove / ep_poll
 //!   (GPL-2.0-or-later, kernel.org).
-//!
-//! # Architecture
-//!
-//! An `EpollInstance` is a `FileOps` object that holds:
-//!   - an *interest table*: `BTreeMap<i32, EpollItem>` mapping
-//!     monitored fds to their desired event mask + opaque user data.
-//!
-//! `epoll_wait` scans the interest table, computes current readiness
-//! for each fd, handles EPOLLET edge detection and EPOLLONESHOT
-//! disarming, and copies results out to user space.
-//!
-//! # Downcast pattern
-//!
-//! `FileOps` is defined in `narf-filesystem` which we cannot touch.
-//! We resolve `epfd → EpollInstance` via a global registry keyed by
-//! `(task_id, fd_number)` — set when `epoll_create1` installs the fd
-//! and cleared when the fd is closed.  This avoids any need to add
-//! `Any`/downcast methods to `FileOps`.
-//!
-//! # Level vs Edge triggered
-//!
-//! Level-triggered (default): an fd is reported on every `epoll_wait`
-//! that finds it ready.
-//!
-//! Edge-triggered (`EPOLLET`): an fd is reported only on a transition
-//! from not-ready → ready.  We track `last_mask` per item.
-//!
-//! # EPOLLONESHOT
-//!
-//! After first delivery the item's events field is cleared; must
-//! be re-armed via `epoll_ctl(MOD)`.
-//!
-//! # EPOLLEXCLUSIVE
-//!
-//! Only one epoll instance returns an event for a given fd when
-//! multiple instances monitor it.  Implemented via a global
-//! `EXCLUSIVE_HOLDERS` table.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use core::sync::atomic::Ordering;
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -59,9 +23,9 @@ use crate::syscall::{SyscallReturn, TrapContext};
 
 /// Data available to read.
 pub const EPOLLIN: u32 = 0x00000001;
-/// Urgent (out-of-band) data.
+/// Urgent (OOB) data available.
 pub const EPOLLPRI: u32 = 0x00000002;
-/// Ready to write.
+/// Data can be written without blocking.
 pub const EPOLLOUT: u32 = 0x00000004;
 /// Stream peer half-closed (read half).
 pub const EPOLLRDHUP: u32 = 0x00002000;
@@ -69,53 +33,51 @@ pub const EPOLLRDHUP: u32 = 0x00002000;
 pub const EPOLLERR: u32 = 0x00000008;
 /// Hang-up / peer closed.
 pub const EPOLLHUP: u32 = 0x00000010;
-/// Edge-triggered: notify only on transitions.
-pub const EPOLLET: u32 = 0x80000000;
-/// One-shot: disarm after first event.
-pub const EPOLLONESHOT: u32 = 0x40000000;
-/// Exclusive wakeup (avoid thundering herd on accept).
-pub const EPOLLEXCLUSIVE: u32 = 0x10000000;
+/// Level-triggered is default; set this for edge-triggered.
+pub const EPOLLET: u32 = 1 << 31;
+/// Disarm the interest record after the first delivery.
+pub const EPOLLONESHOT: u32 = 1 << 30;
+/// Exclusive wakeup for multiple tasks on same FD.
+pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
 
-/// epoll_ctl operations.
+// ── epoll_ctl ops ────────────────────────────────────────────────────
+
 pub const EPOLL_CTL_ADD: u32 = 1;
 pub const EPOLL_CTL_DEL: u32 = 2;
 pub const EPOLL_CTL_MOD: u32 = 3;
 
-/// `EPOLL_CLOEXEC` flag for `epoll_create1`.
-pub const EPOLL_CLOEXEC: u32 = 0x80000;
-
 // ── Wire layout: struct epoll_event ─────────────────────────────────
 // Packed on Linux x86_64: u32 events + u64 data = 12 bytes.
-const EPOLL_EVENT_SIZE: usize = 12;
+pub const EPOLL_EVENT_SIZE: usize = 12;
 
 /// Read a user-supplied `epoll_event` struct (12 bytes).
-///
-/// # Safety
-/// `ptr` must point to at least 12 readable bytes in the current AS.
-unsafe fn read_epoll_event(ptr: *const u8) -> (u32, u64) {
-    // SAFETY: caller guarantees 12 readable bytes.
-    let events = unsafe { core::ptr::read_unaligned(ptr as *const u32) };
-    let data = unsafe { core::ptr::read_unaligned(ptr.add(4) as *const u64) };
-    (events, data)
+fn read_epoll_event(ptr: u64) -> Result<(u32, u64), ()> {
+    let mut buf = [0u8; 12];
+    if unsafe { crate::handlers::copy_from_user(&mut buf, ptr) }.is_err() {
+        return Err(());
+    }
+    let events = u32::from_ne_bytes(buf[0..4].try_into().unwrap());
+    let data = u64::from_ne_bytes(buf[4..12].try_into().unwrap());
+    Ok((events, data))
 }
 
 /// Write an `epoll_event` struct to user memory.
-///
-/// # Safety
-/// `ptr` must point to at least 12 writable bytes in the current AS.
-unsafe fn write_epoll_event(ptr: *mut u8, events: u32, data: u64) {
-    // SAFETY: caller guarantees 12 writable bytes.
-    unsafe {
-        core::ptr::write_unaligned(ptr as *mut u32, events);
-        core::ptr::write_unaligned(ptr.add(4) as *mut u64, data);
+fn write_epoll_event(ptr: u64, events: u32, data: u64) -> Result<(), ()> {
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&events.to_ne_bytes());
+    buf[4..12].copy_from_slice(&data.to_ne_bytes());
+    if unsafe { crate::handlers::copy_to_user(ptr, &buf) }.is_err() {
+        return Err(());
     }
+    Ok(())
 }
 
 // ── EpollItem — per-fd interest record ──────────────────────────────
 
 #[derive(Clone, Debug)]
 struct EpollItem {
-    /// Desired event mask (EPOLLIN | EPOLLOUT | …) + flag bits.
+    fd: i32,
+    /// User-requested interest bits.
     events: u32,
     /// Opaque user data echoed back in every event notification.
     data: u64,
@@ -123,120 +85,29 @@ struct EpollItem {
     last_mask: u32,
 }
 
-// ── EPOLLEXCLUSIVE global holder map ─────────────────────────────────
-// Maps monitored fd → owning epoll instance id so only one waiter
-// wins per fd when EPOLLEXCLUSIVE is set.
+// ── EpollInstance — the core object ──────────────────────────────────
 
-static EXCLUSIVE_HOLDERS: IrqSafeSpinLock<Option<BTreeMap<i32, usize>>> =
-    IrqSafeSpinLock::new(None);
-
-fn exclusive_init() {
-    let mut g = EXCLUSIVE_HOLDERS.lock();
-    if g.is_none() {
-        *g = Some(BTreeMap::new());
-    }
-}
-
-fn exclusive_try_claim(fd: i32, owner_id: usize) -> bool {
-    let mut g = EXCLUSIVE_HOLDERS.lock();
-    let m = match g.as_mut() {
-        Some(m) => m,
-        None => return true,
-    };
-    match m.get(&fd) {
-        None => {
-            m.insert(fd, owner_id);
-            true
-        }
-        Some(&id) => id == owner_id,
-    }
-}
-
-fn exclusive_release(fd: i32, owner_id: usize) {
-    let mut g = EXCLUSIVE_HOLDERS.lock();
-    if let Some(m) = g.as_mut() {
-        if m.get(&fd) == Some(&owner_id) {
-            m.remove(&fd);
-        }
-    }
-}
-
-// ── Global epoll instance registry ───────────────────────────────────
-//
-// Keyed by `(task_id, epfd)`.  Set when `epoll_create1` installs a
-// new fd; cleared when `close()` drops the FdEntry (today we clean
-// up lazily — if the fd number is re-used we just overwrite the
-// old entry in the registry).
-
-static EPOLL_INSTANCES: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), Arc<EpollInstance>>>> =
-    IrqSafeSpinLock::new(None);
-
-fn instances_init() {
-    let mut g = EPOLL_INSTANCES.lock();
-    if g.is_none() {
-        *g = Some(BTreeMap::new());
-    }
-}
-
-fn instances_insert(task: u64, epfd: u32, inst: Arc<EpollInstance>) {
-    instances_init();
-    if let Some(m) = EPOLL_INSTANCES.lock().as_mut() {
-        m.insert((task, epfd), inst);
-    }
-}
-
-fn instances_lookup(task: u64, epfd: u32) -> Option<Arc<EpollInstance>> {
-    EPOLL_INSTANCES.lock().as_ref()?.get(&(task, epfd)).cloned()
-}
-
-fn instances_remove(task: u64, epfd: u32) {
-    if let Some(m) = EPOLL_INSTANCES.lock().as_mut() {
-        m.remove(&(task, epfd));
-    }
-}
-
-// ── EpollInstance ─────────────────────────────────────────────────────
-
-/// The kernel-side object backing an epoll fd.
 #[derive(Debug)]
 pub struct EpollInstance {
-    /// Stable unique id — the Arc raw pointer cast to usize.
-    id: usize,
     inner: IrqSafeSpinLock<EpollInner>,
 }
 
 #[derive(Debug)]
 struct EpollInner {
+    /// fd → interest record.
     interest: BTreeMap<i32, EpollItem>,
 }
 
 impl EpollInstance {
-    fn new() -> Arc<Self> {
-        // Build an initial Arc with id=0, then patch the id field to
-        // the Arc's pointer value (stable unique identity).
-        let arc = Arc::new(Self {
-            id: 0,
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
             inner: IrqSafeSpinLock::new(EpollInner {
                 interest: BTreeMap::new(),
             }),
-        });
-        let id = Arc::as_ptr(&arc) as usize;
-        // SAFETY: the Arc has refcount 1 and is not yet shared.
-        // We write the id field via a raw pointer while we hold
-        // the only reference to make the object self-describing.
-        unsafe {
-            let ptr = Arc::as_ptr(&arc) as *mut EpollInstance;
-            (*ptr).id = id;
-        }
-        arc
+        })
     }
 
-    fn self_id(self: &Arc<Self>) -> usize {
-        Arc::as_ptr(self) as usize
-    }
-
-    // ── interest-table ops ──────────────────────────────────────────
-
+    /// `EPOLL_CTL_ADD` logic.
     fn ctl_add(&self, fd: i32, events: u32, data: u64) -> bool {
         let mut g = self.inner.lock();
         if g.interest.contains_key(&fd) {
@@ -245,6 +116,7 @@ impl EpollInstance {
         g.interest.insert(
             fd,
             EpollItem {
+                fd,
                 events,
                 data,
                 last_mask: 0,
@@ -253,41 +125,32 @@ impl EpollInstance {
         true
     }
 
+    /// `EPOLL_CTL_DEL` logic.
+    fn ctl_del(&self, fd: i32, owner_id: u64) -> bool {
+        let mut g = self.inner.lock();
+        let removed = g.interest.remove(&fd).is_some();
+        if removed {
+            exclusive_release(fd, owner_id);
+        }
+        removed
+    }
+
+    /// `EPOLL_CTL_MOD` logic.
     fn ctl_mod(&self, fd: i32, events: u32, data: u64) -> bool {
         let mut g = self.inner.lock();
         if let Some(item) = g.interest.get_mut(&fd) {
             item.events = events;
             item.data = data;
-            item.last_mask = 0; // reset edge-tracking for re-arm
             true
         } else {
             false // ENOENT
         }
     }
 
-    fn ctl_del(&self, fd: i32, owner_id: usize) -> bool {
-        let mut g = self.inner.lock();
-        if g.interest.remove(&fd).is_some() {
-            exclusive_release(fd, owner_id);
-            true
-        } else {
-            false // ENOENT
-        }
-    }
-
-    // ── readiness scan ──────────────────────────────────────────────
-
-    /// Scan the interest table against the fd table for `task_id`.
-    /// Returns ready events as `(revents_u32, user_data_u64)`.
-    ///
-    /// Handles EPOLLET (edge), EPOLLONESHOT (auto-disarm),
-    /// EPOLLEXCLUSIVE (single-winner).
-    ///
-    /// Linux ref: `fs/eventpoll.c`:ep_send_events_proc
-    /// (GPL-2.0-or-later, kernel.org).
-    fn collect_ready(self: &Arc<Self>, task_id: u64) -> Vec<(u32, u64)> {
-        let mut results = Vec::new();
-        let owner_id = self.self_id();
+    /// Return a vector of (events, data) pairs for ready fds.
+    /// Consults the current fd-table for each interest item.
+    fn collect_ready(&self, task_id: u64) -> Vec<(u32, u64)> {
+        let owner_id = task_id; // simplified owner model
 
         // Snapshot interest table so we don't hold the lock across
         // the poll_readiness() calls (which may themselves lock).
@@ -300,14 +163,15 @@ impl EpollInstance {
                 .collect()
         };
 
+        let mut results = Vec::new();
         for (fd, item) in &snapshot {
-            // EPOLLONESHOT already fired: skip until re-armed.
+            // Disarmed EPOLLONESHOT items (events bitmask zeroed below)
+            // are skipped immediately.
             if (item.events & EPOLLONESHOT) != 0
                 && (item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
             {
                 continue;
             }
-
             // Query current readiness from the fd table.
             let cur_mask: u32 = fd::with_table(task_id, |t| {
                 t.get(*fd as u32)
@@ -369,68 +233,111 @@ impl EpollInstance {
     }
 }
 
-// ── FileOps for EpollInstance ─────────────────────────────────────────
-
 impl FileOps for EpollInstance {
-    fn read<'a>(&'a self, _off: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
-    fn write<'a>(&'a self, _off: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Err(FsError::Unsupported) })
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
         Stat {
             size: 0,
             blocks: 0,
-            mode: Mode {
-                file_type: narf_filesystem::FileType::Special,
-                perms: 0o600,
-            },
+            mode: Mode::FILE_RW,
             mtime_cycles: 0,
         }
     }
+
+    /// epoll-readiness for nested epoll. Returns POLL_IN if any
+    /// interests are currently satisfied.
     fn poll_readiness(&self) -> u32 {
-        // epoll fds are themselves "readable" when any watched fd
-        // is ready — we don't eagerly compute this to avoid holding
-        // locks inside poll_readiness.
-        0
+        let mut mask = 0;
+        let g = self.inner.lock();
+        for (_, item) in &g.interest {
+            let fd = item.fd;
+            let ready = fd::with_table(current_task_id(), |t| {
+                t.get(fd as u32)
+                    .map(|e| e.ops.poll_readiness())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+            if (ready & item.events) != 0 {
+                mask |= narf_filesystem::POLL_IN;
+            }
+        }
+        mask
     }
 }
 
-// ── sys_epoll_create1 ─────────────────────────────────────────────────
+// ── Registry — (task_id, fd) → instance ──────────────────────────────
+// In real Linux the instance is an `anon_inode` file and may be
+// shared across fork or sent via SCM_RIGHTS. NARF Stage 4 stubs it
+// as a global registry keyed by the creator's task id + the fd
+// number.
+static EPOLL_INSTANCES: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), Arc<EpollInstance>>>> =
+    IrqSafeSpinLock::new(None);
 
-/// `epoll_create1(flags)` → fd
-///
-/// - arg0 = flags (EPOLL_CLOEXEC = 0x80000 sets FD_CLOEXEC on the fd)
-///
-/// Returns the new epoll fd, or -1 on failure.
-///
-/// Linux ref: `fs/eventpoll.c`:SYSCALL_DEFINE1(epoll_create1, …)
-/// (GPL-2.0-or-later, kernel.org).
+fn instances_lookup(task: u64, epfd: u32) -> Option<Arc<EpollInstance>> {
+    EPOLL_INSTANCES.lock().as_ref()?.get(&(task, epfd)).cloned()
+}
+
+fn instances_insert(task: u64, epfd: u32, instance: Arc<EpollInstance>) {
+    let mut g = EPOLL_INSTANCES.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    map.insert((task, epfd), instance);
+}
+
+// ── Exclusive wakeup registry ────────────────────────────────────────
+
+static EXCLUSIVE_HOLDERS: IrqSafeSpinLock<Option<BTreeMap<i32, u64>>> = IrqSafeSpinLock::new(None);
+
+fn exclusive_try_claim(fd: i32, owner: u64) -> bool {
+    let mut g = EXCLUSIVE_HOLDERS.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    if let Some(h) = map.get(&fd) {
+        if *h == owner {
+            return true;
+        }
+        return false;
+    }
+    map.insert(fd, owner);
+    true
+}
+
+fn exclusive_release(fd: i32, owner: u64) {
+    let mut g = EXCLUSIVE_HOLDERS.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(h) = map.get(&fd) {
+            if *h == owner {
+                map.remove(&fd);
+            }
+        }
+    }
+}
+
+// ── sys_epoll_create / wait / ctl handlers ───────────────────────────
+
 pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
-    let flags = ctx.args().arg0 as u32;
+    let args = *ctx.args();
+    let _flags = args.arg0 as u32; // ignored for now
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-
-    exclusive_init();
-    instances_init();
 
     let instance = EpollInstance::new();
-    let ops: Arc<dyn FileOps> = instance.clone();
-    let cloexec = if (flags & EPOLL_CLOEXEC) != 0 {
-        crate::fd::FD_CLOEXEC
-    } else {
-        0
-    };
+    let ops = instance.clone() as Arc<dyn FileOps>;
 
-    let new_fd = fd::with_table(task, |t| {
+    let task = current_task_id();
+    let new_fd = match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops,
             offset: 0,
-            flags: cloexec,
+            flags: 0,
             status_flags: 0,
         })
-    });
+    }) {
+        Some(fd) => Some(fd),
+        None => None,
+    };
 
     match new_fd {
         Some(fd) => {
@@ -441,17 +348,6 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     }
 }
 
-// ── sys_epoll_ctl ─────────────────────────────────────────────────────
-
-/// `epoll_ctl(epfd, op, fd, &event)` → 0 or -1
-///
-/// - arg0 = epfd (the epoll instance fd)
-/// - arg1 = op (EPOLL_CTL_ADD=1, EPOLL_CTL_DEL=2, EPOLL_CTL_MOD=3)
-/// - arg2 = target fd to add/modify/remove from the interest set
-/// - arg3 = ptr to `struct epoll_event` (12 bytes; 0 acceptable for DEL)
-///
-/// Linux ref: `fs/eventpoll.c`:SYSCALL_DEFINE4(epoll_ctl, …)
-/// (GPL-2.0-or-later, kernel.org).
 pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
@@ -469,16 +365,19 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
         }
     };
 
-    let owner_id = instance.self_id();
-
     match op {
         EPOLL_CTL_ADD => {
             if ev_ptr.is_null() {
                 ctx.set_return(fail);
                 return;
             }
-            // SAFETY: user pointer; 12 bytes.
-            let (events, data) = unsafe { read_epoll_event(ev_ptr) };
+            let (events, data) = match read_epoll_event(ev_ptr as u64) {
+                Ok(v) => v,
+                Err(_) => {
+                    ctx.set_return(fail);
+                    return;
+                }
+            };
             if instance.ctl_add(tfd, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
@@ -490,7 +389,13 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(fail);
                 return;
             }
-            let (events, data) = unsafe { read_epoll_event(ev_ptr) };
+            let (events, data) = match read_epoll_event(ev_ptr as u64) {
+                Ok(v) => v,
+                Err(_) => {
+                    ctx.set_return(fail);
+                    return;
+                }
+            };
             if instance.ctl_mod(tfd, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
@@ -498,7 +403,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             }
         }
         EPOLL_CTL_DEL => {
-            if instance.ctl_del(tfd, owner_id) {
+            if instance.ctl_del(tfd, task) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(fail); // ENOENT
@@ -508,26 +413,12 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     }
 }
 
-// ── sys_epoll_wait ─────────────────────────────────────────────────────
-
-/// `epoll_wait(epfd, events_out, maxevents, timeout_ms)` → n or -1
-///
-/// - arg0 = epfd
-/// - arg1 = ptr to output array of `struct epoll_event` (12 bytes each)
-/// - arg2 = maxevents (max results to return in one call)
-/// - arg3 = timeout_ms (-1 = block, 0 = nonblock, >0 = bounded wait)
-///
-/// Returns the number of events placed in the output array,
-/// 0 on timeout, or -1 on error.
-///
-/// Linux ref: `fs/eventpoll.c`:SYSCALL_DEFINE4(epoll_wait, …)
-/// (GPL-2.0-or-later, kernel.org).
 pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
     let events_ptr = args.arg1 as *mut u8;
     let maxevents = args.arg2 as usize;
-    let timeout_ms = args.arg3 as i64;
+    let timeout_ms = args.arg3 as i32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
 
@@ -544,14 +435,23 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
         }
     };
 
+    let uctx_ptr = crate::user_task::current_user_task().expect("epoll_wait outside task context");
+    let uctx = unsafe { &*uctx_ptr };
+
     let deadline_ns: Option<u64> = if timeout_ms == 0 {
         Some(0)
     } else if timeout_ms > 0 {
-        Some(
-            narf_scheduler::narf_time::monotonic_ns()
-                .saturating_add((timeout_ms as u64) * 1_000_000),
-        )
+        let persisted = uctx.sleep_deadline_ns.load(Ordering::Acquire);
+        if persisted != 0 && persisted != u64::MAX {
+            Some(persisted)
+        } else {
+            let d = narf_scheduler::narf_time::monotonic_ns()
+                .saturating_add((timeout_ms as u64) * 1_000_000);
+            uctx.sleep_deadline_ns.store(d, Ordering::Release);
+            Some(d)
+        }
     } else {
+        uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
         None
     };
 
@@ -559,10 +459,17 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
         let ready = instance.collect_ready(task);
         let n = ready.len().min(maxevents);
         if n > 0 {
-            // SAFETY: user pointer; n * EPOLL_EVENT_SIZE writable bytes.
+            uctx.sleep_deadline_ns.store(0, Ordering::Release);
             for (i, (events, data)) in ready[..n].iter().enumerate() {
-                unsafe {
-                    write_epoll_event(events_ptr.add(i * EPOLL_EVENT_SIZE), *events, *data);
+                if write_epoll_event(
+                    events_ptr as u64 + (i * EPOLL_EVENT_SIZE) as u64,
+                    *events,
+                    *data,
+                )
+                .is_err()
+                {
+                    ctx.set_return(fail);
+                    return;
                 }
             }
             ctx.set_return(SyscallReturn::ok(n as u64));
@@ -574,16 +481,34 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
-            Some(d) => {
-                let now = narf_scheduler::narf_time::monotonic_ns();
-                if now >= d {
-                    ctx.set_return(SyscallReturn::ok(0));
-                    return;
-                }
-                narf_scheduler::sleep_pumps::run();
-                core::hint::spin_loop();
+            Some(d) if d != u64::MAX && narf_scheduler::narf_time::monotonic_ns() >= d => {
+                uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
             }
-            None => {
+            _ => {
+                if let Some(hook) = crate::user_task::yield_hook() {
+                    // Check for signals. If delivered, return -EINTR.
+                    if let Some(h) = crate::signal_delivery_hook() {
+                        if h(ctx, crate::Syscall::EpollWait.raw()) {
+                            // Signal delivered. Interrupt syscall with EINTR.
+                            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                            uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                            return;
+                        }
+                    }
+
+                    unsafe {
+                        let uc = &*uctx_ptr;
+                        // Rewind RIP so we re-execute epoll_wait on resume.
+                        ctx.set_rip(ctx.rip().wrapping_sub(2));
+                        ctx.save_user_state(uc.state.get() as *mut u8);
+                        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                        hook(uctx_ptr);
+                    }
+                    // unreachable
+                }
+
                 narf_scheduler::sleep_pumps::run();
                 core::hint::spin_loop();
             }
