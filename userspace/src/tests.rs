@@ -73,13 +73,18 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Linux clone(2) ABI: arg0 = flags, arg1 = child stack top,
+    // arg2 = parent_tid ptr, arg3 = child_tid ptr, arg4 = tls.
+    // CLONE_VM|CLONE_SIGHAND|CLONE_THREAD = a thread that shares the
+    // parent address space.
+    const CLONE_VM_SIGHAND_THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 0x8000_0000_1000, // synthetic child entry
-            arg1: 0x7fff_fff0_0000, // synthetic child stack top
-            arg2: 0xC0FFEE,         // arg passed to child (RDI plumbing TBD)
-            arg3: 0,                // inherit parent fs_base
-            arg4: 0,
+            arg0: CLONE_VM_SIGHAND_THREAD,
+            arg1: 0x7fff_fff0_0000, // child stack top
+            arg2: 0,                // parent_tid ptr
+            arg3: 0,                // child_tid ptr
+            arg4: 0,                // tls
             arg5: 0,
         },
         ret: None,
@@ -1863,14 +1868,13 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
         }
         fn set_rip(&mut self, _rip: u64) {}
     }
-    let path = b"hello";
-    let mount = b"/test";
+    // Linux open(2) ABI: arg0 = NUL-terminated absolute path (the
+    // mount prefix is part of the path), arg1 = flags.
+    let path = b"/test/hello\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: mount.as_ptr() as u64,
-            arg3: mount.len() as u64,
+            arg1: 0, // flags
             ..Default::default()
         },
         ret: None,
@@ -2000,13 +2004,13 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
 
     // ── SYS_READLINK: read /sl-test/sl into a 32-byte buf. ────────
     let mut buf = [0u8; 32];
-    let path = b"/sl-test/sl";
+    let path = b"/sl-test/sl\0";
     let mut rctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: buf.as_mut_ptr() as u64,
-            arg3: buf.len() as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            arg3: 0,
             ..Default::default()
         },
         ret: None,
@@ -2108,9 +2112,9 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
     let mut rctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: buf.as_mut_ptr() as u64,
-            arg3: buf.len() as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            arg3: 0,
             ..Default::default()
         },
         ret: None,
@@ -5579,11 +5583,12 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
     );
 
     // Open the file via SYS_OPEN.
-    let path = "/pio/f";
+    // Linux open(2) ABI: arg0 = NUL-terminated absolute path, arg1 = flags.
+    let path = b"/pio/f\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
+            arg1: 0, // flags
             arg2: 0,
             arg3: 0,
             arg4: 0,
@@ -6536,10 +6541,14 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
             }
             fn set_rip(&mut self, _rip: u64) {}
         }
+        // Linux open(2) ABI: arg0 = NUL-terminated absolute path,
+        // arg1 = flags.
+        let mut cpath = alloc::vec::Vec::from(path.as_bytes());
+        cpath.push(0);
         let mut ctx = FakeCtx {
             args: SyscallArgs {
-                arg0: path.as_ptr() as u64,
-                arg1: path.len() as u64,
+                arg0: cpath.as_ptr() as u64,
+                arg1: 0, // flags
                 ..SyscallArgs::default()
             },
             ret: None,
@@ -8735,10 +8744,14 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    let dispatch = |entry: u64| -> Option<u64> {
+    // Linux clone(2): arg0 = flags, arg1 = child stack. CLONE_VM
+    // shares the parent address space; the scheduler still assigns a
+    // fresh tid to each call.
+    const CLONE_VM_SIGHAND_THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
+    let dispatch = || -> Option<u64> {
         let mut ctx = StubCtx {
             args: SyscallArgs {
-                arg0: entry,
+                arg0: CLONE_VM_SIGHAND_THREAD,
                 arg1: 0x7fff_fff0_0000,
                 arg2: 0,
                 arg3: 0,
@@ -8754,14 +8767,14 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
         }
     };
 
-    let t1 = match dispatch(0x8000_0000_1000) {
+    let t1 = match dispatch() {
         Some(v) => v,
         None => {
             *PARENT_AS.lock() = None;
             return TestResult::Fail("first clone failed");
         }
     };
-    let t2 = match dispatch(0x8000_0000_2000) {
+    let t2 = match dispatch() {
         Some(v) => v,
         None => {
             *PARENT_AS.lock() = None;
@@ -9631,11 +9644,14 @@ fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
-    // sigprocmask BLOCK SIGUSR1.
+    // sigprocmask BLOCK SIGUSR1. Linux ABI: arg0=how, arg1=set ptr,
+    // arg2=old ptr, arg3=sigsetsize (must be 8).
+    let block: u64 = 1 << 10;
     let mut m = SigGapCtx {
         args: SyscallArgs {
             arg0: 0, /* SIG_BLOCK */
-            arg1: 1 << 10,
+            arg1: &block as *const u64 as u64,
+            arg3: 8,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -13489,6 +13505,11 @@ fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
     use crate::fd::{ConsoleFile, TIOCGPGRP, TIOCSPGRP};
     use narf_filesystem::FileOps;
 
+    // Drop any leaked current-task lookup from an earlier test so the
+    // TIOCGPGRP auto-install fallback (which reads current_task_pgid())
+    // sees 0 for an unset tty rather than an ambient pgid.
+    crate::handlers::__test_reset_task_id_lookup();
+
     let tty_a = ConsoleFile::new();
     let tty_b = ConsoleFile::new();
 
@@ -13995,6 +14016,10 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // current_task_id() must be 0 here so signalfd's owner_task matches
+    // the kill(pid=0) target; drop any lookup an earlier test leaked.
+    crate::handlers::__test_reset_task_id_lookup();
+
     // Mask = SIGUSR1 only (signum 10 = 1<<10).
     let mask: u64 = 1u64 << 10;
     let mask_bytes = mask.to_le_bytes();
@@ -14103,6 +14128,10 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+
+    // current_task_id() must be 0 here so signalfd's owner_task matches
+    // the kill(pid=0) target; drop any lookup an earlier test leaked.
+    crate::handlers::__test_reset_task_id_lookup();
 
     // Create signalfd watching SIGUSR2 (signum 12).
     let mask: u64 = 1u64 << 12;
@@ -14747,16 +14776,16 @@ fn smoke_userspace_statx_known_file_reports_mode_size() -> TestResult {
         }
     }
 
-    let path = b"/statx-known/probe";
+    let path = b"/statx-known/probe\0";
     let mut out = Statx::default();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: AT_FDCWD as u64,
             arg1: path.as_ptr() as u64,
-            arg2: path.len() as u64,
-            arg3: 0,
-            arg4: 0xFFF, // STATX_BASIC_STATS
-            arg5: &mut out as *mut Statx as u64,
+            arg2: 0,     // flags
+            arg3: 0xFFF, // mask = STATX_BASIC_STATS
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
         },
         ret: None,
     };
@@ -14880,16 +14909,16 @@ fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
         }
     }
 
-    let path = b"/statx-m0/m0";
+    let path = b"/statx-m0/m0\0";
     let mut out = Statx::default();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: AT_FDCWD as u64,
             arg1: path.as_ptr() as u64,
-            arg2: path.len() as u64,
-            arg3: 0,
-            arg4: 0, // mask = 0
-            arg5: &mut out as *mut Statx as u64,
+            arg2: 0, // flags
+            arg3: 0, // mask = 0
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
         },
         ret: None,
     };
@@ -15018,11 +15047,12 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
     }
 
     // Open /statx-ep/ep to get a real fd.
-    let path = b"/statx-ep/ep";
+    // Linux open(2) ABI: arg0 = NUL-terminated path, arg1 = flags.
+    let path = b"/statx-ep/ep\0";
     let mut open_ctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
+            arg1: 0, // flags
             ..SyscallArgs::default()
         },
         ret: None,
@@ -15037,16 +15067,16 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
         }
     };
 
-    let empty: &[u8] = b"";
+    let empty: &[u8] = b"\0";
     let mut out = Statx::default();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: opened_fd as u64,
             arg1: empty.as_ptr() as u64,
-            arg2: 0, // path_len = 0
-            arg3: AT_EMPTY_PATH as u64,
-            arg4: 0xFFF,
-            arg5: &mut out as *mut Statx as u64,
+            arg2: AT_EMPTY_PATH as u64, // flags
+            arg3: 0xFFF,                // mask
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
         },
         ret: None,
     };

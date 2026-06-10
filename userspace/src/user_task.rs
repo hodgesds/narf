@@ -228,14 +228,19 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     // The in-flight polling routine publishes its ctx in `CURRENT`
     // right before entering user mode and clears it on the way back
     // out, so it reflects exactly the task whose trap we're handling.
-    // Fall back to the task-id map only when `CURRENT` is unset (e.g.
-    // a signal waker poking a parked task it isn't currently running).
+    // We deliberately do NOT fall back to the task-id registry here:
+    // its entries point at the poller's stack-pinned `UserTaskCtx`,
+    // which is only live while that task is the in-flight one — a
+    // lookup by id can hand back a pointer to a future that has since
+    // unwound (notably in the in-kernel test harness, where `CURRENT`
+    // is never set). `wake_signal` consults the registry directly when
+    // it genuinely needs to poke a parked task by id.
     let p = CURRENT.load(Ordering::Acquire);
-    if !p.is_null() {
-        return Some(p);
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
     }
-    let task_id = crate::handlers::current_task_id();
-    lookup_user_task_ctx(task_id)
 }
 
 #[derive(Copy, Clone, Debug)]

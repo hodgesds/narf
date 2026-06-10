@@ -785,6 +785,15 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
     }
 
+    // Seed sector 0 (bytes 0..512) with the virtio-blk read-pattern the
+    // driver smoke tests assert: byte i == (i * 0x97) mod 256. This is
+    // ext2 boot-block padding (the superblock starts at byte 1024), so
+    // it doesn't disturb the filesystem the /mnt mount reads — it just
+    // gives the raw-sector-read tests a known pattern at LBA 0.
+    for (i, b) in img[0..512].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0x97);
+    }
+
     img
 }
 

@@ -94,6 +94,15 @@ pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     *TASK_LOOKUP.lock() = Some(lookup);
 }
 
+/// Test hook: drop any installed current-task lookup so
+/// `current_task_id()` falls back to 0. The in-kernel smoke tests
+/// share one boot, and `TASK_LOOKUP` is a process-global — without a
+/// reset, a test that installs a fixed-id lookup leaks it into later
+/// tests that assume the default (e.g. signalfd / per-tty pgrp tests).
+pub fn __test_reset_task_id_lookup() {
+    *TASK_LOOKUP.lock() = None;
+}
+
 pub fn current_task_id() -> u64 {
     let f = *TASK_LOOKUP.lock();
     f.map(|lookup| lookup()).unwrap_or(0)
@@ -5748,17 +5757,21 @@ pub fn pid_task_map_reset() {
 /// Records both directions simultaneously so all translations are O(1).
 pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
     register_task_to_pid(task_raw, pid_raw);
-    let mut g = PID_TO_TASK.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(pid_raw, task_raw);
-    }
+    // Self-initialize: the map may be `None` if `wait_init` hasn't run
+    // yet (early boot, or the kernel-test harness which boots straight
+    // into the smoke runner). Without this a `fork` registration would
+    // silently no-op and every later pid→task translation would miss.
+    PID_TO_TASK
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(pid_raw, task_raw);
 }
 
 pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
-    let mut g = TASK_TO_PID.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task_raw, pid_raw);
-    }
+    TASK_TO_PID
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task_raw, pid_raw);
 }
 
 /// Translate a user-visible ProcessId to the scheduler TaskId. Returns

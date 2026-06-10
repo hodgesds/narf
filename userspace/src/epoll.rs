@@ -522,8 +522,13 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                     // unreachable
                 }
 
-                narf_scheduler::sleep_pumps::run();
-                core::hint::spin_loop();
+                // No task context or no yield hook to park on (the
+                // in-kernel test harness, or an early-boot caller):
+                // there is no cooperative way to block, so report no
+                // events ready rather than spinning forever. A real
+                // task always took the park path above.
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
             }
         }
     }
