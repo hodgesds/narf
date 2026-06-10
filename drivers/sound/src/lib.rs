@@ -471,7 +471,6 @@ pub mod tests_support {
     /// immediately ready — they do not yield to the executor.  The no-op
     /// waker is therefore correct: we never need to wake it.
     pub fn poll_once<T>(fut: impl core::future::Future<Output = T>) -> T {
-        use core::pin::Pin;
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
         fn raw_waker() -> RawWaker {
             unsafe fn no_clone(_: *const ()) -> RawWaker {

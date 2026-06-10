@@ -80,6 +80,7 @@ const REG_CRB_RSP_LO: u64 = 0x40 + 0xA8;
 const REG_CRB_RSP_HI: u64 = 0x40 + 0xAC;
 
 const CTRL_REQ_CMD_READY: u32 = 1 << 0;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
 const CTRL_START_GO: u32 = 1 << 0;

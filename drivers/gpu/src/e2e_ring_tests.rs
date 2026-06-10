@@ -945,6 +945,9 @@ kernel_test_in!(
 // reaches "MES_READY" state
 // ─────────────────────────────────────────────────────────────────────
 
+// `fake_state` tracks the simulated FW state machine; the intermediate
+// writes are overwritten before the final assertion reads it.
+#[allow(unused_assignments)]
 fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
     use crate::amdgpu_mes::{
         build_set_hw_resources, decode_api_header, MesApiOpcode, MesRing, MES_API_FRAME_DWORDS,

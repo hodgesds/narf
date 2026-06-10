@@ -84,6 +84,7 @@ pub trait DmaAllocator {
 /// Production implementation of `DmaAllocator`. Uses `narf_io::alloc_coherent`
 /// and tracks the `DmaBuffer` objects in a `Vec` to ensure they stay live
 /// until the loader or its caller is done with them.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct DmaAllocatorImpl {
     buffers: Vec<narf_io::DmaBuffer>,
 }

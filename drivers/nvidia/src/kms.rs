@@ -23,9 +23,7 @@
 
 use alloc::vec::Vec;
 
-use crate::disp::{
-    decode_dcb_entry, decode_dcb_entry_versioned, ConnectorType, DcbEntry, DisplayPath, EncoderType,
-};
+use crate::disp::{decode_dcb_entry_versioned, ConnectorType, DcbEntry, DisplayPath, EncoderType};
 
 /// One enumerated display path — connector + encoder + the
 /// candidate CRTC indices it can drive.

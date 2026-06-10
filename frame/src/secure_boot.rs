@@ -75,6 +75,7 @@ pub enum SecureBootError {
     BadPkcs7,
     /// SHA-256 digest mismatch between PE image and signed-content
     /// digest in PKCS#7.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     DigestMismatch,
     /// Signer's SHA-256 fingerprint is not in `db`.
     NotInDb,
@@ -84,6 +85,7 @@ pub enum SecureBootError {
     /// platform variables are missing.
     NoPlatformKeys,
     /// Build profile rejects unsigned binaries.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     UnsignedRejected,
 }
 
@@ -111,6 +113,7 @@ pub struct SecureBootState {
     /// PK enrolled).
     pub setup_mode: u8,
     /// Encoded `EFI_SIGNATURE_LIST` chain for the image-allow database.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub db: Vec<u8>,
     /// Encoded `EFI_SIGNATURE_LIST` chain for the image-forbid database.
     pub dbx: Vec<u8>,
@@ -331,6 +334,7 @@ pub struct AuthenticodeSignerInfo {
 }
 
 /// Top-level OID for PKCS#7 SignedData (RFC 5652).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const OID_SIGNED_DATA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02];
 /// Microsoft's `spcIndirectDataContent` OID (Authenticode).
 const OID_SPC_INDIRECT_DATA: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04];
@@ -565,6 +569,7 @@ pub fn fingerprint_in_signature_db(buf: &[u8], fingerprint: &[u8; SHA256_DIGEST_
 ///     PKCS#7 input.
 ///   - `Ok(())` when `enabled()` is false — bring-up builds and
 ///     unprovisioned platforms.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn verify_pe(image: &[u8]) -> Result<(), SecureBootError> {
     let st = match state() {
         Some(s) => s,
@@ -607,6 +612,7 @@ pub fn verify_pe(image: &[u8]) -> Result<(), SecureBootError> {
 /// `EV_EFI_BOOT_SERVICES_APPLICATION` (the canonical PE-measurement
 /// tag), then runs `verify_pe`. The label string lets remote
 /// attestation distinguish which binary was loaded where.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub async fn measure_and_verify(
     image: &[u8],
     pcr: u32,

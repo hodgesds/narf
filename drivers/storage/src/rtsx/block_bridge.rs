@@ -43,14 +43,12 @@
 //! - CSD parse to extract real capacity.
 
 use alloc::format;
-use alloc::string::String;
 use alloc::sync::Arc;
 
 use narf_block::registry::{register_block_device, BlockDeviceSync, BlockIoError};
-use narf_lib::sync::IrqSafeSpinLock;
 
 use super::card::SdCardInfo;
-use super::{with_controller, RtsxError};
+use super::with_controller;
 
 // ── RtsxBlockDevice ───────────────────────────────────────────────────────
 

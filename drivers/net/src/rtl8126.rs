@@ -321,6 +321,7 @@ pub const TD1_GTSENV4: u32 = 1 << 26;
 /// MSS field shift for TSO (bits `[28:18]` in `TxDesc.vlan`).
 pub const TD1_MSS_SHIFT: u32 = 18;
 /// IPv4 header checksum offload. Linux `r8169_main.c` `TD1_IPv4_CS`.
+#[allow(non_upper_case_globals)] // TODO(narf): mirrors the datasheet register/bit name
 pub const TD1_IPv4_CS: u32 = 1 << 29;
 /// TCP checksum offload. Linux `r8169_main.c` `TD1_TCP_CS`.
 pub const TD1_TCP_CS: u32 = 1 << 30;

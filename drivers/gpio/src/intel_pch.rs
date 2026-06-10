@@ -45,9 +45,11 @@ pub const INTEL_PCH_GPIO_HIDS: &[&str] = &[
 // ── Register offsets ───────────────────────────────────────────────
 
 const REG_REVID: u64 = 0x000;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_CAPLIST: u64 = 0x004;
 const REG_PADBAR: u64 = 0x00C;
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CAPLIST_ID_GPIO_HW_INFO: u32 = 1;
 
 const REVID_DEBOUNCE_THRESHOLD: u32 = 0x94;
@@ -75,9 +77,11 @@ const PADCFG1_TERM_NONE: u32 = 0b0000 << 10;
 pub struct IntelPchGpio {
     name: String,
     acpi_path: String,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     community_index: u8,
     mmio_base: PhysAddr,
     mmio_len: u64,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     revid: Option<u16>,
     padbar: Option<u32>,
     pin_count: u16,
@@ -502,13 +506,16 @@ fn try_route_gsi(gsi: u32, flags: u8, ctrls: alloc::vec::Vec<Arc<IntelPchGpio>>)
     }
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn gpio_gsi_bridge(cookie: u64) -> IrqStatus {
     global_gsi_dispatch(cookie as u8)
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 static GSI_MAPPING: IrqSafeSpinLock<BTreeMap<u8, &'static [Arc<IntelPchGpio>]>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn global_gsi_dispatch(vector: u8) -> IrqStatus {
     let mut handled = IrqStatus::None;
     let g = GSI_MAPPING.lock();

@@ -45,6 +45,7 @@ const EC_CMD_QUERY: u8 = 0x84; // Query SCI event
 // ── Status Bits ─────────────────────────────────────────────────────
 const EC_STS_OBF: u8 = 1 << 0; // Output buffer full
 const EC_STS_IBF: u8 = 1 << 1; // Input buffer full
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_STS_SCI: u8 = 1 << 5; // SCI event pending
 
 #[derive(Debug)]

@@ -510,6 +510,7 @@ fn try_route_irq(_gsi: u32, _acpi_flags: u8) -> Option<u8> {
     None
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn noop_irq() {}
 
 #[doc(hidden)]

@@ -16,7 +16,7 @@ use super::dma::{
     queue_register_table, ACTIVE_TX_QUEUES, REG_TXDMA_OFFSET_CHK, RX_RING_DEPTH, TXBD_SEG_NUM,
     TXDMA_BD_DESC_POLL, TX_RING_DEPTH_BE, TX_RING_DEPTH_DEFAULT,
 };
-use super::efuse::{mac_is_valid, EfuseError};
+use super::efuse::mac_is_valid;
 use super::fw::fw_name_for;
 use super::h2c::{
     box_reg, H2cState, FWDL_CHKSUM_RPT, FW_PAGE_SIZE, FW_START_ADDRESS, MCUFWDL_RDY, REG_HMEBOX_0,
@@ -495,7 +495,7 @@ fn smoke_rtlwifi_h2c_box_selector() -> TestResult {
         return TestResult::Fail("box_reg(4) didn't wrap");
     }
     // State advances 0→1→2→3→0.  Track by reading `next`.
-    let mut s = H2cState::new();
+    let s = H2cState::new();
     if s.next() != 0 {
         return TestResult::Fail("H2cState::new() next != 0");
     }

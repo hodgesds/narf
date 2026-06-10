@@ -664,6 +664,9 @@ pub fn train_link<A: AuxChannel>(
 
     let mut rate = requested_rate;
     let mut cur_lanes = lanes;
+    // Defensive default: each loop iteration reassigns `last_err` before
+    // it can be read, so the initializer is a deliberate dead store.
+    #[allow(unused_assignments)]
     let mut last_err = LinkError::Aborted;
 
     loop {

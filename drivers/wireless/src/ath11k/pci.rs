@@ -27,7 +27,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -194,7 +193,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     let did = dev.device_id;
-    let hw_rev = dev.hw_rev;
+    let _hw_rev = dev.hw_rev;
 
     // ── Stage 2: MHI initialization ──
     let auth = match narf_firmware::trusted_loader_authority() {

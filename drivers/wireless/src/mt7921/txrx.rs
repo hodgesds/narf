@@ -319,11 +319,10 @@ use core::convert::TryInto;
 // ── Stage-13/14: live TX submit + RX drain (uses dma::Ring) ──────
 
 use super::dma::{
-    ring_dma_index, ring_doorbell, Mt76Desc, Ring, RingRegs, MT76_DESC_SIZE, MT_DMA_CTL_BURST,
-    MT_DMA_CTL_DMA_DONE, MT_DMA_CTL_LAST_SEC0, MT_DMA_CTL_SD_LEN0_MASK, MT_DMA_CTL_SD_LEN0_SHIFT,
+    ring_dma_index, ring_doorbell, Ring, RingRegs, MT_DMA_CTL_BURST, MT_DMA_CTL_DMA_DONE,
+    MT_DMA_CTL_LAST_SEC0, MT_DMA_CTL_SD_LEN0_MASK, MT_DMA_CTL_SD_LEN0_SHIFT,
 };
 use narf_bus::MmioRegion;
-use narf_io::DmaBuffer;
 
 /// Errors raised by the live TX/RX submit + drain paths.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

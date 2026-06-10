@@ -316,15 +316,20 @@ unsafe fn io_out(_port: u16, _width_bytes: usize, _val: u64) {}
 // data ready for host), bit 1 = IBF (host wrote, EC hasn't
 // drained yet).
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_CMD_READ: u8 = 0x80;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_CMD_WRITE: u8 = 0x81;
 /// `RD_EC = 0x84` — ACPI 6.5 §12.3.5. Host asks EC "what event
 /// fired?" and the EC returns a single byte naming the _Qxx
 /// handler (e.g. 0x33 → invoke `_Q33` from the EC's AML scope).
 /// Issued from the SCI handler when SCI_EVT (bit 5 of EC status)
 /// is asserted; the AML interpreter then runs the named query.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_CMD_QUERY: u8 = 0x84;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_SC_OBF: u8 = 0x01;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_SC_IBF: u8 = 0x02;
 /// `EC_SC_SCI_EVT` (bit 5 of status) — set by the EC to signal
 /// that one or more _Qxx events are pending; cleared when the
@@ -332,6 +337,7 @@ const EC_SC_IBF: u8 = 0x02;
 pub const EC_SC_SCI_EVT: u8 = 1 << 5;
 /// ACPI 6.5 §5.2.15: an EC command is bounded by T_EC (~10 ms
 /// typical); 100 ms wedge threshold.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_TIMEOUT_MS: u64 = 100;
 
 static EC_PORTS: narf_lib::sync::IrqSafeSpinLock<Option<(u16, u16)>> =
@@ -1178,6 +1184,7 @@ pub(crate) fn parse_bank_field_body(
 }
 
 /// Backwards-compat shim — old callers used this name.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub(crate) fn parse_indirect_field_body(
     p: &mut Parser<'_>,
     parent: &str,

@@ -321,6 +321,7 @@ impl FwEntry {
             optional: false,
         }
     }
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     const fn optional(mut self) -> Self {
         self.optional = true;
         self

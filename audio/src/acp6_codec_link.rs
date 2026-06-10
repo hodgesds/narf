@@ -60,8 +60,7 @@
 
 extern crate alloc;
 
-use crate::codec::CodecError;
-use crate::i2s::{Acp3xIter, Acp3xTxFrmt, FrameFormat, I2sFormat, WordLength};
+use crate::i2s::{Acp3xIter, Acp3xTxFrmt, FrameFormat, I2sFormat};
 use crate::realtek_alc::{self, RealtekChip};
 
 // ── Public API ─────────────────────────────────────────────────────────
@@ -891,7 +890,7 @@ mod tests {
         // poll_ready: for SW_IMM_CMD_STS:
         //   - expected_nonzero=false (wait for cmd idle): immediately ok
         //   - expected_nonzero=true (wait for result): immediately ok
-        let mut poll_ready = |m: &FakeMmioAdapter, offset: u64, expected_nonzero: bool| -> bool {
+        let _poll_ready = |m: &FakeMmioAdapter, offset: u64, expected_nonzero: bool| -> bool {
             let val = unsafe { m.read32(offset) };
             if expected_nonzero {
                 val != 0

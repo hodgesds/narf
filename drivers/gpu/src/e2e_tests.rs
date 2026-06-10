@@ -228,6 +228,8 @@ fn smoke_bochs_unprobe_cleanup() -> TestResult {
     mmio.write16(VBE_ENABLE_OFF, VBE_ENABLE_BIT | VBE_LFB_BIT);
 
     // Simulate unprobe by dropping a controller-state tracker.
+    // The initial value is overwritten by the unprobe below before it is read.
+    #[allow(unused_assignments)]
     let mut controller_present = true;
     // "Unprobe" — clear the controller slot.
     controller_present = false;
@@ -328,7 +330,7 @@ fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
     let seq =
         match build_gfx9_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_wb_phys) {
             Ok(s) => s,
-            Err(e) => return TestResult::Fail("build_gfx9_ring_init failed"),
+            Err(_e) => return TestResult::Fail("build_gfx9_ring_init failed"),
         };
 
     if seq.is_empty() {
@@ -586,7 +588,7 @@ fn smoke_edid_parse_640x480_preferred_timing() -> TestResult {
 
     let parsed = match Edid::parse(&edid) {
         Ok(e) => e,
-        Err(e) => return TestResult::Fail("EDID parse rejected synthetic 640x480 block"),
+        Err(_e) => return TestResult::Fail("EDID parse rejected synthetic 640x480 block"),
     };
 
     // Version 1.4.
@@ -628,7 +630,7 @@ fn smoke_drm_multi_monitor_enumerate_independent_modesets() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_atom_displayobj::ConnectorKind;
     use crate::amdgpu_atom_displayobj::DisplayPath;
-    use crate::amdgpu_modeset::{commit_modeset_full, plan_modeset, CrtcState, KmsError, KmsState};
+    use crate::amdgpu_modeset::{commit_modeset_full, plan_modeset, KmsError, KmsState};
 
     // Build KMS state with 4 pipes (APU-typical).
     let mut kms = KmsState::new(4);

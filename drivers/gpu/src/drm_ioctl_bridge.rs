@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use narf_filesystem::FsError;
 
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
-use crate::drm::render_node::{DrmFileCtx, PermError};
+use crate::drm::render_node::DrmFileCtx;
 use crate::drm_uapi::{self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmVersionUapi};
 
 // ── Copy helpers ──────────────────────────────────────────────────────

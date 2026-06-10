@@ -62,6 +62,7 @@ struct CapBinding {
     name: &'static str,
     sha256: [u8; 32],
     signer: Option<[u8; 32]>,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     version: Option<String>,
     backing: Arc<DmaBuffer>,
     payload_len: usize,

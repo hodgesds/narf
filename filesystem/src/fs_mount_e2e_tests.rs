@@ -52,17 +52,13 @@
 
 extern crate alloc;
 
-use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::{
-    bootstrap_mount_authority, registry, resolve, FileType, FsError, FsInstance, Initramfs, MemFs,
-    Mode,
-};
+use crate::{bootstrap_mount_authority, registry, resolve, FileType, FsError, Initramfs, MemFs};
 
 // ── poll_once helper ──────────────────────────────────────────────────
 //

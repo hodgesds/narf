@@ -27,7 +27,7 @@ const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 /// boot stack; kernel-test workloads fit in a single frame.
 const AP_STACK_PAGES: usize = 1;
 
-/// AP entry symbol (defined in `smp_entry.S`).
+// AP entry symbol (defined in `smp_entry.S`).
 extern "C" {
     fn _ap_start();
     /// Per-CPU stack-top table — [u64; MAX_CPUS] in `.boot.data`.

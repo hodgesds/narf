@@ -36,7 +36,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 // ── NXP I3C Register Offsets ───────────────────────────────────────
 const REG_MCTRL: u64 = 0x00; // Main Control
 const REG_MSTATUS: u64 = 0x04; // Main Status
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_IBIRULES: u64 = 0x08; // IBI Rules
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_MINTSET: u64 = 0x0C; // Interrupt Set
 const REG_MDATACTRL: u64 = 0x20; // Data Control
 const REG_MWDATAB: u64 = 0x24; // Write Data Byte
@@ -46,6 +48,7 @@ const REG_MCONFIG: u64 = 0x40; // Master Config
 
 // ── MCTRL.REQUEST values ───────────────────────────────────────────
 // NXP i.MX 93 RM §I3C_MCTRL.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const MCTRL_REQUEST_NONE: u32 = 0x0;
 const MCTRL_REQUEST_SDR_MSG: u32 = 0x1; // SDR private message
 const MCTRL_REQUEST_SDR_BC_CCC: u32 = 0x3; // Broadcast CCC

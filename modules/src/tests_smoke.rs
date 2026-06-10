@@ -795,6 +795,7 @@ fn arc_test_module(name: &str, abi: u32) -> Arc<crate::loader::Module> {
     })
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn arc_test_module_with_params(
     name: &str,
     abi: u32,

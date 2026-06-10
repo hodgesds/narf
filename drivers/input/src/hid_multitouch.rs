@@ -311,6 +311,7 @@ pub struct MtPumpState {
     last_left: bool,
     /// Last seen right-button state — only set when the device's
     /// descriptor exposes Button 2.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     last_right: bool,
 }
 

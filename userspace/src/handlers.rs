@@ -116,6 +116,7 @@ pub fn current_task_id() -> u64 {
 // FSes that yield will need a different shape; this is the
 // quick-path Stage-4 needs to hook real reads from initramfs.
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     // SAFETY: vtable holds null-pointer-clean stubs; the waker is
@@ -4710,24 +4711,34 @@ fn sys_gettid(ctx: &mut dyn TrapContext) {
 // set_tid_address(tidptr) sets the calling task's CLOSE_CHILD_CLEARTID
 // slot in the same per-task table; returns the caller's TID.
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_VM: u64 = 0x0000_0100;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FS: u64 = 0x0000_0200;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FILES: u64 = 0x0000_0400;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_SIGHAND: u64 = 0x0000_0800;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_THREAD: u64 = 0x0001_0000;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_SYSVSEM: u64 = 0x0004_0000;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_SETTLS: u64 = 0x0008_0000;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
 // Per-task CLONE_CHILD_CLEARTID slot. Keyed by scheduler TaskId raw
@@ -4749,6 +4760,7 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 #[derive(Copy, Clone)]
 struct ClearChildTidEntry {
     uaddr: u64,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     as_root: narf_memory::PhysAddr,
 }
 
@@ -4787,6 +4799,7 @@ fn set_clear_child_tid_with_as(task_id_raw: u64, uaddr: u64, as_root: narf_memor
 }
 
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
     let mut g = CLEAR_CHILD_TID.lock();
     g.as_mut().and_then(|m| m.remove(&task_id_raw))
@@ -4899,6 +4912,7 @@ pub fn install_clear_child_tid_observer() {
 #[cfg(feature = "linux-compat")]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 struct CloneArgs {
     flags: u64,
     pidfd: u64,
@@ -4915,6 +4929,7 @@ struct CloneArgs {
 }
 
 #[cfg(feature = "linux-compat")]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_ARGS_MIN: usize = core::mem::size_of::<CloneArgs>();
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
@@ -7183,6 +7198,7 @@ fn sys_msgget(ctx: &mut dyn TrapContext) {
 
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn sys_noop_ok(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -7228,6 +7244,7 @@ static GETRANDOM_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 /// CPUID feature cache: bit 0 = RDRAND probed, bit 1 = RDRAND
 /// available, bit 2 = RDSEED probed, bit 3 = RDSEED available.
 /// Computed lazily on first use; subsequent calls bit-test.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 static RNG_FEATURES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(target_arch = "x86_64")]
@@ -7883,6 +7900,7 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
 /// byte. The pack itself is `len` bytes long; we read until we
 /// see len bytes total. An empty pack (len == 0) returns an
 /// empty Vec (legal — `execve` with no argv).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn copy_user_pack(
     ptr: *const u8,
     len: usize,
@@ -11363,6 +11381,7 @@ fn write_user_u32(ptr: u64, val: u32) {
 
 /// Write a u16 to a user address.
 #[inline]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn write_user_u16(ptr: u64, val: u16) {
     let b = val.to_le_bytes();
     let _ = unsafe { copy_to_user(ptr, &b) };

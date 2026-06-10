@@ -34,18 +34,22 @@
 //!   - `kernel/fork.c::copy_process`    (fork + fd-table inheritance)
 //!   - `kernel/exit.c::do_wait`         (wait4 / zombie reap)
 
+#[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+#[cfg(target_arch = "x86_64")]
 use narf_memory::AddressSpace;
 
 use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 use crate::{
     fd, install_address_space_lookup, install_core_syscalls, install_global, install_task_id_lookup,
 };
+#[cfg(target_arch = "x86_64")]
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Shared infrastructure ─────────────────────────────────────────────

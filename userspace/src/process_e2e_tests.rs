@@ -24,16 +24,20 @@
 //!   - `fs/pipe.c::do_pipe2`                (pipe allocation)
 //!   - `fs/fcntl.c::do_dup2`               (dup2 semantics)
 
+#[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+#[cfg(target_arch = "x86_64")]
 use narf_lib::sync::IrqSafeSpinLock;
+#[cfg(target_arch = "x86_64")]
 use narf_memory::AddressSpace;
 
 use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 use crate::{
     default_signal_delivery, install_address_space_lookup, install_core_syscalls, install_global,
     install_task_id_lookup, signal_mask_of, signal_pending_of, SigDeliveryParams,
@@ -2222,6 +2226,7 @@ kernel_test_in!(
 
 /// `SignalCtx` whose `returning_to_user` reports `true`, used to drive
 /// `default_signal_delivery` on a synthetic trap return.
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn signal_ctx_returning_to_user() -> SignalCtx {
     SignalCtx {
         args: SyscallArgs::default(),

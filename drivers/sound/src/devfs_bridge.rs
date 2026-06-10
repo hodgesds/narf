@@ -35,11 +35,8 @@ use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mo
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
-use crate::mixer::{ControlId, ControlValue};
-use crate::{
-    card_count, list_cards, open_capture, open_capture as _open_capture, open_playback,
-    CaptureStream, Mixer, PlaybackStream, SoundError,
-};
+use crate::mixer::ControlValue;
+use crate::{list_cards, open_capture, open_playback, PlaybackStream, SoundError};
 
 // ── Offset sentinel for hw_params writes ─────────────────────────────
 
@@ -242,6 +239,7 @@ impl FileOps for SoundControlFile {
 pub struct SoundPcmPlaybackFile {
     card_index: u32,
     device: u32,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     stream: IrqSafeSpinLock<Option<PlaybackStream>>,
 }
 
@@ -254,6 +252,7 @@ impl SoundPcmPlaybackFile {
         }
     }
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn ensure_open(&self) -> Result<(), SoundError> {
         let mut g = self.stream.lock();
         if g.is_none() {

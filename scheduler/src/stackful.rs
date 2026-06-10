@@ -342,7 +342,7 @@ impl KernelTask {
         {
             me.ctx = KernelContext::fresh(stack_top, trampoline_entry as u64, task_ptr_as_u64);
         }
-        let _ = stack_top; // silence warning on aarch64 stub
+        let _ = (stack_top, task_ptr_as_u64); // silence warnings on aarch64 stub
 
         me
     }
@@ -822,6 +822,7 @@ impl Future for StackfulAdapter {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
+            let _ = cx;
             // aarch64 has no kernel_ctx primitive yet — fall
             // back to immediate completion. Phase 2 + arm64
             // port follows the same shape.

@@ -43,6 +43,7 @@ use crate::{
 
 const VIRTIO_SND_R_PCM_SET_PARAMS: u32 = 0x0101;
 const VIRTIO_SND_R_PCM_PREPARE: u32 = 0x0102;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const VIRTIO_SND_R_PCM_RELEASE: u32 = 0x0103;
 const VIRTIO_SND_R_PCM_START: u32 = 0x0104;
 #[allow(dead_code)]
@@ -76,8 +77,10 @@ pub struct VirtioSndConfig {
 #[derive(Debug)]
 pub struct VirtioSoundPci {
     control_q: IrqSafeSpinLock<Option<Virtqueue>>,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     event_q: IrqSafeSpinLock<Option<Virtqueue>>,
     tx_q: IrqSafeSpinLock<Option<Virtqueue>>,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     rx_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _q_buf_control: DmaBuffer,
     _q_buf_event: DmaBuffer,

@@ -121,6 +121,7 @@ pub const WMI_TAG_READY_EVENT: u16 = 0x54;
 /// Builder for a WMI command frame. Layout:
 ///   `[ cmd_hdr(4) ][ tlv0_hdr(4) ][ tlv0_payload ][ pad ]...`
 /// All TLV payloads are 4-byte aligned in the stream.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct WmiCmdBuilder {
     bytes: Vec<u8>,
 }

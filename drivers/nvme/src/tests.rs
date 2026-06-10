@@ -1556,7 +1556,7 @@ fn smoke_nvme_completion_phase_tag_unit() -> TestResult {
     }
 
     // Consume all 4 entries in the first lap.
-    for i in 0..DEPTH {
+    for _i in 0..DEPTH {
         let entry_phase = get_phase(&cq, cq_head);
         if entry_phase != expected_phase {
             return TestResult::Fail("first-lap entry should match expected_phase=1");
@@ -1575,7 +1575,7 @@ fn smoke_nvme_completion_phase_tag_unit() -> TestResult {
     for i in 0..DEPTH {
         set_phase(&mut cq, i, 0);
     }
-    for i in 0..DEPTH {
+    for _i in 0..DEPTH {
         let entry_phase = get_phase(&cq, cq_head);
         if entry_phase != expected_phase {
             return TestResult::Fail("second-lap entry should match expected_phase=0");

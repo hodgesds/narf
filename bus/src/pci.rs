@@ -122,6 +122,7 @@ const PM_CAP_ID: u8 = 0x01;
 /// PowerState field (00=D0, 01=D1, 10=D2, 11=D3hot).
 const PM_PMCSR_OFFSET: u64 = 0x04;
 const PM_PMCSR_STATE_MASK: u16 = 0x3;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PM_STATE_D0: u16 = 0;
 const PM_STATE_D3HOT: u16 = 3;
 

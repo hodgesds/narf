@@ -374,6 +374,7 @@ impl core::fmt::Debug for MipiHciI3cMaster {
 /// response descriptors into RR.
 ///
 /// HCI §7; Linux dma.c hci_rh_data.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct DmaRingState {
     /// Command Ring buffer — 16 entries × 16 bytes.
     pub cr: Vec<u8>,

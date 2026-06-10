@@ -43,11 +43,10 @@ kernel_test_in!("drivers/platform/ec", smoke_acpi_ec_discovery);
 
 fn smoke_acpi_thermal_discovery() -> TestResult {
     use narf_power::thermal::zone_count;
-    if zone_count() >= 0 {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("zone_count logic error")
-    }
+    // `zone_count()` returns a `usize`, so it is always >= 0 — just
+    // confirm the call resolves (the discovery walk didn't panic).
+    let _ = zone_count();
+    TestResult::Pass
 }
 kernel_test_in!("drivers/platform/thermal", smoke_acpi_thermal_discovery);
 

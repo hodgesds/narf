@@ -197,7 +197,6 @@ fn smoke_fusb302_receive_empty_returns_no_message() -> TestResult {
     let bus = Arc::new(MockBus::new());
     let chip = Fusb302::new(bus.clone(), FUSB302_DEFAULT_I2C_ADDR);
     // RX FIFO empty by default.
-    use crate::fusb302::I2cBus as _;
     bus.set_reg(REG_STATUS1, STATUS1_RX_EMPTY);
     match chip.receive() {
         Err(TcpcError::NoMessage) => TestResult::Pass,
@@ -263,7 +262,6 @@ kernel_test_in!(
 );
 
 fn smoke_tps65987_decode_cc_orientation() -> TestResult {
-    use crate::fusb302::I2cBus;
     use crate::tps65987::{Tps65987, TPS65987_DEFAULT_I2C_ADDR};
     use narf_usbpd::tcpc::{CcState, Tcpc};
 

@@ -326,9 +326,7 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_enable_slot_trb_encode);
 // xHCI 1.2 §6.2.2 + §6.2.3 + §6.4.3.4.
 
 fn smoke_e2e_address_device_input_context() -> TestResult {
-    use crate::xhci::cmd_ring::{
-        encode_address_device, TRB_TYPE_ADDRESS_DEVICE_CMD, TRB_TYPE_SHIFT,
-    };
+    use crate::xhci::cmd_ring::{encode_address_device, TRB_TYPE_ADDRESS_DEVICE_CMD};
     use crate::xhci::slot::{
         encode_ep_ctx_dword1, encode_ep_ctx_dword2_tr_lo, encode_slot_ctx_dword0,
         encode_slot_ctx_dword1, encode_slot_ctx_dword2, EP_TYPE_CONTROL,
@@ -419,7 +417,7 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_address_device_input_context);
 fn smoke_e2e_get_descriptor_control_transfer_trbs() -> TestResult {
     use crate::control::{get_descriptor, Setup};
     use crate::xhci::cmd_ring::{
-        TRB_CYCLE_BIT, TRB_IDT, TRB_IOC, TRB_TYPE_DATA_STAGE, TRB_TYPE_SETUP_STAGE, TRB_TYPE_SHIFT,
+        TRB_CYCLE_BIT, TRB_IDT, TRB_IOC, TRB_TYPE_DATA_STAGE, TRB_TYPE_SETUP_STAGE,
         TRB_TYPE_STATUS_STAGE,
     };
     use crate::xhci::transfer_ring::{
@@ -535,9 +533,7 @@ kernel_test_in!(
 // xHCI 1.2 §4.6.6 + §6.4.3.5.
 
 fn smoke_e2e_configure_endpoint_input_context() -> TestResult {
-    use crate::xhci::cmd_ring::{
-        encode_configure_endpoint, TRB_TYPE_CONFIGURE_ENDPOINT_CMD, TRB_TYPE_SHIFT,
-    };
+    use crate::xhci::cmd_ring::{encode_configure_endpoint, TRB_TYPE_CONFIGURE_ENDPOINT_CMD};
     use crate::xhci::slot::{
         encode_ep_ctx_dword1, input_ctx_add_flag, EP_TYPE_BULK_IN, EP_TYPE_BULK_OUT,
     };
@@ -706,7 +702,7 @@ kernel_test_in!(
 fn smoke_e2e_bulk_in_roundtrip() -> TestResult {
     use crate::bulk::dci_for;
     use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_SHIFT};
-    use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
+    use crate::xhci::event_ring::{DecodedEvent, TransferEvent};
     use crate::xhci::transfer_ring::encode_normal;
 
     // EP1-IN: ep_addr = 0x81, DCI = 1*2+1 = 3.
@@ -776,7 +772,6 @@ kernel_test_in!("drivers/usb/e2e", smoke_e2e_bulk_in_roundtrip);
 
 fn smoke_e2e_interrupt_in_polling() -> TestResult {
     use crate::bulk::dci_for;
-    use crate::intr;
     use crate::xhci::cmd_ring::{TRB_IOC, TRB_TYPE_SHIFT};
     use crate::xhci::event_ring::{DecodedEvent, TransferEvent, EVT_TRANSFER};
     use crate::xhci::transfer_ring::encode_normal;

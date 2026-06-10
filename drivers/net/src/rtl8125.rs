@@ -493,6 +493,7 @@ pub const fn build_rx_desc(slot: usize, phys: u64, buf_size: u32) -> TxDesc {
 // v2 offload bits in TxDesc.vlan (word1). RTL8125 always uses v2 path.
 pub const TD1_GTSENV4: u32 = 1 << 26;
 pub const TD1_MSS_SHIFT: u32 = 18;
+#[allow(non_upper_case_globals)] // TODO(narf): mirrors the datasheet register/bit name
 pub const TD1_IPv4_CS: u32 = 1 << 29;
 pub const TD1_TCP_CS: u32 = 1 << 30;
 pub const RX_IPOK: u32 = 1 << 5;

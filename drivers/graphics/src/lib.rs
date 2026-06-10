@@ -14,6 +14,7 @@ pub mod generic;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
+    #[cfg(target_arch = "x86_64")]
     use narf_init::{InitResult, Stage};
     #[cfg(target_arch = "x86_64")]
     narf_init::register(Stage::Subsys, "bochs-display", || {

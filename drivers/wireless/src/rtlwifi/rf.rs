@@ -34,9 +34,6 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use narf_bus::MmioRegion;
-use narf_time::Deadline;
-
-use super::regs::*;
 
 // ── RF path / register addresses ─────────────────────────────────────────
 //

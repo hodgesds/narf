@@ -595,6 +595,7 @@ fn smoke_ipc_spsc_drop_ring_runs_payload_destructors() -> TestResult {
     use core::sync::atomic::{AtomicU32, Ordering};
     static DROPS: AtomicU32 = AtomicU32::new(0);
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     struct Counted(u32);
     impl Drop for Counted {
         fn drop(&mut self) {

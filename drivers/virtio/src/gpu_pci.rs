@@ -64,6 +64,7 @@ mod tests;
 // Command codes (VirtIO 1.2 §5.7.6).
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;

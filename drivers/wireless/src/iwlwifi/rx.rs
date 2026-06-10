@@ -30,7 +30,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 // ── RX ring constants ───────────────────────────────────────────────
 
 /// Default RX ring depth. Must be a power of 2. Linux uses 512 for

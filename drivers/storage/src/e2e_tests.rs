@@ -78,6 +78,7 @@ impl FakeBlockDevice {
     }
 
     /// Return a copy of backing bytes at `[byte_off..byte_off+len]`.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn backing_slice(&self, byte_off: usize, len: usize) -> Vec<u8> {
         let g = self.data.lock();
         g[byte_off..byte_off + len].to_vec()
@@ -190,10 +191,12 @@ impl FakeNvmeMmio {
         u32::from_le_bytes(self.mem[off..off + 4].try_into().unwrap())
     }
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn write64(&mut self, off: usize, val: u64) {
         self.mem[off..off + 8].copy_from_slice(&val.to_le_bytes());
     }
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn read64(&self, off: usize) -> u64 {
         u64::from_le_bytes(self.mem[off..off + 8].try_into().unwrap())
     }
@@ -772,6 +775,7 @@ kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_register_block_device);
 /// AHCI HBA register offsets (AHCI 1.3.1 §3.1).
 const AHCI_HBA_CAP: usize = 0x00;
 const AHCI_HBA_GHC: usize = 0x04;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const AHCI_HBA_IS: usize = 0x08;
 const AHCI_HBA_PI: usize = 0x0C;
 const AHCI_HBA_VS: usize = 0x10;
@@ -789,6 +793,7 @@ const PORT_CLB: usize = 0x00; // Command List Base Low
 const PORT_CLBU: usize = 0x04; // Command List Base High
 const PORT_FB: usize = 0x08; // FIS Receive Base Low
 const PORT_FBU: usize = 0x0C; // FIS Receive Base High
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PORT_IS: usize = 0x10; // Interrupt Status
 const PORT_CMD: usize = 0x18;
 const PORT_TFD: usize = 0x20;
@@ -799,6 +804,7 @@ const PORT_CI: usize = 0x38;
 const PORT_CMD_ST: u32 = 1 << 0;
 const PORT_CMD_FRE: u32 = 1 << 4;
 const PORT_CMD_FR: u32 = 1 << 14;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PORT_CMD_CR: u32 = 1 << 15;
 
 /// SATA device signature (ATA).

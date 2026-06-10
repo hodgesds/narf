@@ -254,6 +254,7 @@ impl RxDesc {
     /// Decode the RX checksum result from the legacy ixgbe RxDesc.
     /// The `csum` field is non-zero when hardware computed a checksum;
     /// `errors` being 0 means the check passed.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn csum_result(&self) -> RxCsumResult {
         if self.csum == 0 {
             RxCsumResult::None

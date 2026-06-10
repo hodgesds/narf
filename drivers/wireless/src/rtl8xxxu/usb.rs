@@ -411,6 +411,7 @@ pub trait Rtl8xxxuTransport {
 /// order; reads are served from a register-backed `HashMap` (default
 /// 0). Bulk-IN is served from a FIFO of pre-injected byte buffers.
 #[derive(Default)]
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct FakeUsbTransport {
     inner: core::cell::RefCell<FakeInner>,
 }

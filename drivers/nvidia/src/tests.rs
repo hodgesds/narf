@@ -893,7 +893,7 @@ kernel_test_in!(
 //   nvkm/subdev/bios/dcb.c::dcb_table (v3.0 branch) +
 //   dcb_outp_parse (*ver >= 0x20 branch).
 
-use crate::disp::{decode_dcb_entry_v30, decode_dcb_entry_versioned};
+use crate::disp::decode_dcb_entry_v30;
 use crate::kms::enumerate_dcb_versioned;
 
 fn smoke_dcb_v30_header_signature_and_version() -> TestResult {
@@ -1962,8 +1962,7 @@ kernel_test_in!(
 // ────────────────────────────────────────────────────────────────
 
 use crate::vbios::{
-    connector_entry, connector_table_header, connector_table_offset, ConnTableHeader,
-    ConnectorEntry, DCB_CONN_TABLE_PTR_OFFSET,
+    connector_entry, connector_table_header, connector_table_offset, DCB_CONN_TABLE_PTR_OFFSET,
 };
 
 fn smoke_vbios_connector_table_pointer_decode() -> TestResult {
@@ -2024,6 +2023,7 @@ kernel_test_in!(
     smoke_vbios_connector_table_header_parses_v40
 );
 
+#[allow(non_snake_case)] // TODO(narf): mirrors an external/spec symbol name
 fn smoke_vbios_connector_entry_decode_per_connEp() -> TestResult {
     let mut image = [0u8; 256];
     // Connector table at 0x80, 1 entry, 4 bytes.
@@ -2276,12 +2276,12 @@ fn smoke_gsp_rpc_header_pack_roundtrip() -> TestResult {
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_rpc_header_pack_roundtrip);
 
 fn smoke_gsp_enqueue_dequeue_round_trip() -> TestResult {
-    use crate::gsp::{Gsp, GspRpcRing};
+    use crate::gsp::GspRpcRing;
     // We can't easily build a real Gsp without an MmioRegion, but
     // the enqueue/dequeue logic is on the rings — synthesize them
     // and exercise the path through a stub.
     let mut cmdq = GspRpcRing::new(0x4000_0000, 4096);
-    let mut msgq = GspRpcRing::new(0x4000_4000, 4096);
+    let msgq = GspRpcRing::new(0x4000_4000, 4096);
     // Stage a fake RPC.
     let mut out = [0u8; 256];
     let info = GspSetSystemInfo::new(6, 4, 0x500_00);
@@ -3010,8 +3010,8 @@ kernel_test_in!("drivers/nvidia/nvdec", smoke_nvdec_firmware_request_naming);
 use crate::nvenc::{
     nvenc_class_for, nvenc_falcon_base, nvenc_firmware_for, nvenc_instance_count,
     stage_nvenc_encode, NvencCodec, NVENC_APPID_AV1, NVENC_APPID_H264, NVENC_APPID_HEVC,
-    NVENC_CLASS_ADA_A, NVENC_CLASS_AMPERE_A, NVENC_CLASS_MAXWELL_A, NVENC_CLASS_PASCAL_A,
-    NVENC_CLASS_TURING_A, NVENC_CLASS_VOLTA_A, NVENC_EXECUTE, NVENC_SET_APPLICATION_ID,
+    NVENC_CLASS_ADA_A, NVENC_CLASS_MAXWELL_A, NVENC_CLASS_PASCAL_A, NVENC_CLASS_TURING_A,
+    NVENC_EXECUTE, NVENC_SET_APPLICATION_ID,
 };
 
 fn smoke_nvenc_class_table_unique_per_family() -> TestResult {
@@ -3434,7 +3434,7 @@ kernel_test_in!(
 // ────────────────────────────────────────────────────────────────
 
 use crate::disp::nv50::{
-    doorbell_kick, enc_pixel_clock, enc_raster_blank_end, enc_raster_blank_start, enc_raster_size,
+    enc_pixel_clock, enc_raster_blank_end, enc_raster_blank_start, enc_raster_size,
     enc_raster_sync_end, head_method, put_value, stage_head_mode, stage_head_scanout, stage_update,
     DISP_CHAN_GET, DISP_CHAN_PUT, HEAD_CONTROL_INTERLACED, HEAD_CONTROL_PROGRESSIVE,
     NV507D_HEAD_SET_CONTEXT_DMA_ISO, NV507D_HEAD_SET_CONTROL, NV507D_HEAD_SET_OFFSET,

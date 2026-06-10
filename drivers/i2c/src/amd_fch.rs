@@ -50,7 +50,6 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::resource::ResourceItem;
 use narf_lib::mutex::Mutex as AsyncMutex;
-use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
 use crate::{I2cBus, I2cError, I2cOp};
@@ -688,6 +687,7 @@ fn try_route_irq(_gsi: u32, _acpi_flags: u8) -> Option<u8> {
 /// wakes the registered waker before invoking this; the body is a
 /// no-op because the transfer state machine reads IC_RAW_INTR_STAT
 /// directly to decide its next FIFO move.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn noop_irq() {}
 
 /// Test-only: list the HIDs we recognise. Used by smokes that want

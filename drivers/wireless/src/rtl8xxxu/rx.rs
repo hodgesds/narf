@@ -151,6 +151,7 @@ impl RxDesc24Decoded {
 }
 
 /// Slice of an RX URB into (descriptor, drvinfo, mpdu).
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct RxFrame<'a> {
     pub drvinfo: &'a [u8],
     pub mpdu: &'a [u8],

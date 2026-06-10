@@ -41,6 +41,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
 use crate::registry;
 
 pub type SmmMockFn = fn(cmd: u32, arg: u32) -> SmmResult;
@@ -237,6 +238,7 @@ impl crate::HwmonDevice for DellSmm {
         None // Dell SMM does not expose voltage sensors.
     }
 
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
     fn set_fan(&self, label: &str, level: u8) -> bool {
         let idx = match FAN_LABELS.iter().position(|&l| l == label) {
             Some(i) => i as u8,

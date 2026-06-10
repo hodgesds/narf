@@ -156,6 +156,7 @@ type EfiGetTimeFn = unsafe extern "efiapi" fn(
 ) -> EfiStatus;
 
 /// `EFI_SET_TIME` — UEFI 2.10 §8.3.2.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 type EfiSetTimeFn = unsafe extern "efiapi" fn(time: *const [u8; 16]) -> EfiStatus;
 
 /// `EFI_GET_VARIABLE` — UEFI 2.10 §8.2.1.

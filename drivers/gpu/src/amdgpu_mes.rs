@@ -532,7 +532,7 @@ mod smoke_tests {
 
     fn smoke_mes_ring_full() -> TestResult {
         // Ring of exactly 64 dws — first push fits, second fails.
-        let mut r = MesRing::new(0x10_0000, 64 * 4, 0x80).expect("ring");
+        let r = MesRing::new(0x10_0000, 64 * 4, 0x80).expect("ring");
         let pkt = build_set_hw_resources(0, 0, 0, 0, 0, false);
         // Wait — ring mask = 63; one push of 64 dws will wrap fully.
         // Use a ring of 128 dws + push twice.

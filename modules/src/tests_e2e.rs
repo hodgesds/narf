@@ -513,6 +513,7 @@ kernel_test_in!("modules/e2e", e2e_refcount_blocks_unload);
 
 /// Init function for smoke 4: registers "e2e_cleanup_alive" while
 /// the init-attribution context is set to this module's id.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 extern "C" fn smoke_init_cleanup() -> i32 {
     INIT_RAN.store(true, Ordering::Release);
     crate::symbols::export("e2e_cleanup_alive", smoke_alive as usize, 0x4242);

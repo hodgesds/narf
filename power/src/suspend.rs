@@ -597,6 +597,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
 /// goes to sleep — callers see a fresh `init` path on resume.
 pub fn s3_enter(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), SuspendError> {
     cap.invoke(NoopOp)?;
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
     let slp = s3_slp_typ().ok_or(SuspendError::NotImplemented)?;
 
     // `\_PTS(slp_state)` runs platform-specific quiesce AML (turns

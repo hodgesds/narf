@@ -33,6 +33,7 @@ const INDEX_OP: u8 = 0x88;
 const MID_OP: u8 = 0x9E;
 const OBJECT_TYPE_OP: u8 = 0x8E;
 const MATCH_OP: u8 = 0x89;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const COND_REF_OF_PREFIX: u8 = 0x12; // Extended (0x5B 0x12) — handled in EXT path
 const CONTINUE_OP: u8 = 0x9F;
 const STORE_OP: u8 = 0x70;

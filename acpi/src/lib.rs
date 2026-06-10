@@ -1655,16 +1655,21 @@ pub fn enable_gpe(gpe_num: u32) {
     };
 
     if let Some(b) = block {
-        let half = b.byte_count as u64 / 2;
-        let reg_idx = bit / 8;
-        let reg_bit = bit % 8;
-        let port = b.address + half + reg_idx as u64;
-        // SAFETY: part of the validated GPE block.
+        // GPE enable is an x86 port-I/O write; a no-op on other arches.
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let val = narf_arch::x86_64::io_port::inb(port as u16);
-            narf_arch::x86_64::io_port::outb(port as u16, val | (1 << reg_bit));
+        {
+            let half = b.byte_count as u64 / 2;
+            let reg_idx = bit / 8;
+            let reg_bit = bit % 8;
+            let port = b.address + half + reg_idx as u64;
+            // SAFETY: part of the validated GPE block.
+            unsafe {
+                let val = narf_arch::x86_64::io_port::inb(port as u16);
+                narf_arch::x86_64::io_port::outb(port as u16, val | (1 << reg_bit));
+            }
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (&b, bit);
     }
 }
 

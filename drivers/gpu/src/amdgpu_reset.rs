@@ -31,6 +31,7 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
 
 // ── Engine + TDR config ────────────────────────────────────────────

@@ -40,7 +40,7 @@ use super::fwdl::{
 };
 use super::h2c::{
     make_fwhdr_dl_h2c, make_joininfo_h2c, make_log_cfg_h2c, make_ofld_cfg_h2c,
-    make_ra_macidcfg_h2c, make_scanofld_h2c, H2cBuilder, H2cSeqAllocator, H2C_CAT_CTL_DRV_GEN,
+    make_ra_macidcfg_h2c, make_scanofld_h2c, H2cSeqAllocator, H2C_CAT_CTL_DRV_GEN,
     H2C_CAT_MAC as H2C_CAT_MAC_H2C, H2C_CAT_OUTSRC, H2C_CAT_TEST, H2C_CL_FW_INFO,
     H2C_CL_MAC_FR_EXCHG, H2C_CL_MAC_FWDL as H2C_CL_MAC_FWDL_H2C, H2C_CL_MAC_FW_OFLD,
     H2C_CL_MAC_MEDIA_RPT, H2C_CL_OUTSRC_RA, H2C_CL_OUTSRC_RF_FW_RFK, H2C_FUNC_MAC_BCN_UPD,
@@ -59,15 +59,14 @@ use super::mac_init::{
 use super::pci::{name_for, register_pci_driver};
 use super::phy::PhyError;
 use super::phy_table::{
-    pd, pp, pw, tx_pwr_clamp, PhyEntry, PhyOp, TxPwrByRate, BB_RF_BOOTSTRAP_TABLE,
-    TXPWR_BYRATE_TABLE_SIZE,
+    pd, pp, pw, tx_pwr_clamp, PhyOp, TxPwrByRate, BB_RF_BOOTSTRAP_TABLE, TXPWR_BYRATE_TABLE_SIZE,
 };
 use super::txrx::{
     decode_rxd, encode_h2c_header, encode_rxd_for_test, encode_txwd as encode_txd, RxdInfo,
-    TxwdInfo, AX_RXD_CRC32_ERR, AX_RXD_RPKT_TYPE_WIFI, H2C_CAT_MAC, H2C_CL_MAC_FWDL,
-    H2C_FUNC_MAC_FWHDR_DL, H2C_HDR_REC_ACK, H2C_HEADER_LEN, QSEL_B0_BE, RXD_SHORT_SIZE,
-    TXWD_BODY0_CHANNEL_MASK, TXWD_BODY0_WD_INFO_EN, TXWD_BODY2_MACID_MASK, TXWD_BODY2_QSEL_MASK,
-    TXWD_BODY2_TXPKT_SIZE_MASK, TXWD_BODY_SIZE,
+    TxwdInfo, AX_RXD_RPKT_TYPE_WIFI, H2C_CAT_MAC, H2C_CL_MAC_FWDL, H2C_FUNC_MAC_FWHDR_DL,
+    H2C_HDR_REC_ACK, H2C_HEADER_LEN, QSEL_B0_BE, RXD_SHORT_SIZE, TXWD_BODY0_CHANNEL_MASK,
+    TXWD_BODY0_WD_INFO_EN, TXWD_BODY2_MACID_MASK, TXWD_BODY2_QSEL_MASK, TXWD_BODY2_TXPKT_SIZE_MASK,
+    TXWD_BODY_SIZE,
 };
 use super::*;
 

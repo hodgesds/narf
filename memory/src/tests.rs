@@ -1376,7 +1376,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        use crate::aarch64::paging::{self, PtFlags};
+        use crate::aarch64::paging::{self};
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
             Some(phys) => {

@@ -2076,12 +2076,16 @@ fn smoke_aml_ec_events_register_and_lookup_round_trip() -> TestResult {
         return TestResult::Fail("fresh registry must have no handlers");
     }
     register_qxx_handler(0x42, handler_42);
+    #[allow(unpredictable_function_pointer_comparisons)]
+    // TODO(narf): comparing fn pointers — only used to assert a handler was registered
     if lookup_qxx_handler(0x42) != Some(handler_42 as _) {
         return TestResult::Fail("lookup didn't return registered handler");
     }
     // Registering again with a different fn replaces in place.
     fn handler_42_v2(_idx: u8) {}
     register_qxx_handler(0x42, handler_42_v2);
+    #[allow(unpredictable_function_pointer_comparisons)]
+    // TODO(narf): comparing fn pointers — only used to assert a handler was registered
     if lookup_qxx_handler(0x42) != Some(handler_42_v2 as _) {
         return TestResult::Fail("re-register didn't replace prior handler");
     }
@@ -2357,7 +2361,7 @@ fn smoke_aml_wmi_invoke_method_via_aml() -> TestResult {
     // invoke_method always prepends [instance=0, method_id] as Arg0/Arg1.
     // The method computes Arg0 + Arg1 = 0 + method_id.
     // We call with method_id=9 → expect Integer(9).
-    use crate::wmi::{invoke_method, WmiGuid, WDG_FLAG_METHOD};
+    use crate::wmi::{WmiGuid, WDG_FLAG_METHOD};
     use crate::Value;
 
     // Build Method(\WITS, 2, { Return(Add(Arg0, Arg1, Local0)) })

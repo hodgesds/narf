@@ -94,6 +94,7 @@ pub const VECTOR_ERR: u8 = 2;
 
 /// Mapping from cause index to vector. Used to drive `set_ivar`
 /// during bring-up.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct CauseMap {
     pub cause: u8,
     pub vector: u8,

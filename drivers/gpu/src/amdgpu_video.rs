@@ -873,7 +873,7 @@ mod smoke_tests {
     fn smoke_dpb_admit_retire_round_trip() -> TestResult {
         let mut s = DecodeSession::new(VcnVersion::V4_0_5, Codec::Hevc, 3840, 2160).unwrap();
         // Admit 3 frames; check round-trip.
-        let s1 = s.admit_ref(0x1_0000_0000, 0, false).expect("admit 1");
+        let _s1 = s.admit_ref(0x1_0000_0000, 0, false).expect("admit 1");
         let s2 = s.admit_ref(0x2_0000_0000, 1, false).expect("admit 2");
         let _s3 = s.admit_ref(0x3_0000_0000, 2, true).expect("admit 3");
         if s.dpb_used() != 3 {

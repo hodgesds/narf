@@ -98,6 +98,7 @@ fn path_args(path: &[u8]) -> SyscallArgs {
     }
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn pivot_args(new_root: &[u8], put_old: &[u8]) -> SyscallArgs {
     SyscallArgs {
         arg0: new_root.as_ptr() as u64,

@@ -21,8 +21,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
-#[cfg(not(feature = "kernel-test"))]
-use crate::status;
 use crate::{registry, FbWriter};
 
 static DRAIN_TICKS: AtomicU64 = AtomicU64::new(0);
@@ -35,8 +33,10 @@ static DRAIN_ERRORS: AtomicU64 = AtomicU64::new(0);
 /// HPET probe failure on Zen2 mobile silicon is the motivating
 /// case). Read via raw `now_cycles()` so no wheel dependency.
 #[cfg(not(feature = "kernel-test"))]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 static STATUS_LAST_TSC: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(feature = "kernel-test"))]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const STATUS_REPAINT_CYCLES: u64 = 250_000_000;
 
 /// Snapshot the per-tick / per-call counters. Returns

@@ -277,6 +277,7 @@ pub struct VirtioInputPci {
     /// `None` when the device didn't expose a Device cfg cap —
     /// older QEMU builds skip it for virtio-multitouch and the
     /// driver carries on without axis bounds in that case.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     device_cfg: Option<crate::pci::VirtioRegion>,
     /// Human-readable device name pulled from
     /// `VIRTIO_INPUT_CFG_ID_NAME` at probe. Empty when the cap

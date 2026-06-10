@@ -304,7 +304,7 @@ pub fn parse_nvram(data: &[u8]) -> NvramParsed {
         // Consume `=`.
         i += 1;
         // Scan VALUE until first non-NVRAM char (whitespace/NUL/comment).
-        let val_start = i;
+        let _val_start = i;
         while i < data.len() && is_nvram_char(data[i]) {
             i += 1;
         }
