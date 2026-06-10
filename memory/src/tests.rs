@@ -715,14 +715,20 @@ fn smoke_alloc_pages_on_returns_in_ram() -> TestResult {
     // (the QEMU PCI hole), allocations from that node would land
     // there and a downstream dereference would fault.
     use crate::frame::alloc_pages_on;
-    let s = crate::frame_stats();
-    let usable_bytes = (s.total as u64).saturating_mul(crate::PAGE_SIZE);
+    // The kernel direct/identity map covers the low 4 GiB on x86_64; an
+    // allocation above that ceiling page-faults on first access. RAM is
+    // NOT contiguous from 0 (PCI hole + reserved regions), so
+    // `total_frames * PAGE_SIZE` is not a valid upper bound — a frame
+    // legitimately above that count-derived size still sits in usable
+    // RAM (that mismatch made this test intermittently fail). Use the
+    // same 4 GiB ceiling as `smoke_frame_alloc_returns_pointer_in_ram`.
+    const RAM_CEILING: u64 = 4u64 << 30;
     let pages = match alloc_pages_on(0, 0) {
         Ok(p) => p,
         Err(_) => return TestResult::Skip("alloc_pages_on failed"),
     };
     let phys = pages.start_address().raw();
-    let ok_range = phys < usable_bytes;
+    let ok_range = phys < RAM_CEILING;
     let ok_align = phys & (crate::PAGE_SIZE - 1) == 0;
     crate::frame::free_pages(pages, 0);
     if !ok_range {

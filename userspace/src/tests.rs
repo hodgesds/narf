@@ -9119,16 +9119,33 @@ fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Linux execve(path, argv[], envp[]): the kernel resolves `path`
+    // through the VFS and reads the ELF from it, so mount the program
+    // as a file first.
     let elf = build_minimal_elf_for_execve();
-    // argv pack: "/usr/bin/foo\0" → one NUL-terminated string.
-    let argv = b"/usr/bin/foo\0".to_vec();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-comm",
+        narf_filesystem::MemFs::with_seeds("execve-comm", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("mount of execve FS failed");
+    }
 
+    // argv[0] = "/usr/bin/foo" → comm = basename = "foo". argv is a
+    // NUL-terminated array of `char *`, each a NUL-terminated string.
+    let path = b"/execve-comm/prog\0";
+    let arg0 = b"/usr/bin/foo\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: argv.as_ptr() as u64,
-            arg3: argv.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
             arg4: 0,
             arg5: 0,
         },
@@ -9140,6 +9157,9 @@ fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
 
     let pid = FAKE_TID.load(Ordering::Relaxed);
     let comm = crate::handlers::proc_comm_of(pid);
+    if let Ok(h) = mounted {
+        let _ = narf_filesystem::registry().unmount(&h, "/execve-comm");
+    }
     crate::syscall::__test_clear_global();
     match comm {
         Some(s) if s == "foo" => TestResult::Pass,
@@ -9175,15 +9195,37 @@ fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Linux execve(path, argv[], envp[]): mount the program so the VFS
+    // can resolve `path`, then pass argv as a NUL-terminated array of
+    // `char *`. argv = ["init", "-q", "--debug"].
     let elf = build_minimal_elf_for_execve();
-    // argv pack: ["init", "-q", "--debug"] → "init\0-q\0--debug\0".
-    let argv = b"init\0-q\0--debug\0".to_vec();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-cmd",
+        narf_filesystem::MemFs::with_seeds("execve-cmd", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("mount of execve FS failed");
+    }
+    let path = b"/execve-cmd/prog\0";
+    let a0 = b"init\0";
+    let a1 = b"-q\0";
+    let a2 = b"--debug\0";
+    let argv: [u64; 4] = [
+        a0.as_ptr() as u64,
+        a1.as_ptr() as u64,
+        a2.as_ptr() as u64,
+        0,
+    ];
+    let envp: [u64; 1] = [0];
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: argv.as_ptr() as u64,
-            arg3: argv.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
             arg4: 0,
             arg5: 0,
         },
@@ -9193,6 +9235,9 @@ fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
 
     let pid = FAKE_TID.load(Ordering::Relaxed);
     let recorded = crate::handlers::proc_argv_of(pid);
+    if let Ok(h) = mounted {
+        let _ = narf_filesystem::registry().unmount(&h, "/execve-cmd");
+    }
     crate::syscall::__test_clear_global();
     // We expect the same NUL-separated shape Linux reports: the
     // original pack bytes joined back together.
