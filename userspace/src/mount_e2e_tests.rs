@@ -38,6 +38,13 @@ impl TrapContext for StubCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }

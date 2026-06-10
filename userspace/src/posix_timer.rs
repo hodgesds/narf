@@ -395,8 +395,28 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    // Reuse the sys_sleep busy-wait + pump path.
     let deadline = now.saturating_add(delta);
+
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        if let Some(h) = crate::signal_delivery_hook() {
+            h(ctx, crate::Syscall::ClockNanosleep.raw());
+        }
+
+        ctx.set_return(SyscallReturn::ok(0));
+        unsafe {
+            let uc = &*uctx;
+            uc.sleep_deadline_ns
+                .store(deadline, core::sync::atomic::Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+
     while narf_scheduler::narf_time::monotonic_ns() < deadline {
         narf_scheduler::sleep_pumps::run();
         core::hint::spin_loop();

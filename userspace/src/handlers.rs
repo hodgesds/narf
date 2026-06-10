@@ -34,6 +34,49 @@ use crate::{
     TrapContext,
 };
 
+// ── Signal wakers ───────────────────────────────────────────────────
+
+static SIGNAL_WAKERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn signal_waker_init() {
+    *SIGNAL_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+}
+
+pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
+    let mut g = SIGNAL_WAKERS.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task_id, waker);
+    }
+}
+
+pub fn wake_signal(task_id: u64) {
+    if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
+        let uctx = unsafe { &*uctx_ptr };
+        // If the task is blocked in an infinite wait (pause, epoll_wait),
+        // clear the deadline to wake it.
+        let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
+        if deadline == u64::MAX {
+            uctx.sleep_deadline_ns.store(0, Ordering::Release);
+        }
+    }
+    let waker = {
+        let mut g = SIGNAL_WAKERS.lock();
+        g.as_mut().and_then(|m| m.remove(&task_id))
+    };
+    if let Some(w) = waker {
+        w.wake();
+    }
+}
+
+pub fn drop_signal_waker(task_id: u64) {
+    let mut g = SIGNAL_WAKERS.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&task_id);
+    }
+}
+
 // ── Current-task lookup shim ───────────────────────────────────────
 //
 // Same shape as `AS_LOOKUP` — wired in by the kernel boot to
@@ -49,6 +92,15 @@ static TASK_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TaskIdLookupFn>> =
 /// Boot wires `|| scheduler::current_task_id().raw()` here.
 pub fn install_task_id_lookup(lookup: TaskIdLookupFn) {
     *TASK_LOOKUP.lock() = Some(lookup);
+}
+
+/// Test hook: drop any installed current-task lookup so
+/// `current_task_id()` falls back to 0. The in-kernel smoke tests
+/// share one boot, and `TASK_LOOKUP` is a process-global — without a
+/// reset, a test that installs a fixed-id lookup leaks it into later
+/// tests that assume the default (e.g. signalfd / per-tty pgrp tests).
+pub fn __test_reset_task_id_lookup() {
+    *TASK_LOOKUP.lock() = None;
 }
 
 pub fn current_task_id() -> u64 {
@@ -782,9 +834,16 @@ fn sys_open_linux(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -834,10 +893,8 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         }
     };
 
-    // Stdio (fd 0/1/2) is auto-installed in fresh fd tables by
-    // `fd::with_table`, so all fds — including stdio — route
-    // through the same per-task table path.
     let task = current_task_id();
+
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
@@ -1916,9 +1973,16 @@ fn sys_unlinkat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -1964,9 +2028,16 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2016,9 +2087,16 @@ fn sys_renameat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2060,9 +2138,16 @@ fn sys_symlinkat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2105,9 +2190,16 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2163,9 +2255,16 @@ fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2216,9 +2315,16 @@ fn sys_newfstatat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2518,9 +2624,16 @@ fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -2715,9 +2828,16 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
         fn args(&self) -> &SyscallArgs {
             &self.args
         }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.inner.set_return(r);
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
         }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
             self.inner.redirect_to_kernel(rip, rsp)
         }
@@ -3051,13 +3171,12 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
 fn sys_unlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0 as u64;
-    let len = args.arg1 as usize;
     // POSIX-shaped failure sentinel. The kernel's syscall ABI carries
     // a separate `status` field but the user-runtime asm wrapper only
     // observes the `value` register; we mirror libc and return -1 on
     // failure so the caller can distinguish from a success return of 0.
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_path(ptr, len) {
+    let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -3084,9 +3203,8 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
 fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0 as u64;
-    let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_path(ptr, len) {
+    let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -3104,9 +3222,8 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
 fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0 as u64;
-    let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_path(ptr, len) {
+    let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -3124,18 +3241,16 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
 fn sys_rename(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let old_ptr = args.arg0 as u64;
-    let old_len = args.arg1 as usize;
-    let new_ptr = args.arg2 as u64;
-    let new_len = args.arg3 as usize;
+    let new_ptr = args.arg1 as u64;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let old_path = match copy_user_path(old_ptr, old_len) {
+    let old_path = match copy_user_cstr(old_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let new_path = match copy_user_path(new_ptr, new_len) {
+    let new_path = match copy_user_cstr(new_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -4319,6 +4434,12 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
 // ── ExitTask — redirect to a kernel-registered landing ─────────────
 
 fn sys_exit_task(ctx: &mut dyn TrapContext) {
+    let exit_code = ctx.args().arg0 as u32;
+    let wstatus = (exit_code & 0xff) << 8;
+    let tid = current_task_id();
+    let pid = task_to_pid_raw(tid).unwrap_or(tid);
+    stage_pending_termination(pid, wstatus as i32);
+
     // Polling-future path: if a UserTaskCtx is installed AND an
     // exit hook is registered, save the user state, mark the
     // reason, and tail-call the hook — which longjmps back into
@@ -4353,9 +4474,31 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
     // Redirect succeeded → frame rewritten, `iretq` lands in kernel.
 }
 
+fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
+    let task = current_task_id();
+    let pending = {
+        let g = SIGNAL_PENDING.lock();
+        g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0)
+    };
+    let mask = signal_mask_of(task);
+    if (pending & !mask) != 0 {
+        if let Some(hook) = signal_delivery_hook() {
+            // EINTR
+            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+            hook(ctx, syscall_no);
+            return true;
+        }
+    }
+    false
+}
+
 // ── Yield — cooperative scheduler hand-back ────────────────────────
 
 fn sys_yield(ctx: &mut dyn TrapContext) {
+    if maybe_deliver_signal_before_yield(ctx, Syscall::Yield.raw()) {
+        return;
+    }
+
     // Polling-future path mirroring sys_exit_task.
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -4370,6 +4513,7 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
         }
         // unreachable
     }
+
     // No polling executor wired yet — but a user task that yields
     // is asking for "let other work run." Drive the same pumps
     // sys_sleep does so the FB drain (and any other registered
@@ -4378,6 +4522,40 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
     // forever because nothing else runs.
     sleep_pumps::run();
     ctx.set_return(SyscallReturn::ok(0));
+}
+
+fn sys_pause(ctx: &mut dyn TrapContext) {
+    if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
+        return;
+    }
+
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        unsafe {
+            let uc = &*uctx;
+            // Block forever by setting deadline to u64::MAX.
+            // Any signal delivery will wake the task via wake_signal().
+            uc.sleep_deadline_ns
+                .store(u64::MAX, core::sync::atomic::Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+
+    // Fallback: no polling executor is wired (kernel-test contexts),
+    // so there is nothing to park on. Pump any ready async work once
+    // in case a signal is about to become deliverable, retry delivery,
+    // then surface EINTR rather than spinning forever — a real task
+    // always takes the yield-hook path above and never reaches here.
+    narf_scheduler::sleep_pumps::run();
+    if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
 }
 
 // ── RingKick — drain the shared SQ, post completions to the CQ ────
@@ -4827,7 +5005,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     let share_vm = (flags & CLONE_VM) != 0;
     let share_thread = (flags & CLONE_THREAD) != 0;
     let share_fs = (flags & CLONE_FS) != 0;
-    let share_files = (flags & CLONE_FILES) != 0;
+    let _share_files = (flags & CLONE_FILES) != 0;
     let _share_sighand = (flags & CLONE_SIGHAND) != 0;
     let _share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
 
@@ -4972,12 +5150,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // CLONE_THREAD children visible_pid == parent's pid, so the
     // mapping is "child TaskId → parent's PID" — gettid returns
     // the TaskId raw, getpid translates TaskId → PID.
-    register_pid_task_mapping(child_visible_pid, child_tid.raw());
+    if share_thread {
+        register_task_to_pid(child_tid.raw(), child_visible_pid);
+    } else {
+        register_pid_task_mapping(child_visible_pid, child_tid.raw());
+    }
 
     // POSIX-shaped inheritance for the non-shared resources.
-    if !share_files {
-        crate::fd::fork(parent_pid, child_tid.raw());
-    }
+    // Wave-81 temporary fix: always copy the table so threads
+    // have an entry in the FD table registry. Shared-offset
+    // semantics for CLONE_FILES are deferred.
+    crate::fd::fork(parent_pid, child_tid.raw());
+
     if !share_fs {
         cwd_fork(parent_pid, child_tid.raw());
     }
@@ -5409,6 +5593,8 @@ pub fn wait_init() {
     crate::user_task::register_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
+    crate::user_task::user_task_ctx_init();
+    signal_waker_init();
     crate::pidfd::init();
     // Wave-65: clone3 CLONE_CHILD_CLEARTID + set_tid_address(2)
     // bookkeeping. The table holds per-task user-pointer slots;
@@ -5565,18 +5751,22 @@ pub fn pid_task_map_reset() {
 /// boot spawn_one for every user task that gets a user-visible ProcessId.
 /// Records both directions simultaneously so all translations are O(1).
 pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
-    {
-        let mut g = PID_TO_TASK.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(pid_raw, task_raw);
-        }
-    }
-    {
-        let mut g = TASK_TO_PID.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(task_raw, pid_raw);
-        }
-    }
+    register_task_to_pid(task_raw, pid_raw);
+    // Self-initialize: the map may be `None` if `wait_init` hasn't run
+    // yet (early boot, or the kernel-test harness which boots straight
+    // into the smoke runner). Without this a `fork` registration would
+    // silently no-op and every later pid→task translation would miss.
+    PID_TO_TASK
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(pid_raw, task_raw);
+}
+
+pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
+    TASK_TO_PID
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task_raw, pid_raw);
 }
 
 /// Translate a user-visible ProcessId to the scheduler TaskId. Returns
@@ -8911,11 +9101,47 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 // per-task block mask (modified by `sigprocmask`). NSIG = 32 so
 // `1 << signum` is a u32-clean fit.
 
-static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn is_signal_pending(task_id: u64) -> bool {
+    let pending = {
+        let g = SIGNAL_PENDING.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task_id).copied())
+            .unwrap_or(0)
+    };
+    let mask = signal_mask_of(task_id);
+    (pending & !mask) != 0
+}
 
 static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+// Per-task flag recording whether the most recently delivered signal
+// frame is the Linux `rt_sigframe` (restorer-based) layout. The Linux
+// `rt_sigreturn` (x86_64 #15) takes no argument — the frame is found
+// at the user RSP. NARF's own libc trampoline instead forwards the
+// SigContext vaddr in arg0. We can't tell them apart at sigreturn time
+// from registers alone (a restorer leaves arbitrary garbage in RDI),
+// so we remember the delivery style here. `true` ⇒ resolve the frame
+// from RSP; `false` ⇒ trust arg0.
+static SIGRETURN_USE_RSP: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, bool>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn set_sigreturn_use_rsp(task: u64, use_rsp: bool) {
+    let mut g = SIGRETURN_USE_RSP.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    map.insert(task, use_rsp);
+}
+
+fn sigreturn_use_rsp(task: u64) -> bool {
+    SIGRETURN_USE_RSP
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(false)
+}
 
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
@@ -9216,7 +9442,8 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
             let prot = r.perms.prot_only();
             let label: &'static str = if base == crate::process::DEFAULT_USER_STACK_BASE {
                 "[stack]"
-            } else if base == 0x8000_0000_0000_u64 || (base & 0xffff_ffff_0000_0000) == 0x8000_0000
+            } else if base == 0x8000_0000_0000_u64
+                || (base & 0xffff_ff00_0000_0000) == 0x8000_0000_0000
             {
                 "[text]"
             } else if brk_top != 0 && base <= brk_top && brk_top <= end {
@@ -9408,6 +9635,12 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
             }
         }
     }
+    // Wave-65 follow-up: SIGNAL_PENDING is keyed by TaskId (tid),
+    // but sys_kill takes a ProcessId (pid). Translate.
+    if let Some(tid) = pid_to_task_raw(target) {
+        target = tid;
+    }
+
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -9418,6 +9651,7 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     };
     let slot = map.entry(target).or_insert(0);
     *slot |= 1u32 << signum;
+    wake_signal(target);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -9613,6 +9847,7 @@ fn sys_tgkill(ctx: &mut dyn TrapContext) {
     };
     let slot = map.entry(tid).or_insert(0);
     *slot |= 1u32 << signum;
+    wake_signal(tid);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -9623,28 +9858,57 @@ const SIG_SETMASK: u32 = 2;
 fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let how = args.arg0 as u32;
-    let set = args.arg1 as u32;
+    let set_ptr = args.arg1 as u64;
+    let old_ptr = args.arg2 as u64;
+    let sigsetsize = args.arg3 as usize;
+
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if sigsetsize != 8 {
+        ctx.set_return(fail);
+        return;
+    }
+
     let task = current_task_id();
-    let mut g = SIGNAL_MASK.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+
+    if old_ptr != 0 {
+        let mask = SIGNAL_MASK
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&task).copied())
+            .unwrap_or(0);
+        if unsafe { copy_to_user(old_ptr, &mask.to_ne_bytes()) }.is_err() {
+            ctx.set_return(fail);
             return;
         }
-    };
-    let slot = map.entry(task).or_insert(0);
-    let prior = *slot;
-    *slot = match how {
-        SIG_BLOCK => prior | set,
-        SIG_UNBLOCK => prior & !set,
-        SIG_SETMASK => set,
-        _ => {
-            ctx.set_return(SyscallReturn::invalid_op());
+    }
+
+    if set_ptr != 0 {
+        let mut buf = [0u8; 8];
+        if unsafe { copy_from_user(&mut buf, set_ptr) }.is_err() {
+            ctx.set_return(fail);
             return;
         }
-    };
-    ctx.set_return(SyscallReturn::ok(prior as u64));
+        let set = u64::from_ne_bytes(buf);
+        let mut g = SIGNAL_MASK.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        let slot = map.entry(task).or_insert(0);
+        match how {
+            SIG_BLOCK => *slot |= set as u32,
+            SIG_UNBLOCK => *slot &= !(set as u32),
+            SIG_SETMASK => *slot = set as u32,
+            _ => {
+                ctx.set_return(fail);
+                return;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── Phase-2 signal gap-fills ────────────────────────────────────────
@@ -9721,29 +9985,26 @@ fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
     // even if the *ss_in install fails, the query result is the
     // pre-install state).
     if ss_out != 0 {
-        // SAFETY: caller-supplied pointer; we trust the user mode
-        // ABI here as elsewhere in this file. A bad pointer faults
-        // and the kernel's fault handler turns it into a kill —
-        // user error.
-        unsafe {
-            let p = ss_out as *mut u8;
-            (p as *mut u64).write_unaligned(current.sp);
-            (p.add(8) as *mut u32).write_unaligned(current.flags);
-            (p.add(12) as *mut u32).write_unaligned(0);
-            (p.add(16) as *mut u64).write_unaligned(current.size);
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&current.sp.to_ne_bytes());
+        buf[8..12].copy_from_slice(&current.flags.to_ne_bytes());
+        buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
+        buf[16..24].copy_from_slice(&current.size.to_ne_bytes());
+        if unsafe { copy_to_user(ss_out, &buf) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
         }
     }
 
     if ss_in != 0 {
-        // SAFETY: same.
-        let (sp, flags, size) = unsafe {
-            let p = ss_in as *const u8;
-            (
-                (p as *const u64).read_unaligned(),
-                (p.add(8) as *const u32).read_unaligned(),
-                (p.add(16) as *const u64).read_unaligned(),
-            )
-        };
+        let mut buf = [0u8; 24];
+        if unsafe { copy_from_user(&mut buf, ss_in) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+        let sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let flags = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let size = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
         // Validate: flags must be a subset of {SS_DISABLE, SS_ONSTACK},
         // and if not SS_DISABLE the size must meet MIN_SIGSTKSZ.
         if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 {
@@ -9784,6 +10045,7 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
     };
     let slot = map.entry(tid).or_insert(0);
     *slot |= 1u32 << signum;
+    wake_signal(tid);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -9836,35 +10098,32 @@ fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
 /// arg0 = set in ptr, arg1 = sigsetsize (must be 8).
 fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let set_in = args.arg0;
+    let set_uptr = args.arg0;
     let sigsetsize = args.arg1;
-    if sigsetsize != 8 || set_in == 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    if sigsetsize != 8 || set_uptr == 0 {
+        ctx.set_return(fail);
         return;
     }
-    // SAFETY: caller-supplied pointer.
-    let mask = unsafe { (set_in as *const u64).read_unaligned() as u32 };
+
+    let mut buf = [0u8; 8];
+    if unsafe { copy_from_user(&mut buf, set_uptr) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    let mask = u64::from_ne_bytes(buf) as u32;
     let task = current_task_id();
-    let mut g = SIGNAL_MASK.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-            return;
-        }
-    };
-    // Linux semantics: replace mask wholesale, original is
-    // restored by the libc trampoline post-handler. We could
-    // park-and-poll here to wait for a deliverable signal, but
-    // that requires a `signal_pump` like sleep_pump — landing
-    // that is a follow-on. Today the function returns
-    // immediately with the new mask installed; if a signal
-    // arrives during the trip back to user mode, the
-    // default_signal_delivery hook will deliver it.
-    map.insert(task, mask);
-    // POSIX: always returns -1 with errno = EINTR. The user-side
-    // libc wrapper masks the return.
-    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+
+    // Temporarily install the new mask.
+    {
+        let mut g = SIGNAL_MASK.lock();
+        let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+        map.insert(task, mask);
+    }
+
+    // Pause until signal.
+    sys_pause(ctx);
 }
 
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux
@@ -9941,7 +10200,7 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
 //
 // Same shape as `install_address_space_lookup` so the trap path
 // doesn't need a direct dep on this crate's signal internals.
-type SignalDeliveryHook = fn(&mut dyn TrapContext, u32);
+pub type SignalDeliveryHook = fn(&mut dyn TrapContext, u32) -> bool;
 
 static SIGNAL_DELIVERY_HOOK: narf_lib::sync::IrqSafeSpinLock<Option<SignalDeliveryHook>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -10031,6 +10290,7 @@ fn build_delivery_params(
         && altstack.size != 0;
     SigDeliveryParams {
         handler: action.handler,
+        restorer: action.restorer,
         signum,
         flags: action.flags,
         altstack_sp: if altstack_valid { altstack.sp } else { 0 },
@@ -10065,21 +10325,17 @@ fn build_delivery_params(
 ///   arch can lay out the frame on the altstack (SA_ONSTACK),
 ///   push the 3-arg siginfo_t+ucontext frame (SA_SIGINFO), and
 ///   rewind RIP for re-execution (SA_RESTART).
-pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) {
+pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     if !ctx.returning_to_user() {
-        return;
+        return false;
     }
     let task = current_task_id();
-    // Single lock acquire on the fast path: peek pending+mask
-    // under one lock each, decide whether there's anything to
-    // do, then re-lock briefly to clear the chosen bit. The
-    // common case (nothing pending) falls out after the first
-    // peek with no work.
+
     let pending = {
         let g = SIGNAL_PENDING.lock();
         match g.as_ref().and_then(|m| m.get(&task).copied()) {
             Some(p) if p != 0 => p,
-            _ => return,
+            _ => return false,
         }
     };
     let mask = SIGNAL_MASK
@@ -10089,9 +10345,10 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) {
         .unwrap_or(0);
     let deliverable = pending & !mask;
     if deliverable == 0 {
-        return;
+        return false;
     }
     let signum = deliverable.trailing_zeros();
+
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
         None => {
@@ -10124,14 +10381,17 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) {
                     }
                 }
             }
-            return;
+            return true;
         }
     };
     // Async signals: si_code = SI_USER (0), si_addr = 0.
     let params = build_delivery_params(task, action, signum, syscall_no, 0, 0);
     if !ctx.deliver_signal(&params) {
-        return;
+        return false;
     }
+    // Remember whether this frame is the restorer-based Linux
+    // rt_sigframe so `sys_sigreturn` resolves it from RSP.
+    set_sigreturn_use_rsp(task, params.restorer != 0);
     // Clear only after the rewrite succeeded — a failed
     // delivery (e.g. arch returns false) should leave pending
     // alone so the next trap retries.
@@ -10157,6 +10417,7 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) {
             }
         }
     }
+    true
 }
 
 // ── Synchronous-signal delivery for CPU exceptions ────────────────
@@ -10331,7 +10592,11 @@ pub fn default_sync_signal_delivery(
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
     let params = build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr);
-    ctx.deliver_signal(&params)
+    let delivered = ctx.deliver_signal(&params);
+    if delivered {
+        set_sigreturn_use_rsp(task, params.restorer != 0);
+    }
+    delivered
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────
@@ -10358,6 +10623,8 @@ pub const SA_RESETHAND: u32 = 0x80_00_00_00;
 pub struct SigAction {
     /// User vaddr of the handler. `None` slot ⇒ no handler installed.
     pub handler: u64,
+    /// User vaddr of the restorer trampoline (for Linux ABI).
+    pub restorer: u64,
     /// Linux `sa_flags` (SA_*).
     pub flags: u32,
 }
@@ -10414,7 +10681,20 @@ fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     // arg0 = SigContext vaddr (from libc trampoline, originally
     // delivered in RSI by deliver_signal). The trampoline keeps it
     // alive across the user's signal-handler call.
-    let sc_vaddr = ctx.args().arg0;
+    let mut sc_vaddr = ctx.args().arg0;
+
+    // Linux rt_sigreturn (#15 on x86_64) takes no argument — the
+    // restorer trampoline that calls it leaves arbitrary garbage in
+    // RDI, so we can't trust arg0. When the last delivered frame used
+    // the restorer-based rt_sigframe layout, resolve it from the user
+    // RSP (which points at the frame after the handler's `ret` popped
+    // the restorer return address). NARF's own libc trampoline instead
+    // forwards the SigContext vaddr in arg0.
+    let task = current_task_id();
+    if sigreturn_use_rsp(task) || sc_vaddr == 0 {
+        sc_vaddr = ctx.user_rsp();
+    }
+
     if !ctx.perform_sigreturn(sc_vaddr) {
         ctx.set_return(SyscallReturn::invalid_op());
     }
@@ -11220,6 +11500,11 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
     };
     let file_ptr = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
     let nonblock = op & LOCK_NB != 0;
+    // The blocking path retries by parking via the yield hook and
+    // re-executing the syscall on resume (a longjmp clippy can't see),
+    // so every visible path through the body returns/diverges — hence
+    // `never_loop`. The `loop` keeps the retry intent explicit.
+    #[allow(clippy::never_loop)]
     loop {
         if flock_try(file_ptr, op, task).is_ok() {
             ctx.set_return(SyscallReturn::ok(0));
@@ -11997,6 +12282,52 @@ pub(crate) fn signalfd_arc_from_fd(
 ///
 /// Older 3-arg callers (arg3 = 0) get flags = 0 as before — the
 /// new arg slot is back-compatible.
+fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let signum = args.arg0 as usize;
+    let act_ptr = args.arg1 as u64;
+    let _oact_ptr = args.arg2 as u64;
+    let sigsetsize = args.arg3 as usize;
+
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if signum >= NSIG || sigsetsize != 8 {
+        ctx.set_return(fail);
+        return;
+    }
+
+    if act_ptr != 0 {
+        let mut buf = [0u8; 32]; // sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8)
+        if unsafe { copy_from_user(&mut buf, act_ptr) }.is_err() {
+            ctx.set_return(fail);
+            return;
+        }
+        let handler = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let flags = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as u32;
+        let restorer = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let task = current_task_id();
+
+        let mut g = SIGACTION_TABLE.lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        let slots = map.entry(task).or_insert([None; NSIG]);
+        slots[signum] = if handler == 0 {
+            None
+        } else {
+            Some(SigAction {
+                handler,
+                restorer,
+                flags,
+            })
+        };
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
@@ -12025,6 +12356,7 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
         } else {
             Some(SigAction {
                 handler: new_handler,
+                restorer: 0,
                 flags,
             })
         };
@@ -12094,6 +12426,13 @@ pub fn abi_file_op_bridge(
         fn set_return(&mut self, r: crate::SyscallReturn) {
             self.ret = r;
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
@@ -12104,7 +12443,7 @@ pub fn abi_file_op_bridge(
     };
     crate::kernel_syscall_entry(num, &mut ctx);
     narf_abi::FileOpReturn {
-        status: ctx.ret.status,
+        status: ctx.ret.status as u32,
         value: ctx.ret.value,
     }
 }
@@ -12546,7 +12885,13 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         );
     }
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
+    table.install_raw(
+        Syscall::RtSigaction,
+        "rt_sigaction",
+        RawFnHandler(sys_rt_sigaction),
+    );
     table.install_raw(Syscall::Kill, "kill", RawFnHandler(sys_kill));
+    table.install_raw(Syscall::Pause, "pause", RawFnHandler(sys_pause));
     table.install_raw(Syscall::Tgkill, "tgkill", RawFnHandler(sys_tgkill));
     table.install_raw(Syscall::Tkill, "tkill", RawFnHandler(sys_tkill));
     table.install_raw(Syscall::Ptrace, "ptrace", RawFnHandler(sys_ptrace));
@@ -12727,6 +13072,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::EpollWait,
         "epoll_wait",
+        RawFnHandler(crate::epoll::sys_epoll_wait),
+    );
+    table.install_raw(
+        Syscall::EpollPwait,
+        "epoll_pwait",
         RawFnHandler(crate::epoll::sys_epoll_wait),
     );
 

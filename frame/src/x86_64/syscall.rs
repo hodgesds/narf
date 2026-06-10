@@ -135,9 +135,10 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // which is what SysV requires inside the callee.
         "call {dispatch}",
 
-        // After dispatch:
-        //   rax = SyscallReturn.status (low 32 of struct return)
-        //   rdx = SyscallReturn.value
+        // After dispatch the SysV 16-byte struct return
+        // `SyscallReturn { value: u64, status: NarfStatus }` lands as:
+        //   rax = SyscallReturn.value   (first eightbyte, offset 0)
+        //   rdx = SyscallReturn.status  (second eightbyte, offset 8)
         // The user state on the stack is intact unless the
         // handler wrote back into it via `set_return` /
         // `save_user_state`. The handler's `set_return` modifies
@@ -145,22 +146,17 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         //
         // Linux's syscall ABI returns a single signed value in
         // rax: positive on success, negative-errno on failure.
-        // rdx, rdi, rsi, r10, r8, r9 must all be PRESERVED. The
-        // previous "rax = value, rdx = status" convention worked
-        // for narf-libc callers that read both registers, but it
-        // breaks every musl-built binary — musl emits patterns
-        // like `mov %fs:0, %rdx; syscall; movq $0, 0x98(%rdx)`
-        // around `__init_tp`'s `set_tid_address` call, expecting
-        // rdx to survive the syscall. When we clobbered rdx with
-        // the status word (0 for OK), every forked child #PF'd at
-        // CR2=0x98 inside `__init_tp` because rdx → 0.
+        // rdx, rdi, rsi, r10, r8, r9 must all be PRESERVED (they
+        // get reloaded from the saved UserState slots below). musl
+        // emits patterns like `mov %fs:0, %rdx; syscall; movq $0,
+        // 0x98(%rdx)` around `__init_tp`'s `set_tid_address` call,
+        // expecting rdx to survive the syscall — the reload below
+        // restores it.
         //
         // Fold: if status != OK, set rax = -EINVAL (-22) so
         // userspace sees a negative-errno error per Linux
-        // semantics. Otherwise rax = value.
-        "mov rcx, rax",                        // status → rcx (scratch — about to reload)
-        "test ecx, ecx",                       // status == 0 (OK)?
-        "mov rax, rdx",                        // rax = value (assumed-success path)
+        // semantics. Otherwise rax already holds value.
+        "test edx, edx",                       // status (rdx) == 0 (OK)?
         "jz 2f",                               // status == OK: keep rax = value
         "mov rax, -22",                        // status != OK: rax = -EINVAL
         "2:",
@@ -181,14 +177,15 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov rcx, [rsp + 120]",                // user RIP
         "mov r11, [rsp + 128]",                // user RFLAGS
 
-        // Drop the UserState scratch.
-        "add rsp, 152",
-
-        // Restore user RSP from the per-CPU scratch slot, swap
-        // back to user GS, and return to user mode. `sysretq`
-        // jumps to `rcx` with `rflags = r11`, CS/SS from
-        // STAR[63:48] (+16 / +8 with RPL forced to 3).
-        "mov rsp, gs:[0]",
+        // Restore user RSP from the UserState `rsp` slot rather than
+        // the entry-time per-CPU scratch. For an ordinary syscall the
+        // slot still holds the original user RSP (pushed from gs:[0]
+        // at entry), so this is a no-op change. But a handler that
+        // parks/resumes or delivers a signal rewrites the snapshot's
+        // RSP slot to move the user stack (e.g. onto a signal frame);
+        // honouring the slot here makes those rewrites take effect on
+        // `sysretq`. Must read [rsp+136] BEFORE dropping the scratch.
+        "mov rsp, [rsp + 136]",                // user RSP (from state)
         "swapgs",
         "sysretq",
         dispatch = sym dispatch_syscall,

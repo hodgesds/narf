@@ -3703,6 +3703,75 @@ pub const NARF_PTY_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_PTY_SMOKE_ELF_AA
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")
 ))]
+pub const NARF_NET_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_NET_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_NET_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_NET_SMOKE_ELF_AARCH64"));
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_NET6_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_NET6_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_NET6_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_NET6_SMOKE_ELF_AARCH64"));
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_UNIX_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_UNIX_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_UNIX_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_UNIX_SMOKE_ELF_AARCH64"));
+
+macro_rules! define_smoke_elf {
+    ($name:ident, $env_x86:expr, $env_arm:expr) => {
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(feature = "boot-init", feature = "user-mode-testbin")
+        ))]
+        pub const $name: &[u8] = include_bytes!(env!($env_x86));
+        #[cfg(all(
+            target_arch = "aarch64",
+            any(feature = "boot-init", feature = "user-mode-testbin")
+        ))]
+        pub const $name: &[u8] = include_bytes!(env!($env_arm));
+    };
+}
+
+define_smoke_elf!(
+    NARF_FORK_PIPE_SMOKE_ELF,
+    "NARF_FORK_PIPE_SMOKE_ELF_X86_64",
+    "NARF_FORK_PIPE_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_EPOLL_SMOKE_ELF,
+    "NARF_EPOLL_SMOKE_ELF_X86_64",
+    "NARF_EPOLL_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_SIGNAL_SMOKE_ELF,
+    "NARF_SIGNAL_SMOKE_ELF_X86_64",
+    "NARF_SIGNAL_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_FS_SMOKE_ELF,
+    "NARF_FS_SMOKE_ELF_X86_64",
+    "NARF_FS_SMOKE_ELF_AARCH64"
+);
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_LD_MUSL: &[u8] = include_bytes!(env!("NARF_LD_MUSL_X86_64"));
 #[cfg(all(
     target_arch = "aarch64",
@@ -4571,6 +4640,13 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }

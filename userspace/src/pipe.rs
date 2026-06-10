@@ -151,6 +151,15 @@ impl FileOps for PipeRead {
             mtime_cycles: 0,
         }
     }
+
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = 0;
+        let q = self.shared.queue.lock();
+        if !q.is_empty() || self.shared.writer_closed.load(Ordering::Acquire) {
+            mask |= narf_filesystem::POLL_IN;
+        }
+        mask
+    }
 }
 
 impl FileOps for PipeWrite {
@@ -182,5 +191,14 @@ impl FileOps for PipeWrite {
             mode: Mode::FILE_RW,
             mtime_cycles: 0,
         }
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        let mut mask = 0;
+        let q = self.shared.queue.lock();
+        if q.len() < PIPE_BUF_BYTES || self.shared.reader_closed.load(Ordering::Acquire) {
+            mask |= narf_filesystem::POLL_OUT;
+        }
+        mask
     }
 }

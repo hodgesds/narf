@@ -1006,6 +1006,13 @@ pub fn bootstrap_thermal_authority() -> Cap<Thermal, Grant> {
 /// C1 against a freshly-minted Power authority and installs the
 /// `Performance` governor as the default.
 pub fn init() {
+    // Reset the C-state table to the defaults this `init` installs.
+    // Production calls `init` once at boot (table already empty); the
+    // in-kernel test harness may have left states registered by an
+    // earlier test, and `register_cstate`'s dup-check would otherwise
+    // preserve them and skew governor selection. Keeps `init` truly
+    // "safe to call again" → a defined default set.
+    CSTATES.lock().clear();
     // C-state defaults. `register_cstate`'s duplicate check makes the
     // call safe to repeat; we mint a fresh authority so a previously-
     // revoked one from a prior test doesn't poison init.

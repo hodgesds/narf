@@ -65,6 +65,13 @@ impl TrapContext for StubCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
@@ -85,6 +92,13 @@ impl TrapContext for SignalCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
@@ -771,11 +785,14 @@ fn smoke_process_sa_mask_blocks_reentry() -> TestResult {
 
     // Unblock: clear the mask entry.
     LOOKUP_TASK.store(TASK, Ordering::Relaxed);
-    let unblock_mask: u32 = 1 << SIGUSR1;
+    // Linux rt_sigprocmask ABI: arg0=how, arg1=set ptr, arg2=old ptr,
+    // arg3=sigsetsize (must be 8).
+    let unblock_mask: u64 = 1u64 << SIGUSR1;
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 1u64, // SIG_UNBLOCK
-            arg1: unblock_mask as u64,
+            arg1: &unblock_mask as *const u64 as u64,
+            arg3: 8,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -836,12 +853,14 @@ fn smoke_process_sigprocmask_block_unblock() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
 
-    // Block SIGUSR2.
-    let block_set: u32 = 1 << SIGUSR2;
+    // Block SIGUSR2. Linux rt_sigprocmask ABI: arg0=how, arg1=set ptr,
+    // arg2=old ptr, arg3=sigsetsize (must be 8).
+    let block_set: u64 = 1u64 << SIGUSR2;
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 0, // SIG_BLOCK
-            arg1: block_set as u64,
+            arg1: &block_set as *const u64 as u64,
+            arg3: 8,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -879,11 +898,13 @@ fn smoke_process_sigprocmask_block_unblock() -> TestResult {
         return TestResult::Fail("pending bit must remain after blocked delivery attempt");
     }
 
-    // Unblock.
+    // Unblock. Linux rt_sigprocmask ABI: arg0=how, arg1=set ptr,
+    // arg2=old ptr, arg3=sigsetsize (must be 8).
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 1, // SIG_UNBLOCK
-            arg1: block_set as u64,
+            arg1: &block_set as *const u64 as u64,
+            arg3: 8,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -1322,7 +1343,7 @@ kernel_test_in!("userspace/process", smoke_wave35_dup2_rewires_descriptor);
 // Linux ref: kernel/sys.c::sys_getpid; musl src/process/getpid.c.
 
 fn smoke_wave35_getpid_nonzero() -> TestResult {
-    const TASK: u64 = 0xF0_16;
+    const TASK: u64 = 0xF016;
     crate::syscall::__test_clear_global();
     setup_process_state(TASK);
 

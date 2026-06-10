@@ -33,6 +33,9 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
+use alloc::collections::BTreeMap;
+use narf_lib::sync::IrqSafeSpinLock;
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::UserState;
 
@@ -142,7 +145,6 @@ pub struct UserTaskCtx {
     /// for a specific child, ≤ 0 = any child.
     pub wait_child_want_pid: AtomicI64,
 
-    /// User-space pointer to write the POSIX wstatus integer into
     /// on a successful reap. `0` = caller passed NULL (discard).
     pub wait_child_status_ptr: AtomicU64,
 }
@@ -214,28 +216,62 @@ pub struct ExecRequest {
 /// guarantees only one task is ever in flight.
 static CURRENT: AtomicPtr<UserTaskCtx> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Install `ctx` as the current polling target. Stored as a raw
-/// pointer; the caller's `Pin<&mut UserTaskFuture>` keeps the
-/// allocation alive across the user-mode round-trip.
 pub fn install_current(ctx: *mut UserTaskCtx) {
     CURRENT.store(ctx, Ordering::Release);
 }
 
-/// Clear the current-task slot. Called on `Pending` / `Ready`
-/// return so a stale pointer can't be picked up by an unrelated
-/// trap.
 pub fn clear_current() {
     CURRENT.store(core::ptr::null_mut(), Ordering::Release);
 }
 
-/// Trap-handler-side accessor: returns the currently-polling
-/// `UserTaskCtx`, or `None` if no polling routine is in flight.
 pub fn current_user_task() -> Option<*mut UserTaskCtx> {
+    // The in-flight polling routine publishes its ctx in `CURRENT`
+    // right before entering user mode and clears it on the way back
+    // out, so it reflects exactly the task whose trap we're handling.
+    // We deliberately do NOT fall back to the task-id registry here:
+    // its entries point at the poller's stack-pinned `UserTaskCtx`,
+    // which is only live while that task is the in-flight one — a
+    // lookup by id can hand back a pointer to a future that has since
+    // unwound (notably in the in-kernel test harness, where `CURRENT`
+    // is never set). `wake_signal` consults the registry directly when
+    // it genuinely needs to poke a parked task by id.
     let p = CURRENT.load(Ordering::Acquire);
     if p.is_null() {
         None
     } else {
         Some(p)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct SendPtr<T>(pub *mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+static USER_TASK_CTXS: IrqSafeSpinLock<Option<BTreeMap<u64, SendPtr<UserTaskCtx>>>> =
+    IrqSafeSpinLock::new(None);
+
+pub fn user_task_ctx_init() {
+    *USER_TASK_CTXS.lock() = Some(BTreeMap::new());
+}
+
+pub fn register_user_task_ctx(task_id: u64, ctx: *mut UserTaskCtx) {
+    let mut g = USER_TASK_CTXS.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task_id, SendPtr(ctx));
+    }
+}
+
+pub fn lookup_user_task_ctx(task_id: u64) -> Option<*mut UserTaskCtx> {
+    let g = USER_TASK_CTXS.lock();
+    g.as_ref()?.get(&task_id).map(|p| p.0)
+}
+
+pub fn unregister_user_task_ctx(task_id: u64) {
+    let mut g = USER_TASK_CTXS.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&task_id);
     }
 }
 
@@ -796,6 +832,9 @@ impl core::future::Future for UserTaskFuture {
             }
         }
 
+        let task_id = crate::handlers::current_task_id();
+        register_user_task_ctx(task_id, &mut this.ctx as *mut _);
+
         // Snapshot kernel CR3 EVERY poll, not once. The kernel
         // root can shift between polls — when the page allocator
         // hands out a phys-frame that was previously a PML4 page
@@ -914,6 +953,10 @@ impl core::future::Future for UserTaskFuture {
                     // first entry.
                     #[cfg(target_arch = "x86_64")]
                     narf_memory::beacon::paint(51, 0x0060_FFFF); // cyan: pre-iretq-resume
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        let us = &*(this.ctx.state.get() as *const narf_scheduler::UserState);
+                    }
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
@@ -1158,6 +1201,9 @@ impl core::future::Future for UserTaskFuture {
                 }
             }
         }
+
+        let task_id = crate::handlers::current_task_id();
+        register_user_task_ctx(task_id, &mut this.ctx as *mut _);
 
         // Snapshot kernel TTBR0_EL1 once. Subsequent polls land
         // back here via the trap path; we restore on the way out.

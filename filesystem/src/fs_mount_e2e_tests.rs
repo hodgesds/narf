@@ -284,9 +284,12 @@ fn smoke_vfs_mount_read_unmount() -> TestResult {
         return TestResult::Fail("mount still visible after unmount");
     }
 
-    // resolve_absolute with no covering mount returns None.
+    // After unmount the `/fme1` mount is gone. A covering `/` mount
+    // (installed during boot) may still match the path, but resolving
+    // the fme1 file through the root FS must fail — only a successful
+    // resolve would mean the unmounted FS is still live.
     let post = registry().resolve_absolute(PATH, |fs, rel| resolve(fs.root(), rel));
-    if post.is_some() {
+    if matches!(post, Some(Ok(_))) {
         return TestResult::Fail("resolve_absolute found path after unmount");
     }
 

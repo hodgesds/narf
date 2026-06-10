@@ -358,11 +358,31 @@ impl Arch {
                 // refused. Example:
                 //   NARF_QEMU_CPU="max,-x2apic,-tsc-deadline"
                 let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
+                // `NARF_QEMU_SMP` shrinks the vCPU count and drops the
+                // 2-socket HMAT/NUMA topology that assumes 16 CPUs.
+                // Bringing up + emulating 16 APs under TCG (no KVM, as on
+                // CI) dominates boot time, and a user-program smoke like
+                // musl-demo needs neither many CPUs nor NUMA — set e.g.
+                // `NARF_QEMU_SMP=2` there to cut boot time substantially.
+                // Unset (default) keeps the full layout the kernel NUMA
+                // tests expect, so other jobs and local runs are unchanged.
+                let smp = std::env::var("NARF_QEMU_SMP").ok();
                 let mut args = vec![
-                    "-machine".into(), "q35,hmat=on".into(),
-                    "-cpu".into(),     cpu,
-                    "-smp".into(),     "16,sockets=2,cores=8".into(),
-                    "-m".into(),       "512M".into(),
+                    "-machine".into(),
+                    if smp.is_some() {
+                        "q35".into()
+                    } else {
+                        "q35,hmat=on".into()
+                    },
+                    "-cpu".into(),
+                    cpu,
+                    "-smp".into(),
+                    smp.clone().unwrap_or_else(|| "16,sockets=2,cores=8".into()),
+                    "-m".into(),
+                    "512M".into(),
+                ];
+                if smp.is_none() {
+                    args.extend_from_slice(&[
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
                     "-numa".into(),    "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
                     "-object".into(),  "memory-backend-ram,id=mem0,size=256M".into(),
@@ -375,11 +395,17 @@ impl Arch {
                     "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
-                    "-serial".into(),  "stdio".into(),
-                    "-display".into(), display.clone(),
+                    ]);
+                }
+                args.extend_from_slice(&[
+                    "-serial".into(),
+                    "stdio".into(),
+                    "-display".into(),
+                    display.clone(),
                     "-no-reboot".into(),
-                    "-device".into(),  "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
-                ];
+                    "-device".into(),
+                    "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
+                ]);
 
                 let virtio = matches!(profile, HwProfile::Full | HwProfile::VirtioOnly);
                 let legacy = matches!(profile, HwProfile::Full | HwProfile::LegacyOnly);
@@ -783,6 +809,15 @@ fn build_ext2_disk_image(file_name: &[u8], file_data: &[u8]) -> Vec<u8> {
     if !file_data.is_empty() {
         let data_off = 10 * BS;
         img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
+    }
+
+    // Seed sector 0 (bytes 0..512) with the virtio-blk read-pattern the
+    // driver smoke tests assert: byte i == (i * 0x97) mod 256. This is
+    // ext2 boot-block padding (the superblock starts at byte 1024), so
+    // it doesn't disturb the filesystem the /mnt mount reads — it just
+    // gives the raw-sector-read tests a known pattern at LBA 0.
+    for (i, b) in img[0..512].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0x97);
     }
 
     img
@@ -1372,23 +1407,25 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // either, busybox sh's PATH search hits the
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
-        // PTY smoke. Opens /dev/ptmx, clears TIOCSPTLCK,
-        // reads TIOCGPTN, opens /dev/pts/N, round-trips
-        // "ping" master→slave and "pong" slave→master, then
-        // prints "pty-ok". Exercises the clone-on-open ptmx
-        // path + the new linux-ABI sys_open.
+        ("signal_smoke", "signal-ok"),
+        ("fs_smoke", "fs-ok"),
+        ("fork_pipe_smoke", "fork-ok"),
         ("pty_smoke", "pty-ok"),
+        ("net_smoke", "net-ok"),
+        ("net6_smoke", "net6-ok"),
+        ("unix_smoke", "unix-ok"),
+        ("epoll_smoke", "epoll-ok"),
     ];
-    for (cmd, expect) in cases {
-        eprintln!("\n=== musl-demo: cmd=`{}` expect=`{}` ===\n", cmd, expect);
-        run_interactive_cmd(&RunInteractiveArgs {
-            build: args.clone(),
-            cmd: (*cmd).into(),
-            expect: (*expect).into(),
-        })
-        .with_context(|| format!("musl-demo: `{}` failed", cmd))?;
+    // Run every case in a SINGLE QEMU boot rather than one boot per
+    // command — the TCG boot (especially on CI) dwarfs the per-command
+    // runtime, so amortizing it across all commands is the big win.
+    // The VM keeps its full multi-vCPU/NUMA topology so concurrency
+    // bugs still surface.
+    let (passed, failed) = run_interactive_multi(args, &cases)?;
+    eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
+    if failed > 0 {
+        bail!("musl-demo failed ({} errors)", failed);
     }
-    eprintln!("\nmusl-demo: all cases passed");
     Ok(())
 }
 
@@ -1445,11 +1482,17 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     let prompt_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(120);
+    // Per-command echo timeout. Generous by default: a CI runner
+    // without KVM emulates 5-10x slower than a local KVM host, so the
+    // slowest cases (dynamic-linked musl binaries that run the full
+    // ld-musl relocation path, pthread join, busybox fork/exec) can
+    // take well over the old 30s there even though they finish in a
+    // few seconds locally. Override with XTASK_RI_ECHO_TIMEOUT_SECS.
     let echo_secs = std::env::var("XTASK_RI_ECHO_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30);
+        .unwrap_or(120);
 
     // Channel events from the reader thread. The reader doesn't
     // try to detect the echo reply — main does that off the shared
@@ -1746,6 +1789,306 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         args.cmd, args.expect,
     );
     Ok(())
+}
+
+/// Boot QEMU **once** and run an entire list of `(command, expect)`
+/// pairs in that single VM, rather than one boot per command. Each
+/// command is typed at the `narf> ` prompt; it passes when its
+/// `expect` token appears (CR/LF-terminated) before the echo timeout
+/// and the shell returns to a prompt afterward. Returns
+/// `(passed, failed)`.
+///
+/// This keeps the full multi-vCPU/NUMA machine (so concurrency bugs
+/// still surface) — the only thing it changes is amortizing the slow
+/// TCG boot across all commands instead of paying it N times. Prompt
+/// and token detection are driven off the captured serial buffer; the
+/// channel carries only panic/EOF so a crash aborts fast (remaining
+/// commands are counted failed).
+fn run_interactive_multi(build_in: &BuildArgs, cases: &[(&str, &str)]) -> Result<(usize, usize)> {
+    use std::io::{Read, Write};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
+
+    if !matches!(build_in.arch, Arch::X86_64) {
+        bail!("run-interactive(multi): only x86_64 is wired (aarch64 boot-init is a stub)");
+    }
+
+    let mut build = build_in.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+
+    let root = workspace_root()?;
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+
+    let qemu = build.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(
+        build
+            .arch
+            .qemu_args(&kernel, &build.display, build.hw_profile),
+    );
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    println!(
+        "xtask musl-demo: launching {} {} (single boot for {} commands)",
+        qemu,
+        kernel.display(),
+        cases.len()
+    );
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    let prompt_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
+    let echo_secs = std::env::var("XTASK_RI_ECHO_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
+
+    enum Ev {
+        Panic(String),
+        Eof,
+    }
+    let (tx, rx) = mpsc::channel::<Ev>();
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(256 * 1024)));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
+    let tx_reader = tx.clone();
+    let captured_reader = captured.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let panic_markers: &[&[u8]] = &[
+            b"*** KERNEL PANIC ***",
+            b"panicked at",
+            b"double fault",
+            b"general protection",
+            b"kernel page fault",
+            b"unsafe precondition",
+        ];
+        let mut line: Vec<u8> = Vec::with_capacity(256);
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        let mut out = std::io::stdout();
+        loop {
+            let n = match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let _ = out.write_all(&buf[..n]);
+            let _ = out.flush();
+            if let Ok(mut g) = captured_reader.lock() {
+                g.extend_from_slice(&buf[..n]);
+            }
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    for m in panic_markers {
+                        if line.windows(m.len()).any(|w| w == *m) {
+                            let _ = tx_reader
+                                .send(Ev::Panic(String::from_utf8_lossy(&line).into_owned()));
+                        }
+                    }
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+        let _ = tx_reader.send(Ev::Eof);
+    });
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("qemu child has no stdin"))?;
+
+    // Scan `captured[from..]` for `needle`; when `term`, require the
+    // byte after the match to be CR/LF (mirrors the single-command
+    // detector — distinguishes a real reply from a bare echo). Returns
+    // the absolute index just past the terminator/needle.
+    let scan = |from: usize, needle: &[u8], term: bool| -> Option<usize> {
+        let g = captured.lock().ok()?;
+        if g.len() <= from {
+            return None;
+        }
+        let tail = &g[from..];
+        let mut idx = 0usize;
+        while idx + needle.len() <= tail.len() {
+            if &tail[idx..idx + needle.len()] == needle {
+                if !term {
+                    return Some(from + idx + needle.len());
+                }
+                if idx + needle.len() < tail.len() {
+                    let next = tail[idx + needle.len()];
+                    if next == b'\r' || next == b'\n' {
+                        return Some(from + idx + needle.len());
+                    }
+                }
+            }
+            idx += 1;
+        }
+        None
+    };
+
+    enum Wait {
+        Found(usize),
+        TimedOut,
+        Died(String),
+    }
+    // Poll the buffer for `needle` from `from`, draining panic/EOF.
+    let wait_for = |from: usize, needle: &[u8], term: bool, timeout: Duration| -> Wait {
+        let start = std::time::Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ev::Panic(p)) => {
+                    if let Some(end) = scan(from, needle, term) {
+                        return Wait::Found(end);
+                    }
+                    return Wait::Died(format!("kernel panic — '{p}'"));
+                }
+                Ok(Ev::Eof) => {
+                    if let Some(end) = scan(from, needle, term) {
+                        return Wait::Found(end);
+                    }
+                    return Wait::Died("QEMU stdout EOF".into());
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {}
+            }
+            if let Some(end) = scan(from, needle, term) {
+                return Wait::Found(end);
+            }
+            if start.elapsed() >= timeout {
+                return Wait::TimedOut;
+            }
+        }
+    };
+
+    let prompt_to = Duration::from_secs(prompt_secs);
+    let echo_to = Duration::from_secs(echo_secs);
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut cursor = 0usize; // buffer position consumed so far
+
+    // Initial prompt.
+    match wait_for(cursor, b"narf> ", false, prompt_to) {
+        Wait::Found(end) => cursor = end,
+        Wait::TimedOut => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader_handle.join();
+            bail!("xtask musl-demo: did not see `narf> ` prompt within {prompt_secs}s");
+        }
+        Wait::Died(why) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader_handle.join();
+            bail!("xtask musl-demo: {why} before first prompt");
+        }
+    }
+    // Late-boot log noise (USB-HID enumeration) can interleave with
+    // the first keystrokes; let it settle once.
+    std::thread::sleep(Duration::from_millis(750));
+
+    let mut aborted: Option<String> = None;
+    for (i, (cmdline, expect)) in cases.iter().enumerate() {
+        eprintln!(
+            "\n=== musl-demo [{}/{}]: cmd=`{}` expect=`{}` ===",
+            i + 1,
+            cases.len(),
+            cmdline,
+            expect
+        );
+        let pre = captured.lock().map(|g| g.len()).unwrap_or(cursor);
+        // Type the command byte-by-byte (the shell's line editor needs
+        // time to drain each char through the bounded input ring).
+        let mut typed = cmdline.as_bytes().to_vec();
+        typed.push(b'\n');
+        let mut wrote = true;
+        for &b in &typed {
+            if stdin.write_all(&[b]).is_err() {
+                wrote = false;
+                break;
+            }
+            let _ = stdin.flush();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !wrote {
+            aborted = Some("stdin write failed".into());
+            failed += 1;
+            break;
+        }
+
+        match wait_for(pre, expect.as_bytes(), true, echo_to) {
+            Wait::Found(_) => {
+                passed += 1;
+                println!("xtask musl-demo: ok — `{cmdline}` saw `{expect}`");
+            }
+            Wait::TimedOut => {
+                failed += 1;
+                eprintln!(
+                    "musl-demo: `{cmdline}` failed: did not see `{expect}` within {echo_secs}s"
+                );
+            }
+            Wait::Died(why) => {
+                failed += 1;
+                eprintln!("musl-demo: `{cmdline}` failed: {why}");
+                aborted = Some(why);
+                break;
+            }
+        }
+
+        // Wait for the shell to return to a prompt before typing the
+        // next command. Anchor the search at the PRE-type position,
+        // not the token match: a forking builtin like `busybox sh -c`
+        // re-prompts asynchronously and prints `narf> ` BEFORE its
+        // child's output, so the next prompt can land on either side
+        // of the token. From `pre` (just after the previous prompt)
+        // the first `narf> ` is unambiguously this command's prompt.
+        match wait_for(pre, b"narf> ", false, prompt_to) {
+            Wait::Found(end) => cursor = end,
+            Wait::TimedOut => {
+                aborted = Some(format!(
+                    "shell did not return to a prompt within {prompt_secs}s after `{cmdline}`"
+                ));
+                break;
+            }
+            Wait::Died(why) => {
+                aborted = Some(why);
+                break;
+            }
+        }
+        let _ = cursor;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.join();
+
+    if let Some(why) = aborted {
+        // Count the commands that never got a chance to run as failed.
+        let ran = passed + failed;
+        let remaining = cases.len().saturating_sub(ran);
+        failed += remaining;
+        eprintln!(
+            "musl-demo: aborted after {ran}/{} commands — {why} ({remaining} not run, counted failed)",
+            cases.len()
+        );
+    }
+
+    Ok((passed, failed))
 }
 
 /// Produce a Limine-bootable UEFI ISO at

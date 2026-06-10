@@ -35,6 +35,13 @@ impl TrapContext for StubCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
@@ -66,13 +73,18 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Linux clone(2) ABI: arg0 = flags, arg1 = child stack top,
+    // arg2 = parent_tid ptr, arg3 = child_tid ptr, arg4 = tls.
+    // CLONE_VM|CLONE_SIGHAND|CLONE_THREAD = a thread that shares the
+    // parent address space.
+    const CLONE_VM_SIGHAND_THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 0x8000_0000_1000, // synthetic child entry
-            arg1: 0x7fff_fff0_0000, // synthetic child stack top
-            arg2: 0xC0FFEE,         // arg passed to child (RDI plumbing TBD)
-            arg3: 0,                // inherit parent fs_base
-            arg4: 0,
+            arg0: CLONE_VM_SIGHAND_THREAD,
+            arg1: 0x7fff_fff0_0000, // child stack top
+            arg2: 0,                // parent_tid ptr
+            arg3: 0,                // child_tid ptr
+            arg4: 0,                // tls
             arg5: 0,
         },
         ret: None,
@@ -300,9 +312,17 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),
@@ -419,9 +439,17 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),
@@ -548,9 +576,17 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),
@@ -678,9 +714,17 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),
@@ -829,9 +873,17 @@ fn smoke_userspace_clock_gettime_writes_timespec() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ts: [i64; 2] = [-1, -1];
     let mut ctx = FakeCtx {
@@ -894,9 +946,17 @@ fn smoke_userspace_sigaction_records_handler() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     let mut old: u64 = 0xAAAA_AAAA_AAAA_AAAA;
@@ -1001,7 +1061,14 @@ fn smoke_userspace_signal_delivery() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
         fn returning_to_user(&self) -> bool {
@@ -1095,6 +1162,166 @@ fn smoke_userspace_signal_delivery() -> TestResult {
 #[cfg(not(feature = "user-mode-e2e"))]
 kernel_test_in!("userspace", smoke_userspace_signal_delivery);
 
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_signal_delivery_lowest_first_multiple_pending() -> TestResult {
+    // Two signals pending at once. The async delivery hook must pick
+    // the LOWEST signum first (`deliverable.trailing_zeros()`), route
+    // it to ITS handler, clear only that bit, and leave the higher
+    // signal pending for the next trap — then deliver it on the second
+    // pass. Exercises the multi-pending path that the single-signal
+    // `smoke_userspace_signal_delivery` doesn't.
+    use crate::{
+        default_signal_delivery, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, signal_init, signal_pending_of, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD158);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(task_lookup);
+
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    crate::sigaction_init();
+    signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        delivered: Option<(u64, u32)>,
+        going_to_user: bool,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            self.going_to_user
+        }
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.delivered = Some((p.handler, p.signum));
+            true
+        }
+    }
+
+    const H10: u64 = 0xAAAA_0000;
+    const H12: u64 = 0xBBBB_0000;
+
+    let cleanup = || {
+        __test_clear_global();
+        crate::handlers::__test_sigaction_reset();
+        crate::handlers::__test_signal_reset();
+    };
+
+    // Register a distinct handler for signum 10 and signum 12.
+    for (sig, handler) in [(10u64, H10), (12u64, H12)] {
+        let mut old: u64 = 0;
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: sig,
+                arg1: handler,
+                arg2: &mut old as *mut u64 as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+            delivered: None,
+            going_to_user: false,
+        };
+        kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+        if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+            cleanup();
+            return TestResult::Fail("sigaction registration for 10/12 did not Ok");
+        }
+    }
+
+    // Mark BOTH pending — kill signum 12 FIRST so the test proves the
+    // lowest signum wins regardless of the order the bits were set.
+    for sig in [12u64, 10u64] {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: FAKE_TASK.load(Ordering::Relaxed),
+                arg1: sig,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+            delivered: None,
+            going_to_user: false,
+        };
+        kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    }
+    let pending_before = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
+
+    // First delivery → expect the lowest pending signum (10).
+    let mut ctx1 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
+        going_to_user: true,
+    };
+    default_signal_delivery(&mut ctx1, crate::handlers::SYSCALL_NUM_NONE);
+    let first = ctx1.delivered;
+    let pending_mid = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
+
+    // Second delivery → expect the remaining signal (12).
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
+        going_to_user: true,
+    };
+    default_signal_delivery(&mut ctx2, crate::handlers::SYSCALL_NUM_NONE);
+    let second = ctx2.delivered;
+    let pending_after = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
+
+    cleanup();
+
+    if pending_before & (1 << 10) == 0 || pending_before & (1 << 12) == 0 {
+        return TestResult::Fail("both signals 10 and 12 should be pending before delivery");
+    }
+    if !matches!(first, Some((h, s)) if h == H10 && s == 10) {
+        return TestResult::Fail("first delivery must be the lowest signum (10) with its handler");
+    }
+    if pending_mid & (1 << 10) != 0 {
+        return TestResult::Fail("first delivery must clear only the delivered bit (10)");
+    }
+    if pending_mid & (1 << 12) == 0 {
+        return TestResult::Fail("first delivery must leave the higher signal (12) pending");
+    }
+    if !matches!(second, Some((h, s)) if h == H12 && s == 12) {
+        return TestResult::Fail("second delivery must be signum 12 with its handler");
+    }
+    if pending_after & (1 << 12) != 0 {
+        return TestResult::Fail("second delivery must clear the remaining bit (12)");
+    }
+
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_signal_delivery_lowest_first_multiple_pending
+);
+
 fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     // Verify the per-task cwd state round-trips through Chdir +
     // Getcwd. Drive both through the synthetic TrapContext path so
@@ -1131,9 +1358,17 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // Default cwd should be `/` even before any Chdir call.
@@ -1255,9 +1490,17 @@ fn smoke_userspace_sleep_advances_time() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     const TARGET_NS: u64 = 50_000_000; // 50 ms
@@ -1325,7 +1568,14 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
         fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
@@ -1440,7 +1690,14 @@ fn smoke_userspace_sync_signal_si_addr_from_payload() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
         fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
@@ -1599,18 +1856,25 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
-    let path = b"hello";
-    let mount = b"/test";
+    // Linux open(2) ABI: arg0 = NUL-terminated absolute path (the
+    // mount prefix is part of the path), arg1 = flags.
+    let path = b"/test/hello\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: mount.as_ptr() as u64,
-            arg3: mount.len() as u64,
+            arg1: 0, // flags
             ..Default::default()
         },
         ret: None,
@@ -1701,9 +1965,17 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // ── SYS_SYMLINK: target=/sl-test/target, link=/sl-test/sl ────
@@ -1732,13 +2004,13 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
 
     // ── SYS_READLINK: read /sl-test/sl into a 32-byte buf. ────────
     let mut buf = [0u8; 32];
-    let path = b"/sl-test/sl";
+    let path = b"/sl-test/sl\0";
     let mut rctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: buf.as_mut_ptr() as u64,
-            arg3: buf.len() as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            arg3: 0,
             ..Default::default()
         },
         ret: None,
@@ -1822,9 +2094,17 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     let path = b"/sl-fail/regular";
@@ -1832,9 +2112,9 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
     let mut rctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: buf.as_mut_ptr() as u64,
-            arg3: buf.len() as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            arg3: 0,
             ..Default::default()
         },
         ret: None,
@@ -1945,9 +2225,17 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // Read 16 bytes — handler should poll the future and update offset.
@@ -2115,9 +2403,17 @@ fn smoke_userspace_dup_clones_fd() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // Dup fd 3 → expect fd 4 (next free slot ≥ 3).
@@ -2256,9 +2552,17 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // F_SETFD(FD_CLOEXEC).
@@ -2366,6 +2670,13 @@ fn smoke_userspace_fcntl_dupfd_cloexec() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -2473,6 +2784,13 @@ fn smoke_userspace_fcntl_status_flags() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -2670,9 +2988,17 @@ fn smoke_userspace_stat_returns_size() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     let mut out = StatBuf::default();
@@ -2746,9 +3072,17 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // pipe(out) — kernel writes [read_fd, write_fd] to `out`.
@@ -4466,7 +4800,14 @@ fn smoke_userspace_raw_handler_dispatch() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
-        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             self.redirect_attempts += 1;
             true
         }
@@ -4573,9 +4914,17 @@ fn smoke_userspace_getrandom_fills_buffer() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -4667,9 +5016,17 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -4701,9 +5058,17 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
             fn set_return(&mut self, r: SyscallReturn) {
                 self.ret = Some(r);
             }
-            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            fn user_rsp(&self) -> u64 {
+                0
+            }
+            fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
                 false
             }
+
+            fn rip(&self) -> u64 {
+                0
+            }
+            fn set_rip(&mut self, _rip: u64) {}
         }
         let mut ctx = FakeCtx {
             args: SyscallArgs {
@@ -4797,9 +5162,17 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -4899,9 +5272,17 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -4969,9 +5350,17 @@ fn smoke_userspace_hostname_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5166,9 +5555,17 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5186,11 +5583,12 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
     );
 
     // Open the file via SYS_OPEN.
-    let path = "/pio/f";
+    // Linux open(2) ABI: arg0 = NUL-terminated absolute path, arg1 = flags.
+    let path = b"/pio/f\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
+            arg1: 0, // flags
             arg2: 0,
             arg3: 0,
             arg4: 0,
@@ -5308,9 +5706,17 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5421,9 +5827,17 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5511,9 +5925,17 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5564,9 +5986,17 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5637,9 +6067,17 @@ fn smoke_userspace_umask_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5700,9 +6138,17 @@ fn smoke_userspace_getcpu_returns_zero() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5763,9 +6209,17 @@ fn smoke_userspace_sched_affinity_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -5857,9 +6311,17 @@ fn smoke_userspace_prctl_name_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6028,9 +6490,17 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6059,14 +6529,26 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
             fn set_return(&mut self, r: SyscallReturn) {
                 self.ret = Some(r);
             }
-            fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            fn user_rsp(&self) -> u64 {
+                0
+            }
+            fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
                 false
             }
+
+            fn rip(&self) -> u64 {
+                0
+            }
+            fn set_rip(&mut self, _rip: u64) {}
         }
+        // Linux open(2) ABI: arg0 = NUL-terminated absolute path,
+        // arg1 = flags.
+        let mut cpath = alloc::vec::Vec::from(path.as_bytes());
+        cpath.push(0);
         let mut ctx = FakeCtx {
             args: SyscallArgs {
-                arg0: path.as_ptr() as u64,
-                arg1: path.len() as u64,
+                arg0: cpath.as_ptr() as u64,
+                arg1: 0, // flags
                 ..SyscallArgs::default()
             },
             ret: None,
@@ -6169,9 +6651,17 @@ fn smoke_userspace_clock_settime_pushes_wall_offset() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6273,9 +6763,17 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6342,9 +6840,17 @@ fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6439,9 +6945,17 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6529,9 +7043,17 @@ fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6626,9 +7148,17 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6714,9 +7244,17 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -6785,9 +7323,17 @@ fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -7067,9 +7613,17 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),
@@ -7089,8 +7643,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     // Stable-static buffers for the path/mount/data so the user
     // task can hand pointers across awaits without lifetime
     // complications.
-    static PATH: &[u8] = b"f";
-    static MOUNT: &[u8] = b"/test_abi";
+    static PATH: &[u8] = b"/test_abi/f\0";
     static mut READ_BUF: [u8; 16] = [0u8; 16];
 
     narf_scheduler::__reset_queues_for_test();
@@ -7102,13 +7655,12 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         let mut sq = user_ends.sq_prod;
         let mut cq = user_ends.cq_drain;
 
-        // Open(/test_abi, "f").
+        // Open("/test_abi/f"). Linux open(2) ABI: inline[0] = NUL-
+        // terminated absolute path, inline[1] = flags.
         let mut sub = Submission::noop(Tag::new(0x10));
         sub.op = OpCode::OpenFile;
         sub.inline[0] = PATH.as_ptr() as u64;
-        sub.inline[1] = PATH.len() as u64;
-        sub.inline[2] = MOUNT.as_ptr() as u64;
-        sub.inline[3] = MOUNT.len() as u64;
+        sub.inline[1] = 0;
         sq.send(sub).await.unwrap();
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok || comp.result[0] != 3 {
@@ -7221,9 +7773,17 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),
@@ -7320,10 +7880,7 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
         "yield-v0",
         RawFnHandler(|ctx: &mut dyn TrapContext| {
             V0_SEEN.fetch_add(1, Ordering::Relaxed);
-            ctx.set_return(SyscallReturn {
-                value: 0xC0DE_0000,
-                status: 0,
-            });
+            ctx.set_return(SyscallReturn::ok(0xC0DE_0000));
         }),
     );
     table.install_raw_versioned(
@@ -7331,10 +7888,7 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
         1,
         RawFnHandler(|ctx: &mut dyn TrapContext| {
             V1_SEEN.fetch_add(1, Ordering::Relaxed);
-            ctx.set_return(SyscallReturn {
-                value: 0xC0DE_0001,
-                status: 0,
-            });
+            ctx.set_return(SyscallReturn::ok(0xC0DE_0001));
         }),
     );
 
@@ -7359,6 +7913,13 @@ fn smoke_syscall_versioning_dispatch() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -7453,9 +8014,17 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     // Query the initial break.
@@ -7875,6 +8444,9 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
             false
         }
@@ -7888,6 +8460,11 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
             }
             true
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     let mut ctx = ForkSnapCtx {
@@ -8165,10 +8742,14 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    let dispatch = |entry: u64| -> Option<u64> {
+    // Linux clone(2): arg0 = flags, arg1 = child stack. CLONE_VM
+    // shares the parent address space; the scheduler still assigns a
+    // fresh tid to each call.
+    const CLONE_VM_SIGHAND_THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
+    let dispatch = || -> Option<u64> {
         let mut ctx = StubCtx {
             args: SyscallArgs {
-                arg0: entry,
+                arg0: CLONE_VM_SIGHAND_THREAD,
                 arg1: 0x7fff_fff0_0000,
                 arg2: 0,
                 arg3: 0,
@@ -8184,14 +8765,14 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
         }
     };
 
-    let t1 = match dispatch(0x8000_0000_1000) {
+    let t1 = match dispatch() {
         Some(v) => v,
         None => {
             *PARENT_AS.lock() = None;
             return TestResult::Fail("first clone failed");
         }
     };
-    let t2 = match dispatch(0x8000_0000_2000) {
+    let t2 = match dispatch() {
         Some(v) => v,
         None => {
             *PARENT_AS.lock() = None;
@@ -8536,16 +9117,33 @@ fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Linux execve(path, argv[], envp[]): the kernel resolves `path`
+    // through the VFS and reads the ELF from it, so mount the program
+    // as a file first.
     let elf = build_minimal_elf_for_execve();
-    // argv pack: "/usr/bin/foo\0" → one NUL-terminated string.
-    let argv = b"/usr/bin/foo\0".to_vec();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-comm",
+        narf_filesystem::MemFs::with_seeds("execve-comm", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("mount of execve FS failed");
+    }
 
+    // argv[0] = "/usr/bin/foo" → comm = basename = "foo". argv is a
+    // NUL-terminated array of `char *`, each a NUL-terminated string.
+    let path = b"/execve-comm/prog\0";
+    let arg0 = b"/usr/bin/foo\0";
+    let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
+    let envp: [u64; 1] = [0];
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: argv.as_ptr() as u64,
-            arg3: argv.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
             arg4: 0,
             arg5: 0,
         },
@@ -8557,6 +9155,9 @@ fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
 
     let pid = FAKE_TID.load(Ordering::Relaxed);
     let comm = crate::handlers::proc_comm_of(pid);
+    if let Ok(h) = mounted {
+        let _ = narf_filesystem::registry().unmount(&h, "/execve-comm");
+    }
     crate::syscall::__test_clear_global();
     match comm {
         Some(s) if s == "foo" => TestResult::Pass,
@@ -8592,15 +9193,37 @@ fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Linux execve(path, argv[], envp[]): mount the program so the VFS
+    // can resolve `path`, then pass argv as a NUL-terminated array of
+    // `char *`. argv = ["init", "-q", "--debug"].
     let elf = build_minimal_elf_for_execve();
-    // argv pack: ["init", "-q", "--debug"] → "init\0-q\0--debug\0".
-    let argv = b"init\0-q\0--debug\0".to_vec();
+    let auth = narf_filesystem::bootstrap_mount_authority();
+    let mounted = narf_filesystem::registry().mount(
+        &auth,
+        "/execve-cmd",
+        narf_filesystem::MemFs::with_seeds("execve-cmd", &[("prog", &elf)]),
+    );
+    if mounted.is_err() {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("mount of execve FS failed");
+    }
+    let path = b"/execve-cmd/prog\0";
+    let a0 = b"init\0";
+    let a1 = b"-q\0";
+    let a2 = b"--debug\0";
+    let argv: [u64; 4] = [
+        a0.as_ptr() as u64,
+        a1.as_ptr() as u64,
+        a2.as_ptr() as u64,
+        0,
+    ];
+    let envp: [u64; 1] = [0];
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: argv.as_ptr() as u64,
-            arg3: argv.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: argv.as_ptr() as u64,
+            arg2: envp.as_ptr() as u64,
+            arg3: 0,
             arg4: 0,
             arg5: 0,
         },
@@ -8610,6 +9233,9 @@ fn smoke_userspace_execve_publishes_cmdline_argv_pack() -> TestResult {
 
     let pid = FAKE_TID.load(Ordering::Relaxed);
     let recorded = crate::handlers::proc_argv_of(pid);
+    if let Ok(h) = mounted {
+        let _ = narf_filesystem::registry().unmount(&h, "/execve-cmd");
+    }
     crate::syscall::__test_clear_global();
     // We expect the same NUL-separated shape Linux reports: the
     // original pack bytes joined back together.
@@ -8770,6 +9396,13 @@ impl TrapContext for SigGapCtx {
     fn set_return(&mut self, r: SyscallReturn) {
         self.ret = Some(r);
     }
+    fn user_rsp(&self) -> u64 {
+        0
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
     fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
         false
     }
@@ -9054,11 +9687,14 @@ fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
-    // sigprocmask BLOCK SIGUSR1.
+    // sigprocmask BLOCK SIGUSR1. Linux ABI: arg0=how, arg1=set ptr,
+    // arg2=old ptr, arg3=sigsetsize (must be 8).
+    let block: u64 = 1 << 10;
     let mut m = SigGapCtx {
         args: SyscallArgs {
             arg0: 0, /* SIG_BLOCK */
-            arg1: 1 << 10,
+            arg1: &block as *const u64 as u64,
+            arg3: 8,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -9555,6 +10191,13 @@ fn smoke_userspace_sa_nodefer_skips_auto_block() -> TestResult {
             &DUMMY
         }
         fn set_return(&mut self, _: SyscallReturn) {}
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -9641,6 +10284,13 @@ fn smoke_userspace_default_delivery_auto_blocks_without_nodefer() -> TestResult 
             &DUMMY
         }
         fn set_return(&mut self, _: SyscallReturn) {}
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -10805,7 +11455,7 @@ fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
     }
     // 5. Poke the eventfd directly via its FileOps to bump the counter.
     {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use core::task::{Context, RawWaker, RawWakerVTable, Waker};
         unsafe fn no_op(_: *const ()) {}
         unsafe fn clone(_: *const ()) -> RawWaker {
             RawWaker::new(core::ptr::null(), &VT)
@@ -11727,6 +12377,13 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -11793,6 +12450,13 @@ fn smoke_smap_sys_write_oversized_einval() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -11859,6 +12523,13 @@ fn smoke_smap_sys_write_null_efault() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -11956,6 +12627,13 @@ fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12040,6 +12718,13 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12110,6 +12795,13 @@ fn smoke_console_read_one_byte_in_ring() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12188,6 +12880,13 @@ fn smoke_console_read_drains_burst() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12266,6 +12965,13 @@ fn smoke_console_read_empty_ring_returns_zero() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12364,6 +13070,13 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12531,6 +13244,13 @@ fn smoke_console_ioctl_tiocgwinsz_default_80x24() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12604,6 +13324,13 @@ fn smoke_console_ioctl_tiocswinsz_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12685,6 +13412,13 @@ fn smoke_console_ioctl_fionread_empty_ring_returns_zero() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12757,6 +13491,13 @@ fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -12806,6 +13547,11 @@ kernel_test_in!("userspace", smoke_console_ioctl_tiocspgrp_round_trip);
 fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
     use crate::fd::{ConsoleFile, TIOCGPGRP, TIOCSPGRP};
     use narf_filesystem::FileOps;
+
+    // Drop any leaked current-task lookup from an earlier test so the
+    // TIOCGPGRP auto-install fallback (which reads current_task_pgid())
+    // sees 0 for an unset tty rather than an ambient pgid.
+    crate::handlers::__test_reset_task_id_lookup();
 
     let tty_a = ConsoleFile::new();
     let tty_b = ConsoleFile::new();
@@ -12907,6 +13653,13 @@ fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -13026,6 +13779,13 @@ fn smoke_sys_kill_sigterm_marks_pending() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -13092,6 +13852,13 @@ fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -13270,9 +14037,17 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -13283,6 +14058,10 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+
+    // current_task_id() must be 0 here so signalfd's owner_task matches
+    // the kill(pid=0) target; drop any lookup an earlier test leaked.
+    crate::handlers::__test_reset_task_id_lookup();
 
     // Mask = SIGUSR1 only (signum 10 = 1<<10).
     let mask: u64 = 1u64 << 10;
@@ -13371,9 +14150,17 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -13384,6 +14171,10 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+
+    // current_task_id() must be 0 here so signalfd's owner_task matches
+    // the kill(pid=0) target; drop any lookup an earlier test leaked.
+    crate::handlers::__test_reset_task_id_lookup();
 
     // Create signalfd watching SIGUSR2 (signum 12).
     let mask: u64 = 1u64 << 12;
@@ -13507,9 +14298,17 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -13651,9 +14450,17 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
 
     __test_clear_global();
@@ -14000,21 +14807,28 @@ fn smoke_userspace_statx_known_file_reports_mode_size() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
     }
 
-    let path = b"/statx-known/probe";
+    let path = b"/statx-known/probe\0";
     let mut out = Statx::default();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: AT_FDCWD as u64,
             arg1: path.as_ptr() as u64,
-            arg2: path.len() as u64,
-            arg3: 0,
-            arg4: 0xFFF, // STATX_BASIC_STATS
-            arg5: &mut out as *mut Statx as u64,
+            arg2: 0,     // flags
+            arg3: 0xFFF, // mask = STATX_BASIC_STATS
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
         },
         ret: None,
     };
@@ -14126,21 +14940,28 @@ fn smoke_userspace_statx_mask_zero_still_fills_basic_fields() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
     }
 
-    let path = b"/statx-m0/m0";
+    let path = b"/statx-m0/m0\0";
     let mut out = Statx::default();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: AT_FDCWD as u64,
             arg1: path.as_ptr() as u64,
-            arg2: path.len() as u64,
-            arg3: 0,
-            arg4: 0, // mask = 0
-            arg5: &mut out as *mut Statx as u64,
+            arg2: 0, // flags
+            arg3: 0, // mask = 0
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
         },
         ret: None,
     };
@@ -14256,17 +15077,25 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
     }
 
     // Open /statx-ep/ep to get a real fd.
-    let path = b"/statx-ep/ep";
+    // Linux open(2) ABI: arg0 = NUL-terminated path, arg1 = flags.
+    let path = b"/statx-ep/ep\0";
     let mut open_ctx = FakeCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
+            arg1: 0, // flags
             ..SyscallArgs::default()
         },
         ret: None,
@@ -14281,16 +15110,16 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
         }
     };
 
-    let empty: &[u8] = b"";
+    let empty: &[u8] = b"\0";
     let mut out = Statx::default();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: opened_fd as u64,
             arg1: empty.as_ptr() as u64,
-            arg2: 0, // path_len = 0
-            arg3: AT_EMPTY_PATH as u64,
-            arg4: 0xFFF,
-            arg5: &mut out as *mut Statx as u64,
+            arg2: AT_EMPTY_PATH as u64, // flags
+            arg3: 0xFFF,                // mask
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
         },
         ret: None,
     };
@@ -14409,6 +15238,13 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -14511,6 +15347,13 @@ fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -14618,6 +15461,13 @@ fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -14725,6 +15575,13 @@ fn smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target() -> TestR
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -14824,6 +15681,13 @@ fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
         fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
             false
         }
@@ -14941,9 +15805,17 @@ fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
         fn set_return(&mut self, r: SyscallReturn) {
             self.ret = Some(r);
         }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
         fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
             false
         }
+
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
     }
     let mut ctx = FakeCtx {
         args: SyscallArgs::default(),

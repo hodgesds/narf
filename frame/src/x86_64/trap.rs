@@ -157,7 +157,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // from should be re-executed when SA_RESTART is set on
         // the handler (in which case the arch's `deliver_signal`
         // rewinds RIP - 2 to land on the `int 0x80` opcode).
-        if let Some(hook) = narf_userspace::signal_delivery_hook() {
+        if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
             hook(&mut ctx, num);
         }
         return;
@@ -622,6 +622,18 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         self.frame.rdx = ret.status as u64;
     }
 
+    fn user_rsp(&self) -> u64 {
+        self.frame.rsp
+    }
+
+    fn rip(&self) -> u64 {
+        self.frame.rip
+    }
+
+    fn set_rip(&mut self, rip: u64) {
+        self.frame.rip = rip;
+    }
+
     fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
         // Rewrite the CPU-pushed fields so common_trap's iretq
         // lands in kernel mode at the supplied RIP/RSP. CS=KCODE,
@@ -763,22 +775,31 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         // sys_sigreturn (Linux x86_64 numbers it 15 for sigreturn;
         // NARF uses 187) at the end. For an SA_SIGINFO handler the
         // trampoline reads ucontext.uc_mcontext when restoring.
-        let fallback_return = self.frame.rip;
+        let fallback_return = if params.restorer != 0 {
+            params.restorer
+        } else {
+            self.frame.rip
+        };
         let want_siginfo = (params.flags & SA_SIGINFO) != 0;
         let want_altstack = (params.flags & SA_ONSTACK) != 0 && params.altstack_sp != 0;
-        // Naive handlers (no SA_SIGINFO, no SA_ONSTACK) don't have
-        // a libc trampoline to call sigreturn — they `ret` directly
-        // and the kernel must arrange for that `ret` to land at the
-        // resumption RIP with RSP within the SysV red zone of the
-        // original user RSP. Use a minimal 16-byte `[saved_rip,
+        // Naive handlers (no SA_SIGINFO, no SA_ONSTACK, no restorer)
+        // don't have a libc trampoline to call sigreturn — they `ret`
+        // directly and the kernel must arrange for that `ret` to land
+        // at the resumption RIP with RSP within the SysV red zone of
+        // the original user RSP. Use a minimal 16-byte `[saved_rip,
         // signum]` push; handler ret pops saved_rip, RSP ends at
         // orig_rsp - 8 (red-zone safe). Wave-79: full SigContext
         // layout shifted RSP by ~300 B which broke any post-handler
         // stack-relative access in the trapped code.
-        let minimal_push = !want_siginfo && !want_altstack;
+        let minimal_push = !want_siginfo && !want_altstack && params.restorer == 0;
+
+        // Modern Linux (rt_sigaction) always uses the rt_sigframe
+        // layout if a restorer is present, because the restorer
+        // will call rt_sigreturn which expects that layout.
+        let force_rt = params.restorer != 0;
 
         // Frame size depends on layout choice.
-        let frame_size = if want_siginfo {
+        let frame_size = if want_siginfo || force_rt {
             // 8 (fallback) + 128 (siginfo) + size_of::<UContext>().
             8 + 128 + (core::mem::size_of::<UContext>() as u64)
         } else if minimal_push {
@@ -790,37 +811,24 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             8 + (core::mem::size_of::<SigContext>() as u64)
         };
 
-        // Base address: altstack top if SA_ONSTACK + altstack
-        // configured, else user RSP (SysV red zone 128 B respected).
-        // Linux `sigsp` in arch/x86/kernel/signal.c.
+        // ... (red zone and alignment logic)
         const SYSV_RED_ZONE: u64 = 128;
         let stack_top = if want_altstack {
-            // Altstack grows down from `sp + size`. No red-zone
-            // skipping — the altstack is a dedicated region and
-            // the caller's data isn't living above its top.
             params.altstack_sp.wrapping_add(params.altstack_size)
         } else {
-            // User RSP path: skip the red zone the caller may have
-            // written to (SysV AMD64 ABI §3.2.2 — 128 bytes below
-            // RSP are reserved for the caller).
             self.frame.rsp.wrapping_sub(SYSV_RED_ZONE)
         };
-        // Lay the frame at stack_top - frame_size; then 16-align
-        // and `| 0x8` so the handler observes the post-call ABI
-        // alignment (16k+8) that SysV requires.
         let raw_rsp = stack_top.wrapping_sub(frame_size);
         let new_rsp = (raw_rsp & !0xFu64) | 0x8;
 
-        // SAVED RIP for sigreturn. Default: post-trap RIP. SA_RESTART
-        // path rewinds by 2 so post-handler the syscall re-executes.
         let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
             self.frame.rip.wrapping_sub(2)
         } else {
             self.frame.rip
         };
 
-        if want_siginfo {
-            // SA_SIGINFO path: lay out [fallback_return][siginfo_t][ucontext_t].
+        if want_siginfo || force_rt {
+            // rt_sigframe path: lay out [fallback_return][siginfo_t][ucontext_t].
             let siginfo_vaddr = new_rsp + 8;
             let uctx_vaddr = siginfo_vaddr + 128;
 
@@ -828,7 +836,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 uc_flags: 0,
                 uc_link: 0,
                 uc_stack_sp: params.altstack_sp,
-                uc_stack_flags: if (params.flags & SA_ONSTACK) != 0 && params.altstack_sp != 0 {
+                uc_stack_flags: if want_altstack {
                     1 /* SS_ONSTACK */
                 } else {
                     0
@@ -867,26 +875,14 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 uc_sigmask: 0,
             };
 
-            // SAFETY: user stack is mapped under the active CR3
-            // (we're at CPL=0 holding the trap on behalf of the
-            // trapping task). SMAP bracket required — supervisor
-            // writes to USER pages fault with EFLAGS.AC=0.
             unsafe {
                 narf_arch::x86_64::smap::with_user_access(|| {
                     core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
-                    // siginfo_t: zero 128 bytes, then write si_signo,
-                    // si_errno, si_code prefix. Layout per Linux
-                    // include/uapi/asm-generic/siginfo.h.
                     let info_p = siginfo_vaddr as *mut u8;
                     core::ptr::write_bytes(info_p, 0, 128);
                     (info_p as *mut i32).write_unaligned(params.signum as i32);
                     (info_p.add(4) as *mut i32).write_unaligned(0);
                     (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
-                    // For SIGSEGV / SIGBUS / SIGFPE / SIGILL, si_addr
-                    // lives at offset 16 in the SI_FAULT union shape.
-                    // Writing it unconditionally is safe: async signals
-                    // pass 0 here and the field is well-defined as
-                    // "address associated with signal".
                     (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
                     core::ptr::write_volatile(uctx_vaddr as *mut UContext, uctx);
                 });
@@ -1088,40 +1084,122 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
     if sc_vaddr == 0 {
         return false;
     }
-    // SAFETY: user-supplied vaddr; the read goes through the active
-    // user AS. A bogus addr faults user-side. SMAP bracket required
-    // for supervisor read of a USER page.
-    let sc = unsafe {
+
+    // Heuristic: if signum at offset 144 is 0 but signum at offset 0 (si_signo)
+    // is non-zero, it's likely an rt_sigframe.
+    //
+    // rt_sigframe (Linux x86_64):
+    //   offset 0: pretcode (8)
+    //   offset 8: siginfo (si_signo is here)
+    //   offset 136: ucontext
+    //   offset 176: mcontext (McContext)
+
+    // Read the first 4 bytes to check si_signo.
+    let si_signo = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::read_volatile(sc_vaddr as *const SigContext)
+            core::ptr::read_volatile(sc_vaddr as *const i32)
         })
     };
-    use core::fmt::Write as _;
-    ctx.frame.r15 = sc.r15;
-    ctx.frame.r14 = sc.r14;
-    ctx.frame.r13 = sc.r13;
-    ctx.frame.r12 = sc.r12;
-    ctx.frame.r11 = sc.r11;
-    ctx.frame.r10 = sc.r10;
-    ctx.frame.r9 = sc.r9;
-    ctx.frame.r8 = sc.r8;
-    ctx.frame.rbp = sc.rbp;
-    ctx.frame.rdi = sc.rdi;
-    ctx.frame.rsi = sc.rsi;
-    ctx.frame.rdx = sc.rdx;
-    ctx.frame.rcx = sc.rcx;
-    ctx.frame.rbx = sc.rbx;
-    ctx.frame.rax = sc.rax;
-    ctx.frame.rip = sc.rip;
-    // Preserve only IF (bit 9) + TF (bit 8) from the saved RFLAGS
-    // (POSIX requires the trap context's flags to be restored
-    // verbatim, but a malicious user setting NT/IOPL bits could
-    // escape sandboxing on a future fork; mask to the safe set).
+
+    let (
+        sc_rip,
+        sc_rsp,
+        sc_rax,
+        sc_rbx,
+        sc_rcx,
+        sc_rdx,
+        sc_rsi,
+        sc_rdi,
+        sc_rbp,
+        sc_r8,
+        sc_r9,
+        sc_r10,
+        sc_r11,
+        sc_r12,
+        sc_r13,
+        sc_r14,
+        sc_r15,
+        sc_rflags,
+    );
+
+    if si_signo > 0 && si_signo < 64 {
+        // Assume RT frame. RSP at rt_sigreturn entry points at siginfo
+        // (restorer popped pretcode).
+        // ucontext is at sc_vaddr + 128.
+        // mcontext is at sc_vaddr + 128 + 40 = sc_vaddr + 168.
+        let mc_vaddr = sc_vaddr + 168;
+        let mc = unsafe {
+            narf_arch::x86_64::smap::with_user_access(|| {
+                core::ptr::read_volatile(mc_vaddr as *const McContext)
+            })
+        };
+        sc_rip = mc.rip;
+        sc_rsp = mc.rsp;
+        sc_rax = mc.rax;
+        sc_rbx = mc.rbx;
+        sc_rcx = mc.rcx;
+        sc_rdx = mc.rdx;
+        sc_rsi = mc.rsi;
+        sc_rdi = mc.rdi;
+        sc_rbp = mc.rbp;
+        sc_r8 = mc.r8;
+        sc_r9 = mc.r9;
+        sc_r10 = mc.r10;
+        sc_r11 = mc.r11;
+        sc_r12 = mc.r12;
+        sc_r13 = mc.r13;
+        sc_r14 = mc.r14;
+        sc_r15 = mc.r15;
+        sc_rflags = mc.rflags;
+    } else {
+        // Legacy SigContext.
+        let sc = unsafe {
+            narf_arch::x86_64::smap::with_user_access(|| {
+                core::ptr::read_volatile(sc_vaddr as *const SigContext)
+            })
+        };
+        sc_rip = sc.rip;
+        sc_rsp = sc.rsp;
+        sc_rax = sc.rax;
+        sc_rbx = sc.rbx;
+        sc_rcx = sc.rcx;
+        sc_rdx = sc.rdx;
+        sc_rsi = sc.rsi;
+        sc_rdi = sc.rdi;
+        sc_rbp = sc.rbp;
+        sc_r8 = sc.r8;
+        sc_r9 = sc.r9;
+        sc_r10 = sc.r10;
+        sc_r11 = sc.r11;
+        sc_r12 = sc.r12;
+        sc_r13 = sc.r13;
+        sc_r14 = sc.r14;
+        sc_r15 = sc.r15;
+        sc_rflags = sc.rflags;
+    }
+
+    ctx.frame.r15 = sc_r15;
+    ctx.frame.r14 = sc_r14;
+    ctx.frame.r13 = sc_r13;
+    ctx.frame.r12 = sc_r12;
+    ctx.frame.r11 = sc_r11;
+    ctx.frame.r10 = sc_r10;
+    ctx.frame.r9 = sc_r9;
+    ctx.frame.r8 = sc_r8;
+    ctx.frame.rbp = sc_rbp;
+    ctx.frame.rdi = sc_rdi;
+    ctx.frame.rsi = sc_rsi;
+    ctx.frame.rdx = sc_rdx;
+    ctx.frame.rcx = sc_rcx;
+    ctx.frame.rbx = sc_rbx;
+    ctx.frame.rax = sc_rax;
+    ctx.frame.rip = sc_rip;
+
     const SAFE_RFLAGS: u64 = (1 << 9) | (1 << 8) | (1 << 0); // IF, TF, CF
-    let preserved = sc.rflags & SAFE_RFLAGS;
+    let preserved = sc_rflags & SAFE_RFLAGS;
     let kept_kernel = ctx.frame.rflags & !SAFE_RFLAGS;
     ctx.frame.rflags = preserved | kept_kernel;
-    ctx.frame.rsp = sc.rsp;
+    ctx.frame.rsp = sc_rsp;
     true
 }
 
@@ -1206,7 +1284,7 @@ fn smoke_signal_trap_frame(rip: u64, rsp: u64) -> TrapFrame {
 /// sigreturn will restore on handler return) must be rewound by
 /// 2 bytes so the user re-executes `int 0x80`.
 fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
-    let mut stack = SmokeStack::new();
+    let stack = SmokeStack::new();
     // Post-trap RIP (the instruction AFTER int 0x80). Saved RIP
     // for SA_RESTART must land 2 bytes earlier — the int 0x80
     // opcode itself.
@@ -1216,6 +1294,7 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
 
     let params = SigDeliveryParams {
         handler: 0xDEAD_BEEF_F00D_F00D,
+        restorer: 0,
         signum: 10,
         flags: SA_RESTART,
         altstack_sp: 0,
@@ -1257,12 +1336,13 @@ kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_rewinds_saved_rip);
 /// RIP must NOT be rewound — the syscall returns EINTR and the
 /// next instruction after `int 0x80` runs on handler return.
 fn smoke_x86_64_sa_restart_clear_does_not_rewind() -> TestResult {
-    let mut stack = SmokeStack::new();
+    let stack = SmokeStack::new();
     const POST_TRAP_RIP: u64 = 0x1234_5678_9ABC_DE56;
     let mut frame = smoke_signal_trap_frame(POST_TRAP_RIP, stack.top());
 
     let params = SigDeliveryParams {
         handler: 0xABCD,
+        restorer: 0,
         signum: 11,
         flags: 0, // no SA_RESTART
         altstack_sp: 0,
@@ -1293,12 +1373,13 @@ kernel_test_in!(
 /// rewind RIP regardless of the flag — POSIX-2017 §2.4 says the
 /// timeout family observes the abbreviated wait, not auto-restart.
 fn smoke_x86_64_sa_restart_non_restartable_syscall() -> TestResult {
-    let mut stack = SmokeStack::new();
+    let stack = SmokeStack::new();
     const POST_TRAP_RIP: u64 = 0xFEEDFACE_C0DEBABE;
     let mut frame = smoke_signal_trap_frame(POST_TRAP_RIP, stack.top());
 
     let params = SigDeliveryParams {
         handler: 0xABCD,
+        restorer: 0,
         signum: 14,
         flags: SA_RESTART,
         altstack_sp: 0,
@@ -1336,6 +1417,7 @@ fn smoke_x86_64_sa_onstack_uses_altstack_top() -> TestResult {
 
     let params = SigDeliveryParams {
         handler: 0xBABEFACE,
+        restorer: 0,
         signum: 12,
         flags: SA_ONSTACK,
         altstack_sp: altstack.base(),
@@ -1377,6 +1459,7 @@ fn smoke_x86_64_sa_onstack_no_altstack_falls_back() -> TestResult {
 
     let params = SigDeliveryParams {
         handler: 0xBABEFACE,
+        restorer: 0,
         signum: 12,
         flags: SA_ONSTACK,
         altstack_sp: 0, // no altstack
@@ -1409,11 +1492,12 @@ kernel_test_in!(
 /// laid out at known offsets relative to the frame base so the
 /// trampoline (which is libc-side) can walk them.
 fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
-    let mut stack = SmokeStack::new();
+    let stack = SmokeStack::new();
     let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, stack.top());
 
     let params = SigDeliveryParams {
         handler: 0xCAFE_F00D,
+        restorer: 0,
         signum: 11, // SIGSEGV
         flags: SA_SIGINFO,
         altstack_sp: 0,

@@ -1374,53 +1374,6 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 }
             }
         }
-    } else if cmd == b"head" {
-        // head <path> — first 10 lines, capped at 8 KiB total.
-        let path = trim_arg(rest);
-        if path.is_empty() {
-            unsafe { write_all(fd, b"head: missing path\n"); }
-        } else {
-            let mut pbuf = [0u8; 256];
-            if path.len() + 1 >= pbuf.len() {
-                unsafe { write_all(fd, b"head: path too long\n"); }
-            } else {
-                pbuf[..path.len()].copy_from_slice(path);
-                let in_fd = unsafe {
-                    libc::posix_open(pbuf.as_ptr() as *const i8, libc::O_RDONLY, 0)
-                };
-                if in_fd < 0 {
-                    unsafe { write_all(fd, b"head: open failed\n"); }
-                } else {
-                    let mut buf = [0u8; 1024];
-                    let mut lines = 0u32;
-                    let mut total = 0usize;
-                    'outer: loop {
-                        let n = unsafe {
-                            libc::posix_read(in_fd, buf.as_mut_ptr() as *mut _, buf.len())
-                        };
-                        if n <= 0 || total >= 8 * 1024 {
-                            break;
-                        }
-                        let mut start = 0usize;
-                        for i in 0..n as usize {
-                            if buf[i] == b'\n' {
-                                unsafe { write_all(fd, &buf[start..=i]); }
-                                start = i + 1;
-                                lines += 1;
-                                if lines >= 10 {
-                                    break 'outer;
-                                }
-                            }
-                        }
-                        if start < n as usize {
-                            unsafe { write_all(fd, &buf[start..n as usize]); }
-                        }
-                        total += n as usize;
-                    }
-                    unsafe { libc::posix_close(in_fd); }
-                }
-            }
-        }
     } else if cmd == b"wc" {
         // wc <path> — count bytes + lines + words. Whitespace-delimited
         // words; treats consecutive WS as one separator.
