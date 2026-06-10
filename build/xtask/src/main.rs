@@ -1466,11 +1466,17 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
     let prompt_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60);
+        .unwrap_or(120);
+    // Per-command echo timeout. Generous by default: a CI runner
+    // without KVM emulates 5-10x slower than a local KVM host, so the
+    // slowest cases (dynamic-linked musl binaries that run the full
+    // ld-musl relocation path, pthread join, busybox fork/exec) can
+    // take well over the old 30s there even though they finish in a
+    // few seconds locally. Override with XTASK_RI_ECHO_TIMEOUT_SECS.
     let echo_secs = std::env::var("XTASK_RI_ECHO_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30);
+        .unwrap_or(120);
 
     // Channel events from the reader thread. The reader doesn't
     // try to detect the echo reply — main does that off the shared
