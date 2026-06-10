@@ -137,20 +137,49 @@ impl<'a> TrapContext for UserStateCtx<'a> {
         }
     }
     fn user_rsp(&self) -> u64 {
-        self.state.rsp
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.state.rsp
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.state.sp
+        }
     }
     fn rip(&self) -> u64 {
-        self.state.rip
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.state.rip
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.state.pc
+        }
     }
     fn set_rip(&mut self, rip: u64) {
-        self.state.rip = rip;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.state.rip = rip;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.state.pc = rip;
+        }
     }
     fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
         false
     }
     fn redirect_to_user(&mut self, entry_rip: u64, entry_rsp: u64) -> bool {
-        self.state.rip = entry_rip;
-        self.state.rsp = entry_rsp;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.state.rip = entry_rip;
+            self.state.rsp = entry_rsp;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.state.pc = entry_rip;
+            self.state.sp = entry_rsp;
+        }
         true
     }
     unsafe fn save_user_state(&self, _out: *mut u8) -> bool {

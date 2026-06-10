@@ -296,6 +296,29 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         self.frame.x1 = ret.status as u64;
     }
 
+    fn user_rsp(&self) -> u64 {
+        // The user stack pointer lives in SP_EL0 (the EL1 trap path
+        // selected SP_EL1, so SP_EL0 still holds the user value).
+        let sp_el0: u64;
+        // SAFETY: reading SP_EL0 has no side effects.
+        unsafe {
+            core::arch::asm!(
+                "mrs {v}, SP_EL0",
+                v = out(reg) sp_el0,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        sp_el0
+    }
+
+    fn rip(&self) -> u64 {
+        self.frame.elr
+    }
+
+    fn set_rip(&mut self, rip: u64) {
+        self.frame.elr = rip;
+    }
+
     fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
         // Rewrite ELR_EL1 to the kernel landing; SPSR_EL1's mode
         // field picks EL1h (SP_ELx selected). Push the requested
@@ -896,6 +919,7 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
 
     let params = SigDeliveryParams {
         handler: 0xDEAD_BEEF,
+        restorer: 0,
         signum: 10,
         flags: SA_RESTART,
         altstack_sp: 0,
@@ -968,6 +992,7 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
 
     let params = SigDeliveryParams {
         handler: 0xBABE_FACE,
+        restorer: 0,
         signum: 12,
         flags: SA_ONSTACK,
         altstack_sp: altstack.base(),
@@ -1030,6 +1055,7 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
 
     let params = SigDeliveryParams {
         handler: 0xCAFE_F00D,
+        restorer: 0,
         signum: 11, // SIGSEGV
         flags: SA_SIGINFO,
         altstack_sp: 0,

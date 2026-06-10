@@ -895,11 +895,6 @@ fn sys_write(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
 
-    // Use klog for tracing
-    if fd == 1 || fd == 2 {
-        if let Some(s) = copy_user_path(ptr, len.min(100)) {}
-    }
-
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,

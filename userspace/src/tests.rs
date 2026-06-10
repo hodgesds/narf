@@ -11455,7 +11455,7 @@ fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
     }
     // 5. Poke the eventfd directly via its FileOps to bump the counter.
     {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        use core::task::{Context, RawWaker, RawWakerVTable, Waker};
         unsafe fn no_op(_: *const ()) {}
         unsafe fn clone(_: *const ()) -> RawWaker {
             RawWaker::new(core::ptr::null(), &VT)
