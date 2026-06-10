@@ -1157,6 +1157,166 @@ fn smoke_userspace_signal_delivery() -> TestResult {
 #[cfg(not(feature = "user-mode-e2e"))]
 kernel_test_in!("userspace", smoke_userspace_signal_delivery);
 
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_signal_delivery_lowest_first_multiple_pending() -> TestResult {
+    // Two signals pending at once. The async delivery hook must pick
+    // the LOWEST signum first (`deliverable.trailing_zeros()`), route
+    // it to ITS handler, clear only that bit, and leave the higher
+    // signal pending for the next trap — then deliver it on the second
+    // pass. Exercises the multi-pending path that the single-signal
+    // `smoke_userspace_signal_delivery` doesn't.
+    use crate::{
+        default_signal_delivery, install_core_syscalls, install_global, install_task_id_lookup,
+        kernel_syscall_entry, signal_init, signal_pending_of, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD158);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(task_lookup);
+
+    crate::handlers::__test_sigaction_reset();
+    crate::handlers::__test_signal_reset();
+    crate::sigaction_init();
+    signal_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        delivered: Option<(u64, u32)>,
+        going_to_user: bool,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn returning_to_user(&self) -> bool {
+            self.going_to_user
+        }
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.delivered = Some((p.handler, p.signum));
+            true
+        }
+    }
+
+    const H10: u64 = 0xAAAA_0000;
+    const H12: u64 = 0xBBBB_0000;
+
+    let cleanup = || {
+        __test_clear_global();
+        crate::handlers::__test_sigaction_reset();
+        crate::handlers::__test_signal_reset();
+    };
+
+    // Register a distinct handler for signum 10 and signum 12.
+    for (sig, handler) in [(10u64, H10), (12u64, H12)] {
+        let mut old: u64 = 0;
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: sig,
+                arg1: handler,
+                arg2: &mut old as *mut u64 as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+            delivered: None,
+            going_to_user: false,
+        };
+        kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+        if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+            cleanup();
+            return TestResult::Fail("sigaction registration for 10/12 did not Ok");
+        }
+    }
+
+    // Mark BOTH pending — kill signum 12 FIRST so the test proves the
+    // lowest signum wins regardless of the order the bits were set.
+    for sig in [12u64, 10u64] {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: FAKE_TASK.load(Ordering::Relaxed),
+                arg1: sig,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+            delivered: None,
+            going_to_user: false,
+        };
+        kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    }
+    let pending_before = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
+
+    // First delivery → expect the lowest pending signum (10).
+    let mut ctx1 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
+        going_to_user: true,
+    };
+    default_signal_delivery(&mut ctx1, crate::handlers::SYSCALL_NUM_NONE);
+    let first = ctx1.delivered;
+    let pending_mid = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
+
+    // Second delivery → expect the remaining signal (12).
+    let mut ctx2 = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        delivered: None,
+        going_to_user: true,
+    };
+    default_signal_delivery(&mut ctx2, crate::handlers::SYSCALL_NUM_NONE);
+    let second = ctx2.delivered;
+    let pending_after = signal_pending_of(FAKE_TASK.load(Ordering::Relaxed));
+
+    cleanup();
+
+    if pending_before & (1 << 10) == 0 || pending_before & (1 << 12) == 0 {
+        return TestResult::Fail("both signals 10 and 12 should be pending before delivery");
+    }
+    if !matches!(first, Some((h, s)) if h == H10 && s == 10) {
+        return TestResult::Fail("first delivery must be the lowest signum (10) with its handler");
+    }
+    if pending_mid & (1 << 10) != 0 {
+        return TestResult::Fail("first delivery must clear only the delivered bit (10)");
+    }
+    if pending_mid & (1 << 12) == 0 {
+        return TestResult::Fail("first delivery must leave the higher signal (12) pending");
+    }
+    if !matches!(second, Some((h, s)) if h == H12 && s == 12) {
+        return TestResult::Fail("second delivery must be signum 12 with its handler");
+    }
+    if pending_after & (1 << 12) != 0 {
+        return TestResult::Fail("second delivery must clear the remaining bit (12)");
+    }
+
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_signal_delivery_lowest_first_multiple_pending
+);
+
 fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     // Verify the per-task cwd state round-trips through Chdir +
     // Getcwd. Drive both through the synthetic TrapContext path so

@@ -1954,6 +1954,11 @@ const NARF_EXTENSION_TABLE: &[(Syscall, u32)] = &[
     // listdir is a NARF-only convenience (the libc reads via
     // `getdents64` directly).
     (Syscall::Listdir, 0x4053),
+    // Legacy 3-arg `sigaction` (handler vaddr in a register). Linux
+    // wire 13/134 now route to `RtSigaction` (pointer-to-struct), so
+    // this NARF-internal form needs its own number to stay
+    // dispatchable for narf-libc and the in-kernel signal tests.
+    (Syscall::Sigaction, 0x4060),
 ];
 
 impl Syscall {
@@ -1978,7 +1983,13 @@ impl Syscall {
             }
             j += 1;
         }
-        panic!("Syscall missing from both LINUX and NARF tables");
+        // A variant with no table row on this arch (e.g. `Clone` where
+        // only `Clone3` is wired) maps to an out-of-range sentinel.
+        // `from_raw` returns `None` for it, so a stray dispatch surfaces
+        // `InvalidOp` rather than crashing. Panicking here would turn
+        // any runtime `.raw()` on an unwired variant — including from
+        // the in-kernel test suite — into a kernel panic.
+        u32::MAX
     }
 
     /// Reverse lookup: return the canonical `Syscall` variant for

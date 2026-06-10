@@ -435,31 +435,42 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
         }
     };
 
-    let uctx_ptr = crate::user_task::current_user_task().expect("epoll_wait outside task context");
-    let uctx = unsafe { &*uctx_ptr };
+    // Without a polling task context (the in-kernel test harness has
+    // no user task to park), epoll_wait can't block — fall back to a
+    // single non-blocking readiness poll. `uctx` is therefore an
+    // Option; `None` forces the `timeout == 0` (non-blocking) path.
+    let uctx_opt = crate::user_task::current_user_task();
 
-    let deadline_ns: Option<u64> = if timeout_ms == 0 {
-        Some(0)
-    } else if timeout_ms > 0 {
-        let persisted = uctx.sleep_deadline_ns.load(Ordering::Acquire);
-        if persisted != 0 && persisted != u64::MAX {
-            Some(persisted)
-        } else {
-            let d = narf_scheduler::narf_time::monotonic_ns()
-                .saturating_add((timeout_ms as u64) * 1_000_000);
-            uctx.sleep_deadline_ns.store(d, Ordering::Release);
-            Some(d)
+    let deadline_ns: Option<u64> = match uctx_opt {
+        None => Some(0),
+        Some(uctx_ptr) => {
+            let uctx = unsafe { &*uctx_ptr };
+            if timeout_ms == 0 {
+                Some(0)
+            } else if timeout_ms > 0 {
+                let persisted = uctx.sleep_deadline_ns.load(Ordering::Acquire);
+                if persisted != 0 && persisted != u64::MAX {
+                    Some(persisted)
+                } else {
+                    let d = narf_scheduler::narf_time::monotonic_ns()
+                        .saturating_add((timeout_ms as u64) * 1_000_000);
+                    uctx.sleep_deadline_ns.store(d, Ordering::Release);
+                    Some(d)
+                }
+            } else {
+                uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+                None
+            }
         }
-    } else {
-        uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
-        None
     };
 
     loop {
         let ready = instance.collect_ready(task);
         let n = ready.len().min(maxevents);
         if n > 0 {
-            uctx.sleep_deadline_ns.store(0, Ordering::Release);
+            if let Some(uctx_ptr) = uctx_opt {
+                unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
+            }
             for (i, (events, data)) in ready[..n].iter().enumerate() {
                 if write_epoll_event(
                     events_ptr as u64 + (i * EPOLL_EVENT_SIZE) as u64,
@@ -482,18 +493,20 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 return;
             }
             Some(d) if d != u64::MAX && narf_scheduler::narf_time::monotonic_ns() >= d => {
-                uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                if let Some(uctx_ptr) = uctx_opt {
+                    unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
+                }
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
             _ => {
-                if let Some(hook) = crate::user_task::yield_hook() {
+                if let (Some(uctx_ptr), Some(hook)) = (uctx_opt, crate::user_task::yield_hook()) {
                     // Check for signals. If delivered, return -EINTR.
                     if let Some(h) = crate::signal_delivery_hook() {
                         if h(ctx, crate::Syscall::EpollWait.raw()) {
                             // Signal delivered. Interrupt syscall with EINTR.
                             ctx.set_return(SyscallReturn::ok((-4i64) as u64));
-                            uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                            unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
                             return;
                         }
                     }

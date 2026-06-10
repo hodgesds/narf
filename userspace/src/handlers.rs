@@ -4542,14 +4542,16 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
         // unreachable
     }
 
-    // Fallback if no hook registered (kernel test contexts).
-    loop {
-        if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
-            return;
-        }
-        narf_scheduler::sleep_pumps::run();
-        core::hint::spin_loop();
+    // Fallback: no polling executor is wired (kernel-test contexts),
+    // so there is nothing to park on. Pump any ready async work once
+    // in case a signal is about to become deliverable, retry delivery,
+    // then surface EINTR rather than spinning forever — a real task
+    // always takes the yield-hook path above and never reaches here.
+    narf_scheduler::sleep_pumps::run();
+    if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
+        return;
     }
+    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
 }
 
 // ── RingKick — drain the shared SQ, post completions to the CQ ────
