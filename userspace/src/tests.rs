@@ -7643,8 +7643,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     // Stable-static buffers for the path/mount/data so the user
     // task can hand pointers across awaits without lifetime
     // complications.
-    static PATH: &[u8] = b"f";
-    static MOUNT: &[u8] = b"/test_abi";
+    static PATH: &[u8] = b"/test_abi/f\0";
     static mut READ_BUF: [u8; 16] = [0u8; 16];
 
     narf_scheduler::__reset_queues_for_test();
@@ -7656,13 +7655,12 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         let mut sq = user_ends.sq_prod;
         let mut cq = user_ends.cq_drain;
 
-        // Open(/test_abi, "f").
+        // Open("/test_abi/f"). Linux open(2) ABI: inline[0] = NUL-
+        // terminated absolute path, inline[1] = flags.
         let mut sub = Submission::noop(Tag::new(0x10));
         sub.op = OpCode::OpenFile;
         sub.inline[0] = PATH.as_ptr() as u64;
-        sub.inline[1] = PATH.len() as u64;
-        sub.inline[2] = MOUNT.as_ptr() as u64;
-        sub.inline[3] = MOUNT.len() as u64;
+        sub.inline[1] = 0;
         sq.send(sub).await.unwrap();
         let comp = cq.recv().await.unwrap();
         if comp.status != NarfStatus::Ok || comp.result[0] != 3 {
