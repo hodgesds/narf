@@ -3408,6 +3408,7 @@ fn boot_userspace_init() {
 /// path stays a no-op so `cargo xtask run --arch=aarch64
 /// --features boot-init` still links and boots the kernel proper.
 #[cfg(all(feature = "boot-init", not(target_arch = "x86_64")))]
+#[allow(dead_code)] // TODO(narf): aarch64 boot-init stub; its caller is cfg'd out under kernel-test
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     let _ = writeln!(
