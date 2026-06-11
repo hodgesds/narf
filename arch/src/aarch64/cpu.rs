@@ -63,6 +63,7 @@ pub fn mpidr_aff() -> u32 {
             options(nomem, nostack, preserves_flags),
         );
     }
+    #[allow(clippy::identity_op)] // `>> 0` kept for symmetry with aff1/aff2/aff3 extractions
     let aff0 = ((mpidr >> 0) & 0xFF) as u32;
     let aff1 = ((mpidr >> 8) & 0xFF) as u32;
     let aff2 = ((mpidr >> 16) & 0xFF) as u32;

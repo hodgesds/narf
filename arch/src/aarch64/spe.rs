@@ -114,6 +114,10 @@ pub unsafe fn enable() {
     write_pmblimitr(read_pmblimitr() | PMBLIMITR_E);
 }
 
+/// Disable SPE buffer writes by clearing `PMBLIMITR.E`.
+///
+/// # Safety
+/// EL1; SPE supported.
 pub unsafe fn disable() {
     write_pmblimitr(read_pmblimitr() & !PMBLIMITR_E);
 }

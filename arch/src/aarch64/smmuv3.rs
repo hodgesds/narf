@@ -63,9 +63,11 @@ unsafe fn w64(base: usize, off: usize, v: u64) {
 /// `reg_base` is a strong-uncacheable MMIO mapping of an SMMUv3
 /// register block.
 pub unsafe fn read_caps(reg_base: usize) -> SmmuCaps {
-    // SAFETY: caller-asserted.
+    // SAFETY: `reg_base` is a valid SMMUv3 MMIO mapping (fn contract); IDR0 is in range.
     let idr0 = unsafe { r32(reg_base, SMMU_IDR0) };
+    // SAFETY: same MMIO mapping; IDR1 is a read-only register within the block.
     let idr1 = unsafe { r32(reg_base, SMMU_IDR1) };
+    // SAFETY: same MMIO mapping; IDR5 is a read-only register within the block.
     let idr5 = unsafe { r32(reg_base, SMMU_IDR5) };
     decode_caps(idr0, idr1, idr5)
 }
@@ -97,15 +99,27 @@ pub unsafe fn read_cr0(reg_base: usize) -> u32 {
     unsafe { r32(reg_base, SMMU_CR0) }
 }
 
+/// Write `CR0` at `reg_base`.
+///
+/// # Safety
+/// `reg_base` is the engine's MMIO mapping; enabling/disabling SMMU
+/// translation here changes global DMA visibility, so the caller must
+/// have programmed the stream table and queues first.
 pub unsafe fn write_cr0(reg_base: usize, v: u32) {
-    // SAFETY: caller-asserted.
+    // SAFETY: `reg_base` is a valid SMMUv3 MMIO mapping (fn contract); CR0 is in range.
     unsafe {
         w32(reg_base, SMMU_CR0, v);
     }
 }
 
+/// Program the stream-table base address and its configuration.
+///
+/// # Safety
+/// `reg_base` is the engine's MMIO mapping; `paddr` must point at a
+/// stream table sized per `cfg`, and SMMU translation must be disabled
+/// while these registers are reprogrammed.
 pub unsafe fn write_strtab_base(reg_base: usize, paddr: u64, cfg: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: `reg_base` is a valid SMMUv3 MMIO mapping (fn contract); both regs are in range.
     unsafe {
         w64(reg_base, SMMU_STRTAB_BASE, paddr);
         w64(reg_base, SMMU_STRTAB_BASE_CFG, cfg);

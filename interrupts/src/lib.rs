@@ -70,6 +70,11 @@ pub unsafe fn eoi() {
 }
 
 /// Stub: aarch64 GIC EOI lands with the GICv3 skeleton.
+///
+/// # Safety
+/// Same contract as the x86_64 path: call from an IRQ handler exactly once
+/// per dispatch with the interrupt controller initialised. Currently a
+/// no-op until the GICv3 backend is wired.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn eoi() {}
 
@@ -168,6 +173,10 @@ pub unsafe fn current_cpu_target_id() -> u32 {
     unsafe { current::apic::apic_id() }
 }
 
+/// # Safety
+/// No preconditions on aarch64 yet: returns 0 until the GICv3 ITS
+/// collection / affinity routing id is wired. Marked `unsafe` only to
+/// keep the signature identical to the x86_64 backend.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 pub unsafe fn current_cpu_target_id() -> u32 {

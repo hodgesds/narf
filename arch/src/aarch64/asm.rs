@@ -5,6 +5,9 @@ use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 /// Mask IRQs via `MSR DAIFSET, #0x2`.
+///
+/// # Safety
+/// Executes a privileged `MSR DAIFSET` — caller must run at EL1.
 #[inline(always)]
 pub unsafe fn disable_interrupts() {
     compiler_fence(Ordering::SeqCst);
@@ -16,6 +19,10 @@ pub unsafe fn disable_interrupts() {
 }
 
 /// Unmask IRQs via `MSR DAIFCLR, #0x2`.
+///
+/// # Safety
+/// Executes a privileged `MSR DAIFCLR` — caller must run at EL1 and be
+/// prepared for IRQ delivery once the I-bit clears.
 #[inline(always)]
 pub unsafe fn enable_interrupts() {
     compiler_fence(Ordering::SeqCst);
@@ -27,6 +34,10 @@ pub unsafe fn enable_interrupts() {
 }
 
 /// `WFI` — wait for interrupt.
+///
+/// # Safety
+/// Executes `WFI`; caller must ensure a wake source (live IRQ) exists,
+/// otherwise the CPU stalls indefinitely.
 #[inline(always)]
 pub unsafe fn wfi_once() {
     compiler_fence(Ordering::SeqCst);
@@ -176,6 +187,8 @@ pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     //   DSB ISH        — ensure the invalidate completes before ISB
     //   ISB            — flush the pipeline so the next fetch sees the
     //                     new word
+    // SAFETY: DSB/IC IVAU/ISB are the cache-maintenance ops for SMC at
+    // EL1; `addr` is the just-written word.
     unsafe {
         asm!(
             "dsb ish",

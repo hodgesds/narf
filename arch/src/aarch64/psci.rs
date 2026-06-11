@@ -131,10 +131,12 @@ pub fn set_conduit(c: Conduit) {
 
 #[inline]
 fn dispatch(fn_id: u32, a1: u64, a2: u64, a3: u64) -> [u64; 4] {
-    // SAFETY: caller-asserted EL1 with valid conduit set up by
-    // platform firmware / hypervisor.
     match CONDUIT.load(Ordering::Acquire) {
+        // SAFETY: EL1; SMC conduit confirmed by platform boot path
+        // via `set_conduit(Conduit::Smc)`.
         1 => unsafe { smc(fn_id, a1, a2, a3) },
+        // SAFETY: EL1; HVC conduit — traps to EL2 hypervisor or
+        // firmware handling PSCI on behalf of the guest.
         _ => unsafe { hvc(fn_id, a1, a2, a3) },
     }
 }

@@ -876,6 +876,14 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 uc_sigmask: 0,
             };
 
+            // SAFETY: `new_rsp` is the 16-byte-aligned user stack pointer
+            // derived from the task's own RSP/altstack minus `frame_size`,
+            // and `siginfo_vaddr`/`uctx_vaddr` are the layout offsets within
+            // that same `frame_size` reservation, so all writes stay inside
+            // the user stack we just allocated. `with_user_access` opens the
+            // SMAP window so these CPL=0 writes to user PTEs don't fault; the
+            // `write_unaligned`/`write_bytes` tolerate the unaligned siginfo
+            // fields.
             unsafe {
                 narf_arch::x86_64::smap::with_user_access(|| {
                     core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
@@ -1096,6 +1104,11 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
     //   offset 176: mcontext (McContext)
 
     // Read the first 4 bytes to check si_signo.
+    // SAFETY: `sc_vaddr` is the user RSP captured by the trap entry and
+    // checked non-zero above, with `cs & 3 == 3` confirming it came from
+    // CPL=3; the frame layout guarantees at least 4 readable bytes there.
+    // `with_user_access` opens the SMAP window for this CPL=0 read of a
+    // user PTE.
     let si_signo = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::read_volatile(sc_vaddr as *const i32)
@@ -1129,6 +1142,12 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         // ucontext is at sc_vaddr + 128.
         // mcontext is at sc_vaddr + 128 + 40 = sc_vaddr + 168.
         let mc_vaddr = sc_vaddr + 168;
+        // SAFETY: rt_sigframe path — `mc_vaddr = sc_vaddr + 168` is the
+        // mcontext offset within the user `rt_sigframe` whose base
+        // (`sc_vaddr`) was validated above; the frame the kernel itself laid
+        // out reserves a full `McContext` there. `read_volatile` reads it as
+        // a plain POD copy and `with_user_access` opens the SMAP window for
+        // this read of a user PTE.
         let mc = unsafe {
             narf_arch::x86_64::smap::with_user_access(|| {
                 core::ptr::read_volatile(mc_vaddr as *const McContext)
@@ -1154,6 +1173,11 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         sc_rflags = mc.rflags;
     } else {
         // Legacy SigContext.
+        // SAFETY: legacy-frame path — `sc_vaddr` points at the `SigContext`
+        // the kernel pushed onto the user stack, validated non-zero and
+        // CPL=3 above, so a full `SigContext` is readable there.
+        // `read_volatile` takes a plain POD copy and `with_user_access`
+        // opens the SMAP window for this read of a user PTE.
         let sc = unsafe {
             narf_arch::x86_64::smap::with_user_access(|| {
                 core::ptr::read_volatile(sc_vaddr as *const SigContext)

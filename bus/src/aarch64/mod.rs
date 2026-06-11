@@ -176,10 +176,11 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
 
                 if is_virtio_mmio_node(name_bytes) {
                     // Parse this node's properties to find `reg`.
-                    // SAFETY: `struct_slice` is in-range of the FDT
-                    // per the header we validated; `base` is still
-                    // live; `hdr` was copied by value.
                     if let Some((base_addr, len)) =
+                        // SAFETY: `struct_slice` is in-range of the FDT per
+                        // the header we validated, `base` is still live, and
+                        // `hdr` was copied by value, satisfying
+                        // `scan_reg_in_node`'s contract.
                         unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
                     {
                         // cursor is now at END_NODE; account depth-wise.
@@ -207,8 +208,11 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                     // We only run the walker when the DTB-supplied
                     // base is in the low-4-GiB identity-mapped
                     // window; higher addresses get logged + skipped.
-                    // SAFETY: same FDT walk preconditions.
                     if let Some((ecam_base, ecam_size)) =
+                        // SAFETY: same FDT walk preconditions as above —
+                        // `struct_slice` stays in-range of the validated FDT,
+                        // `base` is live, and `hdr` is a by-value copy, so
+                        // `scan_reg_in_node`'s contract is upheld.
                         unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
                     {
                         depth += 1;

@@ -1418,6 +1418,9 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     #[cfg(target_arch = "aarch64")]
     {
         use crate::aarch64::paging::{self};
+        // SAFETY: `a.root` is the root table of the `AddressSpace` just
+        // materialized above; its tables are identity-mapped and no other
+        // CPU mutates them under the single-threaded test runner.
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
             Some(phys) => {
@@ -1428,6 +1431,9 @@ fn smoke_memory_address_space_materialize() -> TestResult {
             None => return TestResult::Fail("translate found no mapping post-materialize"),
         }
         // Expect VALID + AF + UXN (non-exec default) + TYPE_PAGE.
+        // SAFETY: `a.root` is the materialized address space's root table;
+        // its tables are identity-mapped and unmutated by other CPUs in the
+        // single-threaded test runner.
         let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
         match flags {
             Some(f) => {
@@ -1464,6 +1470,9 @@ unsafe fn translate_arch(root: crate::PhysAddr, virt: crate::VirtAddr) -> Option
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     return unsafe { crate::x86_64::paging::translate(root, virt) };
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: this fn's own contract requires `root` to be a valid,
+    // identity-mapped aarch64 root table; we forward it unchanged to the
+    // arch `translate`, which has the same precondition.
     return unsafe { crate::aarch64::paging::translate(root, virt) };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     return None;

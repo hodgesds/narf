@@ -184,6 +184,11 @@ impl AddressSpace {
         })
     }
 
+    /// # Safety
+    /// Caller must run with the MMU enabled. The fresh `TTBR0_EL1` root
+    /// starts empty (the kernel half lives behind `TTBR1_EL1` and is
+    /// unaffected); post-construction the AS is safe to build up via
+    /// `map_region` and install via `activate()`.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
         // SAFETY: contract documented on the function. aarch64's
@@ -331,11 +336,8 @@ impl AddressSpace {
         for i in 0..pages {
             let v = VirtAddr::new(region.base.as_u64() + (i << 12));
             // SAFETY: see x86_64 variant.
-            match unsafe { unmap_4kb(self.root, v) } {
-                Ok(phys) => {
-                    free_frame(PhysFrame::new(phys));
-                }
-                Err(_) => {}
+            if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+                free_frame(PhysFrame::new(phys));
             }
         }
     }
@@ -424,6 +426,12 @@ impl AddressSpace {
         Err(AddressSpaceError::Unmapped)
     }
 
+    /// # Safety
+    /// - The low-memory identity map must be live (used to zero the fresh
+    ///   frame and walk the translation tables).
+    /// - `self.root` must be a valid `TTBR0_EL1` root for the AS currently
+    ///   active on this CPU.
+    /// - The frame allocator must be initialised.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
@@ -561,6 +569,12 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// # Safety
+    /// - The low-memory identity map must be live (used to zero the fresh
+    ///   frame).
+    /// - `self.root` must be a valid `TTBR0_EL1` root for the AS currently
+    ///   active on this CPU.
+    /// - The frame allocator must be initialised.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn try_grow_stack(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
@@ -1239,6 +1253,11 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// # Safety
+    /// The AS must have been constructed via `new_for_user` (so `root`
+    /// points at a valid `TTBR0_EL1` L0 table). Repeated calls are
+    /// idempotent — `map_4kb` returns `AlreadyMapped` on the second pass
+    /// and this surface treats it as success.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
@@ -1313,6 +1332,9 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// # Safety
+    /// Non-x86_64 stub: a no-op that never touches page tables, so it has
+    /// no preconditions. Present only to keep the per-arch API uniform.
     #[cfg(not(target_arch = "x86_64"))]
     pub unsafe fn rematerialize(&self) -> Result<(), AddressSpaceError> {
         Ok(())
@@ -1530,6 +1552,11 @@ impl AddressSpace {
     /// for that 4 KiB page reflecting the region's current
     /// `phys[i]` + `perms`. Used by the data-abort handler after
     /// `cow_split_on_write` repointed the per-page phys entry.
+    ///
+    /// # Safety
+    /// - `self.root` must be a valid `TTBR0_EL1` L0 table (per `new_for_user`).
+    /// - The caller must serialise this against any concurrent mutation of
+    ///   the same region.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn remap_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, unmap_4kb, MapError, PtFlags};
@@ -1555,10 +1582,13 @@ impl AddressSpace {
             flags = flags | PtFlags::UXN | PtFlags::PXN;
         }
 
-        // SAFETY: root is a valid translation table; `page_va`
-        // sits inside `region`. unmap_4kb invalidates the local
-        // TLB; map_4kb installs the fresh leaf.
+        // SAFETY: `self.root` is a valid `TTBR0_EL1` table (checked non-zero
+        // above); `page_va` was just located inside `region`. unmap_4kb
+        // invalidates the stale local TLB entry for that page.
         let _ = unsafe { unmap_4kb(self.root, page_va) };
+        // SAFETY: same `self.root`/`page_va` validity as above; `phys` is
+        // `region.phys[page_idx]` for this page and `flags` derive from the
+        // region's perms. map_4kb installs the fresh leaf PTE.
         match unsafe { map_4kb(self.root, page_va, phys, flags) } {
             Ok(()) => Ok(()),
             Err(MapError::AlreadyMapped) => Ok(()),
@@ -1646,11 +1676,16 @@ impl AddressSpace {
             // user-AS mapping.
             // SAFETY: ttbr0 read is unconditional.
             let cur = unsafe { crate::aarch64::paging::read_ttbr0_el1() };
+            // SAFETY: writes the value just read from `TTBR0_EL1` straight
+            // back, so the active low-half translation is unchanged; the
+            // accompanying TLBI only flushes entries that are re-derived
+            // identically. The kernel half lives in `TTBR1_EL1` and is
+            // untouched, so kernel fetches/loads stay valid across the MSR.
             unsafe {
                 crate::aarch64::paging::write_ttbr0_el1(cur);
             }
             let _ = self.root;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {

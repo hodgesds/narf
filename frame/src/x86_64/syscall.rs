@@ -70,6 +70,14 @@ const SFMASK_BITS: u64 = RFLAGS_IF | RFLAGS_DF | RFLAGS_TF | RFLAGS_AC;
 ///   - `rdx` = SyscallReturn.value
 ///   - `rcx` = user RIP (consumed by `sysretq`)
 ///   - `r11` = user RFLAGS (consumed by `sysretq`)
+///
+/// # Safety
+/// Never call this from Rust: it is the raw `syscall` instruction
+/// landing pad installed in `IA32_LSTAR`. It assumes it was entered
+/// by `syscall` from CPL=3 with the kernel `GS` base in
+/// `IA32_KERNEL_GS_BASE`, executes `swapgs`, and switches to the
+/// per-CPU kernel stack. Invoking it in any other context corrupts
+/// `GS`/`rsp` and the user-state snapshot.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn syscall_entry_x86_64() {
@@ -246,7 +254,7 @@ pub unsafe fn enable() {
     let user_cs_minus_16: u64 = 0x20;
     let star = (user_cs_minus_16 << 48) | (kernel_cs << 32);
 
-    let lstar = syscall_entry_x86_64 as u64;
+    let lstar = syscall_entry_x86_64 as usize as u64;
 
     // SAFETY: WRMSR at CPL=0 against architecturally-defined
     // SYSCALL MSRs. Reads + writes EFER preserving other bits

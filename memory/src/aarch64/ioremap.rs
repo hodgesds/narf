@@ -106,6 +106,10 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     }
 
     let range = vmalloc::alloc(len)?;
+    // SAFETY: `read_ttbr1_el1` only issues `MRS .., TTBR1_EL1`, which
+    // is defined at EL1 with no precondition; we run at EL1 in the
+    // kernel and use the returned root solely as the page-table base
+    // for the mapping below.
     let root = unsafe { read_ttbr1_el1() };
 
     let attr_flag = match attrs {

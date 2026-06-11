@@ -44,9 +44,10 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     // Validate DTB magic only if the bootloader gave us a non-null
     // pointer. Null → treat as "no DTB, use defaults."
     if raw.payload.raw() != 0 {
-        // SAFETY: non-null pointer into identity-mapped RAM; read of
-        // 4 unaligned bytes is defined on aarch64.
         let magic_ptr = raw.payload.raw() as *const u32;
+        // SAFETY: `raw.payload` is non-null (checked above) and points into
+        // identity-mapped RAM the bootloader handed us; an unaligned 4-byte
+        // read of the DTB magic is defined on aarch64.
         let magic = unsafe { magic_ptr.read_unaligned() }.to_be();
         if magic != DTB_MAGIC_BE {
             // Non-null but bad magic — really wrong, bail.
@@ -137,8 +138,10 @@ const FDT_END: u32 = 0x0000_0009;
 /// blob whose `totalsize` covers the structure + strings blocks.
 unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
     // Read header fields (all big-endian u32).
-    // SAFETY: caller-asserted readability; identity-mapped Normal.
     let read_be32 = |off: u64| -> u32 {
+        // SAFETY: per this fn's contract `dtb_phys` is a 4-byte-aligned,
+        // identity-mapped Normal-memory DTB; `off` indexes within its
+        // `totalsize`, so the u32 read is in-bounds and aligned.
         unsafe { core::ptr::read_volatile((dtb_phys + off) as *const u32) }.to_be()
     };
     if read_be32(0) != 0xd00d_feed {
@@ -181,7 +184,7 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                     len += 1;
                 }
                 // Round up to 4-byte boundary.
-                let consumed = (p - name_start) as u64;
+                let consumed = p - name_start;
                 let pad = (4 - (consumed & 3)) & 3;
                 p += pad;
                 // SAFETY: name spans `len` bytes from name_start.

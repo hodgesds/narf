@@ -158,6 +158,9 @@ pub fn supported() -> bool {
 /// CPU must report `supported()`. The returned tagged pointer aliases
 /// `ptr`; storing the tag via `stg` is the caller's responsibility
 /// before any tag-checked access.
+// IRG is register-to-register only; the pointer operand is never
+// dereferenced, so `nomem` is accurate despite the pointer input.
+#[allow(clippy::pointers_in_nomem_asm_block)]
 #[inline]
 pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
     let out: *mut u8;
@@ -211,6 +214,9 @@ pub unsafe fn stg(ptr: *mut u8) {
 /// # Safety
 /// `ptr` must reference a tag-storage-backed mapping; CPU must
 /// report `supported()`.
+// LDG reads allocation-tag storage, not the pointee; the load is
+// invisible to the Rust memory model, so `nomem` is intentional.
+#[allow(clippy::pointers_in_nomem_asm_block)]
 #[inline]
 pub unsafe fn ldg(ptr: *mut u8) -> *mut u8 {
     let out: *mut u8;
@@ -238,6 +244,9 @@ pub unsafe fn ldg(ptr: *mut u8) -> *mut u8 {
 ///
 /// # Safety
 /// CPU must report `supported()`.
+// GMI folds the pointer's logical tag into a mask via a pure ALU op;
+// the pointer operand is never dereferenced, so `nomem` is accurate.
+#[allow(clippy::pointers_in_nomem_asm_block)]
 #[inline]
 pub unsafe fn gmi(tag_excl_mask: u64, ptr: *mut u8) -> u64 {
     let out: u64;

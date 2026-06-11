@@ -17,9 +17,7 @@
 
 use core::sync::atomic::Ordering;
 
-use narf_ipc::shared_ring::{
-    SharedConsumer, SharedProducer, SharedRing, TryRecvError, TrySendError,
-};
+use narf_ipc::shared_ring::{SharedConsumer, SharedProducer, SharedRing, TrySendError};
 
 use crate::{FbWriteError, FbWriter, Rect};
 
@@ -35,13 +33,13 @@ pub const TAG_BLIT: u32 = 3;
 /// - `TAG_FILL`:  `(x, y, w, h)` rect; `pixel` = XRGB8888.
 /// - `TAG_FLUSH`: `(x, y, w, h)` rect to push; other fields zero.
 /// - `TAG_BLIT`:  `(x, y, w, h)` = dst rect on scanout;
-///                `buffer` = `narf-shmem` handle owned by the
-///                same pid as the connection's `FbHandle`;
-///                `src_offset` = byte offset into the shmem
-///                where the row-major XRGB8888 source begins;
-///                `src_stride` = bytes per source row (typically
-///                `w * 4`, but caller may set larger to blit a
-///                sub-rect of a wider image).
+///   `buffer` = `narf-shmem` handle owned by the
+///   same pid as the connection's `FbHandle`;
+///   `src_offset` = byte offset into the shmem
+///   where the row-major XRGB8888 source begins;
+///   `src_stride` = bytes per source row (typically
+///   `w * 4`, but caller may set larger to blit a
+///   sub-rect of a wider image).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct DrawCmd {
@@ -167,8 +165,11 @@ pub unsafe fn split(
     SharedProducer<DrawCmd, RING_DEPTH>,
     SharedConsumer<DrawCmd, RING_DEPTH>,
 ) {
-    // SAFETY: caller asserts SPSC + initialised.
+    // SAFETY: per the fn contract `ring` was `init_in`-initialised and this is
+    // the sole producer; we hand out exactly one producer half here.
     let p = unsafe { SharedProducer::from_raw(ring) };
+    // SAFETY: same `init_in`-initialised `ring`; this is the sole consumer
+    // half, upholding the SPSC contract.
     let c = unsafe { SharedConsumer::from_raw(ring) };
     (p, c)
 }
@@ -184,25 +185,19 @@ pub unsafe fn split(
 pub fn drain(consumer: &mut SharedConsumer<DrawCmd, RING_DEPTH>, writer: &FbWriter) -> (u32, u32) {
     let mut executed = 0u32;
     let mut errors = 0u32;
-    loop {
-        match consumer.try_recv() {
-            Ok(cmd) => {
-                let rect = Rect::new(cmd.x, cmd.y, cmd.w, cmd.h);
-                let res: Result<(), FbWriteError> = match cmd.tag {
-                    TAG_FILL => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
-                    TAG_FLUSH => writer.flush(rect),
-                    TAG_BLIT => {
-                        writer.blit_from_shmem(rect, cmd.buffer, cmd.src_offset, cmd.src_stride)
-                    }
-                    _ => Err(FbWriteError::OutOfBounds),
-                };
-                if res.is_err() {
-                    errors += 1;
-                } else {
-                    executed += 1;
-                }
-            }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+    // Loop ends when `try_recv` returns `Empty` or `Closed`.
+    while let Ok(cmd) = consumer.try_recv() {
+        let rect = Rect::new(cmd.x, cmd.y, cmd.w, cmd.h);
+        let res: Result<(), FbWriteError> = match cmd.tag {
+            TAG_FILL => writer.fill(rect, narf_graphics::Pixel32(cmd.pixel)),
+            TAG_FLUSH => writer.flush(rect),
+            TAG_BLIT => writer.blit_from_shmem(rect, cmd.buffer, cmd.src_offset, cmd.src_stride),
+            _ => Err(FbWriteError::OutOfBounds),
+        };
+        if res.is_err() {
+            errors += 1;
+        } else {
+            executed += 1;
         }
     }
     (executed, errors)
@@ -220,6 +215,11 @@ pub fn try_send(
 /// Mark the ring closed from the producer side — consumer will
 /// see no further commands. Useful for orderly shutdown of a
 /// userspace client.
+///
+/// # Safety
+/// `ring` must point at a live, `init_in`-initialised `DrawRing`
+/// that stays valid for the duration of this call, and must be
+/// invoked from the producer side only (the SPSC contract).
 pub unsafe fn close(ring: *mut DrawRing) {
     // SAFETY: `closed` is at a fixed offset; safe to write any time.
     unsafe {

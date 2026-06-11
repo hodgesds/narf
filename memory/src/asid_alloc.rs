@@ -35,6 +35,10 @@ const MAX_TAG: u16 = 0xFFF; // 12-bit PCID
 
 #[cfg(target_arch = "aarch64")]
 fn max_tag_runtime() -> u16 {
+    // SAFETY: `MRS` from `ID_AA64MMFR0_EL1` is a read of an
+    // architecturally-defined feature ID register, always legal at
+    // EL1 with no side effects; `nomem`/`nostack` hold and the only
+    // output is the register value moved into `v`.
     let bits = unsafe {
         // narf-arch dependency would create a cycle; read directly.
         let v: u64;

@@ -84,7 +84,7 @@ pub trait FbScanout: Send + Sync + core::fmt::Debug {
     /// other writer is in flight. The returned Framebuffer aliases
     /// the scanout buffer; lifetime is tied to the scanout's
     /// lifetime (which today is `'static`).
-    unsafe fn framebuffer<'a>(&'a self) -> Framebuffer;
+    unsafe fn framebuffer(&self) -> Framebuffer;
 }
 
 // ── bochs-display backend ───────────────────────────────────────────
@@ -338,6 +338,10 @@ impl FbScanout for IntelGpuScanout {
             let mode = d.current_mode().expect("intel-gpu scanout without mode");
             // GMADR is mapped in the CPU, we offset it by the active scanout offset.
             let base = (d.gmadr.phys.as_u64() + mode.gtt_offset as u64) as *mut u32;
+            // SAFETY: `base` points into the CPU-mapped GMADR aperture at the
+            // active scanout's `gtt_offset`; the aperture is 4-byte aligned and
+            // covers `width*height` pixels at `stride_bytes/4` pixels per row.
+            // The caller holds the FbScanout cap that serializes writers.
             unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride_bytes / 4) }
         })
         .expect("intel-gpu scanout selected without controller")
@@ -430,13 +434,14 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
     {
         let g = TEST_SCANOUT.lock();
         if let Some(s) = g.as_ref() {
-            // SAFETY: TEST_SCANOUT is a static IrqSafeSpinLock<Option<TestScanout>>;
-            // taking a raw pointer to the Some(...) interior and casting to
-            // &'static is sound while the slot remains Some. Smokes that
-            // install + use + clear within a single test boundary uphold
-            // this. Multi-threaded test access requires the smoke holds the
-            // lock externally, which today's single-CPU smokes do trivially.
             let ptr: *const TestScanout = s as *const TestScanout;
+            // SAFETY: `ptr` points at the `Some(...)` interior of the static
+            // TEST_SCANOUT IrqSafeSpinLock<Option<TestScanout>>. The static
+            // lives forever and the slot is only mutated by
+            // install_test_scanout / clear_test_scanout, so the `&'static`
+            // re-cast stays valid while the slot remains Some. Smokes
+            // install + use + clear within a single single-CPU test boundary,
+            // so no concurrent mutation of the slot occurs.
             return Some(unsafe { &*ptr });
         }
     }
@@ -659,8 +664,8 @@ impl FbWriter {
         let clipped = rect
             .clip(self.scanout.width(), self.scanout.height())
             .ok_or(FbWriteError::OutOfBounds)?;
-        let dx = (clipped.x - rect.x) as u32;
-        let dy = (clipped.y - rect.y) as u32;
+        let dx = clipped.x - rect.x;
+        let dy = clipped.y - rect.y;
         // Pre-validate the deepest source byte: if the buffer is
         // too small or the handle is bogus, fail before any pixel
         // lands on the scanout.
@@ -686,6 +691,10 @@ impl FbWriter {
                     Some(p) => p,
                     None => return Err(FbWriteError::OutOfBounds),
                 };
+                // SAFETY: `phys` was just resolved by `phys_at` for this in-bounds
+                // (row, col) offset, so it is a valid identity-mapped address of a
+                // kernel-allocated shmem frame we own; the 4-byte u32 read is within
+                // that frame and naturally aligned (offset is a multiple of 4).
                 let pix = unsafe { core::ptr::read_volatile(phys as *const u32) };
                 fb.draw_pixel(clipped.x + col, clipped.y + row, Pixel32(pix));
             }

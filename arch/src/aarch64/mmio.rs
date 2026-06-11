@@ -4,6 +4,9 @@ use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 /// Read a byte from `addr` via a `ldrb` through a volatile pointer.
+///
+/// # Safety
+/// `addr` must be a valid, 1-byte-aligned MMIO address of a mapped device.
 #[inline(always)]
 pub unsafe fn read_u8(addr: *const u8) -> u8 {
     compiler_fence(Ordering::SeqCst);
@@ -15,6 +18,9 @@ pub unsafe fn read_u8(addr: *const u8) -> u8 {
 }
 
 /// Write a byte to `addr`.
+///
+/// # Safety
+/// `addr` must be a valid, 1-byte-aligned MMIO address of a mapped device.
 #[inline(always)]
 pub unsafe fn write_u8(addr: *mut u8, value: u8) {
     compiler_fence(Ordering::SeqCst);
@@ -24,6 +30,9 @@ pub unsafe fn write_u8(addr: *mut u8, value: u8) {
 }
 
 /// Read a 32-bit word (used for PL011 register block).
+///
+/// # Safety
+/// `addr` must be a valid, 4-byte-aligned MMIO register of a mapped device.
 #[inline(always)]
 pub unsafe fn read_u32(addr: *const u32) -> u32 {
     compiler_fence(Ordering::SeqCst);
@@ -34,6 +43,9 @@ pub unsafe fn read_u32(addr: *const u32) -> u32 {
 }
 
 /// Write a 32-bit word.
+///
+/// # Safety
+/// `addr` must be a valid, 4-byte-aligned MMIO register of a mapped device.
 #[inline(always)]
 pub unsafe fn write_u32(addr: *mut u32, value: u32) {
     compiler_fence(Ordering::SeqCst);

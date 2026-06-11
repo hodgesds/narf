@@ -1372,8 +1372,12 @@ pub fn run_until_empty() {
             };
             #[cfg(target_arch = "aarch64")]
             let saved_ttbr0: u64 = if slot.addr_space.is_some() {
-                // SAFETY: TTBR0_EL1 read is unconditional at EL1.
                 let raw: u64;
+                // SAFETY: `mrs ttbr0_el1` reads the EL1 translation-table
+                // base register; the scheduler runs at EL1 where this read
+                // is unconditionally permitted. It has no memory operand,
+                // so `nomem`/`nostack`/`preserves_flags` hold, and `raw`
+                // receives the register value.
                 unsafe {
                     core::arch::asm!(
                         "mrs {0}, ttbr0_el1",

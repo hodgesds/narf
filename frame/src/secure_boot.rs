@@ -725,7 +725,7 @@ fn smoke_secure_boot_win_certificate_header_parse() -> TestResult {
     if hdr.length != total_len || hdr.revision != WIN_CERT_REVISION_2_0 {
         return TestResult::Fail("header field mismatch");
     }
-    if payload != &body {
+    if payload != body {
         return TestResult::Fail("payload mismatch");
     }
     // Wrong cert_type rejected.
@@ -857,7 +857,7 @@ fn smoke_secure_boot_fingerprint_db_walk() -> TestResult {
     let mut db = alloc::vec::Vec::new();
     let entries = [[0x11u8; 32], [0x22u8; 32]];
     let entry_size: u32 = 16 + 32;
-    let list_size: u32 = 28 + 0 + entry_size * entries.len() as u32;
+    let list_size: u32 = 28 + entry_size * entries.len() as u32;
 
     db.extend_from_slice(&EFI_CERT_SHA256_GUID.0);
     db.extend_from_slice(&list_size.to_le_bytes());

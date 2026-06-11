@@ -355,6 +355,11 @@ fn smoke_fb_cmd_ring_round_trip() -> TestResult {
     // Allocate a DrawRing on the heap. SharedRing is repr(C) +
     // 64-byte aligned via its header; Box::new gives us 8-byte
     // alignment which matches the init_in contract.
+    // SAFETY: `DrawRing` is `SharedRing<DrawCmd, _>`, a `repr(C)` struct
+    // of `AtomicU32` head/tail/closed, a `[u8]` pad, and
+    // `MaybeUninit<DrawCmd>` slots — every field accepts an all-zero bit
+    // pattern (atomics zero-init, `MaybeUninit` holds any bits), so
+    // `zeroed()` is a valid value; `init_in` below sets up the header.
     let mut ring: Box<DrawRing> = Box::new(unsafe { core::mem::zeroed() });
     // SAFETY: zero-init via mem::zeroed is exactly what init_in
     // expects (sets head/tail/closed to 0).
