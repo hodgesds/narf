@@ -104,8 +104,8 @@ pub mod crc8 {
     pub fn compute_bits(bytes: &[u8], nbits: usize) -> u8 {
         let mut crc: u8 = 0x0F;
         let full = nbits / 8;
-        for i in 0..full {
-            crc = step_byte(crc, bytes[i]);
+        for &b in &bytes[..full] {
+            crc = step_byte(crc, b);
         }
         let rem = nbits - full * 8;
         if rem > 0 {
@@ -229,10 +229,10 @@ pub fn frame_length(h: &Header) -> usize {
     let blk = h.nrof_blocks();
     let bp = h.bitpool as usize;
     match h.channel_mode {
-        CM_MONO => 4 + (4 * sb) / 8 + ((blk * bp + 7) / 8),
-        CM_DUAL_CHANNEL => 4 + (4 * sb * 2) / 8 + ((blk * 2 * bp + 7) / 8),
-        CM_STEREO => 4 + (4 * sb * 2) / 8 + ((blk * bp + 7) / 8),
-        CM_JOINT_STEREO => 4 + ((sb + 4 * sb * 2) + 7) / 8 + ((blk * bp + 7) / 8),
+        CM_MONO => 4 + (4 * sb) / 8 + (blk * bp).div_ceil(8),
+        CM_DUAL_CHANNEL => 4 + (4 * sb * 2) / 8 + (blk * 2 * bp).div_ceil(8),
+        CM_STEREO => 4 + (4 * sb * 2) / 8 + (blk * bp).div_ceil(8),
+        CM_JOINT_STEREO => 4 + (sb + 4 * sb * 2).div_ceil(8) + (blk * bp).div_ceil(8),
         _ => 0,
     }
 }
@@ -431,37 +431,37 @@ pub mod analysis {
             //    The polyphase pattern matches A2DP §12.5 fig. 12-12.
             let n = self.x.len();
             self.x.copy_within(0..n - m, m);
-            for i in 0..m {
-                self.x[m - 1 - i] = input[i];
+            for (i, &v) in input.iter().enumerate() {
+                self.x[m - 1 - i] = v;
             }
             // 2) Polyphase fold with correct strides:
             //    Y[k] = Σ_{j=0..4} X[k + j·2M] · C[j·M + k]
             //    The analysis proto has 5·M taps indexed as C[j·M + k].
             let proto: &[i32] = if m == 8 { &PROTO_8_Q15 } else { &PROTO_4_Q15 };
             let mut y = alloc::vec![0i64; m];
-            for k in 0..m {
+            for (k, yk) in y.iter_mut().enumerate() {
                 let mut acc: i64 = 0;
                 for j in 0..5 {
                     let x_idx = k + j * 2 * m; // stride 2M in history
                     let p_idx = j * m + k; // stride M in proto
                     acc += (self.x[x_idx] as i64) * (proto[p_idx] as i64);
                 }
-                y[k] = acc;
+                *yk = acc;
             }
             // 3) Subband output: S[k] = Σ_{i=0..M} M[k][i] · Y[i].
             //    M's coefficients live in Q15; Y is Q15 × sample range.
             //    Shift by 30 to recover the PCM-range integer.
-            for k in 0..m {
+            for (k, ok) in out.iter_mut().enumerate() {
                 let mut acc: i64 = 0;
-                for i in 0..m {
+                for (i, &yi) in y.iter().enumerate() {
                     let mk = if m == 8 {
                         analysis_mat_8(k, i)
                     } else {
                         analysis_mat_4(k, i)
                     } as i64;
-                    acc += mk * y[i];
+                    acc += mk * yi;
                 }
-                out[k] = (acc >> 30) as i32;
+                *ok = (acc >> 30) as i32;
             }
         }
     }
@@ -507,13 +507,13 @@ pub mod synthesis {
             //    back by 2^15.
             for k in 0..2 * m {
                 let mut acc: i64 = 0;
-                for i in 0..m {
+                for (i, &sb) in subbands.iter().enumerate() {
                     let nki = if m == 8 {
                         synthesis_mat_8(i, k)
                     } else {
                         synthesis_mat_4(i, k)
                     } as i64;
-                    acc += nki * (subbands[i] as i64);
+                    acc += nki * (sb as i64);
                 }
                 self.v[k] = (acc >> 15) as i32;
             }
@@ -529,7 +529,7 @@ pub mod synthesis {
             } else {
                 &PROTO_4_SYN_Q15
             };
-            for j in 0..m {
+            for (j, oj) in out.iter_mut().enumerate() {
                 let mut acc: i64 = 0;
                 for i in 0..10 {
                     let v_idx = i * 2 * m + j;
@@ -543,7 +543,7 @@ pub mod synthesis {
                 // the BlueZ reference divides by 2^15 here; both proto
                 // and V entry were Q15 divided once so net Q30>>15=Q15
                 // divided once more gives the correct PCM range).
-                out[j] = (acc >> 30) as i32;
+                *oj = (acc >> 30) as i32;
             }
         }
     }
@@ -563,9 +563,7 @@ pub mod bitalloc {
     //! `sbc/sbc.c::sbc_calculate_bits_internal` — same recipe, just
     //! re-derived from the prose in the spec.
 
-    use super::{
-        Header, ALLOC_LOUDNESS, ALLOC_SNR, CM_DUAL_CHANNEL, CM_JOINT_STEREO, CM_MONO, CM_STEREO,
-    };
+    use super::{Header, ALLOC_SNR, CM_DUAL_CHANNEL, CM_JOINT_STEREO, CM_MONO, CM_STEREO};
 
     /// Loudness offset table for 4 subbands @ 4 sampling rates
     /// (A2DP §12.6.2 Table 12.4 / SBC PDF Annex G). Indexed by
@@ -614,7 +612,7 @@ pub mod bitalloc {
                 let sf = scale_factors[ch][sb] as i32;
                 let need = match h.allocation_method {
                     ALLOC_SNR => sf,
-                    ALLOC_LOUDNESS | _ => {
+                    _ => {
                         // Loudness: subtract a small perceptual offset.
                         let off = if nb == 4 {
                             LOUDNESS_OFFSET_4[h.sampling_frequency as usize][sb]
@@ -646,7 +644,7 @@ pub mod bitalloc {
                     distribute(
                         &bitneed[ch][..nb],
                         bitslice,
-                        bp - consumed as i32,
+                        bp - consumed,
                         &mut bits[ch][..nb],
                     );
                     bits_sum[ch] = bits[ch][..nb].iter().map(|&b| b as u32).sum();
@@ -665,7 +663,7 @@ pub mod bitalloc {
                 distribute(
                     &pooled[..nch * nb],
                     bitslice,
-                    bp - consumed as i32,
+                    bp - consumed,
                     &mut flat[..nch * nb],
                 );
                 for ch in 0..nch {
@@ -955,9 +953,7 @@ impl Sbc {
                 }
                 let mut out_sb = vec![0i32; nb];
                 self.enc_state[ch].step(&input_buf, &mut out_sb);
-                for s in 0..nb {
-                    x[b][ch][s] = out_sb[s];
-                }
+                x[b][ch][..nb].copy_from_slice(&out_sb[..nb]);
             }
         }
         // 2) Joint-stereo mixing (per A2DP §12.6.1.2): for each sb,
@@ -965,12 +961,15 @@ impl Sbc {
         //    mask bit.
         let mut join: u8 = 0;
         if self.header.channel_mode == CM_JOINT_STEREO {
+            // `s` is used in the bit-shift `join |= 1 << s` and comparison
+            // `s > 0`, so a plain index loop is needed here.
+            #[allow(clippy::needless_range_loop)]
             for s in 0..nb {
                 let mut max_lr = 0u32;
                 let mut max_ms = 0u32;
-                for b in 0..blk {
-                    let l = x[b][0][s];
-                    let r = x[b][1][s];
+                for xb in x.iter() {
+                    let l = xb[0][s];
+                    let r = xb[1][s];
                     let m = (l + r) / 2;
                     let s2 = (l - r) / 2;
                     max_lr = max_lr.max(l.unsigned_abs()).max(r.unsigned_abs());
@@ -978,11 +977,11 @@ impl Sbc {
                 }
                 if max_ms < max_lr && s > 0 {
                     // Use joint coding for this subband (bit set).
-                    for b in 0..blk {
-                        let l = x[b][0][s];
-                        let r = x[b][1][s];
-                        x[b][0][s] = (l + r) / 2;
-                        x[b][1][s] = (l - r) / 2;
+                    for xb in x.iter_mut() {
+                        let l = xb[0][s];
+                        let r = xb[1][s];
+                        xb[0][s] = (l + r) / 2;
+                        xb[1][s] = (l - r) / 2;
                     }
                     // SBC PDF: bit 0 of join byte corresponds to highest
                     // subband; bit (nb-1) to subband 0. Use a simple
@@ -997,8 +996,8 @@ impl Sbc {
         for ch in 0..nch {
             for s in 0..nb {
                 let mut max = 0u32;
-                for b in 0..blk {
-                    let v = x[b][ch][s].unsigned_abs();
+                for xb in &x[..blk] {
+                    let v = xb[ch][s].unsigned_abs();
                     if v > max {
                         max = v;
                     }
@@ -1041,20 +1040,20 @@ impl Sbc {
                 bw.write(nb, join as u32);
             }
             // 5b) Scale factors.
-            for ch in 0..nch {
-                for s in 0..nb {
-                    bw.write(4, sf[ch][s] as u32);
+            for sf_ch in &sf[..nch] {
+                for &sfv in &sf_ch[..nb] {
+                    bw.write(4, sfv as u32);
                 }
             }
             // 5c) Samples. Per A2DP §12.6.4 linear midtread.
-            for b in 0..blk {
+            for xb in &x[..blk] {
                 for ch in 0..nch {
                     for s in 0..nb {
                         let nbits = bits[ch][s] as usize;
                         if nbits == 0 {
                             continue;
                         }
-                        let q = quantize_sample(x[b][ch][s], sf[ch][s], nbits);
+                        let q = quantize_sample(xb[ch][s], sf[ch][s], nbits);
                         bw.write(nbits, q);
                     }
                 }
@@ -1063,7 +1062,7 @@ impl Sbc {
         }
         // 5d) Compute CRC over config + join + scale_factor bits.
         let crc_bits_total = 16 + join_bits + sf_bits;
-        let crc_bytes_len = (crc_bits_total + 7) / 8;
+        let crc_bytes_len = crc_bits_total.div_ceil(8);
         let mut crc_input = vec![0u8; crc_bytes_len];
         crc_input[0] = out[1];
         crc_input[1] = out[2];
@@ -1109,9 +1108,9 @@ impl Sbc {
             join = br.read(nb) as u8;
         }
         let mut sf = vec![[0u8; 8]; nch];
-        for ch in 0..nch {
-            for s in 0..nb {
-                sf[ch][s] = br.read(4) as u8;
+        for sf_ch in &mut sf[..nch] {
+            for sfv in &mut sf_ch[..nb] {
+                *sfv = br.read(4) as u8;
             }
         }
         // CRC check
@@ -1122,7 +1121,7 @@ impl Sbc {
             0
         };
         let crc_bits_total = 16 + join_bits + sf_bits;
-        let crc_bytes_len = (crc_bits_total + 7) / 8;
+        let crc_bytes_len = crc_bits_total.div_ceil(8);
         let mut crc_input = vec![0u8; crc_bytes_len];
         crc_input[0] = frame[1];
         crc_input[1] = frame[2];
@@ -1141,7 +1140,7 @@ impl Sbc {
         bitalloc::allocate(&header, &sf, &mut bits);
         // Samples.
         let mut x = vec![vec![vec![0i32; nb]; nch]; blk];
-        for b in 0..blk {
+        for xb in x.iter_mut() {
             for ch in 0..nch {
                 for s in 0..nb {
                     let nbits = bits[ch][s] as usize;
@@ -1149,19 +1148,22 @@ impl Sbc {
                         continue;
                     }
                     let q = br.read(nbits);
-                    x[b][ch][s] = dequantize_sample(q, sf[ch][s], nbits);
+                    xb[ch][s] = dequantize_sample(q, sf[ch][s], nbits);
                 }
             }
         }
         // Joint-stereo unmix.
         if header.channel_mode == CM_JOINT_STEREO {
+            // `s` is used in `join >> s` (bit-shift), so a plain index loop
+            // is required here.
+            #[allow(clippy::needless_range_loop)]
             for s in 0..nb {
                 if (join >> s) & 1 != 0 {
-                    for b in 0..blk {
-                        let m = x[b][0][s];
-                        let sd = x[b][1][s];
-                        x[b][0][s] = m + sd;
-                        x[b][1][s] = m - sd;
+                    for xb in x.iter_mut() {
+                        let m = xb[0][s];
+                        let sd = xb[1][s];
+                        xb[0][s] = m + sd;
+                        xb[1][s] = m - sd;
                     }
                 }
             }
@@ -1179,8 +1181,8 @@ impl Sbc {
             for ch in 0..nch {
                 let sb = &x[b][ch][..nb];
                 self.dec_state[ch].step(sb, &mut out_buf);
-                for s in 0..nb {
-                    let v = out_buf[s].clamp(i16::MIN as i32, i16::MAX as i32);
+                for (s, &v_raw) in out_buf[..nb].iter().enumerate() {
+                    let v = v_raw.clamp(i16::MIN as i32, i16::MAX as i32);
                     pcm[(b * nb + s) * nch + ch] = v as i16;
                 }
             }
@@ -1200,7 +1202,7 @@ fn quantize_sample(sample: i32, sf: u8, nbits: usize) -> u32 {
     let scale = 1i64 << (sf as u32 + 1); // 2^(sf+1)
                                          // q = (((sample / scale) + 1) * levels) / 2, clipped to [0, levels].
     let num = (sample as i64 + scale) * (levels as i64);
-    let den = (scale << 1) as i64; // 2 * scale
+    let den = scale << 1; // 2 * scale
     let q = num / den;
     q.clamp(0, levels as i64) as u32
 }
@@ -1370,9 +1372,9 @@ mod tests {
             crc: 0,
         };
         let mut sf = [[0u8; 8]; 2];
-        for ch in 0..2 {
-            for s in 0..8 {
-                sf[ch][s] = (4 + (s as u8 % 4)) as u8;
+        for sf_ch in &mut sf {
+            for (s, sfv) in sf_ch.iter_mut().enumerate() {
+                *sfv = 4 + (s as u8 % 4);
             }
         }
         let mut bits = [[0u8; 8]; 2];
@@ -1401,7 +1403,7 @@ mod tests {
         let pcm_len = enc.pcm_frame_len();
         // Sine-ish synthetic input.
         let mut pcm_in = vec![0i16; pcm_len];
-        for i in 0..pcm_len {
+        for (i, pcm_v) in pcm_in.iter_mut().enumerate() {
             // Triangle wave, amplitude 0x2000.
             let phase = (i % 64) as i32;
             let v = if phase < 32 {
@@ -1409,7 +1411,7 @@ mod tests {
             } else {
                 (64 - phase) * 256
             };
-            pcm_in[i] = (v - 4096) as i16;
+            *pcm_v = (v - 4096) as i16;
         }
         let mut buf = vec![0u8; enc.frame_bytes()];
         let bytes_out = enc.encode(&pcm_in, &mut buf).unwrap_or(0);

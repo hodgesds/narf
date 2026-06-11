@@ -1300,6 +1300,8 @@ pub unsafe fn ahci_write_lba_ncq(
     }
 }
 
+// All parameters map directly to AHCI NCQ FIS and PRD fields; no grouping is natural.
+#[allow(clippy::too_many_arguments)]
 unsafe fn ahci_lba_ncq(
     ahci: &Ahci,
     port_idx: u8,

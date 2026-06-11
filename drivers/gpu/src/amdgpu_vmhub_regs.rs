@@ -233,7 +233,7 @@ pub fn write_vmid_pt_base<M: VmHubMmio>(
     vmid: u8,
     pt_root_phys: u64,
 ) {
-    let stride = (regs.ctx_addr_distance as u32) * (vmid as u32);
+    let stride = regs.ctx_addr_distance * (vmid as u32);
     let lo_dword = regs.ctx0_pt_base_lo + stride;
     let hi_dword = regs.ctx0_pt_base_hi + stride;
     mmio.write(lo_dword << 2, pt_root_phys as u32);
@@ -277,7 +277,7 @@ pub fn write_vmid_cntl<M: VmHubMmio>(
     depth: u8,
     fault_on_invalid: bool,
 ) {
-    let dword = regs.ctx0_cntl + (regs.ctx_distance as u32) * (vmid as u32);
+    let dword = regs.ctx0_cntl + regs.ctx_distance * (vmid as u32);
     let mut val = CTX_CNTL_ENABLE_CONTEXT;
     val |= ((depth as u32) & 0x3) << CTX_CNTL_PT_DEPTH_SHIFT;
     if !fault_on_invalid {
@@ -556,7 +556,7 @@ mod smoke_tests {
     fn smoke_invalidate_tlb_polls_ack() -> TestResult {
         let mut m = MockVmHubMmio::new();
         // Set up: ack reads 0 twice, then bit-for-VMID-2 appears.
-        m.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 2));
+        m.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2), 1 << 2));
         let r = write_invalidate_tlb(&mut m, &GFXHUB_V3_0, 2, 0);
         if r.is_err() {
             return TestResult::Fail("tlb invalidate failed");
@@ -585,8 +585,8 @@ mod smoke_tests {
     fn smoke_broadcast_invalidate_writes_both_hubs() -> TestResult {
         let mut g = MockVmHubMmio::new();
         let mut m = MockVmHubMmio::new();
-        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 5));
-        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 5));
+        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2), 1 << 5));
+        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2), 1 << 5));
         broadcast_invalidate_tlb(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 5, 0)
             .expect("broadcast");
         if !g
@@ -610,8 +610,8 @@ mod smoke_tests {
     fn smoke_invalidate_vmid_full_uses_range_flush_type() -> TestResult {
         let mut g = MockVmHubMmio::new();
         let mut m = MockVmHubMmio::new();
-        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 3));
-        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2) as u32, 1 << 3));
+        g.auto_ack_after = Some(((GFXHUB_V3_0.inv_eng0_ack << 2), 1 << 3));
+        m.auto_ack_after = Some(((MMHUB_V3_0.inv_eng0_ack << 2), 1 << 3));
         invalidate_vmid_full(&mut g, &GFXHUB_V3_0, &mut m, &MMHUB_V3_0, 3).expect("full");
         // The REQ word's flush_type field is bits[7:4]; we passed
         // 0 for range — check the field is 0 in the first write

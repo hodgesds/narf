@@ -267,6 +267,7 @@ impl VirtioGpuPci {
             return Ok(());
         }
         // Wrap the body so we can capture the failing step.
+        // SAFETY: bring_up completed; BSP-only as required by caller contract.
         let r = unsafe { self.init_scanout_inner() };
         if let Err(e) = r {
             self.last_err = Some(e);
@@ -496,15 +497,19 @@ impl VirtioGpuPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let p = self.resp_buf.phys_addr().raw();
-        for i in 0..MAX_SCANOUTS {
+        for (i, slot) in out.iter_mut().enumerate().take(MAX_SCANOUTS) {
             let entry = p + HDR_LEN as u64 + (i as u64) * 24;
             // SAFETY: resp_buf is 4 KiB and we never read past 408.
             let _x = unsafe { core::ptr::read_volatile(entry as *const u32) };
+            // SAFETY: same.
             let _y = unsafe { core::ptr::read_volatile((entry + 4) as *const u32) };
+            // SAFETY: same.
             let w = unsafe { core::ptr::read_volatile((entry + 8) as *const u32) };
+            // SAFETY: same.
             let h = unsafe { core::ptr::read_volatile((entry + 12) as *const u32) };
+            // SAFETY: same.
             let en = unsafe { core::ptr::read_volatile((entry + 16) as *const u32) };
-            out[i] = DisplayMode {
+            *slot = DisplayMode {
                 width: w,
                 height: h,
                 enabled: en != 0,

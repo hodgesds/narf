@@ -148,6 +148,13 @@ pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
     None
 }
 
+/// Non-x86_64 stub: there is no architectural legacy BIOS region to
+/// scan, so this always returns `None`.
+///
+/// # Safety
+/// This stub performs no memory accesses and has no preconditions; it
+/// is marked `unsafe` only to share the signature with the x86_64
+/// `scan_legacy_bios`, which dereferences identity-mapped low ROM.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
     None

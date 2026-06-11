@@ -180,6 +180,10 @@ pub unsafe fn read_esr_el1() -> u64 {
 }
 
 /// Read `FAR_EL1` (fault address register).
+///
+/// # Safety
+/// Issues a privileged `MRS` on `FAR_EL1`; the caller must execute at
+/// EL1 (or a level where the register is accessible).
 #[inline]
 pub unsafe fn read_far_el1() -> u64 {
     let v: u64;
@@ -192,6 +196,10 @@ pub unsafe fn read_far_el1() -> u64 {
 }
 
 /// Read `ELR_EL1` — exception-link register (saved PC at exception entry).
+///
+/// # Safety
+/// Issues a privileged `MRS` on `ELR_EL1`; the caller must execute at
+/// EL1 (or a level where the register is accessible).
 #[inline]
 pub unsafe fn read_elr_el1() -> u64 {
     let v: u64;
@@ -204,6 +212,10 @@ pub unsafe fn read_elr_el1() -> u64 {
 }
 
 /// Read `SCTLR_EL1` — System Control Register.
+///
+/// # Safety
+/// Issues a privileged `MRS` on `SCTLR_EL1`; the caller must execute at
+/// EL1 (or a level where the register is accessible).
 #[inline]
 pub unsafe fn read_sctlr_el1() -> u64 {
     let v: u64;
@@ -216,6 +228,11 @@ pub unsafe fn read_sctlr_el1() -> u64 {
 }
 
 /// Write `SCTLR_EL1`.
+///
+/// # Safety
+/// Issues a privileged `MSR` on `SCTLR_EL1`; the caller must ensure the
+/// written value is valid for the register (MMU/cache/alignment control)
+/// and that the write is permitted at the current exception level.
 #[inline]
 pub unsafe fn write_sctlr_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
@@ -228,6 +245,11 @@ pub unsafe fn write_sctlr_el1(value: u64) {
 }
 
 /// Write `TCR_EL1` — Translation Control Register.
+///
+/// # Safety
+/// Issues a privileged `MSR` on `TCR_EL1`; the caller must ensure the
+/// written value is a valid translation-control configuration and that
+/// the write is permitted at the current exception level.
 #[inline]
 pub unsafe fn write_tcr_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
@@ -240,6 +262,10 @@ pub unsafe fn write_tcr_el1(value: u64) {
 }
 
 /// Read `TCR_EL1`.
+///
+/// # Safety
+/// Issues a privileged `MRS` on `TCR_EL1`; the caller must execute at
+/// EL1 (or a level where the register is accessible).
 #[inline]
 pub unsafe fn read_tcr_el1() -> u64 {
     let v: u64;
@@ -287,6 +313,11 @@ pub unsafe fn read_gcr_el1() -> u64 {
 }
 
 /// Write `MAIR_EL1` — Memory Attribute Indirection Register.
+///
+/// # Safety
+/// Issues a privileged `MSR` on `MAIR_EL1`; the caller must ensure the
+/// written memory-attribute encoding is valid and that the write is
+/// permitted at the current exception level.
 #[inline]
 pub unsafe fn write_mair_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
@@ -299,6 +330,11 @@ pub unsafe fn write_mair_el1(value: u64) {
 }
 
 /// Write `TTBR0_EL1` — Translation Table Base Register 0.
+///
+/// # Safety
+/// Issues a privileged `MSR` on `TTBR0_EL1`; the caller must ensure the
+/// value points at a valid translation-table base and that the write is
+/// permitted at the current exception level.
 #[inline]
 pub unsafe fn write_ttbr0_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
@@ -311,6 +347,11 @@ pub unsafe fn write_ttbr0_el1(value: u64) {
 }
 
 /// Write `TTBR1_EL1` — Translation Table Base Register 1.
+///
+/// # Safety
+/// Issues a privileged `MSR` on `TTBR1_EL1`; the caller must ensure the
+/// value points at a valid translation-table base and that the write is
+/// permitted at the current exception level.
 #[inline]
 pub unsafe fn write_ttbr1_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
@@ -323,6 +364,11 @@ pub unsafe fn write_ttbr1_el1(value: u64) {
 }
 
 /// Invalidate entire TLB for EL1.
+///
+/// # Safety
+/// Issues a privileged `TLBI VMALLE1`; the caller must execute at EL1.
+/// Stale translations may be used until this completes, so callers must
+/// sequence it correctly with page-table edits.
 #[inline]
 pub unsafe fn tlb_flush_all() {
     compiler_fence(Ordering::SeqCst);
@@ -339,6 +385,10 @@ pub unsafe fn tlb_flush_all() {
 }
 
 /// Invalidate TLB by virtual address for EL1.
+///
+/// # Safety
+/// Issues a privileged `TLBI VAAE1`; the caller must execute at EL1 and
+/// pass a virtual address whose stale translations are safe to drop.
 #[inline]
 pub unsafe fn tlb_flush_page(virt_addr: u64) {
     compiler_fence(Ordering::SeqCst);
@@ -352,6 +402,10 @@ pub unsafe fn tlb_flush_page(virt_addr: u64) {
 }
 
 /// Instruction Synchronization Barrier.
+///
+/// # Safety
+/// Issues a privileged `ISB`; the caller must execute at EL1 (or a level
+/// where the barrier is permitted).
 #[inline]
 pub unsafe fn isb() {
     compiler_fence(Ordering::SeqCst);

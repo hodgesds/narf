@@ -45,6 +45,10 @@ pub unsafe fn read_brbcr_el1() -> u64 {
     v
 }
 
+/// Write `BRBCR_EL1` (`S2_1_C9_C0_0`).
+///
+/// # Safety
+/// EL1; BRBE supported (`caps() >= 1`). Writes a privileged `MSR`.
 pub unsafe fn write_brbcr_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {
@@ -70,6 +74,10 @@ pub unsafe fn read_brbfcr_el1() -> u64 {
     v
 }
 
+/// Write `BRBFCR_EL1` (`S2_1_C9_C0_1`).
+///
+/// # Safety
+/// EL1; BRBE supported. Writes a privileged `MSR`.
 pub unsafe fn write_brbfcr_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {
@@ -93,14 +101,20 @@ const BRBCR_PAUSED: u64 = 1 << 7;
 pub unsafe fn enable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_brbcr_el1() } | BRBCR_E1BRE | BRBCR_E0BRE;
+    // SAFETY: caller-asserted EL1 + BRBE; writes the updated control value.
     unsafe {
         write_brbcr_el1(v);
     }
 }
 
+/// Disable branch recording for both EL0 and EL1.
+///
+/// # Safety
+/// EL1; BRBE supported.
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_brbcr_el1() } & !(BRBCR_E1BRE | BRBCR_E0BRE);
+    // SAFETY: caller-asserted EL1 + BRBE; writes the cleared control value.
     unsafe {
         write_brbcr_el1(v);
     }
@@ -114,6 +128,7 @@ pub unsafe fn disable() {
 pub unsafe fn freeze() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_brbcr_el1() } | BRBCR_PAUSED;
+    // SAFETY: caller-asserted EL1 + BRBE; writes the paused control value.
     unsafe {
         write_brbcr_el1(v);
     }

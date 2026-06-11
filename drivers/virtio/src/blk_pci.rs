@@ -314,8 +314,8 @@ impl VirtioBlkPci {
         // SAFETY: page-sized DMA buffer; fill the first 512 bytes
         // with the caller's data.
         unsafe {
-            for i in 0..512usize {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, data[i]);
+            for (i, &byte) in data.iter().enumerate() {
+                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, byte);
             }
         }
         // For Write, payload is read-only from the device's POV.
@@ -504,8 +504,10 @@ impl VirtioBlkPci {
 
         // Copy the payload out.
         // SAFETY: identity-mapped 4 KiB page.
-        for i in 0..512usize {
-            out[i] = unsafe { core::ptr::read_volatile((payload_phys + i as u64) as *const u8) };
+        unsafe {
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
+            }
         }
 
         // Free the descriptor chain.
@@ -630,8 +632,10 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         // SAFETY: same.
-        for i in 0..512usize {
-            out[i] = unsafe { core::ptr::read_volatile((payload_phys + i as u64) as *const u8) };
+        unsafe {
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
+            }
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {
@@ -669,8 +673,8 @@ impl VirtioBlkPci {
         let payload_phys = payload.phys_addr().raw();
         // SAFETY: page-sized DMA buffer; copy in caller's data.
         unsafe {
-            for i in 0..512usize {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, data[i]);
+            for (i, &byte) in data.iter().enumerate() {
+                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, byte);
             }
         }
         // Write payload is read-only from the device's POV (no
@@ -867,8 +871,10 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         // SAFETY: same.
-        for i in 0..512usize {
-            out[i] = unsafe { core::ptr::read_volatile((payload_phys + i as u64) as *const u8) };
+        unsafe {
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
+            }
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {

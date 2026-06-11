@@ -168,6 +168,8 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -279,6 +281,8 @@ fn smoke_process_fork_return_values() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1164,6 +1168,8 @@ fn smoke_wave35_fork_returns_nonzero_child_pid() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1390,6 +1396,8 @@ fn smoke_wave35_getppid_differs_from_getpid() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1726,6 +1734,9 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
     static VTAB: RawWakerVTable =
         RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
 
+    // SAFETY: `VTAB`'s clone/wake/wake_by_ref/drop fns honor the
+    // `RawWaker` contract — they ignore the null data pointer and only
+    // touch the `'static WOKE` flag, so the waker is sound to construct.
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
     crate::user_task::register_wait_child_waker(PARENT, waker);
 
@@ -1919,6 +1930,8 @@ fn smoke_wave38_fork_registers_mapping() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -2003,6 +2016,8 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -2855,6 +2870,8 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -2886,13 +2903,15 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
         tls: u64,
     }
     let mut child_tid_slot: u32 = 0;
-    let mut ca = TestCloneArgs::default();
-    // CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FS | CLONE_FILES
-    // | CLONE_PARENT_SETTID
-    ca.flags = 0x0000_0100 | 0x0001_0000 | 0x0000_0800 | 0x0000_0200 | 0x0000_0400 | 0x0010_0000;
-    ca.stack = 0x7fff_fff0_0000;
-    ca.stack_size = 0x1_0000;
-    ca.parent_tid = &mut child_tid_slot as *mut u32 as u64;
+    let ca = TestCloneArgs {
+        // CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_FS | CLONE_FILES
+        // | CLONE_PARENT_SETTID
+        flags: 0x0000_0100 | 0x0001_0000 | 0x0000_0800 | 0x0000_0200 | 0x0000_0400 | 0x0010_0000,
+        stack: 0x7fff_fff0_0000,
+        stack_size: 0x1_0000,
+        parent_tid: &mut child_tid_slot as *mut u32 as u64,
+        ..Default::default()
+    };
 
     let uargs = &ca as *const TestCloneArgs as u64;
     let size = core::mem::size_of::<TestCloneArgs>() as u64;
@@ -3035,6 +3054,8 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     setup_process_state(PARENT);
     crate::handlers::__test_reset_clear_child_tid();
 
+    // SAFETY: `new_for_user` only requires paging to be enabled; these
+    // smokes run after kernel boot has installed the page tables.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -3070,12 +3091,14 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     // But the futex_bump_counter side fires regardless, which is
     // what we assert here.
     let mut clear_tid_word: u32 = 0xDEAD_BEEF;
-    let mut ca = TestCloneArgs::default();
-    // CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_CHILD_CLEARTID
-    ca.flags = 0x0000_0100 | 0x0001_0000 | 0x0000_0800 | 0x0020_0000;
-    ca.stack = 0x7fff_fff0_0000;
-    ca.stack_size = 0x1_0000;
-    ca.child_tid = &mut clear_tid_word as *mut u32 as u64;
+    let ca = TestCloneArgs {
+        // CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_CHILD_CLEARTID
+        flags: 0x0000_0100 | 0x0001_0000 | 0x0000_0800 | 0x0020_0000,
+        stack: 0x7fff_fff0_0000,
+        stack_size: 0x1_0000,
+        child_tid: &mut clear_tid_word as *mut u32 as u64,
+        ..Default::default()
+    };
 
     let uargs = &ca as *const TestCloneArgs as u64;
     let size = core::mem::size_of::<TestCloneArgs>() as u64;

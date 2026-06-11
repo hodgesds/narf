@@ -264,7 +264,7 @@ pub struct DsmSupported {
 impl DsmSupported {
     /// True iff function `f` appears in the supported set.
     pub fn supports(&self, f: u8) -> bool {
-        self.functions.iter().any(|&x| x == f)
+        self.functions.contains(&f)
     }
 }
 

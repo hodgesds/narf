@@ -33,7 +33,7 @@ use core::convert::TryFrom;
 /// MMIO base of the GMBUS block on Gen12 iGPUs.
 pub const GMBUS_BASE: u64 = 0x0000_C510;
 /// Pin pair selection + clock rate.
-pub const GMBUS0: u64 = GMBUS_BASE + 0x00;
+pub const GMBUS0: u64 = GMBUS_BASE;
 /// Command + slave address.
 pub const GMBUS1: u64 = GMBUS_BASE + 0x04;
 /// Status + handshake.
@@ -176,7 +176,7 @@ impl EdidReadProgram {
     /// Number of `GMBUS3` reads (4 bytes per read) needed to
     /// drain `byte_count` bytes from the FIFO. Rounded up.
     pub const fn fifo_reads(&self) -> u16 {
-        (self.byte_count + 3) / 4
+        self.byte_count.div_ceil(4)
     }
 }
 

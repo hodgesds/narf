@@ -5,15 +5,13 @@
 //! userspace plumbing can be cfg-gated at the import line and
 //! share otherwise-identical control flow.
 //!
-//! - [`UserState`]   — snapshot of the user-mode CPU state at
-//!                     trap time (31 GPRs + PC + SP + SPSR +
-//!                     valid sentinel).
-//! - [`enter_user_mode`]        — `eret` to EL0 at (PC, SP) with
-//!                                a clean PSTATE; never returns.
+//! - [`UserState`] — snapshot of the user-mode CPU state at trap
+//!   time (31 GPRs + PC + SP + SPSR + valid sentinel).
+//! - [`enter_user_mode`] — `eret` to EL0 at (PC, SP) with a clean
+//!   PSTATE; never returns.
 //! - [`enter_user_mode_resume`] — `eret` to EL0 with every GPR /
-//!                                ELR / SPSR / SP_EL0 restored
-//!                                from a `UserState`; never
-//!                                returns.
+//!   ELR / SPSR / SP_EL0 restored from a `UserState`; never
+//!   returns.
 //! - [`JmpBuf`] / [`setjmp`] / [`longjmp`] — kernel-side
 //!   long-jump using the AArch64 procedure-call-standard
 //!   callee-saved register set. Used by the polling-future glue

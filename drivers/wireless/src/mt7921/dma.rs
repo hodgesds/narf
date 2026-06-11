@@ -482,6 +482,8 @@ pub unsafe fn dma_disable(mmio: &MmioRegion) -> Result<(), DmaError> {
     // Clear TX/RX-EN.
     // SAFETY: BAR0 mapped + owned.
     let v = unsafe { mmio.read32(MT_WFDMA0_GLO_CFG as u64) };
+    // SAFETY: BAR0 mapped + owned per `# Safety`; `MT_WFDMA0_GLO_CFG`
+    // is a 32-bit register in range, written read-modify-write.
     unsafe {
         mmio.write32(
             MT_WFDMA0_GLO_CFG as u64,

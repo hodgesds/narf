@@ -166,7 +166,7 @@ pub fn on_sgi(intid: u8) {
 pub unsafe fn send_to_cpu_aff(intid: u8, target_aff: u32) {
     let intid = (intid as u64) & 0xF;
     // Decompose target affinity bytes.
-    let aff0 = ((target_aff >> 0) & 0xFF) as u64;
+    let aff0 = (target_aff & 0xFF) as u64;
     let aff1 = ((target_aff >> 8) & 0xFF) as u64;
     let aff2 = ((target_aff >> 16) & 0xFF) as u64;
     let aff3 = ((target_aff >> 24) & 0xFF) as u64;

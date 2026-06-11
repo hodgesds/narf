@@ -599,15 +599,15 @@ fn smoke_sp5100_pmio_base_resolution() -> TestResult {
     use crate::watchdog::Sp5100PmioBase;
 
     // SB7xx: raw & ~0xFFF → aligned page.
-    let sb7 = Sp5100PmioBase::Sb7xx(0xFEB00_ABC);
-    if sb7.mmio_addr() != 0xFEB00_000 {
+    let sb7 = Sp5100PmioBase::Sb7xx(0xFEB0_0ABC);
+    if sb7.mmio_addr() != 0xFEB0_0000 {
         return TestResult::Fail("Sb7xx page alignment wrong");
     }
 
     // SB8xx: (raw & ~0xFFF) + SB800_WDT_MMIO_OFFSET.
     // SB800_WDT_MMIO_OFFSET = 0xB00.
-    let sb8 = Sp5100PmioBase::Sb8xx(0xFED80_000);
-    if sb8.mmio_addr() != 0xFED80_000 + sp5100::SB800_WDT_MMIO_OFFSET as u64 {
+    let sb8 = Sp5100PmioBase::Sb8xx(0xFED8_0000);
+    if sb8.mmio_addr() != 0xFED8_0000 + sp5100::SB800_WDT_MMIO_OFFSET as u64 {
         return TestResult::Fail("Sb8xx mmio_addr wrong");
     }
 
@@ -962,7 +962,6 @@ kernel_test_in!("power/psci", smoke_psci_status_decode);
 // ── AMD CPPC ──────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
-
 fn smoke_cppc_request_round_trip() -> TestResult {
     use crate::cppc::{epp, Request};
 
@@ -984,7 +983,6 @@ fn smoke_cppc_request_round_trip() -> TestResult {
 kernel_test_in!("power/cppc", smoke_cppc_request_round_trip);
 
 #[cfg(target_arch = "x86_64")]
-
 fn smoke_cppc_cap1_field_layout() -> TestResult {
     use crate::cppc::Cap1;
 
@@ -1006,7 +1004,6 @@ fn smoke_cppc_cap1_field_layout() -> TestResult {
 kernel_test_in!("power/cppc", smoke_cppc_cap1_field_layout);
 
 #[cfg(target_arch = "x86_64")]
-
 fn smoke_cppc_supported_query_does_not_fault() -> TestResult {
     // `cppc::supported()` must be safe to call on any host —
     // CPUID-only, no MSR access. This pins down the contract that
@@ -1103,9 +1100,10 @@ fn smoke_syscall_perf_state_rejects_other_cpu_for_non_tcb() -> TestResult {
 
     // Caller is on cpu 0 but asks for cpu 7.
 
-    let mut a = CpuOpArgs::default();
-
-    a.a0 = 7;
+    let a = CpuOpArgs {
+        a0: 7,
+        ..Default::default()
+    };
 
     let r = handle(CpuOpKind::PerfState, &a, 0);
 
@@ -1132,9 +1130,10 @@ fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
 
     __reset_latency_hints_for_test();
 
-    let mut a = CpuOpArgs::default();
-
-    a.a0 = 50;
+    let a = CpuOpArgs {
+        a0: 50,
+        ..Default::default()
+    };
 
     let r = handle(CpuOpKind::LatencyHint, &a, 0);
 
@@ -1148,9 +1147,10 @@ fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
         return TestResult::Fail("floor not 50");
     }
 
-    let mut b = CpuOpArgs::default();
-
-    b.a0 = 200;
+    let b = CpuOpArgs {
+        a0: 200,
+        ..Default::default()
+    };
 
     let _ = handle(CpuOpKind::LatencyHint, &b, 0);
 
@@ -1158,9 +1158,10 @@ fn smoke_syscall_latency_hint_register_and_release() -> TestResult {
         return TestResult::Fail("floor must stay at strictest");
     }
 
-    let mut rel = CpuOpArgs::default();
-
-    rel.a0 = token;
+    let rel = CpuOpArgs {
+        a0: token,
+        ..Default::default()
+    };
 
     handle(CpuOpKind::LatencyRelease, &rel, 0);
 
@@ -1183,10 +1184,12 @@ fn smoke_syscall_set_freq_range_returns_unsupported_without_dvfs() -> TestResult
         has_dvfs: false,
         has_rapl: false,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = 0;
-    a.a1 = 800_000;
-    a.a2 = 4_000_000;
+    let a = CpuOpArgs {
+        a0: 0,
+        a1: 800_000,
+        a2: 4_000_000,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::SetFreqRange, &a, 0);
     __set_caps_for_test(None);
     if r.status != 9
@@ -1208,10 +1211,12 @@ fn smoke_syscall_set_freq_range_echoes_request_when_dvfs_present() -> TestResult
         has_dvfs: true,
         has_rapl: false,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = 0;
-    a.a1 = 800_000;
-    a.a2 = 4_000_000;
+    let a = CpuOpArgs {
+        a0: 0,
+        a1: 800_000,
+        a2: 4_000_000,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::SetFreqRange, &a, 0);
     __set_caps_for_test(None);
     if r.status != 0 || r.result[0] != 800_000 || r.result[1] != 4_000_000 {
@@ -1231,9 +1236,11 @@ fn smoke_syscall_set_epp_returns_unsupported_without_dvfs() -> TestResult {
         has_dvfs: false,
         has_rapl: false,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = 0;
-    a.a1 = 0x40;
+    let a = CpuOpArgs {
+        a0: 0,
+        a1: 0x40,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::SetEpp, &a, 0);
     __set_caps_for_test(None);
     if r.status != 9 {
@@ -1253,9 +1260,11 @@ fn smoke_syscall_set_governor_returns_unsupported_without_dvfs() -> TestResult {
         has_dvfs: false,
         has_rapl: false,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = 0;
-    a.a1 = Governor::Powersave as u64;
+    let a = CpuOpArgs {
+        a0: 0,
+        a1: Governor::Powersave as u64,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::SetGovernor, &a, 0);
     __set_caps_for_test(None);
     if r.status != 9 {
@@ -1275,10 +1284,12 @@ fn smoke_syscall_energy_budget_returns_unsupported_without_rapl() -> TestResult 
         has_dvfs: false,
         has_rapl: false,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = RaplDomain::Package as u64;
-    a.a1 = 1000;
-    a.a2 = 5000;
+    let a = CpuOpArgs {
+        a0: RaplDomain::Package as u64,
+        a1: 1000,
+        a2: 5000,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::SetEnergyBudget, &a, 0);
     __set_caps_for_test(None);
     if r.status != 9 {
@@ -1302,10 +1313,12 @@ fn smoke_syscall_energy_budget_install_and_clear_with_rapl() -> TestResult {
         has_dvfs: false,
         has_rapl: true,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = RaplDomain::Package as u64;
-    a.a1 = 1000;
-    a.a2 = 5000;
+    let a = CpuOpArgs {
+        a0: RaplDomain::Package as u64,
+        a1: 1000,
+        a2: 5000,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::SetEnergyBudget, &a, 0);
     if r.status != 0 {
         __set_caps_for_test(None);
@@ -1315,8 +1328,10 @@ fn smoke_syscall_energy_budget_install_and_clear_with_rapl() -> TestResult {
         __set_caps_for_test(None);
         return TestResult::Fail("install state");
     }
-    let mut c = CpuOpArgs::default();
-    c.a0 = RaplDomain::Package as u64;
+    let c = CpuOpArgs {
+        a0: RaplDomain::Package as u64,
+        ..Default::default()
+    };
     handle(CpuOpKind::ClearEnergyBudget, &c, 0);
     __set_caps_for_test(None);
     if current_energy_budget(RaplDomain::Package).is_some() {
@@ -1336,9 +1351,11 @@ fn smoke_syscall_rapl_energy_returns_unsupported_without_rapl() -> TestResult {
         has_dvfs: false,
         has_rapl: false,
     }));
-    let mut a = CpuOpArgs::default();
-    a.a0 = 0;
-    a.a1 = RaplDomain::Package as u64;
+    let a = CpuOpArgs {
+        a0: 0,
+        a1: RaplDomain::Package as u64,
+        ..Default::default()
+    };
     let r = handle(CpuOpKind::RaplEnergy, &a, 0);
     __set_caps_for_test(None);
     if r.status != 9 {
@@ -1721,6 +1738,9 @@ fn smoke_rapl_pkg_energy_advances() -> TestResult {
     while narf_time::Instant::now().cycles_since(start) < 10_000_000 {
         core::hint::spin_loop();
     }
+    // SAFETY: same preconditions as the first read above — kernel-test
+    // runs at CPL=0 and `rapl::is_supported()` gated the RAPL pkg-energy
+    // `rdmsr`, so the MSR access cannot #GP.
     let e2 = unsafe { rapl::read_pkg_uj() };
     // 32-bit counter × scale; can wrap. We accept either e2 >= e1
     // or a clear wrap (e2 much smaller). What we reject is a
@@ -2083,6 +2103,10 @@ fn smoke_s3_resume_context_phys_resolvable_via_cr3() -> TestResult {
     let cr3 = unsafe { read_cr3() } & !0xFFFu64;
     let pml4_phys = PhysAddr::new(cr3);
     let ctx_virt = resume_context_static_addr() as u64;
+    // SAFETY: `pml4_phys` is the PML4 frame from the live CR3 just read
+    // above, so it points at the running kernel's valid 4-level page
+    // tables; `translate` only reads those table frames to walk the
+    // mapping for `ctx_virt` and does not dereference user memory.
     let phys = unsafe { translate(pml4_phys, VirtAddr::new(ctx_virt)) };
     let phys_page = match phys {
         Some(p) => p.raw(),
@@ -2117,6 +2141,10 @@ fn smoke_s3_wake_entry_phys_resolvable_via_cr3() -> TestResult {
     // SAFETY: CPL=0 read.
     let cr3 = unsafe { read_cr3() } & !0xFFFu64;
     let entry_virt = s3_wake_entry as usize as u64;
+    // SAFETY: `PhysAddr::new(cr3)` is the PML4 frame from the live CR3
+    // just read above, so it points at the running kernel's valid
+    // 4-level page tables; `translate` only reads those table frames to
+    // walk the mapping for `entry_virt`.
     let phys = unsafe { translate(PhysAddr::new(cr3), VirtAddr::new(entry_virt)) };
     let phys_page = match phys {
         Some(p) => p.raw(),
@@ -2603,8 +2631,15 @@ fn poll_once_watchdog<F: core::future::Future>(mut fut: F) -> Option<F::Output> 
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: the `RawWaker`'s vtable functions (`no_clone`/`no_op`) are
+    // valid for the null data pointer it carries — clone re-derives the
+    // same waker and wake/drop are no-ops — so the `RawWaker` upholds the
+    // `Waker` contract.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local owned by this frame and is never moved
+    // after this point — it is only polled through `pinned` and the
+    // function returns immediately after — so the pin invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),
@@ -2624,7 +2659,7 @@ fn smoke_watchdog_write_any_byte_kicks() -> TestResult {
     let node = DevWatchdog::new(state.clone());
     let r = poll_once_watchdog(node.write(0, b"a"));
     match r {
-        Some(Ok(n)) if n == 1 => {}
+        Some(Ok(1)) => {}
         _ => return TestResult::Fail("write 'a' did not return Ok(1)"),
     }
     let after = state.kick_count.load(Ordering::Relaxed);

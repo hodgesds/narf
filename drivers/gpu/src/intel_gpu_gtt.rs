@@ -175,7 +175,7 @@ pub fn map_contiguous_scanout(
     // to avoid colliding with whatever the UEFI GOP mapped lower down (often at 0).
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
-    let pages = (size_bytes + GTT_PAGE_SIZE - 1) / GTT_PAGE_SIZE;
+    let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     for i in 0..pages {
         let phys = start_phys + i * GTT_PAGE_SIZE;
         let pte = encode_scanout_pte(phys, PatSlot::Slot2)?;
@@ -184,6 +184,11 @@ pub fn map_contiguous_scanout(
         let pte_offset = GGTT_BASE + pte_index * 8;
 
         // Write 64-bit PTE (as two 32-bit writes)
+        // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
+        // `pte_offset` is `GGTT_BASE` (8 MiB into the BAR) plus `pte_index * 8`,
+        // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
+        // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
+        // 32-bit GGTT register writes.
         unsafe {
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
@@ -203,7 +208,7 @@ pub fn alloc_coherent_scanout(
     const GGTT_BASE: u64 = 0x80_0000;
     const SCANOUT_GTT_OFFSET: u64 = 0x100_0000;
 
-    let pages = (size_bytes + GTT_PAGE_SIZE - 1) / GTT_PAGE_SIZE;
+    let pages = size_bytes.div_ceil(GTT_PAGE_SIZE);
     let mut frames = alloc::vec::Vec::with_capacity(pages as usize);
 
     for i in 0..pages {
@@ -218,6 +223,11 @@ pub fn alloc_coherent_scanout(
         let pte_offset = GGTT_BASE + pte_index * 8;
 
         // Write 64-bit PTE (as two 32-bit writes)
+        // SAFETY: `gtt_mmadr` is the caller-mapped BAR0 (`GTTMMADR`) region.
+        // `pte_offset` is `GGTT_BASE` (8 MiB into the BAR) plus `pte_index * 8`,
+        // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
+        // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
+        // 32-bit GGTT register writes.
         unsafe {
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);

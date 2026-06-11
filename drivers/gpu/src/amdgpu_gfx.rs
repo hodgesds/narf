@@ -264,7 +264,7 @@ pub fn build_gfx11_ring_init(
     doorbell_idx: u32,
     rptr_writeback_phys: u64,
 ) -> Result<GfxRingInitSequence, GfxError> {
-    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+    if !ring_size_dw.is_power_of_two() || !(8..=(1 << 20)).contains(&ring_size_dw) {
         return Err(GfxError::BadRingSize);
     }
     if ring_phys & 0xFF != 0 {
@@ -378,7 +378,7 @@ pub fn build_gfx9_ring_init(
     rptr_writeback_phys: u64,
 ) -> Result<GfxRingInitSequence, GfxError> {
     // Validate inputs.
-    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+    if !ring_size_dw.is_power_of_two() || !(8..=(1 << 20)).contains(&ring_size_dw) {
         return Err(GfxError::BadRingSize);
     }
     if ring_phys & 0xFF != 0 {
@@ -572,8 +572,8 @@ impl GfxContext {
     /// a later submission's completion implicitly retires earlier
     /// fences on the same queue (per CP ordering).
     pub fn fence_completed(&self, fence: &Fence) -> bool {
-        // SAFETY: identity-mapped DMA backing, exclusive owner.
         let observed: u32 =
+            // SAFETY: identity-mapped DMA backing, exclusive owner.
             unsafe { core::ptr::read_volatile(self.fence_buf.phys_addr().raw() as *const u32) };
         (observed as u64) >= fence.seq
     }

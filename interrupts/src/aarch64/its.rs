@@ -47,7 +47,7 @@ const ITS_BASE: usize = 0x0808_0000;
 /// QEMU virt GICv3 redistributor base for CPU 0.
 const GICR_BASE: usize = 0x080A_0000;
 
-const GITS_CTLR: usize = ITS_BASE + 0x0000;
+const GITS_CTLR: usize = ITS_BASE;
 #[allow(dead_code)]
 const GITS_TYPER: usize = ITS_BASE + 0x0008;
 const GITS_CBASER: usize = ITS_BASE + 0x0080;
@@ -57,7 +57,7 @@ const GITS_BASER0: usize = ITS_BASE + 0x0100;
 /// Doorbell — the physical address devices write to deliver MSI.
 const GITS_TRANSLATER: usize = ITS_BASE + 0x10040;
 
-const GICR_CTLR: usize = GICR_BASE + 0x0000;
+const GICR_CTLR: usize = GICR_BASE;
 const GICR_PROPBASER: usize = GICR_BASE + 0x0070;
 const GICR_PENDBASER: usize = GICR_BASE + 0x0078;
 
@@ -157,8 +157,8 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // SAFETY: identity-mapped MMIO read.
     let baser0_old = unsafe { read_u64(GITS_BASER0) };
     let entry_size_dev = baser0_old & (0x1F << 48);
-    let baser0 = (1u64 << 63) | entry_size_dev | (device_tab & 0x000F_FFFF_FFFF_F000) | 0; // size = 1 page
-                                                                                           // SAFETY: device table page is fresh & zeroed.
+    let baser0 = (1u64 << 63) | entry_size_dev | (device_tab & 0x000F_FFFF_FFFF_F000); // size = 1 page
+                                                                                       // SAFETY: device table page is fresh & zeroed.
     unsafe {
         write_u64(GITS_BASER0, baser0);
     }
@@ -166,7 +166,7 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // SAFETY: identity-mapped MMIO read.
     let baser1_old = unsafe { read_u64(GITS_BASER0 + 8) };
     let entry_size_coll = baser1_old & (0x1F << 48);
-    let baser1 = (1u64 << 63) | entry_size_coll | (coll_tab & 0x000F_FFFF_FFFF_F000) | 0;
+    let baser1 = (1u64 << 63) | entry_size_coll | (coll_tab & 0x000F_FFFF_FFFF_F000);
     // SAFETY: collection table page is fresh & zeroed.
     unsafe {
         write_u64(GITS_BASER0 + 8, baser1);
@@ -180,7 +180,7 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     //
     // One 4 KiB page = 128 × 32-byte ITS commands. Plenty for boot
     // + Stage-3 driver count.
-    let cbaser = (1u64 << 63) | (cmdq & 0x000F_FFFF_FFFF_F000) | 0;
+    let cbaser = (1u64 << 63) | (cmdq & 0x000F_FFFF_FFFF_F000);
     // SAFETY: command-queue page is fresh & zeroed.
     unsafe {
         write_u64(GITS_CBASER, cbaser);

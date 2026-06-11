@@ -591,11 +591,11 @@ pub enum Syscall {
     /// poll under WNOHANG) until a child of the calling task
     /// exits, then reap its exit status. arg0 = pid (signed —
     /// >0 specific child, -1 any), arg1 = status user-pointer
-    /// (may be 0), arg2 = options bitmask (low bit = WNOHANG),
-    /// arg3 = rusage user-pointer (zeroed; no per-process
-    /// resource accounting yet). Returns the reaped child pid
-    /// on success, 0 on WNOHANG with no exited child, InvalidOp
-    /// on no-children / timeout.
+    /// > (may be 0), arg2 = options bitmask (low bit = WNOHANG),
+    /// > arg3 = rusage user-pointer (zeroed; no per-process
+    /// > resource accounting yet). Returns the reaped child pid
+    /// > on success, 0 on WNOHANG with no exited child, InvalidOp
+    /// > on no-children / timeout.
     Wait4,
 
     /// `pause()` — block until a signal is delivered.
@@ -892,7 +892,7 @@ pub enum Syscall {
     /// userspace mapping stays installed for now (page-table
     /// teardown lands when shmem grows a `Drop` path that walks
     /// + unmaps the user VA range). Returns 0 on success, !0 on
-    /// bad handle / not-owner.
+    ///   bad handle / not-owner.
     ShmemDestroy,
 
     /// Install (or replace) a firmware blob in the kernel firmware
@@ -1088,15 +1088,15 @@ pub enum Syscall {
     ///
     /// - `arg0 = entry_pc`  : user vaddr the new task starts at
     /// - `arg1 = stack_top` : user RSP the new task starts on
-    ///                        (caller-allocated; kernel does NOT
-    ///                        validate that the page is mapped)
+    ///   (caller-allocated; kernel does NOT
+    ///   validate that the page is mapped)
     /// - `arg2 = arg`       : opaque u64 passed in RDI to `entry_pc`
     /// - `arg3 = fs_base`   : if non-zero, value the kernel writes
-    ///                        into the new task's `IA32_FS_BASE` so
-    ///                        it can find its own TLS block. Zero
-    ///                        means "inherit parent's fs_base"
-    ///                        (suitable for child code that does
-    ///                        not touch TLS).
+    ///   into the new task's `IA32_FS_BASE` so
+    ///   it can find its own TLS block. Zero
+    ///   means "inherit parent's fs_base"
+    ///   (suitable for child code that does
+    ///   not touch TLS).
     ///
     /// Returns the new task's tid on success (non-zero), or
     /// `SyscallReturn::invalid_op` if the parent's address space
@@ -1123,7 +1123,7 @@ pub enum Syscall {
     /// Inheritance per POSIX:
     ///   - address space  : copied (independent on either side)
     ///   - fd table       : copied (entries share underlying file
-    ///                      Arcs via Arc::clone)
+    ///     Arcs via Arc::clone)
     ///   - cwd / brk / sigaction / signal_mask / uid+gid /
     ///     pgid / sid    : copied
     ///   - pending signals: reset (POSIX)
@@ -1151,17 +1151,17 @@ pub enum Syscall {
     /// Honoured `CLONE_*` flags (Wave-65):
     ///   - `CLONE_VM`              child shares parent's AS via Arc.
     ///   - `CLONE_THREAD`          child joins parent's thread group
-    ///                             (same getpid(), distinct gettid()).
+    ///     (same getpid(), distinct gettid()).
     ///   - `CLONE_SIGHAND`         share sigaction table (accepted).
     ///   - `CLONE_FS`              share cwd table.
     ///   - `CLONE_FILES`           share fd table.
     ///   - `CLONE_SYSVSEM`         accepted-and-ignored (no SysV sem).
     ///   - `CLONE_PARENT_SETTID`   on success, write child TID to
-    ///                             `*parent_tid`.
+    ///     `*parent_tid`.
     ///   - `CLONE_CHILD_CLEARTID`  on thread exit, zero `*child_tid`
-    ///                             and FUTEX_WAKE one waiter there.
+    ///     and FUTEX_WAKE one waiter there.
     ///   - `CLONE_SETTLS`          program child's `IA32_FS_BASE` to
-    ///                             `args.tls` on first dispatch.
+    ///     `args.tls` on first dispatch.
     ///
     /// Unsupported flags (CLONE_NEWPID, CLONE_NEWNS, etc.) are
     /// silently accepted today; container support lands in Wave-67.
@@ -1199,30 +1199,32 @@ pub enum Syscall {
     /// `arg1 = op`, `arg2 = val`, `arg3 = timeout/uaddr2`,
     /// `arg4 = val3`. Honoured ops:
     ///   - FUTEX_WAIT (0): if `*uaddr == val`, would block. NARF
-    ///                     is single-threaded so no other task can
-    ///                     wake us — we return 0 (spurious wakeup
-    ///                     allowed by spec) so consumer code falls
-    ///                     into its loop.
+    ///     is single-threaded so no other task can
+    ///     wake us — we return 0 (spurious wakeup
+    ///     allowed by spec) so consumer code falls
+    ///     into its loop.
     ///   - FUTEX_WAKE (1): would wake up to `val` waiters; we have
-    ///                     none, so return 0.
+    ///     none, so return 0.
     ///   - FUTEX_PRIVATE (0x80) and FUTEX_CLOCK_REALTIME (0x100)
-    ///                     bits are accepted-and-ignored.
+    ///     bits are accepted-and-ignored.
+    ///
     /// Other ops return -1.
     Futex,
 
     /// Linux prctl(2): per-task settings switchboard. `arg0 = op`,
     /// `arg1 = argA`, `arg2 = argB`. Honoured ops:
     ///   - PR_SET_NAME  (15): argA = pointer to up-to-15-byte
-    ///                        UTF-8 name; bytes copied into the
-    ///                        kernel-side name slot, NUL-padded
-    ///                        to 16. Returns 0.
+    ///     UTF-8 name; bytes copied into the
+    ///     kernel-side name slot, NUL-padded
+    ///     to 16. Returns 0.
     ///   - PR_GET_NAME  (16): argA = writable 16-byte buffer;
-    ///                        kernel writes the recorded name +
-    ///                        NUL. Returns 0.
+    ///     kernel writes the recorded name +
+    ///     NUL. Returns 0.
     ///   - PR_SET_DUMPABLE (4) / PR_GET_DUMPABLE (3): round-trip
-    ///                        the boolean.
+    ///     the boolean.
     ///   - PR_SET_NO_NEW_PRIVS (38) / PR_GET_NO_NEW_PRIVS (39):
-    ///                        round-trip the boolean.
+    ///     round-trip the boolean.
+    ///
     /// Everything else returns -1.
     Prctl,
 
@@ -2054,6 +2056,10 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // SAFETY: `p` is the non-null pointer just loaded (Acquire) from
+    // `GLOBAL_TABLE`, published by `install_global` via `Box::into_raw`
+    // (Release). The Box is leaked and never freed while a table is
+    // installed, so the `&SyscallTable` is valid for this dispatch.
     let table = unsafe { &*p };
     let version = syscall_version(num);
     let raw_n = syscall_number(num);
@@ -2082,6 +2088,10 @@ pub fn kernel_syscall_entry_plain_with_state(
     if p.is_null() {
         return SyscallReturn::invalid_op();
     }
+    // SAFETY: `p` is the non-null pointer just loaded (Acquire) from
+    // `GLOBAL_TABLE`, published by `install_global` via `Box::into_raw`
+    // (Release). The Box is leaked and never freed while a table is
+    // installed, so the `&SyscallTable` is valid for this dispatch.
     let table = unsafe { &*p };
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     table.dispatch(n, &mut ctx);
@@ -2137,6 +2147,10 @@ impl TrapContext for ArgsOnlyCtx {
         // deliberately never call `set_return`, leaving the original
         // syscall number in rax so the re-run dispatches correctly.
         if !self.user_state.is_null() {
+            // SAFETY: `user_state` is non-null (checked above) and points
+            // at the `[u64; 19]` kernel-stack `UserState` snapshot the
+            // syscall-entry asm built; slot 14 is `rax` (offset asserted
+            // by the `const _` guard above), in bounds and `u64`-aligned.
             unsafe { *(self.user_state as *mut u64).add(14) = ret.value }
         }
     }
@@ -2151,6 +2165,10 @@ impl TrapContext for ArgsOnlyCtx {
         if self.user_state.is_null() {
             return 0;
         }
+        // SAFETY: `user_state` is non-null (checked above) and points at
+        // the `[u64; 19]` kernel-stack `UserState` snapshot; slot 17 is
+        // `rsp` (offset asserted by the `const _` guard above), in bounds
+        // and `u64`-aligned.
         unsafe { *(self.user_state as *const u64).add(17) }
     }
     #[inline]
@@ -2158,6 +2176,10 @@ impl TrapContext for ArgsOnlyCtx {
         if self.user_state.is_null() {
             return 0;
         }
+        // SAFETY: `user_state` is non-null (checked above) and points at
+        // the `[u64; 19]` kernel-stack `UserState` snapshot; slot 15 is
+        // `rip` (offset asserted by the `const _` guard above), in bounds
+        // and `u64`-aligned.
         unsafe { *(self.user_state as *const u64).add(15) }
     }
     #[inline]
@@ -2165,6 +2187,11 @@ impl TrapContext for ArgsOnlyCtx {
         if self.user_state.is_null() {
             return;
         }
+        // SAFETY: `user_state` is non-null (checked above) and points at
+        // the `[u64; 19]` kernel-stack `UserState` snapshot; slot 15 is
+        // `rip` (offset asserted by the `const _` guard above), in bounds
+        // and `u64`-aligned. The exit asm reloads RIP from this slot, so
+        // the write steers where `sysretq` lands.
         unsafe { *(self.user_state as *mut u64).add(15) = rip }
     }
     #[inline]
@@ -2179,6 +2206,10 @@ impl TrapContext for ArgsOnlyCtx {
         if self.user_state.is_null() || out.is_null() {
             return false;
         }
+        // SAFETY: both pointers are non-null (checked above). `user_state`
+        // points at the 152-byte (`[u64; 19]`) kernel-stack `UserState`
+        // snapshot; the caller guarantees `out` has at least 152 bytes of
+        // writable, non-overlapping storage (this fn's `# Safety` contract).
         unsafe {
             // Copy the snapshot verbatim. The rax slot already holds
             // the right value: `set_return` mirrors a return value
@@ -2307,6 +2338,10 @@ mod sigframe {
     };
 
     unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
+        // SAFETY: `v` is a live `&T`, so its pointer is non-null, aligned
+        // and valid for `size_of::<T>()` bytes; `T: Copy` (POD `#[repr(C)]`
+        // here) has no padding invariants that reading raw bytes violates.
+        // The returned slice borrows `v` for the same lifetime.
         unsafe {
             core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>())
         }
@@ -2412,6 +2447,10 @@ mod sigframe {
             // back to `saved_rip` without calling sigreturn.
             let raw_rsp = stack_top.wrapping_sub(16);
             let new_rsp = (raw_rsp & !0xFu64) | 0x8;
+            // SAFETY: the active CR3 is the trapping task's; copy_to_user
+            // brackets each write with SMAP and faults user-side on a bad
+            // address. `new_rsp` / `new_rsp + 8` are 16-byte-aligned user
+            // stack slots derived from the task's RSP.
             let ok = unsafe {
                 crate::handlers::copy_to_user(new_rsp, &saved_rip.to_ne_bytes()).is_ok()
                     && crate::handlers::copy_to_user(
@@ -2448,6 +2487,10 @@ mod sigframe {
                 core::mem::size_of::<McContext>(),
             )
         };
+        // SAFETY: `mc_vaddr` is a user vaddr; `dst` borrows the local
+        // `mc` for `size_of::<McContext>()` bytes. copy_from_user brackets
+        // the read with SMAP and faults user-side on a bad address, so an
+        // invalid `mc_vaddr` returns Err rather than reading kernel memory.
         if unsafe { crate::handlers::copy_from_user(dst, mc_vaddr) }.is_err() {
             return None;
         }
@@ -2602,6 +2645,12 @@ impl core::fmt::Debug for SyscallTable {
     }
 }
 
+impl Default for SyscallTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SyscallTable {
     pub fn new() -> Self {
         Self {
@@ -2625,6 +2674,10 @@ impl SyscallTable {
 
     pub fn len(&self) -> usize {
         self.names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
     }
 
     /// Register `handler` for `variant`. If `variant` already has a
@@ -2752,6 +2805,11 @@ where
 pub fn __test_clear_global() {
     let ptr = GLOBAL_TABLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !ptr.is_null() {
+        // SAFETY: `ptr` is the non-null pointer atomically swapped out of
+        // `GLOBAL_TABLE`; it originated from `install_global`'s
+        // `Box::into_raw(Box::new(SyscallTable))`. The swap gives us
+        // exclusive ownership (no other thread can observe it now), so
+        // reconstituting and dropping the Box frees it exactly once.
         unsafe { drop(Box::from_raw(ptr)) };
     }
 }

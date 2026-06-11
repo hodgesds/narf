@@ -53,7 +53,7 @@ pub const TX_RING_MASK: usize = TX_RING_SIZE - 1;
 /// TX queue's new write-pointer here to kick the device scheduler.
 ///
 /// Source: `pcie/gen1_2/tx-gen2.c::iwl_pcie_gen2_update_byte_tbl`.
-pub const SCD_BASE: u32 = 0xA02C_00;
+pub const SCD_BASE: u32 = 0x00A0_2C00;
 /// Per-queue write-pointer register: `SCD_BASE + queue_id * 4`.
 #[inline]
 pub const fn scd_queue_wrptr(queue_id: u32) -> u32 {
@@ -345,7 +345,15 @@ pub struct TxQueue {
     pub tfds: *mut Tfd,
 }
 
+// SAFETY: the only non-`Send` field is the `tfds` raw pointer to the TFD
+// ring in host RAM. That ring is owned solely by this `TxQueue` and is only
+// ever touched while the caller holds the queue lock, so moving the queue to
+// another thread does not create aliasing.
 unsafe impl Send for TxQueue {}
+// SAFETY: `&TxQueue` exposes only the raw `tfds` pointer; all ring access
+// goes through `&mut self` methods (`enqueue`), which are externally
+// serialized by the driver's per-queue lock, so concurrent `&` references
+// cannot race on the ring.
 unsafe impl Sync for TxQueue {}
 
 impl TxQueue {
@@ -362,6 +370,10 @@ impl TxQueue {
     /// Returns the slot index where the TFD was placed.
     pub fn enqueue(&mut self, tfd: Tfd) -> usize {
         let slot = self.write_ptr;
+        // SAFETY: `slot == write_ptr` is always masked to `TX_RING_MASK`, so
+        // `tfds.add(slot)` stays within the `TX_RING_SIZE`-element ring that
+        // `tfds` points at; the slot is `Tfd`-aligned and owned by this queue,
+        // so the write does not alias the device's in-flight reads.
         unsafe {
             *self.tfds.add(slot) = tfd;
         }

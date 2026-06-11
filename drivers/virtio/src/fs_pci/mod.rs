@@ -92,7 +92,9 @@ impl VirtioFsPci {
         let device_cap = caps.device_cfg.ok_or(VirtioPciError::NoCommonCfg)?;
         // SAFETY: caller-owned BARs.
         let common = unsafe { map_cap(device, &caps.common) }?;
+        // SAFETY: caller-owned BARs.
         let notify = unsafe { map_cap(device, &caps.notify) }?;
+        // SAFETY: caller-owned BARs.
         let device_region = unsafe { map_cap(device, &device_cap) }?;
         let notify_off_multiplier = caps.notify.notify_off_multiplier;
 
@@ -113,6 +115,7 @@ impl VirtioFsPci {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
             common.read32(CC_DEVICE_FEATURE)
         };
+        // SAFETY: identity-mapped MMIO.
         let feats_hi = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 1);
             common.read32(CC_DEVICE_FEATURE)
@@ -143,8 +146,8 @@ impl VirtioFsPci {
         let mut cfg_buf = [0u8; config::FS_CONFIG_LEN];
         // SAFETY: same.
         unsafe {
-            for i in 0..config::FS_CONFIG_LEN {
-                cfg_buf[i] = device_region.read8(i as u64);
+            for (i, slot) in cfg_buf.iter_mut().enumerate() {
+                *slot = device_region.read8(i as u64);
             }
         }
         let cfg = decode_device_config(&cfg_buf).ok_or(VirtioPciError::NoCommonCfg)?;
@@ -158,6 +161,7 @@ impl VirtioFsPci {
         // SAFETY: identity-mapped MMIO.
         let (hi_buf, hiprio, _) = unsafe { setup_queue(&common, HIPRIO_IDX) }?;
         let (req_buf, requestq, request_notify_off) =
+            // SAFETY: identity-mapped MMIO.
             unsafe { setup_queue(&common, REQUEST_IDX_0) }?;
 
         // SAFETY: same.
@@ -290,8 +294,8 @@ impl VirtioFsPci {
         let mut out = alloc::vec![0u8; n];
         // SAFETY: identity-mapped DMA.
         unsafe {
-            for i in 0..n {
-                out[i] = core::ptr::read_volatile((resp_phys + i as u64) as *const u8);
+            for (i, slot) in out.iter_mut().enumerate().take(n) {
+                *slot = core::ptr::read_volatile((resp_phys + i as u64) as *const u8);
             }
         }
         let mut g = self.requestq.lock();

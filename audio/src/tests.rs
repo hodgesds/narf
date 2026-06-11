@@ -41,6 +41,10 @@ fn smoke_virtio_snd_writer_submit_round_trip() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     use narf_drivers_virtio::snd_pci;
 
+    // SAFETY: the kernel-test runner executes post-bootstrap, so the
+    // memory map is parsed and the allocator is online; `ECAM_DEFAULT_BASE`
+    // is the platform's well-known ECAM physical base, and `init` only
+    // reads config-space words from it.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -93,6 +97,10 @@ fn smoke_audio_submit_shmem_zero_copy() -> TestResult {
     use narf_drivers_virtio::snd_pci;
     use narf_shmem::{__reset_for_test as shmem_reset, create as shmem_create};
 
+    // SAFETY: the kernel-test runner executes post-bootstrap, so the
+    // memory map is parsed and the allocator is online; `ECAM_DEFAULT_BASE`
+    // is the platform's well-known ECAM physical base, and `init` only
+    // reads config-space words from it.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {

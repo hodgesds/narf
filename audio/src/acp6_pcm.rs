@@ -281,8 +281,8 @@ pub fn play_pcm(samples: &[i16]) -> Result<usize, PcmError> {
     let ring_phys = stream.ring_phys;
     // SAFETY: identity-mapped DMA page; n × 2 ≤ ring.len().
     unsafe {
-        for i in 0..n {
-            core::ptr::write_volatile((ring_phys + (i * 2) as u64) as *mut i16, samples[i]);
+        for (i, &s) in samples[..n].iter().enumerate() {
+            core::ptr::write_volatile((ring_phys + (i * 2) as u64) as *mut i16, s);
         }
         // Zero the tail so a short buffer doesn't replay stale
         // samples from a previous load.

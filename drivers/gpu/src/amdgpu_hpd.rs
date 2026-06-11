@@ -329,6 +329,8 @@ mod smoke_tests {
             return TestResult::Fail("kind wrong");
         }
         // Disconnect on HPD1.
+        // `0 << 8` documents bits[9:8] = 0 (disconnect event type) explicitly.
+        #[allow(clippy::identity_op)]
         let dw1 = (HpdSource::Hpd1 as u32) | (0 << 8);
         let e = HpdEvent::from_ih_cookie(dw1, 0).unwrap();
         if e.kind != HpdEventKind::LongPulseDisconnect {

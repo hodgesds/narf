@@ -222,7 +222,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<RtlwifiDevice, ProbeError> 
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_arc = alloc::sync::Arc::new(RtlwifiDevice {
-        mmio_bar0: mmio_bar0.clone(),
+        mmio_bar0,
         mac,
         device_id: device.id.device,
         link_up: AtomicBool::new(false),

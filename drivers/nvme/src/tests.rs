@@ -377,6 +377,10 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     }
     let write_cap = register_with_cap(buf);
     // Downgrade Write→Read so the cap matches BlockRequest::buffer's type.
+    // SAFETY: `mint` reconstructs a cap from a slot we own — `write_cap`'s
+    // live `generation`/`index` — narrowed to `Read::BITS` (a subset of the
+    // original rights) and the same `DmaBuffer` kind, so it aliases the same
+    // valid DMA-buffer slot with strictly fewer rights.
     let read_cap = unsafe {
         use narf_capabilities::{Cap, CapSlot, Read, Rights};
         let s = write_cap.slot();
@@ -415,7 +419,7 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
         op: BlockOp::Write { fua: false },
         lba: 0,
         blocks: 1,
-        buffer: read_cap.clone(),
+        buffer: read_cap,
         qos: QosHint::Latency,
         user_tag: 0xC0FFEE,
     };
@@ -549,6 +553,9 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
         return TestResult::Fail("submit_io_irq(Read) failed");
     }
     for i in 0..512usize {
+        // SAFETY: `phys` is the live identity-mapped 4-KiB DMA page from
+        // `alloc_coherent`; `i < 512` stays well within the page, so
+        // `phys+i` is a valid, aligned `u8` to read back.
         let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
         if v != (i as u8).wrapping_mul(7) {
             return TestResult::Fail("IRQ-driven read-back pattern mismatch");
@@ -1493,6 +1500,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
     };
     // Stamp distinct patterns via volatile writes so the compiler
     // doesn't elide them.
+    // SAFETY: `page_a/b/c` are the three live identity-mapped 4-KiB DMA
+    // pages from `alloc_coherent`; `i < 4096` keeps every `add(i)` inside
+    // its page, so each is a valid, aligned `u8` to write.
     unsafe {
         let pa = page_a.phys_addr().raw() as *mut u8;
         let pb = page_b.phys_addr().raw() as *mut u8;
@@ -1511,6 +1521,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
         return TestResult::Fail("write_lba_pages (3 pages) failed");
     }
     // Zero all three pages, then read back.
+    // SAFETY: same three live identity-mapped 4-KiB DMA pages; `i < 4096`
+    // keeps every `add(i)` in-page, so each is a valid, aligned `u8` to
+    // zero.
     unsafe {
         let pa = page_a.phys_addr().raw() as *mut u8;
         let pb = page_b.phys_addr().raw() as *mut u8;
@@ -1525,6 +1538,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
         return TestResult::Fail("read_lba_pages (3 pages) failed");
     }
     for i in 0..4096usize {
+        // SAFETY: same three live identity-mapped 4-KiB DMA pages; `i < 4096`
+        // keeps every `add(i)` in-page, so each is a valid, aligned `u8` to
+        // read back.
         unsafe {
             let pa = page_a.phys_addr().raw() as *const u8;
             let pb = page_b.phys_addr().raw() as *const u8;

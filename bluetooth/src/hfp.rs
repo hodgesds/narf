@@ -127,11 +127,11 @@ pub fn parse_at(line: &str) -> Result<AtCommand, HfpError> {
     if let Some(eq_pos) = body.find('=') {
         let name = body[..eq_pos].into();
         let after = &body[eq_pos + 1..];
-        if after.starts_with('?') {
+        if let Some(stripped) = after.strip_prefix('?') {
             return Ok(AtCommand {
                 name,
                 form: AtForm::Test,
-                params: after[1..].into(),
+                params: stripped.into(),
             });
         }
         return Ok(AtCommand {

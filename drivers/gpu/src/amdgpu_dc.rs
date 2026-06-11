@@ -177,19 +177,10 @@ pub struct PipeAlloc {
 }
 
 /// Full DC state — what's currently programmed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DcState {
     pub streams: Vec<Stream>,
     pub pipes: Vec<PipeAlloc>,
-}
-
-impl Default for DcState {
-    fn default() -> Self {
-        Self {
-            streams: Vec::new(),
-            pipes: Vec::new(),
-        }
-    }
 }
 
 impl DcState {

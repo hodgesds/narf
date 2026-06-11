@@ -372,10 +372,9 @@ fn smoke_obs_gdb_read_regs_packs_archregs() -> TestResult {
         ..Default::default()
     };
     #[cfg(target_arch = "aarch64")]
-    let regs = {
-        let mut r = ArchRegs::default();
-        r.pc = 0x1234_5678;
-        r
+    let regs = ArchRegs {
+        pc: 0x1234_5678,
+        ..Default::default()
     };
 
     let mut session = gdb::GdbSession::new(regs, gdb::HaltReason::SigTrap);

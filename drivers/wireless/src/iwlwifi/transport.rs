@@ -450,13 +450,23 @@ impl AliveSink for PollingAliveSink {
         // or check if there's a way to get time.
 
         for _ in 0..(deadline_ms * 1000) {
+            // SAFETY: `self.region` is the live BAR0 `MmioRegion` handed to
+            // `PollingAliveSink::new`; `CSR_INT` is a 32-bit device CSR within
+            // that BAR, so the volatile MMIO read is to a valid, in-range,
+            // 4-byte-aligned register.
             let intr = unsafe { self.region.read32(regs::CSR_INT as u64) };
             if intr & csr_int::ALIVE != 0 {
                 // Acknowledge the interrupt.
+                // SAFETY: `self.region` is the live BAR0 mapping; `CSR_INT` is a
+                // writable 32-bit device CSR within that BAR, and writing the
+                // `ALIVE` bit is the documented way to acknowledge the interrupt.
                 unsafe { self.region.write32(regs::CSR_INT as u64, csr_int::ALIVE) };
 
                 // On many Intel chips, the ALIVE status is written to
                 // CSR_UCODE_DRV_GP2 (0x60).
+                // SAFETY: `self.region` is the live BAR0 mapping; `CSR_UCODE_DRV_GP2`
+                // (0x60) is a 32-bit device CSR within that BAR, so the volatile
+                // MMIO read targets a valid, in-range, 4-byte-aligned register.
                 let status = unsafe { self.region.read32(regs::CSR_UCODE_DRV_GP2 as u64) };
                 if status == regs::IWL_ALIVE_STATUS_OK {
                     return Some(status);

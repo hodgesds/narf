@@ -33,7 +33,7 @@ pub fn block_count_for(byte_len: usize) -> usize {
     if byte_len == 0 {
         1
     } else {
-        (byte_len + MAILBOX_PAYLOAD_LEN - 1) / MAILBOX_PAYLOAD_LEN
+        byte_len.div_ceil(MAILBOX_PAYLOAD_LEN)
     }
 }
 

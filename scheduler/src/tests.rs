@@ -562,6 +562,8 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
 
     // SAFETY: Paging is enabled in the running kernel test environment, which
     // is new_for_user's sole precondition.
+    // SAFETY: `new_for_user` only requires paging be enabled, which always
+    // holds once the kernel test harness is running at EL1/long mode.
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_cr3 = user_as.root.as_u64();
     if user_cr3 == kernel_cr3 {
@@ -618,6 +620,9 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     #[inline(always)]
     unsafe fn read_ttbr0() -> u64 {
         let v: u64;
+        // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
+        // read with no side effects; `nomem`/`nostack`/`preserves_flags`
+        // hold and `out(reg) v` is the sole, written operand.
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -629,8 +634,12 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     }
 
     crate::__reset_queues_for_test();
+    // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
+    // EL1 where that read is always permitted.
     let kernel_ttbr0 = unsafe { read_ttbr0() };
 
+    // SAFETY: `new_for_user` only requires paging be enabled, which always
+    // holds once the kernel test harness is running at EL1/long mode.
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let arc_as = Arc::new(user_as);
 
@@ -638,6 +647,8 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
 
     crate::run_until_empty();
 
+    // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
+    // EL1 where that read is always permitted.
     let ttbr0_after = unsafe { read_ttbr0() };
     drop(arc_as);
     if ttbr0_after == kernel_ttbr0 {
@@ -702,6 +713,8 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
 
     // SAFETY: Paging is enabled in the running kernel test environment, which
     // is new_for_user's sole precondition.
+    // SAFETY: `new_for_user` only requires paging be enabled, which always
+    // holds once the kernel test harness is running at EL1/long mode.
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_cr3 = user_as.root.as_u64();
     let arc_as = Arc::new(user_as);
@@ -776,6 +789,9 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     #[inline(always)]
     unsafe fn read_ttbr0() -> u64 {
         let v: u64;
+        // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
+        // read with no side effects; `nomem`/`nostack`/`preserves_flags`
+        // hold and `out(reg) v` is the sole, written operand.
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -785,8 +801,12 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
         }
         v
     }
+    // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
+    // EL1 where that read is always permitted.
     let kernel_ttbr0 = unsafe { read_ttbr0() };
 
+    // SAFETY: `new_for_user` only requires paging be enabled, which always
+    // holds once the kernel test harness is running at EL1/long mode.
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_root = user_as.root.as_u64();
     let arc_as = Arc::new(user_as);

@@ -104,8 +104,8 @@ const CFG_MTU: u64 = 10;
 /// Upper bound on how many queue pairs we'll actually bring up,
 /// regardless of what `max_virtqueue_pairs` reports. Keeps DMA-page
 /// + MSI-X-vector consumption bounded for absurd device-advertised
-/// counts (some emulators advertise 0x8000). Four is enough to spread
-/// TX submission across a typical small-core machine.
+///   counts (some emulators advertise 0x8000). Four is enough to spread
+///   TX submission across a typical small-core machine.
 const MAX_QUEUE_PAIRS: u16 = 4;
 
 /// virtio-net header (VirtIO 1.2 §5.1.6.1). 12 bytes when
@@ -418,6 +418,8 @@ impl VirtioNetPci {
         // Bring up `num_pairs` RX/TX pairs at virtqueue indices
         // (0,1), (2,3), ..., (2N-2, 2N-1). The control queue (if
         // F_CTRL_VQ negotiated) sits at index 2*num_pairs.
+        // Wide tuple: (rx_layout, rx_buf, rx_qsize, rx_noff, tx_layout, tx_buf, tx_qsize, tx_noff).
+        #[allow(clippy::type_complexity)]
         let mut pair_setups: Vec<(
             VirtqueueLayout,
             DmaBuffer,
@@ -566,9 +568,8 @@ impl VirtioNetPci {
         let mut link_up_init = true;
         if let Some(r) = device_cfg.as_ref() {
             if want_mac {
-                // SAFETY: device-cfg region was just mapped; field
-                // at offset 0..6.
                 for i in 0..6u64 {
+                    // SAFETY: device-cfg region was just mapped; MAC field at offset 0..6.
                     mac[i as usize] = unsafe { r.read8(CFG_MAC + i) };
                 }
             }

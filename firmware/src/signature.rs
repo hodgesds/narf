@@ -258,8 +258,8 @@ fn trusted_signer_pubkey(fingerprint: &[u8; 32]) -> Option<[u8; 32]> {
         // probing attempt to enumerate the trusted-signer list
         // can't time which entries are present.
         let mut diff = 0u8;
-        for i in 0..32 {
-            diff |= s.fingerprint[i] ^ fingerprint[i];
+        for (a, b) in s.fingerprint.iter().zip(fingerprint.iter()) {
+            diff |= a ^ b;
         }
         if diff == 0 {
             return Some(s.pubkey);

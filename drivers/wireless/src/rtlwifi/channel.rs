@@ -47,11 +47,10 @@ pub const fn ch_to_freq_mhz(ch: u8) -> u16 {
         2407 + 5 * ch as u16
     } else if ch == 14 {
         2484
-    } else if ch >= 36 && ch <= 64 && ch % 4 == 0 {
-        5000 + 5 * ch as u16
-    } else if ch >= 100 && ch <= 144 && ch % 4 == 0 {
-        5000 + 5 * ch as u16
-    } else if ch >= 149 && ch <= 165 && ch % 4 == 1 {
+    } else if (ch >= 36 && ch <= 64 && ch % 4 == 0)
+        || (ch >= 100 && ch <= 144 && ch % 4 == 0)
+        || (ch >= 149 && ch <= 165 && ch % 4 == 1)
+    {
         5000 + 5 * ch as u16
     } else {
         0

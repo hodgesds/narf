@@ -53,6 +53,9 @@ pub const EPOLL_EVENT_SIZE: usize = 12;
 /// Read a user-supplied `epoll_event` struct (12 bytes).
 fn read_epoll_event(ptr: u64) -> Result<(u32, u64), ()> {
     let mut buf = [0u8; 12];
+    // SAFETY: runs in the calling task's syscall context (its address space,
+    // never IRQ); `copy_from_user` range-validates `ptr` for `buf.len()` (12)
+    // bytes and brackets the read with the SMAP window itself.
     if unsafe { crate::handlers::copy_from_user(&mut buf, ptr) }.is_err() {
         return Err(());
     }
@@ -66,6 +69,9 @@ fn write_epoll_event(ptr: u64, events: u32, data: u64) -> Result<(), ()> {
     let mut buf = [0u8; 12];
     buf[0..4].copy_from_slice(&events.to_ne_bytes());
     buf[4..12].copy_from_slice(&data.to_ne_bytes());
+    // SAFETY: runs in the calling task's syscall context (its address space,
+    // never IRQ); `copy_to_user` range-validates `ptr` for `buf.len()` (12)
+    // bytes and brackets the write with the SMAP window itself.
     if unsafe { crate::handlers::copy_to_user(ptr, &buf) }.is_err() {
         return Err(());
     }
@@ -196,10 +202,8 @@ impl EpollInstance {
             }
 
             // EPOLLEXCLUSIVE: claim or skip.
-            if (item.events & EPOLLEXCLUSIVE) != 0 {
-                if !exclusive_try_claim(*fd, owner_id) {
-                    continue;
-                }
+            if (item.events & EPOLLEXCLUSIVE) != 0 && !exclusive_try_claim(*fd, owner_id) {
+                continue;
             }
 
             results.push((ready, item.data));
@@ -254,7 +258,7 @@ impl FileOps for EpollInstance {
     fn poll_readiness(&self) -> u32 {
         let mut mask = 0;
         let g = self.inner.lock();
-        for (_, item) in &g.interest {
+        for item in g.interest.values() {
             let fd = item.fd;
             let ready = fd::with_table(current_task_id(), |t| {
                 t.get(fd as u32)
@@ -275,8 +279,9 @@ impl FileOps for EpollInstance {
 // shared across fork or sent via SCM_RIGHTS. NARF Stage 4 stubs it
 // as a global registry keyed by the creator's task id + the fd
 // number.
-static EPOLL_INSTANCES: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), Arc<EpollInstance>>>> =
-    IrqSafeSpinLock::new(None);
+/// Registry map: `(task_id, epfd)` → epoll instance.
+type EpollRegistry = BTreeMap<(u64, u32), Arc<EpollInstance>>;
+static EPOLL_INSTANCES: IrqSafeSpinLock<Option<EpollRegistry>> = IrqSafeSpinLock::new(None);
 
 fn instances_lookup(task: u64, epfd: u32) -> Option<Arc<EpollInstance>> {
     EPOLL_INSTANCES.lock().as_ref()?.get(&(task, epfd)).cloned()
@@ -327,17 +332,14 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     let ops = instance.clone() as Arc<dyn FileOps>;
 
     let task = current_task_id();
-    let new_fd = match fd::with_table(task, |t| {
+    let new_fd = fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
             status_flags: 0,
         })
-    }) {
-        Some(fd) => Some(fd),
-        None => None,
-    };
+    });
 
     match new_fd {
         Some(fd) => {
@@ -445,6 +447,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     let deadline_ns: Option<u64> = match uctx_opt {
         None => Some(0),
         Some(uctx_ptr) => {
+            // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`, published
+            // in `CURRENT` for exactly this trap; it stays live for the whole
+            // syscall and the borrow does not escape this match arm.
             let uctx = unsafe { &*uctx_ptr };
             if timeout_ms == 0 {
                 Some(0)
@@ -470,6 +475,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
         let n = ready.len().min(maxevents);
         if n > 0 {
             if let Some(uctx_ptr) = uctx_opt {
+                // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx` from
+                // `CURRENT`, live for this trap; `sleep_deadline_ns` is an atomic
+                // field, so the store needs only a valid pointer.
                 unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
             }
             for (i, (events, data)) in ready[..n].iter().enumerate() {
@@ -495,6 +503,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             }
             Some(d) if d != u64::MAX && narf_scheduler::narf_time::monotonic_ns() >= d => {
                 if let Some(uctx_ptr) = uctx_opt {
+                    // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx` from
+                    // `CURRENT`, live for this trap; `sleep_deadline_ns` is an
+                    // atomic field, so the store needs only a valid pointer.
                     unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
                 }
                 ctx.set_return(SyscallReturn::ok(0));
@@ -507,11 +518,19 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                         if h(ctx, crate::Syscall::EpollWait.raw()) {
                             // Signal delivered. Interrupt syscall with EINTR.
                             ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                            // SAFETY: `uctx_ptr` is the in-flight task's
+                            // `UserTaskCtx` from `CURRENT`, live for this trap;
+                            // `sleep_deadline_ns` is an atomic field, so the
+                            // store needs only a valid pointer.
                             unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
                             return;
                         }
                     }
 
+                    // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`
+                    // from `CURRENT`, live for this trap; `state`/`exit_reason`
+                    // are its own `UnsafeCell` fields and the `hook` consumes
+                    // the same pointer to park exactly this task.
                     unsafe {
                         let uc = &*uctx_ptr;
                         // Rewind RIP so we re-execute epoll_wait on resume.

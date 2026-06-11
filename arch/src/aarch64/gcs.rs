@@ -126,6 +126,11 @@ pub unsafe fn read_gcspr_el1() -> u64 {
     v
 }
 
+/// Write `GCSPR_EL1` (raw `S3_0_C2_C5_1`).
+///
+/// # Safety
+/// EL1; GCS supported; `v` must be a valid GCS pointer for the
+/// current task's EL1 stack.
 pub unsafe fn write_gcspr_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {
@@ -150,6 +155,11 @@ pub unsafe fn read_gcspr_el0() -> u64 {
     v
 }
 
+/// Write `GCSPR_EL0` (raw `S3_3_C2_C5_1`) from EL1.
+///
+/// # Safety
+/// EL1; GCS supported; `v` must be a valid GCS pointer for the
+/// current task's EL0 stack.
 pub unsafe fn write_gcspr_el0(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {

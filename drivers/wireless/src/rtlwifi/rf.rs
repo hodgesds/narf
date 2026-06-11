@@ -68,7 +68,7 @@ pub const RF_MODE: u8 = 0x00;
 pub const RF_LC_TRIM: u8 = 0x18;
 
 /// Standard 12-bit RF register mask (`MASK12BITS` in Linux).
-pub const RF_MASK_12: u32 = 0x000F_FF;
+pub const RF_MASK_12: u32 = 0x0000_0FFF;
 /// Standard 20-bit RF register mask (`RFREG_OFFSET_MASK`).
 pub const RF_MASK_20: u32 = 0x000F_FFFF;
 

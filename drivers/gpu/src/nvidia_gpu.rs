@@ -166,10 +166,12 @@ impl NvidiaGpu {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(NvidiaGpuError::UnknownAsic)?;
 
-        // SAFETY: caller-asserted exclusive ownership.
         let regs =
+            // SAFETY: caller-asserted exclusive ownership.
             unsafe { map_bar(device, BAR_REGS) }.map_err(|_| NvidiaGpuError::BarMapFailed)?;
         let bar1 =
+            // SAFETY: `bring_up`'s contract gives us exclusive ownership of
+            // BAR1; `map_bar` maps that one BAR's window for the same `device`.
             unsafe { map_bar(device, BAR_BAR1) }.map_err(|_| NvidiaGpuError::BarMapFailed)?;
         // BAR3 (FB aperture) is best-effort — some integrated
         // parts don't expose it.

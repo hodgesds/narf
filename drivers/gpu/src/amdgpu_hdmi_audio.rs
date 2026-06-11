@@ -498,7 +498,7 @@ pub fn program_audio_dto<M: DcnAudioMmio>(
     src_sel: u32,
 ) {
     // DTO source select (DTO0_SOURCE_SEL = src_sel; DTO_SEL = 0).
-    let src_val = ((src_sel & 0xF) << 4) | 0;
+    let src_val = (src_sel & 0xF) << 4;
     mmio.write(dccg_base + DCCG_AUDIO_DTO_SOURCE_REL, src_val);
 
     let (phase, module) = stream.dto;

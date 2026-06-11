@@ -252,8 +252,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
     let _early_fb: Option<narf_boot::info::FramebufferInfo> = {
         if raw.magic == narf_boot::x86_64::multiboot2::BOOT_MAGIC {
-            // SAFETY: bootloader contract; payload is the mb2 info struct.
             let info_ptr = raw.payload.raw() as usize;
+            // SAFETY: `raw.magic` just matched `BOOT_MAGIC`, so the
+            // bootloader contract guarantees `payload` points at the
+            // multiboot2 info struct that `framebuffer` walks.
             let fb = unsafe { narf_boot::x86_64::multiboot2::framebuffer(info_ptr) };
             if let Some(ref fb_info) = fb {
                 // Register the FB for any code that wants to paint
@@ -261,7 +263,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // memory crate). Stride in pixels = pitch / bytes-
                 // per-pixel. Phys ceiling = 4 GiB to match boot.S
                 // identity map.
-                let stride_px = (fb_info.pitch as u32) / ((fb_info.bpp as u32).max(8) / 8);
+                let stride_px = fb_info.pitch / ((fb_info.bpp as u32).max(8) / 8);
                 narf_memory::beacon::register(
                     fb_info.addr.raw(),
                     stride_px,
@@ -589,10 +591,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // automatically. Domain-private mappings (which require
             // a per-domain PDPT under one PML4 slot) are a follow-up.
             //
-            // SAFETY: PCID is a baseline x86_64 feature on all
-            // long-mode CPUs; the bootloader-provided CR3's low bits
-            // are zero.
             narf_memory::beacon::paint(25, 0x0000FFC0); // aqua: pre-PCID
+                                                        // SAFETY: PCID is a baseline x86_64 feature on all
+                                                        // long-mode CPUs, so `enable_pcide` (sets CR4.PCIDE) and
+                                                        // `init` are valid here; the bootloader-provided CR3's low
+                                                        // bits are zero as the PCID code requires.
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
@@ -650,12 +653,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // domain's PML4). After this, accesses to domain D's
             // private VA range from any other domain hard-fault at
             // PML4 level.
-            // SAFETY: pcid::init has run; PML4s are registered;
-            // identity map still covers low frames.
-            let private_pdpts = match unsafe { narf_memory::domain::init_per_domain_pdpts() } {
-                Ok(n) => n,
-                Err(_) => 0,
-            };
+            let private_pdpts =
+                // SAFETY: pcid::init has run; PML4s are registered;
+                // identity map still covers low frames.
+                unsafe { narf_memory::domain::init_per_domain_pdpts() }.unwrap_or_default();
             narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
             let _ = writeln!(
                 console::Writer,
@@ -1454,6 +1455,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         }
                         // SAFETY: same RSDP, validated above.
                         let _ = unsafe { narf_acpi::parse_ecdt(p) };
+                        // SAFETY: `p` is the same validated RSDP pointer
+                        // accepted by `parse_ecdt` just above.
                         let _ = unsafe { narf_acpi::parse_gpe_blocks(p) };
                         let n = narf_aml::gpe::install_aml_handlers();
                         let _ = writeln!(
@@ -1498,6 +1501,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // the no-block-on-missing-hardware rule.
                 if let Some(ecam_phys) = narf_acpi::mcfg_ecam_base() {
                     let ecam = narf_memory::PhysAddr::new(ecam_phys);
+                    // SAFETY: `ecam_phys` is the ECAM base reported by the
+                    // ACPI MCFG table; the frame allocator is online and
+                    // the bootloader handoff invariants hold at this point.
                     let n_dev = unsafe { narf_bus::init(ecam) };
                     let _ = writeln!(
                         console::Writer,
@@ -1922,6 +1928,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
                     // PCR 4: Bootloader handoff.
                     if let Some(r) = raw {
+                        // SAFETY: `r` is the live `&RawBootInfo` handed in
+                        // by the bootloader; the slice spans exactly its
+                        // `size_of::<RawBootInfo>()` bytes for measuring.
                         if let Err(e) = measure::measure(4, "raw_boot_info", unsafe {
                             core::slice::from_raw_parts(
                                 r as *const _ as *const u8,
@@ -2075,6 +2084,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         return narf_init::InitResult::NotPresent;
                     }
                 }
+                // SAFETY: running on the BSP with no concurrent draw, and
+                // the bochs guard above ensured the pixel buffer is
+                // reachable; `framebuffer()` wraps that live mapping.
                 let fb = unsafe { scanout.framebuffer() };
                 let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
                 let (cols, rows) = (con.cols(), con.rows());
@@ -2126,13 +2138,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let pitch_bytes = info.stride as u64 * 4;
                 let raw_len = info.height as u64 * pitch_bytes;
                 let len = (raw_len + 0xFFF) & !0xFFFu64;
-                // SAFETY: FB phys was registered by Limine/UEFI;
-                // exclusive kernel-side; the new virt is fresh
-                // vmalloc.
                 #[cfg(target_arch = "x86_64")]
                 let attrs = MmioAttrs::WriteCombining;
                 #[cfg(not(target_arch = "x86_64"))]
                 let attrs = MmioAttrs::Device;
+                // SAFETY: `phys`/`len` cover the FB region registered by
+                // Limine/UEFI and owned exclusively kernel-side; ioremap
+                // maps it into a fresh vmalloc range with `attrs`.
                 let m = match unsafe { ioremap(phys, len, attrs) } {
                     Ok(m) => m,
                     Err(_) => {
@@ -2345,8 +2357,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
                 use narf_graphics::Pixel32;
                 let painted = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
-                    // SAFETY: BSP, post-bring_up.
                     if !d.ready {
+                        // SAFETY: on the BSP after device bring-up, with
+                        // `&mut d` held exclusively by `with_controller_mut`,
+                        // so `init_scanout` programs the GPU uncontended.
                         if let Err(e) = unsafe { d.init_scanout() } {
                             let _ = writeln!(
                                 console::Writer,
@@ -2490,7 +2504,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_arch::DomainBackend::Pcid => "pcid",
             narf_arch::DomainBackend::Sfi => "sfi",
         };
-        let cpu_count = narf_lib::smp::cpu_count() as u32;
+        let cpu_count = narf_lib::smp::cpu_count();
         let numa_nodes = if narf_memory::is_numa_aware() {
             (0..narf_memory::FRAME_MAX_NUMA_NODES)
                 .filter(|&i| narf_memory::node_free(i) > 0)
@@ -2555,7 +2569,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     run_async_demo()
 }
 
-#[cfg(not(any(feature = "kernel-test", feature = "idt-selftest")))]
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
 fn run_async_demo() -> ! {
     // aarch64 timer start. GICv3 + vector table already installed
     // earlier; this starts the generic-timer PPI and unmasks IRQs
@@ -2624,6 +2642,9 @@ fn run_async_demo() -> ! {
                 // doesn't match, MMIO writes go nowhere and MSI
                 // delivery (targeted at 0xFEE0_0000) won't reach
                 // the LAPIC.
+                // SAFETY: `rdmsr` of IA32_APIC_BASE (0x1B) — an
+                // architectural MSR present on every long-mode CPU — at
+                // CPL0, so the privileged `rdmsr` is permitted here.
                 let apic_base = unsafe { narf_arch::x86_64::msr::rdmsr(0x0000_001B) };
                 let lapic_phys = apic_base & 0x0000_000F_FFFF_F000;
                 let _ = writeln!(
@@ -2937,8 +2958,11 @@ fn run_async_demo() -> ! {
     // never longer than ~5s on a 5 GHz core.
     #[cfg(target_arch = "x86_64")]
     {
+        // SAFETY: `_rdtsc` (RDTSC) is unprivileged and always available
+        // in long mode; it only reads the time-stamp counter.
         let start = unsafe { core::arch::x86_64::_rdtsc() };
         let target = start.wrapping_add(25_000_000_000u64);
+        // SAFETY: same as above — RDTSC just samples the TSC each spin.
         while unsafe { core::arch::x86_64::_rdtsc() } < target {
             core::hint::spin_loop();
         }

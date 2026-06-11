@@ -29,11 +29,11 @@
 //! ## References
 //!
 //! - Linux `brcmfmac/firmware.c::brcmf_nvram_handle_*`
-//!     (~L87..L204) — NVRAM state machine.
+//!   (~L87..L204) — NVRAM state machine.
 //! - Linux `brcmfmac/usb.c` — TRX header definition
-//!     (`TRX_MAGIC = 0x30524448`, `struct trx_header_le` @L96).
+//!   (`TRX_MAGIC = 0x30524448`, `struct trx_header_le` @L96).
 //! - Linux `brcmfmac/pcie.c::brcmf_pcie_download_fw_nvram`
-//!     (~L1689) — download orchestration the parsers feed.
+//!   (~L1689) — download orchestration the parsers feed.
 
 #![allow(dead_code)]
 

@@ -591,12 +591,12 @@ impl Igc {
         let rx_phys = rx_ring_buf.phys_addr().raw();
         // SAFETY: identity-mapped DMA, freshly zeroed.
         unsafe {
-            for i in 0..RX_RING_LEN {
+            for (i, buf) in rx_buf_pool.iter().enumerate().take(RX_RING_LEN) {
                 let desc = (rx_phys + (i * 16) as u64) as *mut AdvRxDescRead;
                 core::ptr::write_volatile(
                     desc,
                     AdvRxDescRead {
-                        pkt_addr: rx_buf_pool[i].phys_addr().raw(),
+                        pkt_addr: buf.phys_addr().raw(),
                         hdr_addr: 0,
                     },
                 );
@@ -688,8 +688,8 @@ impl Igc {
         Ok(igc)
     }
 
-    /// Walk the controller's MSI-X capability, allocate an IDT vector
-    /// + table slot, program slot 0 to deliver to BSP, and flip the
+    /// Walk the controller's MSI-X capability, allocate an IDT vector +
+    /// table slot, program slot 0 to deliver to BSP, and flip the
     /// global MSI-X enable. Returns `(table, vector)` on success.
     /// Failure leaves the device in polled-only mode (we don't have
     /// an INTx fallback for igc — Linux's igc driver requires MSI-X
@@ -712,7 +712,7 @@ impl Igc {
         // global enable so the device can't fire stale data.
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| IgcError::BarMapFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
-        let _ = unsafe { msix.enable() }.map_err(|_| IgcError::BarMapFailed)?;
+        unsafe { msix.enable() }.map_err(|_| IgcError::BarMapFailed)?;
         Ok((msix, v))
     }
 
@@ -822,9 +822,11 @@ impl Igc {
         }
         let len = (desc.length as usize).min(out.len()).min(FRAME_SIZE);
         let buf_phys = self.rx_buf_pool[idx].phys_addr().raw();
-        // SAFETY: identity-mapped DMA.
-        for i in 0..len {
-            out[i] = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
+        for (i, b) in out.iter_mut().enumerate().take(len) {
+            // SAFETY: `buf_phys` is the identity-mapped DMA address of this
+            // RX slot's packet buffer (`rx_buf_pool[idx]`); `i < len` and
+            // `len <= FRAME_SIZE` so `buf_phys + i` stays inside the buffer.
+            *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
                                   // Refill: write the slot in the read form so the chip can

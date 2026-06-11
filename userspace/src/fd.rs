@@ -392,6 +392,9 @@ impl FileOps for ConsoleFile {
                 // is 60 bytes on Linux x86_64 — overshoot to 64
                 // for safety.
                 let zero = [0u8; 64];
+                // SAFETY: `copy_to_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 64-byte
+                // `zero` buffer, which over-covers Linux's 60-byte `termios`.
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &zero) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -399,7 +402,12 @@ impl FileOps for ConsoleFile {
             }
             TIOCGWINSZ => {
                 let ws = console_winsize();
+                // SAFETY: `Winsize` is a `repr(C)` POD of four `u16` (8 bytes)
+                // with no padding, so its layout matches `[u8; 8]` exactly.
                 let bytes: [u8; 8] = unsafe { core::mem::transmute(ws) };
+                // SAFETY: `copy_to_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 8-byte
+                // `bytes` buffer holding the serialized `struct winsize`.
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -407,9 +415,15 @@ impl FileOps for ConsoleFile {
             }
             TIOCSWINSZ => {
                 let mut bytes = [0u8; 8];
+                // SAFETY: `copy_from_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 8-byte
+                // `bytes` buffer that receives the serialized `struct winsize`.
                 if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
+                // SAFETY: `Winsize` is a `repr(C)` POD of four `u16` (8 bytes)
+                // with no padding and every bit pattern valid, so the
+                // round-trip from `[u8; 8]` is sound.
                 let ws: Winsize = unsafe { core::mem::transmute(bytes) };
                 set_console_winsize(ws);
                 Ok(0)
@@ -418,6 +432,9 @@ impl FileOps for ConsoleFile {
                 // Best-effort: peek the input ring's current depth.
                 let n: i32 = narf_input::pending_bytes() as i32;
                 let bytes = n.to_le_bytes();
+                // SAFETY: `copy_to_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 4-byte
+                // little-endian encoding of the `i32` pending-byte count.
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -459,6 +476,9 @@ impl FileOps for ConsoleFile {
                     }
                 }
                 let bytes = (pgrp as i32).to_le_bytes();
+                // SAFETY: `copy_to_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 4-byte
+                // little-endian encoding of the `pid_t` foreground pgid.
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -466,6 +486,9 @@ impl FileOps for ConsoleFile {
             }
             TIOCSPGRP => {
                 let mut bytes = [0u8; 4];
+                // SAFETY: `copy_from_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 4-byte
+                // buffer that receives the little-endian `pid_t` pgid.
                 if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -603,7 +626,7 @@ pub mod locks {
         ensure();
         let mut g = TABLE.lock();
         let map = g.as_mut().unwrap();
-        let bucket = map.entry(key).or_insert_with(Vec::new);
+        let bucket = map.entry(key).or_default();
         if req.ty == F_UNLCK {
             bucket.retain(|l| !(l.owner == req.owner && l.overlaps(&req)));
             return Ok(());
@@ -623,10 +646,7 @@ pub mod locks {
     /// returns None (caller should report F_UNLCK).
     pub fn probe(key: usize, req: Lock) -> Option<Lock> {
         let g = TABLE.lock();
-        let map = match g.as_ref() {
-            Some(m) => m,
-            None => return None,
-        };
+        let map = g.as_ref()?;
         let bucket = map.get(&key)?;
         bucket.iter().copied().find(|l| l.conflicts(&req))
     }

@@ -355,6 +355,11 @@ fn smoke_fb_cmd_ring_round_trip() -> TestResult {
     // Allocate a DrawRing on the heap. SharedRing is repr(C) +
     // 64-byte aligned via its header; Box::new gives us 8-byte
     // alignment which matches the init_in contract.
+    // SAFETY: `DrawRing` is `SharedRing<DrawCmd, _>`, a `repr(C)` struct
+    // of `AtomicU32` head/tail/closed, a `[u8]` pad, and
+    // `MaybeUninit<DrawCmd>` slots — every field accepts an all-zero bit
+    // pattern (atomics zero-init, `MaybeUninit` holds any bits), so
+    // `zeroed()` is a valid value; `init_in` below sets up the header.
     let mut ring: Box<DrawRing> = Box::new(unsafe { core::mem::zeroed() });
     // SAFETY: zero-init via mem::zeroed is exactly what init_in
     // expects (sets head/tail/closed to 0).
@@ -611,10 +616,10 @@ fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
     // Build a producer over A's ring (treating its phys as a
     // kernel-side pointer — identity-mapped low memory).
     let ring_ptr = phys_a as *mut DrawRing;
-    // SAFETY: SPSC contract — kernel side only constructs the
-    // producer here; the consumer was retained by the registry
-    // when attach() ran.
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
+        // SAFETY: SPSC contract — kernel side only constructs the
+        // producer here; the consumer was retained by the registry
+        // when attach() ran.
         unsafe { SharedProducer::from_raw(ring_ptr) };
     let cmd = DrawCmd::fill(Rect::new(0, 0, 2, 2), Pixel32::rgb(0xAA, 0xBB, 0xCC).raw());
     if cmd_ring::try_send(&mut producer, cmd).is_err() {

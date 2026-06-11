@@ -102,7 +102,7 @@ pub fn mount_gatt_service(db: &mut AttributeDatabase) -> u16 {
 /// Mount the Device Information Service. All characteristics are
 /// optional per DIS v1.1 §3; only the ones provided as `Some(_)` are
 /// added.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DeviceInformation<'a> {
     pub manufacturer: Option<&'a str>,
     pub model: Option<&'a str>,
@@ -115,21 +115,6 @@ pub struct DeviceInformation<'a> {
     /// PnP ID per DIS v1.1 §3.9: VendorIDSource(1) + VendorID(2 LE) +
     /// ProductID(2 LE) + ProductVersion(2 LE).
     pub pnp_id: Option<[u8; 7]>,
-}
-
-impl<'a> Default for DeviceInformation<'a> {
-    fn default() -> Self {
-        Self {
-            manufacturer: None,
-            model: None,
-            serial: None,
-            hardware_revision: None,
-            firmware_revision: None,
-            software_revision: None,
-            system_id: None,
-            pnp_id: None,
-        }
-    }
 }
 
 pub fn mount_device_information_service(

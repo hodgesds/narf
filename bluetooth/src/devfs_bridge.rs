@@ -4,7 +4,7 @@
 //! in-memory ring.  The node implements `FileOps`:
 //!   - `read`  — drain incoming bytes from the ring.
 //!   - `write` — push bytes into the outgoing ring (loopback in tests;
-//!               real transport feeds bytes via `push_rx`).
+//!     real transport feeds bytes via `push_rx`).
 //!   - `poll_readiness` — returns `POLL_IN` when RX data is available.
 //!
 //! Linux references:

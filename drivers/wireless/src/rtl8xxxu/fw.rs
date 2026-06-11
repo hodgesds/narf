@@ -98,7 +98,7 @@ impl FwLayout {
     /// Compute layout from a blob length.
     pub fn from_blob_len(len: usize) -> Self {
         use super::regs::RTL_FW_PAGE_SIZE;
-        let page_count = ((len + RTL_FW_PAGE_SIZE - 1) / RTL_FW_PAGE_SIZE) as u8;
+        let page_count = len.div_ceil(RTL_FW_PAGE_SIZE) as u8;
         Self {
             page_count,
             total_bytes: len,

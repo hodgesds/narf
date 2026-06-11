@@ -94,7 +94,7 @@ fn smoke_buffer_queue_fifo() -> TestResult {
     if !q.is_empty() {
         return TestResult::Fail("fresh queue should be empty");
     }
-    if q.len() != 0 {
+    if !q.is_empty() {
         return TestResult::Fail("fresh queue len should be 0");
     }
 

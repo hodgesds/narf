@@ -142,8 +142,8 @@ impl BochsDisplay {
 
         // Only reprogram if the firmware didn't already configure a
         // sensible mode. Avoids disturbing UEFI's GOP setup.
-        // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
         if (xres, yres, bpp) == (DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP) {
+            // SAFETY: BAR2 mapped, valid offsets, exclusive owner.
             unsafe {
                 let enabled = mmio.read16(VBE_ENABLE) as u32;
                 if enabled & VBE_ENABLE_BIT == 0 {

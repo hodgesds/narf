@@ -34,6 +34,11 @@ pub unsafe fn read_sctlr2_el1() -> u64 {
     v
 }
 
+/// Write `SCTLR2_EL1` (raw `S3_0_C1_C0_3`).
+///
+/// # Safety
+/// EL1; FEAT_SCTLR2 supported; an `isb` is issued to ensure the
+/// written control bits take effect before subsequent instructions.
 pub unsafe fn write_sctlr2_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {

@@ -303,8 +303,8 @@ pub unsafe fn parse_xsdt(phys: u64) -> Result<Tables, AcpiError> {
     let entries = (h.length as usize - 36) / 8;
     let mut t = Tables::default();
     for i in 0..entries {
-        // SAFETY: same.
         let sdt_phys =
+            // SAFETY: same.
             unsafe { core::ptr::read_volatile((phys + 36 + (i * 8) as u64) as *const u64) };
         // SAFETY: caller-trusted XSDT entry.
         let sh = unsafe { read_sdt_header(sdt_phys) };

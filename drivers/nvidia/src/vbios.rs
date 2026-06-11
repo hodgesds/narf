@@ -178,7 +178,7 @@ pub fn dcb_header(image: &[u8], off: u16) -> Option<DcbHeader> {
     let entry_count = image[p + 2];
     let entry_size = image[p + 3];
 
-    if version >= 0x30 && version < 0x40 {
+    if (0x30..0x40).contains(&version) {
         // DCB v3.0: magic at dcb+6 (10 bytes minimum).
         if p + 10 > image.len() {
             return None;

@@ -116,8 +116,9 @@ kernel_test_in!("arch", smoke_aarch64_mte_l2);
 
 #[cfg(target_arch = "aarch64")]
 fn smoke_aarch64_features() -> TestResult {
-    // SAFETY: MRS of ID_AA64* and CNTFRQ_EL0 is always legal at EL1.
+    // SAFETY: MRS of ID_AA64* is always legal at EL1.
     let feats = unsafe { crate::aarch64::Features::probe() };
+    // SAFETY: CNTFRQ_EL0 is always readable at EL1.
     let hz = unsafe { crate::aarch64::cpuid::generic_timer_hz() };
 
     // generic_timer = true on ARMv8+; if our probe reports false we've
@@ -808,7 +809,7 @@ fn smoke_generic_timer_calibrate() -> TestResult {
     }
     // QEMU virt reports 62.5 MHz by default; real silicon ranges
     // from 24 MHz to 100 MHz. 1 MHz..1 GHz is a generous window.
-    if hz < 1_000_000 || hz > 1_000_000_000 {
+    if !(1_000_000..=1_000_000_000).contains(&hz) {
         return TestResult::Fail("Generic timer freq out of plausible range");
     }
     TestResult::Pass

@@ -174,15 +174,15 @@ pub fn detect_platform() -> Result<CodecLinkPath, CodecLinkError> {
 /// for the `mmACP_BTTDM_*` set.
 pub mod i2s_regs {
     /// `ACP_BTTDM_IER` — TX interrupt enable (bit 0).
-    pub const IER: u64 = 0x1242_800;
+    pub const IER: u64 = 0x0124_2800;
     /// `ACP_BTTDM_IRER` — RX interrupt enable.
-    pub const IRER: u64 = 0x1242_804;
+    pub const IRER: u64 = 0x0124_2804;
     /// `ACP_BTTDM_RXFRMT` — RX frame format.
-    pub const RXFRMT: u64 = 0x1242_808;
+    pub const RXFRMT: u64 = 0x0124_2808;
     /// `ACP_BTTDM_ITER` — TX enable + sample-length.
-    pub const ITER: u64 = 0x1242_80C;
+    pub const ITER: u64 = 0x0124_280C;
     /// `ACP_BTTDM_TXFRMT` — TX frame format (TDM slots/width).
-    pub const TXFRMT: u64 = 0x1242_810;
+    pub const TXFRMT: u64 = 0x0124_2810;
 }
 
 /// Initialise the ACP3x I2S TX block for Standard I2S, S16LE stereo.
@@ -198,6 +198,9 @@ pub fn init_i2s_tx<M: MmioAccess>(mmio: &M, fmt: I2sFormat) -> Result<(), CodecL
     // SAFETY: caller guarantees valid MMIO.
     let existing = unsafe { mmio.read32(i2s_regs::ITER) };
     let new_iter = iter.apply_to(existing);
+    // SAFETY: `i2s_regs::ITER` is a fixed BT-TDM register offset inside the
+    // BAR0 region the caller's `mmio` accessor wraps; the write width (32-bit)
+    // matches the register.
     unsafe {
         mmio.write32(i2s_regs::ITER, new_iter);
     }
@@ -206,13 +209,19 @@ pub fn init_i2s_tx<M: MmioAccess>(mmio: &M, fmt: I2sFormat) -> Result<(), CodecL
     if is_tdm {
         let n_channels = fmt.channels as u32;
         let txfrmt = Acp3xTxFrmt::build(n_channels, fmt.word_length);
+        // SAFETY: `i2s_regs::TXFRMT` is a fixed BT-TDM register offset inside
+        // the caller-provided BAR0 mapping; 32-bit write matches the register.
         unsafe {
             mmio.write32(i2s_regs::TXFRMT, txfrmt.raw());
         }
     }
 
     // Start the link: set ITER bit 0.
+    // SAFETY: `i2s_regs::ITER` is a fixed BT-TDM register offset inside the
+    // caller-provided BAR0 mapping; 32-bit read matches the register.
     let enabled = unsafe { mmio.read32(i2s_regs::ITER) } | Acp3xIter::ENABLE;
+    // SAFETY: `i2s_regs::ITER` and `IER` are fixed BT-TDM register offsets
+    // inside the caller-provided BAR0 mapping; 32-bit writes match the regs.
     unsafe {
         mmio.write32(i2s_regs::ITER, enabled);
         // TX interrupt enable.
@@ -382,17 +391,23 @@ pub fn init_soundwire<M: MmioAccess>(
     use sdw_regs::*;
 
     // 1. Enable the manager.
+    // SAFETY: `SW_EN` is a fixed SDW0-manager register offset inside the
+    // caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_EN, 1) };
     if !poll_ready(mmio, SW_EN_STATUS, true) {
         return Err(CodecLinkError::SwEnableTimeout);
     }
 
     // 2. Bus reset: assert → wait for DONE → clear.
+    // SAFETY: `SW_BUS_RESET_CTRL` is a fixed SDW0-manager register offset in
+    // the caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_BUS_RESET_CTRL, BUS_RESET_REQ) };
     // Poll for bit 1 (BUS_RESET_DONE = 2) set.
     if !poll_ready(mmio, SW_BUS_RESET_CTRL, true) {
         return Err(CodecLinkError::SwResetTimeout);
     }
+    // SAFETY: `SW_BUS_RESET_CTRL` is a fixed SDW0-manager register offset in
+    // the caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_BUS_RESET_CTRL, BUS_RESET_CLEAR) };
     if !poll_ready(mmio, SW_BUS_RESET_CTRL, false) {
         return Err(CodecLinkError::SwResetTimeout);
@@ -400,12 +415,16 @@ pub fn init_soundwire<M: MmioAccess>(
 
     // 3. Disable manager (required between reset and re-enable per Linux
     //    `amd_init_sdw_manager`).
+    // SAFETY: `SW_EN` is a fixed SDW0-manager register offset inside the
+    // caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_EN, 0) };
     if !poll_ready(mmio, SW_EN_STATUS, false) {
         return Err(CodecLinkError::SwEnableTimeout);
     }
 
     // 4. Re-enable.
+    // SAFETY: `SW_EN` is a fixed SDW0-manager register offset inside the
+    // caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_EN, 1) };
     if !poll_ready(mmio, SW_EN_STATUS, true) {
         return Err(CodecLinkError::SwEnableTimeout);
@@ -417,9 +436,14 @@ pub fn init_soundwire<M: MmioAccess>(
     // values that Linux's `amd_sdw_set_frameshape` applies.
     // Index 0 encodes row=50 and cols=10 for the AMD driver.
     let frame_size = encode_frame_size(0, 0);
+    // SAFETY: `SW_FRAMESIZE` is a fixed SDW0-manager register offset inside
+    // the caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_FRAMESIZE, frame_size) };
 
     // 6. Enable IRQ masks.
+    // SAFETY: `SW_IRQ_MASK_0TO7`, `SW_IRQ_MASK_8TO11` and `SW_ERROR_INTR_MASK`
+    // are fixed SDW0-manager register offsets inside the caller-provided BAR0
+    // mapping; 32-bit writes match the registers.
     unsafe {
         mmio.write32(SW_IRQ_MASK_0TO7, IRQ_MASK_0TO7);
         mmio.write32(SW_IRQ_MASK_8TO11, IRQ_MASK_8TO11);
@@ -445,6 +469,9 @@ pub fn sdw_send_imm_cmd<M: MmioAccess>(
         return Err(CodecLinkError::SwCmdTimeout);
     }
 
+    // SAFETY: `SW_IMM_CMD_UPPER`/`SW_IMM_CMD_LOWER` are fixed SDW0-manager
+    // register offsets inside the caller-provided BAR0 mapping; 32-bit writes
+    // match the registers.
     unsafe {
         mmio.write32(SW_IMM_CMD_UPPER, cmd.upper);
         mmio.write32(SW_IMM_CMD_LOWER, cmd.lower);
@@ -455,10 +482,16 @@ pub fn sdw_send_imm_cmd<M: MmioAccess>(
         return Err(CodecLinkError::SwCmdTimeout);
     }
 
+    // SAFETY: `SW_IMM_RESP_UPPER` is a fixed SDW0-manager register offset in
+    // the caller-provided BAR0 mapping; 32-bit read matches the register.
     let upper_resp = unsafe { mmio.read32(SW_IMM_RESP_UPPER) };
+    // SAFETY: `SW_IMM_RESP_LOWER` is a fixed SDW0-manager register offset in
+    // the caller-provided BAR0 mapping; 32-bit read matches the register.
     let lower_resp = unsafe { mmio.read32(SW_IMM_RESP_LOWER) };
 
     // Clear IMM_RES_VALID by writing 1 to it, then wait for clear.
+    // SAFETY: `SW_IMM_CMD_STS` is a fixed SDW0-manager register offset in the
+    // caller-provided BAR0 mapping; 32-bit write matches the register.
     unsafe { mmio.write32(SW_IMM_CMD_STS, IMM_RES_VALID) };
     if !poll_ready(mmio, SW_IMM_CMD_STS, false) {
         return Err(CodecLinkError::SwCmdTimeout);
@@ -536,7 +569,7 @@ pub fn bring_up_link() -> Result<CodecLinkPath, CodecLinkError> {
             // Use the existing acp6_pcm path to start I2S TX.
             // That module already programs BTTDM_ITER/IER via AcpDevice;
             // bring_up_link just validates the controller is up.
-            let _ok = with_controller(|_c| ()).ok_or(CodecLinkError::NoController)?;
+            with_controller(|_c| ()).ok_or(CodecLinkError::NoController)?;
             Ok(CodecLinkPath::I2s)
         }
         CodecLinkPath::SoundWire => {
@@ -544,7 +577,7 @@ pub fn bring_up_link() -> Result<CodecLinkPath, CodecLinkError> {
             // This path is scaffolded; the real flow needs the SDW manager
             // MMIO sub-range which lives at BAR0 + 0xC00 on Phoenix.
             // Verified structurally via unit tests (FakeMmio).
-            let _ok = with_controller(|_c| ()).ok_or(CodecLinkError::NoController)?;
+            with_controller(|_c| ()).ok_or(CodecLinkError::NoController)?;
             Ok(CodecLinkPath::SoundWire)
         }
     }
@@ -652,7 +685,7 @@ pub fn connect_codec(codec_kind: RealtekChip) -> Result<(), CodecLinkError> {
             // until the AcpDevice singleton exposes a MmioAccess impl
             // this returns NoController.
             use crate::acp6::with_controller;
-            let _ok = with_controller(|_c| ()).ok_or(CodecLinkError::NoController)?;
+            with_controller(|_c| ()).ok_or(CodecLinkError::NoController)?;
             // Controller is present but we can't dispatch through it
             // without the MmioAccess bridge — structural scaffold wired;
             // production wiring is an AcpDevice Stage-2 item.
@@ -824,7 +857,7 @@ mod tests {
         //   DEV_ADDR = 3 << 8
         //   data = 0x7F → data << 7
         let cmd_w = SdwImmCmd::write(3, 0x00AB, 0x7F);
-        let expected_upper_w: u32 = (3 << 8) | sdw_regs::MCP_CMD_WRITE | 0x00;
+        let expected_upper_w: u32 = (3 << 8) | sdw_regs::MCP_CMD_WRITE;
         if cmd_w.upper != expected_upper_w {
             return TestResult::Fail("write cmd upper word wrong");
         }
@@ -891,6 +924,8 @@ mod tests {
         //   - expected_nonzero=false (wait for cmd idle): immediately ok
         //   - expected_nonzero=true (wait for result): immediately ok
         let _poll_ready = |m: &FakeMmioAdapter, offset: u64, expected_nonzero: bool| -> bool {
+            // SAFETY: `FakeMmioAdapter` is a memory-backed test double; any
+            // `offset` is in-bounds and the read has no MMIO side effects.
             let val = unsafe { m.read32(offset) };
             if expected_nonzero {
                 val != 0

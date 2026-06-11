@@ -198,7 +198,7 @@ pub async fn pump(fb: FbWriter) {
         // tick so the user can see the executor is still polling
         // this task. If 25 stops changing, the executor is wedged
         // on a sibling task that doesn't yield.
-        let colour = if n & 1 == 0 { 0x00C040_FF } else { 0x00FF_40C0 };
+        let colour = if n & 1 == 0 { 0x00C0_40FF } else { 0x00FF_40C0 };
         narf_memory::beacon::paint(25, colour);
         n = n.wrapping_add(1);
         narf_time::sleep_cycles(PUMP_PERIOD_CYCLES).await;

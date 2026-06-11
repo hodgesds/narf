@@ -145,6 +145,10 @@ fn smoke_ixgbe_live_bring_up() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test runner executes post-boot, so the memory
+    // map and allocator are online; `ECAM_DEFAULT_BASE` is the standard
+    // MMCONFIG window and the enumerator only reads 4-byte config words,
+    // rejecting all-1s for unpopulated slots.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {

@@ -97,6 +97,12 @@ impl DmaAllocatorImpl {
     }
 }
 
+impl Default for DmaAllocatorImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DmaAllocator for DmaAllocatorImpl {
     fn alloc_coherent(&mut self, size: usize) -> (*mut u8, u64) {
         // narf_io::alloc_coherent returns a DmaBuffer that automatically
@@ -151,8 +157,9 @@ where
     // Phase 1 — INIT image.
     let init_prepared = stage_sections_gen2(&parsed.init_sections, |payload| {
         let (virt, phys) = alloc.alloc_coherent(payload.len());
-        // Copy section payload into coherent buffer. SAFETY: alloc
-        // returned a valid writable buffer of `payload.len()` bytes.
+        // SAFETY: `alloc_coherent(payload.len())` returned `virt`, a valid
+        // writable buffer of exactly `payload.len()` bytes; `payload` is a
+        // distinct, non-overlapping firmware-blob slice of the same length.
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), virt, payload.len());
         }
@@ -165,6 +172,9 @@ where
     // Phase 2 — RUNTIME image.
     let rt_prepared = stage_sections_gen2(&parsed.rt_sections, |payload| {
         let (virt, phys) = alloc.alloc_coherent(payload.len());
+        // SAFETY: `alloc_coherent(payload.len())` returned `virt`, a valid
+        // writable buffer of exactly `payload.len()` bytes; `payload` is a
+        // distinct, non-overlapping firmware-blob slice of the same length.
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), virt, payload.len());
         }
@@ -243,6 +253,9 @@ where
         .payload;
 
     let (iml_virt, iml_phys) = alloc.alloc_coherent(iml_bytes.len());
+    // SAFETY: `alloc_coherent(iml_bytes.len())` returned `iml_virt`, a valid
+    // writable buffer of exactly `iml_bytes.len()` bytes; `iml_bytes` is a
+    // distinct, non-overlapping firmware-blob slice of the same length.
     unsafe {
         core::ptr::copy_nonoverlapping(iml_bytes.as_ptr(), iml_virt, iml_bytes.len());
     }
@@ -262,6 +275,10 @@ where
             .iter()
             .find(|s| s.dest_offset == entry.dest_offset)
             .expect("section table entry must map to rt_section");
+        // SAFETY: `alloc_coherent(entry.byte_count)` returned `virt`, a valid
+        // writable buffer; `sec.payload` is a distinct, non-overlapping
+        // firmware-blob slice and `entry.byte_count == sec.payload.len()`, so
+        // the copy stays within the allocation.
         unsafe {
             core::ptr::copy_nonoverlapping(sec.payload.as_ptr(), virt, sec.payload.len());
         }
@@ -269,6 +286,9 @@ where
     }
 
     // Copy the populated section table into its DMA-coherent region.
+    // SAFETY: `table_virt` came from `alloc_coherent(table_bytes.max(64))`, so
+    // it is a valid writable buffer of at least `table_bytes` bytes; `table` is
+    // a live, non-overlapping `Vec` whose byte length is exactly `table_bytes`.
     unsafe {
         let src = table.as_ptr() as *const u8;
         core::ptr::copy_nonoverlapping(src, table_virt, table_bytes);
@@ -296,6 +316,9 @@ where
     };
 
     let (ctxt_virt, ctxt_phys) = alloc.alloc_coherent(core::mem::size_of::<CtxtInfoV2>());
+    // SAFETY: `ctxt_virt` came from `alloc_coherent(size_of::<CtxtInfoV2>())`,
+    // a valid writable buffer of exactly that many bytes; `ctxt` is a live,
+    // non-overlapping stack value of the same type whose bytes we copy in full.
     unsafe {
         let src = &ctxt as *const CtxtInfoV2 as *const u8;
         core::ptr::copy_nonoverlapping(src, ctxt_virt, core::mem::size_of::<CtxtInfoV2>());

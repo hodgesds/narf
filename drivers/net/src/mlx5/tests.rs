@@ -28,6 +28,7 @@ use super::{
 
 // Helper: build a 4 KiB init-segment buffer with chosen field
 // values, BE-encoded as the PRM specifies.
+#[allow(clippy::too_many_arguments)] // mirrors the real HW init-segment field list
 fn synth_segment(
     fw_major: u16,
     fw_minor: u16,
@@ -267,7 +268,7 @@ fn smoke_mlx5_cqe_fw_status_surfaced() -> TestResult {
     // BAD_PARAM with syndrome 0xABCDEF.
     simulate_completion(&mut cqe, 0x03, 0x00AB_CDEF, 0, &[]);
     match decode_response(&cqe) {
-        Err(CmdError::FwStatus(CmdStatus::BadParam, syn)) if syn == 0x00AB_CDEF => TestResult::Pass,
+        Err(CmdError::FwStatus(CmdStatus::BadParam, 0x00AB_CDEF)) => TestResult::Pass,
         Err(CmdError::FwStatus(_, _)) => TestResult::Fail("FwStatus mapped wrong status code"),
         _ => TestResult::Fail("non-OK status was not reported as FwStatus"),
     }
@@ -405,8 +406,8 @@ fn smoke_mlx5_mailbox_block_layout() -> TestResult {
     }
     // No payload bleed past 480 (offsets 0x1E0..0x1EF are payload's
     // tail, but we put 0 there — it should still be 0).
-    for i in 480..MAILBOX_OFF_NEXT_H {
-        if block[i] != 0 {
+    for byte in block.iter().take(MAILBOX_OFF_NEXT_H).skip(480) {
+        if *byte != 0 {
             return TestResult::Fail("payload bleed into reserved post-payload region");
         }
     }
@@ -442,8 +443,8 @@ fn smoke_mlx5_mailbox_payload_truncates() -> TestResult {
     // chain blocks; Stage 3 only ever fills one).
     let too_big = [0xCCu8; 1024];
     let block = build_mailbox_block(&too_big, 0, 0, 0);
-    for i in 0..MAILBOX_PAYLOAD_LEN {
-        if block[i] != 0xCC {
+    for byte in block.iter().take(MAILBOX_PAYLOAD_LEN) {
+        if *byte != 0xCC {
             return TestResult::Fail("payload byte not copied through");
         }
     }
@@ -492,8 +493,8 @@ fn smoke_mlx5_chain_input_round_trip() -> TestResult {
     // confirm we get the same bytes back.
     const N: usize = 1000;
     let mut payload = [0u8; N];
-    for i in 0..N {
-        payload[i] = (i & 0xFF) as u8;
+    for (i, byte) in payload.iter_mut().enumerate().take(N) {
+        *byte = (i & 0xFF) as u8;
     }
     let n_blocks = block_count_for(N);
     if n_blocks != 3 {
@@ -577,13 +578,13 @@ fn smoke_mlx5_chain_short_output_truncates() -> TestResult {
         return TestResult::Fail("read_output_chain didn't honor output_len");
     }
     // First 480 bytes from block 0 (0xAA), next 220 from block 1 (0xBB).
-    for i in 0..MAILBOX_PAYLOAD_LEN {
-        if out[i] != 0xAA {
+    for byte in out.iter().take(MAILBOX_PAYLOAD_LEN) {
+        if *byte != 0xAA {
             return TestResult::Fail("block 0 payload miscopied");
         }
     }
-    for i in MAILBOX_PAYLOAD_LEN..700 {
-        if out[i] != 0xBB {
+    for byte in out.iter().take(700).skip(MAILBOX_PAYLOAD_LEN) {
+        if *byte != 0xBB {
             return TestResult::Fail("block 1 payload miscopied");
         }
     }
@@ -1343,8 +1344,8 @@ fn smoke_mlx5_qp_transition_opcode_mapping() -> TestResult {
         if (v & 0xF00) != 0x500 {
             return TestResult::Fail("MODIFY_QP opcode outside 0x5xx range");
         }
-        for j in 0..i {
-            if seen[j] == v {
+        for prev in seen.iter().take(i) {
+            if *prev == v {
                 return TestResult::Fail("MODIFY_QP opcodes collide");
             }
         }
@@ -1683,7 +1684,7 @@ fn smoke_mlx5_pop_completion_walks_ring() -> TestResult {
         /* bc */ 64,
         /* status */ 0,
         /* wqe_counter */ 0xAAAA,
-        /* qp_num */ 0xCAFE_42,
+        /* qp_num */ 0x00CA_FE42,
         CqeOpcode::ResponderSend,
     );
     bytes[0..CQE_STRIDE].copy_from_slice(&tmp);
@@ -1692,7 +1693,7 @@ fn smoke_mlx5_pop_completion_walks_ring() -> TestResult {
         Some(v) => v,
         None => return TestResult::Fail("slot 0 completed not found"),
     };
-    if view.qp_num != 0xCAFE_42 {
+    if view.qp_num != 0x00CA_FE42 {
         return TestResult::Fail("popped CQE qp_num wrong");
     }
     if view.byte_count != 64 {

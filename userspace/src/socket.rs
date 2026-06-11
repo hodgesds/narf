@@ -1031,7 +1031,7 @@ impl SocketFile {
             },
             (IPPROTO_TCP, TCP_MAXSEG) => match read_u32(value) {
                 Ok(v) => {
-                    if v < 88 || v > 65_535 {
+                    if !(88..=65_535).contains(&v) {
                         return SocketOpResult::Err(SockError::InvalidArg);
                     }
                     opts.tcp_maxseg = v;
@@ -2166,9 +2166,9 @@ impl RingBuf {
         let mut g = self.inner.lock();
         let avail = RING_CAP - g.len;
         let n = core::cmp::min(src.len(), avail);
-        for i in 0..n {
+        for (i, &byte) in src.iter().enumerate().take(n) {
             let pos = (g.head + g.len + i) % RING_CAP;
-            g.buf[pos] = src[i];
+            g.buf[pos] = byte;
         }
         g.len += n;
         n
@@ -2177,9 +2177,9 @@ impl RingBuf {
     fn read(&self, dst: &mut [u8]) -> usize {
         let mut g = self.inner.lock();
         let n = core::cmp::min(dst.len(), g.len);
-        for i in 0..n {
+        for (i, slot) in dst.iter_mut().enumerate().take(n) {
             let pos = (g.head + i) % RING_CAP;
-            dst[i] = g.buf[pos];
+            *slot = g.buf[pos];
         }
         g.head = (g.head + n) % RING_CAP;
         g.len -= n;
@@ -2205,24 +2205,26 @@ impl RingBuf {
 
 // ── Bound-listener registry ─────────────────────────────────────
 
+/// Registry map keyed by AF_INET (ipv4, port).
+type Inet4Map = BTreeMap<(u32, u16), Arc<SocketFile>>;
+/// Registry map keyed by AF_INET6 (ipv6, port).
+type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
+
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
 
 /// AF_INET listener registry keyed by (ip, port). Loopback only
 /// today; non-loopback addrs are accepted at bind() but no
 /// connect path serves them until the NIC TX side wires in.
-static INET_LISTENERS: IrqSafeSpinLock<Option<BTreeMap<(u32, u16), Arc<SocketFile>>>> =
-    IrqSafeSpinLock::new(None);
+static INET_LISTENERS: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(None);
 
 /// AF_INET6 listener registry keyed by (ipv6, port). Same loopback-
 /// only constraint as INET_LISTENERS.
-static INET6_LISTENERS: IrqSafeSpinLock<Option<BTreeMap<([u8; 16], u16), Arc<SocketFile>>>> =
-    IrqSafeSpinLock::new(None);
+static INET6_LISTENERS: IrqSafeSpinLock<Option<Inet6Map>> = IrqSafeSpinLock::new(None);
 
 /// AF_INET datagram-bound registry: (ip, port) → socket. Lookup
 /// from sendto's destination + delivery into the dest's inbox.
-static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<(u32, u16), Arc<SocketFile>>>> =
-    IrqSafeSpinLock::new(None);
+static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::new(None);
 
 /// AF_UNIX datagram-bound registry: path → socket.
 static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =

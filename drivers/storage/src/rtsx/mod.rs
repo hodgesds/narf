@@ -230,7 +230,7 @@ impl RtsxController {
     /// # Safety
     /// `buf.len() > 0`.  Caller must serialise; no concurrent engine use.
     pub unsafe fn dispatch_cmd_buf(&self, buf: &CmdBuf) -> Result<(), RtsxError> {
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Ok(());
         }
         let n = buf.len();
@@ -239,7 +239,7 @@ impl RtsxController {
         // Serialise entries into the DMA page.
         // SAFETY: identity-mapped DMA page; exclusive access.
         unsafe {
-            let ptr = self.cmd_buf.as_mut_ptr() as *mut u8;
+            let ptr = self.cmd_buf.as_mut_ptr();
             let slice = core::slice::from_raw_parts_mut(ptr, n * 4);
             buf.serialise(slice);
         }
@@ -357,8 +357,12 @@ impl RtsxController {
         // rtsx_pci_add_cmd layout).  For simplicity we re-read via HAIMR.
         // SAFETY: HAIMR read is safe here (no concurrent engine use).
         let b2 = unsafe { self.haimr_read(SD_CMD2)? };
+        // SAFETY: HAIMR read of `SD_CMD3`; the command engine has
+        // already completed (dispatch returned), so no concurrent use.
         let b3 = unsafe { self.haimr_read(SD_CMD3)? };
+        // SAFETY: HAIMR read of `SD_CMD4`; no concurrent engine use.
         let b4 = unsafe { self.haimr_read(SD_CMD4)? };
+        // SAFETY: HAIMR read of `SD_CMD5`; no concurrent engine use.
         let b5 = unsafe { self.haimr_read(SD_CMD5)? };
 
         Ok(((b2 as u32) << 24) | ((b3 as u32) << 16) | ((b4 as u32) << 8) | (b5 as u32))
@@ -374,6 +378,8 @@ impl RtsxController {
         unsafe { self.issue_sd_cmd(&SdCmd::go_idle()) }.ok(); // no response expected
 
         // CMD8: check if SD 2.0+.  Ignore error (SD 1.x won't respond).
+        // SAFETY: the SD slot is enabled+powered per this fn's own
+        // contract; `SdCmd::send_if_cond()` (CMD8) has index < 64.
         let is_v2 = unsafe { self.issue_sd_cmd(&SdCmd::send_if_cond()) }
             .map(|r| {
                 let (v_ok, pat_ok) = card::decode_r7(r);
@@ -384,7 +390,11 @@ impl RtsxController {
         // CMD55 + ACMD41 loop until OCR.BUSY (bit 31) is set.
         let mut ocr: u32 = 0;
         for _ in 0..1000 {
+            // SAFETY: SD slot enabled+powered per this fn's contract;
+            // `SdCmd::app_cmd_prefix()` (CMD55) has index < 64.
             let _ = unsafe { self.issue_sd_cmd(&SdCmd::app_cmd_prefix()) };
+            // SAFETY: SD slot enabled+powered per this fn's contract;
+            // `SdCmd::acmd41()` (ACMD41) has index < 64.
             ocr = unsafe { self.issue_sd_cmd(&SdCmd::acmd41(is_v2)) }.unwrap_or(0);
             if ocr & (1 << 31) != 0 {
                 break;
@@ -396,13 +406,19 @@ impl RtsxController {
         let high_capacity = (ocr & (1 << 30)) != 0;
 
         // CMD2: get CID (we don't parse it but it advances the state machine).
+        // SAFETY: SD slot enabled+powered per this fn's contract;
+        // `SdCmd::all_send_cid()` (CMD2) has index < 64.
         let _ = unsafe { self.issue_sd_cmd(&SdCmd::all_send_cid()) };
 
         // CMD3: get RCA.
+        // SAFETY: SD slot enabled+powered per this fn's contract;
+        // `SdCmd::send_relative_addr()` (CMD3) has index < 64.
         let r6 = unsafe { self.issue_sd_cmd(&SdCmd::send_relative_addr()) }?;
         let rca = card::r6_rca(r6);
 
         // CMD7: select card.
+        // SAFETY: SD slot enabled+powered per this fn's contract;
+        // `SdCmd::select_card()` (CMD7) has index < 64.
         unsafe { self.issue_sd_cmd(&SdCmd::select_card(rca)) }?;
 
         Ok(SdCardInfo {
@@ -464,7 +480,7 @@ impl RtsxController {
         // Copy out from DMA page.
         // SAFETY: identity-mapped DMA page, 512 bytes filled by hardware.
         unsafe {
-            let src = self.data_buf.as_ptr() as *const u8;
+            let src = self.data_buf.as_ptr();
             core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), 512);
         }
         Ok(())
@@ -507,8 +523,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
         return Err(ProbeError::NotForThisDriver);
     }
 
-    // SAFETY: we own the device; PCI enumeration provides exclusive access.
     let controller =
+        // SAFETY: we own the device; PCI enumeration provides exclusive access.
         unsafe { RtsxController::new(&device, &cap, did) }.map_err(|_| ProbeError::BadDevice)?;
 
     *RTSX.lock() = Some(controller);

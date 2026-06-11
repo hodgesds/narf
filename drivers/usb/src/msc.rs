@@ -415,8 +415,7 @@ impl MscDevice {
             1,
             0,
         ];
-        let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(self.lba_bytes as usize);
-        out.resize(self.lba_bytes as usize, 0);
+        let mut out = alloc::vec![0u8; self.lba_bytes as usize];
         let n = self.cmd_data_in(xhci, &cb, &mut out[..]).await?;
         if n != self.lba_bytes as usize {
             return Err(MscError::BadLength);
@@ -569,7 +568,7 @@ pub async fn try_bind_msc_already_addressed(
         .await
         .map_err(MscError::Xhci)?;
     let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
-    let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
+    let bulk_out_dci = (ep_out.ep_addr & 0x0F) * 2; // xHCI OUT DCI: ep_num * 2
     let dev = MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await?;
     let idx = {
         let mut g = MSC_DEVICES.lock();
@@ -650,7 +649,7 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
             return Err(MscError::NotMsc);
         }
         let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-        if total < 9 || total > 4096 {
+        if !(9..=4096).contains(&total) {
             return Err(MscError::NotMsc);
         }
 
@@ -670,7 +669,7 @@ async fn try_attach_msc_port(xhci_dev: &Xhci, port: u8) -> Result<(), MscError> 
             .map_err(MscError::Xhci)?;
 
         let bulk_in_dci = ((ep_in.ep_addr & 0x0F) * 2) + 1;
-        let bulk_out_dci = ((ep_out.ep_addr & 0x0F) * 2) + 0;
+        let bulk_out_dci = (ep_out.ep_addr & 0x0F) * 2; // xHCI OUT DCI: ep_num * 2
         MscDevice::attach(xhci_dev, slot_id, bulk_in_dci, bulk_out_dci).await
     }
     .await;
@@ -860,7 +859,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     ) -> Result<(), narf_block::BlockIoError> {
         if lba
             .checked_add(n_blocks as u64)
-            .map_or(true, |end| end > self.capacity)
+            .is_none_or(|end| end > self.capacity)
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }
@@ -910,7 +909,7 @@ impl narf_block::BlockDeviceSync for UsbMscBlockDevice {
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
         if lba
             .checked_add(n_blocks as u64)
-            .map_or(true, |end| end > self.capacity)
+            .is_none_or(|end| end > self.capacity)
         {
             return Err(narf_block::BlockIoError::OutOfRange);
         }

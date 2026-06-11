@@ -192,7 +192,7 @@ pub fn append_service_data_16(out: &mut Vec<u8>, uuid: u16, data: &[u8]) {
 // ── Convenience decoders ───────────────────────────────────────────
 
 /// Find the first record of `ad_type` and return its payload.
-pub fn find<'a>(buf: &'a [u8], ad_type: u8) -> Option<&'a [u8]> {
+pub fn find(buf: &[u8], ad_type: u8) -> Option<&[u8]> {
     for rec in AdIter::new(buf).flatten() {
         if rec.ad_type == ad_type {
             return Some(rec.payload);
@@ -220,7 +220,7 @@ pub fn tx_power(buf: &[u8]) -> Option<i8> {
 
 /// Decode a 16-bit Manufacturer Specific Data record. Returns
 /// (company id, vendor payload).
-pub fn manufacturer_data<'a>(buf: &'a [u8]) -> Option<(u16, &'a [u8])> {
+pub fn manufacturer_data(buf: &[u8]) -> Option<(u16, &[u8])> {
     let p = find(buf, AD_MANUFACTURER_SPECIFIC)?;
     if p.len() < 2 {
         return None;
@@ -444,9 +444,10 @@ pub const DISCONNECT_REASON_REMOTE_USER: u8 = 0x13;
 // so it's straightforward to unit-test.
 
 /// Phases the Central walks during discovery + connection setup.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum CentralPhase {
     /// Initial state, no scan in progress.
+    #[default]
     Idle,
     /// Set_Scan_Parameters issued, awaiting Command Complete.
     ParametersSent,
@@ -478,12 +479,6 @@ pub struct Central {
     pub phase: CentralPhase,
     pub peers: Vec<DiscoveredPeer>,
     pub connected_handle: Option<u16>,
-}
-
-impl Default for CentralPhase {
-    fn default() -> Self {
-        CentralPhase::Idle
-    }
 }
 
 impl Central {

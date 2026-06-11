@@ -44,6 +44,7 @@ pub mod mode_attr {
 /// `MemoryModel` byte (VBE 3.0 §4.2 offset 0x1B).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum MemoryModel {
     Text = 0x00,
     Cga = 0x01,
@@ -56,6 +57,7 @@ pub enum MemoryModel {
     /// mode).
     DirectColor = 0x06,
     Yuv = 0x07,
+    #[default]
     Other = 0xFF,
 }
 
@@ -101,12 +103,6 @@ pub struct ModeInfoBlock {
     /// extend via the VBE/PM protocol; we accept the 32-bit form
     /// the spec defines.
     pub phys_base_ptr: u32,
-}
-
-impl Default for MemoryModel {
-    fn default() -> Self {
-        Self::Other
-    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -172,7 +168,7 @@ impl ModeInfoBlock {
             blue: mask(self.blue_mask_size, self.blue_field_position),
             reserved: mask(self.reserved_mask_size, self.reserved_field_position),
         };
-        let bytes_per_pixel = ((self.bits_per_pixel + 7) / 8) as u32;
+        let bytes_per_pixel = self.bits_per_pixel.div_ceil(8) as u32;
         Ok(Framebuffer {
             base: self.phys_base_ptr as u64,
             size: (self.bytes_per_scan_line as u64) * (self.y_resolution as u64),

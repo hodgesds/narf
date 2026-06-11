@@ -208,7 +208,7 @@ pub fn build_ih4_ring_init(
     doorbell_idx: u32,
     wptr_writeback_phys: u64,
 ) -> Result<IhRingInitSequence, IhError> {
-    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+    if !ring_size_dw.is_power_of_two() || !(8..=(1 << 20)).contains(&ring_size_dw) {
         return Err(IhError::BadRingSize);
     }
     if ring_phys & 0xFF != 0 {

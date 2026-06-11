@@ -16,8 +16,7 @@
 //! - Report Map              (0x2A4B) — read
 //! - HID Control Point       (0x2A4C) — write-without-response
 //! - One or more Report      (0x2A4D) — read/write/notify, with a
-//!                                       Report Reference descriptor
-//!                                       (0x2908) giving (id, type).
+//!   Report Reference descriptor (0x2908) giving (id, type).
 //!
 //! Optional (boot host fallback):
 //! - Protocol Mode           (0x2A4E) — read + write-without-response
@@ -190,8 +189,10 @@ impl HidServiceBuilder {
 
     /// Materialise the service into the database; returns the handles.
     pub fn build(self, db: &mut AttributeDatabase) -> HidServiceHandles {
-        let mut handles = HidServiceHandles::default();
-        handles.service = db.add_primary_service(Uuid::U16(UUID_SERVICE_HID));
+        let mut handles = HidServiceHandles {
+            service: db.add_primary_service(Uuid::U16(UUID_SERVICE_HID)),
+            ..Default::default()
+        };
 
         // HID Information — read-only.
         let (_, info_h) = db.add_characteristic(

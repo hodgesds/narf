@@ -14,8 +14,8 @@
 //! ## FileOps
 //!
 //! - `read`  → return next reassembled frame bytes (waits if streaming not
-//!             yet delivered a frame; returns 0 / empty on no frame in NARF
-//!             since there is no blocking sleep here — caller polls).
+//!   yet delivered a frame; returns 0 / empty on no frame in NARF
+//!   since there is no blocking sleep here — caller polls).
 //! - `write` → `InvalidData` (V4L2 output devices not supported).
 //! - `poll_readiness` → `POLL_IN` when a frame is ready.
 //!

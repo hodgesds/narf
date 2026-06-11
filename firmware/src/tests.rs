@@ -277,9 +277,9 @@ fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
         None => return TestResult::Fail("trusted_loader_authority not stashed"),
     };
     let blob = build_unsigned_blob(b"sys_install round-trip", None);
-    // SAFETY: blob is a kernel-owned heap allocation; ptr+len
-    // describe a valid range for the duration of this call.
     let r =
+        // SAFETY: blob is a kernel-owned heap allocation; ptr+len
+        // describe a valid range for the duration of this call.
         unsafe { crate::sys_install("test/sys-install/blob", blob.as_ptr(), blob.len(), &auth) };
     match r {
         Ok(()) => {}

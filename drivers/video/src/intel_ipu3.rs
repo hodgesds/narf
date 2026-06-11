@@ -130,8 +130,8 @@ pub fn probe(
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // Map BAR0: IMGU register window.
-    // SAFETY: exclusive BAR ownership held by the bus probe contract.
     let regs =
+        // SAFETY: exclusive BAR ownership held by the bus probe contract.
         unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     let ipu3 = Ipu3 {

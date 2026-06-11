@@ -96,6 +96,12 @@ impl State {
     }
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub static STATE: State = State::new();
 
 /// Evdev device node for the PS/2 mouse. Registered in `init()`.
@@ -179,6 +185,8 @@ pub unsafe fn init() -> Result<(), InitError> {
 
     // 2. Update config: set AUX_IRQ, clear AUX_DIS.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: 0x64 cmd write; input buffer drained above so the controller
+    // accepts `CMD_READ_CONFIG` (0x20), which queues config byte to 0x60.
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
@@ -187,10 +195,15 @@ pub unsafe fn init() -> Result<(), InitError> {
     conf &= !CONF_AUX_DIS;
     conf |= CONF_KBD_IRQ;
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: 0x64 cmd write; input buffer drained above so `CMD_WRITE_CONFIG`
+    // (0x60) is accepted, telling the controller the next 0x60 write is the
+    // new config byte.
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: 0x60 data write; input buffer drained above. Delivers the
+    // recomputed config byte that the preceding `CMD_WRITE_CONFIG` is awaiting.
     unsafe {
         outb(PS2_DATA, conf);
     }
@@ -199,10 +212,14 @@ pub unsafe fn init() -> Result<(), InitError> {
     //    behind 0xD4 (WRITE_AUX) per the i8042 spec — every byte
     //    sent to the mouse needs the prefix.
     let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+    // SAFETY: 0x64 cmd write; `CMD_WRITE_AUX` (0xD4) routes the next 0x60 byte
+    // to the AUX (mouse) channel instead of the keyboard.
     unsafe {
         outb(PS2_CMD, CMD_WRITE_AUX);
     }
     let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+    // SAFETY: 0x60 data write; the preceding 0xD4 forwards this 0xFF (mouse
+    // reset) to the AUX device.
     unsafe {
         outb(PS2_DATA, 0xFF);
     }
@@ -219,10 +236,14 @@ pub unsafe fn init() -> Result<(), InitError> {
     if reporting_ok {
         // 4a. Set defaults (0xF6) — ACK.
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        // SAFETY: 0x64 cmd write; `CMD_WRITE_AUX` (0xD4) routes the next 0x60
+        // byte to the AUX (mouse) channel.
         unsafe {
             outb(PS2_CMD, CMD_WRITE_AUX);
         }
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        // SAFETY: 0x60 data write; the preceding 0xD4 forwards this 0xF6 (set
+        // defaults) to the AUX device.
         unsafe {
             outb(PS2_DATA, 0xF6);
         }
@@ -235,10 +256,14 @@ pub unsafe fn init() -> Result<(), InitError> {
         // 4b. Enable data reporting (0xF4) — ACK. This flips the
         // mouse from "idle" to "actively sending packets."
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        // SAFETY: 0x64 cmd write; `CMD_WRITE_AUX` (0xD4) routes the next 0x60
+        // byte to the AUX (mouse) channel.
         unsafe {
             outb(PS2_CMD, CMD_WRITE_AUX);
         }
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
+        // SAFETY: 0x60 data write; the preceding 0xD4 forwards this 0xF4 (enable
+        // data reporting) to the AUX device.
         unsafe {
             outb(PS2_DATA, 0xF4);
         }
@@ -341,6 +366,9 @@ pub unsafe fn on_irq12() {
     // SAFETY: pointer written once in init() before IRQs armed; Arc kept alive.
     let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
     if !raw.is_null() {
+        // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
+        // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
+        // so the pointee outlives this borrow. Non-null checked just above.
         let node_ref: &DeviceNode = unsafe { &*raw };
         dispatch_rel_to_node(node_ref, dx, dy);
     }

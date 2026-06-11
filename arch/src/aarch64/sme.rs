@@ -46,6 +46,11 @@ pub unsafe fn read_svcr() -> u64 {
     v
 }
 
+/// Write `SVCR` (raw `S3_3_C4_C2_2`); `isb` to synchronise.
+///
+/// # Safety
+/// EL1; SME supported; `CPACR_EL1.SMEN` open. Changing `SVCR.SM`/`ZA`
+/// resets streaming and ZA state, so the caller must save/restore it.
 pub unsafe fn write_svcr(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {
@@ -63,15 +68,22 @@ pub unsafe fn write_svcr(v: u64) {
 /// # Safety
 /// EL1; SME supported; SMEN open.
 pub unsafe fn enter_streaming() {
-    // SAFETY: caller-asserted.
+    // SAFETY: reads `SVCR`; caller guarantees EL1/SME/SMEN per fn contract.
     let v = unsafe { read_svcr() } | SVCR_SM;
+    // SAFETY: writes back `SVCR` with `SM` set under the same preconditions.
     unsafe {
         write_svcr(v);
     }
 }
 
+/// Leave streaming mode (SVCR.SM = 0).
+///
+/// # Safety
+/// EL1; SME supported; SMEN open. Clearing `SM` discards streaming state.
 pub unsafe fn leave_streaming() {
+    // SAFETY: reads `SVCR`; caller guarantees EL1/SME/SMEN per fn contract.
     let v = unsafe { read_svcr() } & !SVCR_SM;
+    // SAFETY: writes back `SVCR` with `SM` cleared under the same preconditions.
     unsafe {
         write_svcr(v);
     }
@@ -82,14 +94,22 @@ pub unsafe fn leave_streaming() {
 /// # Safety
 /// EL1; SME supported; SMEN open.
 pub unsafe fn enable_za() {
+    // SAFETY: reads `SVCR`; caller guarantees EL1/SME/SMEN per fn contract.
     let v = unsafe { read_svcr() } | SVCR_ZA;
+    // SAFETY: writes back `SVCR` with `ZA` set under the same preconditions.
     unsafe {
         write_svcr(v);
     }
 }
 
+/// Disable ZA tile storage (SVCR.ZA = 0).
+///
+/// # Safety
+/// EL1; SME supported; SMEN open. Clearing `ZA` discards ZA tile state.
 pub unsafe fn disable_za() {
+    // SAFETY: reads `SVCR`; caller guarantees EL1/SME/SMEN per fn contract.
     let v = unsafe { read_svcr() } & !SVCR_ZA;
+    // SAFETY: writes back `SVCR` with `ZA` cleared under the same preconditions.
     unsafe {
         write_svcr(v);
     }
@@ -109,6 +129,12 @@ pub unsafe fn read_smcr_el1() -> u64 {
     v
 }
 
+/// Write `SMCR_EL1` (raw `S3_0_C1_C2_6`) — streaming-mode VL
+/// control; `isb` to synchronise.
+///
+/// # Safety
+/// EL1; SME supported; SMEN open. Changing the streaming vector length
+/// invalidates streaming/ZA state, so the caller must reinitialise it.
 pub unsafe fn write_smcr_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {

@@ -113,29 +113,29 @@ pub fn unpack_register_write(buf: [u8; 2]) -> (u8, u16) {
 /// via I2C in order.
 pub fn build_init_sequence_i2s_master_16bit() -> Vec<(u8, u16)> {
     use audio_iface::*;
-    let mut out = Vec::new();
-    // Software reset — write any value to R15.
-    out.push((regs::RESET, 0x000));
-    // Power Management 1: VMID=50 kΩ (bit 8/7 = 01), VREF on.
-    out.push((regs::POWER_MGMT_1, (0b01 << 7) | (1 << 6)));
-    // Power Management 2: DACL, DACR, LOUT1, ROUT1 on.
-    out.push((
-        regs::POWER_MGMT_2,
-        (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5),
-    ));
-    // Power Management 3: LOMIX, ROMIX on.
-    out.push((regs::POWER_MGMT_3, (1 << 3) | (1 << 2)));
-    // Audio Interface (R7): I2S, 16-bit, master.
-    out.push((regs::AUDIO_INTERFACE, FORMAT_I2S | WL_16 | MASTER));
-    // Left/Right DAC volume = 0 dB. The DAC volume register is
-    // 8-bit; bit 8 = simultaneous-update flag.
-    out.push((regs::LEFT_DAC_VOLUME, 0xFF | (1 << 8)));
-    out.push((regs::RIGHT_DAC_VOLUME, 0xFF | (1 << 8)));
-    // Output Mixer enables: LOMIX, ROMIX = LD2LO / RD2RO.
-    out.push((regs::LEFT_OUT_MIX, 1 << 8));
-    out.push((regs::RIGHT_OUT_MIX, 1 << 8));
-    // LOUT1 / ROUT1 volumes = 0 dB with simultaneous update.
-    out.push((regs::LOUT1_VOLUME, 0x79 | (1 << 8) | (1 << 7)));
-    out.push((regs::ROUT1_VOLUME, 0x79 | (1 << 8) | (1 << 7)));
-    out
+    alloc::vec![
+        // Software reset — write any value to R15.
+        (regs::RESET, 0x000),
+        // Power Management 1: VMID=50 kΩ (bit 8/7 = 01), VREF on.
+        (regs::POWER_MGMT_1, (0b01 << 7) | (1 << 6)),
+        // Power Management 2: DACL, DACR, LOUT1, ROUT1 on.
+        (
+            regs::POWER_MGMT_2,
+            (1 << 8) | (1 << 7) | (1 << 6) | (1 << 5),
+        ),
+        // Power Management 3: LOMIX, ROMIX on.
+        (regs::POWER_MGMT_3, (1 << 3) | (1 << 2)),
+        // Audio Interface (R7): I2S, 16-bit, master.
+        (regs::AUDIO_INTERFACE, FORMAT_I2S | WL_16 | MASTER),
+        // Left/Right DAC volume = 0 dB. The DAC volume register is
+        // 8-bit; bit 8 = simultaneous-update flag.
+        (regs::LEFT_DAC_VOLUME, 0xFF | (1 << 8)),
+        (regs::RIGHT_DAC_VOLUME, 0xFF | (1 << 8)),
+        // Output Mixer enables: LOMIX, ROMIX = LD2LO / RD2RO.
+        (regs::LEFT_OUT_MIX, 1 << 8),
+        (regs::RIGHT_OUT_MIX, 1 << 8),
+        // LOUT1 / ROUT1 volumes = 0 dB with simultaneous update.
+        (regs::LOUT1_VOLUME, 0x79 | (1 << 8) | (1 << 7)),
+        (regs::ROUT1_VOLUME, 0x79 | (1 << 8) | (1 << 7)),
+    ]
 }

@@ -43,7 +43,7 @@
 //! AS interfaces carry:
 //!   - 0x01 AS_GENERAL      — terminal link + format tag (FORMAT_TYPE_I etc.)
 //!   - 0x02 FORMAT_TYPE     — Type-I PCM: channels + subframe + bit-resolution
-//!                            + sampling-frequency table
+//!     + sampling-frequency table
 
 use alloc::vec::Vec;
 
@@ -741,7 +741,7 @@ impl PcmRing {
     /// so push/pop are always frame-aligned.
     pub fn new(format: PcmFormat, capacity_bytes: usize) -> Self {
         let frame = format.audio_frame_bytes().max(1);
-        let rounded = ((capacity_bytes + frame - 1) / frame) * frame;
+        let rounded = capacity_bytes.div_ceil(frame) * frame;
         Self {
             format,
             storage: alloc::vec![0u8; rounded],
@@ -794,8 +794,8 @@ impl PcmRing {
         }
         let n = out.len().min(self.filled);
         let cap = self.storage.len();
-        for i in 0..n {
-            out[i] = self.storage[self.head];
+        for slot in out.iter_mut().take(n) {
+            *slot = self.storage[self.head];
             self.head = (self.head + 1) % cap;
         }
         self.filled -= n;

@@ -35,6 +35,7 @@ fn smoke_virtio_blk_pci_read_sector() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_vblk = devs.iter().any(|d| {
@@ -61,9 +62,9 @@ fn smoke_virtio_blk_pci_read_sector() -> TestResult {
     if !read_ok {
         return TestResult::Fail("read_sector(0) failed");
     }
-    for i in 0..512usize {
+    for (i, &b) in sector.iter().enumerate() {
         let expected = (i as u8).wrapping_mul(0x97);
-        if sector[i] != expected {
+        if b != expected {
             return TestResult::Fail("virtio-blk-pci read pattern mismatch");
         }
     }
@@ -76,6 +77,7 @@ fn smoke_virtio_blk_pci_write_then_read() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -92,8 +94,8 @@ fn smoke_virtio_blk_pci_write_then_read() -> TestResult {
         return TestResult::Fail("probe_all_pci failed");
     }
     let mut payload = [0u8; 512];
-    for i in 0..512usize {
-        payload[i] = (i as u8).wrapping_mul(0x5B) ^ 0xC3;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0x5B) ^ 0xC3;
     }
     let wrote = blk_pci::with_controller(|c| c.write_sector(4, &payload))
         .map(|r| r.is_ok())
@@ -125,6 +127,7 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
     use narf_bus::{
         bootstrap_registry_authority, claim_device_cap, devices, probe_all_pci, BusKind,
     };
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let dev = match devs.iter().find(|d| {
@@ -174,9 +177,9 @@ fn smoke_virtio_blk_pci_irq_driven() -> TestResult {
     if !read_ok {
         return TestResult::Fail("read_sector_irq failed");
     }
-    for i in 0..512usize {
+    for (i, &b) in sector.iter().enumerate() {
         let expected = (i as u8).wrapping_mul(0x97);
-        if sector[i] != expected {
+        if b != expected {
             return TestResult::Fail("read_sector_irq pattern mismatch");
         }
     }
@@ -198,6 +201,7 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     use narf_bus::{
         bootstrap_registry_authority, claim_device_cap, devices, probe_all_pci, BusKind,
     };
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let dev = match devs.iter().find(|d| {
@@ -357,9 +361,9 @@ fn smoke_virtio_blk_pci_irq_async() -> TestResult {
     }
     match result {
         Some(Ok(sector)) => {
-            for i in 0..512usize {
+            for (i, &b) in sector.iter().enumerate() {
                 let expected = (i as u8).wrapping_mul(0x97);
-                if sector[i] != expected {
+                if b != expected {
                     return TestResult::Fail("pattern mismatch");
                 }
             }
@@ -384,6 +388,7 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     use narf_bus::{
         bootstrap_registry_authority, claim_device_cap, devices, probe_all_pci, BusKind,
     };
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let dev = match devs.iter().find(|d| {
@@ -454,8 +459,8 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
     }
 
     let mut pattern = [0u8; 512];
-    for i in 0..512usize {
-        pattern[i] = (i as u8).wrapping_add(0x37);
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_add(0x37);
     }
     // Install no-op wheel arm callback if needed — same reasoning
     // as smoke_virtio_blk_pci_irq_async (SleepUntil's self-wake
@@ -492,8 +497,8 @@ fn smoke_virtio_blk_pci_write_irq_async() -> TestResult {
         Some(Err(_)) => return TestResult::Fail("read_sector_irq_async returned Err"),
         None => return TestResult::Fail("read future never resolved"),
     };
-    for i in 0..512usize {
-        if readback[i] != pattern[i] {
+    for (&rb, &pat) in readback.iter().zip(pattern.iter()) {
+        if rb != pat {
             return TestResult::Fail("read-back pattern mismatch");
         }
     }
@@ -511,6 +516,7 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_net = devs.iter().any(|d| {
@@ -537,8 +543,8 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
         narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc tx scratch");
     {
         let slice = tx_buf.as_mut_slice();
-        for i in 14..64 {
-            slice[i] = (i as u8).wrapping_mul(0x3D);
+        for (i, b) in slice[14..64].iter_mut().enumerate() {
+            *b = ((i + 14) as u8).wrapping_mul(0x3D);
         }
     }
     let tx_ok = net_pci::with_controller(|c| c.tx_dma(&tx_buf, 0, 64))
@@ -561,6 +567,7 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_net = devs.iter().any(|d| {
@@ -581,8 +588,8 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
         narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc arp scratch");
     {
         let f = tx_dma.as_mut_slice();
-        for i in 0..6 {
-            f[i] = 0xFF;
+        for b in f.iter_mut().take(6) {
+            *b = 0xFF;
         }
         f[6] = 0x52;
         f[7] = 0x54;
@@ -712,8 +719,8 @@ fn smoke_virtio_net_pci_send_fn_dispatches() -> TestResult {
     // user-mode SLIRP will answer.
     let mut frame = [0u8; 42];
     // Eth dst = ff:ff:ff:ff:ff:ff (broadcast)
-    for i in 0..6 {
-        frame[i] = 0xFF;
+    for b in frame.iter_mut().take(6) {
+        *b = 0xFF;
     }
     // Eth src = our MAC
     frame[6..12].copy_from_slice(&src_mac);
@@ -934,6 +941,7 @@ fn smoke_virtio_rng_pci_probe() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -962,6 +970,7 @@ fn smoke_virtio_snd_pci_probe() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -994,6 +1003,7 @@ fn smoke_virtio_balloon_pci_probe() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -1022,6 +1032,7 @@ fn smoke_virtio_balloon_pci_inflate_deflate() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the identity-mapped QEMU ECAM region; safe to call once per test.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {

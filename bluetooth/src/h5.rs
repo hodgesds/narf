@@ -48,8 +48,8 @@
 //!
 //! ## Scope
 //!
-//! Wire-format codec only — header packing + SLIP escape/unescape
-//! + CRC. The retransmission state machine (sliding window,
+//! Wire-format codec only — header packing, SLIP escape/unescape,
+//! and CRC. The retransmission state machine (sliding window,
 //! sender's/receiver's sequence numbers, RST/SYNC/CONFIG link
 //! establishment messages) is left for the Stage-3 driver core
 //! that drives an actual UART; this codec hands it the framed

@@ -190,9 +190,9 @@ unsafe fn read_cfg(
     // SAFETY: same.
     let size = unsafe { region.read8(CFG_SIZE) } as usize;
     let take = size.min(CFG_PAYLOAD_MAX).min(out.len());
-    for i in 0..take {
+    for (i, slot) in out.iter_mut().enumerate().take(take) {
         // SAFETY: payload window is exactly CFG_PAYLOAD_MAX bytes.
-        out[i] = unsafe { region.read8(CFG_PAYLOAD + i as u64) };
+        *slot = unsafe { region.read8(CFG_PAYLOAD + i as u64) };
     }
     take
 }
@@ -227,7 +227,7 @@ unsafe fn read_device_metadata(
     // SAFETY: same. EV_ABS = 3 (Linux input-event-codes.h).
     let nbits = unsafe { read_cfg(region, CFG_EV_BITS, 3, &mut ev_abs_bits) };
     let mut axis_info = [None; ABS_BOUNDS_LEN];
-    for axis in 0..ABS_BOUNDS_LEN {
+    for (axis, slot) in axis_info.iter_mut().enumerate().take(ABS_BOUNDS_LEN) {
         let byte = axis / 8;
         let bit = axis % 8;
         if byte >= nbits {
@@ -240,7 +240,7 @@ unsafe fn read_device_metadata(
         // SAFETY: same.
         let got = unsafe { read_cfg(region, CFG_ABS_INFO, axis as u8, &mut abs_buf) };
         if got >= 20 {
-            axis_info[axis] = narf_input::AxisInfo::from_virtio_absinfo(&abs_buf);
+            *slot = narf_input::AxisInfo::from_virtio_absinfo(&abs_buf);
         }
     }
 

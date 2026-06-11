@@ -792,6 +792,8 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
 
     // Restore the prior SP_EL0 immediately so any later test
     // that depends on it observes the boot-state value.
+    // SAFETY: `msr SP_EL0` at EL1 is unconditional and side-effect-free
+    // while EL0 is not executing; `prior_sp_el0` is the value read above.
     unsafe {
         core::arch::asm!(
             "msr SP_EL0, {p}",
@@ -933,6 +935,9 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
     // valid (kernel-mapped) stack to write into. Save and restore
     // the prior value around the test.
     let prior_sp: u64;
+    // SAFETY: `mrs`/`msr SP_EL0` at EL1 read/write the EL0 stack pointer
+    // unconditionally with no side effects while EL0 is not executing;
+    // `stack.top()` is a kernel-mapped scratch-buffer address.
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -946,6 +951,8 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
     let mut ctx = Aarch64TrapContext::from_svc(&mut frame);
     let ok = ctx.deliver_signal(&params);
 
+    // SAFETY: `msr SP_EL0` at EL1 restores the EL0 stack pointer
+    // unconditionally; `prior_sp` is the value read above.
     unsafe {
         core::arch::asm!(
             "msr SP_EL0, {p}",
@@ -1003,6 +1010,9 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
     };
 
     let prior_sp: u64;
+    // SAFETY: `mrs`/`msr SP_EL0` at EL1 read/write the EL0 stack pointer
+    // unconditionally with no side effects while EL0 is not executing;
+    // `user_stack.top()` is a kernel-mapped scratch-buffer address.
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -1017,6 +1027,9 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
     // Read SP_EL0 back after delivery to see where the frame landed.
     let ok = ctx.deliver_signal(&params);
     let delivered_sp: u64;
+    // SAFETY: `mrs SP_EL0` captures the EL0 SP that deliver_signal wrote
+    // and `msr SP_EL0` restores the prior value; both are unconditional
+    // EL1 accesses with no side effects while EL0 is not executing.
     unsafe {
         core::arch::asm!(
             "mrs {v}, SP_EL0",
@@ -1066,6 +1079,9 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
     };
 
     let prior_sp: u64;
+    // SAFETY: `mrs`/`msr SP_EL0` at EL1 read/write the EL0 stack pointer
+    // unconditionally with no side effects while EL0 is not executing;
+    // `stack.top()` is a kernel-mapped scratch-buffer address.
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -1079,6 +1095,9 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
     let ok = ctx.deliver_signal(&params);
     // Capture delivered SP_EL0 before restoring.
     let delivered_sp: u64;
+    // SAFETY: `mrs SP_EL0` captures the EL0 SP that deliver_signal wrote
+    // and `msr SP_EL0` restores the prior value; both are unconditional
+    // EL1 accesses with no side effects while EL0 is not executing.
     unsafe {
         core::arch::asm!(
             "mrs {v}, SP_EL0",

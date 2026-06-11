@@ -371,6 +371,8 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
+    // temporarily enables SMAP access and read_unaligned handles any alignment.
     let v = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const i32))
     };
@@ -382,6 +384,8 @@ unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
+    // enables SMAP and write_unaligned handles any alignment.
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut i32, v);
@@ -395,6 +399,8 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
+    // enables SMAP and write_unaligned handles any alignment.
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut u32, v);
@@ -411,6 +417,9 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // (its fn contract); it is non-null per the check above, and
+    // `read_unaligned` reads exactly 4 bytes regardless of alignment.
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const i32) })
 }
 
@@ -419,6 +428,9 @@ unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // (its fn contract); it is non-null per the check above, and
+    // `write_unaligned` writes exactly 4 bytes regardless of alignment.
     unsafe { core::ptr::write_unaligned(uptr as *mut i32, v) };
     Ok(())
 }
@@ -428,6 +440,9 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // (its fn contract); it is non-null per the check above, and
+    // `write_unaligned` writes exactly 4 bytes regardless of alignment.
     unsafe { core::ptr::write_unaligned(uptr as *mut u32, v) };
     Ok(())
 }
@@ -449,6 +464,8 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
+    // enables SMAP and read_unaligned handles any alignment.
     let v = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::read_unaligned(uptr as *const WireWinsize)
@@ -462,6 +479,8 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
+    // enables SMAP and write_unaligned handles any alignment.
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut WireWinsize, v);
@@ -475,6 +494,10 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // (its fn contract); it is non-null per the check above, and
+    // `read_unaligned` reads exactly one `WireWinsize` regardless of
+    // alignment.
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const WireWinsize) })
 }
 
@@ -483,6 +506,10 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // (its fn contract); it is non-null per the check above, and
+    // `write_unaligned` writes exactly one `WireWinsize` regardless of
+    // alignment.
     unsafe { core::ptr::write_unaligned(uptr as *mut WireWinsize, v) };
     Ok(())
 }
@@ -498,6 +525,9 @@ unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
         return Err(FsError::InvalidData);
     }
     let zero = [0u8; 60];
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
+    // enables SMAP; zero.as_ptr() and uptr point to non-overlapping regions of
+    // exactly 60 bytes each.
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60);
@@ -512,6 +542,10 @@ unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
         return Err(FsError::InvalidData);
     }
     let zero = [0u8; 60];
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // (its fn contract) and is non-null per the check above; the local
+    // `zero` buffer and `uptr` are non-overlapping regions of exactly
+    // 60 bytes each.
     unsafe { core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60) };
     Ok(())
 }
@@ -604,20 +638,24 @@ impl FileOps for PtyMaster {
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match cmd {
             TIOCGPTN => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_u32(arg, self.pty.index)? };
                 Ok(0)
             }
             TIOCSPTLCK => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let v = unsafe { read_user_i32(arg)? };
                 self.pty.locked.store(v != 0, Ordering::Release);
                 Ok(0)
             }
             TIOCGPGRP => {
                 let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
             }
             TIOCSPGRP => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let pgrp = unsafe { read_user_i32(arg)? };
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
@@ -633,10 +671,12 @@ impl FileOps for PtyMaster {
                     ws_xpixel: 0,
                     ws_ypixel: 0,
                 };
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_winsize(arg, ws)? };
                 Ok(0)
             }
             TIOCSWINSZ => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let ws = unsafe { read_user_winsize(arg)? };
                 let mut w = self.pty.window.lock();
                 w.rows = ws.ws_row;
@@ -644,6 +684,7 @@ impl FileOps for PtyMaster {
                 Ok(0)
             }
             TCGETS => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_termios_zero(arg)? };
                 Ok(0)
             }
@@ -657,6 +698,7 @@ impl FileOps for PtyMaster {
             FIONREAD => {
                 // Bytes the master can read = bytes slave has written.
                 let n = self.pty.slave_tx_to_master.len() as i32;
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, n)? };
                 Ok(0)
             }
@@ -782,15 +824,18 @@ impl FileOps for PtySlave {
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match cmd {
             TIOCGPTN => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_u32(arg, self.pty.index)? };
                 Ok(0)
             }
             TIOCGPGRP => {
                 let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
             }
             TIOCSPGRP => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let pgrp = unsafe { read_user_i32(arg)? };
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
@@ -816,10 +861,12 @@ impl FileOps for PtySlave {
                     ws_xpixel: 0,
                     ws_ypixel: 0,
                 };
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_winsize(arg, ws)? };
                 Ok(0)
             }
             TIOCSWINSZ => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let ws = unsafe { read_user_winsize(arg)? };
                 let mut w = self.pty.window.lock();
                 w.rows = ws.ws_row;
@@ -827,6 +874,7 @@ impl FileOps for PtySlave {
                 Ok(0)
             }
             TCGETS => {
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_termios_zero(arg)? };
                 Ok(0)
             }
@@ -837,6 +885,7 @@ impl FileOps for PtySlave {
             FIONREAD => {
                 // Bytes the slave can read = bytes master has written.
                 let n = self.pty.master_tx_to_slave.len() as i32;
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, n)? };
                 Ok(0)
             }

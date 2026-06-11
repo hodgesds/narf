@@ -3,8 +3,6 @@
 //! Tests register via `narf_kernel_test::kernel_test_in!` so the
 //! runner groups output under the `"drivers/input"` subsystem.
 
-#![cfg(target_arch = "x86_64")]
-
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_i8042_decode_a_keystroke() -> TestResult {
@@ -323,7 +321,7 @@ fn smoke_virtio_input_multitouch_slot_protocol_b() -> TestResult {
         Some(t) => t,
         None => return TestResult::Fail("expected slot 0 release"),
     };
-    if t_lift.slot != 0 || t_lift.tracking_id != None {
+    if t_lift.slot != 0 || t_lift.tracking_id.is_some() {
         return TestResult::Fail("slot 0 release shape wrong");
     }
     if pop_touch().is_some() {
@@ -2747,7 +2745,7 @@ fn smoke_hid_rmi_attn_report_decode() -> TestResult {
     if attn.interrupt_sources != 0x04 {
         return TestResult::Fail("interrupt source byte mis-decoded");
     }
-    if attn.data != &[0xAA, 0xBB, 0xCC] {
+    if attn.data != [0xAA, 0xBB, 0xCC] {
         return TestResult::Fail("ATTN data slice wrong");
     }
     // Non-ATTN report returns None.

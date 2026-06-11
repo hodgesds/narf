@@ -134,7 +134,7 @@ impl KbdReport {
     }
     /// `true` if the given HID Usage ID appears in the key array.
     pub fn pressed(&self, usage: u8) -> bool {
-        self.keys.iter().any(|&k| k == usage)
+        self.keys.contains(&usage)
     }
 }
 
@@ -397,7 +397,7 @@ fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
             if k == 0 || k == 0x01 {
                 continue;
             }
-            if !cur.keys.iter().any(|&c| c == k) {
+            if !cur.keys.contains(&k) {
                 let code = usage_to_keycode(k);
                 push_global(InputEvent::Key(KeyEvent {
                     code,
@@ -412,7 +412,7 @@ fn translate_diff(prev: &KbdReport, cur: &KbdReport) -> usize {
             if k == 0 || k == 0x01 {
                 continue;
             }
-            if !prev.keys.iter().any(|&p| p == k) {
+            if !prev.keys.contains(&k) {
                 let code = usage_to_keycode(k);
                 push_global(InputEvent::Key(KeyEvent {
                     code,
@@ -708,7 +708,7 @@ async fn bind_kbd_addressed_slot(
         return Err(err);
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total < 9 || total > 4096 {
+    if !(9..=4096).contains(&total) {
         let err = HidError::NotBootKeyboard;
         note_attach_fail(port, AttachStep::GetCfgHeader, &err);
         return Err(err);
@@ -732,9 +732,8 @@ async fn bind_kbd_addressed_slot(
         full.truncate(n2);
     }
 
-    let (iface, ep) = find_boot_keyboard(&full).map_err(|e| {
-        note_attach_fail(port, AttachStep::FindBootKbd, &e);
-        e
+    let (iface, ep) = find_boot_keyboard(&full).inspect_err(|e| {
+        note_attach_fail(port, AttachStep::FindBootKbd, e);
     })?;
 
     // Configure the controller-side endpoint context first
@@ -776,9 +775,8 @@ async fn bind_kbd_addressed_slot(
     let dci = (interrupt_in_ep * 2) + 1;
     let kbd = BootKeyboard::attach(xhci_dev, slot_id, iface, dci)
         .await
-        .map_err(|e| {
-            note_attach_fail(port, AttachStep::SetProtocol, &e);
-            e
+        .inspect_err(|e| {
+            note_attach_fail(port, AttachStep::SetProtocol, e);
         })?;
     {
         let mut g = KEYBOARDS.lock();

@@ -87,13 +87,7 @@ impl FrameMode {
                 .frame_intervals
                 .iter()
                 .copied()
-                .min_by_key(|&iv| {
-                    if iv >= want_interval {
-                        iv - want_interval
-                    } else {
-                        want_interval - iv
-                    }
-                })
+                .min_by_key(|&iv| iv.abs_diff(want_interval))
                 .unwrap_or(self.default_frame_interval);
             return best;
         }
@@ -138,11 +132,7 @@ impl StreamFormat {
             .min_by_key(|f| {
                 let iv = f.nearest_interval_for_fps(fps);
                 let want_iv = if fps == 0 { u32::MAX } else { 10_000_000 / fps };
-                if iv >= want_iv {
-                    iv - want_iv
-                } else {
-                    want_iv - iv
-                }
+                iv.abs_diff(want_iv)
             })
             .unwrap();
 

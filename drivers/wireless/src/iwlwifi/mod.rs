@@ -110,7 +110,16 @@ struct IwlDevice {
     scan_waker: IrqSafeSpinLock<Option<Waker>>,
 }
 
+// SAFETY: every interior-mutable field (`rx_q`, `tx_q0`, `bss_list`,
+// `scan_waker`, the atomics) is guarded by an `IrqSafeSpinLock` or is
+// an `Atomic*`, so concurrent access from multiple threads is
+// serialised. The DMA buffers and `MmioRegion` are owned handles to
+// device memory the driver holds exclusively; raw pointers into them
+// are only dereferenced under those locks. Hence sharing/sending an
+// `IwlDevice` across threads is sound.
 unsafe impl Send for IwlDevice {}
+// SAFETY: see the `Send` impl above — all shared mutable state is
+// behind `IrqSafeSpinLock`/atomics, so `&IwlDevice` is safe to share.
 unsafe impl Sync for IwlDevice {}
 
 impl IwlDevice {
@@ -135,6 +144,12 @@ impl IwlDevice {
         let total = pkt.mac_hdr_len + pkt.payload.len();
         let buf = narf_io::alloc_coherent(total, DomainId::DRIVER_0)
             .map_err(|_| WirelessError::HardwareError)?;
+        // SAFETY: `buf` is a freshly-allocated coherent DMA buffer of
+        // exactly `total = mac_hdr_len + payload.len()` bytes, so both
+        // copies land inside it (`mac_hdr` at offset 0, `payload` at
+        // `mac_hdr_len`). The source slices are owned by `pkt` and
+        // don't overlap `buf`. Both lengths come from `pkt`'s own
+        // fields, so the writes stay in bounds.
         unsafe {
             core::ptr::copy_nonoverlapping(pkt.mac_hdr.as_ptr(), buf.as_mut_ptr(), pkt.mac_hdr_len);
             core::ptr::copy_nonoverlapping(
@@ -151,7 +166,15 @@ impl IwlDevice {
 
         let cmd = tx::IwlTxCmd::for_management(frame_len, 0xFF);
         let cmd_dma = &self.tx_cmd_bufs[0];
+        // SAFETY: `cmd_dma` is a coherent DMA buffer sized
+        // `TX_RING_SIZE * 32` bytes; `slot` is a ring index `<
+        // TX_RING_SIZE`, so `slot * 32` is an in-bounds offset and the
+        // 32-byte command slot fits an `IwlTxCmd`. The result is a
+        // valid, suitably-aligned pointer into that buffer.
         let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
+        // SAFETY: `cmd_ptr` points at the `slot`'s 32-byte command slot
+        // computed above, which is large enough for one `IwlTxCmd`; the
+        // volatile write publishes the command for the device to DMA.
         unsafe {
             core::ptr::write_volatile(cmd_ptr, cmd);
         }
@@ -173,6 +196,8 @@ impl IwlDevice {
         Ok(())
     }
 
+    // wide constructor mirroring the device's allocated DMA resources
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mmio: MmioRegion,
         chip: ChipConfig,
@@ -291,6 +316,10 @@ impl WirelessNetIface for IwlDevice {
         let payload_dma = if let Ok(pd) =
             narf_io::alloc_coherent(cmd_body.len(), DomainId::DRIVER_0)
         {
+            // SAFETY: `pd` was just allocated by `alloc_coherent` with
+            // length `cmd_body.len()`, so copying exactly that many
+            // bytes from the owned `cmd_body` slice into it stays in
+            // bounds; source and destination don't overlap.
             unsafe {
                 core::ptr::copy_nonoverlapping(cmd_body.as_ptr(), pd.as_mut_ptr(), cmd_body.len());
             }
@@ -310,7 +339,15 @@ impl WirelessNetIface for IwlDevice {
                 // 2. Write header to DMA.
                 let cmd_dma = &self.tx_cmd_bufs[0];
                 let hdr_ptr =
+                    // SAFETY: `cmd_dma` is the coherent command buffer sized
+                    // `TX_RING_SIZE * 32`; `slot < TX_RING_SIZE`, so `slot *
+                    // 32` is in bounds and the 32-byte slot fits an
+                    // `IwlCmdHeader`. The result is a valid aligned pointer
+                    // into that buffer.
                     unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlCmdHeader };
+                // SAFETY: `hdr_ptr` is the `slot`'s 32-byte command slot
+                // computed above, big enough for one `IwlCmdHeader`; the
+                // volatile write publishes the header to the device.
                 unsafe {
                     core::ptr::write_volatile(hdr_ptr, hdr);
                 }
@@ -386,7 +423,14 @@ impl WirelessNetIface for IwlDevice {
 
             let cmd = tx::IwlTxCmd::for_management(frame.len() as u16, 0xFF);
             let cmd_dma = &self.tx_cmd_bufs[0];
+            // SAFETY: `cmd_dma` is the coherent command buffer sized
+            // `TX_RING_SIZE * 32`; `slot < TX_RING_SIZE`, so `slot * 32`
+            // is in bounds and the 32-byte slot fits an `IwlTxCmd`,
+            // yielding a valid aligned pointer into that buffer.
             let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
+            // SAFETY: `cmd_ptr` is the `slot`'s 32-byte command slot
+            // computed above, big enough for one `IwlTxCmd`; the
+            // volatile write publishes the command to the device.
             unsafe {
                 core::ptr::write_volatile(cmd_ptr, cmd);
             }
@@ -550,7 +594,14 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
 
         // 2. Write IwlTxCmd to DMA-coherent buffer.
         let cmd_dma = &device.tx_cmd_bufs[0];
+        // SAFETY: `cmd_dma` is the coherent command buffer sized
+        // `TX_RING_SIZE * 32`; `slot = write_ptr < TX_RING_SIZE`, so
+        // `slot * 32` is in bounds and the 32-byte slot fits an
+        // `IwlTxCmd`, giving a valid aligned pointer into that buffer.
         let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
+        // SAFETY: `cmd_ptr` is the `slot`'s 32-byte command slot
+        // computed above, big enough for one `IwlTxCmd`; the volatile
+        // write publishes the command to the device.
         unsafe {
             core::ptr::write_volatile(cmd_ptr, cmd);
         }
@@ -579,9 +630,17 @@ struct IwlMmioImpl(narf_bus::MmioRegion);
 
 impl transport::IwlMmio for IwlMmioImpl {
     fn read(&mut self, offset: u32) -> u32 {
+        // SAFETY: `self.0` is the BAR0 `MmioRegion` mapped by `map_bar`
+        // at probe; `offset` is a 32-bit register offset within BAR0
+        // (callers pass CSR/FH register constants), so the read is
+        // naturally aligned and in range, and the driver owns the
+        // device exclusively.
         unsafe { self.0.read32(offset as u64) }
     }
     fn write(&mut self, offset: u32, value: u32) {
+        // SAFETY: `self.0` is the BAR0 `MmioRegion` from `map_bar`;
+        // `offset` is an in-range, naturally-aligned register offset
+        // within BAR0 and the driver owns the device exclusively.
         unsafe { self.0.write32(offset as u64, value) }
     }
 }
@@ -1284,6 +1343,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // ── Hardware bring-up ──
 
             // 1. Map BAR0.
+            // SAFETY: `device` is the PCIe function the bus handed this
+            // driver to probe, so it's a real PCIe device and this
+            // driver holds exclusive access to its cfg window for the
+            // duration of probe. BAR index 0 is iwlwifi's MMIO BAR.
             let mmio_region = unsafe { map_bar(&device, 0) }.map_err(|_| {
                 let _ = writeln!(narf_console::Writer, "  iwlwifi: BAR0 map failed");
                 narf_bus::ProbeError::Other("BAR0 map failed")
@@ -1349,9 +1412,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
             // Fill RX descriptors.
             let rx_descs = rx_ring_mem.as_mut_ptr() as *mut rx::RxDescriptor;
-            for i in 0..rx::RX_RING_SIZE {
+            for (i, buf) in rx_buffers.iter().enumerate() {
+                // SAFETY: `rx_ring_mem` is a coherent buffer of exactly
+                // `RX_RING_SIZE` `RxDescriptor`s, and `i` ranges over
+                // `0..rx_buffers.len()` which equals `RX_RING_SIZE`, so
+                // `rx_descs.add(i)` points at descriptor `i` in bounds
+                // and is properly aligned for `RxDescriptor`.
                 unsafe {
-                    (*rx_descs.add(i)).host_phys = rx_buffers[i].phys_addr().as_u64();
+                    (*rx_descs.add(i)).host_phys = buf.phys_addr().as_u64();
                 }
             }
 
@@ -1378,6 +1446,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             let mut irq_vector = None;
             if let Ok(v) = narf_interrupts::vector::alloc() {
                 if let Ok(mut msix) = narf_bus::msix::enable_msix(&cap, &device) {
+                    // SAFETY: `msix` is the MSI-X capability just enabled
+                    // for `device`, which this driver owns exclusively
+                    // during probe, so we're the sole writer of its
+                    // table. `v`/`v_tx`/`v_err` are CPU vectors freshly
+                    // allocated from `narf_interrupts::vector::alloc`,
+                    // and the table indices (RX_ALIVE/TX/ERR) are within
+                    // iwlwifi's MSI-X table size.
                     unsafe {
                         let _ = msix.program_vector(iwl_msix::VECTOR_RX_ALIVE as u16, 0, v);
                         // Try to allocate two more CPU vectors for TX
@@ -1396,6 +1471,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     iwl_msix::program_default_causes(&mut mmio);
                     irq_vector = Some(v);
                 } else if let Ok(mut msi) = narf_bus::msi::enable_msi(&cap, &device, 1) {
+                    // SAFETY: `msi` is the MSI capability just enabled
+                    // for `device`, whose cfg window this driver owns
+                    // exclusively during probe; `v` is a freshly
+                    // allocated CPU vector. So programming the single
+                    // MSI message and enabling it has no concurrent
+                    // writer.
                     unsafe {
                         let _ = narf_bus::msi::program_msi(&mut msi, 0, v);
                         let _ = narf_bus::msi::enable(&msi);

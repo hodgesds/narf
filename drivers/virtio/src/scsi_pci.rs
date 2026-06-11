@@ -110,6 +110,7 @@ impl VirtioScsiPci {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
             common.read32(CC_DEVICE_FEATURE)
         };
+        // SAFETY: identity-mapped MMIO.
         let feats_hi = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 1);
             common.read32(CC_DEVICE_FEATURE)
@@ -144,7 +145,9 @@ impl VirtioScsiPci {
 
         // SAFETY: identity-mapped MMIO.
         let (ctrl_buf, ctrlq, ctrl_notify_off) = unsafe { setup_queue(&common, CTRLQ_IDX) }?;
+        // SAFETY: identity-mapped MMIO.
         let (event_buf, eventq, _) = unsafe { setup_queue(&common, EVENTQ_IDX) }?;
+        // SAFETY: identity-mapped MMIO.
         let (cmd_buf, cmdq, cmd_notify_off) = unsafe { setup_queue(&common, CMDQ0_IDX) }?;
 
         // SAFETY: same.
@@ -322,8 +325,8 @@ impl VirtioScsiPci {
             resp.sense_len = core::ptr::read_volatile(p.add(0) as *const u32);
             resp.residual = core::ptr::read_volatile(p.add(4) as *const u32);
             resp.status_qualifier = core::ptr::read_volatile(p.add(8) as *const u16);
-            resp.status = core::ptr::read_volatile(p.add(10) as *const u8);
-            resp.response = core::ptr::read_volatile(p.add(11) as *const u8);
+            resp.status = core::ptr::read_volatile(p.add(10));
+            resp.response = core::ptr::read_volatile(p.add(11));
             for i in 0..SENSE_SIZE {
                 resp.sense[i] = core::ptr::read_volatile(p.add(12 + i));
             }
@@ -334,8 +337,8 @@ impl VirtioScsiPci {
         let mut data_in = alloc::vec![0u8; data_in_len as usize];
         // SAFETY: same.
         unsafe {
-            for i in 0..data_in_len as usize {
-                data_in[i] = core::ptr::read_volatile((data_phys + i as u64) as *const u8);
+            for (i, slot) in data_in.iter_mut().enumerate().take(data_in_len as usize) {
+                *slot = core::ptr::read_volatile((data_phys + i as u64) as *const u8);
             }
         }
         let mut g = self.cmdq.lock();

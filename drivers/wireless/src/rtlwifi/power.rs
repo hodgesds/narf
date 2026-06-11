@@ -92,6 +92,9 @@ pub struct WlanPwrCfg {
 }
 
 impl WlanPwrCfg {
+    // Eight arguments mirror the eight packed fields of the Linux
+    // `wlan_pwr_cfg` table entry; splitting them would obscure the 1:1 mapping.
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         offset: u16,
         cut: u8,

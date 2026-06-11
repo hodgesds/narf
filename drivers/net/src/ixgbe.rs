@@ -595,9 +595,11 @@ impl Ixgbe {
         }
         let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
         let buf_phys = desc.addr;
-        for i in 0..len {
-            // SAFETY: identity-mapped DMA buffer.
-            out[i] = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
+        for (i, b) in out[..len].iter_mut().enumerate() {
+            // SAFETY: identity-mapped DMA buffer; `buf_phys` is the
+            // descriptor-published frame address and `i < len <= RX_BUF_LEN`,
+            // so the byte read stays within the device-owned buffer.
+            *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         let new_desc = RxDesc {
             addr: buf_phys,
@@ -848,16 +850,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    // SAFETY: caller-authority over the device.
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+    // SAFETY: `bring_up` requires exclusive ownership of the device's
+    // BAR0 for init; we hold the bus `Cap<BusDeviceCap, Write>` and the
+    // `CONTROLLER` guard above guarantees no other probe is racing this
+    // device, so BAR0 is owned exclusively here.
     let dev = match unsafe { Ixgbe::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
     {
+        // SAFETY: `dev` was just created by `bring_up` and has not been
+        // published yet (it is stored into `CONTROLLER` only below), so
+        // this is the only `Arc` reference; no other thread can observe
+        // the `Ixgbe`, making this exclusive `&mut` to its interior sound.
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Ixgbe) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

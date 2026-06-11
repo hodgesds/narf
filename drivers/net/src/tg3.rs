@@ -420,7 +420,16 @@ pub struct Tg3Nic {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: every shared/mutable field (the `tx_head`/`rx_head` cursors and the
+// `rx_ipc_ring`/`tx_ipc_ring` IPC endpoints) is guarded by an
+// `IrqSafeSpinLock`, so concurrent access from another CPU is serialised. The
+// remaining fields are owned: `mmio` addresses a device-register window and
+// the `DmaBuffer`s address DMA-coherent frames — both reachable identically
+// from any CPU, with no thread-affine raw state. Sending the `Tg3Nic` to or
+// sharing it across threads therefore introduces no data race.
 unsafe impl Send for Tg3Nic {}
+// SAFETY: see the `Send` impl above — all interior mutability is behind
+// `IrqSafeSpinLock`, so `&Tg3Nic` can be shared across CPUs soundly.
 unsafe impl Sync for Tg3Nic {}
 
 impl core::fmt::Debug for Tg3Nic {
@@ -513,8 +522,8 @@ impl Tg3Nic {
         // `__tg3_readphy`: auto-poll must be off for software-driven
         // MDIO; Stage 1 leaves the MI_MODE default (no auto-poll, no
         // INTLPBK) so the read path is the simple one.
-        // SAFETY: identity-mapped MMIO; caller owns the device.
         let bmsr =
+            // SAFETY: identity-mapped MMIO; caller owns the device.
             unsafe { Self::read_phy(&mmio, PHY_ADDR_INTERNAL, MII_REG_BMSR) }.unwrap_or(0xFFFF);
         let link_up = bmsr != 0xFFFF && (bmsr & MII_BMSR_LINK_UP) != 0;
 
@@ -568,8 +577,8 @@ impl Tg3Nic {
         // don't carry an EOR bit (BCM57xx wraps via the producer
         // index in the mailbox, not in the descriptor).
         let rx_ring_phys = rx_ring.phys_addr().raw();
-        for i in 0..RX_STD_RING_LEN {
-            let buf_phys = rx_pool[i].phys_addr().raw();
+        for (i, buf) in rx_pool.iter().enumerate() {
+            let buf_phys = buf.phys_addr().raw();
             let d = RxBufferDesc {
                 addr_hi: (buf_phys >> 32) as u32,
                 addr_lo: buf_phys as u32,
@@ -633,15 +642,15 @@ impl Tg3Nic {
         // Spawn pumps
         spawn_pumps(tg3.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(tg3).map_err(|_| NicError::NoMemory)?)
+        Arc::try_unwrap(tg3).map_err(|_| NicError::NoMemory)
     }
 
     /// Perform the BCM57xx chip reset sequence — `GRC_MISC_CFG.CORECLK_RESET`
     /// is self-clearing, so we set it then poll until it goes away.
     /// Programs MISC_HOST_CTRL with the standard host-side endian
     /// + indirect-access bits, and GRC_MODE with HOST_STACKUP +
-    /// HOST_SENDBDS so the chip drives its descriptor rings from
-    /// host memory.
+    ///   HOST_SENDBDS so the chip drives its descriptor rings from
+    ///   host memory.
     ///
     /// Adapted from Linux `tg3_chip_reset` (drivers/net/ethernet/
     /// broadcom/tg3.c). Stage 1 omits the ASIC-rev-specific quirks
@@ -669,8 +678,8 @@ impl Tg3Nic {
             | MISC_HOST_CTRL_PCISTATE_RW
             | MISC_HOST_CTRL_CLKREG_RW
             | MISC_HOST_CTRL_TAGGED_STATUS
-            | MISC_HOST_CTRL_BYTE_SWAP * 0
-            | MISC_HOST_CTRL_WORD_SWAP * 0;
+            | (MISC_HOST_CTRL_BYTE_SWAP * 0)
+            | (MISC_HOST_CTRL_WORD_SWAP * 0);
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_MISC_HOST_CTRL, misc_host);
@@ -887,8 +896,11 @@ impl Tg3Nic {
         let copy_len = if err { 0 } else { len.min(RX_BUF_LEN) };
         let buf_phys = self.rx_pool[slot].phys_addr().raw();
         let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(copy_len);
-        // SAFETY: identity-mapped DMA buffer; copy_len bounded.
         for i in 0..copy_len {
+            // SAFETY: `buf_phys` is the identity-mapped DMA frame backing
+            // `rx_pool[slot]`; `i < copy_len <= RX_BUF_LEN`, so `buf_phys + i`
+            // stays within that frame. A byte read is naturally aligned, and
+            // `read_volatile` forces the chip-written DMA bytes to be observed.
             out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
         }
 
@@ -986,16 +998,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    // SAFETY: caller-authority over the device.
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+    // SAFETY: this probe path owns `device`/`cap` exclusively — no other
+    // driver has bound this function yet (guarded by the `CONTROLLER` check
+    // above) — so we hold the device's BAR + cfg windows for the duration of
+    // `bring_up`, satisfying its safety contract.
     let dev = match unsafe { Tg3Nic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
     {
+        // SAFETY: `dev` was just created and has not been cloned or published
+        // yet, so this `Arc` is the unique owner and `Arc::as_ptr` yields a
+        // pointer to a live, exclusively-owned `Tg3Nic`. The `&mut` borrow is
+        // confined to this block and only touches the lock-guarded IPC-ring
+        // fields, so no aliasing `&`/`&mut` exists concurrently.
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Tg3Nic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

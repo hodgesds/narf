@@ -75,7 +75,7 @@ pub const N_RF_A_ROWS: usize = 155;
 /// Stage 0 / 1 register init table for RTL8723BU.
 pub const INIT_TABLE: &[(u16, u8)] = &[
     (REG_EFUSE_ACCESS, EFUSE_ACCESS_ENABLE),
-    (REG_APS_FSMCO as u16 + 1, 0x08),
+    (REG_APS_FSMCO + 1, 0x08),
     (REG_CR, (CR_OPEN_8188E & 0xFF) as u8),
     (REG_CR + 1, ((CR_OPEN_8188E >> 8) & 0xFF) as u8),
 ];

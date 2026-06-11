@@ -22,11 +22,11 @@
 //! ## References
 //!
 //! - Linux `brcmfmac/pcie.c::brcmf_pcie_alloc_dma_and_ring`
-//!     (~L1158..L1190) — allocator that produces a brcmf_pcie_ringbuf
-//!     per ring id.
+//!   (~L1158..L1190) — allocator that produces a brcmf_pcie_ringbuf
+//!   per ring id.
 //! - `brcmf_pcie_ring_mb_*` (~L1020..L1108) — the four IO callbacks
-//!     (write_wptr / write_rptr / update_wptr / update_rptr) +
-//!     `ring_mb_ring_bell` doorbell.
+//!   (write_wptr / write_rptr / update_wptr / update_rptr) +
+//!   `ring_mb_ring_bell` doorbell.
 
 #![allow(dead_code)]
 
@@ -72,6 +72,11 @@ pub struct RingBuf {
 // DMA mapping that's valid for the lifetime of the underlying
 // PhysFrame held in the cap registry.
 unsafe impl Send for RingBuf {}
+// SAFETY: the SPSC discipline means at most one side mutates the index
+// state at a time, and the `host_base` raw pointer addresses a DMA slot
+// array kept alive for the RingBuf's lifetime by the cap registry; so
+// sharing `&RingBuf` across CPUs introduces no data race the producer/
+// consumer protocol doesn't already serialize.
 unsafe impl Sync for RingBuf {}
 
 impl RingBuf {

@@ -370,7 +370,15 @@ pub struct Mlx5Hca {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: the only non-`Send` members are the `MmioRegion`/`DmaBuffer` raw
+// device-memory handles; they address identity-mapped MMIO/DMA that is valid
+// from any CPU, so moving the `Mlx5Hca` across threads is sound.
 unsafe impl Send for Mlx5Hca {}
+// SAFETY: every interior-mutable field (`next_token`, `eqs`, `cqs`, `uars`,
+// `pds`, `qps`, `nic_state`, the IPC rings) is wrapped in `IrqSafeSpinLock`,
+// and the MMIO/DMA handles are only touched through `&self` methods that take
+// those locks, so concurrent `&Mlx5Hca` access from multiple CPUs is
+// serialized and race-free.
 unsafe impl Sync for Mlx5Hca {}
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -446,9 +454,10 @@ impl Mlx5Hca {
         // so the BE byte order is preserved exactly as the PRM lays
         // it out.
         let mut raw = [0u8; INIT_SEGMENT_LEN];
-        for i in 0..INIT_SEGMENT_LEN {
-            // SAFETY: identity-mapped MMIO; offset bounded.
-            raw[i] = unsafe { mmio.read8(i as u64) };
+        for (i, b) in raw.iter_mut().enumerate() {
+            // SAFETY: identity-mapped MMIO; offset `i` is bounded by
+            // `INIT_SEGMENT_LEN`, the documented init-segment window in BAR0.
+            *b = unsafe { mmio.read8(i as u64) };
         }
         let segment = decode_init_segment(&raw);
 
@@ -481,7 +490,7 @@ impl Mlx5Hca {
         // Spawn pumps
         spawn_pumps(hca.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(hca).map_err(|_| Mlx5Error::NoMemory)?)
+        Arc::try_unwrap(hca).map_err(|_| Mlx5Error::NoMemory)
     }
 
     /// Stage 12: refresh the cached MAC + MTU off the live HCA.
@@ -564,11 +573,11 @@ impl Mlx5Hca {
 
         // Read the completed CQE back out.
         let mut completed = [0u8; CQE_LEN];
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..CQE_LEN {
-                completed[i] = core::ptr::read_volatile((slot_phys + i as u64) as *const u8);
-            }
+        for (i, b) in completed.iter_mut().enumerate() {
+            // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
+            // allocated for this command; `i < CQE_LEN` keeps the byte read
+            // within the slot.
+            *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
         }
         // Sanity check + decode.
         debug_assert!(is_complete(&completed));
@@ -707,11 +716,10 @@ impl Mlx5Hca {
         // Decode CQE status; even on failure we want to surface
         // exactly what FW reported.
         let mut completed = [0u8; CQE_LEN];
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..CQE_LEN {
-                completed[i] = core::ptr::read_volatile((slot_phys + i as u64) as *const u8);
-            }
+        for (i, b) in completed.iter_mut().enumerate() {
+            // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
+            // for this command; `i < CQE_LEN` bounds the read to the slot.
+            *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
         }
         debug_assert!(is_complete(&completed));
         let _resp = decode_response(&completed).map_err(Mlx5Error::CmdFailed)?;
@@ -721,11 +729,11 @@ impl Mlx5Hca {
         for dma in out_blocks.iter() {
             let phys = dma.phys_addr().raw();
             let mut block = [0u8; MAILBOX_BLOCK_LEN];
-            // SAFETY: identity-mapped DMA.
-            unsafe {
-                for i in 0..MAILBOX_BLOCK_LEN {
-                    block[i] = core::ptr::read_volatile((phys + i as u64) as *const u8);
-                }
+            for (i, b) in block.iter_mut().enumerate() {
+                // SAFETY: `phys` is the identity-mapped DMA mailbox-block buffer
+                // from `out_blocks`; `i < MAILBOX_BLOCK_LEN` bounds the read to
+                // that block.
+                *b = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
             }
             blocks.push(block);
         }
@@ -798,11 +806,10 @@ impl Mlx5Hca {
         }
 
         let mut completed = [0u8; CQE_LEN];
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..CQE_LEN {
-                completed[i] = core::ptr::read_volatile((slot_phys + i as u64) as *const u8);
-            }
+        for (i, b) in completed.iter_mut().enumerate() {
+            // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
+            // for this command; `i < CQE_LEN` bounds the read to the slot.
+            *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
         }
         debug_assert!(is_complete(&completed));
         decode_response(&completed).map_err(Mlx5Error::CmdFailed)
@@ -845,11 +852,11 @@ impl Mlx5Hca {
         let phys = e.pages[0].phys_addr().raw();
         let off = ((e.consumer % cap) as usize) * eqe::EQE_LEN;
         let mut bytes = [0u8; eqe::EQE_LEN];
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..eqe::EQE_LEN {
-                bytes[i] = core::ptr::read_volatile((phys + off as u64 + i as u64) as *const u8);
-            }
+        for (i, b) in bytes.iter_mut().enumerate() {
+            // SAFETY: `phys` is the identity-mapped DMA EQ buffer; `off` is the
+            // in-range entry offset and `i < eqe::EQE_LEN`, so the read stays
+            // within the EQE.
+            *b = unsafe { core::ptr::read_volatile((phys + off as u64 + i as u64) as *const u8) };
         }
         if eqe::is_hw_owned(&bytes) {
             return Ok(None);
@@ -1093,11 +1100,12 @@ impl Mlx5Hca {
         let off = ring::cq_offset_of(c.consumer, cq_capacity);
         let cq_phys = c.pages[0].phys_addr().raw();
         let mut bytes = [0u8; cqe::CQE_LEN];
-        // SAFETY: identity-mapped DMA.
-        unsafe {
-            for i in 0..cqe::CQE_LEN {
-                bytes[i] = core::ptr::read_volatile((cq_phys + off as u64 + i as u64) as *const u8);
-            }
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b =
+                // SAFETY: `cq_phys` is the identity-mapped DMA CQ buffer; `off` is
+                // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
+                // stays within the CQE.
+                unsafe { core::ptr::read_volatile((cq_phys + off as u64 + i as u64) as *const u8) };
         }
         if cqe::is_hw_owned(&bytes) {
             return Ok(None);
@@ -1178,19 +1186,16 @@ impl Mlx5Hca {
             }
             match self.poll_eq(eq_number) {
                 Ok(Some(view)) => {
-                    // Dispatch by event type.
-                    match view.event_type {
-                        eqe::EventType::CompletionEvent => {
-                            // CQN decoded from EQE byte 0x38 (BE u32,
-                            // low 24 bits). Linux eq.c:125:
-                            //   `be32_to_cpu(eqe->data.comp.cqn) & 0xffffff`
-                            on_cq_completion(view.cqn);
-                        }
-                        // Port-state / cmd-completion / async: no-op
-                        // in this stage; a follow-up can register a
-                        // notifier chain per Linux's
-                        // `atomic_notifier_call_chain` at eq.c:217.
-                        _ => {}
+                    // Dispatch by event type. Only completion events are
+                    // handled in this stage; port-state / cmd-completion /
+                    // async are a no-op for now — a follow-up can register a
+                    // notifier chain per Linux's `atomic_notifier_call_chain`
+                    // at eq.c:217.
+                    if let eqe::EventType::CompletionEvent = view.event_type {
+                        // CQN decoded from EQE byte 0x38 (BE u32,
+                        // low 24 bits). Linux eq.c:125:
+                        //   `be32_to_cpu(eqe->data.comp.cqn) & 0xffffff`
+                        on_cq_completion(view.cqn);
                     }
                     consumed = consumed.wrapping_add(1);
                 }
@@ -1261,6 +1266,9 @@ impl Mlx5Hca {
             .ok_or(Mlx5Error::Other("msix alloc_vector"))?;
         // Program table slot 0 → BSP APIC (id=0), irq_vec.
         // Mirrors igc.rs:557: `msix.program_vector(0, 0, v)`.
+        // SAFETY: `table` is the MSI-X table mapped from this device's MSI-X
+        // BAR by `enable_msix`; slot 0 was just reserved via `alloc_vector`,
+        // so programming/enabling it writes only registers this driver owns.
         unsafe {
             table
                 .program_vector(0, 0, irq_vec)

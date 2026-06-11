@@ -14,8 +14,6 @@
 //! kernel export declares a `required_cap`, the module must
 //! list that CapKind in its manifest.
 
-use alloc::vec::Vec;
-
 use crate::elf::{
     apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header, RelocError,
     SymbolTable, EM_AARCH64, EM_X86_64,

@@ -353,7 +353,7 @@ fn install_with_ist(vec: usize, handler: unsafe extern "C" fn(), ist: u8) {
 }
 
 fn install_full(vec: usize, handler: unsafe extern "C" fn(), ist: u8, gate: u8) {
-    let entry = IdtEntry::new(handler as u64, KCODE_SEL, ist, gate);
+    let entry = IdtEntry::new(handler as usize as u64, KCODE_SEL, ist, gate);
     // SAFETY: IDT is accessed only on the BSP during Stage-1 bring-up, before
     // any other CPU or interrupt handler can observe it. The write happens
     // before `lidt`, and the entry layout matches the hardware spec.

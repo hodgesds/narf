@@ -492,8 +492,8 @@ fn smoke_e2e_blk_live_write_read_roundtrip() -> TestResult {
         return TestResult::Skip("no virtio-blk-pci device");
     }
     let mut payload = [0u8; 512];
-    for i in 0..512usize {
-        payload[i] = (i as u8).wrapping_mul(0xB3).wrapping_add(0x5A);
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0xB3).wrapping_add(0x5A);
     }
     let wrote = blk_pci::with_controller(|c| c.write_sector(2, &payload))
         .map(|r| r.is_ok())
@@ -643,8 +643,8 @@ fn smoke_e2e_net_tx_descriptor_chain() -> TestResult {
     // Verify the frame has a correct Ethernet header structure.
     // Build a synthetic ARP frame (broadcast dst, known src, ethertype 0x0806).
     let mut frame = [0u8; 64];
-    for i in 0..6 {
-        frame[i] = 0xFF; // broadcast dst
+    for b in frame.iter_mut().take(6) {
+        *b = 0xFF; // broadcast dst
     }
     frame[6] = 0x52;
     frame[7] = 0x54;

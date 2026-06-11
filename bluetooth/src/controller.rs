@@ -103,8 +103,10 @@ impl Controller {
     }
 
     pub fn phase(&self) -> BringupPhase {
-        // Safety: only ever stored from the BringupPhase variants.
         let v = self.phase.load(Ordering::Acquire);
+        // SAFETY: `BringupPhase` is `#[repr(u8)]` and `self.phase` is only
+        // ever stored as one of its discriminants (0..=5), so `v` is a valid
+        // bit pattern for the enum.
         unsafe { core::mem::transmute(v) }
     }
 

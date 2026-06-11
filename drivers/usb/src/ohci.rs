@@ -387,8 +387,7 @@ pub mod hcca {
 }
 
 /// Walk a packed HCCA blob and extract the current `frame_number`
-/// + `done_head`. Useful for tests + a future ISR shim that needs
-/// to peek state without taking a lock around the live HCCA.
+/// + `done_head`. Useful for tests + a future ISR shim that needs to peek state without taking a lock around the live HCCA.
 pub fn read_hcca_status(blob: &[u8]) -> Option<(u16, u32)> {
     if blob.len() < HCCA_SIZE {
         return None;

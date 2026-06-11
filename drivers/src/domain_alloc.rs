@@ -225,6 +225,13 @@ pub unsafe fn release(domain: u8, va_base: u64, len: usize) -> Result<(), Domain
 }
 
 /// `release` on non-x86_64 targets: reports unsupported.
+///
+/// # Safety
+/// Mirrors the x86_64 `release` contract: `va_base` must be the base
+/// of a range previously handed out for `domain` and no longer
+/// referenced, since the real implementation tears down its page-table
+/// leaves and broadcasts a TLB shootdown. This stub performs no memory
+/// operations and only returns `UnsupportedArch`.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn release(_domain: u8, _va_base: u64, _len: usize) -> Result<(), DomainAllocError> {
     Err(DomainAllocError::UnsupportedArch)
@@ -245,6 +252,13 @@ pub fn free_chunks_in_domain(_domain: u8) -> usize {
     0
 }
 
+/// `claim_mmio_in_domain` on non-x86_64 targets: reports unsupported.
+///
+/// # Safety
+/// Mirrors the x86_64 `claim_mmio_in_domain` contract: `pa` must be a
+/// valid MMIO physical address belonging to the caller's device (the
+/// cap-system gates this) and `flags` are the page-table flags to map
+/// it with. This stub maps nothing and only returns `UnsupportedArch`.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn claim_mmio_in_domain(
     _domain: u8,

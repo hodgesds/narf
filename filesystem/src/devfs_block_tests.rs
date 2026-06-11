@@ -107,8 +107,11 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: raw_waker() returns a vtable whose functions are all no-ops;
+    // the waker never dereferences its data pointer.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: fut is a local owned future that is not moved after this point.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),
@@ -129,7 +132,7 @@ fn smoke_devfs_block_read_aligned_one_block() -> TestResult {
     let mut buf = [0u8; 512];
     let r = poll_once(bf.read(0, &mut buf));
     match r {
-        Some(Ok(n)) if n == 512 => {}
+        Some(Ok(512)) => {}
         _ => return TestResult::Fail("aligned read should return 512"),
     }
     if buf.iter().any(|&b| b != 0xAB) {
@@ -165,7 +168,7 @@ fn smoke_devfs_block_read_unaligned_start() -> TestResult {
     let mut buf = [0u8; 100];
     let r = poll_once(bf.read(500, &mut buf));
     match r {
-        Some(Ok(n)) if n == 100 => {}
+        Some(Ok(100)) => {}
         _ => return TestResult::Fail("unaligned-start read should return 100"),
     }
     // Bytes 0..11 come from LBA 0 (0x11), bytes 12..99 from LBA 1 (0x22).
@@ -208,7 +211,7 @@ fn smoke_devfs_block_read_spans_three_blocks() -> TestResult {
     let mut buf = [0u8; 1500];
     let r = poll_once(bf.read(0, &mut buf));
     match r {
-        Some(Ok(n)) if n == 1500 => {}
+        Some(Ok(1500)) => {}
         _ => return TestResult::Fail("3-block read should return 1500"),
     }
     if buf[..512].iter().any(|&b| b != 0xAA) {
@@ -239,7 +242,7 @@ fn smoke_devfs_block_write_aligned() -> TestResult {
     let payload = [0xDE_u8; 512];
     let w = poll_once(bf.write(0, &payload));
     match w {
-        Some(Ok(n)) if n == 512 => {}
+        Some(Ok(512)) => {}
         _ => return TestResult::Fail("aligned write should return 512"),
     }
 
@@ -270,7 +273,7 @@ fn smoke_devfs_block_write_unaligned_rmw() -> TestResult {
     let payload = [0x00_u8; 200];
     let w = poll_once(bf.write(100, &payload));
     match w {
-        Some(Ok(n)) if n == 200 => {}
+        Some(Ok(200)) => {}
         _ => return TestResult::Fail("unaligned write should return 200"),
     }
 

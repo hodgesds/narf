@@ -125,7 +125,7 @@ fn skip_ws(s: &[u8]) -> &[u8] {
 fn trim_arg(s: &[u8]) -> &[u8] {
     let s = skip_ws(s);
     let mut end = s.len();
-    while end > 0 && (s[end - 1] == b' ' || s[end - 1] < 0x20) {
+    while end > 0 && s[end - 1] <= b' ' {
         end -= 1;
     }
     &s[..end]
@@ -852,6 +852,9 @@ fn smoke_shell_fork_wait4_exit_status() -> TestResult {
     crate::handlers::sid_init();
     crate::handlers::wait_init();
 
+    // SAFETY: `new_for_user` requires paging/MMU enabled; the kernel-test
+    // runner executes post-boot with the active page-table root installed,
+    // so a fresh user root can be cloned from the kernel half.
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1215,7 +1218,7 @@ kernel_test_in!("userspace/shell", smoke_shell_pipe_sequential_writes);
 // `lex4_words` which pairs the token stream with the original word
 // bytes scanned in the same pass.
 
-fn lex4_with_words<'a>(input: &'a [u8]) -> alloc::vec::Vec<(Tok4, &'a [u8])> {
+fn lex4_with_words(input: &[u8]) -> alloc::vec::Vec<(Tok4, &[u8])> {
     let mut out = alloc::vec::Vec::new();
     let mut i = 0usize;
     while i < input.len() {

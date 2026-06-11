@@ -141,7 +141,7 @@ pub fn register_initcalls() {
 ///   - yt=0   → task never polled (executor isn't scheduling it)
 ///   - yt=1   → first poll happened, never re-polled (waker bug)
 ///   - yt>>1  → polled many times but deadline never fires
-///              (Instant::now frozen, or stuck inner spin loop)
+///     (Instant::now frozen, or stuck inner spin loop)
 pub static YIELD_TIMEOUT_POLLS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
@@ -180,6 +180,9 @@ impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
         // SAFETY: structural pin projection — `fut` is never moved
         // out, only re-pinned for the inner poll call.
         let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `this` came from a `Pin<&mut Self>`, so `this.fut`
+        // is itself structurally pinned. We re-pin the `&mut` to it
+        // and never move `fut` out, upholding the pin contract.
         let fut = unsafe { core::pin::Pin::new_unchecked(&mut this.fut) };
         match fut.poll(cx) {
             core::task::Poll::Ready(v) => return core::task::Poll::Ready(Ok(v)),

@@ -96,9 +96,9 @@ impl SerialRing {
         let cap = self.buf.len();
         let free = cap - self.count;
         let n = data.len().min(free);
-        for i in 0..n {
+        for byte in data.iter().take(n) {
             let tail = (self.head + self.count) % cap;
-            self.buf[tail] = data[i];
+            self.buf[tail] = *byte;
             self.count += 1;
         }
         n
@@ -107,8 +107,8 @@ impl SerialRing {
     /// Pop up to `buf.len()` bytes; returns number returned.
     pub fn pop(&mut self, buf: &mut [u8]) -> usize {
         let n = buf.len().min(self.count);
-        for i in 0..n {
-            buf[i] = self.buf[self.head];
+        for slot in buf.iter_mut().take(n) {
+            *slot = self.buf[self.head];
             self.head = (self.head + 1) % self.buf.len();
             self.count -= 1;
         }
@@ -118,6 +118,12 @@ impl SerialRing {
     /// `true` when at least one byte is waiting.
     pub fn has_data(&self) -> bool {
         self.count > 0
+    }
+}
+
+impl Default for SerialRing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

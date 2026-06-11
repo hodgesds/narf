@@ -6,7 +6,7 @@
 //! References (GPL-2.0-or-later):
 //! - `drivers/leds/leds-pwm.c` — `led_pwm_set`, `led_pwm_brightness_set`.
 //!   Duty calculation at line 52:
-//!     `duty = led->pwmd->period / led->cdev.max_brightness * brightness`
+//!   `duty = led->pwmd->period / led->cdev.max_brightness * brightness`
 
 extern crate alloc;
 

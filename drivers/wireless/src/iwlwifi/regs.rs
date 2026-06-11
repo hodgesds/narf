@@ -190,14 +190,14 @@ pub const HBUS_TARG_PRPH_RDAT: u32 = 0x0044_C00C;
 
 /// PRPH register: "release CPU from reset". Cleared during
 /// firmware load, set when the section loader is done.
-pub const PRPH_RELEASE_CPU_RESET: u32 = 0x0030_0C;
+pub const PRPH_RELEASE_CPU_RESET: u32 = 0x0000_300C;
 pub const PRPH_RELEASE_CPU_RESET_BIT: u32 = 1 << 31;
 /// PRPH register: ucode load status. Driver writes
 /// `FH_UCODE_LOAD_STATUS_GEN2` here on gen2 to signal "host done."
-pub const PRPH_UREG_UCODE_LOAD_STATUS: u32 = 0x0034_0;
+pub const PRPH_UREG_UCODE_LOAD_STATUS: u32 = 0x0000_0340;
 /// PRPH register: OTP cfg1 — fused RF-chip identity. Read by
 /// gen3 probe to decide which `rf_*` to match against.
-pub const PRPH_WFPM_OTP_CFG1_ADDR: u32 = 0x0094_0;
+pub const PRPH_WFPM_OTP_CFG1_ADDR: u32 = 0x0000_0940;
 
 /// `LMPM_CHICK` register — toggled when the DMA destination
 /// falls into extended SRAM (0x40000–0x57FFF). The chick bit

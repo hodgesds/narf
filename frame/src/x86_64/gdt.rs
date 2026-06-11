@@ -81,9 +81,10 @@ static mut IST_STACKS: [IstStack; 4] = [
 /// would push onto a user-controlled RSP — classic CPL-confusion.
 ///
 /// 16 KiB matches the IST slot size; big enough for the trap frame
-/// + one level of Rust call without overflow. Per-task kernel
-/// stacks (once we have multi-process support) will relocate via
-/// `set_kernel_rsp0` when the scheduler switches tasks.
+/// plus one level of Rust call without overflow.
+///
+/// Per-task kernel stacks (once we have multi-process support) will
+/// relocate via `set_kernel_rsp0` when the scheduler switches tasks.
 const KERNEL_RSP0_BYTES: usize = 16 * 1024;
 
 #[repr(C, align(16))]

@@ -239,10 +239,7 @@ fn fb_vt_connect(pid: u64, scanout_id: u64) -> u64 {
     if scanout_id > u32::MAX as u64 {
         return 0;
     }
-    match connect(pid, scanout_id as u32) {
-        Ok(h) => h,
-        Err(_) => 0,
-    }
+    connect(pid, scanout_id as u32).unwrap_or_default()
 }
 
 fn fb_vt_info(handle: u64, out: &mut [u32; 6]) -> bool {

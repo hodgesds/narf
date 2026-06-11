@@ -124,6 +124,7 @@ pub struct WacomFeatures {
 }
 
 impl WacomFeatures {
+    #[allow(clippy::too_many_arguments)] // hardware feature table has 8 fixed fields
     const fn new(
         name: &'static str,
         x_max: u32,

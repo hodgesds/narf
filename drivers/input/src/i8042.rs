@@ -87,6 +87,12 @@ impl State {
     }
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Singleton driver state.
 pub static STATE: State = State::new();
 
@@ -196,6 +202,9 @@ pub unsafe fn init() -> Result<(), InitError> {
         outb(PS2_CMD, CMD_DISABLE_KBD);
     }
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + the fn's `# Safety`
+    // contract gives us exclusive ownership of the 8042 ports, and
+    // the input buffer was just drained.
     unsafe {
         outb(PS2_CMD, CMD_DISABLE_AUX);
     }
@@ -205,22 +214,31 @@ pub unsafe fn init() -> Result<(), InitError> {
 
     // 3. Read the config byte, clear translate + IRQs while we configure.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
     let mut conf = wait_output_byte_ms(CONFIG_WAIT_MS).ok_or(InitError::Timeout)?;
     conf &= !(CONF_KBD_TRANSLATE | CONF_KBD_IRQ | CONF_AUX_IRQ);
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to data port `0x60` delivering the config byte
+    // for the WRITE_CONFIG command issued above; CPL0 + exclusive
+    // ownership; input buffer cleared by the wait.
     unsafe {
         outb(PS2_DATA, conf);
     }
 
     // 4. Self-test.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
     unsafe {
         outb(PS2_CMD, CMD_SELF_TEST);
     }
@@ -231,11 +249,15 @@ pub unsafe fn init() -> Result<(), InitError> {
 
     // 5. Re-enable the keyboard channel + arm IRQ 1.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
     unsafe {
         outb(PS2_CMD, CMD_ENABLE_KBD);
     }
     // Re-read config (self-test may have reset it on some chips), set IRQ.
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
@@ -253,10 +275,15 @@ pub unsafe fn init() -> Result<(), InitError> {
     // set-2 'A' = 0x1C reaching `from_evdev(28)` = Enter.
     conf2 |= CONF_KBD_TRANSLATE;
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
+    // contract; input buffer cleared by the wait above.
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
+    // SAFETY: `out` to data port `0x60` delivering `conf2` for the
+    // WRITE_CONFIG command above; CPL0 + exclusive ownership; input
+    // buffer cleared by the wait.
     unsafe {
         outb(PS2_DATA, conf2);
     }
@@ -300,6 +327,9 @@ pub unsafe fn init() -> Result<(), InitError> {
     if scanning_ok {
         // Set scancode-set 1: 0xF0 then 0x01, each ACK'd.
         let _ = wait_input_clear_ms(KBD_REPLY_MS);
+        // SAFETY: `out` to data port `0x60` (keyboard "set scancode
+        // set" command 0xF0); CPL0 + exclusive ownership; input
+        // buffer cleared by the wait above.
         unsafe {
             outb(PS2_DATA, 0xF0);
         }
@@ -308,6 +338,9 @@ pub unsafe fn init() -> Result<(), InitError> {
         }
         if scanning_ok {
             let _ = wait_input_clear_ms(KBD_REPLY_MS);
+            // SAFETY: `out` to data port `0x60` (the 0x01 argument
+            // selecting scancode set 1); CPL0 + exclusive ownership;
+            // input buffer cleared by the wait above.
             unsafe {
                 outb(PS2_DATA, 0x01);
             }
@@ -322,6 +355,9 @@ pub unsafe fn init() -> Result<(), InitError> {
         // that flips the keyboard from "reset complete, idle"
         // to "actively sending scancodes."
         let _ = wait_input_clear_ms(KBD_REPLY_MS);
+        // SAFETY: `out` to data port `0x60` (keyboard ENABLE_SCANNING
+        // command 0xF4); CPL0 + exclusive ownership; input buffer
+        // cleared by the wait above.
         unsafe {
             outb(PS2_DATA, 0xF4);
         }
@@ -400,10 +436,12 @@ pub unsafe fn on_irq1() {
     let _ = push_key(code, pressed);
 
     // Evdev routing — dispatch to the per-device node if registered.
-    // SAFETY: pointer written once in init() before IRQs armed; Arc
-    // kept alive by KBD_EVDEV_NODE + ROUTER for device lifetime.
     let raw = KBD_NODE_PTR.load(Ordering::Acquire);
     if !raw.is_null() {
+        // SAFETY: `raw` was written once in init() (before IRQs were
+        // armed) as `Arc::as_ptr` of the node, just null-checked, and
+        // the Arc is kept alive by KBD_EVDEV_NODE + ROUTER for the
+        // device's lifetime — so the borrow is valid and aligned.
         let node_ref: &DeviceNode = unsafe { &*raw };
         dispatch_key_to_node(node_ref, code as u16, pressed);
     }

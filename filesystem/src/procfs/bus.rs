@@ -74,6 +74,8 @@ fn usb_snapshot() -> Vec<UsbDeviceSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored via `f as usize` in install_usb_proc_hook, so it
+    // holds a valid function pointer of type UsbSnapshotFn.
     let f: UsbSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -198,8 +200,8 @@ impl ProcFile for PciCfgSpaceFile {
         }
         let mut out = Vec::with_capacity(CFG_SIZE);
         for off in 0..CFG_SIZE {
-            // SAFETY: cfg_phys is the ECAM window; identity-mapped.
             let val =
+                // SAFETY: cfg_phys is the ECAM window; identity-mapped.
                 unsafe { core::ptr::read_volatile((self.cfg_phys as usize + off) as *const u8) };
             out.push(val);
         }

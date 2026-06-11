@@ -102,7 +102,7 @@ impl FanTable {
         let format_revision = raw[2];
         let content_revision = raw[3];
         let rev_id = raw[4];
-        if rev_id < 9 || rev_id > 10 {
+        if !(9..=10).contains(&rev_id) {
             return Err(PpSubtableError::UnsupportedRevision(rev_id));
         }
         let read_u16 = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);
@@ -187,7 +187,7 @@ impl PowerTuneTable {
         let format_revision = raw[2];
         let content_revision = raw[3];
         let rev_id = raw[4];
-        if rev_id < 1 || rev_id > 5 {
+        if !(1..=5).contains(&rev_id) {
             return Err(PpSubtableError::UnsupportedRevision(rev_id));
         }
         let read_u16 = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);

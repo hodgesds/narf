@@ -282,7 +282,7 @@ impl F30Query {
 /// that map to the consumer driver since it's per-device.
 pub fn decode_f30_buttons(data_regs: &[u8], gpio_count: u8) -> Result<u32, Rmi4Error> {
     let count = gpio_count.min(32) as usize;
-    let bytes_needed = (count + 7) / 8;
+    let bytes_needed = count.div_ceil(8);
     if data_regs.len() < bytes_needed {
         return Err(Rmi4Error::Short);
     }

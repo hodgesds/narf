@@ -78,16 +78,23 @@ pub fn decode_caps(typer: u64) -> GitsCaps {
 /// `reg_base` is the engine's MMIO mapping; the command queue
 /// has been programmed via `write_cbaser`.
 pub unsafe fn enable(reg_base: usize) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller-asserted MMIO base; read-modify-write of GITS_CTLR.
     let v = unsafe { r32(reg_base, GITS_CTLR) } | CTLR_ENABLE;
+    // SAFETY: same caller-asserted MMIO base; writes back GITS_CTLR.Enable.
     unsafe {
         w32(reg_base, GITS_CTLR, v);
     }
 }
 
+/// Clear `GITS_CTLR.Enable`.
+///
+/// # Safety
+/// `reg_base` is the engine's MMIO mapping; caller ensures the
+/// command queue is quiesced before disabling.
 pub unsafe fn disable(reg_base: usize) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller-asserted MMIO base; read-modify-write of GITS_CTLR.
     let v = unsafe { r32(reg_base, GITS_CTLR) } & !CTLR_ENABLE;
+    // SAFETY: same caller-asserted MMIO base.
     unsafe {
         w32(reg_base, GITS_CTLR, v);
     }

@@ -50,8 +50,9 @@ use crate::ExecImage;
 /// `MMAP_CURSOR` (starts at `0x0000_4080_0000_0000`) and from the
 /// interpreter bias (`0x0000_4000_0000_0000`) and the program load
 /// region (low half) by design — picking a fresh /49-bit/ slot keeps
-/// the kernel's "what's mapped where" mental model uncluttered. SMP
-/// + multi-thread bring-up will swap this for a per-task allocator
+/// the kernel's "what's mapped where" mental model uncluttered.
+///
+/// SMP + multi-thread bring-up will swap this for a per-task allocator
 /// (each thread needs its own non-aliasing TLS block); single-task
 /// today is fine with a fixed slot.
 pub const TLS_REGION_BASE: u64 = 0x0000_4090_0000_0000;

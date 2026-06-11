@@ -176,7 +176,14 @@ pub struct RxQueue {
     pub write_ptr: usize,
 }
 
+// SAFETY: `descriptors` points into a DMA-coherent host RAM region
+// owned by the driver for the device's lifetime; the pointer carries
+// no thread-local state, so the queue can be moved between threads.
 unsafe impl Send for RxQueue {}
+// SAFETY: the descriptor ring is shared with the device via its phys
+// address; host-side access is serialized by the driver's queue lock
+// and the pointer is fixed after allocation, so sharing `&RxQueue`
+// across threads is sound.
 unsafe impl Sync for RxQueue {}
 
 impl RxQueue {

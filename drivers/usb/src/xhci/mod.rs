@@ -5,19 +5,19 @@
 //! - Intel "eXtensible Host Controller Interface for Universal Serial
 //!   Bus (xHCI)" Revision 1.2, May 2019. Section references throughout
 //!   this file (e.g. `§5.4.5`) point at that spec.
-//!     <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
+//!   <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
 //! - "Universal Serial Bus 3.2 Specification" Revision 1.1, June 2022
 //!   (USB-IF). Standard device requests + descriptor layouts cited as
 //!   `USB 3.2 §9.x`.
-//!     <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
+//!   <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
 //! - "Universal Serial Bus Specification" Revision 2.0 (USB-IF, April
 //!   2000). Boot-class device + control-transfer request semantics
 //!   shared with xHCI; cited as `USB 2.0 §9.x` where applicable.
-//!     <https://www.usb.org/document-library/usb-20-specification>
+//!   <https://www.usb.org/document-library/usb-20-specification>
 //! - PCIe Base Specification (PCI-SIG). MSI-X Capability layout
 //!   (§6.1) + INTx-emulation contract referenced from the
 //!   `try_enable_msix` / `try_install_intx` fallback path.
-//!     <https://pcisig.com/specifications/pciexpress/>
+//!   <https://pcisig.com/specifications/pciexpress/>
 //!
 //! No GPL/BSD source code (Linux, FreeBSD, NetBSD, U-Boot) consulted
 //! at any point during the writing of this driver.
@@ -488,7 +488,7 @@ pub struct Xhci {
     ///
     /// Held purely for ownership — never read after construction.
     /// Drop releases the MSI-X cap (clears the global enable bit
-    /// + restores the device's INTx routing). `#[allow(dead_code)]`
+    /// and restores the device's INTx routing). `#[allow(dead_code)]`
     /// because the field is load-bearing for Drop semantics; the
     /// compiler can't see that.
     #[allow(dead_code)]
@@ -1530,7 +1530,7 @@ impl Xhci {
         // global enable so the device can't fire stale data.
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| XhciError::NoMemory)?;
         // SAFETY: cfg-space write to a known cap-list offset.
-        let _ = unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
+        unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
         // Real ISR — drains the event ring + acknowledges
         // interrupter IP. Replaces the previous fire-count-only
         // pattern; the supervisor pump's wait_for_irq still
@@ -2045,10 +2045,10 @@ impl Xhci {
         // from either class queue. Returns None if no match in
         // either queue. Drains non-matching entries back into a
         // local buffer so they survive for the next await.
-        let try_match = |me: &Self, p: &mut dyn FnMut(&[u32; 4]) -> bool| -> Option<[u32; 4]> {
+        let try_match = |me: &Self, mut p: &mut dyn FnMut(&[u32; 4]) -> bool| -> Option<[u32; 4]> {
             for q in [&me.cmd_events, &me.transfer_events] {
                 let mut g = q.lock();
-                if let Some(pos) = g.iter().position(|ev| p(ev)) {
+                if let Some(pos) = g.iter().position(&mut p) {
                     return g.remove(pos);
                 }
             }
@@ -2346,8 +2346,12 @@ impl Xhci {
         // Plant Device Context phys at DCBAA[slot_id] BEFORE issuing
         // the command (§4.3.4 step 6). The engine reads DCBAA when
         // it processes Address Device.
-        // SAFETY: identity-mapped DCBAA page; slot_id < MaxSlots.
         let dcbaa_phys = self.dcbaa.phys_addr().raw();
+        // SAFETY: `dcbaa_phys` is the identity-mapped base of the
+        // DCBAA page this controller allocated; `slot_id < MaxSlots`
+        // (validated at slot-enable) so `slot_id*8` stays inside the
+        // page, giving an aligned, in-range 8-byte slot we exclusively
+        // own.
         unsafe {
             core::ptr::write_volatile(
                 (dcbaa_phys + (slot_id as u64) * 8) as *mut u64,
@@ -2666,7 +2670,7 @@ impl Xhci {
         w_index: u16,
         out: &mut [u8],
     ) -> Result<usize, XhciError> {
-        if out.len() != w_value.into() && out.len() < 1 {
+        if out.len() != w_value.into() && out.is_empty() {
             // Allow the caller to ask for any byte-count that fits
             // a u16; w_length is just the SETUP-packet field.
         }
@@ -2767,10 +2771,12 @@ impl Xhci {
         let xferred = (w_length as u32).saturating_sub(residue) as usize;
 
         // Copy data buffer → out.
-        // SAFETY: identity-mapped DMA page; xferred ≤ w_length ≤ 4096.
         let copy = xferred.min(out.len());
-        for i in 0..copy {
-            out[i] = unsafe { core::ptr::read_volatile((data_phys + i as u64) as *const u8) };
+        for (i, slot) in out[..copy].iter_mut().enumerate() {
+            // SAFETY: `data_phys` is this slot's identity-mapped DMA
+            // page; `i < copy ≤ xferred ≤ w_length ≤ 4096` keeps the
+            // byte read inside that page, aligned for a `u8`.
+            *slot = unsafe { core::ptr::read_volatile((data_phys + i as u64) as *const u8) };
         }
         Ok(xferred)
     }
@@ -3323,9 +3329,12 @@ impl Xhci {
         }
         let residue = ev[2] & 0x00FF_FFFF;
         let xferred = (out.len() as u32).saturating_sub(residue) as usize;
-        // SAFETY: identity-mapped DMA page.
-        for i in 0..xferred.min(out.len()) {
-            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        let copy = xferred.min(out.len());
+        for (i, slot) in out[..copy].iter_mut().enumerate() {
+            // SAFETY: `phys` is this endpoint's identity-mapped DMA
+            // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
+            // read inside that page, aligned for a `u8`.
+            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         Ok(xferred)
     }
@@ -3369,9 +3378,12 @@ impl Xhci {
         }
         let residue = ev[2] & 0x00FF_FFFF;
         let xferred = (out.len() as u32).saturating_sub(residue) as usize;
-        // SAFETY: identity-mapped DMA page.
-        for i in 0..xferred.min(out.len()) {
-            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        let copy = xferred.min(out.len());
+        for (i, slot) in out[..copy].iter_mut().enumerate() {
+            // SAFETY: `phys` is this endpoint's identity-mapped DMA
+            // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
+            // read inside that page, aligned for a `u8`.
+            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         Ok(xferred)
     }
@@ -3459,9 +3471,12 @@ impl Xhci {
         let residue = ev[2] & 0x00FF_FFFF;
         let xferred = (out.len() as u32).saturating_sub(residue) as usize;
         let phys = self.ep_dma_phys(slot_id, dci)?;
-        // SAFETY: identity-mapped DMA page.
-        for i in 0..xferred.min(out.len()) {
-            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        let copy = xferred.min(out.len());
+        for (i, slot) in out[..copy].iter_mut().enumerate() {
+            // SAFETY: `phys` is this endpoint's identity-mapped DMA
+            // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
+            // read inside that page, aligned for a `u8`.
+            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         // Re-arm for the next report.
         self.arm_interrupt_in(slot_id, dci, out.len() as u32)?;

@@ -69,16 +69,23 @@ pub fn do_select(
     let mut local_e = [0u8; FD_SET_BYTES];
 
     if let Some(p) = readfds {
+        // SAFETY: `p` is the user-supplied `readfds` pointer; `copy_from_user`
+        // validates the `[p, p+FD_SET_BYTES)` range and brackets the read with
+        // the SMAP window. Length is the fixed `FD_SET_BYTES` of `local_r`.
         if unsafe { crate::handlers::copy_from_user(&mut local_r, p as u64) }.is_err() {
             return usize::MAX;
         }
     }
     if let Some(p) = writefds {
+        // SAFETY: `p` is the user-supplied `writefds` pointer; `copy_from_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the read with SMAP.
         if unsafe { crate::handlers::copy_from_user(&mut local_w, p as u64) }.is_err() {
             return usize::MAX;
         }
     }
     if let Some(p) = exceptfds {
+        // SAFETY: `p` is the user-supplied `exceptfds` pointer; `copy_from_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the read with SMAP.
         if unsafe { crate::handlers::copy_from_user(&mut local_e, p as u64) }.is_err() {
             return usize::MAX;
         }
@@ -120,12 +127,19 @@ pub fn do_select(
         }
         let zeros = [0u8; FD_SET_BYTES];
         if let Some(p) = readfds {
+            // SAFETY: `p` is the user-supplied `readfds` pointer; `copy_to_user`
+            // validates the `FD_SET_BYTES`-long range and brackets the write with
+            // SMAP. We clear the user fd_set to report "no fds ready".
             let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
         }
         if let Some(p) = writefds {
+            // SAFETY: `p` is the user-supplied `writefds` pointer; `copy_to_user`
+            // validates the `FD_SET_BYTES`-long range and brackets the write with SMAP.
             let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
         }
         if let Some(p) = exceptfds {
+            // SAFETY: `p` is the user-supplied `exceptfds` pointer; `copy_to_user`
+            // validates the `FD_SET_BYTES`-long range and brackets the write with SMAP.
             let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
         }
         return 0;
@@ -135,12 +149,19 @@ pub fn do_select(
 
     let zeros = [0u8; FD_SET_BYTES];
     if let Some(p) = readfds {
+        // SAFETY: `p` is the user-supplied `readfds` pointer; `copy_to_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the write with
+        // SMAP. We pre-clear each user fd_set before writing back ready bits.
         let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
     }
     if let Some(p) = writefds {
+        // SAFETY: `p` is the user-supplied `writefds` pointer; `copy_to_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the write with SMAP.
         let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
     }
     if let Some(p) = exceptfds {
+        // SAFETY: `p` is the user-supplied `exceptfds` pointer; `copy_to_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the write with SMAP.
         let _ = unsafe { crate::handlers::copy_to_user(p as u64, &zeros) };
     }
 
@@ -182,12 +203,19 @@ pub fn do_select(
     }
 
     if let Some(p) = readfds {
+        // SAFETY: `p` is the user-supplied `readfds` pointer; `copy_to_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the write with
+        // SMAP. `out_r` is a `FD_SET_BYTES`-sized fd_set of ready read bits.
         let _ = unsafe { crate::handlers::copy_to_user(p as u64, &out_r) };
     }
     if let Some(p) = writefds {
+        // SAFETY: `p` is the user-supplied `writefds` pointer; `copy_to_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the write with SMAP.
         let _ = unsafe { crate::handlers::copy_to_user(p as u64, &out_w) };
     }
     if let Some(p) = exceptfds {
+        // SAFETY: `p` is the user-supplied `exceptfds` pointer; `copy_to_user`
+        // validates the `FD_SET_BYTES`-long range and brackets the write with SMAP.
         let _ = unsafe { crate::handlers::copy_to_user(p as u64, &out_e) };
     }
 
@@ -203,7 +231,7 @@ pub fn do_select(
 /// - arg2 = writefds ptr (may be 0)
 /// - arg3 = exceptfds ptr (may be 0)
 /// - arg4 = timeval ptr (may be 0 = block forever)
-///          struct timeval = { tv_sec: i64, tv_usec: i64 }
+///   struct timeval = { tv_sec: i64, tv_usec: i64 }
 ///
 /// Returns the total count of ready fds (across all three sets),
 /// 0 on timeout, or -1 on error.
@@ -233,8 +261,12 @@ pub fn sys_select(ctx: &mut dyn TrapContext) {
     let timeout_ms: i64 = if tv_ptr.is_null() {
         -1 // block forever
     } else {
-        // SAFETY: user pointer, validated by size only.
+        // SAFETY: `tv_ptr` is the non-null user `timeval` pointer; `nfds` was
+        // already bounds-checked. `read_unaligned` reads `tv_sec` (first i64 of
+        // the 16-byte struct) without an alignment requirement.
         let sec = unsafe { core::ptr::read_unaligned(tv_ptr as *const i64) };
+        // SAFETY: `tv_ptr.add(8)` is the `tv_usec` field at offset 8, still
+        // within the 16-byte `timeval`; `read_unaligned` needs no alignment.
         let usec = unsafe { core::ptr::read_unaligned(tv_ptr.add(8) as *const i64) };
         // Convert to milliseconds; clamp to positive + finite range.
         if sec < 0 || usec < 0 {
@@ -276,7 +308,7 @@ pub fn sys_select(ctx: &mut dyn TrapContext) {
 /// - arg2 = writefds ptr (may be 0)
 /// - arg3 = exceptfds ptr (may be 0)
 /// - arg4 = timespec ptr (may be 0 = block forever)
-///          struct timespec = { tv_sec: i64, tv_nsec: i64 }
+///   struct timespec = { tv_sec: i64, tv_nsec: i64 }
 /// - arg5 = `{ *sigset_t, size_t }` pair ptr (may be 0; sigmask ignored)
 ///
 /// The `sigmask` argument allows atomically setting the task's signal
@@ -308,6 +340,9 @@ pub fn sys_pselect6(ctx: &mut dyn TrapContext) {
         -1 // block forever
     } else {
         let mut buf = [0u8; 16];
+        // SAFETY: `ts_ptr` is the non-null user `timespec` pointer; `copy_from_user`
+        // validates the 16-byte range and brackets the read with the SMAP window.
+        // `buf` is exactly the 16 bytes of `{ tv_sec: i64, tv_nsec: i64 }`.
         if unsafe { crate::handlers::copy_from_user(&mut buf, ts_ptr as u64) }.is_err() {
             ctx.set_return(fail);
             return;

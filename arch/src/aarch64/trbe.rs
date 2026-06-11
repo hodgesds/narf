@@ -53,6 +53,11 @@ pub unsafe fn read_trblimitr() -> u64 {
     v
 }
 
+/// Write `TRBLIMITR_EL1` (`S3_0_C9_C11_0`).
+///
+/// # Safety
+/// EL1; TRBE supported. Writes a privileged `MSR` controlling the trace
+/// buffer limit and enable bit.
 pub unsafe fn write_trblimitr(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {
@@ -83,6 +88,8 @@ pub unsafe fn write_base(base: u64, limit: u64) {
     }
     // SAFETY: caller-asserted. TRBLIMITR controls limit + enable.
     let prev = unsafe { read_trblimitr() } & 0xFFF; // preserve low control bits
+                                                    // SAFETY: caller-asserted EL1 + TRBE; writes the new limit preserving
+                                                    // the existing low control bits.
     unsafe {
         write_trblimitr((limit & !0xFFF) | prev);
     }
@@ -97,14 +104,20 @@ const TRBLIMITR_E: u64 = 1 << 0;
 pub unsafe fn enable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_trblimitr() } | TRBLIMITR_E;
+    // SAFETY: caller-asserted EL1 + TRBE; sets the enable bit.
     unsafe {
         write_trblimitr(v);
     }
 }
 
+/// Disable the trace buffer (clear `TRBLIMITR.E`).
+///
+/// # Safety
+/// EL1; TRBE supported.
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_trblimitr() } & !TRBLIMITR_E;
+    // SAFETY: caller-asserted EL1 + TRBE; clears the enable bit.
     unsafe {
         write_trblimitr(v);
     }

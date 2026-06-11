@@ -176,10 +176,11 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
 
                 if is_virtio_mmio_node(name_bytes) {
                     // Parse this node's properties to find `reg`.
-                    // SAFETY: `struct_slice` is in-range of the FDT
-                    // per the header we validated; `base` is still
-                    // live; `hdr` was copied by value.
                     if let Some((base_addr, len)) =
+                        // SAFETY: `struct_slice` is in-range of the FDT per
+                        // the header we validated, `base` is still live, and
+                        // `hdr` was copied by value, satisfying
+                        // `scan_reg_in_node`'s contract.
                         unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
                     {
                         // cursor is now at END_NODE; account depth-wise.
@@ -207,8 +208,11 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                     // We only run the walker when the DTB-supplied
                     // base is in the low-4-GiB identity-mapped
                     // window; higher addresses get logged + skipped.
-                    // SAFETY: same FDT walk preconditions.
                     if let Some((ecam_base, ecam_size)) =
+                        // SAFETY: same FDT walk preconditions as above —
+                        // `struct_slice` stays in-range of the validated FDT,
+                        // `base` is live, and `hdr` is a by-value copy, so
+                        // `scan_reg_in_node`'s contract is upheld.
                         unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
                     {
                         depth += 1;
@@ -270,9 +274,9 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
 /// a 1-GiB identity map for low physical memory).
 unsafe fn read_header(base: *const u8) -> Option<FdtHeader> {
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: caller promises `base` points at readable memory for
-    // the header's extent.
     let raw: [u8; core::mem::size_of::<FdtHeader>()] =
+        // SAFETY: caller promises `base` points at readable memory for
+        // the header's extent.
         unsafe { core::ptr::read(base as *const [u8; core::mem::size_of::<FdtHeader>()]) };
     compiler_fence(Ordering::SeqCst);
 
@@ -421,8 +425,8 @@ unsafe fn probe_virtio_mmio(base_addr: u64, len: u64) -> Option<BusDevice> {
     }
 
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: same region, +0x08 is still inside the 0x200-byte window.
     let device_id =
+        // SAFETY: same region, +0x08 is still inside the 0x200-byte window.
         unsafe { core::ptr::read_volatile((base_addr + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     if device_id == 0 {

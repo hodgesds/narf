@@ -64,8 +64,8 @@ extern "C" {
 /// - The first 1 GiB is identity-mapped (BSP's boot.S sets this up).
 unsafe fn install_trampoline() {
     // Source: kernel high-half virt of the trampoline.
-    let src = core::ptr::addr_of!(_ap_trampoline_start) as *const u8;
-    let end = core::ptr::addr_of!(_ap_trampoline_end) as *const u8;
+    let src = core::ptr::addr_of!(_ap_trampoline_start);
+    let end = core::ptr::addr_of!(_ap_trampoline_end);
     // SAFETY: both symbols are within the same .text section so
     // pointer subtraction is sound.
     let len = unsafe { end.offset_from(src) } as usize;
@@ -117,7 +117,7 @@ unsafe fn install_trampoline() {
 
         // Rust entry pointer.
         let p_rs = phys_addr(core::ptr::addr_of!(ap_param_rust_entry) as u64);
-        (p_rs as *mut u64).write_unaligned(_ap_start_rust as u64);
+        (p_rs as *mut u64).write_unaligned(_ap_start_rust as usize as u64);
 
         // gdt32_ptr base. The 32-bit GDT lives 24 bytes before the
         // gdt32_ptr's limit field, and limit is 2 bytes before
@@ -342,24 +342,30 @@ pub unsafe fn start_aps() -> u32 {
     // ACPI ever surfaces a non-trivial mapping this loop wants a
     // proper apic_id_for_logical(id) lookup.
 
-    // SAFETY: x2APIC enabled by init_bsp.
     for &logical in viable.iter() {
+        // SAFETY: x2APIC was enabled by init_bsp, so the INIT-IPI MSR
+        // write in send_init_ipi targets a valid x2APIC; `logical` is a
+        // viable APIC id selected above.
         unsafe {
             narf_interrupts::x86_64::apic::send_init_ipi(logical);
         }
     }
     delay_us(10_000); // 10 ms per Intel SDM §10.4.4.1, single shared wait
 
-    // SAFETY: same.
     for &logical in viable.iter() {
+        // SAFETY: x2APIC enabled by init_bsp; send_startup_ipi writes the
+        // SIPI MSR to a valid x2APIC. `logical` is a viable APIC id and
+        // SIPI_VECTOR_PAGE is the page-aligned trampoline vector at 0x8000.
         unsafe {
             narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
         }
     }
     delay_us(200); // ≥200 µs between SIPIs, single shared wait
 
-    // SAFETY: same.
     for &logical in viable.iter() {
+        // SAFETY: x2APIC enabled by init_bsp; this is the second (retry)
+        // SIPI to the same valid APIC id with the same page-aligned
+        // trampoline vector, per the Intel-recommended INIT-SIPI-SIPI.
         unsafe {
             narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
         }

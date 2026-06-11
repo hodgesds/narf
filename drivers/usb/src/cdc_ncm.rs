@@ -920,7 +920,7 @@ pub async fn try_bind_ncm_already_addressed(
         return Err(NcmError::SetConfigFailed);
     }
     let bulk_in_dci = ((bulk_in_ep.ep_addr & 0x0F) * 2) + 1;
-    let bulk_out_dci = ((bulk_out_ep.ep_addr & 0x0F) * 2) + 0;
+    let bulk_out_dci = (bulk_out_ep.ep_addr & 0x0F) * 2;
     let idx = {
         let mut g = CDC_NCM_DEVICES.lock();
         let idx = g.len();
@@ -1033,7 +1033,7 @@ pub fn send_frame(idx: usize, eth_frame: &[u8]) -> Result<usize, NcmError> {
 /// first datagram (if any). Caller polls this periodically; on
 /// real silicon the bulk-IN ring continuously holds an NTB-sized
 /// read posted so frames stream in.
-pub fn recv_frame<'a>(idx: usize, scratch: &'a mut [u8]) -> Result<Option<&'a [u8]>, NcmError> {
+pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmError> {
     let (slot_id, bulk_in_dci) = {
         let g = CDC_NCM_DEVICES.lock();
         let dev = g.get(idx).ok_or(NcmError::NotNcm)?;

@@ -4,8 +4,8 @@
 //! the public AMD GFX firmware-loading notes. The RLC firmware
 //! is the piece of GFX microcode that orchestrates power-gating
 //! + the GFX clock-state machine; it ships with extra metadata
-//! past the common ucode header (jump table, save-restore-list
-//! offsets, autoload offset table).
+//!   past the common ucode header (jump table, save-restore-list
+//!   offsets, autoload offset table).
 //!
 //! ## Common header
 //!

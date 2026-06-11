@@ -4,8 +4,6 @@
 //! layout sanity vs. Linux constants, and a `not-present` trace for
 //! the QEMU TCG smoke target (no USB4 model on q35).
 
-#![cfg(target_arch = "x86_64")]
-
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 fn smoke_tb_register_all_known_ids() -> TestResult {
@@ -202,6 +200,8 @@ fn smoke_tb_not_present_on_qemu_tcg() -> TestResult {
     use crate::nhi;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{devices, BusKind};
+    // SAFETY: the QEMU q35 smoke target maps PCIe ECAM at the default base;
+    // init() only reads the config space mapped there during enumeration.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_tb = devs.iter().any(|d| {

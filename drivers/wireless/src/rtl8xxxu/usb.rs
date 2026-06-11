@@ -241,6 +241,12 @@ impl IntrIn {
     }
 }
 
+impl Default for IntrIn {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 extern crate alloc;
 
 // ── narf-usb bridge ────────────────────────────────────────────────

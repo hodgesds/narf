@@ -257,6 +257,9 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     // knows what to ship) and call the MCU patch-load helper, which
     // currently returns `Err(NotImplemented)` past the resolve step.
     let mut mac_bytes = [0u8; MAC_ADDR_LEN];
+    // SAFETY: `mmio_bar0` is the live BAR0 region mapped above and
+    // driver-own was already taken (`take_driver_own` returned `Ok`),
+    // which is exactly the precondition `load_firmware_stub` requires.
     let firmware_outcome = unsafe { mcu::load_firmware_stub(&mmio_bar0, effective_did) };
     if let Err(mcu::McuError::NotImplemented) = firmware_outcome {
         // Expected baseline path — note it but keep the device bound.
@@ -270,6 +273,9 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     // load returned `NotImplemented`, we leave `mac_bytes` zeroed
     // and surface "no EFUSE" via the all-zero sentinel.
     if firmware_outcome.is_ok() {
+        // SAFETY: `mmio_bar0` is the live BAR0 region; this branch only
+        // runs when `load_firmware_stub` returned `Ok`, so firmware is
+        // live and the EFUSE registers are valid to read.
         if let Ok(m) = unsafe { mcu::read_efuse_mac(&mmio_bar0) } {
             mac_bytes = m;
         }

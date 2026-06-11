@@ -227,12 +227,10 @@ impl VmidPool {
 
     /// Touch a VMID — mark it most-recently-used + bump its tag.
     pub fn touch(&mut self, vmid: u8) {
-        if let Some(slot) = self.slots.get_mut(vmid as usize) {
-            if let VmidState::Bound { last_use_tag, .. } = slot {
-                let new_tag = self.next_tag;
-                self.next_tag = self.next_tag.wrapping_add(1);
-                *last_use_tag = new_tag;
-            }
+        if let Some(VmidState::Bound { last_use_tag, .. }) = self.slots.get_mut(vmid as usize) {
+            let new_tag = self.next_tag;
+            self.next_tag = self.next_tag.wrapping_add(1);
+            *last_use_tag = new_tag;
         }
         // Move VMID to the back of the LRU.
         if let Some(pos) = self.lru.iter().position(|v| *v == vmid) {

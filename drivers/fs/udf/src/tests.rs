@@ -305,8 +305,14 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: the vtable's clone returns an equivalent `RawWaker` and its
+    // wake/drop are no-ops; the data pointer is null and never dereferenced,
+    // so all `RawWakerVTable` contracts hold for this no-op waker.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is owned by this stack frame and is not moved again
+    // after being pinned (it is only polled through `pinned` below), so the
+    // `Pin::new_unchecked` no-move invariant is upheld.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),
@@ -365,6 +371,8 @@ fn write_long_ad(dst: &mut [u8], off: usize, extent_length_raw: u32, lbn: u32, p
 
 /// Encode one FID into `dst[off..]`. Returns the total bytes
 /// consumed (already padded to a 4-byte boundary).
+// The wide signature mirrors the on-disk UDF FID + ICB long_ad fields.
+#[allow(clippy::too_many_arguments)]
 fn write_fid(
     dst: &mut [u8],
     off: usize,

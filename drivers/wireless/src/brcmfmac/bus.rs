@@ -196,7 +196,16 @@ pub struct TcmWindow {
     pub size: u64,
 }
 
+// SAFETY: `host_base` is a kernel-owned MMIO mapping of BAR2 (TCM),
+// valid for the lifetime of the device; the raw pointer is not tied
+// to any thread-local state, so moving the window across threads is
+// sound.
 unsafe impl Send for TcmWindow {}
+// SAFETY: TCM accesses go through `read_volatile`/`write_volatile`
+// against the device's own RAM window; concurrent access is the
+// caller's responsibility (guarded by the device lock), and the
+// pointer itself is immutable after mapping, so `&TcmWindow` is safe
+// to share between threads.
 unsafe impl Sync for TcmWindow {}
 
 impl TcmWindow {

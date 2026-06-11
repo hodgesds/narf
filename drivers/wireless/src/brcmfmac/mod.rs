@@ -28,20 +28,20 @@
 //! ## References (all ISC / BSD-3 / GPL-2.0; NARF is GPL-2.0-or-later)
 //!
 //! - Linux `drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c`
-//!     — `brcmf_pcie_probe`, register window + soft-reset
-//!       (v6.6 ~L117..L300 for the register map, ~L2700..L2780 for
-//!       the PCI ID table).
+//!   — `brcmf_pcie_probe`, register window + soft-reset
+//!   (v6.6 ~L117..L300 for the register map, ~L2700..L2780 for
+//!   the PCI ID table).
 //! - Linux `drivers/net/wireless/broadcom/brcm80211/brcmfmac/commonring.c`
-//!     — `brcmf_commonring_*` ring index dance (entire file).
+//!   — `brcmf_commonring_*` ring index dance (entire file).
 //! - Linux `drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c`
-//!     — `msgbuf_*` message structs + IOCTL flow
-//!       (v6.6 ~L30..L180).
+//!   — `msgbuf_*` message structs + IOCTL flow
+//!   (v6.6 ~L30..L180).
 //! - Linux `drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.h`
-//!     — per-ring depth + item-size table (~L10..L23).
+//!   — per-ring depth + item-size table (~L10..L23).
 //! - Linux `drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h`
-//!     — `BRCMF_{H2D,D2H}_MSGRING_*` ring-id assignment (~L14..L26).
+//!   — `BRCMF_{H2D,D2H}_MSGRING_*` ring-id assignment (~L14..L26).
 //! - Linux `drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h`
-//!     — the canonical PCIe device-id table (lines 16..101).
+//!   — the canonical PCIe device-id table (lines 16..101).
 //!
 //! NARF is GPL-2.0-or-later (root `LICENSE`), so direct reference to
 //! these ISC / GPL-2.0 Linux files is in-policy.

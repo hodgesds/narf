@@ -109,6 +109,7 @@ fn current_pid() -> u64 {
     if v == 0 {
         return 0;
     }
+    // SAFETY: v was stored by install_proc_hooks as a CurrentPidFn fn-pointer; non-zero confirms it.
     let f: CurrentPidFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -118,6 +119,7 @@ fn list_pids() -> Vec<u64> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_proc_hooks as a ListPidsFn fn-pointer; non-zero confirms it.
     let f: ListPidsFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -127,6 +129,7 @@ pub(crate) fn task_info(pid: u64) -> Option<ProcTaskInfo> {
     if v == 0 {
         return None;
     }
+    // SAFETY: v was stored by install_proc_hooks as a TaskInfoFn fn-pointer; non-zero confirms it.
     let f: TaskInfoFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -197,6 +200,7 @@ pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {
     if v == 0 {
         return None;
     }
+    // SAFETY: v was stored by install_proc_ext_hooks as a FdPathFn fn-pointer; non-zero confirms it.
     let f: FdPathFn = unsafe { core::mem::transmute(v) };
     f(pid, fd)
 }
@@ -206,6 +210,7 @@ pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
     if v == 0 {
         return [(0, 0); 16];
     }
+    // SAFETY: v was stored by install_proc_ext_hooks as a RlimitsFn fn-pointer; non-zero confirms it.
     let f: RlimitsFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -215,6 +220,7 @@ pub(crate) fn hook_nice(pid: u64) -> i32 {
     if v == 0 {
         return 0;
     }
+    // SAFETY: v was stored by install_proc_ext_hooks as a NiceFn fn-pointer; non-zero confirms it.
     let f: NiceFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -224,6 +230,7 @@ pub(crate) fn hook_environ(pid: u64) -> Vec<u8> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_proc_ext_hooks as an EnvironFn fn-pointer; non-zero confirms it.
     let f: EnvironFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -233,6 +240,7 @@ pub(crate) fn hook_auxv(pid: u64) -> Vec<u8> {
     if v == 0 {
         return alloc::vec![0u8; 16];
     }
+    // SAFETY: v was stored by install_proc_ext_hooks as an AuxvFn fn-pointer; non-zero confirms it.
     let f: AuxvFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -242,6 +250,7 @@ pub(crate) fn hook_set_comm(pid: u64, name: &str) -> Result<(), FsError> {
     if v == 0 {
         return Err(FsError::Unsupported);
     }
+    // SAFETY: v was stored by install_proc_write_hooks as a SetCommFn fn-pointer; non-zero confirms it.
     let f: SetCommFn = unsafe { core::mem::transmute(v) };
     f(pid, name)
 }
@@ -251,6 +260,7 @@ pub(crate) fn hook_oom_adj_get(pid: u64) -> i16 {
     if v == 0 {
         return 0;
     }
+    // SAFETY: v was stored by install_proc_write_hooks as an OomAdjGetFn fn-pointer; non-zero confirms it.
     let f: OomAdjGetFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -260,6 +270,7 @@ pub(crate) fn hook_oom_adj_set(pid: u64, val: i16) -> Result<(), FsError> {
     if v == 0 {
         return Err(FsError::Unsupported);
     }
+    // SAFETY: v was stored by install_proc_write_hooks as an OomAdjSetFn fn-pointer; non-zero confirms it.
     let f: OomAdjSetFn = unsafe { core::mem::transmute(v) };
     f(pid, val)
 }
@@ -269,6 +280,7 @@ pub(crate) fn hook_coredump_get(pid: u64) -> u32 {
     if v == 0 {
         return 0x33;
     } // default: anon + anon-huge + ELF headers
+      // SAFETY: v was stored by install_proc_write_hooks as a CoredumpGetFn fn-pointer; non-zero confirms it.
     let f: CoredumpGetFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -278,6 +290,7 @@ pub(crate) fn hook_coredump_set(pid: u64, val: u32) -> Result<(), FsError> {
     if v == 0 {
         return Err(FsError::Unsupported);
     }
+    // SAFETY: v was stored by install_proc_write_hooks as a CoredumpSetFn fn-pointer; non-zero confirms it.
     let f: CoredumpSetFn = unsafe { core::mem::transmute(v) };
     f(pid, val)
 }
@@ -287,6 +300,7 @@ pub(crate) fn hook_oom_score(pid: u64) -> i32 {
     if v == 0 {
         return 0;
     }
+    // SAFETY: v was stored by install_proc_write_hooks as an OomScoreFn fn-pointer; non-zero confirms it.
     let f: OomScoreFn = unsafe { core::mem::transmute(v) };
     f(pid)
 }
@@ -1113,6 +1127,7 @@ pub fn poll_once<F: core::future::Future>(fut: F) -> Option<F::Output> {
         |_| {},                              // drop
     );
     let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: VTABLE is a valid no-op vtable; the waker never outlives this stack frame.
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
 
@@ -1173,7 +1188,7 @@ fn gen_cpuinfo() -> String {
         let _ = writeln!(s, "processor\t: 0");
         let _ = writeln!(s, "vendor_id\t: NARF");
         let _ = writeln!(s, "model name\t: (arch ident not yet wired)");
-        let _ = writeln!(s, "");
+        let _ = writeln!(s);
     }
     s
 }
@@ -1507,7 +1522,7 @@ kernel_test_in!("filesystem/procfs", smoke_comm_file_is_rw);
 /// Smoke: write "newname\n" to comm succeeds and hook is exercised.
 fn smoke_comm_write_updates_read() -> TestResult {
     // Use a stable per-test pid to avoid colliding with live tasks.
-    const PID: u64 = 0xf0ca1_0001;
+    const PID: u64 = 0x000f_0ca1_0001;
     let f = ProcPidFile {
         pid: PID,
         field: PidField::Comm,
@@ -1524,7 +1539,7 @@ kernel_test_in!("filesystem/procfs", smoke_comm_write_updates_read);
 
 /// Smoke: write 30-char name → truncated to 15 (TASK_COMM_LEN - 1).
 fn smoke_comm_write_truncates_to_15() -> TestResult {
-    const PID: u64 = 0xf0ca1_0002;
+    const PID: u64 = 0x000f_0ca1_0002;
     let f = ProcPidFile {
         pid: PID,
         field: PidField::Comm,

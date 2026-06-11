@@ -315,6 +315,10 @@ impl KernelTask {
         let mut me = Box::new(KernelTask {
             future: Box::pin(future),
             stack,
+            // `KernelContext::default()` is a real register struct on x86_64
+            // and a unit struct elsewhere; the allow covers the unit-struct
+            // arches where clippy would otherwise flag the constructor.
+            #[allow(clippy::default_constructed_unit_structs)]
             ctx: KernelContext::default(),
             exec_ctx: AtomicPtr::new(core::ptr::null_mut()),
             completed: AtomicBool::new(false),

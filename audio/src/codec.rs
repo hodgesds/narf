@@ -415,7 +415,7 @@ pub fn send_verb(cad: u8, nid: u8, verb_id: u16, payload: u8) -> Result<u32, Cod
 /// controller. See [`enumerate_with`] for a transport-injected
 /// variant that the test stand drives.
 pub fn enumerate(cad: u8) -> Result<CodecTree, CodecError> {
-    enumerate_with(cad, |c, n, v, p| send_verb(c, n, v, p))
+    enumerate_with(cad, send_verb)
 }
 
 /// Enumeration with an injected verb closure. Used by the codec

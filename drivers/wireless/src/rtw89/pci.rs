@@ -151,6 +151,10 @@ async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
         {
             let mut rx_q = device.rx_rings[RXCH_RXQ as usize].lock();
             let mmio = &device.mmio_bar2;
+            // SAFETY: `mmio` is the BAR2 region mapped + owned by `bring_up`;
+            // `rx_q.regs` holds in-range RX ring-index register offsets for this
+            // channel, so the MMIO read of the HW ring index is to a valid device
+            // register.
             let idx = unsafe { read_rx_ring_idx(mmio, &rx_q.regs) };
             let (rp, _) = split_idx(idx);
 
@@ -174,6 +178,10 @@ async fn rtw89_rx_pump(device: Arc<Rtw89Device>) {
             }
 
             // Acknowledge processed BDs by updating doorbell WP.
+            // SAFETY: `mmio` is the BAR2 region mapped + owned by `bring_up`;
+            // `rx_q.regs` holds the in-range RX doorbell register offset, and
+            // `wp` is a valid write-pointer index, so this MMIO write targets a
+            // valid device register.
             unsafe {
                 ring_doorbell_rx(mmio, &rx_q.regs, rx_q.state.wp);
             }
@@ -199,13 +207,22 @@ pub unsafe fn bring_up(
     }
 
     let chip_id = ChipId::from_pci_did(device.id.device).ok_or(ProbeError::UnknownChip)?;
+    // SAFETY: `mmio_bar2` is the just-mapped, caller-owned BAR2 region; reading
+    // the chip-version field (`R_AX_SYS_CFG1`) is an MMIO read of a valid,
+    // in-range device register on this owned window.
     let chip_version = unsafe { mac::read_chip_version(&mmio_bar2) };
+    // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `efuse::read_mac`
+    // only touches in-range EFUSE registers on this owned window.
     let mac = unsafe { efuse::read_mac(&mmio_bar2) }.map_err(ProbeError::Efuse)?;
 
     // ── MSI-X Setup ──
     let mut irq_vector = None;
     if let Ok(v) = narf_interrupts::vector::alloc() {
         if let Ok(mut msix) = narf_bus::msix::enable_msix(cap, device) {
+            // SAFETY: `msix` is a live MSI-X table handle returned by
+            // `enable_msix` for this owned device; table entry 0 is in range and
+            // `v` is a freshly allocated interrupt vector, so programming the
+            // vector and enabling the table writes only valid MSI-X registers.
             unsafe {
                 let _ = msix.program_vector(0, 0, v);
                 let _ = msix.enable();
@@ -223,6 +240,9 @@ pub unsafe fn bring_up(
     for ch in 0..TXCH_NUM as u8 {
         let buf = alloc_coherent(tx_ring_bytes(DEFAULT_TXBD_NUM), DomainId::DRIVER_0)
             .map_err(|_| ProbeError::NoMemory)?;
+        // SAFETY: `buf` is a fresh DMA-coherent allocation of exactly
+        // `tx_ring_bytes(DEFAULT_TXBD_NUM)` bytes, so `as_mut_ptr()` is valid and
+        // writable for that length; zeroing the whole region stays in bounds.
         unsafe {
             core::ptr::write_bytes(buf.as_mut_ptr(), 0, tx_ring_bytes(DEFAULT_TXBD_NUM));
         }
@@ -240,6 +260,9 @@ pub unsafe fn bring_up(
     for ch in 0..RXCH_NUM as u8 {
         let buf = alloc_coherent(rx_ring_bytes(DEFAULT_RXBD_NUM), DomainId::DRIVER_0)
             .map_err(|_| ProbeError::NoMemory)?;
+        // SAFETY: `buf` is a fresh DMA-coherent allocation of exactly
+        // `rx_ring_bytes(DEFAULT_RXBD_NUM)` bytes, so `as_mut_ptr()` is valid and
+        // writable for that length; zeroing the whole region stays in bounds.
         unsafe {
             core::ptr::write_bytes(buf.as_mut_ptr(), 0, rx_ring_bytes(DEFAULT_RXBD_NUM));
         }
@@ -248,9 +271,15 @@ pub unsafe fn bring_up(
         for i in 0..DEFAULT_RXBD_NUM {
             let pkt_buf =
                 alloc_coherent(2048, DomainId::DRIVER_0).map_err(|_| ProbeError::NoMemory)?;
+            // SAFETY: `ring_ptr` points into the `DEFAULT_RXBD_NUM`-entry RX ring
+            // buffer just allocated and zeroed above; `i < DEFAULT_RXBD_NUM`, so
+            // `ring_ptr.add(i)` is an in-bounds, properly aligned `RxBd` slot, and
+            // `set_phys` records the physical address of `pkt_buf`.
             unsafe {
-                let mut bd = RxBd::default();
-                bd.buf_size = 2048;
+                let mut bd = RxBd {
+                    buf_size: 2048,
+                    ..Default::default()
+                };
                 bd.set_phys(pkt_buf.phys_addr().raw());
                 core::ptr::write_volatile(ring_ptr.add(i as usize), bd);
             }
@@ -270,6 +299,10 @@ pub unsafe fn bring_up(
         let r = &tx_rings[i].lock();
         let dma = &tx_ring_dma[i];
         let phys = dma.phys_addr().raw();
+        // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `r.regs` holds the
+        // in-range TX ring register offsets (`desa_l/h`, `num`, `bdram`, `idx`)
+        // for this channel, so these MMIO writes target valid device registers
+        // with matching access widths.
         unsafe {
             mmio_bar2.write32(r.regs.desa_l, (phys & 0xFFFFFFFF) as u32);
             mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
@@ -285,6 +318,10 @@ pub unsafe fn bring_up(
         let r = &rx_rings[i].lock();
         let dma = &rx_ring_dma[i];
         let phys = dma.phys_addr().raw();
+        // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `r.regs` holds the
+        // in-range RX ring register offsets (`desa_l/h`, `num`, `idx`) for this
+        // channel, so these MMIO writes target valid device registers with
+        // matching access widths.
         unsafe {
             mmio_bar2.write32(r.regs.desa_l, (phys & 0xFFFFFFFF) as u32);
             mmio_bar2.write32(r.regs.desa_h, (phys >> 32) as u32);
@@ -326,6 +363,9 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
 
         if tx_q.state.is_full() {
             // Poll for completion to free up slots.
+            // SAFETY: `mmio` is the bound device's BAR2 region; `tx_q.regs` holds
+            // the in-range TX ring-index register offset for this channel, so the
+            // MMIO read of the HW ring index is to a valid device register.
             let idx = unsafe { read_tx_ring_idx(mmio, &tx_q.regs) };
             let (rp, _) = split_idx(idx);
             tx_q.state.set_rp(rp);
@@ -343,6 +383,11 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
         // but for now we allocate coherent memory for simplicity
         // (Audit #14: in production we'd use a pool).
         let buf = alloc_coherent(sub.total, DomainId::DRIVER_0).map_err(|_| ())?;
+        // SAFETY: `buf` is a fresh DMA allocation of `sub.total` bytes, and
+        // `stage_tx` guarantees `sub.total == sub.txwd.len() + sub.frame.len()`,
+        // so both copies stay in bounds; the TXWD is written at offset 0 and the
+        // frame immediately after at `sub.txwd.len()`, neither overlapping the
+        // distinct source slices.
         unsafe {
             core::ptr::copy_nonoverlapping(sub.txwd.as_ptr(), buf.as_mut_ptr(), sub.txwd.len());
             core::ptr::copy_nonoverlapping(
@@ -357,16 +402,26 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
         let ring_ptr = ring_dma.as_mut_ptr() as *mut TxBd;
         let slot = tx_q.state.wp as usize;
 
+        // SAFETY: `ring_ptr` points into the `DEFAULT_TXBD_NUM`-entry TX ring DMA
+        // buffer for ACH0; `slot == tx_q.state.wp` is a valid in-range write
+        // pointer (the full check above guarantees the ring is not full), so
+        // `ring_ptr.add(slot)` is an in-bounds, properly aligned `TxBd` slot, and
+        // `set_phys` records the physical address of `buf`.
         unsafe {
-            let mut bd = TxBd::default();
-            bd.length = sub.total as u16;
-            bd.opt = TXBD_OPT_LS;
+            let mut bd = TxBd {
+                length: sub.total as u16,
+                opt: TXBD_OPT_LS,
+                ..Default::default()
+            };
             bd.set_phys(buf.phys_addr().raw());
             core::ptr::write_volatile(ring_ptr.add(slot), bd);
         }
 
         // 4. Advance WP + Ring Doorbell.
         tx_q.state.advance_wp(1);
+        // SAFETY: `mmio` is the bound device's BAR2 region; `tx_q.regs` holds the
+        // in-range TX doorbell register offset, and `wp` is a valid write-pointer
+        // index, so this MMIO write targets a valid device register.
         unsafe {
             ring_doorbell_tx(mmio, &tx_q.regs, tx_q.state.wp);
         }
@@ -426,7 +481,7 @@ pub fn is_probed() -> bool {
 pub fn with_controller<R>(f: impl FnOnce(&Rtw89Device) -> R) -> Option<R> {
     let g = CONTROLLER.lock();
     let arc = g.as_ref()?;
-    Some(f(&*arc))
+    Some(f(arc))
 }
 
 /// Test-only reset of the bound slot. Avoids cross-test leak when the

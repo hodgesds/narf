@@ -33,6 +33,12 @@ use alloc::vec::Vec;
 use super::{register_proc, ProcFile};
 use crate::FsError;
 
+// ── Type alias ───────────────────────────────────────────────────
+
+/// Write handler for a sysctl key: receives the trimmed value string,
+/// returns `Ok(())` or an `FsError`.
+type SysctlWriteFn = Option<fn(&str) -> Result<(), FsError>>;
+
 // ── Public entry descriptor ─────────────────────────────────────
 
 /// One sysctl key descriptor. Pass to `register_sysctl`.
@@ -46,7 +52,7 @@ use crate::FsError;
 pub struct SysctlEntry {
     pub path: &'static str,
     pub read: fn() -> String,
-    pub write: Option<fn(&str) -> Result<(), FsError>>,
+    pub write: SysctlWriteFn,
     pub perms: u16,
 }
 
@@ -85,7 +91,7 @@ pub fn register_sysctl(entry: SysctlEntry) {
 /// through the closures supplied to `register_sysctl`.
 struct SysctlProcFile {
     read_fn: fn() -> String,
-    write_fn: Option<fn(&str) -> Result<(), FsError>>,
+    write_fn: SysctlWriteFn,
 }
 
 impl core::fmt::Debug for SysctlProcFile {

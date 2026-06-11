@@ -103,6 +103,9 @@ impl From<LoadBytesError> for ProcessLoadError {
 ///   Stage-4 structural contract all of `load_elf_bytes` rides on).
 /// - Frame allocator must be initialised.
 pub unsafe fn load_user_process(bytes: &[u8]) -> Result<UserProcess, ProcessLoadError> {
+    // SAFETY: thin forwarder — the caller's `# Safety` contract (live
+    // low-4-GiB identity map + initialised frame allocator) is exactly
+    // what `load_user_process_with` requires; empty argv/envp/aux are valid.
     unsafe { load_user_process_with(bytes, &[], &[], &[]) }
 }
 
@@ -122,6 +125,9 @@ pub unsafe fn load_user_process_with(
     envp: &[&str],
     aux: &[AuxEntry],
 ) -> Result<UserProcess, ProcessLoadError> {
+    // SAFETY: caller upholds this fn's `# Safety` contract (live low-4-GiB
+    // identity map + initialised frame allocator), which is precisely what
+    // `load_elf_bytes` needs to map the program's PT_LOAD segments.
     let (address_space, program_entry) = unsafe { load_elf_bytes(bytes) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
@@ -131,7 +137,7 @@ pub unsafe fn load_user_process_with(
     // `AT_ENTRY`. Bias is well-separated from the typical low-half
     // program load address so the two ranges never collide.
     const INTERP_BIAS: u64 = 0x0000_4000_0000_0000;
-    let image = crate::parse_elf(bytes).map_err(|e| LoadBytesError::Elf(e))?;
+    let image = crate::parse_elf(bytes).map_err(LoadBytesError::Elf)?;
     let mut entry = program_entry;
     let mut interp_loaded = false;
 
@@ -161,6 +167,9 @@ pub unsafe fn load_user_process_with(
         _ => 0,
     };
     if !image.dynamic.is_empty() && image.interp.is_none() {
+        // SAFETY: `address_space` was just materialized by `load_elf_bytes`,
+        // so every PT_DYNAMIC relocation site is walkable via `paging::
+        // translate`; `program_bias` is the same load offset that fn chose.
         unsafe { apply_relocations(bytes, &image, &address_space, program_bias) }?;
     }
 
@@ -178,15 +187,19 @@ pub unsafe fn load_user_process_with(
         .interp
         .as_deref()
         .filter(|name| interp::lookup_interpreter(name).is_none())
-        .and_then(|name| read_path_from_vfs(name));
+        .and_then(read_path_from_vfs);
     #[cfg(not(feature = "linux-compat"))]
     let interp_fs_owned: Option<alloc::vec::Vec<u8>> = None;
 
     if let Some(name) = image.interp.as_deref() {
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
-        let interp_bytes_opt: Option<&[u8]> = registered.or_else(|| interp_fs_owned.as_deref());
+        let interp_bytes_opt: Option<&[u8]> = registered.or(interp_fs_owned.as_deref());
         if let Some(interp_bytes) = interp_bytes_opt {
             let interp_entry =
+                // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
+                // INTERP_BIAS is a fixed user-range offset well-separated from the
+                // program's load range, so appending the interp's segments here
+                // cannot collide with pages already mapped.
                 unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is
@@ -198,9 +211,11 @@ pub unsafe fn load_user_process_with(
             // through the same relocation pass — the interpreter is
             // typically an ET_DYN object with its own .rela.dyn that
             // needs the INTERP_BIAS applied as the load offset.
-            let interp_image =
-                crate::parse_elf(interp_bytes).map_err(|e| LoadBytesError::Elf(e))?;
+            let interp_image = crate::parse_elf(interp_bytes).map_err(LoadBytesError::Elf)?;
             if !interp_image.dynamic.is_empty() {
+                // SAFETY: the interp's segments were just mapped + materialized
+                // at INTERP_BIAS above, so its PT_DYNAMIC relocation sites are
+                // walkable; INTERP_BIAS is the matching load offset to apply.
                 unsafe {
                     apply_relocations(interp_bytes, &interp_image, &address_space, INTERP_BIAS)
                 }?;
@@ -318,7 +333,7 @@ pub unsafe fn load_user_process_with(
     // them. This is what relibc / a Shiva-style ld-narf needs to
     // find the program after the interpreter starts.
     let final_aux: alloc::vec::Vec<AuxEntry> = if interp_loaded {
-        let mut v: alloc::vec::Vec<AuxEntry> = aux.iter().copied().collect();
+        let mut v: alloc::vec::Vec<AuxEntry> = aux.to_vec();
         // AT_PHDR / AT_PHENT / AT_PHNUM let the dynamic linker walk
         // the program's program-header table at runtime. ld-musl
         // needs these to find PT_DYNAMIC (and from there the
@@ -368,7 +383,7 @@ pub unsafe fn load_user_process_with(
         }
         v
     } else {
-        aux.iter().copied().collect()
+        aux.to_vec()
     };
 
     // Lay out argc/argv/envp/auxv if anything was supplied; an
@@ -376,6 +391,10 @@ pub unsafe fn load_user_process_with(
     let rsp = if argv.is_empty() && envp.is_empty() && final_aux.is_empty() {
         stack_top_v
     } else {
+        // SAFETY: the stack region [stack_top_v - stack_bytes .. stack_top_v]
+        // was just mapped + materialized RW above, and the low-4-GiB identity
+        // map is live (this fn's `# Safety` contract) — both preconditions
+        // `init_sysv_stack` documents.
         unsafe {
             init_sysv_stack(
                 &address_space,
@@ -493,6 +512,9 @@ pub enum SysVStackError {
 fn resolve_user_phys_byte(root: PhysAddr, vaddr: u64) -> Option<u64> {
     let page = vaddr & !0xFFFu64;
     let off = vaddr & 0xFFFu64;
+    // SAFETY: `root` is the address space's PML4 phys frame and `page` is a
+    // page-aligned user vaddr; `translate` only reads the page-table hierarchy
+    // through the live low-4-GiB identity map, performing no writes.
     let p = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }?;
     Some(p.as_u64() + off)
 }
@@ -567,6 +589,9 @@ pub unsafe fn init_sysv_stack(
     // physically contiguous, so we can't precompute a single base.
     let write_u8 = |vaddr: u64, byte: u8| -> Result<(), SysVStackError> {
         let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
+        // SAFETY: `phys` is a materialized stack-page phys returned by
+        // `resolve_user_phys_byte`, reachable through the live low-4-GiB
+        // identity map; a single byte write is in-bounds for that page.
         unsafe {
             *(phys as *mut u8) = byte;
         }
@@ -576,6 +601,9 @@ pub unsafe fn init_sysv_stack(
         // u64 writes never cross a page boundary if vaddr is 8-aligned
         // (which all our targets are by construction).
         let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
+        // SAFETY: `phys` is a materialized stack-page phys via the live
+        // low-4-GiB identity map; callers only pass 8-aligned vaddrs so the
+        // u64 store stays within the single resolved page.
         unsafe {
             *(phys as *mut u64) = val;
         }

@@ -148,7 +148,7 @@ impl<'a> GpioPinLut<'a> {
     /// "give me the DDC SCL pin for connector 0".
     pub fn find(&mut self, want: GpioId) -> Option<GpioPin> {
         self.rewind();
-        self.find_map(|p| if p.id == want { Some(p) } else { None })
+        Iterator::find(self, |p| p.id == want)
     }
 }
 

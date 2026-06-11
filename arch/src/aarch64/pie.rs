@@ -50,6 +50,11 @@ pub unsafe fn read_pir_el1() -> u64 {
     v
 }
 
+/// Write `PIR_EL1` (raw `S3_0_C10_C2_3`).
+///
+/// # Safety
+/// EL1; FEAT_S1PIE supported; an `isb` is issued to ensure the
+/// new permission-indirection table takes effect.
 pub unsafe fn write_pir_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {
@@ -75,6 +80,11 @@ pub unsafe fn read_pire0_el1() -> u64 {
     v
 }
 
+/// Write `PIRE0_EL1` (raw `S3_0_C10_C2_2`).
+///
+/// # Safety
+/// EL1; FEAT_S1PIE supported; an `isb` is issued to ensure the
+/// new EL0 permission-indirection table takes effect.
 pub unsafe fn write_pire0_el1(v: u64) {
     // SAFETY: caller-asserted.
     unsafe {

@@ -513,8 +513,8 @@ pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
         let next = ((hdr >> 20) & 0xFFF) as u16;
         if cap_id == DPC_CAP_ID {
             // DPC Capability register is at cap_off + 0x04 (16-bit).
-            // SAFETY: same.
             let dpc_raw =
+                // SAFETY: same.
                 unsafe { core::ptr::read_volatile((cfg_phys + off as u64 + 0x04) as *const u16) };
             return Some(DpcCapability::decode(dpc_raw));
         }

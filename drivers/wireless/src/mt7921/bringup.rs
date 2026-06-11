@@ -122,8 +122,7 @@ pub struct BringUpResult {
 /// posts them on the MCU TX ring.
 pub fn build_mcu_init_sequence(config: &BringUpConfig) -> alloc::vec::Vec<u8> {
     extern crate alloc;
-    let mut out = alloc::vec::Vec::new();
-    out.resize(cmd::PM_STATE_CTRL_SIZE, 0);
+    let mut out = alloc::vec![0u8; cmd::PM_STATE_CTRL_SIZE];
     let _ = cmd::encode_pm_state_ctrl(cmd::PM_STATE_ACTIVE, 0, &mut out);
 
     let ra_start = out.len();
@@ -154,10 +153,8 @@ pub fn build_mac_vif_setup_sequence(
     target_bssid: [u8; 6],
 ) -> alloc::vec::Vec<u8> {
     extern crate alloc;
-    let mut out = alloc::vec::Vec::new();
-
     // 1. DEV_INFO_UPDATE (legacy ext-cmd) — register the BSS index.
-    out.resize(cmd::DEV_INFO_UPDATE_SIZE, 0);
+    let mut out = alloc::vec![0u8; cmd::DEV_INFO_UPDATE_SIZE];
     let _ = cmd::encode_dev_info_update(0, true, config.own_mac, &mut out);
 
     // 2. BSS_INFO_UPDATE → BSS_INFO_BASIC TLV.

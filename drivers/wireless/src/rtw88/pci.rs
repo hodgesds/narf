@@ -233,6 +233,10 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
         None => None,
     };
     if let Some(auth) = auth {
+        // SAFETY: `mmio_bar0` is the powered-on, owned BAR0 mapping and
+        // `mmio_bar2` (if `Some`) the owned BAR2 mapping from `map_bar`;
+        // `download_firmware` only touches those device registers, and the
+        // `auth` token gates this to firmware the trusted loader vouched for.
         match unsafe {
             super::fw::download_firmware(&mmio_bar0, mmio_bar2.as_ref(), device.id.device, &auth)
         } {
@@ -259,8 +263,8 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
     let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_obj = Arc::new(Rtw88Device {
-        mmio_bar0: mmio_bar0.clone(),
-        mmio_bar2: mmio_bar2.clone(),
+        mmio_bar0,
+        mmio_bar2,
         mac,
         device_id: device.id.device,
         link_up: AtomicBool::new(false),

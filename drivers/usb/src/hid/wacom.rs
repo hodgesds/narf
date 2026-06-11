@@ -380,7 +380,7 @@ impl WacomState {
         n += push_abs(abs::ABS_DISTANCE, distance);
 
         match type_nibble {
-            0x00 | 0x01 | 0x02 | 0x03 => {
+            0x00..=0x03 => {
                 // General pen packet.
                 // Pressure: wacom_wac.c:912-914 —
                 //   t = (data[6] << 3) | ((data[7] & 0xC0) >> 5) | (data[1] & 1)

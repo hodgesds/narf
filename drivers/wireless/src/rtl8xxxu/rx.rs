@@ -282,9 +282,7 @@ pub fn build_synthetic_gen1_urb(mpdu: &[u8]) -> alloc::vec::Vec<u8> {
     buf.extend_from_slice(&0u32.to_le_bytes()); // DW3
     buf.extend_from_slice(mpdu);
     let pad = align_up8(buf.len()) - buf.len();
-    for _ in 0..pad {
-        buf.push(0);
-    }
+    buf.extend(core::iter::repeat_n(0u8, pad));
     buf
 }
 

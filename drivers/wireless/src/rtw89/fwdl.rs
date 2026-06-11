@@ -211,7 +211,7 @@ pub fn parse_v0(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
 
     // Walk per-section descriptors.
     let mut payload_off = hdr_len;
-    for i in 0..section_num as usize {
+    for (i, section) in sections.iter_mut().enumerate().take(section_num as usize) {
         let sec_off = FW_HDR_V0_BASE_SIZE + i * FW_HDR_V0_SECTION_SIZE;
         let sw0 = read_u32(blob, sec_off).ok_or(FwError::BadFormat)?;
         let sw1 = read_u32(blob, sec_off + 4).ok_or(FwError::BadFormat)?;
@@ -226,7 +226,7 @@ pub fn parse_v0(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
         };
         let dladdr = sw0 & FWSECTION_W0_DL_ADDR_MASK;
 
-        sections[i] = FwSection {
+        *section = FwSection {
             kind,
             dladdr,
             len: final_len,
@@ -287,7 +287,7 @@ pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
     }
 
     let mut payload_off = hdr_len;
-    for i in 0..section_num as usize {
+    for (i, section) in sections.iter_mut().enumerate().take(section_num as usize) {
         let sec_off = FW_HDR_V1_BASE_SIZE + i * FW_HDR_V1_SECTION_SIZE;
         let sw0 = read_u32(blob, sec_off).ok_or(FwError::BadFormat)?;
         let sw1 = read_u32(blob, sec_off + 4).ok_or(FwError::BadFormat)?;
@@ -303,7 +303,7 @@ pub fn parse_v1(blob: &[u8], sections: &mut [FwSection]) -> Result<FwHeader, FwE
             raw_len
         };
         // v1 DL_ADDR is full 32 bits (no 0x1FFFFFFF mask in fw.c:496-ish).
-        sections[i] = FwSection {
+        *section = FwSection {
             kind,
             dladdr: sw0,
             len: final_len,
@@ -424,5 +424,5 @@ pub const fn packet_count(len: usize, part_size: usize) -> usize {
     } else {
         part_size
     };
-    (len + ps - 1) / ps
+    len.div_ceil(ps)
 }

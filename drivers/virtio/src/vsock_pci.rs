@@ -78,8 +78,8 @@ pub unsafe fn read_device_config(
     let mut buf = [0u8; VsockDeviceConfig::WIRE_SIZE];
     // SAFETY: caller-asserted; offsets bounded above.
     unsafe {
-        for i in 0..VsockDeviceConfig::WIRE_SIZE {
-            buf[i] = region.read8(i as u64);
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = region.read8(i as u64);
         }
     }
     VsockDeviceConfig::decode(&buf).ok_or(VirtioPciError::NoCommonCfg)
@@ -278,6 +278,7 @@ impl VirtioVsockPci {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
             common.read32(CC_DEVICE_FEATURE)
         };
+        // SAFETY: same.
         let feats_hi = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 1);
             common.read32(CC_DEVICE_FEATURE)
@@ -316,7 +317,9 @@ impl VirtioVsockPci {
         // Queues 0/1/2 = rx/tx/event.
         // SAFETY: identity-mapped MMIO.
         let (rx_buf, rx_q, rx_notify_off) = unsafe { setup_queue(&common, 0) }?;
+        // SAFETY: same.
         let (tx_buf, tx_q, tx_notify_off) = unsafe { setup_queue(&common, 1) }?;
+        // SAFETY: same.
         let (ev_buf, ev_q, _) = unsafe { setup_queue(&common, 2) }?;
 
         // SAFETY: identity-mapped MMIO.
@@ -506,9 +509,8 @@ impl VirtioVsockPci {
         let mut hdr_buf = [0u8; VsockHdr::WIRE_SIZE];
         // SAFETY: identity-mapped DMA.
         unsafe {
-            for i in 0..VsockHdr::WIRE_SIZE {
-                hdr_buf[i] =
-                    core::ptr::read_volatile((pool_phys + slot_off + i as u64) as *const u8);
+            for (i, slot) in hdr_buf.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile((pool_phys + slot_off + i as u64) as *const u8);
             }
         }
         let hdr = VsockHdr::decode(&hdr_buf)?;
@@ -516,8 +518,8 @@ impl VirtioVsockPci {
         let mut payload = alloc::vec![0u8; payload_len];
         // SAFETY: same.
         unsafe {
-            for i in 0..payload_len {
-                payload[i] = core::ptr::read_volatile(
+            for (i, slot) in payload.iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile(
                     (pool_phys + slot_off + (VsockHdr::WIRE_SIZE + i) as u64) as *const u8,
                 );
             }
