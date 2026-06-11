@@ -195,11 +195,11 @@ pub unsafe fn load_user_process_with(
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
         let interp_bytes_opt: Option<&[u8]> = registered.or(interp_fs_owned.as_deref());
         if let Some(interp_bytes) = interp_bytes_opt {
-            // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
-            // INTERP_BIAS is a fixed user-range offset well-separated from the
-            // program's load range, so appending the interp's segments here
-            // cannot collide with pages already mapped.
             let interp_entry =
+                // SAFETY: `address_space` is the live AS from `load_elf_bytes`;
+                // INTERP_BIAS is a fixed user-range offset well-separated from the
+                // program's load range, so appending the interp's segments here
+                // cannot collide with pages already mapped.
                 unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is

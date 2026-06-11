@@ -160,8 +160,8 @@ impl VirtioFsPci {
 
         // SAFETY: identity-mapped MMIO.
         let (hi_buf, hiprio, _) = unsafe { setup_queue(&common, HIPRIO_IDX) }?;
-        // SAFETY: identity-mapped MMIO.
         let (req_buf, requestq, request_notify_off) =
+            // SAFETY: identity-mapped MMIO.
             unsafe { setup_queue(&common, REQUEST_IDX_0) }?;
 
         // SAFETY: same.

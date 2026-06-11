@@ -98,11 +98,11 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             return Err(FsError::Unsupported);
         }
 
-        // SAFETY: `ExfatBootSector` is `#[repr(C, packed)]` and
-        // covers the leading bytes of an exFAT main boot sector
-        // exactly per §3.1; we just read those bytes off disk into
-        // a heap buffer we own.
         let boot: ExfatBootSector =
+            // SAFETY: `ExfatBootSector` is `#[repr(C, packed)]` and
+            // covers the leading bytes of an exFAT main boot sector
+            // exactly per §3.1; we just read those bytes off disk into
+            // a heap buffer we own.
             unsafe { core::ptr::read_unaligned(boot_bytes.as_ptr() as *const ExfatBootSector) };
 
         if !boot.has_exfat_signature() || !boot.shifts_in_range() {

@@ -1684,10 +1684,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // and parse the ATOMBIOS version string. Falls back to None on
     // any failure without affecting probe success.
     //
-    // SAFETY: caller-authority over the device. ROM BAR is read-only
-    // from the CPU side once the phys address is known.
-    // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
     let vbios_version: Option<alloc::string::String> =
+        // SAFETY: caller-authority over the device. ROM BAR is read-only
+        // from the CPU side once the phys address is known.
+        // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
         unsafe { read_vbios_version_from_rom(&cap, &device) };
 
     // Register with the DRM card registry so /sys/class/drm/card<N>/

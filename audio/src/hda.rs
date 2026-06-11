@@ -1108,8 +1108,8 @@ impl IntelHda {
         // entries (or two 16-bit entries when bit 7 of conn_len is
         // set). For laptop codecs the first entry is almost always
         // the AOC; we only walk one hop deeper if it's a mixer.
-        // SAFETY: same.
         let entry =
+            // SAFETY: same.
             unsafe { self.send_verb(make_verb(cad, pin_nid, VERB_GET_CONNECTION_LIST_ENTRY))? };
         let mut conv_nid = (entry & 0xFF) as u8;
         // SAFETY: same.

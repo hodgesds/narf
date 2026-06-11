@@ -170,8 +170,8 @@ pub fn probe(
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // Map BAR2: MP2 ISP register window.
-    // SAFETY: exclusive BAR ownership held by bus probe contract.
     let regs =
+        // SAFETY: exclusive BAR ownership held by bus probe contract.
         unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     let isp = AmdMp2Isp {

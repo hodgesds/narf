@@ -209,8 +209,8 @@ pub fn probe(
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     // Map BAR0: IPU6 register window.
-    // SAFETY: exclusive BAR ownership held by bus probe contract.
     let regs =
+        // SAFETY: exclusive BAR ownership held by bus probe contract.
         unsafe { map_bar(&device, BAR_REGS) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     let ipu6 = Ipu6 {

@@ -1584,8 +1584,8 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
     // offset_of!(McContext, rip).
     let mcontext_rip_offset =
         core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, rip);
-    // SAFETY: same justification as siginfo read.
     let saved_rip =
+        // SAFETY: same justification as siginfo read.
         unsafe { ((ucontext_vaddr + mcontext_rip_offset as u64) as *const u64).read_unaligned() };
     if saved_rip != 0xDEAD_F00D {
         return TestResult::Fail("ucontext.uc_mcontext.rip != saved post-trap RIP");

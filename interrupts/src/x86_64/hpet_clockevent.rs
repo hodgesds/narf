@@ -164,9 +164,9 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
         // GSI fallback for HPETs without FSB capability.
         let (n, gsi) = chosen_gsi.ok_or(ClockEventError::NotSupported)?;
         let flags = narf_acpi::ioapic::POLARITY_HIGH | narf_acpi::ioapic::TRIGGER_LEVEL;
-        // SAFETY: vector + handler installed; IOAPIC code upholds
-        // its own preconditions.
         let routed =
+            // SAFETY: vector + handler installed; IOAPIC code upholds
+            // its own preconditions.
             unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi as u32, vector, 0, flags) };
         if !routed {
             return Err(ClockEventError::NoFreeIrq);

@@ -1101,10 +1101,10 @@ impl Mlx5Hca {
         let cq_phys = c.pages[0].phys_addr().raw();
         let mut bytes = [0u8; cqe::CQE_LEN];
         for (i, b) in bytes.iter_mut().enumerate() {
-            // SAFETY: `cq_phys` is the identity-mapped DMA CQ buffer; `off` is
-            // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
-            // stays within the CQE.
             *b =
+                // SAFETY: `cq_phys` is the identity-mapped DMA CQ buffer; `off` is
+                // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
+                // stays within the CQE.
                 unsafe { core::ptr::read_volatile((cq_phys + off as u64 + i as u64) as *const u8) };
         }
         if cqe::is_hw_owned(&bytes) {

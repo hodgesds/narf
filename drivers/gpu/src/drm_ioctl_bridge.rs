@@ -154,11 +154,11 @@ fn handle_version(
     // exactly `size_of::<DrmVersionUapi>()` bytes, which `copy_in` bounds-
     // checks against `IOCTL_MAX_BUF` before copying.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmVersionUapi>())? };
-    // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
-    // `size_of::<DrmVersionUapi>()` bytes, so the read of one
-    // `DrmVersionUapi` stays within the allocation. `read_unaligned` is
-    // used because `bytes`' allocation has only `u8` alignment.
     let mut req: DrmVersionUapi =
+        // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
+        // `size_of::<DrmVersionUapi>()` bytes, so the read of one
+        // `DrmVersionUapi` stays within the allocation. `read_unaligned` is
+        // used because `bytes`' allocation has only `u8` alignment.
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmVersionUapi) };
 
     // Run the generic dispatcher to get the filled in version struct.
@@ -216,11 +216,11 @@ fn handle_version(
     req.version_minor = v.version_minor;
     req.version_patchlevel = v.version_patchlevel;
 
-    // SAFETY: `DrmVersionUapi` is a `#[repr(C)]` POD of plain integer
-    // fields with no padding-dependent invariants, so reinterpreting its
-    // bytes as a `[u8; size_of::<DrmVersionUapi>()]` array is sound; the
-    // source and destination have identical size by construction.
     let out_bytes: [u8; core::mem::size_of::<DrmVersionUapi>()] =
+        // SAFETY: `DrmVersionUapi` is a `#[repr(C)]` POD of plain integer
+        // fields with no padding-dependent invariants, so reinterpreting its
+        // bytes as a `[u8; size_of::<DrmVersionUapi>()]` array is sound; the
+        // source and destination have identical size by construction.
         unsafe { core::mem::transmute(req) };
     // SAFETY: `arg` is the same user/kernel out-pointer validated for the
     // input copy above; we write exactly `size_of::<DrmVersionUapi>()`
@@ -242,11 +242,11 @@ fn handle_getresources(
     // trap layer (or kernel-owned on the test path); we request exactly
     // `size_of::<DrmModeCardResUapi>()` bytes, bounds-checked by `copy_in`.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCardResUapi>())? };
-    // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
-    // `size_of::<DrmModeCardResUapi>()` bytes, so reading one
-    // `DrmModeCardResUapi` stays within the allocation; `read_unaligned`
-    // matches the `u8` alignment of the backing buffer.
     let mut req: DrmModeCardResUapi =
+        // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
+        // `size_of::<DrmModeCardResUapi>()` bytes, so reading one
+        // `DrmModeCardResUapi` stays within the allocation; `read_unaligned`
+        // matches the `u8` alignment of the backing buffer.
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCardResUapi) };
 
     let mut card_guard = mode_state.lock();
@@ -309,10 +309,10 @@ fn handle_getresources(
     req.max_height = res.max_height;
     drop(card_guard);
 
-    // SAFETY: `DrmModeCardResUapi` is a `#[repr(C)]` POD of plain integer /
-    // pointer-sized fields, so reinterpreting its bytes as a `[u8; N]`
-    // array of the same size is sound.
     let out_bytes: [u8; core::mem::size_of::<DrmModeCardResUapi>()] =
+        // SAFETY: `DrmModeCardResUapi` is a `#[repr(C)]` POD of plain integer /
+        // pointer-sized fields, so reinterpreting its bytes as a `[u8; N]`
+        // array of the same size is sound.
         unsafe { core::mem::transmute(req) };
     // SAFETY: `arg` is the validated user/kernel out-pointer from the input
     // copy above; we write exactly `size_of::<DrmModeCardResUapi>()` bytes.
@@ -335,11 +335,11 @@ fn handle_atomic(
     // trap layer (or kernel-owned on the test path); we request exactly
     // `size_of::<DrmModeAtomicUapi>()` bytes, bounds-checked by `copy_in`.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeAtomicUapi>())? };
-    // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
-    // `size_of::<DrmModeAtomicUapi>()` bytes, so reading one
-    // `DrmModeAtomicUapi` stays within the allocation; `read_unaligned`
-    // matches the `u8` alignment of the backing buffer.
     let req: DrmModeAtomicUapi =
+        // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
+        // `size_of::<DrmModeAtomicUapi>()` bytes, so reading one
+        // `DrmModeAtomicUapi` stays within the allocation; `read_unaligned`
+        // matches the `u8` alignment of the backing buffer.
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeAtomicUapi) };
 
     // Wave-36 minimum-viable: we accept the call shape, build an

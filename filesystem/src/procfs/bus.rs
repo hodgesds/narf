@@ -200,8 +200,8 @@ impl ProcFile for PciCfgSpaceFile {
         }
         let mut out = Vec::with_capacity(CFG_SIZE);
         for off in 0..CFG_SIZE {
-            // SAFETY: cfg_phys is the ECAM window; identity-mapped.
             let val =
+                // SAFETY: cfg_phys is the ECAM window; identity-mapped.
                 unsafe { core::ptr::read_volatile((self.cfg_phys as usize + off) as *const u8) };
             out.push(val);
         }

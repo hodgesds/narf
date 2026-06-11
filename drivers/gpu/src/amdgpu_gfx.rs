@@ -572,8 +572,8 @@ impl GfxContext {
     /// a later submission's completion implicitly retires earlier
     /// fences on the same queue (per CP ordering).
     pub fn fence_completed(&self, fence: &Fence) -> bool {
-        // SAFETY: identity-mapped DMA backing, exclusive owner.
         let observed: u32 =
+            // SAFETY: identity-mapped DMA backing, exclusive owner.
             unsafe { core::ptr::read_volatile(self.fence_buf.phys_addr().raw() as *const u32) };
         (observed as u64) >= fence.seq
     }

@@ -522,8 +522,8 @@ impl Tg3Nic {
         // `__tg3_readphy`: auto-poll must be off for software-driven
         // MDIO; Stage 1 leaves the MI_MODE default (no auto-poll, no
         // INTLPBK) so the read path is the simple one.
-        // SAFETY: identity-mapped MMIO; caller owns the device.
         let bmsr =
+            // SAFETY: identity-mapped MMIO; caller owns the device.
             unsafe { Self::read_phy(&mmio, PHY_ADDR_INTERNAL, MII_REG_BMSR) }.unwrap_or(0xFFFF);
         let link_up = bmsr != 0xFFFF && (bmsr & MII_BMSR_LINK_UP) != 0;
 

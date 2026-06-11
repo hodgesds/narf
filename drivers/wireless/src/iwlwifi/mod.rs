@@ -338,12 +338,12 @@ impl WirelessNetIface for IwlDevice {
 
                 // 2. Write header to DMA.
                 let cmd_dma = &self.tx_cmd_bufs[0];
-                // SAFETY: `cmd_dma` is the coherent command buffer sized
-                // `TX_RING_SIZE * 32`; `slot < TX_RING_SIZE`, so `slot *
-                // 32` is in bounds and the 32-byte slot fits an
-                // `IwlCmdHeader`. The result is a valid aligned pointer
-                // into that buffer.
                 let hdr_ptr =
+                    // SAFETY: `cmd_dma` is the coherent command buffer sized
+                    // `TX_RING_SIZE * 32`; `slot < TX_RING_SIZE`, so `slot *
+                    // 32` is in bounds and the 32-byte slot fits an
+                    // `IwlCmdHeader`. The result is a valid aligned pointer
+                    // into that buffer.
                     unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlCmdHeader };
                 // SAFETY: `hdr_ptr` is the `slot`'s 32-byte command slot
                 // computed above, big enough for one `IwlCmdHeader`; the

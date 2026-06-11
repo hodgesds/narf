@@ -132,8 +132,8 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
                     .await
                     .is_ok()
                 {
-                    // SAFETY: same packed-layout argument as Bpb.
                     let info: FsInfo =
+                        // SAFETY: same packed-layout argument as Bpb.
                         unsafe { core::ptr::read_unaligned(info_bytes.as_ptr() as *const FsInfo) };
                     if info.is_valid() {
                         fsinfo = Some(info);

@@ -655,9 +655,9 @@ impl FileOps for DevConsole {
                         if let Some(b) = key_to_ascii(k.code, k.modifiers) {
                             // Signal-shaped control char check.
                             let consumed = if signal_hook != 0 {
-                                // SAFETY: hook ptr installed at boot; signature
-                                // matches `fn(u8) -> bool`.
                                 let hook: fn(u8) -> bool =
+                                    // SAFETY: hook ptr installed at boot; signature
+                                    // matches `fn(u8) -> bool`.
                                     unsafe { core::mem::transmute(signal_hook) };
                                 hook(b)
                             } else {

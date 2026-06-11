@@ -653,9 +653,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // domain's PML4). After this, accesses to domain D's
             // private VA range from any other domain hard-fault at
             // PML4 level.
-            // SAFETY: pcid::init has run; PML4s are registered;
-            // identity map still covers low frames.
             let private_pdpts =
+                // SAFETY: pcid::init has run; PML4s are registered;
+                // identity map still covers low frames.
                 unsafe { narf_memory::domain::init_per_domain_pdpts() }.unwrap_or_default();
             narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
             let _ = writeln!(

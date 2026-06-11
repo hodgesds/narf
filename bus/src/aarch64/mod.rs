@@ -274,9 +274,9 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
 /// a 1-GiB identity map for low physical memory).
 unsafe fn read_header(base: *const u8) -> Option<FdtHeader> {
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: caller promises `base` points at readable memory for
-    // the header's extent.
     let raw: [u8; core::mem::size_of::<FdtHeader>()] =
+        // SAFETY: caller promises `base` points at readable memory for
+        // the header's extent.
         unsafe { core::ptr::read(base as *const [u8; core::mem::size_of::<FdtHeader>()]) };
     compiler_fence(Ordering::SeqCst);
 
@@ -425,8 +425,8 @@ unsafe fn probe_virtio_mmio(base_addr: u64, len: u64) -> Option<BusDevice> {
     }
 
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: same region, +0x08 is still inside the 0x200-byte window.
     let device_id =
+        // SAFETY: same region, +0x08 is still inside the 0x200-byte window.
         unsafe { core::ptr::read_volatile((base_addr + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     if device_id == 0 {

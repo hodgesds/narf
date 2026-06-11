@@ -234,13 +234,13 @@ impl IntelGpu {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(IntelGpuError::UnknownAsic)?;
 
-        // SAFETY: `bring_up`'s contract gives us exclusive ownership of
-        // BAR0 (`GTTMMADR`); `map_bar` maps the PCI BAR `device` advertises.
         let gtt_mmadr =
+            // SAFETY: `bring_up`'s contract gives us exclusive ownership of
+            // BAR0 (`GTTMMADR`); `map_bar` maps the PCI BAR `device` advertises.
             unsafe { map_bar(device, BAR_GTTMMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
-        // SAFETY: same contract grants exclusive ownership of BAR2 (`GMADR`);
-        // `map_bar` maps the PCI BAR `device` advertises.
         let gmadr =
+            // SAFETY: same contract grants exclusive ownership of BAR2 (`GMADR`);
+            // `map_bar` maps the PCI BAR `device` advertises.
             unsafe { map_bar(device, BAR_GMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
 
         // Presence smoke test: read `GMD_ID`. All-ones means the

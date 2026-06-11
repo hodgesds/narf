@@ -523,8 +523,8 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
         return Err(ProbeError::NotForThisDriver);
     }
 
-    // SAFETY: we own the device; PCI enumeration provides exclusive access.
     let controller =
+        // SAFETY: we own the device; PCI enumeration provides exclusive access.
         unsafe { RtsxController::new(&device, &cap, did) }.map_err(|_| ProbeError::BadDevice)?;
 
     *RTSX.lock() = Some(controller);

@@ -309,10 +309,10 @@ impl VirtioBlkDevice {
         let caps = unsafe { discover(device) }.map_err(|_| VirtioError::NoMsix)?;
         // SAFETY: caller-owned device; cap describes a real BAR slot.
         let common = unsafe { map_cap(device, &caps.common) }.map_err(|_| VirtioError::NoMsix)?;
-        // SAFETY: caller-owned device; common is a freshly mapped
-        // BAR-backed region we exclusively reference through the local
-        // `common` binding.
         let (vector, table) =
+            // SAFETY: caller-owned device; common is a freshly mapped
+            // BAR-backed region we exclusively reference through the local
+            // `common` binding.
             unsafe { crate::pci::enable_msix_queue(&common, cap, device, REQUEST_QUEUE) }
                 .map_err(map_msix_err)?;
 
@@ -343,9 +343,8 @@ impl VirtioBlkDevice {
                 // is held for this whole function, serialising every path that
                 // touches `self.pool`; thus this raw &mut to the Option is the
                 // only live mutable access. The pointer is to our own field.
-                if let Some(ref mut pool) =
-                    unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
-                {
+                let pool_slot = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() };
+                if let Some(ref mut pool) = pool_slot {
                     pool.free(req.pool_idx);
                 }
 
@@ -442,10 +441,10 @@ impl BlockDevice for VirtioBlkDevice {
             return BlkRequestFuture::error(req.user_tag, BlockError::DeviceRemoved);
         };
 
-        // SAFETY: `inner_guard` is held for the rest of `submit`, serialising
-        // all access to `self.pool`; this raw &mut to our own field's Option is
-        // therefore the only live mutable borrow.
         let pool_idx = if let Some(ref mut pool) =
+            // SAFETY: `inner_guard` is held for the rest of `submit`, serialising
+            // all access to `self.pool`; this raw &mut to our own field's Option is
+            // therefore the only live mutable borrow.
             unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
         {
             if let Some(idx) = pool.alloc() {
@@ -490,9 +489,8 @@ impl BlockDevice for VirtioBlkDevice {
                 // SAFETY: `inner_guard` is still held, serialising all
                 // access to `self.pool`; this raw &mut to our own field is the
                 // only live mutable borrow as we roll back the allocation.
-                if let Some(ref mut pool) =
-                    unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
-                {
+                let pool_slot = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() };
+                if let Some(ref mut pool) = pool_slot {
                     pool.free(pool_idx);
                 }
                 return BlkRequestFuture::error(req.user_tag, BlockError::PermissionDenied);
