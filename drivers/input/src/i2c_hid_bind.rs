@@ -420,8 +420,7 @@ async fn pump_task(
         .descriptor()
         .map(|d| d.w_max_input_length as usize)
         .unwrap_or(64);
-    let mut buf: Vec<u8> = Vec::new();
-    buf.resize(max_input, 0);
+    let mut buf: Vec<u8> = alloc::vec![0; max_input];
 
     // Per-device delta tracking (PTP path emits PointerEvent based
     // on first contact movement).

@@ -239,6 +239,10 @@ fn smoke_ahci_hba_bring_up() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test harness runs post-boot, so the allocator is
+    // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
+    // QEMU q35's known-good ECAM window and the enumerator only reads config
+    // space (rejecting all-1s), so re-running init here is sound.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -283,6 +287,10 @@ fn smoke_ahci_identify_device() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test harness runs post-boot, so the allocator is
+    // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
+    // QEMU q35's known-good ECAM window and the enumerator only reads config
+    // space (rejecting all-1s), so re-running init here is sound.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -311,7 +319,7 @@ fn smoke_ahci_identify_device() -> TestResult {
     .flatten();
     let idx = port.unwrap_or(0);
     // SAFETY: caller-trusted; the kernel-test harness owns the HBA.
-    let id = match ahci::with_controller(|c| unsafe { c.identify_device(idx) }).map(|r| r) {
+    let id = match ahci::with_controller(|c| unsafe { c.identify_device(idx) }) {
         Some(Ok(buf)) => buf,
         Some(Err(_)) => return TestResult::Fail("identify_device failed"),
         None => return TestResult::Fail("with_controller None"),
@@ -331,6 +339,10 @@ fn smoke_ahci_read_lba() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test harness runs post-boot, so the allocator is
+    // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
+    // QEMU q35's known-good ECAM window and the enumerator only reads config
+    // space (rejecting all-1s), so re-running init here is sound.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -365,9 +377,9 @@ fn smoke_ahci_read_lba() -> TestResult {
         Some(Err(_)) => return TestResult::Fail("ahci_read_lba failed"),
         None => return TestResult::Fail("with_controller None"),
     }
-    for i in 0..512usize {
+    for (i, &got) in sector.iter().enumerate() {
         let expected = (i as u8).wrapping_mul(0x6D) ^ 0x42;
-        if sector[i] != expected {
+        if got != expected {
             return TestResult::Fail("AHCI read pattern mismatch");
         }
     }
@@ -382,6 +394,10 @@ fn smoke_ahci_write_then_read_lba() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test harness runs post-boot, so the allocator is
+    // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
+    // QEMU q35's known-good ECAM window and the enumerator only reads config
+    // space (rejecting all-1s), so re-running init here is sound.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -408,8 +424,8 @@ fn smoke_ahci_write_then_read_lba() -> TestResult {
     .flatten()
     .unwrap_or(0);
     let mut payload = [0u8; 512];
-    for i in 0..512usize {
-        payload[i] = (i as u8).wrapping_mul(0x29) ^ 0xA1;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0x29) ^ 0xA1;
     }
     let w = ahci::with_controller(|c|
         // SAFETY: kernel-test holds the HBA exclusively.
@@ -442,6 +458,10 @@ fn smoke_ahci_ncq_write_then_read_lba() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: the kernel-test harness runs post-boot, so the allocator is
+    // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
+    // QEMU q35's known-good ECAM window and the enumerator only reads config
+    // space (rejecting all-1s), so re-running init here is sound.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -468,8 +488,8 @@ fn smoke_ahci_ncq_write_then_read_lba() -> TestResult {
     .flatten()
     .unwrap_or(0);
     let mut payload = [0u8; 512];
-    for i in 0..512usize {
-        payload[i] = (i as u8).wrapping_mul(0x53) ^ 0x9E;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0x53) ^ 0x9E;
     }
     let w = ahci::with_controller(|c|
         // SAFETY: kernel-test holds the HBA exclusively.
@@ -652,6 +672,10 @@ fn smoke_vmd_not_present_on_qemu_tcg() -> TestResult {
     use crate::vmd;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{devices, BusKind};
+    // SAFETY: the kernel-test harness runs post-boot, so the allocator is
+    // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
+    // QEMU q35's known-good ECAM window and the enumerator only reads config
+    // space (rejecting all-1s), so re-running init here is sound.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_vmd = devs.iter().any(|d| {
@@ -1507,7 +1531,7 @@ fn smoke_rtsx_cmd_buf_serialise() -> TestResult {
     }
     // Check clear + re-use.
     buf.clear();
-    if buf.len() != 0 {
+    if !buf.is_empty() {
         return TestResult::Fail("CmdBuf::clear should reset len to 0");
     }
     TestResult::Pass

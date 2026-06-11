@@ -69,7 +69,7 @@ pub unsafe fn read_edid_block(
 
     // 1. Segment select (only when block > 1).
     if block_number > 1 {
-        let seg = (block_number >> 1) as u8;
+        let seg = block_number >> 1;
         // SAFETY: caller's responsibility.
         let _ = unsafe {
             aux_xfer_retry(
@@ -84,7 +84,7 @@ pub unsafe fn read_edid_block(
         };
     }
     // 2. I²C write byte offset 0 (start of the block).
-    let byte_off = ((block_number & 1) as u8).wrapping_mul(128);
+    let byte_off = (block_number & 1).wrapping_mul(128);
     // SAFETY: same.
     let _ = unsafe {
         aux_xfer_retry(

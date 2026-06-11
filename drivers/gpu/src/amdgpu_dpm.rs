@@ -49,9 +49,10 @@ use crate::amdgpu_smu::ClockDomain;
 
 /// Forced performance level. Mirrors Linux's
 /// `amd_dpm_forced_level`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum PerfLevel {
     /// SMU decides per real-time telemetry. Default at boot.
+    #[default]
     Auto,
     /// Pin to lowest DPM (battery save).
     Low,
@@ -229,12 +230,6 @@ pub struct Dpm {
     pub tables: Vec<DpmTable>,
     /// Cached workload mask from last input.
     pub last_workload_mask: u32,
-}
-
-impl Default for PerfLevel {
-    fn default() -> Self {
-        PerfLevel::Auto
-    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

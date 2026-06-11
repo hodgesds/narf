@@ -10,14 +10,14 @@
 //! ## References (GPL-2.0)
 //!
 //! - Linux `drivers/net/wireless/realtek/rtw89/efuse.c` (v6.6)
-//!     — `rtw89_dump_physical_efuse_map_ddv` (~L113..L138). The
-//!       per-byte arming loop here is a direct port: write address →
-//!       clear `B_AX_EF_RDY` → `read_poll_timeout_atomic` on the bit
-//!       coming back high → fetch the low 8 bits as the data byte.
+//!   — `rtw89_dump_physical_efuse_map_ddv` (~L113..L138). The
+//!   per-byte arming loop here is a direct port: write address →
+//!   clear `B_AX_EF_RDY` → `read_poll_timeout_atomic` on the bit
+//!   coming back high → fetch the low 8 bits as the data byte.
 //! - Linux `drivers/net/wireless/realtek/rtw89/efuse.c` (v6.6)
-//!     — `rtw89_switch_efuse_bank` (~L40..L65). We don't switch banks
-//!       at Stage 0 because Realtek docs the Wi-Fi bank as the POR
-//!       default and the AX parts auto-restore on warm-reset.
+//!   — `rtw89_switch_efuse_bank` (~L40..L65). We don't switch banks
+//!   at Stage 0 because Realtek docs the Wi-Fi bank as the POR
+//!   default and the AX parts auto-restore on warm-reset.
 //! - Linux `drivers/net/wireless/realtek/rtw89/rtw8852a.h` —
 //!   `struct rtw8852ae_efuse::mac_addr` lives at offset 0x000 of the
 //!   PCIe variant's logical map.
@@ -84,7 +84,7 @@ pub unsafe fn read_efuse_bytes(
         "rtw89: read_efuse_bytes out buffer smaller than count"
     );
 
-    for i in 0..count {
+    for (i, out_byte) in out.iter_mut().enumerate().take(count) {
         let byte_addr = addr.saturating_add(i as u32);
 
         // Build the EFUSE_CTRL value: address goes into B_AX_EF_ADDR_MASK
@@ -125,7 +125,7 @@ pub unsafe fn read_efuse_bytes(
         // valid per single-byte read; the upper byte holds the next
         // sequential byte when burst-mode is enabled (we don't enable
         // burst at Stage 0).
-        out[i] = (last & B_AX_EF_DATA_MASK & 0xFF) as u8;
+        *out_byte = (last & B_AX_EF_DATA_MASK & 0xFF) as u8;
     }
 
     Ok(())

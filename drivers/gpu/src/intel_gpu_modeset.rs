@@ -420,6 +420,7 @@ impl<'a, M: MmioWindow + ?Sized> Modeset<'a, M> {
     /// Reference: Linux i915 `hsw_set_power_well`:
     ///   1. Set REQUEST bit in HSW_PWR_WELL_CTL2.
     ///   2. Wait for STATE bit assert.
+    ///
     /// Default grant timeout per i915 is 1 ms (`enable_timeout`).
     fn enable_power_well(&mut self, pw: PowerWell) -> Result<(), ModesetError> {
         let idx = pw as u32;
@@ -1270,9 +1271,16 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
     struct MmioAdapter<'a>(&'a MmioRegion);
     impl<'a> MmioWindow for MmioAdapter<'a> {
         fn read32(&self, off: u64) -> u32 {
+            // SAFETY: `self.0` is the GPU's MMADR BAR window mapped by the
+            // probe; `off` is a register offset within that BAR supplied by the
+            // modeset code, and a 32-bit display register read has no
+            // unwanted read side-effect.
             unsafe { self.0.read32(off) }
         }
         fn write32(&self, off: u64, val: u32) {
+            // SAFETY: `self.0` is the probe-mapped MMADR BAR owned exclusively
+            // by this driver; `off` is an in-range display register offset and
+            // the write targets a programmable 32-bit register.
             unsafe { self.0.write32(off, val) }
         }
     }
@@ -1282,6 +1290,9 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
 
     // Read the existing GOP framebuffer offset from Pipe A.
     let pipe_a_base = Pipe::A.base();
+    // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `pipe_a_base +
+    // PIPECONF_OFFSET` is the Pipe A PIPECONF register, in range of the BAR,
+    // and reading it has no side-effect.
     let pipeconf = unsafe { gpu.gtt_mmadr.read32(pipe_a_base + PIPECONF_OFFSET) };
     if pipeconf & PIPECONF_ENABLE == 0 {
         // Pipe A not enabled by firmware; nothing to take over safely.
@@ -1289,7 +1300,12 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
     }
 
     let plane_base = pipe_a_base + PLANE_PRIMARY_OFFSET;
+    // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `plane_base +
+    // PLANE_SURF_OFFSET` is the primary plane surface-address register, in
+    // range of the BAR, and the read has no side-effect.
     let surf = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_SURF_OFFSET) };
+    // SAFETY: same BAR; `plane_base + PLANE_STRIDE_OFFSET` is the primary
+    // plane stride register, in range, read with no side-effect.
     let stride_val = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_STRIDE_OFFSET) };
 
     let fb = Framebuffer {

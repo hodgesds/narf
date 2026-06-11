@@ -228,9 +228,9 @@ impl VirtioConsolePci {
         let common = unsafe { map_cap(device, &caps.common) }?;
         // SAFETY: same.
         let notify = unsafe { map_cap(device, &caps.notify) }?;
-        // SAFETY: same. `device_cfg` is optional in the spec —
-        // without it cols/rows/emerg_wr default to zero.
+        // `device_cfg` is optional in the spec — without it cols/rows/emerg_wr default to zero.
         let device_cfg = match caps.device_cfg.as_ref() {
+            // SAFETY: same (caller-asserted exclusive ownership).
             Some(c) => Some(unsafe { map_cap(device, c) }?),
             None => None,
         };
@@ -255,6 +255,7 @@ impl VirtioConsolePci {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
             common.read32(CC_DEVICE_FEATURE)
         };
+        // SAFETY: same.
         let feats_hi = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 1);
             common.read32(CC_DEVICE_FEATURE)
@@ -287,13 +288,17 @@ impl VirtioConsolePci {
 
         // Read device-specific cfg if present.
         let cfg = match device_cfg.as_ref() {
-            // SAFETY: identity-mapped MMIO.
-            Some(d) => ConsoleConfig {
-                cols: unsafe { d.read16(CFG_OFF_COLS) },
-                rows: unsafe { d.read16(CFG_OFF_ROWS) },
-                max_nr_ports: unsafe { d.read32(CFG_OFF_MAX_NR_PORTS) },
-                emerg_wr: unsafe { d.read32(CFG_OFF_EMERG_WR) },
-            },
+            Some(d) => {
+                // SAFETY: identity-mapped MMIO; offsets are within the mapped region.
+                unsafe {
+                    ConsoleConfig {
+                        cols: d.read16(CFG_OFF_COLS),
+                        rows: d.read16(CFG_OFF_ROWS),
+                        max_nr_ports: d.read32(CFG_OFF_MAX_NR_PORTS),
+                        emerg_wr: d.read32(CFG_OFF_EMERG_WR),
+                    }
+                }
+            }
             None => ConsoleConfig::default(),
         };
 
@@ -657,5 +662,4 @@ pub fn register_pci_driver() {
     });
 }
 
-#[cfg(target_arch = "x86_64")]
 mod tests;

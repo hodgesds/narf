@@ -210,7 +210,7 @@ pub const fn freq_to_band_chan(freq_mhz: u32) -> Option<(Band, u8)> {
     }
     // 6 GHz: 5955..7115, ch1..233 (PSC channels at 5955 + 80×(ch-1)).
     if freq_mhz >= 5955 && freq_mhz <= 7115 {
-        let ch_idx = ((freq_mhz - 5950) / 5) as u32;
+        let ch_idx = (freq_mhz - 5950) / 5;
         if ch_idx >= 1 && ch_idx <= 233 {
             return Some((Band::G6, ch_idx as u8));
         }

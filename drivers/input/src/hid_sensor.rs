@@ -707,7 +707,7 @@ pub fn build_interval_feature_report(
         .ok_or(FeatureReportError::NoIntervalField)?;
 
     let body_bits = field.bit_offset + field.report_size * field.report_count;
-    let body_bytes = ((body_bits + 7) / 8) as usize;
+    let body_bytes = body_bits.div_ceil(8) as usize;
     if buf.len() < body_bytes {
         return Err(FeatureReportError::BufferTooSmall);
     }
@@ -1091,7 +1091,7 @@ pub mod tests {
         let accel_report = [0x01u8, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
         let als_report = [0x02u8, 0x64, 0x00];
         match decode_report(accel_p.unwrap(), &accel_report, 0) {
-            Ok(SensorEvent::Accel3d { x_milli_g, .. }) if x_milli_g == 256 => {}
+            Ok(SensorEvent::Accel3d { x_milli_g: 256, .. }) => {}
             _ => return TestResult::Fail("accel dispatch decode wrong"),
         }
         match decode_report(als_p.unwrap(), &als_report, 0) {

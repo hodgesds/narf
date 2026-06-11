@@ -105,8 +105,11 @@ impl NvidiaDevice {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(ProbeError::UnknownAsic)?;
 
-        // SAFETY: caller-asserted exclusive ownership of these BARs.
+        // SAFETY: per this fn's `# Safety`, the caller owns `device`'s BARs
+        // exclusively for the device lifetime, so mapping BAR_REGS is sound.
         let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| ProbeError::BarMapFailed)?;
+        // SAFETY: same caller-asserted exclusive BAR ownership; BAR_BAR1 is a
+        // distinct BAR of the same `device` and is mapped at most once here.
         let bar1 = unsafe { map_bar(device, BAR_BAR1) }.map_err(|_| ProbeError::BarMapFailed)?;
         // BAR3 is best-effort — older Maxwell/Pascal parts don't
         // expose a separate instance window via BAR3.

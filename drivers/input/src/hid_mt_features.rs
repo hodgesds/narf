@@ -7,7 +7,7 @@
 //!   the Configuration TLC + Device Mode usage (0x60), Contact Count
 //!   Maximum (0x55), Latency Mode (0x60 in some specs), Surface Switch
 //!   (0x57), Button Switch (0x58).
-//!     <https://usb.org/document-library/hid-usage-tables-14>
+//!   <https://usb.org/document-library/hid-usage-tables-14>
 //! - **Microsoft Precision Touchpad implementation guide** — public
 //!   technical documentation. Defines the Required HID Top-Level
 //!   Collections, Device Mode feature semantics, and the
@@ -17,7 +17,7 @@
 //!     - `mode = 0x03` MULTI_TOUCH / MULTIPLE_INPUT — "Mouse + Touch"
 //!       Microsoft Precision-Touchpad reporting mode (sends both
 //!       standard mouse + MT reports on the wire).
-//!     <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection>
+//!       <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection>
 //!
 //! Linux reference (post-2026-05-20 GPL link policy permits citation):
 //! `linux/drivers/hid/hid-multitouch.c`:
@@ -169,7 +169,7 @@ pub fn encode_max_contact_count(d: &ReportDescriptor, max_contacts: u8) -> Optio
     let f = find_contact_count_max_feature(d)?;
     let report_id = f.report_id;
     let body_bits = d.report_body_bits(report_id, FieldKind::Feature);
-    let body_bytes = ((body_bits as usize) + 7) / 8;
+    let body_bytes = (body_bits as usize).div_ceil(8);
     let mut body = alloc::vec![0u8; body_bytes];
     let value = (max_contacts as i32).min(HARD_MAX_CONTACTS as i32);
     if pack(f, &mut body, &[value]).is_err() {

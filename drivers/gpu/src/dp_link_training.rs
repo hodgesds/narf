@@ -13,8 +13,8 @@
 //! NARF's post-2026-05-20 license:
 //!   - `drivers/gpu/drm/display/drm_dp_helper.c`
 //!     (drm_dp_link_train_clock_recovery_delay,
-//!      drm_dp_link_train_channel_eq_delay,
-//!      drm_dp_clock_recovery_ok, drm_dp_channel_eq_ok)
+//!     drm_dp_link_train_channel_eq_delay,
+//!     drm_dp_clock_recovery_ok, drm_dp_channel_eq_ok)
 //!   - `drivers/gpu/drm/amd/display/dc/link/protocols/
 //!      link_dp_training_8b_10b.c`
 //!     (perform_clock_recovery_sequence, perform_channel_equalization_sequence)
@@ -459,7 +459,7 @@ fn write_vswing_pe<A: AuxChannel>(
     n_lanes: usize,
 ) -> Result<(), AuxError> {
     let mut bytes = [0u8; MAX_LANES];
-    for i in 0..n_lanes {
+    for (i, byte) in bytes.iter_mut().enumerate().take(n_lanes) {
         let t = vswing_pe.lanes[i];
         let mut b = t.swing & 0x3;
         if t.swing >= MAX_VSWING {
@@ -469,7 +469,7 @@ fn write_vswing_pe<A: AuxChannel>(
         if t.pre_emph >= MAX_PRE_EMPH {
             b |= 1 << 5; // MAX_PRE_EMPH_REACHED
         }
-        bytes[i] = b;
+        *byte = b;
     }
     aux.dpcd_write(DPCD_TRAINING_LANE0_SET, &bytes[..n_lanes])
 }

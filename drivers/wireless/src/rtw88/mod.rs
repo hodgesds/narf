@@ -23,15 +23,15 @@
 //! ## References (all GPL-2.0; NARF is GPL-2.0-or-later)
 //!
 //! - Linux `drivers/net/wireless/realtek/rtw88/pci.c`
-//!     — `rtw_pci_probe`, `rtw_pci_id_table` (v6.6 ~L1620..L1750)
+//!   — `rtw_pci_probe`, `rtw_pci_id_table` (v6.6 ~L1620..L1750)
 //! - Linux `drivers/net/wireless/realtek/rtw88/main.c`
-//!     — `rtw_power_on` (v6.6 ~L1900..L2100)
+//!   — `rtw_power_on` (v6.6 ~L1900..L2100)
 //! - Linux `drivers/net/wireless/realtek/rtw88/mac.c`
-//!     — `rtw_pwr_seq_parser`, `rtw_mac_init` (v6.6 ~L140..L280)
+//!   — `rtw_pwr_seq_parser`, `rtw_mac_init` (v6.6 ~L140..L280)
 //! - Linux `drivers/net/wireless/realtek/rtw88/efuse.c`
-//!     — `rtw_efuse_read` (v6.6 ~L50..L200)
+//!   — `rtw_efuse_read` (v6.6 ~L50..L200)
 //! - Linux `drivers/net/wireless/realtek/rtw88/reg.h`
-//!     — REG_* offsets
+//!   — REG_* offsets
 //! - Linux `drivers/net/wireless/realtek/rtw88/rtw8822c.c` /
 //!   `rtw8821c.c` — per-chip PWR-seq tables (only the cross-chip
 //!   prologue is used here)

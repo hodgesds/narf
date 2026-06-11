@@ -44,6 +44,9 @@ pub unsafe fn download_firmware(
         for (j, &b) in chunk.iter().enumerate() {
             val |= (b as u32) << (j * 8);
         }
+        // SAFETY: `mmio_bar2` is a valid BAR2 window the caller guaranteed
+        // (per this fn's `# Safety`); offset `i*4` stays within the copied
+        // blob, which the firmware loader sized to fit the TX buffer.
         unsafe {
             mmio_bar2.write32((i * 4) as u64, val);
         }
@@ -53,6 +56,9 @@ pub unsafe fn download_firmware(
     // - Write source address (OCPBASE_TXBUF_88XX) to REG_DDMA_CH0SA.
     // - Write destination address (e.g., OCPBASE_IMEM_88XX) to REG_DDMA_CH0DA.
     // - Write control (BIT_DDMACH0_OWN | BIT_DDMACH0_CHKSUM_EN | len) to REG_DDMA_CH0CTRL.
+    // SAFETY: `mmio_bar0` is the valid BAR0 register window the caller
+    // guaranteed (per this fn's `# Safety`); `REG_DDMA_CH0*` are in-range
+    // 32-bit DDMA control registers for this chip.
     unsafe {
         mmio_bar0.write32(REG_DDMA_CH0SA, OCPBASE_TXBUF_88XX);
         mmio_bar0.write32(REG_DDMA_CH0DA, OCPBASE_IMEM_88XX);
@@ -68,6 +74,9 @@ pub unsafe fn download_firmware(
 
     // 4. Wait for BIT_DDMACH0_OWN to clear in REG_DDMA_CH0CTRL.
     if !responsive_spin_until(
+        // SAFETY: `mmio_bar0` is the caller-guaranteed BAR0 window;
+        // `REG_DDMA_CH0CTRL` is a valid 32-bit DDMA status register polled
+        // for the `BIT_DDMACH0_OWN` completion bit.
         || unsafe { (mmio_bar0.read32(REG_DDMA_CH0CTRL) & BIT_DDMACH0_OWN) == 0 },
         Deadline::after_ms(500),
     ) {
@@ -76,6 +85,9 @@ pub unsafe fn download_firmware(
 
     // 6. Finally, set BIT_FW_DW_RDY in REG_MCUFW_CTRL and poll FW_READY_MASK in REG_MCUFW_CTRL.
     const BIT_FW_DW_RDY: u32 = 1 << 14;
+    // SAFETY: `mmio_bar0` is the caller-guaranteed BAR0 window;
+    // `REG_MCUFW_CTRL` is a valid 32-bit MCU firmware control register,
+    // read-modify-written to set `BIT_FW_DW_RDY`.
     unsafe {
         let mut val = mmio_bar0.read32(REG_MCUFW_CTRL);
         val |= BIT_FW_DW_RDY;
@@ -83,6 +95,9 @@ pub unsafe fn download_firmware(
     }
 
     if !responsive_spin_until(
+        // SAFETY: `mmio_bar0` is the caller-guaranteed BAR0 window;
+        // `REG_MCUFW_CTRL` is a valid 32-bit MCU firmware control register
+        // polled for `FW_READY_MASK`.
         || unsafe { (mmio_bar0.read32(REG_MCUFW_CTRL) & FW_READY_MASK) == FW_READY_MASK },
         Deadline::after_ms(500),
     ) {

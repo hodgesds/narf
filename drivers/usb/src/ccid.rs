@@ -11,6 +11,7 @@
 //!   ATR encoding (§T.3.1), T=0 / T=1 framing:
 //!   - T=0: ISO/IEC 7816-3:2006 §10 — character-oriented protocol.
 //!   - T=1: ISO/IEC 7816-3:2006 §11 — block-oriented protocol.
+//!
 //!   Framing is handled by the kernel-side `ccid::t0` and `ccid::t1`
 //!   sub-modules (see `send_apdu_t0` / `send_apdu_t1`).
 //! - **Linux `drivers/usb/class/usbtmc.c`** — GPL-2.0; consulted for

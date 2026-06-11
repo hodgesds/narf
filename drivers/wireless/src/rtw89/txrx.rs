@@ -270,6 +270,9 @@ pub fn encode_rxd_for_test(info: &RxdInfo) -> [u8; RXD_SHORT_SIZE] {
 ///   [14]    rec_ack  — receive acknowledgement request
 ///   [13- 0] total_len — payload len + H2C_HEADER_LEN (8)
 /// ```
+// Eight parameters map directly to the H2C header wire fields; grouping
+// them into a struct would add churn at every call site without benefit.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_h2c_header(
     cat: u8,
     class: u8,

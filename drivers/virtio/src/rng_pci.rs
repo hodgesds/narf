@@ -251,9 +251,9 @@ impl VirtioRngPci {
             return Err(VirtioPciError::CompletionTimeout);
         }
         let n = used_len.min(len);
-        // SAFETY: identity-mapped DMA.
-        for i in 0..n {
-            out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+        for (i, slot) in out.iter_mut().enumerate().take(n) {
+            // SAFETY: identity-mapped DMA; phys is the allocated coherent buffer base.
+            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {

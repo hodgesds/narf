@@ -11,15 +11,15 @@
 //! References (public, non-GPL only):
 //! - **HID Class Specification 1.11** (USB-IF, June 2001) §7.1.1
 //!   GET_DESCRIPTOR(REPORT) class request encoding.
-//!     <https://www.usb.org/document-library/device-class-definition-hid-111>
+//!   <https://www.usb.org/document-library/device-class-definition-hid-111>
 //! - **HID Usage Tables 1.4** (USB-IF, March 2022) §16 Digitizers,
 //!   in particular the Touchpad usage page subset (Tip Switch,
 //!   Contact ID, X/Y, In Range, Confidence).
-//!     <https://www.usb.org/document-library/hid-usage-tables-14>
+//!   <https://www.usb.org/document-library/hid-usage-tables-14>
 //! - **Microsoft Precision Touchpad implementation guide** (public
 //!   docs.microsoft.com), drives the device-mode (`Mode Feature
 //!   Report`) byte layout this driver writes once at attach.
-//!     <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-required-hid-top-level-collections>
+//!   <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-required-hid-top-level-collections>
 //!
 //! No GPL/BSD source code (Linux, FreeBSD, NetBSD, U-Boot) consulted.
 //!
@@ -185,9 +185,9 @@ pub fn report_descriptor_length(cfg: &[u8], hid_desc_off: usize) -> Option<u16> 
 
 /// Caller-side post-address PTP touchpad bind: GET_DESCRIPTOR(REPORT)
 /// + parse + ptp::detect + interrupt-IN arm + registry push. Returns
-/// `Err(HidError::NotBootKeyboard)` when the device's report
-/// descriptor doesn't shape like a PTP touchpad — caller's
-/// cleanup_guard handles disable_slot.
+///   `Err(HidError::NotBootKeyboard)` when the device's report
+///   descriptor doesn't shape like a PTP touchpad — caller's
+///   cleanup_guard handles disable_slot.
 pub async fn try_bind_touchpad_already_addressed(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -206,7 +206,7 @@ pub async fn try_bind_touchpad_already_addressed(
             slot_id,
             RT_DEV_TO_HOST_STD_IFACE,
             crate::xhci::USB_REQ_GET_DESCRIPTOR,
-            ((HID_DESC_TYPE_REPORT as u16) << 8) | 0,
+            (HID_DESC_TYPE_REPORT as u16) << 8,
             interface_num as u16,
             &mut blob,
         )

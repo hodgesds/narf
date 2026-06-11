@@ -12,6 +12,7 @@
 //! - `clunk(5)` / `remove(5)` — Tclunk / Rclunk, Tremove / Rremove.
 //! - `stat(5)` — Tstat / Rstat; the variable-length stat structure.
 //! - `error(5)` — Rerror.
+//!
 //! See <https://9fans.github.io/plan9port/man/man9/>.
 //!
 //! No GPL/LGPL 9P implementation source was consulted while writing

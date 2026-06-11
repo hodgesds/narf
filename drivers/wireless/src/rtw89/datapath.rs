@@ -135,9 +135,10 @@ pub struct RxDelivery<'a> {
 }
 
 /// Pull one RX BD's payload. `bd_payload` is the full DMA buffer (RXD
-/// + frame); we return the frame slice and the decoded RXD. Returns
-/// `None` if the buffer is too short or the RXD says CRC/ICV error
-/// (caller should still ACK the BD; this is just a filter).
+/// + frame); we return the frame slice and the decoded RXD.
+///
+/// Returns `None` if the buffer is too short or the RXD says CRC/ICV
+/// error (caller should still ACK the BD; this is just a filter).
 pub fn consume_rx_bd(bd_payload: &[u8]) -> Option<RxDelivery<'_>> {
     let rxd = decode_rxd(bd_payload)?;
     if rxd.crc32_err || rxd.icv_err {

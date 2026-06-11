@@ -12,7 +12,7 @@
 //!   <https://learn.microsoft.com/en-us/windows-hardware/drivers/biometric/>
 //! - **USB 3.1 §9.6.2** — BOS descriptor; **§9.6.2.2** — Device
 //!   Capability descriptor (Platform Capability sub-type).
-//!     <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
+//!   <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
 //!
 //! No GPL / Linux source consulted. Vendor command codecs (Goodix,
 //! Synaptics/Validity, ELAN) are intentionally NOT covered here —
@@ -241,7 +241,7 @@ pub async fn try_bind_wbdi_already_addressed(
         .await
         .ok_or(WbdiBindError::NoMsOs20PlatformCap)?;
     let total_set = total_set as usize;
-    if total_set < 10 || total_set > MS_OS_20_MAX_LEN {
+    if !(10..=MS_OS_20_MAX_LEN).contains(&total_set) {
         return Err(WbdiBindError::InvalidDescriptorSet);
     }
     // Vendor request: bmRequestType=0xC0 (device-to-host | vendor |

@@ -374,7 +374,7 @@ pub const fn chip_kind_from_xid(xid: u32) -> ChipKind {
     match xid {
         0x609 => ChipKind::Rtl8125A,
         0x641 => ChipKind::Rtl8125B,
-        0x688 | 0x689 | 0x68a | 0x68b => ChipKind::Rtl8125D,
+        0x688..=0x68b => ChipKind::Rtl8125D,
         0x681 => ChipKind::Rtl8125Bp,
         other => ChipKind::Unknown(other),
     }
@@ -610,7 +610,15 @@ pub struct RtlNic {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: `RtlNic` only owns an `MmioRegion` (identity-mapped BAR2 device
+// window) and `DmaBuffer`s (identity-mapped DMA pages). Those raw pointers are
+// the sole reason auto `Send` is not derived; the underlying device window is
+// not thread-affine, so the struct may be moved between cores.
 unsafe impl Send for RtlNic {}
+// SAFETY: every interior-mutable field (`tx_head`, `rx_head`, the IPC rings) is
+// guarded by `IrqSafeSpinLock`, so concurrent `&RtlNic` access is serialised.
+// The MMIO/DMA windows are device registers/buffers safe for shared volatile
+// access from multiple cores.
 unsafe impl Sync for RtlNic {}
 
 impl core::fmt::Debug for RtlNic {
@@ -732,8 +740,8 @@ impl RtlNic {
         //     buffer + has BufferSize=RX_BUF_LEN + OWN=1 so the NIC
         //     can DMA into it. Slot RING_LEN-1 carries EOR.
         let rx_ring_phys = rx_ring.phys_addr().raw();
-        for i in 0..RING_LEN {
-            let buf_phys = rx_pool[i].phys_addr().raw();
+        for (i, buf) in rx_pool.iter().enumerate().take(RING_LEN) {
+            let buf_phys = buf.phys_addr().raw();
             let mut flags = RXD_OWN_LOCAL | (RX_BUF_LEN as u32 & RXD_LEN_MASK_LOCAL);
             if i == RING_LEN - 1 {
                 flags |= RXD_EOR_LOCAL;
@@ -830,7 +838,7 @@ impl RtlNic {
         // Spawn pumps
         spawn_pumps(rtl.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(rtl).map_err(|_| NicError::NoMemory)?)
+        Arc::try_unwrap(rtl).map_err(|_| NicError::NoMemory)
     }
 
     /// Bring up MSI-X with a single vector wired to MSI-X table
@@ -993,6 +1001,9 @@ impl RtlNic {
             let copy_len = len.min(RX_BUF_LEN);
             // SAFETY: identity-mapped DMA buffer.
             for i in 0..copy_len {
+                // SAFETY: `buf_phys` is the identity-mapped DMA buffer the NIC
+                // just filled for this slot; `i < copy_len <= RX_BUF_LEN`, so
+                // `buf_phys + i` stays inside the buffer.
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -1078,12 +1089,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+    // SAFETY: probe holds exclusive authority over `device` and its cfg `cap`
+    // for the duration of `bring_up`, satisfying its `# Safety` contract.
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
     {
+        // SAFETY: `dev` is the only `Arc` to this `RtlNic` at this point (it is
+        // cloned into `CONTROLLER` only after this block), so `Arc::as_ptr`
+        // yields a valid, uniquely-owned, properly-aligned pointer and the
+        // exclusive `&mut` borrow lives only within this scope.
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut RtlNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

@@ -412,9 +412,7 @@ impl DjReceiver {
         if f.device_index == DJ_RECEIVER_INDEX || f.device_index == HIDPP_RECEIVER_INDEX {
             return None;
         }
-        if self.slot(f.device_index).is_none() {
-            return None;
-        }
+        self.slot(f.device_index)?;
         Some(f)
     }
 }

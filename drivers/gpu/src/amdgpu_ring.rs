@@ -132,9 +132,12 @@ impl Ring {
             return Err(RingError::NotEnoughRoomBeforeWrap);
         }
         let phys = self.backing.phys_addr().raw();
-        // SAFETY: identity-mapped DMA page; bounds checked above.
         for (i, &w) in packet.iter().enumerate() {
             let off = ((self.wptr_dw + i) * 4) as u64;
+            // SAFETY: `phys` is the base of the ring's identity-mapped DMA
+            // page from `backing`, so `phys + off` is a valid, 4-byte-aligned
+            // address (`off` is a dword multiple). `wptr_dw + packet.len() <=
+            // RING_SIZE_DW` was checked above, so `off` stays within the page.
             unsafe {
                 core::ptr::write_volatile((phys + off) as *mut u32, w);
             }

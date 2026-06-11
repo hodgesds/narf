@@ -7,7 +7,6 @@
 //! References: `version(5)`, `attach(5)`.
 
 use alloc::sync::Arc;
-use core::future::Future;
 
 use narf_driver_runtime::DomainId;
 use narf_filesystem::{DirOps, FsError, FsInstance};

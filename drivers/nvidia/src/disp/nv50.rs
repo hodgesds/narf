@@ -646,8 +646,11 @@ pub unsafe fn aux_read_payload(
     out: &mut [u8],
 ) {
     let base = (channel as u64) * aux_chan_regs::CH_STRIDE;
-    // SAFETY: caller's responsibility.
     let mut words = [0u32; 4];
+    // SAFETY: per this fn's `# Safety`, `bar0` is the kernel-mapped BAR0
+    // device window and the caller owns AUX `channel`. The four reads land
+    // on `DATA_RD..+0xC` within that channel's register block (`base` is a
+    // bounded multiple of `CH_STRIDE`), all valid 32-bit device registers.
     unsafe {
         for (i, w) in words.iter_mut().enumerate() {
             *w = bar0.read32(aux_chan_regs::DATA_RD + base + (i as u64) * 4);
@@ -730,7 +733,7 @@ pub unsafe fn live_commit_head_mode(
     stage_update(pb, 0)?;
     let end_byte_off = pb_byte_base
         .saturating_add((pb.len() - start) as u32)
-        .saturating_add(pb_byte_base.checked_sub(pb_byte_base).unwrap_or(0));
+        .saturating_add(pb_byte_base.saturating_sub(pb_byte_base));
     // The doorbell consumer is the byte position of the *next free
     // word*, not the start. The hardware fetches GET..PUT so PUT
     // must be the byte offset past the last staged word.

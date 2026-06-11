@@ -149,7 +149,7 @@ pub fn insert_into_leaf(
     // physical-contiguous AND same uninit state).
     // Linux `ext4_can_extents_be_merged`.
     for l in existing.iter_mut() {
-        if !l.is_uninitialized == !new_extent.is_uninitialized
+        if l.is_uninitialized == new_extent.is_uninitialized
             && l.logical + l.len as u32 == new_extent.logical
             && l.physical + l.len as u64 == new_extent.physical
             && (l.len as u32 + new_extent.len as u32) <= 0x7FFF
@@ -174,7 +174,7 @@ pub fn insert_into_leaf(
         }
         // Try merging the new extent into the LEFT of an existing one
         // (the inserted extent precedes the existing one + meets it).
-        if !l.is_uninitialized == !new_extent.is_uninitialized
+        if l.is_uninitialized == new_extent.is_uninitialized
             && new_extent.logical + new_extent.len as u32 == l.logical
             && new_extent.physical + new_extent.len as u64 == l.physical
             && (l.len as u32 + new_extent.len as u32) <= 0x7FFF

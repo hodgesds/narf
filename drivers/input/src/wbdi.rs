@@ -227,10 +227,8 @@ pub fn find_wbdi_interface(cfg: &[u8], ms_os_blob: &[u8]) -> Option<u8> {
         if len < 2 || i + len > cfg.len() {
             break;
         }
-        if cfg[i + 1] == 4 && len >= 9 {
-            if cfg[i + 5] == 0xFF {
-                return Some(cfg[i + 2]);
-            }
+        if cfg[i + 1] == 4 && len >= 9 && cfg[i + 5] == 0xFF {
+            return Some(cfg[i + 2]);
         }
         i += len;
     }

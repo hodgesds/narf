@@ -242,6 +242,12 @@ pub mod test_support {
         pub reads: alloc::collections::VecDeque<(u32, u32)>,
         pub writes: alloc::vec::Vec<(u32, u32)>,
     }
+    impl Default for MockPsp {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl MockPsp {
         #[allow(dead_code)]
         pub fn new() -> Self {

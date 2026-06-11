@@ -108,6 +108,12 @@ impl CmdBuf {
         self.len
     }
 
+    /// Returns `true` if the buffer holds no entries.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Append one entry. Returns `false` if the buffer is full.
     #[inline]
     pub fn push(&mut self, e: CmdEntry) -> bool {

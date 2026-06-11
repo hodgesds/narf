@@ -212,7 +212,7 @@ pub fn diff_keycodes(
         if k == 0 || k == ROLLOVER_USAGE {
             continue;
         }
-        if !cur.iter().any(|&c| c == k) {
+        if !cur.contains(&k) {
             let kc = usage_to_keycode(k);
             // Legacy ring.
             push_key(kc, false);
@@ -226,7 +226,7 @@ pub fn diff_keycodes(
         if k == 0 || k == ROLLOVER_USAGE {
             continue;
         }
-        if !prev.iter().any(|&p| p == k) {
+        if !prev.contains(&k) {
             let kc = usage_to_keycode(k);
             // Legacy ring.
             push_key(kc, true);
@@ -499,17 +499,12 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     };
     let mut total = 0;
     let mut buf = [0u8; 8];
-    loop {
-        match xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
-            Ok(Some(_)) => {
-                let mut g = USB_KEYBOARDS.lock();
-                if let Some(kbd) = g.get_mut(idx) {
-                    total += process_boot_report(kbd, &buf);
-                }
-                buf = [0u8; 8];
-            }
-            _ => break,
+    while let Ok(Some(_)) = xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
+        let mut g = USB_KEYBOARDS.lock();
+        if let Some(kbd) = g.get_mut(idx) {
+            total += process_boot_report(kbd, &buf);
         }
+        buf = [0u8; 8];
     }
     total
 }

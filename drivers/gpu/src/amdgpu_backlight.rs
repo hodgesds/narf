@@ -87,7 +87,7 @@ pub fn user_level_for_percent(pct: u8) -> u16 {
 
 /// Build the one-shot PWM init sequence: lock → program period
 /// + cntl + initial duty → unlock. Caller writes it via DCN's
-/// `execute_modeset` (the same MMIO writer the modeset uses).
+///   `execute_modeset` (the same MMIO writer the modeset uses).
 pub fn build_backlight_init(
     panel_cntl_base: u32,
     period_units: u32,
@@ -96,32 +96,33 @@ pub fn build_backlight_init(
     if period_units & !0x00FF_FFFF != 0 {
         return Err(BacklightError::PeriodOverflow);
     }
-    let mut writes = Vec::with_capacity(5);
-    // Lock — pending writes won't take effect until unlock.
-    writes.push(DcnWrite {
-        addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
-        value: BL_PWM_GRP1_LOCK,
-    });
-    // Program period (sets PWM frequency).
-    writes.push(DcnWrite {
-        addr: panel_cntl_base + BL_PWM_PERIOD_CNTL_REL,
-        value: period_units,
-    });
-    // Enable PWM with grp1 source, no override.
-    writes.push(DcnWrite {
-        addr: panel_cntl_base + BL_PWM_CNTL_REL,
-        value: BL_PWM_CNTL_EN | BL_PWM_CNTL_GRP1_FRAC_BL_EN,
-    });
-    // Initial duty cycle.
-    writes.push(DcnWrite {
-        addr: panel_cntl_base + BL_PWM_USER_LEVEL_REL,
-        value: initial_user_level as u32,
-    });
-    // Unlock — DCN latches the new period + duty on next vsync.
-    writes.push(DcnWrite {
-        addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
-        value: 0,
-    });
+    let writes = alloc::vec![
+        // Lock — pending writes won't take effect until unlock.
+        DcnWrite {
+            addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
+            value: BL_PWM_GRP1_LOCK,
+        },
+        // Program period (sets PWM frequency).
+        DcnWrite {
+            addr: panel_cntl_base + BL_PWM_PERIOD_CNTL_REL,
+            value: period_units,
+        },
+        // Enable PWM with grp1 source, no override.
+        DcnWrite {
+            addr: panel_cntl_base + BL_PWM_CNTL_REL,
+            value: BL_PWM_CNTL_EN | BL_PWM_CNTL_GRP1_FRAC_BL_EN,
+        },
+        // Initial duty cycle.
+        DcnWrite {
+            addr: panel_cntl_base + BL_PWM_USER_LEVEL_REL,
+            value: initial_user_level as u32,
+        },
+        // Unlock — DCN latches the new period + duty on next vsync.
+        DcnWrite {
+            addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
+            value: 0,
+        },
+    ];
     Ok(writes)
 }
 
@@ -344,7 +345,7 @@ mod smoke_tests {
         }
         // 50% ≈ 0x7FFF.
         let mid = user_level_for_percent(50);
-        if mid < 0x7F00 || mid > 0x8200 {
+        if !(0x7F00..=0x8200).contains(&mid) {
             return TestResult::Fail("50% not midpoint");
         }
         TestResult::Pass

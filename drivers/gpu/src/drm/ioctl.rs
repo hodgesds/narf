@@ -376,8 +376,7 @@ fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoc
         .connector(connector_id)
         .map_err(|_| DrmIoctlError::UnknownConnector)?;
 
-    let modes: alloc::vec::Vec<DrmModeModeInfo> =
-        conn.modes.iter().map(|m| mode_to_wire(m)).collect();
+    let modes: alloc::vec::Vec<DrmModeModeInfo> = conn.modes.iter().map(mode_to_wire).collect();
 
     let info = DrmModeGetConnector {
         count_modes: modes.len() as u32,

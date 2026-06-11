@@ -87,8 +87,10 @@ pub enum MesApiOpcode {
 /// `enum MES_QUEUE_TYPE`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
+#[derive(Default)]
 pub enum MesQueueType {
     Gfx = 0,
+    #[default]
     Compute = 1,
     Sdma = 2,
 }
@@ -96,8 +98,10 @@ pub enum MesQueueType {
 /// `enum MES_AMD_PRIORITY_LEVEL`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
+#[derive(Default)]
 pub enum MesPriority {
     Low = 0,
+    #[default]
     Normal = 1,
     Medium = 2,
     High = 3,
@@ -251,18 +255,6 @@ pub struct MesAddQueueArgs {
     pub vm_context_cntl: u32,
     pub pipe_id: u32,
     pub queue_id: u32,
-}
-
-impl Default for MesPriority {
-    fn default() -> Self {
-        MesPriority::Normal
-    }
-}
-
-impl Default for MesQueueType {
-    fn default() -> Self {
-        MesQueueType::Compute
-    }
 }
 
 /// `MES_SCH_API_REMOVE_QUEUE` — tear down a previously-added queue.

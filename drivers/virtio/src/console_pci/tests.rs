@@ -131,7 +131,7 @@ fn smoke_virtio_console_pci_live_write() -> TestResult {
     }
     let r = console_pci::with_controller(|c| c.write_bytes(b"NARF virtio-console live\n"));
     match r {
-        Some(Ok(n)) if n == 25 => TestResult::Pass,
+        Some(Ok(25)) => TestResult::Pass,
         Some(Ok(_)) => TestResult::Fail("short write"),
         Some(Err(_)) => TestResult::Fail("write_bytes failed"),
         None => TestResult::Skip("controller missing"),

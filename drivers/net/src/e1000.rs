@@ -664,8 +664,11 @@ fn acquire_phy_swflag(mmio: &MmioRegion) -> Result<bool, E1000Error> {
         // the release path is a no-op too.
         return Ok(false);
     }
-    // SAFETY: identity-mapped MMIO; EXTCNF_CTRL is inside BAR0.
     for _ in 0..10 {
+        // SAFETY: `mmio` was mapped from BAR0 by the caller and
+        // `REG_EXTCNF_CTRL` is a valid 32-bit register offset within it,
+        // so the read/write target a real device register of the right
+        // width.
         unsafe {
             let v = mmio.read32(REG_EXTCNF_CTRL);
             mmio.write32(REG_EXTCNF_CTRL, v | EXTCNF_CTRL_SWFLAG);
@@ -790,7 +793,16 @@ pub struct E1000 {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: `E1000` only auto-fails `Send` because `MmioRegion`/`DmaBuffer`
+// wrap raw device/DMA pointers. Those pointers stay valid for the device
+// lifetime and are not tied to any thread, so the handle is sound to move
+// across threads.
 unsafe impl Send for E1000 {}
+// SAFETY: every field reachable through `&E1000` from multiple threads is
+// either immutable after bring-up (mac/link_up/mmio mapping) or guarded by
+// an `IrqSafeSpinLock` (tx/rx cursors and IPC rings); concurrent MMIO/DMA
+// register access via the shared pointers is serialized by those locks, so
+// shared access is sound.
 unsafe impl Sync for E1000 {}
 
 impl core::fmt::Debug for E1000 {
@@ -895,8 +907,11 @@ impl E1000 {
         }
 
         // 2. Read MAC from RAL/RAH.
-        // SAFETY: identity-mapped.
+        // SAFETY: `mmio` was mapped from BAR0; `REG_RAL0` is a valid 32-bit
+        // register offset within it.
         let ral = unsafe { mmio.read32(REG_RAL0) };
+        // SAFETY: `mmio` was mapped from BAR0; `REG_RAH0` is a valid 32-bit
+        // register offset within it.
         let rah = unsafe { mmio.read32(REG_RAH0) };
         let mac = [
             (ral & 0xFF) as u8,
@@ -1107,7 +1122,7 @@ impl E1000 {
         // global enable so the device can't fire stale data.
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| E1000Error::NoMemory)?;
         // SAFETY: cfg-space write to a known cap-list offset.
-        let _ = unsafe { msix.enable() }.map_err(|_| E1000Error::NoMemory)?;
+        unsafe { msix.enable() }.map_err(|_| E1000Error::NoMemory)?;
         Ok((msix, v))
     }
 
@@ -1173,7 +1188,7 @@ impl E1000 {
     /// path is what bring-up tests run, and it's also the synchronous
     /// fallback for callers that can't await.
     pub fn tx(&self, frame: &[u8]) -> Result<(), E1000Error> {
-        if frame.len() == 0 || frame.len() > 1518 {
+        if frame.is_empty() || frame.len() > 1518 {
             return Err(E1000Error::FrameTooLong);
         }
         // Pick the next TX descriptor slot, then reuse that
@@ -1245,7 +1260,7 @@ impl E1000 {
     /// `tx_async` wrapper, which holds the scratch buffer alive
     /// until DD is observed).
     fn tx_enqueue(&self, frame: &[u8]) -> Result<usize, E1000Error> {
-        if frame.len() == 0 || frame.len() > 1518 {
+        if frame.is_empty() || frame.len() > 1518 {
             return Err(E1000Error::FrameTooLong);
         }
         // Persistent per-slot buffer (audit #4); same change as the
@@ -1304,9 +1319,11 @@ impl E1000 {
         // Copy out the payload.
         let len = (desc.length as usize).min(out.len()).min(RX_BUF_LEN);
         let buf_phys = desc.addr;
-        // SAFETY: identity-mapped DMA buffer.
-        for i in 0..len {
-            out[i] = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
+        for (i, b) in out.iter_mut().enumerate().take(len) {
+            // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
+            // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
+            // address `buf_phys + i` stays within that page.
+            *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         // Rearm the descriptor: clear status, leave addr as-is.
         let new_desc = RxDesc {

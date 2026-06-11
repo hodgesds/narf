@@ -135,8 +135,8 @@ impl SidebandHeader {
 /// Returns the encoded bytes (variable length).
 pub fn encode_sideband_header(h: &SidebandHeader) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(((h.lct & 0xF) << 4) | 0); // lcr count placeholder
-                                        // Each hop is 4 bits; pack two per byte.
+    out.push((h.lct & 0xF) << 4); // lcr count placeholder
+                                  // Each hop is 4 bits; pack two per byte.
     let mut byte = 0u8;
     let mut half = false;
     for i in 0..(h.lct as usize) {

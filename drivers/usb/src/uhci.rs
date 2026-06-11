@@ -10,7 +10,7 @@
 //! - **USB 2.0 Specification §11** — root-hub class semantics
 //!   shared with UHCI's PORTSC bits (UHCI predates USB 2.0 but
 //!   uses the same root-hub semantics).
-//!     <https://www.usb.org/document-library/usb-20-specification>
+//!   <https://www.usb.org/document-library/usb-20-specification>
 //!
 //! No GPL/BSD source code (Linux, FreeBSD, NetBSD, U-Boot)
 //! consulted at any point during the writing of this driver.

@@ -445,7 +445,7 @@ pub fn translate_diff(prev: &[u16; 8], cur: &[u16; 8]) -> usize {
         if p == 0 {
             continue;
         }
-        if !cur.iter().any(|&c| c == p) {
+        if !cur.contains(&p) {
             let code = usage_to_keycode(p);
             if code != KeyCode::Unknown {
                 push_key(code, false);
@@ -458,7 +458,7 @@ pub fn translate_diff(prev: &[u16; 8], cur: &[u16; 8]) -> usize {
         if c == 0 {
             continue;
         }
-        if !prev.iter().any(|&p| p == c) {
+        if !prev.contains(&c) {
             let code = usage_to_keycode(c);
             if code != KeyCode::Unknown {
                 push_key(code, true);
@@ -608,7 +608,7 @@ pub async fn try_bind_consumer_already_addressed(
             slot_id,
             RT_DEV_TO_HOST_STD_IFACE,
             crate::xhci::USB_REQ_GET_DESCRIPTOR,
-            ((HID_DESC_TYPE_REPORT as u16) << 8) | 0,
+            (HID_DESC_TYPE_REPORT as u16) << 8,
             iface_num as u16,
             &mut blob,
         )
@@ -838,9 +838,9 @@ mod tests {
         let report: &[u8] = &[0xE9, 0xE2, 0xCD];
         let decoded = decode_report(report, None);
         // All three should appear in the decoded array.
-        let has_vol_up = decoded.iter().any(|&c| c == 0xE9);
-        let has_mute = decoded.iter().any(|&c| c == 0xE2);
-        let has_play = decoded.iter().any(|&c| c == 0xCD);
+        let has_vol_up = decoded.contains(&0xE9);
+        let has_mute = decoded.contains(&0xE2);
+        let has_play = decoded.contains(&0xCD);
         if !has_vol_up || !has_mute || !has_play {
             return TestResult::Fail("multi-press report not decoded correctly");
         }
@@ -853,10 +853,10 @@ mod tests {
         // Report with report-ID prefix: ID=0x03, then vol-up + brightness-up.
         let report_with_id: &[u8] = &[0x03, 0xE9, 0x6F];
         let decoded2 = decode_report(report_with_id, Some(0x03));
-        if !decoded2.iter().any(|&c| c == 0xE9) {
+        if !decoded2.contains(&0xE9) {
             return TestResult::Fail("vol-up not found in report-ID-prefixed decode");
         }
-        if !decoded2.iter().any(|&c| c == 0x6F) {
+        if !decoded2.contains(&0x6F) {
             return TestResult::Fail("brightness-up not found in report-ID-prefixed decode");
         }
 

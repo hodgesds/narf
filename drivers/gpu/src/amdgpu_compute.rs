@@ -181,7 +181,7 @@ pub fn build_map_queue(
         | (0u32 << MAP_QUEUES_ALLOC_FORMAT_SHIFT)
         | (ring_kind.engine_sel() << MAP_QUEUES_ENGINE_SEL_SHIFT)
         | (1u32 << MAP_QUEUES_NUM_QUEUES_SHIFT);
-    let dbell = (doorbell_off as u32) << MAP_QUEUES_DOORBELL_OFFSET_SHIFT;
+    let dbell = doorbell_off << MAP_QUEUES_DOORBELL_OFFSET_SHIFT;
     alloc::vec![
         header,
         cfg,
@@ -211,11 +211,10 @@ pub enum UnmapAction {
 /// Build an UNMAP_QUEUES packet.
 pub fn build_unmap_queue(ring_kind: RingKind, doorbell_off: u32, action: UnmapAction) -> Vec<u32> {
     let header = packet3(PACKET3_UNMAP_QUEUES, 4);
-    let cfg = ((action as u32) << 0) // ACTION
-        | (0u32 << 4)                // QUEUE_SEL
+    let cfg = (action as u32)                    // QUEUE_SEL
         | (ring_kind.engine_sel() << 26)
         | (1u32 << 29); // NUM_QUEUES
-    let dbell = (doorbell_off as u32) << 2;
+    let dbell = doorbell_off << 2;
     alloc::vec![header, cfg, dbell, 0, 0, 0]
 }
 
@@ -350,7 +349,7 @@ impl KiqScheduler {
 
     /// Set a queue's priority. Affects [`next_queue_at_priority`]
     /// + [`build_set_priority`] (which produces the MES PM4 packet
-    /// to push the new priority to the hardware scheduler).
+    ///   to push the new priority to the hardware scheduler).
     pub fn set_priority(
         &mut self,
         idx: usize,
@@ -486,19 +485,14 @@ pub fn build_cwsr_fields(
 
 /// Per-queue compute priority. Matches `MES_AMD_PRIORITY_LEVEL`.
 /// Used by the round-robin scheduler in `KiqScheduler::next_queue_at_priority`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ComputePriority {
     Low,
+    #[default]
     Normal,
     Medium,
     High,
     Realtime,
-}
-
-impl Default for ComputePriority {
-    fn default() -> Self {
-        ComputePriority::Normal
-    }
 }
 
 /// Extend [`ComputeQueue`] with CWSR + priority via an associated

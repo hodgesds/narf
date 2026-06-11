@@ -214,8 +214,14 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: `raw_waker`'s vtable upholds the `RawWaker` contract — `no_clone`
+    // rebuilds an equivalent waker and `no_op` makes wake/drop side-effect-free
+    // on the null data pointer, so all vtable functions are sound to invoke.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local owned by this fn and never moved after this
+    // point (it lives until `poll_once` returns), so pinning `&mut fut` in
+    // place satisfies `Pin::new_unchecked`'s never-move invariant.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

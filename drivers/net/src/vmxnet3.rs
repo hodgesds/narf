@@ -249,15 +249,16 @@ impl Vmxnet3Nic {
         //    Stage 2: gen = 1 on every initial slot (per
         //    `VMXNET3_INIT_GEN`).
         let rx_ring1_pa = rx_ring1.phys_addr().raw();
-        for i in 0..RX_RING_LEN {
-            let buf_pa = rx_buffers[i].phys_addr().raw();
-            let mut desc = Vmxnet3RxDesc::default();
-            desc.addr = buf_pa.to_le();
+        for (i, buf) in rx_buffers.iter().enumerate().take(RX_RING_LEN) {
+            let buf_pa = buf.phys_addr().raw();
             // len in low 14 bits, btype HEAD (=0), gen=1.
             let len = (RX_BUF_LEN as u32) & RXD_LEN_MASK;
             let gen: u32 = 1 << RXD_GEN_SHIFT;
-            desc.flags = (len | gen).to_le();
-            desc.ext1 = 0;
+            let desc = Vmxnet3RxDesc {
+                addr: buf_pa.to_le(),
+                flags: (len | gen).to_le(),
+                ext1: 0,
+            };
             // SAFETY: identity-mapped DMA page, i < RX_RING_LEN.
             unsafe {
                 core::ptr::write_volatile(

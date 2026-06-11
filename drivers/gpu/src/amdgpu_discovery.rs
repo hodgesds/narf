@@ -458,8 +458,8 @@ pub fn parse_discovery(blob: &[u8]) -> Result<Vec<IpBlock>, DiscoveryError> {
 
             let mut base_addrs = [0u32; MAX_BASE_ADDRS];
             let kept = (num_base as usize).min(MAX_BASE_ADDRS);
-            for k in 0..kept {
-                base_addrs[k] = if base_addr_64_bit {
+            for (k, slot) in base_addrs[..kept].iter_mut().enumerate() {
+                *slot = if base_addr_64_bit {
                     let raw = u64_at(blob, bases_off + k * 8)?;
                     (raw as u32) & 0x3FFF_FFFF
                 } else {

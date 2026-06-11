@@ -182,7 +182,7 @@ pub fn calc_divisor(baud: u32) -> Option<u16> {
     let mut div = CLKRATE / (clk_div * baud);
 
     // Fall back to fact=0 if div is outside [9, 255].
-    if div < 9 || div > 255 {
+    if !(9..=255).contains(&div) {
         div /= 2;
         clk_div *= 2;
         fact = 0;

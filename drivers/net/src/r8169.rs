@@ -240,8 +240,8 @@ pub enum NicError {
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Desc {
-    /// Bits [31..14] are flags (OWN/EOR/FS/LS/... in TX; OWN/EOR/...
-    /// + frame length in RX status), bits [13..0] are buffer size or
+    /// Bits [31..14] are flags (OWN/EOR/FS/LS/... in TX; OWN/EOR/... +
+    /// frame length in RX status), bits [13..0] are buffer size or
     /// frame length depending on direction.
     pub flags_len: u32,
     pub vlan: u32,
@@ -343,7 +343,15 @@ pub struct RtlNic {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: `RtlNic` is only `!Send` because of the raw MMIO/DMA pointers it
+// wraps (`MmioRegion`, `DmaBuffer`). Those regions are owned exclusively by
+// this instance and remain valid for its whole lifetime, so the owning value
+// may be moved to and accessed from another CPU without aliasing them.
 unsafe impl Send for RtlNic {}
+// SAFETY: every field mutated after bring-up (TX/RX cursors, IPC rings) is
+// guarded by an `IrqSafeSpinLock`; the post-init read-only fields (`mmio`,
+// `mac`, the descriptor rings/pools) are not written through `&self`, so
+// concurrent `&RtlNic` access from multiple CPUs/IRQ contexts is data-race free.
 unsafe impl Sync for RtlNic {}
 
 impl core::fmt::Debug for RtlNic {
@@ -460,8 +468,8 @@ impl RtlNic {
         //     can DMA into it. Slot RING_LEN-1 carries EOR so the
         //     internal ring pointer wraps correctly.
         let rx_ring_phys = rx_ring.phys_addr().raw();
-        for i in 0..RING_LEN {
-            let buf_phys = rx_pool[i].phys_addr().raw();
+        for (i, buf) in rx_pool.iter().enumerate().take(RING_LEN) {
+            let buf_phys = buf.phys_addr().raw();
             let mut flags = RXD_OWN | (RX_BUF_LEN as u32 & 0x3FFF);
             if i == RING_LEN - 1 {
                 flags |= RXD_EOR;
@@ -545,7 +553,7 @@ impl RtlNic {
         // Spawn pumps
         spawn_pumps(rtl.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(rtl).map_err(|_| NicError::NoMemory)?)
+        Arc::try_unwrap(rtl).map_err(|_| NicError::NoMemory)
     }
 
     /// Bring up MSI-X with a single vector. Wires MSI-X table entry 0
@@ -716,8 +724,10 @@ impl RtlNic {
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flags_len & RXD_LS != 0 {
             let copy_len = len.min(RX_BUF_LEN);
-            // SAFETY: identity-mapped DMA buffer.
             for i in 0..copy_len {
+                // SAFETY: `buf_phys` is the identity-mapped DMA address of
+                // this slot's RX buffer (`rx_pool[slot]`, `RX_BUF_LEN` bytes);
+                // `i < copy_len <= RX_BUF_LEN`, so `buf_phys + i` is in range.
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -903,17 +913,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    // SAFETY: caller-authority over the device for the duration of
-    // bring_up.
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+    // SAFETY: `bring_up` programs the controller's BARs/DMA rings; the
+    // `cap`+`device` pair handed to us by the PCI probe grants exclusive
+    // configuration authority over exactly this device, and we have just
+    // enabled MEM_SPACE | BUS_MASTER above, so the MMIO/DMA accesses it
+    // performs are valid.
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
     {
+        // SAFETY: `dev` is the only `Arc` to this `RtlNic` at this point
+        // (it has not been cloned or published yet), so we hold unique
+        // ownership and casting the `Arc::as_ptr` to `&mut` does not alias
+        // any other reference; the pointee is a live, just-constructed value.
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut RtlNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

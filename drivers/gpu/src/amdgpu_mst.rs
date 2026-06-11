@@ -16,8 +16,8 @@
 //!
 //! - Linux `drivers/gpu/drm/display/drm_dp_mst_topology.c`
 //!   (`drm_dp_mst_topology_mgr_set_mst`,
-//!    `drm_dp_send_link_address`,
-//!    `drm_dp_payload_send_msg`)
+//!   `drm_dp_send_link_address`,
+//!   `drm_dp_payload_send_msg`)
 //! - VESA DisplayPort Standard 1.4a, §2.11 "MST Sideband Messaging"
 //! - Linux `include/drm/display/drm_dp.h` — sideband opcodes
 //!
@@ -266,7 +266,7 @@ pub fn pixel_clock_to_pbn(pixel_clock_khz: u32, bpp: u32) -> u32 {
     // Use 1006/1000 fixed-point to avoid floating-point.
     let num = (pixel_clock_khz as u64) * (bpp as u64) * 1006;
     let den: u64 = 8 * 54_000 * 1000;
-    ((num + den - 1) / den) as u32
+    num.div_ceil(den) as u32
 }
 
 // ── Topology ────────────────────────────────────────────────────
@@ -454,6 +454,7 @@ pub enum MstStreamError {
 
 /// Full live activation: VCPI alloc (from PayloadTable) → DPCD
 /// commit → sideband ALLOCATE_PAYLOAD → sideband ENABLE_STREAM.
+#[allow(clippy::too_many_arguments)] // MST stream activation genuinely requires all DP topology fields
 pub fn activate_stream<A: MstAux>(
     aux: &mut A,
     table: &mut PayloadTable,
@@ -468,7 +469,7 @@ pub fn activate_stream<A: MstAux>(
     // Time slot count = pbn / link rate per slot. The PayloadTable's
     // link_pbn is split into 64 slots; one slot = link_pbn / 64.
     let slots_per_pbn = if table.link_pbn != 0 {
-        (pbn as u32 * 64 + (table.link_pbn as u32 - 1)) / (table.link_pbn as u32)
+        (pbn as u32 * 64).div_ceil(table.link_pbn as u32)
     } else {
         0
     };

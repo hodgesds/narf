@@ -197,9 +197,9 @@ pub async fn try_bind_generic(
     }
     {
         use core::fmt::Write as _;
-        let _ = core::write!(
+        let _ = core::writeln!(
             narf_console::Writer,
-            "  usb-hid: generic slot={} iface={} dci={}\n",
+            "  usb-hid: generic slot={} iface={} dci={}",
             slot_id,
             interface_num,
             interrupt_in_dci,
@@ -242,37 +242,32 @@ fn pump_one(xhci_dev: &Xhci, idx: usize) -> usize {
     };
     let mut total = 0;
     let mut buf = [0u8; MAX_GENERIC_REPORT];
-    loop {
-        match xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
-            Ok(Some(n)) => {
-                let report = &buf[..n.min(MAX_GENERIC_REPORT)];
-                // Snapshot descriptor + prev_report + evdev_node under lock.
-                let (desc, prev, node) = {
-                    let g = GENERIC_DEVICES.lock();
-                    match g.get(idx) {
-                        Some(d) => {
-                            let pr = *d.prev_report.lock();
-                            (d.descriptor.clone(), pr, Arc::clone(&d.evdev_node))
-                        }
-                        None => break,
-                    }
-                };
-                total += dispatch_report(&desc, report, &prev[..n.min(MAX_GENERIC_REPORT)], &node);
-                // Update prev_report.
-                {
-                    let g = GENERIC_DEVICES.lock();
-                    if let Some(d) = g.get(idx) {
-                        let mut pr = d.prev_report.lock();
-                        let copy_len = n.min(MAX_GENERIC_REPORT);
-                        pr[..copy_len].copy_from_slice(&buf[..copy_len]);
-                        // Zero out any trailing bytes from the previous report.
-                        pr[copy_len..].fill(0);
-                    }
+    while let Ok(Some(n)) = xhci_dev.poll_interrupt_in(slot_id, dci, &mut buf) {
+        let report = &buf[..n.min(MAX_GENERIC_REPORT)];
+        // Snapshot descriptor + prev_report + evdev_node under lock.
+        let (desc, prev, node) = {
+            let g = GENERIC_DEVICES.lock();
+            match g.get(idx) {
+                Some(d) => {
+                    let pr = *d.prev_report.lock();
+                    (d.descriptor.clone(), pr, Arc::clone(&d.evdev_node))
                 }
-                buf = [0u8; MAX_GENERIC_REPORT];
+                None => break,
             }
-            _ => break,
+        };
+        total += dispatch_report(&desc, report, &prev[..n.min(MAX_GENERIC_REPORT)], &node);
+        // Update prev_report.
+        {
+            let g = GENERIC_DEVICES.lock();
+            if let Some(d) = g.get(idx) {
+                let mut pr = d.prev_report.lock();
+                let copy_len = n.min(MAX_GENERIC_REPORT);
+                pr[..copy_len].copy_from_slice(&buf[..copy_len]);
+                // Zero out any trailing bytes from the previous report.
+                pr[copy_len..].fill(0);
+            }
         }
+        buf = [0u8; MAX_GENERIC_REPORT];
     }
     total
 }
@@ -289,7 +284,7 @@ fn extract_field_value(report: &[u8], bit_offset: u32, size_bits: u32, logical_m
     }
     let byte_offset = (bit_offset / 8) as usize;
     let bit_shift = bit_offset % 8;
-    let bytes_needed = ((bit_shift + size_bits + 7) / 8) as usize;
+    let bytes_needed = (bit_shift + size_bits).div_ceil(8) as usize;
     if byte_offset + bytes_needed > report.len() {
         return 0;
     }
@@ -419,13 +414,13 @@ fn dispatch_field(field: &Field, payload: &[u8], prev_payload: &[u8], node: &Dev
         }
         // Releases: in prev but not in cur.
         for &pu in &prev_usages {
-            if !cur_usages.iter().any(|&c| c == pu) {
+            if !cur_usages.contains(&pu) {
                 emitted += dispatch_array_usage(field.usage_page, pu, false, node);
             }
         }
         // Presses: in cur but not in prev.
         for &cu in &cur_usages {
-            if !prev_usages.iter().any(|&p| p == cu) {
+            if !prev_usages.contains(&cu) {
                 emitted += dispatch_array_usage(field.usage_page, cu, true, node);
             }
         }
@@ -501,7 +496,7 @@ fn dispatch_usage_value(
             1
         }
         USAGE_PAGE_CONSUMER => {
-            let kc = consumer_usage_to_keycode(usage as u16);
+            let kc = consumer_usage_to_keycode(usage);
             use narf_input::KeyCode;
             if kc != KeyCode::Unknown {
                 // Legacy ring.
@@ -656,11 +651,8 @@ pub(crate) mod tests {
                 }
                 _ => {}
             }
-            match narf_input::pop_scroll() {
-                Some(_) => {
-                    saw_scroll = true;
-                }
-                None => {}
+            if narf_input::pop_scroll().is_some() {
+                saw_scroll = true;
             }
         }
         if !saw_pointer && !saw_scroll {

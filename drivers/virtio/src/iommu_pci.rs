@@ -99,8 +99,8 @@ pub unsafe fn read_device_config(
     let mut buf = [0u8; IommuDeviceConfig::WIRE_SIZE];
     // SAFETY: caller-asserted; offsets bounded above.
     unsafe {
-        for i in 0..IommuDeviceConfig::WIRE_SIZE {
-            buf[i] = region.read8(i as u64);
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = region.read8(i as u64);
         }
     }
     IommuDeviceConfig::decode(&buf).ok_or(VirtioPciError::NoCommonCfg)
@@ -464,6 +464,7 @@ impl VirtioIommuPci {
             common.write32(CC_DEVICE_FEATURE_SELECT, 0);
             common.read32(CC_DEVICE_FEATURE)
         };
+        // SAFETY: identity-mapped MMIO.
         let feats_hi = unsafe {
             common.write32(CC_DEVICE_FEATURE_SELECT, 1);
             common.read32(CC_DEVICE_FEATURE)

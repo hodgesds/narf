@@ -27,7 +27,7 @@
 //! handing it to the device. The PSP firmware-load handshake
 //! (see `amdgpu::AmdGpu::load_firmware`) reads `uCodeStartByte`
 //! + `uCodeSize` to know where the payload starts and how many
-//! bytes to DMA into the GPU.
+//!   bytes to DMA into the GPU.
 //!
 //! ## Scope
 //!

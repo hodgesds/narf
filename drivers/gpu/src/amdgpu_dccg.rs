@@ -107,8 +107,7 @@ pub fn assign_plls(requests: &[PixelClockRequest]) -> Result<Vec<PllAssignment>,
             if plls.len() >= N_DCCG_PLLS {
                 return Err(DccgError::NotEnoughPlls);
             }
-            let mut pipes = Vec::new();
-            pipes.push(r.pipe_idx);
+            let pipes = alloc::vec![r.pipe_idx];
             plls.push(PllAssignment {
                 pll_idx: plls.len() as u8,
                 freq_khz: r.pixel_clock_khz,

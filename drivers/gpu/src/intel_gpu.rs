@@ -234,9 +234,12 @@ impl IntelGpu {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(IntelGpuError::UnknownAsic)?;
 
-        // SAFETY: caller-asserted ownership of BAR0 + BAR2.
+        // SAFETY: `bring_up`'s contract gives us exclusive ownership of
+        // BAR0 (`GTTMMADR`); `map_bar` maps the PCI BAR `device` advertises.
         let gtt_mmadr =
             unsafe { map_bar(device, BAR_GTTMMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
+        // SAFETY: same contract grants exclusive ownership of BAR2 (`GMADR`);
+        // `map_bar` maps the PCI BAR `device` advertises.
         let gmadr =
             unsafe { map_bar(device, BAR_GMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
 
@@ -355,7 +358,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Tiger Lake / Alder Lake / Raptor Lake all use the same BXT-style
     // PWM registers.
     if dev.chip.generation != Generation::MeteorLake {
-        narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr.clone());
+        narf_drivers_backlight::intel_bl::install(dev.gtt_mmadr);
     }
 
     // Stage 3: Wire up the modeset orchestrator to take over from UEFI GOP.
@@ -390,6 +393,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         .expect("failed to build primary plane");
         let plane_base =
             crate::intel_gpu_pipes::Pipe::A.base() + crate::intel_gpu_pipes::PLANE_PRIMARY_OFFSET;
+        // SAFETY: `dev.gtt_mmadr` is the BAR0 (`GTTMMADR`) region mapped in
+        // `bring_up`, and we own the device. `plane_base` is Pipe A's primary
+        // plane block; each `PLANE_*_OFFSET` is a known in-range register
+        // within that block, so every `write32` targets a valid 32-bit
+        // aligned plane register.
         unsafe {
             dev.gtt_mmadr.write32(
                 plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,

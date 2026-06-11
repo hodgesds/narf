@@ -15,22 +15,22 @@
 //! ## Sources (public)
 //!
 //! - **HID 1.11 §6.2.2 / §7.2** — report descriptor + class request
-//!     encoding.
-//!     <https://www.usb.org/document-library/device-class-definition-hid-111>
+//!   encoding.
+//!   <https://www.usb.org/document-library/device-class-definition-hid-111>
 //! - **HID Usage Tables 1.4 §4 (Generic Desktop) / §16 (Digitizer)** —
-//!     `Touchpad (0x0D/0x05)`, `Touchscreen (0x0D/0x04)`, `Finger
-//!     (0x0D/0x22)`, `Tip Switch (0x0D/0x42)`, `Contact ID (0x0D/0x51)`,
-//!     `Contact Count (0x0D/0x54)`, `Contact Count Maximum
-//!     (0x0D/0x55)`, `Scan Time (0x0D/0x56)`, `Width (0x0D/0x48)`,
-//!     `Height (0x0D/0x49)`, `Device Mode (0x0D/0x60)`.
-//!     <https://usb.org/document-library/hid-usage-tables-14>
+//!   `Touchpad (0x0D/0x05)`, `Touchscreen (0x0D/0x04)`, `Finger
+//!   (0x0D/0x22)`, `Tip Switch (0x0D/0x42)`, `Contact ID (0x0D/0x51)`,
+//!   `Contact Count (0x0D/0x54)`, `Contact Count Maximum
+//!   (0x0D/0x55)`, `Scan Time (0x0D/0x56)`, `Width (0x0D/0x48)`,
+//!   `Height (0x0D/0x49)`, `Device Mode (0x0D/0x60)`.
+//!   <https://usb.org/document-library/hid-usage-tables-14>
 //! - **Microsoft Precision Touchpad implementation guide** — mode
-//!     byte semantics + Configuration TLC layout.
-//!     <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection>
+//!   byte semantics + Configuration TLC layout.
+//!   <https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/touchpad-windows-precision-touchpad-collection>
 //! - **Linux Documentation/input/multi-touch-protocol.rst** — defines
-//!     the Slot-Protocol-B emission shape this driver targets
-//!     (`ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X/Y`,
-//!     `SYN_REPORT` per frame).
+//!   the Slot-Protocol-B emission shape this driver targets
+//!   (`ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X/Y`,
+//!   `SYN_REPORT` per frame).
 //!
 //! Linux ref citations (per project rule allowing GPL refs after
 //! 2026-05-20):
@@ -39,10 +39,10 @@
 //! - L198-241 `MT_CLS_*` class identifiers
 //! - L267-458 `mt_classes[]` quirk-bundle table
 //! - L621-654 `mt_allocate_application` — assigns
-//!     `INPUT_MT_DIRECT` for Touchscreen vs `INPUT_MT_POINTER` for
-//!     Touchpad, sets `MT_INPUTMODE_TOUCHPAD` byte for PTP devices.
+//!   `INPUT_MT_DIRECT` for Touchscreen vs `INPUT_MT_POINTER` for
+//!   Touchpad, sets `MT_INPUTMODE_TOUCHPAD` byte for PTP devices.
 //! - L1713-1748 `mt_set_modes` — drives the Feature SET for Device
-//!     Mode + Latency / Surface / Button Switch.
+//!   Mode + Latency / Surface / Button Switch.
 //! - L2111+ `mt_devices[]` device-id table.
 //!
 //! ## What this driver does
@@ -440,6 +440,9 @@ impl MtShape {
 /// PTP profile (Configuration TLC + Mode Feature is here); for
 /// touchscreens we keep the touchscreen profile.
 #[derive(Clone, Debug)]
+// `Pad(PtpProfile)` is 456 bytes vs `Screen` at 160 bytes; boxing would
+// change the public variant layout and break callers.
+#[allow(clippy::large_enum_variant)]
 pub enum MtProfile {
     Pad(PtpProfile),
     Screen(TouchscreenProfile),

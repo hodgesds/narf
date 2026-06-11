@@ -14,18 +14,18 @@
 //!
 //! The host reads:
 //!   - `flags`        @ +0   → 32-bit; low 8 bits are the version,
-//!                              upper bits are feature flags
-//!                              (DMA_INDEX / HOSTRDY_DB1 / etc).
+//!     upper bits are feature flags
+//!     (DMA_INDEX / HOSTRDY_DB1 / etc).
 //!   - `console_addr` @ +20  → pointer to the firmware-side console
-//!                              ring (debug; not required for assoc).
+//!     ring (debug; not required for assoc).
 //!   - `max_rxbufpost`@ +34  → 16-bit; cap on how many RX buffers the
-//!                              host pre-posts.
+//!     host pre-posts.
 //!   - `rx_dataoffset`@ +36  → 32-bit; bytes from start of an RX DMA
-//!                              buffer to the 802.11 payload.
+//!     buffer to the 802.11 payload.
 //!   - `htod_mb_data` @ +40  → 32-bit; host→dongle mailbox-data slot.
 //!   - `dtoh_mb_data` @ +44  → 32-bit; dongle→host mailbox-data slot.
 //!   - `ring_info`    @ +48  → 32-bit; pointer to the
-//!                              `RingInfoLayout` block.
+//!     `RingInfoLayout` block.
 //!   - `scratch_len`  @ +52  → 32-bit; scratch DMA buffer length.
 //!   - `scratch_addr` @ +56  → 64-bit; host phys of scratch buffer.
 //!   - `ringupd_len`  @ +64  → 32-bit; ring-update DMA buffer length.
@@ -161,7 +161,7 @@ impl SharedInfo {
         }
         let flags = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
         let version = (flags & SHARED_VERSION_MASK) as u8;
-        if version < SHARED_VERSION_MIN || version > SHARED_VERSION_MAX {
+        if !(SHARED_VERSION_MIN..=SHARED_VERSION_MAX).contains(&version) {
             return None;
         }
         let console_addr = u32::from_le_bytes(

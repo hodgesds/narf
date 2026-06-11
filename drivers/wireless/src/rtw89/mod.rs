@@ -33,25 +33,25 @@
 //! 2026-05-20 per the root `LICENSE`)
 //!
 //! - Linux `drivers/net/wireless/realtek/rtw89/pci.c`
-//!     — `rtw89_pci_claim_device` (~L3340..L3420, `bar_id = 2`),
-//!     — `rtw89_pci_id_table` (per-chip `*_pci.c` files).
+//!   — `rtw89_pci_claim_device` (~L3340..L3420, `bar_id = 2`),
+//!   — `rtw89_pci_id_table` (per-chip `*_pci.c` files).
 //! - Linux `drivers/net/wireless/realtek/rtw89/mac.c`
-//!     — `rtw89_mac_pwr_on` (~L1575..L1590),
-//!     — `rtw89_mac_power_switch` (~L1510..L1573),
-//!     — `rtw89_mac_pwr_seq` (~L1259..L1330).
+//!   — `rtw89_mac_pwr_on` (~L1575..L1590),
+//!   — `rtw89_mac_power_switch` (~L1510..L1573),
+//!   — `rtw89_mac_pwr_seq` (~L1259..L1330).
 //! - Linux `drivers/net/wireless/realtek/rtw89/efuse.c`
-//!     — `rtw89_dump_physical_efuse_map_ddv` (~L113..L138)
-//!         (the per-byte `EFUSE_CTRL` access loop),
-//!     — `rtw89_switch_efuse_bank` (~L40..L65).
+//!   — `rtw89_dump_physical_efuse_map_ddv` (~L113..L138)
+//!   (the per-byte `EFUSE_CTRL` access loop),
+//!   — `rtw89_switch_efuse_bank` (~L40..L65).
 //! - Linux `drivers/net/wireless/realtek/rtw89/reg.h`
-//!     — `R_AX_*` offsets,
-//!     — `B_AX_EF_*` mask definitions,
-//!     — `R_AX_SYS_CFG1::B_AX_CHIP_VER_MASK`.
+//!   — `R_AX_*` offsets,
+//!   — `B_AX_EF_*` mask definitions,
+//!   — `R_AX_SYS_CFG1::B_AX_CHIP_VER_MASK`.
 //! - Linux `drivers/net/wireless/realtek/rtw89/core.h`
-//!     — `enum rtw89_core_chip_id`.
+//!   — `enum rtw89_core_chip_id`.
 //! - Linux `drivers/net/wireless/realtek/rtw89/txrx.h`
-//!     — `RTW89_TXCH_*` (13 TX) + `RTW89_RXCH_*` (2 RX) — channel
-//!       counts the Stage-2 ring code will use.
+//!   — `RTW89_TXCH_*` (13 TX) + `RTW89_RXCH_*` (2 RX) — channel
+//!   counts the Stage-2 ring code will use.
 
 #![allow(dead_code)]
 

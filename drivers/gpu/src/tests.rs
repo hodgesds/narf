@@ -156,8 +156,7 @@ fn smoke_amdgpu_atombios_table_directory_round_trip() -> TestResult {
     // tables with distinct payloads. Verify the parser locates
     // the master, decodes the count, and resolves each table id.
     use crate::amdgpu_atombios::{AtomError, Atombios};
-    let mut img = alloc::vec::Vec::new();
-    img.resize(0x200, 0u8);
+    let mut img = alloc::vec![0u8; 0x200];
     // PCI ROM signature.
     img[0] = 0xAA;
     img[1] = 0x55;
@@ -403,8 +402,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_aux_native_write_encodes_payload);
 
 fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
     use crate::amdgpu_atom_fwinfo::{parse, FwInfoError};
-    let mut t = alloc::vec::Vec::new();
-    t.resize(0x80, 0u8);
+    let mut t = alloc::vec![0u8; 0x80];
     // ATOM_COMMON_TABLE_HEADER: usSize=0x80, fmt=4, content=0x34
     t[0..2].copy_from_slice(&0x80u16.to_le_bytes());
     t[2] = 4;
@@ -462,8 +460,7 @@ fn smoke_amdgpu_ucode_header_round_trip() -> TestResult {
     // Build a 1024-byte synthetic blob: 4-byte magic + 32-byte
     // common header at offset 4 + zero-fill to 256, then a
     // 768-byte fake payload starting at offset 256.
-    let mut blob = alloc::vec::Vec::new();
-    blob.resize(1024, 0u8);
+    let mut blob = alloc::vec![0u8; 1024];
     blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
     blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
     blob[8..12].copy_from_slice(&768u32.to_le_bytes()); // payload_size
@@ -589,8 +586,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_link_training_completes_against_stub);
 
 fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
     use crate::amdgpu_pptable::{PpTable, PpTableError, Subtable};
-    let mut t = alloc::vec::Vec::new();
-    t.resize(80, 0u8);
+    let mut t = alloc::vec![0u8; 80];
     // Header: usSize=80, fmt=11, content=0
     t[0..2].copy_from_slice(&80u16.to_le_bytes());
     t[2] = 11;
@@ -643,8 +639,7 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     //   path 0: DP connector (object id 0x13), instance 0
     //   path 1: HDMI-A (0x0C), instance 1
     //   path 2: eDP   (0x14), instance 0
-    let mut t = alloc::vec::Vec::new();
-    t.resize(8 + 3 * 8, 0u8);
+    let mut t = alloc::vec![0u8; 8 + 3 * 8];
     // Header.
     t[0..2].copy_from_slice(&((8u16 + 3 * 8).to_le_bytes()));
     t[2] = 1; // format_revision
@@ -653,9 +648,9 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     t[6] = 3; // num_paths
               // Paths start at 8.
     let paths = [
-        (0x0001u16, (0x13u16 << 8) | 0u16, 0x1100u16), // DP
+        (0x0001u16, (0x13u16 << 8), 0x1100u16),        // DP
         (0x0002u16, (0x0Cu16 << 8) | 1u16, 0x1101u16), // HDMI-A
-        (0x0004u16, (0x14u16 << 8) | 0u16, 0x1102u16), // eDP
+        (0x0004u16, (0x14u16 << 8), 0x1102u16),        // eDP
     ];
     for (i, (tag, conn, gpu)) in paths.iter().enumerate() {
         let off = 8 + i * 8;
@@ -800,7 +795,7 @@ fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult 
     if Family::Vega.mp0_base() != Some(0x000B_0000) {
         return TestResult::Fail("Vega compile-time fallback");
     }
-    if Family::Navi3.mp0_base() != None {
+    if Family::Navi3.mp0_base().is_some() {
         return TestResult::Fail("Navi3 should default None");
     }
     // Plug in Navi3 + override Vega.
@@ -845,8 +840,7 @@ kernel_test_in!(
 
 fn smoke_amdgpu_atom_dcn_init_data_round_trip() -> TestResult {
     use crate::amdgpu_atom_dcn::{parse, DcnInitError};
-    let mut t = alloc::vec::Vec::new();
-    t.resize(0x20, 0u8);
+    let mut t = alloc::vec![0u8; 0x20];
     t[0..2].copy_from_slice(&0x1Au16.to_le_bytes());
     t[2] = 1;
     t[3] = 0;
@@ -900,8 +894,7 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     // Path-with-chain layout: 8-byte header + 6 bytes of chain
     // (3 × u16 — encoder, transmitter, sentinel). One path,
     // size = 14 bytes total.
-    let mut t = alloc::vec::Vec::new();
-    t.resize(8 + 14, 0u8);
+    let mut t = alloc::vec![0u8; 8 + 14];
     // Header.
     t[0..2].copy_from_slice(&((8u16 + 14).to_le_bytes()));
     t[2] = 1;
@@ -912,11 +905,10 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     let off = 8;
     t[off..off + 2].copy_from_slice(&0x0001u16.to_le_bytes()); // device_tag
     t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes()); // path size
-    t[off + 4..off + 6].copy_from_slice(&((0x13u16 << 8) | 0).to_le_bytes()); // DP/0
+    t[off + 4..off + 6].copy_from_slice(&(0x13u16 << 8).to_le_bytes()); // DP/0
     t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes()); // GPU obj
                                                                    // Chain: encoder/0 (0x21<<8), transmitter/2 (0x22<<8 | 2), sentinel.
-    t[off + 8..off + 10]
-        .copy_from_slice(&((ATOM_OBJECT_TYPE_ENCODER as u16) << 8 | 0u16).to_le_bytes());
+    t[off + 8..off + 10].copy_from_slice(&((ATOM_OBJECT_TYPE_ENCODER as u16) << 8).to_le_bytes());
     t[off + 10..off + 12]
         .copy_from_slice(&((ATOM_OBJECT_TYPE_TRANSMITTER as u16) << 8 | 2u16).to_le_bytes());
     t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes());
@@ -946,8 +938,7 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);
 
 fn smoke_amdgpu_pptable_fan_table_round_trip() -> TestResult {
     use crate::amdgpu_pptable_subtables::{FanTable, PpSubtableError};
-    let mut t = alloc::vec::Vec::new();
-    t.resize(0x40, 0u8);
+    let mut t = alloc::vec![0u8; 0x40];
     // Header: usSize=0x40, fmt=11, content=0
     t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
     t[2] = 11;
@@ -1003,8 +994,7 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_fan_table_round_trip);
 
 fn smoke_amdgpu_pptable_powertune_table_round_trip() -> TestResult {
     use crate::amdgpu_pptable_subtables::{PowerTuneTable, PpSubtableError};
-    let mut t = alloc::vec::Vec::new();
-    t.resize(0x40, 0u8);
+    let mut t = alloc::vec![0u8; 0x40];
     t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
     t[2] = 11;
     t[3] = 0;
@@ -1051,8 +1041,7 @@ fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     // image with both directories and verify each indexes its
     // own subtable list.
     use crate::amdgpu_atombios::{AtomError, Atombios};
-    let mut img = alloc::vec::Vec::new();
-    img.resize(0x300, 0u8);
+    let mut img = alloc::vec![0u8; 0x300];
     img[0] = 0xAA;
     img[1] = 0x55;
     img[4..8].copy_from_slice(b"ATOM");
@@ -1109,8 +1098,7 @@ fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
     //   - autoload offset table at 0x100, 3 × 12 byte entries
     //   - payload at 0x200 (24-byte filler — autoload entries
     //     point into it)
-    let mut blob = alloc::vec::Vec::new();
-    blob.resize(1024, 0u8);
+    let mut blob = alloc::vec![0u8; 1024];
     blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
     blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
     blob[8..12].copy_from_slice(&512u32.to_le_bytes()); // payload_size
@@ -1171,8 +1159,7 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     //   pin 1: DDC SDA (0x0B)    on byte 0x11 mask 0x02
     //   pin 2: HPD     (0x01)    on byte 0x20 mask 0x10
     //   pin 3: Backlight (0x03)  on byte 0x40 mask 0x80
-    let mut t = alloc::vec::Vec::new();
-    t.resize(4 + 4 * 8, 0u8);
+    let mut t = alloc::vec![0u8; 4 + 4 * 8];
     t[0..2].copy_from_slice(&((4u16 + 4 * 8).to_le_bytes()));
     t[2] = 1;
     t[3] = 0;
@@ -1724,7 +1711,7 @@ kernel_test_in!(
 fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
     use crate::amdgpu_atom_vm::{execute_bytes, AtomState};
     use alloc::boxed::Box;
-    use alloc::sync::Arc;
+    use alloc::rc::Rc;
     use alloc::vec::Vec;
     use core::cell::RefCell;
 
@@ -1740,7 +1727,7 @@ fn smoke_amdgpu_atom_vm_reg_write_via_closure() -> TestResult {
         91,   // EOT
     ];
 
-    let writes: Arc<RefCell<Vec<(u32, u32)>>> = Arc::new(RefCell::new(Vec::new()));
+    let writes: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
     let mut state = AtomState::new(8, 4);
     let w = writes.clone();
     state.reg_write = Box::new(move |a, v| {
@@ -5005,7 +4992,7 @@ fn smoke_drm_syncobj_create_destroy_roundtrip() -> TestResult {
     if !tbl.is_empty() {
         return TestResult::Fail("not empty after destroying both");
     }
-    if let Ok(_) = tbl.get(unsig) {
+    if tbl.get(unsig).is_ok() {
         return TestResult::Fail("get after destroy should fail");
     }
     TestResult::Pass
@@ -5209,8 +5196,10 @@ fn smoke_drm_atomic_check_then_commit_happy() -> TestResult {
         AtomicCheckPolicy, AtomicState, ConnectorState, CrtcState, PlaneState,
     };
     let mut card = make_test_card_for_atomic();
-    let mut st = AtomicState::default();
-    st.allow_modeset = true;
+    let mut st = AtomicState {
+        allow_modeset: true,
+        ..Default::default()
+    };
     st.crtcs.push(CrtcState {
         id: 1,
         enable: true,
@@ -5257,8 +5246,10 @@ fn smoke_drm_atomic_check_rejects_overbandwidth() -> TestResult {
         AtomicCheckPolicy, AtomicError, AtomicState, ConnectorState, CrtcState, PlaneState,
     };
     let card = make_test_card_for_atomic();
-    let mut st = AtomicState::default();
-    st.allow_modeset = true;
+    let mut st = AtomicState {
+        allow_modeset: true,
+        ..Default::default()
+    };
     st.crtcs.push(CrtcState {
         id: 1,
         enable: true,
@@ -5290,8 +5281,10 @@ fn smoke_drm_atomic_check_rejects_overbandwidth() -> TestResult {
         src_h: 1080,
         ..Default::default()
     });
-    let mut policy = AtomicCheckPolicy::default();
-    policy.max_pixel_budget = 2_000_000;
+    let policy = AtomicCheckPolicy {
+        max_pixel_budget: 2_000_000,
+        ..Default::default()
+    };
     match st.core_check(&card, &policy) {
         Err(AtomicError::OverBandwidth) => TestResult::Pass,
         Ok(_) => TestResult::Fail("over-budget commit should be rejected"),
@@ -5306,8 +5299,10 @@ kernel_test_in!(
 fn smoke_drm_atomic_modeset_gate() -> TestResult {
     use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, CrtcState};
     let card = make_test_card_for_atomic();
-    let mut st = AtomicState::default();
-    st.allow_modeset = false;
+    let mut st = AtomicState {
+        allow_modeset: false,
+        ..Default::default()
+    };
     st.crtcs.push(CrtcState {
         id: 1,
         enable: true,
@@ -5327,8 +5322,10 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_atomic_modeset_gate);
 fn smoke_drm_atomic_plane_fb_crtc_pair() -> TestResult {
     use crate::drm::atomic::{AtomicCheckPolicy, AtomicError, AtomicState, PlaneState};
     let card = make_test_card_for_atomic();
-    let mut st = AtomicState::default();
-    st.allow_modeset = true;
+    let mut st = AtomicState {
+        allow_modeset: true,
+        ..Default::default()
+    };
     st.planes.push(PlaneState {
         id: 1,
         crtc_id: Some(1),
@@ -5631,11 +5628,11 @@ fn smoke_amdgpu_smu_v12_opcode_table_spot_checks() -> TestResult {
         return TestResult::Fail("V12 SetHardMinGfxClk id != 0x31");
     }
     // SetSoftMinGfxclk doesn't exist on SMU12.
-    if amdgpu_smu_v12::msg_id(PpsmcMsg::SetSoftMinGfxclk) != None {
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::SetSoftMinGfxclk).is_some() {
         return TestResult::Fail("V12 SetSoftMinGfxclk should be None");
     }
     // PrepareMp1ForUnload doesn't exist on SMU12.
-    if amdgpu_smu_v12::msg_id(PpsmcMsg::PrepareMp1ForUnload) != None {
+    if amdgpu_smu_v12::msg_id(PpsmcMsg::PrepareMp1ForUnload).is_some() {
         return TestResult::Fail("V12 PrepareMp1ForUnload should be None");
     }
     TestResult::Pass
@@ -5687,7 +5684,7 @@ fn smoke_amdgpu_smu_v13_opcode_table_spot_checks() -> TestResult {
         return TestResult::Fail("V13 PrepareMp1ForUnload id != 0x0C");
     }
     // PowerUpGfx absent on V13 (handled via GfxOff control).
-    if amdgpu_smu_v13::msg_id(PpsmcMsg::PowerUpGfx) != None {
+    if amdgpu_smu_v13::msg_id(PpsmcMsg::PowerUpGfx).is_some() {
         return TestResult::Fail("V13 PowerUpGfx should be None");
     }
     TestResult::Pass

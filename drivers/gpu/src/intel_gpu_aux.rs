@@ -232,11 +232,11 @@ impl<'a, M: MmioWindow + ?Sized> IntelAux<'a, M> {
     /// Single-attempt AUX transaction. Returns the raw reply
     /// bytes (status nibble + payload) for the caller to decode
     /// via `dp_aux::decode_response`.
-    fn xfer_once<'b>(
+    fn xfer_once(
         &self,
         wire: &[u8],
         expected_reply_payload: usize,
-        reply_buf: &'b mut [u8],
+        reply_buf: &mut [u8],
     ) -> Result<usize, AuxError> {
         if wire.len() > 20 {
             return Err(AuxError::TooLong);

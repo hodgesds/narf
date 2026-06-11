@@ -486,7 +486,7 @@ fn smoke_uvc_format_negotiation_720p_30fps() -> TestResult {
     use alloc::vec;
 
     // Device supports MJPEG: 1280×720 @ 30fps and 640×480 @ 30fps.
-    let formats = vec![StreamFormat {
+    let formats = [StreamFormat {
         format_index: 1,
         pixel_fmt: PixelFmt::Mjpeg,
         default_frame_index: 1,

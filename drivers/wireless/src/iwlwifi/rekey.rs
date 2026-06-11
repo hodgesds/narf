@@ -278,8 +278,8 @@ pub fn aes_key_unwrap(kek: &[u8; 16], wrapped: &[u8]) -> Option<Vec<u8>> {
 
     // Reconstruct the plaintext: R[1] || R[2] || ... || R[n].
     let mut out = Vec::with_capacity(n * 8);
-    for i in 1..=n {
-        out.extend_from_slice(&r[i]);
+    for block in &r[1..=n] {
+        out.extend_from_slice(block);
     }
     Some(out)
 }

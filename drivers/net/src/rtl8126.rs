@@ -656,7 +656,17 @@ pub struct Rtl8126Nic {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: all interior-mutable state (`tx_head`, `rx_head`, the IPC
+// rings) is guarded by `IrqSafeSpinLock`, and the remaining fields are
+// either plain data or DMA/MMIO handles that describe identity-mapped
+// physical regions owned exclusively by this NIC instance. There are no
+// non-Send raw thread-local handles, so the device can be moved to and
+// shared across CPUs.
 unsafe impl Send for Rtl8126Nic {}
+// SAFETY: every path that mutates shared state goes through the
+// `IrqSafeSpinLock` fields above, so concurrent `&Rtl8126Nic` access
+// from multiple CPUs is serialized; the bare data fields are read-only
+// after bring-up.
 unsafe impl Sync for Rtl8126Nic {}
 
 impl core::fmt::Debug for Rtl8126Nic {
@@ -752,8 +762,8 @@ impl Rtl8126Nic {
 
         // 6b. Pre-fill RX descriptors.
         let rx_ring_phys = rx_ring.phys_addr().raw();
-        for i in 0..RING_LEN {
-            let buf_phys = rx_pool[i].phys_addr().raw();
+        for (i, buf) in rx_pool.iter().enumerate() {
+            let buf_phys = buf.phys_addr().raw();
             let mut flags = RXD_OWN | (RX_BUF_LEN as u32 & RXD_LEN_MASK);
             if i == RING_LEN - 1 {
                 flags |= RXD_EOR;
@@ -837,7 +847,7 @@ impl Rtl8126Nic {
 
         spawn_pumps(nic.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)?)
+        Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)
     }
 
     /// Bring up MSI-X with a single vector wired to entry 0.
@@ -947,8 +957,10 @@ impl Rtl8126Nic {
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flags_len & RXD_LS != 0 {
             let copy_len = len.min(RX_BUF_LEN);
-            // SAFETY: identity-mapped DMA buffer.
             for i in 0..copy_len {
+                // SAFETY: `buf_phys` is the identity-mapped physical base
+                // of this slot's RX DMA buffer (RX_BUF_LEN bytes); `i <
+                // copy_len <= RX_BUF_LEN`, so the byte read is in bounds.
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -1025,6 +1037,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
 
     {
+        // SAFETY: `dev` was just created here and has not been published
+        // (CONTROLLER is set below, no clones exist yet), so its Arc
+        // refcount is 1 and this is the only reference — forming a unique
+        // `&mut Rtl8126Nic` from the as_ptr pointer does not alias.
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Rtl8126Nic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

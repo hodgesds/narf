@@ -80,7 +80,7 @@ pub const N_RF_B_ROWS: usize = 140;
 /// Stage 0 / 1 register init table for RTL8192EU.
 pub const INIT_TABLE: &[(u16, u8)] = &[
     (REG_8192E_LDOV12_CTRL, LDOV12_ENABLE),
-    (REG_APS_FSMCO as u16 + 1, 0x08),
+    (REG_APS_FSMCO + 1, 0x08),
     (REG_CR, (CR_OPEN_8188E & 0xFF) as u8),
     (REG_CR + 1, ((CR_OPEN_8188E >> 8) & 0xFF) as u8),
 ];

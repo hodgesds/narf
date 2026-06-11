@@ -69,7 +69,7 @@ pub unsafe fn read_efuse_bytes(
         mmio.write32(REG_EFUSE_TEST, (cur & !0xF000_0000) | EFUSE_TEST_LDOE25_EN);
     }
 
-    for i in 0..count {
+    for (i, slot) in out[..count].iter_mut().enumerate() {
         let byte_addr = (addr.saturating_add(i as u32)) & EFUSE_CTRL_ADDR_MASK;
         let arm = byte_addr << EFUSE_CTRL_ADDR_SHIFT;
 
@@ -99,7 +99,7 @@ pub unsafe fn read_efuse_bytes(
             }
             return Err(EfuseError::Timeout);
         }
-        out[i] = (last & EFUSE_CTRL_DATA_MASK) as u8;
+        *slot = (last & EFUSE_CTRL_DATA_MASK) as u8;
     }
 
     // De-assert LDOE25.

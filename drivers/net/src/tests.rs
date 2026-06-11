@@ -53,6 +53,9 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
+    // maps before running; `init` only walks that ECAM region and is safe to
+    // call repeatedly (idempotent on re-entry).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_e1000 = devs.iter().any(|d| {
@@ -80,16 +83,12 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
         return TestResult::Fail("MAC reads as all-zero or all-FF");
     }
     let mut frame = [0u8; 64];
-    for i in 0..6 {
-        frame[i] = 0xFF;
-    }
-    for i in 0..6 {
-        frame[6 + i] = mac[i];
-    }
+    frame[..6].fill(0xFF);
+    frame[6..(6 + 6)].copy_from_slice(&mac);
     frame[12] = 0xFF;
     frame[13] = 0xFF;
-    for i in 14..64 {
-        frame[i] = (i as u8).wrapping_mul(0x4D);
+    for (i, b) in frame.iter_mut().enumerate().skip(14) {
+        *b = (i as u8).wrapping_mul(0x4D);
     }
     let tx_ok = e1000::with_controller(|c| c.tx(&frame))
         .map(|r| r.is_ok())
@@ -109,6 +108,8 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window mapped by the test
+    // harness; `init` only walks that ECAM region and is idempotent on re-entry.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -127,12 +128,8 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     }
     let mac = e1000::with_controller(|c| c.mac).unwrap_or([0; 6]);
     let mut frame = [0u8; 42];
-    for i in 0..6 {
-        frame[i] = 0xFF;
-    }
-    for i in 0..6 {
-        frame[6 + i] = mac[i];
-    }
+    frame[..6].fill(0xFF);
+    frame[6..(6 + 6)].copy_from_slice(&mac);
     frame[12] = 0x08;
     frame[13] = 0x06;
     frame[14] = 0x00;
@@ -143,9 +140,7 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     frame[19] = 4;
     frame[20] = 0x00;
     frame[21] = 0x01;
-    for i in 0..6 {
-        frame[22 + i] = mac[i];
-    }
+    frame[22..(22 + 6)].copy_from_slice(&mac);
     frame[28] = 10;
     frame[29] = 0;
     frame[30] = 2;
@@ -154,10 +149,9 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     frame[39] = 0;
     frame[40] = 2;
     frame[41] = 2;
-    if e1000::with_controller(|c| c.tx(&frame))
+    if !e1000::with_controller(|c| c.tx(&frame))
         .map(|r| r.is_ok())
         .unwrap_or(false)
-        == false
     {
         return TestResult::Fail("tx ARP request");
     }
@@ -482,6 +476,8 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window mapped by the test
+    // harness; `init` only walks that ECAM region and is idempotent on re-entry.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_e1000 = devs.iter().any(|d| {
@@ -908,7 +904,7 @@ fn smoke_mlx5_cqe_decode() -> TestResult {
 
     // qp_op_own: qp_num=0x42, opcode=ResponderSend(0x2), owner=0.
     // bits: [31:8]=0x42, [7:4]=0x2, [0]=0.
-    let qp_op_own: u32 = (0x42u32 << 8) | (0x2u32 << 4) | 0;
+    let qp_op_own: u32 = (0x42u32 << 8) | (0x2u32 << 4);
     raw[cqe::CQE_OFF_QP_OP_OWN..cqe::CQE_OFF_QP_OP_OWN + 4]
         .copy_from_slice(&qp_op_own.to_be_bytes());
 
@@ -1310,7 +1306,7 @@ fn smoke_rtl8126_phy_config_table_size_and_page_coverage() -> TestResult {
     }
     let required_pages: &[u16] = &[0x0a44, 0x0a5b, 0x0a43, 0x0a6d, 0x0a42, 0x0a4a];
     for &page in required_pages {
-        if !PHY_CONFIG_PAGES.iter().any(|&p| p == page) {
+        if !PHY_CONFIG_PAGES.contains(&page) {
             return TestResult::Fail("PHY_CONFIG_PAGES missing a required page");
         }
         if !PHY_CONFIG_TABLE.iter().any(|e| e.page == page) {

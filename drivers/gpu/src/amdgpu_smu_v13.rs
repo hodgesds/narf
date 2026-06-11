@@ -18,6 +18,7 @@
 //!
 //! Source: `/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if/smu_v13_0_4_ppsmc.h`
 //! + `smu_v13_0_4_ppt.c::smu_v13_0_4_message_map`
+//!
 //! (GPL-2.0-or-later; NARF relicensed 2026-05-20).
 
 use crate::amdgpu_smu::{send_message_get, send_message_void};

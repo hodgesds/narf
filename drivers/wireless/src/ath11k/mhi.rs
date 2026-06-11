@@ -38,18 +38,27 @@ use crate::ath11k::pci::{read_via_window, write_via_window, ProbeError};
 
 /// Initialize the MHI controller and load the AMSS firmware.
 /// Advances the chip to Mission Mode (M0).
+///
+/// # Safety
+/// `mmio` must be a valid, live BAR0 mapping for the ath11k device;
+/// this drives the chip's `MHICTRL`/`MHISTATUS`/`BHI` registers via
+/// the sliding window, so the mapping must remain valid for the call.
 pub unsafe fn mhi_init(
     mmio: &MmioRegion,
     did: u16,
     auth: &Cap<FirmwareRegistry, Read>,
 ) -> Result<(), ProbeError> {
     // 1. Reset the MHI controller.
+    // SAFETY: `mmio` is the caller-asserted live BAR0 mapping; `MHICTRL`
+    // is a writable chip register reached via the sliding window.
     unsafe { write_via_window(mmio, MHICTRL, MHICTRL_RESET_MASK) };
 
     // 2. Poll MHISTATUS until READY bit (bit 0) is set.
     // Linux uses a 2-second timeout for this.
     let mut ready = false;
     for _ in 0..2000 {
+        // SAFETY: `mmio` is the caller-asserted live BAR0 mapping;
+        // `MHISTATUS` is a readable chip register via the window.
         let status = unsafe { read_via_window(mmio, MHISTATUS) };
         if status & 0x1 != 0 {
             ready = true;
@@ -68,14 +77,20 @@ pub unsafe fn mhi_init(
     load_amss_firmware(mmio, did, auth)?;
 
     // 4. Set MHI state to M0.
+    // SAFETY: `mmio` is the caller-asserted live BAR0 mapping; `MHICTRL`
+    // is a readable chip register via the window.
     let mut ctrl = unsafe { read_via_window(mmio, MHICTRL) };
     ctrl &= !MHICTRL_MHISTATE_MASK;
     ctrl |= MHI_STATE_M0 << MHICTRL_MHISTATE_SHIFT;
+    // SAFETY: `mmio` is the caller-asserted live BAR0 mapping; `MHICTRL`
+    // is a writable chip register via the window.
     unsafe { write_via_window(mmio, MHICTRL, ctrl) };
 
     // 5. Poll MHISTATUS until state is M0 (bits 15:8 == 2).
     let mut m0_reached = false;
     for _ in 0..2000 {
+        // SAFETY: `mmio` is the caller-asserted live BAR0 mapping;
+        // `MHISTATUS` is a readable chip register via the window.
         let status = unsafe { read_via_window(mmio, MHISTATUS) };
         let state = (status >> 8) & 0xFF;
         if state == MHI_STATE_M0 {
@@ -130,9 +145,14 @@ fn load_amss_firmware(
     let size = view.bytes.len() as u32;
 
     // Read the BHI offset from BAR0+0x28.
+    // SAFETY: `mmio` is the live BAR0 mapping passed down from
+    // `mhi_init`; `BHIOFF` is a readable chip register via the window.
     let bhi_off = unsafe { read_via_window(mmio, BHIOFF) };
 
     // Program BHI registers.
+    // SAFETY: `mmio` is the live BAR0 mapping passed down from
+    // `mhi_init`; `bhi_off + BHI_*` address the writable BHI image
+    // descriptor + doorbell registers within the chip register file.
     unsafe {
         write_via_window(mmio, bhi_off + BHI_IMGADDR_LOW, phys as u32);
         write_via_window(mmio, bhi_off + BHI_IMGADDR_HIGH, (phys >> 32) as u32);
@@ -144,6 +164,8 @@ fn load_amss_firmware(
     // Poll BHI_STATUS for SUCCESS.
     let mut success = false;
     for _ in 0..5000 {
+        // SAFETY: `mmio` is the live BAR0 mapping passed down from
+        // `mhi_init`; `bhi_off + BHI_STATUS` is a readable chip register.
         let status = unsafe { read_via_window(mmio, bhi_off + BHI_STATUS) };
         if status == BHI_STATUS_SUCCESS {
             success = true;
@@ -284,11 +306,12 @@ impl MhiTre {
     ///   - dword1 bit 10     = CHAIN,
     ///   - dword1 bit 11     = BEI (bei: block event interrupt).
     pub fn pack_data(dma: u64, len: u16, ieot: bool, ieob: bool, chain: bool, bei: bool) -> Self {
-        let mut t = MhiTre::default();
-        t.ptr_lo = dma as u32;
-        t.ptr_hi = (dma >> 32) as u32;
-        t.dword0 = len as u32;
-        t.dword1 = 0x02; // type = DATA
+        let mut t = MhiTre {
+            ptr_lo: dma as u32,
+            ptr_hi: (dma >> 32) as u32,
+            dword0: len as u32,
+            dword1: 0x02, // type = DATA
+        };
         if ieot {
             t.dword1 |= 1 << 8;
         }
@@ -310,6 +333,11 @@ impl MhiTre {
 
     pub fn len(&self) -> u16 {
         (self.dword0 & 0xFFFF) as u16
+    }
+
+    /// True when this TRE carries a zero-length payload (`dword0[15:0]` == 0).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn tre_type(&self) -> u8 {

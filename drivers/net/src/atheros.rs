@@ -303,7 +303,14 @@ pub struct AtlNic {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: every mutable field is either confined to the driver thread that
+// owns the device or guarded by an `IrqSafeSpinLock`; `MmioRegion` and the
+// `DmaBuffer` rings are raw device-memory handles with no thread affinity,
+// so moving an `AtlNic` between threads is sound.
 unsafe impl Send for AtlNic {}
+// SAFETY: all interior mutability (ring heads and IPC endpoints) is behind
+// `IrqSafeSpinLock`; the remaining fields are read-only after `bring_up`, so
+// `&AtlNic` can be shared across threads without data races.
 unsafe impl Sync for AtlNic {}
 
 impl core::fmt::Debug for AtlNic {
@@ -398,13 +405,15 @@ impl AtlNic {
         //     buffer. NIC consumes the RFD ring left-to-right; the
         //     RRS ring reports back which RFD slot was used.
         let rfd_phys = rfd_ring.phys_addr().raw();
-        for i in 0..RFD_RING_LEN {
-            let buf_phys = rfd_pool[i].phys_addr().raw();
+        for (i, buf) in rfd_pool.iter().enumerate() {
+            let buf_phys = buf.phys_addr().raw();
             let d = Rfd {
                 addr_lo: buf_phys as u32,
                 addr_hi: (buf_phys >> 32) as u32,
             };
-            // SAFETY: identity-mapped DMA page; i < RFD_RING_LEN.
+            // SAFETY: `rfd_phys` is the identity-mapped base of the freshly
+            // allocated RFD ring; `i < RFD_RING_LEN` (loop bound) so the slot
+            // at `rfd_phys + i*8` lies within the ring's mapped 8-byte stride.
             unsafe {
                 core::ptr::write_volatile((rfd_phys + (i * 8) as u64) as *mut Rfd, d);
             }
@@ -462,6 +471,9 @@ impl AtlNic {
         //    a reset may report no link even on a live cable; we
         //    capture whatever the PHY currently says and let the
         //    link-watch path re-poll.
+        // SAFETY: `mmio` is the BAR0 mapping this `bring_up` owns exclusively
+        // (per its `# Safety` contract), satisfying `read_phy`'s requirement
+        // that the caller own the device's MMIO BAR.
         let bmsr = unsafe { read_phy(&mmio, MII_BMSR) }.unwrap_or(0);
         let link_up = bmsr & BMSR_LINK_STATUS != 0;
         let an_complete = bmsr & BMSR_AUTONEG_COMPLETE != 0;
@@ -489,7 +501,7 @@ impl AtlNic {
         // Spawn pumps
         spawn_pumps(atl.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(atl).map_err(|_| NicError::NoMemory)?)
+        Arc::try_unwrap(atl).map_err(|_| NicError::NoMemory)
     }
 
     /// Transmit a single Ethernet frame. Polled completion.
@@ -588,8 +600,11 @@ impl AtlNic {
 
         let copy_len = len.min(RX_BUF_LEN);
         let mut out = alloc::vec::Vec::with_capacity(copy_len);
-        // SAFETY: identity-mapped DMA buffer.
         for i in 0..copy_len {
+            // SAFETY: `buf_phys` is the identity-mapped base of this RFD slot's
+            // DMA buffer; `i < copy_len <= RX_BUF_LEN`, so each byte read stays
+            // within that DMA-coherent allocation. Volatile because the NIC
+            // wrote the bytes via DMA.
             out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
         }
 
@@ -764,17 +779,24 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    // SAFETY: caller-authority over the device for the duration of
-    // bring_up.
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+    // SAFETY: this probe just programmed the device's PCI command register
+    // (MEM_SPACE | BUS_MASTER | INTX_DISABLE) and is the sole owner of
+    // `device` for the duration of the call, satisfying `bring_up`'s
+    // exclusive-ownership requirement over the BAR + cfg windows.
     let dev = match unsafe { AtlNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
     {
+        // SAFETY: `dev` was just created via `Arc::new` and is the unique
+        // strong reference at this point (no clone exists until the
+        // `CONTROLLER` install below), so `Arc::as_ptr` yields a pointer to a
+        // live, exclusively-owned `AtlNic` and the `&mut` borrow ends before
+        // any clone is published.
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut AtlNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

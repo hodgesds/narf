@@ -357,9 +357,9 @@ impl Qtd {
             _ => QtdPid::Out, // reserved value; dump as Out.
         };
         let mut pages = [0u32; 5];
-        for i in 0..5 {
+        for (i, page) in pages.iter_mut().enumerate() {
             let off = 12 + i * 4;
-            pages[i] = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            *page = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
         }
         Self {
             next: next & 0xFFFF_FFE0,

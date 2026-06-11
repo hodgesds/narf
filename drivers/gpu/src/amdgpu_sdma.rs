@@ -194,7 +194,7 @@ pub fn build_sdma6_ring_init(
     doorbell_idx: u32,
     rptr_writeback_phys: u64,
 ) -> Result<SdmaRingInitSequence, SdmaError> {
-    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+    if !ring_size_dw.is_power_of_two() || !(8..=(1 << 20)).contains(&ring_size_dw) {
         return Err(SdmaError::BadRingSize);
     }
     if ring_phys & 0xFF != 0 {
@@ -251,7 +251,7 @@ pub fn build_sdma4_ring_init(
     doorbell_idx: u32,
     rptr_writeback_phys: u64,
 ) -> Result<SdmaRingInitSequence, SdmaError> {
-    if !ring_size_dw.is_power_of_two() || ring_size_dw < 8 || ring_size_dw > (1 << 20) {
+    if !ring_size_dw.is_power_of_two() || !(8..=(1 << 20)).contains(&ring_size_dw) {
         return Err(SdmaError::BadRingSize);
     }
     if ring_phys & 0xFF != 0 {

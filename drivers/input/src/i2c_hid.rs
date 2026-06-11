@@ -235,8 +235,7 @@ impl I2cHidDriver {
         // First 2 bytes are length. Read into a small local buffer
         // bounded by w_max_input_length to avoid surprising the
         // controller's max-burst limit.
-        let mut total = Vec::<u8>::new();
-        total.resize(max_len.max(2), 0);
+        let mut total = alloc::vec![0; max_len.max(2)];
         let reg = desc.w_input_register.to_le_bytes();
         let mut ops = [I2cOp::Write(&reg), I2cOp::Read(&mut total)];
         self.bus.transfer(self.addr, &mut ops).await?;
@@ -263,8 +262,7 @@ impl I2cHidDriver {
     /// vector is exactly `w_report_desc_length` bytes.
     pub async fn read_report_descriptor(&self) -> Result<Vec<u8>, I2cHidError> {
         let desc = self.descriptor.ok_or(I2cHidError::NotInitialised)?;
-        let mut out = Vec::<u8>::new();
-        out.resize(desc.w_report_desc_length as usize, 0);
+        let mut out = alloc::vec![0; desc.w_report_desc_length as usize];
         let reg = desc.w_report_desc_register.to_le_bytes();
         let mut ops = [I2cOp::Write(&reg), I2cOp::Read(&mut out)];
         self.bus.transfer(self.addr, &mut ops).await?;
@@ -317,8 +315,7 @@ impl I2cHidDriver {
             return Err(I2cHidError::ShortReport);
         }
         let payload_len = len - 2;
-        let mut payload = Vec::<u8>::new();
-        payload.resize(payload_len, 0);
+        let mut payload = alloc::vec![0; payload_len];
         // Phase 2 continued: read the rest of the report. The Data
         // Register stays at the next byte after the length prefix
         // for a continuation read against the same slave address.

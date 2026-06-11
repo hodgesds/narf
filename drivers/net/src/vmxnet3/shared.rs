@@ -94,7 +94,7 @@ const _: () = assert!(core::mem::size_of::<Vmxnet3MiscConf>() == 72);
 /// `Vmxnet3_IntrConf` mirror. `modLevels` is a `u8[25]` (`VMXNET3_MAX_
 /// INTRS`); reserved padding follows so the struct is 64-bit aligned.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct Vmxnet3IntrConf {
     pub autoMask: u8,
     pub numIntrs: u8,
@@ -104,19 +104,6 @@ pub struct Vmxnet3IntrConf {
     pub reserved: [u32; 2],
 }
 const _: () = assert!(core::mem::size_of::<Vmxnet3IntrConf>() == 40);
-
-impl Default for Vmxnet3IntrConf {
-    fn default() -> Self {
-        Self {
-            autoMask: 0,
-            numIntrs: 0,
-            eventIntrIdx: 0,
-            modLevels: [0; 25],
-            intrCtrl: 0,
-            reserved: [0; 2],
-        }
-    }
-}
 
 /// Multi-VLAN filter bitmap size. 4096 VLAN IDs / (4 bytes × 8 bits)
 /// = 128 u32s. We never set any of these — Stage 2 leaves VLAN

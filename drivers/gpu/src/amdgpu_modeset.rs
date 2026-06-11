@@ -193,21 +193,11 @@ pub struct CrtcMode {
 /// Top-level KMS state. One per AMD GPU. Built once at probe by
 /// walking the ATOM display-object table, then mutated by hotplug
 /// + modeset events.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct KmsState {
     pub connectors: Vec<Connector>,
     pub encoders: Vec<Encoder>,
     pub crtcs: Vec<Crtc>,
-}
-
-impl Default for KmsState {
-    fn default() -> Self {
-        Self {
-            connectors: Vec::new(),
-            encoders: Vec::new(),
-            crtcs: Vec::new(),
-        }
-    }
 }
 
 impl KmsState {
@@ -368,6 +358,7 @@ pub struct ModesetPlan {
 ///
 /// `dcn_base` is the discovery-resolved DCN block base
 /// (`amdgpu::ip_block_base(HW_ID_DCN, 0)`).
+#[allow(clippy::too_many_arguments)] // wide hardware/ABI signature: each arg maps to a distinct DCN register group
 pub fn plan_modeset(
     kms: &KmsState,
     family: Family,
@@ -612,7 +603,7 @@ mod smoke_tests {
         if s.connector_by_device_tag(0x0080) != Some(1) {
             return TestResult::Fail("device_tag lookup failed");
         }
-        if s.connector_by_device_tag(0xBEEF) != None {
+        if s.connector_by_device_tag(0xBEEF).is_some() {
             return TestResult::Fail("device_tag for missing returned Some");
         }
         TestResult::Pass

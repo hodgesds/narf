@@ -85,7 +85,7 @@ pub const N_RF_A_ROWS: usize = 95;
 ///
 /// Source: `8188e.c::rtl8188eu_power_on` ~L1165..L1200.
 pub const INIT_TABLE: &[(u16, u8)] = &[
-    (REG_APS_FSMCO as u16 + 1, 0x08),
+    (REG_APS_FSMCO + 1, 0x08),
     (REG_CR, (CR_OPEN_8188E & 0xFF) as u8),
     (REG_CR + 1, ((CR_OPEN_8188E >> 8) & 0xFF) as u8),
 ];
@@ -254,7 +254,7 @@ pub fn init_rf<W: FnMut(u8, u32)>(write_rfreg: W) -> usize {
 // ── USB control-transfer setup helpers ─────────────────────────────
 
 pub fn aps_fsmco_mac_enable_setup() -> UsbControlSetup {
-    UsbControlSetup::write(REG_APS_FSMCO as u16 + 1, 1)
+    UsbControlSetup::write(REG_APS_FSMCO + 1, 1)
 }
 
 pub fn cr_open_setups() -> [UsbControlSetup; 2] {

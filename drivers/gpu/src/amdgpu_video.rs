@@ -589,28 +589,29 @@ pub fn build_encode_frame_packet(
     }
     let seq = session.allocate_seq();
     let codec_word = codec_word_for(session.codec);
-    let mut dws = Vec::with_capacity(14);
     // session-info echo so the firmware can route the packet.
-    dws.push(0x0000_0018);
-    dws.push(session.handle);
-    dws.push(codec_word);
-    dws.push(session.width);
-    dws.push(session.height);
-    dws.push(session.bitrate_bps);
-    // Input frame.
-    dws.push(raw_input_phys as u32);
-    dws.push((raw_input_phys >> 32) as u32);
-    // Output buffer.
-    dws.push(output_phys as u32);
-    dws.push((output_phys >> 32) as u32);
-    dws.push(output_max_size);
-    // Op tag — encode_frame = 0x0800_0002.
-    dws.push(0x0800_0002);
     // Fence dword pair — VCN_ENC_CMD_FENCE writes `seq` to a host
     // sysmem address. Caller fills the wptr-side fence target in a
     // separate envelope; we just record `seq` for completion match.
-    dws.push(VCN_ENC_CMD_FENCE);
-    dws.push(seq as u32);
+    let dws = alloc::vec![
+        0x0000_0018,
+        session.handle,
+        codec_word,
+        session.width,
+        session.height,
+        session.bitrate_bps,
+        // Input frame.
+        raw_input_phys as u32,
+        (raw_input_phys >> 32) as u32,
+        // Output buffer.
+        output_phys as u32,
+        (output_phys >> 32) as u32,
+        output_max_size,
+        // Op tag — encode_frame = 0x0800_0002.
+        0x0800_0002,
+        VCN_ENC_CMD_FENCE,
+        seq as u32,
+    ];
     session.in_flight += 1;
     Ok(EncodePacket {
         dws,
@@ -650,15 +651,16 @@ pub fn build_encode_destroy_msg(session: &mut EncodeSession) -> Result<EncodePac
     if !session.ip.supports_encode(session.codec) {
         return Err(VideoError::UnsupportedCodec);
     }
-    let mut dws = Vec::with_capacity(8);
-    dws.push(0x0000_0018);
-    dws.push(0x0000_0001);
-    dws.push(session.handle);
-    dws.push(0);
-    dws.push(0);
-    dws.push(0x0000_0008);
-    dws.push(0x0800_0003); // op destroy
-    dws.push(VCN_ENC_CMD_END);
+    let dws = alloc::vec![
+        0x0000_0018,
+        0x0000_0001,
+        session.handle,
+        0,
+        0,
+        0x0000_0008,
+        0x0800_0003, // op destroy
+        VCN_ENC_CMD_END,
+    ];
     let seq = session.allocate_seq();
     session.in_flight += 1;
     Ok(EncodePacket {
@@ -758,9 +760,11 @@ pub trait VcnEncMmio {
     fn write(&mut self, vcn_base_plus_offset: u32, value: u32);
 }
 
-/// Set up the encode ring registers — programs UVD_RB_BASE_LO/HI
-/// + UVD_RB_SIZE so the firmware reads packets from the right
-/// place. Adapted from `vcn_v4_0.c::vcn_v4_0_pause_dpg_mode`
+/// Set up the encode ring registers — programs `UVD_RB_BASE_LO`,
+/// `UVD_RB_BASE_HI`, and `UVD_RB_SIZE` so the firmware reads packets
+/// from the right place.
+///
+/// Adapted from `vcn_v4_0.c::vcn_v4_0_pause_dpg_mode`
 /// register-init block (around line 1100-1108).
 pub fn setup_encode_ring_regs<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32, ring: &EncodeRing) {
     mmio.write(
@@ -813,7 +817,7 @@ mod smoke_tests {
         if VcnVersion::from_family(Family::Navi2) != Some(VcnVersion::V3_0) {
             return TestResult::Fail("Navi2 VCN version wrong");
         }
-        if VcnVersion::from_family(Family::Vega) != None {
+        if VcnVersion::from_family(Family::Vega).is_some() {
             return TestResult::Fail("Vega should report no VCN");
         }
         TestResult::Pass

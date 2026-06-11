@@ -7,13 +7,13 @@
 //!   (Linux v6.6 lines ~50..~120) — the byte-loop that:
 //!     1. asserts `LDOE25_EN` in `REG_LDO_EFUSE_CTRL` once,
 //!     2. for each byte:
-//!         a. writes `(addr << 8)` to `REG_EFUSE_CTRL` (data/addr field),
-//!         b. clears bit 31 (`EFUSE_CTRL_VALID`) — this is the *write*
-//!            shape that arms the read once we re-assert it,
-//!         c. sets bit 31 to trigger,
-//!         d. polls bit 31 — when the hardware finishes the read, it
-//!            flips bit 31 back to 0 and presents the data byte in
-//!            bits[7:0],
+//!        a. writes `(addr << 8)` to `REG_EFUSE_CTRL` (data/addr field),
+//!        b. clears bit 31 (`EFUSE_CTRL_VALID`) — this is the *write*
+//!        shape that arms the read once we re-assert it,
+//!        c. sets bit 31 to trigger,
+//!        d. polls bit 31 — when the hardware finishes the read, it
+//!        flips bit 31 back to 0 and presents the data byte in
+//!        bits[7:0],
 //!     3. clears `LDOE25_EN`.
 //!
 //! NARF is GPL-2.0-or-later, so this direct port is in-policy.
@@ -75,7 +75,7 @@ pub unsafe fn read_efuse_bytes(
         mmio.write32(REG_LDO_EFUSE_CTRL, ldo | LDO_EFUSE_EN);
     }
 
-    for i in 0..count {
+    for (i, out_byte) in out.iter_mut().enumerate().take(count) {
         let byte_addr = addr.saturating_add(i as u32) & EFUSE_CTRL_ADDR_MASK;
 
         // Arm the read: write the address into bits[25:8] and clear
@@ -113,7 +113,7 @@ pub unsafe fn read_efuse_bytes(
             }
             return Err(EfuseError::Timeout);
         }
-        out[i] = (last & EFUSE_CTRL_DATA_MASK) as u8;
+        *out_byte = (last & EFUSE_CTRL_DATA_MASK) as u8;
     }
 
     // De-assert the LDO. Linux clears the bit at the end of

@@ -186,7 +186,7 @@ fn smoke_xhci_hid_kbd_first_report() -> TestResult {
     // initial "no keys held" report on enumeration).
     let deadline = narf_time::Deadline::after_ms(200);
     while !deadline.expired() {
-        let n = xhci::with_controller(|c| hid::pump_all(c)).unwrap_or(0);
+        let n = xhci::with_controller(hid::pump_all).unwrap_or(0);
         if n > 0 {
             // Got a press/release event — fully end-to-end.
             return TestResult::Pass;
@@ -997,7 +997,7 @@ fn smoke_uvc_yuy2_guid_bytes() -> TestResult {
         return TestResult::Fail("YUY2 GUID prefix should be ASCII 'YUY2'");
     }
     // The trailing fixed suffix is the FOURCC namespace.
-    if &GUID_FORMAT_YUY2[8..16] != &[0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] {
+    if GUID_FORMAT_YUY2[8..16] != [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] {
         return TestResult::Fail("YUY2 GUID trailer mismatch");
     }
     TestResult::Pass
@@ -1267,7 +1267,7 @@ fn smoke_uvc_stream_header_with_pts() -> TestResult {
     if bytes.len() != 6 {
         return TestResult::Fail("PTS-only header = 2 + 4 = 6 bytes");
     }
-    if &bytes[2..6] != &0xCAFE_BEEFu32.to_le_bytes() {
+    if bytes[2..6] != 0xCAFE_BEEFu32.to_le_bytes() {
         return TestResult::Fail("PTS encoded LE");
     }
     let (back, _) = PayloadHeader::decode(&bytes).expect("decode");
@@ -2542,7 +2542,7 @@ fn smoke_hid_pump_all_with_no_keyboards_is_noop() -> TestResult {
     hid::__reset_keyboards_for_test();
     let before_pumps = hid::PUMP_ALL_CALLS.load(core::sync::atomic::Ordering::Relaxed);
     let before_reports = hid::REPORTS_READ.load(core::sync::atomic::Ordering::Relaxed);
-    let n = xhci::with_controller(|c| hid::pump_all(c)).unwrap_or(0);
+    let n = xhci::with_controller(hid::pump_all).unwrap_or(0);
     if n != 0 {
         return TestResult::Fail("pump_all with no kbds returned non-zero events");
     }
@@ -2578,7 +2578,7 @@ fn smoke_hid_pump_counters_monotonic() -> TestResult {
     let baseline_pumps = hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
     // Drive several pumps; each must advance the counter by 1.
     for i in 1..=5u32 {
-        let _ = xhci::with_controller(|c| hid::pump_all(c));
+        let _ = xhci::with_controller(hid::pump_all);
         let now = hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
         if now != baseline_pumps + i {
             return TestResult::Fail("PUMP_ALL_CALLS didn't advance monotonically");
@@ -3148,7 +3148,7 @@ fn smoke_ccid_t0_case1_encode() -> TestResult {
     use crate::ccid::t0::T0Apdu;
     let apdu = T0Apdu::build_case1(0x00, 0xA4, 0x04, 0x00);
     let b = apdu.as_bytes();
-    if b != &[0x00, 0xA4, 0x04, 0x00] {
+    if b != [0x00, 0xA4, 0x04, 0x00] {
         return TestResult::Fail("T=0 Case 1 byte sequence mismatch");
     }
     TestResult::Pass
@@ -3184,7 +3184,7 @@ fn smoke_ccid_t0_case3_encode() -> TestResult {
     if b[4] != data.len() as u8 {
         return TestResult::Fail("Lc field mismatch");
     }
-    if &b[5..] != &data[..] {
+    if b[5..] != data[..] {
         return TestResult::Fail("DATA field mismatch");
     }
     TestResult::Pass
@@ -3218,7 +3218,7 @@ fn smoke_ccid_t0_get_response_chaining() -> TestResult {
         Ok(t) => t,
         Err(_) => return TestResult::Fail("decode_response failed"),
     };
-    if data != &[] {
+    if !data.is_empty() {
         return TestResult::Fail("no data bytes before SW");
     }
     if sw1 != SW1_GET_RESPONSE {
@@ -3226,7 +3226,7 @@ fn smoke_ccid_t0_get_response_chaining() -> TestResult {
     }
     let gr = build_get_response(0x00, sw2);
     let b = gr.as_bytes();
-    if b != &[0x00, 0xC0, 0x00, 0x00, 0x08] {
+    if b != [0x00, 0xC0, 0x00, 0x00, 0x08] {
         return TestResult::Fail("GET_RESPONSE APDU bytes wrong");
     }
     TestResult::Pass
@@ -4390,8 +4390,8 @@ kernel_test_in!("drivers/usb/hub", smoke_usb_hub_port_status_decode);
 
 /// SET_FEATURE PORT_POWER encodes the correct bmRequestType + bRequest
 /// + wValue triple. This test verifies that the constants used in
-/// `UsbHub::attach` (which issues SET_FEATURE PORT_POWER for each port)
-/// match the USB 2.0 Class-Specific Request table.
+///   `UsbHub::attach` (which issues SET_FEATURE PORT_POWER for each port)
+///   match the USB 2.0 Class-Specific Request table.
 ///
 /// Reference: USB 2.0 §11.24.2.7 Table 11-17 (Port Feature Selectors).
 /// Linux hub.c `hub_power_on` ~L487.

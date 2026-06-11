@@ -394,8 +394,9 @@ async fn try_attach_port(xhci_dev: &Xhci, port: u8) -> Result<(), HidError> {
 /// Post-address mouse bind: assumes caller has already addressed
 /// the slot. Does GET_DESCRIPTOR + EP0-MPS refresh + interface
 /// match + configure_endpoints + SET_CONFIGURATION + SET_PROTOCOL
-/// + arm_interrupt_in + registry push. No disable_slot — caller's
-/// guard handles that.
+/// + arm_interrupt_in + registry push.
+///
+/// No disable_slot — caller's guard handles that.
 async fn bind_mouse_addressed_slot(
     xhci_dev: &Xhci,
     slot_id: u8,
@@ -432,7 +433,7 @@ async fn bind_mouse_addressed_slot(
         return Err(HidError::NoInterruptIn);
     }
     let total = u16::from_le_bytes([head[2], head[3]]) as usize;
-    if total < 9 || total > 4096 {
+    if !(9..=4096).contains(&total) {
         return Err(HidError::NoInterruptIn);
     }
     // bConfigurationValue lives at cfg-descriptor offset +5

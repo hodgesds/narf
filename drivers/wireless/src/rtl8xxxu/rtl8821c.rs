@@ -120,7 +120,7 @@ impl TxDesc40 {
 
 /// Stage 0/1 register init table for RTL8821CU.
 pub const INIT_TABLE: &[(u16, u8)] = &[
-    (REG_APS_FSMCO as u16 + 1, 0x08),
+    (REG_APS_FSMCO + 1, 0x08),
     (
         REG_CR,
         (CR_HCI_TXDMA_ENABLE
@@ -323,7 +323,7 @@ pub fn init_rf<W: FnMut(u8, u32)>(write_rfreg: W) -> usize {
 
 /// Build USB control-transfer setup for APS_FSMCO MAC enable.
 pub fn aps_fsmco_mac_enable_setup() -> UsbControlSetup {
-    UsbControlSetup::write(REG_APS_FSMCO as u16 + 1, 1)
+    UsbControlSetup::write(REG_APS_FSMCO + 1, 1)
 }
 
 extern crate alloc;

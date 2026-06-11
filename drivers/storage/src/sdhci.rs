@@ -323,6 +323,9 @@ impl Sdhci {
         }
 
         // 8. Run the SD identification sequence.
+        // SAFETY: `me.mmio` is the identity-mapped SDHCI register window set
+        // up above and `identify_sequence` runs exactly once here at
+        // bring-up, satisfying its single-call ownership precondition.
         let card = unsafe { me.identify_sequence() }?;
         *me.card.lock() = Some(card);
         Ok(me)
@@ -357,6 +360,9 @@ impl Sdhci {
     /// Returns the 32-bit response (low 32 bits for R1/R3/R6/R7;
     /// for R2, callers read all four response registers via
     /// `read_response_136`).
+    // Wide signature mirrors the SDHCI command/transfer register set
+    // (idx, arg, response kind, data flag, transfer mode, block size/count).
+    #[allow(clippy::too_many_arguments)]
     fn cmd(
         &self,
         idx: u8,
@@ -421,9 +427,11 @@ impl Sdhci {
     /// Read all four 32-bit response slots (R2 / CID / CSD).
     fn read_response_136(&self) -> [u32; 4] {
         let mut r = [0u32; 4];
-        // SAFETY: identity-mapped MMIO.
-        for i in 0..4 {
-            r[i] = unsafe { self.mmio.read32(REG_RESPONSE_0 + (i as u64) * 4) };
+        for (i, slot) in r.iter_mut().enumerate() {
+            // SAFETY: identity-mapped MMIO; `REG_RESPONSE_0 + i*4` for
+            // `i` in 0..4 covers the four contiguous 32-bit response
+            // registers (`R2`/CID/CSD).
+            *slot = unsafe { self.mmio.read32(REG_RESPONSE_0 + (i as u64) * 4) };
         }
         r
     }

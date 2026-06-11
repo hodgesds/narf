@@ -5,13 +5,13 @@
 //!   (xHCI)** Revision 1.2, May 2019 (Intel). §4.5.2 (Route String),
 //!   §4.6.5 (Address Device), §6.2.2 (Slot Context Hub bit / TT
 //!   fields).
-//!     <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
+//!   <https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html>
 //! - **Universal Serial Bus Specification Revision 2.0** §11
 //!   (Hub Specification).
-//!     <https://www.usb.org/document-library/usb-20-specification>
+//!   <https://www.usb.org/document-library/usb-20-specification>
 //! - **Universal Serial Bus 3.2 Specification** Revision 1.1, June
 //!   2022 (USB-IF). §10 (USB 3.x hub class extensions).
-//!     <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
+//!   <https://www.usb.org/document-library/usb-32-revision-11-june-2022>
 //!
 //! No GPL/BSD source code (Linux, FreeBSD, NetBSD, U-Boot) consulted.
 //!
@@ -460,7 +460,7 @@ async fn dispatch_after_address(
         // populated in `this_route`. For a tier-0 hub the route is
         // 0 and tier is 0; downstream-of-hub devices will use
         // tier+1 when calling `Topology::for_downstream`.
-        let tier = (this_route.leading_zeros().wrapping_sub(12) / 4) as u32;
+        let tier = this_route.leading_zeros().wrapping_sub(12) / 4;
         // For root-hub-attached hubs `this_route` is 0 → leading
         // zeros above wraps; clamp to 0 in that case.
         let tier = if this_route == 0 { 0 } else { tier };
@@ -541,25 +541,23 @@ async fn dispatch_after_address(
         // 0x02. Runs after touchpad so a PTP-capable touchpad isn't
         // demoted to a boot mouse, but before CDC-ACM so a USB mouse
         // isn't misclassified as a serial dongle.
-        if mouse::find_boot_mouse(&cfg_blob).is_ok() {
-            if mouse::try_bind_mouse_already_addressed(xhci_dev, slot_id, speed)
+        if mouse::find_boot_mouse(&cfg_blob).is_ok()
+            && mouse::try_bind_mouse_already_addressed(xhci_dev, slot_id, speed)
                 .await
                 .is_ok()
-            {
-                return AttachOutcome::Mouse;
-            }
+        {
+            return AttachOutcome::Mouse;
         }
         // CDC-ACM serial — Comm + Data interface pair (bare or
         // IAD-led composite).
-        if crate::cdc_acm::find_acm_interfaces(&cfg_blob).is_some() {
-            if crate::cdc_acm::try_bind_cdc_acm_already_addressed(
+        if crate::cdc_acm::find_acm_interfaces(&cfg_blob).is_some()
+            && crate::cdc_acm::try_bind_cdc_acm_already_addressed(
                 xhci_dev, slot_id, &cfg_blob, speed,
             )
             .await
             .is_ok()
-            {
-                return AttachOutcome::SerialAcm;
-            }
+        {
+            return AttachOutcome::SerialAcm;
         }
         // USB Mass Storage (BBB BOT) — bInterfaceClass=0x08,
         // SubClass=0x06, Protocol=0x50. `find_bot_endpoints`
@@ -603,15 +601,14 @@ async fn dispatch_after_address(
         // expose vendor class 0xFF but omit the MS OS 2.0 descriptor,
         // so the WBDI recogniser would never fire for them. At most
         // ~10 lines per the scope spec.
-        if fingerprint::classify_vid_pid(dev_vid, dev_pid).is_some() {
-            if fingerprint::try_bind_fingerprint_already_addressed(
+        if fingerprint::classify_vid_pid(dev_vid, dev_pid).is_some()
+            && fingerprint::try_bind_fingerprint_already_addressed(
                 xhci_dev, slot_id, dev_vid, dev_pid, &cfg_blob,
             )
             .await
             .is_ok()
-            {
-                return AttachOutcome::Fingerprint;
-            }
+        {
+            return AttachOutcome::Fingerprint;
         }
         // USB CCID smart-card reader — class 0x0B / subclass 0x00 /
         // protocol 0x00. `find_ccid_interface` walks the config blob;

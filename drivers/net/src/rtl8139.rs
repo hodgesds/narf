@@ -114,7 +114,14 @@ pub struct Rtl8139 {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: `Rtl8139` is only `!Send` because of the raw MMIO/DMA pointers in
+// `MmioRegion`/`DmaBuffer`; those regions are owned solely by this instance
+// and stay valid for its lifetime, so the value can be moved across CPUs.
 unsafe impl Send for Rtl8139 {}
+// SAFETY: the mutable cyclic-ring/TX cursors (`rx_offset`, `tx_index`) and the
+// IPC rings are each guarded by an `IrqSafeSpinLock`; the remaining fields are
+// only written during bring-up and read-only afterwards, so shared `&Rtl8139`
+// access from multiple CPUs/IRQ contexts is data-race free.
 unsafe impl Sync for Rtl8139 {}
 
 impl core::fmt::Debug for Rtl8139 {
@@ -169,9 +176,10 @@ impl Rtl8139 {
 
         // 3. Read MAC from IDR0..5.
         let mut mac = [0u8; 6];
-        // SAFETY: same.
-        for i in 0..6 {
-            mac[i] = unsafe { mmio.read8(REG_IDR0 + i as u64) };
+        for (i, b) in mac.iter_mut().enumerate() {
+            // SAFETY: `mmio` is the BAR mapping established above; `REG_IDR0 +
+            // i` (i in 0..6) addresses the 6 ID-register bytes inside that BAR.
+            *b = unsafe { mmio.read8(REG_IDR0 + i as u64) };
         }
 
         // 4. Allocate RX + TX buffers (alloc_coherent zero-fills).
@@ -195,10 +203,10 @@ impl Rtl8139 {
                 REG_RBSTART,
                 (rx_ring.phys_addr().raw() & 0xFFFF_FFFF) as u32,
             );
-            for i in 0..TX_BUF_COUNT {
+            for (i, buf) in tx_bufs.iter().enumerate() {
                 mmio.write32(
                     REG_TSAD0 + (i as u64) * 4,
-                    (tx_bufs[i].phys_addr().raw() & 0xFFFF_FFFF) as u32,
+                    (buf.phys_addr().raw() & 0xFFFF_FFFF) as u32,
                 );
             }
         }
@@ -244,7 +252,7 @@ impl Rtl8139 {
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         });
 
-        Ok(Arc::try_unwrap(rtl).map_err(|_| Rtl8139Error::Other("Arc unwrap failed"))?)
+        Arc::try_unwrap(rtl).map_err(|_| Rtl8139Error::Other("Arc unwrap failed"))
     }
 
     pub fn mac(&self) -> [u8; 6] {
@@ -334,9 +342,11 @@ impl Rtl8139 {
         // Copy frame (excluding the 4-byte trailing CRC).
         let frame_len = (len as usize).saturating_sub(4);
         let copy = frame_len.min(out.len());
-        // SAFETY: identity-mapped DMA.
-        for i in 0..copy {
-            out[i] = unsafe {
+        for (i, b) in out.iter_mut().enumerate().take(copy) {
+            // SAFETY: `ring_phys` is the identity-mapped DMA address of the RX
+            // ring; the frame payload starts at `off + 4` and `copy` is bounded
+            // by `frame_len`, so `off + 4 + i` stays within the mapped ring.
+            *b = unsafe {
                 core::ptr::read_volatile((ring_phys + (off + 4 + i) as u64) as *const u8)
             };
         }

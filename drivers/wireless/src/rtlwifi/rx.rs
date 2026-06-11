@@ -38,8 +38,12 @@ pub struct RxEntry {
 pub fn peek_descriptor(ring: &RxRing, slot: u16) -> Option<RxDesc> {
     let offset = slot as usize * RX_DESC_SIZE;
     let base = ring.buf.as_ptr();
-    // SAFETY: DMA-coherent backing; offset is in-range (slot < depth).
     let mut desc = RxDesc::default();
+    // SAFETY: `base` points at the DMA-coherent descriptor ring; `slot
+    // < depth` so `offset + i*4` for `i` over `dwords` stays within the
+    // `slot`-th `RX_DESC_SIZE` descriptor. Each read is 4-byte aligned
+    // (offset is a multiple of 4) and `read_volatile` is required to
+    // observe HW-written descriptor state.
     unsafe {
         for i in 0..desc.dwords.len() {
             desc.dwords[i] = core::ptr::read_volatile(base.add(offset + i * 4).cast::<u32>());

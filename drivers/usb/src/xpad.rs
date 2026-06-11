@@ -1042,6 +1042,12 @@ pub struct WirelessReceiver {
     pub slots: [WirelessSlotState; 4],
 }
 
+impl Default for WirelessReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WirelessReceiver {
     /// Create a new receiver with all slots absent.
     pub const fn new() -> Self {

@@ -176,7 +176,7 @@ pub const MAX_DIV_SPEC_300: u16 = 2046;
 
 // ── PCI SDHCI identification ───────────────────────────────────────────
 /// PCI class code for SDHCI: base 0x08 (generic), sub 0x05 (SD host), iface 0x00.
-pub const PCI_CLASS_SDHCI: u32 = 0x0805_00;
+pub const PCI_CLASS_SDHCI: u32 = 0x08_05_00;
 pub const PCI_SDHCI_BAR: u8 = 0; // BAR0 by SDHCI spec
 
 #[cfg(any(test, feature = "kernel-test"))]

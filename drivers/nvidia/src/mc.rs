@@ -289,8 +289,11 @@ pub unsafe fn read_live_intr0(
     // SAFETY: caller's responsibility.
     let top = unsafe { bar0.read32(PMC_INTR_0) };
     walk_intr0(top, |src| {
-        // SAFETY: same.
         match src.engine_status_offset() {
+            // SAFETY: per this fn's `# Safety`, `bar0` is the kernel-mapped
+            // BAR0 view with caller-exclusive access. `off` is the per-engine
+            // status register offset returned by `engine_status_offset()` for
+            // `src`, a fixed valid 32-bit register within BAR0.
             Some(off) => unsafe { bar0.read32(off) },
             None => 0,
         }

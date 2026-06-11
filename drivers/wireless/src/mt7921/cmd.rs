@@ -84,6 +84,7 @@ pub fn encode_pm_state_ctrl(pm_state: u8, pm_mode: u8, out: &mut [u8]) -> Option
 /// silicon at the host visibility).
 pub const INIT_RA_CFG_SIZE: usize = 16;
 
+#[allow(clippy::too_many_arguments)] // wide hw ABI: 7 PHY-rate fields + output slice
 pub fn encode_init_ra_cfg(
     band: u8,
     phy_type: u8,
@@ -231,6 +232,7 @@ pub const PHY_MODE_OFDM: u8 = 0x04;
 pub const PHY_MODE_CCK: u8 = 0x01;
 
 /// Build the `BSS_INFO_BASIC` TLV (the only TLV Stage-9 needs).
+#[allow(clippy::too_many_arguments)] // wide hw ABI: 9 BSS fields mirror the on-wire TLV
 pub fn encode_bss_info_basic_tlv(
     network_type: u32,
     omac_idx: u8,
@@ -288,6 +290,7 @@ pub const CONN_TYPE_AP_INFRA: u32 = 0x02;
 pub const CONN_STATE_PORT_SECURE: u8 = 0x02;
 pub const CONN_STATE_DISCONNECT: u8 = 0x00;
 
+#[allow(clippy::too_many_arguments)] // wide hw ABI: 7 STA_REC fields mirror the on-wire TLV
 pub fn encode_sta_rec_basic_tlv(
     conn_type: u32,
     conn_state: u8,
@@ -427,13 +430,18 @@ pub fn encode_default_channel_switch(out: &mut [u8]) -> Option<()> {
 // 802.11 MAC header + a trivial payload and submits it on the BMC
 // ring (queue 4) so it bypasses the per-station rate fallback.
 
+// 802.11 frame-control layout: bits[1:0]=protocol, bits[3:2]=type,
+// bits[7:4]=subtype. `(0 << 2)` keeps the type field visible in source.
+#[allow(clippy::identity_op)] // `(0 << 2)` documents Type=Management in the FC bit layout
 /// 802.11 MGMT frame control: type=Management (0), subtype=Auth (11).
 pub const FC_MGMT_AUTH: u16 = (0 << 2) | (11 << 4);
 /// 802.11 MGMT frame control: type=Management, subtype=AssocReq (0).
 #[allow(clippy::identity_op, clippy::eq_op)]
 pub const FC_MGMT_ASSOC_REQ: u16 = (0 << 2) | (0 << 4);
+#[allow(clippy::identity_op)] // `(0 << 2)` documents Type=Management in the FC bit layout
 /// 802.11 MGMT frame control: type=Management, subtype=AssocResp (1).
 pub const FC_MGMT_ASSOC_RESP: u16 = (0 << 2) | (1 << 4);
+#[allow(clippy::identity_op)] // `(0 << 2)` documents Type=Management in the FC bit layout
 /// 802.11 MGMT frame control: type=Management, subtype=Beacon (8).
 pub const FC_MGMT_BEACON: u16 = (0 << 2) | (8 << 4);
 /// 802.11 MGMT frame control: type=Data, subtype=QoS Data (8).
@@ -598,6 +606,7 @@ pub fn encode_sta_rec_wtbl_tlv(
 /// path: BASIC TLV + WTBL TLV for the cipher.
 ///
 /// Returns the byte length written.
+#[allow(clippy::too_many_arguments)] // wide hw ABI: 7 join-path fields across two sub-TLVs
 pub fn build_sta_rec_body_for_join(
     aid: u16,
     peer_addr: [u8; MAC_ADDR_LEN],
