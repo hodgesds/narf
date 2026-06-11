@@ -135,10 +135,10 @@ pub(crate) fn view_for<'a>(
     let g = BINDINGS.lock();
     let b = g.last().ok_or(FirmwareError::NotFound)?.clone();
     let phys = b.backing.phys_addr().raw();
+    let bytes_ptr = phys as *const u8;
     // SAFETY: the backing is identity-mapped DMA-coherent memory;
     // the `payload_len` was set when the entry was installed and
     // is bounded by the backing buffer's length.
-    let bytes_ptr = phys as *const u8;
     let bytes = unsafe { core::slice::from_raw_parts(bytes_ptr, b.payload_len) };
     // Leak the version string so the lifetime fits the cap's. The
     // string lives in the registry until revocation, so the leak

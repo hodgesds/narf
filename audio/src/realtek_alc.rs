@@ -431,7 +431,7 @@ pub fn bring_up_alc_supported(cad: u8) -> Result<(), AlcError> {
 ///  7. **Headphone unsol response.** On every Pin Complex with default
 ///     device == 0x2 (Headphone Out), set Unsolicited Response Enable
 ///     (verb 0x708) bit 7 with tag 0.
-pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), AlcError> {
+pub fn bring_up_alc_supported_with(cad: u8, mut send: SendVerb<'_>) -> Result<(), AlcError> {
     // 1. Detect.
     let chip = match detect_with(cad, &mut |c, n, v, p| send(c, n, v, p))? {
         Some(c) => c,
@@ -442,8 +442,7 @@ pub fn bring_up_alc_supported_with(cad: u8, send: SendVerb<'_>) -> Result<(), Al
     }
 
     // 2. Enumerate.
-    let tree = codec::enumerate_with(cad, |c, n, v, p| send(c, n, v, p))
-        .map_err(|_| AlcError::EnumerationFailed)?;
+    let tree = codec::enumerate_with(cad, &mut send).map_err(|_| AlcError::EnumerationFailed)?;
     let afg = tree
         .audio_function_group()
         .ok_or(AlcError::EnumerationFailed)?;

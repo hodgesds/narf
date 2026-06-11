@@ -138,7 +138,7 @@ pub const CTYPE_INTERIM: u8 = 0xF;
 // for media keys; the ID is always 0x00 (unit 0).
 pub const SUBUNIT_PANEL: u8 = 0x09;
 /// Encoded subunit byte = (type<<3) | id. PANEL,0 = 0x48.
-pub const SUBUNIT_PANEL_BYTE: u8 = (SUBUNIT_PANEL << 3) | 0;
+pub const SUBUNIT_PANEL_BYTE: u8 = SUBUNIT_PANEL << 3;
 
 // AV/C opcodes (§5.4).
 pub const AVC_OPCODE_VENDOR_DEPENDENT: u8 = 0x00;

@@ -11,8 +11,9 @@
 //!
 //! Gated under `#[cfg(feature = "linux-compat")]`. The kernel core
 //! pays nothing when the feature is off.
-
-#![cfg(feature = "linux-compat")]
+//!
+//! The `linux-compat` gate lives on the `pub mod posix_timer;` line in
+//! `lib.rs`; no inner `#![cfg]` here (it would duplicate that gate).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -104,7 +105,7 @@ fn write_timespec(out: &mut [u8; 16], sec: i64, nsec: i64) {
 }
 
 fn timespec_to_ns(sec: i64, nsec: i64) -> Option<u64> {
-    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return None;
     }
     Some(
@@ -215,6 +216,9 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
     // Linux; we emit a u32 zero-extended to 8 B to keep wire-size
     // sane on both 32/64-bit consumers).
     let id_bytes = (id as u64).to_le_bytes();
+    // SAFETY: `out_ptr` is a user address; `copy_to_user` range-validates it
+    // and brackets the 8-byte write in the SMAP window. We run in the calling
+    // task's address space from the syscall path (not IRQ context).
     if unsafe { crate::handlers::copy_to_user(out_ptr, &id_bytes) }.is_err() {
         // Best-effort cleanup.
         with_table(|m| {
@@ -242,6 +246,9 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         return;
     }
     let mut buf = [0u8; 32];
+    // SAFETY: `new_ptr` is checked non-zero above and is a user address;
+    // `copy_from_user` range-validates it and brackets the 32-byte read in the
+    // SMAP window. Runs in the calling task's address space, not IRQ context.
     if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -293,6 +300,10 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         let (vs, vn) = ns_to_timespec(remaining);
         write_timespec((&mut out[0..16]).try_into().unwrap(), is, in_);
         write_timespec((&mut out[16..32]).try_into().unwrap(), vs, vn);
+        // SAFETY: `old_ptr` is checked non-zero above and is a user address;
+        // `copy_to_user` range-validates it and brackets the 32-byte write in
+        // the SMAP window. Runs in the calling task's address space, not IRQ
+        // context. Best-effort: a failed copy is ignored per POSIX old-value.
         let _ = unsafe { crate::handlers::copy_to_user(old_ptr, &out) };
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -333,6 +344,9 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
     let (vs, vn) = ns_to_timespec(remaining);
     write_timespec((&mut out[0..16]).try_into().unwrap(), is, in_);
     write_timespec((&mut out[16..32]).try_into().unwrap(), vs, vn);
+    // SAFETY: `out_ptr` is checked non-zero above and is a user address;
+    // `copy_to_user` range-validates it and brackets the 32-byte write in the
+    // SMAP window. Runs in the calling task's address space, not IRQ context.
     if unsafe { crate::handlers::copy_to_user(out_ptr, &out) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -374,6 +388,9 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
         return;
     }
     let mut buf = [0u8; 16];
+    // SAFETY: `req_ptr` is checked non-zero above and is a user address;
+    // `copy_from_user` range-validates it and brackets the 16-byte read in the
+    // SMAP window. Runs in the calling task's address space, not IRQ context.
     if unsafe { crate::handlers::copy_from_user(&mut buf, req_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -407,6 +424,12 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
         }
 
         ctx.set_return(SyscallReturn::ok(0));
+        // SAFETY: `uctx` is the `*mut UserTaskCtx` returned by
+        // `current_user_task()` for the running task; it points to the live
+        // per-task context owned by the scheduler and outlives this syscall.
+        // We hold the task here (no concurrent mutator), so the `&*uctx`
+        // borrow, the interior-mutable atomic/Cell stores, `save_user_state`
+        // into `uc.state`, and the matching `yield_hook` call are sound.
         unsafe {
             let uc = &*uctx;
             uc.sleep_deadline_ns

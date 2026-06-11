@@ -42,7 +42,7 @@ pub struct PollFd {
 /// Returns the number of fds with non-zero revents, or 0 on timeout.
 ///
 /// Linux ref: `fs/select.c`:do_poll (GPL-2.0-or-later, kernel.org).
-pub fn do_poll(task_id: u64, fds: &mut Vec<PollFd>, timeout_ms: i64) -> usize {
+pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
     let deadline_ns: Option<u64> = if timeout_ms == 0 {
         Some(0) // non-blocking: exactly one pass
     } else if timeout_ms > 0 {
@@ -143,9 +143,14 @@ pub unsafe fn parse_pollfds(ptr: *const u8, nfds: usize) -> Option<Vec<PollFd>> 
     }
     #[cfg(not(target_arch = "x86_64"))]
     for i in 0..nfds {
-        // SAFETY: caller guarantees `nfds * 8` readable bytes from `ptr`.
+        // SAFETY: caller guarantees `nfds * 8` readable bytes from `ptr`;
+        // `i < nfds`, so `base = ptr + i*8` stays within that region.
         let base = unsafe { ptr.add(i * 8) };
+        // SAFETY: `base` points at the start of entry `i` (4 readable bytes
+        // for the `fd` field); `read_unaligned` tolerates any alignment.
         let fd_val = unsafe { core::ptr::read_unaligned(base as *const i32) };
+        // SAFETY: `base + 4` is the `events` field, 2 readable bytes still
+        // inside the entry; `read_unaligned` tolerates any alignment.
         let ev_val = unsafe { core::ptr::read_unaligned(base.add(4) as *const u16) };
         out.push(PollFd {
             fd: fd_val,
@@ -175,8 +180,12 @@ pub unsafe fn write_pollfds(ptr: *mut u8, fds: &[PollFd]) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     for (i, item) in fds.iter().enumerate() {
-        // SAFETY: caller guarantees `nfds * 8` writable bytes from `ptr`.
+        // SAFETY: caller guarantees `nfds * 8` writable bytes from `ptr`;
+        // `i < fds.len() == nfds`, so `ptr + i*8 + 6` is the `revents` field
+        // (2 writable bytes) of entry `i`, inside that region.
         let base = unsafe { ptr.add(i * 8).add(6) as *mut u16 };
+        // SAFETY: `base` is the writable 2-byte `revents` slot computed above;
+        // `write_unaligned` tolerates any alignment.
         unsafe { core::ptr::write_unaligned(base, item.revents) };
     }
 }

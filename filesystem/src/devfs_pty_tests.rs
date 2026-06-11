@@ -401,6 +401,7 @@ fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
         let mut n = idx;
         if n == 0 {
             tmp[9] = b'0';
+            // SAFETY: tmp[9..] contains only ASCII digit bytes written above.
             unsafe { core::str::from_utf8_unchecked(&tmp[9..]) }
         } else {
             let mut pos = 10;
@@ -409,6 +410,7 @@ fn smoke_pty_slave_locked_until_tiocsptlck_clear() -> TestResult {
                 tmp[pos] = b'0' + (n % 10) as u8;
                 n /= 10;
             }
+            // SAFETY: tmp[pos..] contains only ASCII digit bytes written in the loop above.
             unsafe { core::str::from_utf8_unchecked(&tmp[pos..]) }
         }
     };

@@ -86,7 +86,7 @@ pub const MSBC_SEQ_BYTES: [u8; 4] = [0x08, 0x38, 0xC8, 0xF8];
 /// The `blocks` field is 0b11 (BLOCKS_16) as specified in the mSBC
 /// header — the actual audio uses 15 blocks (see module doc).
 pub const MSBC_SBC_CFG1: u8 =
-    (FREQ_16000 << 6) | (BLOCKS_16 << 4) | (CM_MONO << 2) | (ALLOC_LOUDNESS << 1) | 0; // subbands=0 → 4 subbands
+    (FREQ_16000 << 6) | (BLOCKS_16 << 4) | (CM_MONO << 2) | (ALLOC_LOUDNESS << 1); // subbands=0 → 4 subbands
 
 /// SBC header byte 2 (bitpool) for mSBC.
 pub const MSBC_SBC_CFG2: u8 = MSBC_BITPOOL;
@@ -123,13 +123,6 @@ impl SeqCounter {
         Self { idx: 0 }
     }
 
-    /// Return the current sequence byte and advance to the next.
-    pub fn next(&mut self) -> u8 {
-        let b = MSBC_SEQ_BYTES[self.idx];
-        self.idx = (self.idx + 1) % 4;
-        b
-    }
-
     /// Current sequence index (0..4).
     pub fn index(&self) -> usize {
         self.idx
@@ -139,6 +132,17 @@ impl SeqCounter {
 impl Default for SeqCounter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Iterator for SeqCounter {
+    type Item = u8;
+
+    /// Return the current sequence byte and advance to the next.
+    fn next(&mut self) -> Option<u8> {
+        let b = MSBC_SEQ_BYTES[self.idx];
+        self.idx = (self.idx + 1) % 4;
+        Some(b)
     }
 }
 
@@ -215,7 +219,7 @@ impl Msbc {
 
         // Bytes 0..2: sync + sequence + SBC config.
         out[0] = MSBC_SYNC;
-        out[1] = self.seq.next();
+        out[1] = self.seq.next().unwrap();
         out[2] = MSBC_SBC_CFG1;
         out[3] = MSBC_SBC_CFG2;
         // byte[4] = CRC — filled below.
@@ -236,8 +240,8 @@ impl Msbc {
         let mut sf = [0u8; 8]; // indexed 0..4; rest unused
         for s in 0..MSBC_SUBBANDS {
             let mut max = 0u32;
-            for b in 0..MSBC_BLOCKS {
-                let v = x[b][s].unsigned_abs();
+            for row in x.iter().take(MSBC_BLOCKS) {
+                let v = row[s].unsigned_abs();
                 if v > max {
                     max = v;
                 }
@@ -265,17 +269,17 @@ impl Msbc {
         {
             let mut bw = BitWriter::new(&mut body);
             // Scale factors: 4 × 4 bits = 16 bits = 2 bytes.
-            for s in 0..MSBC_SUBBANDS {
-                bw.write(4, sf[s] as u32);
+            for &sfac in sf.iter().take(MSBC_SUBBANDS) {
+                bw.write(4, sfac as u32);
             }
             // Packed subband samples: 15 blocks × (bits per subband).
-            for b in 0..MSBC_BLOCKS {
+            for row in x.iter().take(MSBC_BLOCKS) {
                 for s in 0..MSBC_SUBBANDS {
                     let nb = bits[s] as usize;
                     if nb == 0 {
                         continue;
                     }
-                    let q = quantize_sample(x[b][s], sf[s], nb);
+                    let q = quantize_sample(row[s], sf[s], nb);
                     bw.write(nb, q);
                 }
             }
@@ -338,8 +342,8 @@ impl Msbc {
         let mut sf = [0u8; 8];
         {
             let mut br = BitReader::new(body);
-            for s in 0..MSBC_SUBBANDS {
-                sf[s] = br.read(4) as u8;
+            for sfac in sf.iter_mut().take(MSBC_SUBBANDS) {
+                *sfac = br.read(4) as u8;
             }
 
             // Bit allocation.
@@ -351,14 +355,14 @@ impl Msbc {
 
             // Decode subband samples.
             let mut x = [[0i32; 4]; MSBC_BLOCKS];
-            for b in 0..MSBC_BLOCKS {
+            for row in x.iter_mut().take(MSBC_BLOCKS) {
                 for s in 0..MSBC_SUBBANDS {
                     let nb = bits[s] as usize;
                     if nb == 0 {
                         continue;
                     }
                     let q = br.read(nb);
-                    x[b][s] = dequantize_sample(q, sf[s], nb);
+                    row[s] = dequantize_sample(q, sf[s], nb);
                 }
             }
 
@@ -393,7 +397,7 @@ fn quantize_sample(sample: i32, sf: u8, nbits: usize) -> u32 {
     let levels = (1u32 << nbits) - 1;
     let scale = 1i64 << (sf as u32 + 1);
     let num = (sample as i64 + scale) * (levels as i64);
-    let den = (scale << 1) as i64;
+    let den = scale << 1;
     let q = num / den;
     q.clamp(0, levels as i64) as u32
 }
@@ -497,14 +501,14 @@ mod tests {
 
         // Build a triangle wave: 60 samples, amplitude ±4096.
         let mut pcm_in = [0i16; MSBC_PCM_SAMPLES];
-        for i in 0..MSBC_PCM_SAMPLES {
+        for (i, sample) in pcm_in.iter_mut().enumerate().take(MSBC_PCM_SAMPLES) {
             let phase = (i % 32) as i32;
             let v = if phase < 16 {
                 phase * 256
             } else {
                 (32 - phase) * 256
             };
-            pcm_in[i] = (v - 2048) as i16;
+            *sample = (v - 2048) as i16;
         }
 
         let mut frame = [0u8; MSBC_FRAME_BYTES];

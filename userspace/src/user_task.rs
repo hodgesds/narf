@@ -81,7 +81,7 @@ pub enum UserExit {
 /// "not sleeping". Set by the syscall handler before it longjmps
 /// back; consulted by `UserTaskFuture::poll` before any user-mode
 /// re-entry — if `now < deadline`, the future returns `Pending`
-/// + `wake_by_ref` without entering user mode, letting the
+/// and `wake_by_ref` without entering user mode, letting the
 /// executor round-robin other tasks.
 #[repr(C)]
 pub struct UserTaskCtx {
@@ -155,6 +155,12 @@ pub struct UserTaskCtx {
 // completion before the polling routine continues. SMP support
 // will require a per-CPU slot rather than a global static.
 unsafe impl Sync for UserTaskCtx {}
+
+impl Default for UserTaskCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl UserTaskCtx {
     /// Construct a fresh context with all state zeroed.
@@ -246,7 +252,15 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 #[derive(Copy, Clone, Debug)]
 #[repr(transparent)]
 pub struct SendPtr<T>(pub *mut T);
+// SAFETY: `SendPtr` is a raw `*mut UserTaskCtx` newtype stored in the
+// `USER_TASK_CTXS` registry. The pointer targets a poller-pinned
+// `UserTaskCtx` that is only dereferenced on the single cooperative
+// CPU while that task is in flight; the wrapper carries no ownership,
+// so transferring it across the (single-CPU) executor is sound.
 unsafe impl<T> Send for SendPtr<T> {}
+// SAFETY: as above — the wrapper only hands back the bare pointer; any
+// dereference happens on the single cooperative CPU, so shared `&`
+// access across the registry never races a live `&mut`.
 unsafe impl<T> Sync for SendPtr<T> {}
 
 static USER_TASK_CTXS: IrqSafeSpinLock<Option<BTreeMap<u64, SendPtr<UserTaskCtx>>>> =
@@ -470,6 +484,10 @@ pub(crate) fn yield_hook() -> Option<ExitHook> {
     if p.is_null() {
         None
     } else {
+        // SAFETY: `p` is non-null and was stored by `install_yield_hook`
+        // as `hook as *mut ()` from a real `ExitHook` fn pointer; the
+        // round-trip back to `ExitHook` recovers the original fn ptr
+        // (same ABI, pointer-sized).
         Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
     }
 }
@@ -480,6 +498,10 @@ pub(crate) fn exit_hook() -> Option<ExitHook> {
     if p.is_null() {
         None
     } else {
+        // SAFETY: `p` is non-null and was stored by `install_exit_hook`
+        // as `hook as *mut ()` from a real `ExitHook` fn pointer; the
+        // round-trip recovers the original fn ptr (same ABI,
+        // pointer-sized).
         Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
     }
 }
@@ -490,6 +512,10 @@ pub fn execve_hook() -> Option<ExitHook> {
     if p.is_null() {
         None
     } else {
+        // SAFETY: `p` is non-null and was stored by `install_execve_hook`
+        // as `hook as *mut ()` from a real `ExitHook` fn pointer; the
+        // round-trip recovers the original fn ptr (same ABI,
+        // pointer-sized).
         Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
     }
 }
@@ -558,6 +584,10 @@ unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
     if p.is_null() {
         narf_scheduler::halt_forever();
     }
+    // SAFETY: `p` is the non-null `JmpBuf` the in-flight polling
+    // routine published in `CURRENT_JMP`; `longjmp` restores that
+    // routine's setjmp context, which is live for the whole user-mode
+    // round-trip. The null case is handled above.
     unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_YIELDED as u64) }
 }
 
@@ -577,6 +607,15 @@ unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
 /// `ctx.pending_exec`; the polling routine reads it after
 /// setjmp returns and swaps `process.address_space` /
 /// `process.entry` / `process.stack_top` accordingly.
+///
+/// # Safety
+///
+/// Must be called only from the `Execve` syscall handler on the
+/// in-flight task's trap path, with a live polling routine having
+/// published its `JmpBuf` in `CURRENT_JMP` and the new image's
+/// `ExecRequest` published in the task's `ctx.pending_exec`. The
+/// caller must guarantee `CURRENT_JMP`'s setjmp context is still
+/// valid. This function never returns — it longjmps into the poller.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn user_task_execve_hook(_uctx: *mut UserTaskCtx) -> ! {
     let p = CURRENT_JMP.load(Ordering::Acquire);
@@ -633,6 +672,7 @@ impl core::fmt::Debug for UserTaskFuture {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 // SAFETY: the future is polled only on a single CPU at a time
 // (single-CPU cooperative executor); the UnsafeCell-wrapped JmpBuf
 // is only written by `poll` (between the install_current and the
@@ -640,7 +680,6 @@ impl core::fmt::Debug for UserTaskFuture {
 // reach it via the global CURRENT_JMP atomic, so cross-thread
 // publication is the atomic, not the cell. The future never escapes
 // the executor's `Pin<Box<...>>`.
-#[cfg(target_arch = "x86_64")]
 unsafe impl Send for UserTaskFuture {}
 
 #[cfg(target_arch = "x86_64")]
@@ -793,10 +832,13 @@ impl core::future::Future for UserTaskFuture {
                 // the normal resume path.
                 // SAFETY: ctx.state is a valid, aligned UserState;
                 // we own it and hold Pin guarantees on the future.
+                // `state.get()` is the `*mut UserState` (== `*mut
+                // narf_scheduler::UserState`) backing this future's
+                // saved frame; no other handle aliases it here.
                 unsafe {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
+                        let us = &mut *this.ctx.state.get();
                         us.rax = reaped as u64;
                     }
                 }
@@ -815,10 +857,14 @@ impl core::future::Future for UserTaskFuture {
                     // write the result, clear pending, fall through.
                     drop_wait_child_waker(task_pid);
                     // Write reaped pid into saved RAX.
+                    // SAFETY: `state.get()` is the `*mut UserState`
+                    // backing this future's saved frame; we own it
+                    // (Pin-stable) and no other handle aliases it in
+                    // this scope.
                     unsafe {
                         #[cfg(target_arch = "x86_64")]
                         {
-                            let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
+                            let us = &mut *this.ctx.state.get();
                             us.rax = reaped2 as u64;
                         }
                     }
@@ -940,8 +986,16 @@ impl core::future::Future for UserTaskFuture {
                                                                  // pthread start), deliver it as the first
                                                                  // SysV integer arg (RDI).
                     if let Some(arg) = this.process.entry_arg {
+                        // SAFETY: the AS is activated and the user
+                        // mappings cover `entry` + `rsp` by construction
+                        // (`load_user_process_with` mapped them); `arg`
+                        // is the clone(2) start argument delivered in
+                        // RDI. Never returns — control reaches CPL=3.
                         unsafe { narf_scheduler::enter_user_mode_with_arg(entry, rsp, arg) }
                     } else {
+                        // SAFETY: as above — AS activated, `entry`/`rsp`
+                        // mapped by construction; never returns (iretq
+                        // into CPL=3).
                         unsafe { narf_scheduler::enter_user_mode(entry, rsp) }
                     }
                 }
@@ -953,10 +1007,20 @@ impl core::future::Future for UserTaskFuture {
                     // first entry.
                     #[cfg(target_arch = "x86_64")]
                     narf_memory::beacon::paint(51, 0x0060_FFFF); // cyan: pre-iretq-resume
+                                                                 // SAFETY: `state.get()` is the `*mut UserState`
+                                                                 // this future owns; a prior poll's trap path filled
+                                                                 // it via `TrapContext::save_user_state`, so the
+                                                                 // shared `&*` read is of an initialised, aligned
+                                                                 // frame with no aliasing `&mut` live here.
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         let _us = &*(this.ctx.state.get() as *const narf_scheduler::UserState);
                     }
+                    // SAFETY: a prior poll's trap path populated
+                    // `ctx.state` via `TrapContext::save_user_state`;
+                    // the AS is re-activated and kernel state (TSS rsp0,
+                    // GS) is still correct from first entry. Never
+                    // returns — iretq resumes the saved user frame.
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
@@ -1078,11 +1142,11 @@ impl core::fmt::Debug for UserTaskFuture {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 // SAFETY: identical reasoning to the x86_64 impl — single-CPU
 // cooperative executor, the future never escapes the executor's
 // Pin<Box<...>>, the UnsafeCell-wrapped JmpBuf is only written by
 // poll between install_current and setjmp.
-#[cfg(target_arch = "aarch64")]
 unsafe impl Send for UserTaskFuture {}
 
 #[cfg(target_arch = "aarch64")]
@@ -1174,11 +1238,15 @@ impl core::future::Future for UserTaskFuture {
             let task_pid = crate::handlers::current_task_id();
             let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
             if reaped > 0 {
+                // SAFETY: `state.get()` is the `*mut UserState`
+                // (== `*mut narf_scheduler::UserState`) backing this
+                // future's saved frame; we own it (Pin-stable) and no
+                // other handle aliases it here.
                 unsafe {
                     #[cfg(target_arch = "aarch64")]
                     {
                         // On aarch64 x0 is the return register.
-                        let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
+                        let us = &mut *this.ctx.state.get();
                         us.x[0] = reaped as u64;
                     }
                 }
@@ -1188,10 +1256,13 @@ impl core::future::Future for UserTaskFuture {
                 let reaped2 = call_wait_child_check(task_pid, want_pid, status_ptr);
                 if reaped2 > 0 {
                     drop_wait_child_waker(task_pid);
+                    // SAFETY: `state.get()` is the `*mut UserState`
+                    // backing this future's saved frame; we own it
+                    // (Pin-stable) and no other handle aliases it here.
                     unsafe {
                         #[cfg(target_arch = "aarch64")]
                         {
-                            let us = &mut *(this.ctx.state.get() as *mut narf_scheduler::UserState);
+                            let us = &mut *this.ctx.state.get();
                             us.x[0] = reaped2 as u64;
                         }
                     }

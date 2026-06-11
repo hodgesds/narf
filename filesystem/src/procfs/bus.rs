@@ -74,6 +74,8 @@ fn usb_snapshot() -> Vec<UsbDeviceSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored via `f as usize` in install_usb_proc_hook, so it
+    // holds a valid function pointer of type UsbSnapshotFn.
     let f: UsbSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }

@@ -53,6 +53,9 @@ pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
 
 pub fn wake_signal(task_id: u64) {
     if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
+        // SAFETY: `uctx_ptr` came from `lookup_user_task_ctx`, which returns the
+        // `UserTaskCtx` pointer registered for a live task; the ctx outlives this
+        // borrow and is not mutated through another reference here.
         let uctx = unsafe { &*uctx_ptr };
         // If the task is blocked in an infinite wait (pause, epoll_wait),
         // clear the deadline to wake it.
@@ -538,6 +541,9 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // SAFETY: `as_ref` is the calling task's freshly-built AddressSpace with a
+    // valid root and the region just registered via `map_region`; materialize
+    // only installs PTEs for those recorded regions.
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -556,6 +562,8 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // mapped into the user AS at successive vaddrs after the config
     // page so the user runtime can build SharedProducer/Consumer
     // halves directly against the shared backing.
+    // SAFETY: `as_ref` is the calling task's valid AddressSpace; `mint_shared_ring_pair`
+    // allocates fresh frames, maps them into it, and materializes them under that AS.
     let shared = match unsafe { mint_shared_ring_pair(&as_ref) } {
         Ok(s) => s,
         Err(()) => {
@@ -645,6 +653,8 @@ unsafe fn mint_shared_ring_pair(
             phys: alloc::vec![cq_phys],
         })
         .map_err(|_| ())?;
+    // SAFETY: `as_ref` has a valid root and the two SharedRing regions were just
+    // registered above; materialize installs PTEs only for those regions.
     unsafe { as_ref.materialize() }.map_err(|_| ())?;
 
     Ok(SharedRingPair {
@@ -946,7 +956,7 @@ fn sys_writev(ctx: &mut dyn TrapContext) {
 
     // Copy the iovec array in. `struct iovec` is
     // `{ void *iov_base; size_t iov_len; }` — 16 bytes per entry.
-    let iov_bytes = iovcnt.checked_mul(16).unwrap_or(usize::MAX);
+    let iov_bytes = iovcnt.saturating_mul(16);
     // SAFETY: single-threaded syscall; AS is still active.
     let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iov_bytes) } {
         Ok(b) => b,
@@ -1268,10 +1278,15 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             };
             // Pull the `struct flock` from user memory.
             let mut bytes = alloc::vec![0u8; flock_size()];
+            // SAFETY: `arg` is the user `struct flock` pointer; copy_from_user
+            // range-validates it and SMAP-brackets the read into the sized `bytes`.
             if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                 return;
             }
+            // SAFETY: `bytes` holds exactly `flock_size()` validated bytes and
+            // `tmp` is a default-initialized UFlock with at least that many bytes;
+            // the copy reinterprets the wire layout into the repr(C) struct.
             let uf: UFlock = unsafe {
                 let mut tmp = UFlock::default();
                 core::ptr::copy_nonoverlapping(
@@ -1307,6 +1322,8 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     }
                 }
                 let mut obytes = alloc::vec![0u8; flock_size()];
+                // SAFETY: `out` is a repr(C) UFlock; `obytes` is sized to
+                // `flock_size()`, so serializing the struct's bytes into it is in-bounds.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         &out as *const _ as *const u8,
@@ -1314,6 +1331,8 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         flock_size(),
                     );
                 }
+                // SAFETY: `arg` is the user `struct flock` pointer; copy_to_user
+                // range-validates it and SMAP-brackets the write of `obytes`.
                 if unsafe { copy_to_user(arg, &obytes) }.is_err() {
                     ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                     return;
@@ -1488,7 +1507,7 @@ fn sys_ioctl(ctx: &mut dyn TrapContext) {
         return;
     }
     match ops.ioctl(cmd, arg) {
-        Ok(rc) => ctx.set_return(SyscallReturn::ok(rc as u64)),
+        Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
         Err(narf_filesystem::FsError::Unsupported) => {
             ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
         }
@@ -1598,6 +1617,8 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
             core::mem::size_of::<StatBuf>(),
         )
     };
+    // SAFETY: `out_ptr` is the user StatBuf pointer (null-checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `stat_bytes`.
     if unsafe { copy_to_user(out_ptr as u64, stat_bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -1633,6 +1654,8 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
             core::mem::size_of::<StatBuf>(),
         )
     };
+    // SAFETY: `out_ptr` is the user StatBuf pointer (null-checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `stat_bytes`.
     if unsafe { copy_to_user(out_ptr as u64, stat_bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -1691,10 +1714,7 @@ fn sys_pread64(ctx: &mut dyn TrapContext) {
         let ops = entry.ops.clone();
         let res = poll_blocking(ops.read(offset, &mut kbuf))
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        match res {
-            Ok(n) => Some(n),
-            Err(_) => None,
-        }
+        res.ok()
     });
     match outcome {
         Some(Some(n)) => {
@@ -1736,10 +1756,7 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         let ops = entry.ops.clone();
         let res = poll_blocking(ops.write(offset, &kbuf))
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        match res {
-            Ok(n) => Some(n),
-            Err(_) => None,
-        }
+        res.ok()
     });
     match outcome {
         Some(Some(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
@@ -1780,13 +1797,12 @@ fn sys_fallocate(ctx: &mut dyn TrapContext) {
         let cur_size = ops.stat().size;
         // Always ensure size >= offset + len. truncate handles
         // grow + zero-fill.
-        if target_end > cur_size {
-            if poll_blocking(ops.truncate(target_end))
+        if target_end > cur_size
+            && poll_blocking(ops.truncate(target_end))
                 .and_then(|r| r.ok())
                 .is_none()
-            {
-                return Some(false);
-            }
+        {
+            return Some(false);
         }
         if mode == FALLOC_FL_ZERO_RANGE && len > 0 && offset < cur_size {
             // Zero existing bytes in [offset, min(target_end, old size)].
@@ -1923,7 +1939,7 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
 
 fn sys_truncate(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as u64;
+    let ptr = args.arg0;
     let len = args.arg1 as usize;
     let new_size = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -2564,12 +2580,16 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
         }
     };
     let out = linux_stat_from_fs(s);
+    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
+    // and borrows it for the duration of the copy below.
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &out as *const linux_compat::Stat as *const u8,
             core::mem::size_of::<linux_compat::Stat>(),
         )
     };
+    // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -2597,12 +2617,16 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
         }
     };
     let out = linux_stat_from_fs(s);
+    // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
+    // and borrows it for the duration of the copy below.
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &out as *const linux_compat::Stat as *const u8,
             core::mem::size_of::<linux_compat::Stat>(),
         )
     };
+    // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -2684,6 +2708,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
     // We can detect "empty path" cheaply by reading just the first
     // byte; if it's NUL, no need to call copy_user_cstr.
     let mut first = [0u8; 1];
+    // SAFETY: `path_uptr` is the user path pointer; copy_from_user range-validates
+    // it and SMAP-brackets the 1-byte read into `first`.
     let empty = (flags & AT_EMPTY_PATH) != 0
         && unsafe { copy_from_user(&mut first, path_uptr) }.is_ok()
         && first[0] == 0;
@@ -2753,16 +2779,6 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         __reserved: 0,
     };
 
-    let mut out = Statx::default();
-    out.stx_blksize = 4096;
-    out.stx_mode = mode_word;
-    out.stx_size = s.size;
-    out.stx_blocks = s.blocks;
-    out.stx_mtime = mtime;
-    out.stx_ctime = mtime;
-    out.stx_ino = (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff;
-    out.stx_nlink = 1;
-
     // Honour the request mask but only advertise what we filled.
     // STATX_BASIC_STATS = type|mode|nlink|uid|gid|atime|mtime|
     // ctime|ino|size|blocks. We fill type/mode/nlink/ino/size/
@@ -2775,12 +2791,23 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         | STATX_BLOCKS
         | STATX_MTIME
         | STATX_CTIME;
-    out.stx_mask = filled
-        & if mask == 0 {
-            filled
-        } else {
-            mask | STATX_BASIC_STATS & filled
-        };
+    let out = Statx {
+        stx_blksize: 4096,
+        stx_mode: mode_word,
+        stx_size: s.size,
+        stx_blocks: s.blocks,
+        stx_mtime: mtime,
+        stx_ctime: mtime,
+        stx_ino: (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff,
+        stx_nlink: 1,
+        stx_mask: filled
+            & if mask == 0 {
+                filled
+            } else {
+                mask | STATX_BASIC_STATS & filled
+            },
+        ..Default::default()
+    };
 
     // SAFETY: Statx is repr(C) POD; bytes are valid for read.
     let bytes: &[u8] = unsafe {
@@ -2789,6 +2816,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
             core::mem::size_of::<Statx>(),
         )
     };
+    // SAFETY: `out_ptr` is the user statx buffer (null-checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -2875,7 +2904,7 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
 fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _dirfd = args.arg0;
-    let ptr = args.arg1 as u64;
+    let ptr = args.arg1;
     let len = args.arg2 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let path = match copy_user_path(ptr, len) {
@@ -2958,7 +2987,6 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             None => ctx.set_return(fail),
         }
-        return;
     }
     #[cfg(not(feature = "linux-compat"))]
     {
@@ -3029,7 +3057,7 @@ fn sys_fsync(ctx: &mut dyn TrapContext) {
 // in `[read, write]` order (matching POSIX `int pipefd[2]`).
 
 fn sys_pipe(ctx: &mut dyn TrapContext) {
-    let out_ptr = ctx.args().arg0 as u64;
+    let out_ptr = ctx.args().arg0;
     if out_ptr == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3062,6 +3090,8 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 8];
     buf[..4].copy_from_slice(&(r as i32).to_ne_bytes());
     buf[4..].copy_from_slice(&(w as i32).to_ne_bytes());
+    // SAFETY: `out_ptr` is the user fd-pair buffer; copy_to_user range-validates
+    // it and SMAP-brackets the write of the 8-byte `buf`.
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3081,7 +3111,7 @@ const O_CLOEXEC_BIT: u64 = 0x80000;
 
 fn sys_pipe2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let out_ptr = args.arg0 as u64;
+    let out_ptr = args.arg0;
     let flags = args.arg1;
     if out_ptr == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
@@ -3122,6 +3152,8 @@ fn sys_pipe2(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 8];
     buf[..4].copy_from_slice(&(r as i32).to_ne_bytes());
     buf[4..].copy_from_slice(&(w as i32).to_ne_bytes());
+    // SAFETY: `out_ptr` is the user fd-pair buffer; copy_to_user range-validates
+    // it and SMAP-brackets the write of the 8-byte `buf`.
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3177,7 +3209,7 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
 
 fn sys_unlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as u64;
+    let ptr = args.arg0;
     // POSIX-shaped failure sentinel. The kernel's syscall ABI carries
     // a separate `status` field but the user-runtime asm wrapper only
     // observes the `value` register; we mirror libc and return -1 on
@@ -3209,7 +3241,7 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
 
 fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as u64;
+    let ptr = args.arg0;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
@@ -3228,7 +3260,7 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
 
 fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as u64;
+    let ptr = args.arg0;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
@@ -3247,8 +3279,8 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
 
 fn sys_rename(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let old_ptr = args.arg0 as u64;
-    let new_ptr = args.arg1 as u64;
+    let old_ptr = args.arg0;
+    let new_ptr = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let old_path = match copy_user_cstr(old_ptr, 4096) {
         Some(s) => s,
@@ -3281,7 +3313,7 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    if &old_path[..old_split] != &new_path[..new_split] {
+    if old_path[..old_split] != new_path[..new_split] {
         ctx.set_return(fail);
         return;
     }
@@ -3311,7 +3343,7 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     // Linux ABI: `ssize_t readlink(const char *pathname, char *buf,
     // size_t bufsiz)`. arg1 is buf, arg2 is bufsiz. The previous
     // NARF-native shape used arg1 as path_len.
-    let path_ptr = args.arg0 as u64;
+    let path_ptr = args.arg0;
     let buf_ptr = args.arg1 as *mut u8;
     let buf_len = args.arg2 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -3370,9 +3402,9 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
 
 fn sys_symlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let target_ptr = args.arg0 as u64;
+    let target_ptr = args.arg0;
     let target_len = args.arg1 as usize;
-    let link_ptr = args.arg2 as u64;
+    let link_ptr = args.arg2;
     let link_len = args.arg3 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let target_str = match copy_user_path(target_ptr, target_len) {
@@ -3423,7 +3455,7 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
 
 fn sys_listdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let path_ptr = args.arg0 as u64;
+    let path_ptr = args.arg0;
     let path_len = args.arg1 as usize;
     let cursor = args.arg2 as usize;
     let out_ptr = args.arg3 as *mut u8;
@@ -3505,6 +3537,8 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     record[..4].copy_from_slice(&(name_bytes.len() as u32).to_ne_bytes());
     record[4..8].copy_from_slice(&ftype_wire.to_ne_bytes());
     record[8..].copy_from_slice(name_bytes);
+    // SAFETY: `out_ptr` is the user dirent buffer (null-checked, `total <= out_len`);
+    // copy_to_user range-validates it and SMAP-brackets the write of `record`.
     if unsafe { copy_to_user(out_ptr as u64, &record) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -3532,7 +3566,7 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
 
 fn sys_getdents64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let path_ptr = args.arg0 as u64;
+    let path_ptr = args.arg0;
     let path_len = args.arg1 as usize;
     let mut cursor = args.arg2 as usize;
     let out_ptr = args.arg3 as *mut u8;
@@ -3610,7 +3644,11 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
         rec[18] = dt; // d_type
         rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
                                                                     // NUL terminator + zero-padding through end already zeroed by vec init.
+                                                                    // SAFETY: `out_ptr` is the user buffer base; `written < out_len` so the
+                                                                    // offset stays inside the user-supplied region. Forms a user vaddr only.
         let dest = unsafe { out_ptr.add(written) } as u64;
+        // SAFETY: `dest` is in-bounds of the user buffer (checked above); copy_to_user
+        // range-validates it and SMAP-brackets the write of the `reclen`-byte `rec`.
         if unsafe { copy_to_user(dest, &rec) }.is_err() {
             break;
         }
@@ -3666,7 +3704,7 @@ static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let hint = args.arg0;
-    let len = ((args.arg1 as u64 + 0xFFF) & !0xFFFu64).max(0x1000);
+    let len = ((args.arg1 + 0xFFF) & !0xFFFu64).max(0x1000);
     let flags = args.arg2 as u32;
     let as_ref = match current_address_space() {
         Some(a) => a,
@@ -3743,6 +3781,8 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
+    // was just registered via `map_region`, so materialize installs only its PTEs.
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3874,6 +3914,8 @@ fn sys_fb_info(ctx: &mut dyn TrapContext) {
     for (i, &w) in out.iter().enumerate() {
         kbuf[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
     }
+    // SAFETY: `user_p` is the user info buffer (non-zero, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of the 24-byte `kbuf`.
     if unsafe { copy_to_user(user_p, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3916,6 +3958,8 @@ fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
+    // was just registered via `map_region`, so materialize installs only its PTEs.
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -4110,6 +4154,8 @@ fn sys_shmem_map(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
+    // was just registered via `map_region`, so materialize installs only its PTEs.
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -4172,9 +4218,9 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     };
 
     let args = *ctx.args();
-    let name_ptr = args.arg0 as u64;
+    let name_ptr = args.arg0;
     let name_len = args.arg1 as usize;
-    let bytes_ptr = args.arg2 as u64;
+    let bytes_ptr = args.arg2;
     let bytes_len = args.arg3 as usize;
     if name_len == 0 || bytes_len == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
@@ -4209,11 +4255,15 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     // Copy firmware bytes from user memory into a kernel-owned Vec
     // under the SMAP bracket before passing into sys_install.
     let mut kbuf = alloc::vec![0u8; bytes_len];
+    // SAFETY: `bytes_ptr` is the user blob pointer; copy_from_user range-validates
+    // it and SMAP-brackets the read of `bytes_len` (<= MAX_BLOB_BYTES) bytes into `kbuf`.
     if unsafe { copy_from_user(&mut kbuf, bytes_ptr) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
     // sys_install takes a raw pointer + len; feed it our kernel copy.
+    // SAFETY: `kbuf.as_ptr()`/`bytes_len` describe the kernel-owned Vec just filled
+    // above, valid and readable for `bytes_len` bytes for the duration of the call.
     let r = unsafe { narf_firmware::sys_install(leaked, kbuf.as_ptr(), bytes_len, &auth) };
     match r {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
@@ -4337,7 +4387,6 @@ fn sys_mprotect(ctx: &mut dyn TrapContext) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
         }
-        return;
     }
     #[cfg(not(feature = "linux-compat"))]
     {
@@ -4540,6 +4589,9 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
     ) {
+        // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
+        // we hold the only reference while storing the deadline and saving CPU state
+        // into `uc.state`, and the yield hook hands the task to the executor.
         unsafe {
             let uc = &*uctx;
             // Block forever by setting deadline to u64::MAX.
@@ -4594,6 +4646,9 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
             pair.sq_phys.raw() as *mut SqRing
         )
     };
+    // SAFETY: `pair.cq_phys` is the CQ frame this task owns in BOOTSTRAP_TABLE,
+    // initialized as a CqRing by `mint_shared_ring_pair`; identity-mapped and
+    // accessed only from this synchronous trap, so the producer has exclusive use.
     let mut cq = unsafe {
         SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
             pair.cq_phys.raw() as *mut CqRing
@@ -4601,11 +4656,7 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     };
 
     let mut processed: u64 = 0;
-    loop {
-        let sub = match sq.try_recv() {
-            Ok(s) => s,
-            Err(_) => break,
-        };
+    while let Ok(sub) = sq.try_recv() {
         let tag = sub.tag();
         let completion = match sub.op {
             OpCode::Noop => Completion::ok(tag),
@@ -4885,6 +4936,9 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
         // the futex wake we already fired above.
         return;
     }
+    // SAFETY: `root` is the exited task's recorded page-table root (non-zero,
+    // checked above); `translate` walks that table read-only to resolve the
+    // page-aligned user `page` to its current phys frame.
     let phys = match unsafe {
         narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
     } {
@@ -4954,6 +5008,9 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     // would be rejected above on the 8-byte floor.
     let copy_len = core::cmp::min(size, CLONE_ARGS_MIN);
     let mut raw = [0u8; CLONE_ARGS_MIN];
+    // SAFETY: `uargs` is the user clone_args pointer (non-zero, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the read of `copy_len`
+    // (<= CLONE_ARGS_MIN) bytes into the `raw` prefix.
     if unsafe { copy_from_user(&mut raw[..copy_len], uargs) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -5047,6 +5104,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     let child_as = if share_vm {
         parent_as.clone()
     } else {
+        // SAFETY: paging is live and `parent_as` is the caller's current
+        // AddressSpace; clone_for_fork duplicates its region table for the child.
         let dup = match unsafe { parent_as.clone_for_fork() } {
             Ok(a) => a,
             Err(_) => {
@@ -5054,10 +5113,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
                 return;
             }
         };
+        // SAFETY: `dup` is the freshly-built child AddressSpace with a valid root
+        // and the regions cloned above; materialize installs only those PTEs.
         if unsafe { dup.materialize() }.is_err() {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
+        // SAFETY: `parent_as` is the live caller AddressSpace; rematerialize rewrites
+        // its existing PTEs to match the WRITE-stripped (COW) region perms set by clone_for_fork.
         if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
@@ -5089,8 +5152,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     let child_state: Option<crate::user_task::UserState> = {
         use core::mem::MaybeUninit;
         let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
+        // SAFETY: `s` is a zeroed UserState-sized buffer; save_user_state writes a
+        // full UserState trap-frame snapshot into it, fully initializing the bytes.
         let ok = unsafe { ctx.save_user_state(s.as_mut_ptr() as *mut u8) };
         if ok {
+            // SAFETY: save_user_state returned true above, so `s` holds a fully
+            // initialized UserState.
             let mut snap = unsafe { s.assume_init() };
             snap.rax = 0;
             // Plant the user-supplied RSP. The parent's trap-frame
@@ -5136,6 +5203,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             let lo: u32;
             let hi: u32;
             const IA32_FS_BASE: u32 = 0xC000_0100;
+            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax. The MSR is
+            // architectural and always readable at CPL0 (kernel); operands name the
+            // ABI registers and the instruction has no memory side effects.
             unsafe {
                 core::arch::asm!(
                     "rdmsr",
@@ -5201,6 +5271,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // trap entry).
     if (flags & CLONE_PARENT_SETTID) != 0 && ca.parent_tid != 0 {
         let tid_bytes = (child_tid.raw() as u32).to_ne_bytes();
+        // SAFETY: `ca.parent_tid` is the user *parent_tid pointer (non-zero, checked);
+        // the parent's CR3 is still active here. copy_to_user range-validates it and
+        // SMAP-brackets the 4-byte write.
         let _ = unsafe { copy_to_user(ca.parent_tid, &tid_bytes) };
     }
 
@@ -5212,6 +5285,9 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // CHILD_SETTID is structurally weird).
     if (flags & CLONE_CHILD_SETTID) != 0 && ca.child_tid != 0 && share_vm {
         let tid_bytes = (child_tid.raw() as u32).to_ne_bytes();
+        // SAFETY: CLONE_VM means parent and child share the AS, so the live CR3 maps
+        // `ca.child_tid` (non-zero, checked). copy_to_user range-validates it and
+        // SMAP-brackets the 4-byte write.
         let _ = unsafe { copy_to_user(ca.child_tid, &tid_bytes) };
     }
 
@@ -5329,6 +5405,9 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
         ARCH_GET_FS => {
             // Read the live FS_BASE, copy it as a u64 to `addr`.
             let fs_base: u64;
+            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax; the MSR is
+            // architectural and readable at CPL0. Operands name the ABI registers and
+            // the instruction has no memory side effects.
             unsafe {
                 use core::arch::asm;
                 let lo: u32;
@@ -5343,10 +5422,9 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
                 );
                 fs_base = (lo as u64) | ((hi as u64) << 32);
             }
-            // SAFETY: copy_to_user does the SMAP bracket and
-            // bounds the write to a u64; addr is the user-supplied
-            // destination.
             let buf = fs_base.to_le_bytes();
+            // SAFETY: `addr` is the user-supplied destination; copy_to_user
+            // range-validates it and SMAP-brackets the 8-byte write of `buf`.
             if unsafe { copy_to_user(addr, &buf) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
                 return;
@@ -5490,6 +5568,9 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(0),
         fs_base: {
+            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax; the MSR is
+            // architectural and readable at CPL0. Operands name the ABI registers and
+            // the instruction has no memory side effects.
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 use core::arch::asm;
@@ -5590,9 +5671,11 @@ static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
 ///   - Signal-killed (WIFSIGNALED): low 7 bits hold the signum
 ///     (non-zero, not 0x7f), bit 7 is WCOREDUMP →
 ///     `status = signum | (core ? 0x80 : 0)`.
-static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<
-    Option<BTreeMap<u64, alloc::vec::Vec<(u64, i32)>>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+///
+/// task_pid → queued `(child_pid, wstatus)` exit records awaiting wait4.
+type PendingExitMap = BTreeMap<u64, alloc::vec::Vec<(u64, i32)>>;
+static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<Option<PendingExitMap>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// task_pid → wstatus staged by the signal-delivery path when a
 /// signal with a Terminate/CoreDump default action is about to kill
@@ -5699,6 +5782,8 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
     };
     let (child_pid, status) = entry;
     if status_ptr != 0 {
+        // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
         let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
     }
     // Wave-61: PID pool — reaped child's PID returns to the free pool.
@@ -5889,7 +5974,7 @@ fn on_child_exit(child_pid: u64, _child_tid: u64) {
 fn sys_wait4(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let want_pid = args.arg0 as i64;
-    let status_ptr = args.arg1 as u64;
+    let status_ptr = args.arg1;
     let options = args.arg2 as u32;
     let _rusage_ptr = args.arg3; // ignored; no resource accounting yet
     const WNOHANG: u32 = 1;
@@ -5920,6 +6005,8 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
     if let Some((reaped, status)) = try_reap(parent, want_pid) {
         if status_ptr != 0 {
             // Write i32 status under the SMAP bracket.
+            // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
+            // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
@@ -5997,6 +6084,8 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
     match reaped {
         Some((child, status)) => {
             if status_ptr != 0 {
+                // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
+                // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
                 let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
             }
             ctx.set_return(SyscallReturn::ok(child));
@@ -6362,7 +6451,7 @@ fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
 fn sys_getrlimit(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let resource = args.arg0 as usize;
-    let out_ptr = args.arg1 as u64;
+    let out_ptr = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr == 0 {
         ctx.set_return(fail);
@@ -6380,6 +6469,8 @@ fn sys_getrlimit(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&pair.cur.to_ne_bytes());
     buf[8..].copy_from_slice(&pair.max.to_ne_bytes());
+    // SAFETY: `out_ptr` is the user rlimit buffer; copy_to_user range-validates
+    // it and SMAP-brackets the write of the 16-byte `buf`.
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -6390,7 +6481,7 @@ fn sys_getrlimit(ctx: &mut dyn TrapContext) {
 fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let resource = args.arg0 as usize;
-    let in_ptr = args.arg1 as u64;
+    let in_ptr = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if in_ptr == 0 {
         ctx.set_return(fail);
@@ -6398,6 +6489,8 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     }
     // Read two u64s from user buffer under the SMAP bracket.
     let mut buf = [0u8; 16];
+    // SAFETY: `in_ptr` is the user rlimit pointer (non-zero, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
     if unsafe { copy_from_user(&mut buf, in_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -6416,8 +6509,8 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let pid = args.arg0;
     let resource = args.arg1 as usize;
-    let new_ptr = args.arg2 as u64;
-    let old_ptr = args.arg3 as u64;
+    let new_ptr = args.arg2;
+    let old_ptr = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
     // pid = 0 means "self"; non-zero pids are routed to that task
     // unconditionally (no permission check today — capabilities
@@ -6437,6 +6530,8 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     if new_ptr != 0 {
         // Read two u64s from user buffer under the SMAP bracket.
         let mut buf = [0u8; 16];
+        // SAFETY: `new_ptr` is the user new-rlimit pointer (non-zero, checked);
+        // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
         if unsafe { copy_from_user(&mut buf, new_ptr) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -6453,6 +6548,8 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&prior.cur.to_ne_bytes());
         buf[8..].copy_from_slice(&prior.max.to_ne_bytes());
+        // SAFETY: `old_ptr` is the user old-rlimit pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
         if unsafe { copy_to_user(old_ptr, &buf) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -6542,6 +6639,8 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             }
             let mut raw = [0u8; TASK_COMM_LEN];
             // copy_from_user validates range; copy up to TASK_COMM_LEN bytes.
+            // SAFETY: `arg_a` is the user name pointer (non-zero, checked above);
+            // copy_from_user range-validates it and SMAP-brackets the read into `raw`.
             let _ = unsafe { copy_from_user(&mut raw, arg_a) };
             // Trim at first NUL.
             let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(TASK_COMM_LEN);
@@ -6564,6 +6663,8 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             }
             let s = read_prctl(task);
             // Copy the 16-byte name buffer to user space under the SMAP bracket.
+            // SAFETY: `arg_a` is the user name buffer (non-zero, checked above);
+            // copy_to_user range-validates it and SMAP-brackets the write of `s.name`.
             if unsafe { copy_to_user(arg_a, &s.name) }.is_err() {
                 ctx.set_return(fail);
                 return;
@@ -6655,7 +6756,7 @@ pub fn __test_sched_param_reset() {
 fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let pid = args.arg0;
-    let out = args.arg1 as u64;
+    let out = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out == 0 {
         ctx.set_return(fail);
@@ -6665,6 +6766,8 @@ fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
     let g = SCHED_PARAM_TABLE.lock();
     let val = g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0);
     // Write one i32 to user space under the SMAP bracket.
+    // SAFETY: `out` is the user sched_param pointer (non-zero, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
     if unsafe { copy_to_user(out, &val.to_ne_bytes()) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -6675,7 +6778,7 @@ fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
 fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let pid = args.arg0;
-    let inp = args.arg1 as u64;
+    let inp = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if inp == 0 {
         ctx.set_return(fail);
@@ -6683,6 +6786,8 @@ fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     }
     // Read one i32 from user space under the SMAP bracket.
     let mut buf = [0u8; 4];
+    // SAFETY: `inp` is the user sched_param pointer (non-zero, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
     if unsafe { copy_from_user(&mut buf, inp) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -6713,7 +6818,7 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _pid = args.arg0;
     let size = args.arg1 as usize;
-    let out = args.arg2 as u64;
+    let out = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out == 0 || size == 0 {
         ctx.set_return(fail);
@@ -6737,6 +6842,8 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
     // then copy to user space under the SMAP bracket.
     let mut kbuf = alloc::vec![0u8; bytes];
     kbuf[0] = 0x01; // CPU 0 set
+                    // SAFETY: `out`+`bytes` were validated by validate_user_range above; copy_to_user
+                    // re-validates and SMAP-brackets the write of the `bytes`-long `kbuf`.
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -6748,7 +6855,7 @@ fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _pid = args.arg0;
     let size = args.arg1 as usize;
-    let buf = args.arg2 as u64;
+    let buf = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf == 0 || size == 0 {
         ctx.set_return(fail);
@@ -6771,13 +6878,17 @@ fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
 
 fn sys_getcpu(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let cpu_ptr = args.arg0 as u64;
-    let node_ptr = args.arg1 as u64;
+    let cpu_ptr = args.arg0;
+    let node_ptr = args.arg1;
     // Write CPU=0, node=0 under the SMAP bracket.
     if cpu_ptr != 0 {
+        // SAFETY: `cpu_ptr` is the user cpu out-pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
         let _ = unsafe { copy_to_user(cpu_ptr, &0u32.to_ne_bytes()) };
     }
     if node_ptr != 0 {
+        // SAFETY: `node_ptr` is the user node out-pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
         let _ = unsafe { copy_to_user(node_ptr, &0u32.to_ne_bytes()) };
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -6915,7 +7026,7 @@ fn sys_setpriority(ctx: &mut dyn TrapContext) {
 const CLK_TCK_HZ: u64 = 100;
 
 fn sys_times(ctx: &mut dyn TrapContext) {
-    let out_ptr = ctx.args().arg0 as u64;
+    let out_ptr = ctx.args().arg0;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
     let ticks: i64 = (ns / (1_000_000_000 / CLK_TCK_HZ)) as i64;
@@ -6925,6 +7036,8 @@ fn sys_times(ctx: &mut dyn TrapContext) {
         let mut kbuf = [0u8; 32];
         kbuf[..8].copy_from_slice(&ticks.to_ne_bytes()); // utime
                                                          // stime, cutime, cstime already zero.
+                                                         // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
+                                                         // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -6952,7 +7065,7 @@ const RUSAGE_TOTAL_I64S: usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
 fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _who = args.arg0 as i64;
-    let out = args.arg1 as u64;
+    let out = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out == 0 {
         ctx.set_return(fail);
@@ -6967,6 +7080,8 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
     kbuf[..8].copy_from_slice(&utime_sec.to_ne_bytes()); // ru_utime.tv_sec
     kbuf[8..16].copy_from_slice(&utime_usec.to_ne_bytes()); // ru_utime.tv_usec
                                                             // ru_stime + 14 tail fields already zero.
+                                                            // SAFETY: `out` is the user `struct rusage` pointer (non-zero, checked above);
+                                                            // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -7007,7 +7122,7 @@ pub fn __test_hostname_reset() {
 
 fn sys_gethostname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let buf = args.arg0 as u64;
+    let buf = args.arg0;
     let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf == 0 || len == 0 {
@@ -7040,6 +7155,8 @@ fn sys_gethostname(ctx: &mut dyn TrapContext) {
     // kbuf[bytes.len()] is already 0 (NUL).
     let n = bytes.len();
     drop(host_owned);
+    // SAFETY: `buf` is the user hostname buffer (non-zero, checked above; `kbuf`
+    // fits in `len`); copy_to_user range-validates it and SMAP-brackets the write.
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -7049,7 +7166,7 @@ fn sys_gethostname(ctx: &mut dyn TrapContext) {
 
 fn sys_sethostname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let buf = args.arg0 as u64;
+    let buf = args.arg0;
     let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if len == 0 || len > HOSTNAME_MAX {
@@ -7096,7 +7213,7 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
 }
 
 fn sys_uname(ctx: &mut dyn TrapContext) {
-    let buf = ctx.args().arg0 as u64;
+    let buf = ctx.args().arg0;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf == 0 {
         ctx.set_return(fail);
@@ -7136,6 +7253,8 @@ fn sys_uname(ctx: &mut dyn TrapContext) {
     off += UTSNAME_FIELD_LEN;
     pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &domainname);
     let _ = off;
+    // SAFETY: `buf` is the user `struct utsname` pointer (non-zero, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -7263,6 +7382,9 @@ fn cpu_has_rdrand() -> bool {
     // CPUID leaf 1: ECX bit 30 = RDRAND. RBX is reserved by LLVM
     // so we save/restore it manually around the cpuid.
     let ecx: u32;
+    // SAFETY: `cpuid` is unprivileged and always available on x86_64; we
+    // save/restore `rbx` (LLVM-reserved) around it and read leaf 1's ECX.
+    // No memory operands, so no aliasing concerns.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -7290,6 +7412,9 @@ fn cpu_has_rdseed() -> bool {
     // CPUID leaf 7 sub-leaf 0: EBX bit 18 = RDSEED. Save/restore
     // rbx through r9 since LLVM owns rbx.
     let ebx: u32;
+    // SAFETY: `cpuid` is unprivileged and always available on x86_64; we
+    // save/restore `rbx` (LLVM-reserved) and shuttle its result through `r9d`
+    // to read leaf 7 sub-leaf 0's EBX. No memory operands.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -7319,6 +7444,8 @@ fn rdrand_u64() -> Option<u64> {
     for _ in 0..10 {
         let v: u64;
         let cf: u8;
+        // SAFETY: `rdrand` is gated by `cpu_has_rdrand()` above; it writes a random
+        // value to `v` and the carry flag (success) captured into `cf`. No memory operands.
         unsafe {
             core::arch::asm!(
                 "rdrand {v}",
@@ -7345,6 +7472,8 @@ fn rdseed_u64() -> Option<u64> {
     for _ in 0..32 {
         let v: u64;
         let cf: u8;
+        // SAFETY: `rdseed` is gated by `cpu_has_rdseed()` above; it writes a random
+        // value to `v` and the carry flag (success) captured into `cf`. No memory operands.
         unsafe {
             core::arch::asm!(
                 "rdseed {v}",
@@ -7401,7 +7530,7 @@ fn next_random_u32() -> u32 {
 
 fn sys_getrandom(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as u64;
+    let ptr = args.arg0;
     let len = args.arg1 as usize;
     let _flags = args.arg2; // accepted-and-ignored
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -7438,6 +7567,8 @@ fn sys_getrandom(ctx: &mut dyn TrapContext) {
             shift += 8;
         }
     }
+    // SAFETY: `ptr` is the user buffer (non-zero, `len <= MAX_USER_COPY`, both
+    // checked above); copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     if unsafe { copy_to_user(ptr, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -7555,7 +7686,7 @@ pub fn cwd_of(task: u64) -> alloc::string::String {
 
 fn sys_chdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as u64;
+    let ptr = args.arg0;
     let len = args.arg1 as usize;
     // See sys_stat for the failure-sentinel rationale: the user-
     // runtime asm wrapper observes only `value`, so success and
@@ -7617,6 +7748,8 @@ fn sys_getcwd(ctx: &mut dyn TrapContext) {
     let mut kbuf = alloc::vec![0u8; cwd.len() + 1];
     kbuf[..cwd.len()].copy_from_slice(cwd.as_bytes());
     // kbuf[cwd.len()] is already 0 (NUL).
+    // SAFETY: `buf` is the user cwd buffer (non-null, `len >= needed`, both checked);
+    // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     if unsafe { copy_to_user(buf as u64, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -7790,7 +7923,7 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     // Stat for file size, then read everything.
     let stat = ops.stat();
     let file_size = stat.size as usize;
-    if file_size < 64 || file_size > 64 * 1024 * 1024 {
+    if !(64..=64 * 1024 * 1024).contains(&file_size) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -8156,10 +8289,12 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
             core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
         });
     }
+    // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
+    // volatile read of each in-range user byte is the access path.
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
-        for i in 0..dst.len() {
-            dst[i] = core::ptr::read_volatile(src.add(i));
+        for (i, b) in dst.iter_mut().enumerate() {
+            *b = core::ptr::read_volatile(src.add(i));
         }
     }
     Ok(())
@@ -8202,10 +8337,12 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
             core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
         });
     }
+    // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
+    // volatile write of each in-range user byte is the access path.
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
-        for i in 0..src.len() {
-            core::ptr::write_volatile(dst.add(i), src[i]);
+        for (i, b) in src.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), *b);
         }
     }
     Ok(())
@@ -8389,7 +8526,7 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // satisfies POSIX-shaped readers. Real per-FS values land when
     // FsInstance grows a `statfs()` method.
     let _covered = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, _rel| fs.name().len() > 0)
+        .resolve_absolute(path, |fs, _rel| !fs.name().is_empty())
         .unwrap_or(false);
     let stat = StatfsBuf {
         bsize: 4096,
@@ -8402,7 +8539,11 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
         namemax: 255,
     };
     // Copy the statfs struct to user space under the SMAP bracket.
+    // SAFETY: StatfsBuf is repr(C) of eight u64s with no padding; transmuting it to
+    // a `[u8; size_of::<StatfsBuf>()]` reinterprets its bytes 1:1.
     let bytes: [u8; core::mem::size_of::<StatfsBuf>()] = unsafe { core::mem::transmute(stat) };
+    // SAFETY: `buf_ptr` is the user statfs buffer (non-zero, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
 }
 
@@ -8733,7 +8874,7 @@ fn apply_chroot(path: &str) -> alloc::string::String {
 fn sys_chroot(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let raw = match copy_user_path_raw(args.arg0 as u64, args.arg1 as usize) {
+    let raw = match copy_user_path_raw(args.arg0, args.arg1 as usize) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -9000,6 +9141,8 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(cur));
         return;
     }
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the brk
+    // region was just registered via `map_region`, so materialize installs only its PTEs.
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::ok(cur));
         return;
@@ -9066,6 +9209,8 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let mut kbuf = [0u8; 16];
     kbuf[..8].copy_from_slice(&sec.to_ne_bytes());
     kbuf[8..].copy_from_slice(&nsec.to_ne_bytes());
+    // SAFETY: `buf` is the user timespec pointer (non-zero and 8-aligned, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -9092,13 +9237,15 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     }
     // Read the timespec (two i64s) from user space under the SMAP bracket.
     let mut kbuf = [0u8; 16];
+    // SAFETY: `ts` is the user timespec pointer (non-zero, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
     if unsafe { copy_from_user(&mut kbuf, ts) }.is_err() {
         ctx.set_return(fail);
         return;
     }
     let sec = i64::from_ne_bytes(kbuf[..8].try_into().unwrap());
     let nsec = i64::from_ne_bytes(kbuf[8..].try_into().unwrap());
-    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         ctx.set_return(fail);
         return;
     }
@@ -9354,10 +9501,7 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
         let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid));
         task.map(|as_arc| {
             let regions = as_arc.regions_snapshot();
-            regions
-                .iter()
-                .map(|r| (r.len / 4096).max(1) as u64)
-                .sum::<u64>()
+            regions.iter().map(|r| (r.len / 4096).max(1)).sum::<u64>()
         })
         .unwrap_or(0)
     };
@@ -9786,6 +9930,8 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                 return;
             }
             let mut buf4 = [0u8; 4];
+            // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked above);
+            // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
             let current = if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
                 u32::from_ne_bytes(buf4)
             } else {
@@ -9882,8 +10028,8 @@ const SIG_SETMASK: u32 = 2;
 fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let how = args.arg0 as u32;
-    let set_ptr = args.arg1 as u64;
-    let old_ptr = args.arg2 as u64;
+    let set_ptr = args.arg1;
+    let old_ptr = args.arg2;
     let sigsetsize = args.arg3 as usize;
 
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -9900,6 +10046,8 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             .as_ref()
             .and_then(|m| m.get(&task).copied())
             .unwrap_or(0);
+        // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
         if unsafe { copy_to_user(old_ptr, &mask.to_ne_bytes()) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -9908,6 +10056,8 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
 
     if set_ptr != 0 {
         let mut buf = [0u8; 8];
+        // SAFETY: `set_ptr` is the user new-sigmask pointer (non-zero, checked);
+        // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
         if unsafe { copy_from_user(&mut buf, set_ptr) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -10014,6 +10164,8 @@ fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
         buf[8..12].copy_from_slice(&current.flags.to_ne_bytes());
         buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
         buf[16..24].copy_from_slice(&current.size.to_ne_bytes());
+        // SAFETY: `ss_out` is the user old `stack_t` pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 24-byte write.
         if unsafe { copy_to_user(ss_out, &buf) }.is_err() {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64));
             return;
@@ -10022,6 +10174,8 @@ fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
 
     if ss_in != 0 {
         let mut buf = [0u8; 24];
+        // SAFETY: `ss_in` is the user new `stack_t` pointer (non-zero, checked);
+        // copy_from_user range-validates it and SMAP-brackets the 24-byte read.
         if unsafe { copy_from_user(&mut buf, ss_in) }.is_err() {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64));
             return;
@@ -10132,6 +10286,8 @@ fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     }
 
     let mut buf = [0u8; 8];
+    // SAFETY: `set_uptr` is the user sigset pointer (non-zero, sigsetsize==8, both
+    // checked above); copy_from_user range-validates it and SMAP-brackets the 8-byte read.
     if unsafe { copy_from_user(&mut buf, set_uptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -10770,7 +10926,7 @@ fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::S
 }
 
 fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
-    if ptr == 0 || len < 2 || len > 110 {
+    if ptr == 0 || !(2..=110).contains(&len) {
         return None;
     }
     // Copy the whole sockaddr struct into a kernel buffer under SMAP bracket,
@@ -10910,6 +11066,9 @@ fn sys_socket_accept(ctx: &mut dyn TrapContext) {
             ) {
                 ctx.set_return(SyscallReturn::ok((-1i64) as u64));
                 let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+                // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
+                // we hold the only reference while setting the deadline and saving CPU state
+                // into `uc.state` before the yield hook hands the task to the executor.
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -11017,11 +11176,9 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
         }
     };
     // Validate destination range before issuing the Recv op.
-    if buf_len > 0 {
-        if validate_user_range(buf_ptr, buf_len).is_err() {
-            ctx.set_return(fail);
-            return;
-        }
+    if buf_len > 0 && validate_user_range(buf_ptr, buf_len).is_err() {
+        ctx.set_return(fail);
+        return;
     }
     let mut buf = alloc::vec![0u8; buf_len];
     let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
@@ -11046,6 +11203,9 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
             ) {
                 ctx.set_return(SyscallReturn::ok(0));
                 let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+                // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
+                // we hold the only reference while setting the deadline and saving CPU state
+                // into `uc.state` before the yield hook hands the task to the executor.
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -11390,6 +11550,8 @@ fn write_user_u32(ptr: u64, val: u32) {
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn write_user_u16(ptr: u64, val: u16) {
     let b = val.to_le_bytes();
+    // SAFETY: caller guarantees `ptr` is a valid user address; copy_to_user
+    // range-validates it and SMAP-brackets the 2-byte write.
     let _ = unsafe { copy_to_user(ptr, &b) };
 }
 
@@ -11547,6 +11709,9 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
         ) {
             ctx.set_return(fail);
             let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+            // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
+            // we hold the only reference while setting the deadline and saving CPU state
+            // into `uc.state` before the yield hook hands the task to the executor.
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -11669,7 +11834,7 @@ pub fn maybe_deliver_signal_for_input(byte: u8) -> bool {
 fn sys_tcgetattr(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _fd = args.arg0;
-    let out = args.arg1 as u64;
+    let out = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out == 0 {
         ctx.set_return(fail);
@@ -11678,7 +11843,11 @@ fn sys_tcgetattr(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let t = termios_of_task(task);
     // Copy KTermios struct to user space under the SMAP bracket.
+    // SAFETY: KTermios is repr(C) of POD ints + byte arrays (no padding-sensitive or
+    // niche fields); transmuting it to `[u8; size_of::<KTermios>()]` is a 1:1 byte view.
     let bytes: [u8; core::mem::size_of::<KTermios>()] = unsafe { core::mem::transmute(t) };
+    // SAFETY: `out` is the user termios pointer (non-zero, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     if unsafe { copy_to_user(out, &bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -11690,7 +11859,7 @@ fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _fd = args.arg0;
     let _action = args.arg1;
-    let in_ptr = args.arg2 as u64;
+    let in_ptr = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if in_ptr == 0 {
         ctx.set_return(fail);
@@ -11698,10 +11867,14 @@ fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
     }
     let task = current_task_id();
     let mut bytes = [0u8; core::mem::size_of::<KTermios>()];
+    // SAFETY: `in_ptr` is the user termios pointer (non-zero, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the read into `bytes`.
     if unsafe { copy_from_user(&mut bytes, in_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
     }
+    // SAFETY: `bytes` is `size_of::<KTermios>()` bytes; KTermios is repr(C) of POD
+    // ints + byte arrays, so any bit pattern is a valid value — transmute is a 1:1 view.
     let t: KTermios = unsafe { core::mem::transmute(bytes) };
     set_termios_of_task(task, t);
     ctx.set_return(SyscallReturn::ok(0));
@@ -11786,6 +11959,8 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
             let now = narf_scheduler::narf_time::monotonic_ns();
             if now >= deadline {
                 // Timeout — write back zero revents and return 0.
+                // SAFETY: `pollfds_ptr` was validated earlier in this handler and the
+                // AS is still active; copy_to_user re-validates and SMAP-brackets the write.
                 let _ = unsafe { copy_to_user(pollfds_ptr, &user_buf) };
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
@@ -11804,6 +11979,9 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
             let park = 1_000_000u64;
             let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(park);
+            // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
+            // we hold the only reference while setting the deadline and saving CPU state
+            // into `uc.state` before the yield hook hands the task to the executor.
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -11874,6 +12052,8 @@ fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
         return;
     }
     let mut kbuf = [0u8; 12];
+    // SAFETY: `event_ptr` is the user epoll_event pointer (non-null, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the 12-byte read.
     if unsafe { copy_from_user(&mut kbuf, event_ptr as u64) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -11896,7 +12076,7 @@ fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
 fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
-    let events_out = args.arg1 as u64;
+    let events_out = args.arg1;
     let max = args.arg2 as usize;
     let timeout_ms = args.arg3 as i64;
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -11935,6 +12115,9 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 let mut rec = [0u8; 12];
                 rec[..4].copy_from_slice(&active.to_le_bytes());
                 rec[4..].copy_from_slice(&entry.user_data.to_le_bytes());
+                // SAFETY: `events_out + off` is the user epoll_event slot for this entry
+                // (`written < max`); copy_to_user range-validates it and SMAP-brackets the
+                // 12-byte write.
                 if unsafe { copy_to_user(events_out + off, &rec) }.is_err() {
                     break;
                 }
@@ -11959,6 +12142,9 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
             let park = 1_000_000u64;
             let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(park);
+            // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
+            // we hold the only reference while setting the deadline and saving CPU state
+            // into `uc.state` before the yield hook hands the task to the executor.
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -12082,7 +12268,7 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let _flags = args.arg1;
-    let new_value_ptr = args.arg2 as u64;
+    let new_value_ptr = args.arg2;
     let _old_value_ptr = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
@@ -12093,6 +12279,8 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     // itimerspec is { interval: timespec, value: timespec } where
     // timespec = { tv_sec: i64, tv_nsec: i64 } = 16 B. Total 32 B.
     let mut buf = [0u8; 32];
+    // SAFETY: `new_value_ptr` is the user itimerspec pointer (non-zero, checked above);
+    // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
     if unsafe { copy_from_user(&mut buf, new_value_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -12136,7 +12324,7 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
 fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
-    let out_ptr = args.arg1 as u64;
+    let out_ptr = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
     if out_ptr == 0 {
@@ -12162,6 +12350,8 @@ fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
     buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
     buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
     buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+    // SAFETY: `out_ptr` is the user itimerspec pointer (non-zero, checked above);
+    // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -12190,13 +12380,15 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 fn sys_signalfd(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd_arg = args.arg0 as i64; // -1 = create new; else replace mask
-    let mask_ptr = args.arg1 as u64;
+    let mask_ptr = args.arg1;
     let _sizemask = args.arg2;
     let flags = args.arg3 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let mut mask: u64 = 0;
     if mask_ptr != 0 {
         let mut bytes = [0u8; 8];
+        // SAFETY: `mask_ptr` is the user sigset pointer (non-zero, checked above);
+        // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
         if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_ok() {
             mask = u64::from_le_bytes(bytes);
         }
@@ -12238,7 +12430,6 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
             }
         };
         ctx.set_return(SyscallReturn::ok(new_fd as u64));
-        return;
     }
     #[cfg(not(feature = "linux-compat"))]
     {
@@ -12310,8 +12501,8 @@ pub(crate) fn signalfd_arc_from_fd(
 fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
-    let act_ptr = args.arg1 as u64;
-    let _oact_ptr = args.arg2 as u64;
+    let act_ptr = args.arg1;
+    let _oact_ptr = args.arg2;
     let sigsetsize = args.arg3 as usize;
 
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -12322,6 +12513,8 @@ fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
 
     if act_ptr != 0 {
         let mut buf = [0u8; 32]; // sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8)
+                                 // SAFETY: `act_ptr` is the user sigaction pointer (non-zero, checked above);
+                                 // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
         if unsafe { copy_from_user(&mut buf, act_ptr) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -12391,6 +12584,8 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
     if old_out != 0 {
         // Write the prior handler address to user space under the SMAP bracket.
         let val = prior.map(|a| a.handler).unwrap_or(0);
+        // SAFETY: `old_out` is the user old-handler pointer (non-zero, checked above);
+        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
         let _ = unsafe { copy_to_user(old_out, &val.to_ne_bytes()) };
     }
 

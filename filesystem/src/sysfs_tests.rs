@@ -46,6 +46,8 @@ impl core::fmt::Debug for FakeBlock {
 }
 
 impl FakeBlock {
+    // Returns Arc<dyn BlockDeviceSync> rather than Self so callers get the trait object directly.
+    #[allow(clippy::new_ret_no_self)]
     fn new(lba_size: u32, cap: u64) -> Arc<dyn narf_block::BlockDeviceSync> {
         Arc::new(Self {
             data: narf_lib::sync::IrqSafeSpinLock::new(vec![
@@ -91,8 +93,11 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+    // single-threaded test poll; the RawWaker is not used after this scope.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

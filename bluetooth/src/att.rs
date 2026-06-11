@@ -133,9 +133,7 @@ impl Pdu {
 
 /// Build an Exchange_MTU_Request with the client's preferred MTU.
 pub fn build_exchange_mtu_request(client_rx_mtu: u16) -> Pdu {
-    let mut p = Vec::with_capacity(2);
-    p.push((client_rx_mtu & 0xFF) as u8);
-    p.push((client_rx_mtu >> 8) as u8);
+    let p = alloc::vec![(client_rx_mtu & 0xFF) as u8, (client_rx_mtu >> 8) as u8];
     Pdu {
         opcode: ATT_EXCHANGE_MTU_REQ,
         params: p,
@@ -144,9 +142,7 @@ pub fn build_exchange_mtu_request(client_rx_mtu: u16) -> Pdu {
 
 /// Build an Exchange_MTU_Response with the server's preferred MTU.
 pub fn build_exchange_mtu_response(server_rx_mtu: u16) -> Pdu {
-    let mut p = Vec::with_capacity(2);
-    p.push((server_rx_mtu & 0xFF) as u8);
-    p.push((server_rx_mtu >> 8) as u8);
+    let p = alloc::vec![(server_rx_mtu & 0xFF) as u8, (server_rx_mtu >> 8) as u8];
     Pdu {
         opcode: ATT_EXCHANGE_MTU_RSP,
         params: p,
@@ -168,9 +164,7 @@ pub fn decode_exchange_mtu(p: &Pdu) -> Option<u16> {
 // ── Read (§3.4.4) ─────────────────────────────────────────────────
 
 pub fn build_read_request(handle: u16) -> Pdu {
-    let mut p = Vec::with_capacity(2);
-    p.push((handle & 0xFF) as u8);
-    p.push((handle >> 8) as u8);
+    let p = alloc::vec![(handle & 0xFF) as u8, (handle >> 8) as u8];
     Pdu {
         opcode: ATT_READ_REQ,
         params: p,

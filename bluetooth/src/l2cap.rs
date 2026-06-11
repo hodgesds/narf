@@ -228,7 +228,7 @@ impl CidAllocator {
 
     /// Free a previously-allocated LE CID. No-op for non-LE values.
     pub fn free_le(&mut self, cid: u16) {
-        if cid >= CID_DYNAMIC_LE_FIRST && cid <= CID_DYNAMIC_LE_LAST {
+        if (CID_DYNAMIC_LE_FIRST..=CID_DYNAMIC_LE_LAST).contains(&cid) {
             let slot = cid - CID_DYNAMIC_LE_FIRST;
             self.le_used[0] &= !(1u64 << slot);
         }

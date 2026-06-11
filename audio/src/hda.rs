@@ -318,7 +318,10 @@ const SDCTL_STREAM_TAG_SHIFT: u32 = 20; // bits 20..23
 //
 // 48 kHz / 16-bit / 2-ch:
 //   BASE=0, MULT=000 (1×), DIV=000 (÷1), BITS=001 (16-bit), CHAN=0001
-const FMT_48K_S16_STEREO: u16 = (0b0_0000_000 << 8) // base 48k, mult 1×, div 1
+// `identity_op`: the high byte is BASE=0/MULT=000/DIV=000 by spec, kept as an
+// explicit `<< 8` term so the field layout stays visible alongside its siblings.
+#[allow(clippy::identity_op)]
+const FMT_48K_S16_STEREO: u16 = (0b0000_0000 << 8) // base 48k, mult 1×, div 1
     | (0b001 << 4)       // 16-bit
     | 0b0001; // 2 channels (chan_count - 1 == 1)
 
@@ -535,7 +538,7 @@ impl IntelHda {
         // SAFETY: BAR0 mapped.
         unsafe {
             bar0.write32(
-                REG_CORBCTL as u64 & !0x3, // word-aligned write below
+                REG_CORBCTL & !0x3, // word-aligned write below
                 bar0.read32(REG_CORBCTL & !0x3),
             ); // no-op; placeholder for clarity
         }
@@ -766,6 +769,9 @@ impl IntelHda {
         // SRST=0, poll for 0 (§3.3.35).
         // SAFETY: BAR0 mapped.
         let sd = sd_base(out_idx);
+        // SAFETY: `bar0` is the caller-mapped BAR0 MMIO window; `sd + SD_CTL`
+        // is the SDnCTL register of an in-range stream descriptor, a valid
+        // 32-bit device register, so the volatile write is well-defined.
         unsafe {
             bar0.write32(sd + SD_CTL, SDCTL_SRST);
         }
@@ -924,7 +930,7 @@ impl IntelHda {
         // global enable so the device can't fire stale data.
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| HdaError::DmaAllocFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
-        let _ = unsafe { msix.enable() }.map_err(|_| HdaError::DmaAllocFailed)?;
+        unsafe { msix.enable() }.map_err(|_| HdaError::DmaAllocFailed)?;
         Ok((msix, v))
     }
 
@@ -1061,7 +1067,7 @@ impl IntelHda {
                 self.send_verb(make_verb(
                     cad,
                     nid,
-                    VERB_GET_PARAMETER | PARAM_PIN_CAPS as u8 as u32,
+                    VERB_GET_PARAMETER | PARAM_PIN_CAPS as u32,
                 ))?
             };
             if pin_caps & (1 << 4) == 0 {
@@ -1184,6 +1190,9 @@ impl IntelHda {
     /// Caller owns the BAR0 mapping.
     pub unsafe fn bring_up_all_codecs(&self) -> Result<(), HdaError> {
         // 1. Generic path setup (converter + first pin) on primary codec.
+        // SAFETY: this fn's `# Safety` contract guarantees the caller owns the
+        // BAR0 mapping, which is exactly what `setup_default_output_path`
+        // requires to drive the CORB/RIRB verb ring.
         unsafe {
             self.setup_default_output_path()?;
         }
@@ -1191,6 +1200,8 @@ impl IntelHda {
         // 2. Vendor-specific patches for all codecs.
         for codec in self.codecs() {
             let cad = codec.addr;
+            // SAFETY: caller owns the BAR0 mapping (this fn's `# Safety`
+            // contract), so `send_verb` may drive the CORB/RIRB MMIO ring.
             let mut send = |c, n, v, p| unsafe {
                 self.send_verb(crate::codec::verb(c, n, v, p))
                     .map_err(|_| crate::codec::CodecError::TransportFailed)
@@ -1346,8 +1357,8 @@ impl IntelHda {
         let phys = self.period.phys_addr().raw();
         // SAFETY: identity-mapped DMA page; n × 2 ≤ period_bytes().
         unsafe {
-            for i in 0..n {
-                core::ptr::write_volatile((phys + (i * 2) as u64) as *mut i16, samples[i]);
+            for (i, &s) in samples[..n].iter().enumerate() {
+                core::ptr::write_volatile((phys + (i * 2) as u64) as *mut i16, s);
             }
             // Pad the tail with zeroes so a short load doesn't leak
             // stale samples from a prior period.

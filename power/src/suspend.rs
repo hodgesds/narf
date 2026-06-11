@@ -538,12 +538,17 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     let pml4_phys = narf_memory::PhysAddr::new(cr3);
     let entry_virt = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
     let ctx_virt = narf_arch::x86_64::s3_resume::resume_context_static_addr() as u64;
+    // SAFETY: `pml4_phys` is the active CR3 we just read on the boot
+    // CPU, so its PML4 page is identity-reachable as `translate`
+    // requires; `entry_virt` is a kernel function address.
     let entry_phys = match unsafe {
         narf_memory::x86_64::paging::translate(pml4_phys, narf_memory::VirtAddr::new(entry_virt))
     } {
         Some(p) => p.raw() | (entry_virt & 0xFFF),
         None => return Err(SuspendError::Aborted),
     };
+    // SAFETY: same active CR3 PML4 (identity-reachable per `translate`);
+    // `ctx_virt` is the kernel-resident `ResumeContext` static address.
     let ctx_phys = match unsafe {
         narf_memory::x86_64::paging::translate(pml4_phys, narf_memory::VirtAddr::new(ctx_virt))
     } {

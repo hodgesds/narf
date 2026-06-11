@@ -130,7 +130,7 @@ pub(crate) mod regs {
     // (0x14A0), I2S-SP (0x1342). All three are shape-identical.
 
     /// Ring buffer base address (low / high). Phys.
-    pub const ACP_I2STX_RINGBUFADDR: u64 = 0x1242 + 0x00;
+    pub const ACP_I2STX_RINGBUFADDR: u64 = 0x1242;
     pub const ACP_I2STX_RINGBUFSIZE: u64 = 0x1242 + 0x04;
     /// FIFO base address — where the engine pushes samples that
     /// drain to the wire. ACP scratch RAM, programmed below.

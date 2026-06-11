@@ -25,7 +25,7 @@
 //! - `net/ipv6/addrconf.c`     `if6_seq_show` for /proc/net/if_inet6
 //! - `net/ipv6/route.c`        for /proc/net/ipv6_route
 //! - `net/netfilter/nf_conntrack_standalone.c`
-//!                             `ct_seq_show` for /proc/net/nf_conntrack
+//!   `ct_seq_show` for /proc/net/nf_conntrack
 
 extern crate alloc;
 
@@ -375,6 +375,7 @@ static RAW6_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the per-subsystem snapshot hooks. Called by the net
 /// crate's init path before `register_all()` exposes the files.
+#[allow(clippy::too_many_arguments)] // one arg per protocol hook; bundling would obscure the layout
 pub fn install_hooks(
     tcp: TcpSnapshotFn,
     udp: UdpSnapshotFn,
@@ -414,6 +415,7 @@ fn tcp_snapshot() -> Vec<TcbSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a TcpSnapshotFn fn-pointer; non-zero confirms it.
     let f: TcpSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -423,6 +425,7 @@ fn udp_snapshot() -> Vec<UdpSocketSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a UdpSnapshotFn fn-pointer; non-zero confirms it.
     let f: UdpSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -432,6 +435,7 @@ fn raw_snapshot() -> Vec<RawSocketSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a RawSnapshotFn fn-pointer; non-zero confirms it.
     let f: RawSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -441,6 +445,7 @@ fn arp_snapshot() -> Vec<ArpSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as an ArpSnapshotFn fn-pointer; non-zero confirms it.
     let f: ArpSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -450,6 +455,7 @@ fn route_snapshot() -> Vec<RouteSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a RouteSnapshotFn fn-pointer; non-zero confirms it.
     let f: RouteSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -459,6 +465,7 @@ fn iface_counters() -> Vec<IfaceCounterSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as an IfaceCountersFn fn-pointer; non-zero confirms it.
     let f: IfaceCountersFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -468,6 +475,7 @@ fn ipv6_ifaddr_snapshot() -> Vec<Ipv6IfAddrSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as an Ipv6IfAddrFn fn-pointer; non-zero confirms it.
     let f: Ipv6IfAddrFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -477,6 +485,7 @@ fn ipv6_route_snapshot() -> Vec<Ipv6RouteSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as an Ipv6RouteFn fn-pointer; non-zero confirms it.
     let f: Ipv6RouteFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -486,6 +495,7 @@ fn conntrack_snapshot() -> Vec<ConntrackSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a ConntrackFn fn-pointer; non-zero confirms it.
     let f: ConntrackFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -495,6 +505,7 @@ fn snmp_snapshot() -> SnmpMib {
     if v == 0 {
         return SnmpMib::default();
     }
+    // SAFETY: v was stored by install_hooks as a SnmpFn fn-pointer; non-zero confirms it.
     let f: SnmpFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -504,6 +515,7 @@ fn igmp_snapshot() -> Vec<IgmpSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as an IgmpFn fn-pointer; non-zero confirms it.
     let f: IgmpFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -513,6 +525,7 @@ fn igmp6_snapshot() -> Vec<Igmp6Snapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as an Igmp6Fn fn-pointer; non-zero confirms it.
     let f: Igmp6Fn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -522,6 +535,7 @@ fn tcp6_snapshot() -> Vec<Tcb6Snapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a Tcp6SnapshotFn fn-pointer; non-zero confirms it.
     let f: Tcp6SnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -531,6 +545,7 @@ fn udp6_snapshot() -> Vec<Udp6SocketSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a Udp6SnapshotFn fn-pointer; non-zero confirms it.
     let f: Udp6SnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -540,6 +555,7 @@ fn raw6_snapshot() -> Vec<Raw6SocketSnapshot> {
     if v == 0 {
         return Vec::new();
     }
+    // SAFETY: v was stored by install_hooks as a Raw6SnapshotFn fn-pointer; non-zero confirms it.
     let f: Raw6SnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -770,7 +786,7 @@ impl ProcFile for ArpFile {
             let _ = writeln!(
                 s,
                 "{:<16} 0x1         0x{:X}         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
-                format_args!("{}.{}.{}.{}", e.ip[0], e.ip[1], e.ip[2], e.ip[3]),
+                alloc::format!("{}.{}.{}.{}", e.ip[0], e.ip[1], e.ip[2], e.ip[3]),
                 e.flags,
                 e.mac[0], e.mac[1], e.mac[2], e.mac[3], e.mac[4], e.mac[5],
                 e.iface,

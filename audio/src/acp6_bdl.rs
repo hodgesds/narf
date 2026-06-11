@@ -140,8 +140,8 @@ impl BdlRing {
             return None;
         }
         let mut descs = [BdlDescriptor::default(); MAX_PERIODS];
-        for i in 0..n_periods {
-            descs[i] = BdlDescriptor {
+        for (i, desc) in descs[..n_periods].iter_mut().enumerate() {
+            *desc = BdlDescriptor {
                 byte_offset: (i as u32 * period_bytes) as u16,
                 byte_len: period_bytes as u16,
             };

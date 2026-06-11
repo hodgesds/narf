@@ -159,8 +159,8 @@ fn gen_stat() -> Vec<u8> {
         for snap in &snaps {
             per_vec[snap.vector as usize] = snap.total;
         }
-        for v in 0usize..256 {
-            let _ = write!(s, " {}", per_vec[v]);
+        for count in &per_vec {
+            let _ = write!(s, " {}", count);
         }
     }
     let _ = writeln!(s);

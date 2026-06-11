@@ -20,8 +20,6 @@
 //! collide with the Linux ioctl space (the fcntl handler dispatches
 //! by fd type explicitly, not by cmd-word decode).
 
-#![cfg(feature = "linux-compat")]
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

@@ -17,9 +17,9 @@
 //!
 //! # Format notes
 //!   - `file-nr`    emits "<open> <free> <max>" on one line (Linux 2.6+
-//!                  shape; earlier kernels used two integers — we use three).
+//!     shape; earlier kernels used two integers — we use three).
 //!   - `dentry-state` emits six space-separated integers; NARF stubs
-//!                  all six as 0 since there is no dcache yet.
+//!     all six as 0 since there is no dcache yet.
 //!
 //! Linux refs:
 //!   `fs/file.c`            (`file-max`, `file-nr`, `nr_open`)

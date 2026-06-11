@@ -238,6 +238,7 @@ impl ReplayWindow {
 /// - `body`: the plaintext frame body, mutated in-place to ciphertext.
 ///
 /// Returns the on-the-wire layout: `[ccmp_header || ciphertext || mic]`.
+#[allow(clippy::too_many_arguments)] // CCMP requires all 8 protocol inputs; no natural grouping
 pub fn protect(
     aes: &dyn AesCcm,
     mac_header: &[u8],

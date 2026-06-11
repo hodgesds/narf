@@ -55,6 +55,8 @@ impl core::fmt::Debug for FakeBlock {
 }
 
 impl FakeBlock {
+    // Returns Arc<dyn BlockDeviceSync> rather than Self so callers get the trait object directly.
+    #[allow(clippy::new_ret_no_self)]
     fn new(lba_size: u32, cap: u64) -> Arc<dyn narf_block::BlockDeviceSync> {
         Arc::new(Self {
             lba_size,

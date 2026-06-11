@@ -370,8 +370,11 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
+        // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+        // single-threaded test poll; the RawWaker is not used after this scope.
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
@@ -447,8 +450,11 @@ fn smoke_filesystem_devfs_null_zero() -> TestResult {
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
+        // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+        // single-threaded test poll; the RawWaker is not used after this scope.
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
@@ -522,8 +528,11 @@ fn smoke_filesystem_devfs_random_urandom() -> TestResult {
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
+        // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+        // single-threaded test poll; the RawWaker is not used after this scope.
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
@@ -578,8 +587,11 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
+        // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+        // single-threaded test poll; the RawWaker is not used after this scope.
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
@@ -1295,8 +1307,11 @@ fn poll_once_devfs_input<F: core::future::Future>(mut fut: F) -> Option<F::Outpu
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+    // single-threaded test poll; the RawWaker is not used after this scope.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),
@@ -1405,6 +1420,8 @@ fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
     }
 
     // Verify layout: reconstruct EvdevEvent from the raw bytes.
+    // SAFETY: buf holds exactly 16 bytes written by a prior copy from a valid EvdevEvent;
+    // EvdevEvent is a repr(C) POD type with no padding traps at this size.
     let got: EvdevEvent = unsafe {
         let mut v = core::mem::MaybeUninit::<EvdevEvent>::uninit();
         core::ptr::copy_nonoverlapping(buf.as_ptr(), v.as_mut_ptr() as *mut u8, 16);
@@ -1536,6 +1553,8 @@ fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
         value: 1,
     };
     let mut payload = [0u8; 16];
+    // SAFETY: `ev` is a valid EvdevEvent on the stack; payload is 16 bytes matching
+    // size_of::<EvdevEvent>(); the two regions do not overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(
             &ev as *const EvdevEvent as *const u8,
@@ -1547,7 +1566,7 @@ fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
     // Write the event via the uinput path.
     let write_result = poll_once_devfs_input(file.write(0, &payload));
     match write_result {
-        Some(Ok(n)) if n == 16 => {}
+        Some(Ok(16)) => {}
         _ => {
             ROUTER.unregister_device(id);
             return TestResult::Fail("uinput write failed or returned wrong count");

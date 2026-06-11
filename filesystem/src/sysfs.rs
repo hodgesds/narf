@@ -108,6 +108,8 @@ fn net_snapshots() -> Vec<NetIfaceInfo> {
     if ptr == 0 {
         return Vec::new();
     }
+    // SAFETY: ptr was stored via NET_SNAPSHOT_HOOK which only accepts function pointers
+    // matching the NetSnapshotFn signature; non-zero check above ensures it is valid.
     let f: NetSnapshotFn = unsafe { core::mem::transmute(ptr) };
     f()
 }

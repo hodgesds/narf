@@ -211,12 +211,7 @@ pub fn negotiate_sbc(local: &SbcCapability, remote: &SbcCapability) -> Negotiate
 
 /// Pick the first bit in `preference` that is set in `mask`.
 fn pick_best(mask: u8, preference: &[u8]) -> Option<u8> {
-    for &bit in preference {
-        if mask & bit != 0 {
-            return Some(bit);
-        }
-    }
-    None
+    preference.iter().find(|&&bit| mask & bit != 0).copied()
 }
 
 // ── Service-capability blob builder ──────────────────────────────────
@@ -270,6 +265,12 @@ pub struct A2dpSource {
     pub state: SourceState,
     /// Selected SBC configuration (set after negotiation).
     pub config: Option<SbcCapability>,
+}
+
+impl Default for A2dpSource {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl A2dpSource {

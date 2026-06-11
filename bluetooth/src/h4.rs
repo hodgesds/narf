@@ -104,12 +104,12 @@ pub enum H4Error {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DecState {
-    NeedIndicator,
-    NeedHeader {
+    Indicator,
+    Header {
         ptype: PacketType,
         header_len: usize,
     },
-    NeedBody {
+    Body {
         ptype: PacketType,
         body_len: usize,
     },
@@ -132,7 +132,7 @@ impl Decoder {
     /// rail against a runaway controller flooding RAM.
     pub fn new(max_frame: usize) -> Self {
         Self {
-            state: DecState::NeedIndicator,
+            state: DecState::Indicator,
             accum: Vec::new(),
             max_frame,
         }
@@ -144,16 +144,16 @@ impl Decoder {
     /// indicator.
     pub fn feed(&mut self, b: u8) -> Result<Option<H4Frame>, H4Error> {
         match self.state {
-            DecState::NeedIndicator => {
+            DecState::Indicator => {
                 let pt = PacketType::from_u8(b).ok_or(H4Error::BadIndicator(b))?;
-                self.state = DecState::NeedHeader {
+                self.state = DecState::Header {
                     ptype: pt,
                     header_len: header_len(pt),
                 };
                 self.accum.clear();
                 Ok(None)
             }
-            DecState::NeedHeader { ptype, header_len } => {
+            DecState::Header { ptype, header_len } => {
                 self.accum.push(b);
                 if self.accum.len() == header_len {
                     // Header complete; read announced body length.
@@ -168,14 +168,14 @@ impl Decoder {
                         let frame = self.finalize(ptype);
                         return Ok(Some(frame));
                     }
-                    self.state = DecState::NeedBody {
+                    self.state = DecState::Body {
                         ptype,
                         body_len: announced,
                     };
                 }
                 Ok(None)
             }
-            DecState::NeedBody { ptype, body_len } => {
+            DecState::Body { ptype, body_len } => {
                 self.accum.push(b);
                 let header_len = header_len(ptype);
                 if self.accum.len() == header_len + body_len {
@@ -200,7 +200,7 @@ impl Decoder {
     }
 
     fn reset(&mut self) {
-        self.state = DecState::NeedIndicator;
+        self.state = DecState::Indicator;
         self.accum.clear();
     }
 

@@ -139,7 +139,7 @@ pub fn parse(bytes: &[u8]) -> Result<ExecImage, ElfError> {
 
     for i in 0..phnum {
         let off = phoff + i * entsize;
-        let p_type = read_u32(bytes, off + 0x00);
+        let p_type = read_u32(bytes, off);
         let p_flags = read_u32(bytes, off + 0x04);
         let p_offset = read_u64(bytes, off + 0x08);
         let p_vaddr = read_u64(bytes, off + 0x10);

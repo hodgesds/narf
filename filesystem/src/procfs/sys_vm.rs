@@ -12,7 +12,7 @@
 //!
 //! Keys that ARE wired:
 //!   - `min_free_kbytes`  — value is read by the frame allocator's
-//!                          low-watermark check (once that lands).
+//!     low-watermark check (once that lands).
 //!   - `drop_caches`      — write triggers `narf_memory::reclaim::drop_caches`.
 //!   - `max_map_count`    — enforced by the address-space region-count check.
 //!   - `panic_on_oom`     — checked by the OOM handler stub.
@@ -142,7 +142,7 @@ fn compute_min_free_kbytes() -> u64 {
         y = ny;
     }
     let result = y;
-    result.max(128).min(65536)
+    result.clamp(128, 65536)
 }
 
 /// Register every `/proc/sys/vm/*` sysctl. Called once at boot.

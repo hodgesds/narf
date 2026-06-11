@@ -334,6 +334,9 @@ impl FileOps for WatchdogAttrFile {
 
 // ── WatchdogWritableAttrFile — read-write sysfs attribute ─────────────
 
+/// Callback type for the `store` (write) side of a sysfs attribute.
+type StoreFn = Arc<dyn Fn(&[u8]) -> Result<(), FsError> + Send + Sync>;
+
 /// A read-write sysfs attribute file.
 ///
 /// `show` → read, `store` → write.  Matches the Linux `struct kobj_attribute`
@@ -344,7 +347,7 @@ impl FileOps for WatchdogAttrFile {
 /// `attribute->store(kobj, buf, count)` and returns `count` on success.
 struct WatchdogWritableAttrFile {
     show: Arc<dyn Fn() -> String + Send + Sync>,
-    store: Arc<dyn Fn(&[u8]) -> Result<(), FsError> + Send + Sync>,
+    store: StoreFn,
 }
 
 impl core::fmt::Debug for WatchdogWritableAttrFile {

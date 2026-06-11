@@ -95,7 +95,7 @@ where
 
         addr_space.map_region(Region {
             base: VirtAddr::new(seg.vaddr),
-            len: (pages as u64) << 12,
+            len: pages << 12,
             perms: perms_of(seg.flags),
             phys,
         })?;
@@ -478,6 +478,10 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
 fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mut u8> {
     let page = vaddr & !0xFFFu64;
     let off = vaddr & 0xFFFu64;
+    // SAFETY: `addr_space.root` is the live PML4 physical frame of the
+    // address space being loaded into; `translate` only reads page-table
+    // memory reachable from that root and `page` is a page-aligned virtual
+    // address, so the walk stays within valid table entries.
     let p =
         unsafe { narf_memory::x86_64::paging::translate(addr_space.root, VirtAddr::new(page)) }?;
     Some((p.as_u64() + off) as *mut u8)
@@ -699,6 +703,11 @@ pub unsafe fn apply_relocations(
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
             let slice = resolve_dt_pointer(bytes, image, rela_addr, needed)
                 .ok_or(LoadBytesError::RelaOutOfBounds)?;
+            // SAFETY: `resolve_dt_pointer` returned a `slice` of exactly
+            // `needed == count * relaent` in-bounds bytes of the image, so
+            // each `Elf64_Rela` entry read by `process_rela_array` is fully
+            // backed; `addr_space` is the target space whose pages this
+            // relocation patches.
             unsafe {
                 process_rela_array(
                     slice,
@@ -728,6 +737,11 @@ pub unsafe fn apply_relocations(
                     .ok_or(LoadBytesError::RelaOutOfBounds)?;
                 let slice = resolve_dt_pointer(bytes, image, jmprel_addr, needed)
                     .ok_or(LoadBytesError::RelaOutOfBounds)?;
+                // SAFETY: `resolve_dt_pointer` returned a `slice` of exactly
+                // `needed == count * relaent` in-bounds bytes of the image, so
+                // each `Elf64_Rela` PLT entry read by `process_rela_array` is
+                // fully backed; `addr_space` is the target space whose pages
+                // this relocation patches.
                 unsafe {
                     process_rela_array(
                         slice,

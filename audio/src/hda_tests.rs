@@ -209,6 +209,11 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
 
+    // SAFETY: invoked from the in-kernel test runner after boot handoff,
+    // so the memory map is parsed and the allocator is online; on x86_64
+    // `ECAM_DEFAULT_BASE` is the standard MMCONFIG ECAM base for the QEMU
+    // q35 machine these tests run under, which is the region `init`
+    // enumerates.
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -315,7 +320,7 @@ fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
     );
 
     table.insert(
-        make_verb(addr, 2, verb::GET_CONNECTION_LIST_ENTRY | 0),
+        make_verb(addr, 2, verb::GET_CONNECTION_LIST_ENTRY),
         0x0000_0003,
     );
 
@@ -349,7 +354,7 @@ fn smoke_hda_codec_enumerates_output_path_via_mock_verb_table() -> TestResult {
     );
 
     table.insert(
-        make_verb(addr, 3, verb::GET_CONNECTION_LIST_ENTRY | 0),
+        make_verb(addr, 3, verb::GET_CONNECTION_LIST_ENTRY),
         0x0000_0004,
     );
 

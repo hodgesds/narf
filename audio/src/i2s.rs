@@ -373,7 +373,7 @@ mod tests {
 
         // 2 slots × 32-bit: slot_len code = 0 (HW 32-bit sentinel).
         let frmt32 = Acp3xTxFrmt::build(2, WordLength::Bits32);
-        let expected32 = TXFRMT_FRM_LEN | (2 << 15) | (0 << 18);
+        let expected32 = TXFRMT_FRM_LEN | (2 << 15);
         if frmt32.raw() != expected32 {
             return TestResult::Fail("2-slot 32-bit TXFRMT encoding wrong");
         }

@@ -213,6 +213,10 @@ pub fn __nop_marker() {
     unsafe {
         core::arch::asm!("nop", options(nostack, preserves_flags, nomem));
     }
+    // SAFETY: emits a single aarch64 `nop` (encodes to `0xD503201F`),
+    // which has no side effects, reads/writes no memory and clobbers no
+    // registers or flags; `nostack, preserves_flags, nomem` encode those
+    // guarantees to the compiler.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         // `nop` on aarch64 encodes to `0xD503201F`; the assembler
