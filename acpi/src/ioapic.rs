@@ -98,7 +98,7 @@ pub unsafe fn probe(base_phys: u64, gsi_base: u32) -> IoApicHandle {
     // dword holds Maximum Redirection Entry (a 0-based index;
     // total entry count is +1).
     let ver = unsafe { read_reg_locked(base_phys, IDX_IOAPICVER) };
-    let max_entry = ((ver >> 16) & 0xFF) as u32;
+    let max_entry = (ver >> 16) & 0xFF;
     IoApicHandle {
         base_phys,
         gsi_base,
@@ -109,7 +109,7 @@ pub unsafe fn probe(base_phys: u64, gsi_base: u32) -> IoApicHandle {
 /// Program redirection-table entry for `gsi` to deliver `vector`
 /// to APIC id `dest_apic` with the given polarity + trigger mode
 /// + mask state. Returns `false` if the GSI doesn't fall within
-/// this IOAPIC's range.
+///   this IOAPIC's range.
 ///
 /// `flags` is `POLARITY_* | TRIGGER_* | MASKED?` (bits 13/15/16).
 /// Other bits in the low dword (vector, delivery mode, dest mode)

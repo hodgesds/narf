@@ -79,7 +79,7 @@ impl PostureReport {
 
     /// Quick check: are the always-on floors live? SMEP + SMAP + W^X
     /// + canary + KASLR. KPTI is *not* in the floor because on
-    /// Meltdown-immune parts the right answer is Native (don't pay).
+    ///   Meltdown-immune parts the right answer is Native (don't pay).
     pub fn floors_live(&self) -> bool {
         self.smep.load(Ordering::Acquire)
             && self.smap.load(Ordering::Acquire)

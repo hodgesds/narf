@@ -65,6 +65,7 @@ struct MutexInner {
 // guard, the same contract as `std::sync::Mutex`. `T: Send` is
 // sufficient to share the mutex across tasks.
 unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {

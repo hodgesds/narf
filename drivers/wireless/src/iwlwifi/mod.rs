@@ -72,7 +72,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::{Poll, Waker};
+use core::task::Waker;
 
 use crate::iwlwifi::transport::IwlMmio;
 use narf_bus::{map_bar, BusDevice, BusDeviceCap, MmioRegion};

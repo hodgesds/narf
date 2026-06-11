@@ -32,7 +32,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use narf_wireless::eapol::{derive_ptk, HmacPrimitive, KeyFrame, Ptk, Supplicant};
+use narf_wireless::eapol::{derive_ptk, HmacPrimitive, Ptk};
 
 // ── SHA-1 (FIPS 180-4 §6.1) ─────────────────────────────────────────
 
@@ -190,6 +190,7 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
 ///
 /// Pass this to `narf_wireless::eapol::derive_ptk` and `prf` to
 /// implement the WPA2-Personal (AKM-1 / AKM-2) key derivation.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct HmacSha1;
 
 impl HmacPrimitive for HmacSha1 {
@@ -224,6 +225,7 @@ pub fn derive_ptk_sha1(
 }
 
 /// Result of a completed 4-way handshake on the supplicant side.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct HandshakeResult {
     pub ptk: Ptk,
 }
@@ -263,8 +265,8 @@ pub mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_wireless::eapol::{
-        FourWayState, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_KEY_ACK, KI_KEY_MIC,
-        KI_KEY_TYPE_PAIRWISE, KI_SECURE, KI_VERSION_HMAC_SHA1_AES,
+        FourWayState, KeyFrame, Supplicant, KEY_DESCRIPTOR_RSN, KI_KEY_ACK, KI_KEY_TYPE_PAIRWISE,
+        KI_VERSION_HMAC_SHA1_AES,
     };
 
     // ── FIPS 180-4 SHA-1 known-answer ─────────────────────────────

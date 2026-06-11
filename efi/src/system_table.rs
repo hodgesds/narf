@@ -78,9 +78,7 @@ impl TableHeader {
         }
         let mut tmp = whole_table[..self.header_size as usize].to_vec();
         // Zero the CRC field at offset 16..20.
-        for i in 16..20 {
-            tmp[i] = 0;
-        }
+        tmp[16..20].fill(0);
         let computed = crc32_ieee(&tmp);
         if computed != self.crc32 {
             return Err(TableHeaderError::BadChecksum);

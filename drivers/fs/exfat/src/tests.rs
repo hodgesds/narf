@@ -258,8 +258,17 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: the RawWaker carries a null data pointer that none of the
+    // vtable functions ever dereference: `no_clone` rebuilds an
+    // equivalent RawWaker and `no_op` does nothing for wake/wake_by_ref/
+    // drop. This satisfies RawWakerVTable's contract (clone yields a
+    // waker that wakes the same task; wake/drop are sound), so the
+    // resulting Waker is valid.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local owned by this stack frame and is never
+    // moved again — it is only accessed through `pinned` and dropped in
+    // place when the frame returns — so the Pin's no-move invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),
@@ -558,14 +567,14 @@ fn smoke_exfat_set_checksum_round_trip() -> TestResult {
     group[0] = 0x85; // FILE entry type
     group[1] = 1; // secondary_count
                   // Bytes 4..32 are file attributes / timestamps / reserved.
-    for i in 4..32 {
-        group[i] = i as u8;
+    for (i, slot) in group.iter_mut().enumerate().take(32).skip(4) {
+        *slot = i as u8;
     }
     // Stream extension secondary
     group[32] = 0xC0;
     group[33] = 0x03; // ALLOCATION_POSSIBLE | NO_FAT_CHAIN
-    for i in 34..64 {
-        group[i] = i as u8;
+    for (i, slot) in group.iter_mut().enumerate().skip(34) {
+        *slot = i as u8;
     }
     // Compute + write back.
     finalize_set_checksum(&mut group);

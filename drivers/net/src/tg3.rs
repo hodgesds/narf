@@ -655,6 +655,7 @@ impl Tg3Nic {
     ///
     /// # Safety
     /// `mmio` covers BAR0 of an owned tg3 device.
+    #[allow(clippy::erasing_op)]
     unsafe fn chip_reset(mmio: &MmioRegion) -> bool {
         // 1. Program MISC_HOST_CTRL to a known-good state. Linux's
         //    `tg3_get_invariants` sets these in `tp->misc_host_ctrl`

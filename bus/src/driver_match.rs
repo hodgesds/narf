@@ -128,7 +128,7 @@ impl MatchKind {
 }
 
 /// Driver probe signature. The driver receives the discovered device
-/// + a freshly-minted authority cap, and returns success / a typed
+/// and a freshly-minted authority cap, and returns success / a typed
 /// error. The cap is owned by the probe — it can stash it in a
 /// static, hand it to a long-lived task, etc.
 pub type PciProbeFn =
@@ -256,7 +256,7 @@ pub fn probe_all(
             // Mix the colour into the high-saturation range so it's
             // visible against the FB background. Keep alpha high
             // (bits 24..31) at 0 since the FB is BGR0.
-            let colour = (h & 0x00FF_FFFF) | 0x00_4040_40;
+            let colour = (h & 0x00FF_FFFF) | 0x0040_4040;
             narf_memory::beacon::paint(32, colour);
         }
         let result = (m.probe)(*d, cap);

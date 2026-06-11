@@ -126,6 +126,7 @@ impl SinkPort {
     pub fn state(&self) -> SinkState {
         // Safety: we only ever store SinkState discriminants.
         let v = self.state.load(Ordering::Acquire);
+        // SAFETY: source and destination have identical size and a compatible layout.
         unsafe { core::mem::transmute(v) }
     }
 

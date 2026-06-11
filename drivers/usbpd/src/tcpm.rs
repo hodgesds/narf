@@ -23,10 +23,10 @@
 //! - **USB Power Delivery 3.1 v1.8** (USB-IF), §8.3.3.2 (Source PE),
 //!   §8.3.3.3 (Sink PE), §4.5.2 (Type-C attach), §8.3.3.6 (Hard
 //!   Reset), §8.3.3.7 (Error Recovery).
-//!     <https://www.usb.org/document-library/usb-power-delivery>
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //! - **USB Type-C Cable and Connector Spec 2.2** (USB-IF), §4.5.2.2
 //!   (Source.Attached / Sink.Attached substates).
-//!     <https://www.usb.org/document-library/usb-type-c-cable-and-connector-specification-revision-22>
+//!   <https://www.usb.org/document-library/usb-type-c-cable-and-connector-specification-revision-22>
 
 extern crate alloc;
 

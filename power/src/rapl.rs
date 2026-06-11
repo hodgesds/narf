@@ -8,7 +8,6 @@
 //! `PACKAGE_THERM_STATUS`, `TEMPERATURE_TARGET`) since they're
 //! the natural cousin telemetry surface.
 
-#![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
 use narf_arch::x86_64::cpuid::cpuid;
@@ -93,10 +92,17 @@ pub unsafe fn units() -> EnergyUnits {
     }
 }
 
+/// Read a 32-bit RAPL energy-status counter and scale it to µJ.
+///
+/// # Safety
+/// CPL = 0 and `is_supported()` is true (so both `msr` and
+/// `MSR_RAPL_POWER_UNIT` are implemented on this CPU).
 unsafe fn read_energy_uj(msr: u32) -> u64 {
-    // SAFETY: caller-asserted.
-    let raw32 = (unsafe { rdmsr(msr) } & 0xFFFF_FFFF) as u64;
-    // SAFETY: same.
+    // SAFETY: the caller guarantees CPL=0 and that `msr` is an
+    // implemented RAPL energy-status MSR; mask to its low 32 bits.
+    let raw32 = unsafe { rdmsr(msr) } & 0xFFFF_FFFF;
+    // SAFETY: the caller guarantees CPL=0 and is_supported(), which is
+    // exactly `units()`'s contract.
     let u = unsafe { units() };
     raw32.saturating_mul(u.energy_uj_per_unit)
 }

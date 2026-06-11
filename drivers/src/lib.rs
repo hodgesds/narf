@@ -321,8 +321,8 @@ pub fn registry() -> &'static DriverRegistry {
 
 impl DriverRegistry {
     /// Register a driver. The `authority` cap is checked live; a
-    /// revoked authority fails before any side effect. Domain count
-    /// + duplicate-name check + push happen under one critical
+    /// revoked authority fails before any side effect. Domain count,
+    /// duplicate-name check, and push happen under one critical
     /// section so two concurrent registers can't exceed the §4.1
     /// cap or collide on the same `DomainId`.
     pub fn register<D: Driver>(
@@ -631,7 +631,7 @@ pub struct DriverStatus {
     pub handle: Cap<DriverHandle, Write>,
 }
 
-/// Public re-export of the lifecycle phase for observers.
+// Public re-export of the lifecycle phase for observers.
 
 // ── NoopDriver ──────────────────────────────────────────────────────
 

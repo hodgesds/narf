@@ -6,7 +6,7 @@
 //!   structure with type / legacy_record_version / length / fragment).
 //!   §4 (Handshake Protocol — top-level type byte + 24-bit length
 //!   + body). §6 (Alert Protocol — level + description).
-//!   <https://datatracker.ietf.org/doc/html/rfc8446>
+//!     <https://datatracker.ietf.org/doc/html/rfc8446>
 //! - RFC 5246 — TLS 1.2 (kept around for the legacy_record_version
 //!   = 0x0303 invariant TLS 1.3 inherits).
 //!   <https://datatracker.ietf.org/doc/html/rfc5246>

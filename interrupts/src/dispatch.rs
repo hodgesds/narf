@@ -268,6 +268,12 @@ impl Slot {
     }
 }
 
+impl Default for Slot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static SLOTS: [Slot; NUM_VECTORS] = [const { Slot::new() }; NUM_VECTORS];
 
 // ── Handler install / clear ────────────────────────────────────────
@@ -736,7 +742,8 @@ pub struct NmiHandlerId(u8);
 pub fn add_nmi_handler(handler: NmiHandler, cookie: u64) -> Option<NmiHandlerId> {
     for (i, slot) in NMI_SLOTS.iter().enumerate() {
         if !slot.used.swap(true, Ordering::AcqRel) {
-            slot.handler.store(handler as u64, Ordering::Release);
+            slot.handler
+                .store(handler as usize as u64, Ordering::Release);
             slot.cookie.store(cookie, Ordering::Release);
             return Some(NmiHandlerId(i as u8));
         }

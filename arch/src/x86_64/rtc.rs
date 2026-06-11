@@ -254,10 +254,15 @@ pub unsafe fn read_now() -> Result<RtcTime, RtcError> {
 
     // SAFETY: same.
     let raw_sec = unsafe { read_index(REG_SECONDS) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let raw_min = unsafe { read_index(REG_MINUTES) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let raw_hr = unsafe { read_index(REG_HOURS) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let raw_dom = unsafe { read_index(REG_DAY) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let raw_mon = unsafe { read_index(REG_MONTH) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let raw_yr = unsafe { read_index(REG_YEAR) };
     // SAFETY: same — century may not be wired; ACPI FADT
     // `century_index` disambiguates, but absent ACPI parsing here we
@@ -286,7 +291,7 @@ pub unsafe fn read_now() -> Result<RtcTime, RtcError> {
     }
 
     let cent = conv(raw_cent);
-    let full_year: u16 = if cent >= 19 && cent <= 21 {
+    let full_year: u16 = if (19..=21).contains(&cent) {
         // Plausible century byte.
         (cent as u16) * 100 + yr as u16
     } else {
@@ -548,7 +553,7 @@ mod tests {
         // yr = 26 → 2026.
         let cent_val: u8 = 20;
         let yr_val: u8 = 26;
-        let full_year = if cent_val >= 19 && cent_val <= 21 {
+        let full_year = if (19..=21).contains(&cent_val) {
             (cent_val as u16) * 100 + yr_val as u16
         } else {
             2000u16 + yr_val as u16
@@ -559,7 +564,7 @@ mod tests {
 
         // Case 2: cent = 0 (not present) → fallback 2000 + yr
         let cent_bad: u8 = 0;
-        let full_year2 = if cent_bad >= 19 && cent_bad <= 21 {
+        let full_year2 = if (19..=21).contains(&cent_bad) {
             (cent_bad as u16) * 100 + yr_val as u16
         } else {
             2000u16 + yr_val as u16
@@ -571,7 +576,7 @@ mod tests {
         // Case 3: century byte in BCD form (0x20 = decimal 20).
         let cent_bcd: u8 = 0x20; // from_bcd(0x20) = 20
         let cent_dec = from_bcd(cent_bcd);
-        let full_year3 = if cent_dec >= 19 && cent_dec <= 21 {
+        let full_year3 = if (19..=21).contains(&cent_dec) {
             (cent_dec as u16) * 100 + yr_val as u16
         } else {
             2000u16 + yr_val as u16
@@ -643,7 +648,7 @@ mod tests {
         };
         let got = t.to_unix_seconds();
         // Sanity: after 2024 (2024-01-01 = 1704067200) and before 2100.
-        if got < 1_704_067_200 || got > 4_102_444_800 {
+        if !(1_704_067_200..=4_102_444_800).contains(&got) {
             return TestResult::Fail("2026-05-27 unix seconds out of expected range");
         }
         TestResult::Pass

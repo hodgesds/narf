@@ -45,6 +45,7 @@ struct PosixTimer {
     task: u64,
     /// One of CLOCK_REALTIME / CLOCK_MONOTONIC(_RAW) / CLOCK_BOOTTIME.
     /// Realtime currently shares the monotonic source — no NTP yet.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     clockid: u64,
     /// Signum to raise on expiry (SIGEV_SIGNAL); 0 = SIGEV_NONE.
     signum: u32,

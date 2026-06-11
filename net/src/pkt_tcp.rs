@@ -99,7 +99,7 @@ impl TcpHeader {
         out.extend_from_slice(&self.dst_port.to_be_bytes());
         out.extend_from_slice(&self.sequence.to_be_bytes());
         out.extend_from_slice(&self.acknowledgement.to_be_bytes());
-        let data_offset = (self.header_len / 4) as u8;
+        let data_offset = self.header_len / 4;
         out.push(data_offset << 4);
         out.push(self.flags);
         out.extend_from_slice(&self.window.to_be_bytes());
@@ -165,16 +165,15 @@ pub enum TcpOption<'a> {
 /// is exhausted.
 pub fn iter_options(mut buf: &[u8]) -> impl Iterator<Item = TcpOption<'_>> {
     core::iter::from_fn(move || {
-        loop {
-            let head = *buf.first()?;
-            match head {
-                OPT_END_OF_LIST => return None,
-                OPT_NOP => {
-                    buf = &buf[1..];
-                    return Some(TcpOption::Nop);
-                }
-                _ => break,
+        // Single-byte options (end-of-list, NOP) are handled first; any
+        // other kind falls through to the length-prefixed decoder below.
+        match *buf.first()? {
+            OPT_END_OF_LIST => return None,
+            OPT_NOP => {
+                buf = &buf[1..];
+                return Some(TcpOption::Nop);
             }
+            _ => {}
         }
         if buf.len() < 2 {
             return None;

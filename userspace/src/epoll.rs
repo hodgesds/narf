@@ -413,6 +413,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     }
 }
 
+#[allow(clippy::never_loop)]
 pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;

@@ -114,6 +114,7 @@ pub extern "C" fn test_module_alive() -> u32 {
 // would only fire if the module itself panicked. We loop forever so a
 // real-HW failure is at least quiescent.
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {

@@ -126,8 +126,8 @@ impl<const N: usize> ByteRing<N> {
     fn pop(&self, buf: &mut [u8]) -> usize {
         let mut g = self.inner.lock();
         let n = buf.len().min(g.len);
-        for i in 0..n {
-            buf[i] = g.buf[g.head];
+        for slot in buf.iter_mut().take(n) {
+            *slot = g.buf[g.head];
             g.head = (g.head + 1) % N;
         }
         g.len -= n;
@@ -154,8 +154,8 @@ impl<const N: usize> ByteRing<N> {
             None => return 0, // ICANON: block until newline
         };
         let n = consume.min(buf.len());
-        for i in 0..n {
-            buf[i] = g.buf[g.head];
+        for slot in buf.iter_mut().take(n) {
+            *slot = g.buf[g.head];
             g.head = (g.head + 1) % N;
         }
         // Consume the rest of the line if we couldn't fit it all.
@@ -260,12 +260,18 @@ pub struct Pty {
     /// Wave-76: per-tty foreground process group (TIOCSPGRP/TIOCGPGRP).
     /// Owned per pair so a write to a PTY master/slave does NOT clobber
     /// the global console's fg_pgrp. 0 = unset; tcsetpgrp(3) installs.
+    // Only read by the `linux-compat` ioctl path (TIOCSPGRP/TIOCGPGRP); always
+    // constructed so the field is dead only when that feature is off.
+    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
     pub(crate) fg_pgrp: AtomicU64,
 
     /// Wave-76: slave-lock flag (TIOCSPTLCK). After ptmx_open the slave
     /// is locked; userspace calls unlockpt() / TIOCSPTLCK(0) before
     /// `open("/dev/pts/N")`. While locked, `DevPts::lookup` returns
     /// `FsError::Io(...)` so the syscall layer surfaces -EIO.
+    // Only read by the `linux-compat` lock/unlock paths; always constructed so
+    // the field is dead only when that feature is off.
+    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
     pub(crate) locked: AtomicBool,
 }
 
@@ -1007,6 +1013,8 @@ impl DirOps for DevPts {
 fn u32_to_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
     if n == 0 {
         buf[9] = b'0';
+        // SAFETY: the only byte in `buf[9..]` was just set to b'0' (0x30), an
+        // ASCII digit, which is valid UTF-8.
         return unsafe { core::str::from_utf8_unchecked(&buf[9..]) };
     }
     let mut pos = 10;
@@ -1015,6 +1023,9 @@ fn u32_to_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
         buf[pos] = b'0' + (n % 10) as u8;
         n /= 10;
     }
+    // SAFETY: every byte written into `buf[pos..]` above is `b'0' + digit`
+    // where `digit` is `n % 10` in 0..=9, so each byte is an ASCII digit
+    // (0x30..=0x39) and the whole slice is valid UTF-8.
     unsafe { core::str::from_utf8_unchecked(&buf[pos..]) }
 }
 

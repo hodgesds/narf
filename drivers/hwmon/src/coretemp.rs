@@ -30,6 +30,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
 use crate::registry;
 
 // ── MSR numbers ───────────────────────────────────────────────────────

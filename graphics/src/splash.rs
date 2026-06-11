@@ -65,17 +65,17 @@ pub fn render(info: &BootInfo<'_>) -> bool {
     // Skip the title-bar rows visually by writing blank lines.
     let title_rows = (TITLE_BAR_HEIGHT + 2) / 8;
     for _ in 0..title_rows {
-        let _ = writeln!(con, "");
+        let _ = writeln!(con);
     }
 
-    let _ = writeln!(con, "");
+    let _ = writeln!(con);
     let _ = writeln!(con, " kernel:    NARF v{}", info.version);
     let _ = writeln!(con, " arch:      {}", info.arch);
     let _ = writeln!(con, " enforcer:  {}", info.backend);
     let _ = writeln!(con, " cpus:      {}", info.cpu_count);
     let _ = writeln!(con, " numa:      {} node(s)", info.numa_nodes);
     let _ = writeln!(con, " drivers:   {} bound", info.bound_drivers);
-    let _ = writeln!(con, "");
+    let _ = writeln!(con);
     let _ = writeln!(con, " framebuffer console + 8x8 glyphs + arrow cursor");
     let _ = writeln!(con, " press a key, move the mouse — events route");
     let _ = writeln!(con, " through narf-input's global ring.");

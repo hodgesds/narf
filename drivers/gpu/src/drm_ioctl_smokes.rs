@@ -35,7 +35,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 use crate::drm::card::{
     Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
 };
-use crate::drm_devfs_bridge::{BochsCard, DriCardFile, DriRenderFile};
+use crate::drm_devfs_bridge::BochsCard;
 use crate::drm_ioctl_bridge::dispatch_card;
 use crate::drm_uapi::{
     ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi, DrmModeCardResUapi,

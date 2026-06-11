@@ -373,7 +373,7 @@ fn handle_echo_reply(_src_ip: [u8; 4], icmp_body: &[u8]) {
 
 /// Route an ICMP error message back to the socket that originated the
 /// triggering packet.  The error message embeds the original IP header
-/// + 8 bytes of the triggering datagram, which is enough to recover
+/// plus 8 bytes of the triggering datagram, which is enough to recover
 /// the original `(proto, src_port, dst_ip, dst_port)`.
 ///
 /// Mirrors Linux `icmp_err` → `udp_err` (net/ipv4/udp.c:633) and

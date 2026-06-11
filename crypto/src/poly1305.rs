@@ -114,8 +114,8 @@ impl FieldElement {
     /// Field addition.
     fn add(self, rhs: Self) -> Self {
         let mut res = [0u32; 5];
-        for i in 0..5 {
-            res[i] = self.0[i] + rhs.0[i];
+        for (r, (&a, &b)) in res.iter_mut().zip(self.0.iter().zip(rhs.0.iter())) {
+            *r = a + b;
         }
         FieldElement(res)
     }

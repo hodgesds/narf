@@ -276,6 +276,7 @@ impl AddressSpace {
         // tear-down (or a parallel materialise on a different region)
         // doesn't reentrant-deadlock.
         drop(regions);
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe { self.unmap_region_pages(&region) };
         Ok(region)
     }
@@ -303,21 +304,18 @@ impl AddressSpace {
             // SAFETY: same identity-mapping precondition as
             // `materialize`; `v` lies inside `region` which was
             // bookkept by `map_region`.
-            match unsafe { unmap_4kb(self.root, v) } {
-                Ok(phys) => {
-                    // Skip phys that's registered as a page-table
-                    // frame — `free_user_pml4_tree` will reclaim it
-                    // on its own walk. Freeing here would double-free.
-                    if crate::frame::__pagetable_is_registered(phys.raw()) {
-                        continue;
-                    }
-                    free_frame(PhysFrame::new(phys));
+            // An `Err` here means already-unmapped (double munmap, or the
+            // region was partially materialised), which is benign: the
+            // bookkeeping is gone now, the frames either never landed or are
+            // already back in the allocator.
+            if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+                // Skip phys that's registered as a page-table
+                // frame — `free_user_pml4_tree` will reclaim it
+                // on its own walk. Freeing here would double-free.
+                if crate::frame::__pagetable_is_registered(phys.raw()) {
+                    continue;
                 }
-                // Already-unmapped (double munmap, or the region was
-                // partially materialised) is benign: the bookkeeping
-                // is gone now, the frames either never landed or are
-                // already back in the allocator.
-                Err(_) => {}
+                free_frame(PhysFrame::new(phys));
             }
         }
     }
@@ -411,10 +409,10 @@ impl AddressSpace {
             // Build PTE flags from region perms.
             let mut flags = PtFlags::USER;
             if r.perms.contains(RegionPerms::WRITE) {
-                flags = flags | PtFlags::WRITABLE;
+                flags |= PtFlags::WRITABLE;
             }
             if !r.perms.contains(RegionPerms::EXEC) {
-                flags = flags | PtFlags::NO_EXEC;
+                flags |= PtFlags::NO_EXEC;
             }
             // SAFETY: identity map + AS is live (we're being
             // called from the active CR3's #PF handler).
@@ -811,6 +809,7 @@ impl AddressSpace {
     ///    - `[rb, lo)` keeps the old perms (head fragment).
     ///    - `[max(rb, lo), min(re, hi))` gets the new perms (middle).
     ///    - `[hi, re)` keeps the old perms (tail fragment).
+    ///
     ///    Each fragment carries its own slice of the original
     ///    region's `phys` Vec, so `Drop for AddressSpace` doesn't
     ///    double-free.
@@ -927,7 +926,7 @@ impl AddressSpace {
                 new_list.push(mid_region);
 
                 // Tail fragment (preserves old perms).
-                if tail_phys.len() > 0 {
+                if !tail_phys.is_empty() {
                     new_list.push(Region {
                         base: VirtAddr::new(split_hi),
                         len: (tail_phys.len() as u64) << 12,
@@ -1119,10 +1118,10 @@ impl AddressSpace {
             }
             let mut flags = PtFlags::USER;
             if r.perms.contains(RegionPerms::WRITE) {
-                flags = flags | PtFlags::WRITABLE;
+                flags |= PtFlags::WRITABLE;
             }
             if !r.perms.contains(RegionPerms::EXEC) {
-                flags = flags | PtFlags::NO_EXEC;
+                flags |= PtFlags::NO_EXEC;
             }
             for (i, p) in r.phys.iter().enumerate() {
                 // Skip demand-paged pages (phys == 0). They are
@@ -1211,10 +1210,10 @@ impl AddressSpace {
             }
             let mut flags = PtFlags::USER;
             if r.perms.contains(RegionPerms::WRITE) {
-                flags = flags | PtFlags::WRITABLE;
+                flags |= PtFlags::WRITABLE;
             }
             if !r.perms.contains(RegionPerms::EXEC) {
-                flags = flags | PtFlags::NO_EXEC;
+                flags |= PtFlags::NO_EXEC;
             }
 
             for (i, p) in r.phys.iter().enumerate() {
@@ -1504,15 +1503,21 @@ impl AddressSpace {
 
         let mut flags = PtFlags::USER;
         if region.perms.contains(RegionPerms::WRITE) {
-            flags = flags | PtFlags::WRITABLE;
+            flags |= PtFlags::WRITABLE;
         }
         if !region.perms.contains(RegionPerms::EXEC) {
-            flags = flags | PtFlags::NO_EXEC;
+            flags |= PtFlags::NO_EXEC;
         }
 
         // SAFETY: root is a valid PML4; the page we're touching
         // sits inside `region` per the lookup above.
         let _ = unsafe { unmap_4kb(self.root, page_va) };
+        // SAFETY: `self.root` is this AS's live PML4 (same root just
+        // passed to `unmap_4kb`); `page_va` is the page-aligned VA of a
+        // page that belongs to `region` (the lookup above resolved it),
+        // and `phys` is `region.phys[page_idx]`, the frame this AS owns
+        // for that page. `flags` mirror the region's perms, so the new
+        // PTE re-installs exactly the mapping we just tore down.
         match unsafe { map_4kb(self.root, page_va, phys, flags) } {
             Ok(()) => Ok(()),
             Err(MapError::AlreadyMapped) => Ok(()),
@@ -1615,7 +1620,7 @@ impl AddressSpace {
             unsafe {
                 crate::x86_64::paging::write_cr3(self.root);
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(target_arch = "aarch64")]
         {

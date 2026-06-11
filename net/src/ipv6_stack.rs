@@ -139,10 +139,7 @@ pub fn process_fragment(
 
     // Have we got everything? Sum the piece lengths and compare to
     // the declared total.
-    let total = match buf.total {
-        Some(t) => t,
-        None => return None,
-    };
+    let total = buf.total?;
     let mut sorted = buf.pieces.clone();
     sorted.sort_by_key(|p| p.0);
     let mut assembled = Vec::with_capacity(total as usize);
@@ -162,35 +159,48 @@ pub fn process_fragment(
     Some((nh, assembled))
 }
 
+/// Addressing and L4 payload for an outbound IPv6 frame.
+#[derive(Debug)]
+pub struct Ipv6FrameSpec<'a> {
+    pub src_mac: [u8; 6],
+    pub dst_mac: [u8; 6],
+    pub src_ip: [u8; 16],
+    pub dst_ip: [u8; 16],
+    pub next_header: u8,
+    pub hop_limit: u8,
+    pub body: &'a [u8],
+}
+
 /// Build an outbound IPv6 frame at L2: writes Ethernet header,
 /// IPv6 fixed header, and the L4 body. Returns the byte count
 /// written into `out`. `dst_mac` must be either a unicast (resolved
 /// via NDP) or a multicast-mapped MAC.
-pub fn build_frame(
-    out: &mut Vec<u8>,
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-    src_ip: [u8; 16],
-    dst_ip: [u8; 16],
-    next_header: u8,
-    hop_limit: u8,
-    body: &[u8],
-) -> usize {
+pub fn build_frame(out: &mut Vec<u8>, spec: Ipv6FrameSpec<'_>) -> usize {
+    let Ipv6FrameSpec {
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        next_header,
+        hop_limit,
+        body,
+    } = spec;
     out.clear();
     out.reserve(ETH_HDR_LEN + IPV6_HDR_LEN + body.len());
     // L2.
     out.resize(ETH_HDR_LEN, 0);
     let _ = write_eth_header(out, dst_mac, src_mac, ETHERTYPE_IPV6);
     // IPv6.
-    let mut ip = Ipv6Header::default();
-    ip.version = 6;
-    ip.traffic_class = 0;
-    ip.flow_label = 0;
-    ip.payload_length = body.len() as u16;
-    ip.next_header = next_header;
-    ip.hop_limit = hop_limit;
-    ip.src_ip = src_ip;
-    ip.dst_ip = dst_ip;
+    let ip = Ipv6Header {
+        version: 6,
+        traffic_class: 0,
+        flow_label: 0,
+        payload_length: body.len() as u16,
+        next_header,
+        hop_limit,
+        src_ip,
+        dst_ip,
+    };
     out.extend_from_slice(&ip.encode());
     out.extend_from_slice(body);
     out.len()

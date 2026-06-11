@@ -246,14 +246,10 @@ impl BlockDevice for SyncBlock {
             }
         }
     }
-    fn flush(&self) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-    fn discard(&self, _r: LbaRange) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-    fn cancel(&self, _t: u64) -> impl Future<Output = CancelResult> + Send {
-        async { CancelResult::NotFound }
+    async fn flush(&self) {}
+    async fn discard(&self, _r: LbaRange) {}
+    async fn cancel(&self, _t: u64) -> CancelResult {
+        CancelResult::NotFound
     }
 }
 

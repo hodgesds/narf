@@ -195,7 +195,7 @@ impl FileOps for DevWatchdog {
     ///   - Calls `watchdog_ping` regardless (any write = kick).
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let n = buf.len();
-        let magic_v = buf.iter().any(|&b| b == b'V');
+        let magic_v = buf.contains(&b'V');
         if magic_v {
             self.state.magic_close.store(true, Ordering::Release);
         }
@@ -663,7 +663,7 @@ pub fn register_bridge() {
         let auth = narf_filesystem::bootstrap_mount_authority();
         let _ = narf_filesystem::registry().mount(&auth, "/sys/class/watchdog", WatchdogSysFs);
 
-        let _ = narf_console::write_str(
+        narf_console::write_str(
             "  watchdog-bridge: /dev/watchdog0 + /sys/class/watchdog/watchdog0 registered\n",
         );
 

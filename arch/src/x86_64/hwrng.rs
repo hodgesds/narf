@@ -112,6 +112,7 @@ pub unsafe fn rdrand_u32() -> Option<u32> {
         if let Some(v) = unsafe { try_rdrand_u32() } {
             return Some(v);
         }
+        // SAFETY: the inline asm only touches its declared operands and preserves the required invariants.
         unsafe { asm!("pause", options(nostack, nomem, preserves_flags)) };
     }
     None

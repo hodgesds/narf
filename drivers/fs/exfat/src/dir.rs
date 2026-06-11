@@ -15,10 +15,10 @@
 //!   §7.3 Volume Label Directory Entry (type 0x83).
 //!   §7.4 File Directory Entry (type 0x85).
 //!   §7.6 Stream Extension Directory Entry (type 0xC0).
-//!     §7.6.5 GeneralSecondaryFlags — bit 0 AllocationPossible,
-//!       bit 1 NoFatChain (data is contiguous).
+//!   §7.6.5 GeneralSecondaryFlags — bit 0 AllocationPossible,
+//!   bit 1 NoFatChain (data is contiguous).
 //!   §7.7 File Name Directory Entry (type 0xC1) — 15 UTF-16 chars
-//!       per slot.
+//!   per slot.
 //!   <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
 
 /// Size of every exFAT directory entry, in bytes (§6 — fixed).

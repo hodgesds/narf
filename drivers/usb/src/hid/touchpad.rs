@@ -54,7 +54,7 @@ use narf_input::{
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::hid::HidError;
-use crate::xhci::{self, EndpointConfig, EndpointKind, PortSpeed, Xhci};
+use crate::xhci::{EndpointConfig, EndpointKind, Xhci};
 
 /// HID class triple constants (USB 2.0 §9.6.5 + HID 1.11 §4).
 pub const HID_INTERFACE_CLASS: u8 = 0x03;

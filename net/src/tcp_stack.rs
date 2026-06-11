@@ -8,10 +8,10 @@
 //! - `tcp::congestion`     — CUBIC (RFC 9438) + NewReno (RFC 5681).
 //! - `tcp::sack`           — RFC 2018 selective ACK.
 //! - `tcp::options`        — MSS, Window Scale (RFC 7323),
-//!                           Timestamps (RFC 7323), SACK-Permitted.
+//!   Timestamps (RFC 7323), SACK-Permitted.
 //! - `tcp::socket_buf`     — send + reassembly buffers.
 //! - `tcp::core`           — TCB, segment-arrival dispatch, public
-//!                           API surface.
+//!   API surface.
 //!
 //! ## What this file owns
 //!
@@ -156,9 +156,7 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
         arp_cache::insert(name, arp.spa, arp.sha);
     }
     if arp.op == ARP_OP_REQUEST {
-        let snap = iface_name
-            .and_then(|n| iface::lookup(n))
-            .or_else(iface::primary);
+        let snap = iface_name.and_then(iface::lookup).or_else(iface::primary);
         let iface = match snap {
             Some(i) => i,
             None => return,

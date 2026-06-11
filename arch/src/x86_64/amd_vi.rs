@@ -527,6 +527,7 @@ unsafe fn w64(base: usize, off: usize, v: u64) {
 pub unsafe fn read_caps(reg_base: usize) -> AmdViCaps {
     // SAFETY: caller-asserted.
     let ctrl = unsafe { r64(reg_base, AMD_VI_CTRL) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let efr = unsafe { r64(reg_base, AMD_VI_EXT_FEATURES) };
     decode_caps(ctrl, efr)
 }
@@ -549,8 +550,15 @@ pub unsafe fn read_ctrl(reg_base: usize) -> u64 {
     unsafe { r64(reg_base, AMD_VI_CTRL) }
 }
 
+/// Write the AMD-Vi control register.
+///
+/// # Safety
+/// `reg_base` must be the AMD-Vi engine's MMIO mapping. The caller is
+/// responsible for the control bits written (enabling/disabling the IOMMU
+/// changes DMA-remapping behaviour for all downstream devices).
 pub unsafe fn write_ctrl(reg_base: usize, value: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller-asserted `reg_base` is the engine's MMIO base; `w64`
+    // writes the CTRL register at the in-range `AMD_VI_CTRL` offset.
     unsafe {
         w64(reg_base, AMD_VI_CTRL, value);
     }

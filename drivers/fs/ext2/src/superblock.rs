@@ -335,7 +335,7 @@ impl Superblock {
     /// Number of block groups in the volume — ceil(blocks_count /
     /// blocks_per_group).
     pub fn block_group_count(&self) -> u32 {
-        (self.blocks_count + self.blocks_per_group - 1) / self.blocks_per_group
+        self.blocks_count.div_ceil(self.blocks_per_group)
     }
 
     /// Bytes per inode — for rev-0 volumes this is fixed at 128;

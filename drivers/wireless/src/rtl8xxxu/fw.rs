@@ -129,6 +129,7 @@ impl FwLayout {
 }
 
 /// Iterator over firmware pages.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct FwPageIter<'a> {
     blob: &'a [u8],
     pos: usize,

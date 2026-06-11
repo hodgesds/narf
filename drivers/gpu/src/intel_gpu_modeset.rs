@@ -48,7 +48,7 @@
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use crate::dp_aux::{AuxChannel, AuxError};
+use crate::dp_aux::AuxError;
 use crate::intel_gpu_aux::{IntelAux, MmioWindow};
 use crate::intel_gpu_ddi::Ddi;
 use crate::intel_gpu_pipes::Pipe;

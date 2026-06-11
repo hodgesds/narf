@@ -89,7 +89,7 @@ impl VirtioFsPci {
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded cap-list walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
-        let device_cap = caps.device_cfg.clone().ok_or(VirtioPciError::NoCommonCfg)?;
+        let device_cap = caps.device_cfg.ok_or(VirtioPciError::NoCommonCfg)?;
         // SAFETY: caller-owned BARs.
         let common = unsafe { map_cap(device, &caps.common) }?;
         let notify = unsafe { map_cap(device, &caps.notify) }?;

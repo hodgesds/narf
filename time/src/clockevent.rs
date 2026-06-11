@@ -133,11 +133,9 @@ pub static TICK_VECTOR: AtomicU8 = AtomicU8::new(0);
 pub fn register(dev: &'static dyn ClockEvent) {
     let mut slots = REGISTRY.lock();
     // Dedup by name to avoid double-registration on test reruns.
-    for slot in slots.iter() {
-        if let Some(existing) = slot {
-            if existing.name() == dev.name() {
-                return;
-            }
+    for existing in slots.iter().flatten() {
+        if existing.name() == dev.name() {
+            return;
         }
     }
     for slot in slots.iter_mut() {

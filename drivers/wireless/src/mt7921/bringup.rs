@@ -102,6 +102,7 @@ impl Default for BringUpConfig {
 /// What the orchestrator produces on a (real-silicon) successful
 /// bring-up. The ring set is owned by the caller after this; the
 /// caller drives the data-path TX/RX loop from there.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct BringUpResult {
     pub rings: dma::RingSet,
     pub config: BringUpConfig,

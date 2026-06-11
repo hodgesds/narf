@@ -184,6 +184,30 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// A file's ownership triplet for a POSIX access check.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FileOwner {
+    pub uid: u32,
+    pub gid: u32,
+    /// Low 9 bits: rwxrwxrwx.
+    pub perms: u16,
+}
+
+/// The accessing process's identity for a POSIX access check.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Accessor {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// The set of access bits being requested (R=4, W=2, X=1).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccessRequest {
+    pub read: bool,
+    pub write: bool,
+    pub exec: bool,
+}
+
 /// POSIX-2017 §B.2.1 access check: given a file's mode/uid/gid and
 /// the accessor's identity, decide whether the requested operation
 /// (one of read/write/exec) is permitted.
@@ -191,45 +215,36 @@ pub struct Stat {
 /// - UID 0 (root) is always allowed (POSIX privileged-process rule).
 /// - Otherwise: pick owner / group / other triplet by matching uid
 ///   then gid, and AND with the requested-mode bits (R=4, W=2, X=1).
-pub fn posix_access_ok(
-    file_uid: u32,
-    file_gid: u32,
-    file_perms: u16,
-    accessor_uid: u32,
-    accessor_gid: u32,
-    want_r: bool,
-    want_w: bool,
-    want_x: bool,
-) -> bool {
-    if accessor_uid == 0 {
+pub fn posix_access_ok(file: FileOwner, accessor: Accessor, want: AccessRequest) -> bool {
+    if accessor.uid == 0 {
         // Root always has read+write; exec still requires *some*
         // exec bit on the file (matches Linux's get_acl_root path
         // where root gets X iff any exec bit is set, otherwise the
         // file is treated as data even for root).
-        if want_x && (file_perms & 0o111) == 0 {
+        if want.exec && (file.perms & 0o111) == 0 {
             return false;
         }
         return true;
     }
-    let triplet_shift = if accessor_uid == file_uid {
+    let triplet_shift = if accessor.uid == file.uid {
         6 // owner: bits 8..6
-    } else if accessor_gid == file_gid {
+    } else if accessor.gid == file.gid {
         3 // group: bits 5..3
     } else {
         0 // other: bits 2..0
     };
-    let bits = (file_perms >> triplet_shift) & 0o7;
-    let mut want = 0u16;
-    if want_r {
-        want |= 0o4;
+    let bits = (file.perms >> triplet_shift) & 0o7;
+    let mut want_bits = 0u16;
+    if want.read {
+        want_bits |= 0o4;
     }
-    if want_w {
-        want |= 0o2;
+    if want.write {
+        want_bits |= 0o2;
     }
-    if want_x {
-        want |= 0o1;
+    if want.exec {
+        want_bits |= 0o1;
     }
-    (bits & want) == want
+    (bits & want_bits) == want_bits
 }
 
 /// Combined `(FileType, perms)` mode word.
@@ -855,10 +870,8 @@ impl MountNamespace {
                 || m.path == "/"
                 || (abs.starts_with(m.path.as_str())
                     && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match {
-                if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
-                    best = Some(m);
-                }
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                best = Some(m);
             }
         }
         let m = best?;
@@ -1091,10 +1104,8 @@ impl VfsRegistry {
                 || m.path == "/"
                 || (abs.starts_with(m.path.as_str())
                     && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
-            if is_match {
-                if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
-                    best = Some(m);
-                }
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                best = Some(m);
             }
         }
         let m = best?;
@@ -1144,13 +1155,12 @@ impl VfsRegistry {
         // Match the longest mount prefix against `parent_path`.
         let mut best: Option<&Mount> = None;
         for m in q.iter() {
-            if parent_path == m.path
+            if (parent_path == m.path
                 || (parent_path.starts_with(m.path.as_str())
-                    && parent_path.as_bytes().get(m.path.len()) == Some(&b'/'))
+                    && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
+                && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len()
             {
-                if best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
-                    best = Some(m);
-                }
+                best = Some(m);
             }
         }
         let m = best?;
@@ -1510,8 +1520,9 @@ impl fmt::Debug for InitramfsDir {
     }
 }
 
-unsafe impl Send for InitramfsDir {}
-unsafe impl Sync for InitramfsDir {}
+// `InitramfsDir` holds only a `&'static [InitramfsEntry]` and a `String`, both
+// of which are already `Send` + `Sync` (the entries borrow immutable archive
+// bytes), so the auto-derived impls suffice — no manual `unsafe impl` needed.
 
 impl InitramfsDir {
     fn child_prefix(&self, name: &str) -> String {

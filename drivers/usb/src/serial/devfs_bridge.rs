@@ -42,7 +42,7 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN, POLL_OUT};
+use narf_filesystem::{FileOps, FileType, FsFuture, Mode, Stat, POLL_IN, POLL_OUT};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::ChipFamily;
@@ -361,7 +361,7 @@ pub mod tests {
         __reset_for_test();
         let idx = register_tty_usb(ChipFamily::Ch341);
         let port = get_port(idx).unwrap();
-        let node = TtyUsbFile::new(port.clone());
+        let _node = TtyUsbFile::new(port.clone());
         let buf = b"hello";
         // Inline the future by calling poll directly via block_on equivalent.
         // In no_std we just execute the synchronous path.
@@ -369,7 +369,7 @@ pub mod tests {
         let _ = n;
         // Use FileOps::write path: drive the future to completion.
         let written = {
-            let mut dummy_buf = *b"hello";
+            let dummy_buf = *b"hello";
             port.lock().tx.push(&dummy_buf);
             port.lock().tx.count
         };
@@ -391,7 +391,7 @@ pub mod tests {
         // Simulate bulk-IN delivery: push bytes into RX ring.
         port.lock().rx.push(b"world");
         // Now read via FileOps.
-        let node = TtyUsbFile::new(port.clone());
+        let _node = TtyUsbFile::new(port.clone());
         let mut out = [0u8; 8];
         let n = port.lock().rx.pop(&mut out);
         if n != 5 {
@@ -422,7 +422,7 @@ pub mod tests {
         let val = kobj.attr_show("device/driver");
         match val {
             Some(s) if s.contains("ch341") => TestResult::Pass,
-            Some(s) => TestResult::Fail("driver attr wrong value"),
+            Some(_s) => TestResult::Fail("driver attr wrong value"),
             None => TestResult::Fail("device/driver attr missing"),
         }
     }

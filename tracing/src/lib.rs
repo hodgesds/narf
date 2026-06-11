@@ -731,7 +731,7 @@ pub fn current_event_sink_name() -> Option<&'static str> {
     // a `Box<Box<dyn EventSink>>`. The boxed contents live until a
     // subsequent install drops them; on the read side we never alias
     // through `&mut`, only `&`, so the &-borrow is sound.
-    let sink: &Box<dyn EventSink> = unsafe { &*p };
+    let sink: &dyn EventSink = unsafe { &**p };
     Some(sink.name())
 }
 

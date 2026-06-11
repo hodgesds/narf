@@ -106,6 +106,7 @@ const PCI_PROGIF_XHCI: u8 = 0x30;
 
 // Capability-register offsets (relative to BAR0 + 0).
 const CAP_CAPLENGTH: u64 = 0x00; // u8
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CAP_HCIVERSION: u64 = 0x02; // u16
 const CAP_HCSPARAMS1: u64 = 0x04; // u32: bits[7:0]=MaxSlots, [18:8]=MaxIntrs, [31:24]=MaxPorts
 const CAP_HCCPARAMS1: u64 = 0x10; // u32
@@ -132,6 +133,7 @@ const USBCMD_INTE: u32 = 1 << 2; // Interrupter Enable
 
 // USBSTS bits.
 const USBSTS_HCH: u32 = 1 << 0; // Host Controller Halted
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const USBSTS_HSE: u32 = 1 << 2; // Host System Error (RW1C — fatal: PCIe / mem fault)
 const USBSTS_EINT: u32 = 1 << 3; // Event Interrupt (w1c)
 const USBSTS_HCE: u32 = 1 << 12; // Host Controller Error (internal HC fault)
@@ -155,6 +157,7 @@ const PORTSC_PRC: u32 = 1 << 21; // Port Reset Change (RW1C)
 // Interrupter Register Set (§5.5.2). One IR per interrupter,
 // 32 bytes apart, starting at RTSOFF + 0x20 (IR0).
 const IR_BASE_OFF: u64 = 0x20;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const IR_STRIDE: u64 = 0x20;
 const IR_IMAN: u64 = 0x00; // u32
 const IR_IMOD: u64 = 0x04; // u32
@@ -196,6 +199,7 @@ const TRB_TYPE_DISABLE_SLOT_CMD: u32 = 10;
 const TRB_TYPE_ADDRESS_DEVICE_CMD: u32 = 11;
 const TRB_TYPE_CONFIGURE_ENDPOINT_CMD: u32 = 12;
 const TRB_TYPE_EVAL_CONTEXT_CMD: u32 = 13;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const TRB_TYPE_NO_OP_CMD: u32 = 23;
 const TRB_TYPE_TRANSFER_EVENT: u32 = 32;
 const TRB_TYPE_CMD_COMPLETION: u32 = 33;
@@ -206,6 +210,7 @@ const TRB_TYPE_PORT_STATUS_CHANGE: u32 = 34;
 const EP_TYPE_ISOCH_OUT: u32 = 1;
 const EP_TYPE_BULK_OUT: u32 = 2;
 const EP_TYPE_INT_OUT: u32 = 3;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EP_TYPE_CONTROL: u32 = 4;
 const EP_TYPE_ISOCH_IN: u32 = 5;
 const EP_TYPE_BULK_IN: u32 = 6;
@@ -1328,7 +1333,6 @@ impl Xhci {
         // attached" — the latter is the Renoir+internal-touchpad
         // hypothesis (TP wired to an internal port that should
         // come up CCS=1 once powered).
-        use core::fmt::Write as _;
         let mut connected = 0u32;
         for port in 1..=max_ports {
             let port_off = op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
@@ -1961,6 +1965,7 @@ impl Xhci {
     /// signals from the controller (PCIe fault, internal HC error)
     /// — surface them via the log so a future debugger can spot
     /// "controller fell over" vs "device misbehaved".
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn snapshot_usbsts_diagnostics(&self) -> Option<&'static str> {
         // SAFETY: identity-mapped MMIO; OP_USBSTS within bounds.
         let s = unsafe { self.mmio.read32(self.op_off + OP_USBSTS) };

@@ -122,11 +122,8 @@ pub fn decode(blob: &[u8]) -> Result<BlobTrailer<'_>, FirmwareError> {
             break;
         }
         let v = &metadata[i + 2..i + 2 + len];
-        match tag {
-            0x01 => {
-                version = core::str::from_utf8(v).ok().map(|s| s.into());
-            }
-            _ => {}
+        if tag == 0x01 {
+            version = core::str::from_utf8(v).ok().map(|s| s.into());
         }
         i += 2 + len;
     }
@@ -220,9 +217,9 @@ fn verify_key_cap() -> Option<Cap<Key<Ed25519Verify>, Read>> {
         // sufficient. Stage-7 swaps this for a daemon-minted cap.
         let write: Cap<Key<Ed25519Verify>, narf_capabilities::Write> = Cap::bootstrap();
         let read = write.derive().ok();
-        *g = read.clone();
+        *g = read;
     }
-    g.clone()
+    *g
 }
 
 /// Register a `(fingerprint, pubkey)` entry in the trusted-

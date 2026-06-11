@@ -563,8 +563,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         while bm_off < bm_len {
             self.read_cluster(bm_cluster, &mut buf).await?;
             let to_consume = ((bm_len - bm_off) as usize).min(buf.len());
-            for byte_idx in 0..to_consume {
-                let byte = buf[byte_idx];
+            for (byte_idx, &byte) in buf.iter().enumerate().take(to_consume) {
                 for bit in 0..8u32 {
                     let bit_index = (bm_off as u32 * 8) + byte_idx as u32 * 8 + bit;
                     if bit_index >= cluster_count {

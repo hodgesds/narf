@@ -1038,10 +1038,10 @@ unsafe fn wake_raw(data: *const ()) {
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
     WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
+    let ptr = data as *const AtomicBool;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the AtomicBool behind `data` is valid for the duration of this
     // call.
-    let ptr = data as *const AtomicBool;
     unsafe {
         (*ptr).store(true, Ordering::Release);
     }
@@ -1355,8 +1355,10 @@ pub fn run_until_empty() {
             // pre-emptively.
             #[cfg(target_arch = "x86_64")]
             let saved_cr3: u64 = if slot.addr_space.is_some() {
-                // SAFETY: read_cr3 has no preconditions.
                 let raw: u64;
+                // SAFETY: Reading CR3 is an unprivileged-of-side-effects
+                // ring-0 instruction with no memory operand; `nomem`/`nostack`
+                // accurately describe it and `raw` receives the value.
                 unsafe {
                     core::arch::asm!(
                         "mov {0}, cr3",
@@ -1689,11 +1691,11 @@ fn local_ready_count(cpu: usize) -> usize {
 /// while APs idle).
 pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
     let mut out = alloc::vec::Vec::new();
-    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+    for (cpu, ready) in READY.iter().enumerate().take(narf_lib::percpu::MAX_CPUS) {
         if !narf_lib::smp::is_online(cpu as u32) {
             continue;
         }
-        let len = READY[cpu].lock().as_ref().map(|d| d.len()).unwrap_or(0);
+        let len = ready.lock().as_ref().map(|d| d.len()).unwrap_or(0);
         out.push((cpu as u32, len));
     }
     out

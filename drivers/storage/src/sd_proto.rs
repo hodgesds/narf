@@ -155,7 +155,7 @@ impl Cid {
         let product_serial = u32::from_be_bytes([cid[9], cid[10], cid[11], cid[12]]);
         // bytes 13..14 hold MDT (year:8 | month:4) in the top 12 bits.
         let mdt = u16::from_be_bytes([cid[13], cid[14]]);
-        let year_offset = ((mdt >> 4) & 0xFF) as u16;
+        let year_offset = (mdt >> 4) & 0xFF;
         let manufacture_month = (mdt & 0x0F) as u8;
         let manufacture_year = 2000 + year_offset;
 

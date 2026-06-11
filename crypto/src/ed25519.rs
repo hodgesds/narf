@@ -153,9 +153,9 @@ pub fn reduce_mod_l(h: &[u8; 64]) -> [u8; 32] {
     for i in (0..512).rev() {
         // rem = rem << 1
         let mut carry = 0u64;
-        for j in 0..8 {
-            let next_carry = rem[j] >> 63;
-            rem[j] = (rem[j] << 1) | carry;
+        for limb in &mut rem {
+            let next_carry = *limb >> 63;
+            *limb = (*limb << 1) | carry;
             carry = next_carry;
         }
 
@@ -202,9 +202,9 @@ fn sub_l_large(val: &mut [u64; 8]) {
         val[i] = res2;
         borrow = if b || b2 { 1 } else { 0 };
     }
-    for i in 4..8 {
-        let (res, b) = val[i].overflowing_sub(borrow);
-        val[i] = res;
+    for limb in val.iter_mut().skip(4) {
+        let (res, b) = limb.overflowing_sub(borrow);
+        *limb = res;
         borrow = if b { 1 } else { 0 };
     }
 }
@@ -248,9 +248,9 @@ pub(crate) fn mul_add_mod_l(k: &[u8; 32], a: &[u8; 32], r: &[u8; 32]) -> [u8; 32
         prod[i] = res2;
         carry = if b || b2 { 1 } else { 0 };
     }
-    for i in 4..8 {
-        let (res, b) = prod[i].overflowing_add(carry);
-        prod[i] = res;
+    for limb in prod.iter_mut().skip(4) {
+        let (res, b) = limb.overflowing_add(carry);
+        *limb = res;
         carry = if b { 1 } else { 0 };
     }
 

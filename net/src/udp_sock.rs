@@ -311,10 +311,8 @@ pub fn udp_send(
     };
 
     // SO_BROADCAST guard (Linux udp.c:1093).
-    if dst.ip == [255, 255, 255, 255] || dst.ip[3] == 255 {
-        if !sock.options.lock().broadcast {
-            return Err(UdpError::NoBroadcastPermission);
-        }
+    if (dst.ip == [255, 255, 255, 255] || dst.ip[3] == 255) && !sock.options.lock().broadcast {
+        return Err(UdpError::NoBroadcastPermission);
     }
 
     let (opts_sndbuf, ip_ttl, ip_tos) = {
@@ -567,7 +565,7 @@ fn smoke_udp_bind_ephemeral_port_range() -> TestResult {
     };
     let p = sock.local.port;
     udp_close(&sock);
-    if p < UDP_EPHEMERAL_MIN || p > UDP_EPHEMERAL_MAX {
+    if !(UDP_EPHEMERAL_MIN..=UDP_EPHEMERAL_MAX).contains(&p) {
         return TestResult::Fail("ephemeral port outside Linux 32768-60999 range");
     }
     TestResult::Pass
@@ -593,8 +591,10 @@ kernel_test_in!("net/udp", smoke_udp_bind_collision_returns_addr_in_use);
 fn smoke_udp_reuseport_two_sockets_same_port() -> TestResult {
     let port = 59002u16;
     let addr = SocketAddrV4::new([127, 0, 0, 1], port);
-    let mut opts = UdpOptions::default();
-    opts.reuseport = true;
+    let opts = UdpOptions {
+        reuseport: true,
+        ..Default::default()
+    };
     let s1 = match udp_bind(addr, opts.clone()) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("s1 bind failed"),
@@ -692,8 +692,10 @@ kernel_test_in!("net/udp", smoke_udp_broadcast_guard);
 
 fn smoke_udp_rcvbuf_overflow_drops_oldest() -> TestResult {
     let port = 59013u16;
-    let mut opts = UdpOptions::default();
-    opts.rcvbuf = 2; // keep only 2 datagrams
+    let opts = UdpOptions {
+        rcvbuf: 2, // keep only 2 datagrams
+        ..Default::default()
+    };
     let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), opts) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("bind failed"),
@@ -771,8 +773,10 @@ kernel_test_in!("net/udp", smoke_udp_large_datagram_under_mtu);
 fn smoke_udp_reuseport_load_balance() -> TestResult {
     let port = 59015u16;
     let addr = SocketAddrV4::new([0, 0, 0, 0], port);
-    let mut opts = UdpOptions::default();
-    opts.reuseport = true;
+    let opts = UdpOptions {
+        reuseport: true,
+        ..Default::default()
+    };
     let s1 = match udp_bind(addr, opts.clone()) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("s1 bind failed"),

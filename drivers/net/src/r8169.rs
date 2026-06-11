@@ -99,9 +99,11 @@ const TPPOLL_NPQ: u8 = 1 << 6;
 // 9346CR (config-write lock). Bits 7:6 = EEM. 00=normal, 11=config-
 // register write-enable.
 const EEM_NORMAL: u8 = 0x00;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EEM_CONFIG_WRITE: u8 = 0xC0;
 
 // RCR bits.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const RCR_AAP: u32 = 1 << 0; // Accept All (promiscuous)
 const RCR_APM: u32 = 1 << 1; // Accept Physical Match
 const RCR_AM: u32 = 1 << 2; // Accept Multicast
@@ -151,6 +153,7 @@ pub const TD1_GTSENV6: u32 = 1 << 25;
 /// v2 MSS field shift in word1 (bits[28:18]). Mask = 0x1FFC_0000.
 pub const TD1_MSS_SHIFT: u32 = 18;
 /// v2 IPv4 header checksum insert (word1 bit 29).
+#[allow(non_upper_case_globals)] // TODO(narf): mirrors the datasheet register/bit name
 pub const TD1_IPv4_CS: u32 = 1 << 29;
 /// v2 TCP checksum insert (word1 bit 30).
 pub const TD1_TCP_CS: u32 = 1 << 30;
@@ -283,6 +286,7 @@ impl Desc {
     /// a bad result. If no OK bits are set the frame had no checksummed
     /// protocol and we return None. Source: Linux r8169_main.c
     /// `rtl8169_rx_csum`.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn rx_csum_result(&self) -> RxCsumResult {
         let ip_done = self.flags_len & RX_IPOK != 0;
         let tcp_done = self.flags_len & RX_TCPOK != 0;

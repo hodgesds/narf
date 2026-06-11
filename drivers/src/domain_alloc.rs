@@ -93,11 +93,7 @@ pub fn claimed_in_domain(domain: u8) -> u64 {
     }
     let base = domain_va_base(domain).unwrap_or(0);
     let next = NEXT_VA[domain as usize].load(Ordering::Relaxed);
-    if next < base + DOMAIN_HEAP_OFFSET {
-        0
-    } else {
-        next - (base + DOMAIN_HEAP_OFFSET)
-    }
+    next.saturating_sub(base + DOMAIN_HEAP_OFFSET)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -262,6 +258,15 @@ pub unsafe fn claim_mmio_in_domain(
 /// Convenience: look up a registered driver's assigned domain by
 /// name and claim MMIO for it. Returns `BadDomain` if the driver
 /// hasn't been registered yet.
+///
+/// # Safety
+/// This forwards directly to [`claim_mmio_in_domain`], so the caller
+/// must uphold that function's contract:
+/// - `pa` must be a valid MMIO physical address belonging to the
+///   device owned by the driver registered under `name` (the
+///   cap-system gates this).
+/// - `flags` typically include `PRESENT | WRITABLE | NO_CACHE` for
+///   MMIO; the helper does not impose them — caller decides.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn claim_mmio_for_driver(
     name: &str,
@@ -273,6 +278,10 @@ pub unsafe fn claim_mmio_for_driver(
         Some(d) => d,
         None => return Err(DomainAllocError::BadDomain),
     };
-    // SAFETY: caller-asserted MMIO validity carries through.
+    // SAFETY: `domain` is the domain bound to `name`, so the mapping
+    // lands in that driver's private address-space region. `pa`, `len`
+    // and `flags` are passed through unchanged; the caller has asserted
+    // (per this function's `# Safety`) that `pa..pa+len` is MMIO owned
+    // by this driver, which is exactly `claim_mmio_in_domain`'s contract.
     unsafe { claim_mmio_in_domain(domain, pa, len, flags) }
 }

@@ -592,7 +592,7 @@ impl Ahci {
         let scratch =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
         let base = scratch.phys_addr().raw();
-        let cmd_list = base + 0x000;
+        let cmd_list = base;
         let fis_recv = base + 0x400;
         let cmd_tbl = base + 0x500;
         let data_buf = base + 0x600;
@@ -653,7 +653,7 @@ impl Ahci {
         // Program port CLB / FB.
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write32(off + 0x00, cmd_list as u32);
+            self.mmio.write32(off, cmd_list as u32);
             self.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
             self.mmio.write32(off + 0x08, fis_recv as u32);
             self.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -717,9 +717,11 @@ impl Ahci {
 
         // Copy out the IDENTIFY DEVICE response.
         let mut out = [0u8; 512];
-        // SAFETY: identity-mapped DMA.
-        for i in 0..512usize {
-            out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+        for (i, byte) in out.iter_mut().enumerate() {
+            // SAFETY: `data_buf` is the base of the 512-byte DMA region the
+            // HBA filled with the IDENTIFY response; `i < 512` so each read is
+            // within that allocated, identity-mapped page.
+            *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
         }
         // Stop the port.
         // SAFETY: caller-asserted.
@@ -760,7 +762,7 @@ pub unsafe fn ahci_write_lba(
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
@@ -771,8 +773,8 @@ pub unsafe fn ahci_write_lba(
         for i in 0..0x600 {
             core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
         }
-        for i in 0..(n_sectors as usize) * 512 {
-            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, data[i]);
+        for (i, &b) in data.iter().enumerate().take((n_sectors as usize) * 512) {
+            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, b);
         }
     }
 
@@ -812,7 +814,7 @@ pub unsafe fn ahci_write_lba(
 
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -893,7 +895,7 @@ pub unsafe fn ahci_read_lba(
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
@@ -956,7 +958,7 @@ pub unsafe fn ahci_read_lba(
 
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -997,9 +999,11 @@ pub unsafe fn ahci_read_lba(
         return Err(AhciError::ResetTimeout);
     }
 
-    // SAFETY: identity-mapped DMA.
-    for i in 0..(n_sectors as usize) * 512 {
-        out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+    for (i, byte) in out.iter_mut().enumerate().take((n_sectors as usize) * 512) {
+        // SAFETY: `data_buf` is the base of the DMA region the HBA filled with
+        // the read payload; `i < n_sectors*512` bytes which is the size of that
+        // identity-mapped allocation, so each read is in-bounds.
+        *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
@@ -1043,7 +1047,7 @@ pub async unsafe fn ahci_read_lba_async(
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
@@ -1086,7 +1090,7 @@ pub async unsafe fn ahci_read_lba_async(
 
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -1108,9 +1112,11 @@ pub async unsafe fn ahci_read_lba_async(
     let r = unsafe { ahci.issue_and_wait_async(port_idx, 1).await };
     r?;
 
-    // SAFETY: identity-mapped DMA.
-    for i in 0..(n_sectors as usize) * 512 {
-        out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+    for (i, byte) in out.iter_mut().enumerate().take((n_sectors as usize) * 512) {
+        // SAFETY: `data_buf` is the base of the DMA region the HBA filled with
+        // the read payload; `i < n_sectors*512` bytes which is the size of that
+        // identity-mapped allocation, so each read is in-bounds.
+        *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
     }
     // SAFETY: caller-asserted.
     let _ = unsafe { ahci.port_idle(port_idx) };
@@ -1148,7 +1154,7 @@ pub async unsafe fn ahci_write_lba_async(
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
@@ -1157,8 +1163,8 @@ pub async unsafe fn ahci_write_lba_async(
         for i in 0..0x600 {
             core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
         }
-        for i in 0..(n_sectors as usize) * 512 {
-            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, data[i]);
+        for (i, &b) in data.iter().enumerate().take((n_sectors as usize) * 512) {
+            core::ptr::write_volatile((data_buf + i as u64) as *mut u8, b);
         }
     }
     // SAFETY: identity-mapped DMA.
@@ -1195,7 +1201,7 @@ pub async unsafe fn ahci_write_lba_async(
 
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -1317,7 +1323,7 @@ unsafe fn ahci_lba_ncq(
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
     let data_buf = base + 0x600;
@@ -1328,8 +1334,8 @@ unsafe fn ahci_lba_ncq(
             core::ptr::write_volatile((base + i as u64) as *mut u8, 0);
         }
         if write {
-            for i in 0..(n_sectors as usize) * 512 {
-                core::ptr::write_volatile((data_buf + i as u64) as *mut u8, data_in[i]);
+            for (i, &b) in data_in.iter().enumerate().take((n_sectors as usize) * 512) {
+                core::ptr::write_volatile((data_buf + i as u64) as *mut u8, b);
             }
         }
     }
@@ -1389,7 +1395,7 @@ unsafe fn ahci_lba_ncq(
 
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -1436,9 +1442,11 @@ unsafe fn ahci_lba_ncq(
 
     // For reads, copy back.
     if !write {
-        // SAFETY: identity-mapped DMA.
-        for i in 0..(n_sectors as usize) * 512 {
-            out[i] = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
+        for (i, byte) in out.iter_mut().enumerate().take((n_sectors as usize) * 512) {
+            // SAFETY: `data_buf` is the base of the DMA region the HBA filled
+            // for this read; `i < n_sectors*512` which is that region's size, so
+            // the volatile read stays inside the identity-mapped allocation.
+            *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
         }
     }
     // SAFETY: caller-asserted.
@@ -1513,6 +1521,8 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
 
     // Stop port if running.
+    // SAFETY: `pmp_read_gscr`'s contract guarantees the caller owns the HBA
+    // exclusively and `port_idx < 32`, which is exactly `port_idle`'s contract.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
     // Use the persistent scratch at the same layout as identify_device
@@ -1521,7 +1531,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
 
@@ -1557,7 +1567,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     // Program port CLB / FB.
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -1580,7 +1590,11 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     let mut errored = false;
     let done = narf_scheduler::responsive_spin_until(
         || {
+            // SAFETY: `off` is this port's register block (port_idx < 32, so
+            // within the mapped HBA BAR) and PORT_CI is a valid port-register
+            // offset, so the read is in-range; we own the HBA exclusively.
             let ci = unsafe { ahci.mmio.read32(off + PORT_CI) };
+            // SAFETY: same port register block; 0x20 is PORT_TFD, in-range.
             let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
             if tfd & 0x01 != 0 {
                 errored = true;
@@ -1591,6 +1605,8 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
         narf_time::Deadline::after_ms(5_000),
     );
     if errored || !done {
+        // SAFETY: caller owns the HBA exclusively and `port_idx < 32`, matching
+        // `port_idle`'s contract.
         let _ = unsafe { ahci.port_idle(port_idx) };
         return Err(AhciError::ResetTimeout);
     }
@@ -1610,6 +1626,9 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     //   nsect = val[7:0], lbal = val[15:8], lbam = val[23:16],
     //   lbah = val[31:24].  Reference: Linux libata-pmp.c line 57.
     let d2h = fis_recv + 0x40;
+    // SAFETY: `fis_recv` is the identity-mapped received-FIS region of the
+    // scratch DMA page that the HBA wrote the D2H Register FIS into; +0x40 is
+    // the D2H FIS area and offsets 4..=8 are within the 256-byte FIS structure.
     let val = unsafe {
         let nsect = core::ptr::read_volatile((d2h + 4) as *const u8) as u32;
         let lbal = core::ptr::read_volatile((d2h + 5) as *const u8) as u32;
@@ -1618,6 +1637,8 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
         nsect | (lbal << 8) | (lbam << 16) | (lbah << 24)
     };
 
+    // SAFETY: `pmp_read_gscr`'s contract guarantees exclusive HBA ownership and
+    // `port_idx < 32`, satisfying `port_idle`'s contract.
     let _ = unsafe { ahci.port_idle(port_idx) };
     Ok(val)
 }
@@ -1642,13 +1663,20 @@ pub unsafe fn discover_pmp_topology(ahci: &Ahci, port_idx: u8) -> Option<PmpTopo
         return None;
     }
 
+    // Each `pmp_read_gscr` below requires exclusive HBA ownership and
+    // `port_idx < 32`; `discover_pmp_topology`'s own `# Safety` contract
+    // guarantees both, so forwarding `port_idx` unchanged is sound.
     // GSCR[0] = ProductId[31:16] | VendorId[15:0]
+    // SAFETY: see the comment above; contract forwarded from this fn.
     let prod_id = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_PROD_ID) }.unwrap_or(0);
     // GSCR[1] = Revision
+    // SAFETY: see above; exclusive HBA, `port_idx < 32`.
     let rev_raw = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_REV) }.unwrap_or(0);
     // GSCR[2] = bits[3:0] = number of device ports
+    // SAFETY: see above; exclusive HBA, `port_idx < 32`.
     let port_info = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_PORT_INFO) }.unwrap_or(0);
     // GSCR[64] = Features
+    // SAFETY: see above; exclusive HBA, `port_idx < 32`.
     let features = unsafe { pmp_read_gscr(ahci, port_idx, GSCR_FEAT) }.unwrap_or(0);
 
     Some(PmpTopology {
@@ -1764,13 +1792,15 @@ pub unsafe fn atapi_send_cdb(
     }
     let off = PORT_BASE_OFF + (port_idx as u64) * PORT_STRIDE;
 
+    // SAFETY: `atapi_send_cdb`'s contract guarantees exclusive HBA ownership and
+    // `port_idx < 32`, which is what `port_idle` requires.
     let _ = unsafe { ahci.port_idle(port_idx) };
 
     let base = ahci_scratch_phys();
     if base == 0 {
         return Err(AhciError::BarMapFailed);
     }
-    let cmd_list = base + 0x000;
+    let cmd_list = base;
     let fis_recv = base + 0x400;
     let cmd_tbl = base + 0x500;
 
@@ -1839,7 +1869,7 @@ pub unsafe fn atapi_send_cdb(
     // Program port CLB / FB and start.
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        ahci.mmio.write32(off + 0x00, cmd_list as u32);
+        ahci.mmio.write32(off, cmd_list as u32);
         ahci.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
         ahci.mmio.write32(off + 0x08, fis_recv as u32);
         ahci.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
@@ -1862,7 +1892,11 @@ pub unsafe fn atapi_send_cdb(
     let mut errored = false;
     let done = narf_scheduler::responsive_spin_until(
         || {
+            // SAFETY: `off` addresses this port's register block (port_idx < 32,
+            // inside the mapped HBA BAR); PORT_CI is a valid port-register
+            // offset and we own the HBA exclusively.
             let ci = unsafe { ahci.mmio.read32(off + PORT_CI) };
+            // SAFETY: same port register block; 0x20 is PORT_TFD, in-range.
             let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
             if tfd & 0x01 != 0 {
                 errored = true;
@@ -1872,6 +1906,7 @@ pub unsafe fn atapi_send_cdb(
         },
         narf_time::Deadline::after_ms(30_000),
     );
+    // SAFETY: exclusive HBA ownership and `port_idx < 32` per this fn's contract.
     let _ = unsafe { ahci.port_idle(port_idx) };
     if errored || !done {
         return Err(AhciError::ResetTimeout);
@@ -1919,7 +1954,7 @@ pub unsafe fn read_atapi_capacity(ahci: &Ahci, port_idx: u8) -> Result<(u32, u32
     // SAFETY: identity-mapped DMA.
     let (last_lba, block_size) = unsafe {
         let last_lba = u32::from_be_bytes([
-            core::ptr::read_volatile((data_buf + 0) as *const u8),
+            core::ptr::read_volatile(data_buf as *const u8),
             core::ptr::read_volatile((data_buf + 1) as *const u8),
             core::ptr::read_volatile((data_buf + 2) as *const u8),
             core::ptr::read_volatile((data_buf + 3) as *const u8),
@@ -2082,14 +2117,20 @@ pub unsafe fn handle_phyrdy_change(ahci: &Ahci, port_idx: u8) -> PortLinkState {
     }
 
     // Link-up — run COMRESET + re-read signature.
+    // SAFETY: `handle_phyrdy_change`'s contract gives exclusive HBA ownership
+    // and `port_idx < 32`, matching `port_reset`'s contract.
     let kind = match unsafe { ahci.port_reset(port_idx) } {
         Err(_) => {
+            // SAFETY: same contract forwarded — exclusive HBA, `port_idx < 32`.
             unsafe { port_enable_phyrdy_irq(ahci, port_idx) };
             return PortLinkState::Disconnected;
         }
         Ok(()) => {
             // Read new signature from PORT_SIG / PORT_SSTS.
+            // SAFETY: `off` is this port's register block (port_idx < 32, in the
+            // mapped BAR); PORT_SIG is a valid in-range port register.
             let sig = unsafe { ahci.mmio.read32(off + PORT_SIG) };
+            // SAFETY: same port register block; PORT_SSTS is in-range.
             let ssts2 = unsafe { ahci.mmio.read32(off + PORT_SSTS) };
             PortKind::from_sig(sig, ssts2)
         }

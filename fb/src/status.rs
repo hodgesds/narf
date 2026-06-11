@@ -139,11 +139,11 @@ pub fn paint(fb: &FbWriter) {
 
     // USB HID pump telemetry. All three are AtomicU32; reading
     // them never blocks on the supervisor's pump cycle.
-    let usb_pumps = narf_drivers_usb::hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
-    let usb_reports = narf_drivers_usb::hid::REPORTS_READ.load(Ordering::Relaxed);
+    let _usb_pumps = narf_drivers_usb::hid::PUMP_ALL_CALLS.load(Ordering::Relaxed);
+    let _usb_reports = narf_drivers_usb::hid::REPORTS_READ.load(Ordering::Relaxed);
     let supervisor_ticks = narf_drivers_usb::SUPERVISOR_TICKS.load(Ordering::Relaxed);
-    let supervisor_phase = narf_drivers_usb::SUPERVISOR_PHASE.load(Ordering::Relaxed);
-    let supervisor_port = narf_drivers_usb::SUPERVISOR_ATTACHING_PORT.load(Ordering::Relaxed);
+    let _supervisor_phase = narf_drivers_usb::SUPERVISOR_PHASE.load(Ordering::Relaxed);
+    let _supervisor_port = narf_drivers_usb::SUPERVISOR_ATTACHING_PORT.load(Ordering::Relaxed);
     // Clockevent diagnostics. `primary()` returns the selected
     // tick source (LAPIC or HPET). Its tick_count is the
     // platform-agnostic "did the timer fire" signal — replaces

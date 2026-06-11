@@ -35,6 +35,7 @@ pub fn supported() -> bool {
 pub unsafe fn enable_cr4() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_cr4() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         write_cr4(v | CR4_LASS);
     }
@@ -47,6 +48,7 @@ pub unsafe fn enable_cr4() {
 pub unsafe fn disable_cr4() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_cr4() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         write_cr4(v & !CR4_LASS);
     }

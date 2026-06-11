@@ -720,7 +720,7 @@ mod tests {
     kernel_test_in!("wireless/sae", smoke_sae_full_handshake_two_peers_agree);
 
     fn smoke_sae_confirm_mismatch_rejected() -> TestResult {
-        use crate::sae::{ConfirmFrame, Sae, SaeError};
+        use crate::sae::{Sae, SaeError};
 
         let pwd = b"narfwifi";
         let mac_a = [0x11u8; 6];

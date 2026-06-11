@@ -171,13 +171,13 @@ const CAP_BITS: usize = 768;
 /// Fixed-size bit array covering codes 0..CAP_BITS.
 #[derive(Clone, Debug, Default)]
 pub struct CapBitmap {
-    pub words: [u64; (CAP_BITS + 63) / 64],
+    pub words: [u64; CAP_BITS.div_ceil(64)],
 }
 
 impl CapBitmap {
     pub const fn new() -> Self {
         Self {
-            words: [0u64; (CAP_BITS + 63) / 64],
+            words: [0u64; CAP_BITS.div_ceil(64)],
         }
     }
 
@@ -512,6 +512,12 @@ pub struct Router {
 struct RouterInner {
     devices: Vec<Arc<DeviceNode>>,
     next_id: u32,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Router {

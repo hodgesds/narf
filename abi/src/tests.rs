@@ -1072,6 +1072,14 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
         // via the dispatcher hook, then poll between meaningful steps.
         let raw = DISPATCHER_PTR.load(Ordering::Relaxed);
         if raw != 0 {
+            // SAFETY: `raw` is the address of the leaked `Box<Dispatcher<4>>`
+            // stored into DISPATCHER_PTR after construction; the box is
+            // `Box::leak`ed so it lives for the rest of the test, hence the
+            // pointer stays valid and properly aligned. The bridge runs on the
+            // dispatcher's own task while it is blocked inside `dispatch_one`,
+            // so this shared `&` does not alias any concurrent `&mut`, and
+            // `request_inflight_cancel` only touches the spinlock-guarded
+            // cancel state.
             let d = unsafe { &*(raw as *const Dispatcher<4>) };
             d.request_inflight_cancel(Tag::new(args.a0));
         }
@@ -1162,6 +1170,14 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
     fn bridge(_k: FileOpKind, args: &FileOpArgs, cx: &CancelCtx<'_>) -> FileOpReturn {
         let raw = DISPATCHER_PTR.load(Ordering::Relaxed);
         if raw != 0 {
+            // SAFETY: `raw` is the address of the leaked `Box<Dispatcher<4>>`
+            // stored into DISPATCHER_PTR after construction; the box is
+            // `Box::leak`ed so it lives for the rest of the test, hence the
+            // pointer stays valid and properly aligned. The bridge runs on the
+            // dispatcher's own task while it is blocked inside `dispatch_one`,
+            // so this shared `&` does not alias any concurrent `&mut`, and
+            // `request_inflight_cancel` only touches the spinlock-guarded
+            // cancel state.
             let d = unsafe { &*(raw as *const Dispatcher<4>) };
             d.request_inflight_cancel(Tag::new(args.a0));
         }
@@ -1193,6 +1209,11 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
     let dispatcher_addr = alloc::boxed::Box::leak(dispatcher) as *mut Dispatcher<4> as usize as u64;
 
     narf_scheduler::spawn(async move {
+        // SAFETY: `dispatcher_addr` is the address of the `Box::leak`ed
+        // dispatcher, so it is valid and aligned for the whole test. This
+        // spawned task is the sole owner that calls `run`, so the `&mut`
+        // is unique; the bridge only ever takes shared `&` references via
+        // DISPATCHER_PTR while this task is parked inside `dispatch_one`.
         let d = unsafe { &mut *(dispatcher_addr as *mut Dispatcher<4>) };
         d.run().await;
     });

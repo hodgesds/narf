@@ -282,6 +282,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         //   bit 2 (U): set if CPL=3
         const PF_P: u64 = 1 << 0;
         const PF_W: u64 = 1 << 1;
+        #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
         const PF_U: u64 = 1 << 2;
         let ec = frame.error_code;
         let cr2: u64;
@@ -1411,7 +1412,7 @@ kernel_test_in!(
 fn smoke_x86_64_sa_onstack_uses_altstack_top() -> TestResult {
     // Two separate scratch regions so we can prove the frame
     // landed in the altstack, not the user stack.
-    let mut user_stack = SmokeStack::new();
+    let user_stack = SmokeStack::new();
     let altstack = SmokeStack::new();
     let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, user_stack.top());
 
@@ -1454,7 +1455,7 @@ kernel_test_in!("frame/x86_64", smoke_x86_64_sa_onstack_uses_altstack_top);
 /// behaviour (`sigsp` returns the regular sp when no altstack
 /// is configured).
 fn smoke_x86_64_sa_onstack_no_altstack_falls_back() -> TestResult {
-    let mut user_stack = SmokeStack::new();
+    let user_stack = SmokeStack::new();
     let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, user_stack.top());
 
     let params = SigDeliveryParams {

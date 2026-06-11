@@ -53,7 +53,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 // Linux uses 32 MiB (CHACHA_KEY_SIZE * 1024 * 1024) before reseeding.
 // NARF uses 1 MiB — conservative for an embedded/microkernel context where
 // boot sessions are short and hardware entropy is abundant.
-const RESEED_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MiB
+const RESEED_THRESHOLD: usize = 1024 * 1024; // 1 MiB
 
 // ── ChaCha20 constants ───────────────────────────────────────────────────────
 
@@ -106,8 +106,8 @@ impl CsprngInner {
     /// the high 8 bytes, and reset counter.
     fn seed(&mut self, entropy: &[u8; 32]) {
         // Mix new entropy into key via XOR.
-        for i in 0..32 {
-            self.key[i] ^= entropy[i];
+        for (k, &e) in self.key.iter_mut().zip(entropy.iter()) {
+            *k ^= e;
         }
         // Derive a fresh nonce from the last 8 bytes of the entropy buffer,
         // XOR'd with the existing nonce (mix rather than replace).

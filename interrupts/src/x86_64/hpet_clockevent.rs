@@ -1,8 +1,8 @@
 //! HPET periodic-mode `ClockEvent` backend.
 //!
 //! Wires HPET periodic-mode arming (`narf_time::hpet::arm_periodic`)
-//! + IDT vector allocation + IOAPIC routing into a [`ClockEvent`]
-//! implementation. Used as a fallback tick source when the LAPIC
+//! together with IDT vector allocation and IOAPIC routing into a
+//! [`ClockEvent`] implementation. Used as a fallback tick source when the LAPIC
 //! timer is broken on a given platform (Phoenix HawkPoint1 / Renoir
 //! confirmed: LVT_TIMER programs correctly per readback, but the
 //! IRQ never reaches the trap handler).

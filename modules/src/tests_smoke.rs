@@ -100,8 +100,7 @@ impl ElfBuilder {
     fn build(self) -> Vec<u8> {
         // We'll write the header (64), then sections, then section
         // header table at the end.
-        let mut out = Vec::new();
-        out.resize(64, 0u8);
+        let mut out = vec![0u8; 64];
 
         // ─ Section content cursor ────────────────────────────────────
         // Layout offsets in the file:
@@ -591,6 +590,9 @@ fn smoke_lifecycle_loading_to_live() -> TestResult {
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xAAAA);
     let m = arc_test_module("lc_live", 0xAAAA);
+    // SAFETY: `arc_test_module` sets `init_addr` to `noop_init`, a real
+    // `extern "C" fn() -> i32`, and the module is freshly built in state
+    // `Loading`, satisfying `invoke_init`'s contract.
     let r = unsafe { crate::loader::invoke_init(&m) };
     if r.is_err() {
         return TestResult::Fail("invoke_init failed");
@@ -611,7 +613,12 @@ fn smoke_lifecycle_rmmod_clean_unload() -> TestResult {
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xBEEF);
     let m = arc_test_module("lc_unload", 0xBEEF);
+    // SAFETY: freshly built module in state `Loading` with `init_addr` =
+    // `noop_init` (a real `extern "C"` fn), satisfying `invoke_init`.
     unsafe { crate::loader::invoke_init(&m) }.expect("init");
+    // SAFETY: the module is now `Live` (init succeeded above) with refcount
+    // zero, and `exit_addr` = `noop_exit` (a real `extern "C"` fn), so
+    // `invoke_exit`'s Live-state contract is met.
     let r = unsafe { crate::loader::invoke_exit(&m) };
     if r.is_err() {
         return TestResult::Fail("invoke_exit failed");
@@ -632,9 +639,14 @@ fn smoke_lifecycle_rmmod_blocks_on_refcount() -> TestResult {
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xCC);
     let m = arc_test_module("lc_busy", 0xCC);
+    // SAFETY: freshly built module in state `Loading` with `init_addr` =
+    // `noop_init` (a real `extern "C"` fn), satisfying `invoke_init`.
     unsafe { crate::loader::invoke_init(&m) }.expect("init");
     // Hold a ref so exit will refuse.
     m.refcount.get();
+    // SAFETY: the module is `Live` (init succeeded) and `exit_addr` =
+    // `noop_exit`; `invoke_exit` short-circuits on the non-zero refcount
+    // before calling exit, but its Live-state contract is met regardless.
     let r = unsafe { crate::loader::invoke_exit(&m) };
     match r {
         Err(crate::lifecycle::LifecycleError::Busy(1)) => TestResult::Pass,
@@ -726,11 +738,17 @@ fn smoke_two_modules_dep_refcount() -> TestResult {
     crate::registry::insert(a.clone());
     // Simulate B holding a reference to A via the refcount.
     a.refcount.get();
+    // SAFETY: module `a` is in state `Loading`/`Live` with `exit_addr` =
+    // `noop_exit` (a real `extern "C"` fn); `invoke_exit` returns Busy on
+    // the held refcount before invoking exit, meeting its state contract.
     let unload = unsafe { crate::loader::invoke_exit(&a) };
     match unload {
         Err(crate::lifecycle::LifecycleError::Busy(1)) => {
             // Drop B's reference and retry — must succeed now.
             a.refcount.put();
+            // SAFETY: refcount is now zero and `exit_addr` = `noop_exit`
+            // (a real `extern "C"` fn); the module is still Live, so
+            // `invoke_exit` may now run the exit routine soundly.
             match unsafe { crate::loader::invoke_exit(&a) } {
                 Ok(_) => TestResult::Pass,
                 Err(_) => TestResult::Fail("second rmmod after refcount=0 failed"),
@@ -795,6 +813,7 @@ fn arc_test_module(name: &str, abi: u32) -> Arc<crate::loader::Module> {
     })
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn arc_test_module_with_params(
     name: &str,
     abi: u32,

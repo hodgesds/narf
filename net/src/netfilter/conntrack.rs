@@ -179,6 +179,11 @@ impl Conntrack {
         self.by_id.lock().len()
     }
 
+    /// True when no flows are currently tracked.
+    pub fn is_empty(&self) -> bool {
+        self.by_id.lock().is_empty()
+    }
+
     /// Touch LRU (move id to tail).
     fn touch_lru(&self, id: u64) {
         let mut lru = self.lru.lock();

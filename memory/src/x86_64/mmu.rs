@@ -54,31 +54,6 @@ pub const HIGHER_HALF_PML4_INDEX: usize = 511;
 /// PDPT index of the higher-half kernel base (-2 GiB).
 pub const HIGHER_HALF_PDPT_INDEX: usize = 510;
 
-/// Build a fresh PML4 with:
-///   * PML4[0] → PDPT covering the first 4 GiB identity-mapped via
-///     four 1-GiB huge pages. Keeps low-half addresses live for
-///     Stage-2-era kernel code that's still linked at low physical.
-///   * PML4[511] → a second PDPT with a 1-GiB huge page at PDPT[510]
-///     mapping `0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_C000_0000` to
-///     physical `0x0..0x4000_0000`. This is the higher-half window a
-///     future linker script will place `.text/.rodata/.data/.bss`
-///     into — the same physical pages become reachable at both low
-///     and high virtual addresses.
-///
-/// Returns the physical address of the new PML4.
-///
-/// This function is the *memory/* half of the `console/` §3.1
-/// handoff protocol; the caller (`frame/main.rs`) is responsible for
-/// the `mmu: handoff...` print immediately before and the
-/// `console::remap_to_virtual(...)` call immediately after.
-///
-/// # Safety
-/// - Must be called once, on the BSP, with interrupts disabled and no
-///   concurrent MMU activity.
-/// - `memory::init_from_map` must have populated the frame allocator.
-/// - Every address range the kernel will access after this call must
-///   be covered by the identity map being built (currently the low
-///   4 GiB + the high-half -2 GiB window).
 /// Static-BSS storage for the four early page tables.
 ///
 /// The frame allocator can return frames anywhere in usable RAM,
@@ -118,6 +93,31 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
     },
 };
 
+/// Build a fresh PML4 with:
+///   * PML4[0] → PDPT covering the first 4 GiB identity-mapped via
+///     four 1-GiB huge pages. Keeps low-half addresses live for
+///     Stage-2-era kernel code that's still linked at low physical.
+///   * PML4[511] → a second PDPT with a 1-GiB huge page at PDPT[510]
+///     mapping `0xFFFF_FFFF_8000_0000..0xFFFF_FFFF_C000_0000` to
+///     physical `0x0..0x4000_0000`. This is the higher-half window a
+///     future linker script will place `.text/.rodata/.data/.bss`
+///     into — the same physical pages become reachable at both low
+///     and high virtual addresses.
+///
+/// Returns the physical address of the new PML4.
+///
+/// This function is the *memory/* half of the `console/` §3.1
+/// handoff protocol; the caller (`frame/main.rs`) is responsible for
+/// the `mmu: handoff...` print immediately before and the
+/// `console::remap_to_virtual(...)` call immediately after.
+///
+/// # Safety
+/// - Must be called once, on the BSP, with interrupts disabled and no
+///   concurrent MMU activity.
+/// - `memory::init_from_map` must have populated the frame allocator.
+/// - Every address range the kernel will access after this call must
+///   be covered by the identity map being built (currently the low
+///   4 GiB + the high-half -2 GiB window).
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     use crate::beacon;
     // Use BSS-resident page tables (see `EarlyPageTables` doc) so
@@ -138,9 +138,13 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // to `EARLY_PAGE_TABLES`.
     const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
     let tables_ptr = core::ptr::addr_of_mut!(EARLY_PAGE_TABLES);
+    // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     let pml4_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pml4) } as u64;
+    // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     let pdpt_lo_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_lo) } as u64;
+    // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     let pdpt_hi_mmio_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi_mmio) } as u64;
+    // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
     let pdpt_hi_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_hi) } as u64;
     let pml4_addr = PhysAddr::new(pml4_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pdpt_lo_addr = PhysAddr::new(pdpt_lo_virt.wrapping_sub(KERNEL_VIRT_BASE));
@@ -190,7 +194,8 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
         // Skipping it costs nothing — phys 512 GiB ≤ P < 513 GiB
         // is RAM territory in any sane laptop, never MMIO.
         let pml4_hi_mmio_entry = PageTableEntry::new(pdpt_hi_mmio_addr, flags_ptr);
-        let pml4_hi_mmio_slot = PhysAddr::new(pml4_addr.raw() + 1 * 8);
+        // PML4[1]: entry index 1 * 8 bytes per entry = byte offset 8.
+        let pml4_hi_mmio_slot = PhysAddr::new(pml4_addr.raw() + 8);
         write_identity::<PageTableEntry>(pml4_hi_mmio_slot, pml4_hi_mmio_entry);
         for gib in 1u64..512 {
             // Each PDPT entry covers virt 512 GiB + gib * 1 GiB,

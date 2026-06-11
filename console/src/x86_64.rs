@@ -93,7 +93,7 @@ pub unsafe fn init(base: usize, kind: UartKind) {
     unsafe {
         outb(port + 1, 0x00); // disable all interrupts
         outb(port + 3, 0x80); // LCR: enable DLAB
-        outb(port + 0, 0x01); // divisor low  = 1 (115200 baud)
+        outb(port, 0x01); // divisor low  = 1 (115200 baud)
         outb(port + 1, 0x00); // divisor high = 0
         outb(port + 3, 0x03); // LCR: 8 bits, no parity, 1 stop, DLAB off
         outb(port + 2, 0xC7); // FCR: enable FIFO, clear, 14-byte trigger
@@ -117,7 +117,7 @@ pub unsafe fn try_read_byte(base: usize, kind: UartKind) -> Option<u8> {
         if inb(port + 5) & LSR_DATA_READY == 0 {
             return None;
         }
-        Some(inb(port + 0))
+        Some(inb(port))
     }
 }
 
@@ -163,13 +163,13 @@ pub unsafe fn write_bytes(base: usize, kind: UartKind, bytes: &[u8]) {
             }
             // LF ⇒ CR+LF so bare `println` renders on serial terminals.
             if b == b'\n' {
-                outb(port + 0, b'\r');
+                outb(port, b'\r');
                 if !wait_thr_empty(port) {
                     continue;
                 }
-                outb(port + 0, b'\n');
+                outb(port, b'\n');
             } else {
-                outb(port + 0, b);
+                outb(port, b);
             }
         }
     }

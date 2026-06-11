@@ -165,7 +165,7 @@ impl Tps65987 {
                 match self.bus.read_burst(self.addr, REG_CMD1, &mut buf) {
                     Ok(()) => buf == [0u8; 4],
                     Err(e) => {
-                        bus_err = Some(e.into());
+                        bus_err = Some(e);
                         true
                     }
                 }

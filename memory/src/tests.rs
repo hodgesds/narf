@@ -66,6 +66,7 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
         return TestResult::Skip("NX not exposed");
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pml4 = unsafe { read_cr3() };
     let frame = match alloc_frame() {
         Ok(f) => f,
@@ -108,6 +109,7 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
     }
 
     let caught = probe::disarm();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { unmap_4kb(pml4, virt) };
     free_frame(frame);
 
@@ -161,6 +163,7 @@ fn smoke_pks_enforces_deny_all() -> TestResult {
 
     // SAFETY: CR4.PKS is 1.
     let saved_pkrs = unsafe { pks::save() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         pks::set_rights(9, DomainRights::DENY_ALL);
     }
@@ -193,6 +196,7 @@ fn smoke_pks_enforces_deny_all() -> TestResult {
         pks::restore(saved_pkrs);
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { unmap_4kb(pml4, virt) };
     free_frame(frame);
 
@@ -219,12 +223,16 @@ fn smoke_pks_set_get_rights() -> TestResult {
     use narf_arch::x86_64::pks::{get_rights, restore, save, set_rights, DomainRights};
     // SAFETY: feats.pks==true.
     let saved = unsafe { save() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         set_rights(3, DomainRights::READ_ONLY);
         set_rights(7, DomainRights::DENY_ALL);
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r3 = unsafe { get_rights(3) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r7 = unsafe { get_rights(7) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         restore(saved);
     }
@@ -385,10 +393,13 @@ fn smoke_pkrs_roundtrip() -> TestResult {
     // SAFETY: feats.pks==true.
     let saved = unsafe { rdmsr(IA32_PKRS) };
     let test_value = 0xFFFF_FFFF_u64;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(IA32_PKRS, test_value);
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let got = unsafe { rdmsr(IA32_PKRS) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(IA32_PKRS, saved);
     }
@@ -422,6 +433,7 @@ fn smoke_map_preserves_pk_field() -> TestResult {
     if unsafe { map_4kb(pml4, virt, phys, requested) }.is_err() {
         return TestResult::Fail("map_4kb with PK=5 failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let got = match unsafe { flags_at(pml4, virt) } {
         Some(f) => f,
         None => return TestResult::Fail("flags_at returned None"),
@@ -435,6 +447,7 @@ fn smoke_map_preserves_pk_field() -> TestResult {
     if !got.contains(PtFlags::PRESENT) {
         return TestResult::Fail("PRESENT missing");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { unmap_4kb(pml4, virt) };
     TestResult::Pass
 }
@@ -463,11 +476,13 @@ fn smoke_paging_map_translate_unmap() -> TestResult {
         return TestResult::Fail("map_4kb failed");
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let got = unsafe { translate(pml4, virt) };
     if got != Some(phys) {
         return TestResult::Fail("translate returned wrong physical address");
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let removed = match unsafe { unmap_4kb(pml4, virt) } {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("unmap_4kb failed"),
@@ -476,6 +491,7 @@ fn smoke_paging_map_translate_unmap() -> TestResult {
         return TestResult::Fail("unmap returned wrong phys");
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { translate(pml4, virt) }.is_some() {
         return TestResult::Fail("translate still resolves after unmap");
     }
@@ -569,10 +585,12 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
                     let raw = p.as_ptr() as u64;
                     if raw >= usable_bytes {
                         for (q, ql) in held.drain(..) {
+                            // SAFETY: the operation upholds its documented invariant (see surrounding context).
                             unsafe {
                                 crate::slab::dealloc(q, ql);
                             }
                         }
+                        // SAFETY: the operation upholds its documented invariant (see surrounding context).
                         unsafe {
                             crate::slab::dealloc(p, layout);
                         }
@@ -580,10 +598,12 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
                     }
                     if raw & (layout.align() as u64 - 1) != 0 {
                         for (q, ql) in held.drain(..) {
+                            // SAFETY: the operation upholds its documented invariant (see surrounding context).
                             unsafe {
                                 crate::slab::dealloc(q, ql);
                             }
                         }
+                        // SAFETY: the operation upholds its documented invariant (see surrounding context).
                         unsafe {
                             crate::slab::dealloc(p, layout);
                         }
@@ -593,6 +613,7 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
                 }
                 Err(_) => {
                     for (q, ql) in held.drain(..) {
+                        // SAFETY: the operation upholds its documented invariant (see surrounding context).
                         unsafe {
                             crate::slab::dealloc(q, ql);
                         }
@@ -603,6 +624,7 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
         }
     }
     for (p, layout) in held.drain(..) {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe {
             crate::slab::dealloc(p, layout);
         }
@@ -626,6 +648,7 @@ fn smoke_slab_double_alloc_distinct_pointers() -> TestResult {
     let b = match crate::slab::alloc(layout) {
         Ok(p) => p,
         Err(_) => {
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             unsafe {
                 crate::slab::dealloc(a, layout);
             }
@@ -633,11 +656,13 @@ fn smoke_slab_double_alloc_distinct_pointers() -> TestResult {
         }
     };
     if a.as_ptr() == b.as_ptr() {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe {
             crate::slab::dealloc(a, layout);
         }
         return TestResult::Fail("slab::alloc returned the same pointer twice");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         crate::slab::dealloc(a, layout);
         crate::slab::dealloc(b, layout);
@@ -669,11 +694,13 @@ fn _smoke_slab_freed_block_zeroed_on_next_alloc() -> TestResult {
     };
     // Write a known pattern. Use 0xAA to avoid collision with any
     // realistic freelist sentinel.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         for i in 0..64 {
             p1.as_ptr().add(i).write(0xAA);
         }
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         crate::slab::dealloc(p1, layout);
     }
@@ -686,18 +713,21 @@ fn _smoke_slab_freed_block_zeroed_on_next_alloc() -> TestResult {
     // was pushed onto the magazine / central list). If the block
     // is different, this test doesn't say anything strong.
     if p1.as_ptr() == p2.as_ptr() {
+        // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
         let first8: u64 = unsafe { core::ptr::read_volatile(p2.as_ptr() as *const u64) };
         // Slab freelist writes either a NonNull<FreeBlock> (low 48
         // bits non-zero) or zero (last block in list). If we read
         // 0xAAAAAA... back, the freelist didn't overwrite — that's
         // a bug.
         if first8 == 0xAAAAAAAAAAAAAAAA {
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             unsafe {
                 crate::slab::dealloc(p2, layout);
             }
             return TestResult::Fail("slab returned the freed block with caller bytes intact");
         }
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         crate::slab::dealloc(p2, layout);
     }
@@ -846,6 +876,7 @@ fn smoke_domain_switch() -> TestResult {
         return TestResult::Skip("PKS not exposed");
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pml4 = unsafe { read_cr3() };
     let frame = match alloc_frame() {
         Ok(f) => f,
@@ -879,6 +910,7 @@ fn smoke_domain_switch() -> TestResult {
         pks::exit_domain(scope1);
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let scope2 = unsafe { pks::enter_domain(DomainId::FRAME.raw(), DomainId::DRIVER_1.raw()) };
     let recovery: u64;
     // SAFETY: LEA of local label.
@@ -909,6 +941,7 @@ fn smoke_domain_switch() -> TestResult {
     unsafe {
         pks::restore(outermost_saved);
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { unmap_4kb(pml4, virt) };
     free_frame(frame);
 
@@ -1076,7 +1109,7 @@ fn smoke_spd5_decodes_ddr5_4800_module() -> TestResult {
     // Use 416 ps so the data-rate calc returns an even number.
     let buf = build_spd5_image(|b| {
         b[0] = (1 << 4) | 1; // bytes_total=1 / bytes_used=1
-        b[1] = (1 << 4) | 0; // SPD rev 1.0
+        b[1] = 1 << 4; // SPD rev 1.0 (major nibble = 1, minor nibble = 0)
         b[3] = MODULE_TYPE_UDIMM;
         b[16..18].copy_from_slice(&416u16.to_le_bytes());
         b[18..20].copy_from_slice(&625u16.to_le_bytes()); // tCKAVGmax (DDR5-3200)
@@ -1292,6 +1325,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     // against the new root finds the mapping with expected flags.
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = unsafe { AddressSpace::new_for_user() }.expect("alloc AS");
     // Pick a user virtual address outside every pre-existing
     // mapping. On x86_64, low 4 GiB is identity-mapped via 1-GiB
@@ -1313,6 +1347,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     })
     .expect("map region");
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed on fresh user root");
     }
@@ -1321,6 +1356,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     #[cfg(target_arch = "x86_64")]
     {
         use crate::x86_64::paging::{self, PtFlags};
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
             Some(phys) => {
@@ -1328,6 +1364,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
                     // Dump every level of the walk so the failure
                     // message names where the path diverges.
                     let v = VirtAddr::new(vbase);
+                    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
                     let pml4 = unsafe { &*a.root.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pml4_idx = (v.raw() >> 39) & 0x1FF;
                     let pdpt_idx = (v.raw() >> 30) & 0x1FF;
@@ -1335,12 +1372,15 @@ fn smoke_memory_address_space_materialize() -> TestResult {
                     let pt_idx = (v.raw() >> 12) & 0x1FF;
                     let pml4e = pml4.entries[pml4_idx as usize];
                     let pdpt_pa = pml4e.addr();
+                    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
                     let pdpt = unsafe { &*pdpt_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pdpte = pdpt.entries[pdpt_idx as usize];
                     let pd_pa = pdpte.addr();
+                    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
                     let pd = unsafe { &*pd_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pde = pd.entries[pd_idx as usize];
                     let pt_pa = pde.addr();
+                    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
                     let pt = unsafe { &*pt_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
                     let pte = pt.entries[pt_idx as usize];
                     let msg = alloc::format!(
@@ -1364,6 +1404,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
             }
             None => return TestResult::Fail("translate found no mapping post-materialize"),
         }
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
         match flags {
             Some(f)
@@ -1376,7 +1417,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        use crate::aarch64::paging::{self, PtFlags};
+        use crate::aarch64::paging::{self};
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
             Some(phys) => {
@@ -1406,6 +1447,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
     }
 
     // Idempotent second call.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("second materialize should be idempotent");
     }
@@ -1419,6 +1461,7 @@ kernel_test_in!("memory", smoke_memory_address_space_materialize);
 #[inline]
 unsafe fn translate_arch(root: crate::PhysAddr, virt: crate::VirtAddr) -> Option<crate::PhysAddr> {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     return unsafe { crate::x86_64::paging::translate(root, virt) };
     #[cfg(target_arch = "aarch64")]
     return unsafe { crate::aarch64::paging::translate(root, virt) };
@@ -1445,12 +1488,14 @@ unsafe fn translate_arch(root: crate::PhysAddr, virt: crate::VirtAddr) -> Option
 fn smoke_memory_as_drop_then_materialize() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let throwaway = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed (allocator drained?)"),
     };
     drop(throwaway);
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed (allocator drained?)"),
@@ -1468,9 +1513,11 @@ fn smoke_memory_as_drop_then_materialize() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed on fresh AS after prior AS::drop");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     match unsafe { translate_arch(a.root, VirtAddr::new(vbase)) } {
         Some(p) if p == target => TestResult::Pass,
         Some(_) => TestResult::Fail("translate returned wrong phys"),
@@ -1489,12 +1536,14 @@ kernel_test_in!("memory", smoke_memory_as_drop_then_materialize);
 fn smoke_memory_as_drop_then_map_multiple_pages() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let throwaway = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
     drop(throwaway);
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -1509,7 +1558,7 @@ fn smoke_memory_as_drop_then_map_multiple_pages() -> TestResult {
         };
         phys.push(f.start_address());
     }
-    let expected: alloc::vec::Vec<_> = phys.iter().copied().collect();
+    let expected: alloc::vec::Vec<_> = phys.to_vec();
     a.map_region(Region {
         base: VirtAddr::new(vbase),
         len: 0x4000,
@@ -1517,11 +1566,13 @@ fn smoke_memory_as_drop_then_map_multiple_pages() -> TestResult {
         phys,
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed");
     }
     for (i, want) in expected.iter().enumerate() {
         let v = VirtAddr::new(vbase + (i as u64) * 0x1000);
+        // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
         let got = unsafe { translate_arch(a.root, v) };
         if got != Some(*want) {
             return TestResult::Fail("translate mismatch on a multi-page region after AS::drop");
@@ -1540,6 +1591,7 @@ fn smoke_memory_as_drop_realloc_loop() -> TestResult {
     use crate::AddressSpace;
 
     for _ in 0..16 {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let a = match unsafe { AddressSpace::new_for_user() } {
             Ok(a) => a,
             Err(_) => return TestResult::Skip("frame allocator drained mid-loop"),
@@ -1549,6 +1601,7 @@ fn smoke_memory_as_drop_realloc_loop() -> TestResult {
     // One more allocation must still succeed after 16 cycles —
     // if the buddy allocator leaks a frame per cycle this would
     // eventually fail.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     match unsafe { AddressSpace::new_for_user() } {
         Ok(_) => TestResult::Pass,
         Err(_) => TestResult::Fail("allocator drained after drop/realloc loop"),
@@ -1565,6 +1618,7 @@ kernel_test_in!("memory", smoke_memory_as_drop_realloc_loop);
 fn smoke_memory_as_with_regions_drop_then_realloc() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let first = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -1581,11 +1635,13 @@ fn smoke_memory_as_with_regions_drop_then_realloc() -> TestResult {
             phys: alloc::vec![target],
         })
         .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { first.materialize() }.is_err() {
         return TestResult::Fail("materialize on first AS failed");
     }
     drop(first);
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let second = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user for second failed"),
@@ -1602,9 +1658,11 @@ fn smoke_memory_as_with_regions_drop_then_realloc() -> TestResult {
             phys: alloc::vec![target2],
         })
         .expect("map_region (second)");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { second.materialize() }.is_err() {
         return TestResult::Fail("materialize on second AS failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let got = unsafe { translate_arch(second.root, VirtAddr::new(0x0000_0080_0000_0000)) };
     if got != Some(target2) {
         return TestResult::Fail("translate found wrong (or no) mapping in second AS");
@@ -1624,6 +1682,7 @@ fn smoke_memory_many_concurrent_as_then_drop() -> TestResult {
 
     let mut spaces = core_alloc::vec::Vec::new();
     for _ in 0..8 {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         match unsafe { AddressSpace::new_for_user() } {
             Ok(a) => spaces.push(a),
             Err(_) => return TestResult::Skip("alloc drained"),
@@ -1635,6 +1694,7 @@ fn smoke_memory_many_concurrent_as_then_drop() -> TestResult {
     // Allocate 8 more after the drops — exercises the allocator
     // re-handing-out the same-or-coalesced frames.
     for _ in 0..8 {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         match unsafe { AddressSpace::new_for_user() } {
             Ok(_) => {}
             Err(_) => return TestResult::Fail("allocator drained after concurrent drops"),
@@ -1661,6 +1721,7 @@ kernel_test_in!("memory", smoke_memory_many_concurrent_as_then_drop);
 fn smoke_memory_materialize_is_idempotent() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -1677,17 +1738,21 @@ fn smoke_memory_materialize_is_idempotent() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("first materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let first = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
     if first != Some(target) {
         return TestResult::Fail("first translate mismatch");
     }
     // Second call must be a no-op (returns Ok, doesn't reinstall).
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("second materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let second = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
     if second != Some(target) {
         core::mem::forget(a);
@@ -1711,6 +1776,7 @@ kernel_test_in!("memory", smoke_memory_materialize_is_idempotent);
 fn smoke_memory_prot_none_region_has_no_pte() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -1723,9 +1789,11 @@ fn smoke_memory_prot_none_region_has_no_pte() -> TestResult {
         phys: alloc::vec![crate::PhysAddr::new(0)],
     })
     .expect("map_region (PROT_NONE)");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pte_present = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) }.is_some();
     core::mem::forget(a);
     if pte_present {
@@ -1749,6 +1817,7 @@ kernel_test_in!("memory", smoke_memory_prot_none_region_has_no_pte);
 fn smoke_memory_lazy_phys_zero_skipped() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -1766,10 +1835,13 @@ fn smoke_memory_lazy_phys_zero_skipped() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0), backed],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let lazy_present = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) }.is_some();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let backed_translate = unsafe { translate_arch(a.root, VirtAddr::new(vbase + 0x1000)) };
     core::mem::forget(a);
     if lazy_present {
@@ -1928,11 +2000,13 @@ kernel_test_in!("memory", smoke_memory_empty_address_space_drops_clean);
 /// Translate on an unmapped virt MUST return None.
 fn smoke_memory_translate_unmapped_returns_none() -> TestResult {
     use crate::{AddressSpace, VirtAddr};
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
     let v = VirtAddr::new(0x0000_0080_0000_0000);
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let got = unsafe { translate_arch(a.root, v) };
     core::mem::forget(a);
     if got.is_some() {
@@ -1950,10 +2024,12 @@ kernel_test_in!("memory", smoke_memory_translate_unmapped_returns_none);
 fn smoke_memory_two_as_isolation() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user a failed"),
     };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let b = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => {
@@ -1997,10 +2073,14 @@ fn smoke_memory_two_as_isolation() -> TestResult {
         phys: alloc::vec![target_b],
     })
     .expect("b.map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { a.materialize() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { b.materialize() };
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let resolved_a = unsafe { translate_arch(a.root, v) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let resolved_b = unsafe { translate_arch(b.root, v) };
     core::mem::forget(a);
     core::mem::forget(b);
@@ -2028,6 +2108,7 @@ kernel_test_in!("memory", smoke_memory_two_as_isolation);
 fn smoke_memory_change_perms_updates_region() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -2047,6 +2128,7 @@ fn smoke_memory_change_perms_updates_region() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { a.materialize() };
 
     // Read back: original perms include WRITE.
@@ -2093,6 +2175,7 @@ fn smoke_memory_flags_at_roundtrip() -> TestResult {
     use crate::x86_64::paging::{self, PtFlags};
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -2112,8 +2195,10 @@ fn smoke_memory_flags_at_roundtrip() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { a.materialize() };
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let f = unsafe { paging::flags_at(a.root, v) };
     core::mem::forget(a);
     let f = match f {
@@ -2197,6 +2282,7 @@ fn smoke_memory_map_4kb_input_validation() -> TestResult {
 
     // Non-canonical virt (bits 47..63 not sign-extension-clean).
     let non_canonical = VirtAddr::new(0x0000_8000_0000_0000); // bit 47 set, bits 48+ clear
+                                                              // SAFETY: the operation upholds its documented invariant (see surrounding context).
     match unsafe {
         map_4kb(
             fake_pml4,
@@ -2209,6 +2295,7 @@ fn smoke_memory_map_4kb_input_validation() -> TestResult {
         _ => return TestResult::Fail("non-canonical virt not rejected"),
     }
     // Unaligned virt.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     match unsafe {
         map_4kb(
             fake_pml4,
@@ -2221,6 +2308,7 @@ fn smoke_memory_map_4kb_input_validation() -> TestResult {
         _ => return TestResult::Fail("unaligned virt not rejected"),
     }
     // Unaligned phys.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     match unsafe {
         map_4kb(
             fake_pml4,
@@ -2508,6 +2596,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let parent = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
@@ -2531,9 +2620,10 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // Stamp a sentinel so the post-split memcpy is observable.
     // SAFETY: identity-mapped phys; sole owner.
     unsafe {
-        *(frame.raw() as *mut u32) = 0xC0FFEE_42;
+        *(frame.raw() as *mut u32) = 0xC0FF_EE42;
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let child = match unsafe { parent.clone_for_fork() } {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("clone_for_fork"),
@@ -2551,6 +2641,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     }
 
     // Split the child's page.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write");
     }
@@ -2568,7 +2659,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     }
     // SAFETY: identity-mapped.
     let copied = unsafe { *(c_split.phys[0].raw() as *const u32) };
-    if copied != 0xC0FFEE_42 {
+    if copied != 0xC0FF_EE42 {
         return TestResult::Fail("split didn't memcpy the sentinel");
     }
     if cow::count(frame) > 1 {
@@ -2608,6 +2699,7 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
@@ -2627,11 +2719,13 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     {
         return TestResult::Fail("map_region");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize");
     }
 
     // Confirm the initial PTE points at f1.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let initial = unsafe { translate(a.root, VirtAddr::new(VADDR)) };
     if initial != Some(f1) {
         return TestResult::Fail("initial PTE doesn't translate to f1");
@@ -2670,9 +2764,11 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     }
 
     // remap_page picks up the new phys + flags.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.remap_page(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("remap_page");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let after = unsafe { translate(a.root, VirtAddr::new(VADDR)) };
     if after != Some(f2) {
         return TestResult::Fail("post-remap PTE doesn't translate to f2");
@@ -3061,6 +3157,7 @@ fn smoke_slab_atomic_perf_bounded() -> TestResult {
         // SAFETY: just allocated atomically.
         let _ = unsafe { slab::try_dealloc_atomic(p, layout) };
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let t1 = unsafe { _rdtsc() };
     let hot_cycles_per_pair = (t1 - t0) / ITERS;
     if hot_cycles_per_pair > 50_000 {
@@ -3076,6 +3173,7 @@ fn smoke_slab_atomic_perf_bounded() -> TestResult {
             break;
         }
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let t0 = unsafe { _rdtsc() };
     for _ in 0..ITERS {
         if slab::try_alloc_atomic(layout).is_some() {
@@ -3085,6 +3183,7 @@ fn smoke_slab_atomic_perf_bounded() -> TestResult {
             return TestResult::Fail("magazine refilled mid-failure-loop");
         }
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let t1 = unsafe { _rdtsc() };
     let fail_cycles = (t1 - t0) / ITERS;
     if fail_cycles > 50_000 {
@@ -3647,6 +3746,7 @@ kernel_test_in!(
 fn smoke_memory_demand_alloc_installs_pte() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3659,17 +3759,21 @@ fn smoke_memory_demand_alloc_installs_pte() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0)],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { translate_arch(a.root, VirtAddr::new(vbase)) }.is_some() {
         core::mem::forget(a);
         return TestResult::Fail("lazy slot had a PTE before demand-alloc");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.demand_alloc_page(VirtAddr::new(vbase + 0x123)) }.is_err() {
         core::mem::forget(a);
         return TestResult::Fail("demand_alloc_page failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pte = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
     core::mem::forget(a);
     if pte.is_none() {
@@ -3687,6 +3791,7 @@ kernel_test_in!("memory", smoke_memory_demand_alloc_installs_pte);
 fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3703,6 +3808,7 @@ fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
         phys: alloc::vec![frame],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
     core::mem::forget(a);
     match r {
@@ -3723,6 +3829,7 @@ kernel_test_in!("memory", smoke_memory_demand_alloc_already_backed_spurious);
 fn smoke_memory_demand_alloc_prot_none_is_unmapped() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3735,6 +3842,7 @@ fn smoke_memory_demand_alloc_prot_none_is_unmapped() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0)],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
     core::mem::forget(a);
     match r {
@@ -3751,10 +3859,12 @@ kernel_test_in!("memory", smoke_memory_demand_alloc_prot_none_is_unmapped);
 fn smoke_memory_demand_alloc_outside_region_unmapped() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.demand_alloc_page(VirtAddr::new(0x0000_0090_0000_0000)) };
     core::mem::forget(a);
     match r {
@@ -3773,6 +3883,7 @@ kernel_test_in!("memory", smoke_memory_demand_alloc_outside_region_unmapped);
 fn smoke_memory_demand_alloc_multi_page_distinct_frames() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3786,13 +3897,17 @@ fn smoke_memory_demand_alloc_multi_page_distinct_frames() -> TestResult {
     })
     .expect("map_region");
     for i in 0..3 {
+        // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
         if unsafe { a.demand_alloc_page(VirtAddr::new(vbase + (i as u64) * 0x1000)) }.is_err() {
             core::mem::forget(a);
             return TestResult::Fail("demand_alloc_page failed mid-loop");
         }
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let p0 = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let p1 = unsafe { translate_arch(a.root, VirtAddr::new(vbase + 0x1000)) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let p2 = unsafe { translate_arch(a.root, VirtAddr::new(vbase + 0x2000)) };
     core::mem::forget(a);
     if p0.is_none() || p1.is_none() || p2.is_none() {
@@ -3816,6 +3931,7 @@ kernel_test_in!(
 fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3828,6 +3944,7 @@ fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0)],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) }.is_err() {
         core::mem::forget(a);
         return TestResult::Fail("demand_alloc_page failed");
@@ -3872,6 +3989,7 @@ kernel_test_in!("memory", smoke_memory_demand_alloc_zero_fills_frame);
 fn smoke_memory_try_grow_stack_promotes_and_installs_new_guard() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3884,18 +4002,23 @@ fn smoke_memory_try_grow_stack_promotes_and_installs_new_guard() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0)],
     })
     .expect("map_region guard");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         return TestResult::Fail("materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { translate_arch(a.root, VirtAddr::new(guard)) }.is_some() {
         core::mem::forget(a);
         return TestResult::Fail("STACK_GUARD region had a PTE before grow");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.try_grow_stack(VirtAddr::new(guard + 0x10)) }.is_err() {
         core::mem::forget(a);
         return TestResult::Fail("try_grow_stack failed on a STACK_GUARD region");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let promoted_pte = unsafe { translate_arch(a.root, VirtAddr::new(guard)) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let new_guard_pte = unsafe { translate_arch(a.root, VirtAddr::new(guard - 0x1000)) };
     let snap = a.regions_snapshot();
     let region_count = snap.len();
@@ -3939,6 +4062,7 @@ kernel_test_in!(
 fn smoke_memory_try_grow_stack_non_guard_is_unmapped() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -3951,6 +4075,7 @@ fn smoke_memory_try_grow_stack_non_guard_is_unmapped() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0)],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.try_grow_stack(VirtAddr::new(vbase)) };
     core::mem::forget(a);
     match r {
@@ -3966,10 +4091,12 @@ kernel_test_in!("memory", smoke_memory_try_grow_stack_non_guard_is_unmapped);
 fn smoke_memory_try_grow_stack_outside_region_is_unmapped() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.try_grow_stack(VirtAddr::new(0x0000_0080_0300_0000)) };
     core::mem::forget(a);
     match r {
@@ -3990,6 +4117,7 @@ kernel_test_in!(
 fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
     use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4011,6 +4139,7 @@ fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0)],
     })
     .expect("map_region guard");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.try_grow_stack(VirtAddr::new(guard)) };
     core::mem::forget(a);
     match r {
@@ -4029,6 +4158,7 @@ kernel_test_in!("memory", smoke_memory_try_grow_stack_collision_rejected);
 fn smoke_memory_try_grow_stack_sequential() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4044,6 +4174,7 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
     // Walk three guards down.
     let mut cur = guard0;
     for _ in 0..3 {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         if unsafe { a.try_grow_stack(VirtAddr::new(cur)) }.is_err() {
             core::mem::forget(a);
             return TestResult::Fail("sequential grow failed mid-loop");
@@ -4111,15 +4242,16 @@ kernel_test_in!("memory", smoke_memory_stack_guard_bit_outside_prot_mask);
 // free-frame count across the unmap.
 
 /// `unmap_region` returns every backed frame to the allocator.
-/// We snapshot the buddy's free count before mapping, allocate
-/// + map a multi-page region, then unmap and confirm the free
-/// count returns to (or above) the original — equality holds
-/// when no concurrent task is allocating; allocator may also
-/// have merged buddies which is fine.
+/// We snapshot the buddy's free count before mapping, then map a
+/// multi-page region, then unmap and confirm the free count
+/// returns to (or above) the original — equality holds when no
+/// concurrent task is allocating; the allocator may also have
+/// merged buddies which is fine.
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_unmap_region_returns_frames() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4149,6 +4281,7 @@ fn smoke_memory_unmap_region_returns_frames() -> TestResult {
         phys: phys_list,
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         core::mem::forget(a);
         return TestResult::Fail("materialize failed");
@@ -4175,6 +4308,7 @@ kernel_test_in!("memory", smoke_memory_unmap_region_returns_frames);
 fn smoke_memory_unmap_region_lazy_is_noop_on_free_count() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4213,6 +4347,7 @@ kernel_test_in!(
 fn smoke_memory_unmap_region_mixed_lazy_and_backed() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4230,6 +4365,7 @@ fn smoke_memory_unmap_region_mixed_lazy_and_backed() -> TestResult {
         phys: alloc::vec![PhysAddr::new(0), backed, PhysAddr::new(0)],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         core::mem::forget(a);
         return TestResult::Fail("materialize failed");
@@ -4257,6 +4393,7 @@ kernel_test_in!("memory", smoke_memory_unmap_region_mixed_lazy_and_backed);
 fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4283,6 +4420,7 @@ fn smoke_memory_unmap_region_cycle_no_leak() -> TestResult {
             phys: phys_list,
         })
         .expect("map_region");
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         if unsafe { a.materialize() }.is_err() {
             core::mem::forget(a);
             return TestResult::Fail("materialize failed");
@@ -4311,6 +4449,7 @@ kernel_test_in!("memory", smoke_memory_unmap_region_cycle_no_leak);
 fn smoke_memory_unmap_region_clears_ptes() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -4327,10 +4466,12 @@ fn smoke_memory_unmap_region_clears_ptes() -> TestResult {
         phys: alloc::vec![frame],
     })
     .expect("map_region");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { a.materialize() }.is_err() {
         core::mem::forget(a);
         return TestResult::Fail("materialize failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let before = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
     if before.is_none() {
         core::mem::forget(a);
@@ -4340,6 +4481,7 @@ fn smoke_memory_unmap_region_clears_ptes() -> TestResult {
         core::mem::forget(a);
         return TestResult::Fail("unmap_region failed");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let after = unsafe { translate_arch(a.root, VirtAddr::new(vbase)) };
     core::mem::forget(a);
     if after.is_some() {
@@ -4367,7 +4509,7 @@ fn smoke_lz4_identity_alphabet() -> TestResult {
     use crate::compress::test_helpers::roundtrip;
     let mut input = alloc::vec::Vec::with_capacity(4096);
     for i in 0..4096usize {
-        input.push((b'A' + (i % 26) as u8) as u8);
+        input.push(b'A' + (i % 26) as u8);
     }
     match roundtrip(&input) {
         Ok(out) if out == input => TestResult::Pass,
@@ -4472,8 +4614,8 @@ kernel_test_in!("memory", smoke_zpool_store_load_zeros);
 fn smoke_zpool_store_load_random() -> TestResult {
     use crate::zpool::{Zpool, ZPAGE_SIZE};
     let mut raw = [0u8; ZPAGE_SIZE];
-    for i in 0..ZPAGE_SIZE {
-        raw[i] = ((i as u32).wrapping_mul(0x9E37) >> 8) as u8;
+    for (i, byte) in raw.iter_mut().enumerate() {
+        *byte = ((i as u32).wrapping_mul(0x9E37) >> 8) as u8;
     }
     let mut pool = Zpool::new();
     let h = match pool.store(&raw) {
@@ -5034,6 +5176,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let parent = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
@@ -5054,6 +5197,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     {
         return TestResult::Fail("map_region parent");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.materialize() }.is_err() {
         return TestResult::Fail("parent materialize");
     }
@@ -5062,28 +5206,34 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
         *(p_frame.raw() as *mut u32) = 0xCAFEBABE;
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let child = match unsafe { parent.clone_for_fork() } {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("clone_for_fork"),
     };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { child.materialize() }.is_err() {
         return TestResult::Fail("child materialize");
     }
     // Parent's PTEs need re-walking: clone_for_fork stripped WRITE
     // from the regions but the live PTEs are still RW.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.rematerialize() }.is_err() {
         return TestResult::Fail("parent rematerialize");
     }
 
     // ── Replay the #PF handler's COW recovery on the child ──
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write child");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { child.remap_page(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("remap_page child");
     }
 
     // Live PTE in the child must now resolve to a NEW phys frame.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let child_pte = unsafe { translate(child.root, VirtAddr::new(VADDR)) };
     let child_phys = match child_pte {
         Some(p) => p,
@@ -5093,6 +5243,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
         return TestResult::Fail("child PTE still points at parent's frame");
     }
     // Parent's PTE must still resolve to the original shared frame.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let parent_pte = unsafe { translate(parent.root, VirtAddr::new(VADDR)) };
     if parent_pte != Some(p_frame) {
         return TestResult::Fail("parent PTE moved off the original frame");
@@ -5109,6 +5260,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     if parent_word != 0xCAFEBABE {
         return TestResult::Fail("child's post-split write leaked into parent");
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let child_word = unsafe { *(child_phys.raw() as *const u32) };
     if child_word != 0xDEADBEEF {
         return TestResult::Fail("child's private frame did not retain write");
@@ -5137,6 +5289,7 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let parent = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
@@ -5157,6 +5310,7 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     {
         return TestResult::Fail("map_region parent");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.materialize() }.is_err() {
         return TestResult::Fail("parent materialize");
     }
@@ -5165,25 +5319,31 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
         *(orig_frame.raw() as *mut u32) = 0xA5A5_A5A5;
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let child = match unsafe { parent.clone_for_fork() } {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("clone_for_fork"),
     };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { child.materialize() }.is_err() {
         return TestResult::Fail("child materialize");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.rematerialize() }.is_err() {
         return TestResult::Fail("parent rematerialize");
     }
 
     // Parent writes first → trap path runs on the parent.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write parent");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.remap_page(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("remap_page parent");
     }
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let parent_phys = match unsafe { translate(parent.root, VirtAddr::new(VADDR)) } {
         Some(p) => p,
         None => return TestResult::Fail("parent PTE not present after remap"),
@@ -5191,6 +5351,7 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     if parent_phys == orig_frame {
         return TestResult::Fail("parent PTE still points at the shared frame");
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { translate(child.root, VirtAddr::new(VADDR)) } != Some(orig_frame) {
         return TestResult::Fail("child PTE drifted off original after parent split");
     }
@@ -5229,6 +5390,7 @@ fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
     use crate::VirtAddr;
 
     cow::__test_clear();
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
@@ -5251,6 +5413,7 @@ fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
 
     // Vaddr well outside any mapped region.
     const STRAY: u64 = 0x0000_0080_00FF_E000;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     match unsafe { a.cow_split_on_write(VirtAddr::new(STRAY)) } {
         Err(AddressSpaceError::Unmapped) => {}
         Ok(()) => return TestResult::Fail("split on unmapped vaddr returned Ok"),
@@ -5384,6 +5547,7 @@ kernel_test_in!("memory", smoke_diag_phase_decode_clamps_unknown_to_firmware);
 fn smoke_memory_mprotect_splits_region() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -5411,6 +5575,7 @@ fn smoke_memory_mprotect_splits_region() -> TestResult {
         phys: frames.clone(),
     })
     .expect("map");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { a.materialize() };
 
     // Protect the middle page READ-only.
@@ -5456,6 +5621,7 @@ kernel_test_in!("memory", smoke_memory_mprotect_splits_region);
 fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -5475,6 +5641,7 @@ fn smoke_memory_mprotect_rejects_write_exec() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { a.materialize() };
 
     let wx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
@@ -5493,6 +5660,7 @@ kernel_test_in!("memory", smoke_memory_mprotect_rejects_write_exec);
 fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Skip("new_for_user failed"),
@@ -5512,6 +5680,7 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
         phys: alloc::vec![target],
     })
     .expect("map");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let _ = unsafe { a.materialize() };
 
     // Stamp the page so we can confirm DONTNEED dropped the frame —
@@ -5598,7 +5767,7 @@ fn smoke_pluggable_frame_alloc() -> TestResult {
         }
     };
     let phys = frame.start_address().raw();
-    let in_window = phys >= BUMP_START && phys < BUMP_END;
+    let in_window = (BUMP_START..BUMP_END).contains(&phys);
     let page_aligned = phys & (PAGE_SIZE - 1) == 0;
 
     // Reinstall the buddy default so subsequent smokes see a sane

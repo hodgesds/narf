@@ -20,7 +20,7 @@ use narf_acpi::lid::LidState;
 /// at one moment. All fields are `Option<_>` so the snapshot is
 /// usable on systems that don't expose every source (e.g., desktop
 /// SKUs without a battery / lid).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct LaptopStateSnapshot {
     /// AC adapter (wall-power) plug state.
     pub ac_adapter: Option<AcAdapterState>,
@@ -41,38 +41,20 @@ pub struct LaptopStateSnapshot {
     pub battery_state: Option<BatteryState>,
 }
 
-impl Default for LaptopStateSnapshot {
-    fn default() -> Self {
-        Self {
-            ac_adapter: None,
-            lid: None,
-            power_button_presses: 0,
-            sleep_button_presses: 0,
-            cpu_tdie_mc: None,
-            gpu_temp_mc: None,
-            battery_info: None,
-            battery_state: None,
-        }
-    }
-}
-
 impl LaptopStateSnapshot {
     /// "Battery is running low and AC isn't connected" — used by
     /// the power service to fire the critical-low warning.
     pub fn is_running_low_on_battery(&self) -> bool {
         let on_battery = matches!(self.ac_adapter, Some(AcAdapterState::Offline) | None);
-        let critical = self
-            .battery_state
-            .as_ref()
-            .map_or(false, |s| s.is_critical());
+        let critical = self.battery_state.as_ref().is_some_and(|s| s.is_critical());
         on_battery && critical
     }
 
     /// True iff any thermal sensor reports above `threshold_mc` —
     /// the throttle subsystem polls this every few hundred ms.
     pub fn any_temp_above(&self, threshold_mc: i32) -> bool {
-        let cpu_hot = self.cpu_tdie_mc.map_or(false, |t| t > threshold_mc);
-        let gpu_hot = self.gpu_temp_mc.map_or(false, |t| t > threshold_mc);
+        let cpu_hot = self.cpu_tdie_mc.is_some_and(|t| t > threshold_mc);
+        let gpu_hot = self.gpu_temp_mc.is_some_and(|t| t > threshold_mc);
         cpu_hot || gpu_hot
     }
 

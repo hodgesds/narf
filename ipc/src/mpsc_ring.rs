@@ -69,7 +69,18 @@ impl<T, const N: usize> core::fmt::Debug for MpscRing<T, N> {
     }
 }
 
+// SAFETY: the ring owns only atomics, lock-guarded wakers, and
+// `MaybeUninit<T>` slots that hold moved-in values; moving the whole
+// ring across threads is sound when `T: Send`.
 unsafe impl<T: Send, const N: usize> Send for MpscRing<T, N> {}
+// SAFETY: this is a Vyukov-style bounded queue. Each slot carries its
+// own `seq` atomic; a producer only writes a slot's payload after a
+// successful CAS that claims it (seq == position), and the consumer
+// only reads it after observing the producer's release-store of
+// `seq = position + 1`. That per-slot acquire/release pair makes every
+// payload access happen on exactly one side at a time, so concurrent
+// `&MpscRing` use from many producers plus one consumer is
+// data-race-free when `T: Send`.
 unsafe impl<T: Send, const N: usize> Sync for MpscRing<T, N> {}
 
 impl<T, const N: usize> MpscRing<T, N> {
@@ -80,7 +91,7 @@ impl<T, const N: usize> MpscRing<T, N> {
     const MASK: u64 = (N as u64) - 1;
 
     fn new() -> Self {
-        let _ = Self::POW2_GUARD;
+        let () = Self::POW2_GUARD;
         // SAFETY: MaybeUninit array does not require initialisation;
         // each slot's `seq` is then explicitly set to its index so
         // producer CAS sees the expected ready-for-pos-0 invariant.
@@ -211,6 +222,9 @@ impl<T, const N: usize> Drop for MpscRing<T, N> {
     fn drop(&mut self) {
         let head = *self.head.0.get_mut();
         let tail = *self.tail.0.get_mut();
+        // SAFETY: `drop` has `&mut self`, so we hold exclusive access to
+        // the ring; no producer or consumer can be touching `slots`
+        // concurrently, making the `UnsafeCell` deref to `&mut` sound.
         let slots = unsafe { &mut *self.slots.0.get() };
         let mut i = head;
         while i != tail {
@@ -379,6 +393,10 @@ pub struct MpscRingConsumer<T: Send + 'static, const N: usize> {
     _not_sync: PhantomData<*const ()>,
 }
 
+// SAFETY: the consumer owns an `Arc<MpscRing<T, N>>` (Send when
+// `T: Send`) plus a hint-only `PhantomData<*const ()>` that keeps the
+// handle !Sync but is never dereferenced. Moving the single-owner
+// consumer to another thread is therefore sound.
 unsafe impl<T: Send + 'static, const N: usize> Send for MpscRingConsumer<T, N> {}
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for MpscRingConsumer<T, N> {

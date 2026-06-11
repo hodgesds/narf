@@ -239,10 +239,11 @@ impl CidAllocator {
     /// values; "free" is a no-op (slot is reused at wrap).
     pub fn alloc_bredr(&mut self) -> Option<u16> {
         let cid = self.bredr_next;
-        if cid > CID_DYNAMIC_BREDR_LAST {
-            return None;
+        if self.bredr_next == CID_DYNAMIC_BREDR_LAST {
+            self.bredr_next = CID_DYNAMIC_BREDR_FIRST;
+        } else {
+            self.bredr_next += 1;
         }
-        self.bredr_next = self.bredr_next.saturating_add(1);
         Some(cid)
     }
 }

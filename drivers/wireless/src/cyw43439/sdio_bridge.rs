@@ -30,10 +30,7 @@
 #![allow(dead_code)]
 
 use narf_drivers_sdio::sdhci::cmd::{cmd52_arg, cmd53_arg};
-use narf_drivers_sdio::sdio::function::{
-    encode_cmd52_read, encode_cmd52_write, encode_cmd53_block_read, encode_cmd53_block_write,
-    encode_cmd53_byte_read, encode_cmd53_byte_write, SdioError, SdioFunction,
-};
+use narf_drivers_sdio::sdio::function::{SdioError, SdioFunction};
 
 use super::transport::{Function, Transport, TransportError};
 

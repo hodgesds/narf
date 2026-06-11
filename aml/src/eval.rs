@@ -33,6 +33,7 @@ const INDEX_OP: u8 = 0x88;
 const MID_OP: u8 = 0x9E;
 const OBJECT_TYPE_OP: u8 = 0x8E;
 const MATCH_OP: u8 = 0x89;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const COND_REF_OF_PREFIX: u8 = 0x12; // Extended (0x5B 0x12) — handled in EXT path
 const CONTINUE_OP: u8 = 0x9F;
 const STORE_OP: u8 = 0x70;
@@ -1945,13 +1946,12 @@ fn match_check(elem: &Value, op: u8, target: &Value) -> bool {
     }
 }
 
-/// Ordering comparison for `LGreater` / `LLess`. ACPI 6.5 §19.6.87
-/// + §19.6.88 say these operate on Integer, String, and Buffer
-/// types — same coverage as `LEqual`. Buffer + String compare
-/// lexicographically. Mixed types fall back to integer coercion
-/// (matches the integer-only pre-fix behaviour for the common case).
-/// Package ordering isn't defined by ACPI; we coerce to integer
-/// so the result is at least deterministic.
+/// Ordering comparison for `LGreater` / `LLess`. ACPI 6.5 §19.6.87 and
+/// §19.6.88 say these operate on Integer, String, and Buffer types — the
+/// same coverage as `LEqual`. Buffer and String compare lexicographically.
+/// Mixed types fall back to integer coercion (matches the integer-only
+/// pre-fix behaviour for the common case). Package ordering isn't defined
+/// by ACPI; we coerce to integer so the result is at least deterministic.
 fn values_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     match (a, b) {
         (Value::Buffer(x), Value::Buffer(y)) => x.cmp(y),
@@ -1964,9 +1964,8 @@ fn values_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
 fn next_u8(buf: &[u8], cur: &mut usize) -> Result<u8, AmlError> {
     buf.get(*cur)
         .copied()
-        .map(|b| {
+        .inspect(|_| {
             *cur += 1;
-            b
         })
         .ok_or(AmlError::Truncated)
 }
@@ -2060,9 +2059,10 @@ fn read_name_string(buf: &[u8], cur: &mut usize, parent: &str) -> Result<String,
         if !(c0.is_ascii_uppercase() || c0 == b'_') {
             return Err(AmlError::BadNameSegment);
         }
-        if i == 0 && !s.ends_with('\\') && !s.is_empty() {
-            s.push('.');
-        } else if i > 0 {
+        // Separate segments with '.', except: a leading '\' / "^" prefix
+        // (already in `s`) joins the first segment directly, and an empty
+        // `s` gets no leading dot.
+        if i > 0 || (!s.ends_with('\\') && !s.is_empty()) {
             s.push('.');
         }
         let mut end = 4;

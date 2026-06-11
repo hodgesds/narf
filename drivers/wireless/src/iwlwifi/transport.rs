@@ -428,6 +428,7 @@ pub trait AliveSink {
 
 /// Polling implementation of `AliveSink`. Used during Stage 3
 /// bring-up before IRQs and the RX path are fully integrated.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct PollingAliveSink {
     region: narf_bus::MmioRegion,
 }

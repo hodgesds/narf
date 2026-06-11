@@ -316,15 +316,20 @@ unsafe fn io_out(_port: u16, _width_bytes: usize, _val: u64) {}
 // data ready for host), bit 1 = IBF (host wrote, EC hasn't
 // drained yet).
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_CMD_READ: u8 = 0x80;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_CMD_WRITE: u8 = 0x81;
 /// `RD_EC = 0x84` — ACPI 6.5 §12.3.5. Host asks EC "what event
 /// fired?" and the EC returns a single byte naming the _Qxx
 /// handler (e.g. 0x33 → invoke `_Q33` from the EC's AML scope).
 /// Issued from the SCI handler when SCI_EVT (bit 5 of EC status)
 /// is asserted; the AML interpreter then runs the named query.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_CMD_QUERY: u8 = 0x84;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_SC_OBF: u8 = 0x01;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_SC_IBF: u8 = 0x02;
 /// `EC_SC_SCI_EVT` (bit 5 of status) — set by the EC to signal
 /// that one or more _Qxx events are pending; cleared when the
@@ -332,6 +337,7 @@ const EC_SC_IBF: u8 = 0x02;
 pub const EC_SC_SCI_EVT: u8 = 1 << 5;
 /// ACPI 6.5 §5.2.15: an EC command is bounded by T_EC (~10 ms
 /// typical); 100 ms wedge threshold.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_TIMEOUT_MS: u64 = 100;
 
 static EC_PORTS: narf_lib::sync::IrqSafeSpinLock<Option<(u16, u16)>> =
@@ -692,7 +698,7 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
     // every Field write to such a layout silently failed.
     let first_unit_bit = (fi.bit_offset / access_bits) * access_bits;
     let bit_in_unit = fi.bit_offset - first_unit_bit;
-    let units = ((bit_in_unit + fi.bit_length) + access_bits - 1) / access_bits;
+    let units = (bit_in_unit + fi.bit_length).div_ceil(access_bits);
     let mut acc: u64 = 0;
     for u in 0..units {
         let unit_byte_offset = (first_unit_bit / 8) + u * access_bytes as u64;
@@ -736,7 +742,7 @@ pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
     let access_bits = (access_bytes * 8) as u64;
     let first_unit_bit = (fi.bit_offset / access_bits) * access_bits;
     let bit_in_unit = fi.bit_offset - first_unit_bit;
-    let units = ((bit_in_unit + fi.bit_length) + access_bits - 1) / access_bits;
+    let units = (bit_in_unit + fi.bit_length).div_ceil(access_bits);
     let val_mask = if fi.bit_length >= 64 {
         u64::MAX
     } else {
@@ -917,8 +923,14 @@ fn write_unit(
             Ok(())
         }
         RegionSpace::PciConfig => match resolve_pci_config_addr(region) {
-            // SAFETY: ECAM identity-mapped at boot.
             Some(addr) => {
+                // SAFETY: `addr` is the ECAM physical address for this PCI
+                // config field, derived from the firmware MCFG base via
+                // `resolve_pci_config_addr`; the ECAM window is identity-
+                // mapped at boot, so the physical address is directly
+                // accessible. `byte_offset_in_region` is the field's offset
+                // within that device's 4 KiB config space and `width` is the
+                // access-unit width (1/2/4/8) validated by the field decoder.
                 unsafe {
                     mmio_write(addr + byte_offset_in_region, width, val);
                 }
@@ -1178,6 +1190,7 @@ pub(crate) fn parse_bank_field_body(
 }
 
 /// Backwards-compat shim — old callers used this name.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub(crate) fn parse_indirect_field_body(
     p: &mut Parser<'_>,
     parent: &str,

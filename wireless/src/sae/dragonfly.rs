@@ -808,7 +808,7 @@ mod hp_tests {
             return TestResult::Fail("PWE should change with password");
         }
         // The PWE element must decode as a valid on-curve point.
-        if !AffinePoint::from_encoded(&p1).is_some() {
+        if AffinePoint::from_encoded(&p1).is_none() {
             return TestResult::Fail("PWE must be a valid on-curve point");
         }
         TestResult::Pass

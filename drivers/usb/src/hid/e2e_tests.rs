@@ -46,21 +46,16 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::mem;
 
 use narf_filesystem::devfs_input::{DeviceKind, InputEventFile};
-use narf_input::evdev::{
-    dispatch_key_to_node, syn, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, ROUTER,
-};
+use narf_input::evdev::{syn, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, ROUTER};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::hid::kbd_mod;
 use crate::hid::keyboard::{
-    keyboard_evdev_caps, process_boot_report, KbdProtocol, LedState, UsbKeyboard, ROLLOVER_USAGE,
+    keyboard_evdev_caps, process_boot_report, KbdProtocol, LedState, UsbKeyboard,
 };
 use crate::hid::mouse::{boot_mouse_evdev_caps, BootMouse, MouseReport};
-use crate::hid::usage_to_keycode;
 
 // ── Wire constants ────────────────────────────────────────────────────────────
 
@@ -89,6 +84,7 @@ const KEY_F1_CODE: u16 = 59;
 struct BridgedKbd {
     kbd: UsbKeyboard,
     id: DeviceId,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     node: Arc<DeviceNode>,
 }
 

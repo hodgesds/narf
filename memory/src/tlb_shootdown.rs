@@ -284,8 +284,8 @@ pub fn shootdown_target_mask(req: ShootdownRequest) -> u64 {
         let bucket_bit = 1u64 << bucket;
         let mut residency: u64 = 0;
         let mut any_set: bool = false;
-        for cpu in 0..MAX_CPUS {
-            let bm = ACTIVE_AS[cpu].load(Ordering::Acquire);
+        for (cpu, slot) in ACTIVE_AS.iter().enumerate().take(MAX_CPUS) {
+            let bm = slot.load(Ordering::Acquire);
             if bm != 0 {
                 any_set = true;
             }
@@ -404,7 +404,7 @@ fn apply_local(req: ShootdownRequest) {
         (Some(t), Some(va), Some(size)) => {
             // Range: INVPCID(addr) per page. Intel SDM Vol 2
             // INVPCID type 0.
-            let pages = (size + 4095) / 4096;
+            let pages = size.div_ceil(4096);
             for k in 0..pages.max(1) {
                 // SAFETY: caller-asserted CPL=0; INVPCID supported.
                 unsafe {
@@ -440,7 +440,7 @@ fn apply_local(req: ShootdownRequest) {
         (Some(t), Some(va), Some(size)) => {
             // Range invalidation: ARM ARM v8 D4.7 -- TLBI VAEn,IS
             // per page covers the ASID-tagged entries.
-            let pages = (size + 4095) / 4096;
+            let pages = size.div_ceil(4096);
             for k in 0..pages.max(1) {
                 // SAFETY: kernel-test runs at EL1.
                 unsafe {

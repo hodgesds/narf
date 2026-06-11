@@ -49,7 +49,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::dp_aux::{
-    decode_response, encode_request, AuxChannel, AuxError, AuxRequest, AuxResponse, AuxStatus,
+    decode_response, encode_request, AuxChannel, AuxError, AuxRequest, AuxResponse,
 };
 use crate::intel_gpu_ddi::Ddi;
 
@@ -313,6 +313,8 @@ impl<'a, M: MmioWindow + ?Sized> AuxChannel for IntelAux<'a, M> {
         // those are not protocol errors, they're sink-level
         // backoff requests carried in the status nibble.
         let mut attempt = 0;
+        // Defensive default; reassigned on each retry before it is read.
+        #[allow(unused_assignments)]
         let mut last_err = AuxError::ShortReply;
         let raw_len;
         loop {

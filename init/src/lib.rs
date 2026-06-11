@@ -1,8 +1,8 @@
 //! narf-init — staged initcall registry.
 //!
 //! Mirrors Linux's `*_initcall` ordering without the ELF-section
-//! plumbing (linker scripts + per-stage `__initcall_start_N` symbols
-//! + `do_initcalls` walker). Subsystems and drivers express
+//! plumbing (linker scripts, per-stage `__initcall_start_N` symbols,
+//! and the `do_initcalls` walker). Subsystems and drivers express
 //! initialisation order by tagging each call with a `Stage`; the
 //! kernel runs every stage in `Stage::ALL` order, calling each
 //! registered function exactly once.
@@ -29,10 +29,10 @@
 //! Initcalls return `InitResult`:
 //!   * `Ok`           — completed successfully.
 //!   * `NotPresent`   — feature/device absent (silent skip;
-//!                      counted in stage stats but not a failure).
+//!     counted in stage stats but not a failure).
 //!   * `Error(&str)`  — non-fatal failure; logged via the optional
-//!                      log-hook, kernel continues to the next
-//!                      initcall.
+//!     log-hook, kernel continues to the next
+//!     initcall.
 //!
 //! Fatal init (paging on, console early-init, frame allocator
 //! online) stays outside the registry. The registry is for

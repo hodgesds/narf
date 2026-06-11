@@ -67,6 +67,7 @@ pub unsafe fn execute(console_fd: i32, cmd: &Cmd, last_exit: &mut i32) -> bool {
             true
         }
         Cmd::Sequence { cmds, count } => {
+            #[allow(clippy::needless_range_loop)]
             for i in 0..*count {
                 let keep = unsafe {
                     exec_sequence_entry(console_fd, &cmds[i], last_exit)
@@ -407,6 +408,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
 
     if !fork_ok {
         // Close any pipes we managed to open.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..pipe_count {
             if pipes[i][0] >= 0 { unsafe { libc::posix_close(pipes[i][0]); } }
             if pipes[i][1] >= 0 { unsafe { libc::posix_close(pipes[i][1]); } }

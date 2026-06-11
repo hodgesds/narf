@@ -284,7 +284,13 @@ pub fn on_rx_frame(frame: &[u8]) {
     if v == 0 {
         return;
     }
-    let h: RxHandler = unsafe { core::mem::transmute(v) };
+    // SAFETY: `v` is non-zero (checked above) and was produced by
+    // `install_rx_handler`, which stores exactly `h as usize` for a live
+    // `RxHandler` fn pointer. A `RxHandler` (a `fn(&[u8])`) is pointer-sized,
+    // so reconstituting it from that same `usize` yields the original valid,
+    // callable function pointer. The `Acquire`/`Release` pairing guarantees we
+    // observe the fully-written pointer value.
+    let h: RxHandler = unsafe { core::mem::transmute::<usize, RxHandler>(v) };
     h(frame);
 }
 

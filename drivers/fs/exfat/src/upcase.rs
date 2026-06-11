@@ -11,10 +11,10 @@
 //! - exFAT file system specification (Microsoft, 2019),
 //!   §7.2 Up-case Table Directory Entry.
 //!   §7.2.5.1 RecommendedUpcaseTable — sample uncompressed table
-//!     showing the value at each input code unit.
+//!   showing the value at each input code unit.
 //!   §7.2.5.2 Compression — runs of N "identity" entries can be
-//!     replaced by the magic value `0xFFFF` followed by a u16 run
-//!     count (the omitted entries map each input → input).
+//!   replaced by the magic value `0xFFFF` followed by a u16 run
+//!   count (the omitted entries map each input → input).
 //!   <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
 
 use alloc::vec;
@@ -34,8 +34,8 @@ impl UpcaseTable {
     /// freshly formatted volume).
     pub fn ascii_fallback() -> Self {
         let mut table = vec![0u16; 0x10000];
-        for i in 0..0x10000u32 {
-            table[i as usize] = if (b'a'..=b'z').contains(&(i as u8)) && i < 0x80 {
+        for (i, slot) in table.iter_mut().enumerate() {
+            *slot = if i < 0x80 && (i as u8).is_ascii_lowercase() {
                 (i as u8 - b'a' + b'A') as u16
             } else {
                 i as u16
@@ -67,8 +67,8 @@ impl UpcaseTable {
                 let run = u16::from_le_bytes([stream[i], stream[i + 1]]) as usize;
                 i += 2;
                 let end = (input_index + run).min(0x10000);
-                for j in input_index..end {
-                    table[j] = j as u16;
+                for (j, slot) in table.iter_mut().enumerate().take(end).skip(input_index) {
+                    *slot = j as u16;
                 }
                 input_index = end;
             } else {
@@ -79,8 +79,8 @@ impl UpcaseTable {
         // Identity-fill any tail not described by the stream — a
         // truncated table just means "no folding for those code
         // units", which matches the spec's compression semantics.
-        for j in input_index..0x10000 {
-            table[j] = j as u16;
+        for (j, slot) in table.iter_mut().enumerate().skip(input_index) {
+            *slot = j as u16;
         }
         Self { table }
     }

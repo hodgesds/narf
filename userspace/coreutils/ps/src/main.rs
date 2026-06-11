@@ -133,6 +133,7 @@ unsafe fn print_proc(pid_name: &[u8], comm: &[u8]) {
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // argv is kernel-provided; entry signature is fixed
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     // Print header.
     unsafe { write_stdout(b"  PID  CMD\n"); }

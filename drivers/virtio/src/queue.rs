@@ -93,10 +93,14 @@ pub struct Virtqueue {
 }
 
 // SAFETY: Virtqueue owns its raw pointers (derived from layout) and
-// ensures they point to device-accessible (DMA) memory. Synchronisation
-// is handled by the device-driver protocol (release/acquire via
-// virtio_fence) and the wrapping SpinLock in the device driver.
+// ensures they point to device-accessible (DMA) memory. Moving the queue
+// between threads only moves the layout addresses and bookkeeping indices,
+// not aliased references, so transferring ownership across threads is sound.
 unsafe impl Send for Virtqueue {}
+// SAFETY: All ring access goes through &mut self (add_buffer/poll_used) or
+// volatile reads (used_idx_snapshot); concurrent shared access is serialised
+// by the wrapping SpinLock in each device driver and the release/acquire
+// ordering established by virtio_fence, so &Virtqueue is safe to share.
 unsafe impl Sync for Virtqueue {}
 
 impl Virtqueue {
@@ -121,6 +125,10 @@ impl Virtqueue {
         let desc = layout.desc_table as *mut VirtqDesc;
         // Initialise free descriptors stack.
         for i in 0..(layout.capacity - 1) {
+            // SAFETY: `desc` points at the descriptor table that
+            // VirtqueueLayout::new sized for `capacity` entries within one
+            // page; `i` ranges over 0..capacity-1 so `desc.add(i)` is a valid,
+            // aligned, exclusively-owned VirtqDesc just zeroed above.
             unsafe {
                 (*desc.add(i as usize)).next = i + 1;
             }
@@ -151,6 +159,9 @@ impl Virtqueue {
 
     fn alloc_desc(&mut self) -> Option<u16> {
         let id = self.free_head?;
+        // SAFETY: `id` came from the free-list (free_head / a prior `next`
+        // link), so it is a valid descriptor index < capacity; the descriptor
+        // table is owned by this queue and `id` indexes within it.
         self.free_head = unsafe {
             let next = (*self.desc_table().add(id as usize)).next;
             if self.num_free > 1 {
@@ -168,11 +179,19 @@ impl Virtqueue {
         let mut last = head;
         let mut count = 1;
 
+        // SAFETY: `last` is a descriptor index from a chain previously built
+        // by add_buffer, so it is < capacity and the table (owned by this
+        // queue) holds a valid VirtqDesc at that slot.
         while unsafe { (*self.desc_table().add(last as usize)).flags } & VIRTQ_DESC_F_NEXT != 0 {
+            // SAFETY: the NEXT flag just checked guarantees `.next` is a valid
+            // in-chain descriptor index < capacity, owned by this queue.
             last = unsafe { (*self.desc_table().add(last as usize)).next };
             count += 1;
         }
 
+        // SAFETY: `last` is the chain tail (valid index < capacity); writing
+        // its `next` link to splice the chain back onto the free list only
+        // touches this queue's exclusively-owned descriptor table.
         unsafe {
             (*self.desc_table().add(last as usize)).next = self.free_head.unwrap_or(0);
         }
@@ -195,12 +214,18 @@ impl Virtqueue {
                 let next = self.alloc_desc().unwrap();
                 desc_val.flags |= VIRTQ_DESC_F_NEXT;
                 desc_val.next = next;
+                // SAFETY: `curr` is a descriptor index just returned by
+                // alloc_desc (< capacity), so `table.add(curr)` is a valid,
+                // aligned slot in this queue's owned descriptor table.
                 unsafe {
                     *table.add(curr as usize) = desc_val;
                 }
                 curr = next;
             } else {
                 desc_val.flags &= !VIRTQ_DESC_F_NEXT;
+                // SAFETY: `curr` is a descriptor index from alloc_desc
+                // (< capacity); writing the final descriptor only touches this
+                // queue's owned table slot.
                 unsafe {
                     *table.add(curr as usize) = desc_val;
                 }
@@ -209,6 +234,12 @@ impl Virtqueue {
 
         // Add to avail ring.
         // Avail ring layout: flags(u16), idx(u16), ring[N](u16), used_event(u16)
+        // SAFETY: avail_base points at this queue's avail ring (sized for
+        // `capacity` entries within one page by VirtqueueLayout::new). `slot`
+        // is taken modulo capacity so `ring.add(slot)` (ring = base+2, skipping
+        // flags+idx) and base+1 (idx field) are in-bounds, aligned u16 writes
+        // to DMA memory owned by this queue. virtio_fence orders the ring-entry
+        // store before the idx publication the device observes.
         unsafe {
             let ring = self.avail_base().add(2);
             let slot = (self.avail_idx as usize) % (self.layout.capacity as usize);
@@ -231,14 +262,24 @@ impl Virtqueue {
 
     pub fn poll_used(&mut self) -> Option<(u32, u32)> {
         // Used ring layout: flags(u16), idx(u16), ring[N](VirtqUsedElem), avail_event(u16)
+        // SAFETY: used_base+1 is the u16 `idx` field of this queue's used ring
+        // (DMA memory sized within one page by VirtqueueLayout::new), valid and
+        // aligned to read the device-published index.
         let used_idx = unsafe { *(self.used_base().add(1)) };
         if self.last_used_idx == used_idx {
             return None;
         }
 
         virtio_fence();
+        // SAFETY: used_base+2 skips the flags+idx u16 header to the
+        // VirtqUsedElem ring array; the cast is to the ring's actual element
+        // type. The ring base is 4-byte aligned per VirtqueueLayout::new,
+        // matching VirtqUsedElem's alignment.
         let ring = unsafe { self.used_base().add(2) as *mut VirtqUsedElem };
         let slot = (self.last_used_idx as usize) % (self.layout.capacity as usize);
+        // SAFETY: `slot` is taken modulo capacity, so ring.add(slot) is an
+        // in-bounds, aligned VirtqUsedElem in this queue's used ring; the
+        // device wrote it before bumping used_idx (ordered by virtio_fence).
         let elem = unsafe { *ring.add(slot) };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);

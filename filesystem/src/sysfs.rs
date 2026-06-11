@@ -486,6 +486,12 @@ pub fn populate_all() {
 #[derive(Debug)]
 pub struct SysFs;
 
+impl Default for SysFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SysFs {
     pub fn new() -> Self {
         SysFs

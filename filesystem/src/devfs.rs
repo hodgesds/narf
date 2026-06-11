@@ -171,7 +171,7 @@ impl FileOps for DevKmsg {
         let len = narf_console::klog::snapshot().len();
         Stat {
             size: len as u64,
-            blocks: ((len + 511) / 512) as u64,
+            blocks: len.div_ceil(512) as u64,
             mode: Mode {
                 file_type: FileType::Special,
                 perms: 0o444,
@@ -222,6 +222,11 @@ fn rfcomm_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     if ptr == 0 {
         return None;
     }
+    // SAFETY: `ptr` is non-zero (checked above) and was produced by
+    // `install_rfcomm_hooks` storing a `fn(&str) -> Option<Arc<dyn FileOps>>`
+    // via `as usize`. A function-pointer round-trip through `usize` is valid
+    // because they have identical size/alignment, and we transmute back to the
+    // exact same signature, so the resulting `f` points at a live function.
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
@@ -231,6 +236,11 @@ fn rfcomm_enumerate() -> Vec<(String, FileType)> {
     if ptr == 0 {
         return Vec::new();
     }
+    // SAFETY: `ptr` is non-zero (checked above) and was produced by
+    // `install_rfcomm_hooks` storing a `fn() -> Vec<(String, FileType)>` via
+    // `as usize`. The transmute back to the identical signature is valid: a
+    // `fn` pointer and `usize` share size/alignment and the value names a live
+    // function.
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -254,6 +264,11 @@ fn tty_usb_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     if ptr == 0 {
         return None;
     }
+    // SAFETY: `ptr` is non-zero (checked above) and was produced by
+    // `install_tty_usb_hooks` storing a `fn(&str) -> Option<Arc<dyn FileOps>>`
+    // via `as usize`. Transmuting back to the identical signature is valid
+    // because `fn` pointers and `usize` share size/alignment and the value
+    // names a live function.
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
@@ -263,6 +278,11 @@ fn tty_usb_enumerate() -> Vec<(String, FileType)> {
     if ptr == 0 {
         return Vec::new();
     }
+    // SAFETY: `ptr` is non-zero (checked above) and was produced by
+    // `install_tty_usb_hooks` storing a `fn() -> Vec<(String, FileType)>` via
+    // `as usize`. Transmuting back to the identical signature is valid because
+    // `fn` pointers and `usize` share size/alignment and the value names a live
+    // function.
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -286,6 +306,11 @@ fn video_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     if ptr == 0 {
         return None;
     }
+    // SAFETY: `ptr` is non-zero (checked above) and was produced by
+    // `install_video_hooks` storing a `fn(&str) -> Option<Arc<dyn FileOps>>`
+    // via `as usize`. Transmuting back to the identical signature is valid
+    // because `fn` pointers and `usize` share size/alignment and the value
+    // names a live function.
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
@@ -295,6 +320,11 @@ fn video_enumerate() -> Vec<(String, FileType)> {
     if ptr == 0 {
         return Vec::new();
     }
+    // SAFETY: `ptr` is non-zero (checked above) and was produced by
+    // `install_video_hooks` storing a `fn() -> Vec<(String, FileType)>` via
+    // `as usize`. Transmuting back to the identical signature is valid because
+    // `fn` pointers and `usize` share size/alignment and the value names a live
+    // function.
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -646,6 +676,11 @@ impl FileOps for DevConsole {
             if written < buf.len() {
                 if let Some(b) = narf_input::pop_ascii_byte() {
                     let consumed = if signal_hook != 0 {
+                        // SAFETY: `signal_hook` is non-zero (checked) and was
+                        // installed via `install_console_signal_hook` as a
+                        // `fn(u8) -> bool` stored through `as usize`; transmuting
+                        // back to that identical signature is valid because `fn`
+                        // pointers and `usize` share size/alignment.
                         let hook: fn(u8) -> bool = unsafe { core::mem::transmute(signal_hook) };
                         hook(b)
                     } else {
@@ -679,6 +714,10 @@ impl FileOps for DevConsole {
             // handling and keeps the byte count truthful.
             for &b in buf {
                 if b.is_ascii() {
+                    // SAFETY: `b.is_ascii()` is true here, so the single-byte
+                    // slice `from_ref(&b)` contains one byte < 0x80, which is
+                    // always valid UTF-8; `from_utf8_unchecked` therefore has no
+                    // invalid sequence to misinterpret.
                     narf_console::write_str(unsafe {
                         core::str::from_utf8_unchecked(core::slice::from_ref(&b))
                     });

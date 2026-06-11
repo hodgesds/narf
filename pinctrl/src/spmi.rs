@@ -50,7 +50,7 @@ pub fn build_ext_write(sid: u8, addr: u16, data: &[u8]) -> Vec<u8> {
         "ext write byte count 1..=16"
     );
     let mut buf = Vec::with_capacity(4 + data.len());
-    buf.push(((sid & 0xF) << 4));
+    buf.push((sid & 0xF) << 4);
     let opcode = 0x10 | ((data.len() as u8 - 1) & 0x0F);
     buf.push(opcode);
     buf.push((addr >> 8) as u8);
@@ -64,7 +64,7 @@ pub fn build_ext_write(sid: u8, addr: u16, data: &[u8]) -> Vec<u8> {
 pub fn build_ext_read(sid: u8, addr: u16, byte_count: usize) -> Vec<u8> {
     assert!((1..=16).contains(&byte_count), "ext read byte count 1..=16");
     let mut buf = Vec::with_capacity(4);
-    buf.push(((sid & 0xF) << 4));
+    buf.push((sid & 0xF) << 4);
     let opcode = 0x30 | ((byte_count as u8 - 1) & 0x0F);
     buf.push(opcode);
     buf.push((addr >> 8) as u8);

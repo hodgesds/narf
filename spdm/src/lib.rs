@@ -100,10 +100,10 @@ impl<'a> SpdmSession<'a> {
                     index,
                     data: resp[10..].to_vec(),
                 });
-            } else if hdr.code == ResponseCode::Error as u8 {
-                if hdr.param1 == ErrorCode::InvalidRequest as u8 {
-                    break; // No more measurements
-                }
+            } else if hdr.code == ResponseCode::Error as u8
+                && hdr.param1 == ErrorCode::InvalidRequest as u8
+            {
+                break; // No more measurements
             }
         }
         Ok(results)
@@ -343,7 +343,7 @@ mod tests {
         if req[1] != REQ_CHALLENGE {
             return TestResult::Fail("opcode mismatch");
         }
-        if &req[4..36] != &nonce {
+        if req[4..36] != nonce {
             return TestResult::Fail("nonce should follow header");
         }
         if req[3] != 1 {

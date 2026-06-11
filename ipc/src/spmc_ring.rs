@@ -70,7 +70,18 @@ impl<T, const N: usize> core::fmt::Debug for SpmcRing<T, N> {
     }
 }
 
+// SAFETY: the ring owns only atomics, lock-guarded wakers, and
+// `MaybeUninit<T>` slots holding moved-in values; moving the whole ring
+// across threads is sound when `T: Send`.
 unsafe impl<T: Send, const N: usize> Send for SpmcRing<T, N> {}
+// SAFETY: Vyukov-style bounded queue with per-slot `seq` atomics. The
+// sole producer writes a slot's payload only after observing its slot
+// is free, and a consumer reads it only after a successful CAS on
+// `head` claims it plus an acquire-load of the producer's release-store
+// of `seq`. That per-slot release/acquire pairing means each payload is
+// accessed by exactly one side at a time, so concurrent `&SpmcRing` use
+// from one producer plus many consumers is data-race-free when
+// `T: Send`.
 unsafe impl<T: Send, const N: usize> Sync for SpmcRing<T, N> {}
 
 impl<T, const N: usize> SpmcRing<T, N> {
@@ -81,7 +92,7 @@ impl<T, const N: usize> SpmcRing<T, N> {
     const MASK: u64 = (N as u64) - 1;
 
     fn new() -> Self {
-        let _ = Self::POW2_GUARD;
+        let () = Self::POW2_GUARD;
         // SAFETY: see `MpscRing::new` — same uninit-then-init idiom.
         let slots: [Slot<T>; N] = unsafe {
             let mut arr: MaybeUninit<[Slot<T>; N]> = MaybeUninit::uninit();
@@ -205,6 +216,9 @@ impl<T, const N: usize> Drop for SpmcRing<T, N> {
     fn drop(&mut self) {
         let head = *self.head.0.get_mut();
         let tail = *self.tail.0.get_mut();
+        // SAFETY: `drop` has `&mut self`, so we hold exclusive access to
+        // the ring; no producer or consumer can be touching `slots`
+        // concurrently, making the `UnsafeCell` deref to `&mut` sound.
         let slots = unsafe { &mut *self.slots.0.get() };
         let mut i = head;
         while i != tail {
@@ -240,6 +254,10 @@ pub struct SpmcRingProducer<T: Send + 'static, const N: usize> {
     _not_sync: PhantomData<*const ()>,
 }
 
+// SAFETY: the producer owns an `Arc<SpmcRing<T, N>>` (Send when
+// `T: Send`) plus a hint-only `PhantomData<*const ()>` that keeps the
+// handle !Sync but is never dereferenced. Moving the single-owner
+// producer to another thread is therefore sound.
 unsafe impl<T: Send + 'static, const N: usize> Send for SpmcRingProducer<T, N> {}
 
 impl<T: Send + 'static, const N: usize> core::fmt::Debug for SpmcRingProducer<T, N> {

@@ -200,14 +200,34 @@ impl VirtioMmioDevice {
     pub const REG_CONFIG_GENERATION: u64 = 0x0fc;
     pub const REG_CONFIG: u64 = 0x100;
 
+    /// Probe a bus device that claims to be a virtio-mmio transport.
+    ///
+    /// # Safety
+    /// `d.kind` must carry a `VirtioMmio { base, .. }` whose `base` is a live,
+    /// correctly mapped (identity-mapped on x86_64) virtio-mmio register
+    /// window; this reads the magic/version/device-id registers at that
+    /// address. An invalid base is undefined behaviour.
     pub unsafe fn probe(d: &BusDevice) -> Result<Self, ProbeError> {
         let BusKind::VirtioMmio { base, .. } = d.kind else {
             return Err(ProbeError::NotVirtioMmio);
         };
+        // SAFETY: `base` came from the bus enumerator's VirtioMmio descriptor,
+        // and the caller's contract guarantees it is a live mapped register
+        // window, which is exactly probe_raw's requirement.
         unsafe { Self::probe_raw(base.raw()) }
     }
 
+    /// Probe a virtio-mmio transport at a raw physical/identity-mapped base.
+    ///
+    /// # Safety
+    /// `base_raw` must be the base of a live, mapped virtio-mmio register
+    /// window at least `REG_VENDOR_ID + 4` bytes long. This performs volatile
+    /// reads at `base_raw + {0, REG_VERSION, REG_DEVICE_ID, REG_VENDOR_ID}`.
     pub unsafe fn probe_raw(base_raw: u64) -> Result<Self, ProbeError> {
+        // SAFETY: caller guarantees `base_raw` is a live, mapped virtio-mmio
+        // window large enough for the four 4-byte register reads below; each
+        // offset (0, REG_VERSION, REG_DEVICE_ID, REG_VENDOR_ID) is a 4-byte
+        // aligned MMIO register defined by the virtio-mmio layout.
         unsafe {
             let magic = core::ptr::read_volatile(base_raw as *const u32);
             if magic != Self::MAGIC {
@@ -253,6 +273,9 @@ impl VirtioMmioDevice {
     #[inline]
     pub fn read_u32(&self, offset: u64) -> u32 {
         compiler_fence(Ordering::SeqCst);
+        // SAFETY: `self.base` was validated by `probe_raw` to be a live mapped
+        // virtio-mmio window; callers pass a 4-byte-aligned register `offset`
+        // within that window, so this volatile read targets valid MMIO.
         let val = unsafe { core::ptr::read_volatile((self.base.raw() + offset) as *const u32) };
         compiler_fence(Ordering::SeqCst);
         val
@@ -261,6 +284,9 @@ impl VirtioMmioDevice {
     #[inline]
     pub fn write_u32(&self, offset: u64, val: u32) {
         compiler_fence(Ordering::SeqCst);
+        // SAFETY: `self.base` was validated by `probe_raw` to be a live mapped
+        // virtio-mmio window; callers pass a 4-byte-aligned register `offset`
+        // within that window, so this volatile write targets valid MMIO.
         unsafe {
             core::ptr::write_volatile((self.base.raw() + offset) as *mut u32, val);
         }
@@ -293,6 +319,12 @@ pub struct VirtioSkeletonDriver {
     probed: AtomicU32,
 }
 
+impl Default for VirtioSkeletonDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VirtioSkeletonDriver {
     pub const fn new() -> Self {
         Self {
@@ -304,6 +336,9 @@ impl VirtioSkeletonDriver {
     }
     fn probe_registry(&self) {
         for d in narf_bus::devices() {
+            // SAFETY: `d` is enumerated from the kernel bus registry, so a
+            // VirtioMmio device carries a base the bus layer already mapped;
+            // probe only does volatile reads of the transport ID registers.
             if let Ok(_v) = unsafe { VirtioMmioDevice::probe(&d) } {
                 self.probed.fetch_add(1, Ordering::Relaxed);
             }

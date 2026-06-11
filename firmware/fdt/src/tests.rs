@@ -8,6 +8,9 @@ use crate::{self as fdt, Reservation};
 extern crate alloc;
 use alloc::vec::Vec;
 
+/// A node's name paired with its list of `(property name, property value)` pairs.
+type NodeSpec<'a> = (&'a str, &'a [(&'a str, &'a [u8])]);
+
 /// Build a minimal FDT blob for tests.
 ///
 /// Produces a header + struct block + strings block. Optional
@@ -16,7 +19,7 @@ fn build_blob(
     boot_cpuid: u32,
     reservations: &[(u64, u64)],
     root_props: &[(&str, &[u8])],
-    nodes: &[(&str, &[(&str, &[u8])])],
+    nodes: &[NodeSpec],
 ) -> Vec<u8> {
     // 1) Build the strings block: NUL-terminated property names,
     //    deduped via a linear scan.

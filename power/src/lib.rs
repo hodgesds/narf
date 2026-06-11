@@ -126,6 +126,7 @@ pub fn cpu_status_line() -> Option<alloc::string::String> {
 /// out (drivers re-program their controllers, MSI-X tables, etc.),
 /// then IRQ mask restore (re-apply pre-suspend masks for each
 /// vector), then the FB resume hook (repaint the framebuffer).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 extern "C" fn s3_resume_hook_entry() {
     // SAFETY: wake continuation runs at CPL=0 on the boot CPU with
     // interrupts gated; restore_lapic_state is a no-op if no

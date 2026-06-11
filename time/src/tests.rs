@@ -48,11 +48,20 @@ fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {
 kernel_test_in!("time/rtc", smoke_rtc_cmos_bcd_to_bin_and_back);
 
 fn smoke_rtc_cmos_decodes_bcd_24h_with_century() -> TestResult {
-    use crate::rtc::cmos::{decode_snapshot, STATUS_B_24H};
+    use crate::rtc::cmos::{decode_snapshot, CmosSnapshot, STATUS_B_24H};
 
     // 2026-05-07 14:35:22, BCD + 24h.
 
-    let dt = decode_snapshot(0x22, 0x35, 0x14, 0x07, 0x05, 0x26, 0x20, STATUS_B_24H);
+    let dt = decode_snapshot(CmosSnapshot {
+        sec: 0x22,
+        min: 0x35,
+        hour: 0x14,
+        day: 0x07,
+        month: 0x05,
+        year: 0x26,
+        century: 0x20,
+        status_b: STATUS_B_24H,
+    });
 
     if dt.year != 2026 || dt.month != 5 || dt.day != 7 {
         return TestResult::Fail("date wrong");
@@ -68,7 +77,7 @@ fn smoke_rtc_cmos_decodes_bcd_24h_with_century() -> TestResult {
 kernel_test_in!("time/rtc", smoke_rtc_cmos_decodes_bcd_24h_with_century);
 
 fn smoke_rtc_cmos_12h_pm_bit_promotes_hour() -> TestResult {
-    use crate::rtc::cmos::decode_snapshot;
+    use crate::rtc::cmos::{decode_snapshot, CmosSnapshot};
 
     // 12h mode: status_b 24H bit clear. 03 PM with PM bit set →
 
@@ -76,7 +85,16 @@ fn smoke_rtc_cmos_12h_pm_bit_promotes_hour() -> TestResult {
 
     // sec/min/hour are BCD by default (status_b=0).
 
-    let dt = decode_snapshot(0, 0, 0x83, 0x01, 0x01, 0x26, 0x20, 0);
+    let dt = decode_snapshot(CmosSnapshot {
+        sec: 0,
+        min: 0,
+        hour: 0x83,
+        day: 0x01,
+        month: 0x01,
+        year: 0x26,
+        century: 0x20,
+        status_b: 0,
+    });
 
     if dt.hour != 15 {
         return TestResult::Fail("PM 03 should be 15:00");

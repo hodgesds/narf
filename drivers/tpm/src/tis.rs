@@ -63,7 +63,7 @@ pub const TIS_MEM_LEN: usize = 0x5000;
 /// `TPM_ACCESS(locality)` — byte-wide access register.
 /// Linux tpm_tis_core.h: `#define TPM_ACCESS(l) (0x0000 | ((l) << 12))`.
 pub const fn tpm_access(locality: u32) -> usize {
-    (0x0000 | (locality << 12)) as usize
+    (locality << 12) as usize
 }
 /// `TPM_INT_ENABLE(locality)` — 32-bit interrupt-enable mask.
 pub const fn tpm_int_enable(locality: u32) -> usize {

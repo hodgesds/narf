@@ -26,7 +26,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 

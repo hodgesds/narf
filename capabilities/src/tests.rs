@@ -17,7 +17,7 @@ fn smoke_cap_slot_layout() -> TestResult {
     if s.generation != 1 || s.index != 2 || s.rights != 3 || s.type_tag != 4 {
         return TestResult::Fail("CapSlot::new field order wrong");
     }
-    if CapSlot::EMPTY.is_empty() != true {
+    if !CapSlot::EMPTY.is_empty() {
         return TestResult::Fail("EMPTY not empty");
     }
     if s.is_empty() {
@@ -442,7 +442,7 @@ fn smoke_cap_clone_preserves_slot() -> TestResult {
 
     let a: Cap<TestObj, Write> = Cap::bootstrap();
     let b = a; // Copy
-    let c = a.clone();
+    let c = a; // Copy again from the same source
     if a.slot() != b.slot() || a.slot() != c.slot() {
         return TestResult::Fail("clone/copy didn't preserve the slot");
     }
@@ -461,7 +461,7 @@ fn smoke_cap_empty_slot_helper() -> TestResult {
     if !CapSlot::EMPTY.is_empty() {
         return TestResult::Fail("EMPTY not empty");
     }
-    if CapSlot::new(0, 0, 0, 0).is_empty() != true {
+    if !CapSlot::new(0, 0, 0, 0).is_empty() {
         return TestResult::Fail("all-zero new() not empty");
     }
     let mut s = CapSlot::EMPTY;

@@ -260,7 +260,7 @@ fn render_sched(pid: u64) -> String {
 fn render_schedstat(_pid: u64) -> String {
     // TODO: pull run_time_ns / wait_time_ns / timeslices from
     // narf_scheduler per-task accounting once that lands.
-    format!("0 0 0\n")
+    "0 0 0\n".to_string()
 }
 
 /// `/proc/<pid>/stack` — kernel-stack backtrace (privileged).
@@ -270,7 +270,7 @@ fn render_schedstat(_pid: u64) -> String {
 fn render_stack(_pid: u64) -> String {
     // TODO: walk the kernel stack frame chain once an unwinder is
     // available in narf_arch.
-    format!("[<0000000000000000>] 0x0\n")
+    "[<0000000000000000>] 0x0\n".to_string()
 }
 
 /// `/proc/<pid>/wchan` — symbol where the task is currently sleeping.
@@ -283,9 +283,9 @@ fn render_wchan(pid: u64) -> String {
     if state == 'S' {
         // TODO: return the real wait-channel symbol name once
         // narf_scheduler exposes per-task sleep-site info.
-        format!("sys_sleep\n")
+        "sys_sleep\n".to_string()
     } else {
-        format!("0\n")
+        "0\n".to_string()
     }
 }
 
@@ -298,12 +298,12 @@ fn render_wchan(pid: u64) -> String {
 fn render_syscall(pid: u64) -> String {
     let state = task_info(pid).map(|i| i.state).unwrap_or('R');
     if state == 'R' {
-        format!("running\n")
+        "running\n".to_string()
     } else {
         // TODO: read the saved trap frame (syscall nr + args + rsp/rip)
         // from narf_userspace::handlers once it exposes a per-task
         // snapshot accessor for the saved int 0x80 frame.
-        format!("-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n")
+        "-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n".to_string()
     }
 }
 
@@ -353,8 +353,8 @@ fn render_limits(pid: u64) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "{:<25} {:<20} {:<20} {}",
-        "Limit", "Soft Limit", "Hard Limit", "Units"
+        "{:<25} {:<20} {:<20} Units",
+        "Limit", "Soft Limit", "Hard Limit"
     );
     for i in 0..16 {
         let (cur, max) = pairs[i];
@@ -439,7 +439,7 @@ impl FileOps for ProcFdFile {
         let pid = self.pid;
         let fd = self.fd;
         Box::pin(async move {
-            let path = hook_fd_path(pid, fd).unwrap_or_else(|| format!("anon_inode:[unknown]"));
+            let path = hook_fd_path(pid, fd).unwrap_or_else(|| "anon_inode:[unknown]".to_string());
             let bytes = path.into_bytes();
             slice_read(&bytes, offset, buf)
         })

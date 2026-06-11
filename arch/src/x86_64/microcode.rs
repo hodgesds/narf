@@ -6,7 +6,7 @@
 //!   48-byte-header microcode update to MSR `0x79` (`IA32_BIOS_UPDT_TRIG`).
 //!   The CPU validates the header (header_version must be 1) and
 //!   applies the update. Read MSR `0x8B` (`IA32_BIOS_SIGN_ID`) before
-//!   + after to confirm the revision changed. The pre-write
+//!   and after to confirm the revision changed. The pre-write
 //!   handshake is: WRMSR `0x8B = 0`, CPUID, RDMSR `0x8B` to obtain
 //!   the current revision.
 //! - **AMD** (BKDG): write the linear address of the patch blob to
@@ -283,7 +283,9 @@ pub unsafe fn apply_amd(blob: &[u8]) -> Result<u32, UcodeError> {
 pub unsafe fn apply(blob: &[u8]) -> Result<u32, UcodeError> {
     // SAFETY: caller-asserted.
     match vendor() {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         Vendor::Intel => unsafe { apply_intel(blob) },
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         Vendor::Amd => unsafe { apply_amd(blob) },
         Vendor::Unknown => Err(UcodeError::UnknownVendor),
     }

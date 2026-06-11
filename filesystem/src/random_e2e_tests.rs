@@ -232,7 +232,7 @@ fn smoke_rand_histogram_uniform() -> TestResult {
         hist[b as usize] += 1;
     }
 
-    for (_, &count) in hist.iter().enumerate() {
+    for &count in hist.iter() {
         if count as usize > MAX_COUNT {
             return TestResult::Fail(
                 "histogram bucket exceeds 4-sigma threshold (generator may be degenerate)",
@@ -377,7 +377,7 @@ fn smoke_rand_uuid_format() -> TestResult {
         b'A'..=b'F' => variant_char - b'A' + 10,
         _ => return TestResult::Fail("uuid variant character is not valid hex"),
     };
-    if variant_nibble < 8 || variant_nibble > 0xb {
+    if !(8..=0xb).contains(&variant_nibble) {
         return TestResult::Fail("uuid variant nibble (byte 8 high bits) != 0b10xx");
     }
     TestResult::Pass

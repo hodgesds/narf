@@ -4,8 +4,8 @@
 //! - RFC 2784 — Generic Routing Encapsulation (D. Farinacci et al,
 //!   March 2000). §2.1 Header layout (4-byte fixed header — flags
 //!   + version + protocol type, optional 16-bit checksum + 16-bit
-//!   reserved).
-//!   <https://datatracker.ietf.org/doc/html/rfc2784>
+//!     reserved).
+//!     <https://datatracker.ietf.org/doc/html/rfc2784>
 //! - RFC 2890 — Key and Sequence Number Extensions to GRE (G. Dommety,
 //!   September 2000). Adds the K and S flags (32-bit Key + 32-bit
 //!   Sequence Number, when present).

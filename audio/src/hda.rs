@@ -281,6 +281,7 @@ const fn sd_base(idx: u8) -> u64 {
 }
 
 const SD_CTL: u64 = 0x00; // 24-bit
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const SD_STS: u64 = 0x03;
 const SD_LPIB: u64 = 0x04;
 const SD_CBL: u64 = 0x08; // cyclic buffer length, 32-bit

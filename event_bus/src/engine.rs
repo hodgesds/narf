@@ -103,6 +103,12 @@ pub(crate) struct Ring<T: Copy> {
 // matches its expected value, which is the same release-acquire pair
 // that backs the existing `narf_ipc::spmc_ring`).
 unsafe impl<T: Copy + Send + Sync> Send for Ring<T> {}
+// SAFETY: same justification as the `Send` impl above. `T: Send + Sync`
+// and every shared access to `Slot::val` goes through the release-acquire
+// `seq` handshake (producer writes payload then publishes `seq` with
+// Release; consumers load `seq` with Acquire and only read the payload on a
+// matching seq), so no torn or racing reads of the payload are possible
+// across threads.
 unsafe impl<T: Copy + Send + Sync> Sync for Ring<T> {}
 
 impl<T: Copy + Send + Sync> Ring<T> {

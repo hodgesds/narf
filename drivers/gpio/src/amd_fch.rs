@@ -267,7 +267,7 @@ static DISPATCH_LEN: AtomicUsize = AtomicUsize::new(0);
 fn register_for_dispatch(p: *const AmdFchGpio) {
     let pv = p as usize;
     let mut tab = DISPATCH.lock();
-    if tab.iter().any(|&q| q == pv) {
+    if tab.contains(&pv) {
         return;
     }
     let len = DISPATCH_LEN.load(Ordering::Acquire);
@@ -346,15 +346,21 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                 }
             }
             ResourceItem::AddressSpace32 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 if mmio.is_none() {
                     mmio = Some((min as u64, length as u64));
                 }
             }
             ResourceItem::AddressSpace64 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 if mmio.is_none() {
                     mmio = Some((min, length));
                 }

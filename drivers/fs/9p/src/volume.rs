@@ -35,67 +35,65 @@ pub struct NinepVolume {
 impl NinepVolume {
     /// Issue Tversion + Tattach over `transport`, return the mounted
     /// session. uname / aname are empty (anonymous attach).
-    pub fn mount(
+    pub async fn mount(
         transport: Arc<dyn Transport>,
         domain: DomainId,
-    ) -> impl Future<Output = Result<Arc<Self>, FsError>> + Send {
-        async move {
-            let session = Arc::new(P9Session::new());
+    ) -> Result<Arc<Self>, FsError> {
+        let session = Arc::new(P9Session::new());
 
-            // ── Tversion ────────────────────────────────────────────
-            let req = frame_message(session.msize(), MsgType::Tversion, NOTAG, |w| {
-                encode_tversion(w, session.msize(), PROTO_VERSION)
-            })
-            .map_err(map_tx_err)?;
-            let reply = transport.rpc(&req).await.map_err(map_tx_err)?;
-            let mut r = WireRead::new(&reply);
-            let (_size, mt, _tag) = decode_header(&mut r).map_err(map_tx_err)?;
-            match mt {
-                MsgType::Rversion => {
-                    let rv = decode_rversion(&mut r).map_err(map_tx_err)?;
-                    if rv.version != PROTO_VERSION {
-                        return Err(FsError::Unsupported);
-                    }
-                    session.set_msize(rv.msize);
-                }
-                MsgType::Rerror => {
-                    let _ = decode_rerror(&mut r);
+        // ── Tversion ────────────────────────────────────────────
+        let req = frame_message(session.msize(), MsgType::Tversion, NOTAG, |w| {
+            encode_tversion(w, session.msize(), PROTO_VERSION)
+        })
+        .map_err(map_tx_err)?;
+        let reply = transport.rpc(&req).await.map_err(map_tx_err)?;
+        let mut r = WireRead::new(&reply);
+        let (_size, mt, _tag) = decode_header(&mut r).map_err(map_tx_err)?;
+        match mt {
+            MsgType::Rversion => {
+                let rv = decode_rversion(&mut r).map_err(map_tx_err)?;
+                if rv.version != PROTO_VERSION {
                     return Err(FsError::Unsupported);
                 }
-                _ => return Err(FsError::Unsupported),
+                session.set_msize(rv.msize);
             }
-
-            // ── Tattach ─────────────────────────────────────────────
-            let root_fid = session.alloc_fid();
-            let tag = session.alloc_tag();
-            let req = frame_message(session.msize(), MsgType::Tattach, tag, |w| {
-                encode_tattach(w, root_fid, NOFID, "", "")
-            })
-            .map_err(map_tx_err)?;
-            let reply = transport.rpc(&req).await.map_err(map_tx_err)?;
-            let mut r = WireRead::new(&reply);
-            let (_, mt, _) = decode_header(&mut r).map_err(map_tx_err)?;
-            let root_qid = match mt {
-                MsgType::Rattach => r.read_qid().map_err(map_tx_err)?,
-                MsgType::Rerror => {
-                    let _ = decode_rerror(&mut r);
-                    return Err(FsError::Unsupported);
-                }
-                _ => return Err(FsError::Unsupported),
-            };
-            // Sanity: per attach(5) the root must be a directory.
-            if (root_qid.qid_type & qtype::DIR) == 0 {
+            MsgType::Rerror => {
+                let _ = decode_rerror(&mut r);
                 return Err(FsError::Unsupported);
             }
-
-            Ok(Arc::new(Self {
-                transport,
-                session,
-                root_fid,
-                root_qid,
-                domain,
-            }))
+            _ => return Err(FsError::Unsupported),
         }
+
+        // ── Tattach ─────────────────────────────────────────────
+        let root_fid = session.alloc_fid();
+        let tag = session.alloc_tag();
+        let req = frame_message(session.msize(), MsgType::Tattach, tag, |w| {
+            encode_tattach(w, root_fid, NOFID, "", "")
+        })
+        .map_err(map_tx_err)?;
+        let reply = transport.rpc(&req).await.map_err(map_tx_err)?;
+        let mut r = WireRead::new(&reply);
+        let (_, mt, _) = decode_header(&mut r).map_err(map_tx_err)?;
+        let root_qid = match mt {
+            MsgType::Rattach => r.read_qid().map_err(map_tx_err)?,
+            MsgType::Rerror => {
+                let _ = decode_rerror(&mut r);
+                return Err(FsError::Unsupported);
+            }
+            _ => return Err(FsError::Unsupported),
+        };
+        // Sanity: per attach(5) the root must be a directory.
+        if (root_qid.qid_type & qtype::DIR) == 0 {
+            return Err(FsError::Unsupported);
+        }
+
+        Ok(Arc::new(Self {
+            transport,
+            session,
+            root_fid,
+            root_qid,
+            domain,
+        }))
     }
 }
 

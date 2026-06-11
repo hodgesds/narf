@@ -142,7 +142,7 @@ pub fn relinquish_locality<M: CrbMmio>(mmio: &mut M) {
 }
 
 /// Program the command-buffer and response-buffer base addresses
-/// + sizes into the CRB registers. Called once per command-buffer
+/// and sizes into the CRB registers. Called once per command-buffer
 /// pair (typically the same DMA-coherent page across many commands).
 pub fn program_buffers<M: CrbMmio>(
     mmio: &mut M,
@@ -183,6 +183,11 @@ pub mod test_support {
     //! Mock MMIO for smokes — scripts CRB register reads + captures writes.
     use super::*;
 
+    /// A per-register read hook: runs before a read of its register and
+    /// may mutate the whole register file (e.g. to model the TPM toggling
+    /// `CTRL_START.Go`). `None` means pass-through.
+    pub type ReadHook = fn(&mut [u32; 256]);
+
     /// Mock CRB MMIO. Reads come from `regs` (init-zeroed); writes
     /// land in `regs` AND a separate trace so tests assert ordering.
     /// `pre_read_hook` lets the test simulate the TPM toggling bits
@@ -194,7 +199,12 @@ pub mod test_support {
         /// On every read of `offset`, this callback runs first to
         /// let the test mutate the underlying reg value. Indexed
         /// by offset/4. None = pass-through.
-        pub read_hooks: [Option<fn(&mut [u32; 256])>; 256],
+        pub read_hooks: [Option<ReadHook>; 256],
+    }
+    impl Default for MockCrb {
+        fn default() -> Self {
+            Self::new()
+        }
     }
     impl MockCrb {
         #[allow(dead_code)]

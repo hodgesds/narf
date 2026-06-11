@@ -55,6 +55,7 @@ pub fn bhi_dis_s_supported() -> bool {
 pub unsafe fn enable_bhi_dis_s() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_SPEC_CTRL) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(MSR_IA32_SPEC_CTRL, v | SPEC_CTRL_BHI_DIS_S);
     }
@@ -67,6 +68,7 @@ pub unsafe fn enable_bhi_dis_s() {
 pub unsafe fn disable_bhi_dis_s() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_SPEC_CTRL) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(MSR_IA32_SPEC_CTRL, v & !SPEC_CTRL_BHI_DIS_S);
     }

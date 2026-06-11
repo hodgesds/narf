@@ -20,7 +20,7 @@
 //! - RFC 1071 — Internet checksum mechanism reused for the IPv6
 //!   pseudo-header (40 bytes: src 16 + dst 16 + length 4 + zero 3
 //!   + next-header 1, see RFC 8200 §8.1).
-//!   <https://datatracker.ietf.org/doc/html/rfc1071>
+//!     <https://datatracker.ietf.org/doc/html/rfc1071>
 //!
 //! No GPL Linux source consulted.
 

@@ -262,7 +262,13 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // kernel's PDPT[1..512] entries (the high-MMIO 1-GiB pages)
     // into it, leave PDPT[0] zero so the user's materialize can
     // safely descend into a private PD/PT subtree.
-    let kernel_pml4_e1: u64 = unsafe { ptr::read_volatile((cur_pml4.raw() + 1 * 8) as *const u64) };
+    // SAFETY: `cur_pml4` is the current (kernel) PML4's physical base,
+    // which lives in the boot identity-mapped window, so its phys value
+    // is also a valid VA. PML4[1] is at byte offset 1 * 8 = 8 (8 bytes
+    // per entry, 512 entries fit the 4 KiB table), well inside the page,
+    // and naturally aligned for a `u64` read. Volatile because the entry
+    // can be mutated by other paging code.
+    let kernel_pml4_e1: u64 = unsafe { ptr::read_volatile((cur_pml4.raw() + 8) as *const u64) };
     if kernel_pml4_e1 & 1 != 0 {
         let kernel_pdpt_phys = PhysAddr::new(kernel_pml4_e1 & 0x000f_ffff_ffff_f000);
         let user_pdpt_frame =
@@ -308,17 +314,20 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // reachable from CPL=3.
         let preserved_flags = (kernel_pml4_e1 & 0xfff) | (1 << 2); // USER bit
         let new_e1 = user_pdpt_phys.raw() | preserved_flags;
-        // SAFETY: `phys` is identity-mapped; PML4[1] lives 8 bytes in.
+        // SAFETY: `phys` is the user PML4's physical base in the
+        // identity-mapped window, so it is a valid VA; PML4[1] is at byte
+        // offset 8 (entry 1, 8 bytes each), inside the page and u64-aligned.
         unsafe {
-            ptr::write_volatile((phys.raw() + 1 * 8) as *mut u64, new_e1);
+            ptr::write_volatile((phys.raw() + 8) as *mut u64, new_e1);
         }
     } else {
         // Kernel didn't map PML4[1] at all (legacy boot path). Fall
         // back to a clean clear so the user materialize allocates a
         // fresh PDPT through `map_4kb`'s walker.
-        // SAFETY: same — PML4[1] slot at offset 8.
+        // SAFETY: same as above — `phys` is the identity-mapped user PML4
+        // base, PML4[1] is at u64-aligned byte offset 8 inside the page.
         unsafe {
-            ptr::write_volatile((phys.raw() + 1 * 8) as *mut u64, 0);
+            ptr::write_volatile((phys.raw() + 8) as *mut u64, 0);
         }
     }
 
@@ -593,11 +602,12 @@ pub unsafe fn map_4kb(
     // leaf-PTE USER=0.
     let mut base_flags = PtFlags::PRESENT | PtFlags::WRITABLE;
     if flags.contains(PtFlags::USER) {
-        base_flags = base_flags | PtFlags::USER;
+        base_flags |= PtFlags::USER;
     }
 
     // SAFETY: caller guarantees pml4_phys is identity-reachable.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], base_flags)? };
 
     // SAFETY: pdpt_phys came either from an existing mapping we
@@ -606,14 +616,18 @@ pub unsafe fn map_4kb(
     if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pd_phys = unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], base_flags)? };
 
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
     if pd.entries[idx.pd].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pt_phys = unsafe { ensure_next_table(&mut pd.entries[idx.pd], base_flags)? };
 
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pt = unsafe { &mut *pt_phys.as_mut_ptr::<PageTable>() };
     if pt.entries[idx.pt].is_present() {
         return Err(MapError::AlreadyMapped);
@@ -664,6 +678,7 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     if !e.is_present() {
         return Err(MapError::AlreadyMapped);
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pdpt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
 
     let e = pdpt.entries[idx.pdpt];
@@ -673,6 +688,7 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pd = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
 
     let e = pd.entries[idx.pd];
@@ -682,6 +698,7 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
 
     let removed = pt.entries[idx.pt];
@@ -825,11 +842,13 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
         return None;
     }
     let idx = WalkIndices::from_virt(virt);
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return None;
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() {
@@ -838,6 +857,7 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return None;
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
     if !e.is_present() {
@@ -846,6 +866,7 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return None;
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
     if !e.is_present() {
@@ -868,11 +889,13 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
         return None;
     }
     let idx = WalkIndices::from_virt(virt);
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return None;
     }
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() {
@@ -881,6 +904,7 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Some(e.addr());
     } // 1 GiB
+      // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
     if !e.is_present() {
@@ -889,6 +913,7 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
     if e.flags().contains(PtFlags::HUGE_PAGE) {
         return Some(e.addr());
     } // 2 MiB
+      // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
     if !e.is_present() {

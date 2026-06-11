@@ -183,7 +183,7 @@ impl Fp {
                 let mul = result.mul(self);
                 // Constant-time select: if bit set, take `mul`; else
                 // keep `result`. We materialise both and mask.
-                let take = ((limb >> bit) & 1) as u64;
+                let take = (limb >> bit) & 1;
                 result = ct_select(&mul, &result, take);
             }
         }
@@ -328,8 +328,8 @@ fn mul_512(a: [u64; 4], b: [u64; 4]) -> [u64; 8] {
 fn ct_select(a: &Fp, b: &Fp, take: u64) -> Fp {
     let mask = 0u64.wrapping_sub(take);
     let mut out = [0u64; 4];
-    for i in 0..4 {
-        out[i] = (a.0[i] & mask) | (b.0[i] & !mask);
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = (a.0[i] & mask) | (b.0[i] & !mask);
     }
     Fp(out)
 }

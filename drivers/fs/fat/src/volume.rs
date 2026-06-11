@@ -155,9 +155,8 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
     }
 
     pub fn first_data_sector(&self) -> u32 {
-        let root_dir_sectors = ((self.bpb.root_ent_cnt as u32 * 32)
-            + (self.bpb.bytes_per_sec as u32 - 1))
-            / self.bpb.bytes_per_sec as u32;
+        let root_dir_sectors =
+            (self.bpb.root_ent_cnt as u32 * 32).div_ceil(self.bpb.bytes_per_sec as u32);
         let fat_sz = self.bpb.fat_size(self.fat32_ext.as_ref());
         self.bpb.rsvd_sec_cnt as u32 + (self.bpb.num_fats as u32 * fat_sz) + root_dir_sectors
     }
@@ -167,9 +166,8 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
     }
 
     pub fn total_data_clusters(&self) -> u32 {
-        let root_dir_sectors = ((self.bpb.root_ent_cnt as u32 * 32)
-            + (self.bpb.bytes_per_sec as u32 - 1))
-            / self.bpb.bytes_per_sec as u32;
+        let root_dir_sectors =
+            (self.bpb.root_ent_cnt as u32 * 32).div_ceil(self.bpb.bytes_per_sec as u32);
         let fat_sz = self.bpb.fat_size(self.fat32_ext.as_ref());
         let data_sectors = self.bpb.total_sectors()
             - (self.bpb.rsvd_sec_cnt as u32
@@ -366,9 +364,10 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         {
             let mut info = self.fsinfo.lock();
             if let Some(ref mut i) = *info {
-                if i.free_count != 0xFFFFFFFF {
-                    i.free_count += 1;
-                }
+                // 0xFFFFFFFF is the FSInfo "unknown free count" sentinel; a
+                // saturating add keeps it pinned at the sentinel and otherwise
+                // increments by one.
+                i.free_count = i.free_count.saturating_add(1);
                 if cluster < i.nxt_free {
                     i.nxt_free = cluster;
                 }

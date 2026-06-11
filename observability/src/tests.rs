@@ -260,7 +260,7 @@ fn smoke_obs_core_dump_bundles_snapshot() -> TestResult {
             return TestResult::Fail("snapshot missing after install + record");
         }
     };
-    if snap.len() < 1 {
+    if snap.is_empty() {
         __test_clear_panic_ring();
         return TestResult::Fail("snapshot is empty after recording an event");
     }

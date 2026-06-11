@@ -214,8 +214,14 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
         if (size as usize) < 16 {
             continue;
         }
-        // SAFETY: bounds-checked.
+        // SAFETY: `size >= 16` was checked above, so the tag payload spans at
+        // least bytes [0, 16). `mod_start` occupies bytes [0, 4) of the payload,
+        // entirely within that range. `read_unaligned` is used because the field
+        // has no guaranteed alignment within the multiboot2 tag stream.
         let mod_start = unsafe { (payload as *const u32).read_unaligned() } as u64;
+        // SAFETY: `mod_end` occupies bytes [4, 8) of the payload, which lies
+        // within the [0, 16) range guaranteed by the `size >= 16` check above.
+        // `read_unaligned` accounts for the field's lack of alignment.
         let mod_end = unsafe { ((payload + 4) as *const u32).read_unaligned() } as u64;
         let str_start = payload + 8;
         let str_max = (size as usize).saturating_sub(16);

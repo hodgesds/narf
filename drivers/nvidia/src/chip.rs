@@ -236,7 +236,7 @@ pub fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
 /// Static table of all known PCI ids, in registration order. Used
 /// by the PCI driver-match registration and by smoke tests for
 /// coverage.
-pub const KNOWN_DEVICES: &[(&'static str, u16)] = &[
+pub const KNOWN_DEVICES: &[(&str, u16)] = &[
     // Maxwell.
     ("nvidia-gm107-gtx750ti", GM107_GTX_750_TI),
     ("nvidia-gm107-gtx750", GM107_GTX_750),

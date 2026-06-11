@@ -174,22 +174,19 @@ impl LoopbackTransport {
         let mut inner = self.inner.lock();
 
         // Per version(5): a Tversion at any time resets the session.
-        match mtype {
-            MsgType::Tversion => {
-                let proposed_msize = r.read_u32()?;
-                let _proposed_version = r.read_str()?;
-                inner.fids.clear();
-                inner.versioned = true;
-                let agreed = proposed_msize.min(inner.server_msize);
-                inner.server_msize = agreed;
-                drop(inner);
-                return frame_message(agreed, MsgType::Rversion, tag, |w| {
-                    w.write_u32(agreed)?;
-                    w.write_str(super::volume::PROTO_VERSION)?;
-                    Ok(())
-                });
-            }
-            _ => {}
+        if mtype == MsgType::Tversion {
+            let proposed_msize = r.read_u32()?;
+            let _proposed_version = r.read_str()?;
+            inner.fids.clear();
+            inner.versioned = true;
+            let agreed = proposed_msize.min(inner.server_msize);
+            inner.server_msize = agreed;
+            drop(inner);
+            return frame_message(agreed, MsgType::Rversion, tag, |w| {
+                w.write_u32(agreed)?;
+                w.write_str(super::volume::PROTO_VERSION)?;
+                Ok(())
+            });
         }
 
         if !inner.versioned {

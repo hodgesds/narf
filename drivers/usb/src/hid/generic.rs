@@ -582,8 +582,7 @@ pub(crate) mod tests {
     use super::super::report_descriptor::parse;
     use super::*;
     use narf_input::{
-        __reset_global_ring_for_test, evdev::ROUTER, init_global_ring, pop_button, pop_key,
-        pop_pointer, pop_scroll, KeyCode,
+        __reset_global_ring_for_test, evdev::ROUTER, init_global_ring, pop_button, pop_key, KeyCode,
     };
     use narf_kernel_test::{kernel_test_in, TestResult};
 

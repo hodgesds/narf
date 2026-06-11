@@ -16,7 +16,7 @@
 //! References (public, non-GPL):
 //! - **USB Power Delivery 3.1 v1.8** (USB-IF), §8.3.1 (policy split),
 //!   §6.4.1.3 (Fixed Source PDO), §6.4.2 (RDO encoding).
-//!     <https://www.usb.org/document-library/usb-power-delivery>
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //!
 //! Linux's `drivers/usb/typec/tcpm/tcpm.c` keeps the same shape but
 //! folds policy into the state machine; we keep it separate so the

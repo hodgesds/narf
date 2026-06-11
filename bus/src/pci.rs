@@ -122,6 +122,7 @@ const PM_CAP_ID: u8 = 0x01;
 /// PowerState field (00=D0, 01=D1, 10=D2, 11=D3hot).
 const PM_PMCSR_OFFSET: u64 = 0x04;
 const PM_PMCSR_STATE_MASK: u16 = 0x3;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PM_STATE_D0: u16 = 0;
 const PM_STATE_D3HOT: u16 = 3;
 
@@ -326,6 +327,9 @@ pub fn restore_config(
 #[inline]
 unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base and `off` is within that device's config window, so `cfg.raw() + off`
+    // is a readable MMIO address correctly aligned for a u8.
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
     compiler_fence(Ordering::SeqCst);
     v
@@ -334,6 +338,9 @@ unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
 #[inline]
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base and `off` is a dword-aligned offset within that device's config
+    // window, so `cfg.raw() + off` is a readable MMIO address valid for a u32.
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     v
@@ -342,6 +349,9 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
 #[inline]
 unsafe fn cfg_write8(cfg: PhysAddr, off: u64, value: u8) {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base it exclusively owns and `off` is within that device's config window,
+    // so `cfg.raw() + off` is a writable MMIO address correctly aligned for a u8.
     unsafe {
         core::ptr::write_volatile((cfg.raw() + off) as *mut u8, value);
     }
@@ -351,6 +361,10 @@ unsafe fn cfg_write8(cfg: PhysAddr, off: u64, value: u8) {
 #[inline]
 unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base it exclusively owns and `off` is a dword-aligned offset within that
+    // device's config window, so `cfg.raw() + off` is a writable MMIO address
+    // valid for a u32.
     unsafe {
         core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
     }

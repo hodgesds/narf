@@ -68,6 +68,7 @@ const RCR_APM: u32 = 1 << 1; // Accept Physical Match
 const RCR_AM: u32 = 1 << 2; // Accept Multicast
 const RCR_AB: u32 = 1 << 3; // Accept Broadcast
 const RCR_WRAP: u32 = 1 << 7; // Wrap RX buffer
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const RCR_RBLEN_8K: u32 = 0; // bits[12:11] = 0 → 8 KB + 16 byte WRAP
 const RCR_RBLEN_64K: u32 = 0b11 << 11; // bits[12:11] = 3 → 64 KB + 16
 
@@ -133,8 +134,8 @@ impl Rtl8139 {
     pub unsafe fn bring_up(
         device: &BusDevice,
         _cap: &Cap<BusDeviceCap, Write>,
-        rx_cons: Consumer<Frame, RX_RING_N>,
-        tx_prod: Producer<Frame, TX_RING_N>,
+        _rx_cons: Consumer<Frame, RX_RING_N>,
+        _tx_prod: Producer<Frame, TX_RING_N>,
     ) -> Result<Self, Rtl8139Error> {
         // SAFETY: caller-asserted. RTL8139 advertises both BAR0
         // (IO) and BAR1 (MMIO); MMIO is more portable + cross-arch
@@ -228,8 +229,8 @@ impl Rtl8139 {
             mmio.write8(REG_CR, CR_TE | CR_RE);
         }
 
-        let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-        let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+        let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+        let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
         let rtl = Arc::new(Self {
             mmio,

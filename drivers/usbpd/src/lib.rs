@@ -17,12 +17,12 @@
 //!
 //! References (public, non-GPL only):
 //! - **USB Power Delivery 3.1 v1.8** (USB-IF).
-//!     <https://www.usb.org/document-library/usb-power-delivery>
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //! - **USB Type-C Cable and Connector Specification 2.2** (USB-IF).
-//!     <https://www.usb.org/document-library/usb-type-c-cable-and-connector-specification-revision-22>
+//!   <https://www.usb.org/document-library/usb-type-c-cable-and-connector-specification-revision-22>
 //! - **USB Type-C Port Controller Interface Specification 2.0**
 //!   (USB-IF, TCPCI 2.0).
-//!     <https://www.usb.org/document-library/usb-type-c-port-controller-interface-specification-revision-20>
+//!   <https://www.usb.org/document-library/usb-type-c-port-controller-interface-specification-revision-20>
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]

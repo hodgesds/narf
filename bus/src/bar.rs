@@ -445,6 +445,9 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, Assign
                 // SAFETY: cfg-space writes at validated offsets.
                 let orig_lo = unsafe { cfg_read32(cfg_phys, off_lo) };
                 let type_bits = orig_lo & 0x0F;
+                // SAFETY: off_lo/off_hi are BAR0_OFFSET + idx*4 with idx <
+                // NUM_BARS, so both lie inside this device's 256-byte config
+                // space at cfg_phys, whose ownership the caller asserted.
                 unsafe {
                     cfg_write32(
                         cfg_phys,

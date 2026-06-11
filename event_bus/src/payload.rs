@@ -101,12 +101,14 @@ impl Arena {
         let _g = slot.lock.lock();
         let written = bytes.len().min(self.slot_bytes);
         let start = idx * self.slot_bytes;
-        // SAFETY: idx < num_slots, so start + slot_bytes <= buf.len.
-        // We hold the per-slot lock during the write.
-        // `self.buf` is `&self` so we need interior mutability via the
-        // lock guard. We use an UnsafeCell-style aliasing pattern via
-        // a raw pointer to the boxed buffer.
         let ptr = self.buf.as_ptr() as *mut u8;
+        // SAFETY: `start = idx * slot_bytes` with `idx < num_slots`, and
+        // `buf.len() == num_slots * slot_bytes`, so the destination range
+        // `[start, start + written)` (with `written <= slot_bytes`) lies
+        // fully within `buf`. We hold this slot's `IrqSafeSpinLock` for the
+        // duration of the copy, so no other producer or reader touches these
+        // bytes concurrently; `bytes` is an independent caller-owned slice
+        // and cannot overlap `buf`, satisfying `copy_nonoverlapping`.
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(start), written);
         }
@@ -163,6 +165,11 @@ impl Arena {
 // `IrqSafeSpinLock`; the buf bytes are only touched while a slot
 // lock is held; slot metadata is atomic.
 unsafe impl Send for Arena {}
+// SAFETY: same justification as the `Send` impl above. Every shared access
+// to the interior `buf` bytes happens only while the corresponding per-slot
+// `IrqSafeSpinLock` is held, and all slot metadata (`generation`, `len`,
+// `head`) is atomic, so concurrent access from multiple threads is fully
+// synchronized.
 unsafe impl Sync for Arena {}
 
 impl core::fmt::Debug for Arena {

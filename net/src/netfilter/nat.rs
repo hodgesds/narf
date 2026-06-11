@@ -49,6 +49,11 @@ impl MasqRule {
     }
 }
 
+/// Egress-map key: `(nat_src_ip, nat_src_port, proto)`.
+type EgressKey = ([u8; 4], u16, u8);
+/// A rewritten source endpoint: `(src_ip, src_port)`.
+type Endpoint = ([u8; 4], u16);
+
 /// NAT mapping table. Keys are `(iface_ip, nat_port, proto)`; values
 /// are `(orig_src_ip, orig_src_port)`. On ingress with dst matching a
 /// key, restore the original.
@@ -56,12 +61,18 @@ impl MasqRule {
 pub struct Nat {
     rules: IrqSafeSpinLock<Vec<MasqRule>>,
     /// `(nat_src_ip, nat_src_port, proto) → (orig_src_ip, orig_src_port)`.
-    egress_map: IrqSafeSpinLock<BTreeMap<([u8; 4], u16, u8), ([u8; 4], u16)>>,
+    egress_map: IrqSafeSpinLock<BTreeMap<EgressKey, Endpoint>>,
     /// Conntrack id → allocated `(nat_src_ip, nat_src_port)` so the
     /// same flow always rewrites consistently.
-    by_ct: IrqSafeSpinLock<BTreeMap<u64, ([u8; 4], u16)>>,
+    by_ct: IrqSafeSpinLock<BTreeMap<u64, Endpoint>>,
     /// Next port to try when allocating.
     next_port: AtomicU16,
+}
+
+impl Default for Nat {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Nat {

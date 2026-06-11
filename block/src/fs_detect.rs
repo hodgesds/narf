@@ -114,8 +114,7 @@ pub fn detect_filesystem(dev: &Arc<dyn BlockDeviceSync>) -> Result<Option<FsType
     let ext_magic_byte = ext_byte_offset + 56;
     let ext_first_lba = (ext_byte_offset / lba_size as usize) as u64;
     let ext_last_byte = ext_magic_byte + 2; // need 2 bytes for the magic
-    let ext_lba_count =
-        (ext_last_byte + lba_size as usize - 1) / lba_size as usize - ext_first_lba as usize;
+    let ext_lba_count = ext_last_byte.div_ceil(lba_size as usize) - ext_first_lba as usize;
     let mut ext_buf = vec![0u8; ext_lba_count * lba_size as usize];
     if dev
         .read(ext_first_lba, ext_lba_count as u16, &mut ext_buf)

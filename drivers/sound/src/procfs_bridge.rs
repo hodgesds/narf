@@ -136,10 +136,10 @@ pub fn render_codec_dump(card_index: u32, codec_index: u32) -> String {
             // real widget count — sufficient for tooling that just wants to
             // know the codec is alive.
             let widget_count = card.playback_count + card.capture_count;
-            out.push_str(&format!("Default PCM:\n"));
-            out.push_str(&format!("  rates [0x0060]: 44100 48000\n"));
-            out.push_str(&format!("  bits [0x0006]: 16 24\n"));
-            out.push_str(&format!("  formats [0x00000001]: PCM\n"));
+            out.push_str("Default PCM:\n");
+            out.push_str("  rates [0x0060]: 44100 48000\n");
+            out.push_str("  bits [0x0006]: 16 24\n");
+            out.push_str("  formats [0x00000001]: PCM\n");
             out.push_str(&format!("Node count: {}\n", widget_count));
             out
         }
@@ -163,15 +163,15 @@ pub fn render_pcm_info(card_index: u32, device: u32, is_capture: bool) -> String
             let mut out = String::new();
             out.push_str(&format!("card: {}\n", card_index));
             out.push_str(&format!("device: {}\n", device));
-            out.push_str(&format!("subdevice: 0\n"));
+            out.push_str("subdevice: 0\n");
             out.push_str(&format!("stream: {}\n", direction));
             out.push_str(&format!("id: {}\n", card.id));
             out.push_str(&format!("name: {}\n", card.name));
-            out.push_str(&format!("subname: \n"));
-            out.push_str(&format!("class: 0\n"));
-            out.push_str(&format!("subclass: 0\n"));
-            out.push_str(&format!("subdevices_count: 1\n"));
-            out.push_str(&format!("subdevices_avail: 1\n"));
+            out.push_str("subname: \n");
+            out.push_str("class: 0\n");
+            out.push_str("subclass: 0\n");
+            out.push_str("subdevices_count: 1\n");
+            out.push_str("subdevices_avail: 1\n");
             out
         }
     }

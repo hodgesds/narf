@@ -185,7 +185,7 @@ pub fn decode_hkey_event(value: u32) -> HkeyEvent {
         HKEY_TABLET_ENTER => HkeyEvent::TabletEnter,
         HKEY_TABLET_EXIT => HkeyEvent::TabletExit,
         HKEY_MIC_MUTE_LED => HkeyEvent::MicMuteLed,
-        v if v >= HKEY_FN_RANGE_LO && v <= HKEY_FN_RANGE_HI => HkeyEvent::FnKey { code: v },
+        v if (HKEY_FN_RANGE_LO..=HKEY_FN_RANGE_HI).contains(&v) => HkeyEvent::FnKey { code: v },
         other => HkeyEvent::Unknown { value: other },
     }
 }

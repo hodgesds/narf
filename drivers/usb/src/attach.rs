@@ -41,7 +41,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::fingerprint;
 use crate::hid;
 use crate::hid::mouse;
-use crate::hub::{self, UsbHub, HUB_INTERFACE_CLASS};
+use crate::hub::{self, UsbHub};
 use crate::xhci::{self, PortSpeed, Topology, Xhci};
 
 /// USB Device Class triple values we recognise (§9.6.1 of USB 2.0).

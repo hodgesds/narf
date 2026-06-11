@@ -122,9 +122,7 @@ impl Umem {
     /// Linux ref: `xdp_umem_create` /
     /// `xdp_umem_reg` in `net/xdp/xdp_umem.c`.
     pub fn register(size: u32, frame_size: u32) -> Result<Arc<Self>, UmemError> {
-        if frame_size < MIN_FRAME_SIZE
-            || frame_size > MAX_FRAME_SIZE
-            || !frame_size.is_power_of_two()
+        if !(MIN_FRAME_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) || !frame_size.is_power_of_two()
         {
             return Err(UmemError::InvalidFrameSize);
         }

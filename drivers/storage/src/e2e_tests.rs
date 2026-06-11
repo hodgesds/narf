@@ -78,6 +78,7 @@ impl FakeBlockDevice {
     }
 
     /// Return a copy of backing bytes at `[byte_off..byte_off+len]`.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn backing_slice(&self, byte_off: usize, len: usize) -> Vec<u8> {
         let g = self.data.lock();
         g[byte_off..byte_off + len].to_vec()
@@ -190,10 +191,12 @@ impl FakeNvmeMmio {
         u32::from_le_bytes(self.mem[off..off + 4].try_into().unwrap())
     }
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn write64(&mut self, off: usize, val: u64) {
         self.mem[off..off + 8].copy_from_slice(&val.to_le_bytes());
     }
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     fn read64(&self, off: usize) -> u64 {
         u64::from_le_bytes(self.mem[off..off + 8].try_into().unwrap())
     }
@@ -326,7 +329,7 @@ fn smoke_nvme_controller_reset() -> TestResult {
     }
 
     // Step 4: set CC.EN → controller asserts CSTS.RDY.
-    let cc: u32 = NVME_CC_EN | (0 << 4) | (0 << 7) | (6 << 16) | (4 << 20);
+    let cc: u32 = NVME_CC_EN | (6 << 16) | (4 << 20);
     bar.write32(NVME_REG_CC, cc);
     bar.react_cc();
     let csts = bar.read32(NVME_REG_CSTS);
@@ -454,7 +457,7 @@ fn smoke_nvme_identify_namespace() -> TestResult {
 
     // Verify SQE for IDENTIFY NAMESPACE: CDW10=0 (CNS=0), NSID=1.
     let mut sq = [0u8; 64];
-    let cdw0: u32 = (0u32 << 16) | (OPC_IDENTIFY as u32); // CID=0
+    let cdw0: u32 = OPC_IDENTIFY as u32; // CID=0
     sq[0..4].copy_from_slice(&cdw0.to_le_bytes());
     sq[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID = 1
     sq[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10 = CNS=0
@@ -496,7 +499,7 @@ fn smoke_nvme_create_io_cq() -> TestResult {
     sq[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
     // Decode opcode + QID.
-    let got_opc = sq[0] as u8;
+    let got_opc = sq[0];
     let got_cid = u16::from_le_bytes(sq[2..4].try_into().unwrap());
     let got_cdw10 = u32::from_le_bytes(sq[40..44].try_into().unwrap());
     let got_qid = (got_cdw10 & 0xFFFF) as u16;
@@ -561,7 +564,7 @@ fn smoke_nvme_create_io_sq() -> TestResult {
     sq[40..44].copy_from_slice(&cdw10.to_le_bytes());
     sq[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
-    let got_opc = sq[0] as u8;
+    let got_opc = sq[0];
     let got_cdw10 = u32::from_le_bytes(sq[40..44].try_into().unwrap());
     let got_cdw11 = u32::from_le_bytes(sq[44..48].try_into().unwrap());
     let got_qid = (got_cdw10 & 0xFFFF) as u16;
@@ -772,6 +775,7 @@ kernel_test_in!("drivers/storage/nvme-e2e", smoke_nvme_register_block_device);
 /// AHCI HBA register offsets (AHCI 1.3.1 §3.1).
 const AHCI_HBA_CAP: usize = 0x00;
 const AHCI_HBA_GHC: usize = 0x04;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const AHCI_HBA_IS: usize = 0x08;
 const AHCI_HBA_PI: usize = 0x0C;
 const AHCI_HBA_VS: usize = 0x10;
@@ -789,6 +793,7 @@ const PORT_CLB: usize = 0x00; // Command List Base Low
 const PORT_CLBU: usize = 0x04; // Command List Base High
 const PORT_FB: usize = 0x08; // FIS Receive Base Low
 const PORT_FBU: usize = 0x0C; // FIS Receive Base High
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PORT_IS: usize = 0x10; // Interrupt Status
 const PORT_CMD: usize = 0x18;
 const PORT_TFD: usize = 0x20;
@@ -799,6 +804,7 @@ const PORT_CI: usize = 0x38;
 const PORT_CMD_ST: u32 = 1 << 0;
 const PORT_CMD_FRE: u32 = 1 << 4;
 const PORT_CMD_FR: u32 = 1 << 14;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PORT_CMD_CR: u32 = 1 << 15;
 
 /// SATA device signature (ATA).
@@ -817,7 +823,7 @@ impl FakeAhciMmio {
             mem: [0u8; 64 * 1024],
         };
         // CAP: NCS (num cmd slots) at bits[12:8] = 31, NP (num ports-1) at bits[4:0] = 0.
-        let cap: u32 = (31 << 8) | 0;
+        let cap: u32 = 31 << 8;
         m.write32(AHCI_HBA_CAP, cap);
         // GHC: AE set, HR clear.
         m.write32(AHCI_HBA_GHC, AHCI_GHC_AE);

@@ -70,9 +70,15 @@ pub struct Framebuffer {
 }
 
 // SAFETY: Framebuffer holds a raw pointer into MMIO that is owned
-// exclusively by the display driver. Sharing the framebuffer across
-// threads is the driver's responsibility (e.g. via IrqSafeSpinLock).
+// exclusively by the display driver. Moving the framebuffer between
+// threads only transfers ownership of that pointer, which is sound
+// because the underlying mapping is process-global MMIO valid on any
+// CPU.
 unsafe impl Send for Framebuffer {}
+// SAFETY: `&Framebuffer` exposes only the immutable dimension fields;
+// every method that writes through `base` takes `&mut self`, so shared
+// access cannot create concurrent writes. Coordinating exclusive access
+// for drawing is the driver's responsibility (e.g. via IrqSafeSpinLock).
 unsafe impl Sync for Framebuffer {}
 
 impl Framebuffer {

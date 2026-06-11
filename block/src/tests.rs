@@ -14,6 +14,11 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn make_block_request(op: crate::BlockOp, user_tag: u64) -> crate::BlockRequest {
     use crate::{BlockRequest, QosHint};
     use narf_capabilities::{Cap, CapSlot, Read, Rights};
+    // SAFETY: this is a test-only synthetic capability. `mint` requires the
+    // slot's `type_tag` and `rights` to match the `Cap`'s `T` and `R`. The
+    // slot is built here with `type_tag = CapKind::DmaBuffer` and `rights =
+    // Read::BITS`, which exactly match `Cap::<DmaBuffer, Read>`, so the
+    // type/rights coherence invariant holds.
     let cap = unsafe {
         Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
             1,
@@ -291,10 +296,10 @@ fn smoke_scsi_read_10_carries_lba_and_length() -> TestResult {
     if cdb[1] & (1 << 3) == 0 {
         return TestResult::Fail("FUA bit at byte 1 bit 3");
     }
-    if &cdb[2..6] != &[0xCA, 0xFE, 0xBE, 0xEF] {
+    if cdb[2..6] != [0xCA, 0xFE, 0xBE, 0xEF] {
         return TestResult::Fail("LBA stored big-endian");
     }
-    if &cdb[7..9] != &[0x00, 0x40] {
+    if cdb[7..9] != [0x00, 0x40] {
         return TestResult::Fail("transfer length stored big-endian");
     }
     TestResult::Pass
@@ -613,7 +618,7 @@ fn smoke_block_deadline_empty_dequeue_is_none() -> TestResult {
     if !s.is_empty() {
         return TestResult::Fail("fresh scheduler not empty");
     }
-    if s.len() != 0 || s.reads_pending() != 0 || s.writes_pending() != 0 {
+    if !s.is_empty() || s.reads_pending() != 0 || s.writes_pending() != 0 {
         return TestResult::Fail("fresh scheduler pending counts non-zero");
     }
     if s.dequeue_next(0).is_some() {
@@ -750,7 +755,7 @@ fn smoke_block_mq_enqueue_on_out_of_range_returns_none() -> TestResult {
     if r.is_some() {
         return TestResult::Fail("very-out-of-range lane accepted submission");
     }
-    if s.len() != 0 {
+    if !s.is_empty() {
         return TestResult::Fail("failed enqueue still bumped pending count");
     }
     TestResult::Pass

@@ -866,8 +866,7 @@ impl PendingCancels {
     fn enter_inflight(&self, tag: Tag, chain: u32) -> Arc<CancelToken> {
         let mut g = self.inner.lock();
         let tok = Arc::new(CancelToken::new(tag));
-        let pre_cancelled =
-            g.tags.iter().any(|&t| t == tag.raw()) || g.chains.iter().any(|&c| c == chain);
+        let pre_cancelled = g.tags.contains(&tag.raw()) || g.chains.contains(&chain);
         if pre_cancelled {
             tok.request();
         }
@@ -948,7 +947,7 @@ impl PendingCancels {
             g.tags.push(target.raw());
         }
         if let Some(&(_, chain)) = g.chain_of.iter().find(|&&(t, _)| t == target.raw()) {
-            if !g.chains.iter().any(|&c| c == chain) {
+            if !g.chains.contains(&chain) {
                 g.chains.push(chain);
             }
         }
@@ -965,7 +964,7 @@ impl PendingCancels {
             g.tags.swap_remove(pos);
             hit = true;
         }
-        if g.chains.iter().any(|&c| c == chain) {
+        if g.chains.contains(&chain) {
             hit = true;
         }
         hit
@@ -1106,7 +1105,7 @@ impl<const N: usize> Dispatcher<N> {
                 let r = dispatch_file_op(kind, &args, &cx);
                 // Bridge may have observed the cancel and returned
                 // status=2 (Cancelled). Translate per CANCELLABLE.
-                let result_completion = match r.status {
+                match r.status {
                     0 => {
                         let mut result = [0u64; 6];
                         result[0] = r.value;
@@ -1114,8 +1113,7 @@ impl<const N: usize> Dispatcher<N> {
                     }
                     2 => cancel_outcome(tag, sub.flags),
                     _ => Completion::with(tag, NarfStatus::InvalidOp, [0; 6]),
-                };
-                result_completion
+                }
             }
 
             OpCode::CpuTopology

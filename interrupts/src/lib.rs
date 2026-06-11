@@ -91,7 +91,7 @@ fn ipi_fanout_bridge(req: narf_memory::tlb_shootdown::ShootdownRequest) {
         // Tag + VA + size: tag-aware range shootdown. Peers
         // INVPCID(tag, va) per page. Intel SDM Vol 2 INVPCID type 0.
         (Some(tag), Some(va), Some(size)) => {
-            let pages = (size + 0xFFF) / 0x1000;
+            let pages = size.div_ceil(0x1000);
             // SAFETY: x2APIC online post-boot; vector installed.
             unsafe {
                 x86_64::ipi::shoot_range(va, pages.max(1), tag);

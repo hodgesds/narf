@@ -955,7 +955,7 @@ impl core::future::Future for UserTaskFuture {
                     narf_memory::beacon::paint(51, 0x0060_FFFF); // cyan: pre-iretq-resume
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        let us = &*(this.ctx.state.get() as *const narf_scheduler::UserState);
+                        let _us = &*(this.ctx.state.get() as *const narf_scheduler::UserState);
                     }
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }

@@ -182,7 +182,7 @@ pub struct DeviceFanoutOutcome {
 }
 
 /// Result of a suspend or resume fan-out — per-device outcomes
-/// + a count of failures so the caller can decide whether to
+/// plus a count of failures so the caller can decide whether to
 /// abort the surrounding phase machinery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FanoutReport {

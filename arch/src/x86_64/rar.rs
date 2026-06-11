@@ -42,20 +42,32 @@ pub unsafe fn read_info_base() -> u64 {
     unsafe { rdmsr(MSR_IA32_RAR_INFO_BASE) }
 }
 
+/// # Safety
+/// CPL = 0; RAR must be supported (see [`supported`]). `base` must be the
+/// physical address of a valid, page-aligned RAR info table that outlives its
+/// use by the hardware.
 pub unsafe fn write_info_base(base: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts RAR is supported and CPL=0, so writing the
+    // architectural RAR info-base MSR is well-defined.
     unsafe {
         wrmsr(MSR_IA32_RAR_INFO_BASE, base);
     }
 }
 
+/// # Safety
+/// CPL = 0; RAR must be supported (see [`supported`]).
 pub unsafe fn read_ctrl() -> u64 {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts RAR is supported and CPL=0, so reading the
+    // architectural RAR control MSR is well-defined.
     unsafe { rdmsr(MSR_IA32_RAR_CTRL) }
 }
 
+/// # Safety
+/// CPL = 0; RAR must be supported (see [`supported`]). `v` must be a valid
+/// `IA32_RAR_CTRL` bit pattern.
 pub unsafe fn write_ctrl(v: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts RAR is supported and CPL=0, so writing the
+    // architectural RAR control MSR is well-defined.
     unsafe {
         wrmsr(MSR_IA32_RAR_CTRL, v);
     }

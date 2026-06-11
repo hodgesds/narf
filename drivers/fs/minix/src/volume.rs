@@ -332,7 +332,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             if ind == 0 {
                 return Ok(None);
             }
-            return Ok(self.read_zone_ptr(ind, idx).await?);
+            return self.read_zone_ptr(ind, idx).await;
         }
         idx -= zpb;
 
@@ -348,7 +348,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
                 Some(m) => m,
                 None => return Ok(None),
             };
-            return Ok(self.read_zone_ptr(mid, inner).await?);
+            return self.read_zone_ptr(mid, inner).await;
         }
         idx -= zpb * zpb;
 
@@ -371,7 +371,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             Some(i) => i,
             None => return Ok(None),
         };
-        Ok(self.read_zone_ptr(inner_blk, inner).await?)
+        self.read_zone_ptr(inner_blk, inner).await
     }
 
     /// Read the `idx`-th zone pointer from the indirect block at

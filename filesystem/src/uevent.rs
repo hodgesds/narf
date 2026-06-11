@@ -203,6 +203,12 @@ pub struct UeventReader {
     next_seqnum: u64,
 }
 
+impl Default for UeventReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UeventReader {
     /// Position the reader at the *current* tail — future events only.
     pub fn new() -> Self {

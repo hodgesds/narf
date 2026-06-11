@@ -327,12 +327,16 @@ pub const IGC_ADVTXD_MSS_SHIFT: u32 = 16;
 // Source: Linux igc_defines.h lines 726–729.
 
 /// status_error bit 6 — IP checksum computed.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const ADV_RXD_STAT_IPCS: u32 = 1 << 6;
 /// status_error bit 7 — L4 (TCP/UDP) checksum computed.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const ADV_RXD_STAT_L4CS: u32 = 1 << 7;
 /// status_error bit 24 — TCP/UDP checksum error.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const ADV_RXD_ERR_TCPE: u32 = 1 << 24;
 /// status_error bit 25 — IP checksum error.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const ADV_RXD_ERR_IPE: u32 = 1 << 25;
 
 /// RX checksum verification result decoded from an igc AdvRxDescWb.
@@ -371,6 +375,7 @@ pub struct AdvTxDataDesc {
 
 impl AdvRxDescWb {
     /// Decode the RX checksum result from `status_error`.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn csum_result(&self) -> RxCsumResult {
         let ip_computed = self.status_error & ADV_RXD_STAT_IPCS != 0;
         let l4_computed = self.status_error & ADV_RXD_STAT_L4CS != 0;

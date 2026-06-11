@@ -37,7 +37,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
+use narf_filesystem::{FileOps, FileType, FsFuture, Mode, Stat, POLL_IN};
 
 // ── RX / TX ring ─────────────────────────────────────────────────────
 

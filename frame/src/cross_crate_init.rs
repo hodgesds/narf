@@ -18,6 +18,7 @@ use narf_console as console;
 /// boot time. Called once from `bare_main` after the per-task
 /// initialisers (sigaction_init, signal_init, fd::init,
 /// init_per_task_state) have run.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn install_all_hooks() {
     install_console_signal_hook();
     #[cfg(feature = "linux-compat")]
@@ -31,6 +32,7 @@ pub fn install_all_hooks() {
     install_procfs_net_hooks();
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn install_console_signal_hook() {
     // ^C / ^\ / ^Z input-byte handling into the console driver
     // so they deliver SIGINT/SIGQUIT/SIGTSTP to the foreground
@@ -76,6 +78,7 @@ fn install_proc_write_hooks() {
     );
 }
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn install_net_stack() {
     // TCP-over-NIC: register the RX dispatch handler and spawn an
     // async kernel task that drains the NIC RX ring. Inline drain

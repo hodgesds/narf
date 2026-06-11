@@ -41,6 +41,10 @@ impl core::fmt::Debug for GpeHandler {
 
 static HANDLERS: IrqSafeSpinLock<Vec<GpeHandler>> = IrqSafeSpinLock::new(Vec::new());
 
+/// Snapshot of a handler's dispatch targets: an optional native function
+/// pointer and an optional fully-qualified AML method path.
+type HandlerSnapshot = (Option<fn(u32)>, Option<String>);
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Scan the AML namespace for GPE handler methods and register them.
@@ -102,12 +106,12 @@ pub fn install_aml_handlers() -> u32 {
         }
         // seg[2] and seg[3] must be ASCII hex digits.
         fn is_hex(c: u8) -> bool {
-            (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'f') || (c >= b'A' && c <= b'F')
+            c.is_ascii_hexdigit()
         }
         fn hex_val(c: u8) -> u32 {
-            if c >= b'0' && c <= b'9' {
+            if c.is_ascii_digit() {
                 (c - b'0') as u32
-            } else if c >= b'a' && c <= b'f' {
+            } else if c.is_ascii_lowercase() {
                 (c - b'a') as u32 + 10
             } else {
                 (c - b'A') as u32 + 10
@@ -157,7 +161,7 @@ pub fn register_native_handler(gpe_num: u32, handler: fn(u32)) {
 /// method (if present). No-op when no handler is registered.
 pub fn dispatch(gpe_num: u32) {
     // Snapshot under lock.
-    let (native, aml_path): (Option<fn(u32)>, Option<String>) = {
+    let (native, aml_path): HandlerSnapshot = {
         let g = HANDLERS.lock();
         match g.iter().find(|h| h.gpe_num == gpe_num) {
             Some(h) => (h.native, h.aml_path.clone()),

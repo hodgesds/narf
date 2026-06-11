@@ -430,6 +430,7 @@ pub fn encode_default_channel_switch(out: &mut [u8]) -> Option<()> {
 /// 802.11 MGMT frame control: type=Management (0), subtype=Auth (11).
 pub const FC_MGMT_AUTH: u16 = (0 << 2) | (11 << 4);
 /// 802.11 MGMT frame control: type=Management, subtype=AssocReq (0).
+#[allow(clippy::identity_op, clippy::eq_op)]
 pub const FC_MGMT_ASSOC_REQ: u16 = (0 << 2) | (0 << 4);
 /// 802.11 MGMT frame control: type=Management, subtype=AssocResp (1).
 pub const FC_MGMT_ASSOC_RESP: u16 = (0 << 2) | (1 << 4);

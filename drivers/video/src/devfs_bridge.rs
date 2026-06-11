@@ -331,7 +331,7 @@ pub mod tests {
         let dev = get_device(idx).unwrap();
         // Simulate a captured frame.
         dev.lock().push_frame(alloc::vec![0xABu8; 64]);
-        let file = VideoFile::new(dev.clone());
+        let _file = VideoFile::new(dev.clone());
         let mut out = [0u8; 128];
         let n = {
             let frame = dev.lock().pop_frame();

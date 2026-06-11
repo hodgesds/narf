@@ -95,8 +95,8 @@ fn i2c_read(bus: &Arc<dyn I2cBus>, addr: u8, offset: u8, width: usize) -> u64 {
         return 0;
     }
     let mut acc = 0u64;
-    for i in 0..w {
-        acc |= (buf[i] as u64) << (i * 8);
+    for (i, &b) in buf.iter().enumerate().take(w) {
+        acc |= (b as u64) << (i * 8);
     }
     acc
 }

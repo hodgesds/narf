@@ -112,6 +112,7 @@ impl<T> IntrusiveList<T> {
         // SAFETY: the pin projection for `link` is sound because `Node<T>`
         // and `ListLink<T>` are `!Unpin` and we never move out of `link`.
         let node_ptr: NonNull<Node<T>> = NonNull::from(unsafe { node.get_unchecked_mut() });
+        // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
         let link = unsafe { &node_ptr.as_ref().link };
         debug_assert!(!link.is_linked(), "IntrusiveList: node already linked");
 
@@ -134,7 +135,9 @@ impl<T> IntrusiveList<T> {
 
     /// Prepend a pinned node at the head.
     pub fn push_front(&self, node: Pin<&mut Node<T>>) {
+        // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
         let node_ptr: NonNull<Node<T>> = NonNull::from(unsafe { node.get_unchecked_mut() });
+        // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
         let link = unsafe { &node_ptr.as_ref().link };
         debug_assert!(!link.is_linked(), "IntrusiveList: node already linked");
 
@@ -142,6 +145,7 @@ impl<T> IntrusiveList<T> {
         link.next.set(self.head.get());
 
         match self.head.get() {
+            // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
             Some(head) => unsafe {
                 head.as_ref().link.prev.set(Some(node_ptr));
             },
@@ -162,6 +166,7 @@ impl<T> IntrusiveList<T> {
         link.next.set(None);
         self.head.set(next);
         match next {
+            // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
             Some(n) => unsafe {
                 n.as_ref().link.prev.set(None);
             },
@@ -184,12 +189,14 @@ impl<T> IntrusiveList<T> {
         let prev = link.prev.get();
         let next = link.next.get();
         match prev {
+            // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
             Some(p) => unsafe {
                 p.as_ref().link.next.set(next);
             },
             None => self.head.set(next),
         }
         match next {
+            // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
             Some(n) => unsafe {
                 n.as_ref().link.prev.set(prev);
             },

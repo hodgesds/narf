@@ -129,9 +129,6 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 }
 
 fn spawn_pumps(device: Arc<Rtw89Device>) {
-    use narf_ipc::{channel, Consumer, Producer};
-    use narf_net::{Frame, RX_RING_N, TX_RING_N};
-
     let d1 = device.clone();
     narf_scheduler::spawn(async move {
         rtw89_rx_pump(d1).await;

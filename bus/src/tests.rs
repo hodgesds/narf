@@ -618,6 +618,9 @@ fn smoke_pci_cap_ext_walker() -> TestResult {
     use crate::pci_cap_ext::iter as ext_iter;
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1100,13 +1103,13 @@ fn smoke_cxl_get_log_input_layout() -> TestResult {
     if buf.len() != 24 {
         return TestResult::Fail("Get Log input = 16 UUID + 4 offset + 4 length");
     }
-    if &buf[0..16] != &uuid {
+    if buf[0..16] != uuid {
         return TestResult::Fail("UUID prefix");
     }
-    if &buf[16..20] != &0x40u32.to_le_bytes() {
+    if buf[16..20] != 0x40u32.to_le_bytes() {
         return TestResult::Fail("offset is LE u32");
     }
-    if &buf[20..24] != &0x100u32.to_le_bytes() {
+    if buf[20..24] != 0x100u32.to_le_bytes() {
         return TestResult::Fail("length is LE u32");
     }
     TestResult::Pass
@@ -1219,6 +1222,9 @@ fn smoke_pci_cap_walker_finds_msix() -> TestResult {
     // present.
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{devices, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1236,6 +1242,8 @@ fn smoke_pci_cap_walker_finds_msix() -> TestResult {
         return TestResult::Fail("MSI-X cap offset out of range");
     }
     // PCI Express cap should also exist on a QEMU NVMe.
+    // SAFETY: `d` came from the enumerated registry, so its cfg-space is the
+    // identity-mapped ECAM window; find_cap only does a bounded read-only walk.
     match unsafe { crate::pci_cap::find_cap(d, crate::pci_cap::id::PCI_EXPRESS) } {
         Ok(Some(_)) => {}
         _ => return TestResult::Fail("PCI Express cap not found"),
@@ -1252,6 +1260,9 @@ fn smoke_pci_express_cap_link_status() -> TestResult {
     use crate::pci_express::read_status;
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1298,6 +1309,9 @@ fn smoke_msix_program_block() -> TestResult {
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_interrupts::vector;
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1452,6 +1466,9 @@ fn smoke_bus_pci_read_intx_pin_against_devices() -> TestResult {
     use crate::{
         bootstrap_registry_authority, claim_device_cap, devices, pci::read_intx_pin, BusKind,
     };
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut tested = 0u32;
@@ -1492,6 +1509,9 @@ fn smoke_bus_pcie_aer_cap_walker() -> TestResult {
     use crate::pcie_aer::find_aer_cap_offset;
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{devices, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut walked = 0u32;
@@ -1531,6 +1551,9 @@ fn smoke_bus_hotplug_pcie_cap_walker() -> TestResult {
     use crate::hotplug::find_pcie_cap_offset;
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{devices, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut walked = 0u32;
@@ -2136,7 +2159,7 @@ fn smoke_aer_cap_discovery_synthetic() -> TestResult {
     use crate::pcie_aer::find_aer_cap_offset;
     let mut space = alloc::vec![0u32; 1024]; // 4096 bytes
     space[0x100 / 4] = 0xABCDu32 | (1 << 16) | (0x140u32 << 20);
-    space[0x140 / 4] = 0x0001u32 | (2 << 16) | (0u32 << 20);
+    space[0x140 / 4] = 0x0001u32 | (2 << 16); // next-cap pointer = 0 (end of list)
     let cfg_phys = space.as_ptr() as u64;
     // SAFETY: `space` is a live heap allocation; walk is read-only;
     // all pointer arithmetic stays within the 4096-byte Vec.
@@ -2526,6 +2549,9 @@ fn smoke_dpc_capability_presence_detect() -> TestResult {
     use crate::pcie_dpc::find_dpc_cap_offset;
     use crate::x86_64::ECAM_DEFAULT_BASE;
     use crate::{devices, BusKind};
+    // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
+    // identity-mapped below the 4-GiB map and the enumerator only
+    // issues config-space reads; init is idempotent across calls.
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     for d in devs.iter() {
@@ -2536,7 +2562,7 @@ fn smoke_dpc_capability_presence_detect() -> TestResult {
         // SAFETY: live ECAM; walker is read-only + bounded.
         let off = unsafe { find_dpc_cap_offset(cfg_phys) };
         if let Some(o) = off {
-            if o < 0x100 || o >= 0x1000 {
+            if !(0x100..0x1000).contains(&o) {
                 return TestResult::Fail("DPC cap offset out of range");
             }
         }

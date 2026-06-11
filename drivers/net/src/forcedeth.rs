@@ -446,7 +446,17 @@ pub struct ForcedethNic {
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+// SAFETY: The only non-Send/Sync members are the raw MMIO/DMA pointers
+// inside `mmio`, `tx_ring`, `rx_ring`, and the per-slot pools. Those
+// point at device BAR0 / DMA-coherent memory that is not bound to any
+// particular thread, so they are valid to touch from any CPU. All
+// interior-mutable driver state (`tx_head`, `rx_head`, the IPC rings) is
+// guarded by `IrqSafeSpinLock`, which serialises concurrent access, so
+// sharing `&ForcedethNic` across threads cannot create a data race.
 unsafe impl Send for ForcedethNic {}
+// SAFETY: see the `Send` impl above — every field that is mutated through
+// `&self` lives behind an `IrqSafeSpinLock`, so `&ForcedethNic` is sound
+// to share between threads.
 unsafe impl Sync for ForcedethNic {}
 
 impl core::fmt::Debug for ForcedethNic {
@@ -498,13 +508,12 @@ impl ForcedethNic {
             // `readl` of any post-decoded register).
             let _ = mmio.read32(REG_TX_RX_CONTROL);
         }
-        // Spin briefly. Linux uses a 4 µs `udelay`; we use the
-        // responsive variant so background pumps still tick.
-        narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mmio.read32(REG_TX_RX_CONTROL) } & TXRXCTL_RESET == 0 || true, /* TX_RX reset is self-cleared by writing 0 below */
-            narf_time::Deadline::after_ms(2),
-        );
+        // Spin briefly. Linux uses a fixed 4 µs `udelay` here and does
+        // NOT poll for RESET to self-clear — the reset bit is dropped by
+        // the explicit write of 0 below. So we want a pure delay: pass a
+        // predicate that never reports "done" and let the call run until
+        // the deadline expires, while background pumps still tick.
+        narf_scheduler::responsive_spin_until(|| false, narf_time::Deadline::after_ms(2));
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TX_RX_CONTROL, TXRXCTL_BIT2 | txrxctl_bits);
@@ -525,11 +534,11 @@ impl ForcedethNic {
         let txpoll = unsafe { mmio.read32(REG_TRANSMIT_POLL) };
         let mac = if txpoll & TRANSMIT_POLL_MAC_ADDR_REV != 0 {
             [
-                (mac_a >> 0) as u8,
+                mac_a as u8,
                 (mac_a >> 8) as u8,
                 (mac_a >> 16) as u8,
                 (mac_a >> 24) as u8,
-                (mac_b >> 0) as u8,
+                mac_b as u8,
                 (mac_b >> 8) as u8,
             ]
         } else {
@@ -539,11 +548,11 @@ impl ForcedethNic {
             // MAC after the reset.
             let m = [
                 (mac_b >> 8) as u8,
-                (mac_b >> 0) as u8,
+                mac_b as u8,
                 (mac_a >> 24) as u8,
                 (mac_a >> 16) as u8,
                 (mac_a >> 8) as u8,
-                (mac_a >> 0) as u8,
+                mac_a as u8,
             ];
             let new_a = (m[5] as u32)
                 | ((m[4] as u32) << 8)
@@ -652,8 +661,8 @@ impl ForcedethNic {
         //    pool buffer + carries AVAIL=1 so the chip can DMA into
         //    it on first receive.
         let rx_ring_phys = rx_ring.phys_addr().raw();
-        for i in 0..RING_LEN {
-            let buf_phys = rx_pool[i].phys_addr().raw();
+        for (i, slot) in rx_pool.iter().enumerate().take(RING_LEN) {
+            let buf_phys = slot.phys_addr().raw();
             let d = Desc {
                 buf: buf_phys as u32,
                 flaglen: RXD_AVAIL | (RX_BUF_LEN as u32 & DESC_LEN_MASK_V2),
@@ -705,7 +714,7 @@ impl ForcedethNic {
         // Spawn pumps
         spawn_pumps(nic.clone(), rx_prod, tx_cons);
 
-        Ok(Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)?)
+        Arc::try_unwrap(nic).map_err(|_| NicError::NoMemory)
     }
 
     /// Transmit a single Ethernet frame, polled. Frame must be in
@@ -804,8 +813,11 @@ impl ForcedethNic {
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flaglen & RXD_DESCRIPTOR_VALID != 0 {
             let copy_len = len.min(RX_BUF_LEN);
-            // SAFETY: identity-mapped DMA buffer; bounds-checked.
             for i in 0..copy_len {
+                // SAFETY: `buf_phys` is the identity-mapped physical base
+                // of this slot's RX_BUF_LEN-byte DMA buffer; `i < copy_len
+                // <= RX_BUF_LEN`, so `buf_phys + i` stays inside that
+                // buffer and is a valid, aligned `u8` address to read.
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -942,17 +954,25 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     )
     .map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
-    // SAFETY: caller-authority over the device for the duration of
-    // bring_up.
     let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
     let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
 
+    // SAFETY: `bring_up` requires exclusive ownership of the device's
+    // BAR/config windows for the duration of init. This is the probe
+    // entry point for `device`/`cap`: nothing else has touched the BARs
+    // yet, and we hold the `Write` capability `cap`, so the contract is
+    // satisfied.
     let nic = match unsafe { ForcedethNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
 
     {
+        // SAFETY: `nic` was just created above and no clone has been
+        // published yet (the `CONTROLLER` store and `spawn_pumps` happen
+        // later), so this is the unique `Arc` and forming a `&mut` to its
+        // contents cannot alias. We only assign the two IPC-ring fields,
+        // each guarded by its own lock.
         let d = unsafe { &mut *(Arc::as_ptr(&nic) as *mut ForcedethNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);
@@ -1122,7 +1142,7 @@ impl crate::HwNic for ForcedethHwNic {
         crate::NicCaps::NONE
     }
     fn ring_capacity(&self) -> usize {
-        RING_LEN as usize
+        RING_LEN
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
         static RING: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> =
@@ -1225,10 +1245,10 @@ mod tests {
         if TXRXCTL_DESC_1 != 0 {
             return TestResult::Fail("TXRXCTL_DESC_1 must be 0");
         }
-        if TXRXCTL_DESC_2 != 0x0021_00 {
+        if TXRXCTL_DESC_2 != 0x0000_2100 {
             return TestResult::Fail("TXRXCTL_DESC_2 drift");
         }
-        if TXRXCTL_DESC_3 != 0xc022_00 {
+        if TXRXCTL_DESC_3 != 0x00c0_2200 {
             return TestResult::Fail("TXRXCTL_DESC_3 drift");
         }
         if TXRXCTL_KICK != 0x0001 {

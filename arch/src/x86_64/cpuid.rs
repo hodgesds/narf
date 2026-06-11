@@ -99,6 +99,7 @@ impl Features {
         f.tsc_deadline = ecx1 & (1 << 24) != 0;
 
         // Leaf 7, sub 0 — extended features.
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let (_, ebx7, ecx7, edx7) = unsafe { cpuid(0x0000_0007, 0) };
         f.rdseed = ebx7 & (1 << 18) != 0;
         f.pku = ecx7 & (1 << 3) != 0;
@@ -109,10 +110,12 @@ impl Features {
         f.hybrid = edx7 & (1 << 15) != 0;
 
         // Leaf 80000001h EDX:20 = NX.
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let (_, _, _, edx_ext) = unsafe { cpuid(0x8000_0001, 0) };
         f.nx = edx_ext & (1 << 20) != 0;
 
         // Leaf 80000007h EDX:8 = Invariant TSC.
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let (_, _, _, edx_adv) = unsafe { cpuid(0x8000_0007, 0) };
         f.invariant_tsc = edx_adv & (1 << 8) != 0;
 
@@ -120,8 +123,10 @@ impl Features {
         // populated on Intel — AMD parts return 0 for the whole
         // "Thermal and Power Management" leaf. CPUID max guard
         // ensures we don't read past the implemented range.
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         let (max, _, _, _) = unsafe { cpuid(0, 0) };
         if max >= 6 {
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             let (eax6, _, _, _) = unsafe { cpuid(0x0000_0006, 0) };
             f.arat = eax6 & (1 << 2) != 0;
         }

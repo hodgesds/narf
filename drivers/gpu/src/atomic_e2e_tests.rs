@@ -781,6 +781,7 @@ kernel_test_in!(
 
 /// Minimal range property model.
 struct RangeProp {
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     name: &'static str,
     min: u64,
     max: u64,
@@ -834,6 +835,7 @@ kernel_test_in!("drivers/gpu/atomic_e2e", smoke_atomic_property_range);
 // ════════════════════════════════════════════════════════════════════════════
 
 struct EnumProp {
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     name: &'static str,
     variants: &'static [(&'static str, u64)],
 }

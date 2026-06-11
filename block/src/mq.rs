@@ -53,7 +53,7 @@ impl MqDeadlineScheduler {
     /// Construct with `n` lanes. Panics on `n == 0 || n > MAX_LANES`.
     pub fn with_lanes(n: usize) -> Self {
         assert!(
-            n >= 1 && n <= MAX_LANES,
+            (1..=MAX_LANES).contains(&n),
             "lane count must be in 1..=MAX_LANES"
         );
         let mut lanes = Vec::with_capacity(n);
@@ -130,7 +130,7 @@ impl MqDeadlineScheduler {
         // invariant "expired beats in-deadline", delegate the choice
         // to the per-lane deadline logic — ask each lane if it has
         // something due.
-        for (_, lane) in self.lanes.iter().enumerate() {
+        for lane in self.lanes.iter() {
             // `dequeue_next(now)` already promotes expired entries.
             // But calling it on every lane would drain round-robin
             // style. Instead, check `len()` cheaply and only poke

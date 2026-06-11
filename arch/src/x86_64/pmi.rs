@@ -54,6 +54,7 @@ pub unsafe fn program_lvt_pc(lapic_base: usize, vector: u8, nmi: bool, masked: b
 pub unsafe fn mask_lvt_pc(lapic_base: usize) {
     // SAFETY: caller-asserted.
     let cur = unsafe { read_volatile(lvt_addr(lapic_base)) };
+    // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     unsafe {
         write_volatile(lvt_addr(lapic_base), cur | LVT_MASKED_BIT);
     }
@@ -68,6 +69,7 @@ pub unsafe fn mask_lvt_pc(lapic_base: usize) {
 pub unsafe fn unmask_lvt_pc(lapic_base: usize) {
     // SAFETY: caller-asserted.
     let cur = unsafe { read_volatile(lvt_addr(lapic_base)) };
+    // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
     unsafe {
         write_volatile(lvt_addr(lapic_base), cur & !LVT_MASKED_BIT);
     }

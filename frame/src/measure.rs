@@ -62,16 +62,21 @@ use narf_tpm::TpmError;
 /// `EV_NO_ACTION` — informational; ignored by PCR computation but
 /// recorded in the event log. The PC Client Spec uses this for the
 /// "spec ID" event that anchors the log header.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub const EV_NO_ACTION: u32 = 0x0000_0003;
 /// `EV_SEPARATOR` — written by firmware at the end of pre-OS to
 /// terminate a PCR's measurement sequence.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub const EV_SEPARATOR: u32 = 0x0000_0004;
 /// `EV_S_CRTM_VERSION` — Static Root of Trust for Measurement version.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub const EV_S_CRTM_VERSION: u32 = 0x0000_0008;
 /// `EV_PLATFORM_CONFIG_FLAGS` — generic platform config event.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub const EV_PLATFORM_CONFIG_FLAGS: u32 = 0x0000_000A;
 /// `EV_EFI_VARIABLE_BOOT` — measurement of `BootXXXX`/`BootOrder` for
 /// the bootloader-config PCR.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub const EV_EFI_VARIABLE_BOOT: u32 = 0x8000_000C;
 /// `EV_EFI_BOOT_SERVICES_APPLICATION` — measurement of a PE/COFF
 /// image the firmware launched.
@@ -88,6 +93,7 @@ pub const EV_IPL_PARTITION_DATA: u32 = 0x0000_000E;
 /// `TPM_ALG_SHA256` — the digest algorithm used in the SHA-256 bank.
 pub const TPM_ALG_SHA256: u16 = 0x000B;
 /// `TPM_ALG_SHA384` — alternative bank required by PC Client 1.5.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub const TPM_ALG_SHA384: u16 = 0x000C;
 
 /// Digest size in bytes for `TPM_ALG_SHA256`.
@@ -258,6 +264,7 @@ pub async fn measure_precomputed(
 
 /// Measure a physical memory range. Caller asserts the range is
 /// identity-mapped readable.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub async fn measure_phys(
     pcr: u32,
     label: &'static str,
@@ -337,11 +344,13 @@ pub fn get_log() -> Vec<Measurement> {
 
 /// Public alias for the userspace attestation surface. Matches the
 /// spec's `narf_measure::event_log()` name.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn event_log() -> Vec<Measurement> {
     get_log()
 }
 
 /// Number of recorded measurements. O(1).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 pub fn event_count() -> usize {
     LOG.lock().len()
 }

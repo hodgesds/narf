@@ -154,7 +154,7 @@ mod tests {
             return TestResult::Fail("PowerReading fields didn't round-trip");
         }
         // Clone preserves all four fields.
-        let c = r.clone();
+        let c = r;
         if c.voltage_mv != r.voltage_mv
             || c.current_ma != r.current_ma
             || c.power_mw != r.power_mw

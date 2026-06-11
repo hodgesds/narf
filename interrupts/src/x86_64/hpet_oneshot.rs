@@ -121,9 +121,9 @@ fn slot0_irq() {
 }
 
 /// Pick the first GSI from a `Tn_INT_ROUTE_CAP` mask that is
-///  - in `mask`, and
-///  - >= `min_gsi` (default 16 — keeps us out of the legacy ISA
-///    block where SCI / IRQ 0..15 may already live).
+/// - in `mask`, and
+/// - at least `min_gsi` (default 16 — keeps us out of the legacy ISA
+///   block where SCI / IRQ 0..15 may already live).
 ///
 /// Returns `None` if the mask is empty or only carries low GSIs.
 fn pick_gsi(mask: u32, min_gsi: u8) -> Option<u8> {
@@ -139,12 +139,7 @@ fn pick_gsi(mask: u32, min_gsi: u8) -> Option<u8> {
     // QEMU, HPET timer 0 route_cap is 0x4 (GSI 2 only), so
     // without this allowance hpet_oneshot returns NoSafeGsi.
     const LEGACY_RESERVED: u32 = (1 << 0) | (1 << 1) | (1 << 8) | (1 << 13);
-    for g in 0u8..16 {
-        if mask & (1u32 << g) != 0 && LEGACY_RESERVED & (1u32 << g) == 0 {
-            return Some(g);
-        }
-    }
-    None
+    (0u8..16).find(|&g| mask & (1u32 << g) != 0 && LEGACY_RESERVED & (1u32 << g) == 0)
 }
 
 /// Program HPET comparator 0 to deliver `handler` at HPET tick

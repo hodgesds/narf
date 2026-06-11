@@ -29,7 +29,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use narf_wireless::eapol::{FourWayError, FourWayState, KeyFrame, Ptk, Supplicant};
 
 use super::wpa::HmacSha1;
@@ -80,6 +79,7 @@ pub fn install_mic(frame: &mut KeyFrame, kck: &[u8]) {
 // ── Driver wrapper ──────────────────────────────────────────────────
 
 /// Per-association handshake state.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct Wpa2Handshake {
     /// Derived PMK (32 bytes).
     pub pmk: [u8; 32],

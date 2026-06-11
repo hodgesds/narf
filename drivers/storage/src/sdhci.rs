@@ -58,6 +58,7 @@ pub const SDHCI_PCI_CLASS: u8 = 0x08;
 pub const SDHCI_PCI_SUBCLASS: u8 = 0x05;
 
 /// Standard register offsets (SDHCI 3.00 §2).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_SDMA_ADDR: u64 = 0x00;
 const REG_BLOCK_SIZE: u64 = 0x04;
 const REG_BLOCK_COUNT: u64 = 0x06;
@@ -67,6 +68,7 @@ const REG_COMMAND: u64 = 0x0E;
 const REG_RESPONSE_0: u64 = 0x10;
 const REG_BUFFER_PORT: u64 = 0x20;
 const REG_PRESENT_STATE: u64 = 0x24;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_HOST_CONTROL_1: u64 = 0x28;
 const REG_POWER_CONTROL: u64 = 0x29;
 const REG_CLOCK_CONTROL: u64 = 0x2C;
@@ -80,7 +82,9 @@ const REG_CAPABILITIES: u64 = 0x40;
 
 // Software-reset bits (§2.2.16): write-1 self-clearing.
 const SRST_ALL: u8 = 1 << 0;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const SRST_CMD: u8 = 1 << 1;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const SRST_DAT: u8 = 1 << 2;
 
 // Clock control bits (§2.2.14).
@@ -95,7 +99,9 @@ const POWER_3V3: u8 = 0b111 << 1; // 3.3V
 // Present state bits (§2.2.9).
 const PSTATE_CMD_INHIBIT: u32 = 1 << 0;
 const PSTATE_DAT_INHIBIT: u32 = 1 << 1;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PSTATE_BUFFER_READ_EN: u32 = 1 << 11;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const PSTATE_BUFFER_WRITE_EN: u32 = 1 << 10;
 const PSTATE_CARD_INSERTED: u32 = 1 << 16;
 
@@ -118,14 +124,17 @@ const CMD_INDEX_EN: u16 = 1 << 4;
 const CMD_DATA_PRES: u16 = 1 << 5;
 
 // Transfer mode bits (§2.2.5).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const TM_BLOCK_COUNT_EN: u16 = 1 << 1;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const TM_AUTO_CMD12: u16 = 1 << 2;
 const TM_DATA_DIR_READ: u16 = 1 << 4;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const TM_MULTI_BLOCK: u16 = 1 << 5;
 
 /// SD command index → encoded register write per §2.2.6.
 fn make_cmd(idx: u8, resp_kind: u16, has_data: bool) -> u16 {
-    let mut v = (idx as u16) << 8 | (resp_kind << 0);
+    let mut v = (idx as u16) << 8 | resp_kind;
     // CRC + index check are required for most R1/R3/R6 paths; the
     // spec says they're enabled per response-type table 2-19.
     match resp_kind {

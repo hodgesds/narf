@@ -182,7 +182,7 @@ pub fn decode_header(buf: &[u8]) -> Result<PacketHeader, DsiError> {
 }
 
 /// Decoded long-packet payload borrow + CRC validation.
-pub fn decode_long_payload<'a>(buf: &'a [u8]) -> Result<(PacketHeader, &'a [u8]), DsiError> {
+pub fn decode_long_payload(buf: &[u8]) -> Result<(PacketHeader, &[u8]), DsiError> {
     let h = decode_header(buf)?;
     if !is_long_data_type(h.data_type) {
         return Err(DsiError::Truncated);

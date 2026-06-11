@@ -395,6 +395,7 @@ pub fn tx_doorbell<M: IwlMmio>(mmio: &mut M, queue_id: u32, write_ptr: usize) {
 
 /// Complete TX packet: `iwl_tx_cmd` + 802.11 MAC header bytes.
 /// Suitable for serialisation into a DMA-coherent buffer.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct TxPacket {
     pub cmd: IwlTxCmd,
     pub mac_hdr: [u8; 24],

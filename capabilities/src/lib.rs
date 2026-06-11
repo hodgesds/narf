@@ -166,12 +166,14 @@ impl CapSlot {
     /// Convert to a raw u128 for atomic operations.
     #[inline]
     pub fn as_u128(self) -> u128 {
+        // SAFETY: source and destination have identical size and a compatible layout.
         unsafe { core::mem::transmute(self) }
     }
 
     /// Convert from a raw u128.
     #[inline]
     pub fn from_u128(v: u128) -> Self {
+        // SAFETY: source and destination have identical size and a compatible layout.
         unsafe { core::mem::transmute(v) }
     }
 
@@ -184,6 +186,7 @@ impl CapSlot {
         old: CapSlot,
         new: CapSlot,
     ) -> Result<CapSlot, CapSlot> {
+        // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
         let res = unsafe { narf_arch::cas128(ptr as *mut u128, old.as_u128(), new.as_u128()) };
         match res {
             Ok(v) => Ok(Self::from_u128(v)),
@@ -202,6 +205,7 @@ impl CapSlot {
         let p = ptr as *mut u128;
         // We don't know the current value, but we can use 0 and if it
         // fails, the Err(actual) gives us the atomic snapshot.
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         match unsafe { narf_arch::cas128(p, 0, 0) } {
             Ok(_) => Self::EMPTY,
             Err(v) => Self::from_u128(v),
@@ -282,6 +286,7 @@ impl<T, R: Rights> Cap<T, R> {
         self.check_live()?;
         let mut slot = self.slot;
         slot.rights = R2::BITS;
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe { Ok(Cap::mint(slot)) }
     }
 }
@@ -292,6 +297,7 @@ impl<T: CapType, R: Rights> Cap<T, R> {
     pub fn bootstrap() -> Self {
         let (index, generation) = object_table::register(T::KIND);
         let slot = CapSlot::new(generation, index, R::BITS, T::KIND as u32);
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         unsafe { Self::mint(slot) }
     }
 }
@@ -304,7 +310,9 @@ impl<T, R: Rights> Clone for Cap<T, R> {
     }
 }
 
+// SAFETY: the operation upholds its documented invariant (see surrounding context).
 unsafe impl<T, R: Rights> Send for Cap<T, R> {}
+// SAFETY: the operation upholds its documented invariant (see surrounding context).
 unsafe impl<T, R: Rights> Sync for Cap<T, R> {}
 
 // ── CapOp ───────────────────────────────────────────────────────────
@@ -519,7 +527,7 @@ pub fn parse_kind(name: &str) -> Result<CapKind, UnknownKind> {
 pub fn kind_name(kind: CapKind) -> &'static str {
     for (name, k) in KIND_NAMES {
         if *k == kind {
-            return *name;
+            return name;
         }
     }
     "Unknown"

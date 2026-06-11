@@ -427,8 +427,12 @@ pub fn enable_msix(
     //   +2: Message Control (u16)        — bits 10..0 = N-1
     //   +4: Table (u32)                  — BIR (low 3) + offset
     //   +8: Pending Bit Array (u32)
-    // SAFETY: cap_ptr lives inside the 256-byte config window.
+    // SAFETY: cap_ptr was returned by find_cap and points at a valid MSI-X
+    // capability; cap_ptr+2 (Message Control) lies inside the 256-byte config
+    // window at cfg_phys, whose ownership the caller asserted.
     let msg_ctrl = unsafe { cfg_read16(cfg_phys, cap_ptr + 2) };
+    // SAFETY: cap_ptr+4 (Table BIR/offset dword) is the next field of the same
+    // MSI-X capability and likewise lies inside the config window at cfg_phys.
     let table = unsafe { cfg_read32(cfg_phys, cap_ptr + 4) };
 
     let size = ((msg_ctrl & 0x07FF) as u16) + 1;

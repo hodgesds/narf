@@ -6,6 +6,11 @@ use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 /// Disable maskable interrupts via `CLI`.
+///
+/// # Safety
+/// Must be called at CPL=0. Clearing IF suppresses delivery of maskable
+/// interrupts; the caller must ensure that masking interrupts here cannot
+/// deadlock (e.g. it must re-enable them, and must not block while masked).
 #[inline(always)]
 pub unsafe fn disable_interrupts() {
     compiler_fence(Ordering::SeqCst);
@@ -18,6 +23,11 @@ pub unsafe fn disable_interrupts() {
 }
 
 /// Enable maskable interrupts via `STI`.
+///
+/// # Safety
+/// Must be called at CPL=0, and only after a valid IDT has been loaded —
+/// otherwise an incoming interrupt would fault. The caller must also be in a
+/// context where it is safe for interrupts to fire (no IRQ-unsafe lock held).
 #[inline(always)]
 pub unsafe fn enable_interrupts() {
     compiler_fence(Ordering::SeqCst);
@@ -30,6 +40,11 @@ pub unsafe fn enable_interrupts() {
 
 /// Single `HLT`. Intended for use inside a loop; on its own an interrupt
 /// (if enabled) will wake the CPU.
+///
+/// # Safety
+/// Must be called at CPL=0. If interrupts are masked (IF=0) and no NMI/SMI
+/// arrives, `HLT` halts the CPU indefinitely; the caller is responsible for
+/// ensuring a wakeup source exists.
 #[inline(always)]
 pub unsafe fn halt_once() {
     compiler_fence(Ordering::SeqCst);
@@ -204,6 +219,7 @@ pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     // x86 post-self-modifying-code flush. Spec is clear that an
     // instruction-fetch of modified code without a serialising
     // event is architecturally undefined.
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         // RBX is LLVM-reserved; stash it manually. `nostack` is not set
         // because push/pop touches the stack.

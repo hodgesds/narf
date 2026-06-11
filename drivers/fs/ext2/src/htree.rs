@@ -58,10 +58,10 @@ pub mod hash_version {
 /// directory's first data block, AFTER the "." and ".." dirents.
 ///
 /// Offsets are relative to the start of the directory block.
-/// `.` is 12 bytes (4-byte inode + 2-byte rec_len + 1-byte name_len
-/// + 1-byte file_type + 4-byte name pad). `..` is also 12 bytes.
-/// So `dx_root_info` starts at byte 24, `dx_head` at byte 32, and
-/// `dx_entry[0]` at byte 40.
+/// `.` is 12 bytes (4-byte inode, 2-byte rec_len, 1-byte name_len,
+/// 1-byte file_type, 4-byte name pad). `..` is also 12 bytes.
+/// So `dx_root_info` starts at byte 24, `dx_head` at byte 32, and `dx_entry[0]`
+/// at byte 40.
 pub const DX_ROOT_INFO_OFF: usize = 24;
 pub const DX_ROOT_HEAD_OFF: usize = 32;
 pub const DX_ROOT_ENTRIES_OFF: usize = 40;
@@ -249,12 +249,8 @@ fn str2hashbuf(msg: &[u8], buf: &mut [u32; 4], num: usize, signed: bool) {
     };
     let mut out_i = 0usize;
     let mut left = num;
-    for i in 0..bytes {
-        let ch = if signed {
-            msg[i] as i8 as i32
-        } else {
-            msg[i] as i32
-        };
+    for (i, &b) in msg.iter().enumerate().take(bytes) {
+        let ch = if signed { b as i8 as i32 } else { b as i32 };
         val = (ch as u32).wrapping_add(val << 8);
         if (i & 3) == 3 {
             buf[out_i] = val;

@@ -192,11 +192,21 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
         )
     };
 
-    // SAFETY: ACPI reported the base; HPET-style identity-mapped
-    // MMIO assumption applies. If the BIOS lied (read returns
-    // 0/!0), bail.
     let caps = match vendor {
+        // SAFETY: `mmio_base` is `buf[0].base` copied from the IVRS
+        // table parsed by `narf_acpi`, and this arm only runs when
+        // `amd_present` selected the AMD-Vi vendor, so the base
+        // belongs to an AMD-Vi unit. IOMMU MMIO is identity-mapped
+        // (HPET-style); `read_amd_caps` validates the read and
+        // returns `None` if the BIOS-reported base is dead (0/!0).
         IommuVendor::AmdVi => unsafe { read_amd_caps(mmio_base) },
+        // SAFETY: `mmio_base` is `buf[0].register_base` copied from
+        // the DMAR table parsed by `narf_acpi`, reached only on the
+        // Intel branch where `amd_present` was false and DMAR DRHDs
+        // were found, so the base belongs to a VT-d unit. The VT-d
+        // register window is identity-mapped MMIO; `read_vtd_caps`
+        // validates the version register and returns `None` on a
+        // dead window.
         IommuVendor::IntelVtd => unsafe { read_vtd_caps(mmio_base) },
         IommuVendor::None => unreachable!(),
     };

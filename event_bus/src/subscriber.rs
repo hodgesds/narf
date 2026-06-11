@@ -78,6 +78,9 @@ impl<T: Event> Subscriber<T> {
 
     /// Async receive. Parks via the cursor's waker slot; the
     /// publisher wakes on every `publish`.
+    // reason: deliberate `next`/`try_next` async-channel API surface; the type
+    // returns a `Future`, not `Option<Item>`, so it cannot implement `Iterator`.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> SubscriberRecv<'_, T> {
         SubscriberRecv { sub: self }
     }

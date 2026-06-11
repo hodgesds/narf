@@ -87,9 +87,9 @@ fn be_bytes_to_limbs(be: &[u8; RSA_3072_LEN]) -> [u64; N_LIMBS] {
     let mut out = [0u64; N_LIMBS];
     // Limb 0 is the least-significant 8 bytes. Bytes at indices [376..384]
     // are LS-byte octets in BE → limb 0.
-    for i in 0..N_LIMBS {
+    for (i, limb) in out.iter_mut().enumerate() {
         let off = RSA_3072_LEN - (i + 1) * 8;
-        out[i] = u64::from_be_bytes([
+        *limb = u64::from_be_bytes([
             be[off],
             be[off + 1],
             be[off + 2],
@@ -106,9 +106,9 @@ fn be_bytes_to_limbs(be: &[u8; RSA_3072_LEN]) -> [u64; N_LIMBS] {
 /// little-endian u64-limb array → big-endian byte array.
 fn limbs_to_be_bytes(limbs: &[u64; N_LIMBS]) -> [u8; RSA_3072_LEN] {
     let mut out = [0u8; RSA_3072_LEN];
-    for i in 0..N_LIMBS {
+    for (i, limb) in limbs.iter().enumerate() {
         let off = RSA_3072_LEN - (i + 1) * 8;
-        out[off..off + 8].copy_from_slice(&limbs[i].to_be_bytes());
+        out[off..off + 8].copy_from_slice(&limb.to_be_bytes());
     }
     out
 }
@@ -379,8 +379,8 @@ fn oaep_decode(em: [u8; RSA_3072_LEN], label: &[u8]) -> Result<Vec<u8>, OaepErro
 
     // Find the 0x01 separator after PS.
     let mut sep = None;
-    for i in H_LEN..masked_db.len() {
-        match masked_db[i] {
+    for (i, &byte) in masked_db.iter().enumerate().skip(H_LEN) {
+        match byte {
             0 => continue,
             1 => {
                 sep = Some(i);

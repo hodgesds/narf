@@ -50,7 +50,6 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use narf_aml::resource::ResourceItem;
 use narf_lib::mutex::Mutex as AsyncMutex;
-use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::PhysAddr;
 
 use crate::{I2cBus, I2cError, I2cOp};
@@ -191,7 +190,7 @@ impl core::fmt::Debug for AmdFchI2c {
 impl AmdFchI2c {
     /// Construct a controller against an already-decoded MMIO region
     /// + IRQ vector. Used both by `probe_all` (real discovery) and by
-    /// the smoke tests (synthetic backing buffer instead of MMIO).
+    ///   the smoke tests (synthetic backing buffer instead of MMIO).
     pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
         Self {
             name,
@@ -520,16 +519,22 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                 }
             }
             ResourceItem::AddressSpace32 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 // kind 0 = memory range
                 if mmio.is_none() {
                     mmio = Some((min as u64, length as u64));
                 }
             }
             ResourceItem::AddressSpace64 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 if mmio.is_none() {
                     mmio = Some((min, length));
                 }
@@ -688,6 +693,7 @@ fn try_route_irq(_gsi: u32, _acpi_flags: u8) -> Option<u8> {
 /// wakes the registered waker before invoking this; the body is a
 /// no-op because the transfer state machine reads IC_RAW_INTR_STAT
 /// directly to decide its next FIFO move.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn noop_irq() {}
 
 /// Test-only: list the HIDs we recognise. Used by smokes that want

@@ -243,12 +243,14 @@ pub unsafe fn snapshot() -> McSnapshot {
         }
         // SAFETY: same.
         let addr = if st.addrv {
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             Some(unsafe { mci_addr(i as u8) })
         } else {
             None
         };
         // SAFETY: same.
         let misc = if st.miscv {
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             Some(unsafe { mci_misc(i as u8) })
         } else {
             None

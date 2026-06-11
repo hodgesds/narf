@@ -95,12 +95,7 @@ fn pick_gsi(mask: u32, min_gsi: u8) -> Option<u8> {
     // so without this allowance timer_pump init returns NoSafeGsi
     // and async sleep_cycles falls back to busy-poll.
     const LEGACY_RESERVED: u32 = (1 << 0) | (1 << 1) | (1 << 8) | (1 << 13);
-    for g in 0u8..16 {
-        if mask & (1u32 << g) != 0 && LEGACY_RESERVED & (1u32 << g) == 0 {
-            return Some(g);
-        }
-    }
-    None
+    (0u8..16).find(|&g| mask & (1u32 << g) != 0 && LEGACY_RESERVED & (1u32 << g) == 0)
 }
 
 /// Convert a TSC-cycle delta to HPET ticks using the calibrated

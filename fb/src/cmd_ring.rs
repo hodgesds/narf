@@ -220,7 +220,7 @@ pub fn try_send(
 /// Mark the ring closed from the producer side — consumer will
 /// see no further commands. Useful for orderly shutdown of a
 /// userspace client.
-pub fn close(ring: *mut DrawRing) {
+pub unsafe fn close(ring: *mut DrawRing) {
     // SAFETY: `closed` is at a fixed offset; safe to write any time.
     unsafe {
         (*ring).closed.store(1, Ordering::Release);

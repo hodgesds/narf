@@ -199,7 +199,9 @@ mod tests {
         if c.polarity != Polarity::Inversed {
             return TestResult::Fail("polarity round-trip");
         }
-        if c != c.clone() {
+        #[allow(clippy::clone_on_copy)]
+        let cloned = c.clone();
+        if c != cloned {
             return TestResult::Fail("PwmConfig Clone broken");
         }
         TestResult::Pass
@@ -226,18 +228,12 @@ mod tests {
                 o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             }
             // Channel == channel_count (out of range, valid range is 0..count).
-            match p.set_config(2, &cfg).await {
-                Err(PwmError::InvalidChannel) => {
-                    o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-                }
-                _ => {}
+            if let Err(PwmError::InvalidChannel) = p.set_config(2, &cfg).await {
+                o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             }
             // Channel 100 → InvalidChannel.
-            match p.enable(100).await {
-                Err(PwmError::InvalidChannel) => {
-                    o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-                }
-                _ => {}
+            if let Err(PwmError::InvalidChannel) = p.enable(100).await {
+                o.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             }
         });
         narf_scheduler::run_until_empty();

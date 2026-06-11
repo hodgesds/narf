@@ -346,6 +346,7 @@ pub enum RekeyError {
 }
 
 /// The PTK subkeys needed to process a group-rekey message.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct PtkKeys {
     /// Key Confirmation Key (16 bytes) — used for MIC validation.
     pub kck: [u8; 16],
@@ -553,7 +554,7 @@ pub mod tests {
         ];
 
         // GTK to install: same as RFC 3394 §4.1 test vector plaintext.
-        let gtk: [u8; 16] = [
+        let _gtk: [u8; 16] = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ];
@@ -584,7 +585,7 @@ pub mod tests {
         // We just set up the MIC correctly.
 
         // Compute HMAC-SHA1 over frame with MIC zeroed.
-        let mut frame_for_mic = raw.to_vec();
+        let frame_for_mic = raw.to_vec();
         // MIC zeroed already (all zero).
         let mic = super::hmac_sha1(&kck, &frame_for_mic);
         raw[81..81 + 16].copy_from_slice(&mic[..16]);

@@ -3,7 +3,7 @@
 //! Spec: `scheduler/specification/preemption.md` Phase 1b.
 //!
 //! Wraps a `Pin<Box<dyn Future>>` with a dedicated kernel stack
-//! + a saved `KernelContext`, so the future's `poll()` runs on
+//! plus a saved `KernelContext`, so the future's `poll()` runs on
 //! the task's own stack instead of the executor's. The point is
 //! NOT (yet) preemption — phase 1b is the foundation. Phase 2
 //! adds the timer-driven preemption that's the actual fix for
@@ -265,6 +265,10 @@ pub struct KernelTask {
 // IRQ context on the same CPU as the executor. No cross-CPU
 // access in phase 2.
 unsafe impl Send for KernelTask {}
+// SAFETY: Same single-CPU (BSP-only) invariant as the Send impl above.
+// The only interior-mutability path is the `current_waker` lock written
+// by the trap-handler hook, which runs in IRQ context on the same CPU as
+// the executor; phase 2 has no cross-CPU sharing of a `KernelTask`.
 unsafe impl Sync for KernelTask {}
 
 impl core::fmt::Debug for KernelTask {
@@ -340,9 +344,10 @@ impl KernelTask {
 
         #[cfg(target_arch = "x86_64")]
         {
-            me.ctx = KernelContext::fresh(stack_top, trampoline_entry as u64, task_ptr_as_u64);
+            me.ctx =
+                KernelContext::fresh(stack_top, trampoline_entry as usize as u64, task_ptr_as_u64);
         }
-        let _ = stack_top; // silence warning on aarch64 stub
+        let _ = (stack_top, task_ptr_as_u64); // silence warnings on aarch64 stub
 
         me
     }
@@ -641,12 +646,18 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     if no_preempt {
         return false;
     }
+    // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
+    // non-null; per the invariant noted there, the Box it points at is kept
+    // alive by the in-progress poll_to_yield, so the atomic field reads below
+    // dereference a live `KernelTask`.
     let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    // SAFETY: Same live-`KernelTask` invariant as above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
     let now = narf_time::now_cycles();
     if now.saturating_sub(started) < slice {
         return false; // task hasn't used its slice yet
     }
+    // SAFETY: Same live-`KernelTask` invariant as above.
     let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
         return false; // no executor to switch to
@@ -657,6 +668,8 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // slot's `awake` flag stays at the false the last poll
     // cleared it to, and we'd be dormant forever (the inner
     // future never finished, so it never called wake_by_ref).
+    // SAFETY: Same live-`KernelTask` invariant as above; `current_waker` is an
+    // IrqSafeSpinLock, so locking it from this IRQ context is sound.
     unsafe {
         let waker_guard = (*task_ptr).current_waker.lock();
         if let Some(w) = waker_guard.as_ref() {
@@ -666,6 +679,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     }
 
     // Mark for debug visibility (consumed by the smoke tests).
+    // SAFETY: Same live-`KernelTask` invariant as above. `saved_trap_frame` is
+    // an UnsafeCell owned by this task and only written here while the task is
+    // the CPU's CURRENT_STACKFUL_TASK, so there is no concurrent access; the
+    // volatile write copies the caller-owned `*frame` into it.
     unsafe {
         core::ptr::write_volatile((*task_ptr).saved_trap_frame.get(), *frame);
         (*task_ptr).preempted.store(true, Ordering::Release);
@@ -682,7 +699,13 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // rsp+8 (post-call rsp), the return PC (next instruction
     // after the kernel_switch call), AND current RFLAGS (which
     // includes IF=0 since we're in a trap handler).
+    // SAFETY: Same live-`KernelTask` invariant; taking a raw pointer to its
+    // `ctx` field does not dereference beyond the live allocation.
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
+    // SAFETY: `task_ctx_ptr` points at this task's `KernelContext` (save slot)
+    // and `exec_ctx` is the non-null executor context published by the
+    // in-progress poll_to_yield; kernel_switch saves the current callee-saved
+    // state / RFLAGS into the former and restores the latter.
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
 
     // ── Resumed here when the executor switches back into this
@@ -699,6 +722,9 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // CURRENT=null and never preempt — the task busy-loop runs
     // forever until it yields on its own.
     let cpu = this_cpu();
+    // SAFETY: We were resumed by the executor switching back into this task, so
+    // its Box is still alive (poll_to_yield has not returned). Re-publishing
+    // CURRENT and restarting the slice counter dereferences that live task.
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
         (*task_ptr)
@@ -814,6 +840,10 @@ impl Future for StackfulAdapter {
         // otherwise busy-looping pumps would starve everyone else.
         #[cfg(target_arch = "x86_64")]
         {
+            // SAFETY: `StackfulAdapter` has no structurally-pinned fields we
+            // move out of here — `inner` stays behind its `Box` and we only
+            // take a `&mut` to call `poll_to_yield`, so the pin guarantee on
+            // `self` is upheld.
             let this = unsafe { self.get_unchecked_mut() };
             let mut exec_ctx = KernelContext::default();
             // SAFETY: single-threaded; this poll() is the only
@@ -822,6 +852,7 @@ impl Future for StackfulAdapter {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
+            let _ = cx;
             // aarch64 has no kernel_ctx primitive yet — fall
             // back to immediate completion. Phase 2 + arm64
             // port follows the same shape.

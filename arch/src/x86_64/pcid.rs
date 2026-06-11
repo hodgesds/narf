@@ -268,6 +268,10 @@ pub unsafe fn restore(s: SavedPcid) {
 
 /// Rights probe. Until per-domain PML4 divergence lands, every domain
 /// reads as ALLOW_ALL.
+///
+/// # Safety
+/// `domain` must be a valid domain index (`< NUM_DOMAINS`). Once this reads
+/// real per-domain page-table state it will also require CR4.PCIDE enabled.
 #[inline]
 pub unsafe fn get_rights(domain: u8) -> DomainRights {
     debug_assert!((domain as usize) < NUM_DOMAINS);
@@ -276,6 +280,11 @@ pub unsafe fn get_rights(domain: u8) -> DomainRights {
 
 /// Rights mutation. Land-site for the future "tighten PTEs in domain N's
 /// PML4" path. Today: no-op.
+///
+/// # Safety
+/// `domain` must be a valid domain index (`< NUM_DOMAINS`). Once this mutates
+/// real per-domain page-table state it will also require CR4.PCIDE enabled and
+/// exclusive access to that domain's PML4.
 #[inline]
 pub unsafe fn set_rights(domain: u8, _rights: DomainRights) {
     debug_assert!((domain as usize) < NUM_DOMAINS);

@@ -56,7 +56,7 @@ use alloc::vec::Vec;
 use crate::amdgpu::Family;
 use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
 use crate::amdgpu_dcn::{
-    self, dcn20_modeset_sequence, dcn35_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming,
+    dcn20_modeset_sequence, dcn35_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming,
 };
 
 // ── Connector ────────────────────────────────────────────────────

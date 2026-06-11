@@ -51,6 +51,7 @@ pub struct VirtioScsiPci {
     notify: VirtioRegion,
     notify_off_multiplier: u32,
     ctrlq: IrqSafeSpinLock<Option<Virtqueue>>,
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     eventq: IrqSafeSpinLock<Option<Virtqueue>>,
     cmdq: IrqSafeSpinLock<Option<Virtqueue>>,
     _ctrl_buf: DmaBuffer,

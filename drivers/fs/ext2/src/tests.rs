@@ -233,8 +233,15 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         RawWaker::new(core::ptr::null(), &VTAB)
     }
+    // SAFETY: `raw_waker()` returns a RawWaker built from `VTAB`, whose clone
+    // function returns another such RawWaker and whose wake/drop functions are
+    // no-ops, so every vtable contract is upheld and the null data pointer is
+    // never dereferenced.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local owned by this function and never moved again
+    // after this point (it is only polled through the returned pin), so the
+    // pinning guarantee holds for the rest of the function.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),
@@ -289,7 +296,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
 
     // ── Block group descriptor at start of block 2 ──────────────
     let gdt_off = 2 * BS;
-    put_u32(&mut img, gdt_off + 0, 3); // bg_block_bitmap
+    put_u32(&mut img, gdt_off, 3); // bg_block_bitmap
     put_u32(&mut img, gdt_off + 4, 4); // bg_inode_bitmap
     put_u32(&mut img, gdt_off + 8, 5); // bg_inode_table
     put_u16(&mut img, gdt_off + 12, 0); // free blocks (we don't track in this test)
@@ -313,8 +320,8 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     let itab_off = 5 * BS;
 
     // Root directory inode (#2) sits at index 1 of the table.
-    let root_off = itab_off + 1 * INODE_SIZE as usize;
-    put_u16(&mut img, root_off + 0, 0x4000 | 0o755); // S_IFDIR | 0755
+    let root_off = itab_off + INODE_SIZE as usize;
+    put_u16(&mut img, root_off, 0x4000 | 0o755); // S_IFDIR | 0755
     put_u32(&mut img, root_off + 4, BS as u32); // size = 1 block
     put_u32(&mut img, root_off + 28, (BS / 512) as u32); // i_blocks
                                                          // i_block[0] = 9 (data block for the root dir)
@@ -322,12 +329,12 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
 
     // File inode (#12) at index 11.
     let file_off = itab_off + 11 * INODE_SIZE as usize;
-    put_u16(&mut img, file_off + 0, 0x8000 | 0o644); // S_IFREG | 0644
+    put_u16(&mut img, file_off, 0x8000 | 0o644); // S_IFREG | 0644
     put_u32(&mut img, file_off + 4, file_data.len() as u32); // size
     put_u32(
         &mut img,
         file_off + 28,
-        ((file_data.len() + 511) / 512) as u32,
+        file_data.len().div_ceil(512) as u32,
     );
     if !file_data.is_empty() {
         put_u32(&mut img, file_off + 40, 10); // i_block[0] = 10
@@ -342,7 +349,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     // "." → inode 2
     {
         let off = root_data + cursor;
-        put_u32(&mut img, off + 0, 2);
+        put_u32(&mut img, off, 2);
         put_u16(&mut img, off + 4, 12); // rec_len
         img[off + 6] = 1; // name_len
         img[off + 7] = ftype::DIR;
@@ -353,7 +360,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
     // ".." → inode 2 (root's parent is itself in this trivial image)
     {
         let off = root_data + cursor;
-        put_u32(&mut img, off + 0, 2);
+        put_u32(&mut img, off, 2);
         put_u16(&mut img, off + 4, 12);
         img[off + 6] = 2;
         img[off + 7] = ftype::DIR;
@@ -367,7 +374,7 @@ fn build_ext2_image(file_data: &[u8]) -> Vec<u8> {
         let off = root_data + cursor;
         let name = b"data";
         let remaining = BS - cursor;
-        put_u32(&mut img, off + 0, 12);
+        put_u32(&mut img, off, 12);
         put_u16(&mut img, off + 4, remaining as u16);
         img[off + 6] = name.len() as u8;
         img[off + 7] = ftype::REGULAR;
@@ -781,10 +788,9 @@ fn smoke_ext4_inode_block_array_serialises_as_extent_root() -> TestResult {
 
     // Now stuff bytes into a [u32; 15] like the inode parser does.
     let mut block_array = [0u32; I_BLOCK_LEN];
-    for i in 0..I_BLOCK_LEN {
+    for (i, slot) in block_array.iter_mut().enumerate() {
         let off = i * 4;
-        block_array[i] =
-            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        *slot = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
     }
     // Re-serialise back to bytes — what map_block_extents does.
     let mut node_buf = alloc::vec![0u8; 60];
@@ -1118,7 +1124,7 @@ fn build_ext3_unclean_image() -> Vec<u8> {
 
     // Block group descriptor at start of block 2.
     let gdt_off = 2 * BS;
-    put_u32(&mut img, gdt_off + 0, 3);
+    put_u32(&mut img, gdt_off, 3);
     put_u32(&mut img, gdt_off + 4, 4);
     put_u32(&mut img, gdt_off + 8, 5);
     put_u16(&mut img, gdt_off + 12, 0);
@@ -1129,8 +1135,8 @@ fn build_ext3_unclean_image() -> Vec<u8> {
     let itab_off = 5 * BS;
 
     // Inode 2 (root dir).
-    let root_off = itab_off + 1 * INODE_SIZE as usize;
-    put_u16(&mut img, root_off + 0, 0x4000 | 0o755);
+    let root_off = itab_off + INODE_SIZE as usize;
+    put_u16(&mut img, root_off, 0x4000 | 0o755);
     put_u32(&mut img, root_off + 4, BS as u32);
     put_u32(&mut img, root_off + 28, (BS / 512) as u32);
     put_u32(&mut img, root_off + 40, 9); // i_block[0] = 9
@@ -1140,7 +1146,7 @@ fn build_ext3_unclean_image() -> Vec<u8> {
     let journal_size_blocks: u32 = 16;
     let journal_start_block: u32 = 16;
     let journal_inode_off = itab_off + 7 * INODE_SIZE as usize;
-    put_u16(&mut img, journal_inode_off + 0, 0x8000 | 0o600); // regular file
+    put_u16(&mut img, journal_inode_off, 0x8000 | 0o600); // regular file
     put_u32(
         &mut img,
         journal_inode_off + 4,
@@ -1168,7 +1174,7 @@ fn build_ext3_unclean_image() -> Vec<u8> {
     // replay must override). One entry: "ondisk" → inode 12.
     {
         let off = 9 * BS;
-        put_u32(&mut img, off + 0, 12);
+        put_u32(&mut img, off, 12);
         put_u16(&mut img, off + 4, BS as u16);
         img[off + 6] = b"ondisk".len() as u8;
         img[off + 7] = ftype::REGULAR;
@@ -1201,7 +1207,7 @@ fn build_ext3_unclean_image() -> Vec<u8> {
     // Block 18 (journal block 2): data — the replayed root dir.
     {
         let off = 18 * BS;
-        put_u32(&mut img, off + 0, 12); // inode
+        put_u32(&mut img, off, 12); // inode
         put_u16(&mut img, off + 4, BS as u16); // rec_len fills block
         img[off + 6] = b"REPLAYED".len() as u8;
         img[off + 7] = ftype::REGULAR;
@@ -1253,10 +1259,10 @@ fn smoke_ext3_unclean_mount_replays_root_dir() -> TestResult {
         _ => return TestResult::Fail("enumerate_async failed"),
     };
     let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-    if names.iter().any(|n| *n == "ondisk") {
+    if names.contains(&"ondisk") {
         return TestResult::Fail("post-replay enumeration must NOT see the on-disk stale entry");
     }
-    if !names.iter().any(|n| *n == "REPLAYED") {
+    if !names.contains(&"REPLAYED") {
         return TestResult::Fail("expected REPLAYED entry from replay override");
     }
     TestResult::Pass

@@ -3,12 +3,15 @@
 use alloc::sync::Arc;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
+#[cfg(target_arch = "x86_64")]
 use narf_lib::sync::IrqSafeSpinLock;
+#[cfg(target_arch = "x86_64")]
 use narf_memory::AddressSpace;
 
 use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 use crate::{install_address_space_lookup, install_core_syscalls, install_global};
 
 /// Static so the AS-lookup `fn` pointer can resolve it without a
@@ -5005,6 +5008,7 @@ fn smoke_userspace_listdir_walks_memfs() -> TestResult {
     };
     use narf_filesystem as fs;
 
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -7402,6 +7406,7 @@ kernel_test_in!("userspace", smoke_userspace_setsid_makes_session_leader);
 
 // ── ELF helper used by unresolved-symbol tests (relocated from verification) ──
 
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn build_unresolved_named_elf(strtab: &[u8]) -> alloc::vec::Vec<u8> {
     const SEG_VA: u64 = 0x0000_0080_0000_1000;
     const SEG_FOFF: u64 = 0x1000;
@@ -10176,6 +10181,7 @@ fn smoke_userspace_sa_nodefer_skips_auto_block() -> TestResult {
 
     // FakeCtx that pretends to return to user — drives delivery.
     struct UserBoundCtx {
+        #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
         signum: u32,
     }
     impl TrapContext for UserBoundCtx {
@@ -13204,6 +13210,7 @@ kernel_test_in!("userspace", smoke_echo_hello_world_end_to_end);
 // stop returning ENOTTY. Each smoke runs the syscall path end-to-end
 // via sys_ioctl.
 
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_tiocgwinsz_default_80x24() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -13283,6 +13290,7 @@ fn smoke_console_ioctl_tiocgwinsz_default_80x24() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_tiocgwinsz_default_80x24);
 
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_tiocswinsz_round_trip() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -13374,6 +13382,7 @@ fn smoke_console_ioctl_tiocswinsz_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_tiocswinsz_round_trip);
 
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_fionread_empty_ring_returns_zero() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -13454,6 +13463,7 @@ kernel_test_in!(
     smoke_console_ioctl_fionread_empty_ring_returns_zero
 );
 
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -13544,6 +13554,7 @@ kernel_test_in!("userspace", smoke_console_ioctl_tiocspgrp_round_trip);
 // Wave-60: two ConsoleFile instances must not share fg_pgrp.
 // Pre-fix, TIOCSPGRP poked a single global, so any "second tty"
 // would be a thin alias of the first.
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
     use crate::fd::{ConsoleFile, TIOCGPGRP, TIOCSPGRP};
     use narf_filesystem::FileOps;
@@ -13618,6 +13629,7 @@ fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_per_tty_fg_pgrp_is_isolated);
 
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,

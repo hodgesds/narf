@@ -274,6 +274,7 @@ pub const E1000_DEV_I350_COPPER: u16 = 0x1521;
 
 const REG_CTRL: u64 = 0x0000;
 const REG_STATUS: u64 = 0x0008;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_EERD: u64 = 0x0014;
 /// Interrupt Cause Read — reading this register returns the set of
 /// pending causes and clears them all (8254x SDM §13.4.17). The ISR
@@ -480,6 +481,7 @@ impl TxDesc {
     /// `csum_opts` should be `TXD_OPTS_IXSM | TXD_OPTS_TXSM` for
     /// full TCP/IPv4 offload. Setting DEXT + DTYP_D signals the
     /// hardware that the `css` byte carries offload options.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn new_with_csum(addr: u64, len: u16, csum_opts: u8) -> Self {
         let mut cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
         let mut css = 0u8;
@@ -501,6 +503,7 @@ impl TxDesc {
     /// Build a TX descriptor with TSO enabled. The hardware will segment
     /// the payload into MSS-sized chunks. DEXT | DTYP_D | TSE must all
     /// be set; both IP and TCP csum-insert bits are also required.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
         let cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS | TXD_CMD_DEXT | TXD_DTYP_D | TXD_CMD_TSE;
         let css = TXD_OPTS_IXSM | TXD_OPTS_TXSM;
@@ -519,6 +522,7 @@ impl TxDesc {
 impl RxDesc {
     /// Decode the RX checksum result from the legacy e1000 descriptor
     /// status and errors bytes.
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn csum_result(&self) -> RxCsumResult {
         let ip_computed = self.status & RXD_STAT_IPCS != 0;
         let tcp_computed = self.status & RXD_STAT_TCPCS != 0;
@@ -752,6 +756,7 @@ pub struct E1000 {
     rx_ring: DmaBuffer,
     /// RX buffer pool — one DMA page per descriptor (`RX_BUF_LEN`
     /// bytes consumed; remainder unused).
+    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     rx_pool: alloc::vec::Vec<DmaBuffer>,
     /// Driver-side RX head cursor (next descriptor to inspect for
     /// completion). The hardware writes to RDT and we lag behind

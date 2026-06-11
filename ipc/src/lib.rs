@@ -131,10 +131,17 @@ impl<T, const N: usize> core::fmt::Debug for Ring<T, N> {
     }
 }
 
-// SAFETY: cross-task sharing is correct under the release/acquire pair
-// on `head` / `tail`. `T: Send` so moving ownership through a slot
-// across task boundaries is sound.
+// SAFETY: moving the whole ring to another thread is sound when the
+// payload is Send, since every slot holds a `MaybeUninit<T>` value that
+// is moved (not aliased) across the boundary.
 unsafe impl<T: Send, const N: usize> Send for Ring<T, N> {}
+// SAFETY: concurrent access from the producer and consumer halves is
+// data-race-free: the producer is the sole writer of `head` and of
+// freshly-claimed slots, the consumer is the sole writer of `tail` and
+// the sole reader of published slots, and the release/acquire pair on
+// `head`/`tail` orders every slot write before the matching read. The
+// waker `SpinLock`s serialise the only shared mutable state. `T: Send`
+// because ownership of a payload is transferred between the two halves.
 unsafe impl<T: Send, const N: usize> Sync for Ring<T, N> {}
 
 impl<T, const N: usize> Ring<T, N> {
@@ -148,8 +155,10 @@ impl<T, const N: usize> Ring<T, N> {
     const MASK: u64 = (N as u64) - 1;
 
     const fn new() -> Self {
-        // Touch the guard so a non-pow2 N fails at compile time.
-        let _ = Self::POW2_GUARD;
+        // Touch the guard so a non-pow2 N fails at compile time. The
+        // `let () =` pattern forces evaluation of the associated const
+        // without tripping `let_unit_value` / `path_statement`.
+        let () = Self::POW2_GUARD;
         Self {
             head: Align64(AtomicU64::new(0)),
             tail: Align64(AtomicU64::new(0)),

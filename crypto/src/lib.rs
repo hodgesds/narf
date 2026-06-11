@@ -16,8 +16,8 @@
 //!   <https://trustedcomputinggroup.org/resource/tpm-library-specification/>
 //! - Full key-management surface (`generate`, `import`, `derive`
 //!   producing typed `Cap<Key, _>`). Stage 3 covers verify + seal/open
-//!   + KDF expand on caps the caller already holds; Stage 4 wires the
-//!   key-store and cap mint path.
+//!   plus KDF expand on caps the caller already holds; Stage 4 wires
+//!   the key-store and cap mint path.
 //! - X25519 handshake + replay-window for SecureRing (spec §3.6).
 //! - SP 800-90B health tests on the entropy source (spec §3.2).
 //!   <https://csrc.nist.gov/publications/sp800>

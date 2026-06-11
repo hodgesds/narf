@@ -180,11 +180,8 @@ pub fn lz4_encode(input: &[u8], output: &mut [u8]) -> Result<usize, CompressErro
         } else {
             output[token_idx] = (literal_len as u8) << 4;
         }
-        // Copy literals byte-by-byte (small N, no need for an
-        // explicit SIMD/4-byte copy).
-        for i in 0..literal_len {
-            output[op + i] = input[anchor + i];
-        }
+        // Copy the literal run.
+        output[op..op + literal_len].copy_from_slice(&input[anchor..anchor + literal_len]);
         op += literal_len;
 
         // Offset (little-endian u16).
@@ -259,9 +256,7 @@ fn emit_last_literals(
         output[op] = (lastlen as u8) << 4;
         op += 1;
     }
-    for i in 0..lastlen {
-        output[op + i] = input[anchor + i];
-    }
+    output[op..op + lastlen].copy_from_slice(&input[anchor..anchor + lastlen]);
     op += lastlen;
     Ok(op)
 }
@@ -306,9 +301,7 @@ pub fn lz4_decode(input: &[u8], output: &mut [u8]) -> Result<usize, CompressErro
         if op + lit_len > output.len() {
             return Err(CompressError::OutputTooSmall);
         }
-        for i in 0..lit_len {
-            output[op + i] = input[ip + i];
-        }
+        output[op..op + lit_len].copy_from_slice(&input[ip..ip + lit_len]);
         op += lit_len;
         ip += lit_len;
 

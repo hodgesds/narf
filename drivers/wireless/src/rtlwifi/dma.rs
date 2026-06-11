@@ -31,8 +31,8 @@ use narf_io::{alloc_coherent, DmaBuffer, IoError};
 use narf_lib::id::DomainId;
 
 use super::mac::{
-    bd_num_reg_for_queue, desa_reg_for_queue, REG_BCNQ_DESA, REG_BEQ_DESA, REG_BKQ_DESA,
-    REG_HQ0_DESA, REG_MGQ_DESA, REG_RX_DESA, REG_VIQ_DESA, REG_VOQ_DESA,
+    bd_num_reg_for_queue, desa_reg_for_queue, REG_BCNQ_DESA, REG_BKQ_DESA, REG_HQ0_DESA,
+    REG_MGQ_DESA, REG_RX_DESA, REG_VIQ_DESA, REG_VOQ_DESA,
 };
 use super::regs::*;
 
@@ -72,6 +72,7 @@ impl From<IoError> for DmaError {
 /// always page-aligned (`alloc_coherent` returns one PhysFrame's worth)
 /// and zero-initialized.  Hardware ownership is communicated through
 /// the OWN bit in each descriptor's DW0.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct TxRing {
     /// DMA-coherent backing.  Slot 0 lives at offset 0.
     pub buf: DmaBuffer,
@@ -134,6 +135,7 @@ impl TxRing {
 // ── RX ring ──────────────────────────────────────────────────────────────
 
 /// A single RX descriptor ring (32-byte descriptors).
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct RxRing {
     pub buf: DmaBuffer,
     pub depth: u16,
@@ -237,6 +239,7 @@ pub const REG_RX_RXBD_NUM: u64 = 0x0382;
 // ── Aggregate setup: BE + MGT + HI + RX ──────────────────────────────────
 
 /// The minimum ring set required to associate + carry data traffic.
+#[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct MinRingSet {
     pub be: TxRing,
     pub mgt: TxRing,

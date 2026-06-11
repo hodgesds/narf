@@ -143,7 +143,7 @@ pub fn protect_outbound(
     let start_of_mmie = body.len();
     body.extend_from_slice(&[ELEMENT_ID_MMIE, (MMIE_LEN_CMAC_128) as u8]);
     // Zero the MMIE body region; we'll fill it in after MIC computation.
-    body.extend(core::iter::repeat(0u8).take(MMIE_LEN_CMAC_128));
+    body.extend(core::iter::repeat_n(0u8, MMIE_LEN_CMAC_128));
 
     // Per §12.5.4.4, the MIC is computed over (AAD || frame body) with
     // the MIC field inside the MMIE set to zero — which is what we just
@@ -197,7 +197,7 @@ pub fn verify_inbound<'a>(
     probe.extend_from_slice(&body[..split]);
     probe.extend_from_slice(&mmie_bytes[..2]);
     probe.extend_from_slice(&mmie_bytes[2..2 + 8]); // KeyID + IPN
-    probe.extend(core::iter::repeat(0u8).take(BIP_MIC_LEN)); // MIC zeroed
+    probe.extend(core::iter::repeat_n(0u8, BIP_MIC_LEN)); // MIC zeroed
 
     let aad = build_bip_aad(hdr_24).map_err(MfpError::from)?;
     let igtk = store.find_by_key_id_mut(key_id).ok_or(MfpError::NoMmie)?;

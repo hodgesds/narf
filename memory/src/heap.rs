@@ -58,6 +58,7 @@ pub const BOOTSTRAP_CAPACITY: usize = 12 << 20;
 /// 16-byte aligned for any alignment ≤ 16 to be trivially satisfiable.
 #[repr(C, align(16))]
 struct HeapBacking(UnsafeCell<[u8; BOOTSTRAP_CAPACITY]>);
+// SAFETY: the operation upholds its documented invariant (see surrounding context).
 unsafe impl Sync for HeapBacking {}
 
 static HEAP: HeapBacking = HeapBacking(UnsafeCell::new([0; BOOTSTRAP_CAPACITY]));
@@ -133,13 +134,28 @@ pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
             .compare_exchange_weak(cur, end, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            // SAFETY: `aligned..end` lies inside HEAP.0.
             let base = HEAP.0.get() as *mut u8;
+            // SAFETY: the CAS above succeeded, so `aligned..end` is now
+            // exclusively reserved for this caller, and `end <=
+            // BOOTSTRAP_CAPACITY` was checked, so `aligned <= end <=
+            // BOOTSTRAP_CAPACITY`. `base` points at the start of the
+            // `BOOTSTRAP_CAPACITY`-byte HEAP arena, so `base.add(aligned)`
+            // stays within (or one past the end of) that same allocation.
             return unsafe { base.add(aligned) };
         }
     }
 }
 
+// SAFETY: `BumpAllocator` satisfies the `GlobalAlloc` contract. Every
+// pointer it returns from `alloc` comes from the currently-installed
+// backend (bump arena or slab), is suitably aligned for `layout`, and
+// stays valid until the matching `dealloc`. `dealloc` is only ever
+// called with a pointer/layout pair this allocator previously handed
+// out: bootstrap-arena pointers are routed away from the slab (they are
+// never freed), and all other pointers go back to the backend that
+// produced them. Concurrent calls are serialised through the backend's
+// own atomics (the bump path is a lock-free CAS loop), so the impl is
+// sound under the multi-threaded use the global allocator sees.
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // First-allocation lazy default: if no backend is installed

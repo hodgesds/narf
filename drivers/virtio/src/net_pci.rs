@@ -104,7 +104,7 @@ const CFG_MTU: u64 = 10;
 /// Upper bound on how many queue pairs we'll actually bring up,
 /// regardless of what `max_virtqueue_pairs` reports. Keeps DMA-page
 /// + MSI-X-vector consumption bounded for absurd device-advertised
-/// counts (some emulators advertise 0x8000). 4 is enough to spread
+/// counts (some emulators advertise 0x8000). Four is enough to spread
 /// TX submission across a typical small-core machine.
 const MAX_QUEUE_PAIRS: u16 = 4;
 
@@ -335,13 +335,13 @@ impl VirtioNetPci {
         // virtio-net F_* bits we care about live in the low 32
         // (max is F_CTRL_MAC_ADDR = 23); only F_VERSION_1 = 32 is in
         // the high half.
-        let drv_lo = (1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32)
-            | (1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32)
-            | (1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32)
-            | (1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32)
-            | (1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32)
-            | (1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32)
-            | (1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32);
+        let drv_lo = ((1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32))
+            | ((1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32))
+            | ((1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32))
+            | ((1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32))
+            | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
+            | ((1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32))
+            | ((1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32));
         let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
         unsafe {
@@ -398,10 +398,7 @@ impl VirtioNetPci {
         // MAC / MTU / link-status reads, so map_cap fires once.
         let device_cfg = if let Some(cap) = caps.device_cfg.as_ref() {
             // SAFETY: caller-owned device.
-            match unsafe { crate::pci::map_cap(device, cap) } {
-                Ok(r) => Some(r),
-                Err(_) => None,
-            }
+            unsafe { crate::pci::map_cap(device, cap) }.ok()
         } else {
             None
         };
@@ -452,10 +449,7 @@ impl VirtioNetPci {
         // that's queue 2 — matches the legacy single-queue layout.
         let ctrl_qidx: u16 = 2 * num_pairs;
         let ctrl_setup = if want_ctrl_vq {
-            match size_q(ctrl_qidx) {
-                Ok(t) => Some(t),
-                Err(_) => None,
-            }
+            size_q(ctrl_qidx).ok()
         } else {
             None
         };
@@ -1233,7 +1227,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     // virtio-net always prepends a 12-byte header to
                     // every RX frame. Strip it via Frame::with_offset
                     // — the bytes stay where the device wrote them.
-                    let payload_len = (total_len as u32).saturating_sub(12);
+                    let payload_len = total_len.saturating_sub(12);
                     if payload_len == 0 {
                         // Empty frame (just header); drop it and keep
                         // draining. `buf` frees on scope exit.
@@ -1354,7 +1348,7 @@ fn vnet0_drain_fn() -> bool {
         Some(t) => t,
         None => return false,
     };
-    let payload_len = (total_len as u32).saturating_sub(12);
+    let payload_len = total_len.saturating_sub(12);
     if payload_len == 0 {
         return true;
     }

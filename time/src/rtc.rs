@@ -103,25 +103,50 @@ pub mod cmos {
         ((b / 10) << 4) | (b % 10)
     }
 
+    /// A coherent snapshot of the CMOS date/time registers, read
+    /// while UIP was clear. Bundles the raw register bytes so they
+    /// travel together through [`decode_snapshot`].
+    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+    pub struct CmosSnapshot {
+        /// REG_SECONDS (0x00).
+        pub sec: u8,
+        /// REG_MINUTES (0x02).
+        pub min: u8,
+        /// REG_HOURS (0x04).
+        pub hour: u8,
+        /// REG_DAY_OF_MONTH (0x07).
+        pub day: u8,
+        /// REG_MONTH (0x08).
+        pub month: u8,
+        /// REG_YEAR (0x09) — two-digit year within the century.
+        pub year: u8,
+        /// Optional Century byte (REG 0x32); 0 if the FADT reports
+        /// no Century byte.
+        pub century: u8,
+        /// REG_STATUS_B (0x0B) — selects BCD/binary and 12h/24h.
+        pub status_b: u8,
+    }
+
     /// Decode a coherent snapshot of the seven date/time registers
-    /// taken with UIP clear. `status_b` is the value of REG_STATUS_B
-    /// when the snapshot was taken — it determines BCD vs binary
-    /// and 12h vs 24h interpretation.
+    /// taken with UIP clear. The `status_b` field of `snap` is the
+    /// value of REG_STATUS_B when the snapshot was taken — it
+    /// determines BCD vs binary and 12h vs 24h interpretation.
     ///
-    /// `century` is the value of the optional Century byte (REG 0x32);
-    /// pass 0 if the FADT says no Century byte. Without a century,
-    /// we assume 2000 + `year` (kernels currently can't run before
-    /// 2000 without other failures).
-    pub fn decode_snapshot(
-        sec: u8,
-        min: u8,
-        hour: u8,
-        day: u8,
-        month: u8,
-        year: u8,
-        century: u8,
-        status_b: u8,
-    ) -> RtcDateTime {
+    /// `snap.century` is the value of the optional Century byte
+    /// (REG 0x32); 0 if the FADT says no Century byte. Without a
+    /// century, we assume 2000 + `year` (kernels currently can't run
+    /// before 2000 without other failures).
+    pub fn decode_snapshot(snap: CmosSnapshot) -> RtcDateTime {
+        let CmosSnapshot {
+            sec,
+            min,
+            hour,
+            day,
+            month,
+            year,
+            century,
+            status_b,
+        } = snap;
         let bcd = status_b & STATUS_B_BIN == 0;
         let h24 = status_b & STATUS_B_24H != 0;
 

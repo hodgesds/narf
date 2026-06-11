@@ -123,7 +123,7 @@ pub fn alloc_block(n: u8) -> Result<u8, VectorError> {
 /// Release a previously-allocated vector. `AlreadyFree` if the bit
 /// wasn't set — points at a double-free in caller code.
 pub fn free(vector: u8) -> Result<(), VectorError> {
-    if vector < ALLOC_BASE || vector > ALLOC_MAX {
+    if !(ALLOC_BASE..=ALLOC_MAX).contains(&vector) {
         return Err(VectorError::OutOfRange);
     }
     let (w, bit) = split(vector);

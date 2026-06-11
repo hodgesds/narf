@@ -68,10 +68,15 @@ pub struct MpscProducer<T> {
     _not_sync_hint: PhantomData<*const ()>,
 }
 
-// Safety: we never access raw pointers from producers; the
-// PhantomData above is hint-only. Multiple tasks on multiple CPUs
-// can hold an `MpscProducer` and the `Inner`'s locks make it safe.
+// SAFETY: `MpscProducer` owns only an `Arc<Inner<T>>`; the
+// `PhantomData<*const ()>` is a documentation hint and is never
+// dereferenced. Moving it to another thread is sound when `T: Send`
+// because the only shared state (`Inner`'s queue and wakers) is behind
+// spin locks.
 unsafe impl<T: Send> Send for MpscProducer<T> {}
+// SAFETY: all access to the shared `Inner` from a producer goes through
+// `Inner`'s spin locks, so concurrent `&MpscProducer` use from multiple
+// threads is data-race-free when `T: Send`.
 unsafe impl<T: Send> Sync for MpscProducer<T> {}
 
 impl<T> Clone for MpscProducer<T> {
@@ -115,6 +120,11 @@ pub struct MpscConsumer<T> {
     _not_sync: PhantomData<*const ()>,
 }
 
+// SAFETY: `MpscConsumer` owns only an `Arc<Inner<T>>` and a hint-only
+// `PhantomData<*const ()>` that is never dereferenced; the consumer is
+// !Sync (single-threaded by construction) but may be moved between
+// threads, which is sound when `T: Send` since all `Inner` access is
+// lock-guarded.
 unsafe impl<T: Send> Send for MpscConsumer<T> {}
 
 impl<T> MpscConsumer<T> {

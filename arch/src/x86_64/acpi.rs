@@ -184,8 +184,8 @@ unsafe fn check_rsdp(phys: u64) -> bool {
     // SAFETY: caller-asserted readable.
     let sig = unsafe {
         let mut s = [0u8; 8];
-        for i in 0..8 {
-            s[i] = core::ptr::read_volatile((phys + i as u64) as *const u8);
+        for (i, byte) in s.iter_mut().enumerate() {
+            *byte = core::ptr::read_volatile((phys + i as u64) as *const u8);
         }
         s
     };
@@ -194,21 +194,23 @@ unsafe fn check_rsdp(phys: u64) -> bool {
     }
     // Verify the revision-1 (20-byte) checksum first.
     let mut sum: u8 = 0;
-    // SAFETY: same.
     for i in 0..20 {
+        // SAFETY: the signature matched above, so `phys` points at an RSDP whose
+        // first 20 bytes (the revision-1 structure) are readable; `i < 20`.
         sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
     }
     if sum != 0 {
         return false;
     }
     // For revision >= 2, also verify the 36-byte checksum.
-    // SAFETY: same.
+    // SAFETY: byte 15 (revision) is within the already-validated 20-byte RSDP.
     let rev = unsafe { core::ptr::read_volatile((phys + 15) as *const u8) };
     if rev >= 2 {
         let mut sum: u8 = 0;
-        // SAFETY: same.
         for i in 0..36 {
             sum = sum
+                // SAFETY: revision >= 2 means the RSDP is the 36-byte extended
+                // form, so bytes 0..36 at `phys` are all readable; `i < 36`.
                 .wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
         }
         if sum != 0 {
@@ -226,9 +228,10 @@ pub unsafe fn decode_rsdp(phys: u64) -> Rsdp {
     // SAFETY: caller-asserted.
     let revision = unsafe { core::ptr::read_volatile((phys + 15) as *const u8) };
     let mut oem_id = [0u8; 6];
-    // SAFETY: same.
-    for i in 0..6 {
-        oem_id[i] = unsafe { core::ptr::read_volatile((phys + 9 + i as u64) as *const u8) };
+    for (i, byte) in oem_id.iter_mut().enumerate() {
+        // SAFETY: `check_rsdp` validated this RSDP, so bytes 9..15 (the 6-byte
+        // OEMID field) lie within the readable RSDP region at `phys`.
+        *byte = unsafe { core::ptr::read_volatile((phys + 9 + i as u64) as *const u8) };
     }
     // SAFETY: same.
     let rsdt_address = unsafe { core::ptr::read_volatile((phys + 16) as *const u32) };
@@ -253,11 +256,11 @@ unsafe fn read_sdt_header(phys: u64) -> SdtHeader {
     let mut oem_id = [0u8; 6];
     // SAFETY: caller-asserted SDT phys.
     unsafe {
-        for i in 0..4 {
-            signature[i] = core::ptr::read_volatile((phys + i as u64) as *const u8);
+        for (i, byte) in signature.iter_mut().enumerate() {
+            *byte = core::ptr::read_volatile((phys + i as u64) as *const u8);
         }
-        for i in 0..6 {
-            oem_id[i] = core::ptr::read_volatile((phys + 10 + i as u64) as *const u8);
+        for (i, byte) in oem_id.iter_mut().enumerate() {
+            *byte = core::ptr::read_volatile((phys + 10 + i as u64) as *const u8);
         }
     }
     // SAFETY: same.
@@ -276,6 +279,7 @@ unsafe fn checksum_ok(phys: u64, length: u32) -> bool {
     let mut sum: u8 = 0;
     // SAFETY: caller-asserted readable + bounded.
     for i in 0..length as u64 {
+        // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
         sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i) as *const u8) });
     }
     sum == 0
@@ -312,8 +316,11 @@ pub unsafe fn parse_xsdt(phys: u64) -> Result<Tables, AcpiError> {
         match &sh.signature {
             // SAFETY: parsed below.
             SIG_MADT => unsafe { parse_madt(sdt_phys, sh.length, &mut t) },
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             SIG_HPET => unsafe { parse_hpet(sdt_phys, sh.length, &mut t) },
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             SIG_MCFG => unsafe { parse_mcfg(sdt_phys, sh.length, &mut t) },
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             SIG_FADT => unsafe { parse_fadt(sdt_phys, sh.length, &mut t) },
             _ => {}
         }

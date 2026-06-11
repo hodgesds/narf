@@ -19,7 +19,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -256,8 +255,8 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
     }
 
     // Initialize IPC rings.
-    let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
-    let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+    let (_rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
+    let (tx_prod, _tx_cons) = channel::<Frame, TX_RING_N>();
 
     let device_obj = Arc::new(Rtw88Device {
         mmio_bar0: mmio_bar0.clone(),

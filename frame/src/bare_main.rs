@@ -95,6 +95,7 @@ pub fn narf_cpu_to_node(cpu: u32) -> u32 {
 /// initcall remains in place; it re-binds the hook to whichever
 /// scanout `narf_fb::select_active()` picks (potentially a real
 /// GPU driver instead of the bootloader-supplied generic FB).
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     use narf_graphics::{FbConsole, Pixel32};
 
@@ -1901,6 +1902,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     );
 
                     // SAFETY: Single-threaded boot path, statics populated in _start_rust.
+                    #[allow(static_mut_refs)]
+                    // TODO(narf): migrate this boot-time static to addr_of!/OnceCell
                     let (raw, info) = unsafe { (RAW_BOOT_INFO.as_ref(), BOOT_INFO.as_ref()) };
 
                     // PCR 0 is for FIRMWARE measurement per TCG PC Client
@@ -2958,6 +2961,7 @@ fn run_async_demo() -> ! {
 /// `narf_verification::run_all_and_exit()` instead, so this fn
 /// never fires under `cargo xtask test`.
 #[cfg(all(feature = "boot-init", target_arch = "x86_64"))]
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     use narf_userspace::{
@@ -3404,6 +3408,7 @@ fn boot_userspace_init() {
 /// path stays a no-op so `cargo xtask run --arch=aarch64
 /// --features boot-init` still links and boots the kernel proper.
 #[cfg(all(feature = "boot-init", not(target_arch = "x86_64")))]
+#[allow(dead_code)] // TODO(narf): aarch64 boot-init stub; its caller is cfg'd out under kernel-test
 fn boot_userspace_init() {
     use core::fmt::Write as _;
     let _ = writeln!(

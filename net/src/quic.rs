@@ -85,8 +85,8 @@ pub fn varint_decode(buf: &[u8]) -> Result<(u64, usize), QuicError> {
         return Err(QuicError::Short);
     }
     let mut v = (buf[0] & 0b0011_1111) as u64;
-    for i in 1..len {
-        v = (v << 8) | buf[i] as u64;
+    for &b in &buf[1..len] {
+        v = (v << 8) | b as u64;
     }
     Ok((v, len))
 }

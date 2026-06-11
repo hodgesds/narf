@@ -319,11 +319,19 @@ impl<F: Future> Future for Timeout<F> {
         // `pin_project_lite`. Neither field is moved out — only
         // re-pinned for the inner poll call.
         let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `this.fut` is a field of the pinned `Timeout`, so it is
+        // structurally pinned: it lives as long as `self` and is never moved
+        // out (we only re-pin it here and poll through it). Re-establishing
+        // the pin invariant for the projected field is therefore sound.
         let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
         match fut.poll(cx) {
             Poll::Ready(v) => return Poll::Ready(Ok(v)),
             Poll::Pending => {}
         }
+        // SAFETY: `this.sleep` is a field of the pinned `Timeout`, so it is
+        // structurally pinned exactly like `this.fut` above: it is never moved
+        // out, only re-pinned here for the inner poll. Re-establishing the pin
+        // invariant for the projected field is sound.
         let sleep = unsafe { Pin::new_unchecked(&mut this.sleep) };
         match sleep.poll(cx) {
             Poll::Ready(()) => Poll::Ready(Err(Elapsed)),

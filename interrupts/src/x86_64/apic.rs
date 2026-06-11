@@ -64,6 +64,14 @@ const DIV_16: u64 = 0b011;
 
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Set true by `init_bsp` only after the IA32_APIC_BASE.EXTD bit
+/// is verified to have stuck. QEMU TCG's qemu64 model advertises
+/// x2APIC in CPUID but the EXTD WRMSR is a silent no-op there; we
+/// can't trust CPUID alone. Other LAPIC entry points check this
+/// flag before doing x2APIC MSR writes that would otherwise #GP.
+pub static X2APIC_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Initialise the BSP's LAPIC in x2APIC mode (no timer yet).
 ///
 /// Also masks both legacy 8259 PICs so their IRQs can't land on our
@@ -76,14 +84,6 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// - Must run on the BSP, exactly once.
 /// - CPUID must confirm x2APIC; caller gates on `Features::probe`.
 /// - Interrupts are assumed disabled at the call site.
-/// Set true by `init_bsp` only after the IA32_APIC_BASE.EXTD bit
-/// is verified to have stuck. QEMU TCG's qemu64 model advertises
-/// x2APIC in CPUID but the EXTD WRMSR is a silent no-op there; we
-/// can't trust CPUID alone. Other LAPIC entry points check this
-/// flag before doing x2APIC MSR writes that would otherwise #GP.
-pub static X2APIC_ACTIVE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
 pub unsafe fn init_bsp() {
     // SAFETY: CPL=0; rdmsr/wrmsr against IA32_APIC_BASE are
     // unconditional on long-mode x86_64. The EXTD write below is
@@ -114,6 +114,9 @@ pub unsafe fn init_bsp() {
     // SAFETY: CPUID is unconditional at CPL=0.
     let feats = unsafe { narf_arch::x86_64::Features::probe() };
     if feats.x2apic {
+        // SAFETY: CPL=0; reading IA32_APIC_BASE is unconditional on
+        // long mode. We re-read here to OR the EXTD bit onto the
+        // current value rather than clobbering the APIC base address.
         let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
         // SAFETY: CPUID-gated above; CPU supports the EXTD bit.
         unsafe {
@@ -126,6 +129,10 @@ pub unsafe fn init_bsp() {
     // IPIs (TLB shootdown), and IRQ delivery. Used under QEMU TCG
     // without `+x2apic` and any host whose firmware refuses the
     // EXTD bit.
+    // SAFETY: CPL=0; reading IA32_APIC_BASE is unconditional on long
+    // mode. Reading back the just-written value tells us whether the
+    // EXTD bit actually stuck (it silently drops on QEMU TCG / locked
+    // firmware).
     let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
     if confirm & APIC_BASE_EXTD == 0 {
         // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
@@ -234,16 +241,20 @@ fn install_apic_diag_handlers() {
 fn apic_error_handler() {
     // SDM §11.5.3: ESR latches errors but only updates on a
     // write. Write 0, then read to drain.
-    // SAFETY: APIC is live; ESR MSR is well-defined.
     let esr = if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        // SAFETY: this handler only runs in x2APIC mode here, so the
+        // APIC_ESR MSR is accessible at CPL=0; the write-then-read
+        // drain sequence is the architected way to sample ESR.
         unsafe {
             wrmsr(APIC_ESR_MSR, 0);
             rdmsr(APIC_ESR_MSR)
         }
     } else {
         // xAPIC ESR at MMIO offset 0x280.
-        // SAFETY: LAPIC MMIO identity-mapped.
         let esr_reg = (XAPIC_MMIO_BASE + 0x280) as *mut u32;
+        // SAFETY: in xAPIC mode the LAPIC MMIO window is identity-mapped
+        // (low 4 GiB) and EN is set, so this 32-bit aligned write/read
+        // to the architected ESR register at base+0x280 is valid.
         unsafe {
             core::ptr::write_volatile(esr_reg, 0);
             core::ptr::read_volatile(esr_reg) as u64
@@ -464,7 +475,7 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
     }
     let mut m = cpu_mask;
     while m != 0 {
-        let cpu = m.trailing_zeros() as u32;
+        let cpu = m.trailing_zeros();
         m &= m - 1;
         // Fixed delivery, edge-triggered, level-assert,
         // physical destination, no shorthand. Dest in high
@@ -523,10 +534,11 @@ pub unsafe fn eoi() {
         // IRQ of a given priority, blocking all further deliveries
         // — the symptom is "first tick fires then nothing". This
         // is the canonical mainframe Linux pattern (`native_apic_mem_eoi`).
-        //
-        // SAFETY: LAPIC MMIO identity-mapped; 32-bit aligned write
-        // to architected register has no side effect beyond ack.
         let eoi_reg = (XAPIC_MMIO_BASE + 0x0B0) as *mut u32;
+        // SAFETY: in xAPIC mode the LAPIC MMIO window is identity-mapped
+        // (low 4 GiB) with EN set, so this 32-bit aligned write to the
+        // architected EOI register at base+0xB0 is valid and has no
+        // side effect beyond acknowledging the in-service IRQ.
         unsafe {
             core::ptr::write_volatile(eoi_reg, 0);
         }
@@ -629,9 +641,10 @@ pub unsafe fn apic_id() -> u32 {
         // SAFETY: MSR 0x802 is x2APIC APIC_ID — read-only.
         unsafe { rdmsr(0x0000_0802) as u32 }
     } else {
-        // SAFETY: LAPIC MMIO identity-mapped; reading the APIC_ID
-        // register has no side effects.
         let id_reg = (XAPIC_MMIO_BASE + 0x20) as *const u32;
+        // SAFETY: caller guarantees init_bsp ran, so the LAPIC MMIO
+        // window is identity-mapped; this 32-bit aligned read of the
+        // architected APIC_ID register at base+0x20 has no side effects.
         let raw = unsafe { core::ptr::read_volatile(id_reg) };
         // xAPIC APIC_ID occupies bits[31:24].
         raw >> 24
@@ -773,6 +786,9 @@ pub fn on_timer_tick() {
     let period = TSC_DEADLINE_PERIOD_CYCLES.load(Ordering::Relaxed);
     if period != 0 {
         let prev = TSC_DEADLINE_NEXT.load(Ordering::Relaxed);
+        // SAFETY: _rdtsc compiles to the RDTSC instruction, which is
+        // unconditionally available in long mode at CPL=0 and only
+        // reads the time-stamp counter — no memory or fault risk.
         let now = unsafe { core::arch::x86_64::_rdtsc() };
         // If we've fallen behind (e.g. long handler), snap forward
         // to now + period rather than slipping forever.

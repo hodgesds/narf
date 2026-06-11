@@ -67,7 +67,7 @@ pub const TPM_BASE_LOCALITY_0: u64 = 0xFED4_0000;
 const REG_INTERFACE_ID: u64 = 0x30;
 
 // CRB control block (offsets relative to `TPM_BASE_LOCALITY_0`).
-const REG_LOC_CTRL: u64 = 0x40 + 0x00;
+const REG_LOC_CTRL: u64 = 0x40; // 0x40 + 0x00
 const REG_LOC_STS: u64 = 0x40 + 0x04;
 const REG_CRB_CTRL_REQ: u64 = 0x40 + 0x80;
 const REG_CRB_CTRL_STS: u64 = 0x40 + 0x84;
@@ -80,6 +80,7 @@ const REG_CRB_RSP_LO: u64 = 0x40 + 0xA8;
 const REG_CRB_RSP_HI: u64 = 0x40 + 0xAC;
 
 const CTRL_REQ_CMD_READY: u32 = 1 << 0;
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 const CTRL_STS_TPM_IDLE: u32 = 1 << 1;
 const CTRL_START_GO: u32 = 1 << 0;
@@ -318,10 +319,13 @@ impl Tpm {
         // 5. Read response. The size lives in bytes [2..6] of the
         //    response header (TPM2 §5.6 paragraphSize).
         let mut header = [0u8; 10];
-        // SAFETY: identity-mapped DMA.
+        // SAFETY: rsp_phys is the CRB response buffer physical address
+        // published by firmware (REG_CRB_RSP_LO/HI), identity-mapped at boot,
+        // and rsp_size >= 10 was checked when the buffer was set up, so
+        // rsp_phys..rsp_phys+10 are valid readable MMIO/DMA bytes.
         unsafe {
-            for i in 0..10 {
-                header[i] = core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8);
+            for (i, byte) in header.iter_mut().enumerate() {
+                *byte = core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8);
             }
         }
         let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
@@ -329,9 +333,11 @@ impl Tpm {
             return Err(TpmError::BadResponse);
         }
         let mut out = alloc::vec![0u8; resp_size as usize];
-        // SAFETY: same.
-        for i in 0..resp_size as usize {
-            out[i] = unsafe { core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8) };
+        for (i, byte) in out.iter_mut().enumerate() {
+            // SAFETY: resp_size <= self.rsp_size was checked above, so every
+            // i in 0..resp_size addresses a byte inside the firmware-published,
+            // identity-mapped CRB response buffer at rsp_phys.
+            *byte = unsafe { core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8) };
         }
         Ok(out)
     }

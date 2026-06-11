@@ -56,7 +56,7 @@ pub fn hkdf_extract(salt: Option<&[u8]>, ikm: &[u8]) -> [u8; 32] {
 /// HKDF-Expand(PRK, info, L) -> OKM
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc5869#section-2.3>
 pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], l: usize) -> alloc::vec::Vec<u8> {
-    let n = (l + 31) / 32;
+    let n = l.div_ceil(32);
     let mut okm = alloc::vec::Vec::with_capacity(n * 32);
     let mut t = alloc::vec::Vec::new();
 

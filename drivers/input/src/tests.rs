@@ -1252,7 +1252,7 @@ mod i2c_hid_bind_smokes {
         use narf_drivers_i2c::I2cBus;
 
         use super::i2c_hid_smokes::{make_descriptor_bytes, run_async, MockBus};
-        use crate::i2c_hid::{HidDescriptor, I2cHidDriver};
+        use crate::i2c_hid::I2cHidDriver;
         use crate::i2c_hid_bind::{set_ptp_multi_touch_mode, PtpModeSetResult};
 
         // Parse the shared PTP descriptor blob → ReportDescriptor →

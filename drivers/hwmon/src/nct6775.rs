@@ -70,6 +70,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(target_arch = "x86_64")]
 use crate::registry;
 
 // ── Chip IDs ──────────────────────────────────────────────────────────
@@ -388,6 +389,7 @@ impl crate::HwmonDevice for Nct6775 {
 /// Probe both standard (0x2E) and alternate (0x4E) SIO base addresses.
 /// Registers a [`Nct6775`] device if a known chip is found.
 pub fn register_isa_driver() {
+    #[cfg(target_arch = "x86_64")]
     use core::fmt::Write as _;
     #[cfg(target_arch = "x86_64")]
     {

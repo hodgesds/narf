@@ -340,10 +340,10 @@ fn smoke_sink_rejects_empty_source_caps() -> TestResult {
             if port.state() == SinkState::Unattached {
                 return TestResult::Pass;
             }
-            return TestResult::Fail("empty Source_Caps should drop to Unattached");
+            TestResult::Fail("empty Source_Caps should drop to Unattached")
         }
-        Err(SinkError::NoPdos) => return TestResult::Pass,
-        Err(_) => return TestResult::Fail("unexpected error variant"),
+        Err(SinkError::NoPdos) => TestResult::Pass,
+        Err(_) => TestResult::Fail("unexpected error variant"),
     }
 }
 kernel_test_in!("usbpd/tcpm", smoke_sink_rejects_empty_source_caps);
@@ -488,7 +488,7 @@ fn smoke_dp_alt_mode_discovery_full_walk() -> TestResult {
     }
 
     // SVIDs ACK — header + a VDO listing DisplayPort SVID in the high half.
-    let svid_pack = ((SVID_DISPLAYPORT as u32) << 16) | 0x0000;
+    let svid_pack = ((SVID_DISPLAYPORT as u32) << 16);
     let svids_ack = alloc::vec![
         VdmHeader::structured(SVID_PD, VdmCommand::DiscoverSvids, CommandType::Ack).encode(),
         svid_pack,

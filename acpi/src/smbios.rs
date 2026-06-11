@@ -215,7 +215,7 @@ impl<'a> Iterator for StructIter<'a> {
         // ending in an extra NUL. If the formatted section is followed
         // immediately by a single NUL, the structure has no strings.
         let mut strings = Vec::new();
-        if p + 1 <= self.buf.len()
+        if p < self.buf.len()
             && self.buf[p] == 0
             && (p + 2 > self.buf.len() || self.buf[p + 1] == 0)
         {
@@ -244,7 +244,7 @@ impl<'a> Iterator for StructIter<'a> {
             }
         }
         let header = StructHeader {
-            typ: typ,
+            typ,
             length: length as u8,
             handle,
         };
@@ -367,7 +367,7 @@ impl SystemInfoIndices {
 /// Look up an SMBIOS 1-based string index in the structure's string
 /// set. Returns `""` for index 0 (the spec's convention for "no
 /// string").
-pub fn string_at<'a>(strings: &'a [String], idx: u8) -> &'a str {
+pub fn string_at(strings: &[String], idx: u8) -> &str {
     if idx == 0 {
         return "";
     }

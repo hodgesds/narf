@@ -22,7 +22,7 @@
 use alloc::vec::Vec;
 
 use crate::codec::generic::{
-    encode_verb, set_amp_gain_mute_verb, CodecVerbBus, VerbError, PARAM_VENDOR_ID,
+    encode_verb, set_amp_gain_mute_verb, AmpGainMute, CodecVerbBus, VerbError, PARAM_VENDOR_ID,
     VERB_GET_PARAMETER, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL, VERB_SET_POWER_STATE,
     VERB_SET_UNSOLICITED_RESPONSE,
 };
@@ -392,8 +392,17 @@ pub fn bring_up(
     }
     // 3) Unmute the DAC output amp.
     let unmute = set_amp_gain_mute_verb(
-        cad, dac_nid, /*set_output=*/ true, /*set_input=*/ false, /*left=*/ true,
-        /*right=*/ true, /*index=*/ 0, /*mute=*/ false, /*gain=*/ 0,
+        cad,
+        dac_nid,
+        AmpGainMute {
+            set_output: true,
+            set_input: false,
+            left: true,
+            right: true,
+            index: 0,
+            mute: false,
+            gain: 0,
+        },
     );
     bus.send_verb(unmute)?;
     // 4) Drive speaker pin OUT enabled.

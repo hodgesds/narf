@@ -552,7 +552,7 @@ fn smoke_icmpv6_neighbor_solicitation_carries_target() -> TestResult {
     if body[0] != ICMPV6_NEIGHBOR_SOLICITATION {
         return TestResult::Fail("type byte = 135");
     }
-    if &body[8..24] != &target {
+    if body[8..24] != target {
         return TestResult::Fail("target IP at bytes 8..24");
     }
     TestResult::Pass
@@ -877,7 +877,7 @@ fn smoke_dhcp_build_discover_carries_required_options() -> TestResult {
                 if opt.data.len() != 7 || opt.data[0] != 1 {
                     return TestResult::Fail("Client ID must be hardware-type prefixed");
                 }
-                if &opt.data[1..7] != &mac {
+                if opt.data[1..7] != mac {
                     return TestResult::Fail("Client ID MAC mismatch");
                 }
                 saw_cid = true;
@@ -1372,10 +1372,12 @@ kernel_test_in!("net/ntp", smoke_ntp_header_round_trip);
 
 fn smoke_ntp_li_vn_mode_byte_packing() -> TestResult {
     use crate::pkt_ntp::NtpHeader;
-    let mut h = NtpHeader::default();
-    h.leap_indicator = 3; // alarm
-    h.version = 4;
-    h.mode = 3; // client
+    let h = NtpHeader {
+        leap_indicator: 3, // alarm
+        version: 4,
+        mode: 3, // client
+        ..Default::default()
+    };
     let bytes = h.encode();
     // Expected: (3 << 6) | (4 << 3) | 3 = 0xC0 | 0x20 | 3 = 0xE3
     if bytes[0] != 0xE3 {
@@ -1642,7 +1644,7 @@ fn smoke_dhcpv6_clientid_duid_ll() -> TestResult {
     if duid_type != DUID_TYPE_LL {
         return TestResult::Fail("DUID type = 3 (LL)");
     }
-    if &opt.data[4..10] != &mac {
+    if opt.data[4..10] != mac {
         return TestResult::Fail("MAC at end of DUID-LL");
     }
     TestResult::Pass
@@ -1849,10 +1851,10 @@ kernel_test_in!("net/http2", smoke_http2_client_preface_constant);
 fn smoke_http2_frame_header_round_trip() -> TestResult {
     use crate::http2::{FrameHeader, FLAG_END_HEADERS, FRAME_HEADER_LEN, FT_HEADERS};
     let h = FrameHeader {
-        length: 0x12_3456,
+        length: 0x12_34_56,
         frame_type: FT_HEADERS,
         flags: FLAG_END_HEADERS,
-        stream_id: 0x12_3456_78,
+        stream_id: 0x12_34_56_78,
     };
     let bytes = h.encode();
     if bytes.len() != FRAME_HEADER_LEN {
@@ -3306,7 +3308,7 @@ fn smoke_tcp_iter_options_on_empty_is_empty() -> TestResult {
     }
     // Single EOL byte: iterator stops immediately.
     let eol = alloc::vec![0u8];
-    for _ in iter_options(&eol) {
+    if iter_options(&eol).next().is_some() {
         return TestResult::Fail("iter_options walked past EOL");
     }
     // Single NOP only.
@@ -4666,7 +4668,7 @@ fn smoke_ipv6_fragment_reassembly_two_pieces() -> TestResult {
     let mut frag1_hdr = [0u8; 8];
     frag1_hdr[0] = NEXT_HEADER_TCP;
     // offset 0 / m=1: low bit set
-    let off1 = 0u16 | 1;
+    let off1 = 1u16;
     frag1_hdr[2..4].copy_from_slice(&off1.to_be_bytes());
     frag1_hdr[4..8].copy_from_slice(&id.to_be_bytes());
     let part1 = alloc::vec![0xAAu8; 8]; // 8 octets
@@ -4694,7 +4696,7 @@ fn smoke_ipv6_fragment_reassembly_two_pieces() -> TestResult {
     if assembled.len() != 12 {
         return TestResult::Fail("reassembled length mismatch");
     }
-    if &assembled[..8] != &[0xAA; 8] || &assembled[8..] != &[0xBB; 4] {
+    if assembled[..8] != [0xAA; 8] || assembled[8..] != [0xBB; 4] {
         return TestResult::Fail("reassembled bytes mismatch");
     }
     TestResult::Pass
@@ -4765,7 +4767,7 @@ fn smoke_ipv6_mld_join_report() -> TestResult {
     }
     // Record header: type(1) + auxlen(1) + #sources(2) + group(16).
     // Starts at byte 8.
-    if &body[12..28] != &group {
+    if body[12..28] != group {
         return TestResult::Fail("group not embedded correctly");
     }
     TestResult::Pass
@@ -5022,7 +5024,7 @@ fn smoke_ct_expiry_evicts_idle_entry() -> TestResult {
     if removed != 1 {
         return TestResult::Fail("expected 1 entry reaped");
     }
-    if ct().len() != 0 {
+    if !ct().is_empty() {
         return TestResult::Fail("table should be empty after reap");
     }
     TestResult::Pass
@@ -7537,12 +7539,12 @@ fn smoke_dns_parse_a_response() -> TestResult {
         0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
     ]);
     msg.extend_from_slice(qname);
-    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
-    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(&TYPE_A.to_be_bytes());
+    msg.extend_from_slice(&CLASS_IN.to_be_bytes());
     // Answer: compression pointer → offset 12.
     msg.extend_from_slice(&[0xC0, 0x0C]);
-    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
-    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(&TYPE_A.to_be_bytes());
+    msg.extend_from_slice(&CLASS_IN.to_be_bytes());
     msg.extend_from_slice(&300u32.to_be_bytes()); // TTL
     msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
     msg.extend_from_slice(&[1, 2, 3, 4]); // RDATA
@@ -7574,7 +7576,7 @@ fn smoke_dns_cname_chain_resolve() -> TestResult {
     // Both names as plain (uncompressed) labels:
     //   foo.com = 3 f o o . 3 c o m . 0  (9 bytes)
     //   bar.com = 3 b a r . 3 c o m . 0  (9 bytes)
-    let foo: &[u8] = &[3, b'f', b'o', b'o', 3, b'c', b'o', b'm', 0];
+    let foo_name: &[u8] = &[3, b'f', b'o', b'o', 3, b'c', b'o', b'm', 0];
     let bar: &[u8] = &[3, b'b', b'a', b'r', 3, b'c', b'o', b'm', 0];
     let mut msg = alloc::vec::Vec::new();
     // Header: QDCOUNT=1, ANCOUNT=2.
@@ -7582,20 +7584,20 @@ fn smoke_dns_cname_chain_resolve() -> TestResult {
         0x00, 0x02, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
     ]);
     // Question: foo.com A IN.
-    msg.extend_from_slice(foo);
-    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
-    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(foo_name);
+    msg.extend_from_slice(&TYPE_A.to_be_bytes());
+    msg.extend_from_slice(&CLASS_IN.to_be_bytes());
     // Answer 1: foo.com CNAME bar.com (TTL=60).
-    msg.extend_from_slice(foo);
-    msg.extend_from_slice(&(TYPE_CNAME as u16).to_be_bytes());
-    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(foo_name);
+    msg.extend_from_slice(&TYPE_CNAME.to_be_bytes());
+    msg.extend_from_slice(&CLASS_IN.to_be_bytes());
     msg.extend_from_slice(&60u32.to_be_bytes());
     msg.extend_from_slice(&(bar.len() as u16).to_be_bytes());
     msg.extend_from_slice(bar);
     // Answer 2: bar.com A 5.6.7.8 (TTL=120).
     msg.extend_from_slice(bar);
-    msg.extend_from_slice(&(TYPE_A as u16).to_be_bytes());
-    msg.extend_from_slice(&(CLASS_IN as u16).to_be_bytes());
+    msg.extend_from_slice(&TYPE_A.to_be_bytes());
+    msg.extend_from_slice(&CLASS_IN.to_be_bytes());
     msg.extend_from_slice(&120u32.to_be_bytes());
     msg.extend_from_slice(&4u16.to_be_bytes());
     msg.extend_from_slice(&[5, 6, 7, 8]);

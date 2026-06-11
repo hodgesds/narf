@@ -110,7 +110,7 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
     ) -> Result<(), FsError> {
         let nl = self.volume.sb.name_len;
         let entry_sz = nl.entry_size();
-        if name.as_bytes().len() > nl.bytes() {
+        if name.len() > nl.bytes() {
             return Err(FsError::InvalidPath);
         }
         // Find a hole (ino == 0 slot) or extend.
@@ -256,7 +256,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
             for (n, ino) in entries {
                 if n == name {
                     let child = self.volume.read_inode(ino).await?;
-                    if !(child.mode & mode::IFMT == mode::IFDIR) {
+                    if child.mode & mode::IFMT != mode::IFDIR {
                         return Err(FsError::InvalidPath);
                     }
                     return Ok(
@@ -515,7 +515,7 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
                 return Err(FsError::Busy);
             }
             // Length check on the new name.
-            if new_name.as_bytes().len() > self.volume.sb.name_len.bytes() {
+            if new_name.len() > self.volume.sb.name_len.bytes() {
                 return Err(FsError::InvalidPath);
             }
             // Overwrite old slot's name in place — same inode number.

@@ -311,12 +311,12 @@ pub fn init() {
 
     for g in &guids {
         if let Some(ref eg) = event_bytes {
-            if &g.guid == eg.as_slice() {
+            if g.guid == eg.as_slice() {
                 narf_aml::wmi::subscribe_event(g, on_hp_event);
             }
         }
         if let Some(ref bg) = bios_bytes {
-            if &g.guid == bg.as_slice() {
+            if g.guid == bg.as_slice() {
                 BIOS_FOUND.store(true, Ordering::Release);
             }
         }

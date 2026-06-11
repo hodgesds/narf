@@ -1743,7 +1743,7 @@ fn smoke_laptop_state_default_is_all_none() -> TestResult {
     if s.cpu_tdie_mc.is_some() || s.gpu_temp_mc.is_some() {
         return TestResult::Fail("default thermal fields must be None");
     }
-    if !s.battery_info.is_none() || !s.battery_state.is_none() {
+    if s.battery_info.is_some() || s.battery_state.is_some() {
         return TestResult::Fail("default battery fields must be None");
     }
     if s.power_button_presses != 0 || s.sleep_button_presses != 0 {
@@ -2020,7 +2020,7 @@ fn smoke_device_pm_drivers_register_at_probe_if_probed() -> TestResult {
     // exposes an xHCI controller.
     let snap = registered_devices();
     let names: alloc::vec::Vec<&str> = snap.iter().map(|e| e.name.as_str()).collect();
-    if !names.iter().any(|n| *n == "xhci0") {
+    if !names.contains(&"xhci0") {
         return TestResult::Skip("xhci not probed in this QEMU config");
     }
     TestResult::Pass
@@ -2503,7 +2503,7 @@ fn smoke_production_s3_sentinel_default_off_opt_in_flip() -> TestResult {
     // Boot-cmdline path: the magic token sets the flag without a
     // cap (it runs pre-cap-creation).
     __test_reset_production_s3();
-    if boot_apply_s3_validated_flag("ro console=ttyS0 S3_VALIDATED quiet") != true {
+    if !boot_apply_s3_validated_flag("ro console=ttyS0 S3_VALIDATED quiet") {
         return TestResult::Fail("cmdline scan didn't find S3_VALIDATED");
     }
     if !production_s3_enabled() {

@@ -94,6 +94,7 @@ fn smoke_lib_assert_in_domain_passes_on_frame() -> TestResult {
 }
 kernel_test_in!("lib", smoke_lib_assert_in_domain_passes_on_frame);
 
+#[allow(clippy::eq_op)] // bug_on! re-evaluates the (deliberately-false) condition
 fn smoke_lib_bug_on_false_is_silent() -> TestResult {
     // bug_on! is a panic-path macro; a false condition must NOT panic.
     // Also implicitly tests the format-args path compiles.

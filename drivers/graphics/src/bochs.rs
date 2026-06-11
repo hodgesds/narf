@@ -30,7 +30,7 @@ pub const BOCHS_PCI_VENDOR: u16 = 0x1234;
 pub const BOCHS_PCI_DEVICE: u16 = 0x1111;
 
 const VBE_BASE: u64 = 0x500;
-const VBE_ID: u64 = VBE_BASE + 0x00;
+const VBE_ID: u64 = VBE_BASE;
 const VBE_XRES: u64 = VBE_BASE + 0x02;
 const VBE_YRES: u64 = VBE_BASE + 0x04;
 const VBE_BPP: u64 = VBE_BASE + 0x06;
@@ -123,7 +123,7 @@ impl BochsDisplay {
             let enabled = mmio.read16(VBE_ENABLE) as u32;
             // VBE_ENABLE_BIT set = firmware already programmed a mode.
             // Treat as authoritative if dims look sane (non-zero, ≤4K).
-            if enabled & (VBE_ENABLE_BIT as u32) != 0 {
+            if enabled & VBE_ENABLE_BIT != 0 {
                 let x = mmio.read16(VBE_XRES) as u32;
                 let y = mmio.read16(VBE_YRES) as u32;
                 let b = mmio.read16(VBE_BPP) as u16;
@@ -146,7 +146,7 @@ impl BochsDisplay {
         if (xres, yres, bpp) == (DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_BPP) {
             unsafe {
                 let enabled = mmio.read16(VBE_ENABLE) as u32;
-                if enabled & (VBE_ENABLE_BIT as u32) == 0 {
+                if enabled & VBE_ENABLE_BIT == 0 {
                     mmio.write16(VBE_ENABLE, 0);
                     mmio.write16(VBE_XRES, DEFAULT_WIDTH as u16);
                     mmio.write16(VBE_YRES, DEFAULT_HEIGHT as u16);

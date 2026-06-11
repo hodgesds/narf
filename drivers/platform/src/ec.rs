@@ -45,6 +45,7 @@ const EC_CMD_QUERY: u8 = 0x84; // Query SCI event
 // ── Status Bits ─────────────────────────────────────────────────────
 const EC_STS_OBF: u8 = 1 << 0; // Output buffer full
 const EC_STS_IBF: u8 = 1 << 1; // Input buffer full
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const EC_STS_SCI: u8 = 1 << 5; // SCI event pending
 
 #[derive(Debug)]
@@ -98,27 +99,45 @@ impl AcpiEc {
 
     pub fn read_byte(&self, addr: u8) -> Result<u8, DriverError> {
         self.wait_ibf_empty()?;
+        // SAFETY: control_port is the EC command register (ECDT-provided or
+        // the ACPI standard 0x66). Writing EC_CMD_READ after IBF is clear is
+        // the spec-defined start of the EC read protocol (ACPI §12.3) and has
+        // no effect on host memory.
         unsafe {
             narf_arch::x86_64::io_port::outb(self.control_port, EC_CMD_READ);
         }
         self.wait_ibf_empty()?;
+        // SAFETY: data_port is the EC data register (0x62). Writing the target
+        // EC address after IBF is clear is the second step of the read
+        // protocol; the port is a fixed peripheral register, not memory.
         unsafe {
             narf_arch::x86_64::io_port::outb(self.data_port, addr);
         }
         self.wait_obf_full()?;
+        // SAFETY: OBF is set, so the EC has published the result byte in its
+        // data register; reading data_port here returns that byte. Port reads
+        // touch only the EC peripheral, never host memory.
         Ok(unsafe { narf_arch::x86_64::io_port::inb(self.data_port) })
     }
 
     pub fn write_byte(&self, addr: u8, val: u8) -> Result<(), DriverError> {
         self.wait_ibf_empty()?;
+        // SAFETY: control_port is the EC command register. Writing EC_CMD_WRITE
+        // once IBF is clear begins the EC write protocol (ACPI §12.3); the port
+        // is a fixed peripheral register and the write touches no host memory.
         unsafe {
             narf_arch::x86_64::io_port::outb(self.control_port, EC_CMD_WRITE);
         }
         self.wait_ibf_empty()?;
+        // SAFETY: data_port is the EC data register. Writing the target EC
+        // address after IBF is clear is the second step of the write protocol.
         unsafe {
             narf_arch::x86_64::io_port::outb(self.data_port, addr);
         }
         self.wait_ibf_empty()?;
+        // SAFETY: data_port is the EC data register. Writing the value byte
+        // after IBF is clear completes the write protocol; only the EC
+        // peripheral is affected.
         unsafe {
             narf_arch::x86_64::io_port::outb(self.data_port, val);
         }
@@ -407,8 +426,8 @@ async fn sci_drain_task() {
         }
 
         // Drain GPE bits.
-        for word in 0..2usize {
-            let bits = PENDING_GPES[word].swap(0, Ordering::AcqRel);
+        for (word, gpe) in PENDING_GPES.iter().enumerate() {
+            let bits = gpe.swap(0, Ordering::AcqRel);
             for bit in 0..64u32 {
                 if bits & (1 << bit) != 0 {
                     handle_gpe(word as u32 * 64 + bit);

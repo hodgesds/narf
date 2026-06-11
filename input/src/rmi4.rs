@@ -219,7 +219,7 @@ impl TouchpadReport {
         if max_fingers == 0 {
             return Err(Rmi4Error::BadEntry);
         }
-        let state_bytes = (max_fingers + 3) / 4; // 2 bits per finger
+        let state_bytes = max_fingers.div_ceil(4); // 2 bits per finger
         let total = state_bytes + max_fingers * Finger::REPORT_SIZE;
         if buf.len() < total {
             return Err(Rmi4Error::Short);

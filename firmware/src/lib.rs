@@ -294,9 +294,9 @@ pub fn grant_firmware_authority(task_id: u64) -> Cap<FirmwareRegistry, Write> {
     let cap: Cap<FirmwareRegistry, Write> = Cap::bootstrap();
     let mut g = LOADER_AUTHORITIES.lock();
     if let Some(pos) = g.iter().position(|(t, _)| *t == task_id) {
-        g[pos] = (task_id, cap.clone());
+        g[pos] = (task_id, cap);
     } else {
-        g.push((task_id, cap.clone()));
+        g.push((task_id, cap));
     }
     cap
 }
@@ -308,7 +308,7 @@ pub fn firmware_authority_of(task_id: u64) -> Option<Cap<FirmwareRegistry, Write
         .lock()
         .iter()
         .find(|(t, _)| *t == task_id)
-        .map(|(_, c)| c.clone())
+        .map(|(_, c)| *c)
 }
 
 /// Revoke `task_id`'s firmware-registry authority. The cap is
@@ -596,6 +596,14 @@ fn walk_and_register_dir(
 ) -> Result<usize, FirmwareError> {
     use alloc::string::String;
     use alloc::vec::Vec;
+
+    // Re-validate the authority at every directory level so a
+    // revocation that lands part-way through a deep walk aborts the
+    // rest of it — the recursive call sites propagate
+    // `AuthorityRevoked` upward rather than swallowing it.
+    if auth.check_live().is_err() {
+        return Err(FirmwareError::AuthorityRevoked);
+    }
 
     let mut n_ok = 0usize;
 

@@ -1011,6 +1011,7 @@ kernel_test!(smoke_exit_gate_virtio_blk);
 //   header TRAILER!!!     : 110   (-> 234)
 //   name   "TRAILER!!!\0" :  11   (-> 245)
 //   pad                   :   3   (-> 248)
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 static SMOKE_INITRAMFS: &[u8] = b"\
 070701\
 00000001\
@@ -1165,6 +1166,7 @@ fn smoke_rcu_sleepable_timeout() -> TestResult {
     // round so the executor doesn't deadlock.
     narf_scheduler::spawn(async move {
         // SAFETY: CAP is set above before spawn.
+        #[allow(static_mut_refs)] // TODO(narf): migrate this boot-time static to addr_of!/OnceCell
         let cap = unsafe { CAP.as_ref().unwrap() };
         let _g = SCOPE.enter(cap).expect("enter must succeed");
         while !DONE.load(Ordering::Acquire) {
@@ -1270,6 +1272,7 @@ kernel_test!(smoke_rcu_sleepable_timeout);
 
 // `smoke_scheduler_cpu_set_membership` migrated to scheduler/src/tests.rs (subsystem `"scheduler"`).
 
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 fn make_block_request(op: narf_block::BlockOp, user_tag: u64) -> narf_block::BlockRequest {
     use narf_block::{BlockRequest, QosHint};
     use narf_capabilities::{Cap, CapSlot, Read, Rights};

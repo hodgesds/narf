@@ -5,7 +5,7 @@
 //!   * `symbols`  — `.symtab` walker + `.strtab` resolver.
 //!   * `reloc`    — `.rela.*` decoder + per-arch apply.
 //!   * `sections` — special-section recognition (`.modinfo`,
-//!                  `.narf_caps`, `.narf_kparams`).
+//!     `.narf_caps`, `.narf_kparams`).
 //!
 //! Linux equivalents:
 //!   * `linux/kernel/module/main.c::elf_validity_cache_copy`

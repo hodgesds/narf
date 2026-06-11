@@ -132,8 +132,7 @@ struct SmokeElfSpec {
 }
 
 fn build_smoke_elf(spec: &SmokeElfSpec) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.resize(64, 0u8);
+    let mut out = alloc::vec![0u8; 64];
 
     // .shstrtab: name offsets recorded as we push.
     let mut shstr = Vec::<u8>::new();
@@ -513,6 +512,7 @@ kernel_test_in!("modules/e2e", e2e_refcount_blocks_unload);
 
 /// Init function for smoke 4: registers "e2e_cleanup_alive" while
 /// the init-attribution context is set to this module's id.
+#[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 extern "C" fn smoke_init_cleanup() -> i32 {
     INIT_RAN.store(true, Ordering::Release);
     crate::symbols::export("e2e_cleanup_alive", smoke_alive as usize, 0x4242);
@@ -680,8 +680,10 @@ fn e2e_cap_gate_blocks_undeclared() -> TestResult {
     );
 
     // Manifest that *doesn't* declare BlockDevice.
-    let mut mf_no = crate::manifest::Manifest::default();
-    mf_no.name = "e2e_cap_no".to_string();
+    let mf_no = crate::manifest::Manifest {
+        name: "e2e_cap_no".to_string(),
+        ..Default::default()
+    };
     let r = crate::symbols::resolve("narf_block_register_block_device", None, &mf_no);
     match r {
         Err(crate::symbols::ResolveError::CapMissing(CapKind::BlockDevice)) => {}

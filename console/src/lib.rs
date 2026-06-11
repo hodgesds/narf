@@ -330,7 +330,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
             // canonical-hole [0x0001_0000_0000_0000 .. 0xffff_0000_0000_0000].
             if rbp == 0
                 || rbp & 0x7 != 0
-                || (rbp >= 0x0000_8000_0000_0000 && rbp < 0xffff_8000_0000_0000)
+                || (0x0000_8000_0000_0000..0xffff_8000_0000_0000).contains(&rbp)
             {
                 break;
             }

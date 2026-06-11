@@ -42,6 +42,8 @@ unsafe fn cstr_len(p: *const u8) -> usize {
 }
 
 #[no_mangle]
+// argv is the kernel-exec-provided argument vector; the entry signature is fixed.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     // argv[0] is the program name; print argv[1..].
     let mut i = 1i32;
