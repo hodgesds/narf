@@ -73,6 +73,31 @@ const PADCFG1_TERM_UP_20K: u32 = 0b1100 << 10;
 const PADCFG1_TERM_DN_20K: u32 = 0b0100 << 10;
 const PADCFG1_TERM_NONE: u32 = 0b0000 << 10;
 
+/// Construction parameters for a single Intel PCH GPIO community.
+///
+/// Groups the fields decoded from `_CRS` + the community probe so the
+/// constructor takes one cohesive descriptor instead of a long
+/// positional argument list.
+#[derive(Debug, Clone)]
+pub struct IntelPchGpioConfig {
+    /// ACPI namespace path of the parent device (e.g. `\_SB.PC00.GPI0`).
+    pub acpi_path: String,
+    /// Zero-based index of this community within the parent device.
+    pub community_index: u8,
+    /// Physical base of the community's MMIO window.
+    pub mmio_base: PhysAddr,
+    /// Length of the MMIO window in bytes.
+    pub mmio_len: u64,
+    /// Probed REVID (`None` if the window couldn't be probed).
+    pub revid: Option<u16>,
+    /// Probed PADBAR offset (`None` if the window couldn't be probed).
+    pub padbar: Option<u32>,
+    /// Number of pads in this community.
+    pub pin_count: u16,
+    /// Whether pads use the 16-byte (debounce-capable) stride.
+    pub has_debounce: bool,
+}
+
 /// One Intel PCH GPIO community.
 pub struct IntelPchGpio {
     name: String,
@@ -102,16 +127,17 @@ impl core::fmt::Debug for IntelPchGpio {
 }
 
 impl IntelPchGpio {
-    pub fn new(
-        acpi_path: String,
-        community_index: u8,
-        mmio_base: PhysAddr,
-        mmio_len: u64,
-        revid: Option<u16>,
-        padbar: Option<u32>,
-        pin_count: u16,
-        has_debounce: bool,
-    ) -> Self {
+    pub fn new(cfg: IntelPchGpioConfig) -> Self {
+        let IntelPchGpioConfig {
+            acpi_path,
+            community_index,
+            mmio_base,
+            mmio_len,
+            revid,
+            padbar,
+            pin_count,
+            has_debounce,
+        } = cfg;
         let name = format!("{}.C{}", acpi_path, community_index);
 
         // Heuristic offsets for modern PCHs.
@@ -140,13 +166,38 @@ impl IntelPchGpio {
         }
     }
 
+    /// Read a 32-bit register at byte offset `off` within this
+    /// community's MMIO window.
+    ///
+    /// # Safety
+    /// `off + 4` must be within `self.mmio_len`, i.e. the access must
+    /// fall inside the community's mapped MMIO window. Callers obtain
+    /// `off` from [`Self::padcfg0_offset`] (which bounds-checks against
+    /// `mmio_len`) or from interrupt-register offsets that are bounded
+    /// by `pin_count`. The window itself is identity-mapped MMIO, so
+    /// `mmio_base.raw() + off` is a valid, correctly-aligned device
+    /// address with no aliasing Rust references.
     #[inline]
     unsafe fn read32(&self, off: u64) -> u32 {
+        // SAFETY: the caller guarantees `off + 4 <= mmio_len`, so
+        // `mmio_base.raw() + off` addresses a dword fully inside this
+        // community's mapped MMIO window.
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
+    /// Write `val` to the 32-bit register at byte offset `off` within
+    /// this community's MMIO window.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::read32`]: `off + 4` must lie within
+    /// `self.mmio_len`. The write targets a hardware register; the
+    /// caller is responsible for the value being meaningful for that
+    /// register.
     #[inline]
     unsafe fn write32(&self, off: u64, val: u32) {
+        // SAFETY: the caller guarantees `off + 4 <= mmio_len`, so
+        // `mmio_base.raw() + off` addresses a dword fully inside this
+        // community's mapped MMIO window.
         unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
     }
 
@@ -171,13 +222,21 @@ impl IntelPchGpio {
     /// Primary interrupt dispatcher for this community. Called from the GSI ISR.
     pub fn dispatch_irq(&self) -> IrqStatus {
         let mut handled = IrqStatus::None;
-        let groups = (self.pin_count as usize + 31) / 32;
+        let groups = (self.pin_count as usize).div_ceil(32);
 
         for g in 0..groups {
             let is_reg = self.is_offset as u64 + (g as u64 * 4);
             let ie_reg = self.ie_offset as u64 + (g as u64 * 4);
 
+            // SAFETY: `is_reg`/`ie_reg` are the GPI_IS / GPI_IE group
+            // registers at `is_offset`/`ie_offset` (community-relative
+            // constants chosen from REVID) plus `g*4`, with
+            // `g < ceil(pin_count/32)`. The community window always
+            // contains the full GPI_IS/GPI_IE arrays for its pads, so
+            // these offsets are within `mmio_len`.
             let status = unsafe { self.read32(is_reg) };
+            // SAFETY: as above — `ie_reg` is the matching GPI_IE group
+            // register, in-bounds for the same reason.
             let enabled = unsafe { self.read32(ie_reg) };
             let active = status & enabled;
 
@@ -193,7 +252,10 @@ impl IntelPchGpio {
                         handler(pin);
                         handled = IrqStatus::Handled;
                     }
-                    // Ack by writing 1 back to status.
+                    // Ack by writing 1 back to status (RW1C).
+                    // SAFETY: `is_reg` is the same in-bounds GPI_IS
+                    // group register read above; writing the single
+                    // active bit acknowledges that pin's interrupt.
                     unsafe { self.write32(is_reg, 1 << bit) };
                 }
             }
@@ -213,12 +275,15 @@ impl GpioController for IntelPchGpio {
 
     fn read_pin(&self, pin: u16) -> Result<bool, GpioError> {
         let off = self.padcfg0_offset(pin).ok_or(GpioError::InvalidPin)?;
+        // SAFETY: `padcfg0_offset` returned `Some`, which guarantees
+        // `off + 4 <= mmio_len`, satisfying `read32`'s contract.
         let val = unsafe { self.read32(off) };
         Ok(val & PADCFG0_GPIORXSTATE != 0)
     }
 
     fn set_pin(&self, pin: u16, value: bool) -> Result<(), GpioError> {
         let off = self.padcfg0_offset(pin).ok_or(GpioError::InvalidPin)?;
+        // SAFETY: `padcfg0_offset` returned `Some`, so `off + 4 <= mmio_len`.
         let mut val = unsafe { self.read32(off) };
         if value {
             val |= PADCFG0_GPIOTXSTATE;
@@ -227,6 +292,7 @@ impl GpioController for IntelPchGpio {
         }
         // Ensure TX is enabled.
         val &= !PADCFG0_GPIOTXDIS;
+        // SAFETY: same bounded `off` from `padcfg0_offset`.
         unsafe { self.write32(off, val) };
         Ok(())
     }
@@ -241,6 +307,7 @@ impl GpioController for IntelPchGpio {
         let off = self.padcfg0_offset(pin).ok_or(GpioError::InvalidPin)?;
 
         // 1. Program pad configuration.
+        // SAFETY: `padcfg0_offset` returned `Some`, so `off + 4 <= mmio_len`.
         let mut val = unsafe { self.read32(off) };
         // Mode = GPIO, RX enabled, TX disabled.
         val &= !PADCFG0_PMODE_MASK;
@@ -268,9 +335,15 @@ impl GpioController for IntelPchGpio {
             val &= !PADCFG0_RXINV;
         }
 
+        // SAFETY: same bounded `off` from `padcfg0_offset`.
         unsafe { self.write32(off, val) };
 
         // 2. Program pull-up/down in PADCFG1.
+        // SAFETY: PADCFG1 sits at `off + 4` within the same pad slot.
+        // The pad stride is >= 8 bytes and `pin_count` was derived in
+        // `probe_community` as `(mmio_len - padbar) / stride`, so every
+        // pad's full slot (including PADCFG1 at `off + 4`) lies inside
+        // `mmio_len`; thus `(off + 4) + 4 <= mmio_len`.
         let mut val1 = unsafe { self.read32(off + 4) };
         val1 &= !(0b1111 << 10); // Termination mask.
         match pull {
@@ -279,6 +352,7 @@ impl GpioController for IntelPchGpio {
             GpioPull::None => val1 |= PADCFG1_TERM_NONE,
             GpioPull::Default => {}
         }
+        // SAFETY: same `off + 4` PADCFG1 register, in-bounds as above.
         unsafe { self.write32(off + 4, val1) };
 
         // 3. Store handler and enable in GPI_IE.
@@ -287,8 +361,12 @@ impl GpioController for IntelPchGpio {
         let g = (pin / 32) as u64;
         let bit = (pin % 32) as u32;
         let ie_reg = self.ie_offset as u64 + (g * 4);
+        // SAFETY: `ie_reg` is the GPI_IE group register for `pin`'s
+        // group (`g = pin / 32`), within the GPI_IE array that the
+        // community window always maps; so `ie_reg + 4 <= mmio_len`.
         let mut ie = unsafe { self.read32(ie_reg) };
         ie |= 1 << bit;
+        // SAFETY: same in-bounds `ie_reg`; sets this pin's enable bit.
         unsafe { self.write32(ie_reg, ie) };
 
         Ok(())
@@ -299,13 +377,19 @@ impl GpioController for IntelPchGpio {
             let g = (pin / 32) as u64;
             let bit = (pin % 32) as u32;
             let ie_reg = self.ie_offset as u64 + (g * 4);
+            // SAFETY: `ie_reg` is the GPI_IE group register for `pin`'s
+            // group, within the always-mapped GPI_IE array, so
+            // `ie_reg + 4 <= mmio_len`.
             let mut ie = unsafe { self.read32(ie_reg) };
             ie &= !(1 << bit);
+            // SAFETY: same in-bounds `ie_reg`; clears this pin's enable bit.
             unsafe { self.write32(ie_reg, ie) };
 
             // Disable RX to save power.
+            // SAFETY: `padcfg0_offset` returned `Some`, so `off + 4 <= mmio_len`.
             let mut val = unsafe { self.read32(off) };
             val |= PADCFG0_GPIORXDIS;
+            // SAFETY: same bounded `off` from `padcfg0_offset`.
             unsafe { self.write32(off, val) };
         }
         self.handlers.lock().remove(&pin);
@@ -347,16 +431,22 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                 });
             }
             ResourceItem::AddressSpace32 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 communities.push(CommunityRes {
                     mmio_base: min as u64,
                     mmio_len: length as u64,
                 });
             }
             ResourceItem::AddressSpace64 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 communities.push(CommunityRes {
                     mmio_base: min,
                     mmio_len: length,
@@ -386,24 +476,46 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
 /// Test hook: route around the AML probe so a synthetic MMIO
 /// backing can be exercised directly. Mirrors `probe_community`'s
 /// return shape.
+///
+/// # Safety
+/// `mmio_base..mmio_base + mmio_len` must be a readable, mapped MMIO
+/// (or test-backed) region. See [`probe_community`].
 #[doc(hidden)]
 pub unsafe fn __probe_community_for_test(
     mmio_base: PhysAddr,
     mmio_len: u64,
 ) -> Option<(u16, u32, bool, u16)> {
+    // SAFETY: forwarded directly from this function's own contract:
+    // the caller guarantees the `[mmio_base, mmio_base + mmio_len)`
+    // region is mapped and readable.
     unsafe { probe_community(mmio_base, mmio_len) }
 }
 
+/// Probe a candidate community MMIO window: read REVID + PADBAR and
+/// derive `(revid, padbar, has_debounce, pin_count)`. Returns `None`
+/// if the window is too small, reads back all-ones (absent device),
+/// or has an out-of-range PADBAR.
+///
+/// # Safety
+/// `mmio_base..mmio_base + mmio_len` must be a mapped, readable MMIO
+/// region for the duration of the call. Only the REVID (offset 0x0)
+/// and PADBAR (offset 0xC) dwords are read, and only after checking
+/// `mmio_len >= 0x10`, so both reads stay inside the window.
 unsafe fn probe_community(mmio_base: PhysAddr, mmio_len: u64) -> Option<(u16, u32, bool, u16)> {
     if mmio_len < 0x10 {
         return None;
     }
+    // SAFETY: `mmio_len >= 0x10` was checked above, so the REVID dword
+    // at offset `REG_REVID` (0x0) is within the caller-provided mapped
+    // window.
     let revid_raw = unsafe { narf_arch::mmio::read32(mmio_base.raw() + REG_REVID) };
     if revid_raw == u32::MAX {
         return None;
     }
     let revid = ((revid_raw >> 16) & 0xFFFF) as u16;
     let has_debounce = (revid as u32) >= REVID_DEBOUNCE_THRESHOLD;
+    // SAFETY: `REG_PADBAR` (0xC) + 4 = 0x10 <= mmio_len (checked above),
+    // so the PADBAR dword is within the mapped window.
     let padbar = unsafe { narf_arch::mmio::read32(mmio_base.raw() + REG_PADBAR) };
     if (padbar as u64) >= mmio_len || padbar < 0x10 {
         return None;
@@ -443,21 +555,25 @@ fn probe_one(hid: &str, path: &str) -> usize {
     let mut registered = 0usize;
     for (idx, c) in res.communities.iter().enumerate() {
         let phys = PhysAddr::new(c.mmio_base);
+        // SAFETY: `phys`/`c.mmio_len` come from a Memory/AddressSpace
+        // resource in the device's `_CRS`, i.e. firmware-declared MMIO
+        // for this GPIO community; that physical range is identity-
+        // mapped and readable, satisfying `probe_community`'s contract.
         let probe = unsafe { probe_community(phys, c.mmio_len) };
         let (revid, padbar, has_debounce, pin_count) = match probe {
             Some(t) => (Some(t.0), Some(t.1), t.2, t.3),
             None => (None, None, false, 0),
         };
-        let ctrl = Arc::new(IntelPchGpio::new(
-            path.to_string(),
-            idx as u8,
-            phys,
-            c.mmio_len,
+        let ctrl = Arc::new(IntelPchGpio::new(IntelPchGpioConfig {
+            acpi_path: path.to_string(),
+            community_index: idx as u8,
+            mmio_base: phys,
+            mmio_len: c.mmio_len,
             revid,
             padbar,
             pin_count,
             has_debounce,
-        ));
+        }));
         crate::registry::register_unique(ctrl.clone());
         controllers.push(ctrl);
         registered += 1;
@@ -501,6 +617,12 @@ fn try_route_gsi(gsi: u32, flags: u8, ctrls: alloc::vec::Vec<Arc<IntelPchGpio>>)
         gpio_gsi_bridge,
     );
 
+    // SAFETY: `vector` was freshly allocated from the interrupt vector
+    // allocator and its handler (`gpio_gsi_bridge`) was installed just
+    // above, before the GSI is unmasked — so once the IOAPIC routes
+    // `gsi` to `vector`, any delivered interrupt has a valid handler to
+    // run. `polarity | trigger` are the canonical IOAPIC flag constants
+    // for the decoded `_CRS` ExtendedIrq flags.
     unsafe {
         narf_acpi::ioapic::route_gsi_to_vector(gsi, vector, 0, polarity | trigger);
     }
@@ -540,24 +662,6 @@ pub fn recognised_hids() -> &'static [&'static str] {
 }
 
 #[doc(hidden)]
-pub fn __new_for_test(
-    acpi_path: String,
-    community_index: u8,
-    mmio_base: PhysAddr,
-    mmio_len: u64,
-    revid: Option<u16>,
-    padbar: Option<u32>,
-    pin_count: u16,
-    has_debounce: bool,
-) -> IntelPchGpio {
-    IntelPchGpio::new(
-        acpi_path,
-        community_index,
-        mmio_base,
-        mmio_len,
-        revid,
-        padbar,
-        pin_count,
-        has_debounce,
-    )
+pub fn __new_for_test(cfg: IntelPchGpioConfig) -> IntelPchGpio {
+    IntelPchGpio::new(cfg)
 }

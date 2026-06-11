@@ -98,9 +98,9 @@ impl Inode {
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
         let mut block = [0u32; I_BLOCK_LEN];
-        for i in 0..I_BLOCK_LEN {
+        for (i, b) in block.iter_mut().enumerate() {
             let off = 40 + i * 4;
-            block[i] = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            *b = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
         }
         Some(Self {
             mode,

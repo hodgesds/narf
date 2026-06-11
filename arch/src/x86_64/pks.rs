@@ -144,6 +144,7 @@ pub unsafe fn set_rights(domain: u8, rights: DomainRights) {
     // SAFETY: PKS is enabled.
     let current = unsafe { rdmsr(IA32_PKRS) };
     let next = (current & mask) | (rights.encode() << shift);
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(IA32_PKRS, next);
     }
@@ -185,6 +186,10 @@ pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPkrs {
 
 /// Exit a domain scope; restore the PKRS value captured by
 /// `enter_domain`. Alias for `restore`, named for call-site symmetry.
+///
+/// # Safety
+/// CPL=0 with CR4.PKS enabled (same precondition as `save`/`restore`).
+/// `saved` must be the value returned by the matching `enter_domain`.
 #[inline]
 pub unsafe fn exit_domain(saved: SavedPkrs) {
     // SAFETY: same as restore.

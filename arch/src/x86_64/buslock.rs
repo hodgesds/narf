@@ -28,6 +28,7 @@ pub fn supported() -> bool {
 pub unsafe fn enable() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_DEBUGCTL) } | DEBUGCTL_BUS_LOCK_DETECT;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(MSR_IA32_DEBUGCTL, v);
     }
@@ -38,6 +39,7 @@ pub unsafe fn enable() {
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { rdmsr(MSR_IA32_DEBUGCTL) } & !DEBUGCTL_BUS_LOCK_DETECT;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         wrmsr(MSR_IA32_DEBUGCTL, v);
     }

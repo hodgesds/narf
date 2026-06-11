@@ -11,10 +11,10 @@
 //! - **USB Power Delivery 3.1 v1.8** (USB-IF), §6.4.4 (VDM), §6.4.4.3
 //!   (Discover Identity), §6.4.4.4 (Discover SVIDs / Modes), §6.4.4.5
 //!   (Enter / Exit Mode).
-//!     <https://www.usb.org/document-library/usb-power-delivery>
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //! - **VESA DisplayPort Alt Mode on USB Type-C, Version 2.0** (VESA),
 //!   §5 (Capabilities + Status VDOs), §6 (pin assignments).
-//!     <https://vesa.org/vesa-standards/>
+//!   <https://vesa.org/vesa-standards/>
 //!
 //! The pure VDM encode/decode + the unscheduled `DpAltModeDriver`
 //! state machine live in `narf_usbpd::vdm`. This module wires the

@@ -1166,7 +1166,7 @@ fn gen_cpuinfo() -> String {
         let _ = writeln!(s, "model\t\t: {}", id.model);
         let _ = writeln!(s, "model name\t: {}", model_name);
         let _ = writeln!(s, "stepping\t: {}", id.stepping);
-        let _ = writeln!(s, "");
+        let _ = writeln!(s);
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

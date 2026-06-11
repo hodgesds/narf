@@ -149,8 +149,12 @@ pub fn on_udp_in(_src_ip: [u8; 4], _dst_ip: [u8; 4], src_port: u16, dst_port: u1
             // bytes; parse up to 3 addresses.
             OPT_DNS_SERVER if opt.data.len() >= 4 => {
                 let n = (opt.data.len() / 4).min(3) as u8;
-                for i in 0..n as usize {
-                    dns[i].copy_from_slice(&opt.data[i * 4..i * 4 + 4]);
+                for (slot, chunk) in dns
+                    .iter_mut()
+                    .zip(opt.data.chunks_exact(4))
+                    .take(n as usize)
+                {
+                    slot.copy_from_slice(chunk);
                 }
                 dns_count = n;
             }
@@ -373,9 +377,9 @@ pub fn dhcp_acquire(iface_name: &str, _timeout_ms: u32) -> Result<Lease, DhcpErr
             };
 
             let mut dns_vec: Vec<Ipv4Addr> = Vec::new();
-            for i in 0..dns_count as usize {
-                if dns_raw[i] != [0u8; 4] {
-                    dns_vec.push(Ipv4Addr(dns_raw[i]));
+            for addr in dns_raw.iter().take(dns_count as usize) {
+                if *addr != [0u8; 4] {
+                    dns_vec.push(Ipv4Addr(*addr));
                 }
             }
 

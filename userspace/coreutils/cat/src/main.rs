@@ -86,6 +86,7 @@ unsafe fn cat_fd(in_fd: i32) -> i32 {
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // argv is kernel-provided; entry signature is fixed
 pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argc <= 1 {
         // No arguments: read from stdin (fd 0).

@@ -278,6 +278,7 @@ pub fn rdtsc() -> u64 {
     // SAFETY: RDTSC is always legal at CPL=0.
     let lo: u32;
     let hi: u32;
+    // SAFETY: the inline asm only touches its declared operands and preserves the required invariants.
     unsafe {
         core::arch::asm!(
             "lfence",

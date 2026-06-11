@@ -698,7 +698,7 @@ pub fn read_field(path: &str) -> Result<u64, FieldAccessError> {
     // every Field write to such a layout silently failed.
     let first_unit_bit = (fi.bit_offset / access_bits) * access_bits;
     let bit_in_unit = fi.bit_offset - first_unit_bit;
-    let units = ((bit_in_unit + fi.bit_length) + access_bits - 1) / access_bits;
+    let units = (bit_in_unit + fi.bit_length).div_ceil(access_bits);
     let mut acc: u64 = 0;
     for u in 0..units {
         let unit_byte_offset = (first_unit_bit / 8) + u * access_bytes as u64;
@@ -742,7 +742,7 @@ pub fn write_field(path: &str, value: u64) -> Result<(), FieldAccessError> {
     let access_bits = (access_bytes * 8) as u64;
     let first_unit_bit = (fi.bit_offset / access_bits) * access_bits;
     let bit_in_unit = fi.bit_offset - first_unit_bit;
-    let units = ((bit_in_unit + fi.bit_length) + access_bits - 1) / access_bits;
+    let units = (bit_in_unit + fi.bit_length).div_ceil(access_bits);
     let val_mask = if fi.bit_length >= 64 {
         u64::MAX
     } else {
@@ -923,8 +923,14 @@ fn write_unit(
             Ok(())
         }
         RegionSpace::PciConfig => match resolve_pci_config_addr(region) {
-            // SAFETY: ECAM identity-mapped at boot.
             Some(addr) => {
+                // SAFETY: `addr` is the ECAM physical address for this PCI
+                // config field, derived from the firmware MCFG base via
+                // `resolve_pci_config_addr`; the ECAM window is identity-
+                // mapped at boot, so the physical address is directly
+                // accessible. `byte_offset_in_region` is the field's offset
+                // within that device's 4 KiB config space and `width` is the
+                // access-unit width (1/2/4/8) validated by the field decoder.
                 unsafe {
                     mmio_write(addr + byte_offset_in_region, width, val);
                 }

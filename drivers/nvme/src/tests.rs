@@ -58,7 +58,8 @@ fn smoke_nvme_cap_register_decode() -> TestResult {
     // CAP layout: MQES[0..=15], DSTRD[32..=35], MPSMIN[48..=51],
     // MPSMAX[52..=55]. Craft a value with MQES=0x3FF, DSTRD=2,
     // MPSMIN=0, MPSMAX=4 and check the decoder.
-    let raw: u64 = 0x3FF | (2u64 << 32) | (0u64 << 48) | (4u64 << 52);
+    // MPSMIN=0 occupies bits[51:48] and contributes nothing to `raw`.
+    let raw: u64 = 0x3FF | (2u64 << 32) | (4u64 << 52);
     let c = NvmeCaps::from_raw(raw);
     if c.mqes != 0x3FF || c.dstrd != 2 || c.mpsmin != 0 || c.mpsmax != 4 {
         return TestResult::Fail("NvmeCaps::from_raw decoded wrong");
@@ -140,6 +141,9 @@ fn smoke_nvme_io_round_trip() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
     use narf_lib::id::DomainId;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme_dev = devs.iter().find(|d| {
@@ -190,6 +194,8 @@ fn smoke_nvme_io_round_trip() -> TestResult {
         return TestResult::Fail("read_lba(0) failed");
     }
     for i in 0..512usize {
+        // SAFETY: `phys` is the 4096-byte identity-mapped DMA buffer the
+        // controller just wrote via `read_lba`; `i` < 512 stays in-bounds.
         let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
         let expected = (i as u8) ^ 0xA5;
         if v != expected {
@@ -209,6 +215,9 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
     use narf_lib::id::DomainId;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme_dev = devs.iter().find(|d| {
@@ -247,6 +256,9 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     // truncated DMA shows up as a mismatch. Use volatile so the
     // compiler can't elide writes to memory the controller will
     // observe.
+    // SAFETY: `page_a`/`page_b` are freshly-allocated 4096-byte
+    // identity-mapped coherent DMA pages we own exclusively; every
+    // `i` < 4096 keeps both writes inside their respective page.
     unsafe {
         let pa = page_a.phys_addr().raw() as *mut u8;
         let pb = page_b.phys_addr().raw() as *mut u8;
@@ -265,6 +277,8 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     }
     // Zero both pages, then read back — anything the controller
     // returns has to match what we wrote.
+    // SAFETY: same two 4096-byte identity-mapped DMA pages, still owned
+    // exclusively here; every `i` < 4096 keeps both writes in-bounds.
     unsafe {
         let pa = page_a.phys_addr().raw() as *mut u8;
         let pb = page_b.phys_addr().raw() as *mut u8;
@@ -277,6 +291,9 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
         return TestResult::Fail("read_lba_pages failed");
     }
     for i in 0..4096usize {
+        // SAFETY: same two 4096-byte identity-mapped DMA pages the
+        // controller just refilled via `read_lba_pages`; `i` < 4096 keeps
+        // both reads inside their respective page.
         unsafe {
             let pa = page_a.phys_addr().raw() as *const u8;
             let pb = page_b.phys_addr().raw() as *const u8;
@@ -307,6 +324,9 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     use narf_io::{alloc_coherent, register_with_cap};
     use narf_lib::id::DomainId;
 
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()
@@ -459,6 +479,9 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
     use narf_lib::id::DomainId;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme_dev = devs.iter().find(|d| {
@@ -641,6 +664,9 @@ fn smoke_nvme_params_typed_round_trip() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     use narf_capabilities::{Cap, Write};
     use narf_drivers::DriverHandle;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_nvme = devs.iter().any(|d| {
@@ -1230,6 +1256,9 @@ fn smoke_admin_ns_enumerate_qemu() -> TestResult {
     use crate::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()
@@ -1267,6 +1296,9 @@ fn smoke_admin_get_set_features_power_qemu() -> TestResult {
     use crate::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()
@@ -1321,6 +1353,9 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
     use crate::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()
@@ -1416,6 +1451,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
     use narf_lib::id::DomainId;
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme_dev = devs.iter().find(|d| {
@@ -1630,6 +1668,9 @@ fn smoke_nvme_aer_drain_dispatch() -> TestResult {
     use crate::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()
@@ -1667,6 +1708,9 @@ fn smoke_nvme_per_queue_lock_count_matches() -> TestResult {
     use crate::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()
@@ -1875,6 +1919,9 @@ fn smoke_security_send_receive_round_trip_qemu() -> TestResult {
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
 
+    // SAFETY: kernel-test runs at boot with the allocator online and the
+    // memory map parsed; ECAM_DEFAULT_BASE is the standard x86_64 ECAM
+    // window base, identity-mapped. `init` is idempotent (last call wins).
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let nvme_dev = devices()
         .iter()

@@ -5,7 +5,6 @@
 //! SpeedStep on older Intel (CPUID(1).ECX[7] = EIST), AMD
 //! legacy on AMD Family 10h+ (CPUID(0x8000_0007).EDX[7] = HwPstate).
 
-#![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -64,6 +63,8 @@ fn hwp_supported() -> bool {
     if max < 6 {
         return false;
     }
+    // SAFETY: leaf 6 (thermal/power) is defined because the max
+    // standard leaf reported above is >= 6.
     let (eax, _, _, _) = unsafe { cpuid(6, 0) };
     eax & (1 << 7) != 0
 }
@@ -81,6 +82,8 @@ fn amd_pstate_supported() -> bool {
     if max < 0x8000_0007 {
         return false;
     }
+    // SAFETY: extended leaf 0x8000_0007 is defined because the max
+    // extended leaf reported above is >= 0x8000_0007.
     let (_, _, _, edx) = unsafe { cpuid(0x8000_0007, 0) };
     edx & (1 << 7) != 0
 }
@@ -202,8 +205,15 @@ pub unsafe fn hwp_status() -> u64 {
 /// CPL = 0.
 pub unsafe fn current_status() -> u64 {
     match detect() {
+        // SAFETY: the caller guarantees CPL=0; this arm is only
+        // reached when `detect()` confirmed HWP, so the HWP status
+        // MSR is implemented on this CPU.
         Mechanism::Hwp => unsafe { rdmsr(MSR_IA32_HWP_STATUS) },
+        // SAFETY: caller guarantees CPL=0; reached only when SpeedStep
+        // (EIST) was detected, so IA32_PERF_STATUS is implemented.
         Mechanism::SpeedStep => unsafe { rdmsr(MSR_IA32_PERF_STATUS) },
+        // SAFETY: caller guarantees CPL=0; reached only when AMD legacy
+        // HwPstate was detected, so the AMD P-state status MSR exists.
         Mechanism::AmdLegacy => unsafe { rdmsr(MSR_AMD_PSTATE_STATUS) },
         Mechanism::None => 0,
     }
@@ -323,10 +333,9 @@ pub fn init_or_gp() -> InitOutcome {
             // SAFETY: HWP confirmed present and just enabled; the
             // CPUID-attested layout matches `HwpCaps`.
             let caps = unsafe { hwp_capabilities() };
-            let v = (caps.min_perf as u64)
-                | ((caps.max_perf as u64) << 8)
-                | (0u64 << 16)
-                | (0x80u64 << 24);
+            // bits 0..7 = min, 8..15 = max, 16..23 = desired (0 =
+            // autonomous, left unset), 24..31 = EPP (0x80 balanced).
+            let v = (caps.min_perf as u64) | ((caps.max_perf as u64) << 8) | (0x80u64 << 24);
             if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, v).is_err() {
                 return InitOutcome::HwpRequestGp;
             }

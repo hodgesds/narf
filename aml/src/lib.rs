@@ -682,9 +682,9 @@ pub fn for_each_node_of_kind<F: FnMut(&AmlNode)>(kind: NodeKind, mut f: F) {
 /// the device has no `_HID`, or when the value isn't a recognised
 /// shape.
 /// Return the path of every Device node in the namespace. Used by
-/// driver bind paths that need to walk all devices to check _HID
-/// + _CID combinations (rather than searching by a single _HID).
-/// Single NAMESPACE.lock pass.
+/// driver bind paths that need to walk all devices to check `_HID`
+/// and `_CID` combinations (rather than searching by a single `_HID`).
+/// Single `NAMESPACE.lock` pass.
 pub fn list_all_device_paths() -> alloc::vec::Vec<alloc::string::String> {
     let g = NAMESPACE.lock();
     g.nodes
@@ -877,7 +877,7 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
     // SAFETY: caller assertion.
     unsafe {
         let mut e: Result<(), AmlError> = Ok(());
-        let _ = narf_acpi::walk_ssdts(rsdp_phys, |phys, _hdr| {
+        narf_acpi::walk_ssdts(rsdp_phys, |phys, _hdr| {
             if e.is_err() {
                 return;
             }
@@ -1114,9 +1114,10 @@ pub(crate) fn read_name_string(p: &mut Parser<'_>, parent: &str) -> Result<Strin
         if !(c0.is_ascii_uppercase() || c0 == b'_') {
             return Err(AmlError::BadNameSegment);
         }
-        if i == 0 && !s.ends_with('\\') && !s.is_empty() {
-            s.push('.');
-        } else if i > 0 {
+        // Separate segments with '.', except: a leading '\' prefix
+        // (already in `s`) joins the first segment directly, and an empty
+        // `s` gets no leading dot.
+        if i > 0 || (!s.ends_with('\\') && !s.is_empty()) {
             s.push('.');
         }
         // Strip trailing underscore padding.
@@ -1801,7 +1802,7 @@ pub(crate) fn skip_predicate_term_arg(
     match op {
         // Constants / Locals / Args.
         ZERO_OP | ONE_OP | ONES_OP => Ok(()),
-        0x60..=0x67 | 0x68..=0x6E => Ok(()),
+        0x60..=0x6E => Ok(()),
 
         // Sized integer literals.
         BYTE_PREFIX => {
@@ -1897,7 +1898,7 @@ pub(crate) fn skip_predicate_term_arg(
         // NameSeg lead char — first byte of an inline NameSeg.
         // Must be `_` or A-Z (uppercase ASCII). Same handling
         // as the lead-char arm above.
-        b if b == b'_' || (b >= b'A' && b <= b'Z') => {
+        b if b == b'_' || b.is_ascii_uppercase() => {
             *cur -= 1; // back up to read the full NameSeg
             let name = read_name_string_inline(buf, cur, end)?;
             let argc = predefined_method_argcount(&name);
@@ -2112,7 +2113,7 @@ pub fn write_buffer_field(source_path: &str, bit_offset: u64, bit_length: u64, v
         _ => return,
     };
     let total_bits = (bit_offset + bit_length) as usize;
-    let need_bytes = (total_bits + 7) / 8;
+    let need_bytes = total_bits.div_ceil(8);
     if buf.len() < need_bytes {
         buf.resize(need_bytes, 0);
     }

@@ -438,7 +438,7 @@ impl VirtioIommuPci {
     ) -> Result<Self, VirtioPciError> {
         // SAFETY: bounded cap-list walk.
         let caps: VirtioCaps = unsafe { discover(device) }?;
-        let device_cap = caps.device_cfg.clone().ok_or(VirtioPciError::NoCommonCfg)?;
+        let device_cap = caps.device_cfg.ok_or(VirtioPciError::NoCommonCfg)?;
         // SAFETY: caller-owned BAR.
         let common = unsafe { map_cap(device, &caps.common) }?;
         // SAFETY: same.

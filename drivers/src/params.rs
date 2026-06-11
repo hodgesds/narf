@@ -138,6 +138,12 @@ impl<T: DriverParams> ParamSlot<T> {
     }
 }
 
+impl<T: DriverParams> Default for ParamSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: DriverParams> core::fmt::Debug for ParamSlot<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ParamSlot")

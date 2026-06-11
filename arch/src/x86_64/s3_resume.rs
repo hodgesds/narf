@@ -15,12 +15,12 @@
 //!      the firmware where to jump on wake.
 //!   3. Wake: firmware enters `s3_wake_entry`. The entry needs to
 //!      be `extern "C" naked` with hand-written asm that:
-//!        a. Loads the saved GDTR (lgdt)
-//!        b. Loads the saved IDTR (lidt)
-//!        c. Loads CR3 with the saved kernel page table phys
-//!        d. Loads RSP from the saved kernel stack pointer
-//!        e. Re-enters the high-half kernel via jmp to a Rust
-//!           continuation function.
+//!      a. Loads the saved GDTR (lgdt)
+//!      b. Loads the saved IDTR (lidt)
+//!      c. Loads CR3 with the saved kernel page table phys
+//!      d. Loads RSP from the saved kernel stack pointer
+//!      e. Re-enters the high-half kernel via jmp to a Rust
+//!      continuation function.
 //!   4. Rust continuation: calls power::resume_all_devices() and
 //!      returns to the suspending thread (longjmp-style).
 //!
@@ -205,8 +205,8 @@ pub fn resume_context_static_addr() -> usize {
 }
 
 #[cfg(target_arch = "x86_64")]
-/// Rust continuation invoked by the asm trampoline after CR3 + GDT
-/// + IDT + RSP have been reloaded. Runs the device resume fan-out
+/// Rust continuation invoked by the asm trampoline after CR3, GDT,
+/// IDT, and RSP have been reloaded. Runs the device resume fan-out
 /// (registered handlers fire in forward registration order), then
 /// longjmps back to the suspending caller using the saved JmpBuf.
 ///

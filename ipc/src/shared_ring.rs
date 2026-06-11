@@ -64,11 +64,16 @@ pub struct SharedRing<T, const N: usize> {
     pub slots: [UnsafeCell<MaybeUninit<T>>; N],
 }
 
-// SAFETY: the wire-stable atomics order all cross-side memory
-// accesses; no Rust-level aliasing of `slots` is possible because
-// only one side writes a given slot index between head/tail
-// transitions. `T: Send` lets values cross between kernel and user.
+// SAFETY: the ring itself only owns plain atomics and `MaybeUninit<T>`
+// slots that hold moved-in values; moving the whole ring to another
+// thread is sound whenever `T: Send`.
 unsafe impl<T: Send, const N: usize> Send for SharedRing<T, N> {}
+// SAFETY: the wire-stable atomics order all cross-side memory accesses.
+// A given slot index is written by exactly one side (the producer)
+// between a `head` advance and the matching `tail` advance, and the
+// release-store of `head` / `tail` happens-before the paired acquire on
+// the other side, so there is never a data race on `slots`. `T: Send`
+// because payload ownership is transferred between the two sides.
 unsafe impl<T: Send, const N: usize> Sync for SharedRing<T, N> {}
 
 impl<T, const N: usize> core::fmt::Debug for SharedRing<T, N> {
@@ -108,10 +113,14 @@ impl<T, const N: usize> SharedRing<T, N> {
     ///   (or at least ensuring header bytes are writable). The Stage-4
     ///   call sites zero a freshly-allocated frame, satisfying this.
     pub unsafe fn init_in(ptr: *mut Self) {
-        let _ = Self::POW2_GUARD;
+        let () = Self::POW2_GUARD;
         // Direct atomic stores (rather than constructing a Self via
         // the stack) avoid touching the slot region — important when
         // the buffer might be partially writable or partially uncached.
+        // SAFETY: per this fn's `# Safety` contract, `ptr` is 8-aligned
+        // and points at writable storage of at least `size_bytes()`
+        // bytes, so the `head`/`tail`/`closed` atomics (the first 12
+        // bytes of the `#[repr(C)]` layout) are valid to store into.
         unsafe {
             (*ptr).head.store(0, Ordering::Relaxed);
             (*ptr).tail.store(0, Ordering::Relaxed);
@@ -136,11 +145,15 @@ pub struct SharedConsumer<T, const N: usize> {
     _marker: PhantomData<*const ()>,
 }
 
-// SAFETY: the producer/consumer halves are explicitly !Sync (single
-// caller per side). `Send` is OK because the *pointer* is just a
-// reference to shared memory — the actual cross-thread story is the
-// release/acquire pair on head/tail.
+// SAFETY: the producer half is explicitly !Sync (one active producer
+// per side). Sending it to another thread is sound because it only
+// owns a raw `*mut SharedRing<T, N>`; cross-thread correctness is
+// carried by the release/acquire pair on head/tail, and `T: Send`
+// allows the payload to move with the producer.
 unsafe impl<T: Send, const N: usize> Send for SharedProducer<T, N> {}
+// SAFETY: the consumer half is the mirror of `SharedProducer`: !Sync,
+// holds only a raw pointer to the shared page, and ordering is carried
+// by head/tail. `T: Send` for the same payload-transfer reason.
 unsafe impl<T: Send, const N: usize> Send for SharedConsumer<T, N> {}
 
 /// Errors `try_send` can surface.
@@ -201,10 +214,7 @@ impl<T, const N: usize> SharedProducer<T, N> {
         // contract: the slot is a wire-format mailbox shared with
         // another execution context the compiler can't see.
         unsafe {
-            core::ptr::write_volatile(
-                r.slots[idx].get() as *mut MaybeUninit<T>,
-                MaybeUninit::new(msg),
-            );
+            core::ptr::write_volatile(r.slots[idx].get(), MaybeUninit::new(msg));
         }
         // Release: pairs with consumer's Acquire on `head` — slot
         // payload becomes visible before the consumer sees the new

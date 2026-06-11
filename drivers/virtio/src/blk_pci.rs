@@ -268,7 +268,7 @@ impl VirtioBlkPci {
         let _ = unsafe { table.program_vector(0, target_apic, v) }
             .map_err(|_| VirtioPciError::BarMapFailed)?;
         // SAFETY: same.
-        let _ = unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
+        unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
         // 4. Tell the device which MSI-X vector queue 0 should fire.
         //    Common Cfg `queue_select=0` was already written during
         //    bring_up; re-write to be safe + then queue_msix_vector.

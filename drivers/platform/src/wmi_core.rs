@@ -57,10 +57,10 @@ pub fn guid_to_bytes(s: &str) -> Option<[u8; 16]> {
         }
     };
     let mut raw = [0u8; 16];
-    for i in 0..16 {
+    for (i, byte) in raw.iter_mut().enumerate() {
         let hi = hex.as_bytes()[i * 2];
         let lo = hex.as_bytes()[i * 2 + 1];
-        raw[i] = (nibble(hi)? << 4) | nibble(lo)?;
+        *byte = (nibble(hi)? << 4) | nibble(lo)?;
     }
     // Apply mixed-endian byte-swap for Data1/2/3.
     raw[0..4].reverse();

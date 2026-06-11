@@ -65,7 +65,9 @@ pub struct FbContext {
 // fine — no cross-thread aliasing in single-threaded userspace
 // today, and the SharedRing's atomics protect the head/tail cursor
 // when SMP userspace lands.
+// SAFETY: the mapped scanout region is owned by this handle for its lifetime; single-threaded userspace has no cross-thread aliasing.
 unsafe impl Send for FbContext {}
+// SAFETY: the mapped scanout region is owned by this handle for its lifetime; single-threaded userspace has no cross-thread aliasing.
 unsafe impl Sync for FbContext {}
 
 impl FbContext {

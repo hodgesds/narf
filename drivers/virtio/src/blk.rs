@@ -71,9 +71,23 @@ struct VirtioBlkInner {
     requests: BTreeMap<u16, InFlightRequest>,
 }
 
+// SAFETY: VirtioBlkInner owns its Virtqueue (already Send) and a BTreeMap of
+// bookkeeping; the only raw pointers are inside the Virtqueue, which controls
+// its own DMA memory. Moving the struct across threads moves these owned values
+// without creating aliases, so transferring ownership is sound.
 unsafe impl Send for VirtioBlkInner {}
+// SAFETY: VirtioBlkInner is only ever accessed behind the device's
+// IrqSafeSpinLock, which serialises all shared access, so &VirtioBlkInner is
+// never used to mutate the rings concurrently.
 unsafe impl Sync for VirtioBlkInner {}
+// SAFETY: VirtioBlkDevice owns MMIO/DMA resources (mmio register window, queue
+// buffer, DMA pool, MSI-X table) plus an IrqSafeSpinLock guarding the inner
+// state. These are owned, not borrowed, so moving the device to another thread
+// does not alias any of them.
 unsafe impl Send for VirtioBlkDevice {}
+// SAFETY: all mutable device state lives behind `inner`'s IrqSafeSpinLock;
+// MMIO register accesses are volatile and the spinlock serialises queue
+// submission/completion, so &VirtioBlkDevice can be shared across threads.
 unsafe impl Sync for VirtioBlkDevice {}
 
 #[derive(Debug)]
@@ -156,6 +170,15 @@ impl VirtioBlkDevice {
     }
 
     /// Initialise the device and its primary virtqueue.
+    ///
+    /// # Safety
+    /// The `mmio` transport captured by this device must point at a live,
+    /// correctly mapped virtio-blk MMIO register window (a real virtio-blk
+    /// device probed via [`VirtioMmioDevice`]); this function performs the
+    /// device reset/feature-negotiation handshake and programs queue base
+    /// addresses by writing to those registers. `domain` must be a valid IOMMU
+    /// domain for the DMA allocations. Calling this with bogus MMIO or while
+    /// another agent drives the same device is undefined behaviour.
     pub unsafe fn init(&mut self, domain: DomainId) -> Result<(), VirtioError> {
         // 1. Reset device.
         self.mmio.write_u32(VirtioMmioDevice::REG_STATUS, 0);
@@ -242,6 +265,10 @@ impl VirtioBlkDevice {
         self.pool = Some(DmaPool::new(p_buf));
         self.queue_buf = Some(q_buf);
         *self.inner.lock() = Some(VirtioBlkInner {
+            // SAFETY: `layout` was just produced by VirtqueueLayout::new over
+            // `q_buf`, a freshly allocated DMA-coherent page that we own and
+            // keep alive in `self.queue_buf`, so the memory it describes is
+            // device-accessible for the queue's lifetime.
             queue: unsafe { Virtqueue::new(layout) },
             requests: BTreeMap::new(),
         });
@@ -312,6 +339,10 @@ impl VirtioBlkDevice {
 
         while let Some((id, _len)) = inner.queue.poll_used() {
             if let Some(mut req) = inner.requests.remove(&(id as u16)) {
+                // SAFETY: `inner_guard` (the IrqSafeSpinLock on `self.inner`)
+                // is held for this whole function, serialising every path that
+                // touches `self.pool`; thus this raw &mut to the Option is the
+                // only live mutable access. The pointer is to our own field.
                 if let Some(ref mut pool) =
                     unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
                 {
@@ -411,6 +442,9 @@ impl BlockDevice for VirtioBlkDevice {
             return BlkRequestFuture::error(req.user_tag, BlockError::DeviceRemoved);
         };
 
+        // SAFETY: `inner_guard` is held for the rest of `submit`, serialising
+        // all access to `self.pool`; this raw &mut to our own field's Option is
+        // therefore the only live mutable borrow.
         let pool_idx = if let Some(ref mut pool) =
             unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
         {
@@ -434,6 +468,11 @@ impl BlockDevice for VirtioBlkDevice {
         let header_phys = pool.header_phys(pool_idx);
         let status_phys = pool.status_phys(pool_idx);
 
+        // SAFETY: `pool_idx` was just returned by `pool.alloc()`, so slot
+        // `pool_idx` is reserved for this request. `header_ptr`/`status_ptr`
+        // compute in-bounds, correctly aligned offsets (idx*64 / idx*64+16)
+        // into the DMA-coherent pool page we own, and the lock guarantees no
+        // other writer touches this slot.
         unsafe {
             let h_ptr = pool.header_ptr(pool_idx);
             *h_ptr = VirtioBlkHeader {
@@ -448,6 +487,9 @@ impl BlockDevice for VirtioBlkDevice {
         let buffer_phys = match req.buffer.invoke(GetPhysAddr) {
             Ok(p) => p.raw(),
             Err(_) => {
+                // SAFETY: `inner_guard` is still held, serialising all
+                // access to `self.pool`; this raw &mut to our own field is the
+                // only live mutable borrow as we roll back the allocation.
                 if let Some(ref mut pool) =
                     unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
                 {
@@ -500,6 +542,9 @@ impl BlockDevice for VirtioBlkDevice {
                 user_tag: req.user_tag,
             }
         } else {
+            // SAFETY: `inner_guard` is still held, serialising all access to
+            // `self.pool`; this raw &mut to our own field is the only live
+            // mutable borrow as we roll back the allocation.
             if let Some(ref mut pool) = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() } {
                 pool.free(pool_idx);
             }

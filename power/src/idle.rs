@@ -4,7 +4,6 @@
 //! MONITOR/MWAIT for deep idle; falls back to STI;HLT when MWAIT
 //! isn't available.
 
-#![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU8, Ordering};

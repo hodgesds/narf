@@ -18,11 +18,36 @@ use narf_memory::PhysAddr;
 
 use crate::amd_fch::{recognised_hid, AmdFchGpio, __dispatch_for_test, __reset_dispatch_for_test};
 use crate::intel_pch::{
-    recognised_hids as intel_recognised_hids, IntelPchGpio, __new_for_test as intel_new_for_test,
-    __probe_community_for_test as intel_probe_community,
+    recognised_hids as intel_recognised_hids, IntelPchGpio, IntelPchGpioConfig,
+    __new_for_test as intel_new_for_test, __probe_community_for_test as intel_probe_community,
 };
 use crate::{registry, GpioController, GpioError, GpioIrqConfig, GpioPull};
 use narf_interrupts::IrqStatus;
+
+/// Build an [`IntelPchGpioConfig`] from positional args so the smoke
+/// tests stay terse after the constructor moved to a config struct.
+#[allow(clippy::too_many_arguments)] // reason: test-only positional shim mirroring the historic ctor signature
+fn intel_cfg(
+    acpi_path: alloc::string::String,
+    community_index: u8,
+    mmio_base: PhysAddr,
+    mmio_len: u64,
+    revid: Option<u16>,
+    padbar: Option<u32>,
+    pin_count: u16,
+    has_debounce: bool,
+) -> IntelPchGpioConfig {
+    IntelPchGpioConfig {
+        acpi_path,
+        community_index,
+        mmio_base,
+        mmio_len,
+        revid,
+        padbar,
+        pin_count,
+        has_debounce,
+    }
+}
 
 /// Allocate a 1 KiB zeroed MMIO backing buffer (256 pin registers).
 /// Leak it so the synthetic device outlives the smoke.
@@ -90,12 +115,16 @@ fn smoke_gpio_set_pin_requires_output_enable() -> TestResult {
     // Manually flip Output Enable in the synthetic backing so set_pin
     // can succeed.
     let base = p.raw() as *mut u32;
+    // SAFETY: `base` points at the 256-dword buffer from
+    // `make_synthetic_mmio`; index 7 < 256 is in-bounds and the buffer
+    // is leaked, so the pointer stays valid for the whole test.
     unsafe {
         core::ptr::write_volatile(base.add(7), 1u32 << 23);
     }
     if drv.set_pin(7, true).is_err() {
         return TestResult::Fail("set_pin should succeed once OE bit is set");
     }
+    // SAFETY: same in-bounds index 7 into the leaked 256-dword buffer.
     let v = unsafe { core::ptr::read_volatile(base.add(7)) };
     if v & (1 << 22) == 0 {
         return TestResult::Fail("Output Value bit didn't get set");
@@ -444,7 +473,7 @@ kernel_test_in!("drivers-gpio", smoke_intel_pch_probe_rejects_bogus_padbar);
 
 fn smoke_intel_pch_read_pin_reports_rx_state() -> TestResult {
     let (phys, len, padbar, _, _) = make_intel_synthetic_mmio(0x94, 0x80, 1024);
-    let drv = intel_new_for_test(
+    let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
         0,
         phys,
@@ -453,7 +482,7 @@ fn smoke_intel_pch_read_pin_reports_rx_state() -> TestResult {
         Some(padbar),
         128,
         true,
-    );
+    ));
     let base = phys.raw() as *mut u32;
     // Set GPIORXSTATE (bit 1) on pin 5.
     // PADCFG0 for pin 5 is at padbar + 5 * 16.
@@ -477,7 +506,7 @@ kernel_test_in!("drivers-gpio", smoke_intel_pch_read_pin_reports_rx_state);
 
 fn smoke_intel_pch_set_pin_updates_tx_state() -> TestResult {
     let (phys, len, padbar, _, _) = make_intel_synthetic_mmio(0x94, 0x80, 1024);
-    let drv = intel_new_for_test(
+    let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
         0,
         phys,
@@ -486,7 +515,7 @@ fn smoke_intel_pch_set_pin_updates_tx_state() -> TestResult {
         Some(padbar),
         128,
         true,
-    );
+    ));
     let base = phys.raw() as *mut u32;
     let off = (padbar as usize + 7 * 16) / 4;
 
@@ -516,7 +545,7 @@ kernel_test_in!("drivers-gpio", smoke_intel_pch_set_pin_updates_tx_state);
 
 fn smoke_intel_pch_register_irq_programs_pad_and_ie() -> TestResult {
     let (phys, len, padbar, _, _) = make_intel_synthetic_mmio(0x94, 0x80, 1024);
-    let drv = intel_new_for_test(
+    let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
         0,
         phys,
@@ -525,7 +554,7 @@ fn smoke_intel_pch_register_irq_programs_pad_and_ie() -> TestResult {
         Some(padbar),
         128,
         true,
-    );
+    ));
 
     fn dummy(_p: u16) {}
     let cfg = GpioIrqConfig {
@@ -576,7 +605,7 @@ kernel_test_in!(
 fn smoke_intel_pch_dispatch_irq_fires_handler_and_acks() -> TestResult {
     FIRE_COUNT.store(0, Ordering::SeqCst);
     let (phys, len, padbar, _, _) = make_intel_synthetic_mmio(0x94, 0x80, 1024);
-    let drv = intel_new_for_test(
+    let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
         0,
         phys,
@@ -585,7 +614,7 @@ fn smoke_intel_pch_dispatch_irq_fires_handler_and_acks() -> TestResult {
         Some(padbar),
         128,
         true,
-    );
+    ));
 
     drv.register_irq(
         42,
@@ -636,7 +665,7 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
     // the per-community suffix (`.C<idx>`) keys the dedupe.
     registry::__reset_for_test();
     let phys = PhysAddr::new(0xFFC0_0000);
-    let a: Arc<dyn GpioController> = Arc::new(intel_new_for_test(
+    let a: Arc<dyn GpioController> = Arc::new(intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
         0,
         phys,
@@ -645,8 +674,8 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
         Some(0x80),
         128,
         true,
-    ));
-    let b: Arc<dyn GpioController> = Arc::new(intel_new_for_test(
+    )));
+    let b: Arc<dyn GpioController> = Arc::new(intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI0".to_string(),
         1,
         PhysAddr::new(0xFFC0_1000),
@@ -655,7 +684,7 @@ fn smoke_intel_pch_names_communities_uniquely() -> TestResult {
         Some(0x80),
         128,
         true,
-    ));
+    )));
     registry::register_unique(a.clone());
     registry::register_unique(b.clone());
     if registry::count() != 2 {
@@ -679,7 +708,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
     // `GpioInt::resource_source` against `registry::find` without
     // knowing or caring which backend populated the entry.
     registry::__reset_for_test();
-    let drv = intel_new_for_test(
+    let drv = intel_new_for_test(intel_cfg(
         "\\_SB.PC00.GPI3".to_string(),
         2,
         PhysAddr::new(0xFFC0_3000),
@@ -688,7 +717,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
         Some(0xC0),
         80,
         true,
-    );
+    ));
     let bus: Arc<dyn GpioController> = Arc::new(drv);
     registry::register_unique(bus.clone());
     if registry::count() != 1 {
@@ -705,7 +734,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
         }
     }
     registry::__reset_for_test();
-    let _ = IntelPchGpio::new(
+    let _ = IntelPchGpio::new(intel_cfg(
         "smoke".to_string(),
         0,
         PhysAddr::new(0),
@@ -714,7 +743,7 @@ fn smoke_intel_pch_registers_into_shared_registry() -> TestResult {
         None,
         0,
         false,
-    );
+    ));
     TestResult::Pass
 }
 kernel_test_in!(

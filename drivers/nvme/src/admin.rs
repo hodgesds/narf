@@ -375,10 +375,10 @@ pub fn set_features_async_event_config(cid: u16, aec: u32) -> AdminSqe {
 ///
 /// Completion CDW0 bits (from CQE.cmd_specific):
 ///   - bits[2:0]  = Async Event Type
-///                  0x00 = Error status
-///                  0x01 = SMART / Health status
-///                  0x02 = Notice
-///                  0x06 = NVM Command Set specific
+///     0x00 = Error status
+///     0x01 = SMART / Health status
+///     0x02 = Notice
+///     0x06 = NVM Command Set specific
 ///   - bits[15:8] = Async Event Information (event-type specific)
 ///   - bits[31:24] = Log Page Identifier (which log to read for detail)
 ///
@@ -569,12 +569,12 @@ impl IdentifyNamespaceData {
         let nlbaf = buf[25];
         let count = (nlbaf as usize + 1).min(16);
         let mut lbaf = [LbaFormat::default(); 16];
-        for i in 0..count {
+        for (i, slot) in lbaf.iter_mut().enumerate().take(count) {
             let off = 128 + i * 4;
             let ms = u16::from_le_bytes([buf[off], buf[off + 1]]);
             let lbads = buf[off + 2];
             let rp = buf[off + 3] & 0x03;
-            lbaf[i] = LbaFormat { ms, lbads, rp };
+            *slot = LbaFormat { ms, lbads, rp };
         }
         Some(Self {
             nsze,

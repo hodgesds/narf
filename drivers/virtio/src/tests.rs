@@ -612,10 +612,9 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
         f[40] = 2;
         f[41] = 2;
     }
-    if net_pci::with_controller(|c| c.tx_dma(&tx_dma, 0, 42))
+    if !net_pci::with_controller(|c| c.tx_dma(&tx_dma, 0, 42))
         .map(|r| r.is_ok())
         .unwrap_or(false)
-        == false
     {
         return TestResult::Fail("virtio-net tx_dma");
     }
@@ -651,7 +650,7 @@ fn smoke_virtio_net_pci_registers_iface() -> TestResult {
         // still a valid pass. The MAC ought to be non-zero on QEMU
         // (QEMU advertises a 52:54:00:XX:XX:XX vendor default).
         let mac_ok = mac.iter().any(|&b| b != 0);
-        let mtu_ok = mtu >= 64 && mtu <= 65535;
+        let mtu_ok = (64..=65535).contains(&mtu);
         (mac_ok, mtu_ok, link)
     });
     match found {

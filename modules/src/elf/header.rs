@@ -217,7 +217,7 @@ pub fn parse_section(
         return Err(HeaderError::BadOffset);
     }
     Ok(Elf64SectionHeader {
-        sh_name: read_u32(bytes, off + 0x00),
+        sh_name: read_u32(bytes, off),
         sh_type: read_u32(bytes, off + 0x04),
         sh_flags: read_u64(bytes, off + 0x08),
         sh_addr: read_u64(bytes, off + 0x10),

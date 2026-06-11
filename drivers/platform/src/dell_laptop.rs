@@ -205,7 +205,7 @@ pub fn set_kbd_backlight(level: KbdBacklight) {
     KBD_BACKLIGHT.store(level as u32, Ordering::Release);
     // In live kernel: issue SMBIOS class=4 select=0 token=0x02C6 value=level.
     let cmd = DellSmbiosCmd {
-        header: (4u32 << 8) | 0,
+        header: 4u32 << 8, // class=4 (bits 15:8), select=0 (bits 7:0)
         in1: 0x02C6,
         in2: level as u32,
         in3: 0,

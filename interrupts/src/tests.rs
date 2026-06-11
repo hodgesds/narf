@@ -122,6 +122,9 @@ fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
 
     let mut fut = crate::wait_for_irq(101);
     // First poll: no IRQ yet, registers waker.
+    // SAFETY: `fut` lives on this stack frame and is never moved
+    // after this point — we only poll it through `pinned` — so the
+    // pinning invariant required by `Pin::new_unchecked` holds.
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
     if !matches!(pinned.as_mut().poll(&mut cx), Poll::Pending) {
         return TestResult::Fail("wait_for_irq returned Ready before any IRQ");
@@ -151,7 +154,7 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
         return TestResult::Skip("UP boot — no peer CPUs to shoot");
     }
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
-    let total = narf_lib::smp::cpu_count() as u32;
+    let total = narf_lib::smp::cpu_count();
     let mut snap = [0u64; narf_lib::percpu::MAX_CPUS];
     for cpu in 0..total {
         if cpu == self_cpu {
@@ -668,6 +671,8 @@ fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake_ref, noop_drop);
 
     WOKEN.store(false, Ordering::Release);
+    // SAFETY: `VTABLE`'s clone/wake/drop fns are all valid for the
+    // null data pointer they ignore, satisfying the RawWaker contract.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let w_clone = w.clone();
     crate::dispatch::set_waker(SCRATCH_VEC_DROP_CLEARS, w);
@@ -712,7 +717,10 @@ fn smoke_dispatch_clear_waker_targets_only_own() -> TestResult {
     WOKEN_A.store(0, Ordering::Release);
     WOKEN_B.store(0, Ordering::Release);
 
+    // SAFETY: VTABLE_A/B's fns ignore the data pointer and are valid
+    // for the null pointer passed, satisfying the RawWaker contract.
     let w_a = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE_A)) };
+    // SAFETY: see above — VTABLE_B is a valid no-data waker vtable.
     let w_b = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE_B)) };
     let w_a_probe = w_a.clone();
 
@@ -844,15 +852,21 @@ fn smoke_wait_for_irq_baseline_ignores_prior_fires() -> TestResult {
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    // SAFETY: VTABLE's fns ignore the data pointer and are valid for
+    // the null pointer passed, satisfying the RawWaker contract.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
     let mut fut = crate::wait_for_irq(SCRATCH_VEC_BASELINE);
+    // SAFETY: `fut` is a local that is never moved while `pinned`
+    // borrows it, so the Pin invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Pending => {
             // Now fire once and re-poll — must resolve.
             crate::on_irq(SCRATCH_VEC_BASELINE);
+            // SAFETY: `fut` is still pinned in place on this frame and
+            // has not moved since the previous poll.
             let pinned = unsafe { Pin::new_unchecked(&mut fut) };
             match pinned.poll(&mut cx) {
                 Poll::Ready(_) => TestResult::Pass,
@@ -890,11 +904,15 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake, noop_drop);
 
     WOKEN.store(false, Ordering::Release);
+    // SAFETY: VTABLE's fns ignore the data pointer and are valid for
+    // the null pointer passed, satisfying the RawWaker contract.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
     {
         let mut fut = crate::wait_for_irq(120);
+        // SAFETY: `fut` is a local in this block that is never moved
+        // while `pinned` borrows it, so the Pin invariant holds.
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         let _ = pinned.poll(&mut cx); // installs waker
                                       // fut drops here → WaitForIrq::Drop clears the slot.
@@ -1096,16 +1114,21 @@ fn smoke_wait_for_irq_until_succeeds_before_deadline() -> TestResult {
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    // SAFETY: VTABLE's fns ignore the data pointer and are valid for
+    // the null pointer passed, satisfying the RawWaker contract.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
     let deadline = narf_time::Deadline::after_ns(60_000_000_000);
     let mut fut = crate::wait_for_irq_until(SCRATCH_VEC_TIMEOUT_A, deadline);
+    // SAFETY: `fut` is a local that is not moved while `pinned`
+    // borrows it, so the Pin invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
         return TestResult::Fail("first poll should be Pending");
     }
     crate::on_irq(SCRATCH_VEC_TIMEOUT_A);
+    // SAFETY: `fut` has not moved since the previous poll.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(Ok(_)) => TestResult::Pass,
@@ -1133,6 +1156,8 @@ fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    // SAFETY: VTABLE's fns ignore the data pointer and are valid for
+    // the null pointer passed, satisfying the RawWaker contract.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
@@ -1141,6 +1166,8 @@ fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
     let _ = now;
     let deadline = narf_time::Deadline::after_ns(0); // immediate
     let mut fut = crate::wait_for_irq_until(SCRATCH_VEC_TIMEOUT_B, deadline);
+    // SAFETY: `fut` is a local that is not moved while `pinned`
+    // borrows it, so the Pin invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     // The timeout future may or may not return Elapsed on the first
     // poll depending on how `after_ns(0)` rounds; loop a few polls
@@ -1151,6 +1178,7 @@ fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
         if narf_time::Instant::now().cycles_since(start) > 500_000_000 {
             return TestResult::Fail("timeout future never resolved on past-deadline");
         }
+        // SAFETY: `fut` has not moved since the previous poll.
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         result = pinned.poll(&mut cx);
     }
@@ -1178,16 +1206,21 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
     fn noop_drop(_: *const ()) {}
     static VTABLE: RawWakerVTable =
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
+    // SAFETY: VTABLE's fns ignore the data pointer and are valid for
+    // the null pointer passed, satisfying the RawWaker contract.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
     // First wait_for_irq.
     let mut fut1 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
+    // SAFETY: `fut1` is a local that is not moved while `pinned`
+    // borrows it, so the Pin invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut1) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
         return TestResult::Fail("first wait first poll should be Pending");
     }
     crate::on_irq(SCRATCH_VEC_WAIT_RETRY);
+    // SAFETY: `fut1` has not moved since the previous poll.
     let pinned = unsafe { Pin::new_unchecked(&mut fut1) };
     if !matches!(pinned.poll(&mut cx), Poll::Ready(_)) {
         return TestResult::Fail("first wait didn't resolve after IRQ");
@@ -1197,6 +1230,8 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
     // Second wait_for_irq — snapshots a NEW baseline after the
     // first IRQ landed, so first poll is Pending.
     let mut fut2 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
+    // SAFETY: `fut2` is a local that is not moved while `pinned`
+    // borrows it, so the Pin invariant holds.
     let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
         return TestResult::Fail(
@@ -1204,6 +1239,7 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
         );
     }
     crate::on_irq(SCRATCH_VEC_WAIT_RETRY);
+    // SAFETY: `fut2` has not moved since the previous poll.
     let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
     if !matches!(pinned.poll(&mut cx), Poll::Ready(_)) {
         return TestResult::Fail("second wait didn't resolve after second IRQ");
@@ -1477,7 +1513,7 @@ fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
         return TestResult::Skip("UP boot — no peer CPUs");
     }
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
-    let total = narf_lib::smp::cpu_count() as u32;
+    let total = narf_lib::smp::cpu_count();
     let mut snap = [0u64; narf_lib::percpu::MAX_CPUS];
     for cpu in 0..total {
         if cpu == self_cpu {

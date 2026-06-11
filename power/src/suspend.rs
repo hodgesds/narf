@@ -303,9 +303,9 @@ pub fn s3_supported() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        return narf_acpi::fadt_pm()
+        narf_acpi::fadt_pm()
             .map(|p| p.pm1a_cnt != 0)
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

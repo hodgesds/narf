@@ -424,8 +424,8 @@ fn gen_slabinfo() -> Vec<u8> {
         };
         let objs_per_slab = objs_per_slab.max(1);
         // active_slabs ≈ ceil(in_use / objs_per_slab).
-        let active_slabs = (cls.in_use + objs_per_slab - 1) / objs_per_slab;
-        let total_slabs = (cls.grown + objs_per_slab - 1) / objs_per_slab;
+        let active_slabs = cls.in_use.div_ceil(objs_per_slab);
+        let total_slabs = cls.grown.div_ceil(objs_per_slab);
         let _ = writeln!(
             s,
             "kmalloc-{:<6} {:>8} {:>8} {:>8} {:>8} {:>12} \
@@ -679,28 +679,28 @@ fn gen_pagetypeinfo() -> Vec<u8> {
         for (zone, zone_name) in [("Normal", "Normal"), ("DMA32", "DMA32")].iter() {
             let _ = writeln!(
                 s,
-                "Node {:4}, zone {:8}, type    Unmovable {}",
-                node, zone_name, "  0  0  0  0  0  0  0  0  0  0  0"
+                "Node {:4}, zone {:8}, type    Unmovable   0  0  0  0  0  0  0  0  0  0  0",
+                node, zone_name
             );
             let _ = writeln!(
                 s,
-                "Node {:4}, zone {:8}, type      Movable {}",
-                node, zone_name, "  0  0  0  0  0  0  0  0  0  0  0"
+                "Node {:4}, zone {:8}, type      Movable   0  0  0  0  0  0  0  0  0  0  0",
+                node, zone_name
             );
             let _ = writeln!(
                 s,
-                "Node {:4}, zone {:8}, type  Reclaimable {}",
-                node, zone_name, "  0  0  0  0  0  0  0  0  0  0  0"
+                "Node {:4}, zone {:8}, type  Reclaimable   0  0  0  0  0  0  0  0  0  0  0",
+                node, zone_name
             );
             let _ = writeln!(
                 s,
-                "Node {:4}, zone {:8}, type   HighAtomic {}",
-                node, zone_name, "  0  0  0  0  0  0  0  0  0  0  0"
+                "Node {:4}, zone {:8}, type   HighAtomic   0  0  0  0  0  0  0  0  0  0  0",
+                node, zone_name
             );
             let _ = writeln!(
                 s,
-                "Node {:4}, zone {:8}, type      Isolate {}",
-                node, zone_name, "  0  0  0  0  0  0  0  0  0  0  0"
+                "Node {:4}, zone {:8}, type      Isolate   0  0  0  0  0  0  0  0  0  0  0",
+                node, zone_name
             );
             let _ = zone; // suppress dead-code warning on the tuple element
         }
@@ -811,7 +811,7 @@ fn gen_filesystems_annotated() -> Vec<u8> {
     }
     // Mounted instances.
     for n in &names {
-        if nodev_always.iter().any(|fixed| *fixed == n.as_str()) {
+        if nodev_always.contains(&n.as_str()) {
             continue;
         }
         // Block-backed FS types get no "nodev" prefix.

@@ -124,9 +124,14 @@ impl Iterator for CapIter {
         if self.next == 0 || self.hops >= MAX_HOPS {
             return None;
         }
-        // SAFETY: cfg-space is identity-mapped; `next` is < 0x100 by
-        // mask + bound.
+        // SAFETY: `self.cfg` is the config-space base passed to `iter`, which
+        // validated the cap list; `self.next` was produced by masking a cap
+        // pointer with 0xFC so it is <= 0xFC, hence the cap-header ID byte at
+        // `self.next` lies inside the 256-byte config window.
         let id = unsafe { cfg_read8(self.cfg, self.next) };
+        // SAFETY: `self.next + 1` is the Next-Cap-Pointer byte of the same
+        // capability header; with self.next <= 0xFC it is <= 0xFD, still inside
+        // the 256-byte config window at `self.cfg`.
         let nxt = unsafe { cfg_read8(self.cfg, self.next + 1) };
         let here = self.next;
         self.next = (nxt as u64) & 0xFC;

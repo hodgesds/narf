@@ -714,7 +714,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let gd = &self.group_descs[group as usize];
         let inode_size = self.superblock.inode_size_bytes();
         let bs = self.block_size() as u64;
-        let table_byte_off = gd.inode_table as u64 * bs;
+        let table_byte_off = gd.inode_table * bs;
         let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
         let mut buf = vec![0u8; inode_size];
         self.read_byte_range(inode_byte_off, &mut buf).await?;
@@ -949,9 +949,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(new as u64)
     }
 
-    /// Free every block an inode owns (direct + indirect + double-
-    /// + triple-indirect), zeroing the inode's `block[]` field.
-    /// Caller persists the inode.
+    /// Free every block an inode owns (direct, indirect, double-indirect, and
+    /// triple-indirect), zeroing the inode's `block[]` field. Caller persists
+    /// the inode.
     pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
         if self.superblock.uses_extents() {
             return Err(FsError::Unsupported);
@@ -1093,7 +1093,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let inode_size = self.superblock.inode_size_bytes();
         let bs = self.block_size() as u64;
 
-        let table_byte_off = gd.inode_table as u64 * bs;
+        let table_byte_off = gd.inode_table * bs;
         let inode_byte_off = table_byte_off + (index as u64) * inode_size as u64;
 
         // Only need 128 bytes — the rest of the inode (rev-1+ extra

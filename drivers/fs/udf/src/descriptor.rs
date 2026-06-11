@@ -246,7 +246,7 @@ pub fn read_anchor(buf: &[u8]) -> AnchorVolumeDescriptorPointer {
 // ── Partition Descriptor ────────────────────────────────────────────
 
 /// Partition Descriptor (ECMA-167 §3/10.5). Names the on-disc start
-/// + length of one partition. The driver only uses the
+/// and length of one partition. The driver only uses the
 /// `partition_starting_location` and `partition_length` fields; the
 /// rest are decoded into a single byte slab so we can keep the layout
 /// honest without naming each field.

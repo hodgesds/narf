@@ -81,6 +81,12 @@ pub struct CmdBuf {
     len: usize,
 }
 
+impl Default for CmdBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CmdBuf {
     /// Create an empty buffer.
     pub const fn new() -> Self {

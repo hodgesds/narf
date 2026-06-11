@@ -830,6 +830,7 @@ kernel_test_in!("drivers/wireless/rtw89", smoke_rtw89_mac_init_qta_mode_enum);
 
 // ── Stage-6: H2C dispatch ──────────────────────────────────────────
 
+#[allow(clippy::absurd_extreme_comparisons)]
 fn smoke_rtw89_h2c_category_values() -> TestResult {
     // Pin all three real categories against fw.h:4505..4694.
     if H2C_CAT_TEST != 0x0 {

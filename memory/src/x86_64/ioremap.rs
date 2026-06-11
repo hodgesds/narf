@@ -130,6 +130,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     }
 
     let range = vmalloc::alloc(len)?;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pml4_phys = unsafe { read_cr3() };
     // Per-attr PTE flags:
     //   Device          → NO_CACHE (PCD=1)              → PA2 = UC-

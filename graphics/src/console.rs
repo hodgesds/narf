@@ -13,6 +13,7 @@
 
 use core::fmt;
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -66,8 +67,7 @@ impl FbConsole {
         // state. A full `fb.clear(bg)` would wipe all of it.
         let text_h = rows * GLYPH_H;
         fb.fill_rect(0, TOP_PX_OFFSET, fb.width, text_h, bg);
-        let mut chars = Vec::new();
-        chars.resize((cols * rows) as usize, 0u8);
+        let chars = vec![0u8; (cols * rows) as usize];
         Self {
             fb,
             cols,

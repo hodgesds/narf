@@ -75,6 +75,12 @@ pub struct Sha256 {
     total_len: u64,
 }
 
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sha256 {
     pub fn new() -> Self {
         Self {
@@ -91,8 +97,8 @@ impl Sha256 {
         let mut w = [0u32; 64];
 
         // 1. Prepare the message schedule, W
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
+        for (i, word) in w.iter_mut().enumerate().take(16) {
+            *word = u32::from_be_bytes([
                 self.block[i * 4],
                 self.block[i * 4 + 1],
                 self.block[i * 4 + 2],

@@ -137,9 +137,11 @@ fn core_type_byte() -> u8 {
 }
 
 pub fn discover() -> Topology {
-    let mut t = Topology::default();
-    t.hybrid = hybrid_flag();
-    t.core_type = core_type_byte();
+    let mut t = Topology {
+        hybrid: hybrid_flag(),
+        core_type: core_type_byte(),
+        ..Default::default()
+    };
 
     if let Some(leaf) = extended_topo_leaf() {
         // Walk sub-leaves until EAX = 0 + ECX[15:8] = 0.
@@ -179,7 +181,7 @@ pub fn discover() -> Topology {
         // Legacy path: CPUID(1).EBX[23:16] is logical-processors.
         // SAFETY: leaf 1 always defined.
         let (_, ebx, _, _) = unsafe { cpuid(1, 0) };
-        let logical = ((ebx >> 16) & 0xFF) as u32;
+        let logical = (ebx >> 16) & 0xFF;
         t.thread_count = logical.max(1);
         t.core_count = 1;
         t.package_count = 1;
@@ -200,7 +202,7 @@ pub fn discover_caches() -> [Option<CacheLevelInfo>; 4] {
             break;
         }
         let level = ((eax >> 5) & 0x7) as u8;
-        let max_threads_sharing = (((eax >> 14) & 0xFFF) + 1) as u32;
+        let max_threads_sharing = ((eax >> 14) & 0xFFF) + 1;
         let line_size = ((ebx & 0xFFF) + 1) as u16;
         let partitions = (((ebx >> 12) & 0x3FF) + 1) as u16;
         let ways = (((ebx >> 22) & 0x3FF) + 1) as u16;

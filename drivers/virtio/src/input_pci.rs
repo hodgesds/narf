@@ -542,10 +542,7 @@ impl VirtioInputPci {
         // any spec-defined config-read interactions.
         let device_cfg = if let Some(cap) = caps.device_cfg.as_ref() {
             // SAFETY: caller-owned device.
-            match unsafe { map_cap(device, cap) } {
-                Ok(r) => Some(r),
-                Err(_) => None,
-            }
+            unsafe { map_cap(device, cap) }.ok()
         } else {
             None
         };

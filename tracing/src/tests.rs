@@ -92,7 +92,7 @@ fn smoke_tracing_arm_disarm_cycle() -> TestResult {
     use narf_capabilities::{Cap, Grant};
 
     static SLOT: AtomicU32 = AtomicU32::new(0x9090_9090); // nop sled
-    let addr = SLOT.as_ptr() as *mut u32;
+    let addr = SLOT.as_ptr();
 
     let cap: Cap<ProbeArming, Grant> = Cap::<ProbeArming, Grant>::bootstrap();
     let before_armed = any_armed();

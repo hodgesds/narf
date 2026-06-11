@@ -126,10 +126,10 @@ fn smoke_amd_fch_recognises_zen2_hid() -> TestResult {
     // The Zen2 laptop bring-up target uses AMDI0019 — guard against
     // someone trimming the list and silently dropping bring-up
     // hardware coverage.
-    if !recognised_hids().iter().any(|h| *h == "AMDI0019") {
+    if !recognised_hids().contains(&"AMDI0019") {
         return TestResult::Fail("AMDI0019 (Zen2 FCH) not in recognised HID list");
     }
-    if !recognised_hids().iter().any(|h| *h == "AMDI0010") {
+    if !recognised_hids().contains(&"AMDI0010") {
         return TestResult::Fail("AMDI0010 (Zen / Zen+) not in recognised HID list");
     }
     TestResult::Pass
@@ -241,14 +241,14 @@ fn smoke_lpss_i2c_recognises_modern_intel_hids() -> TestResult {
     // Tiger Lake / Alder Lake / Raptor Lake — the modern Intel laptop
     // bring-up target. Guard against the list being trimmed.
     for required in ["INT34B7", "INT34BA", "INT34C5"] {
-        if !lpss_recognised_hids().iter().any(|h| *h == required) {
+        if !lpss_recognised_hids().contains(&required) {
             return TestResult::Fail("required Intel LPSS HID missing from list");
         }
     }
     // Older PCI-mode LPSS (Baytrail / Apollo Lake) — kept in for the
     // long tail of Intel-laptop firmware out there.
     for required in ["80860F41", "808622C1"] {
-        if !lpss_recognised_hids().iter().any(|h| *h == required) {
+        if !lpss_recognised_hids().contains(&required) {
             return TestResult::Fail("required Intel LPSS-PCI HID missing from list");
         }
     }

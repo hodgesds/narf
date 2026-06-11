@@ -162,7 +162,7 @@ pub fn build_long(vc: u8, dt: u8, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-pub fn decode_long_payload<'a>(buf: &'a [u8]) -> Result<(LongHeader, &'a [u8]), CsiError> {
+pub fn decode_long_payload(buf: &[u8]) -> Result<(LongHeader, &[u8]), CsiError> {
     if buf.len() < 6 {
         return Err(CsiError::Short);
     }

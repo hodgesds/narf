@@ -400,21 +400,38 @@ impl MipiHciI3cMaster {
     /// Read a global HCI register.
     #[allow(dead_code)]
     fn hci_read(&self, reg: u64) -> u32 {
+        // SAFETY: `reg` is one of the fixed 4-byte-aligned global register
+        // offsets defined in this module (all < 0x68), which lie within the
+        // HCI BAR 0 region mapped by `map_bar(&device, 0)` in `probe`. This
+        // `MipiHciI3cMaster` owns that BAR exclusively, so the 32-bit
+        // register read is in-bounds, aligned, and side-effect-free.
         unsafe { self.mmio.read32(reg) }
     }
 
     /// Write a global HCI register.
     fn hci_write(&self, reg: u64, val: u32) {
+        // SAFETY: `reg` is one of the fixed 4-byte-aligned global register
+        // offsets defined in this module, all within BAR 0 mapped in `probe`.
+        // This driver owns the device exclusively, so the aligned in-bounds
+        // 32-bit register write is sound.
         unsafe { self.mmio.write32(reg, val) }
     }
 
     /// Read a PIO sub-block register.
     fn pio_read(&self, reg: u64) -> u32 {
+        // SAFETY: `reg` is a fixed 4-byte-aligned PIO offset (< 0x40) and
+        // `self.pio_offset` is the PIO sub-block base read from PIO_SECTION
+        // in `probe`; their sum stays within the BAR 0 region. The driver
+        // owns the device exclusively, so this aligned register read is sound.
         unsafe { self.mmio.read32(self.pio_offset + reg) }
     }
 
     /// Write a PIO sub-block register.
     fn pio_write(&self, reg: u64, val: u32) {
+        // SAFETY: `reg` is a fixed 4-byte-aligned PIO offset (< 0x40) added to
+        // the PIO sub-block base `self.pio_offset`; the sum stays within BAR 0
+        // mapped in `probe`. The driver owns the device exclusively, so this
+        // aligned in-bounds register write is sound.
         unsafe { self.mmio.write32(self.pio_offset + reg, val) }
     }
 
@@ -506,6 +523,11 @@ impl MipiHciI3cMaster {
 
         // Read the first ring header offset from the RHS.
         // RHS+0x04 holds the byte offset of ring header 0 within the BAR.
+        // SAFETY: `rhs_offset` is the Ring Headers Section base read from the
+        // RING_HEADERS_SECTION register (masked to 16 bits) and is non-zero
+        // (checked above); `rhs_offset + 0x04` is the 4-byte-aligned RH0 offset
+        // word within BAR 0. The driver owns the device exclusively, so this
+        // aligned register read is sound.
         let rh_offset_val = unsafe { self.mmio.read32(rhs_offset + 0x04) };
         let rh_base = rh_offset_val as u64;
 
@@ -513,6 +535,12 @@ impl MipiHciI3cMaster {
         // Linux dma.c hci_dma_init_rh():
         //   rh_reg_write(CMD_RING_BASE_LO, lower_32_bits(rh->xfer_dma))
         //   rh_reg_write(CMD_RING_BASE_HI, upper_32_bits(rh->xfer_dma))
+        //
+        // SAFETY: `rh_base` is the ring-header base offset read from the RHS;
+        // every `rh_base + RH_*` target below is one of the fixed
+        // 4-byte-aligned per-ring-header register offsets (all <= 0x4C) and so
+        // lies within BAR 0 mapped in `probe`. The driver owns the device
+        // exclusively, so each aligned in-bounds 32-bit register write is sound.
         unsafe {
             self.mmio
                 .write32(rh_base + RH_CMD_RING_BASE_LO, cr_phys as u32);
@@ -680,11 +708,14 @@ pub fn probe(
 
     // Discover PIO sub-block offset from PIO_SECTION register [15:0].
     // HCI §6.1.12: lower 16 bits of PIO_SECTION give the byte offset.
+    // SAFETY: PIO_SECTION (0x3C) is a fixed 4-byte-aligned global register
+    // offset within BAR 0, which `map_bar` just mapped above; we own the
+    // device exclusively here, so the aligned register read is sound.
     let pio_section_val = unsafe { mmio.read32(PIO_SECTION) };
     let pio_offset = (pio_section_val & 0xFFFF) as u64;
 
     let driver = Arc::new(MipiHciI3cMaster {
-        mmio: mmio.clone(),
+        mmio,
         pio_offset,
         ibi_wakers: IrqSafeSpinLock::new([const { None }; 128]),
         ibi_handlers: IrqSafeSpinLock::new(Vec::new()),
@@ -767,7 +798,7 @@ impl I3cBus for MipiHciI3cMaster {
                     let rx_len = (resp & RESP_DATA_LEN_MASK) as usize;
                     // Drain RX FIFO into `buf`.
                     let mut i = 0usize;
-                    let words = (rx_len + 3) / 4;
+                    let words = rx_len.div_ceil(4);
                     for _ in 0..words {
                         let word = self.pio_read(PIO_XFER_DATA_PORT);
                         let bytes = word.to_le_bytes();
@@ -919,7 +950,7 @@ impl I3cBus for MipiHciI3cMaster {
 
             // Drain 8 bytes (PID + BCR + DCR) from RX FIFO.
             let mut raw = [0u8; 8];
-            let words = (rx_len.min(8) + 3) / 4;
+            let words = rx_len.min(8).div_ceil(4);
             let mut byte_idx = 0usize;
             for _ in 0..words {
                 let word = self.pio_read(PIO_XFER_DATA_PORT);
@@ -1033,7 +1064,7 @@ impl I3cBus for MipiHciI3cMaster {
         let rx_len = (resp & RESP_DATA_LEN_MASK) as usize;
 
         // Drain RX FIFO: 32-bit reads, each holds two 16-bit DDR words.
-        let words_to_read = (rx_len + 1) / 2; // round up
+        let words_to_read = rx_len.div_ceil(2); // round up
         let mut fifo_words: Vec<u32> = Vec::with_capacity(words_to_read);
         for _ in 0..words_to_read {
             fifo_words.push(self.pio_read(PIO_XFER_DATA_PORT));
@@ -1217,7 +1248,7 @@ pub fn dma_cr_entry(cmd_lo: u32, cmd_hi: u32, data_len: u16, dma_addr: u64, ioc:
 /// Returns `(addr, data_len, is_last, is_error)` from the raw status word.
 /// HCI §7.7; Linux ibi.h IBI_TARGET_ADDR / IBI_DATA_LENGTH.
 pub fn decode_ibi_status(status: u32) -> (u8, u8, bool, bool) {
-    let addr = ((status >> IBI_TARGET_ADDR_SHIFT) & IBI_TARGET_ADDR_MASK as u32) as u8;
+    let addr = ((status >> IBI_TARGET_ADDR_SHIFT) & IBI_TARGET_ADDR_MASK) as u8;
     let data_len = (status & IBI_DATA_LENGTH_MASK) as u8;
     let is_last = (status & IBI_LAST_STATUS) != 0;
     let is_error = (status & IBI_ERROR) != 0;
@@ -1614,11 +1645,10 @@ mod tests {
             recv: AtomicU8::new(0),
         });
 
-        let mut handlers: Vec<IbiHandlerSlot> = Vec::new();
-        handlers.push(IbiHandlerSlot {
+        let handlers: Vec<IbiHandlerSlot> = alloc::vec![IbiHandlerSlot {
             addr: 0x10,
             handler: handler.clone(),
-        });
+        }];
 
         // Simulate drain_ibi_ring() logic inline (we can't easily construct
         // a full MipiHciI3cMaster without MMIO, so we test the decode path).

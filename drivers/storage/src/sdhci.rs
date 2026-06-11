@@ -134,7 +134,7 @@ const TM_MULTI_BLOCK: u16 = 1 << 5;
 
 /// SD command index → encoded register write per §2.2.6.
 fn make_cmd(idx: u8, resp_kind: u16, has_data: bool) -> u16 {
-    let mut v = (idx as u16) << 8 | (resp_kind << 0);
+    let mut v = (idx as u16) << 8 | resp_kind;
     // CRC + index check are required for most R1/R3/R6 paths; the
     // spec says they're enabled per response-type table 2-19.
     match resp_kind {

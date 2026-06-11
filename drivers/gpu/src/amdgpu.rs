@@ -251,8 +251,8 @@ pub struct ChipInfo {
     /// Real silicon goes through [`fw_list`] instead.
     pub fw_name: &'static str,
     /// Per-IP firmware enumeration. Walked in order during
-    /// `load_firmware_multi` — each entry names a registry blob
-    /// + the PSP command used to dispatch it. List comes from the
+    /// `load_firmware_multi` — each entry names a registry blob plus
+    /// the PSP command used to dispatch it. List comes from the
     /// Linux amdgpu driver's `MODULE_FIRMWARE` declarations for
     /// the matching `gc_*`, `dcn_*`, `psp_*`, `sdma_*`, `vcn_*`,
     /// `smu_*` IP versions.
@@ -542,6 +542,9 @@ impl AmdGpu {
             .ok_or(AmdgpuError::UnknownAsic)?;
         // SAFETY: caller-authority over BAR0 + BAR5.
         let fb_bar = unsafe { map_bar(device, BAR_FB) }.map_err(|_| AmdgpuError::BarMapFailed)?;
+        // SAFETY: caller-authority over BAR0 + BAR5 (the `bring_up` contract);
+        // `BAR_REGS` selects the MMIO register BAR which the caller owns
+        // exclusively for the duration of probe.
         let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| AmdgpuError::BarMapFailed)?;
 
         // Presence test: MM_INDEX is read/write; write a sentinel,
@@ -789,12 +792,17 @@ impl AmdGpu {
         if h_total == 0 || h_total == 0xFFFF_FFFF {
             return None;
         }
+        // SAFETY: caller-asserted exclusive ownership of BAR5; `OTG_V_TOTAL`
+        // is a read-only OTG timing register on the same MMIO BAR.
         let v_total = unsafe { mm_read(&self.regs, OTG_V_TOTAL) };
         if v_total == 0 || v_total == 0xFFFF_FFFF {
             return None;
         }
-        // SAFETY: same.
+        // SAFETY: caller-asserted exclusive ownership of BAR5; OTG blank
+        // registers are read-only timing latches on the same MMIO BAR.
         let h_blank = unsafe { mm_read(&self.regs, OTG_H_BLANK_START_END) };
+        // SAFETY: caller-asserted exclusive ownership of BAR5; same OTG
+        // blank-register MMIO BAR as above.
         let v_blank = unsafe { mm_read(&self.regs, OTG_V_BLANK_START_END) };
 
         // OTG_H_TOTAL is `total - 1`; bits[15:0] are the value.
@@ -1474,6 +1482,9 @@ pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
 unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
     // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair.
     let base_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_BASE) };
+    // SAFETY: caller-asserted exclusive ownership of BAR5 (`read_vram_info`
+    // contract); `MC_VM_FB_LOCATION_TOP` is a read-only MC aperture register
+    // accessed through the same MM_INDEX/MM_DATA latch pair.
     let top_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
     // Bits[23:0] are the FB location; high bits are reserved.
     let base = (base_field as u64 & 0x00FF_FFFF) << 24;
@@ -1531,10 +1542,7 @@ unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock
         buf[i + 3] = bytes[3];
         i += 4;
     }
-    match amdgpu_discovery::parse_discovery(&buf) {
-        Ok(blocks) => blocks,
-        Err(_) => Vec::new(),
-    }
+    amdgpu_discovery::parse_discovery(&buf).unwrap_or_default()
 }
 
 // ── VBIOS image acquisition ────────────────────────────────────────────────
@@ -1586,12 +1594,18 @@ unsafe fn read_vbios_version_from_rom(
     // Guard against unmapped / absent ROM (reads back 0xFF 0xFF).
     // SAFETY: identity-mapped MMIO in NARF's kernel context.
     let b0 = unsafe { probe_region.read8(0) };
+    // SAFETY: identity-mapped MMIO in NARF's kernel context; offset 1 is the
+    // second byte of the 512-byte `probe_region` mapped at the PCI ROM base,
+    // well within bounds.
     let b1 = unsafe { probe_region.read8(1) };
     if b0 == 0xFF && b1 == 0xFF {
         return None;
     }
 
     // PCI ROM header byte 2: image size in 512-byte blocks.
+    // SAFETY: identity-mapped MMIO in NARF's kernel context; offset 2 is the
+    // third byte of the 512-byte `probe_region` mapped at the PCI ROM base,
+    // well within bounds.
     let blocks = unsafe { probe_region.read8(2) };
     let rom_size: u64 = if blocks == 0 {
         65536 // fallback: 64 KiB

@@ -95,7 +95,7 @@ const TRANSIENT_FIRST: u32 = 0x8000_0000;
 const TRANSIENT_LAST: u32 = 0xBFFF_FFFF;
 
 fn is_transient(handle: u32) -> bool {
-    handle >= TRANSIENT_FIRST && handle <= TRANSIENT_LAST
+    (TRANSIENT_FIRST..=TRANSIENT_LAST).contains(&handle)
 }
 
 // ── Build TPM2_FlushContext command ───────────────────────────────────

@@ -44,7 +44,6 @@
 //!      (`AMD_FCH_MMIO_BASE 0xFED80000`); AMD FCH PPR for
 //!      Renoir/Phoenix, §AOAC.
 
-#![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
 extern crate alloc;

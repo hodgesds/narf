@@ -76,7 +76,7 @@ fn smoke_variable_name_ucs2_encode_decode() -> TestResult {
     if buf[0] != b'B' || buf[1] != 0 {
         return TestResult::Fail("first char wrong");
     }
-    if &buf[buf.len() - 2..] != [0, 0] {
+    if buf[buf.len() - 2..] != [0, 0] {
         return TestResult::Fail("missing NUL terminator");
     }
     if decode_name(&buf) != s {

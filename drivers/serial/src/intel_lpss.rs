@@ -129,7 +129,7 @@ fn probe_one(path: &str) -> Option<()> {
     let (base, len) = mmio?;
 
     // IRQ routing.
-    let irq_vec = gsi.and_then(|g| try_route_gsi(g));
+    let irq_vec = gsi.and_then(try_route_gsi);
 
     let drv = IntelLpssUart::new(path.to_string(), PhysAddr::new(base), len, irq_vec);
 

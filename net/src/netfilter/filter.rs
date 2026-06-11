@@ -28,6 +28,12 @@ pub struct Filter {
     inner: IrqSafeSpinLock<Vec<Table>>,
 }
 
+impl Default for Filter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Filter {
     pub const fn new() -> Self {
         Self {

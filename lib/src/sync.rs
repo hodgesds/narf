@@ -54,6 +54,7 @@ pub struct SpinLock<T: ?Sized> {
 // SAFETY: `SpinLock` serialises access to `T`; if `T: Send`, the lock is
 // `Send + Sync`. We never construct a `&T` alias while the lock is held.
 unsafe impl<T: ?Sized + Send> Send for SpinLock<T> {}
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
 unsafe impl<T: ?Sized + Send> Sync for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
@@ -175,7 +176,9 @@ pub struct IrqSafeSpinLock<T: ?Sized> {
     inner: SpinLock<T>,
 }
 
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
 unsafe impl<T: ?Sized + Send> Send for IrqSafeSpinLock<T> {}
+// SAFETY: exclusive access is serialized by the lock; `T: Send` makes sharing the guarded value across tasks sound.
 unsafe impl<T: ?Sized + Send> Sync for IrqSafeSpinLock<T> {}
 
 impl<T> IrqSafeSpinLock<T> {
@@ -433,6 +436,8 @@ pub struct OnceLock<T> {
 // SAFETY: `OnceLock` publishes `T` only through `Release`/`Acquire` on
 // `Once::state`; subsequent reads observe the initialised value.
 unsafe impl<T: Send + Sync> Sync for OnceLock<T> {}
+// SAFETY: `OnceLock` publishes `T` only after Release/Acquire on `Once::state`;
+// `T: Send` makes moving the value to another task sound.
 unsafe impl<T: Send> Send for OnceLock<T> {}
 
 impl<T> OnceLock<T> {

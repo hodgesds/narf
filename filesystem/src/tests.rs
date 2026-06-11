@@ -699,19 +699,34 @@ kernel_test_in!(
 //   - error-discriminant distinctness
 
 fn smoke_fs_posix_access_root_bypass() -> TestResult {
-    use crate::posix_access_ok;
+    use crate::{AccessRequest, Accessor, FileOwner};
+    let check = |fu, fg, fp, au, ag, r, w, x| {
+        crate::posix_access_ok(
+            FileOwner {
+                uid: fu,
+                gid: fg,
+                perms: fp,
+            },
+            Accessor { uid: au, gid: ag },
+            AccessRequest {
+                read: r,
+                write: w,
+                exec: x,
+            },
+        )
+    };
     // Root reads + writes anything regardless of perms (POSIX privileged-process rule).
-    if !posix_access_ok(1000, 1000, 0o000, 0, 0, true, true, false) {
+    if !check(1000, 1000, 0o000, 0, 0, true, true, false) {
         return TestResult::Fail("root denied read on perms=000");
     }
-    if !posix_access_ok(1000, 1000, 0o000, 0, 0, false, true, false) {
+    if !check(1000, 1000, 0o000, 0, 0, false, true, false) {
         return TestResult::Fail("root denied write on perms=000");
     }
     // Root exec requires at least one exec bit somewhere.
-    if posix_access_ok(1000, 1000, 0o644, 0, 0, false, false, true) {
+    if check(1000, 1000, 0o644, 0, 0, false, false, true) {
         return TestResult::Fail("root got exec on perms=644 (no x bit anywhere)");
     }
-    if !posix_access_ok(1000, 1000, 0o755, 0, 0, false, false, true) {
+    if !check(1000, 1000, 0o755, 0, 0, false, false, true) {
         return TestResult::Fail("root denied exec on perms=755");
     }
     TestResult::Pass
@@ -719,31 +734,46 @@ fn smoke_fs_posix_access_root_bypass() -> TestResult {
 kernel_test_in!("filesystem", smoke_fs_posix_access_root_bypass);
 
 fn smoke_fs_posix_access_owner_group_other() -> TestResult {
-    use crate::posix_access_ok;
+    use crate::{AccessRequest, Accessor, FileOwner};
+    let check = |fu, fg, fp, au, ag, r, w, x| {
+        crate::posix_access_ok(
+            FileOwner {
+                uid: fu,
+                gid: fg,
+                perms: fp,
+            },
+            Accessor { uid: au, gid: ag },
+            AccessRequest {
+                read: r,
+                write: w,
+                exec: x,
+            },
+        )
+    };
     // File owned by 1000:2000 with perms=0o640 (owner rw-, group r--, other ---).
     // Owner (uid=1000): can read + write, can't exec.
-    if !posix_access_ok(1000, 2000, 0o640, 1000, 0, true, true, false) {
+    if !check(1000, 2000, 0o640, 1000, 0, true, true, false) {
         return TestResult::Fail("owner denied legitimate rw");
     }
-    if posix_access_ok(1000, 2000, 0o640, 1000, 0, false, false, true) {
+    if check(1000, 2000, 0o640, 1000, 0, false, false, true) {
         return TestResult::Fail("owner got exec when perms had no x");
     }
     // Group member (gid=2000 but uid != owner): can read, can't write.
-    if !posix_access_ok(1000, 2000, 0o640, 1001, 2000, true, false, false) {
+    if !check(1000, 2000, 0o640, 1001, 2000, true, false, false) {
         return TestResult::Fail("group member denied read");
     }
-    if posix_access_ok(1000, 2000, 0o640, 1001, 2000, false, true, false) {
+    if check(1000, 2000, 0o640, 1001, 2000, false, true, false) {
         return TestResult::Fail("group member got write when group bits forbade it");
     }
     // Other (different uid + gid): no access at all.
-    if posix_access_ok(1000, 2000, 0o640, 1001, 2001, true, false, false) {
+    if check(1000, 2000, 0o640, 1001, 2001, true, false, false) {
         return TestResult::Fail("other got read on perms=640 (other=---)");
     }
     // Other with perms=0o644 → other can read but not write.
-    if !posix_access_ok(1000, 2000, 0o644, 1001, 2001, true, false, false) {
+    if !check(1000, 2000, 0o644, 1001, 2001, true, false, false) {
         return TestResult::Fail("other denied read on perms=644");
     }
-    if posix_access_ok(1000, 2000, 0o644, 1001, 2001, false, true, false) {
+    if check(1000, 2000, 0o644, 1001, 2001, false, true, false) {
         return TestResult::Fail("other got write on perms=644");
     }
     TestResult::Pass

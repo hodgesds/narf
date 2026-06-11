@@ -9,25 +9,25 @@
 //! Layered like Linux's `sound/hda/`:
 //!
 //! - `hda::controller`  — PCI probe, BAR map, GCAP/GCTL/INTCTL reset
-//!                        sequence, INTSTS path.
+//!   sequence, INTSTS path.
 //! - `hda::corb`        — Command Output Ring Buffer (verb send).
 //! - `hda::rirb`        — Response Input Ring Buffer (verb response).
 //! - `hda::streams`     — Stream descriptors + Buffer Descriptor List.
 //! - `hda::widget`      — Codec widget graph + node walking.
 //! - `codec::generic`   — Vendor-agnostic AFG bring-up (any compliant
-//!                        codec — power, unmute, default routing).
+//!   codec — power, unmute, default routing).
 //! - `codec::realtek`   — ALC233/235/236/255/256/270/280/282/283/285/
-//!                        286/287/289/290/292/293/294/295/298/3204/
-//!                        3225/3236/3254/3266/3268/3286/3287 init
-//!                        verb sequences.
+//!   286/287/289/290/292/293/294/295/298/3204/
+//!   3225/3236/3254/3266/3268/3286/3287 init
+//!   verb sequences.
 //! - `codec::quirks`    — Per-laptop-model widget connection quirks
-//!                        (Lenovo, Dell, HP, ASUS, MSI laptop tables).
+//!   (Lenovo, Dell, HP, ASUS, MSI laptop tables).
 //! - `pcm`              — PCM substream model (open/hw_params/prepare/
-//!                        trigger/pointer/close).
+//!   trigger/pointer/close).
 //! - `mixer`            — ALSA-style mixer control surface (volume,
-//!                        mute, jack-sense).
+//!   mute, jack-sense).
 //! - `format`           — Sample formats (S16/S24/S32 LE,
-//!                        44.1/48/96/192 kHz).
+//!   44.1/48/96/192 kHz).
 //!
 //! ## What this crate is for
 //!
@@ -480,6 +480,11 @@ pub mod tests_support {
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
+        // SAFETY: `raw_waker()` builds a `RawWaker` whose vtable functions
+        // satisfy the `Waker` contract: `clone` returns an equivalent
+        // `RawWaker`, and `wake`/`wake_by_ref`/`drop` are no-ops. The data
+        // pointer is null and is never dereferenced by any vtable function,
+        // so there is no aliasing or lifetime hazard.
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
         let mut boxed = alloc::boxed::Box::pin(fut);

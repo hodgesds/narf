@@ -76,24 +76,25 @@ pub fn supported() -> bool {
     edx & (1 << 16) != 0
 }
 
-/// Build the 8-byte PAT value (8 × 3-bit type codes, low byte =
-/// PA0 type). Encoded as one u64 — that's exactly the MSR layout.
-pub const fn encode(pa0: u8, pa1: u8, pa2: u8, pa3: u8, pa4: u8, pa5: u8, pa6: u8, pa7: u8) -> u64 {
-    (pa0 as u64) << 0
-        | (pa1 as u64) << 8
-        | (pa2 as u64) << 16
-        | (pa3 as u64) << 24
-        | (pa4 as u64) << 32
-        | (pa5 as u64) << 40
-        | (pa6 as u64) << 48
-        | (pa7 as u64) << 56
+/// Build the 8-byte PAT value from the eight PA entry type codes
+/// (`pa[0]` = PA0 type, in the low byte). Encoded as one u64 — that's
+/// exactly the `IA32_PAT` MSR layout.
+pub const fn encode(pa: [u8; 8]) -> u64 {
+    (pa[0] as u64)
+        | (pa[1] as u64) << 8
+        | (pa[2] as u64) << 16
+        | (pa[3] as u64) << 24
+        | (pa[4] as u64) << 32
+        | (pa[5] as u64) << 40
+        | (pa[6] as u64) << 48
+        | (pa[7] as u64) << 56
 }
 
 /// NARF's standard PAT layout. PA1 reprogrammed to WC so PTE.PWT=1
 /// gives write-combining. All other entries match the hardware
 /// reset default — code that didn't know about PAT before the
 /// reprogramming sees identical behaviour for PWT=0 pages.
-pub const NARF_PAT: u64 = encode(
+pub const NARF_PAT: u64 = encode([
     ty::WB,       // PA0
     ty::WC,       // PA1 — reprogrammed (was WT)
     ty::UC_MINUS, // PA2
@@ -102,7 +103,7 @@ pub const NARF_PAT: u64 = encode(
     ty::WC,       // PA5 — reprogrammed (was WT)
     ty::UC_MINUS, // PA6
     ty::UC,       // PA7
-);
+]);
 
 /// Read the currently-programmed `IA32_PAT`.
 pub fn read() -> u64 {
@@ -152,7 +153,7 @@ pub mod tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     fn smoke_pat_encode_round_trips() -> TestResult {
-        let v = encode(
+        let v = encode([
             ty::WB,
             ty::WC,
             ty::UC_MINUS,
@@ -161,7 +162,7 @@ pub mod tests {
             ty::WC,
             ty::UC_MINUS,
             ty::UC,
-        );
+        ]);
         // Spot-check bytes.
         if (v & 0xFF) as u8 != ty::WB {
             return TestResult::Fail("PA0 wrong");

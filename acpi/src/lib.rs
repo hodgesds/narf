@@ -2056,10 +2056,10 @@ pub fn acpi_enable() {
 pub fn gpe_block_status(b: GpeBlockInfo) -> alloc::vec::Vec<u8> {
     let half = (b.byte_count / 2) as usize;
     let mut out = alloc::vec![0u8; half];
-    for i in 0..half {
+    for (i, slot) in out.iter_mut().enumerate() {
         let port = (b.address + i as u64) as u16;
         // SAFETY: GPE block address from a checksummed FADT.
-        out[i] = unsafe { narf_arch::x86_64::io_port::inb(port) };
+        *slot = unsafe { narf_arch::x86_64::io_port::inb(port) };
     }
     out
 }
@@ -2076,10 +2076,10 @@ pub fn gpe_block_status_irq(b: GpeBlockInfo) -> ([u8; 32], usize) {
     let half = (b.byte_count / 2) as usize;
     let count = half.min(32);
     let mut buf = [0u8; 32];
-    for i in 0..count {
+    for (i, slot) in buf.iter_mut().enumerate().take(count) {
         let port = (b.address + i as u64) as u16;
         // SAFETY: GPE block address from a checksummed FADT.
-        buf[i] = unsafe { narf_arch::x86_64::io_port::inb(port) };
+        *slot = unsafe { narf_arch::x86_64::io_port::inb(port) };
     }
     (buf, count)
 }
@@ -2170,9 +2170,22 @@ fn parse_ecdt_body(body: &[u8]) {
 }
 
 /// Discover the Embedded Controller via ECDT.
+///
+/// # Safety
+/// `rsdp_phys` must point at an identity-mapped, checksum-valid RSDP,
+/// and every table it transitively references (XSDT/RSDT and the ECDT)
+/// must likewise be identity-mapped for the full `length` each header
+/// advertises. The caller must guarantee the ACPI tables are not
+/// concurrently remapped or freed for the duration of the call.
 pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
+    // SAFETY: caller guarantees `rsdp_phys` points at an identity-mapped
+    // RSDP large enough for `parse_rsdp`'s 36-byte read (its own contract).
     let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
     let mut ecdt: Option<u64> = None;
+    // SAFETY: `xsdt` is the physical address `parse_rsdp` just validated;
+    // the caller guarantees it (and its children) stay identity-mapped for
+    // the table's advertised length, satisfying `walk_xsdt`'s contract. The
+    // closure only records a child phys, no further dereference here.
     unsafe {
         walk_xsdt(xsdt, |phys, hdr| {
             if &hdr.signature == b"ECDT" {
@@ -2185,10 +2198,16 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
         None => return Ok(()),
     };
 
+    // SAFETY: `ecdt_phys` is a child pointer reported by `walk_xsdt`, which
+    // only yields it after confirming an `SdtHeader` is readable there;
+    // `read_unaligned` tolerates any alignment of the firmware-placed table.
     let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
     if total < SDT_HEADER_SIZE + 29 {
         return Err(AcpiError::BadXsdtSignature);
     }
+    // SAFETY: `total` is the header's self-reported `length`; the caller
+    // guarantees the ECDT is identity-mapped for that full span, so the
+    // `[u8; total]` slice stays within the mapped table.
     let body = unsafe { core::slice::from_raw_parts(ecdt_phys as *const u8, total) };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
@@ -3296,7 +3315,7 @@ fn parse_pcct_body(body: &[u8]) -> u32 {
         }
         let entry = &body[cur..cur + len];
 
-        if matches!(kind, 0 | 1 | 2) && entry.len() >= 62 {
+        if matches!(kind, 0..=2) && entry.len() >= 62 {
             // Generic PCCT channel layout (offsets within entry):
             //   8..16  = BaseAddress
             //   16..24 = Length

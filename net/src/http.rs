@@ -186,8 +186,8 @@ pub fn parse_headers(buf: &[u8]) -> Result<(Vec<HeaderField<'_>>, usize), HttpEr
             core::str::from_utf8(&buf[line_start..end]).map_err(|_| HttpError::BadFieldLine)?;
         let colon = line.find(':').ok_or(HttpError::BadFieldLine)?;
         let name = &line[..colon];
-        let value = line[colon + 1..].trim_start_matches(|c| c == ' ' || c == '\t');
-        let value = value.trim_end_matches(|c| c == ' ' || c == '\t');
+        let value = line[colon + 1..].trim_start_matches([' ', '\t']);
+        let value = value.trim_end_matches([' ', '\t']);
         fields.push(HeaderField { name, value });
         pos = end + 2;
     }

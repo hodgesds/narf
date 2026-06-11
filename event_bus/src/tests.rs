@@ -38,15 +38,13 @@ fn pump<F: core::future::Future>(mut fut: F) -> F::Output {
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is owned, we move it once into the pin.
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => {
-                // For these smokes we never expect Pending — every
-                // publish happens before next() is polled, or
-                // close()/revoke() makes it Ready.
-                return panic_pending::<F::Output>();
-            }
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => {
+            // For these smokes we never expect Pending — every
+            // publish happens before next() is polled, or
+            // close()/revoke() makes it Ready.
+            panic_pending::<F::Output>()
         }
     }
 }
@@ -470,7 +468,7 @@ fn smoke_event_bus_async_next_ready() -> TestResult {
     let mut sub = lookup_topic::<u32>(&reg_r, "user.testd.async").expect("lookup");
     publisher.publish(99).expect("publish");
     match pump(sub.next()) {
-        Ok((_seq, v)) if v == 99 => TestResult::Pass,
+        Ok((_seq, 99)) => TestResult::Pass,
         _ => TestResult::Fail("async next did not return value"),
     }
 }

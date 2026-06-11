@@ -62,6 +62,7 @@ pub fn pack(field: &Field, body: &mut [u8], values: &[i32]) -> Result<(), Report
         return Err(ReportError::UnsupportedSize);
     }
     let count = field.report_count as usize;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..count.min(values.len()) {
         let bit = field.bit_offset as u64 + (i as u64) * (size as u64);
         write_bits(body, bit, size as usize, values[i])?;

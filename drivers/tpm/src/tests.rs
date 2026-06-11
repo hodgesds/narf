@@ -364,7 +364,7 @@ mod smokes {
             return TestResult::Fail("sizeofSelect != 3");
         }
         // bitmap = all-ones
-        if &cmd[17..20] != &[0xFF, 0xFF, 0xFF] {
+        if cmd[17..20] != [0xFF, 0xFF, 0xFF] {
             return TestResult::Fail("PCR bitmap should be all-ones for full bank");
         }
         TestResult::Pass
@@ -403,7 +403,7 @@ mod smokes {
             return TestResult::Fail("hashAlg != SHA256");
         }
         // digest = 32 × 0xA5 at bytes 33..65
-        if &cmd[33..65] != &digest {
+        if cmd[33..65] != digest {
             return TestResult::Fail("digest bytes mismatch");
         }
         TestResult::Pass
@@ -430,9 +430,7 @@ mod smokes {
     // ── TPM2 ACPI table parse ─────────────────────────────────────────
 
     fn smoke_tpm2_table_parse() -> TestResult {
-        use crate::probe::{
-            parse_tpm2_table, Tpm2AcpiTable, ACPI_TPM2_COMMAND_BUFFER, TPM2_TABLE_MIN_LEN,
-        };
+        use crate::probe::{parse_tpm2_table, ACPI_TPM2_COMMAND_BUFFER, TPM2_TABLE_MIN_LEN};
         // Build a synthetic TPM2 ACPI table.
         let mut table = [0u8; TPM2_TABLE_MIN_LEN + 4];
         // Signature "TPM2"
@@ -634,7 +632,6 @@ mod smokes {
 
     // Minimal sync future poller for no_std tests.
     fn poll_once_sync<F: core::future::Future>(fut: F) -> Option<F::Output> {
-        use core::pin::Pin;
         use core::task::{Context, RawWaker, RawWakerVTable, Waker};
         unsafe fn no_clone(p: *const ()) -> RawWaker {
             RawWaker::new(p, &VTAB)
@@ -728,7 +725,7 @@ mod smokes {
             return TestResult::Fail("read did not return 20");
         }
         let expected = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
-        if &buf[12..20] != &expected {
+        if buf[12..20] != expected {
             crate::devfs_bridge::unregister_transport();
             return TestResult::Fail("response payload mismatch");
         }

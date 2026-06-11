@@ -579,6 +579,10 @@ fn smoke_evdev_reader_wait_future_resolves() -> TestResult {
         RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker)
     };
     let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: `raw` pairs a null data pointer with `VTABLE`, whose clone returns a
+    // fresh RawWaker over the same null pointer and the same `'static` VTABLE, while
+    // wake/wake_by_ref/drop are no-ops that never dereference the (unused) pointer.
+    // This satisfies the RawWaker contract, so `Waker::from_raw` is sound.
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
 

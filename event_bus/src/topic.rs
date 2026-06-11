@@ -137,7 +137,7 @@ impl TopicName {
     /// `true` if this name's root is one of `RESERVED_ROOTS`.
     pub fn is_reserved(&self) -> bool {
         let r = self.root();
-        RESERVED_ROOTS.iter().any(|&p| p == r)
+        RESERVED_ROOTS.contains(&r)
     }
 
     /// `true` if this name's root is `user`.

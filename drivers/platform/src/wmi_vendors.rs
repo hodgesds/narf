@@ -81,6 +81,7 @@ const LENOVO_YMC_EVENT_GUID: &str = "06129D99-6083-4164-81AD-F092F9D773A6";
 /// - Data2 (2 bytes, LE)
 /// - Data3 (2 bytes, LE)
 /// - Data4 (8 bytes, big-endian)
+///
 /// matching the mixed-endian encoding Microsoft uses in WMI _WDG.
 /// Reference: `wmi.c::wmi_guid_eq` + RFC 4122 §4.1.2.
 pub fn guid_str_to_bytes(s: &str) -> Option<[u8; 16]> {
@@ -90,18 +91,18 @@ pub fn guid_str_to_bytes(s: &str) -> Option<[u8; 16]> {
         return None;
     }
     let mut raw = [0u8; 16];
-    for i in 0..16 {
+    let nibble = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    for (i, byte) in raw.iter_mut().enumerate() {
         let hi = hex.as_bytes()[i * 2];
         let lo = hex.as_bytes()[i * 2 + 1];
-        let nibble = |b: u8| -> Option<u8> {
-            match b {
-                b'0'..=b'9' => Some(b - b'0'),
-                b'a'..=b'f' => Some(b - b'a' + 10),
-                b'A'..=b'F' => Some(b - b'A' + 10),
-                _ => None,
-            }
-        };
-        raw[i] = (nibble(hi)? << 4) | nibble(lo)?;
+        *byte = (nibble(hi)? << 4) | nibble(lo)?;
     }
     // The GUID string "AABBCCDD-EEFF-GGHH-IIJJ-KKLLMMNNOOPP"
     // stores Data1 = AABBCCDD as big-endian text but wire encoding
@@ -487,8 +488,8 @@ pub fn decode_lenovo_ymc_event(data: &[u8]) -> Option<LenovoEvent> {
     }
     let code = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     let tablet = match code {
-        0x01 => false,              // laptop mode
-        0x02 | 0x03 | 0x04 => true, // tablet / tent / stand
+        0x01 => false,       // laptop mode
+        0x02..=0x04 => true, // tablet / tent / stand
         _ => return Some(LenovoEvent::Unknown { raw: code }),
     };
     Some(LenovoEvent::TabletMode { on: tablet })
@@ -589,39 +590,39 @@ pub fn init() -> Result<(), WmiVendorError> {
 
     for g in &guids {
         if let Some(ref dell_desc) = dell_desc_bytes {
-            if &g.guid == dell_desc.as_slice() {
+            if g.guid == dell_desc.as_slice() {
                 DELL_DESCRIPTOR_FOUND.store(true, Ordering::Release);
             }
         }
         if let Some(ref hp_bios) = hp_bios_bytes {
-            if &g.guid == hp_bios.as_slice() {
+            if g.guid == hp_bios.as_slice() {
                 HP_BIOS_FOUND.store(true, Ordering::Release);
             }
         }
 
         if let Some(ref dell_ev) = dell_ev_bytes {
-            if &g.guid == dell_ev.as_slice() {
+            if g.guid == dell_ev.as_slice() {
                 subscribe_event(g, on_dell_event);
                 *DETECTED_VENDOR.lock() = Some(Vendor::Dell);
                 found = true;
             }
         }
         if let Some(ref hp_ev) = hp_ev_bytes {
-            if &g.guid == hp_ev.as_slice() {
+            if g.guid == hp_ev.as_slice() {
                 subscribe_event(g, on_hp_event);
                 *DETECTED_VENDOR.lock() = Some(Vendor::Hp);
                 found = true;
             }
         }
         if let Some(ref lenovo_ev) = lenovo_ev_bytes {
-            if &g.guid == lenovo_ev.as_slice() {
+            if g.guid == lenovo_ev.as_slice() {
                 subscribe_event(g, on_lenovo_hotkey_event);
                 *DETECTED_VENDOR.lock() = Some(Vendor::Lenovo);
                 found = true;
             }
         }
         if let Some(ref lenovo_ymc) = lenovo_ymc_bytes {
-            if &g.guid == lenovo_ymc.as_slice() {
+            if g.guid == lenovo_ymc.as_slice() {
                 subscribe_event(g, on_lenovo_ymc_event);
                 // YMC is a Lenovo-only GUID — set vendor if not already set.
                 let mut v = DETECTED_VENDOR.lock();

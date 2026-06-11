@@ -252,7 +252,7 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
     if va == 0 || pages == 0 {
         return;
     }
-    let total = narf_lib::smp::cpu_count() as u32;
+    let total = narf_lib::smp::cpu_count();
     if total <= 1 {
         return;
     }
@@ -321,7 +321,7 @@ pub unsafe fn shoot_tag_only(tag: u16) {
     if tag == 0 {
         return;
     }
-    let total = narf_lib::smp::cpu_count() as u32;
+    let total = narf_lib::smp::cpu_count();
     if total <= 1 {
         return;
     }

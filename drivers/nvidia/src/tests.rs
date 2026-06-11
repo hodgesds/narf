@@ -982,6 +982,7 @@ fn smoke_dcb_v30_entry_bit_layout() -> TestResult {
 }
 kernel_test_in!("drivers/nvidia/disp", smoke_dcb_v30_entry_bit_layout);
 
+#[allow(clippy::identity_op, clippy::eq_op)]
 fn smoke_dcb_mixed_version_table_routing() -> TestResult {
     // Older firmware sometimes writes a v3.0-layout table even when
     // the DCB header says v3.0, while newer firmware uses v4.x.

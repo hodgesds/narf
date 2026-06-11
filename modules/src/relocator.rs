@@ -163,7 +163,7 @@ pub fn apply_all_relas(
     bytes: &[u8],
     hdr: &Elf64Header,
     symbols: &SymbolTable,
-    placements: &mut Vec<SectionPlacement>,
+    placements: &mut [SectionPlacement],
     manifest: &Manifest,
 ) -> Result<usize, RelocatorError> {
     let mut total = 0usize;

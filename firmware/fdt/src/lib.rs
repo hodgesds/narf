@@ -812,6 +812,12 @@ mod heapless_str {
         }
     }
 
+    impl<const N: usize> Default for Bytes<N> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl<const N: usize> Bytes<N> {
         pub const fn new() -> Self {
             Self {
@@ -824,6 +830,9 @@ mod heapless_str {
         }
         pub fn len(&self) -> usize {
             self.len
+        }
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
         }
         pub fn extend(&mut self, src: &[u8]) {
             let n = src.len().min(N - self.len);

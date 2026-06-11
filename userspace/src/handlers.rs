@@ -768,14 +768,20 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let want_r = access_mode == 0 || access_mode == 2;
     let want_w = access_mode == 1 || access_mode == 2;
     if !narf_filesystem::posix_access_ok(
-        file_uid,
-        file_gid,
-        stat.mode.perms,
-        acc.uid,
-        acc.gid,
-        want_r,
-        want_w,
-        false,
+        narf_filesystem::FileOwner {
+            uid: file_uid,
+            gid: file_gid,
+            perms: stat.mode.perms,
+        },
+        narf_filesystem::Accessor {
+            uid: acc.uid,
+            gid: acc.gid,
+        },
+        narf_filesystem::AccessRequest {
+            read: want_r,
+            write: want_w,
+            exec: false,
+        },
     ) {
         ctx.set_return(fail);
         return;

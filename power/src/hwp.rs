@@ -37,7 +37,6 @@
 //!   (caps read → request program → enable sticky) is documented in
 //!   `intel_pstate_hwp_enable` / `intel_pstate_get_hwp_cap`.
 
-#![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -269,9 +268,10 @@ pub fn intel_hwp_summary() -> HwpSummary {
         let _ = writeln!(narf_console::Writer, "  hwp: enable #GP — firmware default");
         return HwpSummary::EnableGp;
     }
+    // bits 0..7 = min, 8..15 = max, 16..23 = desired (0 = autonomous,
+    // left unset), 24..31 = EPP.
     let req = (caps.lowest_perf as u64)
         | ((caps.highest_perf as u64) << 8)
-        | (0u64 << 16)
         | ((EPP_BALANCED_PERFORMANCE as u64) << 24);
     if wrmsr_or_gp(MSR_IA32_HWP_REQUEST, req).is_err() {
         let _ = writeln!(

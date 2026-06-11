@@ -149,11 +149,12 @@ impl<'g, T: 'static> Shared<'g, T> {
     pub fn as_ref(&self) -> Option<&'g T> {
         if self.ptr.is_null() {
             None
-        }
-        // SAFETY: the reader holds a live `ReadGuard` for `'g`; any
-        // `Owned<T>` whose publication we observed is retained by QSBR
-        // at least until the guard reports quiescence (i.e. drops).
-        else {
+        } else {
+            // SAFETY: the reader holds a live `ReadGuard` for `'g`; any
+            // `Owned<T>` whose publication we observed is retained by QSBR
+            // at least until the guard reports quiescence (i.e. drops). The
+            // pointer was non-null (checked above) and points at a valid
+            // `T` that outlives `'g`, so producing a `&'g T` is sound.
             Some(unsafe { &*self.ptr })
         }
     }

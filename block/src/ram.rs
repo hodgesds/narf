@@ -114,16 +114,12 @@ impl BlockDevice for RamBlockDevice {
         }
     }
 
-    fn flush(&self) -> impl Future<Output = ()> + Send {
-        async {}
-    }
+    async fn flush(&self) {}
 
-    fn discard(&self, _r: LbaRange) -> impl Future<Output = ()> + Send {
-        async {}
-    }
+    async fn discard(&self, _r: LbaRange) {}
 
-    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> + Send {
-        async { CancelResult::NotFound }
+    async fn cancel(&self, _tag: u64) -> CancelResult {
+        CancelResult::NotFound
     }
 }
 

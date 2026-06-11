@@ -293,7 +293,7 @@ mod tests {
         if cmd[16] != 3 {
             return TestResult::Fail("size of select = bitmap byte count (3)");
         }
-        if &cmd[17..20] != &[0x80, 0x00, 0x00] {
+        if cmd[17..20] != [0x80, 0x00, 0x00] {
             return TestResult::Fail("PCR-select bitmap should round-trip");
         }
         TestResult::Pass

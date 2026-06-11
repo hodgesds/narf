@@ -8,12 +8,12 @@
 //!   1.1+ devices, Memory-Mapped Component Registers).
 //!   §8.2.9.1 (Mailbox Capabilities + Control + Status registers).
 //!   §8.2.9.2 (Mailbox Command Format — opcode | input length |
-//!     command payload | return code | output length | output
-//!     payload).
+//!   command payload | return code | output length | output
+//!   payload).
 //!   §8.2.9.5 (Background Command Status register).
 //!   Table 8-44 (Component Command Set opcodes — Identify, Get FW
-//!     Info, Get Timestamp, Set Timestamp, Health Info & Alerts,
-//!     Get Supported Logs, Get Log).
+//!   Info, Get Timestamp, Set Timestamp, Health Info & Alerts,
+//!   Get Supported Logs, Get Log).
 //! - DSP0276 "MCTP over PCIe Vendor Defined Messages" — referenced
 //!   for the MCTP+CXL message-binding, not consumed here.
 //!   <https://www.dmtf.org/standards/pmci>

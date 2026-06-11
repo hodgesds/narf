@@ -190,7 +190,7 @@ impl core::fmt::Debug for AmdFchI2c {
 impl AmdFchI2c {
     /// Construct a controller against an already-decoded MMIO region
     /// + IRQ vector. Used both by `probe_all` (real discovery) and by
-    /// the smoke tests (synthetic backing buffer instead of MMIO).
+    ///   the smoke tests (synthetic backing buffer instead of MMIO).
     pub fn new(name: String, mmio_base: PhysAddr, mmio_len: u64, irq_vector: Option<u8>) -> Self {
         Self {
             name,
@@ -519,16 +519,22 @@ fn decode_ctrl_crs(path: &str) -> Option<CtrlResources> {
                 }
             }
             ResourceItem::AddressSpace32 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 // kind 0 = memory range
                 if mmio.is_none() {
                     mmio = Some((min as u64, length as u64));
                 }
             }
             ResourceItem::AddressSpace64 {
-                kind, min, length, ..
-            } if kind == 0 => {
+                kind: 0,
+                min,
+                length,
+                ..
+            } => {
                 if mmio.is_none() {
                     mmio = Some((min, length));
                 }

@@ -181,7 +181,7 @@ pub fn apply_aarch64(
                 return Err(RelocError::Overflow);
             }
             let imm = diff >> 2;
-            if imm < -(1 << 25) || imm >= (1 << 25) {
+            if !(-(1 << 25)..(1 << 25)).contains(&imm) {
                 return Err(RelocError::Overflow);
             }
             let imm_bits = (imm as u32) & 0x03FF_FFFF;
@@ -195,7 +195,7 @@ pub fn apply_aarch64(
             let page_val = val & !0xFFF;
             let page_place = place & !0xFFF;
             let diff = (page_val as i64).wrapping_sub(page_place as i64) >> 12;
-            if diff < -(1 << 20) || diff >= (1 << 20) {
+            if !(-(1 << 20)..(1 << 20)).contains(&diff) {
                 return Err(RelocError::Overflow);
             }
             let imm = diff as u32;

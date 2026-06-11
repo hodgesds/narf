@@ -84,7 +84,7 @@ fn smoke_aml_synthetic_scope_and_name() -> TestResult {
         None => return TestResult::Fail("\\X._HID missing"),
     };
     match hid.value {
-        Some(crate::NameValue::Integer(v)) if v == 0x12345678 => {}
+        Some(crate::NameValue::Integer(0x12345678)) => {}
         _ => return TestResult::Fail("_HID value didn't decode"),
     }
     TestResult::Pass
@@ -184,17 +184,17 @@ fn smoke_aml_eval_if_lequal() -> TestResult {
                                                  // PkgLength for If: 1 (PkgLength byte) + pred.len() + if_body.len()
     let if_pkg_total = 1 + pred.len() + if_body.len();
 
-    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    body.push(0x70);
-    body.push(0x0A);
-    body.push(0x10);
-    body.push(0x60); // Store(0x10, Local0)
-    body.push(0xA0);
-    body.push(if_pkg_total as u8); // IfOp PkgLength
+    let mut body: alloc::vec::Vec<u8> = alloc::vec![
+        0x70,
+        0x0A,
+        0x10,
+        0x60, // Store(0x10, Local0)
+        0xA0,
+        if_pkg_total as u8, // IfOp PkgLength
+    ];
     body.extend_from_slice(pred); // predicate
     body.extend_from_slice(if_body); // then-body
-    body.push(0xA4);
-    body.push(0x00); // Return(Zero)
+    body.extend_from_slice(&[0xA4, 0x00]); // Return(Zero)
 
     let blob = build_eval_method_blob(b"EV2_", 0, &body);
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
@@ -215,16 +215,16 @@ fn smoke_aml_eval_while_increment() -> TestResult {
                                                  // PkgLength for While: 1 (PkgLength byte) + pred.len() + while_body.len()
     let while_pkg_total = 1 + pred.len() + while_body.len();
 
-    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    body.push(0x70);
-    body.push(0x00);
-    body.push(0x60); // Store(0, Local0)
-    body.push(0xA2);
-    body.push(while_pkg_total as u8); // WhileOp PkgLength
+    let mut body: alloc::vec::Vec<u8> = alloc::vec![
+        0x70,
+        0x00,
+        0x60, // Store(0, Local0)
+        0xA2,
+        while_pkg_total as u8, // WhileOp PkgLength
+    ];
     body.extend_from_slice(pred);
     body.extend_from_slice(while_body);
-    body.push(0xA4);
-    body.push(0x60); // Return(Local0)
+    body.extend_from_slice(&[0xA4, 0x60]); // Return(Local0)
 
     let blob = build_eval_method_blob(b"EV3_", 0, &body);
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
@@ -288,7 +288,7 @@ fn smoke_aml_resource_irq_io_endtag() -> TestResult {
             if *mask != 0x0010 {
                 return TestResult::Fail("IRQ mask wrong");
             }
-            if *flags != None {
+            if flags.is_some() {
                 return TestResult::Fail("IRQ flags should be None");
             }
         }
@@ -600,7 +600,7 @@ kernel_test_in!("aml", smoke_aml_resource_gpio_io_decode);
 fn smoke_aml_resource_serial_bus_unknown_type_falls_through() -> TestResult {
     // Bus type 2 = SPI. Not decoded yet; should land in Unknown
     // rather than asserting/panicking.
-    let payload_len = 9u16 + 0 + 0;
+    let payload_len = 9u16;
     let mut buf = alloc::vec::Vec::new();
     buf.push(0x8E);
     buf.extend_from_slice(&payload_len.to_le_bytes());
@@ -650,7 +650,7 @@ fn smoke_aml_prt_decode() -> TestResult {
     if e0.pin != 0 {
         return TestResult::Fail("e0 pin wrong");
     }
-    if e0.source != None {
+    if e0.source.is_some() {
         return TestResult::Fail("e0 source should be None");
     }
     if e0.source_index != 16 {
@@ -858,15 +858,9 @@ fn smoke_aml_oregion_pci_config_resolves() -> TestResult {
     crate::oregion::__reset_for_test();
 
     // ── Build AML ────────────────────────────────────────────────────
-    let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-
-    // Device(\PCIT): 0x5B 0x82
-    body.push(0x5B);
-    body.push(0x82);
-    // PkgLength = 46
-    body.push(46);
-    // Rooted NameString: root char + "PCIT"
-    body.push(b'\\');
+    // Device(\PCIT): 0x5B 0x82, PkgLength = 46, rooted NameString '\'
+    let mut body: alloc::vec::Vec<u8> = alloc::vec![0x5B, 0x82, 46, b'\\'];
+    // Rooted NameString: "PCIT"
     body.extend_from_slice(b"PCIT");
 
     // Name(_BBN, 0x00)
@@ -1234,23 +1228,14 @@ fn smoke_aml_sync_stall_sleep_no_trap() -> TestResult {
     // Method(\SM3_, 0) { Stall(10); Sleep(1); Return(0x42) }
     use alloc::vec::Vec;
 
-    let mut body: Vec<u8> = Vec::new();
-    body.push(0x5B);
-    body.push(0x21); // StallOp
-    body.push(0x0A);
-    body.push(10); // BytePrefix 10
-    body.push(0x5B);
-    body.push(0x22); // SleepOp
-    body.push(0x0A);
-    body.push(1); // BytePrefix 1
-    body.push(0xA4); // ReturnOp
-    body.push(0x0A);
-    body.push(0x42); // BytePrefix 0x42
+    let body: Vec<u8> = alloc::vec![
+        0x5B, 0x21, 0x0A, 10, // Stall(10): StallOp BytePrefix 10
+        0x5B, 0x22, 0x0A, 1, // Sleep(1): SleepOp BytePrefix 1
+        0xA4, 0x0A, 0x42, // Return(0x42): ReturnOp BytePrefix 0x42
+    ];
 
     let pkg_total = 1 + 1 + 4 + 1 + body.len();
-    let mut blob: Vec<u8> = Vec::new();
-    blob.push(0x14);
-    blob.push(pkg_total as u8);
+    let mut blob: Vec<u8> = alloc::vec![0x14, pkg_total as u8];
     blob.extend_from_slice(&name_seg_root(b"SM3_"));
     blob.push(0x00);
     blob.extend_from_slice(&body);
@@ -1306,9 +1291,8 @@ fn smoke_aml_sync_notify_dispatch() -> TestResult {
     }
 
     NOTIFY_VAL.store(0, Ordering::Relaxed);
-    match crate::eval::evaluate_method("\\SM4", &[]) {
-        Err(_) => return TestResult::Fail("evaluate_method \\SM4 failed"),
-        Ok(_) => {}
+    if crate::eval::evaluate_method("\\SM4", &[]).is_err() {
+        return TestResult::Fail("evaluate_method \\SM4 failed");
     }
     if NOTIFY_VAL.load(Ordering::Relaxed) == 5 {
         TestResult::Pass
@@ -1540,40 +1524,26 @@ fn smoke_aml_prt_evaluation_round_trip() -> TestResult {
     crate::__reset_for_test();
 
     // inner Package(4) { 0x0001FFFF, 0, 0, 16 }
-    let inner1: alloc::vec::Vec<u8> = {
-        let mut v = alloc::vec::Vec::new();
-        v.push(0x12); // PackageOp
-        v.push(0x0B); // PkgLen = 11
-        v.push(0x04); // NumElements = 4
-        v.push(0x0C);
-        v.push(0xFF);
-        v.push(0xFF);
-        v.push(0x01);
-        v.push(0x00);
-        v.push(0x00); // ZeroOp
-        v.push(0x00); // ZeroOp
-        v.push(0x0A);
-        v.push(0x10); // BytePrefix 16
-        v
-    };
+    let inner1: alloc::vec::Vec<u8> = alloc::vec![
+        0x12, // PackageOp
+        0x0B, // PkgLen = 11
+        0x04, // NumElements = 4
+        0x0C, 0xFF, 0xFF, 0x01, 0x00, // DWord 0x0001FFFF
+        0x00, // ZeroOp
+        0x00, // ZeroOp
+        0x0A, 0x10, // BytePrefix 16
+    ];
 
     // inner Package(4) { 0x0002FFFF, 1, 0, 17 }
-    let inner2: alloc::vec::Vec<u8> = {
-        let mut v = alloc::vec::Vec::new();
-        v.push(0x12); // PackageOp
-        v.push(0x0B); // PkgLen = 11
-        v.push(0x04); // NumElements = 4
-        v.push(0x0C);
-        v.push(0xFF);
-        v.push(0xFF);
-        v.push(0x02);
-        v.push(0x00);
-        v.push(0x01); // OneOp (1)
-        v.push(0x00); // ZeroOp (0)
-        v.push(0x0A);
-        v.push(0x11); // BytePrefix 17
-        v
-    };
+    let inner2: alloc::vec::Vec<u8> = alloc::vec![
+        0x12, // PackageOp
+        0x0B, // PkgLen = 11
+        0x04, // NumElements = 4
+        0x0C, 0xFF, 0xFF, 0x02, 0x00, // DWord 0x0002FFFF
+        0x01, // OneOp (1)
+        0x00, // ZeroOp (0)
+        0x0A, 0x11, // BytePrefix 17
+    ];
 
     // outer Package(2) { inner1, inner2 }
     let outer_pkg: alloc::vec::Vec<u8> = {
@@ -1675,11 +1645,8 @@ fn smoke_aml_crs_evaluation_round_trip() -> TestResult {
     ];
 
     let buffer: alloc::vec::Vec<u8> = {
-        let mut v = alloc::vec::Vec::new();
-        v.push(0x11); // BufferOp
-        v.push(0x10); // PkgLen = 16
-        v.push(0x0A);
-        v.push(0x0D); // BytePrefix 13 (size TermArg)
+        // BufferOp, PkgLen = 16, BytePrefix 13 (size TermArg).
+        let mut v: alloc::vec::Vec<u8> = alloc::vec![0x11, 0x10, 0x0A, 0x0D];
         v.extend_from_slice(&res_bytes);
         v
     };
@@ -2007,11 +1974,8 @@ fn smoke_aml_evaluate_dsm_returns_value() -> TestResult {
     // Device(\TSTD): 0x5B 0x82 PkgLen \TSTD body
     // PkgLen content = 1 (PkgLen) + 1 (root) + 4 (NameSeg) + method_blob.len()
     let dev_pkg = 1 + 1 + 4 + method_blob.len();
-    let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    blob.push(0x5B);
-    blob.push(0x82);
-    blob.push(dev_pkg as u8);
-    blob.push(b'\\');
+    // DeviceOp (0x5B 0x82), PkgLength, rooted NameString '\' "TSTD".
+    let mut blob: alloc::vec::Vec<u8> = alloc::vec![0x5B, 0x82, dev_pkg as u8, b'\\'];
     blob.extend_from_slice(b"TSTD");
     blob.extend_from_slice(&method_blob);
     if crate::__parse_body_for_test(&blob, "\\").is_err() {

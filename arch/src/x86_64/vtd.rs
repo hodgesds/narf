@@ -477,7 +477,9 @@ unsafe fn w64(base: usize, off: usize, v: u64) {
 pub unsafe fn read_caps(reg_base: usize) -> VtdCaps {
     // SAFETY: caller-asserted.
     let ver = unsafe { r32(reg_base, VTD_VER) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let cap = unsafe { r64(reg_base, VTD_CAP) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let ecap = unsafe { r64(reg_base, VTD_ECAP) };
     decode_caps(ver, cap, ecap)
 }
@@ -504,15 +506,29 @@ pub unsafe fn read_gsts(reg_base: usize) -> u32 {
     unsafe { r32(reg_base, VTD_GSTS) }
 }
 
+/// Write the VT-d Global Command register.
+///
+/// # Safety
+/// `reg_base` must be the VT-d engine's MMIO mapping. The caller owns the
+/// command-bit sequencing (e.g. SRTP/TE ordering and the matching `GSTS`
+/// poll) — an out-of-order command can leave the IOMMU in a broken state.
 pub unsafe fn write_gcmd(reg_base: usize, bits: u32) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts `reg_base` is the engine's MMIO base; `w32`
+    // writes the GCMD register at the in-range `VTD_GCMD` offset.
     unsafe {
         w32(reg_base, VTD_GCMD, bits);
     }
 }
 
+/// Write the VT-d Root-Table Address register.
+///
+/// # Safety
+/// `reg_base` must be the VT-d engine's MMIO mapping. `paddr` must be the
+/// physical address of a valid, page-aligned root table that outlives the
+/// IOMMU's use of it.
 pub unsafe fn write_rtaddr(reg_base: usize, paddr: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts `reg_base` is the engine's MMIO base; `w64`
+    // writes the RTADDR register at the in-range `VTD_RTADDR` offset.
     unsafe {
         w64(reg_base, VTD_RTADDR, paddr);
     }
@@ -528,6 +544,7 @@ pub unsafe fn write_rtaddr(reg_base: usize, paddr: u64) {
 pub unsafe fn enable_translation(reg_base: usize) {
     // SAFETY: caller-asserted.
     let gsts = unsafe { read_gsts(reg_base) };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         write_gcmd(reg_base, gsts | GCMD_TE);
     }

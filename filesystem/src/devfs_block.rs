@@ -221,7 +221,7 @@ impl FileOps for BlockFile {
     fn stat(&self) -> Stat {
         let size = self.byte_capacity();
         let bs = self.block_size as u64;
-        let blocks = (size + bs - 1) / bs;
+        let blocks = size.div_ceil(bs);
         Stat {
             size,
             blocks,

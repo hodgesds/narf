@@ -255,7 +255,7 @@ pub fn encode_error_code(error_code: u16, reason: &str) -> Vec<u8> {
 }
 
 /// Decode an ERROR-CODE attribute body → (error_code, reason).
-pub fn decode_error_code<'a>(body: &'a [u8]) -> Result<(u16, &'a str), StunError> {
+pub fn decode_error_code(body: &[u8]) -> Result<(u16, &str), StunError> {
     if body.len() < 4 {
         return Err(StunError::Short);
     }

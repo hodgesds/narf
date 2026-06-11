@@ -230,11 +230,12 @@ pub unsafe fn find_aer_cap_offset(cfg_phys: u64) -> Option<u16> {
     // Bound the walk so a corrupted next-pointer can't loop us
     // forever; the extended config space is at most 4 KiB.
     for _ in 0..256 {
-        if off == 0 || off < 0x100 || off >= 0x1000 {
+        if !(0x100..0x1000).contains(&off) {
             return None;
         }
-        // SAFETY: caller-asserted live config space; offset
-        // bounded above.
+        // SAFETY: caller-asserted live 4 KiB config space at cfg_phys; `off` is
+        // bounded to 0x100..0x1000 above and read as a dword, so cfg_phys+off is
+        // a readable, in-window MMIO address.
         let header = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if header == 0 || header == u32::MAX {
             return None;
@@ -404,9 +405,9 @@ impl RootErrorStatus {
             UeSeverity::Severe
         } else if self.fatal_nonfatal_received {
             UeSeverity::NonFatal
-        } else if self.corr_received {
-            UeSeverity::None // correctable — not an UE
         } else {
+            // A correctable-only error (or no error at all) is not an
+            // uncorrectable error, so its UE severity is None.
             UeSeverity::None
         }
     }
@@ -498,10 +499,12 @@ pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
     // Walk the extended cap list from 0x100.
     let mut off: u16 = 0x100;
     for _ in 0..256 {
-        if off == 0 || off < 0x100 || off >= 0x1000 {
+        if !(0x100..0x1000).contains(&off) {
             return None;
         }
-        // SAFETY: caller-asserted; offset bounded.
+        // SAFETY: caller-asserted live 4 KiB config page at cfg_phys; `off` is
+        // bounded to 0x100..0x1000 above and read as a dword, so cfg_phys+off is
+        // a readable, in-window MMIO address.
         let hdr = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if hdr == 0 || hdr == 0xFFFF_FFFF {
             return None;
@@ -662,6 +665,10 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
                     (cfg_phys + aer + regs::UNCORRECTABLE_ERROR_STATUS as u64) as *const u32,
                 )
             };
+            // SAFETY: `aer` was returned by the cap walk and points at this
+            // device's AER capability block, which is 0x40 bytes inside the same
+            // live config page at cfg_phys; the Correctable Error Status dword is
+            // within that block, so the address is readable and in-window.
             let ce = unsafe {
                 core::ptr::read_volatile(
                     (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64) as *const u32,

@@ -97,7 +97,7 @@ impl CoolingDevice for AcpiFan {
             // Map 0..=255 onto 1..=max_level. `level == 0` is already
             // handled by the off path above.
             let span = self.max_level as u64;
-            let step = (level as u64 * span + 254) / 255;
+            let step = (level as u64 * span).div_ceil(255);
             let step = step.max(1).min(span);
             self.call_with("_FSL", step);
         }
@@ -233,6 +233,10 @@ impl CoolingDevice for PwmFan {
             // PwmFan; safe to dereference for the duration of
             // this task.
             let target = unsafe { &*(target_ptr as *const core::sync::atomic::AtomicU8) };
+            // SAFETY: inflight_ptr was formed from &self.worker_inflight above;
+            // self is a PwmFan kept alive by an Arc in the fan registry for the
+            // lifetime of this task, so the AtomicBool it points at is live and
+            // properly aligned for the whole loop below.
             let inflight = unsafe { &*(inflight_ptr as *const core::sync::atomic::AtomicBool) };
             // Standard PC / Intel 4-wire fan: 25 kHz PWM.
             const FREQ: u32 = 25_000;

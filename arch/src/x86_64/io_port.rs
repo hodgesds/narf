@@ -5,6 +5,11 @@ use core::arch::asm;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 /// Read a byte from I/O port `port`.
+///
+/// # Safety
+/// Must be called at CPL=0 (or with IOPL permitting). Reading a port can have
+/// device-visible side effects; the caller must ensure `port` addresses a
+/// device that tolerates a byte read and that no conflicting access races it.
 #[inline(always)]
 pub unsafe fn inb(port: u16) -> u8 {
     let value: u8;
@@ -20,6 +25,11 @@ pub unsafe fn inb(port: u16) -> u8 {
 }
 
 /// Write a byte to I/O port `port`.
+///
+/// # Safety
+/// Must be called at CPL=0 (or with IOPL permitting). A port write drives the
+/// I/O fabric and can reprogram hardware; the caller owns the correctness of
+/// `port`, `value`, and any required access ordering (e.g. UART DLAB toggles).
 #[inline(always)]
 pub unsafe fn outb(port: u16, value: u8) {
     compiler_fence(Ordering::SeqCst);
@@ -33,6 +43,11 @@ pub unsafe fn outb(port: u16, value: u8) {
 }
 
 /// Read a 16-bit word from I/O port `port`.
+///
+/// # Safety
+/// Must be called at CPL=0 (or with IOPL permitting). Reading a port can have
+/// device-visible side effects; the caller must ensure `port` addresses a
+/// device that tolerates a word read and that no conflicting access races it.
 #[inline(always)]
 pub unsafe fn inw(port: u16) -> u16 {
     let value: u16;
@@ -47,6 +62,11 @@ pub unsafe fn inw(port: u16) -> u16 {
 }
 
 /// Write a 16-bit word to I/O port `port`.
+///
+/// # Safety
+/// Must be called at CPL=0 (or with IOPL permitting). A port write drives the
+/// I/O fabric and can reprogram hardware; the caller owns the correctness of
+/// `port`, `value`, and any required access ordering.
 #[inline(always)]
 pub unsafe fn outw(port: u16, value: u16) {
     compiler_fence(Ordering::SeqCst);

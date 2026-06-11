@@ -166,24 +166,22 @@ impl ThermalZone {
     /// Read all trip points from this zone in one shot. Missing
     /// methods are returned as `None`; never errors.
     pub fn trip_points(&self) -> ThermalTripPoints {
-        let mut tp = ThermalTripPoints::default();
-        tp.critical_milli_c = self.read_dk_milli("_CRT");
-        tp.hot_milli_c = self.read_dk_milli("_HOT");
-        tp.passive_milli_c = self.read_dk_milli("_PSV");
-        for i in 0..10 {
+        let mut active_milli_c = [None; 10];
+        for (i, slot) in active_milli_c.iter_mut().enumerate() {
             // Method names are `_AC0` .. `_AC9`; assemble cheaply.
-            let mut name = [0u8; 4];
-            name[0] = b'_';
-            name[1] = b'A';
-            name[2] = b'C';
-            name[3] = b'0' + i as u8;
+            let name = [b'_', b'A', b'C', b'0' + i as u8];
             // SAFETY: bytes 0..=9 are all valid ASCII.
             let s = core::str::from_utf8(&name).unwrap();
-            tp.active_milli_c[i] = self.read_dk_milli(s);
+            *slot = self.read_dk_milli(s);
         }
-        tp.tc1 = self.read_int("_TC1");
-        tp.tc2 = self.read_int("_TC2");
-        tp
+        ThermalTripPoints {
+            critical_milli_c: self.read_dk_milli("_CRT"),
+            hot_milli_c: self.read_dk_milli("_HOT"),
+            passive_milli_c: self.read_dk_milli("_PSV"),
+            active_milli_c,
+            tc1: self.read_int("_TC1"),
+            tc2: self.read_int("_TC2"),
+        }
     }
 
     /// Helper: read a method that returns deciKelvin, convert to
@@ -361,7 +359,7 @@ pub fn enumerate() -> Vec<ThermalZone> {
         // Skip duplicates — a zone CAN have both forms (one declares
         // a ThermalZone(...) block, the other declares a Device(...)
         // with HID=PNP0C0F that contains the same methods).
-        if !paths.iter().any(|p| *p == node.path) {
+        if !paths.contains(&node.path) {
             paths.push(node.path);
         }
     }
@@ -420,7 +418,7 @@ pub fn register_with_generic_registry(cap: &Cap<generic::Thermal, Grant>) -> usi
         let warn_milli = trips
             .passive_milli_c
             .or(trips.active_milli_c[0])
-            .unwrap_or_else(|| crit_milli / 2);
+            .unwrap_or(crit_milli / 2);
         if let Ok(id) = generic::register_zone(cap, &zone.path, warn_milli, crit_milli) {
             bridge.push((zone.path.clone(), id));
             newly_registered += 1;
@@ -489,12 +487,16 @@ mod tests {
         // Trips: _CRT=100 C, _HOT=95 C, _PSV=85 C, _AC0=75 C, _AC1=65 C.
         // The classifier must report Critical when t >= _CRT, even
         // though every lower trip is also crossed.
-        let mut trips = ThermalTripPoints::default();
-        trips.critical_milli_c = Some(100_000);
-        trips.hot_milli_c = Some(95_000);
-        trips.passive_milli_c = Some(85_000);
-        trips.active_milli_c[0] = Some(75_000);
-        trips.active_milli_c[1] = Some(65_000);
+        let mut active_milli_c = [None; 10];
+        active_milli_c[0] = Some(75_000);
+        active_milli_c[1] = Some(65_000);
+        let trips = ThermalTripPoints {
+            critical_milli_c: Some(100_000),
+            hot_milli_c: Some(95_000),
+            passive_milli_c: Some(85_000),
+            active_milli_c,
+            ..Default::default()
+        };
 
         if classify(105_000, &trips) != ActiveTrip::Critical {
             return TestResult::Fail("105 C with _CRT=100 should be Critical");
@@ -533,9 +535,11 @@ mod tests {
     fn smoke_acpi_thermal_classify_sparse_trips() -> TestResult {
         // Many real-world DSDTs only export _CRT + _TMP. Confirm the
         // classifier handles unbounded ranges gracefully.
-        let mut trips = ThermalTripPoints::default();
-        trips.critical_milli_c = Some(100_000);
         // No _HOT / _PSV / _AC*.
+        let trips = ThermalTripPoints {
+            critical_milli_c: Some(100_000),
+            ..Default::default()
+        };
 
         if classify(99_999, &trips) != ActiveTrip::None {
             return TestResult::Fail("99.999 C with only _CRT=100 should be None");
@@ -574,8 +578,10 @@ mod tests {
 
     fn smoke_acpi_thermal_psv_trip_passive_cooling() -> TestResult {
         // _PSV = 75 C = 75_000 milli-C. Boundary and above → Passive.
-        let mut trips = ThermalTripPoints::default();
-        trips.passive_milli_c = Some(75_000);
+        let trips = ThermalTripPoints {
+            passive_milli_c: Some(75_000),
+            ..Default::default()
+        };
 
         // Below PSV: still None.
         if classify(74_999, &trips) != ActiveTrip::None {
@@ -599,10 +605,14 @@ mod tests {
     fn smoke_acpi_thermal_acx_fan_engagement() -> TestResult {
         // _AC0 = 70 C, _AC1 = 60 C, _PSV = 80 C.
         // ACPI §11.4.5: Passive > Active; lower index is more aggressive.
-        let mut trips = ThermalTripPoints::default();
-        trips.passive_milli_c = Some(80_000);
-        trips.active_milli_c[0] = Some(70_000);
-        trips.active_milli_c[1] = Some(60_000);
+        let mut active_milli_c = [None; 10];
+        active_milli_c[0] = Some(70_000);
+        active_milli_c[1] = Some(60_000);
+        let trips = ThermalTripPoints {
+            passive_milli_c: Some(80_000),
+            active_milli_c,
+            ..Default::default()
+        };
 
         // 65 C: above _AC1 (60) but below _AC0 (70) → Active(1).
         match classify(65_000, &trips) {

@@ -1421,7 +1421,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
     // runtime, so amortizing it across all commands is the big win.
     // The VM keeps its full multi-vCPU/NUMA topology so concurrency
     // bugs still surface.
-    let (passed, failed) = run_interactive_multi(args, &cases)?;
+    let (passed, failed) = run_interactive_multi(args, cases)?;
     eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);

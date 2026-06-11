@@ -1458,6 +1458,7 @@ pub unsafe fn execve(
     // char *const argv[], char *const envp[])`. The kernel
     // resolves the path through the VFS, reads the ELF file
     // server-side, and never returns to the caller on success.
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_EXECVE, path as u64, argv as u64, envp as u64) };
     if r == 0 {
         Ok(())
@@ -1645,16 +1646,19 @@ pub unsafe fn sigreturn_with(sc_vaddr: u64) -> ! {
 /// either return through normal ABI or rewrite the trap frame.
 #[inline]
 pub unsafe fn syscall0_raw(num: u64) -> u64 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     unsafe { syscall0(num) }
 }
 
 #[inline]
 pub unsafe fn syscall2_raw(num: u64, a0: u64, a1: u64) -> u64 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     unsafe { syscall2(num, a0, a1) }
 }
 
 #[inline]
 pub unsafe fn syscall3_raw(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     unsafe { syscall3(num, a0, a1, a2) }
 }
 
@@ -1669,18 +1673,21 @@ pub unsafe fn syscall3_raw(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
 /// ready events, 0 on timeout, -1 on error.
 #[inline]
 pub fn poll(pollfds: *mut u8, n: usize, timeout_ms: i32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_POLL, pollfds as u64, n as u64, timeout_ms as i64 as u64) };
     r as i32
 }
 
 #[inline]
 pub fn epoll_create(flags: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall1(SYS_EPOLL_CREATE, flags as u64) };
     r as i32
 }
 
 #[inline]
 pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event: *const u8) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall4(
             SYS_EPOLL_CTL,
@@ -1695,6 +1702,7 @@ pub fn epoll_ctl(epfd: i32, op: u32, fd: i32, event: *const u8) -> i32 {
 
 #[inline]
 pub fn epoll_wait(epfd: i32, events_out: *mut u8, max: i32, timeout_ms: i32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall4(
             SYS_EPOLL_WAIT,
@@ -1709,18 +1717,21 @@ pub fn epoll_wait(epfd: i32, events_out: *mut u8, max: i32, timeout_ms: i32) -> 
 
 #[inline]
 pub fn eventfd(initval: u64, flags: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall2(SYS_EVENTFD, initval, flags as u64) };
     r as i32
 }
 
 #[inline]
 pub fn timerfd_create(clockid: u32, flags: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall2(SYS_TIMERFD_CREATE, clockid as u64, flags as u64) };
     r as i32
 }
 
 #[inline]
 pub fn timerfd_settime(fd: i32, flags: u32, new_value: *const u8, old_value: *mut u8) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall4(
             SYS_TIMERFD_SETTIME,
@@ -1735,6 +1746,7 @@ pub fn timerfd_settime(fd: i32, flags: u32, new_value: *const u8, old_value: *mu
 
 #[inline]
 pub fn signalfd(fd: i32, mask_ptr: *const u64, sizemask: usize, flags: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall4(
             SYS_SIGNALFD,
@@ -1750,6 +1762,7 @@ pub fn signalfd(fd: i32, mask_ptr: *const u64, sizemask: usize, flags: u32) -> i
 /// `socket(domain, type, protocol)` — returns a new socket fd or -1.
 #[inline]
 pub fn socket(domain: u32, kind: u32, proto: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_SOCKET, domain as u64, kind as u64, proto as u64) };
     r as i32
 }
@@ -1757,6 +1770,7 @@ pub fn socket(domain: u32, kind: u32, proto: u32) -> i32 {
 /// `bind(fd, addr, addrlen)`. Returns 0 on success, -1 on failure.
 #[inline]
 pub fn bind(fd: i32, addr: *const u8, addrlen: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_BIND, fd as u64, addr as u64, addrlen as u64) };
     r as i32
 }
@@ -1764,6 +1778,7 @@ pub fn bind(fd: i32, addr: *const u8, addrlen: u32) -> i32 {
 /// `listen(fd, backlog)`.
 #[inline]
 pub fn listen(fd: i32, backlog: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall2(SYS_LISTEN, fd as u64, backlog as u64) };
     r as i32
 }
@@ -1772,6 +1787,7 @@ pub fn listen(fd: i32, backlog: u32) -> i32 {
 /// fd or -1. addr_out / addrlen_out may be NULL.
 #[inline]
 pub fn accept(fd: i32, addr_out: *mut u8, addrlen_out: *mut u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_ACCEPT, fd as u64, addr_out as u64, addrlen_out as u64) };
     r as i32
 }
@@ -1779,6 +1795,7 @@ pub fn accept(fd: i32, addr_out: *mut u8, addrlen_out: *mut u32) -> i32 {
 /// `connect(fd, addr, addrlen)`.
 #[inline]
 pub fn connect(fd: i32, addr: *const u8, addrlen: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_CONNECT, fd as u64, addr as u64, addrlen as u64) };
     r as i32
 }
@@ -1794,6 +1811,7 @@ pub fn sendto(
     addr: *const u8,
     addrlen: u32,
 ) -> isize {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall6(
             SYS_SOCKET_SEND,
@@ -1818,6 +1836,7 @@ pub fn recvfrom(
     addr_out: *mut u8,
     addrlen_out: *mut u32,
 ) -> isize {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall6(
             SYS_SOCKET_RECV,
@@ -1835,6 +1854,7 @@ pub fn recvfrom(
 /// `shutdown(fd, how)`. how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR.
 #[inline]
 pub fn shutdown(fd: i32, how: u32) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall2(SYS_SHUTDOWN, fd as u64, how as u64) };
     r as i32
 }
@@ -1843,6 +1863,7 @@ pub fn shutdown(fd: i32, how: u32) -> i32 {
 /// an opaque buf_id usable in `send_zc`.
 #[inline]
 pub fn sock_register_buffer(ptr: *const u8, len: usize) -> i32 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall2(SYS_SOCK_REGISTER_BUF, ptr as u64, len as u64) };
     r as i32
 }
@@ -1850,6 +1871,7 @@ pub fn sock_register_buffer(ptr: *const u8, len: usize) -> i32 {
 /// ZC fast path: send a slice of a registered buffer over `fd`.
 #[inline]
 pub fn sock_send_zc(fd: i32, buf_id: u32, off: u64, len: u64, flags: u32) -> isize {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe {
         syscall5(
             SYS_SOCK_SEND_ZC,

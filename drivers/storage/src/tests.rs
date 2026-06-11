@@ -892,7 +892,7 @@ fn smoke_emmc_ext_csd_boot_and_rpmb_size_mult() -> TestResult {
     if ext.boot_partition_bytes() != 4 * 1024 * 1024 {
         return TestResult::Fail("boot partition size formula: mult × 128 KiB");
     }
-    if ext.rpmb_partition_bytes() != 1 * 1024 * 1024 {
+    if ext.rpmb_partition_bytes() != 1024 * 1024 {
         return TestResult::Fail("RPMB partition size formula: mult × 128 KiB");
     }
     TestResult::Pass
@@ -1003,7 +1003,7 @@ fn smoke_ufs_command_upiu_layout() -> TestResult {
         return TestResult::Fail("Expected Data Length lost");
     }
 
-    if &buf[16..16 + cdb.len()] != cdb {
+    if buf[16..16 + cdb.len()] != cdb {
         return TestResult::Fail("CDB lost");
     }
 

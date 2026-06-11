@@ -69,7 +69,6 @@
 //! Intel / AMD / ACPI specs and Linux is cross-checked for the
 //! algorithm shape.
 
-#![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -298,7 +297,7 @@ pub fn tick() -> Result<u32, CpuFreqError> {
         }
         let target = target_perf(util, min, max);
         // Hysteresis: skip the write if we land inside the band.
-        if prev != 0 && abs_diff(target, prev) <= HYSTERESIS_BAND {
+        if prev != 0 && target.abs_diff(prev) <= HYSTERESIS_BAND {
             continue;
         }
         if write_desired(b, target).is_ok() {
@@ -474,8 +473,7 @@ fn sample_utilization(cpu: usize) -> u16 {
     let now = narf_interrupts::fire_count_on_cpu(narf_interrupts::VECTOR_TIMER, cpu);
     let prev = {
         let mut pc = PERCPU.lock();
-        let p = core::mem::replace(&mut pc[cpu].last_timer_fires, now);
-        p
+        core::mem::replace(&mut pc[cpu].last_timer_fires, now)
     };
     let delta = now.saturating_sub(prev);
     util_permille_from_delta(delta, FULL_LOAD_TARGET_FIRES)
@@ -508,15 +506,6 @@ pub fn target_perf(util_permille: u16, min: u8, max: u8) -> u8 {
     let span = (max - min) as u32;
     let scaled = (util * span) / 1000;
     (min as u32 + scaled) as u8
-}
-
-#[inline]
-fn abs_diff(a: u8, b: u8) -> u8 {
-    if a >= b {
-        a - b
-    } else {
-        b - a
-    }
 }
 
 // ── MSR writes ─────────────────────────────────────────────────────
@@ -677,7 +666,7 @@ mod smoke_tests {
         // Pack a recognisable raw: 0x_LL_EE_GG_HH where LL is in
         // the top byte (lowest_perf) and so on. Use distinct
         // nibble pairs so a swap shows up immediately.
-        let raw: u64 = 0x__01_05_19_FF_u64;
+        let raw: u64 = 0x0105_19FF_u64;
         let caps = HwpCapabilities::decode(raw);
         if caps.highest_perf != 0xFF {
             return TestResult::Fail("highest");

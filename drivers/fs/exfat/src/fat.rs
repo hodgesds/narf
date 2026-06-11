@@ -11,11 +11,11 @@
 //! References:
 //! - exFAT file system specification (Microsoft, 2019),
 //!   §3.3 "File Allocation Table" — entry size, sentinels.
-//!     EOC      : `0xFFFFFFFF` (§3.3 final value of any active chain).
-//!     Bad      : `0xFFFFFFF7`.
-//!     Free     : `0x00000000`.
-//!     Reserved : index 0 holds `0xFFFFFFF8 | MediaType` per §3.3,
-//!                index 1 holds `0xFFFFFFFF`.
+//!   EOC      : `0xFFFFFFFF` (§3.3 final value of any active chain).
+//!   Bad      : `0xFFFFFFF7`.
+//!   Free     : `0x00000000`.
+//!   Reserved : index 0 holds `0xFFFFFFF8 | MediaType` per §3.3,
+//!   index 1 holds `0xFFFFFFFF`.
 //!   <https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification>
 
 /// FAT entry sentinels per §3.3, exposed as raw u32 so the write

@@ -926,6 +926,7 @@ kernel_test_in!(
     smoke_uac_feature_unit_decodes_per_channel_controls
 );
 
+#[allow(clippy::erasing_op)]
 fn smoke_uac_format_type_i_pcm_44k_48k() -> TestResult {
     use crate::uac::{FormatTypeI, FORMAT_TYPE_I};
     // bLength=14, CS_INTERFACE, FORMAT_TYPE, bFormatType=1,

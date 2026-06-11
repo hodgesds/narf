@@ -74,8 +74,7 @@ impl Bpb {
 
     /// Determine FAT version based on cluster count logic (MS spec p. 14).
     pub fn detect_version(&self, fat32_ext: Option<&Fat32ExtBpb>) -> FatVersion {
-        let root_dir_sectors = ((self.root_ent_cnt as u32 * 32) + (self.bytes_per_sec as u32 - 1))
-            / self.bytes_per_sec as u32;
+        let root_dir_sectors = (self.root_ent_cnt as u32 * 32).div_ceil(self.bytes_per_sec as u32);
         let fat_size = self.fat_size(fat32_ext);
         let data_sectors = self.total_sectors()
             - (self.rsvd_sec_cnt as u32 + (self.num_fats as u32 * fat_size) + root_dir_sectors);

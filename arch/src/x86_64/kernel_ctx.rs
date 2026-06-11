@@ -309,6 +309,10 @@ pub mod tests {
             // own stack frame.
             let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
             let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
+            // SAFETY: both pointers were published by the test driver from
+            // live `KernelContext` locals that outlive this switch; `child_ctx`
+            // is the running context (safe to save into) and `main_ctx` is the
+            // suspended caller to resume.
             unsafe { kernel_switch(child_ctx, main_ctx) };
             // If main switches back to us, we'd resume here — but
             // this test only does one round trip, so spin.
@@ -326,7 +330,7 @@ pub mod tests {
         let mut main_ctx = KernelContext::default();
         let mut child_ctx = KernelContext::fresh(
             stack_top,
-            child_trampoline as u64,
+            child_trampoline as usize as u64,
             /* arg = */ 0xDEAD_BEEF,
         );
 
@@ -375,6 +379,9 @@ pub mod tests {
             CHILD_OBSERVED_R12.store(r12_seen, Ordering::Release);
             let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
             let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
+            // SAFETY: both pointers were published by the test driver from live
+            // `KernelContext` locals that outlive this switch; `child_ctx` is
+            // the running context and `main_ctx` is the caller to resume.
             unsafe { kernel_switch(child_ctx, main_ctx) };
             loop {
                 core::hint::spin_loop();
@@ -386,7 +393,7 @@ pub mod tests {
         let mut main_ctx = KernelContext::default();
         let mut child_ctx = KernelContext {
             rsp: stack_top,
-            rip: child_trampoline as u64,
+            rip: child_trampoline as usize as u64,
             rbx: 0xAAAA_AAAA_AAAA_AAAA,
             r12: 0xBBBB_BBBB_BBBB_BBBB,
             rflags: 0x202,
@@ -395,6 +402,9 @@ pub mod tests {
         CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
         MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
 
+        // SAFETY: `main_ctx` is the live running context to save into and
+        // `child_ctx` is a fresh context with a boxed stack still in scope and
+        // a valid entry point, so kernel_switch can switch into it.
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
 
         if CHILD_OBSERVED_RBX.load(Ordering::Acquire) != 0xAAAA_AAAA_AAAA_AAAA {
@@ -437,6 +447,9 @@ pub mod tests {
             CHILD_IF_OBSERVED.store(rflags_at_entry & 0x200, Ordering::Release);
             let child_ctx = CHILD_CTX.load(Ordering::Acquire) as *mut KernelContext;
             let main_ctx = MAIN_CTX.load(Ordering::Acquire) as *const KernelContext;
+            // SAFETY: both pointers were published by the test driver from live
+            // `KernelContext` locals that outlive this switch; `child_ctx` is
+            // the running context and `main_ctx` is the caller to resume.
             unsafe { kernel_switch(child_ctx, main_ctx) };
             loop {
                 core::hint::spin_loop();
@@ -449,7 +462,7 @@ pub mod tests {
         // Case 1: switch in with IF=1 stored in child_ctx. Child
         // should observe IF=1.
         let mut main_ctx = KernelContext::default();
-        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as u64, 0);
+        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as usize as u64, 0);
         // KernelContext::fresh seeds rflags = 0x202 (IF=1). Verify.
         if child_ctx.rflags & 0x200 == 0 {
             return TestResult::Fail("fresh() didn't set IF=1 in rflags");
@@ -460,15 +473,21 @@ pub mod tests {
         // is the ONLY way IF could come back on for the child.
         // If kernel_switch didn't restore IF from rflags, the
         // child would observe IF=0 (matching our pre-switch state).
+        // SAFETY: `cli` only clears IF; this test runs at CPL=0 in the kernel
+        // and re-enables interrupts via the `sti` below before returning.
         unsafe {
             asm!("cli", options(nomem, nostack));
         }
+        // SAFETY: `main_ctx` is the live running context and `child_ctx` is a
+        // fresh context with a live boxed stack and valid entry point.
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
         // The child set IF=1 on entry (via STI in load half) and
         // switched back. On return, our IF state was restored from
         // main_ctx.rflags — which kernel_switch saved on the way
         // out. Since we CLI'd before the switch, main_ctx.rflags
         // recorded IF=0, so we resume with IF=0.
+        // SAFETY: `sti` only sets IF; a valid IDT is installed in this kernel
+        // test context, so re-enabling interrupts here is sound.
         unsafe {
             asm!("sti", options(nomem, nostack));
         } // restore for the rest of the suite
@@ -481,10 +500,12 @@ pub mod tests {
         // Case 2: switch in with IF=0. Child observes IF=0.
         CHILD_IF_OBSERVED.store(0xFFFF, Ordering::Release);
         let mut main_ctx = KernelContext::default();
-        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as u64, 0);
+        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as usize as u64, 0);
         child_ctx.rflags = 0x2; // reserved bit 1 only; IF=0
         CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
         MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
+        // SAFETY: `main_ctx` is the live running context and `child_ctx` is a
+        // fresh context with a live boxed stack and valid entry point.
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
         // Child observed pre-restore RFLAGS via pushfq — that
         // reflects what kernel_switch arranged for the child. STI
@@ -536,7 +557,7 @@ pub mod tests {
         let mut stack = alloc::boxed::Box::<[u8; 8192]>::new([0u8; 8192]);
         let stack_top = (stack.as_mut_ptr() as u64).wrapping_add(8192) & !0xFu64;
         let mut main_ctx = KernelContext::default();
-        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as u64, 0);
+        let mut child_ctx = KernelContext::fresh(stack_top, child_trampoline as usize as u64, 0);
         CHILD_CTX.store(&mut child_ctx as *mut _ as u64, Ordering::Release);
         MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
 

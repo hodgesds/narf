@@ -413,7 +413,7 @@ pub fn jack_event(controller_index: usize, plugged: bool) {
     if let Some(card) = mx.iter().find(|c| c.controller_index == controller_index) {
         for ctrl in card.controls.iter() {
             if matches!(ctrl.info.id.kind, ControlKind::JackSense) {
-                let _ = ctrl.value_packed.store(plugged as i32, Ordering::Release);
+                ctrl.value_packed.store(plugged as i32, Ordering::Release);
             }
         }
     }

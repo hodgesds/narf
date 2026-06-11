@@ -509,12 +509,15 @@ fn peek_memory(addr: u64, len: u32) -> Option<Vec<u8>> {
         return None;
     }
     let mut buf = Vec::with_capacity(len as usize);
-    // SAFETY: gdb-stub clients are TCB; the cap-gated `attach`
-    // entry point is the only way to reach this. Reads through a
-    // bad address will fault — we accept that as the failure mode
-    // ("? on host shows a fault") rather than fault-handling the
-    // peek and silently returning zeros.
     for i in 0..len as u64 {
+        // SAFETY: `addr + i` stays within `[addr, addr + len)`, the byte range
+        // the gdb-stub host requested to read. gdb-stub clients are part of the
+        // TCB and the cap-gated `attach` entry point is the only way to reach
+        // here, so the host is trusted to name a meaningful address. The access
+        // is a single-byte volatile read with natural (1-byte) alignment. A bad
+        // address faults rather than returning garbage — we accept that as the
+        // failure mode ("? on host shows a fault") instead of fault-handling the
+        // peek and silently returning zeros.
         let b = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
         buf.push(b);
     }
@@ -834,10 +837,14 @@ impl GdbTransport for Com1Transport {
     fn read_byte(&mut self) -> Option<u8> {
         const MAX_SPIN: u32 = 100_000_000;
         for _ in 0..MAX_SPIN {
-            // SAFETY: COM1 reads are side-effect-free; the console
-            // crate has already validated the port is live at boot.
+            // SAFETY: `self.base + 5` is the 16550 UART Line Status Register for
+            // COM1 (base 0x3F8). Reading the LSR is side-effect-free, and the
+            // console crate has already validated this port is live at boot.
             let lsr = unsafe { narf_arch::x86_64::io_port::inb(self.base + 5) };
             if lsr & 0x01 != 0 {
+                // SAFETY: LSR bit 0 (Data Ready) is set, so the UART's Receiver
+                // Buffer Register at `self.base` (COM1, 0x3F8) holds a pending
+                // byte. Reading the RBR is the documented way to consume it.
                 let b = unsafe { narf_arch::x86_64::io_port::inb(self.base) };
                 return Some(b);
             }
@@ -849,9 +856,14 @@ impl GdbTransport for Com1Transport {
     fn write_byte(&mut self, b: u8) -> bool {
         const MAX_SPIN: u32 = 10_000_000;
         for _ in 0..MAX_SPIN {
-            // SAFETY: same justification as read_byte.
+            // SAFETY: `self.base + 5` is the 16550 UART Line Status Register for
+            // COM1 (base 0x3F8). Reading the LSR is side-effect-free, and the
+            // console crate has already validated this port is live at boot.
             let lsr = unsafe { narf_arch::x86_64::io_port::inb(self.base + 5) };
             if lsr & 0x20 != 0 {
+                // SAFETY: LSR bit 5 (Transmitter Holding Register Empty) is set,
+                // so writing `b` to the THR at `self.base` (COM1, 0x3F8) is safe
+                // and will not clobber an in-flight byte.
                 unsafe { narf_arch::x86_64::io_port::outb(self.base, b) };
                 return true;
             }

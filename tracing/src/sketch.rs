@@ -39,6 +39,12 @@ pub struct Histogram {
     count: AtomicU64,
 }
 
+impl Default for Histogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Histogram {
     pub const fn new() -> Self {
         // Cannot `#[derive(Default)]` because `AtomicU64` isn't Copy.
@@ -96,9 +102,9 @@ impl Histogram {
             return 0;
         }
         let p = p.min(1000) as u64;
-        // target = ceil(total * p / 1000). Integer ceil = (a + b - 1) / b.
+        // target = ceil(total * p / 1000).
         let numer = total.saturating_mul(p);
-        let target_count = (numer + 999) / 1000;
+        let target_count = numer.div_ceil(1000);
         let target = target_count.max(1);
         let mut cum = 0u64;
         for (i, b) in self.buckets.iter().enumerate() {

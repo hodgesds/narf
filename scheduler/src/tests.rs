@@ -471,6 +471,8 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     // constructor takes care of the kernel/high-half bits that
     // have to survive activation (full-copy PML4 on x86_64, empty
     // TTBR0 on aarch64 since the kernel lives behind TTBR1).
+    // SAFETY: Paging is enabled in the running kernel test environment, which
+    // is new_for_user's sole precondition.
     let a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     a.map_region(Region {
         base: VirtAddr::new(0x4000),
@@ -536,10 +538,14 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     use alloc::sync::Arc;
     use narf_memory::AddressSpace;
 
-    // SAFETY: `mov %cr3, reg` is unconditional at CPL=0.
+    /// # Safety
+    /// Must run at CPL=0 (kernel test context); reading CR3 is otherwise
+    /// privileged. Has no memory or stack effects.
     #[inline(always)]
     unsafe fn read_cr3() -> u64 {
         let v: u64;
+        // SAFETY: `mov reg, cr3` is a side-effect-free ring-0 read; the test
+        // runner executes at CPL=0 and `v` receives the value.
         unsafe {
             core::arch::asm!(
                 "mov {0}, cr3",
@@ -551,8 +557,11 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     }
 
     crate::__reset_queues_for_test();
+    // SAFETY: read_cr3 runs at CPL=0 in the in-kernel test runner.
     let kernel_cr3 = unsafe { read_cr3() };
 
+    // SAFETY: Paging is enabled in the running kernel test environment, which
+    // is new_for_user's sole precondition.
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_cr3 = user_as.root.as_u64();
     if user_cr3 == kernel_cr3 {
@@ -572,6 +581,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
 
     crate::run_until_empty();
 
+    // SAFETY: read_cr3 runs at CPL=0 in the in-kernel test runner.
     let cr3_after = unsafe { read_cr3() };
     if cr3_after == kernel_cr3 {
         TestResult::Pass
@@ -670,10 +680,14 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
 
     crate::__reset_queues_for_test();
 
-    // SAFETY: `mov %cr3, reg` is unconditional at CPL=0.
+    /// # Safety
+    /// Must run at CPL=0 (kernel test context); reading CR3 is otherwise
+    /// privileged. Has no memory or stack effects.
     #[inline(always)]
     unsafe fn read_cr3() -> u64 {
         let v: u64;
+        // SAFETY: `mov reg, cr3` is a side-effect-free ring-0 read; the test
+        // runner executes at CPL=0 and `v` receives the value.
         unsafe {
             core::arch::asm!(
                 "mov {0}, cr3",
@@ -683,8 +697,11 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
         }
         v
     }
+    // SAFETY: read_cr3 runs at CPL=0 in the in-kernel test runner.
     let kernel_cr3 = unsafe { read_cr3() };
 
+    // SAFETY: Paging is enabled in the running kernel test environment, which
+    // is new_for_user's sole precondition.
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_cr3 = user_as.root.as_u64();
     let arc_as = Arc::new(user_as);
@@ -921,7 +938,8 @@ fn smoke_scheduler_cpuset_constants() -> TestResult {
     if !CpuSet::EMPTY.is_empty() {
         return TestResult::Fail("EMPTY not empty");
     }
-    if CpuSet::EMPTY.len() != 0 {
+    let empty_len: u32 = CpuSet::EMPTY.len();
+    if empty_len != 0 {
         return TestResult::Fail("EMPTY len != 0");
     }
     if CpuSet::ALL.is_empty() {
@@ -1028,10 +1046,10 @@ fn smoke_scheduler_priority_constants_ordered() -> TestResult {
         return TestResult::Fail("LOW drifted from 10");
     }
     // PartialOrd: HIGH < NORMAL < LOW (lower nice = higher priority).
-    if !(Priority::HIGH < Priority::NORMAL) {
+    if Priority::HIGH >= Priority::NORMAL {
         return TestResult::Fail("HIGH not < NORMAL under PartialOrd");
     }
-    if !(Priority::NORMAL < Priority::LOW) {
+    if Priority::NORMAL >= Priority::LOW {
         return TestResult::Fail("NORMAL not < LOW under PartialOrd");
     }
     TestResult::Pass
@@ -1409,6 +1427,9 @@ fn smoke_scheduler_yield_now_resolves_on_second_poll() -> TestResult {
     fn wake(_: *const ()) {}
     fn drop_no(_: *const ()) {}
     static VT: RawWakerVTable = RawWakerVTable::new(noop_clone, wake, wake, drop_no);
+    // SAFETY: The vtable `VT`'s clone/wake/drop are all no-ops that never
+    // dereference the data pointer, so the null data pointer is never read and
+    // the RawWaker contract (each fn behaves correctly for this data) holds.
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
     let mut cx = Context::from_waker(&w);
 
@@ -1628,9 +1649,13 @@ fn smoke_scheduler_pkrs_save_restore_round_trip() -> TestResult {
         }
         return TestResult::Pass;
     }
-    // SAFETY: PKS is on; both reads are unconditional at CPL=0.
+    // SAFETY: We are inside the `pks::is_active()` branch, so CR4.PKS is set,
+    // satisfying save()'s precondition that RDMSR(IA32_PKRS) won't #GP.
     let a = unsafe { pks::save() };
+    // SAFETY: CR4.PKS is set (is_active branch); `a` was produced by save(),
+    // so writing it back is a well-defined restore.
     unsafe { pks::restore(a) };
+    // SAFETY: CR4.PKS is set (is_active branch), satisfying save()'s precondition.
     let b = unsafe { pks::save() };
     if a != b {
         return TestResult::Fail("save/restore round-trip didn't preserve PKRS");

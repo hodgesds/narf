@@ -8,8 +8,8 @@
 //! / format encoding.
 
 use crate::codec::generic::{
-    encode_verb, set_amp_gain_mute_verb, PinDevice, Widget, WidgetKind, VERB_GET_PARAMETER,
-    VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL,
+    encode_verb, set_amp_gain_mute_verb, AmpGainMute, PinDevice, Widget, WidgetKind,
+    VERB_GET_PARAMETER, VERB_SET_EAPD_BTL, VERB_SET_PIN_WIDGET_CONTROL,
 };
 use crate::codec::quirks::{find_quirk, first_for_chip, quirk_count};
 use crate::codec::realtek::{
@@ -42,7 +42,7 @@ fn smoke_pci_id_match_amd_zen2_phoenix() -> TestResult {
     if !supported_device(HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE) {
         return TestResult::Fail("Phoenix HDA ID rejected");
     }
-    if HDA_CLASS_TRIPLE != 0x0403_00 {
+    if HDA_CLASS_TRIPLE != 0x04_03_00 {
         return TestResult::Fail("HDA class triple mismatch");
     }
     if supported_device(0xDEAD, 0xBEEF) {
@@ -56,7 +56,8 @@ kernel_test_in!("drivers/sound", smoke_pci_id_match_amd_zen2_phoenix);
 
 fn smoke_hda_register_layout_gcap_decode() -> TestResult {
     // GCAP = output=4, input=4, bidir=0, 64bit=1 → 0x4401
-    let gcap: u16 = (4 << 12) | (4 << 8) | (0 << 4) | 1;
+    // (bidir field is 0, so it is omitted from the OR below).
+    let gcap: u16 = (4 << 12) | (4 << 8) | 1;
     let (noss, niss, nbss, addr64) = HdaController::decode_gcap(gcap);
     if (noss, niss, nbss, addr64) != (4, 4, 0, true) {
         return TestResult::Fail("GCAP decode wrong for AMD-typical layout");
@@ -702,18 +703,44 @@ kernel_test_in!("drivers/sound", smoke_pin_widget_control_verb);
 
 fn smoke_amp_gain_mute_pack() -> TestResult {
     // Output amp, both channels, index 0, mute=false, gain=0 → 0xB000.
-    let p = crate::codec::generic::amp_gain_mute_payload(true, false, true, true, 0, false, 0);
+    let p = crate::codec::generic::amp_gain_mute_payload(AmpGainMute {
+        set_output: true,
+        set_input: false,
+        left: true,
+        right: true,
+        index: 0,
+        mute: false,
+        gain: 0,
+    });
     if p != 0xB000 {
         return TestResult::Fail("output unmute payload wrong");
     }
     // Output, both channels, mute=true, gain=0x40 → high byte 0xB0, low 0xC0.
-    let p = crate::codec::generic::amp_gain_mute_payload(true, false, true, true, 0, true, 0x40);
+    let p = crate::codec::generic::amp_gain_mute_payload(AmpGainMute {
+        set_output: true,
+        set_input: false,
+        left: true,
+        right: true,
+        index: 0,
+        mute: true,
+        gain: 0x40,
+    });
     if p != 0xB0C0 {
         return TestResult::Fail("mute payload wrong");
     }
     // Full verb word — major opcode 0x3 split.
     let w = set_amp_gain_mute_verb(
-        /*cad=*/ 0, /*nid=*/ 0x02, true, false, true, true, 0, false, 0,
+        /*cad=*/ 0,
+        /*nid=*/ 0x02,
+        AmpGainMute {
+            set_output: true,
+            set_input: false,
+            left: true,
+            right: true,
+            index: 0,
+            mute: false,
+            gain: 0,
+        },
     );
     // Major opcode 3 in bits 19..16.
     if (w >> 16) & 0xF != 0x3 {
@@ -872,7 +899,7 @@ fn smoke_devfs_pcm_write_4096() -> TestResult {
     let samples = alloc::vec![0u8; 4096];
     let result = crate::tests_support::poll_once(node.write(0, &samples));
     match result {
-        Ok(n) if n == 4096 => TestResult::Pass,
+        Ok(4096) => TestResult::Pass,
         Ok(n) => {
             // Partial write is acceptable too (ring may absorb less).
             let _ = n;

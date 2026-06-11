@@ -52,6 +52,7 @@ fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
     // sa_family = 1 (AF_UNIX), little-endian u16
     buf[0] = 1;
     buf[1] = 0;
+    #[allow(clippy::needless_range_loop)]
     let n = core::cmp::min(path.len(), 108);
     for i in 0..n {
         buf[2 + i] = path[i];
@@ -2200,6 +2201,7 @@ fn u32_to_decimal(mut v: u32, buf: &mut [u8]) -> &[u8] {
 }
 
 #[no_mangle]
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // argv is kernel-provided; entry signature is fixed
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     unsafe {
         libc::puts(b"NARF shell -- type 'help' for commands.\n\0".as_ptr());

@@ -681,6 +681,13 @@ impl Controller {
             if let Ok(v) = narf_interrupts::vector::alloc() {
                 // Program MSI-X slot 0 for Admin queue.
                 // Target the BSP (apic_id=0) for now.
+                // SAFETY: `table` was just obtained from `enable_msix(cap,
+                // &device)` for this device, so we hold its BAR exclusively
+                // via the `&mut` borrow of `self.msix` (no other writer to
+                // the MSI-X table). `v` came from `narf_interrupts::vector::
+                // alloc()`, so slot 0 is a valid, owned vector index, and
+                // `enable()` runs last to gate MSI delivery only after the
+                // entry is fully programmed (PCIe-recommended order).
                 unsafe {
                     let _ = table.program_vector(0, 0, v);
                     let _ = table.enable();
@@ -765,6 +772,13 @@ impl Controller {
         if let Some(table) = self.msix.as_mut() {
             if let Ok(v) = narf_interrupts::vector::alloc() {
                 // Use MSI-X slot 1 for the first I/O queue.
+                // SAFETY: `table` is this device's MSI-X table from
+                // `enable_msix`, held exclusively here via the `&mut` borrow
+                // of `self.msix` (no concurrent writer). `v` came from
+                // `narf_interrupts::vector::alloc()`, and slot 1 is within the
+                // table (the Admin queue used slot 0). The table was already
+                // globally enabled during `init`, so programming a new entry
+                // here just adds the I/O CQ's vector.
                 unsafe {
                     let _ = table.program_vector(1, 0, v);
                 }
@@ -892,9 +906,9 @@ impl Controller {
     /// Identifier 0x07):
     ///   - CDW10 bits[7:0]  = FID = 0x07
     ///   - CDW11 bits[15:0] = NSQR (number of submission queues
-    ///                        requested, zero-based)
+    ///     requested, zero-based)
     ///   - CDW11 bits[31:16] = NCQR (number of completion queues
-    ///                         requested, zero-based)
+    ///     requested, zero-based)
     ///
     /// The controller responds with CDW0 carrying the **granted**
     /// counts in the same layout:
@@ -972,7 +986,7 @@ impl Controller {
         // *queues* doesn't run through MQES — that gates depth — so
         // strictly we only need the static cap + cpu_count gate here.
         let cpu_n = narf_lib::smp::cpu_count() as u16;
-        let host_cap = cpu_n.max(1).min(NVME_MAX_IO_QUEUE_PAIRS);
+        let host_cap = cpu_n.clamp(1, NVME_MAX_IO_QUEUE_PAIRS);
         let req = requested.max(1).min(host_cap);
 
         // ── 1. Ask the controller for `req` pairs ─────────────
@@ -1019,11 +1033,14 @@ impl Controller {
             vectors.push(v);
         }
         // ── 4. Flip the global MSI-X enable bit ──────────────
-        // SAFETY: cfg-space write at the cached cap offset.
-        let _ = unsafe { msix.enable() }.map_err(|_| NvmeError::Msix)?;
+        // SAFETY: `msix` is this device's MSI-X table from `enable_msix`,
+        // owned exclusively here; `enable()` only flips the global enable
+        // bit in cfg-space at the cached cap offset, with all table entries
+        // already programmed in the loop above.
+        unsafe { msix.enable() }.map_err(|_| NvmeError::Msix)?;
 
         for i in 0..granted {
-            let qid = (i + 1) as u16; // NVMe Base Spec §4.1.4: I/O qids ≥ 1
+            let qid = i + 1; // NVMe Base Spec §4.1.4: I/O qids ≥ 1
 
             // Per pair: CQ DMA first, then admin Create CQ, then
             // SQ DMA + Create SQ. CQ-before-SQ is required by
@@ -1264,9 +1281,11 @@ impl Controller {
         // Read the 4 KiB response into a slice and parse.
         let base = buf.phys_addr().raw() as *const u8;
         let mut raw = alloc::vec![0u8; 4096];
-        // SAFETY: 4 KiB DMA buffer, identity-mapped.
-        for i in 0..4096usize {
-            raw[i] = unsafe { core::ptr::read_volatile(base.add(i)) };
+        for (i, byte) in raw.iter_mut().enumerate() {
+            // SAFETY: `base` is the 4 KiB identity-mapped DMA page just
+            // filled by the controller's Identify response; `i` ranges over
+            // 0..4096, so `base.add(i)` stays within that one mapped page.
+            *byte = unsafe { core::ptr::read_volatile(base.add(i)) };
         }
         drop(buf);
         admin::IdentifyNamespaceData::parse(&raw).ok_or(NvmeError::CommandFailed {
@@ -2055,10 +2074,10 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
 /// IDENTIFY NAMESPACE layout (NVMe base spec §5.15.2.2):
 ///   - bytes 0..7   : NSZE (Namespace Size, in LBAs)
 ///   - byte  26     : FLBAS (Formatted LBA Size). Bits[3:0] index
-///                    into LBAF[].
+///     into LBAF[].
 ///   - bytes 128.. : LBAF[0..16] @ 4 bytes each. LBAF.LBADS is at
-///                    byte offset 2 (relative to the LBAF start), low
-///                    byte = log2(LBA size in bytes).
+///     byte offset 2 (relative to the LBAF start), low
+///     byte = log2(LBA size in bytes).
 ///
 /// # Safety
 /// `buf` must be a 4 KiB coherent DMA buffer the controller has
@@ -2156,27 +2175,25 @@ impl BlockDevice for NvmeBlockDevice {
             }
         }
     }
-    fn flush(&self) -> impl Future<Output = ()> + Send {
+    async fn flush(&self) {
         // Wave-3a: the I/O-queue path is single-threaded behind the
         // `CONTROLLER` lock and every `read_lba` / `write_lba` polls
         // its own completion before returning. There is therefore no
         // outstanding-write set to drain. When the multi-queue
         // submission path lands (Wave 3b), this becomes a real Flush
         // (admin opcode 0x00) on each I/O queue.
-        async {}
     }
-    fn discard(&self, _r: LbaRange) -> impl Future<Output = ()> + Send {
+    async fn discard(&self, _r: LbaRange) {
         // Dataset Management opcode 0x09 with AD=1 lands with the
         // larger-transfer rework; today the no-op is structurally
         // correct (NVMe permits ignoring DSM hints).
-        async {}
     }
-    fn cancel(&self, _tag: u64) -> impl Future<Output = CancelResult> + Send {
+    async fn cancel(&self, _tag: u64) -> CancelResult {
         // Polled completions are synchronous from the caller's POV,
         // so there is nothing to cancel by the time the future
         // suspends. Real cancel arrives with the queued submission
         // model.
-        async { CancelResult::NotFound }
+        CancelResult::NotFound
     }
 }
 
@@ -2343,9 +2360,12 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
             let ctrl = g.as_mut().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
             ctrl.read_lba(lba, n_blocks, buf)
                 .map_err(|_| narf_block::BlockIoError::DriverError)?;
-            // SAFETY: identity-mapped DMA buffer.
-            for i in 0..need {
-                out[i] = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+            for (i, slot) in out.iter_mut().enumerate().take(need) {
+                // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA
+                // page that the controller just filled via `read_lba`; `i`
+                // ranges over 0..need with need ≤ 4096 (checked above), so
+                // the read stays within that page.
+                *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
             }
             Ok(())
         });
@@ -2364,10 +2384,13 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         }
         let res = with_nvme_scratch(|buf| -> Result<(), narf_block::BlockIoError> {
             let phys = buf.phys_addr().raw();
-            // SAFETY: identity-mapped DMA.
-            unsafe {
-                for i in 0..need {
-                    core::ptr::write_volatile((phys + i as u64) as *mut u8, data[i]);
+            for (i, &byte) in data.iter().enumerate().take(need) {
+                // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA
+                // page; `i` ranges over 0..need with need ≤ 4096 (checked
+                // above), so the write stays within that page. The page is
+                // exclusively ours while CONTROLLER stays locked below.
+                unsafe {
+                    core::ptr::write_volatile((phys + i as u64) as *mut u8, byte);
                 }
             }
             let mut g = CONTROLLER.lock();

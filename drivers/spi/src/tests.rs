@@ -242,7 +242,7 @@ kernel_test_in!("drivers/spi", smoke_spi_chunked_transfer_256b);
 
 fn smoke_amd_fch_acpi_hids() -> TestResult {
     for required in ["AMDI0061", "AMDI0062", "AMDI0063"] {
-        if !amd_hids().iter().any(|h| *h == required) {
+        if !amd_hids().contains(&required) {
             return TestResult::Fail("required AMD SPI ACPI HID missing");
         }
     }
@@ -257,7 +257,7 @@ kernel_test_in!("drivers/spi", smoke_amd_fch_acpi_hids);
 fn smoke_intel_lpss_acpi_hids() -> TestResult {
     // INT3430 and INT3431 are Broadwell/Skylake LPSS SSP HIDs.
     for required in ["INT3430", "INT3431", "80860F0E"] {
-        if !lpss_acpi_hids().iter().any(|h| *h == required) {
+        if !lpss_acpi_hids().contains(&required) {
             return TestResult::Fail("required Intel LPSS ACPI HID missing");
         }
     }

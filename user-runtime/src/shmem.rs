@@ -33,7 +33,9 @@ pub struct Shmem {
     len: usize,
 }
 
+// SAFETY: the mapped region is owned by this handle for its lifetime; single-threaded userspace has no cross-thread aliasing.
 unsafe impl Send for Shmem {}
+// SAFETY: the mapped region is owned by this handle for its lifetime; single-threaded userspace has no cross-thread aliasing.
 unsafe impl Sync for Shmem {}
 
 impl Shmem {

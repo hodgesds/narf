@@ -251,7 +251,8 @@ impl SourcePdo {
                 // bits 10..19 = voltage / 50 mV, bits 0..9 = current / 10 mA.
                 let v = (voltage_mv / 50) & 0x3FF;
                 let i = (max_current_ma / 10) & 0x3FF;
-                (0b00 << 30) | (v << 10) | i
+                // type field (bits 30..31) is 0b00, contributing nothing.
+                (v << 10) | i
             }
             SourcePdo::Battery {
                 max_voltage_mv,

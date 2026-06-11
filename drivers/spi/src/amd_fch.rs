@@ -212,14 +212,14 @@ impl AmdFchSpi {
 
     #[inline]
     unsafe fn read8(&self, off: u64) -> u8 {
-        debug_assert!(off + 1 <= self.mmio_len);
+        debug_assert!(off < self.mmio_len);
         // SAFETY: caller holds the bus lock; offset bounds-checked.
         unsafe { narf_arch::mmio::read8(self.mmio_base.raw() + off) }
     }
 
     #[inline]
     unsafe fn write8(&self, off: u64, val: u8) {
-        debug_assert!(off + 1 <= self.mmio_len);
+        debug_assert!(off < self.mmio_len);
         // SAFETY: same.
         unsafe { narf_arch::mmio::write8(self.mmio_base.raw() + off, val) }
     }
@@ -308,7 +308,7 @@ impl AmdFchSpi {
     /// Program the speed registers for the nearest frequency ≤ `hz`.
     /// From Linux amd_set_spi_freq().
     fn apply_freq(&self, hz: u32) -> Result<(), SpiError> {
-        if hz < AMD_SPI_MIN_HZ || hz > AMD_SPI_MAX_HZ {
+        if !(AMD_SPI_MIN_HZ..=AMD_SPI_MAX_HZ).contains(&hz) {
             return Err(SpiError::FrequencyOutOfRange);
         }
         // Pick the highest speed that does not exceed `hz`.

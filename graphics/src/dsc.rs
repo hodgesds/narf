@@ -140,9 +140,9 @@ impl Pps {
         let mut rc_buf_thresh = [0u8; DSC_RC_BUF_THRESH_COUNT];
         rc_buf_thresh.copy_from_slice(&buf[57..57 + DSC_RC_BUF_THRESH_COUNT]);
         let mut rc_range_parameters = [0u16; DSC_RC_RANGE_PARAMS_COUNT];
-        for i in 0..DSC_RC_RANGE_PARAMS_COUNT {
+        for (i, param) in rc_range_parameters.iter_mut().enumerate() {
             let off = 88 + i * 2;
-            rc_range_parameters[i] = u16::from_be_bytes([buf[off], buf[off + 1]]);
+            *param = u16::from_be_bytes([buf[off], buf[off + 1]]);
         }
 
         Ok(Self {

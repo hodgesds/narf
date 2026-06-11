@@ -102,13 +102,15 @@ fn build_icmpv6_frame(
     let total = ETH_HDR_LEN + IPV6_HDR_LEN + icmpv6_body.len();
     let mut frame = vec![0u8; total];
     write_eth_header(&mut frame, dst_mac, src_mac, ETHERTYPE_IPV6);
-    let mut ip = Ipv6Header::default();
-    ip.version = 6;
-    ip.payload_length = icmpv6_body.len() as u16;
-    ip.next_header = NEXT_HEADER_ICMPV6;
-    ip.hop_limit = 255;
-    ip.src_ip = src_ip;
-    ip.dst_ip = dst_ip;
+    let ip = Ipv6Header {
+        version: 6,
+        payload_length: icmpv6_body.len() as u16,
+        next_header: NEXT_HEADER_ICMPV6,
+        hop_limit: 255,
+        src_ip,
+        dst_ip,
+        ..Default::default()
+    };
     frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN].copy_from_slice(&ip.encode());
     frame[ETH_HDR_LEN + IPV6_HDR_LEN..].copy_from_slice(&icmpv6_body);
     frame
@@ -661,7 +663,7 @@ fn smoke_v6_ra_m1_triggers_dhcpv6_solicit() -> TestResult {
 
     // Build the SOLICIT as the DHCPv6 client would when M=1.
     let mut client = crate::ipv6::dhcpv6::DhcpV6Client::new(IFACE, MAC, 1);
-    let solicit = client.build_solicit(0xDEAD_01);
+    let solicit = client.build_solicit(0xDE_AD_01);
 
     // Verify msg_type = 1 (SOLICIT).
     if solicit.is_empty() || solicit[0] != MT_SOLICIT {

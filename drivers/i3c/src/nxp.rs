@@ -83,7 +83,7 @@ pub fn probe(
     let mmio = unsafe { map_bar(&device, 0) }.map_err(|_| narf_bus::ProbeError::BadDevice)?;
 
     let driver = Arc::new(NxpI3c {
-        mmio: mmio.clone(),
+        mmio,
         ibi_wakers: IrqSafeSpinLock::new([const { None }; 128]),
     });
 
@@ -113,6 +113,10 @@ pub struct NxpI3c {
 impl NxpI3c {
     /// Flush the TX/RX FIFOs before starting any new frame.
     fn flush_fifos(&self) {
+        // SAFETY: REG_MDATACTRL (0x20) is a fixed 4-byte-aligned register
+        // offset within BAR 0, which `map_bar(&device, 0)` mapped in `probe`.
+        // This driver owns the device exclusively, so the aligned in-bounds
+        // 32-bit register write is sound.
         unsafe {
             self.mmio
                 .write32(REG_MDATACTRL, MDATACTRL_FLUSH_TX | MDATACTRL_FLUSH_RX);
@@ -127,6 +131,9 @@ impl NxpI3c {
     /// delivery stay live.
     async fn wait_complete(&self) -> Result<(), I3cError> {
         loop {
+            // SAFETY: REG_MSTATUS (0x04) is a fixed 4-byte-aligned register
+            // offset within BAR 0 mapped in `probe`; the driver owns the
+            // device exclusively, so this aligned status-register read is sound.
             let status = unsafe { self.mmio.read32(REG_MSTATUS) };
             if (status & MSTATUS_COMPLETE) != 0 {
                 return Ok(());
@@ -143,6 +150,10 @@ impl Driver for NxpI3c {
     fn start<'a>(&'a mut self, _env: DriverEnv<'a>) -> DriverFuture<'a> {
         Box::pin(async move {
             // Enable master mode.
+            // SAFETY: REG_MCONFIG (0x40) is a fixed 4-byte-aligned register
+            // within BAR 0 mapped in `probe`; `start` takes `&mut self`, so
+            // this driver holds the device exclusively and the aligned
+            // in-bounds register write is sound.
             unsafe {
                 self.mmio.write32(REG_MCONFIG, 0x1);
             }
@@ -151,6 +162,10 @@ impl Driver for NxpI3c {
 
     fn quiesce<'a>(&'a mut self) -> DriverFuture<'a> {
         Box::pin(async move {
+            // SAFETY: REG_MCONFIG (0x40) is a fixed 4-byte-aligned register
+            // within BAR 0 mapped in `probe`; `quiesce` takes `&mut self`, so
+            // the driver holds the device exclusively and the aligned in-bounds
+            // register write is sound.
             unsafe {
                 self.mmio.write32(REG_MCONFIG, 0x0);
             }
@@ -165,6 +180,9 @@ impl I3cBus for NxpI3c {
 
         // Write target address into MWMSG_SADDR (7-bit, left-shifted by 1
         // to leave room for R/W bit at bit 0; NXP convention).
+        // SAFETY: REG_MWMSG_SADDR (0x30) is a fixed 4-byte-aligned register
+        // within BAR 0 mapped in `probe`; the driver owns the device
+        // exclusively, so the aligned in-bounds register write is sound.
         unsafe {
             self.mmio.write32(REG_MWMSG_SADDR, (addr as u32) << 1);
         }
@@ -173,6 +191,10 @@ impl I3cBus for NxpI3c {
             match op {
                 I3cOp::Write(data) => {
                     for &byte in data.iter() {
+                        // SAFETY: REG_MWDATAB (0x24) is a fixed 4-byte-aligned
+                        // FIFO register within BAR 0 mapped in `probe`; the
+                        // driver owns the device exclusively, so this aligned
+                        // in-bounds register write is sound.
                         unsafe {
                             self.mmio.write32(REG_MWDATAB, byte as u32);
                         }
@@ -180,6 +202,10 @@ impl I3cBus for NxpI3c {
                 }
                 I3cOp::Read(buf) => {
                     for i in 0..buf.len() {
+                        // SAFETY: REG_MRDATAB (0x2C) is a fixed 4-byte-aligned
+                        // RX-FIFO register within BAR 0 mapped in `probe`; the
+                        // driver owns the device exclusively, so this aligned
+                        // in-bounds register read is sound.
                         buf[i] = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
                     }
                 }
@@ -187,6 +213,9 @@ impl I3cBus for NxpI3c {
         }
 
         // Issue SDR private message request.
+        // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
+        // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
+        // the aligned in-bounds register write is sound.
         unsafe {
             self.mmio.write32(
                 REG_MCTRL,
@@ -217,11 +246,18 @@ impl I3cBus for NxpI3c {
         self.flush_fifos();
 
         // CCC opcode is always the first byte on the wire.
+        // SAFETY: REG_MWDATAB (0x24) is a fixed 4-byte-aligned TX-FIFO register
+        // within BAR 0 mapped in `probe`; the driver owns the device
+        // exclusively, so the aligned in-bounds register write is sound.
         unsafe {
             self.mmio.write32(REG_MWDATAB, ccc.opcode() as u32);
         }
 
         for &byte in payload {
+            // SAFETY: REG_MWDATAB (0x24) is a fixed 4-byte-aligned TX-FIFO
+            // register within BAR 0 mapped in `probe`; the driver owns the
+            // device exclusively, so the aligned in-bounds register write is
+            // sound.
             unsafe {
                 self.mmio.write32(REG_MWDATAB, byte as u32);
             }
@@ -232,6 +268,9 @@ impl I3cBus for NxpI3c {
             CccDest::Address(a) => (MCTRL_REQUEST_SDR_DIR_CCC, mctrl_addr(a)),
         };
 
+        // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
+        // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
+        // the aligned in-bounds register write is sound.
         unsafe {
             self.mmio
                 .write32(REG_MCTRL, request | MCTRL_TYPE_I3C | addr_field);
@@ -272,11 +311,18 @@ impl I3cBus for NxpI3c {
             // Pre-load the candidate dynamic address for the next device.
             // Bit 7 = odd parity of bits [6:0], per I3C spec §5.1.9.3.
             let addr_with_parity = next_addr | (parity7(next_addr) << 7);
+            // SAFETY: REG_MWDATAB (0x24) is a fixed 4-byte-aligned TX-FIFO
+            // register within BAR 0 mapped in `probe`; the driver owns the
+            // device exclusively, so the aligned in-bounds register write is
+            // sound.
             unsafe {
                 self.mmio.write32(REG_MWDATAB, addr_with_parity as u32);
             }
 
             // Trigger ENTDAA.
+            // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
+            // BAR 0 mapped in `probe`; the driver owns the device exclusively,
+            // so the aligned in-bounds register write is sound.
             unsafe {
                 self.mmio
                     .write32(REG_MCTRL, MCTRL_REQUEST_DAA | MCTRL_TYPE_I3C);
@@ -284,6 +330,9 @@ impl I3cBus for NxpI3c {
 
             // Wait for either a device response or completion (no more devices).
             let got_device = loop {
+                // SAFETY: REG_MSTATUS (0x04) is a fixed 4-byte-aligned register
+                // within BAR 0 mapped in `probe`; the driver owns the device
+                // exclusively, so this aligned status-register read is sound.
                 let status = unsafe { self.mmio.read32(REG_MSTATUS) };
                 if (status & MSTATUS_ERROR) != 0 {
                     return Err(I3cError::HardwareError);
@@ -306,6 +355,10 @@ impl I3cBus for NxpI3c {
             // Read 8 bytes: PID[5:0], BCR, DCR.
             let mut raw = [0u8; 8];
             for b in raw.iter_mut() {
+                // SAFETY: REG_MRDATAB (0x2C) is a fixed 4-byte-aligned RX-FIFO
+                // register within BAR 0 mapped in `probe`; the driver owns the
+                // device exclusively, so this aligned in-bounds register read
+                // is sound.
                 *b = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
             }
 
@@ -344,11 +397,18 @@ impl I3cBus for NxpI3c {
     async fn hdr_ddr_write(&self, addr: u8, _command: u8, data: &[u16]) -> Result<(), I3cError> {
         self.flush_fifos();
         for &w in data {
+            // SAFETY: REG_MWDATAB (0x24) is a fixed 4-byte-aligned TX-FIFO
+            // register within BAR 0 mapped in `probe`; the driver owns the
+            // device exclusively, so both aligned in-bounds register writes are
+            // sound.
             unsafe {
                 self.mmio.write32(REG_MWDATAB, (w & 0xFF) as u32);
                 self.mmio.write32(REG_MWDATAB, (w >> 8) as u32);
             }
         }
+        // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
+        // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
+        // the aligned in-bounds register write is sound.
         unsafe {
             self.mmio.write32(
                 REG_MCTRL,
@@ -364,6 +424,9 @@ impl I3cBus for NxpI3c {
     /// MRDATAB byte pairs into the output word slice.
     async fn hdr_ddr_read(&self, addr: u8, _command: u8, data: &mut [u16]) -> Result<(), I3cError> {
         self.flush_fifos();
+        // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
+        // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
+        // the aligned in-bounds register write is sound.
         unsafe {
             self.mmio.write32(
                 REG_MCTRL,
@@ -372,7 +435,14 @@ impl I3cBus for NxpI3c {
         }
         self.wait_complete().await?;
         for w in data.iter_mut() {
+            // SAFETY: REG_MRDATAB (0x2C) is a fixed 4-byte-aligned RX-FIFO
+            // register within BAR 0 mapped in `probe`; the driver owns the
+            // device exclusively, so the aligned in-bounds register read is
+            // sound.
             let lo = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
+            // SAFETY: same as the `lo` read above — REG_MRDATAB is the fixed,
+            // aligned, in-bounds RX-FIFO register and the driver owns the
+            // device exclusively.
             let hi = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
             *w = (lo as u16) | ((hi as u16) << 8);
         }

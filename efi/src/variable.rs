@@ -204,7 +204,7 @@ pub struct SignatureEntry<'a> {
 }
 
 /// Iterate a single EFI_SIGNATURE_LIST. Returns the decoded header
-/// + an iterator of entries. Caller can chain successive lists by
+/// and an iterator of entries. Caller can chain successive lists by
 /// advancing the input by `header.list_size`.
 pub fn parse_signature_list<'a>(
     buf: &'a [u8],

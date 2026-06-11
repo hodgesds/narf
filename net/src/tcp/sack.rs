@@ -61,6 +61,12 @@ impl SackBlock {
     pub fn len(&self) -> u32 {
         self.right.wrapping_sub(self.left)
     }
+
+    /// True when the block covers no sequence space (`left == right`).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.left == self.right
+    }
 }
 
 /// Encode up to `MAX_SACK_BLOCKS` SackBlocks as the option payload

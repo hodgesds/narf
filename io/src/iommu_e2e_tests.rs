@@ -794,8 +794,14 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
     // The FakeDevice dma_read resolves only the page base, so we access the
     // last byte via a direct phys read — modelling a device that has already
     // resolved the IOVA to phys and then DMAed to an offset within the page.
-    // SAFETY: last page is allocated; offset 4095 is within the frame.
     let last_phys = bufs[N_PAGES - 1].phys_addr().raw();
+    // SAFETY: `last_phys` is the physical base of a live 4096-byte
+    // coherent buffer (`alloc_coherent(4096, ..)` at the top of this
+    // test, still owned in `bufs`), and coherent DMA memory is
+    // identity-mapped, so `last_phys` is a valid readable address.
+    // Offset 4095 is the last byte of that 4096-byte frame — the same
+    // byte written via `as_mut_slice()[4095] = LAST_SENTINEL` above —
+    // so the read is in-bounds and reads an initialized `u8`.
     let last_val = unsafe { core::ptr::read_volatile((last_phys + 4095) as *const u8) };
     if last_val != LAST_SENTINEL {
         for i in 0..N_PAGES {

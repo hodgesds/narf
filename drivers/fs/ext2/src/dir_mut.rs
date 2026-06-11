@@ -117,7 +117,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::InvalidPath);
         }
         let bs = self.block_size();
-        let blocks = (parent_inode.size as usize + bs - 1) / bs;
+        let blocks = (parent_inode.size as usize).div_ceil(bs);
         let file_type = ftype_for_mode(target_mode);
 
         // Determine whether HTREE is active on this directory.
@@ -273,7 +273,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
     ) -> Result<(u32, u8), FsError> {
         let bs = self.block_size();
-        let blocks = (parent_inode.size as usize + bs - 1) / bs;
+        let blocks = (parent_inode.size as usize).div_ceil(bs);
         for i in 0..blocks {
             let phys = self.map_block(parent_inode, i as u64).await?;
             if phys == 0 {

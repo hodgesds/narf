@@ -132,8 +132,7 @@ struct SmokeElfSpec {
 }
 
 fn build_smoke_elf(spec: &SmokeElfSpec) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.resize(64, 0u8);
+    let mut out = alloc::vec![0u8; 64];
 
     // .shstrtab: name offsets recorded as we push.
     let mut shstr = Vec::<u8>::new();
@@ -681,8 +680,10 @@ fn e2e_cap_gate_blocks_undeclared() -> TestResult {
     );
 
     // Manifest that *doesn't* declare BlockDevice.
-    let mut mf_no = crate::manifest::Manifest::default();
-    mf_no.name = "e2e_cap_no".to_string();
+    let mf_no = crate::manifest::Manifest {
+        name: "e2e_cap_no".to_string(),
+        ..Default::default()
+    };
     let r = crate::symbols::resolve("narf_block_register_block_device", None, &mf_no);
     match r {
         Err(crate::symbols::ResolveError::CapMissing(CapKind::BlockDevice)) => {}

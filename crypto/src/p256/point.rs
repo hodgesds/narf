@@ -200,11 +200,11 @@ impl ProjectivePoint {
         }
     }
 
-    /// Add a Jacobian point `self` and an affine point `other`. Affine
-    /// + Jacobian is cheaper than Jacobian + Jacobian and is what the
-    /// scalar-mul ladder needs. Handles all degenerate cases:
-    /// self == ∞, other == ∞, self == other (doubling), self == -other
-    /// (infinity).
+    /// Add a Jacobian point `self` and an affine point `other`. Mixed
+    /// affine-plus-Jacobian is cheaper than Jacobian + Jacobian and is what
+    /// the scalar-mul ladder needs. Handles all degenerate cases (self == ∞,
+    /// other == ∞, self == other (doubling), self == -other giving
+    /// infinity).
     ///
     /// Formula: "madd-2007-bl" from the Bernstein-Lange explicit-formulas
     /// database (mixed addition for short Weierstrass / Jacobian /
@@ -339,7 +339,7 @@ pub fn scalar_mul(k: &Scalar, p: &AffinePoint) -> AffinePoint {
         for bit in (0..64).rev() {
             acc = acc.double();
             let candidate = acc.add_mixed(p);
-            let take = ((limb >> bit) & 1) as u64;
+            let take = (limb >> bit) & 1;
             acc = ProjectivePoint::ct_select(&candidate, &acc, take);
         }
     }

@@ -127,8 +127,8 @@ impl Status {
 /// `MSR_AMD_CPPC_ENABLE` — bit 0 = master enable.
 pub const ENABLE_BIT: u64 = 1 << 0;
 
-/// Canonical Energy-Performance-Preference values used by Linux
-/// + Windows + ACPI. AMD honours arbitrary 0..=255 values; these
+/// Canonical Energy-Performance-Preference values used by Linux,
+/// Windows, and ACPI. AMD honours arbitrary 0..=255 values; these
 /// are the well-known anchors.
 pub mod epp {
     pub const PERFORMANCE: u8 = 0x00;
@@ -155,6 +155,8 @@ mod x86 {
         if max < 0x8000_0008 {
             return false;
         }
+        // SAFETY: extended leaf 0x8000_0008 is defined because the max
+        // extended leaf reported above is >= 0x8000_0008.
         let (_, ebx, _, _) = unsafe { cpuid(0x8000_0008, 0) };
         ebx & (1 << 27) != 0
     }

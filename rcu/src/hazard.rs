@@ -148,6 +148,11 @@ struct RetireEntry {
 // was `Send + 'static` at retire time, so moving the entry across CPUs
 // is sound.
 unsafe impl Send for RetireEntry {}
+// SAFETY: `RetireEntry` only ever holds a type-erased raw pointer plus an
+// `unsafe fn` dropper; it exposes no interior mutability of its own. All
+// access to the shared entry array is serialized by `RetireList::busy`
+// (the spinlock flag), so two CPUs never touch the same entry concurrently.
+// Sharing `&RetireEntry` across threads therefore cannot create a data race.
 unsafe impl Sync for RetireEntry {}
 
 struct RetireList {
@@ -404,8 +409,8 @@ impl HazardDomain {
         for read in 0..len {
             let entry = entries[read];
             let mut held = false;
-            for i in 0..h_count {
-                if hazards[i] == entry.ptr {
+            for &hazard in hazards.iter().take(h_count) {
+                if hazard == entry.ptr {
                     held = true;
                     break;
                 }

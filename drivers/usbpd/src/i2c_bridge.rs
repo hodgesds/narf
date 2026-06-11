@@ -20,7 +20,7 @@
 //! References (public, non-GPL only):
 //! - **USB Power Delivery 3.1 v1.8** (USB-IF) — §5.6 BMC framing
 //!   (informs the FIFO usage that drives the I2C transfers below).
-//!     <https://www.usb.org/document-library/usb-power-delivery>
+//!   <https://www.usb.org/document-library/usb-power-delivery>
 //!
 //! No GPL/BSD source consulted.
 

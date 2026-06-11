@@ -89,8 +89,7 @@ pub struct StreamHandle {
 impl StreamHandle {
     /// Create a streaming handle for the given slot/DCI pair.
     pub fn new(mode: TransferMode, slot_id: u8, dci: u8) -> Self {
-        let mut packet_buf = Vec::new();
-        packet_buf.resize(ISOC_PACKET_SIZE, 0u8);
+        let packet_buf = alloc::vec![0; ISOC_PACKET_SIZE];
         Self {
             mode,
             slot_id,

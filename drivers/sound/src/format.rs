@@ -87,13 +87,13 @@ impl SampleRate {
     pub const fn fmt_rate_field(self) -> u16 {
         match self {
             // 48 kHz family: bit 14 = 0.
-            SampleRate::R48000 => 0b0_000_000_0000_0000, // 48k × 1 / 1
-            SampleRate::R96000 => 0b0_001_000_0000_0000, // 48k × 2 / 1
-            SampleRate::R192000 => 0b0_011_000_0000_0000, // 48k × 4 / 1
+            SampleRate::R48000 => 0b0000_0000_0000_0000, // 48k × 1 / 1
+            SampleRate::R96000 => 0b0000_1000_0000_0000, // 48k × 2 / 1
+            SampleRate::R192000 => 0b0001_1000_0000_0000, // 48k × 4 / 1
             // 44.1 kHz family: bit 14 = 1.
-            SampleRate::R44100 => 0b1_000_000_0000_0000,
-            SampleRate::R88200 => 0b1_001_000_0000_0000,
-            SampleRate::R176400 => 0b1_011_000_0000_0000,
+            SampleRate::R44100 => 0b0100_0000_0000_0000,
+            SampleRate::R88200 => 0b0100_1000_0000_0000,
+            SampleRate::R176400 => 0b0101_1000_0000_0000,
         }
     }
 }

@@ -69,19 +69,17 @@ impl FieldElement {
         let mut res = [0u8; 32];
 
         let mut bit_total = 0;
-        for i in 0..32 {
+        for byte in res.iter_mut() {
             let mut val = 0u8;
             for bit_in_byte in 0..8 {
                 let limb_idx = bit_total / 51;
                 let bit_offset = bit_total % 51;
-                if limb_idx < 5 {
-                    if (t[limb_idx] & (1i64 << bit_offset)) != 0 {
-                        val |= 1u8 << bit_in_byte;
-                    }
+                if limb_idx < 5 && (t[limb_idx] & (1i64 << bit_offset)) != 0 {
+                    val |= 1u8 << bit_in_byte;
                 }
                 bit_total += 1;
             }
-            res[i] = val;
+            *byte = val;
         }
         res
     }
@@ -127,9 +125,9 @@ impl FieldElement {
         // (limb 4 + carry-in) is set.
         let mut t = self.0;
         let mut c = 19i64;
-        for i in 0..4 {
-            let val = t[i] + c;
-            t[i] = val & 0x7ffffffffffff;
+        for limb in t.iter_mut().take(4) {
+            let val = *limb + c;
+            *limb = val & 0x7ffffffffffff;
             c = val >> 51;
         }
         let val4 = t[4] + c;
@@ -137,15 +135,15 @@ impl FieldElement {
         // mask = -1 if self ≥ p (need to swap to t = self - p), else 0.
         let mask = (val4 >> 51).wrapping_neg();
 
-        for i in 0..5 {
-            self.0[i] ^= mask & (self.0[i] ^ t[i]);
+        for (limb, &ti) in self.0.iter_mut().zip(t.iter()) {
+            *limb ^= mask & (*limb ^ ti);
         }
     }
 
     pub fn add(&self, rhs: &Self) -> Self {
         let mut res = [0i64; 5];
-        for i in 0..5 {
-            res[i] = self.0[i] + rhs.0[i];
+        for (r, (&a, &b)) in res.iter_mut().zip(self.0.iter().zip(rhs.0.iter())) {
+            *r = a + b;
         }
         let mut fe = FieldElement(res);
         fe.weak_reduce();

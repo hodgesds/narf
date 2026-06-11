@@ -28,7 +28,7 @@ use crate::hda::streams::{StreamDescriptor, StreamSlot};
 /// HDA-class controller without enumerating PCI IDs first; the probe
 /// then opts out (via `ProbeError::NotForThisDriver`) for chips it
 /// doesn't recognise.
-pub const HDA_CLASS_TRIPLE: u32 = 0x0403_00;
+pub const HDA_CLASS_TRIPLE: u32 = 0x04_03_00;
 
 /// AMD vendor ID. Renoir / Lucienne (Zen2) + Phoenix (Zen4) iGPUs
 /// expose HDA on the PCH; both use this vendor.
@@ -329,13 +329,13 @@ pub fn enable_irqs(mut read_intctl: impl FnMut() -> u32, mut write_intctl: impl 
 /// vendor/device. Returns `Ok(false)` to skip a class-backstop match
 /// the driver doesn't actually want to claim.
 pub fn supported_device(vendor: u16, device: u16) -> bool {
-    match (vendor, device) {
-        (HDA_AMD_RENOIR_VENDOR, HDA_AMD_RENOIR_DEVICE) => true,
-        (HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE) => true,
-        (HDA_AMD_VENDOR, HDA_AMD_RADEON_DEVICE) => true,
-        (HDA_INTEL_VENDOR, _) => true,
-        _ => false,
-    }
+    matches!(
+        (vendor, device),
+        (HDA_AMD_RENOIR_VENDOR, HDA_AMD_RENOIR_DEVICE)
+            | (HDA_AMD_PHOENIX_VENDOR, HDA_AMD_PHOENIX_DEVICE)
+            | (HDA_AMD_VENDOR, HDA_AMD_RADEON_DEVICE)
+            | (HDA_INTEL_VENDOR, _)
+    )
 }
 
 /// CORB ring buffer size used by this driver. The HDA spec mandates

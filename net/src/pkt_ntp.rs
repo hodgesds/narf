@@ -89,7 +89,7 @@ pub fn unix_to_ntp(unix_seconds: u64, fractional_2e32: u32) -> u64 {
 /// 32-bit fractional field. Returns `None` if the timestamp is below
 /// the Unix epoch (rarely meaningful — would mean before 1970).
 pub fn ntp_to_unix(ntp: u64) -> Option<(u64, u32)> {
-    let ntp_seconds = (ntp >> 32) as u64;
+    let ntp_seconds = ntp >> 32;
     if ntp_seconds < NTP_UNIX_EPOCH_OFFSET_SECS {
         return None;
     }

@@ -329,7 +329,7 @@ fn smoke_nvme_controller_reset() -> TestResult {
     }
 
     // Step 4: set CC.EN → controller asserts CSTS.RDY.
-    let cc: u32 = NVME_CC_EN | (0 << 4) | (0 << 7) | (6 << 16) | (4 << 20);
+    let cc: u32 = NVME_CC_EN | (6 << 16) | (4 << 20);
     bar.write32(NVME_REG_CC, cc);
     bar.react_cc();
     let csts = bar.read32(NVME_REG_CSTS);
@@ -457,7 +457,7 @@ fn smoke_nvme_identify_namespace() -> TestResult {
 
     // Verify SQE for IDENTIFY NAMESPACE: CDW10=0 (CNS=0), NSID=1.
     let mut sq = [0u8; 64];
-    let cdw0: u32 = (0u32 << 16) | (OPC_IDENTIFY as u32); // CID=0
+    let cdw0: u32 = OPC_IDENTIFY as u32; // CID=0
     sq[0..4].copy_from_slice(&cdw0.to_le_bytes());
     sq[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID = 1
     sq[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10 = CNS=0
@@ -499,7 +499,7 @@ fn smoke_nvme_create_io_cq() -> TestResult {
     sq[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
     // Decode opcode + QID.
-    let got_opc = sq[0] as u8;
+    let got_opc = sq[0];
     let got_cid = u16::from_le_bytes(sq[2..4].try_into().unwrap());
     let got_cdw10 = u32::from_le_bytes(sq[40..44].try_into().unwrap());
     let got_qid = (got_cdw10 & 0xFFFF) as u16;
@@ -564,7 +564,7 @@ fn smoke_nvme_create_io_sq() -> TestResult {
     sq[40..44].copy_from_slice(&cdw10.to_le_bytes());
     sq[44..48].copy_from_slice(&cdw11.to_le_bytes());
 
-    let got_opc = sq[0] as u8;
+    let got_opc = sq[0];
     let got_cdw10 = u32::from_le_bytes(sq[40..44].try_into().unwrap());
     let got_cdw11 = u32::from_le_bytes(sq[44..48].try_into().unwrap());
     let got_qid = (got_cdw10 & 0xFFFF) as u16;
@@ -823,7 +823,7 @@ impl FakeAhciMmio {
             mem: [0u8; 64 * 1024],
         };
         // CAP: NCS (num cmd slots) at bits[12:8] = 31, NP (num ports-1) at bits[4:0] = 0.
-        let cap: u32 = (31 << 8) | 0;
+        let cap: u32 = 31 << 8;
         m.write32(AHCI_HBA_CAP, cap);
         // GHC: AE set, HR clear.
         m.write32(AHCI_HBA_GHC, AHCI_GHC_AE);

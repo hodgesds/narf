@@ -354,9 +354,9 @@ fn main() {
 
 fn build_arch(
     testbin_dir: &PathBuf,
-    target_dir: &PathBuf,
+    target_dir: &std::path::Path,
     triple: &str,
-    linker_script: &PathBuf,
+    linker_script: &std::path::Path,
     extra_flag: Option<&str>,
     env_var: &str,
     bin_name: &str,

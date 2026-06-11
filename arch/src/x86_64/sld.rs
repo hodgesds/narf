@@ -51,8 +51,12 @@ pub unsafe fn read_test_ctrl() -> u64 {
     unsafe { rdmsr(MSR_IA32_TEST_CTRL) }
 }
 
+/// # Safety
+/// CPL = 0; SLD must be supported (see [`supported`]). `v` must be a valid
+/// `IA32_TEST_CTRL` bit pattern.
 pub unsafe fn write_test_ctrl(v: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts SLD is supported and CPL=0, so writing the
+    // architectural IA32_TEST_CTRL MSR is well-defined.
     unsafe {
         wrmsr(MSR_IA32_TEST_CTRL, v);
     }
@@ -69,6 +73,7 @@ pub unsafe fn enable_ac() {
     let mut v = unsafe { read_test_ctrl() };
     v &= !TEST_CTRL_SLD_DISABLE_AC;
     v |= TEST_CTRL_SLD_DISABLE_AC_GP;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         write_test_ctrl(v);
     }
@@ -81,6 +86,7 @@ pub unsafe fn enable_ac() {
 pub unsafe fn disable() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_test_ctrl() } | TEST_CTRL_SLD_DISABLE_AC;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         write_test_ctrl(v);
     }

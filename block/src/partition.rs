@@ -90,10 +90,10 @@ pub fn parse_mbr(sector0: &[u8]) -> Result<[MbrPartition; 4], MbrError> {
         start_lba: 0,
         sector_count: 0,
     }; 4];
-    for i in 0..4 {
+    for (i, slot) in out.iter_mut().enumerate() {
         let off = 446 + i * 16;
         let e = &sector0[off..off + 16];
-        out[i] = MbrPartition {
+        *slot = MbrPartition {
             boot_flag: e[0],
             kind: e[4],
             start_lba: u32::from_le_bytes([e[8], e[9], e[10], e[11]]),
@@ -353,10 +353,7 @@ impl BlockDeviceSync for PartitionBlockDevice {
     }
     fn read(&self, lba: u64, n_blocks: u16, out: &mut [u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
-        if lba
-            .checked_add(n)
-            .map_or(true, |end| end > self.sector_count)
-        {
+        if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
             return Err(BlockIoError::OutOfRange);
         }
         let abs = self.start_lba + lba;
@@ -364,10 +361,7 @@ impl BlockDeviceSync for PartitionBlockDevice {
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), BlockIoError> {
         let n = n_blocks as u64;
-        if lba
-            .checked_add(n)
-            .map_or(true, |end| end > self.sector_count)
-        {
+        if lba.checked_add(n).is_none_or(|end| end > self.sector_count) {
             return Err(BlockIoError::OutOfRange);
         }
         let abs = self.start_lba + lba;
@@ -430,7 +424,7 @@ pub fn scan_and_register_partitions(
         // Compute how many LBAs the entries array occupies.
         let array_bytes =
             header.num_partition_entries as usize * header.partition_entry_size as usize;
-        let array_lbas = ((array_bytes + lba_bytes - 1) / lba_bytes) as u16;
+        let array_lbas = array_bytes.div_ceil(lba_bytes) as u16;
         let mut array = alloc::vec![0u8; array_lbas as usize * lba_bytes];
         parent
             .read(header.partition_entries_lba, array_lbas, &mut array)

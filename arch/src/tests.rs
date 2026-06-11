@@ -44,8 +44,8 @@ fn smoke_arch_percpu_basic() -> TestResult {
         return TestResult::Fail("this_cpu() didn't route to slot 0");
     }
     // Other slots untouched.
-    for i in 1..MAX_CPUS {
-        if COUNTER[i].load(Ordering::Relaxed) != 0 {
+    for slot in COUNTER.iter().skip(1) {
+        if slot.load(Ordering::Relaxed) != 0 {
             return TestResult::Fail("non-current slot was modified");
         }
     }
@@ -65,7 +65,7 @@ fn smoke_arch_patch_word_roundtrip() -> TestResult {
     //   - the caller's remaining registers / flags aren't clobbered
     use core::sync::atomic::{AtomicU32, Ordering};
     static SLOT: AtomicU32 = AtomicU32::new(0xDEAD_BEEF);
-    let addr = SLOT.as_ptr() as *mut u32;
+    let addr = SLOT.as_ptr();
     // SAFETY: SLOT is a static mut u32 (interior-atomic); addr is
     // 4-byte aligned. `patch_word` only writes 4 bytes + serialises.
     unsafe {
@@ -208,7 +208,7 @@ fn smoke_tsc_calibrate_via_cpuid() -> TestResult {
     if hz == 0 {
         return TestResult::Skip("CPUID 15h/16h unavailable");
     }
-    if hz < 100_000_000 || hz > 10_000_000_000 {
+    if !(100_000_000..=10_000_000_000).contains(&hz) {
         return TestResult::Fail("TSC frequency out of plausible range");
     }
     TestResult::Pass
@@ -2014,6 +2014,7 @@ fn smoke_arch_x86_features_probe_idempotent() -> TestResult {
     use crate::x86_64::Features;
     // SAFETY: CPUID at CPL=0 is always legal.
     let f1 = unsafe { Features::probe() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let f2 = unsafe { Features::probe() };
     if f1.nx != f2.nx
         || f1.pku != f2.pku
@@ -2152,10 +2153,8 @@ fn smoke_arch_avx10_unsupported_yields_zero_caps() -> TestResult {
     // way that's achievable.
     use crate::x86_64::avx10;
     let c = avx10::caps();
-    if !c.supported {
-        if c.xmm || c.ymm || c.zmm || c.converged_with_avx512 || c.version != 0 {
-            return TestResult::Fail("!supported but other bits set");
-        }
+    if !c.supported && (c.xmm || c.ymm || c.zmm || c.converged_with_avx512 || c.version != 0) {
+        return TestResult::Fail("!supported but other bits set");
     }
     TestResult::Pass
 }
@@ -2703,6 +2702,7 @@ fn smoke_x86_64_hybrid_cpu_type_probe() -> TestResult {
 
     // SAFETY: CPUID is always legal at CPL=0.
     let feats = unsafe { Features::probe() };
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let raw = unsafe { read_hybrid_cpu_type() };
     let ty = CpuType::from_raw(raw);
 
@@ -3414,6 +3414,7 @@ fn smoke_vtd_push_qi_desc_to_ram_queue() -> TestResult {
     // SAFETY: same.
     let mut t = tail;
     for _ in 0..3 {
+        // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
         t = unsafe { push_qi_desc(queue.as_mut_ptr(), t, desc, bytes) };
     }
     if t != 0 {

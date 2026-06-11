@@ -500,7 +500,7 @@ pub fn reclaim_sweep() -> usize {
         } else if state.slots[idx].entry.age > 0 {
             state.slots[idx].entry.age -= 1;
         }
-        if state.slots[idx].entry.age <= DEMOTE_AT_AGE
+        if state.slots[idx].entry.age == DEMOTE_AT_AGE
             && !state.slots[idx].entry.flags.contains(PageFlags::ACCESSED)
         {
             // Demote to inactive.

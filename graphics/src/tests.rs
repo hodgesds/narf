@@ -282,7 +282,7 @@ fn smoke_dp_aux_native_write_command_byte_layout() -> TestResult {
     if req[3] != 1 {
         return TestResult::Fail("length field is len-1");
     }
-    if &req[4..] != &[0xDE, 0xAD] {
+    if req[4..] != [0xDE, 0xAD] {
         return TestResult::Fail("write payload must follow length");
     }
     TestResult::Pass
@@ -461,9 +461,11 @@ kernel_test_in!("graphics/dsc", smoke_dsc_pps_round_trip_4k_8bpc_at_8bpp);
 
 fn smoke_dsc_bpp_fractional_split() -> TestResult {
     use crate::dsc::Pps;
-    let mut p = Pps::default();
-    p.dsc_version_major = 1;
-    p.bits_per_pixel = 8 * 16 + 5; // 8.3125 bpp
+    let p = Pps {
+        dsc_version_major: 1,
+        bits_per_pixel: 8 * 16 + 5, // 8.3125 bpp
+        ..Default::default()
+    };
     if p.bpp_integer_part() != 8 {
         return TestResult::Fail("integer part = high 12 bits / 16");
     }

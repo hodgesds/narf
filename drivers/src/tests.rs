@@ -211,6 +211,11 @@ fn smoke_drivers_release_and_reuse_domain_va() -> TestResult {
     if va2 != va1 {
         return TestResult::Fail("reuse didn't return the same VA");
     }
+    // SAFETY: `(va2, 4096)` exactly matches the claim made just above
+    // via `claim_mmio_in_domain(domain, .., 4096, ..)`, so it satisfies
+    // `release`'s contract that the `(va_base, len)` pair correspond to a
+    // prior live claim in this same `domain`. The mapping is not used
+    // after this point, so releasing it here is sound.
     let _ = unsafe { release_domain_mmio(domain, va2, 4096) };
     TestResult::Pass
 }

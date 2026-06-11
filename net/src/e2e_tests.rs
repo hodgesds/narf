@@ -115,7 +115,8 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
 
 /// Build a minimal Ethernet + IPv4 + TCP segment. Used to inject frames
 /// into the RX dispatch path (matching `netif_receive_skb` in Linux).
-fn build_tcp_frame(
+/// Parameters describing an Ethernet + IPv4 + TCP frame to synthesize.
+struct TcpFrameSpec<'a> {
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     src_ip: [u8; 4],
@@ -126,8 +127,23 @@ fn build_tcp_frame(
     ack: u32,
     flags: u8,
     window: u16,
-    payload: &[u8],
-) -> Vec<u8> {
+    payload: &'a [u8],
+}
+
+fn build_tcp_frame(spec: TcpFrameSpec<'_>) -> Vec<u8> {
+    let TcpFrameSpec {
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        window,
+        payload,
+    } = spec;
     let tcp_hdr_len = TCP_HDR_MIN; // no options for test frames
     let total = ETH_HDR_LEN + IPV4_HDR_LEN + tcp_hdr_len + payload.len();
     let mut frame = vec![0u8; total];
@@ -201,7 +217,6 @@ fn build_udp_frame(
     frame
 }
 
-/// Drive the three-way handshake between a SYN-SENT client TCB and a
 // ── Smoke 1: full TCP loopback round-trip ───────────────────────────────────
 //
 // Exercises: listen → SYN inject → SYN-ACK captured → ACK inject →
@@ -227,19 +242,19 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
 
     // ── Client: build & inject SYN ──
     let client_iss: u32 = 0x2000_0000;
-    let syn = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
     // Stack emits SYN-ACK — extract server ISS.
@@ -260,19 +275,19 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     ]);
 
     // ── Client: inject ACK of SYN-ACK → child reaches ESTABLISHED ──
-    let ack = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
@@ -280,12 +295,9 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     let server_id = {
         let mut sid = None;
         for _ in 0..50 {
-            match accept(listen_id) {
-                Ok(Some(id)) => {
-                    sid = Some(id);
-                    break;
-                }
-                _ => {}
+            if let Ok(Some(id)) = accept(listen_id) {
+                sid = Some(id);
+                break;
             }
         }
         match sid {
@@ -313,19 +325,19 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
 
     // ── Data: inject 16-byte PSH+ACK from client → recv on server ──
     let payload = b"hello-narf-stack";
-    let data_frame = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK | 0x08, /* PSH */
-        65535,
+    let data_frame = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK | 0x08, // PSH
+        window: 65535,
         payload,
-    );
+    });
     handle_segment(
         LOCAL_IP,
         LOCAL_IP,
@@ -452,19 +464,19 @@ fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
 
     // sys_connect equivalent: inject SYN + complete handshake via frames.
     let client_iss: u32 = 0x3000_0000;
-    let syn = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
     let txd = drain_captured();
@@ -482,19 +494,19 @@ fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
         synack[tcp_off + 6],
         synack[tcp_off + 7],
     ]);
-    let ack = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
@@ -515,19 +527,19 @@ fn smoke_e2e_af_inet_socket_fd_table() -> TestResult {
 
     // sys_send: inject a data frame to the server child (simulates M sending "hi").
     let data = b"hi";
-    let data_frame = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK | 0x08,
-        65535,
-        data,
-    );
+    let data_frame = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK | 0x08,
+        window: 65535,
+        payload: data,
+    });
     handle_segment(
         LOCAL_IP,
         LOCAL_IP,
@@ -609,19 +621,19 @@ fn smoke_e2e_routing_and_arp_resolution() -> TestResult {
     crate::tcp_stack::__arp_insert_legacy(REMOTE_IP, GW_MAC);
     arp_cache::insert(IFACE, REMOTE_IP, GW_MAC);
 
-    let syn = build_tcp_frame(
-        GW_MAC,
-        [0x02, 0, 0, 0, 0, 0x05],
-        REMOTE_IP,
-        LOCAL_IP,
-        12345,
-        SERVER_PORT,
-        0xABCD_0000,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_frame(TcpFrameSpec {
+        src_mac: GW_MAC,
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: REMOTE_IP,
+        dst_ip: LOCAL_IP,
+        src_port: 12345,
+        dst_port: SERVER_PORT,
+        seq: 0xABCD_0000,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(REMOTE_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
     let txd = drain_captured();
@@ -677,19 +689,19 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
 
     // Complete handshake (inject SYN + ACK from "client").
     let client_iss: u32 = 0x4000_0000;
-    let syn = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
     let txd = drain_captured();
@@ -707,19 +719,19 @@ fn smoke_e2e_tcp_retransmit_on_missed_ack() -> TestResult {
         synack[tcp_off + 6],
         synack[tcp_off + 7],
     ]);
-    let ack = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
@@ -850,19 +862,19 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
 
     let client_iss: u32 = 0x5000_0000;
     // Perform handshake.
-    let syn = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let txd = drain_captured();
     let synack = match txd.iter().find(|f| {
@@ -879,19 +891,19 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
         synack[tcp_off + 6],
         synack[tcp_off + 7],
     ]);
-    let ack_frame = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack_frame = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_frame[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
@@ -932,19 +944,19 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
         let t = arc.lock();
         t.fin_seq
     };
-    let client_ack_fin = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_fin_seq.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let client_ack_fin = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_fin_seq.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(
         LOCAL_IP,
         LOCAL_IP,
@@ -965,19 +977,19 @@ fn smoke_e2e_tcp_time_wait_after_close() -> TestResult {
     }
 
     // ── Client sends FIN (passive close) ──
-    let client_fin = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_fin_seq.wrapping_add(1),
-        FLAG_FIN | FLAG_ACK,
-        65535,
-        &[],
-    );
+    let client_fin = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_fin_seq.wrapping_add(1),
+        flags: FLAG_FIN | FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(
         LOCAL_IP,
         LOCAL_IP,
@@ -1030,8 +1042,10 @@ fn smoke_e2e_udp_reuseport_load_balance() -> TestResult {
     const PORT: u16 = 26000;
     const ADDR: SocketAddrV4 = SocketAddrV4::new([0, 0, 0, 0], PORT);
 
-    let mut opts = UdpOptions::default();
-    opts.reuseport = true;
+    let opts = UdpOptions {
+        reuseport: true,
+        ..Default::default()
+    };
 
     let s1 = match udp_bind(ADDR, opts.clone()) {
         Ok(s) => s,
@@ -1106,19 +1120,19 @@ fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
 
     // Complete handshake.
     let client_iss: u32 = 0x7000_0000;
-    let syn = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let txd = drain_captured();
     let synack = match txd.iter().find(|f| {
@@ -1135,19 +1149,19 @@ fn smoke_e2e_proc_net_tcp_shows_connections() -> TestResult {
         synack[tcp_off + 6],
         synack[tcp_off + 7],
     ]);
-    let ack_frame = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack_frame = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_frame[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = drain_captured();
 
@@ -1216,19 +1230,19 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
     // Build a full Ethernet frame (ETH + IPv4 + TCP SYN) and inject
     // through rx_handler to exercise the netfilter conntrack path.
     let client_iss: u32 = 0x8000_0000;
-    let syn_full = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn_full = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     crate::tcp_stack::rx_handler(&syn_full);
     let _ = drain_captured();
 
@@ -1261,19 +1275,19 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         synack[tcp_off + 6],
         synack[tcp_off + 7],
     ]);
-    let ack_full = build_tcp_frame(
-        [0x02, 0, 0, 0, 0, 0x05],
-        [0x02, 0, 0, 0, 0, 0x05],
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack_full = build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x05],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x05],
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     crate::tcp_stack::rx_handler(&ack_full);
     let _ = drain_captured();
 

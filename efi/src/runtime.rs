@@ -458,12 +458,16 @@ pub unsafe fn read_secure_boot_state() -> Option<(u8, u8, Vec<u8>, Vec<u8>)> {
     if !is_available() {
         return None;
     }
+    // SAFETY: only reads firmware-owned EFI variables through the validated runtime-services table.
     let sb_bytes = unsafe { get_variable("SecureBoot", &EFI_GLOBAL_VARIABLE).ok()? };
+    // SAFETY: only reads firmware-owned EFI variables through the validated runtime-services table.
     let sm_bytes = unsafe { get_variable("SetupMode", &EFI_GLOBAL_VARIABLE).ok()? };
     let secure_boot = sb_bytes.first().copied().unwrap_or(0);
     let setup_mode = sm_bytes.first().copied().unwrap_or(0);
 
+    // SAFETY: only reads firmware-owned EFI variables through the validated runtime-services table.
     let db = unsafe { get_variable("db", &EFI_IMAGE_SECURITY_DATABASE_GUID).unwrap_or_default() };
+    // SAFETY: only reads firmware-owned EFI variables through the validated runtime-services table.
     let dbx = unsafe { get_variable("dbx", &EFI_IMAGE_SECURITY_DATABASE_GUID).unwrap_or_default() };
     Some((secure_boot, setup_mode, db, dbx))
 }
@@ -513,7 +517,7 @@ mod tests {
         fn new_valid() -> Self {
             let hdr = make_header(
                 signature::RUNTIME_SERVICES,
-                (1u32 << 16) | 0, // revision 1.0
+                (1u32 << 16), // revision 1.0
             );
             let mut t: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
             t.hdr.copy_from_slice(&hdr);
@@ -546,7 +550,7 @@ mod tests {
         }
 
         // A table with a wrong signature must be rejected.
-        let hdr_bad = make_header(0xDEAD_BEEF_DEAD_BEEFu64, (1u32 << 16) | 0);
+        let hdr_bad = make_header(0xDEAD_BEEF_DEAD_BEEFu64, (1u32 << 16));
         let mut t_bad: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
         t_bad.hdr.copy_from_slice(&hdr_bad);
         let result_bad = unsafe { install(&t_bad as *const _) };
@@ -619,7 +623,7 @@ mod tests {
 
     fn smoke_efi_get_variable_fake_rt() -> TestResult {
         // Build a fake RT table with only get_variable populated.
-        let hdr = make_header(signature::RUNTIME_SERVICES, (1u32 << 16) | 0);
+        let hdr = make_header(signature::RUNTIME_SERVICES, (1u32 << 16));
         let mut t: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
         t.hdr.copy_from_slice(&hdr);
         t.get_variable = fake_get_variable as usize;

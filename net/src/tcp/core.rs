@@ -1728,7 +1728,7 @@ fn handle_in_established(
     if hdr.flags & FLAG_FIN != 0 {
         process_fin(arc, hdr);
     }
-    schedule_ack(arc, payload.len() > 0);
+    schedule_ack(arc, !payload.is_empty());
     pump_send(arc);
 }
 
@@ -1764,7 +1764,7 @@ fn handle_in_fin_wait1(
         t.state = TcpState::Closing;
     }
     drop(t);
-    schedule_ack(arc, payload.len() > 0 || their_fin);
+    schedule_ack(arc, !payload.is_empty() || their_fin);
 }
 
 fn handle_in_fin_wait2(
@@ -1785,7 +1785,7 @@ fn handle_in_fin_wait2(
         t.time_wait_deadline_cycles = narf_scheduler::narf_time::now_cycles()
             .wrapping_add(TIME_WAIT_NS.saturating_mul(cpn as u64));
     }
-    schedule_ack(arc, payload.len() > 0 || hdr.flags & FLAG_FIN != 0);
+    schedule_ack(arc, !payload.is_empty() || hdr.flags & FLAG_FIN != 0);
 }
 
 fn handle_in_close_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, parsed: &ParsedOptions) {
@@ -2051,9 +2051,7 @@ fn process_fin(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader) {
         t.rcv_nxt = t.rcv_nxt.wrapping_add(1);
         // FSM transitions: ESTABLISHED → CLOSE-WAIT; SYN-RECEIVED
         // path already handled by callers.
-        if t.state == TcpState::Established {
-            t.state = TcpState::CloseWait;
-        } else if t.state == TcpState::SynReceived {
+        if matches!(t.state, TcpState::Established | TcpState::SynReceived) {
             t.state = TcpState::CloseWait;
         }
     }

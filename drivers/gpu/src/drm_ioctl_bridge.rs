@@ -149,14 +149,22 @@ fn handle_version(
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
     // Read the user struct.
+    // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
+    // trap layer (or a kernel-owned pointer on the test path); we request
+    // exactly `size_of::<DrmVersionUapi>()` bytes, which `copy_in` bounds-
+    // checks against `IOCTL_MAX_BUF` before copying.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmVersionUapi>())? };
+    // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
+    // `size_of::<DrmVersionUapi>()` bytes, so the read of one
+    // `DrmVersionUapi` stays within the allocation. `read_unaligned` is
+    // used because `bytes`' allocation has only `u8` alignment.
     let mut req: DrmVersionUapi =
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmVersionUapi) };
 
     // Run the generic dispatcher to get the filled in version struct.
     let v = {
         let mut card_guard = mode_state.lock();
-        let result = dispatch(&mut *card_guard, 0x00, &[], ctx).map_err(map_err)?;
+        let result = dispatch(&mut card_guard, 0x00, &[], ctx).map_err(map_err)?;
         match result {
             DrmIoctlResult::Version(v) => v,
             _ => return Err(FsError::Unsupported),
@@ -173,6 +181,10 @@ fn handle_version(
     if req.name != 0 && req.name_len > 0 {
         let cap = req.name_len as usize;
         let n = name.len().min(cap);
+        // SAFETY: `req.name` is the user-supplied out-pointer and is non-
+        // null here; we write at most `cap` (= `req.name_len`) bytes, the
+        // capacity the user advertised, so the copy stays within the
+        // user-provided buffer.
         unsafe {
             copy_out(req.name as usize, &name[..n])?;
         }
@@ -180,6 +192,9 @@ fn handle_version(
     if req.date != 0 && req.date_len > 0 {
         let cap = req.date_len as usize;
         let n = date.len().min(cap);
+        // SAFETY: `req.date` is the user-supplied out-pointer and is non-
+        // null here; we write at most `cap` (= `req.date_len`) bytes, the
+        // capacity the user advertised, so the copy stays in bounds.
         unsafe {
             copy_out(req.date as usize, &date[..n])?;
         }
@@ -187,6 +202,9 @@ fn handle_version(
     if req.desc != 0 && req.desc_len > 0 {
         let cap = req.desc_len as usize;
         let n = desc.len().min(cap);
+        // SAFETY: `req.desc` is the user-supplied out-pointer and is non-
+        // null here; we write at most `cap` (= `req.desc_len`) bytes, the
+        // capacity the user advertised, so the copy stays in bounds.
         unsafe {
             copy_out(req.desc as usize, &desc[..n])?;
         }
@@ -198,8 +216,15 @@ fn handle_version(
     req.version_minor = v.version_minor;
     req.version_patchlevel = v.version_patchlevel;
 
+    // SAFETY: `DrmVersionUapi` is a `#[repr(C)]` POD of plain integer
+    // fields with no padding-dependent invariants, so reinterpreting its
+    // bytes as a `[u8; size_of::<DrmVersionUapi>()]` array is sound; the
+    // source and destination have identical size by construction.
     let out_bytes: [u8; core::mem::size_of::<DrmVersionUapi>()] =
         unsafe { core::mem::transmute(req) };
+    // SAFETY: `arg` is the same user/kernel out-pointer validated for the
+    // input copy above; we write exactly `size_of::<DrmVersionUapi>()`
+    // bytes, the size the user struct occupies.
     unsafe {
         copy_out(arg, &out_bytes)?;
     }
@@ -213,13 +238,20 @@ fn handle_getresources(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
+    // trap layer (or kernel-owned on the test path); we request exactly
+    // `size_of::<DrmModeCardResUapi>()` bytes, bounds-checked by `copy_in`.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCardResUapi>())? };
+    // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
+    // `size_of::<DrmModeCardResUapi>()` bytes, so reading one
+    // `DrmModeCardResUapi` stays within the allocation; `read_unaligned`
+    // matches the `u8` alignment of the backing buffer.
     let mut req: DrmModeCardResUapi =
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCardResUapi) };
 
     let mut card_guard = mode_state.lock();
     // Run the existing dispatch path for the count fields.
-    let result = dispatch(&mut *card_guard, 0xA0, &[], ctx).map_err(map_err)?;
+    let result = dispatch(&mut card_guard, 0xA0, &[], ctx).map_err(map_err)?;
     let res = match result {
         DrmIoctlResult::GetResources(r) => r,
         _ => return Err(FsError::Unsupported),
@@ -246,6 +278,10 @@ fn handle_getresources(
             }
             buf.extend_from_slice(&id.to_le_bytes());
         }
+        // SAFETY: `uptr` is the user-supplied id-array out-pointer, non-null
+        // (checked above); `buf` holds at most `cap` (= `user_count`) ids of
+        // 4 bytes each, so we never write past the `user_count`-element
+        // array the user advertised.
         unsafe { copy_out(uptr as usize, &buf) }
     }
 
@@ -273,8 +309,13 @@ fn handle_getresources(
     req.max_height = res.max_height;
     drop(card_guard);
 
+    // SAFETY: `DrmModeCardResUapi` is a `#[repr(C)]` POD of plain integer /
+    // pointer-sized fields, so reinterpreting its bytes as a `[u8; N]`
+    // array of the same size is sound.
     let out_bytes: [u8; core::mem::size_of::<DrmModeCardResUapi>()] =
         unsafe { core::mem::transmute(req) };
+    // SAFETY: `arg` is the validated user/kernel out-pointer from the input
+    // copy above; we write exactly `size_of::<DrmModeCardResUapi>()` bytes.
     unsafe {
         copy_out(arg, &out_bytes)?;
     }
@@ -290,7 +331,14 @@ fn handle_atomic(
     arg: usize,
     _ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
+    // trap layer (or kernel-owned on the test path); we request exactly
+    // `size_of::<DrmModeAtomicUapi>()` bytes, bounds-checked by `copy_in`.
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeAtomicUapi>())? };
+    // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
+    // `size_of::<DrmModeAtomicUapi>()` bytes, so reading one
+    // `DrmModeAtomicUapi` stays within the allocation; `read_unaligned`
+    // matches the `u8` alignment of the backing buffer.
     let req: DrmModeAtomicUapi =
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeAtomicUapi) };
 
@@ -333,6 +381,9 @@ fn handle_generic(
     // For ioctls with a known struct size, copy the input through.
     let size = drm_uapi::ioc_size(cmd) as usize;
     let in_bytes: Vec<u8> = if size > 0 && arg != 0 {
+        // SAFETY: guarded by `arg != 0`; `size` is the encoded ioctl struct
+        // size from `ioc_size(cmd)` and is bounds-checked again by `copy_in`
+        // against `IOCTL_MAX_BUF`. `arg` is the validated user pointer.
         unsafe { copy_in(arg, size)? }
     } else {
         Vec::new()

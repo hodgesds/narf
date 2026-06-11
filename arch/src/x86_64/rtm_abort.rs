@@ -33,8 +33,12 @@ pub unsafe fn read_force_abort() -> u64 {
     unsafe { rdmsr(MSR_IA32_TSX_FORCE_ABORT) }
 }
 
+/// # Safety
+/// CPL = 0; `RTM_ALWAYS_ABORT`/`TSX_FORCE_ABORT` must be supported (see
+/// [`supported`]). `v` must be a valid `IA32_TSX_FORCE_ABORT` bit pattern.
 pub unsafe fn write_force_abort(v: u64) {
-    // SAFETY: caller-asserted.
+    // SAFETY: caller asserts the feature is supported and CPL=0, so writing
+    // the architectural TSX_FORCE_ABORT MSR is well-defined.
     unsafe {
         wrmsr(MSR_IA32_TSX_FORCE_ABORT, v);
     }
@@ -47,6 +51,7 @@ pub unsafe fn write_force_abort(v: u64) {
 pub unsafe fn force_rtm_abort() {
     // SAFETY: caller-asserted.
     let v = unsafe { read_force_abort() } | TSX_FORCE_ABORT_RTM;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe {
         write_force_abort(v);
     }

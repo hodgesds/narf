@@ -1385,8 +1385,8 @@ fn parse_cache(t: &mut Tables, fmt: &[u8], pool: &[u8]) {
     let mut rec = SmbiosCache::ZERO;
     copy_truncated(&mut rec.socket_designation, lookup_string(pool, fmt[4]));
     rec.configuration = u16::from_le_bytes([fmt[5], fmt[6]]);
-    rec.max_size_kb = decode_cache_size(u16::from_le_bytes([fmt[7], fmt[8]])) as u32;
-    rec.installed_size_kb = decode_cache_size(u16::from_le_bytes([fmt[9], fmt[10]])) as u32;
+    rec.max_size_kb = decode_cache_size(u16::from_le_bytes([fmt[7], fmt[8]]));
+    rec.installed_size_kb = decode_cache_size(u16::from_le_bytes([fmt[9], fmt[10]]));
     rec.supported_sram = u16::from_le_bytes([fmt[11], fmt[12]]);
     rec.current_sram = u16::from_le_bytes([fmt[13], fmt[14]]);
     if fmt.len() > 15 {

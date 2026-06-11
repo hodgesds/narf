@@ -48,7 +48,7 @@ pub fn parse_section(bytes: &[u8]) -> Vec<ParamSlot> {
         Ok(s) => s,
         Err(_) => return out,
     };
-    for raw in s.split(|c| c == '\n' || c == 0 as char) {
+    for raw in s.split(['\n', 0 as char]) {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;

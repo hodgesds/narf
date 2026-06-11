@@ -769,7 +769,7 @@ fn smoke_acpi_dbg2_synthetic_decode() -> TestResult {
     buf.extend_from_slice(&0x3F8u64.to_le_bytes()); // GAS.Address = 16550 base
 
     // Patch InfoOffset.
-    let info_off_val = (info_off_actual) as u32;
+    let info_off_val = info_off_actual;
     buf[info_off_pos..info_off_pos + 4].copy_from_slice(&info_off_val.to_le_bytes());
     let _ = (entry_start, info_off);
 
@@ -1172,7 +1172,7 @@ fn smoke_acpi_ibft_synthetic_decode() -> TestResult {
     if nt != 1 || targets[0].port != 3260 || targets[0].lun != 0x0102_0304_0506_0708 {
         return TestResult::Fail("IBFT target decode mismatch");
     }
-    if &targets[0].ip[12..] != &[192, 168, 1, 42] {
+    if targets[0].ip[12..] != [192, 168, 1, 42] {
         return TestResult::Fail("IBFT IP decode mismatch");
     }
     TestResult::Pass
@@ -1565,7 +1565,7 @@ fn smoke_smbios_string_indexing_one_based() -> TestResult {
         alloc::string::String::from("Acme"),
         alloc::string::String::from("Laptop"),
     ];
-    if string_at(&strings, 0) != "" {
+    if !string_at(&strings, 0).is_empty() {
         return TestResult::Fail("index 0 means 'no string'");
     }
     if string_at(&strings, 1) != "Acme" {
@@ -1574,7 +1574,7 @@ fn smoke_smbios_string_indexing_one_based() -> TestResult {
     if string_at(&strings, 2) != "Laptop" {
         return TestResult::Fail("index 2 should be second string");
     }
-    if string_at(&strings, 5) != "" {
+    if !string_at(&strings, 5).is_empty() {
         return TestResult::Fail("out-of-range index returns empty");
     }
     TestResult::Pass
@@ -2562,7 +2562,7 @@ fn smoke_acpi_battery_percent_remaining_handles_unknown() -> TestResult {
     // remaining_capacity = 0xFFFFFFFF (unknown).
     let bst: [u32; 4] = [1, 0, 0xFFFF_FFFF, 11_000];
     let state = decode_bst(&bst).expect("bst decode failed");
-    if state.percent_remaining(&info) != None {
+    if state.percent_remaining(&info).is_some() {
         return TestResult::Fail("unknown remaining must yield None");
     }
     TestResult::Pass
@@ -2827,6 +2827,10 @@ fn smoke_acpi_arm_s3_waking_vector_requires_facs() -> TestResult {
     crate::__test_set_facs_phys(0);
     // FACS_PARSED stays true from earlier tests — we test the
     // FACS_PHYS=0 path which is also a Not-Parsed signal.
+    // SAFETY: with FACS_PHYS forced to 0, arm_s3_waking_vector
+    // returns Err(FacsNotParsed) before it ever reads or jumps to
+    // the supplied phys, so the 0x1000_0000 entry value is never
+    // dereferenced and need not point at live, long-mode code.
     match unsafe { crate::arm_s3_waking_vector(0x1000_0000) } {
         Err(WakeVectorError::FacsNotParsed) => TestResult::Pass,
         _ => TestResult::Fail("FACS phys=0 must yield FacsNotParsed"),

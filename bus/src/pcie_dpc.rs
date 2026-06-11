@@ -212,7 +212,7 @@ pub static DPC_LINK_DOWN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub unsafe fn find_dpc_cap_offset(cfg_phys: u64) -> Option<u16> {
     let mut off: u16 = 0x100;
     for _ in 0..256 {
-        if off == 0 || off < 0x100 || off >= 0x1000 {
+        if !(0x100..0x1000).contains(&off) {
             return None;
         }
         // SAFETY: caller-asserted live config; offset bounded above.

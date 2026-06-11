@@ -136,6 +136,15 @@ missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
+# Deliberate codebase patterns, allowed workspace-wide rather than littered with
+# per-site #[allow]s:
+#   - result_unit_err: many low-level kernel/userspace helpers return
+#     `Result<T, ()>` on purpose — the *fact* of failure is all the caller acts
+#     on, and a bespoke error enum per helper would be noise.
+#   - declare_interior_mutable_const: `const FOO: AtomicX = AtomicX::new(..)`
+#     used as array/initializer seeds is intentional, not an accidental copy.
+result_unit_err = "allow"
+declare_interior_mutable_const = "allow"
 # A kernel crate needing panic = abort must never allocate in panic path.
 # Explicit lints land as subsystems come online.
 

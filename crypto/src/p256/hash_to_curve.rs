@@ -290,8 +290,7 @@ pub fn p256_hash_to_curve(msg: &[u8], dst: &[u8]) -> AffinePoint {
     let q0 = map_to_curve_sswu(&us[0]);
     let q1 = map_to_curve_sswu(&us[1]);
     // R = Q0 + Q1; clear_cofactor is identity for P-256.
-    let sum = q0.to_projective().add_mixed(&q1).to_affine();
-    sum
+    q0.to_projective().add_mixed(&q1).to_affine()
 }
 
 /// `encode_to_curve` for the suite `P256_XMD:SHA-256_SSWU_NU_` — same

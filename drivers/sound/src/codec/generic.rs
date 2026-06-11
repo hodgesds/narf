@@ -272,21 +272,44 @@ pub fn get_param(
 /// `set_output`, `set_input` choose which amp; `left`, `right`
 /// choose which channel; `index` is the connection-list index
 /// (output amps use 0); `mute` is the mute bit; `gain` is the
+/// Parameters for a Set Amp Gain/Mute verb (HDA §7.3.3.8).
+///
+/// Groups the amp-control selectors so callers (and the verb encoder)
+/// pass one cohesive value instead of seven positional booleans.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AmpGainMute {
+    /// Apply to the output amp.
+    pub set_output: bool,
+    /// Apply to the input amp.
+    pub set_input: bool,
+    /// Apply to the left channel.
+    pub left: bool,
+    /// Apply to the right channel.
+    pub right: bool,
+    /// Amp index (connection-list index for input amps).
+    pub index: u8,
+    /// Mute bit.
+    pub mute: bool,
+    /// 7-bit gain/attenuator value (0 = max).
+    pub gain: u8,
+}
+
 /// 7-bit attenuator (0 = max).
 ///
 /// Returns a 16-bit value: high byte is the payload's high byte
 /// (containing the channel + amp-type bits), low byte is the
 /// payload's low byte (containing mute + gain). The 0x300 verb is a
 /// 4-bit-major verb so callers pack the high byte into the verb_id.
-pub const fn amp_gain_mute_payload(
-    set_output: bool,
-    set_input: bool,
-    left: bool,
-    right: bool,
-    index: u8,
-    mute: bool,
-    gain: u8,
-) -> u16 {
+pub const fn amp_gain_mute_payload(amp: AmpGainMute) -> u16 {
+    let AmpGainMute {
+        set_output,
+        set_input,
+        left,
+        right,
+        index,
+        mute,
+        gain,
+    } = amp;
     let mut hi: u8 = 0;
     if set_output {
         hi |= 0x80;
@@ -310,18 +333,8 @@ pub const fn amp_gain_mute_payload(
 
 /// Pack a Set Amp Gain/Mute verb (HDA §7.3.3.8). Returns the full
 /// 32-bit CORB word — major opcode 0x3 + payload.
-pub const fn set_amp_gain_mute_verb(
-    cad: u8,
-    nid: u8,
-    set_output: bool,
-    set_input: bool,
-    left: bool,
-    right: bool,
-    index: u8,
-    mute: bool,
-    gain: u8,
-) -> u32 {
-    let payload = amp_gain_mute_payload(set_output, set_input, left, right, index, mute, gain);
+pub const fn set_amp_gain_mute_verb(cad: u8, nid: u8, amp: AmpGainMute) -> u32 {
+    let payload = amp_gain_mute_payload(amp);
     // major opcode 0x3 lives in bits 19..16 of the CORB word —
     // i.e. the high nibble of the 12-bit verb_id.
     let verb_id = (0x3 << 8) | ((payload >> 8) & 0xFF);
@@ -345,8 +358,17 @@ pub fn generic_bring_up_output(
     // Unmute the DAC output amp (output, both channels, index 0,
     // gain 0 = max).
     let unmute = set_amp_gain_mute_verb(
-        cad, dac_nid, /*set_output=*/ true, /*set_input=*/ false, /*left=*/ true,
-        /*right=*/ true, /*index=*/ 0, /*mute=*/ false, /*gain=*/ 0,
+        cad,
+        dac_nid,
+        AmpGainMute {
+            set_output: true,
+            set_input: false,
+            left: true,
+            right: true,
+            index: 0,
+            mute: false,
+            gain: 0,
+        },
     );
     bus.send_verb(unmute)?;
     // Drive pin widget control to "out enable" (bit 6 = 0x40).

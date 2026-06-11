@@ -188,10 +188,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
 
     async fn ensure_sector_loaded(&mut self, lba: u64) -> Result<(), FsError> {
         let lbs = self.volume.bytes_per_sector as usize;
-        let need_load = match self.sector {
-            Some((cached, _)) if cached == lba => false,
-            _ => true,
-        };
+        let need_load = !matches!(self.sector, Some((cached, _)) if cached == lba);
         if need_load {
             let mut buf = vec![0u8; lbs];
             self.volume.read_sector(lba, &mut buf).await?;

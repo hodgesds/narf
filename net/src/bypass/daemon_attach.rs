@@ -41,7 +41,7 @@ use super::xdp::XdpSocket;
 /// `socket` and `admin` are kept for revocation / detach paths that
 /// reach into the record to take the cap or the Arc — the dead-code
 /// lint can't see those uses because they go through `__reset_for_test`
-/// + the classifier's `daemon_socket` helper rather than direct field
+/// plus the classifier's `daemon_socket` helper rather than direct field
 /// reads here.
 #[allow(dead_code)]
 #[derive(Clone)]

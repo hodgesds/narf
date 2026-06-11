@@ -327,6 +327,9 @@ pub fn restore_config(
 #[inline]
 unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base and `off` is within that device's config window, so `cfg.raw() + off`
+    // is a readable MMIO address correctly aligned for a u8.
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
     compiler_fence(Ordering::SeqCst);
     v
@@ -335,6 +338,9 @@ unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
 #[inline]
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base and `off` is a dword-aligned offset within that device's config
+    // window, so `cfg.raw() + off` is a readable MMIO address valid for a u32.
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     v
@@ -343,6 +349,9 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
 #[inline]
 unsafe fn cfg_write8(cfg: PhysAddr, off: u64, value: u8) {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base it exclusively owns and `off` is within that device's config window,
+    // so `cfg.raw() + off` is a writable MMIO address correctly aligned for a u8.
     unsafe {
         core::ptr::write_volatile((cfg.raw() + off) as *mut u8, value);
     }
@@ -352,6 +361,10 @@ unsafe fn cfg_write8(cfg: PhysAddr, off: u64, value: u8) {
 #[inline]
 unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     compiler_fence(Ordering::SeqCst);
+    // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
+    // base it exclusively owns and `off` is a dword-aligned offset within that
+    // device's config window, so `cfg.raw() + off` is a writable MMIO address
+    // valid for a u32.
     unsafe {
         core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
     }

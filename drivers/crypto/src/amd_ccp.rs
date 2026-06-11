@@ -455,6 +455,12 @@ pub struct LsbPool {
     map: [u64; 2],
 }
 
+impl Default for LsbPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LsbPool {
     /// Create an empty pool (all 128 slots free).
     pub const fn new() -> Self {
@@ -521,9 +527,7 @@ pub fn passthru_to_lsb<M: CcpMmio>(
     src_phys: u64,
     lsb_slot: u32,
     byte_count: u32,
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
     if byte_count == 0 || byte_count > LSB_ITEM_BYTES {
         return Err(CcpError::InvalidKeySize);
@@ -537,7 +541,7 @@ pub fn passthru_to_lsb<M: CcpMmio>(
     desc.set_length(byte_count);
     desc.set_src(src_phys, MEMTYPE_SYSTEM);
     desc.set_dst(dst_addr, MEMTYPE_SB);
-    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+    submit_desc(mmio, 0, &desc, ring)
 }
 
 // ── RSA constants and function encoder ───────────────────────────────
@@ -563,14 +567,14 @@ pub const RSA_MAX_BITS: u32 = 16384;
 /// Matches Linux: `o_len = 32 * ((rsa->key_size + 255) / 256)`.
 #[inline]
 pub fn rsa_o_len(key_size_bits: u32) -> u32 {
-    32 * ((key_size_bits + 255) / 256)
+    32 * key_size_bits.div_ceil(256)
 }
 
 /// Encode the RSA function word for a given key size.
 /// Matches Linux: `CCP_RSA_SIZE(&function) = (op->u.rsa.mod_size + 7) >> 3`.
 #[inline]
 pub fn rsa_function(key_size_bits: u32) -> u16 {
-    let byte_len = (key_size_bits + 7) / 8;
+    let byte_len = key_size_bits.div_ceil(8);
     RSA_MODE_MODEXP | ((byte_len as u16) << 3)
 }
 
@@ -591,9 +595,7 @@ pub fn rsa_modexp_submit<M: CcpMmio>(
     src_phys: u64,
     dst_phys: u64,
     exp_phys: u64,
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
     if key_size_bits == 0 || key_size_bits > RSA_MAX_BITS {
         return Err(CcpError::InvalidKeySize);
@@ -611,7 +613,7 @@ pub fn rsa_modexp_submit<M: CcpMmio>(
     desc.set_src(src_phys, MEMTYPE_SYSTEM);
     desc.set_dst(dst_phys, MEMTYPE_SYSTEM);
     desc.set_key(exp_phys, MEMTYPE_SYSTEM);
-    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+    submit_desc(mmio, 0, &desc, ring)
 }
 
 // ── ECC constants ─────────────────────────────────────────────────────
@@ -684,9 +686,7 @@ pub fn ecc_point_op_submit<M: CcpMmio>(
     src_phys: u64,
     src_len: u32,
     dst_phys: u64,
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
     let func = ecc_function(ecc_mode);
     let mut desc = Desc::new();
@@ -698,7 +698,7 @@ pub fn ecc_point_op_submit<M: CcpMmio>(
     desc.set_length(src_len);
     desc.set_src(src_phys, MEMTYPE_SYSTEM);
     desc.set_dst(dst_phys, MEMTYPE_SYSTEM);
-    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+    submit_desc(mmio, 0, &desc, ring)
 }
 
 // ── NIST P-256 / P-384 curve parameters (FIPS 186-4) ─────────────────
@@ -801,37 +801,50 @@ pub fn ecc_result_ok(dst: &[u8; ECC_DST_BUF_SIZE]) -> bool {
 /// At ~1 ns/iteration (MMIO round-trip) this is about 5 ms.
 pub const POLL_BUDGET: u32 = 5_000_000;
 
+/// Borrowed view of a caller-managed CCP command-queue ring.
+///
+/// The three fields always travel together: the ring slot buffer, the
+/// current tail index into it, and the physical (DMA) base address the
+/// hardware reads descriptors from.  Bundling them keeps the submit-API
+/// signatures small and ties the tail index to its backing buffer.
+///
+/// On real hardware `buf` is the kernel VA of the DMA-coherent allocation
+/// whose physical base is `phys`.  For tests `phys = 0` is acceptable.
+#[derive(Debug)]
+pub struct CmdRing<'a> {
+    /// Ring slot buffer: 16 descriptors × 8 words = 128 u32.
+    pub buf: &'a mut [u32; 128],
+    /// Current tail index (0..16); updated on successful submission.
+    pub tail: &'a mut u32,
+    /// Physical base address of the ring as seen by the hardware.
+    pub phys: u64,
+}
+
 /// Submit one 32-byte descriptor to queue 0 and spin until complete.
 ///
 /// The caller fills `desc` with the fully-formed descriptor.  This
 /// function writes it to the ring at the current tail, advances tail,
 /// kicks Q_RUN, then polls Q_INT_STATUS bit 0 (INT_COMPLETION).
 ///
-/// `queue_ring` is a caller-managed 512-byte (16 × 32) buffer at a
-/// known physical address `ring_phys`.  The tail index `*tail_idx`
-/// is updated on successful submission.
-///
-/// On real hardware the ring is DMA-coherent memory at `ring_phys`;
-/// `queue_ring` is the kernel VA of the same allocation.  For tests
-/// `ring_phys = 0` is acceptable.
+/// `ring.buf` is a caller-managed 512-byte (16 × 32) buffer at the
+/// physical address `ring.phys`.  `ring.tail` is updated on successful
+/// submission.  See [`CmdRing`] for the full contract.
 pub fn submit_desc<M: CcpMmio>(
     mmio: &mut M,
     queue_n: u32,
     desc: &Desc,
-    queue_ring: &mut [u32; 128], // 16 descs × 8 words
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
-    // Write descriptor words into the ring buffer at *tail_idx.
-    let slot = *tail_idx as usize * 8;
+    // Write descriptor words into the ring buffer at the current tail.
+    let slot = *ring.tail as usize * 8;
     for (i, &w) in desc.dw.iter().enumerate() {
-        queue_ring[slot + i] = w;
+        ring.buf[slot + i] = w;
     }
 
     // Advance tail, compute new DMA address, write to Q_TAIL_LO.
-    let old_tail = *tail_idx;
-    *tail_idx = ring_next(old_tail);
-    let new_tail_phys = ring_phys + (*tail_idx as u64 * DESC_SIZE_BYTES as u64);
+    let old_tail = *ring.tail;
+    *ring.tail = ring_next(old_tail);
+    let new_tail_phys = ring.phys + (*ring.tail as u64 * DESC_SIZE_BYTES as u64);
     mmio.write(queue_reg(queue_n, Q_TAIL_LO), new_tail_phys as u32);
 
     // Kick the queue.
@@ -859,17 +872,31 @@ pub fn submit_desc<M: CcpMmio>(
 
 // ── Public API ────────────────────────────────────────────────────────
 
+/// DMA operand addresses for one in-place AES operation.
+///
+/// All addresses are physical (DMA) addresses pre-computed by the caller
+/// from DMA-mapped allocations.  `data_phys`/`data_len` describe the
+/// plaintext-or-ciphertext buffer (modified in place); `key_phys` points
+/// at the expanded key; `iv_phys` points at the 16-byte IV (set to 0 for
+/// ECB, which ignores it).
+#[derive(Debug, Clone, Copy)]
+pub struct AesBuffers {
+    /// DMA address of the in-place data buffer (src == dst).
+    pub data_phys: u64,
+    /// Length of the data buffer in bytes (must be a non-zero multiple of 16).
+    pub data_len: u32,
+    /// DMA address of the AES key.
+    pub key_phys: u64,
+    /// DMA address of the 16-byte IV; 0 for ECB.
+    pub iv_phys: u64,
+}
+
 /// Build and submit an AES encrypt/decrypt descriptor.
 ///
-/// `key`   — AES key (128/192/256 bits); determines engine type.
-/// `iv`    — 16-byte IV for CBC/CTR.  Ignored for ECB.  Must be exactly
-///           16 bytes for CBC/CTR.
-/// `data`  — plaintext (encrypt) or ciphertext (decrypt); modified in-place.
-/// `mode`  — AES block mode.
-/// `action`— `Encrypt` or `Decrypt`.
-///
-/// The physical addresses `data_phys`, `key_phys`, `iv_phys` must be
-/// pre-computed by the caller from the DMA-mapped allocations.
+/// `key`    — AES key (128/192/256 bits); determines engine type.
+/// `mode`   — AES block mode.
+/// `action` — `Encrypt` or `Decrypt`.
+/// `bufs`   — DMA operand addresses (data/key/iv); see [`AesBuffers`].
 ///
 /// Returns `Ok(())` on hardware completion.
 pub fn aes_op<M: CcpMmio>(
@@ -877,15 +904,10 @@ pub fn aes_op<M: CcpMmio>(
     key: &Key,
     mode: AesMode,
     action: AesAction,
-    data_phys: u64,
-    data_len: u32,
-    key_phys: u64,
-    iv_phys: u64, // unused for ECB; pass 0
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    bufs: &AesBuffers,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
-    if data_len == 0 || data_len % 16 != 0 {
+    if bufs.data_len == 0 || bufs.data_len % 16 != 0 {
         return Err(CcpError::UnalignedLength);
     }
 
@@ -898,20 +920,20 @@ pub fn aes_op<M: CcpMmio>(
     desc.set_ioc(true);
     desc.set_init(true); // load IV / key on first block
     desc.set_eom(true); // single-shot: all data in one descriptor
-    desc.set_length(data_len);
-    desc.set_src(data_phys, MEMTYPE_SYSTEM);
-    desc.set_dst(data_phys, MEMTYPE_SYSTEM); // in-place
-                                             // Key lives in system memory (we don't use the on-chip LSB here).
-    desc.set_key(key_phys, MEMTYPE_SYSTEM);
+    desc.set_length(bufs.data_len);
+    desc.set_src(bufs.data_phys, MEMTYPE_SYSTEM);
+    desc.set_dst(bufs.data_phys, MEMTYPE_SYSTEM); // in-place
+                                                  // Key lives in system memory (we don't use the on-chip LSB here).
+    desc.set_key(bufs.key_phys, MEMTYPE_SYSTEM);
     // Context (IV) stored at LSB; we use the iv_phys slot in system memory.
     // For simplicity we put IV address in the lsb_cxt_id field as 0 and
     // pass the iv address as the key so the caller just needs one allocation.
     // For a full silicon port the IV goes through a passthru-to-SB step.
     // Here we encode it into the descriptor's src_hi / lsb region for the
     // mock path used by tests.
-    let _ = iv_phys; // accepted for API completeness; not wired to HW yet
+    let _ = bufs.iv_phys; // accepted for API completeness; not wired to HW yet
 
-    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+    submit_desc(mmio, 0, &desc, ring)
 }
 
 /// Convenience wrapper: AES encrypt in-place.
@@ -920,29 +942,13 @@ pub fn aes_encrypt<M: CcpMmio>(
     key: &Key,
     iv: &[u8],
     mode: AesMode,
-    data_phys: u64,
-    data_len: u32,
-    key_phys: u64,
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    bufs: &AesBuffers,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
     if !matches!(mode, AesMode::Ecb) && iv.len() != 16 {
         return Err(CcpError::BadIv);
     }
-    aes_op(
-        mmio,
-        key,
-        mode,
-        AesAction::Encrypt,
-        data_phys,
-        data_len,
-        key_phys,
-        0,
-        queue_ring,
-        tail_idx,
-        ring_phys,
-    )
+    aes_op(mmio, key, mode, AesAction::Encrypt, bufs, ring)
 }
 
 /// Convenience wrapper: AES decrypt in-place.
@@ -951,29 +957,13 @@ pub fn aes_decrypt<M: CcpMmio>(
     key: &Key,
     iv: &[u8],
     mode: AesMode,
-    data_phys: u64,
-    data_len: u32,
-    key_phys: u64,
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    bufs: &AesBuffers,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
     if !matches!(mode, AesMode::Ecb) && iv.len() != 16 {
         return Err(CcpError::BadIv);
     }
-    aes_op(
-        mmio,
-        key,
-        mode,
-        AesAction::Decrypt,
-        data_phys,
-        data_len,
-        key_phys,
-        0,
-        queue_ring,
-        tail_idx,
-        ring_phys,
-    )
+    aes_op(mmio, key, mode, AesAction::Decrypt, bufs, ring)
 }
 
 /// Build and submit a SHA descriptor.
@@ -988,9 +978,7 @@ pub fn sha_op<M: CcpMmio>(
     data_phys: u64,
     data_len: u32,
     ctx_phys: u64,
-    queue_ring: &mut [u32; 128],
-    tail_idx: &mut u32,
-    ring_phys: u64,
+    ring: &mut CmdRing<'_>,
 ) -> Result<(), CcpError> {
     let func = sha_function(sha_type);
     let msg_bits = (data_len as u64) * 8;
@@ -1009,7 +997,7 @@ pub fn sha_op<M: CcpMmio>(
     desc.set_key(ctx_phys, MEMTYPE_SYSTEM);
     desc.set_lsb_cxt_id(0);
 
-    submit_desc(mmio, 0, &desc, queue_ring, tail_idx, ring_phys)
+    submit_desc(mmio, 0, &desc, ring)
 }
 
 /// Software SHA-256 fallback — pure Rust, no CCP.
@@ -1053,7 +1041,7 @@ pub fn sha256_soft(data: &[u8]) -> [u8; 32] {
     for blk in 0..full_blocks {
         let mut w = [0u32; 64];
         // Fill 16 message words for this block.
-        for i in 0..16 {
+        for (i, word) in w.iter_mut().enumerate().take(16) {
             let byte_off = blk * 64 + i * 4;
             let get = |off: usize| -> u8 {
                 if off < data.len() {
@@ -1067,7 +1055,7 @@ pub fn sha256_soft(data: &[u8]) -> [u8; 32] {
                     0x00
                 }
             };
-            w[i] = ((get(byte_off) as u32) << 24)
+            *word = ((get(byte_off) as u32) << 24)
                 | ((get(byte_off + 1) as u32) << 16)
                 | ((get(byte_off + 2) as u32) << 8)
                 | (get(byte_off + 3) as u32);
@@ -1161,10 +1149,7 @@ pub mod test_support {
         /// Pre-queue a sequence of INT_STATUS reads for the given queue.
         pub fn queue_int_response(&mut self, queue_n: u32, val: u32) {
             let off = queue_reg(queue_n, Q_INT_STATUS);
-            self.int_responses
-                .entry(off)
-                .or_insert_with(alloc::collections::VecDeque::new)
-                .push_back(val);
+            self.int_responses.entry(off).or_default().push_back(val);
         }
     }
 
@@ -1300,12 +1285,17 @@ fn smoke_ccp_aes256_cbc_round_trip() -> TestResult {
         &key,
         &iv,
         AesMode::Cbc,
-        0x1000,
-        64,
-        0x2000,
-        &mut ring,
-        &mut tail,
-        0,
+        &AesBuffers {
+            data_phys: 0x1000,
+            data_len: 64,
+            key_phys: 0x2000,
+            iv_phys: 0,
+        },
+        &mut CmdRing {
+            buf: &mut ring,
+            tail: &mut tail,
+            phys: 0,
+        },
     );
     if enc.is_err() {
         return TestResult::Fail("aes_encrypt returned error");
@@ -1322,12 +1312,17 @@ fn smoke_ccp_aes256_cbc_round_trip() -> TestResult {
         &key,
         &iv,
         AesMode::Cbc,
-        0x1000,
-        64,
-        0x2000,
-        &mut ring,
-        &mut tail,
-        0,
+        &AesBuffers {
+            data_phys: 0x1000,
+            data_len: 64,
+            key_phys: 0x2000,
+            iv_phys: 0,
+        },
+        &mut CmdRing {
+            buf: &mut ring,
+            tail: &mut tail,
+            phys: 0,
+        },
     );
     if dec.is_err() {
         return TestResult::Fail("aes_decrypt returned error");
@@ -1418,17 +1413,22 @@ fn smoke_ccp_queue_wrap_around() -> TestResult {
             &key,
             &iv,
             AesMode::Ecb,
-            0x1000,
-            16,
-            0x2000,
-            &mut ring,
-            &mut tail,
-            0,
+            &AesBuffers {
+                data_phys: 0x1000,
+                data_len: 16,
+                key_phys: 0x2000,
+                iv_phys: 0,
+            },
+            &mut CmdRing {
+                buf: &mut ring,
+                tail: &mut tail,
+                phys: 0,
+            },
         );
         if res.is_err() {
             return TestResult::Fail("aes_encrypt failed during wrap test");
         }
-        let expected_next = ((i + 1) % COMMANDS_PER_QUEUE) as u32;
+        let expected_next = (i + 1) % COMMANDS_PER_QUEUE;
         if tail != expected_next {
             return TestResult::Fail("tail wrap-around incorrect");
         }
@@ -1668,7 +1668,16 @@ fn smoke_ccp_rsa_fake_mmio_round_trip() -> TestResult {
     let mut tail = 0u32;
 
     let res = rsa_modexp_submit(
-        &mut mmio, 2048, 0x4000, 0x5000, 0x6000, &mut ring, &mut tail, 0,
+        &mut mmio,
+        2048,
+        0x4000,
+        0x5000,
+        0x6000,
+        &mut CmdRing {
+            buf: &mut ring,
+            tail: &mut tail,
+            phys: 0,
+        },
     );
     if res.is_err() {
         return TestResult::Fail("rsa_modexp_submit returned error on FakeMmio");
@@ -1736,9 +1745,11 @@ fn smoke_ccp_ecdh_fake_mmio_descriptor() -> TestResult {
         0x8000,
         ECC_SRC_BUF_SIZE as u32,
         0x9000,
-        &mut ring,
-        &mut tail,
-        0,
+        &mut CmdRing {
+            buf: &mut ring,
+            tail: &mut tail,
+            phys: 0,
+        },
     );
     if res.is_err() {
         return TestResult::Fail("ecc_point_op_submit returned error on FakeMmio");

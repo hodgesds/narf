@@ -107,6 +107,12 @@ pub struct Sha512 {
     total_len: u128,
 }
 
+impl Default for Sha512 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sha512 {
     pub const fn new() -> Self {
         Self {

@@ -205,7 +205,7 @@ kernel_test_in!("pinctrl/dwapb", smoke_pinctrl_dwapb_make_set_output);
 fn smoke_pinctrl_dwapb_make_set_input_clears_ddr_bit() -> TestResult {
     use crate::dwapb::make_set_input;
     let ddr = make_set_input(0xFFFF_FFFF, 7);
-    if ddr != (0xFFFF_FFFFu32 & !(1u32 << 7)) {
+    if ddr != !(1u32 << 7) {
         return TestResult::Fail("set_input didn't clear pin's DDR bit");
     }
     TestResult::Pass

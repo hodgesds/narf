@@ -221,6 +221,7 @@ pub fn halt_forever() -> ! {
 /// `ptr` must be 16-byte aligned.
 #[inline(always)]
 pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128> {
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
     unsafe { current::cas128(ptr, old, new) }
 }
 
@@ -322,6 +323,11 @@ pub unsafe fn exit_kernel(code: u32) -> ! {
 
 /// Disable interrupts on the current CPU. Stage 1 only — proper save/restore
 /// typestate comes with `frame/`'s IRQ context token.
+///
+/// # Safety
+/// Must be called at CPL=0 (kernel context). Masking interrupts must not be
+/// allowed to deadlock the caller: it is responsible for re-enabling them and
+/// for not blocking on an interrupt-driven event while they are masked.
 #[inline(always)]
 pub unsafe fn disable_interrupts() {
     // SAFETY: arch backend upholds the compiler_fence discipline from §4.
@@ -329,6 +335,11 @@ pub unsafe fn disable_interrupts() {
 }
 
 /// Enable interrupts on the current CPU.
+///
+/// # Safety
+/// Must be called at CPL=0 with a valid IDT installed, and only from a context
+/// where it is safe for interrupts to fire (no IRQ-unsafe lock held). At
+/// Stage 1 the single-domain model makes the capability check vacuous.
 #[inline(always)]
 pub unsafe fn enable_interrupts() {
     // SAFETY: caller must hold the equivalent capability (Stage 3); Stage 1

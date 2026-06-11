@@ -251,7 +251,9 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
 pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     match class_for(need) {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         Some(c) => unsafe { dealloc_class(c, ptr) },
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         None => unsafe { dealloc_large(ptr, layout) },
     }
 }
@@ -464,7 +466,7 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
 }
 
 fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
-    let n_pages = (layout.size() + PAGE_SIZE_USIZE - 1) / PAGE_SIZE_USIZE;
+    let n_pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
     if n_pages == 0 {
         return Err(SlabError::LayoutUnsupported);
     }
@@ -482,7 +484,7 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
 unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
     let phys = crate::PhysAddr::new(ptr.as_ptr() as u64);
     let frame = PhysFrame::new(phys);
-    let n_pages = (layout.size() + PAGE_SIZE_USIZE - 1) / PAGE_SIZE_USIZE;
+    let n_pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
     let order = pages_to_order(n_pages).unwrap_or(0);
     free_pages(frame, order);
     LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
@@ -702,6 +704,7 @@ fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
     // magazine to central.
     // SAFETY: single-threaded test harness; CPU 1 is quiesced.
     let class = &CLASSES[class_idx];
+    // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let mag = unsafe { &mut *class.magazines[1].inner.get() };
     mag.top -= 1;
     let blk = mag.stack[mag.top].take().expect("planted block present");

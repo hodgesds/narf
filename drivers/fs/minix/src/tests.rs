@@ -156,7 +156,7 @@ fn smoke_minix_inode_decode_v1_v2() -> TestResult {
     // V1 inode: 32 bytes. Build: mode=IFREG|0o644, size=42,
     // mtime=0xCAFE, gid=0, nlinks=1, zone[0]=7.
     let mut v1 = vec![0u8; 32];
-    v1[0..2].copy_from_slice(&((super::inode::mode::IFREG | 0o644) as u16).to_le_bytes());
+    v1[0..2].copy_from_slice(&(super::inode::mode::IFREG | 0o644).to_le_bytes());
     v1[4..8].copy_from_slice(&42u32.to_le_bytes());
     v1[8..12].copy_from_slice(&0xCAFEu32.to_le_bytes());
     v1[13] = 1;
@@ -171,7 +171,7 @@ fn smoke_minix_inode_decode_v1_v2() -> TestResult {
 
     // V2 inode: 64 bytes.
     let mut v2 = vec![0u8; 64];
-    v2[0..2].copy_from_slice(&((super::inode::mode::IFDIR | 0o755) as u16).to_le_bytes());
+    v2[0..2].copy_from_slice(&(super::inode::mode::IFDIR | 0o755).to_le_bytes());
     v2[2..4].copy_from_slice(&2u16.to_le_bytes()); // nlinks
     v2[8..12].copy_from_slice(&128u32.to_le_bytes()); // size
     v2[16..20].copy_from_slice(&0x1234u32.to_le_bytes()); // mtime
@@ -283,7 +283,7 @@ fn build_minix3_image(data: &[u8]) -> Vec<u8> {
     let it = BS * 4;
     let i1 = &mut img[it..it + 64];
     // mode = IFDIR | 0755
-    let mode_dir = (super::inode::mode::IFDIR | 0o755) as u16;
+    let mode_dir = super::inode::mode::IFDIR | 0o755;
     i1[0..2].copy_from_slice(&mode_dir.to_le_bytes());
     // nlinks = 2
     i1[2..4].copy_from_slice(&2u16.to_le_bytes());
@@ -296,7 +296,7 @@ fn build_minix3_image(data: &[u8]) -> Vec<u8> {
 
     // Inode 2 at offset 64.
     let i2 = &mut img[it + 64..it + 128];
-    let mode_reg = (super::inode::mode::IFREG | 0o644) as u16;
+    let mode_reg = super::inode::mode::IFREG | 0o644;
     i2[0..2].copy_from_slice(&mode_reg.to_le_bytes());
     i2[2..4].copy_from_slice(&1u16.to_le_bytes()); // nlinks
     i2[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());

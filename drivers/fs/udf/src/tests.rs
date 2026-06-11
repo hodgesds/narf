@@ -276,7 +276,7 @@ fn smoke_udf_fid_decode() -> TestResult {
     if decode_identifier(b"\x08HI") != "HI" {
         return TestResult::Fail("decode_identifier 8-bit mismatch");
     }
-    if decode_identifier(b"") != "" {
+    if !decode_identifier(b"").is_empty() {
         return TestResult::Fail("decode_identifier empty mismatch");
     }
     TestResult::Pass

@@ -75,8 +75,8 @@ impl Inode {
         let gid = s[12] as u16;
         let nlinks = s[13] as u16;
         let mut zones = [0u32; 10];
-        for i in 0..9 {
-            zones[i] = u16le(14 + i * 2) as u32;
+        for (i, zone) in zones.iter_mut().enumerate().take(9) {
+            *zone = u16le(14 + i * 2) as u32;
         }
         Some(Self {
             mode,
@@ -105,8 +105,8 @@ impl Inode {
         let mtime = u32le(16);
         let _ctime = u32le(20);
         let mut zones = [0u32; 10];
-        for i in 0..10 {
-            zones[i] = u32le(24 + i * 4);
+        for (i, zone) in zones.iter_mut().enumerate() {
+            *zone = u32le(24 + i * 4);
         }
         Some(Self {
             mode,

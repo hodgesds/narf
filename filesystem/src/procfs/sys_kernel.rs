@@ -263,7 +263,7 @@ fn read_perf_event_paranoid() -> String {
 fn write_perf_event_paranoid(v: &str) -> Result<(), FsError> {
     let n: i32 = v.parse().map_err(|_| FsError::InvalidData)?;
     // Linux accepts -1 (no restriction) through 3; NARF accepts same range.
-    if n < -1 || n > 3 {
+    if !(-1..=3).contains(&n) {
         return Err(FsError::InvalidData);
     }
     PERF_EVENT_PARANOID.store(n, Ordering::Relaxed);

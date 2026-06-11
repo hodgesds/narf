@@ -263,9 +263,9 @@ pub fn prf(
     context: &[u8],
     out_bits: usize,
 ) -> Vec<u8> {
-    let out_bytes = (out_bits + 7) / 8;
+    let out_bytes = out_bits.div_ceil(8);
     let mut result = Vec::with_capacity(out_bytes);
-    let chunks = (out_bytes + hmac.out_len() - 1) / hmac.out_len();
+    let chunks = out_bytes.div_ceil(hmac.out_len());
     let mut data = Vec::with_capacity(label.len() + 1 + context.len() + 1);
     for i in 0..chunks as u8 {
         data.clear();

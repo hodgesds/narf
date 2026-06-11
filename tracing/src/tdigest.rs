@@ -217,8 +217,8 @@ impl TDigest {
         // Move all centroids + buffered samples into one working set,
         // sort by mean. This is the §3.2 merging-compression sweep.
         let mut work: Vec<Centroid> = Vec::with_capacity(self.centroids.len() + self.buffer.len());
-        work.extend(self.centroids.drain(..));
-        work.extend(self.buffer.drain(..));
+        work.append(&mut self.centroids);
+        work.append(&mut self.buffer);
         work.sort_by(|a, b| a.mean.partial_cmp(&b.mean).unwrap_or(Ordering::Equal));
 
         let total_w = self.total_weight;
@@ -639,10 +639,19 @@ fn smoke_tdigest_skewed_quantiles_ordered() -> TestResult {
     let p95 = td.quantile(0.95);
     let p99 = td.quantile(0.99);
     let p999 = td.quantile(0.999);
-    if !(p95 <= p99 + 1e-6) {
+    // Use `partial_cmp` so a NaN quantile (which would make every `<=`
+    // comparison false) is treated as an ordering failure rather than
+    // silently passing.
+    if !matches!(
+        p95.partial_cmp(&(p99 + 1e-6)),
+        Some(Ordering::Less | Ordering::Equal)
+    ) {
         return TestResult::Fail("p95 not ≤ p99");
     }
-    if !(p99 <= p999 + 1e-6) {
+    if !matches!(
+        p99.partial_cmp(&(p999 + 1e-6)),
+        Some(Ordering::Less | Ordering::Equal)
+    ) {
         return TestResult::Fail("p99 not ≤ p999");
     }
     // p99 should be in the heavy-tail range (≥ 1000).
@@ -778,7 +787,12 @@ fn smoke_tdigest_scale_function_monotonic() -> TestResult {
     for i in 1..=100 {
         let q = i as f64 / 100.0;
         let k = k_scale(q, delta);
-        if !(k >= prev - 1e-9) {
+        // `partial_cmp` keeps NaN handling explicit: a NaN scale value
+        // is an ordering failure, not a silent pass.
+        if !matches!(
+            k.partial_cmp(&(prev - 1e-9)),
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
             return TestResult::Fail("k(q) not monotone");
         }
         prev = k;

@@ -9,10 +9,10 @@
 //!
 //! References:
 //! - Microsoft FAT File System Specification (FATGEN v1.03):
-//!     §6 Directory Structure (32-byte SFN entry layout, attribute
-//!     bits, first-cluster split, file-size field).
-//!     §7 Long File Names (LFN entry layout, ord byte + 0x40 last-
-//!     entry mask, LFN-to-SFN checksum algorithm pseudocode on p.28).
+//!   §6 Directory Structure (32-byte SFN entry layout, attribute
+//!   bits, first-cluster split, file-size field).
+//!   §7 Long File Names (LFN entry layout, ord byte + 0x40 last-
+//!   entry mask, LFN-to-SFN checksum algorithm pseudocode on p.28).
 //!   <https://download.microsoft.com/download/7/0/3/70320475-7281-420b-8594-531a7bc86e42/fatgen103.pdf>
 //! - UEFI Specification v2.10 §13.3.
 //!   <https://uefi.org/specs/UEFI/2.10/13_Protocols_Media_Access.html#file-system-format>
@@ -93,9 +93,8 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
         let _ = lbs;
         if cluster == 0 {
             // FAT12/16 fixed root.
-            let root_dir_sectors = ((self.volume.bpb.root_ent_cnt as u32 * 32)
-                + (self.volume.bpb.bytes_per_sec as u32 - 1))
-                / self.volume.bpb.bytes_per_sec as u32;
+            let root_dir_sectors = (self.volume.bpb.root_ent_cnt as u32 * 32)
+                .div_ceil(self.volume.bpb.bytes_per_sec as u32);
             if self.sector_in_cluster >= root_dir_sectors {
                 return None;
             }
@@ -112,10 +111,7 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
 
     async fn ensure_sector_loaded(&mut self, lba: u64) -> Result<(), FsError> {
         let lbs = self.volume.bpb.bytes_per_sec as usize;
-        let need_load = match self.sector {
-            Some((cached, _)) if cached == lba => false,
-            _ => true,
-        };
+        let need_load = !matches!(self.sector, Some((cached, _)) if cached == lba);
         if need_load {
             let mut buf = vec![0u8; lbs];
             self.volume.read_sector(lba, &mut buf).await?;
@@ -207,12 +203,14 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
 // ── Byte-layout helpers ─────────────────────────────────────────────
 
 fn read_dir_entry(buf: &[u8], offset: usize) -> RawDirEntry {
+    debug_assert!(offset + DIR_ENTRY_SIZE <= buf.len());
     // SAFETY: `RawDirEntry` is `#[repr(C, packed)]` with a 32-byte
     // layout that exactly matches the on-disk format (FATGEN §6).
-    // The buffer is a freshly-read sector copy we own; we read at
-    // a byte offset that the caller has bounded to
-    // `entries_per_sector * 32`.
-    debug_assert!(offset + DIR_ENTRY_SIZE <= buf.len());
+    // The buffer is a freshly-read sector copy we own; the preceding
+    // debug_assert plus the caller's bound (offset < entries_per_sector
+    // * 32 <= buf.len()) guarantees `offset + 32 <= buf.len()`, so the
+    // unaligned 32-byte read stays in-bounds, and read_unaligned tolerates
+    // the packed layout's lack of alignment.
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const RawDirEntry) }
 }
 
@@ -595,11 +593,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         let mut first_lba: u64 = 0;
         let mut first_offset: usize = 0;
 
-        loop {
-            let lba = match scanner.current_lba() {
-                Some(l) => l,
-                None => break,
-            };
+        while let Some(lba) = scanner.current_lba() {
             scanner.ensure_sector_loaded(lba).await?;
 
             while scanner.entry_in_sector < entries_per_sector {

@@ -139,13 +139,21 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
         //   +8  offset   (u32)
         //   +12 length   (u32)
         //   +16 notify_off_multiplier (u32) — Notify cap only
-        // SAFETY: cfg-space identity-mapped; offsets stay below 0x100.
+        // SAFETY: `cfg` is the device's identity-mapped PCI config space and
+        // `hdr.offset` is a capability pointer (< 0x100) walked from the
+        // standard cap list, so reading the vendor-cap fields at +3/+4 stays
+        // within the 256-byte config region.
         let cfg_type = unsafe { cfg_read8(cfg, hdr.offset + 3) };
+        // SAFETY: same identity-mapped cfg space; +4 (bar) is within the cap.
         let bar = unsafe { cfg_read8(cfg, hdr.offset + 4) };
+        // SAFETY: same cfg space; +8 (offset, u32) lies within the >=16-byte
+        // vendor cap and below 0x100.
         let offset = unsafe { cfg_read32(cfg, hdr.offset + 8) };
+        // SAFETY: same cfg space; +12 (length, u32) lies within the cap.
         let length = unsafe { cfg_read32(cfg, hdr.offset + 12) };
         let multi = if cfg_type == CfgType::Notify as u8 {
-            // SAFETY: Notify cap is at least 20 bytes by spec.
+            // SAFETY: a Notify cap is >= 20 bytes by VirtIO 1.2 §4.1.4.4, so
+            // the notify_off_multiplier field at +16 is in-bounds.
             unsafe { cfg_read32(cfg, hdr.offset + 16) }
         } else {
             0
@@ -241,6 +249,9 @@ impl VirtioRegion {
     /// low-half first, high-half second — but on QEMU x86_64 we have
     /// the freedom to use 64-bit MMIO. The split form is universally
     /// safe.
+    ///
+    /// # Safety
+    /// `off + 8 <= self.length` and the region must be a live MMIO mapping.
     #[inline]
     pub unsafe fn write64_split(&self, off: u64, v: u64) {
         // SAFETY: caller-bounded.
@@ -250,12 +261,20 @@ impl VirtioRegion {
         }
     }
 
+    /// Read a 16-bit register at `off` bytes into the region.
+    ///
+    /// # Safety
+    /// `off + 2 <= self.length` and the region must be a live MMIO mapping.
     #[inline]
     pub unsafe fn read16(&self, off: u64) -> u16 {
         // SAFETY: caller-bounded.
         unsafe { narf_arch::mmio::read16(self.addr(off)) }
     }
 
+    /// Write a 16-bit register at `off` bytes into the region.
+    ///
+    /// # Safety
+    /// `off + 2 <= self.length` and the region must be a live MMIO mapping.
     #[inline]
     pub unsafe fn write16(&self, off: u64, v: u16) {
         // SAFETY: caller-bounded.
@@ -264,12 +283,20 @@ impl VirtioRegion {
         }
     }
 
+    /// Read an 8-bit register at `off` bytes into the region.
+    ///
+    /// # Safety
+    /// `off < self.length` and the region must be a live MMIO mapping.
     #[inline]
     pub unsafe fn read8(&self, off: u64) -> u8 {
         // SAFETY: caller-bounded.
         unsafe { narf_arch::mmio::read8(self.addr(off)) }
     }
 
+    /// Write an 8-bit register at `off` bytes into the region.
+    ///
+    /// # Safety
+    /// `off < self.length` and the region must be a live MMIO mapping.
     #[inline]
     pub unsafe fn write8(&self, off: u64, v: u8) {
         // SAFETY: caller-bounded.

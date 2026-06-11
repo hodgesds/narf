@@ -66,6 +66,12 @@ pub struct ArpCache {
     count: usize,
 }
 
+impl Default for ArpCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArpCache {
     pub const fn new() -> Self {
         Self {

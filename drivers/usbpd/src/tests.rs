@@ -139,7 +139,7 @@ fn smoke_fusb302_transmit_emits_sop_frame() -> TestResult {
         return TestResult::Fail("PACKSYM token did not encode body length");
     }
     // The pd_body bytes follow.
-    if &log[5..5 + pd_body.len()] != pd_body {
+    if log[5..5 + pd_body.len()] != pd_body {
         return TestResult::Fail("body bytes did not appear in TX FIFO");
     }
     TestResult::Pass
@@ -173,10 +173,10 @@ fn smoke_fusb302_receive_drains_rx_fifo() -> TestResult {
     if frame.len() != 2 + payload.len() {
         return TestResult::Fail("receive should drop SOP+CRC tokens");
     }
-    if &frame[0..2] != header_bytes {
+    if frame[0..2] != header_bytes {
         return TestResult::Fail("PD header bytes wrong");
     }
-    if &frame[2..] != payload {
+    if frame[2..] != payload {
         return TestResult::Fail("PD payload bytes wrong");
     }
     // After draining, RX should report empty.

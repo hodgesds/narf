@@ -125,7 +125,8 @@ fn timer_full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4
 
 // ── Frame builder ──────────────────────────────────────────────────────────
 
-fn build_tcp_seg(
+/// Parameters describing a single TCP segment to synthesize into a frame.
+struct TcpSegSpec<'a> {
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
     src_port: u16,
@@ -134,8 +135,21 @@ fn build_tcp_seg(
     ack: u32,
     flags: u8,
     window: u16,
-    payload: &[u8],
-) -> Vec<u8> {
+    payload: &'a [u8],
+}
+
+fn build_tcp_seg(spec: TcpSegSpec<'_>) -> Vec<u8> {
+    let TcpSegSpec {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        window,
+        payload,
+    } = spec;
     let total = ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN + payload.len();
     let mut frame = vec![0u8; total];
     let ip_total = (IPV4_HDR_LEN + TCP_HDR_MIN + payload.len()) as u16;
@@ -236,17 +250,17 @@ fn establish_server_side(
 > {
     let listen_id = listen(local_ip, server_port, 8).map_err(|_| "listen failed")?;
 
-    let syn = build_tcp_seg(
-        local_ip,
-        local_ip,
-        client_port,
-        server_port,
-        client_iss,
-        0,
-        FLAG_SYN,
-        65535,
-        &[],
-    );
+    let syn = build_tcp_seg(TcpSegSpec {
+        src_ip: local_ip,
+        dst_ip: local_ip,
+        src_port: client_port,
+        dst_port: server_port,
+        seq: client_iss,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(local_ip, local_ip, &syn[ETH_HDR_LEN + IPV4_HDR_LEN..]);
 
     let txd = timer_drain_captured();
@@ -262,17 +276,17 @@ fn establish_server_side(
 
     let server_iss = frame_seq(&synack);
 
-    let ack = build_tcp_seg(
-        local_ip,
-        local_ip,
-        client_port,
-        server_port,
-        client_iss.wrapping_add(1),
-        server_iss.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack = build_tcp_seg(TcpSegSpec {
+        src_ip: local_ip,
+        dst_ip: local_ip,
+        src_port: client_port,
+        dst_port: server_port,
+        seq: client_iss.wrapping_add(1),
+        ack: server_iss.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(local_ip, local_ip, &ack[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
 
@@ -345,7 +359,7 @@ fn smoke_rtt_ewma_smoothing_across_samples() -> TestResult {
     }
     // RTO must be >= RTO_MIN and <= RTO_MAX.
     let rto = e.current_rto();
-    if rto < RTO_MIN_NS || rto > RTO_MAX_NS {
+    if !(RTO_MIN_NS..=RTO_MAX_NS).contains(&rto) {
         return TestResult::Fail("RTO out of bounds after EWMA samples");
     }
     TestResult::Pass
@@ -508,7 +522,7 @@ fn smoke_karn_algorithm_no_sample_on_retransmit() -> TestResult {
         };
 
     // Send 50 bytes.
-    match send(child_id, &vec![0xCCu8; 50]) {
+    match send(child_id, &[0xCCu8; 50]) {
         Ok(n) if n > 0 => {}
         _ => return TestResult::Fail("send(50) failed"),
     }
@@ -545,17 +559,17 @@ fn smoke_karn_algorithm_no_sample_on_retransmit() -> TestResult {
 
     // Now inject a cumulative ACK covering the segment.
     let client_next = 0x1200_0001u32; // client's next seq
-    let ack_seg = build_tcp_seg(
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_next,
-        seg_end_seq,
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack_seg = build_tcp_seg(TcpSegSpec {
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_next,
+        ack: seg_end_seq,
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_seg[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
 
@@ -629,7 +643,7 @@ fn smoke_seven_strike_give_up() -> TestResult {
         };
 
     // Queue some data (to arm the retransmit timer).
-    match send(child_id, &vec![0xDDu8; 20]) {
+    match send(child_id, &[0xDDu8; 20]) {
         Ok(n) if n > 0 => {}
         _ => return TestResult::Fail("send(20) failed in 7-strike smoke"),
     }
@@ -810,17 +824,17 @@ fn smoke_three_dup_acks_fast_retransmit() -> TestResult {
     let client_seq: u32 = 0x1400_0001;
 
     for _ in 0..3 {
-        let dup = build_tcp_seg(
-            LOCAL_IP,
-            LOCAL_IP,
-            CLIENT_PORT,
-            SERVER_PORT,
-            client_seq,
-            snd_una,
-            FLAG_ACK,
-            65535,
-            &[],
-        );
+        let dup = build_tcp_seg(TcpSegSpec {
+            src_ip: LOCAL_IP,
+            dst_ip: LOCAL_IP,
+            src_port: CLIENT_PORT,
+            dst_port: SERVER_PORT,
+            seq: client_seq,
+            ack: snd_una,
+            flags: FLAG_ACK,
+            window: 65535,
+            payload: &[],
+        });
         handle_segment(LOCAL_IP, LOCAL_IP, &dup[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     }
     let retx_frames = timer_drain_captured();
@@ -1035,7 +1049,7 @@ fn smoke_zero_window_persist_timer() -> TestResult {
         };
 
     // Queue 100 bytes in send buffer.
-    match send(child_id, &vec![0xEEu8; 100]) {
+    match send(child_id, &[0xEEu8; 100]) {
         Ok(n) if n > 0 => {}
         _ => return TestResult::Fail("send(100) failed in persist smoke"),
     }
@@ -1044,17 +1058,17 @@ fn smoke_zero_window_persist_timer() -> TestResult {
     // Advertise window = 0 from the peer — pump_send must arm the persist timer.
     let snd_una = __with_tcb(child_id, |t| t.snd_una).unwrap_or(0);
     let client_seq: u32 = 0x1500_0001;
-    let zero_win = build_tcp_seg(
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_seq,
-        snd_una,
-        FLAG_ACK,
-        0, // window = 0
-        &[],
-    );
+    let zero_win = build_tcp_seg(TcpSegSpec {
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_seq,
+        ack: snd_una,
+        flags: FLAG_ACK,
+        window: 0, // window = 0
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &zero_win[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
 
@@ -1232,32 +1246,32 @@ fn smoke_time_wait_2msl_expiry() -> TestResult {
     // Peer ACKs the FIN (FIN-WAIT-1 → FIN-WAIT-2).
     let fin_seq = __with_tcb(child_id, |t| t.fin_seq).unwrap_or(0);
     let client_seq: u32 = 0x1700_0001;
-    let ack_fin = build_tcp_seg(
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_seq,
-        fin_seq.wrapping_add(1),
-        FLAG_ACK,
-        65535,
-        &[],
-    );
+    let ack_fin = build_tcp_seg(TcpSegSpec {
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_seq,
+        ack: fin_seq.wrapping_add(1),
+        flags: FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(LOCAL_IP, LOCAL_IP, &ack_fin[ETH_HDR_LEN + IPV4_HDR_LEN..]);
     let _ = timer_drain_captured();
 
     // Peer sends FIN (passive close → server reaches TIME-WAIT).
-    let client_fin = build_tcp_seg(
-        LOCAL_IP,
-        LOCAL_IP,
-        CLIENT_PORT,
-        SERVER_PORT,
-        client_seq,
-        fin_seq.wrapping_add(1),
-        FLAG_FIN | FLAG_ACK,
-        65535,
-        &[],
-    );
+    let client_fin = build_tcp_seg(TcpSegSpec {
+        src_ip: LOCAL_IP,
+        dst_ip: LOCAL_IP,
+        src_port: CLIENT_PORT,
+        dst_port: SERVER_PORT,
+        seq: client_seq,
+        ack: fin_seq.wrapping_add(1),
+        flags: FLAG_FIN | FLAG_ACK,
+        window: 65535,
+        payload: &[],
+    });
     handle_segment(
         LOCAL_IP,
         LOCAL_IP,
