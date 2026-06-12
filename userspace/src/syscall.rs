@@ -1917,6 +1917,35 @@ pub enum Syscall {
     /// `shmctl(shmid, cmd, buf)` — System V shared-memory control.
     /// Linux (x86_64=31, aarch64=195).
     Shmctl,
+
+    /// `lsetxattr(path, name, value, size, flags)` — set an xattr without
+    /// following a final symlink. Linux (x86_64=189, aarch64=6).
+    Lsetxattr,
+
+    /// `fsetxattr(fd, name, value, size, flags)` — set an xattr by fd.
+    /// Linux (x86_64=190, aarch64=7).
+    Fsetxattr,
+
+    /// `lgetxattr(path, name, value, size)`. Linux (x86_64=192, aarch64=9).
+    Lgetxattr,
+
+    /// `fgetxattr(fd, name, value, size)`. Linux (x86_64=193, aarch64=10).
+    Fgetxattr,
+
+    /// `llistxattr(path, list, size)`. Linux (x86_64=195, aarch64=12).
+    Llistxattr,
+
+    /// `flistxattr(fd, list, size)`. Linux (x86_64=196, aarch64=13).
+    Flistxattr,
+
+    /// `removexattr(path, name)`. Linux (x86_64=197, aarch64=14).
+    Removexattr,
+
+    /// `lremovexattr(path, name)`. Linux (x86_64=198, aarch64=15).
+    Lremovexattr,
+
+    /// `fremovexattr(fd, name)`. Linux (x86_64=199, aarch64=16).
+    Fremovexattr,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2051,6 +2080,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Shmat, 30),
     (Syscall::Shmdt, 67),
     (Syscall::Shmctl, 31),
+    (Syscall::Lsetxattr, 189),
+    (Syscall::Fsetxattr, 190),
+    (Syscall::Lgetxattr, 192),
+    (Syscall::Fgetxattr, 193),
+    (Syscall::Llistxattr, 195),
+    (Syscall::Flistxattr, 196),
+    (Syscall::Removexattr, 197),
+    (Syscall::Lremovexattr, 198),
+    (Syscall::Fremovexattr, 199),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2419,6 +2457,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Shmat, 196),
     (Syscall::Shmdt, 197),
     (Syscall::Shmctl, 195),
+    (Syscall::Lsetxattr, 6),
+    (Syscall::Fsetxattr, 7),
+    (Syscall::Lgetxattr, 9),
+    (Syscall::Fgetxattr, 10),
+    (Syscall::Llistxattr, 12),
+    (Syscall::Flistxattr, 13),
+    (Syscall::Removexattr, 14),
+    (Syscall::Lremovexattr, 15),
+    (Syscall::Fremovexattr, 16),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

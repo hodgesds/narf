@@ -4485,16 +4485,19 @@ fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
     copy_user_cstr(ptr, 4096).map(|s| apply_chroot(&s))
 }
 
-/// `setxattr(path, name, value, size, flags)`.
-fn sys_setxattr(ctx: &mut dyn TrapContext) {
+/// Resolve the fd argument of an `f*xattr` syscall to a side-table key.
+/// NARF has no fd→pathname cache yet, so `fd_path_of` returns a stable
+/// per-fd `anon_inode:[Type]` placeholder: `f*xattr` calls round-trip
+/// against each other on the same fd, but do NOT share storage with the
+/// path-keyed `*xattr` family (a documented limitation).
+fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
+    fd_path_of(current_task_id(), fd)
+}
+
+/// `setxattr` / `lsetxattr` / `fsetxattr` core (name/value/size/flags at
+/// arg1..arg4; the key path is resolved by the caller).
+fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match xattr_user_path(a.arg0) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
     let name = match copy_user_cstr(a.arg1, 256) {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -4506,8 +4509,7 @@ fn sys_setxattr(ctx: &mut dyn TrapContext) {
     let value = if size == 0 {
         alloc::vec::Vec::new()
     } else {
-        // SAFETY: size != 0 here; copy_from_user_vec range-validates a.arg2
-        // before the SMAP-bracketed read.
+        // SAFETY: size != 0; copy_from_user_vec range-validates a.arg2.
         match unsafe { copy_from_user_vec(a.arg2, size) } {
             Ok(v) => v,
             Err(_) => {
@@ -4533,17 +4535,10 @@ fn sys_setxattr(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// `getxattr(path, name, value, size)`. With `size == 0` returns the
-/// attribute length without copying; ERANGE if the buffer is too small.
-fn sys_getxattr(ctx: &mut dyn TrapContext) {
+/// `getxattr` / `lgetxattr` / `fgetxattr` core (name at arg1, value at
+/// arg2, size at arg3).
+fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match xattr_user_path(a.arg0) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
     let name = match copy_user_cstr(a.arg1, 256) {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -4578,17 +4573,9 @@ fn sys_getxattr(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(value.len() as u64));
 }
 
-/// `listxattr(path, list, size)` — NUL-separated attribute names for
-/// `path`. With `size == 0` returns the total length without copying.
-fn sys_listxattr(ctx: &mut dyn TrapContext) {
+/// `listxattr` / `llistxattr` / `flistxattr` core (list at arg1, size at arg2).
+fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match xattr_user_path(a.arg0) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
     let size = a.arg2 as usize;
     let mut names: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     {
@@ -4616,6 +4603,91 @@ fn sys_listxattr(ctx: &mut dyn TrapContext) {
         return;
     }
     ctx.set_return(SyscallReturn::ok(names.len() as u64));
+}
+
+/// `removexattr` / `lremovexattr` / `fremovexattr` core (name at arg1).
+fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let name = match copy_user_cstr(a.arg1, 256) {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+    let removed = {
+        let mut g = XATTR_TABLE.lock();
+        g.as_mut().map(|m| m.remove(&(path, name)).is_some())
+    };
+    if removed == Some(true) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+    }
+}
+
+/// `setxattr(path, name, value, size, flags)`.
+fn sys_setxattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_set_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `getxattr(path, name, value, size)`.
+fn sys_getxattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_get_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `listxattr(path, list, size)`.
+fn sys_listxattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_list_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `removexattr(path, name)`.
+fn sys_removexattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_remove_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `fsetxattr(fd, name, value, size, flags)`.
+fn sys_fsetxattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_set_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `fgetxattr(fd, name, value, size)`.
+fn sys_fgetxattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_get_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `flistxattr(fd, list, size)`.
+fn sys_flistxattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_list_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `fremovexattr(fd, name)`.
+fn sys_fremovexattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_remove_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
 }
 
 /// `readahead(fd, offset, count)` — page-cache populate hint. NARF's
@@ -16114,6 +16186,37 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setxattr, "setxattr", RawFnHandler(sys_setxattr));
     table.install_raw(Syscall::Getxattr, "getxattr", RawFnHandler(sys_getxattr));
     table.install_raw(Syscall::Listxattr, "listxattr", RawFnHandler(sys_listxattr));
+    // Batch 13: xattr l*/f*/remove variants. NARF has no symlink-follow
+    // distinction, so the l* variants alias the path handlers.
+    table.install_raw(Syscall::Lsetxattr, "lsetxattr", RawFnHandler(sys_setxattr));
+    table.install_raw(Syscall::Lgetxattr, "lgetxattr", RawFnHandler(sys_getxattr));
+    table.install_raw(
+        Syscall::Llistxattr,
+        "llistxattr",
+        RawFnHandler(sys_listxattr),
+    );
+    table.install_raw(
+        Syscall::Removexattr,
+        "removexattr",
+        RawFnHandler(sys_removexattr),
+    );
+    table.install_raw(
+        Syscall::Lremovexattr,
+        "lremovexattr",
+        RawFnHandler(sys_removexattr),
+    );
+    table.install_raw(Syscall::Fsetxattr, "fsetxattr", RawFnHandler(sys_fsetxattr));
+    table.install_raw(Syscall::Fgetxattr, "fgetxattr", RawFnHandler(sys_fgetxattr));
+    table.install_raw(
+        Syscall::Flistxattr,
+        "flistxattr",
+        RawFnHandler(sys_flistxattr),
+    );
+    table.install_raw(
+        Syscall::Fremovexattr,
+        "fremovexattr",
+        RawFnHandler(sys_fremovexattr),
+    );
     table.install_raw(Syscall::Readahead, "readahead", RawFnHandler(sys_readahead));
     table.install_raw(
         Syscall::SyncFileRange,
