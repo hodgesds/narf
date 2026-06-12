@@ -1967,6 +1967,31 @@ pub enum Syscall {
     /// musl routes utime/utimes/futimens through this. Linux
     /// (x86_64=280, aarch64=88).
     Utimensat,
+
+    /// `geteuid()` — effective uid (== real uid in NARF).
+    /// Linux (x86_64=107, aarch64=175).
+    Geteuid,
+
+    /// `getegid()` — effective gid. Linux (x86_64=108, aarch64=177).
+    Getegid,
+
+    /// `getpgrp()` — the calling process's process-group id (legacy).
+    /// Linux (x86_64=111).
+    Getpgrp,
+
+    /// `setreuid(ruid, euid)`. Linux (x86_64=113, aarch64=145).
+    Setreuid,
+
+    /// `setregid(rgid, egid)`. Linux (x86_64=114, aarch64=143).
+    Setregid,
+
+    /// `setfsuid(fsuid)` — set filesystem uid, return the previous one.
+    /// Linux (x86_64=122, aarch64=151).
+    Setfsuid,
+
+    /// `setfsgid(fsgid)` — set filesystem gid, return the previous one.
+    /// Linux (x86_64=123, aarch64=152).
+    Setfsgid,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2115,6 +2140,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Utime, 132),
     (Syscall::Utimes, 235),
     (Syscall::Utimensat, 280),
+    (Syscall::Geteuid, 107),
+    (Syscall::Getegid, 108),
+    (Syscall::Getpgrp, 111),
+    (Syscall::Setreuid, 113),
+    (Syscall::Setregid, 114),
+    (Syscall::Setfsuid, 122),
+    (Syscall::Setfsgid, 123),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2493,6 +2525,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
     (Syscall::Utimensat, 88),
+    (Syscall::Geteuid, 175),
+    (Syscall::Getegid, 177),
+    (Syscall::Setreuid, 145),
+    (Syscall::Setregid, 143),
+    (Syscall::Setfsuid, 151),
+    (Syscall::Setfsgid, 152),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

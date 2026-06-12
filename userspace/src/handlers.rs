@@ -8566,8 +8566,17 @@ pub fn set_controlling_tty(pty_index: u32) {
 
 #[derive(Copy, Clone, Default)]
 struct UidGid {
+    /// Real uid/gid.
     uid: u32,
     gid: u32,
+    /// Effective uid/gid (geteuid/getegid). No separate saved-id is
+    /// tracked; getres*id reports the effective id as the saved id too.
+    euid: u32,
+    egid: u32,
+    /// Filesystem uid/gid (setfsuid/setfsgid). Tracks the effective id
+    /// unless overridden by setfs*id.
+    fsuid: u32,
+    fsgid: u32,
 }
 
 static UIDGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>> =
@@ -8616,7 +8625,12 @@ fn sys_setuid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let uid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    if write_uidgid(task, |e| e.uid = uid) {
+    // A (notionally privileged) setuid sets real, effective, and fs uids.
+    if write_uidgid(task, |e| {
+        e.uid = uid;
+        e.euid = uid;
+        e.fsuid = uid;
+    }) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
@@ -8627,11 +8641,92 @@ fn sys_setgid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let gid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    if write_uidgid(task, |e| e.gid = gid) {
+    if write_uidgid(task, |e| {
+        e.gid = gid;
+        e.egid = gid;
+        e.fsgid = gid;
+    }) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
     }
+}
+
+fn sys_geteuid(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(
+        read_uidgid(current_task_id()).euid as u64,
+    ));
+}
+
+fn sys_getegid(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(
+        read_uidgid(current_task_id()).egid as u64,
+    ));
+}
+
+/// `getpgrp()` — the calling process's process-group id (legacy; takes
+/// no argument, so it always targets self).
+fn sys_getpgrp(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(read_pgid(current_task_id())));
+}
+
+/// `setreuid(ruid, euid)` — set the real and/or effective uid; `-1`
+/// leaves a field unchanged. The fs uid follows the new effective uid.
+fn sys_setreuid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let ruid = a.arg0 as u32;
+    let euid = a.arg1 as u32;
+    let ok = write_uidgid(current_task_id(), |e| {
+        if ruid != u32::MAX {
+            e.uid = ruid;
+        }
+        if euid != u32::MAX {
+            e.euid = euid;
+            e.fsuid = euid;
+        }
+    });
+    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
+}
+
+/// `setregid(rgid, egid)`.
+fn sys_setregid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let rgid = a.arg0 as u32;
+    let egid = a.arg1 as u32;
+    let ok = write_uidgid(current_task_id(), |e| {
+        if rgid != u32::MAX {
+            e.gid = rgid;
+        }
+        if egid != u32::MAX {
+            e.egid = egid;
+            e.fsgid = egid;
+        }
+    });
+    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
+}
+
+/// `setfsuid(fsuid)` — set the filesystem uid and return the PREVIOUS
+/// one. Always "succeeds" (the return is the old fsuid, never an errno),
+/// matching Linux. `-1` queries without changing.
+fn sys_setfsuid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    let new = ctx.args().arg0 as u32;
+    let old = read_uidgid(task).fsuid;
+    if new != u32::MAX {
+        let _ = write_uidgid(task, |e| e.fsuid = new);
+    }
+    ctx.set_return(SyscallReturn::ok(old as u64));
+}
+
+/// `setfsgid(fsgid)` — set the filesystem gid, return the previous one.
+fn sys_setfsgid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    let new = ctx.args().arg0 as u32;
+    let old = read_uidgid(task).fsgid;
+    if new != u32::MAX {
+        let _ = write_uidgid(task, |e| e.fsgid = new);
+    }
+    ctx.set_return(SyscallReturn::ok(old as u64));
 }
 
 /// Write `val` into each of the (up to three) user `u32` out-pointers
@@ -8680,7 +8775,18 @@ fn sys_setresuid(ctx: &mut dyn TrapContext) {
         None
     };
     if let Some(u) = new {
-        let _ = write_uidgid(current_task_id(), |e| e.uid = u);
+        // arg1 is the requested euid; set real+effective+fs coherently so
+        // a later geteuid/setfsuid sees the change.
+        let euid = if a.arg1 as u32 != u32::MAX {
+            a.arg1 as u32
+        } else {
+            u
+        };
+        let _ = write_uidgid(current_task_id(), |e| {
+            e.uid = u;
+            e.euid = euid;
+            e.fsuid = euid;
+        });
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -8696,7 +8802,16 @@ fn sys_setresgid(ctx: &mut dyn TrapContext) {
         None
     };
     if let Some(g) = new {
-        let _ = write_uidgid(current_task_id(), |e| e.gid = g);
+        let egid = if a.arg1 as u32 != u32::MAX {
+            a.arg1 as u32
+        } else {
+            g
+        };
+        let _ = write_uidgid(current_task_id(), |e| {
+            e.gid = g;
+            e.egid = egid;
+            e.fsgid = egid;
+        });
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -16306,6 +16421,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime_noop));
     table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utime_noop));
     table.install_raw(Syscall::Utimensat, "utimensat", RawFnHandler(sys_utimensat));
+    // Batch 15: credential gaps (real/effective/fs uid+gid).
+    table.install_raw(Syscall::Geteuid, "geteuid", RawFnHandler(sys_geteuid));
+    table.install_raw(Syscall::Getegid, "getegid", RawFnHandler(sys_getegid));
+    table.install_raw(Syscall::Getpgrp, "getpgrp", RawFnHandler(sys_getpgrp));
+    table.install_raw(Syscall::Setreuid, "setreuid", RawFnHandler(sys_setreuid));
+    table.install_raw(Syscall::Setregid, "setregid", RawFnHandler(sys_setregid));
+    table.install_raw(Syscall::Setfsuid, "setfsuid", RawFnHandler(sys_setfsuid));
+    table.install_raw(Syscall::Setfsgid, "setfsgid", RawFnHandler(sys_setfsgid));
     table.install_raw(Syscall::Readahead, "readahead", RawFnHandler(sys_readahead));
     table.install_raw(
         Syscall::SyncFileRange,
