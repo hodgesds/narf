@@ -3994,6 +3994,11 @@ define_smoke_elf!(
     "NARF_VIO_SMOKE_ELF_X86_64",
     "NARF_VIO_SMOKE_ELF_AARCH64"
 );
+define_smoke_elf!(
+    NARF_SYSVIPC_SMOKE_ELF,
+    "NARF_SYSVIPC_SMOKE_ELF_X86_64",
+    "NARF_SYSVIPC_SMOKE_ELF_AARCH64"
+);
 
 #[cfg(all(
     target_arch = "x86_64",

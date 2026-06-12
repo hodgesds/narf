@@ -1462,6 +1462,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("introspect_smoke", "introspect-ok"),
         // Linux-compat round 10: vectored + extended I/O.
         ("vio_smoke", "vio-ok"),
+        // Linux-compat round 11: System V semaphores + message queues.
+        ("sysvipc_smoke", "sysvipc-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
