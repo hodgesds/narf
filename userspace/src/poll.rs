@@ -206,9 +206,42 @@ use crate::syscall::{SyscallReturn, TrapContext};
 /// Linux ref: `fs/select.c`:do_sys_poll (GPL-2.0-or-later, kernel.org).
 pub fn sys_poll(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ptr = args.arg0 as *mut u8;
-    let nfds = args.arg1 as usize;
-    let timeout = args.arg2 as i64;
+    poll_common(
+        ctx,
+        args.arg0 as *mut u8,
+        args.arg1 as usize,
+        args.arg2 as i64,
+    );
+}
+
+/// `ppoll(fds, nfds, timespec*, sigmask, sigsetsize)` — poll with a
+/// `timespec` timeout (NULL = block indefinitely) and an ignored
+/// sigmask. Converts the timespec to a millisecond timeout and shares
+/// the poll core with `sys_poll`.
+pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let timeout: i64 = if args.arg2 == 0 {
+        -1
+    } else {
+        // SAFETY: `arg2` is a user `timespec*` in-pointer; copy_from_user_vec
+        // range-validates the 16-byte read.
+        match unsafe { crate::handlers::copy_from_user_vec(args.arg2, 16) } {
+            Ok(b) => {
+                let secs = u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                let nsec =
+                    u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+                secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64
+            }
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                return;
+            }
+        }
+    };
+    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout);
+}
+
+fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     // Upper bound on nfds to prevent OOM from hostile input.

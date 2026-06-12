@@ -1623,6 +1623,31 @@ pub enum Syscall {
     /// setresgid (x86_64=119, aarch64=149).
     Getresgid,
     Setresgid,
+
+    /// `ppoll(fds, nfds, timespec*, sigmask, sigsetsize)` — poll(2)
+    /// with a `timespec` timeout (NULL = block) and an ignored
+    /// sigmask. Linux `ppoll` (x86_64=271, aarch64=73 — the generic
+    /// ABI has no plain poll).
+    Ppoll,
+
+    /// `sysinfo(struct sysinfo*)` — system statistics (uptime, RAM).
+    /// Linux `sysinfo` (x86_64=99, aarch64=179).
+    Sysinfo,
+
+    /// `splice(fd_in, off_in*, fd_out, off_out*, len, flags)` — move
+    /// data between two fds (one a pipe) without a userspace copy.
+    /// Linux `splice` (x86_64=275, aarch64=76).
+    Splice,
+
+    /// `membarrier(cmd, flags, cpu_id)` — process-wide memory barrier.
+    /// QUERY returns the supported-command mask; barrier commands are
+    /// no-ops on the cooperative single-CPU kernel. Linux `membarrier`
+    /// (x86_64=324, aarch64=283).
+    Membarrier,
+
+    /// `clock_getres(clockid, timespec*)` — report a clock's
+    /// resolution. Linux `clock_getres` (x86_64=229, aarch64=114).
+    ClockGetres,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1686,6 +1711,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getresuid, 118),
     (Syscall::Setresgid, 119),
     (Syscall::Getresgid, 120),
+    (Syscall::Ppoll, 271),
+    (Syscall::Sysinfo, 99),
+    (Syscall::Splice, 275),
+    (Syscall::Membarrier, 324),
+    (Syscall::ClockGetres, 229),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -1981,6 +2011,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getresuid, 148),
     (Syscall::Setresgid, 149),
     (Syscall::Getresgid, 150),
+    (Syscall::Sysinfo, 179),
+    (Syscall::Splice, 76),
+    (Syscall::Membarrier, 283),
+    (Syscall::ClockGetres, 114),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -2002,7 +2036,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Statfs, 43),
     (Syscall::Fstatfs, 44),
     (Syscall::Pselect6, 72), // pselect6
-    (Syscall::Poll, 73),     // ppoll
+    (Syscall::Ppoll, 73),    // ppoll (generic ABI has no plain poll)
     // Loadable kernel modules — aarch64 generic ABI numbers.
     // init_module = 105, delete_module = 106, finit_module = 273.
     (Syscall::InitModule, 105),

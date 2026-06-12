@@ -3831,26 +3831,25 @@ fn sys_mremap(ctx: &mut dyn TrapContext) {
 /// If `off` is non-NULL it is a pread-style start offset that is
 /// updated and does NOT advance `in_fd`'s own file offset; NULL uses
 /// and advances the fd offset. Returns the number of bytes copied.
-fn sys_sendfile(ctx: &mut dyn TrapContext) {
-    let a = *ctx.args();
-    let out_fd = a.arg0 as u32;
-    let in_fd = a.arg1 as u32;
-    let off_ptr = a.arg2;
-    let count = a.arg3 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let task = current_task_id();
-
-    let use_off_ptr = off_ptr != 0;
+/// Shared core for `sendfile(2)` / `splice(2)`: copy up to `count`
+/// bytes from `in_fd` to `out_fd` entirely in the kernel via the fd
+/// table's FileOps. When `in_off_ptr` is non-zero it is a user
+/// pread-style offset pointer (read from, updated, and the fd's own
+/// offset is left untouched); zero uses and advances the fd offset.
+/// Returns the bytes copied, or `None` on a bad fd / fault.
+fn copy_fd_to_fd(
+    task: u64,
+    in_fd: u32,
+    out_fd: u32,
+    in_off_ptr: u64,
+    count: usize,
+) -> Option<usize> {
+    let use_off_ptr = in_off_ptr != 0;
     let mut in_off: u64 = if use_off_ptr {
-        // SAFETY: `off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
+        // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
         // range-validates the 8-byte read.
-        match unsafe { copy_from_user_vec(off_ptr, 8) } {
-            Ok(b) => u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
-            Err(_) => {
-                ctx.set_return(fail);
-                return;
-            }
-        }
+        let b = unsafe { copy_from_user_vec(in_off_ptr, 8) }.ok()?;
+        u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     } else {
         0
     };
@@ -3859,8 +3858,7 @@ fn sys_sendfile(ctx: &mut dyn TrapContext) {
     const CHUNK: usize = 4096;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        // Read up to `want` bytes from in_fd into a kernel buffer.
-        let read_out: Option<alloc::vec::Vec<u8>> = fd::with_table(task, |t| {
+        let kbuf: alloc::vec::Vec<u8> = fd::with_table(task, |t| {
             let entry = t.get_mut(in_fd)?;
             let off = if use_off_ptr { in_off } else { entry.offset };
             let mut kbuf = alloc::vec![0u8; want];
@@ -3874,20 +3872,12 @@ fn sys_sendfile(ctx: &mut dyn TrapContext) {
             }
             Some(kbuf)
         })
-        .flatten();
-        let kbuf = match read_out {
-            Some(b) => b,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
+        .flatten()?;
         if kbuf.is_empty() {
             break; // EOF on in_fd
         }
         in_off = in_off.saturating_add(kbuf.len() as u64);
-        // Write the chunk to out_fd.
-        let wrote: Option<usize> = fd::with_table(task, |t| {
+        let w: usize = fd::with_table(task, |t| {
             let entry = t.get_mut(out_fd)?;
             let off = entry.offset;
             let w = match poll_blocking(entry.ops.write(off, &kbuf)) {
@@ -3897,14 +3887,7 @@ fn sys_sendfile(ctx: &mut dyn TrapContext) {
             entry.offset = off.saturating_add(w as u64);
             Some(w)
         })
-        .flatten();
-        let w = match wrote {
-            Some(w) => w,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
+        .flatten()?;
         total += w;
         if w < kbuf.len() {
             break; // short write (e.g. pipe full) — stop here
@@ -3912,11 +3895,95 @@ fn sys_sendfile(ctx: &mut dyn TrapContext) {
     }
 
     if use_off_ptr {
-        // SAFETY: `off_ptr` is the user `off_t*` (non-zero); copy_to_user
+        // SAFETY: `in_off_ptr` is the user `off_t*` (non-zero); copy_to_user
         // range-validates the 8-byte write-back of the advanced offset.
-        let _ = unsafe { copy_to_user(off_ptr, &in_off.to_ne_bytes()) };
+        let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
     }
-    ctx.set_return(SyscallReturn::ok(total as u64));
+    Some(total)
+}
+
+/// `sendfile(out_fd, in_fd, off*, count)` — copy bytes between fds in
+/// the kernel. See `copy_fd_to_fd`.
+fn sys_sendfile(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let task = current_task_id();
+    match copy_fd_to_fd(task, a.arg1 as u32, a.arg0 as u32, a.arg2, a.arg3 as usize) {
+        Some(total) => ctx.set_return(SyscallReturn::ok(total as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+    }
+}
+
+/// `splice(fd_in, off_in*, fd_out, off_out*, len, flags)` — move data
+/// between two fds (at least one a pipe) without a userspace copy.
+/// NARF reuses the sendfile copy core; `off_out` (only meaningful for
+/// a seekable out_fd) is not honoured — pipes pass NULL.
+fn sys_splice(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let task = current_task_id();
+    match copy_fd_to_fd(task, a.arg0 as u32, a.arg2 as u32, a.arg1, a.arg4 as usize) {
+        Some(total) => ctx.set_return(SyscallReturn::ok(total as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
+    }
+}
+
+/// `sysinfo(struct sysinfo*)` — fill the uptime (from the monotonic
+/// clock) and RAM totals (from the frame allocator). Swap, loads, and
+/// the high-memory fields stay zero; mem_unit is 1 (bytes).
+fn sys_sysinfo(ctx: &mut dyn TrapContext) {
+    let buf = ctx.args().arg0;
+    if buf == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    let uptime_secs = (narf_scheduler::narf_time::monotonic_ns() / 1_000_000_000) as i64;
+    let stats = narf_memory::frame_stats();
+    let total_bytes = (stats.total as u64).saturating_mul(4096);
+    let free_bytes = (stats.free as u64).saturating_mul(4096);
+    // struct sysinfo (LP64): uptime@0, loads@8/16/24, totalram@32,
+    // freeram@40, sharedram@48, bufferram@56, totalswap@64, freeswap@72,
+    // procs@80(u16), totalhigh@88, freehigh@96, mem_unit@104(u32). 112
+    // bytes covers through mem_unit; the remaining __reserved stays as
+    // the caller left it.
+    let mut si = [0u8; 112];
+    si[0..8].copy_from_slice(&uptime_secs.to_ne_bytes());
+    si[32..40].copy_from_slice(&total_bytes.to_ne_bytes());
+    si[40..48].copy_from_slice(&free_bytes.to_ne_bytes());
+    si[80..82].copy_from_slice(&1u16.to_ne_bytes()); // procs
+    si[104..108].copy_from_slice(&1u32.to_ne_bytes()); // mem_unit = 1 byte
+                                                       // SAFETY: `buf` is the user `struct sysinfo*` (non-zero); copy_to_user
+                                                       // range-validates the 112-byte write.
+    if unsafe { copy_to_user(buf, &si) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `membarrier(cmd, flags, cpu_id)` — process-wide memory barrier.
+/// QUERY (0) returns the supported-command bitmask; the actual barrier
+/// commands are no-ops on the cooperative single-CPU kernel (loads and
+/// stores are already globally ordered when a task is in flight).
+fn sys_membarrier(ctx: &mut dyn TrapContext) {
+    let cmd = ctx.args().arg0 as u32;
+    const QUERY: u32 = 0;
+    const GLOBAL: u32 = 1 << 0;
+    const GLOBAL_EXPEDITED: u32 = 1 << 1;
+    const REGISTER_GLOBAL_EXPEDITED: u32 = 1 << 2;
+    const PRIVATE_EXPEDITED: u32 = 1 << 3;
+    const REGISTER_PRIVATE_EXPEDITED: u32 = 1 << 4;
+    let supported = GLOBAL
+        | GLOBAL_EXPEDITED
+        | REGISTER_GLOBAL_EXPEDITED
+        | PRIVATE_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED;
+    let r: u64 = if cmd == QUERY {
+        supported as u64
+    } else if cmd & supported == cmd && cmd.is_power_of_two() {
+        0 // barrier / registration is a no-op here
+    } else {
+        (-22i64) as u64 // EINVAL
+    };
+    ctx.set_return(SyscallReturn::ok(r));
 }
 
 // ── FB syscalls ────────────────────────────────────────────────────
@@ -8679,7 +8746,10 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
 ///
 /// # Safety
 /// Same as `copy_from_user`.
-unsafe fn copy_from_user_vec(src_uptr: u64, len: usize) -> Result<alloc::vec::Vec<u8>, u64> {
+pub(crate) unsafe fn copy_from_user_vec(
+    src_uptr: u64,
+    len: usize,
+) -> Result<alloc::vec::Vec<u8>, u64> {
     validate_user_range(src_uptr, len)?;
     let mut buf = alloc::vec![0u8; len];
     // SAFETY: validated above; SMAP bracket inside copy_from_user.
@@ -9581,6 +9651,35 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `clock_getres(clock_id, *timespec)` — report the resolution of a
+/// supported clock. NARF's monotonic/wall clocks are nanosecond-
+/// granular, so we report `{0, 1}`. `timespec` may be NULL (the call
+/// then just validates the clock id).
+fn sys_clock_getres(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let id = args.arg0;
+    let buf = args.arg1;
+    if !matches!(
+        id,
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME
+    ) {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    if buf != 0 {
+        let mut kbuf = [0u8; 16];
+        // tv_sec = 0, tv_nsec = 1 (1 ns resolution).
+        kbuf[8..16].copy_from_slice(&1i64.to_ne_bytes());
+        // SAFETY: `buf` is the user `timespec*` (non-zero); copy_to_user
+        // range-validates the 16-byte write.
+        if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -13751,6 +13850,23 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
 
     // I/O multiplexing: poll / select / pselect6 / epoll.
     table.install_raw(Syscall::Poll, "poll", RawFnHandler(crate::poll::sys_poll));
+    table.install_raw(
+        Syscall::Ppoll,
+        "ppoll",
+        RawFnHandler(crate::poll::sys_ppoll),
+    );
+    table.install_raw(Syscall::Sysinfo, "sysinfo", RawFnHandler(sys_sysinfo));
+    table.install_raw(Syscall::Splice, "splice", RawFnHandler(sys_splice));
+    table.install_raw(
+        Syscall::Membarrier,
+        "membarrier",
+        RawFnHandler(sys_membarrier),
+    );
+    table.install_raw(
+        Syscall::ClockGetres,
+        "clock_getres",
+        RawFnHandler(sys_clock_getres),
+    );
     table.install_raw(
         Syscall::Select,
         "select",
