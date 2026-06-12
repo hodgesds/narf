@@ -3408,6 +3408,11 @@ fn boot_userspace_init() {
                 ("mmsg_smoke", narf_verification::NARF_MMSG_SMOKE_ELF),
                 ("openat2_smoke", narf_verification::NARF_OPENAT2_SMOKE_ELF),
                 ("pv_smoke", narf_verification::NARF_PV_SMOKE_ELF),
+                // Linux-compat round 7: capget+capset / setitimer+getitimer+alarm / xattr / readahead+sync_file_range.
+                ("cap_smoke", narf_verification::NARF_CAP_SMOKE_ELF),
+                ("itimer_smoke", narf_verification::NARF_ITIMER_SMOKE_ELF),
+                ("xattr_smoke", narf_verification::NARF_XATTR_SMOKE_ELF),
+                ("fhint_smoke", narf_verification::NARF_FHINT_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

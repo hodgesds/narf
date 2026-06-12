@@ -298,6 +298,10 @@ fn main() {
         "mmsg_smoke",
         "openat2_smoke",
         "pv_smoke",
+        "cap_smoke",
+        "itimer_smoke",
+        "xattr_smoke",
+        "fhint_smoke",
     ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));

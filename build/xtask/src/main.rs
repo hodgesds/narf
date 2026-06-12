@@ -1445,6 +1445,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("mmsg_smoke", "mmsg-ok"),
         ("openat2_smoke", "openat2-ok"),
         ("pv_smoke", "pv-ok"),
+        // Linux-compat round 7: capget+capset, setitimer+getitimer+alarm, xattr, readahead+sync_file_range.
+        ("cap_smoke", "cap-ok"),
+        ("itimer_smoke", "itimer-ok"),
+        ("xattr_smoke", "xattr-ok"),
+        ("fhint_smoke", "fhint-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
