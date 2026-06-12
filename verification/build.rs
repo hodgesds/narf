@@ -294,6 +294,10 @@ fn main() {
         "robust_smoke",
         "renameat2_smoke",
         "pidfdsig_smoke",
+        "host_smoke",
+        "mmsg_smoke",
+        "openat2_smoke",
+        "pv_smoke",
     ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));

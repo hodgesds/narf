@@ -3403,6 +3403,11 @@ fn boot_userspace_init() {
                     narf_verification::NARF_RENAMEAT2_SMOKE_ELF,
                 ),
                 ("pidfdsig_smoke", narf_verification::NARF_PIDFDSIG_SMOKE_ELF),
+                // Linux-compat round 6: sethostname+setdomainname / sendmmsg+recvmmsg / openat2 / preadv+pwritev.
+                ("host_smoke", narf_verification::NARF_HOST_SMOKE_ELF),
+                ("mmsg_smoke", narf_verification::NARF_MMSG_SMOKE_ELF),
+                ("openat2_smoke", narf_verification::NARF_OPENAT2_SMOKE_ELF),
+                ("pv_smoke", narf_verification::NARF_PV_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

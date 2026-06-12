@@ -1440,6 +1440,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("robust_smoke", "robust-ok"),
         ("renameat2_smoke", "renameat2-ok"),
         ("pidfdsig_smoke", "pidfdsig-ok"),
+        // Linux-compat round 6: sethostname+setdomainname, sendmmsg+recvmmsg, openat2, preadv+pwritev.
+        ("host_smoke", "host-ok"),
+        ("mmsg_smoke", "mmsg-ok"),
+        ("openat2_smoke", "openat2-ok"),
+        ("pv_smoke", "pv-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
