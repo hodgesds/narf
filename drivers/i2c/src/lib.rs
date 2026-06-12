@@ -25,7 +25,9 @@ extern crate alloc;
 
 pub mod amd_fch;
 pub mod gsb;
+pub mod i801;
 pub mod lpss;
+pub mod piix4;
 pub mod registry;
 
 use alloc::boxed::Box;
@@ -127,6 +129,14 @@ pub fn register_initcalls() {
             narf_aml::oregion::set_gsb_dispatcher(gsb::dispatch);
             InitResult::Ok
         }
+    });
+    narf_init::register(Stage::Subsys, "i801-smbus", || {
+        i801::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "piix4-smbus", || {
+        piix4::register_pci_driver();
+        InitResult::Ok
     });
 }
 

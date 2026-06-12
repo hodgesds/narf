@@ -40,6 +40,7 @@ narf-drivers         = { path = "../drivers" }
 narf-drivers-storage = { path = "../drivers/storage" }
 narf-drivers-usb     = { path = "../drivers/usb" }
 narf-drivers-video   = { path = "../drivers/video" }
+narf-drivers-media = { path = "../drivers/media" }
 narf-drivers-thunderbolt = { path = "../drivers/thunderbolt" }
 narf-drivers-fingerprint = { path = "../drivers/fingerprint" }
 narf-drivers-platform = { path = "../drivers/platform" }

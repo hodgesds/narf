@@ -802,3 +802,17 @@ impl PcmRing {
         Ok(n)
     }
 }
+
+pub static UAC_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
+    crate::class_registry::UsbClassMatch::class_only(USB_CLASS_AUDIO),
+];
+
+pub fn probe(_device: alloc::sync::Arc<crate::device::USBDevice>) -> Result<(), crate::class_registry::UsbProbeError> {
+    use core::fmt::Write;
+    let _ = writeln!(narf_console::Writer, "  usb: USB Audio Class (UAC) device bound!");
+    Ok(())
+}
+
+pub fn register_initcalls() {
+    let _ = crate::class_registry::register_class_driver("snd-usb-audio", &UAC_MATCH, probe);
+}

@@ -333,3 +333,47 @@ fn smoke_lpss_i2c_registers_into_shared_registry() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers-i2c", smoke_lpss_i2c_registers_into_shared_registry);
+
+// ── Intel i801 smokes ────────────────────────────────────────────
+
+fn smoke_i801_smbus_rejects_transfer_when_disabled() -> TestResult {
+    narf_scheduler::__reset_queues_for_test();
+    let (phys, _len) = make_synthetic_mmio(false);
+    let mmio = narf_bus::MmioRegion {
+        phys,
+        len: 32,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let drv = crate::i801::__new_for_test("smoke-i801-disabled".to_string(), mmio);
+    // disable the controller manually
+    drv.enabled
+        .store(false, core::sync::atomic::Ordering::Release);
+
+    let bus: Arc<dyn I2cBus> = Arc::new(drv);
+    let result = Arc::new(core::sync::atomic::AtomicI32::new(-1));
+    let r = result.clone();
+    narf_scheduler::spawn(async move {
+        let mut buf = [0u8; 4];
+        let mut ops = [I2cOp::Read(&mut buf)];
+        let outcome = bus.transfer(0x2c, &mut ops).await;
+        let code = match outcome {
+            Err(I2cError::BadHardware) => 0,
+            Err(_) => 1,
+            Ok(()) => 2,
+        };
+        r.store(code, core::sync::atomic::Ordering::SeqCst);
+    });
+    narf_scheduler::run_until_empty();
+    match result.load(core::sync::atomic::Ordering::SeqCst) {
+        0 => TestResult::Pass,
+        1 => TestResult::Fail("expected BadHardware, got different error"),
+        2 => TestResult::Fail("transfer succeeded against a not-yet-enabled controller"),
+        _ => TestResult::Fail("transfer task didn't run"),
+    }
+}
+kernel_test_in!(
+    "drivers-i2c",
+    smoke_i801_smbus_rejects_transfer_when_disabled
+);

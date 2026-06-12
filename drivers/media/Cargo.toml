@@ -1,0 +1,25 @@
+[package]
+name         = "narf-drivers-media"
+description  = "Media drivers: DVB, SDR, CEC, and TV Tuners."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_media"
+path = "src/lib.rs"
+
+[dependencies]
+narf-lib             = { path = "../../lib" }
+narf-bus             = { path = "../../bus" }
+narf-init            = { path = "../../init" }
+narf-console         = { path = "../../console" }
+narf-drivers-usb     = { path = "../usb" }
+
+[features]
+kernel-test = []
+
+[lints]
+workspace = true

@@ -22,6 +22,8 @@ narf-console      = { path = "../../console" }
 narf-interrupts   = { path = "../../interrupts" }
 narf-scheduler    = { path = "../../scheduler" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
+narf-bus          = { path = "../../bus" }
+narf-capabilities = { path = "../../capabilities" }
 async-trait       = "0.1"
 
 [features]

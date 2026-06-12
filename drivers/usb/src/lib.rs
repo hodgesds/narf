@@ -26,6 +26,7 @@ pub mod intr;
 pub mod iso;
 pub mod msc;
 pub mod ohci;
+pub mod r8152;
 pub mod serial;
 pub mod uac;
 pub mod uhci;
@@ -49,6 +50,10 @@ pub fn register_initcalls() {
             serial::devfs_bridge::lookup_tty_usb,
             serial::devfs_bridge::enumerate_tty_usb,
         );
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-uac", || {
+        let _ = uac::register_initcalls();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "xhci", || {
@@ -132,6 +137,10 @@ pub fn register_initcalls() {
     // The HID supervisor's per-port try_attach now handles MSC via
     // AttachOutcome::MassStorage — same retry / hot-plug semantics
     // as keyboard and mouse. Removed cleanly per the no-shims rule.
+    narf_init::register(Stage::Subsys, "usb-r8152", || {
+        r8152::register();
+        InitResult::Ok
+    });
 }
 
 /// Number of times YieldTimeout::poll was entered (across the

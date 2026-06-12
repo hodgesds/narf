@@ -984,6 +984,7 @@ dependencies = [
 name = "narf-drivers-hwmon"
 version = "0.0.0"
 dependencies = [
+ "narf-aml",
  "narf-arch",
  "narf-bus",
  "narf-capabilities",
@@ -1003,6 +1004,8 @@ dependencies = [
  "narf-acpi",
  "narf-aml",
  "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
  "narf-console",
  "narf-init",
  "narf-interrupts",
@@ -1039,6 +1042,17 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-pwm",
+]
+
+[[package]]
+name = "narf-drivers-media"
+version = "0.0.0"
+dependencies = [
+ "narf-bus",
+ "narf-console",
+ "narf-drivers-usb",
+ "narf-init",
+ "narf-lib",
 ]
 
 [[package]]
@@ -1528,6 +1542,7 @@ dependencies = [
  "narf-drivers-i2c",
  "narf-drivers-i3c",
  "narf-drivers-leds",
+ "narf-drivers-media",
  "narf-drivers-net",
  "narf-drivers-nvidia",
  "narf-drivers-nvme",

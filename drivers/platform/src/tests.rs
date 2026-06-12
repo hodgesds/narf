@@ -31,6 +31,60 @@ fn smoke_smbus_class_match_registered() -> TestResult {
 }
 kernel_test_in!("drivers/platform/smbus", smoke_smbus_class_match_registered);
 
+fn smoke_asus_wmi_fan_curve_interpolate() -> TestResult {
+    let curve = crate::asus_wmi::FanCurve::new((40, 20), (60, 40), (75, 70), (90, 100));
+    if curve.interpolate(30) != 20 {
+        return TestResult::Fail("below lowest point should cap at lowest pct");
+    }
+    if curve.interpolate(50) != 30 {
+        return TestResult::Fail("linear interpolation failed (40..60)");
+    }
+    if curve.interpolate(100) != 100 {
+        return TestResult::Fail("above highest point should cap at highest pct");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-platform", smoke_asus_wmi_fan_curve_interpolate);
+
+fn smoke_acer_wmi_keycode_decode() -> TestResult {
+    use narf_input::KeyCode;
+    if crate::acer_wmi::acer_keycode(0x01) != Some(KeyCode::WLan) {
+        return TestResult::Fail("0x01 should be WLan");
+    }
+    if crate::acer_wmi::acer_keycode(0x48) != Some(KeyCode::VolumeUp) {
+        return TestResult::Fail("0x48 should be VolumeUp");
+    }
+    if crate::acer_wmi::acer_keycode(0x9999) != None {
+        return TestResult::Fail("0x9999 should be None");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-platform", smoke_acer_wmi_keycode_decode);
+
+fn smoke_alienware_wmi_guids_valid() -> TestResult {
+    if crate::wmi_vendors::guid_str_to_bytes(crate::alienware_wmi::WMAX_CONTROL_GUID).is_none() {
+        return TestResult::Fail("WMAX_CONTROL_GUID is invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-platform", smoke_alienware_wmi_guids_valid);
+
+fn smoke_system76_acpi_hid_valid() -> TestResult {
+    if crate::system76_acpi::SYSTEM76_ACPI_HID.len() < 7 {
+        return TestResult::Fail("System76 HID is invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-platform", smoke_system76_acpi_hid_valid);
+
+fn smoke_surface_acpi_hid_valid() -> TestResult {
+    if crate::surface_acpi::SURFACE_BUTTON_HID.len() < 7 {
+        return TestResult::Fail("Surface HID is invalid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers-platform", smoke_surface_acpi_hid_valid);
+
 fn smoke_acpi_ec_discovery() -> TestResult {
     use crate::ec;
     if ec::with_ec(|_| {}).is_some() {
