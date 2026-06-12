@@ -269,6 +269,23 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_UNIX_SMOKE_ELF_AARCH64=/dev/null");
 
+    // These smokes all share one uniform static-PIE compile recipe
+    // (musl-gcc -O2 -Wall -fPIE -pie -mcmodel=large). Rather than commit
+    // the prebuilt ELFs, we build each from its checked-in `.c` source
+    // into OUT_DIR when musl-gcc is on PATH (the musl-demo CI job installs
+    // musl-tools). When it isn't, we fall back to an empty placeholder
+    // (/dev/null) — only `boot-init` builds embed these, and only the
+    // musl-demo job actually runs them, so the other jobs are unaffected.
+    // The `REGEN_<name>.sh` scripts document the same recipe for manual
+    // regeneration. Non-uniform smokes (pty / hello_musl* / pthread) keep
+    // their committed binaries and individual handling above.
+    let musl_gcc = which("musl-gcc");
+    if musl_gcc.is_none() {
+        println!(
+            "cargo:warning=musl-demo: musl-gcc not on PATH; smokes use empty \
+             placeholders (run via the musl-demo job, which installs musl-tools)"
+        );
+    }
     for test in [
         "fork_pipe_smoke",
         "epoll_smoke",
@@ -317,17 +334,30 @@ fn main() {
         "fsmisc_smoke",
         "creds2_smoke",
     ] {
-        println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
-        let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));
-        println!(
-            "cargo:rustc-env=NARF_{}_ELF_X86_64={}",
-            test.to_uppercase(),
-            path.display()
-        );
-        println!(
-            "cargo:rustc-env=NARF_{}_ELF_AARCH64=/dev/null",
-            test.to_uppercase()
-        );
+        let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
+        println!("cargo:rerun-if-changed={}", src.display());
+        let x86_path = match &musl_gcc {
+            Some(cc) => {
+                let out = out_dir.join(format!("{test}_x86_64"));
+                let status = Command::new(cc)
+                    .args(["-O2", "-Wall", "-fPIE", "-pie", "-mcmodel=large"])
+                    .arg(&src)
+                    .arg("-o")
+                    .arg(&out)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => out.display().to_string(),
+                    _ => {
+                        println!("cargo:warning=musl-demo: failed to build {test}; placeholder");
+                        "/dev/null".to_string()
+                    }
+                }
+            }
+            None => "/dev/null".to_string(),
+        };
+        let upper = test.to_uppercase();
+        println!("cargo:rustc-env=NARF_{upper}_ELF_X86_64={x86_path}");
+        println!("cargo:rustc-env=NARF_{upper}_ELF_AARCH64=/dev/null");
     }
 
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
@@ -397,6 +427,16 @@ fn main() {
     } else {
         println!("cargo:rustc-env=NARF_LIBC_VALIDATE_ELF_X86_64=/dev/null");
     }
+}
+
+/// Locate an executable on `PATH`, returning its full path. Used to
+/// gate musl-gcc-dependent smoke compilation (mirrors the busybox
+/// build's gate).
+fn which(prog: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(prog))
+        .find(|full| full.is_file())
 }
 
 fn build_arch(
