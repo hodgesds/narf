@@ -1045,3 +1045,17 @@ pub enum ReassemblerOutcome {
     /// Packet header didn't parse — skipped (logged + dropped).
     Skipped,
 }
+
+pub static UVC_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
+    crate::class_registry::UsbClassMatch::class_only(USB_CLASS_VIDEO),
+];
+
+pub fn probe(_device: alloc::sync::Arc<crate::device::USBDevice>) -> Result<(), crate::class_registry::UsbProbeError> {
+    use core::fmt::Write;
+    let _ = writeln!(narf_console::Writer, "  usb: USB Video Class (UVC) device bound!");
+    Ok(())
+}
+
+pub fn register_initcalls() {
+    let _ = crate::class_registry::register_class_driver("uvcvideo", &UVC_MATCH, probe);
+}

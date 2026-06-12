@@ -35,8 +35,13 @@ const MATCHES: &[UsbClassMatch] = &[
 ];
 
 fn probe(device: Arc<USBDevice>) -> Result<(), UsbProbeError> {
-    // Just a stub for now. Claim the device.
-    let _ = device;
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  net: Realtek RTL8152/8153 USB Ethernet device bound! (vendor={:04x}, product={:04x})",
+        device.vendor_id(),
+        device.product_id()
+    );
     Ok(())
 }
 

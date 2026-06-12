@@ -23,6 +23,8 @@ pub mod i2c_hid_touch;
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042_mouse;
+#[cfg(target_arch = "x86_64")]
+pub mod psmouse;
 pub mod rmi4_core;
 pub mod wbdi;
 
@@ -110,6 +112,8 @@ fn register_i8042_initcalls() {
             );
             return InitResult::NotPresent;
         }
+        // SAFETY: Same as keyboard, safe at module level through the
+        // dispatch table.
         let irq_ok = install_isa_irq(12, on_irq12_safe);
         narf_input::I8042_MOUSE_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
         let _ = writeln!(
@@ -117,6 +121,10 @@ fn register_i8042_initcalls() {
             "  i8042-mouse: init=ok irq12={}",
             if irq_ok { "routed" } else { "ROUTING_FAILED" },
         );
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Device, "psmouse-extensions", || {
+        let _ = psmouse::register_initcalls();
         InitResult::Ok
     });
 }

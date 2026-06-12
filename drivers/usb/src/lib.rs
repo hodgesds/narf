@@ -56,6 +56,14 @@ pub fn register_initcalls() {
         let _ = uac::register_initcalls();
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "usb-uvc", || {
+        let _ = uvc::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-r8152", || {
+        let _ = r8152::register();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "xhci", || {
         xhci::register_pci_driver();
         InitResult::Ok
