@@ -100,6 +100,7 @@ impl Drop for VkBytes {
             // SAFETY: `b` is a live, exclusive reference into a
             // local-to-this-Drop array; volatile write of a u8 is
             // a single store with no side effects.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::write_volatile(b, 0);
             }

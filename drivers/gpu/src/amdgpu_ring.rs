@@ -138,6 +138,7 @@ impl Ring {
             // page from `backing`, so `phys + off` is a valid, 4-byte-aligned
             // address (`off` is a dword multiple). `wptr_dw + packet.len() <=
             // RING_SIZE_DW` was checked above, so `off` stays within the page.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile((phys + off) as *mut u32, w);
             }

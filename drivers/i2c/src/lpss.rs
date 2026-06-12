@@ -154,6 +154,7 @@ impl LpssI2c {
         // SAFETY: `mmio_base + off` is a 4-byte-aligned register offset that
         // the caller has guaranteed lies inside the mapped MMIO window (see
         // the `# Safety` contract above), so the volatile read is valid.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
@@ -168,6 +169,7 @@ impl LpssI2c {
         // SAFETY: `mmio_base + off` is a 4-byte-aligned register offset that
         // the caller has guaranteed lies inside the mapped MMIO window (see
         // the `# Safety` contract above), so the volatile write is valid.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
     }
 
@@ -193,6 +195,7 @@ impl LpssI2c {
         // SAFETY: IC_COMP_TYPE is a fixed DW I2C register offset well within
         // the mapped MMIO window; probe runs serially so we have exclusive
         // access to the register file.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ct = unsafe { self.read32(IC_COMP_TYPE) };
         if ct == DW_COMP_TYPE_MAGIC {
             Ok(())
@@ -235,6 +238,7 @@ impl LpssI2c {
     pub fn disable(&self) {
         // SAFETY: IC_ENABLE is a fixed DW I2C register offset within the
         // mapped MMIO window; clearing it disables the controller.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.write32(IC_ENABLE, 0);
         }
@@ -245,6 +249,7 @@ impl LpssI2c {
         // SAFETY: all offsets (IC_ENABLE, IC_ENABLE_STATUS, IC_TAR) are fixed
         // DW I2C register offsets within the mapped MMIO window; the caller
         // (transfer) holds the bus mutex, so access is exclusive.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.write32(IC_ENABLE, 0);
             for _ in 0..1000 {
@@ -262,13 +267,16 @@ impl LpssI2c {
         // SAFETY: IC_RAW_INTR_STAT is a fixed DW I2C register offset within
         // the mapped MMIO window; called only from transfer with the bus
         // mutex held, so access is exclusive.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let raw = unsafe { self.read32(IC_RAW_INTR_STAT) };
         if raw & INTR_TX_ABRT != 0 {
             // SAFETY: IC_TX_ABRT_SOURCE is a fixed register offset within the
             // mapped MMIO window; exclusive access via the bus mutex.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let src = unsafe { self.read32(IC_TX_ABRT_SOURCE) };
             // SAFETY: IC_CLR_TX_ABRT is a fixed register offset within the
             // mapped MMIO window; reading it clears the abort latch.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let _ = unsafe { self.read32(IC_CLR_TX_ABRT) };
             if src & 0b1001 != 0 {
                 Err(I2cError::Nack)
@@ -312,6 +320,7 @@ impl I2cBus for LpssI2c {
                                 self.check_abort()?;
                                 // SAFETY: IC_STATUS is a fixed register offset
                                 // within the mapped MMIO window; bus mutex held.
+                                // SAFETY: Valid MMIO bounds or trusted driver environment
                                 Ok(unsafe { self.read32(IC_STATUS) } & STATUS_TFNF != 0)
                             },
                             TRANSFER_TIMEOUT_POLLS,
@@ -320,6 +329,7 @@ impl I2cBus for LpssI2c {
                         // SAFETY: IC_DATA_CMD is a fixed register offset within
                         // the mapped MMIO window; bus mutex held and TFNF was
                         // just observed, so the TX FIFO has room.
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         unsafe {
                             self.write32(IC_DATA_CMD, cmd);
                         }
@@ -333,6 +343,7 @@ impl I2cBus for LpssI2c {
                         while issued < len {
                             // SAFETY: IC_STATUS is a fixed register offset
                             // within the mapped MMIO window; bus mutex held.
+                            // SAFETY: Valid MMIO bounds or trusted driver environment
                             let tfnf = unsafe { self.read32(IC_STATUS) } & STATUS_TFNF != 0;
                             if !tfnf {
                                 break;
@@ -345,6 +356,7 @@ impl I2cBus for LpssI2c {
                             // SAFETY: IC_DATA_CMD is a fixed register offset
                             // within the mapped MMIO window; bus mutex held and
                             // TFNF was just observed, so the TX FIFO has room.
+                            // SAFETY: Valid MMIO bounds or trusted driver environment
                             unsafe {
                                 self.write32(IC_DATA_CMD, cmd);
                             }
@@ -355,6 +367,7 @@ impl I2cBus for LpssI2c {
                                 self.check_abort()?;
                                 // SAFETY: IC_STATUS is a fixed register offset
                                 // within the mapped MMIO window; bus mutex held.
+                                // SAFETY: Valid MMIO bounds or trusted driver environment
                                 Ok(unsafe { self.read32(IC_STATUS) } & STATUS_RFNE != 0)
                             },
                             TRANSFER_TIMEOUT_POLLS,
@@ -362,12 +375,14 @@ impl I2cBus for LpssI2c {
                         .await?;
                         // SAFETY: IC_RXFLR is a fixed register offset within the
                         // mapped MMIO window; bus mutex held.
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         let avail = unsafe { self.read32(IC_RXFLR) } as usize;
                         let take = avail.min(len - received);
                         for _ in 0..take {
                             // SAFETY: IC_DATA_CMD is a fixed register offset
                             // within the mapped MMIO window; `take <= avail` so
                             // the RX FIFO holds an unread byte; bus mutex held.
+                            // SAFETY: Valid MMIO bounds or trusted driver environment
                             buf[received] = unsafe { self.read32(IC_DATA_CMD) } as u8;
                             received += 1;
                         }
@@ -381,6 +396,7 @@ impl I2cBus for LpssI2c {
                 self.check_abort()?;
                 // SAFETY: IC_STATUS is a fixed register offset within the
                 // mapped MMIO window; bus mutex held.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let st = unsafe { self.read32(IC_STATUS) };
                 Ok(st & STATUS_ACTIVITY == 0 && st & STATUS_TFE != 0)
             },
@@ -557,6 +573,7 @@ fn try_route_irq(gsi: u32, acpi_flags: u8) -> Option<u8> {
     // handler (`noop_irq`) was installed on the line immediately above, so
     // the dispatch slot is configured before the GSI is routed to it — the
     // contract `route_gsi_to_vector` requires.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     if unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, pol | trig) } {
         Some(v)
     } else {

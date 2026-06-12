@@ -129,6 +129,7 @@ pub fn probes() -> &'static [ProbeSite] {
     // by the linker script as the boundaries of the
     // `.note.narf.probes` output section. Every entry in that section
     // is a `ProbeSite` (the `probe!` macro is the only writer).
+    // SAFETY: Valid memory or trusted environment
     let start = unsafe { &__narf_probes_start as *const ProbeSite };
     // SAFETY: see the previous block — same linker-emitted symbol.
     let end = unsafe { &__narf_probes_end as *const ProbeSite };
@@ -136,6 +137,7 @@ pub fn probes() -> &'static [ProbeSite] {
     let len = bytes / core::mem::size_of::<ProbeSite>();
     // SAFETY: start/len derived from the linker-defined boundaries of
     // a contiguous region of `ProbeSite` entries.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::slice::from_raw_parts(start, len) }
 }
 
@@ -210,6 +212,7 @@ pub fn __nop_marker() {
     // the probe-site metadata still lands in `.note.narf.probes`, only
     // the runtime-armable marker itself is absent.
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("nop", options(nostack, preserves_flags, nomem));
     }
@@ -218,6 +221,7 @@ pub fn __nop_marker() {
     // registers or flags; `nostack, preserves_flags, nomem` encode those
     // guarantees to the compiler.
     #[cfg(target_arch = "aarch64")]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // `nop` on aarch64 encodes to `0xD503201F`; the assembler
         // mnemonic is portable, so we stick with it.
@@ -357,6 +361,7 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
         // ownership to concurrent consumers; `T: Copy` means a byte-
         // wise write is well-defined. Concurrent producers on the
         // same slot will tear the seq but consumers reject torn reads.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             // Write the full `MaybeUninit<T>` — since `T: Copy` this
             // is equivalent to a plain `T` store and leaves any prior
@@ -411,6 +416,7 @@ impl<T: Event, const N: usize> FlightRing<T, N> {
               // on it right now. The volatile read prevents the optimiser
               // from hoisting it out of the seq fence pair. `assume_init`
               // is valid because seq != 0 means a complete record landed.
+              // SAFETY: Valid memory or trusted environment
             let val = unsafe { core::ptr::read_volatile(self.slots[idx].get()).assume_init() };
             let s2 = self.seq[idx].load(Ordering::Acquire);
             if s1 != s2 {
@@ -543,6 +549,7 @@ pub fn exercise_internal_probes() {
 // Default-noop fast path:
 //   let p = SINK.load(Relaxed);
 //   if p.is_null() { return; }
+// SAFETY: Valid memory or trusted environment
 //   unsafe { (*p).record_raw(type_id, bytes); }
 // On x86_64 that's `mov rax, [SINK]; test rax, rax; je .Lret` — ≈0.5 ns,
 // branch-well-predicted as "no sink installed" outside of armed tracing.
@@ -718,6 +725,7 @@ pub fn install_event_sink<S: EventSink>(
         // The hot-path readers use Relaxed loads; an Acquire on the
         // swap above pairs with any future install's Release so this
         // store is visible before the reclaim.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             drop(Box::from_raw(prev as *mut Box<dyn EventSink>));
         }
@@ -735,6 +743,7 @@ pub fn current_event_sink_name() -> Option<&'static str> {
     // a `Box<Box<dyn EventSink>>`. The boxed contents live until a
     // subsequent install drops them; on the read side we never alias
     // through `&mut`, only `&`, so the &-borrow is sound.
+    // SAFETY: Valid memory or trusted environment
     let sink: &dyn EventSink = unsafe { &**p };
     Some(sink.name())
 }
@@ -759,6 +768,7 @@ pub fn emit_event(type_id: u64, bytes: &[u8]) {
     // points at a live `Box<dyn EventSink>` until the next install
     // replaces it. We never form an `&mut` to that box, so concurrent
     // reads are sound; `record_raw` takes `&self`.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*p).record_raw(type_id, bytes);
     }

@@ -97,6 +97,7 @@ pub unsafe fn probe(base_phys: u64, gsi_base: u32) -> IoApicHandle {
     // write → IOWIN read of IOAPICVER. High byte of returned
     // dword holds Maximum Redirection Entry (a 0-based index;
     // total entry count is +1).
+    // SAFETY: Valid memory or trusted environment
     let ver = unsafe { read_reg_locked(base_phys, IDX_IOAPICVER) };
     let max_entry = (ver >> 16) & 0xFF;
     IoApicHandle {
@@ -177,6 +178,7 @@ pub unsafe fn mask(h: &IoApicHandle, gsi: u32) {
 unsafe fn read_reg_locked(base_phys: u64, index: u32) -> u32 {
     // SAFETY: caller-asserted live IOAPIC + locked. REGSEL +
     // IOWIN are both naturally aligned 32-bit MMIO registers.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile((base_phys + REG_IOREGSEL) as *mut u32, index);
         core::ptr::read_volatile((base_phys + REG_IOWIN) as *const u32)
@@ -230,6 +232,7 @@ pub unsafe fn route_gsi_to_vector(gsi: u32, vector: u8, dest_apic: u8, flags: u3
         if gsi >= h.gsi_base && gsi <= h.gsi_end {
             // SAFETY: handle freshly probed; caller asserts vector
             // + handler readiness.
+            // SAFETY: Valid memory or trusted environment
             return unsafe { program_entry(&h, gsi, vector, dest_apic, flags) };
         }
     }

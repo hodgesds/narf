@@ -112,6 +112,7 @@ impl Coretemp {
         // This path is exercised only after coretemp probe succeeds,
         // which requires CPL-0 with CPUID.01H:EDX[bit 22] = 1
         // (ACPI MSR support present).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         Some(unsafe { narf_arch::x86_64::msr::rdmsr(MSR_IA32_THERM_STATUS) })
     }
 

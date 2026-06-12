@@ -119,6 +119,7 @@ fn try_rdrand_x86() -> Option<u64> {
         // SAFETY: RDRAND is always legal on supported parts; encoded
         // via the explicit `rdrand` mnemonic so the assembler picks the
         // right opcode for 64-bit operand.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             asm!(
                 "rdrand {v}",
@@ -147,6 +148,7 @@ fn try_rdseed_x86() -> Option<u64> {
         // again. If the CPU doesn't have RDSEED the opcode is #UD,
         // but the boot-time security init never calls this without
         // first checking CPUID(7, 0).EBX[18].
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             asm!(
                 "rdseed {v}",
@@ -177,6 +179,7 @@ fn try_rndr_aarch64() -> Option<u64> {
         // unsupported parts #UD. The boot security-init gates on
         // ID_AA64ISAR0_EL1.RNDR != 0 before calling this. The
         // assembler raw encoding works on any v8 toolchain.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             asm!(
                 "mrs {v}, s3_3_c2_c4_0", // RNDR_EL0

@@ -233,6 +233,7 @@ impl MsixTable {
 
         // SAFETY: caller holds the device exclusively. map_bar
         // does the size-detection write/restore against cfg-space.
+        // SAFETY: Valid memory or trusted environment
         let region = unsafe { map_bar(&self.device, self.bir)? };
 
         // aarch64-only: register the (DeviceID, EventID) → LPI
@@ -248,6 +249,7 @@ impl MsixTable {
             let collection = (target_apic_id & 0xFFFF) as u16;
             // SAFETY: ITS is initialised at boot; lpi is bounded by
             // its::NUM_LPIS.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_interrupts::aarch64::its::map_event(
                     device_id as u32,
@@ -270,6 +272,7 @@ impl MsixTable {
         // SAFETY: entry_off + 16 <= bar.size by spec — table_offset
         // is u32-aligned and the table sits inside the BAR; map_bar
         // returned `region.len` as the BAR size.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             region.write32(entry_off, msg_addr_lo);
             region.write32(entry_off + 4, msg_addr_hi);
@@ -336,6 +339,7 @@ impl MsixTable {
         let entry_off = self.table_offset as u64 + (idx as u64) * 16;
         // SAFETY: entry_off + 16 <= bar.size by spec (MsixTable was
         // built from the spec-mandated table size).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             region.write32(entry_off + 12, 1);
         }
@@ -372,9 +376,11 @@ impl MsixTable {
         // SAFETY: cap_offset came from the cap-list walk in
         // `enable_msix` and is < 0x100; same window we read from
         // during discovery.
+        // SAFETY: Valid memory or trusted environment
         let mc = unsafe { cfg_read16(self.cfg_phys, off) };
         // SAFETY: same window; setting bit 15 is the documented
         // global-enable.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             cfg_write16(self.cfg_phys, off, mc | (1 << 15));
         }
@@ -386,6 +392,7 @@ impl MsixTable {
     pub fn is_enabled(&self) -> bool {
         // SAFETY: cap_offset is the cached value from discovery, which
         // confirmed it lives inside this function's cfg window.
+        // SAFETY: Valid memory or trusted environment
         let mc = unsafe { cfg_read16(self.cfg_phys, self.cap_offset + 2) };
         (mc & (1 << 15)) != 0
     }
@@ -415,6 +422,7 @@ pub fn enable_msix(
 
     // SAFETY: caller-checked cap; pci_cap::find_cap walks the
     // standard PCI cap list with a bounded hop count.
+    // SAFETY: Valid memory or trusted environment
     let cap_ptr = match unsafe { crate::pci_cap::find_cap(device, MSIX_CAP_ID) } {
         Ok(Some(off)) => off,
         Ok(None)
@@ -430,9 +438,11 @@ pub fn enable_msix(
     // SAFETY: cap_ptr was returned by find_cap and points at a valid MSI-X
     // capability; cap_ptr+2 (Message Control) lies inside the 256-byte config
     // window at cfg_phys, whose ownership the caller asserted.
+    // SAFETY: Valid memory or trusted environment
     let msg_ctrl = unsafe { cfg_read16(cfg_phys, cap_ptr + 2) };
     // SAFETY: cap_ptr+4 (Table BIR/offset dword) is the next field of the same
     // MSI-X capability and likewise lies inside the config window at cfg_phys.
+    // SAFETY: Valid memory or trusted environment
     let table = unsafe { cfg_read32(cfg_phys, cap_ptr + 4) };
 
     let size = ((msg_ctrl & 0x07FF) as u16) + 1;

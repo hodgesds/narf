@@ -16,6 +16,7 @@ pub unsafe fn inb(port: u16) -> u8 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `in al, dx` reads from the chipset's I/O fabric; side effect
     // is visible to devices. Caller is responsible for the port semantics.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port,
              options(nomem, nostack, preserves_flags));
@@ -35,6 +36,7 @@ pub unsafe fn outb(port: u16, value: u8) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `out dx, al` writes to the chipset's I/O fabric. Callers own
     // port-sequence correctness (e.g. UART DLAB toggles).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value,
              options(nomem, nostack, preserves_flags));

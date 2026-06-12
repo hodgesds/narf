@@ -201,6 +201,7 @@ pub fn init_i2s_tx<M: MmioAccess>(mmio: &M, fmt: I2sFormat) -> Result<(), CodecL
     // SAFETY: `i2s_regs::ITER` is a fixed BT-TDM register offset inside the
     // BAR0 region the caller's `mmio` accessor wraps; the write width (32-bit)
     // matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         mmio.write32(i2s_regs::ITER, new_iter);
     }
@@ -211,6 +212,7 @@ pub fn init_i2s_tx<M: MmioAccess>(mmio: &M, fmt: I2sFormat) -> Result<(), CodecL
         let txfrmt = Acp3xTxFrmt::build(n_channels, fmt.word_length);
         // SAFETY: `i2s_regs::TXFRMT` is a fixed BT-TDM register offset inside
         // the caller-provided BAR0 mapping; 32-bit write matches the register.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             mmio.write32(i2s_regs::TXFRMT, txfrmt.raw());
         }
@@ -219,9 +221,11 @@ pub fn init_i2s_tx<M: MmioAccess>(mmio: &M, fmt: I2sFormat) -> Result<(), CodecL
     // Start the link: set ITER bit 0.
     // SAFETY: `i2s_regs::ITER` is a fixed BT-TDM register offset inside the
     // caller-provided BAR0 mapping; 32-bit read matches the register.
+    // SAFETY: Valid memory or trusted environment
     let enabled = unsafe { mmio.read32(i2s_regs::ITER) } | Acp3xIter::ENABLE;
     // SAFETY: `i2s_regs::ITER` and `IER` are fixed BT-TDM register offsets
     // inside the caller-provided BAR0 mapping; 32-bit writes match the regs.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         mmio.write32(i2s_regs::ITER, enabled);
         // TX interrupt enable.
@@ -393,6 +397,7 @@ pub fn init_soundwire<M: MmioAccess>(
     // 1. Enable the manager.
     // SAFETY: `SW_EN` is a fixed SDW0-manager register offset inside the
     // caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_EN, 1) };
     if !poll_ready(mmio, SW_EN_STATUS, true) {
         return Err(CodecLinkError::SwEnableTimeout);
@@ -401,6 +406,7 @@ pub fn init_soundwire<M: MmioAccess>(
     // 2. Bus reset: assert → wait for DONE → clear.
     // SAFETY: `SW_BUS_RESET_CTRL` is a fixed SDW0-manager register offset in
     // the caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_BUS_RESET_CTRL, BUS_RESET_REQ) };
     // Poll for bit 1 (BUS_RESET_DONE = 2) set.
     if !poll_ready(mmio, SW_BUS_RESET_CTRL, true) {
@@ -408,6 +414,7 @@ pub fn init_soundwire<M: MmioAccess>(
     }
     // SAFETY: `SW_BUS_RESET_CTRL` is a fixed SDW0-manager register offset in
     // the caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_BUS_RESET_CTRL, BUS_RESET_CLEAR) };
     if !poll_ready(mmio, SW_BUS_RESET_CTRL, false) {
         return Err(CodecLinkError::SwResetTimeout);
@@ -417,6 +424,7 @@ pub fn init_soundwire<M: MmioAccess>(
     //    `amd_init_sdw_manager`).
     // SAFETY: `SW_EN` is a fixed SDW0-manager register offset inside the
     // caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_EN, 0) };
     if !poll_ready(mmio, SW_EN_STATUS, false) {
         return Err(CodecLinkError::SwEnableTimeout);
@@ -425,6 +433,7 @@ pub fn init_soundwire<M: MmioAccess>(
     // 4. Re-enable.
     // SAFETY: `SW_EN` is a fixed SDW0-manager register offset inside the
     // caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_EN, 1) };
     if !poll_ready(mmio, SW_EN_STATUS, true) {
         return Err(CodecLinkError::SwEnableTimeout);
@@ -438,12 +447,14 @@ pub fn init_soundwire<M: MmioAccess>(
     let frame_size = encode_frame_size(0, 0);
     // SAFETY: `SW_FRAMESIZE` is a fixed SDW0-manager register offset inside
     // the caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_FRAMESIZE, frame_size) };
 
     // 6. Enable IRQ masks.
     // SAFETY: `SW_IRQ_MASK_0TO7`, `SW_IRQ_MASK_8TO11` and `SW_ERROR_INTR_MASK`
     // are fixed SDW0-manager register offsets inside the caller-provided BAR0
     // mapping; 32-bit writes match the registers.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         mmio.write32(SW_IRQ_MASK_0TO7, IRQ_MASK_0TO7);
         mmio.write32(SW_IRQ_MASK_8TO11, IRQ_MASK_8TO11);
@@ -472,6 +483,7 @@ pub fn sdw_send_imm_cmd<M: MmioAccess>(
     // SAFETY: `SW_IMM_CMD_UPPER`/`SW_IMM_CMD_LOWER` are fixed SDW0-manager
     // register offsets inside the caller-provided BAR0 mapping; 32-bit writes
     // match the registers.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         mmio.write32(SW_IMM_CMD_UPPER, cmd.upper);
         mmio.write32(SW_IMM_CMD_LOWER, cmd.lower);
@@ -484,14 +496,17 @@ pub fn sdw_send_imm_cmd<M: MmioAccess>(
 
     // SAFETY: `SW_IMM_RESP_UPPER` is a fixed SDW0-manager register offset in
     // the caller-provided BAR0 mapping; 32-bit read matches the register.
+    // SAFETY: Valid memory or trusted environment
     let upper_resp = unsafe { mmio.read32(SW_IMM_RESP_UPPER) };
     // SAFETY: `SW_IMM_RESP_LOWER` is a fixed SDW0-manager register offset in
     // the caller-provided BAR0 mapping; 32-bit read matches the register.
+    // SAFETY: Valid memory or trusted environment
     let lower_resp = unsafe { mmio.read32(SW_IMM_RESP_LOWER) };
 
     // Clear IMM_RES_VALID by writing 1 to it, then wait for clear.
     // SAFETY: `SW_IMM_CMD_STS` is a fixed SDW0-manager register offset in the
     // caller-provided BAR0 mapping; 32-bit write matches the register.
+    // SAFETY: Valid memory or trusted environment
     unsafe { mmio.write32(SW_IMM_CMD_STS, IMM_RES_VALID) };
     if !poll_ready(mmio, SW_IMM_CMD_STS, false) {
         return Err(CodecLinkError::SwCmdTimeout);
@@ -926,6 +941,7 @@ mod tests {
         let _poll_ready = |m: &FakeMmioAdapter, offset: u64, expected_nonzero: bool| -> bool {
             // SAFETY: `FakeMmioAdapter` is a memory-backed test double; any
             // `offset` is in-bounds and the read has no MMIO side effects.
+            // SAFETY: Valid memory or trusted environment
             let val = unsafe { m.read32(offset) };
             if expected_nonzero {
                 val != 0

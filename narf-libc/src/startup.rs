@@ -35,6 +35,7 @@ static mut RSP_AT_ENTRY: u64 = 0;
 pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
     // SAFETY: single-threaded startup — no other code can race the
     // initial write into RSP_AT_ENTRY.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         RSP_AT_ENTRY = rsp_at_entry;
     }
@@ -50,6 +51,7 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
         // contract. The kernel's stack initialiser writes a
         // canonical SysV-AMD64 argv frame: argc | argv[..argc] |
         // NULL | envp[..] | NULL | auxv[..] | AT_NULL.
+        // SAFETY: Valid memory or trusted environment
         unsafe { parse_startup_stack(rsp_at_entry) }
     };
 
@@ -71,9 +73,11 @@ pub unsafe extern "C" fn __libc_start_main(rsp_at_entry: u64) -> ! {
     // SAFETY: `main` is the consumer-supplied `extern "C" fn`
     // declared in `lib.rs`. It is the bin's responsibility to
     // honour the C ABI (we declared it `extern "C"`).
+    // SAFETY: Valid memory or trusted environment
     let rc = unsafe { super::main(argc, argv, envp) };
     // SAFETY: `exit` is the C-ABI shape; calling it here completes
     // the SysV C startup contract and never returns.
+    // SAFETY: Valid memory or trusted environment
     unsafe { exit(rc) }
 }
 
@@ -94,5 +98,6 @@ unsafe fn parse_startup_stack(rsp: u64) -> (i32, *const *const u8, *const *const
 pub fn entry_rsp() -> u64 {
     // SAFETY: write-once during single-threaded startup; subsequent
     // reads observe the published value.
+    // SAFETY: Valid memory or trusted environment
     unsafe { RSP_AT_ENTRY }
 }

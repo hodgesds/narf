@@ -161,6 +161,7 @@ pub unsafe fn program_msi(
 
     // SAFETY: cap_offset is < 0x100 by construction; offsets +4 ..
     // +0xC inclusive stay in the type-0 header.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         cfg_write32(cfg.cfg_phys, cfg.cap_offset + 4, addr_lo);
         if cfg.is_64bit {

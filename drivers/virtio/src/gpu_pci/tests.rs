@@ -270,6 +270,7 @@ fn smoke_virtio_gpu_pci_live_paint_pattern() -> TestResult {
     }
     // SAFETY: live device + bring_up succeeded if `is_probed`; the
     // lock guards concurrent submitters.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let r = gpu_pci::with_controller_mut(|c| unsafe {
         c.init_scanout()?;
         c.paint_test_pattern()

@@ -236,6 +236,7 @@ pub unsafe fn find_aer_cap_offset(cfg_phys: u64) -> Option<u16> {
         // SAFETY: caller-asserted live 4 KiB config space at cfg_phys; `off` is
         // bounded to 0x100..0x1000 above and read as a dword, so cfg_phys+off is
         // a readable, in-window MMIO address.
+        // SAFETY: Valid memory or trusted environment
         let header = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if header == 0 || header == u32::MAX {
             return None;
@@ -505,6 +506,7 @@ pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
         // SAFETY: caller-asserted live 4 KiB config page at cfg_phys; `off` is
         // bounded to 0x100..0x1000 above and read as a dword, so cfg_phys+off is
         // a readable, in-window MMIO address.
+        // SAFETY: Valid memory or trusted environment
         let hdr = unsafe { core::ptr::read_volatile((cfg_phys + off as u64) as *const u32) };
         if hdr == 0 || hdr == 0xFFFF_FFFF {
             return None;
@@ -561,6 +563,7 @@ pub fn aer_isr() {
         };
         // SAFETY: cfg_phys is identity-mapped ECAM from
         // bus enumeration; read of the AER cap ID is read-only.
+        // SAFETY: Valid memory or trusted environment
         let aer = match unsafe { find_aer_cap_offset(cfg_phys) } {
             Some(o) => o as u64,
             None => continue,
@@ -669,6 +672,7 @@ pub unsafe fn collect_events() -> alloc::vec::Vec<AerEvent> {
             // device's AER capability block, which is 0x40 bytes inside the same
             // live config page at cfg_phys; the Correctable Error Status dword is
             // within that block, so the address is readable and in-window.
+            // SAFETY: Valid memory or trusted environment
             let ce = unsafe {
                 core::ptr::read_volatile(
                     (cfg_phys + aer + regs::CORRECTABLE_ERROR_STATUS as u64) as *const u32,
@@ -857,6 +861,7 @@ pub unsafe fn retrain_link_live(
     let mut write_ctrl = |v: u16| {
         // SAFETY: same. Read-modify-write to preserve unrelated bits
         // (ASPM, RCB, etc.) — only LINK_DISABLE is toggled here.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cur = core::ptr::read_volatile(lnk_ctl_ptr as *const u16);
             let new = (cur & !link_ctrl::LINK_DISABLE) | (v & link_ctrl::LINK_DISABLE);

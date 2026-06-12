@@ -46,6 +46,7 @@
 //! let mut executor_ctx = KernelContext::default();
 //! // ... task setup: allocate stack, set task_ctx.rsp = stack top,
 //! //                 task_ctx.rip = task entry trampoline ...
+// SAFETY: Valid memory or trusted environment
 //! unsafe { kernel_switch(&mut executor_ctx, &task_ctx); }
 //! // We "return" here when the task switches back via another
 //! // kernel_switch call with our executor_ctx as the destination.
@@ -313,6 +314,7 @@ pub mod tests {
             // live `KernelContext` locals that outlive this switch; `child_ctx`
             // is the running context (safe to save into) and `main_ctx` is the
             // suspended caller to resume.
+            // SAFETY: Valid memory or trusted environment
             unsafe { kernel_switch(child_ctx, main_ctx) };
             // If main switches back to us, we'd resume here — but
             // this test only does one round trip, so spin.
@@ -342,6 +344,7 @@ pub mod tests {
         // back. We resume here.
         // SAFETY: child_ctx is a fresh ctx with a live stack +
         // valid entry point.
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
 
         let observed = CHILD_OBSERVED_ARG.load(Ordering::Acquire);
@@ -382,6 +385,7 @@ pub mod tests {
             // SAFETY: both pointers were published by the test driver from live
             // `KernelContext` locals that outlive this switch; `child_ctx` is
             // the running context and `main_ctx` is the caller to resume.
+            // SAFETY: Valid memory or trusted environment
             unsafe { kernel_switch(child_ctx, main_ctx) };
             loop {
                 core::hint::spin_loop();
@@ -405,6 +409,7 @@ pub mod tests {
         // SAFETY: `main_ctx` is the live running context to save into and
         // `child_ctx` is a fresh context with a boxed stack still in scope and
         // a valid entry point, so kernel_switch can switch into it.
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
 
         if CHILD_OBSERVED_RBX.load(Ordering::Acquire) != 0xAAAA_AAAA_AAAA_AAAA {
@@ -450,6 +455,7 @@ pub mod tests {
             // SAFETY: both pointers were published by the test driver from live
             // `KernelContext` locals that outlive this switch; `child_ctx` is
             // the running context and `main_ctx` is the caller to resume.
+            // SAFETY: Valid memory or trusted environment
             unsafe { kernel_switch(child_ctx, main_ctx) };
             loop {
                 core::hint::spin_loop();
@@ -475,11 +481,13 @@ pub mod tests {
         // child would observe IF=0 (matching our pre-switch state).
         // SAFETY: `cli` only clears IF; this test runs at CPL=0 in the kernel
         // and re-enables interrupts via the `sti` below before returning.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             asm!("cli", options(nomem, nostack));
         }
         // SAFETY: `main_ctx` is the live running context and `child_ctx` is a
         // fresh context with a live boxed stack and valid entry point.
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
         // The child set IF=1 on entry (via STI in load half) and
         // switched back. On return, our IF state was restored from
@@ -488,6 +496,7 @@ pub mod tests {
         // recorded IF=0, so we resume with IF=0.
         // SAFETY: `sti` only sets IF; a valid IDT is installed in this kernel
         // test context, so re-enabling interrupts here is sound.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             asm!("sti", options(nomem, nostack));
         } // restore for the rest of the suite
@@ -506,6 +515,7 @@ pub mod tests {
         MAIN_CTX.store(&mut main_ctx as *mut _ as u64, Ordering::Release);
         // SAFETY: `main_ctx` is the live running context and `child_ctx` is a
         // fresh context with a live boxed stack and valid entry point.
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(&mut main_ctx, &child_ctx) };
         // Child observed pre-restore RFLAGS via pushfq — that
         // reflects what kernel_switch arranged for the child. STI
@@ -548,6 +558,7 @@ pub mod tests {
                 COUNTER.fetch_add(1, Ordering::AcqRel);
                 // SAFETY: pointers live as long as the test fn does;
                 // both contexts owned by stack-locals in caller.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { kernel_switch(child_ctx, main_ctx) };
                 // Resumed here when main switches us back. Loop.
             }

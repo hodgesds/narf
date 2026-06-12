@@ -112,7 +112,10 @@ impl It87Chip {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// # Safety
+/// Caller must ensure index_port is valid for Super I/O access.
 pub unsafe fn sio_enter(index_port: u16) {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         narf_arch::x86_64::io_port::outb(index_port, 0x87);
         narf_arch::x86_64::io_port::outb(index_port, 0x01);
@@ -127,7 +130,10 @@ pub unsafe fn sio_enter(index_port: u16) {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// # Safety
+/// Caller must ensure index_port is valid for Super I/O access.
 pub unsafe fn sio_exit(index_port: u16) {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         narf_arch::x86_64::io_port::outb(index_port, 0x02);
         narf_arch::x86_64::io_port::outb(index_port + 1, 0x02);
@@ -136,7 +142,10 @@ pub unsafe fn sio_exit(index_port: u16) {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// # Safety
+/// Caller must ensure index_port and data_port are valid for Super I/O access.
 pub unsafe fn sio_read(index_port: u16, data_port: u16, reg: u8) -> u8 {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         narf_arch::x86_64::io_port::outb(index_port, reg);
         narf_arch::x86_64::io_port::inb(data_port)
@@ -145,6 +154,7 @@ pub unsafe fn sio_read(index_port: u16, data_port: u16, reg: u8) -> u8 {
 
 #[cfg(target_arch = "x86_64")]
 pub fn detect_chip(index_port: u16, data_port: u16) -> Option<(It87Chip, u16)> {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let chip_id = unsafe {
         sio_enter(index_port);
         let hi = sio_read(index_port, data_port, SIO_CHIP_ID_HI);

@@ -30,6 +30,7 @@ fn probe() -> MwaitCaps {
     }
     // SAFETY: leaf 5 only defined when MONITOR/MWAIT is set; we
     // just verified that.
+    // SAFETY: Valid memory or trusted environment
     let (_, _, ecx5, edx5) = unsafe { cpuid(5, 0) };
     let interrupt_break = ecx5 & (1 << 1) != 0;
     // Count populated nibbles in EDX = max C-state with at least

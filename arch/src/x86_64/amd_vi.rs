@@ -559,6 +559,7 @@ pub unsafe fn read_ctrl(reg_base: usize) -> u64 {
 pub unsafe fn write_ctrl(reg_base: usize, value: u64) {
     // SAFETY: caller-asserted `reg_base` is the engine's MMIO base; `w64`
     // writes the CTRL register at the in-range `AMD_VI_CTRL` offset.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         w64(reg_base, AMD_VI_CTRL, value);
     }

@@ -532,6 +532,7 @@ pub fn levels() -> &'static [u8] {
     // first push without re-storing ptr. Worst case under a race
     // with a re-activation: callers see a partial new ladder; they
     // never see out-of-bounds memory.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::slice::from_raw_parts(ptr as *const u8, len) }
 }
 

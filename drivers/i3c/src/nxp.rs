@@ -117,6 +117,7 @@ impl NxpI3c {
         // offset within BAR 0, which `map_bar(&device, 0)` mapped in `probe`.
         // This driver owns the device exclusively, so the aligned in-bounds
         // 32-bit register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio
                 .write32(REG_MDATACTRL, MDATACTRL_FLUSH_TX | MDATACTRL_FLUSH_RX);
@@ -134,6 +135,7 @@ impl NxpI3c {
             // SAFETY: REG_MSTATUS (0x04) is a fixed 4-byte-aligned register
             // offset within BAR 0 mapped in `probe`; the driver owns the
             // device exclusively, so this aligned status-register read is sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let status = unsafe { self.mmio.read32(REG_MSTATUS) };
             if (status & MSTATUS_COMPLETE) != 0 {
                 return Ok(());
@@ -154,6 +156,7 @@ impl Driver for NxpI3c {
             // within BAR 0 mapped in `probe`; `start` takes `&mut self`, so
             // this driver holds the device exclusively and the aligned
             // in-bounds register write is sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 self.mmio.write32(REG_MCONFIG, 0x1);
             }
@@ -166,6 +169,7 @@ impl Driver for NxpI3c {
             // within BAR 0 mapped in `probe`; `quiesce` takes `&mut self`, so
             // the driver holds the device exclusively and the aligned in-bounds
             // register write is sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 self.mmio.write32(REG_MCONFIG, 0x0);
             }
@@ -183,6 +187,7 @@ impl I3cBus for NxpI3c {
         // SAFETY: REG_MWMSG_SADDR (0x30) is a fixed 4-byte-aligned register
         // within BAR 0 mapped in `probe`; the driver owns the device
         // exclusively, so the aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(REG_MWMSG_SADDR, (addr as u32) << 1);
         }
@@ -195,6 +200,7 @@ impl I3cBus for NxpI3c {
                         // FIFO register within BAR 0 mapped in `probe`; the
                         // driver owns the device exclusively, so this aligned
                         // in-bounds register write is sound.
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         unsafe {
                             self.mmio.write32(REG_MWDATAB, byte as u32);
                         }
@@ -206,6 +212,7 @@ impl I3cBus for NxpI3c {
                         // RX-FIFO register within BAR 0 mapped in `probe`; the
                         // driver owns the device exclusively, so this aligned
                         // in-bounds register read is sound.
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         buf[i] = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
                     }
                 }
@@ -216,6 +223,7 @@ impl I3cBus for NxpI3c {
         // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
         // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
         // the aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(
                 REG_MCTRL,
@@ -249,6 +257,7 @@ impl I3cBus for NxpI3c {
         // SAFETY: REG_MWDATAB (0x24) is a fixed 4-byte-aligned TX-FIFO register
         // within BAR 0 mapped in `probe`; the driver owns the device
         // exclusively, so the aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(REG_MWDATAB, ccc.opcode() as u32);
         }
@@ -258,6 +267,7 @@ impl I3cBus for NxpI3c {
             // register within BAR 0 mapped in `probe`; the driver owns the
             // device exclusively, so the aligned in-bounds register write is
             // sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 self.mmio.write32(REG_MWDATAB, byte as u32);
             }
@@ -271,6 +281,7 @@ impl I3cBus for NxpI3c {
         // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
         // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
         // the aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio
                 .write32(REG_MCTRL, request | MCTRL_TYPE_I3C | addr_field);
@@ -315,6 +326,7 @@ impl I3cBus for NxpI3c {
             // register within BAR 0 mapped in `probe`; the driver owns the
             // device exclusively, so the aligned in-bounds register write is
             // sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 self.mmio.write32(REG_MWDATAB, addr_with_parity as u32);
             }
@@ -323,6 +335,7 @@ impl I3cBus for NxpI3c {
             // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
             // BAR 0 mapped in `probe`; the driver owns the device exclusively,
             // so the aligned in-bounds register write is sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 self.mmio
                     .write32(REG_MCTRL, MCTRL_REQUEST_DAA | MCTRL_TYPE_I3C);
@@ -333,6 +346,7 @@ impl I3cBus for NxpI3c {
                 // SAFETY: REG_MSTATUS (0x04) is a fixed 4-byte-aligned register
                 // within BAR 0 mapped in `probe`; the driver owns the device
                 // exclusively, so this aligned status-register read is sound.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let status = unsafe { self.mmio.read32(REG_MSTATUS) };
                 if (status & MSTATUS_ERROR) != 0 {
                     return Err(I3cError::HardwareError);
@@ -359,6 +373,7 @@ impl I3cBus for NxpI3c {
                 // register within BAR 0 mapped in `probe`; the driver owns the
                 // device exclusively, so this aligned in-bounds register read
                 // is sound.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 *b = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
             }
 
@@ -401,6 +416,7 @@ impl I3cBus for NxpI3c {
             // register within BAR 0 mapped in `probe`; the driver owns the
             // device exclusively, so both aligned in-bounds register writes are
             // sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 self.mmio.write32(REG_MWDATAB, (w & 0xFF) as u32);
                 self.mmio.write32(REG_MWDATAB, (w >> 8) as u32);
@@ -409,6 +425,7 @@ impl I3cBus for NxpI3c {
         // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
         // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
         // the aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(
                 REG_MCTRL,
@@ -427,6 +444,7 @@ impl I3cBus for NxpI3c {
         // SAFETY: REG_MCTRL (0x00) is a fixed 4-byte-aligned register within
         // BAR 0 mapped in `probe`; the driver owns the device exclusively, so
         // the aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(
                 REG_MCTRL,
@@ -439,10 +457,12 @@ impl I3cBus for NxpI3c {
             // register within BAR 0 mapped in `probe`; the driver owns the
             // device exclusively, so the aligned in-bounds register read is
             // sound.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let lo = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
             // SAFETY: same as the `lo` read above — REG_MRDATAB is the fixed,
             // aligned, in-bounds RX-FIFO register and the driver owns the
             // device exclusively.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let hi = unsafe { self.mmio.read32(REG_MRDATAB) as u8 };
             *w = (lo as u16) | ((hi as u16) << 8);
         }

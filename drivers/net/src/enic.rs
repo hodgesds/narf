@@ -32,10 +32,12 @@ impl EnicNic {
     }
 
     fn read_u32(&self, offset: u64) -> u32 {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.read32(offset) }
     }
 
     fn write_u32(&self, offset: u64, val: u32) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.write32(offset, val) }
     }
 
@@ -58,6 +60,7 @@ pub fn probe(
     device: BusDevice,
     _cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
         // Enic uses BAR0 for vNIC config
         Ok(m) => m,

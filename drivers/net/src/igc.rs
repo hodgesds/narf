@@ -219,6 +219,7 @@ fn igc_isr() {
     }
     // SAFETY: `base` is the device's BAR0 phys, identity-mapped at
     // bring-up; ICR (offset 0xC0) is inside the IGC register window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let _icr = narf_arch::mmio::read32(base + REG_ICR);
     }
@@ -504,6 +505,7 @@ impl Igc {
         // slow reset. Intel I225 datasheet §8.2.3.1: CTRL.RST self-
         // clears within ~10 ms; 100 ms is the wedge threshold.
         narf_scheduler::responsive_spin_until(
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             || unsafe { mmio.read32(REG_CTRL) } & CTRL_RST == 0,
             narf_time::Deadline::after_ms(100),
         );
@@ -710,6 +712,7 @@ impl Igc {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| IgcError::BarMapFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         unsafe { msix.enable() }.map_err(|_| IgcError::BarMapFailed)?;
@@ -826,6 +829,7 @@ impl Igc {
             // SAFETY: `buf_phys` is the identity-mapped DMA address of this
             // RX slot's packet buffer (`rx_buf_pool[idx]`); `i < len` and
             // `len <= FRAME_SIZE` so `buf_phys + i` stays inside the buffer.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
@@ -839,6 +843,7 @@ impl Igc {
         // SAFETY: identity-mapped DMA; AdvRxDescRead is the same 16
         // bytes as AdvRxDescWb (the chip selects interpretation via
         // SRRCTL.DESCTYPE).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(desc_ptr as *mut AdvRxDescRead, read_form);
         }

@@ -189,6 +189,7 @@ pub fn map_contiguous_scanout(
         // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
         // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
         // 32-bit GGTT register writes.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);
@@ -228,6 +229,7 @@ pub fn alloc_coherent_scanout(
         // landing on an 8-byte-aligned slot inside the GGTT PTE array, so both
         // `pte_offset` and `pte_offset + 4` are in-range, naturally-aligned
         // 32-bit GGTT register writes.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             gtt_mmadr.write32(pte_offset, (pte & 0xFFFF_FFFF) as u32);
             gtt_mmadr.write32(pte_offset + 4, (pte >> 32) as u32);

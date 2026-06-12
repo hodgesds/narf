@@ -182,6 +182,7 @@ impl IntelPchGpio {
         // SAFETY: the caller guarantees `off + 4 <= mmio_len`, so
         // `mmio_base.raw() + off` addresses a dword fully inside this
         // community's mapped MMIO window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
@@ -198,6 +199,7 @@ impl IntelPchGpio {
         // SAFETY: the caller guarantees `off + 4 <= mmio_len`, so
         // `mmio_base.raw() + off` addresses a dword fully inside this
         // community's mapped MMIO window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
     }
 
@@ -234,9 +236,11 @@ impl IntelPchGpio {
             // `g < ceil(pin_count/32)`. The community window always
             // contains the full GPI_IS/GPI_IE arrays for its pads, so
             // these offsets are within `mmio_len`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let status = unsafe { self.read32(is_reg) };
             // SAFETY: as above — `ie_reg` is the matching GPI_IE group
             // register, in-bounds for the same reason.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let enabled = unsafe { self.read32(ie_reg) };
             let active = status & enabled;
 
@@ -256,6 +260,7 @@ impl IntelPchGpio {
                     // SAFETY: `is_reg` is the same in-bounds GPI_IS
                     // group register read above; writing the single
                     // active bit acknowledges that pin's interrupt.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     unsafe { self.write32(is_reg, 1 << bit) };
                 }
             }
@@ -277,6 +282,7 @@ impl GpioController for IntelPchGpio {
         let off = self.padcfg0_offset(pin).ok_or(GpioError::InvalidPin)?;
         // SAFETY: `padcfg0_offset` returned `Some`, which guarantees
         // `off + 4 <= mmio_len`, satisfying `read32`'s contract.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let val = unsafe { self.read32(off) };
         Ok(val & PADCFG0_GPIORXSTATE != 0)
     }
@@ -344,6 +350,7 @@ impl GpioController for IntelPchGpio {
         // `probe_community` as `(mmio_len - padbar) / stride`, so every
         // pad's full slot (including PADCFG1 at `off + 4`) lies inside
         // `mmio_len`; thus `(off + 4) + 4 <= mmio_len`.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let mut val1 = unsafe { self.read32(off + 4) };
         val1 &= !(0b1111 << 10); // Termination mask.
         match pull {
@@ -364,6 +371,7 @@ impl GpioController for IntelPchGpio {
         // SAFETY: `ie_reg` is the GPI_IE group register for `pin`'s
         // group (`g = pin / 32`), within the GPI_IE array that the
         // community window always maps; so `ie_reg + 4 <= mmio_len`.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let mut ie = unsafe { self.read32(ie_reg) };
         ie |= 1 << bit;
         // SAFETY: same in-bounds `ie_reg`; sets this pin's enable bit.
@@ -380,6 +388,7 @@ impl GpioController for IntelPchGpio {
             // SAFETY: `ie_reg` is the GPI_IE group register for `pin`'s
             // group, within the always-mapped GPI_IE array, so
             // `ie_reg + 4 <= mmio_len`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let mut ie = unsafe { self.read32(ie_reg) };
             ie &= !(1 << bit);
             // SAFETY: same in-bounds `ie_reg`; clears this pin's enable bit.
@@ -488,6 +497,7 @@ pub unsafe fn __probe_community_for_test(
     // SAFETY: forwarded directly from this function's own contract:
     // the caller guarantees the `[mmio_base, mmio_base + mmio_len)`
     // region is mapped and readable.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { probe_community(mmio_base, mmio_len) }
 }
 
@@ -508,6 +518,7 @@ unsafe fn probe_community(mmio_base: PhysAddr, mmio_len: u64) -> Option<(u16, u3
     // SAFETY: `mmio_len >= 0x10` was checked above, so the REVID dword
     // at offset `REG_REVID` (0x0) is within the caller-provided mapped
     // window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let revid_raw = unsafe { narf_arch::mmio::read32(mmio_base.raw() + REG_REVID) };
     if revid_raw == u32::MAX {
         return None;
@@ -516,6 +527,7 @@ unsafe fn probe_community(mmio_base: PhysAddr, mmio_len: u64) -> Option<(u16, u3
     let has_debounce = (revid as u32) >= REVID_DEBOUNCE_THRESHOLD;
     // SAFETY: `REG_PADBAR` (0xC) + 4 = 0x10 <= mmio_len (checked above),
     // so the PADBAR dword is within the mapped window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let padbar = unsafe { narf_arch::mmio::read32(mmio_base.raw() + REG_PADBAR) };
     if (padbar as u64) >= mmio_len || padbar < 0x10 {
         return None;
@@ -559,6 +571,7 @@ fn probe_one(hid: &str, path: &str) -> usize {
         // resource in the device's `_CRS`, i.e. firmware-declared MMIO
         // for this GPIO community; that physical range is identity-
         // mapped and readable, satisfying `probe_community`'s contract.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let probe = unsafe { probe_community(phys, c.mmio_len) };
         let (revid, padbar, has_debounce, pin_count) = match probe {
             Some(t) => (Some(t.0), Some(t.1), t.2, t.3),
@@ -623,6 +636,7 @@ fn try_route_gsi(gsi: u32, flags: u8, ctrls: alloc::vec::Vec<Arc<IntelPchGpio>>)
     // `gsi` to `vector`, any delivered interrupt has a valid handler to
     // run. `polarity | trigger` are the canonical IOAPIC flag constants
     // for the decoded `_CRS` ExtendedIrq flags.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         narf_acpi::ioapic::route_gsi_to_vector(gsi, vector, 0, polarity | trigger);
     }

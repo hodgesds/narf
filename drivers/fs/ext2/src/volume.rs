@@ -562,6 +562,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 // SAFETY: see read_byte_range_with. Single-CPU
                 // cooperative async means the spinlock guards the
                 // buffer bytes for the duration of the copy.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
                 dst.copy_from_slice(&sector);
             }
@@ -634,6 +635,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // via the outer spinlock so no other CPU/task is racing
             // the buffer bytes during this copy. Identity-mapped
             // phys backs the read.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
             dst[cursor..cursor + want].copy_from_slice(&src[in_lba..in_lba + want]);
             cursor += want;

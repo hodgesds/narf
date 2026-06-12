@@ -128,6 +128,7 @@ unsafe fn inb(port: u16) -> u8 {
     let val: u8;
     // SAFETY: caller asserts port is owned by the EC driver
     // (validated by `init()`'s _CRS decode).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "in al, dx",
@@ -173,6 +174,7 @@ fn wait_ibf_clear(cmd: u16) -> Result<(), EcError> {
     let done = narf_scheduler::responsive_spin_until(
         // SAFETY: `cmd` is owned by the EC driver (validated by
         // init's _CRS decode).
+        // SAFETY: Valid memory or trusted environment
         || unsafe { inb(cmd) } & STATUS_IBF == 0,
         narf_time::Deadline::after_ms(EC_TIMEOUT_MS),
     );

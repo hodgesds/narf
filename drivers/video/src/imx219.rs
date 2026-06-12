@@ -10,7 +10,7 @@ extern crate alloc;
 use core::fmt::Write;
 use narf_console::Writer;
 
-use crate::{BufferQueue, Camera, CameraError, PixelFormat, Result};
+use crate::{BufferQueue, Camera, PixelFormat, Result};
 
 pub const IMX219_I2C_ADDR: u16 = 0x10;
 pub const IMX219_CHIP_ID_REG: u16 = 0x0000;
@@ -28,6 +28,7 @@ pub enum Imx219Format {
 }
 
 /// The IMX219 sensor state and DMA queue.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Imx219 {
     i2c_bus: u16,

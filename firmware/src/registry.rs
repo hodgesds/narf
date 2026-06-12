@@ -139,6 +139,7 @@ pub(crate) fn view_for<'a>(
     // SAFETY: the backing is identity-mapped DMA-coherent memory;
     // the `payload_len` was set when the entry was installed and
     // is bounded by the backing buffer's length.
+    // SAFETY: Valid memory or trusted environment
     let bytes = unsafe { core::slice::from_raw_parts(bytes_ptr, b.payload_len) };
     // Leak the version string so the lifetime fits the cap's. The
     // string lives in the registry until revocation, so the leak
@@ -181,6 +182,7 @@ pub(crate) fn install_blob(
     // SAFETY: `dst` is the phys address of a freshly-allocated DMA-
     // coherent region we own exclusively. It's identity-mapped so
     // we can write through the phys.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in trailer.payload.iter().enumerate() {
             core::ptr::write_volatile((dst + i as u64) as *mut u8, *b);

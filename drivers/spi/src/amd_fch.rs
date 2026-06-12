@@ -245,6 +245,7 @@ impl AmdFchSpi {
     unsafe fn clear_fifo(&self) {
         // SAFETY: caller serialises.
         let ctrl0 = unsafe { self.read32(AMD_SPI_CTRL0_REG) };
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.write32(AMD_SPI_CTRL0_REG, ctrl0 | AMD_SPI_FIFO_CLEAR) };
     }
 
@@ -272,6 +273,7 @@ impl AmdFchSpi {
             AmdSpiVersion::V1 => {
                 // SAFETY: caller serialises.
                 let ctrl0 = unsafe { self.read32(AMD_SPI_CTRL0_REG) };
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     self.write32(
                         AMD_SPI_CTRL0_REG,
@@ -294,11 +296,13 @@ impl AmdFchSpi {
             AmdSpiVersion::V1 => {
                 // SAFETY: caller serialises.
                 let ctrl0 = unsafe { self.read32(AMD_SPI_CTRL0_REG) };
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe { self.write32(AMD_SPI_CTRL0_REG, ctrl0 | AMD_SPI_EXEC_CMD) };
             }
             AmdSpiVersion::V2 | AmdSpiVersion::Hid2 => {
                 // SAFETY: same.
                 let trig = unsafe { self.read8(AMD_SPI_CMD_TRIGGER_REG) };
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe { self.write8(AMD_SPI_CMD_TRIGGER_REG, trig | AMD_SPI_TRIGGER_CMD) };
             }
         }

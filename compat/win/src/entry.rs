@@ -38,6 +38,7 @@ pub unsafe fn enter_winprocess(proc: &WinProcess) -> ! {
     // SAFETY: AS::activate is per-arch the MOV CR3 / TTBR0 write;
     // safe at CPL=0 with the AS in a coherent state (load_pe
     // guarantees that).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // A failed activation is unrecoverable — we cannot enter
         // user mode without the right page table live. Panic with

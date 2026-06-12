@@ -222,6 +222,7 @@ impl VirtioGpuPci {
         // Best-effort MSI-X for the controlq (queue 0).
         // SAFETY: caller-asserted exclusive ownership.
         let (irq_vector, msix) =
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             match unsafe { crate::pci::enable_msix_queue(&common, cap, device, 0) } {
                 Ok((v, t)) => (Some(v), Some(t)),
                 Err(_) => (None, None),

@@ -1048,7 +1048,7 @@ fn smoke_mt7921_uni_dev_info_update_encode() -> TestResult {
     if info_tag != UNI_DEV_INFO_TAG_INFO {
         return TestResult::Fail("INFO TLV tag wrong");
     }
-    if &buf[p + 8..p + 8 + 6] != &mac {
+    if buf[p + 8..p + 8 + 6] != mac {
         return TestResult::Fail("own_mac round-trip wrong");
     }
     TestResult::Pass
@@ -1088,7 +1088,7 @@ fn smoke_mt7921_bss_info_basic_tlv_encode() -> TestResult {
     if nt != NETWORK_TYPE_INFRA {
         return TestResult::Fail("network_type wrong");
     }
-    if &buf[12..18] != &bssid {
+    if buf[12..18] != bssid {
         return TestResult::Fail("bssid round-trip wrong");
     }
     if buf[21] != PHY_MODE_HE {
@@ -1106,7 +1106,7 @@ fn smoke_mt7921_dev_info_update_legacy_encode() -> TestResult {
     let mac = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
     let mut buf = [0xFFu8; DEV_INFO_UPDATE_SIZE];
     encode_dev_info_update(0, true, mac, &mut buf).unwrap();
-    if &buf[8..14] != &mac {
+    if buf[8..14] != mac {
         return TestResult::Fail("own_mac round-trip wrong");
     }
     if buf[4] != 1 {
@@ -1141,7 +1141,7 @@ fn smoke_mt7921_sta_rec_basic_tlv_encode() -> TestResult {
     if conn != CONN_TYPE_STA_INFRA {
         return TestResult::Fail("conn_type wrong");
     }
-    if &buf[12..18] != &peer {
+    if buf[12..18] != peer {
         return TestResult::Fail("peer_addr round-trip wrong");
     }
     TestResult::Pass
@@ -1194,13 +1194,13 @@ fn smoke_mt7921_ieee80211_mgmt_hdr_encode() -> TestResult {
     if fc != FC_MGMT_AUTH {
         return TestResult::Fail("frame control round-trip wrong");
     }
-    if &buf[4..10] != &da {
+    if buf[4..10] != da {
         return TestResult::Fail("addr1 (DA) wrong");
     }
-    if &buf[10..16] != &sa {
+    if buf[10..16] != sa {
         return TestResult::Fail("addr2 (SA) wrong");
     }
-    if &buf[16..22] != &bssid {
+    if buf[16..22] != bssid {
         return TestResult::Fail("addr3 (BSSID) wrong");
     }
     let seq_ctrl = u16::from_le_bytes([buf[22], buf[23]]);
@@ -1309,7 +1309,7 @@ fn smoke_mt7921_sta_rec_wtbl_encode() -> TestResult {
     if buf[4] != 6 {
         return TestResult::Fail("cipher byte should be 6 (CCMP-128)");
     }
-    if &buf[8..24] != &key {
+    if buf[8..24] != key {
         return TestResult::Fail("key round-trip wrong");
     }
     TestResult::Pass
@@ -1407,7 +1407,7 @@ fn smoke_mt7921_mac_vif_setup_layout() -> TestResult {
     }
     // BSS_INFO_BASIC TLV at offset DEV_INFO_UPDATE_SIZE — bssid at +12.
     let bssid_at = DEV_INFO_UPDATE_SIZE + 12;
-    if &seq[bssid_at..bssid_at + 6] != &bssid {
+    if seq[bssid_at..bssid_at + 6] != bssid {
         return TestResult::Fail("BSS_INFO bssid not at expected offset");
     }
     TestResult::Pass
@@ -1417,8 +1417,10 @@ kernel_test_in!("drivers/wireless/mt7921", smoke_mt7921_mac_vif_setup_layout);
 fn smoke_mt7921_assoc_open_frames_for_ssid() -> TestResult {
     use super::bringup::{build_assoc_open_frames, BringUpConfig};
     use super::cmd::{IEEE80211_AUTH_FRAME_SIZE, IEEE80211_MAC_HDR_SIZE};
-    let mut cfg = BringUpConfig::default();
-    cfg.own_mac = [0x11; 6];
+    let cfg = BringUpConfig {
+        own_mac: [0x11; 6],
+        ..Default::default()
+    };
     let bssid = [0x22; 6];
     let ssid = b"narf";
     let (auth, assoc) = build_assoc_open_frames(&cfg, bssid, ssid);
@@ -1427,10 +1429,10 @@ fn smoke_mt7921_assoc_open_frames_for_ssid() -> TestResult {
     }
     // Auth's addr1 (DA) is bssid; addr3 (BSSID) is bssid; addr2
     // (SA) is own_mac.
-    if &auth[4..10] != &bssid {
+    if auth[4..10] != bssid {
         return TestResult::Fail("auth addr1 not bssid");
     }
-    if &auth[10..16] != &cfg.own_mac {
+    if auth[10..16] != cfg.own_mac {
         return TestResult::Fail("auth addr2 not own_mac");
     }
     // Assoc carries the SSID IE at offset MAC_HDR + 4.

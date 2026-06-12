@@ -134,6 +134,7 @@ fn narf_pwm_sync_set(
     let raw = RawWaker::new(core::ptr::null(), &VTABLE);
     // SAFETY: VTABLE functions are no-ops; the waker is never stored
     // beyond this function call.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
 

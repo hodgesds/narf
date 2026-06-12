@@ -149,6 +149,7 @@ fn smoke_ixgbe_live_bring_up() -> TestResult {
     // map and allocator are online; `ECAM_DEFAULT_BASE` is the standard
     // MMCONFIG window and the enumerator only reads 4-byte config words,
     // rejecting all-1s for unpopulated slots.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {

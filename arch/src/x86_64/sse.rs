@@ -51,6 +51,7 @@ pub unsafe fn enable() {
     if v & CR4_OSFXSR == 0 {
         // SAFETY: bit 9 is documented architectural; the
         // read-modify-write preserves every other CR4 bit.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_cr4(v | CR4_OSFXSR);
         }

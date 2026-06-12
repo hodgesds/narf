@@ -456,6 +456,7 @@ impl RtlNic {
         // SAFETY: identity-mapped MMIO. RDSAR / TNPDS take a 64-bit
         // value; per §2.20 the spec splits it as low-32 at offset+0
         // and high-32 at offset+4.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             mmio.write32(REG_TNPDS, tx_phys as u32);
             mmio.write32(REG_TNPDS + 4, (tx_phys >> 32) as u32);
@@ -728,6 +729,7 @@ impl RtlNic {
                 // SAFETY: `buf_phys` is the identity-mapped DMA address of
                 // this slot's RX buffer (`rx_pool[slot]`, `RX_BUF_LEN` bytes);
                 // `i < copy_len <= RX_BUF_LEN`, so `buf_phys + i` is in range.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -820,6 +822,7 @@ impl RtlNic {
             phys = self.tx_pool[slot].phys_addr().raw();
             // SAFETY: identity-mapped DMA buffer; bounds-checked by
             // FrameTooLong guard.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 for (i, b) in frame.iter().enumerate() {
                     core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
@@ -921,6 +924,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // configuration authority over exactly this device, and we have just
     // enabled MEM_SPACE | BUS_MASTER above, so the MMIO/DMA accesses it
     // performs are valid.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -931,6 +935,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // (it has not been cloned or published yet), so we hold unique
         // ownership and casting the `Arc::as_ptr` to `&mut` does not alias
         // any other reference; the pointee is a live, just-constructed value.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut RtlNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

@@ -78,6 +78,7 @@ impl<T> RoCell<T> {
         // immediate dereference) so even if a parallel `set` were
         // somehow racing it would read either the old or new value
         // atomically by virtue of `T: Copy` requirements upstream.
+        // SAFETY: Valid memory or trusted environment
         unsafe { &*self.inner.get() }
     }
 

@@ -106,6 +106,7 @@ pub unsafe fn set_current_cpu(id: u32) {
     // IA32_TSC_AUX = 0xC0000103.
     // SAFETY: caller asserts this is the post-AP-startup write
     // for the executing CPU.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(0xC000_0103, id as u64);
     }

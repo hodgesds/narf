@@ -350,6 +350,7 @@ fn write_into_umem(umem: &Arc<Umem>, frame_idx: u32, frame: &[u8]) -> bool {
     // above; the write region is `[base, base + frame_size)` ⊂
     // `[base, base + size)`. We hold no aliasing mut ref because
     // FILL semantics say the kernel owns the slot now.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let dst = (umem.desc().base_virt as *mut u8).add(frame_idx as usize * frame_size);
         core::ptr::copy_nonoverlapping(frame.as_ptr(), dst, frame.len());

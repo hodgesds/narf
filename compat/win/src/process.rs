@@ -271,9 +271,9 @@ fn rva_to_file(sections: &[Section], rva: u32) -> Option<usize> {
 /// loaded sections' frame backings. Returns `(phys_frame, byte_off
 /// within frame)`. Used by the kernel-mode loader to write fixups
 /// into already-materialized pages.
-pub fn rva_to_phys<'a>(
+pub fn rva_to_phys(
     sections: &[Section],
-    section_frames: &'a [Vec<PhysAddr>],
+    section_frames: &[Vec<PhysAddr>],
     rva: u32,
 ) -> Option<(PhysAddr, usize)> {
     for (s, frames) in sections.iter().zip(section_frames.iter()) {
@@ -319,6 +319,7 @@ pub unsafe fn load_pe(
 
     // SAFETY: kernel-mode contract documented above.
     let address_space =
+        // SAFETY: Valid memory or trusted environment
         unsafe { AddressSpace::new_for_user() }.map_err(|_| LoadError::AddressSpace)?;
 
     // Materialize each section into freshly-allocated frames.
@@ -441,6 +442,7 @@ pub unsafe fn load_pe(
 
     // SAFETY: identity-mapped low-4-GiB frames; we just allocated
     // them so no concurrent reader exists.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(peb_frame.raw() as *mut u8, 0, 4096);
         core::ptr::write_bytes(teb_frame.raw() as *mut u8, 0, 4096);

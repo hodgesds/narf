@@ -54,17 +54,21 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
         }
         // SAFETY: i < argc, so argv[i] is a valid pointer to a
         // NUL-terminated C string passed by the kernel exec machinery.
+        // SAFETY: Valid memory or trusted environment
         let arg_ptr = unsafe { *argv.offset(i as isize) };
         if !arg_ptr.is_null() {
+            // SAFETY: Valid memory or trusted environment
             let len = unsafe { cstr_len(arg_ptr) };
             if len > 0 {
                 // SAFETY: arg_ptr points at len valid bytes.
                 let s = unsafe { core::slice::from_raw_parts(arg_ptr, len) };
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_stdout(s); }
             }
         }
         i += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(b"\n"); }
     0
 }

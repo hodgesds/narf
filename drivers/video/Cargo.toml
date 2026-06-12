@@ -26,6 +26,7 @@ narf-scheduler       = { path = "../../scheduler" }
 
 [features]
 kernel-test = []
+linux-compat = []
 
 [lints]
 workspace = true

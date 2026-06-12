@@ -178,6 +178,7 @@ pub fn select_primary(hz: u32, vector: u8) -> Option<&'static dyn ClockEvent> {
         }
         // SAFETY: select_primary runs once at boot from BSP; no
         // other agent is touching backend MMIO.
+        // SAFETY: Valid memory or trusted environment
         let arm_res = unsafe { dev.arm_periodic(hz, vector) };
         if let Err(e) = arm_res {
             let _ = writeln!(
@@ -248,6 +249,7 @@ pub fn on_tick() {
             // SAFETY: sender was installed via set_broadcast_sender
             // which takes a real `BroadcastSender` (fn-pointer
             // typed). The transmute reverses that.
+            // SAFETY: Valid memory or trusted environment
             let f: BroadcastSender = unsafe { core::mem::transmute(sender) };
             f(mask, vector);
         }

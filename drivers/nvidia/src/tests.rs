@@ -1637,7 +1637,7 @@ fn smoke_flip_enqueue_dequeue_round_trip() -> TestResult {
         return TestResult::Fail("second enqueue must reject while pending");
     }
     match q.on_vblank(42) {
-        Some(s) if s == 0x1234_5678_9ABC_DEF0 => {}
+        Some(0x1234_5678_9ABC_DEF0) => {}
         _ => return TestResult::Fail("on_vblank should return enqueued seqno"),
     }
     if q.vblank_counter() != 42 {
@@ -2285,7 +2285,7 @@ fn smoke_gsp_enqueue_dequeue_round_trip() -> TestResult {
     let msgq = GspRpcRing::new(0x4000_4000, 4096);
     // Stage a fake RPC.
     let mut out = [0u8; 256];
-    let info = GspSetSystemInfo::new(6, 4, 0x500_00);
+    let info = GspSetSystemInfo::new(6, 4, 0x0005_0000);
     let body = info.to_bytes();
     // Manually pack — we can't construct `Gsp` here without an
     // MmioRegion; the wptr-advance code on the ring is the
@@ -2319,7 +2319,7 @@ fn smoke_gsp_enqueue_dequeue_round_trip() -> TestResult {
 kernel_test_in!("drivers/nvidia/gsp", smoke_gsp_enqueue_dequeue_round_trip);
 
 fn smoke_gsp_set_system_info_body_layout() -> TestResult {
-    let info = GspSetSystemInfo::new(5, 19, 0x511_00);
+    let info = GspSetSystemInfo::new(5, 19, 0x0005_1100);
     let bytes = info.to_bytes();
     if bytes.len() != 16 {
         return TestResult::Fail("body is 16 bytes");
@@ -2330,7 +2330,7 @@ fn smoke_gsp_set_system_info_body_layout() -> TestResult {
     if u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) != 19 {
         return TestResult::Fail("os_minor");
     }
-    if u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) != 0x511_00 {
+    if u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) != 0x0005_1100 {
         return TestResult::Fail("driver_version");
     }
     if u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) != 0 {
@@ -3279,7 +3279,7 @@ fn smoke_ce_stage_copy_emits_4_blocks_with_class_bind() -> TestResult {
         let mut pb = PbBuilder::new(&mut buf);
         let desc = CopyDesc {
             src: 0x1234_5678_DEAD_BEEF,
-            dst: 0x8000_0000_FEEDF00D,
+            dst: 0x8000_0000_FEED_F00D,
             line_length: 0x1000,
             line_count: 32,
             flags: CE_FLAGS_DEFAULT,
@@ -3709,7 +3709,7 @@ fn smoke_pci_controller_list_starts_empty() -> TestResult {
     if crate::pci::card_count() != 0 {
         return TestResult::Fail("card_count() must be 0 after reset");
     }
-    if crate::pci::card_indices().len() != 0 {
+    if !crate::pci::card_indices().is_empty() {
         return TestResult::Fail("card_indices() must be empty after reset");
     }
     if crate::pci::card_arc(0).is_some() {

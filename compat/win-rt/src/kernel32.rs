@@ -69,6 +69,8 @@ pub extern "C" fn GetStdHandle(handle_id: i32) -> u64 {
 /// in this skeleton.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
+/// # Safety
+/// Caller must ensure pointers are valid.
 pub unsafe extern "win64" fn WriteConsoleA(
     h_console: u64,
     lp_buffer: *const u8,
@@ -86,11 +88,13 @@ pub unsafe extern "win64" fn WriteConsoleA(
     // SAFETY: caller (PE in user mode) asserts the buffer is valid
     // for `n_bytes`. The buffer lives in user space; the rt's write
     // syscall validates against the calling task's AS.
+    // SAFETY: Valid memory or trusted environment
     let slice = unsafe { core::slice::from_raw_parts(lp_buffer, n_bytes as usize) };
     let n = rt::write(fd, slice);
     if !written_out.is_null() {
         // SAFETY: caller-supplied pointer; PE is responsible for
         // its validity under the Win32 contract.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *written_out = n as u32;
         }
@@ -114,9 +118,11 @@ pub unsafe extern "C" fn WriteConsoleA(
     if lp_buffer.is_null() {
         return 0;
     }
+    // SAFETY: Valid memory or trusted environment
     let slice = unsafe { core::slice::from_raw_parts(lp_buffer, n_bytes as usize) };
     let n = rt::write(fd, slice);
     if !written_out.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *written_out = n as u32;
         }

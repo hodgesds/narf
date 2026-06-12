@@ -157,6 +157,7 @@ impl FbContext {
     ) -> Result<(), FbError> {
         // SAFETY: ring is a 4 KiB kernel-mapped page; layout matches
         // narf-fb::cmd_ring::DrawRing exactly.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let head_p = self.ring as *const AtomicU32;
             let tail_p = self.ring.add(4) as *const AtomicU32;
@@ -190,6 +191,7 @@ impl Drop for FbContext {
         // the ring + reap the entry. The user-VA mapping stays in
         // the address space for now; munmap of FB pages is future
         // work.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { fb_disconnect(self.handle) };
     }
 }

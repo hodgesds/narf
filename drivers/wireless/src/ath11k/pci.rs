@@ -186,6 +186,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let result = unsafe { bring_up(&device, chip) };
     let dev = match result {
         Ok(d) => d,
@@ -205,6 +206,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // `bring_up`'s `map_bar`, still mapped and owned by this driver; it is
         // exactly the live BAR0 mapping `mhi_init` requires to drive the MHI
         // registers via the sliding window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         match unsafe { crate::ath11k::mhi::mhi_init(&dev.mmio_bar0, did, &auth) } {
             Ok(()) => {
                 let _ = writeln!(
@@ -298,6 +300,7 @@ pub unsafe fn bring_up(device: &BusDevice, chip: ChipInfo) -> Result<Ath11kDevic
     // exclusively, so `device` is a PCIe function whose cfg window we hold
     // exclusively — exactly the precondition `map_bar` requires to read and map
     // BAR0.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mmio_bar0 = unsafe { map_bar(device, 0) }.map_err(|_| ProbeError::Bar0MapFailed)?;
 
     // SAFETY: BAR0 mapped + owned.

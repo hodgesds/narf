@@ -107,6 +107,7 @@ pub unsafe fn smm_call(cmd: u32, arg: u32) -> SmmResult {
     let edx: u32;
     // SAFETY: caller guarantees Dell firmware + CPL-0 + x86_64.
     // We save/restore rbx around the int because LLVM reserves it.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         core::arch::asm!(
             "push rbx",

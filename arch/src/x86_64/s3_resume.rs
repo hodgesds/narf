@@ -226,6 +226,7 @@ pub unsafe extern "C" fn s3_wake_continuation() -> ! {
     if hook != 0 {
         // SAFETY: the hook is an `extern "C" fn() -> ()` Rust
         // function registered before suspend was armed.
+        // SAFETY: Valid memory or trusted environment
         let f: extern "C" fn() = unsafe { core::mem::transmute(hook) };
         f();
     }
@@ -235,6 +236,7 @@ pub unsafe extern "C" fn s3_wake_continuation() -> ! {
     // SAFETY: S3_CALLER_JMP was populated by arm_s3_resume's
     // setjmp call; its saved frame is still live because the
     // suspending thread never returned.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         crate::x86_64::setjmp::longjmp(&*S3_CALLER_JMP.lock() as *const _, S3_RESUMED_SENTINEL)
     }

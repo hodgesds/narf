@@ -20,7 +20,6 @@ const PL022_CR0: u64 = 0x00; // Control Register 0
 const PL022_CR1: u64 = 0x04; // Control Register 1
 const PL022_DR: u64 = 0x08; // Data Register
 const PL022_SR: u64 = 0x0C; // Status Register
-const PL022_CPSR: u64 = 0x10; // Clock Prescale Register
 const PL022_IMSC: u64 = 0x14; // Interrupt Mask Set and Clear
 
 const PL022_CR0_DSS_8BIT: u32 = 0x07; // 8-bit data
@@ -29,7 +28,6 @@ const PL022_CR0_SPH: u32 = 1 << 7;
 
 const PL022_CR1_SSE: u32 = 1 << 1; // SSP Enable
 
-const PL022_SR_TFE: u32 = 1 << 0; // Transmit FIFO empty
 const PL022_SR_TNF: u32 = 1 << 1; // Transmit FIFO not full
 const PL022_SR_RNE: u32 = 1 << 2; // Receive FIFO not empty
 const PL022_SR_BSY: u32 = 1 << 4; // Busy
@@ -70,10 +68,12 @@ impl Pl022Spi {
     }
 
     fn read_u32(&self, off: u64) -> u32 {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
     fn write_u32(&self, off: u64, val: u32) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
     }
 

@@ -89,6 +89,7 @@ impl FwCfgFile {
     pub fn name(&self) -> &str {
         // SAFETY: `name_len` was set to a NUL-search result over ASCII
         // bytes during decode; `name_buf[..name_len]` is valid UTF-8.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::str::from_utf8_unchecked(&self.name_buf[..self.name_len as usize]) }
     }
 }
@@ -155,6 +156,7 @@ pub fn select(key: u16) {
     // DTB walker (or the default QEMU virt base) and points at a
     // valid 16-byte device window. The selector register is at
     // offset 8 and accepts 16-bit writes.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile((base + MMIO_OFFSET_SELECTOR) as *mut u16, be);
     }

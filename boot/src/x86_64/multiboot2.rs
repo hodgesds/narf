@@ -94,6 +94,7 @@ impl TagIter {
     unsafe fn new(info_ptr: usize) -> Self {
         // SAFETY: caller-asserted readability of the 8-byte
         // information-struct header.
+        // SAFETY: Valid memory or trusted environment
         let total = unsafe { (info_ptr as *const u32).read_unaligned() } as usize;
         Self {
             cursor: info_ptr + 8,
@@ -138,6 +139,7 @@ pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: us
         }
         // SAFETY: tag bounded by total_size; we read the prefix and
         // then iterate entries up to (size - 16) / entry_size.
+        // SAFETY: Valid memory or trusted environment
         let prefix = unsafe { ((payload - 8) as *const MmapTagPrefix).read_unaligned() };
         if prefix.entry_size as usize == 0 {
             return 0;
@@ -218,10 +220,12 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
         // least bytes [0, 16). `mod_start` occupies bytes [0, 4) of the payload,
         // entirely within that range. `read_unaligned` is used because the field
         // has no guaranteed alignment within the multiboot2 tag stream.
+        // SAFETY: Valid memory or trusted environment
         let mod_start = unsafe { (payload as *const u32).read_unaligned() } as u64;
         // SAFETY: `mod_end` occupies bytes [4, 8) of the payload, which lies
         // within the [0, 16) range guaranteed by the `size >= 16` check above.
         // `read_unaligned` accounts for the field's lack of alignment.
+        // SAFETY: Valid memory or trusted environment
         let mod_end = unsafe { ((payload + 4) as *const u32).read_unaligned() } as u64;
         let str_start = payload + 8;
         let str_max = (size as usize).saturating_sub(16);

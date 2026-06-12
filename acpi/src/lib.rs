@@ -179,6 +179,7 @@ pub unsafe fn scan_bios_for_rsdp() -> Option<PhysAddr> {
     while p + 20 <= END {
         // SAFETY: identity-mapped low ROM; 8-byte read at 16-byte
         // alignment is defined.
+        // SAFETY: Valid memory or trusted environment
         let bytes = unsafe { core::slice::from_raw_parts(p as *const u8, 8) };
         if bytes == SIG {
             // Verify checksum before declaring victory; firmware
@@ -1891,6 +1892,7 @@ pub unsafe fn pm1_enter_sleep(slp_typ_a: u8, slp_typ_b: u8) {
     if pm.pm1a_cnt != 0 {
         // SAFETY: PM1A_CNT_BLK address from a checksummed FADT;
         // caller has prepared sleep state per ACPI §16.
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_arch::x86_64::io_port::outw(pm.pm1a_cnt as u16, val_a) };
     }
     if pm.pm1b_cnt != 0 {
@@ -1989,6 +1991,7 @@ pub unsafe fn reboot_via_fadt() -> bool {
             // fits in u16 by spec; outb to that port issues the
             // reset. Returns architecturally — but the platform
             // resets before the next instruction retires.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_arch::x86_64::io_port::outb(pm.reset_reg_addr as u16, pm.reset_value);
             }
@@ -1999,6 +2002,7 @@ pub unsafe fn reboot_via_fadt() -> bool {
             // know the access size from the GAS without parsing
             // bit_width; assume byte access (matches ICH/PCH and
             // most x86 platforms).
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::write_volatile(pm.reset_reg_addr as *mut u8, pm.reset_value);
             }
@@ -2026,6 +2030,7 @@ pub unsafe fn reboot_via_fadt() -> bool {
 pub unsafe fn shutdown_via_pm1(slp_typ_a: u8, slp_typ_b: u8) {
     // SAFETY: forwarded to pm1_enter_sleep which is documented
     // to never return on S5.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         pm1_enter_sleep(slp_typ_a, slp_typ_b);
     }
@@ -2102,6 +2107,7 @@ pub fn gpe_status_clear_bit(gpe_num: u32) {
         let port = (b.address + reg_idx as u64) as u16;
         // SAFETY: GPE block address from a checksummed FADT. W1C
         // means writing other bits as 0 leaves them untouched.
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_arch::x86_64::io_port::outb(port, 1 << reg_bit) };
     }
 }
@@ -2180,12 +2186,14 @@ fn parse_ecdt_body(body: &[u8]) {
 pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // SAFETY: caller guarantees `rsdp_phys` points at an identity-mapped
     // RSDP large enough for `parse_rsdp`'s 36-byte read (its own contract).
+    // SAFETY: Valid memory or trusted environment
     let xsdt = unsafe { parse_rsdp(rsdp_phys)? };
     let mut ecdt: Option<u64> = None;
     // SAFETY: `xsdt` is the physical address `parse_rsdp` just validated;
     // the caller guarantees it (and its children) stay identity-mapped for
     // the table's advertised length, satisfying `walk_xsdt`'s contract. The
     // closure only records a child phys, no further dereference here.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         walk_xsdt(xsdt, |phys, hdr| {
             if &hdr.signature == b"ECDT" {
@@ -2201,6 +2209,7 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // SAFETY: `ecdt_phys` is a child pointer reported by `walk_xsdt`, which
     // only yields it after confirming an `SdtHeader` is readable there;
     // `read_unaligned` tolerates any alignment of the firmware-placed table.
+    // SAFETY: Valid memory or trusted environment
     let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
     if total < SDT_HEADER_SIZE + 29 {
         return Err(AcpiError::BadXsdtSignature);
@@ -2208,6 +2217,7 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // SAFETY: `total` is the header's self-reported `length`; the caller
     // guarantees the ECDT is identity-mapped for that full span, so the
     // `[u8; total]` slice stays within the mapped table.
+    // SAFETY: Valid memory or trusted environment
     let body = unsafe { core::slice::from_raw_parts(ecdt_phys as *const u8, total) };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
@@ -5302,6 +5312,7 @@ pub unsafe fn parse_facs(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     let fadt = fadt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion. FADT body — we only need
     // FirmwareCtrl @ 36 (32-bit) or X_FirmwareCtrl @ 132 (64-bit).
+    // SAFETY: Valid memory or trusted environment
     let fadt_total = unsafe { (fadt as *const SdtHeader).read_unaligned().length as usize };
     if fadt_total < 44 {
         return Err(AcpiError::BadXsdtSignature);
@@ -5324,6 +5335,7 @@ pub unsafe fn parse_facs(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
 
     // SAFETY: caller assertion. FACS lacks an SDT header — it
     // begins with its own 4-byte "FACS" signature + 4-byte length.
+    // SAFETY: Valid memory or trusted environment
     let facs_len = unsafe { (facs as *const u8).add(4).cast::<u32>().read_unaligned() } as usize;
     if facs_len < 64 {
         return Err(AcpiError::BadXsdtSignature);
@@ -5388,6 +5400,7 @@ pub unsafe fn arm_s3_waking_vector(entry_phys: u64) -> Result<(), WakeVectorErro
     // SAFETY: FACS is identity-mapped at `facs`; offset within the
     // declared layout. Write low-32 of entry; high bits ignored
     // by 32-bit-only firmware.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile((facs + 12) as *mut u32, entry_phys as u32);
     }

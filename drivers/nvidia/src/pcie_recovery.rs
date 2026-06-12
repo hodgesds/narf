@@ -83,6 +83,7 @@ impl ErrorCallback for CardRecovery {
         let alive = crate::pci::with_card(self.card_index, |card| {
             // SAFETY: BAR0 was mapped by `NvidiaDevice::bring_up`;
             // PMC_BOOT_0 is at offset 0 and read-only.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let raw = unsafe { card.regs.read32(crate::mc::PMC_BOOT_0) };
             crate::mc::Boot0::looks_present(raw)
         })

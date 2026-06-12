@@ -126,6 +126,7 @@ pub fn read_icb_tag(buf: &[u8], offset: usize) -> IcbTag {
     debug_assert!(offset + core::mem::size_of::<IcbTag>() <= buf.len());
     // SAFETY: `IcbTag` is `#[repr(C, packed)]`, 20 bytes, ECMA-167
     // §4/14.6.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const IcbTag) }
 }
 

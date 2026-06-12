@@ -67,6 +67,7 @@ pub fn levels<F: FnMut(CacheLevel)>(mut f: F) {
     loop {
         // SAFETY: leaf 0 / 0x8000_0000 always defined; valid
         // sub-leaves stop at the first cache-type-0 sentinel.
+        // SAFETY: Valid memory or trusted environment
         let (eax, ebx, ecx, _) = unsafe { cpuid(leaf, sub) };
         match decode(eax, ebx, ecx) {
             Some(c) => f(c),

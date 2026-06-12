@@ -47,6 +47,7 @@ pub unsafe fn download_firmware(
         // SAFETY: `mmio_bar2` is a valid BAR2 window the caller guaranteed
         // (per this fn's `# Safety`); offset `i*4` stays within the copied
         // blob, which the firmware loader sized to fit the TX buffer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             mmio_bar2.write32((i * 4) as u64, val);
         }
@@ -59,6 +60,7 @@ pub unsafe fn download_firmware(
     // SAFETY: `mmio_bar0` is the valid BAR0 register window the caller
     // guaranteed (per this fn's `# Safety`); `REG_DDMA_CH0*` are in-range
     // 32-bit DDMA control registers for this chip.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         mmio_bar0.write32(REG_DDMA_CH0SA, OCPBASE_TXBUF_88XX);
         mmio_bar0.write32(REG_DDMA_CH0DA, OCPBASE_IMEM_88XX);
@@ -77,6 +79,7 @@ pub unsafe fn download_firmware(
         // SAFETY: `mmio_bar0` is the caller-guaranteed BAR0 window;
         // `REG_DDMA_CH0CTRL` is a valid 32-bit DDMA status register polled
         // for the `BIT_DDMACH0_OWN` completion bit.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         || unsafe { (mmio_bar0.read32(REG_DDMA_CH0CTRL) & BIT_DDMACH0_OWN) == 0 },
         Deadline::after_ms(500),
     ) {
@@ -88,6 +91,7 @@ pub unsafe fn download_firmware(
     // SAFETY: `mmio_bar0` is the caller-guaranteed BAR0 window;
     // `REG_MCUFW_CTRL` is a valid 32-bit MCU firmware control register,
     // read-modify-written to set `BIT_FW_DW_RDY`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let mut val = mmio_bar0.read32(REG_MCUFW_CTRL);
         val |= BIT_FW_DW_RDY;
@@ -98,6 +102,7 @@ pub unsafe fn download_firmware(
         // SAFETY: `mmio_bar0` is the caller-guaranteed BAR0 window;
         // `REG_MCUFW_CTRL` is a valid 32-bit MCU firmware control register
         // polled for `FW_READY_MASK`.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         || unsafe { (mmio_bar0.read32(REG_MCUFW_CTRL) & FW_READY_MASK) == FW_READY_MASK },
         Deadline::after_ms(500),
     ) {

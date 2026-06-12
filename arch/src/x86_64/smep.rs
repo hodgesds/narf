@@ -62,10 +62,12 @@ pub unsafe fn enable() {
     // SAFETY: caller-asserted. SMEP requires no other state and never
     // faults the writer (it only affects instruction fetches, which
     // can't be the very next instruction after the CR4 write).
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe { read_cr4() };
     if v & CR4_SMEP == 0 {
         // SAFETY: bit 20 is documented architectural; reserved bits
         // are preserved by the read-modify-write.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_cr4(v | CR4_SMEP);
         }

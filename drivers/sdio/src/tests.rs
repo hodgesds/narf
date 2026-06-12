@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 #[cfg(any(test, feature = "kernel-test"))]
-mod tests {
+mod smoke_tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
     use crate::sdhci::cmd::{cmd52_arg, cmd53_arg, CMD5_ARG_QUERY};

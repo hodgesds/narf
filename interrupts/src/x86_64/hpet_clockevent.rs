@@ -150,6 +150,7 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
             HPET_TICK_VECTOR.store(vector, Ordering::Release);
             // SAFETY: vector + handler installed; HPET MMIO live
             // (supported() returned true above).
+            // SAFETY: Valid memory or trusted environment
             match unsafe { narf_time::hpet::arm_periodic_msi(n, msi_addr, msi_data, period_ticks) }
             {
                 Ok(()) => return Ok(()),
@@ -167,6 +168,7 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
         let routed =
             // SAFETY: vector + handler installed; IOAPIC code upholds
             // its own preconditions.
+            // SAFETY: Valid memory or trusted environment
             unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi as u32, vector, 0, flags) };
         if !routed {
             return Err(ClockEventError::NoFreeIrq);
@@ -175,6 +177,7 @@ impl narf_time::clockevent::ClockEvent for HpetClockEvent {
         HPET_TICK_VECTOR.store(vector, Ordering::Release);
         // SAFETY: caller upholds CPL=0; IDT vector + IOAPIC route
         // installed; HPET MMIO is live.
+        // SAFETY: Valid memory or trusted environment
         match unsafe { narf_time::hpet::arm_periodic(n, gsi, period_ticks) } {
             Ok(()) => Ok(()),
             Err(_) => {

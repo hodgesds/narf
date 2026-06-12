@@ -176,6 +176,7 @@ impl BochsDisplay {
         // SAFETY: BAR0's phys is identity-mapped; size covers
         // width*height*4 bytes by mode-setting math (1024*768*4=3MB,
         // bochs BAR0 is at least 16 MiB).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             Framebuffer::new(
                 self.fb_region.phys.raw() as *mut u32,

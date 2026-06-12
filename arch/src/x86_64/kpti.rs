@@ -80,6 +80,7 @@ pub fn detect() -> Posture {
         if edx & (1 << 29) != 0 {
             // ARCH_CAPABILITIES MSR is present. SAFETY: RDMSR 0x10A is
             // architectural on parts that advertise CPUID.7.0.EDX[29].
+            // SAFETY: Valid memory or trusted environment
             let caps = unsafe { rdmsr(MSR_IA32_ARCH_CAPABILITIES) };
             if caps & ARCH_CAP_RDCL_NO != 0 {
                 return Posture::Native;

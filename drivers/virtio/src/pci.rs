@@ -143,17 +143,20 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
         // `hdr.offset` is a capability pointer (< 0x100) walked from the
         // standard cap list, so reading the vendor-cap fields at +3/+4 stays
         // within the 256-byte config region.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cfg_type = unsafe { cfg_read8(cfg, hdr.offset + 3) };
         // SAFETY: same identity-mapped cfg space; +4 (bar) is within the cap.
         let bar = unsafe { cfg_read8(cfg, hdr.offset + 4) };
         // SAFETY: same cfg space; +8 (offset, u32) lies within the >=16-byte
         // vendor cap and below 0x100.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let offset = unsafe { cfg_read32(cfg, hdr.offset + 8) };
         // SAFETY: same cfg space; +12 (length, u32) lies within the cap.
         let length = unsafe { cfg_read32(cfg, hdr.offset + 12) };
         let multi = if cfg_type == CfgType::Notify as u8 {
             // SAFETY: a Notify cap is >= 20 bytes by VirtIO 1.2 §4.1.4.4, so
             // the notify_off_multiplier field at +16 is in-bounds.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { cfg_read32(cfg, hdr.offset + 16) }
         } else {
             0
@@ -338,6 +341,7 @@ pub unsafe fn map_cap(device: &BusDevice, cap: &VirtioCap) -> Result<VirtioRegio
     }
     // SAFETY: caller owns the BAR window; we map in kernel VA
     // space using strongly-uncached attributes for MMIO.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mapping = unsafe {
         narf_memory::ioremap::ioremap(
             bar_phys_pg,

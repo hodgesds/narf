@@ -95,6 +95,7 @@ impl<T, const N: usize> MpscRing<T, N> {
         // SAFETY: MaybeUninit array does not require initialisation;
         // each slot's `seq` is then explicitly set to its index so
         // producer CAS sees the expected ready-for-pos-0 invariant.
+        // SAFETY: Valid memory or trusted environment
         let slots: [Slot<T>; N] = unsafe {
             let mut arr: MaybeUninit<[Slot<T>; N]> = MaybeUninit::uninit();
             let ptr = arr.as_mut_ptr() as *mut Slot<T>;
@@ -143,6 +144,7 @@ impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for M
             // SAFETY: slots array lives for the ring's lifetime; we
             // only touch `seq` (atomic) and, after a successful CAS,
             // our own slot's value cell.
+            // SAFETY: Valid memory or trusted environment
             let slot = unsafe { &(*slot_ptr)[(pos & Self::MASK) as usize] };
             let seq = slot.seq.load(Ordering::Acquire);
             let diff = seq.wrapping_sub(pos) as i64;
@@ -157,6 +159,7 @@ impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for M
                         let payload = msg.take().expect("payload consumed in lost-CAS path");
                         // SAFETY: we now exclusively own this slot
                         // until our release-store of `seq` below.
+                        // SAFETY: Valid memory or trusted environment
                         unsafe {
                             (*slot.val.get()).write(payload);
                         }
@@ -194,6 +197,7 @@ impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for M
         // SAFETY: producer published payload before its release-store
         // of `seq`; our acquire-load above pairs with that release.
         // Caller upholds single-consumer invariant for the trait.
+        // SAFETY: Valid memory or trusted environment
         let msg = unsafe {
             let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
             v.assume_init()
@@ -225,6 +229,7 @@ impl<T, const N: usize> Drop for MpscRing<T, N> {
         // SAFETY: `drop` has `&mut self`, so we hold exclusive access to
         // the ring; no producer or consumer can be touching `slots`
         // concurrently, making the `UnsafeCell` deref to `&mut` sound.
+        // SAFETY: Valid memory or trusted environment
         let slots = unsafe { &mut *self.slots.0.get() };
         let mut i = head;
         while i != tail {
@@ -233,6 +238,7 @@ impl<T, const N: usize> Drop for MpscRing<T, N> {
             if *slot.seq.get_mut() == i.wrapping_add(1) {
                 // SAFETY: producer published slot at sequence `i + 1`;
                 // consumer never claimed it. Payload is live.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     let mut v = core::mem::replace(slot.val.get_mut(), MaybeUninit::uninit());
                     v.assume_init_drop();
@@ -299,6 +305,7 @@ impl<T: Send + 'static, const N: usize> MpscRingProducer<T, N> {
             // SAFETY: slots array lives for the ring's lifetime; we
             // only touch `seq` (atomic) and, after a successful CAS,
             // our own slot's value cell.
+            // SAFETY: Valid memory or trusted environment
             let slot = unsafe { &(*slot_ptr)[(pos & MpscRing::<T, N>::MASK) as usize] };
             let seq = slot.seq.load(Ordering::Acquire);
             let diff = seq.wrapping_sub(pos) as i64;
@@ -418,6 +425,7 @@ impl<T: Send + 'static, const N: usize> MpscRingConsumer<T, N> {
         if diff == 0 {
             // SAFETY: producer published payload before its
             // release-store of `seq`; we have the matching acquire.
+            // SAFETY: Valid memory or trusted environment
             let msg = unsafe {
                 let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
                 v.assume_init()

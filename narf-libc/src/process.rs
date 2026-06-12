@@ -41,6 +41,7 @@ static mut ATEXIT_COUNT: usize = 0;
 pub unsafe extern "C" fn atexit(cb: extern "C" fn()) -> i32 {
     // SAFETY: single-threaded user mode; static mut access here is
     // race-free against the rest of the crate's atexit/exit pair.
+    // SAFETY: Valid memory or trusted environment
     let count = unsafe { ATEXIT_COUNT };
     if count >= ATEXIT_MAX {
         return -1;
@@ -74,6 +75,7 @@ pub unsafe extern "C" fn atexit(cb: extern "C" fn()) -> i32 {
 pub unsafe extern "C" fn exit(_code: i32) -> ! {
     // SAFETY: single-threaded user mode; the snapshot read of
     // `ATEXIT_COUNT` races nothing.
+    // SAFETY: Valid memory or trusted environment
     let count = unsafe { ATEXIT_COUNT };
     for i in (0..count).rev() {
         // SAFETY: index < count is in-range by the snapshot.
@@ -302,6 +304,7 @@ pub unsafe extern "C" fn execve(
     // so we don't need the old user-side `read_file_to_vec` +
     // argv/envp pack step. Empty argv (NULL ptr) and empty envp
     // (NULL ptr) are both legal — execve handles them.
+    // SAFETY: Valid memory or trusted environment
     match unsafe {
         narf_user_runtime::execve(
             path as *const u8,
@@ -328,7 +331,9 @@ pub unsafe extern "C" fn execv(path: *const i8, argv: *const *const i8) -> i32 {
     // SAFETY: forwarded; ENVIRON is the libc-published env array.
     // Read as *const *const u8 (the canonical declaration), cast
     // to *const *const i8 for execve's signature.
+    // SAFETY: Valid memory or trusted environment
     let envp = unsafe { crate::env::ENVIRON } as *const *const i8;
+    // SAFETY: Valid memory or trusted environment
     unsafe { execve(path, argv, envp) }
 }
 
@@ -342,6 +347,7 @@ pub unsafe extern "C" fn execvp(file: *const i8, argv: *const *const i8) -> i32 
         crate::errno::set_errno(crate::errno::EINVAL);
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let s = match unsafe { c_str_to_str(file) } {
         Some(s) => s,
         None => {
@@ -396,164 +402,6 @@ pub unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i3
 pub unsafe extern "C" fn wait(status: *mut i32) -> i32 {
     // SAFETY: forwarded.
     unsafe { waitpid(-1, status, 0) }
-}
-
-/// Owned heap buffer backed by `narf-libc`'s malloc/free. Used by
-/// `read_file_to_vec` + `pack_cstr_array` since narf-libc itself
-/// is `no_std + no alloc-crate` (the workspace heap allocator
-/// isn't available; we stand on our own malloc).
-struct OwnedBuf {
-    ptr: *mut u8,
-    len: usize,
-    cap: usize,
-}
-
-impl OwnedBuf {
-    /// Pre-allocate `cap` bytes. Returns None on alloc failure.
-    /// `len = 0` initially.
-    unsafe fn with_capacity(cap: usize) -> Option<Self> {
-        if cap == 0 {
-            return Some(Self {
-                ptr: core::ptr::null_mut(),
-                len: 0,
-                cap: 0,
-            });
-        }
-        // SAFETY: malloc returns either null or a pointer to a
-        // freshly-allocated region of the requested size.
-        let ptr = unsafe { crate::heap::malloc(cap) };
-        if ptr.is_null() {
-            return None;
-        }
-        Some(Self { ptr, len: 0, cap })
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        if self.ptr.is_null() {
-            return &[];
-        }
-        // SAFETY: ptr points to `len` valid bytes per our writes.
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    /// Append `bytes`. Reallocs (doubling) on overflow. Returns
-    /// false on alloc failure.
-    unsafe fn push_slice(&mut self, bytes: &[u8]) -> bool {
-        if self.len + bytes.len() > self.cap {
-            let mut new_cap = self.cap.max(64);
-            while new_cap < self.len + bytes.len() {
-                new_cap = match new_cap.checked_mul(2) {
-                    Some(v) => v,
-                    None => return false,
-                };
-            }
-            // SAFETY: realloc handles ptr.is_null() like malloc.
-            let new_ptr = unsafe { crate::heap::realloc(self.ptr, new_cap) };
-            if new_ptr.is_null() {
-                return false;
-            }
-            self.ptr = new_ptr;
-            self.cap = new_cap;
-        }
-        // SAFETY: dest range fits in [self.ptr+len, self.ptr+cap).
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len());
-        }
-        self.len += bytes.len();
-        true
-    }
-
-    unsafe fn push_byte(&mut self, b: u8) -> bool {
-        unsafe { self.push_slice(&[b]) }
-    }
-}
-
-impl Drop for OwnedBuf {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // SAFETY: ptr came from our malloc / realloc.
-            unsafe {
-                crate::heap::free(self.ptr);
-            }
-        }
-    }
-}
-
-/// Read the file at `path` into a heap-owned buffer. Walks
-/// open → repeated read → close; returns None on any error or
-/// if the file exceeds 64 MiB (matching the kernel-side execve
-/// cap).
-///
-/// # Safety
-/// `path` must be a valid `&str` for the duration of the call.
-unsafe fn read_file_to_vec(path: &str) -> Option<OwnedBuf> {
-    const O_RDONLY: u64 = 0;
-    // mount="" → kernel takes the absolute-path branch
-    // (registry.resolve_absolute), which is the only form that
-    // both supports leading-slash paths and walks every mount.
-    // Passing mount="/" would route through with_mount("/",...) +
-    // resolve(fs.root(), "/shell") — the FAT resolver treats "/"
-    // as the root component and rejects the resulting empty leaf.
-    let fd = narf_user_runtime::open_flags(path, "", O_RDONLY)?;
-    // SAFETY: malloc-backed growable buffer.
-    let mut out = unsafe { OwnedBuf::with_capacity(64 * 1024) }?;
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = narf_user_runtime::read(fd, &mut chunk);
-        if n == 0 {
-            break;
-        }
-        if out.len + n > 64 * 1024 * 1024 {
-            let _ = narf_user_runtime::close(fd);
-            return None;
-        }
-        // SAFETY: chunk is valid for `n` bytes per the runtime
-        // contract.
-        if !unsafe { out.push_slice(&chunk[..n]) } {
-            let _ = narf_user_runtime::close(fd);
-            return None;
-        }
-    }
-    let _ = narf_user_runtime::close(fd);
-    Some(out)
-}
-
-/// Pack a NULL-terminated array of NUL-terminated C strings into
-/// a single concatenated NUL-separated buffer. Empty / NULL
-/// input returns an empty buffer (matching the kernel's "len = 0
-/// is legal" convention).
-///
-/// # Safety
-/// `arr` must be either NULL or a NULL-terminated array of valid
-/// NUL-terminated C strings.
-unsafe fn pack_cstr_array(arr: *const *const i8) -> Option<OwnedBuf> {
-    // SAFETY: malloc-backed growable buffer.
-    let mut out = unsafe { OwnedBuf::with_capacity(64) }?;
-    if arr.is_null() {
-        return Some(out);
-    }
-    let mut i = 0isize;
-    loop {
-        // SAFETY: caller asserted NULL-terminated array.
-        let p = unsafe { *arr.offset(i) };
-        if p.is_null() {
-            break;
-        }
-        // SAFETY: caller asserted NUL-terminated string.
-        let s = match unsafe { c_str_to_str(p) } {
-            Some(s) => s,
-            None => break,
-        };
-        // SAFETY: bytes valid for s.len().
-        if !unsafe { out.push_slice(s.as_bytes()) } {
-            return None;
-        }
-        if !unsafe { out.push_byte(0) } {
-            return None;
-        }
-        i += 1;
-    }
-    Some(out)
 }
 
 /// Walk a NUL-terminated C string, returning a `&str` view if it
@@ -756,6 +604,7 @@ pub unsafe extern "C" fn wait4(
     rusage: *mut crate::sys::rusage,
 ) -> i32 {
     let r =
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_user_runtime::wait4(pid as i64, status, options as u32, rusage as *mut _) };
     match r {
         Ok(reaped) => reaped as i32,

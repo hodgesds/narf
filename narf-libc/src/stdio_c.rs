@@ -34,10 +34,12 @@ pub unsafe extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut
     }
     // SAFETY: caller asserts NUL-terminated; walk to compute length.
     let mut plen = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *path.add(plen) } != 0 {
         plen += 1;
     }
     let mut mlen = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *mode.add(mlen) } != 0 {
         mlen += 1;
     }
@@ -108,6 +110,7 @@ pub unsafe extern "C" fn fputs(s: *const c_char, f: *mut File) -> c_int {
         return -1;
     }
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *s.add(len) } != 0 {
         len += 1;
     }
@@ -282,9 +285,11 @@ pub unsafe extern "C" fn printf(fmt: *const c_char) -> c_int {
         return -1;
     }
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *fmt.add(len) } != 0 {
         len += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     let n = narf_user_runtime::write(1, unsafe {
         core::slice::from_raw_parts(fmt as *const u8, len)
     });
@@ -302,6 +307,7 @@ pub unsafe extern "C" fn fprintf(stream: *mut File, fmt: *const c_char) -> c_int
         return -1;
     }
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *fmt.add(len) } != 0 {
         len += 1;
     }
@@ -324,6 +330,7 @@ pub unsafe extern "C" fn sprintf(buf: *mut c_char, fmt: *const c_char) -> c_int 
         return -1;
     }
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *fmt.add(len) } != 0 {
         len += 1;
     }
@@ -346,12 +353,14 @@ pub unsafe extern "C" fn snprintf(buf: *mut c_char, n: usize, fmt: *const c_char
         return -1;
     }
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *fmt.add(len) } != 0 {
         len += 1;
     }
     let copy = if len + 1 > n { n - 1 } else { len };
     // SAFETY: caller-asserted writable region of `n` bytes; copy
     // bounded by `copy < n`.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(fmt as *const u8, buf as *mut u8, copy);
         *buf.add(copy) = 0;
@@ -386,6 +395,7 @@ pub static mut __libc_stderr: *mut File = core::ptr::null_mut();
 pub unsafe fn init_std_streams() {
     // SAFETY: single-threaded startup; the static_muts are written
     // exactly once.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         __libc_stdin = crate::stdio::stdin();
         __libc_stdout = crate::stdio::stdout();

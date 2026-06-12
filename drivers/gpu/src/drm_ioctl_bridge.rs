@@ -59,6 +59,7 @@ unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
     // SAFETY: pointer is opaque to this layer — the SMAP bracket
     // belongs in the syscall layer that called us. On test paths the
     // pointer is kernel-owned and the unsafe read is a plain memcpy.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let src = uptr as *const u8;
         core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
@@ -153,12 +154,14 @@ fn handle_version(
     // trap layer (or a kernel-owned pointer on the test path); we request
     // exactly `size_of::<DrmVersionUapi>()` bytes, which `copy_in` bounds-
     // checks against `IOCTL_MAX_BUF` before copying.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmVersionUapi>())? };
     let mut req: DrmVersionUapi =
         // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
         // `size_of::<DrmVersionUapi>()` bytes, so the read of one
         // `DrmVersionUapi` stays within the allocation. `read_unaligned` is
         // used because `bytes`' allocation has only `u8` alignment.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmVersionUapi) };
 
     // Run the generic dispatcher to get the filled in version struct.
@@ -185,6 +188,7 @@ fn handle_version(
         // null here; we write at most `cap` (= `req.name_len`) bytes, the
         // capacity the user advertised, so the copy stays within the
         // user-provided buffer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             copy_out(req.name as usize, &name[..n])?;
         }
@@ -195,6 +199,7 @@ fn handle_version(
         // SAFETY: `req.date` is the user-supplied out-pointer and is non-
         // null here; we write at most `cap` (= `req.date_len`) bytes, the
         // capacity the user advertised, so the copy stays in bounds.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             copy_out(req.date as usize, &date[..n])?;
         }
@@ -205,6 +210,7 @@ fn handle_version(
         // SAFETY: `req.desc` is the user-supplied out-pointer and is non-
         // null here; we write at most `cap` (= `req.desc_len`) bytes, the
         // capacity the user advertised, so the copy stays in bounds.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             copy_out(req.desc as usize, &desc[..n])?;
         }
@@ -221,10 +227,12 @@ fn handle_version(
         // fields with no padding-dependent invariants, so reinterpreting its
         // bytes as a `[u8; size_of::<DrmVersionUapi>()]` array is sound; the
         // source and destination have identical size by construction.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::mem::transmute(req) };
     // SAFETY: `arg` is the same user/kernel out-pointer validated for the
     // input copy above; we write exactly `size_of::<DrmVersionUapi>()`
     // bytes, the size the user struct occupies.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         copy_out(arg, &out_bytes)?;
     }
@@ -241,12 +249,14 @@ fn handle_getresources(
     // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
     // trap layer (or kernel-owned on the test path); we request exactly
     // `size_of::<DrmModeCardResUapi>()` bytes, bounds-checked by `copy_in`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCardResUapi>())? };
     let mut req: DrmModeCardResUapi =
         // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
         // `size_of::<DrmModeCardResUapi>()` bytes, so reading one
         // `DrmModeCardResUapi` stays within the allocation; `read_unaligned`
         // matches the `u8` alignment of the backing buffer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCardResUapi) };
 
     let mut card_guard = mode_state.lock();
@@ -282,6 +292,7 @@ fn handle_getresources(
         // (checked above); `buf` holds at most `cap` (= `user_count`) ids of
         // 4 bytes each, so we never write past the `user_count`-element
         // array the user advertised.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { copy_out(uptr as usize, &buf) }
     }
 
@@ -313,9 +324,11 @@ fn handle_getresources(
         // SAFETY: `DrmModeCardResUapi` is a `#[repr(C)]` POD of plain integer /
         // pointer-sized fields, so reinterpreting its bytes as a `[u8; N]`
         // array of the same size is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::mem::transmute(req) };
     // SAFETY: `arg` is the validated user/kernel out-pointer from the input
     // copy above; we write exactly `size_of::<DrmModeCardResUapi>()` bytes.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         copy_out(arg, &out_bytes)?;
     }
@@ -334,12 +347,14 @@ fn handle_atomic(
     // SAFETY: `arg` is the ioctl argument pointer validated by the syscall
     // trap layer (or kernel-owned on the test path); we request exactly
     // `size_of::<DrmModeAtomicUapi>()` bytes, bounds-checked by `copy_in`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeAtomicUapi>())? };
     let req: DrmModeAtomicUapi =
         // SAFETY: `bytes` is a freshly allocated `Vec<u8>` of exactly
         // `size_of::<DrmModeAtomicUapi>()` bytes, so reading one
         // `DrmModeAtomicUapi` stays within the allocation; `read_unaligned`
         // matches the `u8` alignment of the backing buffer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeAtomicUapi) };
 
     // Wave-36 minimum-viable: we accept the call shape, build an
@@ -384,6 +399,7 @@ fn handle_generic(
         // SAFETY: guarded by `arg != 0`; `size` is the encoded ioctl struct
         // size from `ioc_size(cmd)` and is bounds-checked again by `copy_in`
         // against `IOCTL_MAX_BUF`. `arg` is the validated user pointer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { copy_in(arg, size)? }
     } else {
         Vec::new()

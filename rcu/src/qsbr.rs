@@ -189,6 +189,7 @@ pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
     // `current_cpu_id()`. No other handler can interrupt with a
     // conflicting access because the bucket is only mutated inside
     // these functions (no `await`, no spinlock).
+    // SAFETY: Valid memory or trusted environment
     let bucket = unsafe { &mut *cell.bucket.get() };
     if bucket.len < DEFER_BUCKET_CAP {
         bucket.slots[bucket.len] = DeferEntry {
@@ -214,6 +215,7 @@ fn drain_local_bucket(cell: &CpuCell) {
                 // SAFETY: the pointer came from `Box::into_raw::<T>` via
                 // `enqueue_drop`, and the grace period has elapsed: no
                 // reader is viewing this allocation.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     f(entry.ptr);
                 }

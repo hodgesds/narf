@@ -127,6 +127,7 @@ pub unsafe fn init(
     {
         // SAFETY: caller-provided ECAM base; the enumerator only reads
         // 4-byte config-space words and rejects all-1s (unpopulated).
+        // SAFETY: Valid memory or trusted environment
         let devs = unsafe { crate::x86_64::enumerate(ecam_base) };
         let n = devs.len();
         install(devs);
@@ -136,6 +137,7 @@ pub unsafe fn init(
     {
         // SAFETY: FDT walker tolerates null / bad magic by returning
         // an empty Vec (same tolerance as `boot/src/aarch64` §parse_raw).
+        // SAFETY: Valid memory or trusted environment
         let devs = unsafe { crate::aarch64::enumerate(dtb) };
         let n = devs.len();
         install(devs);

@@ -129,7 +129,7 @@ fn register_i8042_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Device, "psmouse-extensions", || {
-        let _ = psmouse::register_initcalls();
+        psmouse::register_initcalls();
         InitResult::Ok
     });
 }
@@ -141,6 +141,7 @@ fn on_irq1_safe() {
     // SAFETY: dispatch context — ISR runs with IRQs masked,
     // single-CPU ownership of the i8042 ports for the duration
     // of one handler invocation.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         i8042::on_irq1();
     }
@@ -228,6 +229,7 @@ fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
     }
     // SAFETY: vector + handler installed before the IOAPIC
     // unmasks the line.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) }
 }
 

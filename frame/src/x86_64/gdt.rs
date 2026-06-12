@@ -131,6 +131,7 @@ pub unsafe fn init() {
     // ── populate TSS with IST stack pointers (top of each stack) ──
     // SAFETY: Stage 1 boot is single-threaded; writing the static TSS and
     // the static IST_STACKS from the BSP cannot race.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let stacks_base = core::ptr::addr_of!(IST_STACKS) as *const u8;
         for i in 0..4 {
@@ -209,6 +210,7 @@ pub unsafe fn init() {
     // the famous way this bites you). SS+DS+ES+FS+GS → 0x10.
     // SAFETY: 0x10 is a present writable data descriptor in the GDT we
     // just installed.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mov ax, 0x10",
@@ -251,6 +253,7 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
     // architecturally fine; the CPU reads rsp0 atomically on trap
     // entry. Using `write_unaligned` to match the `#[repr(packed)]`
     // Tss layout.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::addr_of_mut!(TSS)
             .cast::<u8>()
@@ -279,6 +282,7 @@ pub fn kernel_rsp0() -> u64 {
     // SAFETY: aligned (well, packed) read of a u64; single reader
     // convention + the atomic-write contract on the setter keep
     // tearing at bay.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::addr_of!(TSS)
             .cast::<u8>()

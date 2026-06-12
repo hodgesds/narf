@@ -302,6 +302,7 @@ pub(crate) fn page_out_via_installed(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_for_test() {
     *PAGER.lock() = None;
     install_default_if_unset();

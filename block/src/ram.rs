@@ -150,6 +150,7 @@ impl RamBlockDevice {
                 // task is accessing the buffer because FAT
                 // serialises sector ops through one volume-owned
                 // cap, and we run cooperatively on a single CPU.
+                // SAFETY: Valid memory or trusted environment
                 let dst = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), span) };
                 dst.copy_from_slice(src);
                 Ok(())

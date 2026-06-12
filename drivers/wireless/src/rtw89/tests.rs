@@ -73,11 +73,14 @@ use super::*;
 // ── Stage-2: BD layout smokes ────────────────────────────────────
 
 fn smoke_rtw89_bd_layout() -> TestResult {
-    let mut tx = super::dma::TxBd::default();
-    tx.length = 0x1234;
+    let mut tx = super::dma::TxBd {
+        length: 0x1234,
+        ..Default::default()
+    };
     tx.set_phys(0x1_2345_6789);
 
     // Manual check of packed layout.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let bytes: [u8; 8] = unsafe { core::mem::transmute(tx) };
     if bytes[0] != 0x34 || bytes[1] != 0x12 {
         return TestResult::Fail("length wrong");
@@ -93,8 +96,10 @@ fn smoke_rtw89_bd_layout() -> TestResult {
         return TestResult::Fail("dma address wrong");
     }
 
-    let mut rx = super::dma::RxBd::default();
-    rx.buf_size = 2048;
+    let mut rx = super::dma::RxBd {
+        buf_size: 2048,
+        ..Default::default()
+    };
     rx.set_phys(0xFEDC_BA98_7654_3210);
     if rx.buf_size != 2048 {
         return TestResult::Fail("rx buf_size wrong");
@@ -1045,7 +1050,7 @@ fn smoke_rtw89_fwdl_v0_parse() -> TestResult {
     blob.extend_from_slice(&sw0.to_le_bytes());
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
-    blob.extend(core::iter::repeat(0xABu8).take(512));
+    blob.extend(core::iter::repeat_n(0xABu8, 512));
 
     let mut sections = [FwSection {
         kind: 0,
@@ -1100,7 +1105,7 @@ fn smoke_rtw89_fwdl_v0_chksum() -> TestResult {
     blob.extend_from_slice(&sw0.to_le_bytes());
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
-    blob.extend(core::iter::repeat(0x55u8).take(1008));
+    blob.extend(core::iter::repeat_n(0x55u8, 1008));
 
     let mut sections = [FwSection {
         kind: 0,
@@ -1143,7 +1148,7 @@ fn smoke_rtw89_fwdl_v1_parse() -> TestResult {
     blob.extend_from_slice(&sw1.to_le_bytes());
     blob.extend_from_slice(&sw2.to_le_bytes());
     blob.extend_from_slice(&sw3.to_le_bytes());
-    blob.extend(core::iter::repeat(0xCDu8).take(256));
+    blob.extend(core::iter::repeat_n(0xCDu8, 256));
 
     let mut sections = [FwSection {
         kind: 0,
@@ -1652,7 +1657,7 @@ fn smoke_rtw89_datapath_consume_rx() -> TestResult {
     let rxd_bytes = super::txrx::encode_rxd_for_test(&rxd_info);
     let mut bd = alloc::vec::Vec::new();
     bd.extend_from_slice(&rxd_bytes);
-    bd.extend(core::iter::repeat(0xEEu8).take(100));
+    bd.extend(core::iter::repeat_n(0xEEu8, 100));
 
     let d = match consume_rx_bd(&bd) {
         Some(d) => d,
@@ -1675,7 +1680,7 @@ fn smoke_rtw89_datapath_consume_rx() -> TestResult {
     let bad_bytes = super::txrx::encode_rxd_for_test(&bad_info);
     let mut bad_bd = alloc::vec::Vec::new();
     bad_bd.extend_from_slice(&bad_bytes);
-    bad_bd.extend(core::iter::repeat(0u8).take(100));
+    bad_bd.extend(core::iter::repeat_n(0u8, 100));
     if consume_rx_bd(&bad_bd).is_some() {
         return TestResult::Fail("CRC32 errored frame not dropped");
     }
@@ -1690,7 +1695,7 @@ fn smoke_rtw89_datapath_consume_rx() -> TestResult {
     let trunc_bytes = super::txrx::encode_rxd_for_test(&trunc_info);
     let mut trunc = alloc::vec::Vec::new();
     trunc.extend_from_slice(&trunc_bytes);
-    trunc.extend(core::iter::repeat(0u8).take(50));
+    trunc.extend(core::iter::repeat_n(0u8, 50));
     if consume_rx_bd(&trunc).is_some() {
         return TestResult::Fail("truncated BD not rejected");
     }

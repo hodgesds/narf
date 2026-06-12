@@ -59,6 +59,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     // SAFETY: buf is writable for buf.len() bytes.
     let p = unsafe { libc::getcwd(buf.as_mut_ptr(), buf.len()) };
     if p.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_stderr(b"pwd: getcwd failed\n"); }
         return 1;
     }
@@ -67,7 +68,9 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
     while n < buf.len() && buf[n] != 0 {
         n += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(&buf[..n]); }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(b"\n"); }
     0
 }

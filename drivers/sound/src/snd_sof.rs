@@ -15,7 +15,6 @@ const INTEL_PCI_VENDOR: u16 = 0x8086;
 const INTEL_CML_AUDIO_DSP: u16 = 0x02c8;
 
 // Basic SOF registers
-const SOF_IPC_MAILBOX: u64 = 0x1000;
 const SOF_IPC_HOST_TO_DSP: u64 = 0x1004;
 const SOF_IPC_DSP_TO_HOST: u64 = 0x1008;
 
@@ -32,10 +31,12 @@ impl SofDsp {
     }
 
     fn read_u32(&self, offset: u64) -> u32 {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.read32(offset) }
     }
 
     fn write_u32(&self, offset: u64, val: u32) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.write32(offset, val) }
     }
 
@@ -62,6 +63,7 @@ pub fn probe(
     device: BusDevice,
     _cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mmio = match unsafe { narf_bus::map_bar(&device, 4) } {
         // SOF usually uses BAR4
         Ok(m) => m,

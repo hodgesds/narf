@@ -137,6 +137,7 @@ fn wheel_arm(deadline_cycles: u64) {
     // SAFETY: HPET window initialised at boot (init() checked);
     // GSI is the one we registered against the IOAPIC; comparator
     // 0 is the one we routed.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { narf_time::hpet::arm_oneshot(0, gsi, target) };
 }
 

@@ -469,6 +469,7 @@ pub fn probe(
     );
     // SAFETY: caller-authority. BAR0 is the OHCI operational-
     // register window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mmio = match unsafe { narf_bus::map_bar(&device, OHCI_BAR_INDEX) } {
         Ok(m) => m,
         Err(_) => {

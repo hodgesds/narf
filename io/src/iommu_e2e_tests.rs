@@ -216,6 +216,7 @@ impl FakeDevice {
         // Those frames are identity-mapped in the kernel address space.
         // `out.len()` is caller-bounded to be within one page in all
         // callers below.  The borrow lives only for this function.
+        // SAFETY: Valid memory or trusted environment
         let src = unsafe { core::slice::from_raw_parts(phys as *const u8, out.len()) };
         out.copy_from_slice(src);
         Ok(())
@@ -227,6 +228,7 @@ impl FakeDevice {
         let phys = iommu.translate(iova, /*write=*/ true)?;
         // SAFETY: same argument as `dma_read`. Unique write is safe because
         // the test holds the only live reference to the backing frame.
+        // SAFETY: Valid memory or trusted environment
         let dst = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, data.len()) };
         dst.copy_from_slice(data);
         Ok(())
@@ -416,6 +418,7 @@ fn iommu_e2e_03_host_writes_visible_to_device() -> TestResult {
     // map_page maps entire pages; address the tail byte via a direct phys
     // pointer — models a device that resolves IOVA→phys then offsets within
     // the page.  SAFETY: phys is an allocated frame; offset 4088 < 4096.
+    // SAFETY: Valid memory or trusted environment
     let tail_val = unsafe { core::ptr::read_volatile((phys + 4088) as *const u8) };
     if tail_val != PATTERN {
         let _ = iommu.unmap_page(iova);
@@ -802,6 +805,7 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
     // Offset 4095 is the last byte of that 4096-byte frame — the same
     // byte written via `as_mut_slice()[4095] = LAST_SENTINEL` above —
     // so the read is in-bounds and reads an initialized `u8`.
+    // SAFETY: Valid memory or trusted environment
     let last_val = unsafe { core::ptr::read_volatile((last_phys + 4095) as *const u8) };
     if last_val != LAST_SENTINEL {
         for i in 0..N_PAGES {

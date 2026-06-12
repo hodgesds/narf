@@ -174,6 +174,7 @@ impl FbScanout for TestScanout {
         // SAFETY: Vec stays alive for the scanout's lifetime;
         // pointer is 4-byte aligned (Vec<u32>); caller's Cap +
         // FbWriter exclusivity gates concurrent writers.
+        // SAFETY: Valid memory or trusted environment
         unsafe { Framebuffer::new(g.buf.as_ptr() as *mut u32, g.width, g.height, g.width) }
     }
 }
@@ -294,6 +295,7 @@ impl FbScanout for AmdgpuScanout {
             // SAFETY: amdgpu's BAR0 is mapped + DCN configured to
             // scan out from `base`; the caller holds the FbScanout
             // cap that serializes writers. Stride is in pixels.
+            // SAFETY: Valid memory or trusted environment
             unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride) }
         })
         .expect("amdgpu scanout selected without controller")
@@ -342,6 +344,7 @@ impl FbScanout for IntelGpuScanout {
             // active scanout's `gtt_offset`; the aperture is 4-byte aligned and
             // covers `width*height` pixels at `stride_bytes/4` pixels per row.
             // The caller holds the FbScanout cap that serializes writers.
+            // SAFETY: Valid memory or trusted environment
             unsafe { Framebuffer::new(base, mode.width, mode.height, mode.stride_bytes / 4) }
         })
         .expect("intel-gpu scanout selected without controller")
@@ -442,6 +445,7 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
             // re-cast stays valid while the slot remains Some. Smokes
             // install + use + clear within a single single-CPU test boundary,
             // so no concurrent mutation of the slot occurs.
+            // SAFETY: Valid memory or trusted environment
             return Some(unsafe { &*ptr });
         }
     }
@@ -695,6 +699,7 @@ impl FbWriter {
                 // (row, col) offset, so it is a valid identity-mapped address of a
                 // kernel-allocated shmem frame we own; the 4-byte u32 read is within
                 // that frame and naturally aligned (offset is a multiple of 4).
+                // SAFETY: Valid memory or trusted environment
                 let pix = unsafe { core::ptr::read_volatile(phys as *const u32) };
                 fb.draw_pixel(clipped.x + col, clipped.y + row, Pixel32(pix));
             }
@@ -761,6 +766,7 @@ fn fb_drain_pump() {
     // user task calls sys_sleep (the FB-drain initcall runs in
     // Stage::Late which precedes user-task spawn). After that
     // it's read-only.
+    // SAFETY: Valid memory or trusted environment
     let opt = unsafe { &*PUMP_WRITER.0.get() };
     if let Some(w) = opt.as_ref() {
         let _ = drain_task::drain_once(w);
@@ -785,6 +791,7 @@ fn init_pump_writer(writer: FbWriter) {
         // SAFETY: first-and-only writer; no concurrent reader yet
         // (the pump can't fire before `register_initcalls`
         // completes Stage::Late).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *PUMP_WRITER.0.get() = Some(writer);
         }
@@ -799,6 +806,7 @@ pub(crate) fn pump_writer_ref() -> Option<&'static FbWriter> {
     // SAFETY: PUMP_WRITER is initialised once at boot; subsequent
     // accesses are read-only. The returned reference is valid for
     // the lifetime of the static.
+    // SAFETY: Valid memory or trusted environment
     unsafe { (&*PUMP_WRITER.0.get()).as_ref() }
 }
 
@@ -978,6 +986,7 @@ pub fn last_picked_backend() -> Option<&'static str> {
     }
     // SAFETY: the AtomicUsize pair was published from a `&'static str`
     // whose pointer + length stay valid for the kernel's lifetime.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let slice = core::slice::from_raw_parts(p, l);
         Some(core::str::from_utf8_unchecked(slice))

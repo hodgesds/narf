@@ -81,6 +81,7 @@ pub unsafe fn read_prph(mmio: &MmioRegion, mask: PrphMask, reg: u32) -> u32 {
     // SAFETY: caller-owned device + awake MAC. The CSR offsets are
     // bounded by the BAR0 mapping size (4 KiB+ on every AX-class
     // part).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         mmio.write32(csr::HBUS_TARG_PRPH_RADDR as u64, pack_addr(reg, mask));
         compiler_fence(Ordering::SeqCst);

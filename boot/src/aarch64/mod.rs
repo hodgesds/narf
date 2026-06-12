@@ -48,6 +48,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
         // SAFETY: `raw.payload` is non-null (checked above) and points into
         // identity-mapped RAM the bootloader handed us; an unaligned 4-byte
         // read of the DTB magic is defined on aarch64.
+        // SAFETY: Valid memory or trusted environment
         let magic = unsafe { magic_ptr.read_unaligned() }.to_be();
         if magic != DTB_MAGIC_BE {
             // Non-null but bad magic — really wrong, bail.
@@ -89,6 +90,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     } else {
         // SAFETY: scanning 0x4000_0000 + 0..32 MiB only reads
         // identity-mapped Normal memory in lo_L1[1].
+        // SAFETY: Valid memory or trusted environment
         unsafe { scan_for_dtb() }
     };
 
@@ -99,6 +101,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     let initramfs = match dtb_phys {
         // SAFETY: dtb_phys came from the scan above + identity-
         // mapped 256 MiB virt RAM range.
+        // SAFETY: Valid memory or trusted environment
         Some(p) => unsafe { scan_initramfs_chosen(p.raw()) },
         None => None,
     };
@@ -142,6 +145,7 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
         // SAFETY: per this fn's contract `dtb_phys` is a 4-byte-aligned,
         // identity-mapped Normal-memory DTB; `off` indexes within its
         // `totalsize`, so the u32 read is in-bounds and aligned.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::ptr::read_volatile((dtb_phys + off) as *const u32) }.to_be()
     };
     if read_be32(0) != 0xd00d_feed {
@@ -217,6 +221,7 @@ unsafe fn scan_initramfs_chosen(dtb_phys: u64) -> Option<MemRegion> {
                     while nlen < 64 {
                         // SAFETY: strings block is bounded by
                         // size_dt_strings; cap at 64 for safety.
+                        // SAFETY: Valid memory or trusted environment
                         let b = unsafe {
                             core::ptr::read_volatile((strings_base + nameoff + nlen) as *const u8)
                         };

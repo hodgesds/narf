@@ -142,6 +142,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
     // for this device's cfg + BARs for the duration of probe.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let result = unsafe { bring_up(&device) };
     let dev = match result {
         Ok(d) => d,
@@ -260,6 +261,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
     // SAFETY: `mmio_bar0` is the live BAR0 region mapped above and
     // driver-own was already taken (`take_driver_own` returned `Ok`),
     // which is exactly the precondition `load_firmware_stub` requires.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let firmware_outcome = unsafe { mcu::load_firmware_stub(&mmio_bar0, effective_did) };
     if let Err(mcu::McuError::NotImplemented) = firmware_outcome {
         // Expected baseline path — note it but keep the device bound.
@@ -276,6 +278,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Mt7921Device, ProbeError> {
         // SAFETY: `mmio_bar0` is the live BAR0 region; this branch only
         // runs when `load_firmware_stub` returned `Ok`, so firmware is
         // live and the EFUSE registers are valid to read.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         if let Ok(m) = unsafe { mcu::read_efuse_mac(&mmio_bar0) } {
             mac_bytes = m;
         }

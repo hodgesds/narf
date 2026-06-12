@@ -855,6 +855,7 @@ fn smoke_shell_fork_wait4_exit_status() -> TestResult {
     // SAFETY: `new_for_user` requires paging/MMU enabled; the kernel-test
     // runner executes post-boot with the active page-table root installed,
     // so a fresh user root can be cloned from the kernel half.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {

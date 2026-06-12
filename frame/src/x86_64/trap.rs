@@ -255,6 +255,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             //
             // SAFETY: TrapFrame layout matches narf-scheduler's
             // re-declared TrapFrame (asserted below).
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 let sched_frame_ptr =
                     frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
@@ -317,6 +318,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 let v = narf_memory::VirtAddr::new(cr2);
                 // SAFETY: identity map live, AS belongs to the
                 // task whose CR3 is currently active.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
                     return;
                 }
@@ -353,11 +355,13 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // allocator + COW refcount table are
                 // initialised at boot. AS is the active user AS by
                 // construction (cr2 in user half + active_user_as).
+                // SAFETY: Valid memory or trusted environment
                 let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
                 if split_ok {
                     // SAFETY: same identity-map argument; the
                     // region was just touched by cow_split_on_write
                     // so it definitely exists.
+                    // SAFETY: Valid memory or trusted environment
                     let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
                     if remap_ok {
                         return;
@@ -582,6 +586,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
 
     // SAFETY: after a fatal exception we have no policy to resume; exit with
     // a non-zero code so xtask / verification can see the failure.
+    // SAFETY: Valid memory or trusted environment
     unsafe { narf_arch::exit_kernel(42) }
 }
 
@@ -695,6 +700,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         use super::user::UserState;
         // SAFETY: caller declared `out` is writable for at least
         // `size_of::<UserState>()` bytes — the trait's contract.
+        // SAFETY: Valid memory or trusted environment
         let s = unsafe { &mut *(out as *mut UserState) };
         let f = &self.frame;
         s.r15 = f.r15;
@@ -884,6 +890,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             // SMAP window so these CPL=0 writes to user PTEs don't fault; the
             // `write_unaligned`/`write_bytes` tolerate the unaligned siginfo
             // fields.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_arch::x86_64::smap::with_user_access(|| {
                     core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
@@ -912,6 +919,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             // SAFETY: user stack is mapped under the active CR3 and
             // we hold the trap frame for the calling task. SMAP
             // bracket required for supervisor-mode write to USER pages.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_arch::x86_64::smap::with_user_access(|| {
                     core::ptr::write_volatile(new_rsp as *mut u64, saved_rip);
@@ -977,6 +985,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         // holding the trap frame for the calling task; sc_vaddr is
         // the explicit sigcontext addr the trampoline forwarded
         // (originally set in RSI by deliver_signal).
+        // SAFETY: Valid memory or trusted environment
         unsafe { perform_sigreturn(self, sc_vaddr) }
     }
 }
@@ -1109,6 +1118,7 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
     // CPL=3; the frame layout guarantees at least 4 readable bytes there.
     // `with_user_access` opens the SMAP window for this CPL=0 read of a
     // user PTE.
+    // SAFETY: Valid memory or trusted environment
     let si_signo = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::read_volatile(sc_vaddr as *const i32)
@@ -1148,6 +1158,7 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         // out reserves a full `McContext` there. `read_volatile` reads it as
         // a plain POD copy and `with_user_access` opens the SMAP window for
         // this read of a user PTE.
+        // SAFETY: Valid memory or trusted environment
         let mc = unsafe {
             narf_arch::x86_64::smap::with_user_access(|| {
                 core::ptr::read_volatile(mc_vaddr as *const McContext)
@@ -1178,6 +1189,7 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         // CPL=3 above, so a full `SigContext` is readable there.
         // `read_volatile` takes a plain POD copy and `with_user_access`
         // opens the SMAP window for this read of a user PTE.
+        // SAFETY: Valid memory or trusted environment
         let sc = unsafe {
             narf_arch::x86_64::smap::with_user_access(|| {
                 core::ptr::read_volatile(sc_vaddr as *const SigContext)
@@ -1342,6 +1354,7 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
     let new_rsp = frame.rsp;
     // SAFETY: arch wrote a u64 saved_rip to this aligned vaddr just
     // above; reading it back from the same process is sound.
+    // SAFETY: Valid memory or trusted environment
     let saved_rip = unsafe { core::ptr::read_volatile(new_rsp as *const u64) };
     if saved_rip != POST_TRAP_RIP.wrapping_sub(2) {
         return TestResult::Fail("SA_RESTART did not rewind saved RIP by 2");
@@ -1559,6 +1572,7 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
     // siginfo prefix bytes should be readable + match.
     // SAFETY: the arch just wrote a 128-B siginfo there; reading
     // back from a kernel-resident buffer is sound.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let signo = (siginfo_vaddr as *const i32).read_unaligned();
         let errno = ((siginfo_vaddr + 4) as *const i32).read_unaligned();

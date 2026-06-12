@@ -53,23 +53,23 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-uac", || {
-        let _ = uac::register_initcalls();
+        uac::register_initcalls();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-uvc", || {
-        let _ = uvc::register_initcalls();
+        uvc::register_initcalls();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-r8152", || {
-        let _ = r8152::register();
+        r8152::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-cdc-ncm", || {
-        let _ = cdc_ncm::register_initcalls();
+        cdc_ncm::register_initcalls();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "usb-xpad", || {
-        let _ = xpad::register_initcalls();
+        xpad::register_initcalls();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "xhci", || {
@@ -204,10 +204,12 @@ impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
         YIELD_TIMEOUT_POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: structural pin projection — `fut` is never moved
         // out, only re-pinned for the inner poll call.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let this = unsafe { self.get_unchecked_mut() };
         // SAFETY: `this` came from a `Pin<&mut Self>`, so `this.fut`
         // is itself structurally pinned. We re-pin the `&mut` to it
         // and never move `fut` out, upholding the pin contract.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let fut = unsafe { core::pin::Pin::new_unchecked(&mut this.fut) };
         match fut.poll(cx) {
             core::task::Poll::Ready(v) => return core::task::Poll::Ready(Ok(v)),

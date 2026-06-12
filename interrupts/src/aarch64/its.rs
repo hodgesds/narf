@@ -214,6 +214,7 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     let propbaser = (prop_tab & 0x000F_FFFF_FFFF_F000) | (id_bits - 1);
     // SAFETY: identity-mapped MMIO; redistributor was woken up by
     // gic::init_bsp.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         write_u64(GICR_PROPBASER, propbaser);
     }

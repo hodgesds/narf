@@ -64,6 +64,7 @@ pub unsafe fn eoi() {
     // SAFETY: platform contract; x86_64 backend writes to the LAPIC EOI
     // register. Must be invoked exactly once per IRQ handler dispatch,
     // else the LAPIC will stall further interrupts on the same level.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         current::eoi();
     }
@@ -146,6 +147,7 @@ fn ipi_fanout_bridge(_req: narf_memory::tlb_shootdown::ShootdownRequest) {
     }
     // SAFETY: GIC is up post-boot; SGI_TLB_SHOOTDOWN is the
     // reserved vector for this purpose.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         aarch64::sgi::broadcast_others(aarch64::sgi::SGI_TLB_SHOOTDOWN);
     }

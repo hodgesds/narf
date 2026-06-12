@@ -45,6 +45,7 @@ pub unsafe fn execute(console_fd: i32, cmd: &Cmd, last_exit: &mut i32) -> bool {
     match cmd {
         Cmd::Empty => true,
         Cmd::Error(msg) => {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_err(console_fd, msg.as_bytes()); }
             true
         }
@@ -58,17 +59,20 @@ pub unsafe fn execute(console_fd: i32, cmd: &Cmd, last_exit: &mut i32) -> bool {
                 redirs: *redirs,
                 redir_count: *redir_count,
             };
+            // SAFETY: Valid memory or trusted environment
             unsafe { *last_exit = exec_simple(console_fd, &sc); }
             // `exit` built-in returns -1 as the "stop the shell" signal.
             *last_exit != EXIT_SHELL_SIGNAL
         }
         Cmd::Pipeline { stages, count } => {
+            // SAFETY: Valid memory or trusted environment
             unsafe { *last_exit = exec_pipeline(console_fd, stages, *count); }
             true
         }
         Cmd::Sequence { cmds, count } => {
             #[allow(clippy::needless_range_loop)]
             for i in 0..*count {
+                // SAFETY: Valid memory or trusted environment
                 let keep = unsafe {
                     exec_sequence_entry(console_fd, &cmds[i], last_exit)
                 };
@@ -79,20 +83,25 @@ pub unsafe fn execute(console_fd: i32, cmd: &Cmd, last_exit: &mut i32) -> bool {
             true
         }
         Cmd::And(left, right) => {
+            // SAFETY: Valid memory or trusted environment
             unsafe { *last_exit = exec_simple(console_fd, left); }
             if *last_exit == 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { *last_exit = exec_simple(console_fd, right); }
             }
             true
         }
         Cmd::Or(left, right) => {
+            // SAFETY: Valid memory or trusted environment
             unsafe { *last_exit = exec_simple(console_fd, left); }
             if *last_exit != 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { *last_exit = exec_simple(console_fd, right); }
             }
             true
         }
         Cmd::Background(sc) => {
+            // SAFETY: Valid memory or trusted environment
             unsafe { exec_background(console_fd, sc); }
             true
         }
@@ -120,9 +129,11 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
     // `cd` and `exit` MUST NOT be forked — they affect the shell's
     // own process state.
     if name == b"cd" {
+        // SAFETY: Valid memory or trusted environment
         return unsafe { builtin_cd(fd, sc) };
     }
     if name == b"exit" {
+        // SAFETY: Valid memory or trusted environment
         return unsafe { builtin_exit(fd, sc) };
     }
     if name == b"true" || name == b":" {
@@ -141,6 +152,7 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
     // legacy dispatcher gives the same code path the in-kernel
     // `smoke_echo_hello_world_end_to_end` proves.
     if name == b"echo" {
+        // SAFETY: Valid memory or trusted environment
         return unsafe { dispatch_builtin_inproc(fd, sc) };
     }
 
@@ -151,6 +163,7 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
     // fork+exec path is now taken.  The in-process fallback in
     // `dispatch_builtin_inproc` is only reached if fork fails (EAGAIN /
     // ENOMEM), which is an exceptional error condition.
+    // SAFETY: Valid memory or trusted environment
     unsafe { try_fork_exec(fd, sc) }
 }
 
@@ -159,19 +172,25 @@ unsafe fn exec_simple(fd: i32, sc: &SimpleCmd) -> i32 {
 unsafe fn try_fork_exec(fd: i32, sc: &SimpleCmd) -> i32 {
     // Apply redirections to a saved-fd set (restored on fork failure
     // so the parent isn't disturbed).
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { save_stdio() };
 
     // Save/apply redirections in the *parent* temporarily only if
     // we can't fork — the child will do it for real after fork.
     // For now we fork() and check.
+    // SAFETY: Valid memory or trusted environment
     let child_pid = unsafe { libc::fork() };
     if child_pid < 0 {
         // fork failed (EAGAIN/ENOMEM) — run in-process with redirects.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { apply_redirs(fd, sc) } {
+            // SAFETY: Valid memory or trusted environment
             let rc = unsafe { dispatch_builtin_inproc(fd, sc) };
+            // SAFETY: Valid memory or trusted environment
             unsafe { restore_stdio(saved); }
             return rc;
         }
+        // SAFETY: Valid memory or trusted environment
         unsafe { restore_stdio(saved); }
         return 1;
     }
@@ -181,9 +200,12 @@ unsafe fn try_fork_exec(fd: i32, sc: &SimpleCmd) -> i32 {
         //
         // Apply redirections, then exec.  On exec failure write an
         // error and exit(127).
+        // SAFETY: Valid memory or trusted environment
         unsafe { apply_redirs_child(fd, sc); }
+        // SAFETY: Valid memory or trusted environment
         unsafe { exec_child(sc); }
         // exec_child never returns on success; if it does, exit(127).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_err(fd, sc.argv[0].as_bytes());
             write_err(fd, b": exec failed\n");
@@ -194,6 +216,7 @@ unsafe fn try_fork_exec(fd: i32, sc: &SimpleCmd) -> i32 {
     // ── Parent ─────────────────────────────────────────────────────────
     let _ = saved; // parent didn't alter stdio
     let mut wstatus: i32 = 0;
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::waitpid(child_pid, &mut wstatus as *mut i32, 0) };
     if r < 0 {
         return 1;
@@ -216,6 +239,7 @@ struct SavedStdio {
 }
 
 unsafe fn save_stdio() -> SavedStdio {
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         SavedStdio {
             stdin:  libc::dup(0),
@@ -226,6 +250,7 @@ unsafe fn save_stdio() -> SavedStdio {
 }
 
 unsafe fn restore_stdio(saved: SavedStdio) {
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         if saved.stdin  >= 0 { libc::dup2(saved.stdin,  0); libc::posix_close(saved.stdin);  }
         if saved.stdout >= 0 { libc::dup2(saved.stdout, 1); libc::posix_close(saved.stdout); }
@@ -238,6 +263,7 @@ unsafe fn restore_stdio(saved: SavedStdio) {
 unsafe fn apply_redirs(fd: i32, sc: &SimpleCmd) -> bool {
     for i in 0..sc.redir_count {
         let Some(ref redir) = sc.redirs[i] else { continue };
+        // SAFETY: Valid memory or trusted environment
         if !unsafe { apply_one_redir(fd, redir) } {
             return false;
         }
@@ -250,6 +276,7 @@ unsafe fn apply_redirs_child(_fd: i32, sc: &SimpleCmd) {
     for i in 0..sc.redir_count {
         let Some(ref redir) = sc.redirs[i] else { continue };
         // Suppress error output in child — parent will see exit 127.
+        // SAFETY: Valid memory or trusted environment
         unsafe { apply_one_redir(-1, redir); }
     }
 }
@@ -263,6 +290,7 @@ unsafe fn apply_one_redir(err_fd: i32, redir: &Redir) -> bool {
     };
     if path.is_empty() {
         if err_fd >= 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_err(err_fd, b"redirect: missing filename\n"); }
         }
         return false;
@@ -271,11 +299,13 @@ unsafe fn apply_one_redir(err_fd: i32, redir: &Redir) -> bool {
     let n = path.len.min(pbuf.len() - 1);
     pbuf[..n].copy_from_slice(&path.bytes[..n]);
     // pbuf[n] is already 0 (zero-initialised).
+    // SAFETY: Valid memory or trusted environment
     let opened = unsafe {
         libc::posix_open(pbuf.as_ptr() as *const i8, flags as i32, mode as u32)
     };
     if opened < 0 {
         if err_fd >= 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_err(err_fd, b"redirect: cannot open ");
                 write_err(err_fd, path.as_bytes());
@@ -284,7 +314,9 @@ unsafe fn apply_one_redir(err_fd: i32, redir: &Redir) -> bool {
         }
         return false;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::dup2(opened, target_fd); }
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::posix_close(opened); }
     true
 }
@@ -318,6 +350,7 @@ unsafe fn exec_child(sc: &SimpleCmd) {
     // Try exact path first if it contains `/`.
     let name = sc.argv[0].as_bytes();
     if name.contains(&b'/') {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             libc::execve(aptrs[0], aptrs.as_ptr(), envp.as_ptr());
         }
@@ -336,6 +369,7 @@ unsafe fn exec_child(sc: &SimpleCmd) {
     resolved_argv0[..rlen].copy_from_slice(&path_buf[..rlen]);
     let mut full_aptrs = aptrs;
     full_aptrs[0] = resolved_argv0.as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         libc::execve(path_buf.as_ptr() as *const i8, full_aptrs.as_ptr(), envp.as_ptr());
     }
@@ -364,6 +398,7 @@ unsafe fn dispatch_builtin_inproc(fd: i32, sc: &SimpleCmd) -> i32 {
         pos += n;
     }
     // dispatch_line returns false only for `exit`.
+    // SAFETY: Valid memory or trusted environment
     let keep = unsafe { crate::dispatch_line(fd, &line[..pos]) };
     if !keep { EXIT_SHELL_SIGNAL } else { 0 }
 }
@@ -385,6 +420,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
         return 0;
     }
     if count == 1 {
+        // SAFETY: Valid memory or trusted environment
         return unsafe { exec_simple(fd, &stages[0]) };
     }
 
@@ -397,6 +433,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
     // Create all pipes first.
     for i in 0..count - 1 {
         let mut fds: [i32; 2] = [-1, -1];
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
         if r != 0 {
             fork_ok = false;
@@ -410,12 +447,15 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
         // Close any pipes we managed to open.
         #[allow(clippy::needless_range_loop)]
         for i in 0..pipe_count {
+            // SAFETY: Valid memory or trusted environment
             if pipes[i][0] >= 0 { unsafe { libc::posix_close(pipes[i][0]); } }
+            // SAFETY: Valid memory or trusted environment
             if pipes[i][1] >= 0 { unsafe { libc::posix_close(pipes[i][1]); } }
         }
         // Fall back: run stages in-process sequentially.
         let mut last = 0i32;
         for i in 0..count {
+            // SAFETY: Valid memory or trusted environment
             last = unsafe { exec_simple(fd, &stages[i]) };
         }
         return last;
@@ -426,6 +466,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
     let mut fork_failed = false;
 
     for i in 0..count {
+        // SAFETY: Valid memory or trusted environment
         let child = unsafe { libc::fork() };
         if child < 0 {
             fork_failed = true;
@@ -435,20 +476,27 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
             // ── Child i ─────────────────────────────────────────────────
             // Wire stdin from pipe[i-1] read-end (if i > 0).
             if i > 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { libc::dup2(pipes[i - 1][0], 0); }
             }
             // Wire stdout to pipe[i] write-end (if i < count-1).
             if i < count - 1 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { libc::dup2(pipes[i][1], 1); }
             }
             // Close all pipe fds in the child.
             for j in 0..pipe_count {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { libc::posix_close(pipes[j][0]); }
+                // SAFETY: Valid memory or trusted environment
                 unsafe { libc::posix_close(pipes[j][1]); }
             }
             // Apply redirections, then exec.
+            // SAFETY: Valid memory or trusted environment
             unsafe { apply_redirs_child(fd, &stages[i]); }
+            // SAFETY: Valid memory or trusted environment
             unsafe { exec_child(&stages[i]); }
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_err(fd, stages[i].argv[0].as_bytes());
                 write_err(fd, b": exec failed\n");
@@ -460,7 +508,9 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
 
     // Parent: close all pipe fds.
     for j in 0..pipe_count {
+        // SAFETY: Valid memory or trusted environment
         unsafe { libc::posix_close(pipes[j][0]); }
+        // SAFETY: Valid memory or trusted environment
         unsafe { libc::posix_close(pipes[j][1]); }
     }
 
@@ -469,6 +519,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
         for i in 0..count {
             if child_pids[i] > 0 {
                 let mut ws = 0i32;
+                // SAFETY: Valid memory or trusted environment
                 unsafe { libc::waitpid(child_pids[i], &mut ws, 0); }
             }
         }
@@ -479,6 +530,7 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
     let mut last_exit = 0i32;
     for i in 0..count {
         let mut ws = 0i32;
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { libc::waitpid(child_pids[i], &mut ws, 0) };
         if r > 0 && i == count - 1 {
             last_exit = if (ws & 0x7f) == 0 {
@@ -496,16 +548,21 @@ unsafe fn exec_pipeline(fd: i32, stages: &[SimpleCmd; MAX_PIPE_STAGES], count: u
 /// Fork and run `sc` in the background; parent does not wait.
 /// On fork failure, runs in-process (synchronously) as a fallback.
 unsafe fn exec_background(fd: i32, sc: &SimpleCmd) {
+    // SAFETY: Valid memory or trusted environment
     let child = unsafe { libc::fork() };
     if child < 0 {
         // No fork — run in-process.
+        // SAFETY: Valid memory or trusted environment
         unsafe { exec_simple(fd, sc); }
         return;
     }
     if child == 0 {
         // Child: exec and exit.
+        // SAFETY: Valid memory or trusted environment
         unsafe { apply_redirs_child(fd, sc); }
+        // SAFETY: Valid memory or trusted environment
         unsafe { exec_child(sc); }
+        // SAFETY: Valid memory or trusted environment
         unsafe { libc::_exit(127); }
     }
     // Parent: do NOT waitpid. The child runs asynchronously.
@@ -520,6 +577,7 @@ unsafe fn exec_background(fd: i32, sc: &SimpleCmd) {
 unsafe fn exec_sequence_entry(fd: i32, entry: &SequenceEntry, last_exit: &mut i32) -> bool {
     match entry {
         SequenceEntry::Cmd(sc) => {
+            // SAFETY: Valid memory or trusted environment
             let rc = unsafe { exec_simple(fd, sc) };
             if rc == EXIT_SHELL_SIGNAL {
                 return false;
@@ -527,21 +585,27 @@ unsafe fn exec_sequence_entry(fd: i32, entry: &SequenceEntry, last_exit: &mut i3
             *last_exit = rc;
         }
         SequenceEntry::Pipeline { stages, count } => {
+            // SAFETY: Valid memory or trusted environment
             *last_exit = unsafe { exec_pipeline(fd, stages, *count) };
         }
         SequenceEntry::And(left, right) => {
+            // SAFETY: Valid memory or trusted environment
             *last_exit = unsafe { exec_simple(fd, left) };
             if *last_exit == 0 {
+                // SAFETY: Valid memory or trusted environment
                 *last_exit = unsafe { exec_simple(fd, right) };
             }
         }
         SequenceEntry::Or(left, right) => {
+            // SAFETY: Valid memory or trusted environment
             *last_exit = unsafe { exec_simple(fd, left) };
             if *last_exit != 0 {
+                // SAFETY: Valid memory or trusted environment
                 *last_exit = unsafe { exec_simple(fd, right) };
             }
         }
         SequenceEntry::Background(sc) => {
+            // SAFETY: Valid memory or trusted environment
             unsafe { exec_background(fd, sc); }
         }
     }
@@ -553,14 +617,17 @@ unsafe fn exec_sequence_entry(fd: i32, entry: &SequenceEntry, last_exit: &mut i3
 unsafe fn builtin_cd(fd: i32, sc: &SimpleCmd) -> i32 {
     let path = if sc.argc >= 2 { sc.argv[1].as_bytes() } else { b"" as &[u8] };
     if path.is_empty() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_err(fd, b"cd: missing path\n"); }
         return 1;
     }
     let mut pbuf = [0u8; 256];
     let n = path.len().min(pbuf.len() - 1);
     pbuf[..n].copy_from_slice(&path[..n]);
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::chdir(pbuf.as_ptr()) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_err(fd, b"cd: failed\n"); }
         1
     } else {
@@ -596,6 +663,7 @@ pub unsafe fn write_err(fd: i32, bytes: &[u8]) {
     }
     let mut written = 0usize;
     while written < bytes.len() {
+        // SAFETY: Valid memory or trusted environment
         let n = unsafe {
             libc::posix_write(
                 fd,

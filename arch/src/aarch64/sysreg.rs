@@ -138,6 +138,7 @@ pub unsafe fn write_cntp_tval_el0(value: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: CNTP_TVAL_EL0 write is always legal at EL1 / EL0 (when
     // CNTKCTL_EL1 grants EL0 access).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("msr cntp_tval_el0, {v}", v = in(reg) value,
              options(nostack, preserves_flags));

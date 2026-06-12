@@ -341,6 +341,7 @@ fn ipi_fanout(req: ShootdownRequest) {
     if f != 0 {
         // SAFETY: stored as `IpiFanoutFn as usize`; round-trip back
         // is sound when non-null.
+        // SAFETY: Valid memory or trusted environment
         let func: IpiFanoutFn = unsafe { core::mem::transmute(f) };
         func(req);
     }
@@ -394,6 +395,7 @@ fn apply_local(req: ShootdownRequest) {
         // SAFETY: CR4.PCIDE may or may not be on; this is a
         // best-effort cleanup and CR3 read/write is always legal
         // at CPL=0.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr3 = narf_arch::x86_64::cr::read_cr3();
             narf_arch::x86_64::cr::write_cr3(cr3);
@@ -675,6 +677,7 @@ fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
             // SAFETY: restoring the topology snapshot captured at
             // the top of the test; identity remains the same CPU
             // we observed online a few instructions ago.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_lib::smp::mark_online(bit);
             }

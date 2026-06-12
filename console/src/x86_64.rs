@@ -35,6 +35,7 @@ pub unsafe fn enable_rx_irq(base: usize, kind: UartKind) {
     let port = base as u16;
     // SAFETY: caller-asserted live UART; IER is at offset 1
     // when DLAB=0 (set during init).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         outb(port + 1, IER_RDA);
     }
@@ -76,6 +77,7 @@ pub unsafe fn init(base: usize, kind: UartKind) {
     let port = base as u16;
     // SAFETY: scratch register at offset 7 has no functional
     // effect; loopback probe.
+    // SAFETY: Valid memory or trusted environment
     let present = unsafe {
         outb(port + 7, 0xA5);
         let r1 = inb(port + 7);

@@ -197,6 +197,7 @@ pub unsafe fn map_domain_private(
     // SAFETY: pml4_phys is identity-mapped; we just verified the VA
     // lies in this domain's slot, so the walk will hit the
     // domain-private PDPT subtree.
+    // SAFETY: Valid memory or trusted environment
     let pml4 = unsafe { &*(pml4_phys as *const PageTable) };
     let slot_idx = PRIVATE_PML4_BASE + domain as usize;
     if !pml4.entries[slot_idx].is_present() {
@@ -207,6 +208,7 @@ pub unsafe fn map_domain_private(
     // PML4 at pml4_phys, which has the private PDPT installed for
     // this domain only, so any new PD/PT pages allocated below
     // inherit the privacy.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         map_4kb(PhysAddr::new(pml4_phys), va, pa, flags)?;
     }

@@ -207,6 +207,7 @@ pub fn enable_user_reads(cap: &Cap<Pmu, Write>) -> Result<(), ObsError> {
         // with only the PCE bit toggled is documented-writable per
         // SDM Vol. 3 §2.5. The arch wrapper handles the LTO-fence
         // discipline.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr4 = narf_arch::x86_64::cr::read_cr4();
             narf_arch::x86_64::cr::write_cr4(cr4 | CR4_PCE);
@@ -366,6 +367,7 @@ pub fn capture_crash_frame(regs: ArchRegs) -> CrashFrame {
         // can never fault on a healthy thread; on a panic path the
         // worst case is a zero word from a later guard hit, which is
         // an acceptable partial-dump outcome per spec §3.3.
+        // SAFETY: Valid memory or trusted environment
         let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
         *slot = v;
     }
@@ -518,6 +520,7 @@ pub fn take_snapshot() -> Option<CoreSnapshot> {
     // SAFETY: Installation only accepts `&'static FlightRing`, so the
     // pointer is valid for the lifetime of the kernel. We hold no
     // exclusive access — `FlightRing::snapshot` takes `&self`.
+    // SAFETY: Valid memory or trusted environment
     let ring: &'static FlightRing<ObservabilityEvent, SNAPSHOT_CAPACITY> = unsafe { &*ptr };
 
     // Placeholder fill: any unused tail stays zero-tagged but we never

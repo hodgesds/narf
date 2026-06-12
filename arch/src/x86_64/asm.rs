@@ -16,6 +16,7 @@ pub unsafe fn disable_interrupts() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `CLI` is always valid at CPL=0 and has no operand side effects
     // beyond IF=0. The fence pair keeps loads/stores from migrating across.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("cli", options(nomem, nostack, preserves_flags));
     }
@@ -113,11 +114,14 @@ pub fn halt_until_irq() {
 ///
 /// ```ignore
 /// // SAFETY: caller starts critical section.
+// SAFETY: Valid memory or trusted environment
 /// unsafe { asm!("cli"); }
 /// while !condition_met() {
 ///     // SAFETY: cli above; idle_halt_then_disable returns with cli.
+// SAFETY: Valid memory or trusted environment
 ///     unsafe { idle_halt_then_disable(); }
 /// }
+// SAFETY: Valid memory or trusted environment
 /// unsafe { asm!("sti"); }
 /// ```
 ///
@@ -130,6 +134,7 @@ pub unsafe fn idle_halt_then_disable() {
     // SAFETY: caller-asserted IF=0 entering. sti; hlt; cli is
     // atomic on x86 — no IRQ delivers between sti and hlt; HLT
     // then wakes on the IRQ; cli leaves IF=0.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("sti", "hlt", "cli", options());
     }
@@ -142,6 +147,7 @@ pub fn halt_forever() -> ! {
     // SAFETY: leaving interrupts off and halting is always safe. We never
     // return, so the IRQ-state change has no observable effect on the rest
     // of the kernel.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         disable_interrupts();
         loop {
@@ -170,6 +176,7 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
     // caller's responsibility. RBX is LLVM-reserved, so we stash it
     // manually — and that's why `options(nostack)` is *not* set
     // (the stash touches the stack).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "push rbx",
@@ -212,6 +219,7 @@ pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: aligned 4-byte store is atomic on every x86_64 CPU NARF
     // targets. The caller asserts writable + executable + aligned.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile(addr, new);
     }

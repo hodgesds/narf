@@ -545,6 +545,7 @@ impl AmdGpu {
         // SAFETY: caller-authority over BAR0 + BAR5 (the `bring_up` contract);
         // `BAR_REGS` selects the MMIO register BAR which the caller owns
         // exclusively for the duration of probe.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| AmdgpuError::BarMapFailed)?;
 
         // Presence test: MM_INDEX is read/write; write a sentinel,
@@ -553,6 +554,7 @@ impl AmdGpu {
         // SAFETY: identity-mapped MMIO; MM_INDEX is a register
         // latch with no side effects when the data port isn't
         // touched.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let prev = unsafe { regs.read32(MM_INDEX) };
         if prev == 0xFFFF_FFFF {
             return Err(AmdgpuError::DeviceGone);
@@ -579,6 +581,7 @@ impl AmdGpu {
         // aperture is `[base << 24, ((top + 1) << 24))`.
         // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
         // sequential pair with no side effects beyond the access.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let vram = unsafe { read_vram_info(&regs) };
 
         // Try to parse the on-die IP discovery table. Lives in
@@ -591,6 +594,7 @@ impl AmdGpu {
         //
         // SAFETY: BAR0 mapped, exclusive owner; the discovery
         // blob is read-only from the host side.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ip_blocks = unsafe { read_ip_discovery(&fb_bar, &vram) };
 
         Ok(Self {
@@ -679,6 +683,7 @@ impl AmdGpu {
         // SAFETY: caller-asserted BAR5 ownership; mm_read uses the
         // MM_INDEX/MM_DATA pair which is a r/w latch with no side
         // effect on the addressed register.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let raw = unsafe { mm_read(&self.regs, off) };
         Some(crate::amdgpu_gfx::GrbmStatus { raw })
     }
@@ -794,15 +799,18 @@ impl AmdGpu {
         }
         // SAFETY: caller-asserted exclusive ownership of BAR5; `OTG_V_TOTAL`
         // is a read-only OTG timing register on the same MMIO BAR.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let v_total = unsafe { mm_read(&self.regs, OTG_V_TOTAL) };
         if v_total == 0 || v_total == 0xFFFF_FFFF {
             return None;
         }
         // SAFETY: caller-asserted exclusive ownership of BAR5; OTG blank
         // registers are read-only timing latches on the same MMIO BAR.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let h_blank = unsafe { mm_read(&self.regs, OTG_H_BLANK_START_END) };
         // SAFETY: caller-asserted exclusive ownership of BAR5; same OTG
         // blank-register MMIO BAR as above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let v_blank = unsafe { mm_read(&self.regs, OTG_V_BLANK_START_END) };
 
         // OTG_H_TOTAL is `total - 1`; bits[15:0] are the value.
@@ -878,6 +886,7 @@ impl AmdGpu {
         // Step 2-3: program phys + size + command.
         // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
         // are valid register-bus addresses for this family.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
             mm_write(
@@ -953,6 +962,7 @@ impl AmdGpu {
         if entry.cmd == SMU_LOAD_PMFW_MP1 {
             // SAFETY: caller-asserted exclusive BAR5; same MMIO
             // discipline as the PSP path.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             return unsafe { self.smu_dispatch_pmfw(entry, fw_authority) };
         }
 
@@ -978,6 +988,7 @@ impl AmdGpu {
 
         // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
         // are valid register-bus addresses for this family.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
             mm_write(
@@ -1125,6 +1136,7 @@ impl AmdGpu {
         for entry in self.chip.fw_list {
             // SAFETY: caller-asserted exclusive BAR5; mp0_base
             // is resolved live (not stale).
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             match unsafe { self.psp_dispatch_one(entry, mp0_base, fw_authority) } {
                 Ok(true) => loaded += 1,
                 Ok(false) => {
@@ -1427,6 +1439,7 @@ impl<'a> crate::amdgpu_smu::SmuMmio for SmuRegsAdapter<'a> {
         // SAFETY: adapter constructed inside `initialize` which
         // holds &mut AmdGpu — `self.regs` is exclusively owned for
         // the duration of the bring-up sequence.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { mm_read(self.regs, addr) }
     }
     fn write(&mut self, addr: u32, value: u32) {
@@ -1485,6 +1498,7 @@ unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
     // SAFETY: caller-asserted exclusive ownership of BAR5 (`read_vram_info`
     // contract); `MC_VM_FB_LOCATION_TOP` is a read-only MC aperture register
     // accessed through the same MM_INDEX/MM_DATA latch pair.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let top_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
     // Bits[23:0] are the FB location; high bits are reserved.
     let base = (base_field as u64 & 0x00FF_FFFF) << 24;
@@ -1534,6 +1548,7 @@ unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock
         // SAFETY: caller-asserted ownership of BAR0; the
         // aperture covers `[0, vram.size)` and we've bounded
         // `off_in_vram + i` against `vram.size`.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let word = unsafe { fb_bar.read32(off_in_vram + i as u64) };
         let bytes = word.to_le_bytes();
         buf[i] = bytes[0];
@@ -1597,6 +1612,7 @@ unsafe fn read_vbios_version_from_rom(
     // SAFETY: identity-mapped MMIO in NARF's kernel context; offset 1 is the
     // second byte of the 512-byte `probe_region` mapped at the PCI ROM base,
     // well within bounds.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let b1 = unsafe { probe_region.read8(1) };
     if b0 == 0xFF && b1 == 0xFF {
         return None;
@@ -1606,6 +1622,7 @@ unsafe fn read_vbios_version_from_rom(
     // SAFETY: identity-mapped MMIO in NARF's kernel context; offset 2 is the
     // third byte of the 512-byte `probe_region` mapped at the PCI ROM base,
     // well within bounds.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let blocks = unsafe { probe_region.read8(2) };
     let rom_size: u64 = if blocks == 0 {
         65536 // fallback: 64 KiB
@@ -1688,6 +1705,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // SAFETY: caller-authority over the device. ROM BAR is read-only
         // from the CPU side once the phys address is known.
         // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { read_vbios_version_from_rom(&cap, &device) };
 
     // Register with the DRM card registry so /sys/class/drm/card<N>/

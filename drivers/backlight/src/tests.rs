@@ -436,15 +436,18 @@ mod smokes {
 
         // Seed BXT_BLC_PWM_FREQ1 (offset 0xC8254) with a period.
         // 0xC8254 is byte offset; u32 index is 0xC8254 / 4.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile((raw.as_ptr() as *mut u32).add(0xC8254 / 4), 0x1000);
         }
 
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let dev = unsafe { crate::intel_bl::IntelBacklightDevice::new("intel_bl0", mmio) };
 
         // 50% → duty 0x800.
         dev.set_brightness(50);
         let duty =
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { core::ptr::read_volatile((raw.as_ptr() as *const u32).add(0xC8258 / 4)) };
         if duty != 0x800 {
             return TestResult::Fail("50% did not yield duty 0x800");

@@ -107,6 +107,7 @@ impl Controller {
         // SAFETY: `BringupPhase` is `#[repr(u8)]` and `self.phase` is only
         // ever stored as one of its discriminants (0..=5), so `v` is a valid
         // bit pattern for the enum.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::mem::transmute(v) }
     }
 

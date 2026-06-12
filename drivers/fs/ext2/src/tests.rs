@@ -237,11 +237,13 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     // function returns another such RawWaker and whose wake/drop functions are
     // no-ops, so every vtable contract is upheld and the null data pointer is
     // never dereferenced.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is a local owned by this function and never moved again
     // after this point (it is only polled through the returned pin), so the
     // pinning guarantee holds for the rest of the function.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

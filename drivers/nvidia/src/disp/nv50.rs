@@ -651,6 +651,7 @@ pub unsafe fn aux_read_payload(
     // device window and the caller owns AUX `channel`. The four reads land
     // on `DATA_RD..+0xC` within that channel's register block (`base` is a
     // bounded multiple of `CH_STRIDE`), all valid 32-bit device registers.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         for (i, w) in words.iter_mut().enumerate() {
             *w = bar0.read32(aux_chan_regs::DATA_RD + base + (i as u64) * 4);

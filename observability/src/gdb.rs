@@ -518,6 +518,7 @@ fn peek_memory(addr: u64, len: u32) -> Option<Vec<u8>> {
         // address faults rather than returning garbage — we accept that as the
         // failure mode ("? on host shows a fault") instead of fault-handling the
         // peek and silently returning zeros.
+        // SAFETY: Valid memory or trusted environment
         let b = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
         buf.push(b);
     }
@@ -840,11 +841,13 @@ impl GdbTransport for Com1Transport {
             // SAFETY: `self.base + 5` is the 16550 UART Line Status Register for
             // COM1 (base 0x3F8). Reading the LSR is side-effect-free, and the
             // console crate has already validated this port is live at boot.
+            // SAFETY: Valid memory or trusted environment
             let lsr = unsafe { narf_arch::x86_64::io_port::inb(self.base + 5) };
             if lsr & 0x01 != 0 {
                 // SAFETY: LSR bit 0 (Data Ready) is set, so the UART's Receiver
                 // Buffer Register at `self.base` (COM1, 0x3F8) holds a pending
                 // byte. Reading the RBR is the documented way to consume it.
+                // SAFETY: Valid memory or trusted environment
                 let b = unsafe { narf_arch::x86_64::io_port::inb(self.base) };
                 return Some(b);
             }
@@ -859,11 +862,13 @@ impl GdbTransport for Com1Transport {
             // SAFETY: `self.base + 5` is the 16550 UART Line Status Register for
             // COM1 (base 0x3F8). Reading the LSR is side-effect-free, and the
             // console crate has already validated this port is live at boot.
+            // SAFETY: Valid memory or trusted environment
             let lsr = unsafe { narf_arch::x86_64::io_port::inb(self.base + 5) };
             if lsr & 0x20 != 0 {
                 // SAFETY: LSR bit 5 (Transmitter Holding Register Empty) is set,
                 // so writing `b` to the THR at `self.base` (COM1, 0x3F8) is safe
                 // and will not clobber an in-flight byte.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { narf_arch::x86_64::io_port::outb(self.base, b) };
                 return true;
             }

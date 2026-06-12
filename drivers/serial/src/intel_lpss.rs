@@ -174,6 +174,7 @@ fn try_route_gsi(gsi: u32) -> Option<u8> {
     {
         let v = narf_interrupts::vector::alloc().ok()?;
         // Default: Active High, Level Triggered for PCH devices.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         if unsafe {
             narf_acpi::ioapic::route_gsi_to_vector(
                 gsi,

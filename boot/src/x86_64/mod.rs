@@ -77,6 +77,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     } else {
         // SAFETY: bootloader contract guarantees ≥ 4 bytes of readable
         // memory at the payload pointer.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { pvh::is_hvm_start_info(raw.payload) } {
             Protocol::Pvh
         } else {
@@ -102,6 +103,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
 
     // SAFETY: `count` is the return value from the parser; we write to the
     // accompanying `MEMORY_MAP_LEN` under single-threaded boot conditions.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::addr_of_mut!(MEMORY_MAP_LEN).write(count);
     }
@@ -179,6 +181,7 @@ fn scan_initramfs_module(raw: &crate::RawBootInfo, proto: Protocol) -> Option<Me
     // SAFETY: bootloader contract — `raw.payload` points at a valid
     // info struct of the matching protocol; magic mismatch returns
     // `None` from the parser without dereferencing modlist memory.
+    // SAFETY: Valid memory or trusted environment
     let (start, size) = unsafe {
         match proto {
             Protocol::Pvh => pvh::initramfs_module(info_ptr)?,

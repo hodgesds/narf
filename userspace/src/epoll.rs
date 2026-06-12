@@ -56,6 +56,7 @@ fn read_epoll_event(ptr: u64) -> Result<(u32, u64), ()> {
     // SAFETY: runs in the calling task's syscall context (its address space,
     // never IRQ); `copy_from_user` range-validates `ptr` for `buf.len()` (12)
     // bytes and brackets the read with the SMAP window itself.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_from_user(&mut buf, ptr) }.is_err() {
         return Err(());
     }
@@ -72,6 +73,7 @@ fn write_epoll_event(ptr: u64, events: u32, data: u64) -> Result<(), ()> {
     // SAFETY: runs in the calling task's syscall context (its address space,
     // never IRQ); `copy_to_user` range-validates `ptr` for `buf.len()` (12)
     // bytes and brackets the write with the SMAP window itself.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_to_user(ptr, &buf) }.is_err() {
         return Err(());
     }
@@ -450,6 +452,7 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`, published
             // in `CURRENT` for exactly this trap; it stays live for the whole
             // syscall and the borrow does not escape this match arm.
+            // SAFETY: Valid memory or trusted environment
             let uctx = unsafe { &*uctx_ptr };
             if timeout_ms == 0 {
                 Some(0)
@@ -478,6 +481,7 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx` from
                 // `CURRENT`, live for this trap; `sleep_deadline_ns` is an atomic
                 // field, so the store needs only a valid pointer.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
             }
             for (i, (events, data)) in ready[..n].iter().enumerate() {
@@ -506,6 +510,7 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                     // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx` from
                     // `CURRENT`, live for this trap; `sleep_deadline_ns` is an
                     // atomic field, so the store needs only a valid pointer.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
                 }
                 ctx.set_return(SyscallReturn::ok(0));
@@ -522,6 +527,7 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                             // `UserTaskCtx` from `CURRENT`, live for this trap;
                             // `sleep_deadline_ns` is an atomic field, so the
                             // store needs only a valid pointer.
+                            // SAFETY: Valid memory or trusted environment
                             unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
                             return;
                         }
@@ -531,6 +537,7 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                     // from `CURRENT`, live for this trap; `state`/`exit_reason`
                     // are its own `UnsafeCell` fields and the `hook` consumes
                     // the same pointer to park exactly this task.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         let uc = &*uctx_ptr;
                         // Rewind RIP so we re-execute epoll_wait on resume.

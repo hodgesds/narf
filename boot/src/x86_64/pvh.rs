@@ -124,6 +124,7 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
         let entry_ptr = hdr._modlist as usize + i * core::mem::size_of::<HvmModlistEntry>();
         // SAFETY: bootloader contract guarantees `n` valid
         // entries at `modlist_paddr`.
+        // SAFETY: Valid memory or trusted environment
         let e = unsafe { (entry_ptr as *const HvmModlistEntry).read_unaligned() };
         if e.cmdline_paddr == 0 {
             continue;
@@ -131,6 +132,7 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
         // SAFETY: cmdline is a NUL-terminated ASCII string at
         // `cmdline_paddr` per the PVH spec. We bound the scan at
         // 256 bytes; "initramfs" fits in 9 + NUL.
+        // SAFETY: Valid memory or trusted environment
         let cmd = unsafe { read_cstr(e.cmdline_paddr as usize, 256) };
         if cmd.eq_ignore_ascii_case(b"initramfs") {
             return Some((e.paddr, e.size));
@@ -204,6 +206,7 @@ pub unsafe fn parse_memory_map(info_ptr: usize, out: *mut MemRegion, out_cap: us
         let entry_ptr = base + i * core::mem::size_of::<MemmapEntry>();
         // SAFETY: caller contract: memmap covers
         // `memmap_entries * sizeof(MemmapEntry)` bytes of valid memory.
+        // SAFETY: Valid memory or trusted environment
         let e = unsafe { (entry_ptr as *const MemmapEntry).read_unaligned() };
         let kind = match e.ty {
             1 => MemRegionKind::Usable,

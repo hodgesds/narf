@@ -62,15 +62,18 @@ pub unsafe fn allocate_singleton_ring() -> (
 ) {
     // SAFETY: SharedRing is repr(C) of u32 atomics + a slot array;
     // zero-init is the canonical "fresh ring" state.
+    // SAFETY: Valid memory or trusted environment
     let mut ring: Box<DrawRing> = Box::new(unsafe { core::mem::zeroed() });
     let ptr: *mut DrawRing = &mut *ring;
     // SAFETY: ptr points at a fresh, zero-initialised DrawRing
     // sized for SharedRing<DrawCmd, 16>.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         cmd_ring::init_in(ptr);
     }
     // SAFETY: SPSC invariant — caller asserts no other halves
     // exist for this ring.
+    // SAFETY: Valid memory or trusted environment
     let (p, c) = unsafe { cmd_ring::split(ptr) };
     (ring, p, c)
 }

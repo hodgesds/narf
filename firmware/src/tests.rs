@@ -280,6 +280,7 @@ fn smoke_firmware_sys_install_trusted_loader_round_trip() -> TestResult {
     let r =
         // SAFETY: blob is a kernel-owned heap allocation; ptr+len
         // describe a valid range for the duration of this call.
+        // SAFETY: Valid memory or trusted environment
         unsafe { crate::sys_install("test/sys-install/blob", blob.as_ptr(), blob.len(), &auth) };
     match r {
         Ok(()) => {}

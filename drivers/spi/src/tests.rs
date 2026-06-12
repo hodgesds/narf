@@ -281,12 +281,14 @@ fn smoke_intel_lpss_data_path_smokes() -> TestResult {
     // Inspect synthetic MMIO.
     let base = phys.raw() as *const u32;
     // Clock gate @ 0x838 should be 0x3.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let gate = unsafe { core::ptr::read_volatile(base.add(0x838 / 4)) };
     if gate != 0x3 {
         return TestResult::Fail("LPSS clock gate not set to 0x3");
     }
 
     // SSCR0 @ 0x00 should have SSE (1 << 7) and DSS_8BIT (0x7).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let cr0 = unsafe { core::ptr::read_volatile(base) };
     if cr0 & 0x87 != 0x87 {
         return TestResult::Fail("LPSS SSCR0 not programmed for 8-bit enable");

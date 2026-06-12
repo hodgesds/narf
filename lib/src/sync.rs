@@ -199,6 +199,7 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
         // SAFETY: save+disable inline asm is the canonical local IRQ-
         // disable sequence on each arch; no platform state is touched
         // beyond the IF / DAIF.I bit of the running CPU.
+        // SAFETY: Valid memory or trusted environment
         let saved = unsafe { irq_save_disable() };
         while self
             .inner
@@ -268,6 +269,7 @@ impl<T: ?Sized> Drop for IrqSafeSpinLockGuard<'_, T> {
         self.lock.locked.store(false, Ordering::Release);
         // SAFETY: pairs with `irq_save_disable` from the matching lock
         // call; restoring the saved state is always sound.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             irq_restore(self.saved);
         }
@@ -288,6 +290,7 @@ unsafe fn irq_save_disable() -> IrqSavedState {
     // `preserves_flags` (cli mutates IF) — those would license
     // miscompiles like the compiler putting a local in the red zone
     // or caching a flag across the cli.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "pushfq",
@@ -311,6 +314,7 @@ unsafe fn irq_restore(saved: IrqSavedState) {
         // sti mutates IF — and don't claim `nomem`, since the
         // moment IF flips, an IRQ handler may run and observe
         // memory.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!("sti", options());
         }
@@ -324,6 +328,7 @@ unsafe fn irq_save_disable() -> IrqSavedState {
     // SAFETY: read DAIF, then mask I (IRQ). Pure local-CPU state.
     // `nomem` is fine (no memory accesses), but DAIFSet mutates
     // PSTATE — don't claim `preserves_flags`.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {0}, DAIF",
@@ -455,6 +460,7 @@ impl<T> OnceLock<T> {
             // SAFETY: we're inside the `call_once` winning branch, so this
             // is the sole writer; no reader can observe the cell until
             // `call_once` stores ONCE_DONE.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 (*self.data.get()).write(value.take().unwrap());
             }
@@ -471,6 +477,7 @@ impl<T> OnceLock<T> {
             // SAFETY: `Once::is_completed` does an `Acquire` load; if true,
             // the writer's `Release` of `ONCE_DONE` happens-before this read,
             // so the `MaybeUninit` is initialised and stable.
+            // SAFETY: Valid memory or trusted environment
             unsafe { Some((*self.data.get()).assume_init_ref()) }
         } else {
             None

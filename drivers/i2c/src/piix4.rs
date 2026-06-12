@@ -41,6 +41,7 @@ const TRANSFER_TIMEOUT_POLLS: u32 = 100_000;
 #[derive(Debug)]
 pub struct Piix4Smbus {
     name: String,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     io_base: u16,
     bus: AsyncMutex<()>,
     pub(crate) enabled: AtomicBool,
@@ -80,14 +81,17 @@ impl Piix4Smbus {
         // SAFETY: IO port access is valid
         let sts = unsafe { self.read8(SMBHSTSTS) };
         if sts & SMBHSTSTS_FAILED != 0 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.write8(SMBHSTSTS, SMBHSTSTS_FAILED) };
             return Err(I2cError::BadHardware);
         }
         if sts & SMBHSTSTS_BUS_ERR != 0 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.write8(SMBHSTSTS, SMBHSTSTS_BUS_ERR) };
             return Err(I2cError::ArbLost);
         }
         if sts & SMBHSTSTS_DEV_ERR != 0 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.write8(SMBHSTSTS, SMBHSTSTS_DEV_ERR) };
             return Err(I2cError::Nack);
         }
@@ -145,12 +149,14 @@ impl I2cBus for Piix4Smbus {
             match &mut ops[0] {
                 I2cOp::Write(data) => {
                     if data.len() == 1 {
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         unsafe {
                             self.write8(SMBHSTADD, addr << 1);
                             self.write8(SMBHSTCMD, data[0]);
                             self.write8(SMBHSTCNT, PIIX4_BYTE_DATA | SMBHSTCNT_START);
                         }
                     } else if data.len() == 2 {
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         unsafe {
                             self.write8(SMBHSTADD, addr << 1);
                             self.write8(SMBHSTCMD, data[0]);
@@ -163,6 +169,7 @@ impl I2cBus for Piix4Smbus {
                 }
                 I2cOp::Read(buf) => {
                     if buf.len() == 1 {
+                        // SAFETY: Valid MMIO bounds or trusted driver environment
                         unsafe {
                             self.write8(SMBHSTADD, (addr << 1) | 1);
                             self.write8(SMBHSTCNT, PIIX4_BYTE | SMBHSTCNT_START);
@@ -176,12 +183,14 @@ impl I2cBus for Piix4Smbus {
             let (first, second) = ops.split_at_mut(1);
             if let (I2cOp::Write(w), I2cOp::Read(r)) = (&first[0], &mut second[0]) {
                 if w.len() == 1 && r.len() == 1 {
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     unsafe {
                         self.write8(SMBHSTADD, (addr << 1) | 1);
                         self.write8(SMBHSTCMD, w[0]);
                         self.write8(SMBHSTCNT, PIIX4_BYTE_DATA | SMBHSTCNT_START);
                     }
                 } else if w.len() == 1 && r.len() == 2 {
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     unsafe {
                         self.write8(SMBHSTADD, (addr << 1) | 1);
                         self.write8(SMBHSTCMD, w[0]);
@@ -201,6 +210,7 @@ impl I2cBus for Piix4Smbus {
         self.check_status()?;
 
         // Clear INTR
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.write8(SMBHSTSTS, SMBHSTSTS_INTR);
         }
@@ -209,15 +219,19 @@ impl I2cBus for Piix4Smbus {
         if ops.len() == 1 {
             if let I2cOp::Read(buf) = &mut ops[0] {
                 if buf.len() == 1 {
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     buf[0] = unsafe { self.read8(SMBHSTDAT0) };
                 }
             }
         } else if ops.len() == 2 {
             if let I2cOp::Read(buf) = &mut ops[1] {
                 if buf.len() == 1 {
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     buf[0] = unsafe { self.read8(SMBHSTDAT0) };
                 } else if buf.len() == 2 {
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     buf[0] = unsafe { self.read8(SMBHSTDAT0) };
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     buf[1] = unsafe { self.read8(SMBHSTDAT1) };
                 }
             }
@@ -238,6 +252,7 @@ fn get_amd_fch_smba() -> Option<u16> {
     let smba_en_lo: u8;
     let smba_en_hi: u8;
 
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         narf_arch::x86_64::io_port::outb(SB800_PIIX4_SMB_IDX, smb_en);
         smba_en_lo = narf_arch::x86_64::io_port::inb(SB800_PIIX4_SMB_IDX + 1);

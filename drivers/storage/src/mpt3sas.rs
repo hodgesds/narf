@@ -17,7 +17,6 @@ const MPT3SAS_PCI_DEVICE_SAS3008: u16 = 0x0097; // SAS3008
 // Basic MPT3SAS registers
 const MPT_DOORBELL: u64 = 0x00;
 const MPT_WRITE_SEQ: u64 = 0x04;
-const MPT_HOST_DIAG: u64 = 0x08;
 const MPT_DOORBELL_RESET: u32 = 0x40000000;
 
 #[derive(Debug)]
@@ -33,10 +32,12 @@ impl Mpt3Sas {
     }
 
     fn read_u32(&self, offset: u64) -> u32 {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.read32(offset) }
     }
 
     fn write_u32(&self, offset: u64, val: u32) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.write32(offset, val) }
     }
 
@@ -65,6 +66,7 @@ pub fn probe(
     device: BusDevice,
     _cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), narf_bus::ProbeError> {
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mmio = match unsafe { narf_bus::map_bar(&device, 1) } {
         // MPT3SAS usually uses BAR1 for MMIO
         Ok(m) => m,

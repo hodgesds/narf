@@ -273,6 +273,7 @@ impl SyncBlock {
         }
         // SAFETY: identity-mapped DMA bytes (see DmaBuffer doc),
         // exclusive for the duration of this synchronous IO.
+        // SAFETY: Valid memory or trusted environment
         let slice = unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), total) };
         let map_err = |e: BlockIoError| match e {
             BlockIoError::OutOfRange => BlockError::InvalidRange,

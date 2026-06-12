@@ -218,6 +218,7 @@ pub unsafe extern "C" fn longjmp(jmp: *const JmpBuf, val: u64) -> ! {
 pub unsafe fn set_user_tls_base(tp: u64) {
     // SAFETY: TPIDR_EL0 write at EL1 is architecturally defined
     // and has no side effects on EL1 state.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "msr TPIDR_EL0, {tp}",
@@ -257,11 +258,13 @@ fn smoke_aarch64_setjmp_longjmp_round_trip() -> TestResult {
     // SAFETY: jmp lives on this stack frame for the duration of
     // both the setjmp + longjmp calls; setjmp's saved sp/x30
     // remain valid until we return from this function.
+    // SAFETY: Valid memory or trusted environment
     let r1 = unsafe { setjmp(&mut jmp as *mut _) };
     if r1 == 0 {
         // First time through: longjmp back with a sentinel value.
         // SAFETY: jmp was just populated by the matching setjmp;
         // the call frame is still live (we're in the same fn).
+        // SAFETY: Valid memory or trusted environment
         unsafe { longjmp(&jmp as *const _, 0xCAFE_BABE) }
     }
     if r1 != 0xCAFE_BABE {

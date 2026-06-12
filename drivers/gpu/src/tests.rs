@@ -1952,6 +1952,7 @@ fn smoke_dcn20_set_mode_rejects_without_fw() -> TestResult {
         }
         // SAFETY: probe gave us BAR0+BAR5 ownership; set_mode bails
         // before any MMIO when fw_loaded is false.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         Some(unsafe {
             d.set_mode(Mode {
                 width: 1920,

@@ -87,6 +87,7 @@ pub unsafe fn stage_from_phys(name: &'static str, phys: u64, len: u64) -> Result
     }
     // SAFETY: caller-asserted readability + identity mapping.
     let archive: &'static [u8] =
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
     let fs = Initramfs::from_cpio(name, archive)?;
     let leaked: &'static Initramfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));

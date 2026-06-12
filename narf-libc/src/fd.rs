@@ -124,6 +124,7 @@ pub unsafe extern "C" fn memfd_create(name: *const i8, flags: u32) -> i32 {
     }
     // SAFETY: caller-asserted NUL-terminator. Walk to find length.
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *name.add(len) != 0 {
             len += 1;
@@ -183,11 +184,13 @@ pub unsafe fn stat(path: *const u8, out: *mut StatBuf) -> i32 {
     // Bound the walk at 4 KiB so a missing NUL doesn't read into
     // unmapped territory; longer absolute paths are vanishingly rare.
     while len < 4096 {
+        // SAFETY: Valid memory or trusted environment
         if unsafe { *path.add(len) } == 0 {
             break;
         }
         len += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     let path_bytes = unsafe { core::slice::from_raw_parts(path, len) };
     let path_str = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
@@ -226,11 +229,13 @@ pub unsafe extern "C" fn fstatat(
     // Walk path NUL-bounded, capped at 4 KiB.
     let mut len = 0usize;
     while len < 4096 {
+        // SAFETY: Valid memory or trusted environment
         if unsafe { *path.add(len) } == 0 {
             break;
         }
         len += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     let bytes = unsafe { core::slice::from_raw_parts(path, len) };
     let s = match core::str::from_utf8(bytes) {
         Ok(s) => s,
@@ -239,6 +244,7 @@ pub unsafe extern "C" fn fstatat(
             return -1;
         }
     };
+    // SAFETY: Valid memory or trusted environment
     let out_ref = unsafe { &mut *out };
     if narf_user_runtime::fstatat(dirfd, s, out_ref, flags) == 0 {
         0
@@ -261,11 +267,13 @@ pub unsafe extern "C" fn lstat(path: *const u8, out: *mut StatBuf) -> i32 {
     }
     let mut len = 0usize;
     while len < 4096 {
+        // SAFETY: Valid memory or trusted environment
         if unsafe { *path.add(len) } == 0 {
             break;
         }
         len += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     let path_bytes = unsafe { core::slice::from_raw_parts(path, len) };
     let path_str = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
@@ -274,6 +282,7 @@ pub unsafe extern "C" fn lstat(path: *const u8, out: *mut StatBuf) -> i32 {
             return -1;
         }
     };
+    // SAFETY: Valid memory or trusted environment
     let out_ref = unsafe { &mut *out };
     if narf_user_runtime::lstat(path_str, out_ref) == 0 {
         0

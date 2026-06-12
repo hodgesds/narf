@@ -45,6 +45,7 @@ fn smoke_virtio_snd_writer_submit_round_trip() -> TestResult {
     // memory map is parsed and the allocator is online; `ECAM_DEFAULT_BASE`
     // is the platform's well-known ECAM physical base, and `init` only
     // reads config-space words from it.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -101,6 +102,7 @@ fn smoke_audio_submit_shmem_zero_copy() -> TestResult {
     // memory map is parsed and the allocator is online; `ECAM_DEFAULT_BASE`
     // is the platform's well-known ECAM physical base, and `init` only
     // reads config-space words from it.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {

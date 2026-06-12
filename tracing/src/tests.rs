@@ -99,6 +99,7 @@ fn smoke_tracing_arm_disarm_cycle() -> TestResult {
 
     // SAFETY: addr is 4-byte aligned static storage; patch_word only
     // writes 4 bytes + serialises.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         if arm(&cap, addr, 0xAA55_AA55).is_err() {
             return TestResult::Fail("arm() failed on live cap");

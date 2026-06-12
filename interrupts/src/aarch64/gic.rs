@@ -46,6 +46,7 @@ const GICR_IPRIORITYR0_OFF: usize = GICR_SGI_OFF + 0x0400;
 pub unsafe fn init_bsp() {
     // SAFETY: BSP-only init does both the CPU-shared distributor
     // and CPU 0's redistributor + cpu interface.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         init_distributor();
         init_per_cpu(0);

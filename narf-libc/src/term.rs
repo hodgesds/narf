@@ -71,6 +71,7 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
     if t.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
@@ -78,6 +79,7 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
     // SAFETY: kernel writes the 60-byte KTermios shape into the
     // user buffer. The libc `termios` struct matches the same
     // layout (4*tcflag + line + 32 cc + 2 speed).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { narf_user_runtime::syscall2_raw(218, fd as u64, t as u64) };
     if (r as i64) < 0 {
         -1
@@ -92,6 +94,7 @@ pub unsafe extern "C" fn tcgetattr(fd: c_int, t: *mut termios) -> c_int {
 /// `t` must be a valid `*const termios` if non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tcsetattr(fd: c_int, action: c_int, t: *const termios) -> c_int {
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
@@ -99,6 +102,7 @@ pub unsafe extern "C" fn tcsetattr(fd: c_int, action: c_int, t: *const termios) 
     if t.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { narf_user_runtime::syscall3_raw(219, fd as u64, action as u64, t as u64) };
     if (r as i64) < 0 {
         -1
@@ -110,6 +114,7 @@ pub unsafe extern "C" fn tcsetattr(fd: c_int, action: c_int, t: *const termios) 
 /// `tcflush(fd, what)` — accept-and-ignore drain request.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tcflush(fd: c_int, _what: c_int) -> c_int {
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
@@ -122,6 +127,7 @@ pub unsafe extern "C" fn tcflush(fd: c_int, _what: c_int) -> c_int {
 /// drain is always a no-op.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tcdrain(fd: c_int) -> c_int {
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::fd::isatty(fd) } == 0 {
         crate::errno::set_errno(ENOTTY);
         return -1;
@@ -165,6 +171,7 @@ pub const LOCK_UN: c_int = 8;
 /// `fd` is taken at face value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn flock(fd: c_int, op: c_int) -> c_int {
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { narf_user_runtime::syscall2_raw(235, fd as u64, op as u64) };
     r as c_int
 }

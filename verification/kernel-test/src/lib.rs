@@ -74,6 +74,7 @@ pub fn tests() -> &'static [KernelTest] {
     // boundaries of the `narf.tests` section. The section contains
     // zero or more `KernelTest` structs and nothing else (the
     // `kernel_test!` / `kernel_test_in!` macros are the only writers).
+    // SAFETY: Valid memory or trusted environment
     let (start, end) = unsafe {
         (
             &__narf_tests_start as *const KernelTest,

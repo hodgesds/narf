@@ -343,6 +343,7 @@ pub fn probe(
     // go through `read_bar` directly.
     // SAFETY: caller-authority + exclusive cfg-window claim
     // (probe path; bus walker holds the lock).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let bar = match unsafe { narf_bus::read_bar(&device, UHCI_BAR_INDEX) } {
         Ok(b) => b,
         Err(_) => {

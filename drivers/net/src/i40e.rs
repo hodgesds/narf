@@ -6,7 +6,6 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use core::fmt::Write;
 use narf_console::Writer;
 

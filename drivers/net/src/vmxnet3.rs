@@ -197,6 +197,7 @@ impl Vmxnet3Nic {
         let shared_ptr = shared.phys_addr().raw() as *mut Vmxnet3DriverShared;
         // SAFETY: shared_ptr fits an identity-mapped DMA page sized
         // for sizeof::<Vmxnet3DriverShared>().
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             (*shared_ptr).magic = VMXNET3_REV1_MAGIC.to_le();
             (*shared_ptr).size = (core::mem::size_of::<Vmxnet3DriverShared>() as u32).to_le();
@@ -276,6 +277,7 @@ impl Vmxnet3Nic {
         let queue_desc_pa = queue_desc.phys_addr().raw();
         // SAFETY: identity-mapped DMA page. devRead lives at offset
         // 8 of Vmxnet3DriverShared (after magic + size).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             (*shared_ptr).devRead.misc.driverInfo.version = VMXNET3_DRIVER_VERSION_NUM.to_le();
             (*shared_ptr).devRead.misc.driverInfo.gos = Vmxnet3GOSInfo::for_narf().to_raw().to_le();
@@ -521,10 +523,12 @@ impl Vmxnet3Nic {
     pub unsafe fn reset(&self) -> Result<(), Vmxnet3Error> {
         // Step 1: quiesce — stop host-side DMA into our rings.
         // Safety: caller-asserted exclusive BAR access.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.quiesce_dev() };
 
         // Step 2: hard reset — returns device to power-on state.
         // Safety: same.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.reset_dev() };
 
         // Step 3: re-publish DriverShared PA into DSAL/DSAH (cleared
@@ -592,6 +596,7 @@ pub fn probe(
 
     // SAFETY: caller-authority over the device for the duration of
     // bring_up.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { Vmxnet3Nic::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),

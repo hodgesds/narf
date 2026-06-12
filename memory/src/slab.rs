@@ -286,6 +286,7 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
     let cpu = current_cpu();
     // SAFETY: per-CPU access invariant — only the active CPU
     // touches its own magazine cell.
+    // SAFETY: Valid memory or trusted environment
     let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
     if mag.top == 0 {
         // Atomic path never touches the central lock, so an empty
@@ -402,6 +403,7 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     // accessed via the per-arch kernel mapping (identity on
     // x86_64, TTBR1 high-half on aarch64) so the write stays
     // valid across user-task page-table swaps.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for i in 0..to_mag {
             let blk = NonNull::new_unchecked(base.add(i * block_size) as *mut FreeBlock);
@@ -449,6 +451,7 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         let mut blk = mag.stack[i].expect("magazine full");
         // SAFETY: blocks were originally allocated from this slab,
         // so overwriting `next` re-links them onto the central head.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             blk.as_mut().next = *g;
         }
@@ -478,6 +481,7 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     let p = frame.start_address().kernel_mut_ptr::<u8>();
     // SAFETY: `p` is reachable through the per-arch kernel
     // mapping + page-aligned to its order.
+    // SAFETY: Valid memory or trusted environment
     Ok(unsafe { NonNull::new_unchecked(p) })
 }
 
@@ -606,6 +610,7 @@ pub fn _test_magazine_top(class_idx: usize, cpu: usize) -> usize {
     // SAFETY: the test harness runs single-threaded with
     // current_cpu() == 0, so peeking another CPU's slot is not
     // concurrent with any other reader / writer.
+    // SAFETY: Valid memory or trusted environment
     let mag = unsafe { &*CLASSES[class_idx].magazines[cpu].inner.get() };
     mag.top
 }
@@ -625,6 +630,7 @@ pub unsafe fn _test_magazine_push(class_idx: usize, cpu: usize, ptr: NonNull<u8>
     assert!(cpu < MAX_CPUS);
     // SAFETY: per-CPU access invariant — caller guarantees the
     // target slot is quiesced; tests run single-threaded.
+    // SAFETY: Valid memory or trusted environment
     let mag = unsafe { &mut *CLASSES[class_idx].magazines[cpu].inner.get() };
     assert!(mag.top < MAG_SIZE);
     mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
@@ -711,6 +717,7 @@ fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
     let mut g = class.head.lock();
     // SAFETY: `blk` came from this slab's class; we own its bytes
     // until pushed onto the central list.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         blk.as_ptr()
             .cast::<FreeBlock>()

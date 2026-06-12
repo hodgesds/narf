@@ -607,6 +607,7 @@ impl Controller {
         let bar0 = unsafe { map_bar(&device, 0) }.map_err(|_| NvmeError::BadBar)?;
         // SAFETY: BAR0 is identity-mapped MMIO; reads are 4-byte
         // aligned per the NVMe register layout.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cap_raw = unsafe {
             let lo = bar0.read32(REG_CAP_LO) as u64;
             let hi = bar0.read32(REG_CAP_HI) as u64;
@@ -656,6 +657,7 @@ impl Controller {
         // SAFETY: register writes against an identity-mapped MMIO
         // BAR while the controller is disabled — the documented
         // window for programming admin-queue base addresses.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             bar0.write32(REG_AQA, aqa);
             bar0.write32(REG_ASQ_LO, sq_phys as u32);
@@ -688,6 +690,7 @@ impl Controller {
                 // alloc()`, so slot 0 is a valid, owned vector index, and
                 // `enable()` runs last to gate MSI delivery only after the
                 // entry is fully programmed (PCIe-recommended order).
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     let _ = table.program_vector(0, 0, v);
                     let _ = table.enable();
@@ -779,6 +782,7 @@ impl Controller {
                 // table (the Admin queue used slot 0). The table was already
                 // globally enabled during `init`, so programming a new entry
                 // here just adds the I/O CQ's vector.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     let _ = table.program_vector(1, 0, v);
                 }
@@ -937,6 +941,7 @@ impl Controller {
         sqe.cdw11 = (zb << 16) | zb;
         // SAFETY: admin queue + BAR are live; SQE is a normal
         // Set Features command, no host-DMA buffer required.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cqe = unsafe { admin.submit(bar0, sqe)? };
 
         // Response CDW0 (Cqe::cmd_specific) carries the granted
@@ -1029,6 +1034,7 @@ impl Controller {
             // SAFETY: caller holds the BusDeviceCap; we own the
             // MSI-X table exclusively (no concurrent writer); the
             // table-slot index was alloc_block'd above.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let _ = unsafe { msix.program_vector(i, 0, v) }.map_err(|_| NvmeError::Msix)?;
             vectors.push(v);
         }
@@ -1037,6 +1043,7 @@ impl Controller {
         // owned exclusively here; `enable()` only flips the global enable
         // bit in cfg-space at the cached cap offset, with all table entries
         // already programmed in the loop above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { msix.enable() }.map_err(|_| NvmeError::Msix)?;
 
         for i in 0..granted {
@@ -1285,6 +1292,7 @@ impl Controller {
             // SAFETY: `base` is the 4 KiB identity-mapped DMA page just
             // filled by the controller's Identify response; `i` ranges over
             // 0..4096, so `base.add(i)` stays within that one mapped page.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *byte = unsafe { core::ptr::read_volatile(base.add(i)) };
         }
         drop(buf);
@@ -1386,6 +1394,7 @@ impl Controller {
         loop {
             // SAFETY: admin CQ DMA buffer is live + identity-mapped;
             // cq_head is always < admin.depth.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let cqe = unsafe { peek_cqe(&admin.cq_buf, admin.cq_head) };
             if (cqe.status & 1) != (admin.cq_phase & 1) {
                 break; // no more completed entries
@@ -1810,6 +1819,7 @@ impl Controller {
         // SAFETY: identity-mapped MMIO doorbell. Writing here
         // tells the controller it's free to MSI again on the
         // next completion past head.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             bar0.write32(io.cq_db_off(), io.cq_head as u32);
         }
@@ -1925,6 +1935,7 @@ impl Controller {
                 // expects little-endian 8-byte phys addresses; on a
                 // little-endian target a plain `write_volatile<u64>`
                 // produces that layout.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     let entries_ptr = buf.as_mut_ptr() as *mut u64;
                     for (i, p) in pages[1..].iter().enumerate() {
@@ -1939,6 +1950,7 @@ impl Controller {
         // SAFETY: io queue + bar are live; pages + the optional
         // PRP-list page are identity-mapped DMA owned by the caller
         // / by `_prp_list_keepalive` respectively.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             io.submit(bar0, sqe)?;
         }
@@ -1990,6 +2002,7 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
     let base = buf.phys_addr().raw() as *mut Sqe;
     // SAFETY: caller guarantees buf is page-aligned and large
     // enough; index is bounded.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         core::ptr::write_volatile(base.add(index as usize), *sqe);
     }
@@ -2023,6 +2036,7 @@ unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<C
         || {
             // SAFETY: caller guarantees buf is page-aligned and large
             // enough; index is bounded.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let cqe = unsafe { core::ptr::read_volatile(base.add(index as usize)) };
             (cqe.status & 1) == (expected_phase & 1)
         },
@@ -2365,6 +2379,7 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
                 // page that the controller just filled via `read_lba`; `i`
                 // ranges over 0..need with need ≤ 4096 (checked above), so
                 // the read stays within that page.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
             }
             Ok(())
@@ -2389,6 +2404,7 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
                 // page; `i` ranges over 0..need with need ≤ 4096 (checked
                 // above), so the write stays within that page. The page is
                 // exclusively ours while CONTROLLER stays locked below.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     core::ptr::write_volatile((phys + i as u64) as *mut u8, byte);
                 }

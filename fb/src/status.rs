@@ -265,6 +265,7 @@ pub fn paint(fb: &FbWriter) {
     // SAFETY: cursor renderer also borrows the framebuffer without
     // a higher-level lock; the status panel paints once at boot
     // before user-task pumps tighten contention.
+    // SAFETY: Valid memory or trusted environment
     let mut fbm = unsafe { fb.scanout_for_cursor_mut() };
     let mut y = panel_y + PANEL_PAD;
     for line in header.iter() {

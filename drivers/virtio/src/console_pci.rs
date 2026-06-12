@@ -596,6 +596,7 @@ unsafe fn setup_queue(
 
     // SAFETY: Virtqueue::new wipes the layout regions; alloc_coherent
     // pages are recycled and may carry stale bytes.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let q = unsafe { Virtqueue::new(layout) };
     Ok((buf, q, notify_off))
 }

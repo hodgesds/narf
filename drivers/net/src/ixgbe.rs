@@ -599,6 +599,7 @@ impl Ixgbe {
             // SAFETY: identity-mapped DMA buffer; `buf_phys` is the
             // descriptor-published frame address and `i < len <= RX_BUF_LEN`,
             // so the byte read stays within the device-owned buffer.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         let new_desc = RxDesc {
@@ -857,6 +858,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // BAR0 for init; we hold the bus `Cap<BusDeviceCap, Write>` and the
     // `CONTROLLER` guard above guarantees no other probe is racing this
     // device, so BAR0 is owned exclusively here.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { Ixgbe::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -867,6 +869,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // published yet (it is stored into `CONTROLLER` only below), so
         // this is the only `Arc` reference; no other thread can observe
         // the `Ixgbe`, making this exclusive `&mut` to its interior sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Ixgbe) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

@@ -18,15 +18,9 @@ use crate::{SpiBus, SpiError, SpiMode};
 
 const CDNS_SPI_CR: u64 = 0x00; // Configuration Register
 const CDNS_SPI_ISR: u64 = 0x04; // Interrupt Status Register
-const CDNS_SPI_IER: u64 = 0x08; // Interrupt Enable Register
-const CDNS_SPI_IDR: u64 = 0x0c; // Interrupt Disable Register
-const CDNS_SPI_IMR: u64 = 0x10; // Interrupt Enabled Mask
 const CDNS_SPI_ER: u64 = 0x14; // Enable/Disable Register
-const CDNS_SPI_DR: u64 = 0x18; // Delay Register
 const CDNS_SPI_TXD: u64 = 0x1C; // Data Transmit Register
 const CDNS_SPI_RXD: u64 = 0x20; // Data Receive Register
-const CDNS_SPI_SICR: u64 = 0x24; // Slave Idle Count Register
-const CDNS_SPI_THLD: u64 = 0x28; // Transmit FIFO Watermark
 
 const CDNS_SPI_CR_MANSTRT: u32 = 0x0001_0000;
 const CDNS_SPI_CR_CPHA: u32 = 0x0000_0004;
@@ -35,7 +29,6 @@ const CDNS_SPI_CR_SSCTRL: u32 = 0x0000_3C00;
 const CDNS_SPI_CR_MSTREN: u32 = 0x0000_0001;
 const CDNS_SPI_CR_MANSTRTEN: u32 = 0x0000_8000;
 const CDNS_SPI_CR_SSFORCE: u32 = 0x0000_4000;
-const CDNS_SPI_CR_BAUD_DIV: u32 = 0x0000_0038;
 
 const CDNS_SPI_ER_ENABLE: u32 = 0x0000_0001;
 const CDNS_SPI_ER_DISABLE: u32 = 0x0000_0000;
@@ -71,10 +64,12 @@ impl CadenceSpi {
     }
 
     fn read_u32(&self, off: u64) -> u32 {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
     fn write_u32(&self, off: u64, val: u32) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
     }
 

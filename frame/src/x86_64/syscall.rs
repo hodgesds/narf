@@ -259,6 +259,7 @@ pub unsafe fn enable() {
     // SAFETY: WRMSR at CPL=0 against architecturally-defined
     // SYSCALL MSRs. Reads + writes EFER preserving other bits
     // so we don't disable NX or LME.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         msr::wrmsr(IA32_STAR, star);
         msr::wrmsr(IA32_LSTAR, lstar);

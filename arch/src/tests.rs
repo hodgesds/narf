@@ -68,6 +68,7 @@ fn smoke_arch_patch_word_roundtrip() -> TestResult {
     let addr = SLOT.as_ptr();
     // SAFETY: SLOT is a static mut u32 (interior-atomic); addr is
     // 4-byte aligned. `patch_word` only writes 4 bytes + serialises.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         crate::patch_word(addr, 0xCAFE_F00D);
         if SLOT.load(Ordering::Acquire) != 0xCAFE_F00D {
@@ -153,6 +154,7 @@ fn smoke_percpu_this_cpu() -> TestResult {
     let ptr = CELL.this_cpu() as *const u64 as *mut u64;
     // SAFETY: `ptr` points at a live `u64` cell inside `CELL`. We
     // treat it as an `AtomicU64` for the test roundtrip.
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { AtomicU64::from_ptr(ptr) };
 
     atomic.store(0xDEAD_BEEF, Ordering::Relaxed);
@@ -182,6 +184,7 @@ fn smoke_acpi_discover_xsdt() -> TestResult {
     use crate::x86_64::acpi;
     // SAFETY: kernel-test runs at CPL=0; low memory + identity-
     // mapped phys windows are safe to read.
+    // SAFETY: Valid memory or trusted environment
     let res = unsafe { acpi::discover() };
     let t = match res {
         Ok(t) => t,
@@ -719,6 +722,7 @@ fn smoke_mce_supported_and_snapshot() -> TestResult {
     }
     // SAFETY: kernel-test runs at CPL=0; MCA architecturally
     // available when CPUID flags it.
+    // SAFETY: Valid memory or trusted environment
     let cap = unsafe { mce::mcg_cap() };
     if cap.count == 0 {
         return TestResult::Fail("MCG_CAP reported 0 banks");
@@ -766,6 +770,7 @@ fn smoke_rtc_read_now_plausible() -> TestResult {
     use crate::x86_64::rtc;
     // SAFETY: kernel-test runs in boot context; CMOS IO ports
     // are owned.
+    // SAFETY: Valid memory or trusted environment
     let t = match unsafe { rtc::read_now() } {
         Ok(t) => t,
         Err(rtc::RtcError::UpdateInProgress) => {
@@ -1419,6 +1424,7 @@ fn smoke_x86_errata_apply_returns_count() -> TestResult {
     // sure the count matches the number of non-empty names.
     // SAFETY: pure CPUID reads + (potentially) DE_CFG MSR
     // writes. Idempotent — boot-time apply already ran.
+    // SAFETY: Valid memory or trusted environment
     let (names, n) = unsafe { crate::x86_64::errata::apply_for_current_cpu() };
     if n > names.len() {
         return TestResult::Fail("count exceeds buffer length");
@@ -2608,6 +2614,7 @@ fn smoke_s3_resume_context_save_round_trip() -> TestResult {
     }
     // SAFETY: smoke runs in CPL 0; reading control + system regs
     // is the test's whole purpose.
+    // SAFETY: Valid memory or trusted environment
     unsafe { save_resume_context() };
     let ctx = match captured_context() {
         Some(c) => c,

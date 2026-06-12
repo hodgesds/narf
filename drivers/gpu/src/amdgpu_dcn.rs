@@ -846,6 +846,7 @@ pub unsafe fn execute_modeset(regs: &MmioRegion, seq: &[DcnWrite]) {
         // SAFETY: caller-asserted ownership of BAR5; MM_INDEX /
         // MM_DATA are the standard indexed-access pair documented
         // in the AMD GPU register reference.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             regs.write32(MM_INDEX, w.addr);
         }

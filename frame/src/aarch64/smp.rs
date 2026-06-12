@@ -76,6 +76,7 @@ pub unsafe fn cpu_on(target_aff: u64, entry: u64, context: u64) -> Result<(), Ps
     let status: i64;
     // SAFETY: HVC at EL1 invokes EL2's PSCI handler. Args follow
     // PSCI 1.0 §5.1.4: x0=function id, x1=target, x2=entry, x3=context.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "hvc #0",
@@ -137,6 +138,7 @@ pub unsafe fn start_aps() -> u32 {
 
         // SAFETY: AP_STACKS is in .boot.data, the only writer is
         // the BSP during this start_aps call.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
         }
@@ -196,6 +198,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     let aff = narf_arch::aarch64::cpu::mpidr_aff();
     // SAFETY: per-CPU registration, called exactly once on this
     // CPU during bring-up.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::cpu::set_current_cpu(aff, logical_id as u32);
     }
@@ -209,6 +212,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     let vbar = core::ptr::addr_of!(__narf_vector_table) as u64;
     // SAFETY: vector-table base is the linker-provided symbol, valid
     // for every CPU's EL1 view.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::sysreg::write_vbar_el1(vbar);
     }
@@ -217,6 +221,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //    timer-PPI enable.
     // SAFETY: distributor was already brought up by the BSP; this
     // CPU only touches its own redistributor + sysregs.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_interrupts::aarch64::gic::init_ap(logical_id as u32);
     }

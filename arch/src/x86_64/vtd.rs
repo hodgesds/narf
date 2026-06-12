@@ -515,6 +515,7 @@ pub unsafe fn read_gsts(reg_base: usize) -> u32 {
 pub unsafe fn write_gcmd(reg_base: usize, bits: u32) {
     // SAFETY: caller asserts `reg_base` is the engine's MMIO base; `w32`
     // writes the GCMD register at the in-range `VTD_GCMD` offset.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         w32(reg_base, VTD_GCMD, bits);
     }
@@ -529,6 +530,7 @@ pub unsafe fn write_gcmd(reg_base: usize, bits: u32) {
 pub unsafe fn write_rtaddr(reg_base: usize, paddr: u64) {
     // SAFETY: caller asserts `reg_base` is the engine's MMIO base; `w64`
     // writes the RTADDR register at the in-range `VTD_RTADDR` offset.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         w64(reg_base, VTD_RTADDR, paddr);
     }

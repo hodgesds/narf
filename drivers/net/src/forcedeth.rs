@@ -729,6 +729,7 @@ impl ForcedethNic {
         let phys = self.tx_pool[slot].phys_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked by
         // FrameTooLong guard.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
@@ -818,6 +819,7 @@ impl ForcedethNic {
                 // of this slot's RX_BUF_LEN-byte DMA buffer; `i < copy_len
                 // <= RX_BUF_LEN`, so `buf_phys + i` stays inside that
                 // buffer and is a valid, aligned `u8` address to read.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -962,6 +964,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // entry point for `device`/`cap`: nothing else has touched the BARs
     // yet, and we hold the `Write` capability `cap`, so the contract is
     // satisfied.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let nic = match unsafe { ForcedethNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -973,6 +976,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // later), so this is the unique `Arc` and forming a `&mut` to its
         // contents cannot alias. We only assign the two IPC-ring fields,
         // each guarded by its own lock.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&nic) as *mut ForcedethNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

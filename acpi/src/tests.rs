@@ -1891,6 +1891,7 @@ fn smoke_acpi_pmtt_synthetic_dimm_entry() -> TestResult {
 
     // SAFETY: pointers refer to live in-process buffers backed by
     // the heap; reads are bounded by the encoded lengths.
+    // SAFETY: Valid memory or trusted environment
     let n = match unsafe { crate::parse_pmtt(rsdp_phys) } {
         Ok(n) => n,
         Err(e) => {
@@ -2831,6 +2832,7 @@ fn smoke_acpi_arm_s3_waking_vector_requires_facs() -> TestResult {
     // returns Err(FacsNotParsed) before it ever reads or jumps to
     // the supplied phys, so the 0x1000_0000 entry value is never
     // dereferenced and need not point at live, long-mode code.
+    // SAFETY: Valid memory or trusted environment
     match unsafe { crate::arm_s3_waking_vector(0x1000_0000) } {
         Err(WakeVectorError::FacsNotParsed) => TestResult::Pass,
         _ => TestResult::Fail("FACS phys=0 must yield FacsNotParsed"),

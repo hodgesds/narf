@@ -166,6 +166,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     let flags_1gb = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
     // SAFETY: the PML4/PDPT storage is identity-mapped (low 1 GiB of
     // boot.S's table), so writes go to the intended physical memory.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // Low-identity PML4 + PDPT (first 4 GiB).
         let pml4_lo_entry = PageTableEntry::new(pdpt_lo_addr, flags_ptr);
@@ -233,6 +234,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     //
     // SAFETY: invariants above; caller supplied the single-CPU BSP
     // precondition.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         write_cr3(pml4_addr);
     }

@@ -288,6 +288,7 @@ fn shared_isr() {
         // only called from a method on an Arc-pinned controller
         // owned by the global registry; the registry's slot is
         // never dropped after boot.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ctrl = unsafe { &*(pv as *const AmdFchGpio) };
         ctrl.dispatch_irqs();
     }

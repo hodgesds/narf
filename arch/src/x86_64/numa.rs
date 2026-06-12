@@ -33,6 +33,7 @@ pub fn domain_for_apic_id(apic_id: u32) -> u8 {
     }
     // SAFETY: `p` was stored as a `Cb` function pointer via
     // `set_apic_to_domain`; the round-trip preserves provenance.
+    // SAFETY: Valid memory or trusted environment
     let cb: Cb = unsafe { core::mem::transmute(p) };
     cb(apic_id)
 }

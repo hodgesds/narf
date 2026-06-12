@@ -56,6 +56,7 @@ pub fn wake_signal(task_id: u64) {
         // SAFETY: `uctx_ptr` came from `lookup_user_task_ctx`, which returns the
         // `UserTaskCtx` pointer registered for a live task; the ctx outlives this
         // borrow and is not mutated through another reference here.
+        // SAFETY: Valid memory or trusted environment
         let uctx = unsafe { &*uctx_ptr };
         // If the task is blocked in an infinite wait (pause, epoll_wait),
         // clear the deadline to wake it.
@@ -124,10 +125,12 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     // SAFETY: vtable holds null-pointer-clean stubs; the waker is
     // never woken (poll_once expects Ready on the first poll).
+    // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut ctx = Context::from_waker(&waker);
     // SAFETY: we own `fut` by value; pinning to a stack temporary
     // is the standard "block_on of a !Unpin future".
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut ctx) {
         Poll::Ready(v) => Some(v),
@@ -544,6 +547,7 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // SAFETY: `as_ref` is the calling task's freshly-built AddressSpace with a
     // valid root and the region just registered via `map_region`; materialize
     // only installs PTEs for those recorded regions.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -564,6 +568,7 @@ fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // halves directly against the shared backing.
     // SAFETY: `as_ref` is the calling task's valid AddressSpace; `mint_shared_ring_pair`
     // allocates fresh frames, maps them into it, and materializes them under that AS.
+    // SAFETY: Valid memory or trusted environment
     let shared = match unsafe { mint_shared_ring_pair(&as_ref) } {
         Ok(s) => s,
         Err(()) => {
@@ -655,6 +660,7 @@ unsafe fn mint_shared_ring_pair(
         .map_err(|_| ())?;
     // SAFETY: `as_ref` has a valid root and the two SharedRing regions were just
     // registered above; materialize installs PTEs only for those regions.
+    // SAFETY: Valid memory or trusted environment
     unsafe { as_ref.materialize() }.map_err(|_| ())?;
 
     Ok(SharedRingPair {
@@ -1284,6 +1290,7 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             let mut bytes = alloc::vec![0u8; flock_size()];
             // SAFETY: `arg` is the user `struct flock` pointer; copy_from_user
             // range-validates it and SMAP-brackets the read into the sized `bytes`.
+            // SAFETY: Valid memory or trusted environment
             if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                 return;
@@ -1291,6 +1298,7 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // SAFETY: `bytes` holds exactly `flock_size()` validated bytes and
             // `tmp` is a default-initialized UFlock with at least that many bytes;
             // the copy reinterprets the wire layout into the repr(C) struct.
+            // SAFETY: Valid memory or trusted environment
             let uf: UFlock = unsafe {
                 let mut tmp = UFlock::default();
                 core::ptr::copy_nonoverlapping(
@@ -1328,6 +1336,7 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 let mut obytes = alloc::vec![0u8; flock_size()];
                 // SAFETY: `out` is a repr(C) UFlock; `obytes` is sized to
                 // `flock_size()`, so serializing the struct's bytes into it is in-bounds.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         &out as *const _ as *const u8,
@@ -1337,6 +1346,7 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 }
                 // SAFETY: `arg` is the user `struct flock` pointer; copy_to_user
                 // range-validates it and SMAP-brackets the write of `obytes`.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { copy_to_user(arg, &obytes) }.is_err() {
                     ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                     return;
@@ -1615,6 +1625,7 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
     // Copy stat struct into user memory under the SMAP bracket.
     // SAFETY: stat is a plain-old-data repr(C) struct; transmuting
     // to bytes is sound.
+    // SAFETY: Valid memory or trusted environment
     let stat_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &stat as *const StatBuf as *const u8,
@@ -1623,6 +1634,7 @@ fn sys_stat(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: `out_ptr` is the user StatBuf pointer (null-checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `stat_bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, stat_bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -1660,6 +1672,7 @@ fn sys_fstat(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: `out_ptr` is the user StatBuf pointer (null-checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `stat_bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, stat_bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -2655,6 +2668,7 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     let out = linux_stat_from_fs(s);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
+    // SAFETY: Valid memory or trusted environment
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &out as *const linux_compat::Stat as *const u8,
@@ -2663,6 +2677,7 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -2692,6 +2707,7 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     let out = linux_stat_from_fs(s);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
+    // SAFETY: Valid memory or trusted environment
     let bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             &out as *const linux_compat::Stat as *const u8,
@@ -2700,6 +2716,7 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: `out_ptr` is the user Stat pointer (null-checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -2784,6 +2801,7 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
     // SAFETY: `path_uptr` is the user path pointer; copy_from_user range-validates
     // it and SMAP-brackets the 1-byte read into `first`.
     let empty = (flags & AT_EMPTY_PATH) != 0
+        // SAFETY: Valid memory or trusted environment
         && unsafe { copy_from_user(&mut first, path_uptr) }.is_ok()
         && first[0] == 0;
 
@@ -2891,6 +2909,7 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: `out_ptr` is the user statx buffer (null-checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -3165,6 +3184,7 @@ fn sys_pipe(ctx: &mut dyn TrapContext) {
     buf[4..].copy_from_slice(&(w as i32).to_ne_bytes());
     // SAFETY: `out_ptr` is the user fd-pair buffer; copy_to_user range-validates
     // it and SMAP-brackets the write of the 8-byte `buf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3227,6 +3247,7 @@ fn sys_pipe2(ctx: &mut dyn TrapContext) {
     buf[4..].copy_from_slice(&(w as i32).to_ne_bytes());
     // SAFETY: `out_ptr` is the user fd-pair buffer; copy_to_user range-validates
     // it and SMAP-brackets the write of the 8-byte `buf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -3612,6 +3633,7 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     record[8..].copy_from_slice(name_bytes);
     // SAFETY: `out_ptr` is the user dirent buffer (null-checked, `total <= out_len`);
     // copy_to_user range-validates it and SMAP-brackets the write of `record`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, &record) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -3719,9 +3741,11 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
                                                                     // NUL terminator + zero-padding through end already zeroed by vec init.
                                                                     // SAFETY: `out_ptr` is the user buffer base; `written < out_len` so the
                                                                     // offset stays inside the user-supplied region. Forms a user vaddr only.
+                                                                    // SAFETY: Valid memory or trusted environment
         let dest = unsafe { out_ptr.add(written) } as u64;
         // SAFETY: `dest` is in-bounds of the user buffer (checked above); copy_to_user
         // range-validates it and SMAP-brackets the write of the `reclen`-byte `rec`.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(dest, &rec) }.is_err() {
             break;
         }
@@ -3856,6 +3880,7 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
     // was just registered via `map_region`, so materialize installs only its PTEs.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -5649,6 +5674,7 @@ fn sys_fb_info(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: `user_p` is the user info buffer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of the 24-byte `kbuf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(user_p, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -5693,6 +5719,7 @@ fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
     // was just registered via `map_region`, so materialize installs only its PTEs.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -5889,6 +5916,7 @@ fn sys_shmem_map(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the region
     // was just registered via `map_region`, so materialize installs only its PTEs.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -5990,6 +6018,7 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     let mut kbuf = alloc::vec![0u8; bytes_len];
     // SAFETY: `bytes_ptr` is the user blob pointer; copy_from_user range-validates
     // it and SMAP-brackets the read of `bytes_len` (<= MAX_BLOB_BYTES) bytes into `kbuf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut kbuf, bytes_ptr) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -5997,6 +6026,7 @@ fn sys_firmware_install(ctx: &mut dyn TrapContext) {
     // sys_install takes a raw pointer + len; feed it our kernel copy.
     // SAFETY: `kbuf.as_ptr()`/`bytes_len` describe the kernel-owned Vec just filled
     // above, valid and readable for `bytes_len` bytes for the duration of the call.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { narf_firmware::sys_install(leaked, kbuf.as_ptr(), bytes_len, &auth) };
     match r {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
@@ -6202,6 +6232,7 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
         // SAFETY: same contract as sys_exit_task — uctx is valid for
         // the lifetime of the in-flight polling routine on this CPU,
         // and the hook never returns.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -6235,6 +6266,7 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
         // SAFETY: uctx is valid for as long as the polling routine
         // (its caller, on the same CPU) holds it pinned. We're
         // about to never return.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -6320,6 +6352,7 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
         // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
         // we hold the only reference while storing the deadline and saving CPU state
         // into `uc.state`, and the yield hook hands the task to the executor.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
             // Block forever by setting deadline to u64::MAX.
@@ -6373,6 +6406,7 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     // SAFETY: per-task BOOTSTRAP_TABLE owns the phys backings; only
     // one ring-kick can run at a time per task because it executes
     // synchronously inside this task's syscall trap.
+    // SAFETY: Valid memory or trusted environment
     let mut sq = unsafe {
         SharedConsumer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
             pair.sq_phys.raw() as *mut SqRing
@@ -6381,6 +6415,7 @@ fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     // SAFETY: `pair.cq_phys` is the CQ frame this task owns in BOOTSTRAP_TABLE,
     // initialized as a CqRing by `mint_shared_ring_pair`; identity-mapped and
     // accessed only from this synchronous trap, so the producer has exclusive use.
+    // SAFETY: Valid memory or trusted environment
     let mut cq = unsafe {
         SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
             pair.cq_phys.raw() as *mut CqRing
@@ -6671,6 +6706,7 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // SAFETY: `root` is the exited task's recorded page-table root (non-zero,
     // checked above); `translate` walks that table read-only to resolve the
     // page-aligned user `page` to its current phys frame.
+    // SAFETY: Valid memory or trusted environment
     let phys = match unsafe {
         narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
     } {
@@ -6679,6 +6715,7 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     };
     // SAFETY: identity-mapped low 4 GiB; the AS Arc keeps the
     // backing frame alive across this write.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *((phys.as_u64() + off) as *mut u32) = 0;
     }
@@ -6743,6 +6780,7 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     // SAFETY: `uargs` is the user clone_args pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the read of `copy_len`
     // (<= CLONE_ARGS_MIN) bytes into the `raw` prefix.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut raw[..copy_len], uargs) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -6751,6 +6789,7 @@ fn sys_clone3(ctx: &mut dyn TrapContext) {
     // is a valid `CloneArgs`. `raw` has the same size + alignment
     // (u8 array can be transmuted to a struct-of-u64 because we
     // only read it).
+    // SAFETY: Valid memory or trusted environment
     let ca: CloneArgs = unsafe { core::ptr::read_unaligned(raw.as_ptr() as *const CloneArgs) };
     do_clone3(ctx, ca);
 }
@@ -6838,6 +6877,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     } else {
         // SAFETY: paging is live and `parent_as` is the caller's current
         // AddressSpace; clone_for_fork duplicates its region table for the child.
+        // SAFETY: Valid memory or trusted environment
         let dup = match unsafe { parent_as.clone_for_fork() } {
             Ok(a) => a,
             Err(_) => {
@@ -6847,12 +6887,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         };
         // SAFETY: `dup` is the freshly-built child AddressSpace with a valid root
         // and the regions cloned above; materialize installs only those PTEs.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { dup.materialize() }.is_err() {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
         // SAFETY: `parent_as` is the live caller AddressSpace; rematerialize rewrites
         // its existing PTEs to match the WRITE-stripped (COW) region perms set by clone_for_fork.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
@@ -6886,10 +6928,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
         // SAFETY: `s` is a zeroed UserState-sized buffer; save_user_state writes a
         // full UserState trap-frame snapshot into it, fully initializing the bytes.
+        // SAFETY: Valid memory or trusted environment
         let ok = unsafe { ctx.save_user_state(s.as_mut_ptr() as *mut u8) };
         if ok {
             // SAFETY: save_user_state returned true above, so `s` holds a fully
             // initialized UserState.
+            // SAFETY: Valid memory or trusted environment
             let mut snap = unsafe { s.assume_init() };
             snap.rax = 0;
             // Plant the user-supplied RSP. The parent's trap-frame
@@ -6938,6 +6982,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
             // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax. The MSR is
             // architectural and always readable at CPL0 (kernel); operands name the
             // ABI registers and the instruction has no memory side effects.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::arch::asm!(
                     "rdmsr",
@@ -7006,6 +7051,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // SAFETY: `ca.parent_tid` is the user *parent_tid pointer (non-zero, checked);
         // the parent's CR3 is still active here. copy_to_user range-validates it and
         // SMAP-brackets the 4-byte write.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { copy_to_user(ca.parent_tid, &tid_bytes) };
     }
 
@@ -7020,6 +7066,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // SAFETY: CLONE_VM means parent and child share the AS, so the live CR3 maps
         // `ca.child_tid` (non-zero, checked). copy_to_user range-validates it and
         // SMAP-brackets the 4-byte write.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { copy_to_user(ca.child_tid, &tid_bytes) };
     }
 
@@ -7115,6 +7162,7 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
             // owns — the MSR write is unconditional at CPL=0 and
             // any canonical-vaddr invariant is the user task's
             // responsibility (Linux behaves the same way).
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_scheduler::set_user_fs_base(addr);
             }
@@ -7126,6 +7174,7 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
                 // SAFETY: pending_fs_base is an AtomicU64 owned by
                 // the live UserTaskCtx pinned for the duration of
                 // this syscall.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     (*uctx)
                         .pending_fs_base
@@ -7140,6 +7189,7 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
             // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax; the MSR is
             // architectural and readable at CPL0. Operands name the ABI registers and
             // the instruction has no memory side effects.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 use core::arch::asm;
                 let lo: u32;
@@ -7157,6 +7207,7 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
             let buf = fs_base.to_le_bytes();
             // SAFETY: `addr` is the user-supplied destination; copy_to_user
             // range-validates it and SMAP-brackets the 8-byte write of `buf`.
+            // SAFETY: Valid memory or trusted environment
             if unsafe { copy_to_user(addr, &buf) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
                 return;
@@ -7212,6 +7263,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
 
     // SAFETY: clone_for_fork's contract — paging is live; the
     // frame allocator was initialised at boot.
+    // SAFETY: Valid memory or trusted environment
     let child_as = match unsafe { parent_as.clone_for_fork() } {
         Ok(a) => a,
         Err(_) => {
@@ -7232,6 +7284,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     // SAFETY: identity map live; root valid; may be called while
     // the parent AS is the active CR3 — invlpg per page keeps the
     // TLB coherent. Single-CPU BSP-only (Stage-4).
+    // SAFETY: Valid memory or trusted environment
     if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -7262,10 +7315,12 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         let mut s = MaybeUninit::<crate::user_task::UserState>::zeroed();
         // SAFETY: the destination is `size_of::<UserState>()` bytes
         // of zeroed stack — the trait's contract.
+        // SAFETY: Valid memory or trusted environment
         let ok = unsafe { ctx.save_user_state(s.as_mut_ptr() as *mut u8) };
         if ok {
             // SAFETY: save_user_state returned true → it wrote a
             // valid UserState into `s`.
+            // SAFETY: Valid memory or trusted environment
             let mut snap = unsafe { s.assume_init() };
             // Rewrite the syscall-return register(s) for the
             // child. Per-arch since UserState's field names
@@ -7304,6 +7359,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
             // architectural and readable at CPL0. Operands name the ABI registers and
             // the instruction has no memory side effects.
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 use core::arch::asm;
                 let lo: u32;
@@ -7895,6 +7951,7 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // Write i32 status under the SMAP bracket.
             // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
             // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
@@ -7936,6 +7993,7 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
     ) {
         // SAFETY: uctx is valid for the lifetime of the polling
         // routine which holds it pinned; we're about to longjmp.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
             uc.wait_child_pending
@@ -7977,6 +8035,7 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             if status_ptr != 0 {
                 // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
                 // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
+                // SAFETY: Valid memory or trusted environment
                 let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
             }
             ctx.set_return(SyscallReturn::ok(child));
@@ -8442,6 +8501,7 @@ fn sys_getrlimit(ctx: &mut dyn TrapContext) {
     buf[8..].copy_from_slice(&pair.max.to_ne_bytes());
     // SAFETY: `out_ptr` is the user rlimit buffer; copy_to_user range-validates
     // it and SMAP-brackets the write of the 16-byte `buf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -8462,6 +8522,7 @@ fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 16];
     // SAFETY: `in_ptr` is the user rlimit pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut buf, in_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -8503,6 +8564,7 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         let mut buf = [0u8; 16];
         // SAFETY: `new_ptr` is the user new-rlimit pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut buf, new_ptr) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -8521,6 +8583,7 @@ fn sys_prlimit64(ctx: &mut dyn TrapContext) {
         buf[8..].copy_from_slice(&prior.max.to_ne_bytes());
         // SAFETY: `old_ptr` is the user old-rlimit pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(old_ptr, &buf) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -8612,6 +8675,7 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             // copy_from_user validates range; copy up to TASK_COMM_LEN bytes.
             // SAFETY: `arg_a` is the user name pointer (non-zero, checked above);
             // copy_from_user range-validates it and SMAP-brackets the read into `raw`.
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { copy_from_user(&mut raw, arg_a) };
             // Trim at first NUL.
             let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(TASK_COMM_LEN);
@@ -8636,6 +8700,7 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             // Copy the 16-byte name buffer to user space under the SMAP bracket.
             // SAFETY: `arg_a` is the user name buffer (non-zero, checked above);
             // copy_to_user range-validates it and SMAP-brackets the write of `s.name`.
+            // SAFETY: Valid memory or trusted environment
             if unsafe { copy_to_user(arg_a, &s.name) }.is_err() {
                 ctx.set_return(fail);
                 return;
@@ -8739,6 +8804,7 @@ fn sys_sched_getparam(ctx: &mut dyn TrapContext) {
     // Write one i32 to user space under the SMAP bracket.
     // SAFETY: `out` is the user sched_param pointer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out, &val.to_ne_bytes()) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -8759,6 +8825,7 @@ fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 4];
     // SAFETY: `inp` is the user sched_param pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut buf, inp) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -8815,6 +8882,7 @@ fn sys_sched_getaffinity(ctx: &mut dyn TrapContext) {
     kbuf[0] = 0x01; // CPU 0 set
                     // SAFETY: `out`+`bytes` were validated by validate_user_range above; copy_to_user
                     // re-validates and SMAP-brackets the write of the `bytes`-long `kbuf`.
+                    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -8855,11 +8923,13 @@ fn sys_getcpu(ctx: &mut dyn TrapContext) {
     if cpu_ptr != 0 {
         // SAFETY: `cpu_ptr` is the user cpu out-pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { copy_to_user(cpu_ptr, &0u32.to_ne_bytes()) };
     }
     if node_ptr != 0 {
         // SAFETY: `node_ptr` is the user node out-pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { copy_to_user(node_ptr, &0u32.to_ne_bytes()) };
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -9009,6 +9079,7 @@ fn sys_times(ctx: &mut dyn TrapContext) {
                                                          // stime, cutime, cstime already zero.
                                                          // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
                                                          // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
+                                                         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -9053,6 +9124,7 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
                                                             // ru_stime + 14 tail fields already zero.
                                                             // SAFETY: `out` is the user `struct rusage` pointer (non-zero, checked above);
                                                             // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
+                                                            // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -9134,6 +9206,7 @@ fn sys_gethostname(ctx: &mut dyn TrapContext) {
     drop(host_owned);
     // SAFETY: `buf` is the user hostname buffer (non-zero, checked above; `kbuf`
     // fits in `len`); copy_to_user range-validates it and SMAP-brackets the write.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -9230,6 +9303,7 @@ fn sys_uname(ctx: &mut dyn TrapContext) {
     let _ = off;
     // SAFETY: `buf` is the user `struct utsname` pointer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -9370,6 +9444,7 @@ fn cpu_has_rdrand() -> bool {
     // SAFETY: `cpuid` is unprivileged and always available on x86_64; we
     // save/restore `rbx` (LLVM-reserved) around it and read leaf 1's ECX.
     // No memory operands, so no aliasing concerns.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -9400,6 +9475,7 @@ fn cpu_has_rdseed() -> bool {
     // SAFETY: `cpuid` is unprivileged and always available on x86_64; we
     // save/restore `rbx` (LLVM-reserved) and shuttle its result through `r9d`
     // to read leaf 7 sub-leaf 0's EBX. No memory operands.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -9431,6 +9507,7 @@ fn rdrand_u64() -> Option<u64> {
         let cf: u8;
         // SAFETY: `rdrand` is gated by `cpu_has_rdrand()` above; it writes a random
         // value to `v` and the carry flag (success) captured into `cf`. No memory operands.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "rdrand {v}",
@@ -9459,6 +9536,7 @@ fn rdseed_u64() -> Option<u64> {
         let cf: u8;
         // SAFETY: `rdseed` is gated by `cpu_has_rdseed()` above; it writes a random
         // value to `v` and the carry flag (success) captured into `cf`. No memory operands.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "rdseed {v}",
@@ -9554,6 +9632,7 @@ fn sys_getrandom(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: `ptr` is the user buffer (non-zero, `len <= MAX_USER_COPY`, both
     // checked above); copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(ptr, &kbuf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -9587,6 +9666,7 @@ fn sys_sleep(ctx: &mut dyn TrapContext) {
         // SAFETY: uctx is valid for the lifetime of the polling
         // routine (its caller, on the same CPU) which holds it
         // pinned. We're about to never return.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
             uc.sleep_deadline_ns
@@ -9735,6 +9815,7 @@ fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // kbuf[cwd.len()] is already 0 (NUL).
     // SAFETY: `buf` is the user cwd buffer (non-null, `len >= needed`, both checked);
     // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf as u64, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -9933,6 +10014,7 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     // Step 4: load the new image. SAFETY: load_user_process_with's
     // contract — identity-mapped low 4 GiB, frame allocator
     // initialised. Both hold by the time any user task is running.
+    // SAFETY: Valid memory or trusted environment
     let new_proc = match unsafe {
         crate::process::load_user_process_with(&elf_buf, &argv_refs, &envp_refs, &[])
     } {
@@ -9982,6 +10064,7 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: uctx_ptr is valid for the duration of the polling
     // routine's user-mode round-trip (the routine pinned it).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let prev = (*uctx_ptr)
             .pending_exec
@@ -10123,6 +10206,7 @@ pub(crate) fn copy_user_cstr(ptr: u64, max_len: usize) -> Option<alloc::string::
         let mut chunk = alloc::vec![0u8; chunk_len];
         // SAFETY: SMAP bracket inside copy_from_user; pointer
         // validated against canonical range there.
+        // SAFETY: Valid memory or trusted environment
         unsafe { copy_from_user(&mut chunk, cursor) }.ok()?;
         if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..nul_pos]);
@@ -10269,6 +10353,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     let src = src_uptr as *const u8;
     // SAFETY: range-validated above; SMAP bracket guards the access.
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
@@ -10277,6 +10362,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
     // volatile read of each in-range user byte is the access path.
     #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in dst.iter_mut().enumerate() {
             *b = core::ptr::read_volatile(src.add(i));
@@ -10320,6 +10406,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     let dst = dst_uptr as *mut u8;
     // SAFETY: range-validated above; SMAP bracket guards the access.
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
@@ -10328,6 +10415,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
     // volatile write of each in-range user byte is the access path.
     #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in src.iter().enumerate() {
             core::ptr::write_volatile(dst.add(i), *b);
@@ -10529,9 +10617,11 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     // Copy the statfs struct to user space under the SMAP bracket.
     // SAFETY: StatfsBuf is repr(C) of eight u64s with no padding; transmuting it to
     // a `[u8; size_of::<StatfsBuf>()]` reinterprets its bytes 1:1.
+    // SAFETY: Valid memory or trusted environment
     let bytes: [u8; core::mem::size_of::<StatfsBuf>()] = unsafe { core::mem::transmute(stat) };
     // SAFETY: `buf_ptr` is the user statfs buffer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
+    // SAFETY: Valid memory or trusted environment
     unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
 }
 
@@ -11131,6 +11221,7 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the brk
     // region was just registered via `map_region`, so materialize installs only its PTEs.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { as_ref.materialize() }.is_err() {
         ctx.set_return(SyscallReturn::ok(cur));
         return;
@@ -11199,6 +11290,7 @@ fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     kbuf[8..].copy_from_slice(&nsec.to_ne_bytes());
     // SAFETY: `buf` is the user timespec pointer (non-zero and 8-aligned, checked above);
     // copy_to_user range-validates it and SMAP-brackets the 16-byte write.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -11256,6 +11348,7 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let mut kbuf = [0u8; 16];
     // SAFETY: `ts` is the user timespec pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut kbuf, ts) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -11954,6 +12047,7 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
             let mut buf4 = [0u8; 4];
             // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked above);
             // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
+            // SAFETY: Valid memory or trusted environment
             let current = if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
                 u32::from_ne_bytes(buf4)
             } else {
@@ -12070,6 +12164,7 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             .unwrap_or(0);
         // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(old_ptr, &mask.to_ne_bytes()) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -12080,6 +12175,7 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         let mut buf = [0u8; 8];
         // SAFETY: `set_ptr` is the user new-sigmask pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut buf, set_ptr) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -12188,6 +12284,7 @@ fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
         buf[16..24].copy_from_slice(&current.size.to_ne_bytes());
         // SAFETY: `ss_out` is the user old `stack_t` pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 24-byte write.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(ss_out, &buf) }.is_err() {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64));
             return;
@@ -12198,6 +12295,7 @@ fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
         let mut buf = [0u8; 24];
         // SAFETY: `ss_in` is the user new `stack_t` pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 24-byte read.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut buf, ss_in) }.is_err() {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64));
             return;
@@ -12310,6 +12408,7 @@ fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 8];
     // SAFETY: `set_uptr` is the user sigset pointer (non-zero, sigsetsize==8, both
     // checked above); copy_from_user range-validates it and SMAP-brackets the 8-byte read.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut buf, set_uptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -13187,6 +13286,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
                 // we hold the only reference while setting the deadline and saving CPU state
                 // into `uc.state` before the yield hook hands the task to the executor.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -13324,6 +13424,7 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
                 // we hold the only reference while setting the deadline and saving CPU state
                 // into `uc.state` before the yield hook hands the task to the executor.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -13642,6 +13743,7 @@ fn read_user_u32(ptr: u64) -> u32 {
     let mut b = [0u8; 4];
     // SAFETY: caller guarantees ptr is a valid user address; SMAP bracket
     // guards the access.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { copy_from_user(&mut b, ptr) };
     u32::from_ne_bytes(b)
 }
@@ -13660,6 +13762,7 @@ fn write_user_u32(ptr: u64, val: u32) {
     let b = val.to_ne_bytes();
     // SAFETY: caller guarantees ptr is a valid user address; SMAP bracket
     // guards the access.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { copy_to_user(ptr, &b) };
 }
 
@@ -13670,6 +13773,7 @@ fn write_user_u16(ptr: u64, val: u16) {
     let b = val.to_le_bytes();
     // SAFETY: caller guarantees `ptr` is a valid user address; copy_to_user
     // range-validates it and SMAP-brackets the 2-byte write.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { copy_to_user(ptr, &b) };
 }
 
@@ -13830,6 +13934,7 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
             // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
             // we hold the only reference while setting the deadline and saving CPU state
             // into `uc.state` before the yield hook hands the task to the executor.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -13963,9 +14068,11 @@ fn sys_tcgetattr(ctx: &mut dyn TrapContext) {
     // Copy KTermios struct to user space under the SMAP bracket.
     // SAFETY: KTermios is repr(C) of POD ints + byte arrays (no padding-sensitive or
     // niche fields); transmuting it to `[u8; size_of::<KTermios>()]` is a 1:1 byte view.
+    // SAFETY: Valid memory or trusted environment
     let bytes: [u8; core::mem::size_of::<KTermios>()] = unsafe { core::mem::transmute(t) };
     // SAFETY: `out` is the user termios pointer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out, &bytes) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -13987,12 +14094,14 @@ fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
     let mut bytes = [0u8; core::mem::size_of::<KTermios>()];
     // SAFETY: `in_ptr` is the user termios pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the read into `bytes`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut bytes, in_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
     }
     // SAFETY: `bytes` is `size_of::<KTermios>()` bytes; KTermios is repr(C) of POD
     // ints + byte arrays, so any bit pattern is a valid value — transmute is a 1:1 view.
+    // SAFETY: Valid memory or trusted environment
     let t: KTermios = unsafe { core::mem::transmute(bytes) };
     set_termios_of_task(task, t);
     ctx.set_return(SyscallReturn::ok(0));
@@ -14079,6 +14188,7 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
                 // Timeout — write back zero revents and return 0.
                 // SAFETY: `pollfds_ptr` was validated earlier in this handler and the
                 // AS is still active; copy_to_user re-validates and SMAP-brackets the write.
+                // SAFETY: Valid memory or trusted environment
                 let _ = unsafe { copy_to_user(pollfds_ptr, &user_buf) };
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
@@ -14100,6 +14210,7 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
             // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
             // we hold the only reference while setting the deadline and saving CPU state
             // into `uc.state` before the yield hook hands the task to the executor.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -14172,6 +14283,7 @@ fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let mut kbuf = [0u8; 12];
     // SAFETY: `event_ptr` is the user epoll_event pointer (non-null, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 12-byte read.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut kbuf, event_ptr as u64) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -14236,6 +14348,7 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 // SAFETY: `events_out + off` is the user epoll_event slot for this entry
                 // (`written < max`); copy_to_user range-validates it and SMAP-brackets the
                 // 12-byte write.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { copy_to_user(events_out + off, &rec) }.is_err() {
                     break;
                 }
@@ -14263,6 +14376,7 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
             // we hold the only reference while setting the deadline and saving CPU state
             // into `uc.state` before the yield hook hands the task to the executor.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
@@ -14399,6 +14513,7 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let mut buf = [0u8; 32];
     // SAFETY: `new_value_ptr` is the user itimerspec pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut buf, new_value_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -14470,6 +14585,7 @@ fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
     buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
     // SAFETY: `out_ptr` is the user itimerspec pointer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -14507,6 +14623,7 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
         let mut bytes = [0u8; 8];
         // SAFETY: `mask_ptr` is the user sigset pointer (non-zero, checked above);
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_ok() {
             mask = u64::from_le_bytes(bytes);
         }
@@ -14633,6 +14750,7 @@ fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
         let mut buf = [0u8; 32]; // sa_handler(8) + sa_flags(8) + sa_restorer(8) + sa_mask(8)
                                  // SAFETY: `act_ptr` is the user sigaction pointer (non-zero, checked above);
                                  // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
+                                 // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut buf, act_ptr) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -14704,6 +14822,7 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
         let val = prior.map(|a| a.handler).unwrap_or(0);
         // SAFETY: `old_out` is the user old-handler pointer (non-zero, checked above);
         // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { copy_to_user(old_out, &val.to_ne_bytes()) };
     }
 

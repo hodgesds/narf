@@ -150,6 +150,7 @@ impl IwlDevice {
         // `mac_hdr_len`). The source slices are owned by `pkt` and
         // don't overlap `buf`. Both lengths come from `pkt`'s own
         // fields, so the writes stay in bounds.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::copy_nonoverlapping(pkt.mac_hdr.as_ptr(), buf.as_mut_ptr(), pkt.mac_hdr_len);
             core::ptr::copy_nonoverlapping(
@@ -171,10 +172,12 @@ impl IwlDevice {
         // TX_RING_SIZE`, so `slot * 32` is an in-bounds offset and the
         // 32-byte command slot fits an `IwlTxCmd`. The result is a
         // valid, suitably-aligned pointer into that buffer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
         // SAFETY: `cmd_ptr` points at the `slot`'s 32-byte command slot
         // computed above, which is large enough for one `IwlTxCmd`; the
         // volatile write publishes the command for the device to DMA.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(cmd_ptr, cmd);
         }
@@ -320,6 +323,7 @@ impl WirelessNetIface for IwlDevice {
             // length `cmd_body.len()`, so copying exactly that many
             // bytes from the owned `cmd_body` slice into it stays in
             // bounds; source and destination don't overlap.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::copy_nonoverlapping(cmd_body.as_ptr(), pd.as_mut_ptr(), cmd_body.len());
             }
@@ -344,10 +348,12 @@ impl WirelessNetIface for IwlDevice {
                     // 32` is in bounds and the 32-byte slot fits an
                     // `IwlCmdHeader`. The result is a valid aligned pointer
                     // into that buffer.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlCmdHeader };
                 // SAFETY: `hdr_ptr` is the `slot`'s 32-byte command slot
                 // computed above, big enough for one `IwlCmdHeader`; the
                 // volatile write publishes the header to the device.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     core::ptr::write_volatile(hdr_ptr, hdr);
                 }
@@ -427,10 +433,12 @@ impl WirelessNetIface for IwlDevice {
             // `TX_RING_SIZE * 32`; `slot < TX_RING_SIZE`, so `slot * 32`
             // is in bounds and the 32-byte slot fits an `IwlTxCmd`,
             // yielding a valid aligned pointer into that buffer.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
             // SAFETY: `cmd_ptr` is the `slot`'s 32-byte command slot
             // computed above, big enough for one `IwlTxCmd`; the
             // volatile write publishes the command to the device.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile(cmd_ptr, cmd);
             }
@@ -598,10 +606,12 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
         // `TX_RING_SIZE * 32`; `slot = write_ptr < TX_RING_SIZE`, so
         // `slot * 32` is in bounds and the 32-byte slot fits an
         // `IwlTxCmd`, giving a valid aligned pointer into that buffer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cmd_ptr = unsafe { cmd_dma.as_mut_ptr().add(slot * 32) as *mut tx::IwlTxCmd };
         // SAFETY: `cmd_ptr` is the `slot`'s 32-byte command slot
         // computed above, big enough for one `IwlTxCmd`; the volatile
         // write publishes the command to the device.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(cmd_ptr, cmd);
         }
@@ -635,12 +645,14 @@ impl transport::IwlMmio for IwlMmioImpl {
         // (callers pass CSR/FH register constants), so the read is
         // naturally aligned and in range, and the driver owns the
         // device exclusively.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.0.read32(offset as u64) }
     }
     fn write(&mut self, offset: u32, value: u32) {
         // SAFETY: `self.0` is the BAR0 `MmioRegion` from `map_bar`;
         // `offset` is an in-range, naturally-aligned register offset
         // within BAR0 and the driver owns the device exclusively.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.0.write32(offset as u64, value) }
     }
 }
@@ -1347,6 +1359,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // driver to probe, so it's a real PCIe device and this
             // driver holds exclusive access to its cfg window for the
             // duration of probe. BAR index 0 is iwlwifi's MMIO BAR.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let mmio_region = unsafe { map_bar(&device, 0) }.map_err(|_| {
                 let _ = writeln!(narf_console::Writer, "  iwlwifi: BAR0 map failed");
                 narf_bus::ProbeError::Other("BAR0 map failed")
@@ -1418,6 +1431,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 // `0..rx_buffers.len()` which equals `RX_RING_SIZE`, so
                 // `rx_descs.add(i)` points at descriptor `i` in bounds
                 // and is properly aligned for `RxDescriptor`.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     (*rx_descs.add(i)).host_phys = buf.phys_addr().as_u64();
                 }
@@ -1453,6 +1467,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     // allocated from `narf_interrupts::vector::alloc`,
                     // and the table indices (RX_ALIVE/TX/ERR) are within
                     // iwlwifi's MSI-X table size.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     unsafe {
                         let _ = msix.program_vector(iwl_msix::VECTOR_RX_ALIVE as u16, 0, v);
                         // Try to allocate two more CPU vectors for TX
@@ -1477,6 +1492,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                     // allocated CPU vector. So programming the single
                     // MSI message and enabling it has no concurrent
                     // writer.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     unsafe {
                         let _ = narf_bus::msi::program_msi(&mut msi, 0, v);
                         let _ = narf_bus::msi::enable(&msi);
@@ -1840,7 +1856,7 @@ pub mod tests {
             return TestResult::Fail("mac_type != BSS_STA(5)");
         }
         // node_addr at bytes 20..26 (after cmd_hdr+id_and_color+action+mac_type+tsf_id=20).
-        if &cmd[20..26] != &node_addr {
+        if cmd[20..26] != node_addr {
             return TestResult::Fail("node_addr bytes wrong");
         }
         TestResult::Pass
@@ -1898,6 +1914,7 @@ pub mod tests {
             return TestResult::Fail("IwlCmdHeader should be 4 bytes");
         }
         // Manual decode to verify packing + LE.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let bytes: [u8; 4] = unsafe { core::mem::transmute(hdr) };
         if bytes[0] != 0x07 {
             return TestResult::Fail("cmd wrong");

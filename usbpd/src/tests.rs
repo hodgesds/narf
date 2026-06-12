@@ -488,7 +488,7 @@ fn smoke_dp_alt_mode_discovery_full_walk() -> TestResult {
     }
 
     // SVIDs ACK — header + a VDO listing DisplayPort SVID in the high half.
-    let svid_pack = ((SVID_DISPLAYPORT as u32) << 16);
+    let svid_pack = (SVID_DISPLAYPORT as u32) << 16;
     let svids_ack = alloc::vec![
         VdmHeader::structured(SVID_PD, VdmCommand::DiscoverSvids, CommandType::Ack).encode(),
         svid_pack,

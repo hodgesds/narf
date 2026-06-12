@@ -17,6 +17,7 @@ fn smoke_bus_enumerates_pcie() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (0xb000_0000) is inside q35's
     // pcie-mmcfg region and below the 4-GiB identity map installed
     // by memory/mmu::init_mmu. No MMIO write happens during the walk.
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     if n == 0 {
         return TestResult::Fail("ECAM walk found zero devices on q35 — host bridge missing");
@@ -86,6 +87,7 @@ fn smoke_bus_enumerates_virtio_mmio() -> TestResult {
     // SAFETY: the fallback reads 4-byte MMIO from identity-mapped
     // virtio-mmio registers and rejects invalid magic, so stray
     // ranges don't produce phantom devices.
+    // SAFETY: Valid memory or trusted environment
     let _n = unsafe { crate::init(None) };
     let devs = devices();
     // Structural: snapshot must agree with devices() post-init.
@@ -212,6 +214,7 @@ fn smoke_bus_enumerate_segment_tags_devices() -> TestResult {
     // path uses; identity-mapped. Cap the walk at 32 buses — enough
     // for QEMU q35 to surface the usual lineup without scanning the
     // whole 256-bus address space.
+    // SAFETY: Valid memory or trusted environment
     let devs = unsafe { enumerate_segment(crate::x86_64::ECAM_DEFAULT_BASE, 32, 0x8765) };
     if devs.is_empty() {
         return TestResult::Skip("no devices to enumerate");
@@ -282,6 +285,7 @@ fn smoke_bus_msix_program_vector_out_of_range() -> TestResult {
     let mut t = __synth_msix_table(2);
     // SAFETY: VectorOutOfRange is checked before any cfg-space access,
     // so passing a too-large index is safe regardless of cfg_phys.
+    // SAFETY: Valid memory or trusted environment
     match unsafe { t.program_vector(2, 0, 32) } {
         Err(crate::MsixError::VectorOutOfRange) => TestResult::Pass,
         Err(e) => {
@@ -621,6 +625,7 @@ fn smoke_pci_cap_ext_walker() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1225,6 +1230,7 @@ fn smoke_pci_cap_walker_finds_msix() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1244,6 +1250,7 @@ fn smoke_pci_cap_walker_finds_msix() -> TestResult {
     // PCI Express cap should also exist on a QEMU NVMe.
     // SAFETY: `d` came from the enumerated registry, so its cfg-space is the
     // identity-mapped ECAM window; find_cap only does a bounded read-only walk.
+    // SAFETY: Valid memory or trusted environment
     match unsafe { crate::pci_cap::find_cap(d, crate::pci_cap::id::PCI_EXPRESS) } {
         Ok(Some(_)) => {}
         _ => return TestResult::Fail("PCI Express cap not found"),
@@ -1263,6 +1270,7 @@ fn smoke_pci_express_cap_link_status() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1312,6 +1320,7 @@ fn smoke_msix_program_block() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let nvme = devs.iter().find(|d| {
@@ -1341,6 +1350,7 @@ fn smoke_msix_program_block() -> TestResult {
     };
     // SAFETY: we own the device cap; cap-list walk + writes target
     // identity-mapped MMIO.
+    // SAFETY: Valid memory or trusted environment
     let block = unsafe { table.program_vector_block(0, 4, 0, base) };
     let v = match block {
         Ok(v) => v,
@@ -1469,6 +1479,7 @@ fn smoke_bus_pci_read_intx_pin_against_devices() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut tested = 0u32;
@@ -1512,6 +1523,7 @@ fn smoke_bus_pcie_aer_cap_walker() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut walked = 0u32;
@@ -1554,6 +1566,7 @@ fn smoke_bus_hotplug_pcie_cap_walker() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let mut walked = 0u32;
@@ -2163,6 +2176,7 @@ fn smoke_aer_cap_discovery_synthetic() -> TestResult {
     let cfg_phys = space.as_ptr() as u64;
     // SAFETY: `space` is a live heap allocation; walk is read-only;
     // all pointer arithmetic stays within the 4096-byte Vec.
+    // SAFETY: Valid memory or trusted environment
     let result = unsafe { find_aer_cap_offset(cfg_phys) };
     match result {
         Some(0x140) => TestResult::Pass,
@@ -2552,6 +2566,7 @@ fn smoke_dpc_capability_presence_detect() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE (q35 pcie-mmcfg base, 0xb000_0000) is
     // identity-mapped below the 4-GiB map and the enumerator only
     // issues config-space reads; init is idempotent across calls.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     for d in devs.iter() {

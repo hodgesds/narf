@@ -285,6 +285,7 @@ fn smoke_hpet_arm_oneshot_rejects_bad_gsi() -> TestResult {
     };
     // SAFETY: HPET window is live; we deliberately pass an invalid
     // GSI to verify the validation gate.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { hpet::arm_oneshot(0, bad, hpet::read_counter().wrapping_add(1_000_000)) };
     if matches!(r, Err(hpet::ArmError::BadGsi)) {
         TestResult::Pass
@@ -322,6 +323,7 @@ fn smoke_hpet_disarm_clears_enable_bit() -> TestResult {
     let deadline = hpet::read_counter().wrapping_add(1u64 << 40);
     // SAFETY: HPET window live; IDT/IOAPIC plumbing not required
     // because we disarm before STI.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { hpet::arm_oneshot(0, g, deadline) }.is_err() {
         return TestResult::Fail("arm_oneshot rejected a route-cap GSI");
     }

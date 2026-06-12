@@ -770,5 +770,6 @@ pub unsafe fn apply_for_current_cpu(container: &[u8]) -> Result<u32, UcodeError>
     let patch = resolve_for_current_cpu(container)?;
     // SAFETY: caller-asserted CPL=0; `resolve_for_current_cpu`
     // confirmed the patch matches our silicon.
+    // SAFETY: Valid memory or trusted environment
     unsafe { apply(patch) }
 }

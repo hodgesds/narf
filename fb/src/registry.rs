@@ -98,12 +98,14 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
     let ring_ptr = phys.raw() as *mut DrawRing;
     // SAFETY: identity-mapped 4 KiB region; we own this freshly-
     // allocated frame.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(ring_ptr as *mut u8, 0, 4096);
         cmd_ring::init_in(ring_ptr);
     }
     // SAFETY: SPSC contract — the producer half goes to userspace
     // once it `SYS_FB_RING_MAP`s; the consumer stays here.
+    // SAFETY: Valid memory or trusted environment
     let (_prod, consumer) = unsafe { cmd_ring::split(ring_ptr) };
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);

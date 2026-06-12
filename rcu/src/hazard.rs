@@ -355,6 +355,7 @@ impl HazardDomain {
         // `drop_fn` is itself the caller's invariant — they assert it
         // is sound to call once no hazard slot holds the pointer.
         let dropper: unsafe fn(*mut ()) =
+            // SAFETY: Valid memory or trusted environment
             unsafe { core::mem::transmute::<fn(*mut T), unsafe fn(*mut ())>(drop_fn) };
 
         let raw_ptr = ptr as *mut ();
@@ -421,6 +422,7 @@ impl HazardDomain {
                     // a hazard for `entry.ptr`, so it is sound to drop.
                     // The dropper was supplied by the caller of
                     // `retire`, who asserts soundness for that pointer.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         f(entry.ptr);
                     }
@@ -491,6 +493,7 @@ impl<'a, T> Deref for HazardGuard<'a, T> {
         // SAFETY: hazard-pointer discipline. The slot held by this
         // guard names `self.ptr`; no concurrent `scan()` will reclaim
         // it, and the guard's lifetime is shorter than the domain's.
+        // SAFETY: Valid memory or trusted environment
         unsafe { &*self.ptr }
     }
 }

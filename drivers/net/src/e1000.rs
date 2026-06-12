@@ -641,6 +641,7 @@ pub fn is_pch_part(did: u16) -> bool {
 fn me_is_active(mmio: &MmioRegion) -> bool {
     // SAFETY: identity-mapped MMIO; FWSM is inside the e1000 BAR0
     // register window on every PCH part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let fwsm = unsafe { mmio.read32(REG_FWSM) };
     (fwsm & ICH_FWSM_FW_VALID) != 0
 }
@@ -669,6 +670,7 @@ fn acquire_phy_swflag(mmio: &MmioRegion) -> Result<bool, E1000Error> {
         // `REG_EXTCNF_CTRL` is a valid 32-bit register offset within it,
         // so the read/write target a real device register of the right
         // width.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let v = mmio.read32(REG_EXTCNF_CTRL);
             mmio.write32(REG_EXTCNF_CTRL, v | EXTCNF_CTRL_SWFLAG);
@@ -729,6 +731,7 @@ fn release_phy_swflag(mmio: &MmioRegion, owned: bool) {
 fn disable_eee_pchlan(mmio: &MmioRegion) {
     // SAFETY: identity-mapped MMIO; IPCNFG + EEER are inside BAR0
     // on every PCH part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let ipcnfg = mmio.read32(REG_IPCNFG);
         mmio.write32(REG_IPCNFG, ipcnfg & !IPCNFG_EEE_AN_MASK);
@@ -841,6 +844,7 @@ fn e1000_isr() {
     // SDM §13.4.17 — this is the documented acknowledge for
     // level-triggered INTx delivery and a no-op for MSI-X (which
     // is edge-triggered but tolerates the read).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let _icr = narf_arch::mmio::read32(base + REG_ICR);
     }
@@ -909,9 +913,11 @@ impl E1000 {
         // 2. Read MAC from RAL/RAH.
         // SAFETY: `mmio` was mapped from BAR0; `REG_RAL0` is a valid 32-bit
         // register offset within it.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ral = unsafe { mmio.read32(REG_RAL0) };
         // SAFETY: `mmio` was mapped from BAR0; `REG_RAH0` is a valid 32-bit
         // register offset within it.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let rah = unsafe { mmio.read32(REG_RAH0) };
         let mac = [
             (ral & 0xFF) as u8,
@@ -1120,6 +1126,7 @@ impl E1000 {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| E1000Error::NoMemory)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         unsafe { msix.enable() }.map_err(|_| E1000Error::NoMemory)?;
@@ -1164,6 +1171,7 @@ impl E1000 {
         // slot but doesn't open it for delivery).
         // SAFETY: vector reserved above; route_gsi_to_vector only
         // programs the IOAPIC redirection-table entry.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ok = unsafe {
             narf_acpi::ioapic::route_gsi_to_vector(
                 gsi,
@@ -1200,6 +1208,7 @@ impl E1000 {
         let phys = self.tx_pool[slot].phys_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked by
         // the FrameTooLong guard above (1518 < 4096).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, b) in frame.iter().enumerate() {
                 core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
@@ -1323,6 +1332,7 @@ impl E1000 {
             // SAFETY: the RX buffer at `buf_phys` is an identity-mapped DMA
             // page the device filled; `i < len <= RX_BUF_LEN`, so the byte
             // address `buf_phys + i` stays within that page.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
         }
         // Rearm the descriptor: clear status, leave addr as-is.

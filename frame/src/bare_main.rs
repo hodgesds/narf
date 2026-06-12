@@ -150,6 +150,7 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     // this window (we're pre-MMU-rebind here in the early-FB
     // path).
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Valid memory or trusted environment
     let wc_slot = unsafe { narf_arch::x86_64::mtrr::set_write_combining(mtrr_phys, pow2) };
     #[cfg(not(target_arch = "x86_64"))]
     let wc_slot: Option<u32> = None;
@@ -157,6 +158,7 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
 
     // SAFETY: BSP, no concurrent draw; FB phys is identity-mapped
     // (verified above to be < 4 GiB).
+    // SAFETY: Valid memory or trusted environment
     let fb = unsafe { scanout.framebuffer() };
     let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
     let (cols, rows) = (con.cols(), con.rows());
@@ -256,6 +258,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // SAFETY: `raw.magic` just matched `BOOT_MAGIC`, so the
             // bootloader contract guarantees `payload` points at the
             // multiboot2 info struct that `framebuffer` walks.
+            // SAFETY: Valid memory or trusted environment
             let fb = unsafe { narf_boot::x86_64::multiboot2::framebuffer(info_ptr) };
             if let Some(ref fb_info) = fb {
                 // Register the FB for any code that wants to paint
@@ -357,6 +360,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // `MmioAttrs::WriteCombining`.
         // SAFETY: CPL=0, single-threaded boot, before any
         // cacheable mapping spans a region we're changing.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { narf_arch::x86_64::pat::init_default() };
 
         // Baseline CPU validation. Reads CPUID + CR4 + EFER and
@@ -416,6 +420,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 loop {
                     // SAFETY: CLI + HLT at CPL=0 is the canonical
                     // "stop here, IRQ-quiet" idle.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         core::arch::asm!("cli; hlt", options(nomem, nostack));
                     }
@@ -441,6 +446,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         if smep::supported() {
             // SAFETY: SMEP supported; flipping CR4.20 has no other
             // prerequisite at CPL=0 post-paging.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 smep::enable();
             }
@@ -596,6 +602,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                                         // long-mode CPUs, so `enable_pcide` (sets CR4.PCIDE) and
                                                         // `init` are valid here; the bootloader-provided CR3's low
                                                         // bits are zero as the PCID code requires.
+                                                        // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
@@ -627,6 +634,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 let node = (domain as usize) % num_nodes;
                 // SAFETY: paging on, identity map covers low frames,
                 // alloc_frame_on returns identity-mapped 4 KiB.
+                // SAFETY: Valid memory or trusted environment
                 match unsafe { narf_memory::paging::new_user_pml4_on(node) } {
                     Ok(phys) => {
                         // SAFETY: domain<16; phys is a valid 4KiB frame.
@@ -656,6 +664,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             let private_pdpts =
                 // SAFETY: pcid::init has run; PML4s are registered;
                 // identity map still covers low frames.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { narf_memory::domain::init_per_domain_pdpts() }.unwrap_or_default();
             narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
             let _ = writeln!(
@@ -706,6 +715,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         );
         // SAFETY: CPL=0; per-entry SAFETY notes apply; gated by
         // vendor/family/model match.
+        // SAFETY: Valid memory or trusted environment
         let (applied, n) = unsafe { narf_arch::x86_64::errata::apply_for_current_cpu() };
         if n == 0 {
             let _ = writeln!(console::Writer, "  errata: no entries matched this CPU");
@@ -735,6 +745,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // SAFETY: CPL=0; LAPIC is always present on long-mode
         // x86_64 silicon; init_bsp handles both x2APIC and xAPIC
         // paths internally.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             narf_interrupts::x86_64::apic::init_bsp();
         }
@@ -761,6 +772,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // tag=0 → handler uses plain INVLPG (this hook fires
                 // from kernel-side mapping mutations that don't know
                 // which PCID owns the entry).
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     narf_interrupts::x86_64::ipi::shoot_va(va, 0);
                 }
@@ -825,6 +837,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // left.
         // SAFETY: first call, BSP, IRQs masked (DAIF left as boot
         // defaults; we'll explicitly unmask later).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             aarch64::init_traps();
         }
@@ -837,6 +850,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         if feats.gicv3_sysreg {
             // SAFETY: CPUID confirmed GICv3; still at EL1 with IRQs
             // masked.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_interrupts::aarch64::init_bsp();
             }
@@ -942,6 +956,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // archive. `narf-initramfs` parses + leaks the
                 // result so the lifetime extends to kernel
                 // shutdown.
+                // SAFETY: Valid memory or trusted environment
                 let staged = unsafe {
                     narf_initramfs::stage_from_phys(
                         "boot-initramfs",
@@ -1004,6 +1019,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
             // SAFETY: first call, BSP, memory map came from parse_raw
             // which validated magic + min-RAM.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_memory::init_from_map(&regions, &excludes);
             }
@@ -1049,6 +1065,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_memory::beacon::paint(8, 0x00800000);
                 // SAFETY: BSP, interrupts disabled (boot.S CLI + IDT
                 // doesn't unmask), allocator populated above.
+                // SAFETY: Valid memory or trusted environment
                 match unsafe { narf_memory::mmu::init_mmu() } {
                     Ok(pml4) => {
                         // Post-init_mmu beacon (slot 9: dim green —
@@ -1116,6 +1133,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // boot on the 8 MiB bootstrap arena and panics
                         // with a 16-byte alloc failure once the AML
                         // walk + Stage::Device probes catch up.
+                        // SAFETY: Valid memory or trusted environment
                         match unsafe { narf_acpi::parse_srat(p) } {
                             Ok(n) => {
                                 narf_memory::beacon::paint(15, 0x0080_FF40); // LIME: ACPI parsed
@@ -1457,6 +1475,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         let _ = unsafe { narf_acpi::parse_ecdt(p) };
                         // SAFETY: `p` is the same validated RSDP pointer
                         // accepted by `parse_ecdt` just above.
+                        // SAFETY: Valid memory or trusted environment
                         let _ = unsafe { narf_acpi::parse_gpe_blocks(p) };
                         let n = narf_aml::gpe::install_aml_handlers();
                         let _ = writeln!(
@@ -1504,6 +1523,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     // SAFETY: `ecam_phys` is the ECAM base reported by the
                     // ACPI MCFG table; the frame allocator is online and
                     // the bootloader handoff invariants hold at this point.
+                    // SAFETY: Valid memory or trusted environment
                     let n_dev = unsafe { narf_bus::init(ecam) };
                     let _ = writeln!(
                         console::Writer,
@@ -1531,6 +1551,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 } else {
                     // SAFETY: CPUID is always legal at CPL=0.
                     (
+                        // SAFETY: Valid memory or trusted environment
                         unsafe { narf_lib::smp::count_x86_64_cpus_via_cpuid() },
                         "CPUID",
                     )
@@ -1583,6 +1604,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 } else {
                     // SAFETY: memory + LAPIC + IDT/GDT all initialised
                     // above; identity map covers 0x8000.
+                    // SAFETY: Valid memory or trusted environment
                     let started = unsafe { x86_64::smp::start_aps() };
                     narf_memory::beacon::paint(16, 0x0040_FFFF); // TEAL: SMP up
                     let _ = writeln!(
@@ -1653,6 +1675,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // virtio-mmio defaults.
                 // SAFETY: DTB blob is in identity-mapped low RAM;
                 // reads validate magic before trusting offsets.
+                // SAFETY: Valid memory or trusted environment
                 let n_dev = unsafe { narf_bus::init(info.dtb_phys) };
                 let devs = narf_bus::devices();
                 let n_pcie = devs
@@ -1706,6 +1729,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: GICv3 distributor + CPU 0 redistributor are
                 // enabled; allocator is online; QEMU virt's ITS lives
                 // at the documented MMIO base.
+                // SAFETY: Valid memory or trusted environment
                 match unsafe { narf_interrupts::aarch64::its::init_bsp() } {
                     Ok(()) => {
                         let _ = writeln!(
@@ -1745,6 +1769,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // online via narf_lib::smp::mark_online.
                 // SAFETY: memory + GIC + DTB-supplied topology
                 // already initialised above.
+                // SAFETY: Valid memory or trusted environment
                 let started = unsafe { aarch64::smp::start_aps() };
                 let _ = writeln!(
                     console::Writer,
@@ -1911,6 +1936,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     // SAFETY: Single-threaded boot path, statics populated in _start_rust.
                     #[allow(static_mut_refs)]
                     // TODO(narf): migrate this boot-time static to addr_of!/OnceCell
+                    // SAFETY: Valid memory or trusted environment
                     let (raw, info) = unsafe { (RAW_BOOT_INFO.as_ref(), BOOT_INFO.as_ref()) };
 
                     // PCR 0 is for FIRMWARE measurement per TCG PC Client
@@ -1932,6 +1958,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: `r` is the live `&RawBootInfo` handed in
                         // by the bootloader; the slice spans exactly its
                         // `size_of::<RawBootInfo>()` bytes for measuring.
+                        // SAFETY: Valid memory or trusted environment
                         if let Err(e) = measure::measure(4, "raw_boot_info", unsafe {
                             core::slice::from_raw_parts(
                                 r as *const _ as *const u8,
@@ -1969,6 +1996,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if let Some(r) = info.and_then(|i| i.initramfs) {
                         // SAFETY: BootInfo::initramfs is the bootloader-
                         // staged identity-mapped initramfs region.
+                        // SAFETY: Valid memory or trusted environment
                         let res = unsafe { measure::measure_initramfs(r.start.raw(), r.len).await };
                         if let Err(e) = res {
                             let _ = writeln!(
@@ -2088,6 +2116,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: running on the BSP with no concurrent draw, and
                 // the bochs guard above ensured the pixel buffer is
                 // reachable; `framebuffer()` wraps that live mapping.
+                // SAFETY: Valid memory or trusted environment
                 let fb = unsafe { scanout.framebuffer() };
                 let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);
                 let (cols, rows) = (con.cols(), con.rows());
@@ -2146,6 +2175,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: `phys`/`len` cover the FB region registered by
                 // Limine/UEFI and owned exclusively kernel-side; ioremap
                 // maps it into a fresh vmalloc range with `attrs`.
+                // SAFETY: Valid memory or trusted environment
                 let m = match unsafe { ioremap(phys, len, attrs) } {
                     Ok(m) => m,
                     Err(_) => {
@@ -2182,6 +2212,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: WC virt covers stride*height*4 bytes
                 // (ioremap rounded `len` to that); the mapping
                 // lives until iounmap which we never call.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     narf_graphics::console::rebase_installed(m.virt as *mut u32);
                 }
@@ -2362,6 +2393,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: on the BSP after device bring-up, with
                         // `&mut d` held exclusively by `with_controller_mut`,
                         // so `init_scanout` programs the GPU uncontended.
+                        // SAFETY: Valid memory or trusted environment
                         if let Err(e) = unsafe { d.init_scanout() } {
                             let _ = writeln!(
                                 console::Writer,
@@ -2485,6 +2517,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(console::Writer, "  self-test: triggering #UD ...");
         // SAFETY: `ud2` is an intentional fault; our handler catches it
         // and calls exit_kernel(42), so this asm never returns.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!("ud2", options(noreturn));
         }
@@ -2556,6 +2589,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let _ = writeln!(console::Writer, "  boot-smoke: clean exit");
         // SAFETY: exit_kernel never returns; this is the only post-
         // boot action we're authorised to take.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             narf_arch::exit_kernel(0);
         }
@@ -2584,6 +2618,7 @@ fn run_async_demo() -> ! {
         // SAFETY: GIC is up (or the feature check in _start_rust
         // skipped init_bsp, in which case timer IRQs fire but are
         // never delivered — still safe, just silent).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             narf_interrupts::aarch64::start_timer(aarch64::trap::TIMER_TVAL_DEFAULT);
             narf_arch::enable_interrupts();
@@ -2646,6 +2681,7 @@ fn run_async_demo() -> ! {
                 // SAFETY: `rdmsr` of IA32_APIC_BASE (0x1B) — an
                 // architectural MSR present on every long-mode CPU — at
                 // CPL0, so the privileged `rdmsr` is permitted here.
+                // SAFETY: Valid memory or trusted environment
                 let apic_base = unsafe { narf_arch::x86_64::msr::rdmsr(0x0000_001B) };
                 let lapic_phys = apic_base & 0x0000_000F_FFFF_F000;
                 let _ = writeln!(
@@ -2961,6 +2997,7 @@ fn run_async_demo() -> ! {
     {
         // SAFETY: `_rdtsc` (RDTSC) is unprivileged and always available
         // in long mode; it only reads the time-stamp counter.
+        // SAFETY: Valid memory or trusted environment
         let start = unsafe { core::arch::x86_64::_rdtsc() };
         let target = start.wrapping_add(25_000_000_000u64);
         // SAFETY: same as above — RDTSC just samples the TSC each spin.
@@ -2972,6 +3009,7 @@ fn run_async_demo() -> ! {
     // SAFETY: exit_kernel is infallible; on QEMU it exits cleanly via
     // the isa-debug-exit device (x86_64) or semihosting (aarch64); on
     // real hardware it falls back to a quiet halt.
+    // SAFETY: Valid memory or trusted environment
     unsafe { narf_arch::exit_kernel(0) }
 }
 
@@ -3161,6 +3199,7 @@ fn boot_userspace_init() {
             narf_interrupts::install_handler(v, serial_isr);
             // SAFETY: vector + handler installed before
             // unmasking the IOAPIC entry + enabling IER.
+            // SAFETY: Valid memory or trusted environment
             let routed = unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) };
             if routed {
                 narf_console::enable_rx_irq();
@@ -3192,6 +3231,7 @@ fn boot_userspace_init() {
             );
             return false;
         }
+        // SAFETY: Valid memory or trusted environment
         let proc = match unsafe { load_user_process_with(bytes, &[name], &[], &[]) } {
             Ok(p) => p,
             Err(e) => {

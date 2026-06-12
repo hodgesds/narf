@@ -232,11 +232,13 @@ impl CoolingDevice for PwmFan {
             // SAFETY: pointers are to fields of an Arc-kept-alive
             // PwmFan; safe to dereference for the duration of
             // this task.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let target = unsafe { &*(target_ptr as *const core::sync::atomic::AtomicU8) };
             // SAFETY: inflight_ptr was formed from &self.worker_inflight above;
             // self is a PwmFan kept alive by an Arc in the fan registry for the
             // lifetime of this task, so the AtomicBool it points at is live and
             // properly aligned for the whole loop below.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let inflight = unsafe { &*(inflight_ptr as *const core::sync::atomic::AtomicBool) };
             // Standard PC / Intel 4-wire fan: 25 kHz PWM.
             const FREQ: u32 = 25_000;

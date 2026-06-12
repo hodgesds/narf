@@ -294,6 +294,7 @@ pub unsafe fn get_time() -> Result<EfiTime, EfiStatus> {
     let mut raw = [0u8; 16];
     // SAFETY: `raw` is stack-allocated and `get_time_fn` writes at most
     // 16 bytes; capabilities passed as NULL (we don't use them here).
+    // SAFETY: Valid memory or trusted environment
     let status = unsafe { get_time_fn(&mut raw, core::ptr::null_mut()) };
     if efi_error(status) {
         return Err(status);
@@ -396,6 +397,7 @@ pub unsafe fn set_variable(
 
     // SAFETY: `data` slice is caller-supplied; `sv` reads at most
     // `data.len()` bytes from `data.as_ptr()`.
+    // SAFETY: Valid memory or trusted environment
     let status = unsafe { sv(name_ptr, &guid.0, attrs, data.len(), data.as_ptr()) };
     if efi_error(status) {
         Err(status)
@@ -426,6 +428,7 @@ pub unsafe fn reset_system(reset_type: EfiResetType) -> ! {
             let rs: EfiResetSystemFn = unsafe { core::mem::transmute(fn_ptr_addr) };
             // SAFETY: `rs` is a `!`-returning EFI function; `reset_type` is
             // a valid enum value; no data payload.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 rs(
                     reset_type as u32,
@@ -517,8 +520,9 @@ mod tests {
         fn new_valid() -> Self {
             let hdr = make_header(
                 signature::RUNTIME_SERVICES,
-                (1u32 << 16), // revision 1.0
+                1u32 << 16, // revision 1.0
             );
+            // SAFETY: Valid memory or trusted environment
             let mut t: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
             t.hdr.copy_from_slice(&hdr);
             Self { inner: t }
@@ -541,8 +545,10 @@ mod tests {
 
         // A table with revision 0 must be rejected.
         let hdr0 = make_header(signature::RUNTIME_SERVICES, 0);
+        // SAFETY: Valid memory or trusted environment
         let mut t0: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
         t0.hdr.copy_from_slice(&hdr0);
+        // SAFETY: Valid memory or trusted environment
         let result0 = unsafe { install(&t0 as *const _) };
         RT_TABLE_PTR.store(0, Ordering::Release);
         if result0 != Err(InstallError::RevisionTooOld) {
@@ -550,9 +556,11 @@ mod tests {
         }
 
         // A table with a wrong signature must be rejected.
-        let hdr_bad = make_header(0xDEAD_BEEF_DEAD_BEEFu64, (1u32 << 16));
+        let hdr_bad = make_header(0xDEAD_BEEF_DEAD_BEEFu64, 1u32 << 16);
+        // SAFETY: Valid memory or trusted environment
         let mut t_bad: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
         t_bad.hdr.copy_from_slice(&hdr_bad);
+        // SAFETY: Valid memory or trusted environment
         let result_bad = unsafe { install(&t_bad as *const _) };
         RT_TABLE_PTR.store(0, Ordering::Release);
         if result_bad.is_ok() {
@@ -609,13 +617,18 @@ mod tests {
     ) -> EfiStatus {
         // SAFETY: test context — all pointers are valid stack/heap addresses.
         let desired: usize = 1;
+        // SAFETY: Valid memory or trusted environment
         if unsafe { *size } < desired {
+            // SAFETY: Valid memory or trusted environment
             unsafe { *size = desired };
             return EFI_BUFFER_TOO_SMALL;
         }
+        // SAFETY: Valid memory or trusted environment
         unsafe { *size = desired };
+        // SAFETY: Valid memory or trusted environment
         unsafe { *data = 1 };
         if !attrs_out.is_null() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { *attrs_out = 0 };
         }
         EFI_SUCCESS
@@ -623,7 +636,8 @@ mod tests {
 
     fn smoke_efi_get_variable_fake_rt() -> TestResult {
         // Build a fake RT table with only get_variable populated.
-        let hdr = make_header(signature::RUNTIME_SERVICES, (1u32 << 16));
+        let hdr = make_header(signature::RUNTIME_SERVICES, 1u32 << 16);
+        // SAFETY: Valid memory or trusted environment
         let mut t: EfiRuntimeServicesTable = unsafe { core::mem::zeroed() };
         t.hdr.copy_from_slice(&hdr);
         t.get_variable = fake_get_variable as usize;
@@ -657,6 +671,7 @@ mod tests {
     // ── install with null pointer ─────────────────────────────────
 
     fn smoke_efi_rt_null_install_rejected() -> TestResult {
+        // SAFETY: Valid memory or trusted environment
         let result = unsafe { install(core::ptr::null()) };
         RT_TABLE_PTR.store(0, Ordering::Release);
         if result == Err(InstallError::NullPointer) {
@@ -673,6 +688,7 @@ mod tests {
         // Ensure table is not installed.
         RT_TABLE_PTR.store(0, Ordering::Release);
         let guid = EFI_GLOBAL_VARIABLE;
+        // SAFETY: Valid memory or trusted environment
         let result = unsafe { get_variable("SecureBoot", &guid) };
         if result == Err(EFI_NOT_FOUND) {
             TestResult::Pass

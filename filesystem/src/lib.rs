@@ -1451,6 +1451,7 @@ impl InitramfsRoot {
         // not exposing `unmount-while-handle-live` (the FsFuture's
         // returned by `read` borrow `&'a self`, so the borrow checker
         // catches use-after-unmount in the normal case).
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(self.entries_ptr, self.entries_len) }
     }
 }

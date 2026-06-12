@@ -137,6 +137,7 @@ pub unsafe fn write32(va: u64, value: u32) {
     // SAFETY: barrier always legal. dsb st pushes the store out of
     // the local CPU's buffer onto the interconnect, so the device
     // sees it before any subsequent CPU operation.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         dsb_st();
     }

@@ -174,6 +174,7 @@ impl VirtioBalloonPci {
 
         // SAFETY: Virtqueue::new wipes the layout regions; the
         // backing pages may be recycled (alloc_frame doesn't zero).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let inflate_q = unsafe { Virtqueue::new(inf_layout) };
         // SAFETY: same.
         let deflate_q = unsafe { Virtqueue::new(def_layout) };

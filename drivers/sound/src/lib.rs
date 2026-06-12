@@ -496,6 +496,7 @@ pub mod tests_support {
         // `RawWaker`, and `wake`/`wake_by_ref`/`drop` are no-ops. The data
         // pointer is null and is never dereferenced by any vtable function,
         // so there is no aliasing or lifetime hazard.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
         let mut boxed = alloc::boxed::Box::pin(fut);

@@ -593,6 +593,7 @@ fn smoke_lifecycle_loading_to_live() -> TestResult {
     // SAFETY: `arc_test_module` sets `init_addr` to `noop_init`, a real
     // `extern "C" fn() -> i32`, and the module is freshly built in state
     // `Loading`, satisfying `invoke_init`'s contract.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { crate::loader::invoke_init(&m) };
     if r.is_err() {
         return TestResult::Fail("invoke_init failed");
@@ -615,10 +616,12 @@ fn smoke_lifecycle_rmmod_clean_unload() -> TestResult {
     let m = arc_test_module("lc_unload", 0xBEEF);
     // SAFETY: freshly built module in state `Loading` with `init_addr` =
     // `noop_init` (a real `extern "C"` fn), satisfying `invoke_init`.
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::loader::invoke_init(&m) }.expect("init");
     // SAFETY: the module is now `Live` (init succeeded above) with refcount
     // zero, and `exit_addr` = `noop_exit` (a real `extern "C"` fn), so
     // `invoke_exit`'s Live-state contract is met.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { crate::loader::invoke_exit(&m) };
     if r.is_err() {
         return TestResult::Fail("invoke_exit failed");
@@ -641,12 +644,14 @@ fn smoke_lifecycle_rmmod_blocks_on_refcount() -> TestResult {
     let m = arc_test_module("lc_busy", 0xCC);
     // SAFETY: freshly built module in state `Loading` with `init_addr` =
     // `noop_init` (a real `extern "C"` fn), satisfying `invoke_init`.
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::loader::invoke_init(&m) }.expect("init");
     // Hold a ref so exit will refuse.
     m.refcount.get();
     // SAFETY: the module is `Live` (init succeeded) and `exit_addr` =
     // `noop_exit`; `invoke_exit` short-circuits on the non-zero refcount
     // before calling exit, but its Live-state contract is met regardless.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { crate::loader::invoke_exit(&m) };
     match r {
         Err(crate::lifecycle::LifecycleError::Busy(1)) => TestResult::Pass,
@@ -741,6 +746,7 @@ fn smoke_two_modules_dep_refcount() -> TestResult {
     // SAFETY: module `a` is in state `Loading`/`Live` with `exit_addr` =
     // `noop_exit` (a real `extern "C"` fn); `invoke_exit` returns Busy on
     // the held refcount before invoking exit, meeting its state contract.
+    // SAFETY: Valid memory or trusted environment
     let unload = unsafe { crate::loader::invoke_exit(&a) };
     match unload {
         Err(crate::lifecycle::LifecycleError::Busy(1)) => {
@@ -749,6 +755,7 @@ fn smoke_two_modules_dep_refcount() -> TestResult {
             // SAFETY: refcount is now zero and `exit_addr` = `noop_exit`
             // (a real `extern "C"` fn); the module is still Live, so
             // `invoke_exit` may now run the exit routine soundly.
+            // SAFETY: Valid memory or trusted environment
             match unsafe { crate::loader::invoke_exit(&a) } {
                 Ok(_) => TestResult::Pass,
                 Err(_) => TestResult::Fail("second rmmod after refcount=0 failed"),

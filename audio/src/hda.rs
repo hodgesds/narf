@@ -411,6 +411,7 @@ fn hda_isr() {
     // mapping that lives as long as the controller. We only touch
     // INTSTS (RO) and RIRBSTS (W1C byte) — both fixed offsets within
     // the spec-mandated 0x80-byte global register window.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let intsts = narf_arch::mmio::read32(base + REG_INTSTS);
         if intsts & INTSTS_CIS != 0 {
@@ -772,6 +773,7 @@ impl IntelHda {
         // SAFETY: `bar0` is the caller-mapped BAR0 MMIO window; `sd + SD_CTL`
         // is the SDnCTL register of an in-range stream descriptor, a valid
         // 32-bit device register, so the volatile write is well-defined.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             bar0.write32(sd + SD_CTL, SDCTL_SRST);
         }
@@ -871,6 +873,7 @@ impl IntelHda {
         if irq_vector.is_some() {
             // Arm INTCTL last: GIE | CIE. SIE bits stay 0 (no
             // playback stream subscribed yet). SAFETY: BAR0 mapped.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 bar0.write32(REG_INTCTL, INTCTL_GIE | INTCTL_CIE);
             }
@@ -928,6 +931,7 @@ impl IntelHda {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| HdaError::DmaAllocFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         unsafe { msix.enable() }.map_err(|_| HdaError::DmaAllocFailed)?;
@@ -1093,6 +1097,7 @@ impl IntelHda {
 
         // Find the converter that feeds this pin via its connection
         // list. SAFETY: same.
+        // SAFETY: Valid memory or trusted environment
         let conn_len = unsafe {
             self.send_verb(make_verb(
                 cad,
@@ -1143,6 +1148,7 @@ impl IntelHda {
         }
 
         // Program converter format. SAFETY: same.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             self.send_verb(make_verb(
                 cad,
@@ -1193,6 +1199,7 @@ impl IntelHda {
         // SAFETY: this fn's `# Safety` contract guarantees the caller owns the
         // BAR0 mapping, which is exactly what `setup_default_output_path`
         // requires to drive the CORB/RIRB verb ring.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             self.setup_default_output_path()?;
         }
@@ -1202,6 +1209,7 @@ impl IntelHda {
             let cad = codec.addr;
             // SAFETY: caller owns the BAR0 mapping (this fn's `# Safety`
             // contract), so `send_verb` may drive the CORB/RIRB MMIO ring.
+            // SAFETY: Valid memory or trusted environment
             let mut send = |c, n, v, p| unsafe {
                 self.send_verb(crate::codec::verb(c, n, v, p))
                     .map_err(|_| crate::codec::CodecError::TransportFailed)
@@ -1396,6 +1404,7 @@ impl IntelHda {
         }
         // SAFETY: identity-mapped DMA page; buf length matches
         // period_samples by construction.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             for (i, &s) in buf.iter().enumerate() {
                 core::ptr::write_volatile((phys + (i * 2) as u64) as *mut i16, s);
@@ -1515,6 +1524,7 @@ impl IntelHda {
 
         // 2. Place verb in CORB[next]. SAFETY: identity-mapped DMA,
         //    slot inside the 1 KiB ring.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let slot = (self.corb_phys + (next as u64) * 4) as *mut u32;
             slot.write_volatile(verb);

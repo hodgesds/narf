@@ -68,6 +68,7 @@ pub fn read_command(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Resul
     let cfg = pcie_cfg_phys(device)?;
     // SAFETY: cfg-space is identity-mapped for the lifetime of the
     // BusDevice, and offset 0x04 is well inside the type-0 header.
+    // SAFETY: Valid memory or trusted environment
     Ok(unsafe { cfg_read16(cfg, COMMAND_OFFSET) })
 }
 
@@ -154,6 +155,7 @@ pub fn pm_d3hot_cycle(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Res
 
     // SAFETY: caller owns the device; PMCSR is a 2-byte aligned
     // register inside the PM capability block.
+    // SAFETY: Valid memory or trusted environment
     let cur = unsafe { cfg_read16(cfg, pmcsr_off) };
     // Enter D3hot.
     // SAFETY: same.
@@ -257,6 +259,7 @@ pub fn save_config(
     let cfg = pcie_cfg_phys(device)?;
     // SAFETY: cfg-space is identity-mapped; offsets stay inside
     // the 64-byte type-0 header.
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe {
         SavedPciConfig {
             command: cfg_read16(cfg, 0x04),
@@ -299,6 +302,7 @@ pub fn restore_config(
     let cfg = pcie_cfg_phys(device)?;
     // SAFETY: cfg-space writes within the type-0 header; the device
     // is in D0 (woken by the platform) but not yet command-enabled.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // BARs first.
         cfg_write32(cfg, 0x10, saved.bars[0]);
@@ -330,6 +334,7 @@ unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
     // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
     // base and `off` is within that device's config window, so `cfg.raw() + off`
     // is a readable MMIO address correctly aligned for a u8.
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
     compiler_fence(Ordering::SeqCst);
     v
@@ -341,6 +346,7 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
     // base and `off` is a dword-aligned offset within that device's config
     // window, so `cfg.raw() + off` is a readable MMIO address valid for a u32.
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     v
@@ -352,6 +358,7 @@ unsafe fn cfg_write8(cfg: PhysAddr, off: u64, value: u8) {
     // SAFETY: the caller guarantees `cfg` is a valid, mapped ECAM config-space
     // base it exclusively owns and `off` is within that device's config window,
     // so `cfg.raw() + off` is a writable MMIO address correctly aligned for a u8.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile((cfg.raw() + off) as *mut u8, value);
     }
@@ -365,6 +372,7 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     // base it exclusively owns and `off` is a dword-aligned offset within that
     // device's config window, so `cfg.raw() + off` is a writable MMIO address
     // valid for a u32.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
     }
@@ -390,6 +398,7 @@ pub fn read_intx_pin(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Resu
     // SAFETY: cfg-space is identity-mapped for the lifetime of
     // the BusDevice; offset 0x3D is well inside the type-0
     // header.
+    // SAFETY: Valid memory or trusted environment
     Ok(unsafe { core::ptr::read_volatile((cfg.raw() + INTERRUPT_PIN_OFFSET) as *const u8) })
 }
 

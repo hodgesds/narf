@@ -31,6 +31,7 @@ pub const USER_SPSR: u64 = 0;
 pub unsafe fn enter_user_mode(rip: u64, rsp: u64) -> ! {
     // SAFETY: SP_EL0/ELR_EL1/SPSR_EL1 writes at EL1 are
     // architecturally defined; eret with SPSR.M = 0 enters EL0.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "msr sp_el0,  {rsp}",

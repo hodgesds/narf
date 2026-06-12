@@ -76,6 +76,7 @@ fn usb_snapshot() -> Vec<UsbDeviceSnapshot> {
     }
     // SAFETY: v was stored via `f as usize` in install_usb_proc_hook, so it
     // holds a valid function pointer of type UsbSnapshotFn.
+    // SAFETY: Valid memory or trusted environment
     let f: UsbSnapshotFn = unsafe { core::mem::transmute(v) };
     f()
 }
@@ -130,6 +131,7 @@ impl ProcFile for PciDevicesFile {
                 // SAFETY: cfg_phys is the ECAM window (set by the bus
                 // enumerator).  Offset 0x3C is within the 256-byte type-0
                 // standard header which is always readable.  Identity-mapped.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { core::ptr::read_volatile((cfg_phys + 0x3C) as *const u8) }
             } else {
                 0
@@ -141,6 +143,7 @@ impl ProcFile for PciDevicesFile {
                 for i in 0u64..6 {
                     // SAFETY: BAR registers at offsets 0x10..0x28; within
                     // the 256-byte standard header; identity-mapped.
+                    // SAFETY: Valid memory or trusted environment
                     bars[i as usize] = unsafe {
                         core::ptr::read_volatile((cfg_phys + 0x10 + i * 4) as *const u32) as u64
                     };

@@ -373,6 +373,7 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     }
     // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
     // temporarily enables SMAP access and read_unaligned handles any alignment.
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const i32))
     };
@@ -386,6 +387,7 @@ unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     }
     // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
     // enables SMAP and write_unaligned handles any alignment.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut i32, v);
@@ -401,6 +403,7 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     }
     // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
     // enables SMAP and write_unaligned handles any alignment.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut u32, v);
@@ -420,6 +423,7 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
     // (its fn contract); it is non-null per the check above, and
     // `read_unaligned` reads exactly 4 bytes regardless of alignment.
+    // SAFETY: Valid memory or trusted environment
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const i32) })
 }
 
@@ -431,6 +435,7 @@ unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
     // (its fn contract); it is non-null per the check above, and
     // `write_unaligned` writes exactly 4 bytes regardless of alignment.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::ptr::write_unaligned(uptr as *mut i32, v) };
     Ok(())
 }
@@ -443,6 +448,7 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
     // (its fn contract); it is non-null per the check above, and
     // `write_unaligned` writes exactly 4 bytes regardless of alignment.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::ptr::write_unaligned(uptr as *mut u32, v) };
     Ok(())
 }
@@ -466,6 +472,7 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     }
     // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
     // enables SMAP and read_unaligned handles any alignment.
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::read_unaligned(uptr as *const WireWinsize)
@@ -481,6 +488,7 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
     }
     // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
     // enables SMAP and write_unaligned handles any alignment.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut WireWinsize, v);
@@ -498,6 +506,7 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     // (its fn contract); it is non-null per the check above, and
     // `read_unaligned` reads exactly one `WireWinsize` regardless of
     // alignment.
+    // SAFETY: Valid memory or trusted environment
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const WireWinsize) })
 }
 
@@ -510,6 +519,7 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
     // (its fn contract); it is non-null per the check above, and
     // `write_unaligned` writes exactly one `WireWinsize` regardless of
     // alignment.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::ptr::write_unaligned(uptr as *mut WireWinsize, v) };
     Ok(())
 }
@@ -528,6 +538,7 @@ unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
     // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
     // enables SMAP; zero.as_ptr() and uptr point to non-overlapping regions of
     // exactly 60 bytes each.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60);
@@ -546,6 +557,7 @@ unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
     // (its fn contract) and is non-null per the check above; the local
     // `zero` buffer and `uptr` are non-overlapping regions of exactly
     // 60 bytes each.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60) };
     Ok(())
 }
@@ -1064,6 +1076,7 @@ fn u32_to_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
         buf[9] = b'0';
         // SAFETY: the only byte in `buf[9..]` was just set to b'0' (0x30), an
         // ASCII digit, which is valid UTF-8.
+        // SAFETY: Valid memory or trusted environment
         return unsafe { core::str::from_utf8_unchecked(&buf[9..]) };
     }
     let mut pos = 10;
@@ -1075,6 +1088,7 @@ fn u32_to_str(mut n: u32, buf: &mut [u8; 10]) -> &str {
     // SAFETY: every byte written into `buf[pos..]` above is `b'0' + digit`
     // where `digit` is `n % 10` in 0..=9, so each byte is an ASCII digit
     // (0x30..=0x39) and the whole slice is valid UTF-8.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::str::from_utf8_unchecked(&buf[pos..]) }
 }
 

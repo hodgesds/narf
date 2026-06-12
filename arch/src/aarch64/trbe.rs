@@ -90,6 +90,7 @@ pub unsafe fn write_base(base: u64, limit: u64) {
     let prev = unsafe { read_trblimitr() } & 0xFFF; // preserve low control bits
                                                     // SAFETY: caller-asserted EL1 + TRBE; writes the new limit preserving
                                                     // the existing low control bits.
+                                                    // SAFETY: Valid memory or trusted environment
     unsafe {
         write_trblimitr((limit & !0xFFF) | prev);
     }

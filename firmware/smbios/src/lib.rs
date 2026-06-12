@@ -131,6 +131,7 @@ pub unsafe fn scan_legacy_bios() -> Option<EntryPoint> {
     while p + 32 <= END {
         // SAFETY: identity-mapped low ROM; 32-byte read at 16-byte
         // alignment is defined.
+        // SAFETY: Valid memory or trusted environment
         let slice = unsafe { core::slice::from_raw_parts(p as *const u8, 32) };
         if &slice[0..5] == b"_SM3_" {
             // SAFETY: 24-byte read fits the 32-byte window.

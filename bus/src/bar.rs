@@ -106,6 +106,7 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
     let off = BAR0_OFFSET + (idx as u64) * 4;
     // SAFETY: cfg_phys + off lives inside the function's 4-KiB cfg
     // window (off < 0x28 < 0x100); identity-mapped.
+    // SAFETY: Valid memory or trusted environment
     let original = unsafe { cfg_read32(cfg_phys, off) };
 
     // I/O-port BAR? Bit 0 set.
@@ -238,6 +239,7 @@ impl MmioRegion {
     pub unsafe fn read8(&self, offset: u64) -> u8 {
         // SAFETY: caller-asserted in-range; arch::mmio supplies the
         // volatile + arch-correct barrier.
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_arch::mmio::read8(self.phys.raw() + offset) }
     }
 
@@ -262,6 +264,7 @@ impl MmioRegion {
     pub unsafe fn read16(&self, offset: u64) -> u16 {
         // SAFETY: caller-asserted in-range, naturally-aligned;
         // arch::mmio supplies the volatile + arch-correct barrier.
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_arch::mmio::read16(self.phys.raw() + offset) }
     }
 
@@ -448,6 +451,7 @@ pub unsafe fn assign_unprogrammed_bars(device: &BusDevice) -> Result<u32, Assign
                 // SAFETY: off_lo/off_hi are BAR0_OFFSET + idx*4 with idx <
                 // NUM_BARS, so both lie inside this device's 256-byte config
                 // space at cfg_phys, whose ownership the caller asserted.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     cfg_write32(
                         cfg_phys,

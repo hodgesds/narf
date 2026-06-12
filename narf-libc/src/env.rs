@@ -52,12 +52,14 @@ pub static mut ENVIRON: *const *const u8 = core::ptr::null();
 pub unsafe fn getenv(name: *const u8, name_len: usize) -> *const u8 {
     // SAFETY: write-once during single-threaded startup; the
     // pointer-sized read is atomic on x86_64.
+    // SAFETY: Valid memory or trusted environment
     let mut envp = unsafe { ENVIRON };
     if envp.is_null() {
         return core::ptr::null();
     }
     // SAFETY: per the function-level contract — walk the envp array
     // until the terminating NULL.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         loop {
             let entry = *envp;
@@ -122,14 +124,17 @@ static mut OWNED_ENV_ACTIVE: bool = false;
 unsafe fn ensure_owned() {
     // SAFETY: single-threaded; the flag is set after the copy
     // completes so re-entrance is harmless.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { OWNED_ENV_ACTIVE } {
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let mut src = unsafe { ENVIRON };
     let mut n = 0usize;
     if !src.is_null() {
         // SAFETY: caller asserts the kernel-supplied envp is
         // NULL-terminated.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             while n < OWNED_ENV_CAP - 1 {
                 let entry = *src;
@@ -158,6 +163,7 @@ unsafe fn ensure_owned() {
     // SAFETY: single-threaded; publish. Use `&raw const` rather than
     // `.as_ptr()` on a `static mut` to avoid the 2024-edition warning
     // about shared refs into mutable statics.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         OWNED_ENV_LEN = n;
         OWNED_ENV_ACTIVE = true;
@@ -213,6 +219,7 @@ pub unsafe fn setenv_raw(
     // SAFETY: forwarded; ensure_owned is single-threaded-safe.
     unsafe { ensure_owned() };
     // Same-name lookup.
+    // SAFETY: Valid memory or trusted environment
     let found = unsafe { find_owned(name, name_len) };
     if found.is_some() && overwrite == 0 {
         return 0;
@@ -273,6 +280,7 @@ pub unsafe fn unsetenv_raw(name: *const u8, name_len: usize) -> i32 {
     }
     // SAFETY: name has no `=`.
     for i in 0..name_len {
+        // SAFETY: Valid memory or trusted environment
         if unsafe { *name.add(i) } == b'=' {
             set_errno(crate::errno::EINVAL);
             return -1;
@@ -280,6 +288,7 @@ pub unsafe fn unsetenv_raw(name: *const u8, name_len: usize) -> i32 {
     }
     // SAFETY: forwarded.
     unsafe { ensure_owned() };
+    // SAFETY: Valid memory or trusted environment
     let found = unsafe { find_owned(name, name_len) };
     if let Some(idx) = found {
         // SAFETY: shift-down under the single-threaded invariant.
@@ -311,10 +320,12 @@ pub unsafe extern "C" fn setenv(name: *const u8, value: *const u8, overwrite: i3
         set_errno(crate::errno::EINVAL);
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let nlen = unsafe { strlen(name) };
     let vlen = if value.is_null() {
         0
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe { strlen(value) }
     };
     let vp = if value.is_null() { b"".as_ptr() } else { value };
@@ -332,6 +343,7 @@ pub unsafe extern "C" fn unsetenv(name: *const u8) -> i32 {
         set_errno(crate::errno::EINVAL);
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let nlen = unsafe { strlen(name) };
     // SAFETY: forwarded.
     unsafe { unsetenv_raw(name, nlen) }

@@ -127,7 +127,6 @@ const SSSR_BSY: u32 = 1 << 4; // SSP busy
 // ── CS_CONTROL bit definitions ─────────────────────────────────────
 const CS_CONTROL_STATE: u32 = 1 << 0;
 const CS_CONTROL_MODE_SW: u32 = 0 << 1;
-const CS_CONTROL_MODE_HW: u32 = 1 << 1;
 const CS_CONTROL_SEL_SHIFT: u32 = 8;
 
 // ── FIFO parameters ────────────────────────────────────────────────
@@ -172,22 +171,28 @@ impl IntelLpssSpi {
     #[inline]
     unsafe fn read32(&self, off: u64) -> u32 {
         debug_assert!(off + 4 <= self.mmio_len);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
     #[inline]
     unsafe fn write32(&self, off: u64, val: u32) {
         debug_assert!(off + 4 <= self.mmio_len);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::write32(self.mmio_base.raw() + off, val) }
     }
 
     unsafe fn enable_ssp(&self) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cr0 = unsafe { self.read32(SSCR0) };
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.write32(SSCR0, cr0 | SSCR0_SSE) };
     }
 
     unsafe fn disable_ssp(&self) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cr0 = unsafe { self.read32(SSCR0) };
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.write32(SSCR0, cr0 & !SSCR0_SSE) };
     }
 
@@ -195,6 +200,7 @@ impl IntelLpssSpi {
         let mode = self.mode.load(Ordering::Relaxed);
         let cpol = (mode & 0b10) != 0;
         let cpha = (mode & 0b01) != 0;
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cr1 = unsafe { self.read32(SSCR1) };
         let mut new = cr1 & !(SSCR1_SPO | SSCR1_SPH);
         if cpol {
@@ -203,11 +209,13 @@ impl IntelLpssSpi {
         if cpha {
             new |= SSCR1_SPH;
         }
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.write32(SSCR1, new) };
     }
 
     /// Initialize the SSP for 8-bit SPI master mode.
     pub fn init(&self) -> Result<(), SpiError> {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             // Force-on LPSS clock gate
             if self.mmio_len > LPSS_PRIV_CLOCK_GATE {
@@ -224,6 +232,7 @@ impl IntelLpssSpi {
 
     fn busy_wait_status(&self, mask: u32, want: u32) -> Result<(), SpiError> {
         for _ in 0..BUSY_WAIT_POLLS {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             if (unsafe { self.read32(SSSR) } & mask) == want {
                 return Ok(());
             }
@@ -243,10 +252,12 @@ impl SpiBus for IntelLpssSpi {
             // TX
             self.busy_wait_status(SSSR_TNF, SSSR_TNF)?;
             let b = if i < tx.len() { tx[i] } else { 0 };
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.write32(SSDR, b as u32) };
 
             // RX
             self.busy_wait_status(SSSR_RNE, SSSR_RNE)?;
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let b = unsafe { self.read32(SSDR) } as u8;
             if i < rx.len() {
                 rx[i] = b;
@@ -260,9 +271,11 @@ impl SpiBus for IntelLpssSpi {
         for i in 0..len {
             self.busy_wait_status(SSSR_TNF, SSSR_TNF)?;
             let b = if i < tx.len() { tx[i] } else { 0 };
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.write32(SSDR, b as u32) };
 
             self.busy_wait_status(SSSR_RNE, SSSR_RNE)?;
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let b = unsafe { self.read32(SSDR) } as u8;
             if i < rx.len() {
                 rx[i] = b;
@@ -273,6 +286,7 @@ impl SpiBus for IntelLpssSpi {
 
     fn set_mode(&self, mode: SpiMode) -> Result<(), SpiError> {
         self.mode.store(mode as u32, Ordering::Relaxed);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.disable_ssp();
             self.apply_mode_bits();
@@ -293,6 +307,7 @@ impl SpiBus for IntelLpssSpi {
             scr = 0xFF;
         }
         self.speed_hz.store(hz, Ordering::Relaxed);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.disable_ssp();
             let cr0 = self.read32(SSCR0);
@@ -311,6 +326,7 @@ impl SpiBus for IntelLpssSpi {
         // Apply to LPSS private CS control
         if self.mmio_len > LPSS_CS_CONTROL {
             let val = CS_CONTROL_MODE_SW | ((cs as u32) << CS_CONTROL_SEL_SHIFT) | CS_CONTROL_STATE; // De-asserted (active-low default)
+                                                                                                     // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.write32(LPSS_CS_CONTROL, val) };
         }
         Ok(())

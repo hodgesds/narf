@@ -86,6 +86,7 @@ pub unsafe fn submit_mpdu(
     let dst_ptr = ring.buf.as_mut_ptr();
     // SAFETY: ring buffer is DMA-coherent and we own `slot` exclusively
     // via the producer's `reserve_one`.  Length is statically bounded.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let dst = core::slice::from_raw_parts_mut(dst_ptr.add(offset).cast::<u32>(), 16);
         dst.copy_from_slice(&desc.dwords);

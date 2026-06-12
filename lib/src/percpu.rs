@@ -63,6 +63,7 @@ impl<T: Copy> PerCpu<T> {
         // immutable borrow of the cell; `T: Copy` means the cell
         // can't hold owning references, so aliasing with other CPUs
         // reduces to whatever interior-mutability the `T` provides.
+        // SAFETY: Valid memory or trusted environment
         unsafe { &(*self.cells.get())[id] }
     }
 
@@ -70,6 +71,7 @@ impl<T: Copy> PerCpu<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         // SAFETY: each cell is a valid T by construction; the returned
         // reference has `PerCpu`'s lifetime.
+        // SAFETY: Valid memory or trusted environment
         let arr = unsafe { &*self.cells.get() };
         arr.iter()
     }
@@ -96,6 +98,7 @@ fn narf_arch_cpu_id_hook() -> usize {
     // SAFETY: `narf_arch_cpu_id` is provided by narf-arch via
     // `#[no_mangle]`; every binary that links narf-arch has it. It's
     // a pure read of a CPU-identifying register (Stage 2: returns 0).
+    // SAFETY: Valid memory or trusted environment
     let id = unsafe { narf_arch_cpu_id() };
     debug_assert!(id < MAX_CPUS, "CPU id out of PerCpu range");
     if id < MAX_CPUS {

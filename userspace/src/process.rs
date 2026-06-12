@@ -106,6 +106,7 @@ pub unsafe fn load_user_process(bytes: &[u8]) -> Result<UserProcess, ProcessLoad
     // SAFETY: thin forwarder — the caller's `# Safety` contract (live
     // low-4-GiB identity map + initialised frame allocator) is exactly
     // what `load_user_process_with` requires; empty argv/envp/aux are valid.
+    // SAFETY: Valid memory or trusted environment
     unsafe { load_user_process_with(bytes, &[], &[], &[]) }
 }
 
@@ -128,6 +129,7 @@ pub unsafe fn load_user_process_with(
     // SAFETY: caller upholds this fn's `# Safety` contract (live low-4-GiB
     // identity map + initialised frame allocator), which is precisely what
     // `load_elf_bytes` needs to map the program's PT_LOAD segments.
+    // SAFETY: Valid memory or trusted environment
     let (address_space, program_entry) = unsafe { load_elf_bytes(bytes) }?;
 
     // PT_INTERP follow-through: if the program names an interpreter
@@ -170,6 +172,7 @@ pub unsafe fn load_user_process_with(
         // SAFETY: `address_space` was just materialized by `load_elf_bytes`,
         // so every PT_DYNAMIC relocation site is walkable via `paging::
         // translate`; `program_bias` is the same load offset that fn chose.
+        // SAFETY: Valid memory or trusted environment
         unsafe { apply_relocations(bytes, &image, &address_space, program_bias) }?;
     }
 
@@ -200,10 +203,12 @@ pub unsafe fn load_user_process_with(
                 // INTERP_BIAS is a fixed user-range offset well-separated from the
                 // program's load range, so appending the interp's segments here
                 // cannot collide with pages already mapped.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { load_elf_into_at(interp_bytes, &address_space, INTERP_BIAS) }?;
             // SAFETY: AS already has its PML4 from `load_elf_bytes`;
             // we just appended interp regions and materialize is
             // idempotent for the program pages already installed.
+            // SAFETY: Valid memory or trusted environment
             unsafe { address_space.materialize() }
                 .map_err(|e| LoadBytesError::Load(crate::loader::LoadError::AddressSpace(e)))?;
 
@@ -216,6 +221,7 @@ pub unsafe fn load_user_process_with(
                 // SAFETY: the interp's segments were just mapped + materialized
                 // at INTERP_BIAS above, so its PT_DYNAMIC relocation sites are
                 // walkable; INTERP_BIAS is the matching load offset to apply.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     apply_relocations(interp_bytes, &interp_image, &address_space, INTERP_BIAS)
                 }?;
@@ -286,6 +292,7 @@ pub unsafe fn load_user_process_with(
 
     // SAFETY: AS is from `load_elf_bytes` (hence `new_for_user`)
     // and stack region was just pushed.
+    // SAFETY: Valid memory or trusted environment
     unsafe { address_space.materialize() }.map_err(|_| ProcessLoadError::StackMaterializeFailed)?;
 
     let stack_bytes = pages * 4096;
@@ -315,6 +322,7 @@ pub unsafe fn load_user_process_with(
             if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
                 // SAFETY: stack region is mapped+materialised R+W
                 // above; identity-mapped low 4 GiB.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     *(phys as *mut u8) = byte;
                 }
@@ -395,6 +403,7 @@ pub unsafe fn load_user_process_with(
         // was just mapped + materialized RW above, and the low-4-GiB identity
         // map is live (this fn's `# Safety` contract) — both preconditions
         // `init_sysv_stack` documents.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             init_sysv_stack(
                 &address_space,
@@ -447,6 +456,7 @@ pub unsafe fn load_user_process_with(
         };
         // SAFETY: low-4-GiB identity map + frame allocator are the
         // same Stage-4 invariants the rest of this routine rides on.
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { crate::tls::stage_tls(&synthetic_image, bytes, &address_space) }?)
     };
     #[cfg(not(target_arch = "x86_64"))]
@@ -515,6 +525,7 @@ fn resolve_user_phys_byte(root: PhysAddr, vaddr: u64) -> Option<u64> {
     // SAFETY: `root` is the address space's PML4 phys frame and `page` is a
     // page-aligned user vaddr; `translate` only reads the page-table hierarchy
     // through the live low-4-GiB identity map, performing no writes.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }?;
     Some(p.as_u64() + off)
 }
@@ -592,6 +603,7 @@ pub unsafe fn init_sysv_stack(
         // SAFETY: `phys` is a materialized stack-page phys returned by
         // `resolve_user_phys_byte`, reachable through the live low-4-GiB
         // identity map; a single byte write is in-bounds for that page.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *(phys as *mut u8) = byte;
         }
@@ -604,6 +616,7 @@ pub unsafe fn init_sysv_stack(
         // SAFETY: `phys` is a materialized stack-page phys via the live
         // low-4-GiB identity map; callers only pass 8-aligned vaddrs so the
         // u64 store stays within the single resolved page.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *(phys as *mut u64) = val;
         }

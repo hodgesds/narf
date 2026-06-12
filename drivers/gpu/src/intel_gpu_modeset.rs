@@ -856,6 +856,12 @@ pub mod tests {
         pub state_value: u32,
     }
 
+    impl Default for FakeMmio {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl FakeMmio {
         pub fn new() -> Self {
             Self {
@@ -1275,12 +1281,14 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
             // probe; `off` is a register offset within that BAR supplied by the
             // modeset code, and a 32-bit display register read has no
             // unwanted read side-effect.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.0.read32(off) }
         }
         fn write32(&self, off: u64, val: u32) {
             // SAFETY: `self.0` is the probe-mapped MMADR BAR owned exclusively
             // by this driver; `off` is an in-range display register offset and
             // the write targets a programmable 32-bit register.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { self.0.write32(off, val) }
         }
     }
@@ -1293,6 +1301,7 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
     // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `pipe_a_base +
     // PIPECONF_OFFSET` is the Pipe A PIPECONF register, in range of the BAR,
     // and reading it has no side-effect.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let pipeconf = unsafe { gpu.gtt_mmadr.read32(pipe_a_base + PIPECONF_OFFSET) };
     if pipeconf & PIPECONF_ENABLE == 0 {
         // Pipe A not enabled by firmware; nothing to take over safely.
@@ -1303,9 +1312,11 @@ pub fn takeover_display(gpu: &crate::intel_gpu::IntelGpu) -> Option<Mode> {
     // SAFETY: `gtt_mmadr` is the probe-mapped MMADR BAR; `plane_base +
     // PLANE_SURF_OFFSET` is the primary plane surface-address register, in
     // range of the BAR, and the read has no side-effect.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let surf = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_SURF_OFFSET) };
     // SAFETY: same BAR; `plane_base + PLANE_STRIDE_OFFSET` is the primary
     // plane stride register, in range, read with no side-effect.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let stride_val = unsafe { gpu.gtt_mmadr.read32(plane_base + PLANE_STRIDE_OFFSET) };
 
     let fb = Framebuffer {

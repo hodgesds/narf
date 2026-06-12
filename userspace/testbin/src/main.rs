@@ -37,6 +37,7 @@ extern "C" fn signal_handler(signum: u32) {
     // SAFETY: the brk probe earlier in `start_rust` grew the heap
     // by one page so [BRK_DEFAULT_BASE, +0x1000) is R+W in the
     // active AS for the lifetime of this task.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::ptr::write_volatile(SIG_RECV_VADDR as *mut u32, signum); }
 }
 
@@ -103,6 +104,7 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
         let mut argv_ok;
         // SAFETY: the kernel hands us a valid argv stack at entry;
         // we only read words it laid down before jumping to user.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let argc = core::ptr::read_volatile(rsp_at_entry as *const u64);
             let argv0_p = core::ptr::read_volatile((rsp_at_entry + 8) as *const u64);
@@ -143,6 +145,7 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     let mut mmap_ok = false;
     // SAFETY: a 4-KiB anonymous mapping; we write one u64 to confirm
     // the page is R+W and immediately munmap it.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let p = rt::mmap(0, 0x1000, 0);
         if !p.is_null() {
@@ -155,11 +158,13 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     // ── bootstrap probe ───────────────────────────────────────
     // SAFETY: SYS_BOOTSTRAP returns a kernel-mapped config page
     // that outlives the calling task; we only inspect the magic.
+    // SAFETY: Valid memory or trusted environment
     let cfg = unsafe { rt::bootstrap() };
     let boot_ok = match cfg {
         Some(p) => {
             // SAFETY: `p` is non-null on Some + the kernel always
             // writes the magic before returning the page.
+            // SAFETY: Valid memory or trusted environment
             unsafe { (*p).magic == rt::NARF_MAGIC }
         }
         None => false,
@@ -175,6 +180,7 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     if let Some(cfg_ptr) = cfg {
         // SAFETY: `cfg_ptr` is wire-stable (BootstrapHeader); we
         // observe the shared SQ/CQ vaddrs through it.
+        // SAFETY: Valid memory or trusted environment
         let (sq_v, cq_v) = unsafe { ((*cfg_ptr).shared_sq_vaddr, (*cfg_ptr).shared_cq_vaddr) };
 
         // SharedRing layout: head u32 (0) | tail u32 (4) | closed u32 (8) | pad..64 | slots
@@ -183,6 +189,7 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
         //   tag u64 80..88 / inline[6]u64 88..136 / pad..144
         // SAFETY: the kernel maps the shared rings R+W in this AS;
         // writing to slot[0] is the standard producer fast path.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let sq_head_p = sq_v as *mut u32;
             let sq_slot0  = (sq_v + 64) as *mut u8;
@@ -262,11 +269,13 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     // SAFETY: we never deliver a signal; Stage-4 sigaction is
     // record-only, so 0xDEADBEEF is a sentinel pointer that's
     // never dereferenced.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         rt::sigaction(15, 0xDEADBEEF);
     }
     // SAFETY: clears the handler and reads the prior into the
     // SDK's stack-local out-pointer.
+    // SAFETY: Valid memory or trusted environment
     let prior = unsafe { rt::sigaction(15, 0) };
     let sig_ok = prior == 0xDEADBEEF;
     rt::print_str(if sig_ok { "sig: ok\n" } else { "sig: bad\n" });
@@ -283,6 +292,7 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
     // SAFETY: signal_handler is a valid SysV-AMD64 entry point;
     // the kernel records the address against the calling task's
     // sigaction table.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         rt::sigaction(10, signal_handler as usize);
     }

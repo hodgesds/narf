@@ -54,7 +54,7 @@ fn smoke_acer_wmi_keycode_decode() -> TestResult {
     if crate::acer_wmi::acer_keycode(0x48) != Some(KeyCode::VolumeUp) {
         return TestResult::Fail("0x48 should be VolumeUp");
     }
-    if crate::acer_wmi::acer_keycode(0x9999) != None {
+    if crate::acer_wmi::acer_keycode(0x9999).is_some() {
         return TestResult::Fail("0x9999 should be None");
     }
     TestResult::Pass

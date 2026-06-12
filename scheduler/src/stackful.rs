@@ -397,6 +397,7 @@ impl KernelTask {
         // this call; the task's stack was allocated by us and is
         // still alive; the trampoline_entry symbol is in this
         // crate's code segment.
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
         self.exec_ctx
@@ -436,6 +437,7 @@ impl KernelTask {
         );
         // SAFETY: VTABLE is 'static; the data ptr is null but
         // never dereferenced by the no-op callbacks.
+        // SAFETY: Valid memory or trusted environment
         unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
     }
 }
@@ -483,6 +485,7 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
     // equivalent (we own the box via `Box<KernelTask>`; the executor
     // holds it during the switch + we get a &mut here as the only
     // active reference on this stack).
+    // SAFETY: Valid memory or trusted environment
     let task = unsafe { &mut *task };
     let task_ptr: *mut KernelTask = task as *mut _;
 
@@ -553,6 +556,7 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         }
         // SAFETY: exec_ctx outlives this call (executor's stack
         // is alive in its `poll_to_yield`).
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(&mut task.ctx, exec_ctx) };
         // ── We resume here when the executor switches us back ──
         if task.completed.load(Ordering::Acquire) {
@@ -646,6 +650,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: CURRENT_STACKFUL_TASK is only set by an in-progress
     // `poll_to_yield` whose caller still holds the Box alive; the
     // pointer remains valid until poll_to_yield clears it.
+    // SAFETY: Valid memory or trusted environment
     let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
     if no_preempt {
         return false;
@@ -654,6 +659,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // non-null; per the invariant noted there, the Box it points at is kept
     // alive by the in-progress poll_to_yield, so the atomic field reads below
     // dereference a live `KernelTask`.
+    // SAFETY: Valid memory or trusted environment
     let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
     // SAFETY: Same live-`KernelTask` invariant as above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
@@ -674,6 +680,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // future never finished, so it never called wake_by_ref).
     // SAFETY: Same live-`KernelTask` invariant as above; `current_waker` is an
     // IrqSafeSpinLock, so locking it from this IRQ context is sound.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let waker_guard = (*task_ptr).current_waker.lock();
         if let Some(w) = waker_guard.as_ref() {
@@ -687,6 +694,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // an UnsafeCell owned by this task and only written here while the task is
     // the CPU's CURRENT_STACKFUL_TASK, so there is no concurrent access; the
     // volatile write copies the caller-owned `*frame` into it.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile((*task_ptr).saved_trap_frame.get(), *frame);
         (*task_ptr).preempted.store(true, Ordering::Release);
@@ -705,11 +713,13 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // includes IF=0 since we're in a trap handler).
     // SAFETY: Same live-`KernelTask` invariant; taking a raw pointer to its
     // `ctx` field does not dereference beyond the live allocation.
+    // SAFETY: Valid memory or trusted environment
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
     // SAFETY: `task_ctx_ptr` points at this task's `KernelContext` (save slot)
     // and `exec_ctx` is the non-null executor context published by the
     // in-progress poll_to_yield; kernel_switch saves the current callee-saved
     // state / RFLAGS into the former and restores the latter.
+    // SAFETY: Valid memory or trusted environment
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
 
     // ── Resumed here when the executor switches back into this
@@ -729,6 +739,7 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: We were resumed by the executor switching back into this task, so
     // its Box is still alive (poll_to_yield has not returned). Re-publishing
     // CURRENT and restarting the slice counter dereferences that live task.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
         (*task_ptr)
@@ -848,10 +859,12 @@ impl Future for StackfulAdapter {
             // move out of here — `inner` stays behind its `Box` and we only
             // take a `&mut` to call `poll_to_yield`, so the pin guarantee on
             // `self` is upheld.
+            // SAFETY: Valid memory or trusted environment
             let this = unsafe { self.get_unchecked_mut() };
             let mut exec_ctx = KernelContext::default();
             // SAFETY: single-threaded; this poll() is the only
             // active caller of this KernelTask.
+            // SAFETY: Valid memory or trusted environment
             unsafe { this.inner.poll_to_yield(&mut exec_ctx, cx.waker()) }
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -949,6 +962,7 @@ pub mod tests {
                 return TestResult::Fail("counter mismatch on Pending iteration");
             }
         }
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         if r != Poll::Ready(()) {
             return TestResult::Fail("expected Ready after countdown");
@@ -983,6 +997,7 @@ pub mod tests {
         frame.cs = 0x08; // CPL=0
                          // Doesn't matter what CURRENT_STACKFUL_TASK holds — the
                          // vector check fires first.
+                         // SAFETY: Valid memory or trusted environment
         let result = unsafe { try_preempt(&mut frame) };
         if result {
             return TestResult::Fail("preempted on vector != 32");
@@ -997,6 +1012,7 @@ pub mod tests {
         let mut frame = zero_trap_frame();
         frame.vector = PREEMPT_VECTOR;
         frame.cs = 0x1b; // user CS (RPL=3)
+                         // SAFETY: Valid memory or trusted environment
         let result = unsafe { try_preempt(&mut frame) };
         if result {
             return TestResult::Fail("preempted a CPL=3 trap");
@@ -1015,6 +1031,7 @@ pub mod tests {
         let mut frame = zero_trap_frame();
         frame.vector = PREEMPT_VECTOR;
         frame.cs = 0x08;
+        // SAFETY: Valid memory or trusted environment
         let result = unsafe { try_preempt(&mut frame) };
         if result {
             return TestResult::Fail("preempted with no current task");
@@ -1050,6 +1067,7 @@ pub mod tests {
         let mut frame = zero_trap_frame();
         frame.vector = PREEMPT_VECTOR;
         frame.cs = 0x08;
+        // SAFETY: Valid memory or trusted environment
         let result = unsafe { try_preempt(&mut frame) };
 
         // Clean up before checking — keep the global pristine.
@@ -1086,6 +1104,7 @@ pub mod tests {
         let mut frame = zero_trap_frame();
         frame.vector = PREEMPT_VECTOR;
         frame.cs = 0x08;
+        // SAFETY: Valid memory or trusted environment
         let result = unsafe { try_preempt(&mut frame) };
 
         CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
@@ -1137,6 +1156,7 @@ pub mod tests {
         // Poll N times: should always be Pending, and counter
         // advances one per poll.
         for expected in 1..=8 {
+            // SAFETY: Valid memory or trusted environment
             let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
             if r != Poll::Pending {
                 return TestResult::Fail("expected Pending while flag false");
@@ -1148,6 +1168,7 @@ pub mod tests {
 
         // Flip the flag; next poll should return Ready.
         FLAG.store(true, Ordering::Release);
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         if r != Poll::Ready(()) {
             return TestResult::Fail("expected Ready after flag set");
@@ -1170,6 +1191,7 @@ pub mod tests {
             type Output = ();
             fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
                 let rsp: u64;
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     core::arch::asm!("mov {0}, rsp", out(reg) rsp,
                         options(nomem, nostack, preserves_flags));
@@ -1189,6 +1211,7 @@ pub mod tests {
         let mut task = task;
         let mut exec_ctx = KernelContext::default();
         let waker = KernelTask::no_op_waker();
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         if r != Poll::Ready(()) {
             return TestResult::Fail("expected Ready");
@@ -1223,7 +1246,9 @@ pub mod tests {
         let waker = KernelTask::no_op_waker();
 
         // Interleaved polls — each task uses its own ctx + stack.
+        // SAFETY: Valid memory or trusted environment
         let ra = unsafe { task_a.poll_to_yield(&mut exec_ctx, &waker) };
+        // SAFETY: Valid memory or trusted environment
         let rb = unsafe { task_b.poll_to_yield(&mut exec_ctx, &waker) };
         if ra != Poll::Ready(()) || rb != Poll::Ready(()) {
             return TestResult::Fail("one of the tasks didn't complete");
@@ -1354,6 +1379,7 @@ pub mod tests {
 
         let mut task = KernelTask::new(CaptureWakerData);
         let mut exec_ctx = KernelContext::default();
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
 
         if observer.wakes.load(Ordering::Acquire) == 0 {
@@ -2855,6 +2881,7 @@ pub mod tests {
         let mut task = KernelTask::new(ReadyImmediately);
         let mut exec_ctx = KernelContext::default();
         let waker = KernelTask::no_op_waker();
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
 
         let after = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);

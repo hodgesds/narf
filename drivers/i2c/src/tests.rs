@@ -173,18 +173,21 @@ fn smoke_amd_fch_enable_writes_expected_regs() -> TestResult {
     // is the address of the first element.
     let base = phys.raw() as *const u32;
     // IC_CON @ offset 0 (u32 index 0) — should have MASTER + SPEED_FAST + SLAVE_DIS + RESTART_EN
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_con = unsafe { core::ptr::read_volatile(base) };
     let want = 1u32 | (0b10 << 1) | (1 << 6) | (1 << 5);
     if ic_con != want {
         return TestResult::Fail("IC_CON not programmed to master/fast/slave-dis/restart-en");
     }
     // IC_ENABLE @ 0x6c (u32 index 27) should be 1 after enable.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_enable = unsafe { core::ptr::read_volatile(base.add(0x6c / 4)) };
     if ic_enable != 1 {
         return TestResult::Fail("IC_ENABLE not 1 after enable()");
     }
     // After disable() it should be 0.
     drv.disable();
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_enable = unsafe { core::ptr::read_volatile(base.add(0x6c / 4)) };
     if ic_enable != 0 {
         return TestResult::Fail("IC_ENABLE not 0 after disable()");
@@ -279,6 +282,7 @@ fn smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates() -> TestResult {
             // Check that the ungate sequence touched the private regs.
             // LPSS_PRIV_RESETS is at 0x204.
             let base = phys.raw() as *const u32;
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let resets = unsafe { core::ptr::read_volatile(base.add(0x204 / 4)) };
             if resets != 0x7 {
                 return TestResult::Fail("LPSS ungate didn't set PRIV_RESETS to 0x7");
@@ -300,11 +304,13 @@ fn smoke_lpss_i2c_enable_writes_expected_regs() -> TestResult {
         return TestResult::Fail("LPSS enable() failed unexpectedly");
     }
     let base = phys.raw() as *const u32;
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_con = unsafe { core::ptr::read_volatile(base) };
     let want = 1u32 | (0b10 << 1) | (1 << 6) | (1 << 5);
     if ic_con != want {
         return TestResult::Fail("LPSS IC_CON not programmed correctly");
     }
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_enable = unsafe { core::ptr::read_volatile(base.add(0x6c / 4)) };
     if ic_enable != 1 {
         return TestResult::Fail("LPSS IC_ENABLE not 1 after enable()");

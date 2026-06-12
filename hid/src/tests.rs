@@ -607,13 +607,9 @@ kernel_test_in!("hid/ptp", smoke_ptp_detect_rejects_non_touchpad);
 // ── HID Pen profile ───────────────────────────────────────────────
 
 /// Synthetic Pen descriptor. One Pen Application Collection, Report
-
 /// ID 5: tip / barrel / invert / eraser / in-range (5 bits + 3 pad)
-
 /// + X/Y (16-bit each) + Pressure (16) + X-Tilt/Y-Tilt (8-bit signed)
-
 /// + Twist (16).
-
 const PEN_DESCRIPTOR: &[u8] = &[
     0x05, 0x0D, // Digitizer page
     0x09, 0x02, // Usage (Pen)
@@ -748,9 +744,7 @@ kernel_test_in!("hid/pen", smoke_pen_detect_rejects_non_pen_descriptor);
 // ── HID Sensor Collections ────────────────────────────────────────
 
 /// Synthetic accelerometer descriptor: page 0x20 / usage 0x73, with
-
 /// 16-bit X/Y/Z fields under report ID 1.
-
 const ACCEL_DESCRIPTOR: &[u8] = &[
     0x05, 0x20, // Usage Page (Sensors)
     0x09, 0x73, // Usage (Motion: Accelerometer 3D)
@@ -814,7 +808,6 @@ fn smoke_sensor_decode_xyz_signed() -> TestResult {
 kernel_test_in!("hid/sensor", smoke_sensor_decode_xyz_signed);
 
 /// Ambient-light descriptor: single 32-bit Illuminance field.
-
 const ALS_DESCRIPTOR: &[u8] = &[
     0x05, 0x20, // Sensors
     0x09, 0x41, // Light: Ambient Light

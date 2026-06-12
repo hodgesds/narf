@@ -323,6 +323,7 @@ impl Tpm {
         // published by firmware (REG_CRB_RSP_LO/HI), identity-mapped at boot,
         // and rsp_size >= 10 was checked when the buffer was set up, so
         // rsp_phys..rsp_phys+10 are valid readable MMIO/DMA bytes.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, byte) in header.iter_mut().enumerate() {
                 *byte = core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8);
@@ -337,6 +338,7 @@ impl Tpm {
             // SAFETY: resp_size <= self.rsp_size was checked above, so every
             // i in 0..resp_size addresses a byte inside the firmware-published,
             // identity-mapped CRB response buffer at rsp_phys.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *byte = unsafe { core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8) };
         }
         Ok(out)
@@ -521,6 +523,7 @@ pub fn try_init_default() {
     }
     // SAFETY: boot-time exclusive access; the locality-0 window
     // is identity-mapped on x86_64.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     if let Ok(dev) = unsafe { Tpm::probe(TPM_BASE_LOCALITY_0) } {
         *TPM.lock() = Some(dev);
     }

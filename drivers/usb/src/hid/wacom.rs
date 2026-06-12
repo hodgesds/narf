@@ -768,6 +768,8 @@ fn intuos_tool_type(id: u32) -> u16 {
     }
 }
 
+extern crate alloc;
+
 // ── Smoke tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -862,6 +864,7 @@ mod tests {
     }
 
     /// Construct a 10-byte Intuos5/Pro pen-data report.
+    #[allow(clippy::too_many_arguments)]
     fn intuos_pen_data(
         x: u16,
         y: u16,
@@ -1103,5 +1106,3 @@ mod tests {
         assert!(btn0, "BTN_0 not pressed in Cintiq ExpressKey report");
     }
 }
-
-extern crate alloc;

@@ -56,6 +56,7 @@ fn smoke_e1000_bring_up_and_tx() -> TestResult {
     // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the test harness
     // maps before running; `init` only walks that ECAM region and is safe to
     // call repeatedly (idempotent on re-entry).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_e1000 = devs.iter().any(|d| {
@@ -110,6 +111,7 @@ fn smoke_e1000_rx_arp_request() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window mapped by the test
     // harness; `init` only walks that ECAM region and is idempotent on re-entry.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -478,6 +480,7 @@ fn smoke_e1000_qemu_fwsm_dance_is_noop() -> TestResult {
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
     // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window mapped by the test
     // harness; `init` only walks that ECAM region and is idempotent on re-entry.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_e1000 = devs.iter().any(|d| {

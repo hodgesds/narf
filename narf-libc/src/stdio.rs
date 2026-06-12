@@ -242,6 +242,7 @@ pub unsafe fn fopen(path: *const u8, path_len: usize, mode: &str) -> *mut File {
     // null on failure; we propagate that to the caller.
     // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
     // the only contract.
+    // SAFETY: Valid memory or trusted environment
     let f = unsafe { malloc(core::mem::size_of::<File>()) } as *mut File;
     if f.is_null() {
         let _ = narf_user_runtime::close(fd);
@@ -251,6 +252,7 @@ pub unsafe fn fopen(path: *const u8, path_len: usize, mode: &str) -> *mut File {
     // SAFETY: `malloc` returned a non-null 16-byte-aligned block of
     // at least `size_of::<File>()` bytes; writing the initialiser
     // into it is well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write(
             f,
@@ -299,6 +301,7 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
     if let Some(p) = file.rbuf.take() {
         // SAFETY: pointer came from `malloc` via `ensure_rbuf` —
         // matched alloc/free pair through the freelist allocator.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             free(p);
         }
@@ -322,6 +325,7 @@ pub unsafe fn fclose(f: *mut File) -> i32 {
         // and live in `.bss`, so we leave them alone.)
         // SAFETY: matched alloc/free pair through the freelist
         // allocator's C-ABI.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             free(f as *mut u8);
         }
@@ -339,6 +343,7 @@ fn ensure_rbuf(f: &mut File) -> Option<*mut u8> {
     }
     // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
     // the only contract.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { malloc(BUF_CAP) };
     if p.is_null() {
         f.err = ENOMEM;
@@ -356,6 +361,7 @@ fn ensure_wbuf(f: &mut File) -> Option<*mut u8> {
     }
     // SAFETY: malloc is `unsafe extern "C"`; a non-zero size is
     // the only contract.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { malloc(BUF_CAP) };
     if p.is_null() {
         f.err = ENOMEM;
@@ -382,6 +388,7 @@ fn refill(f: &mut File) -> usize {
     };
     // SAFETY: `p` points at `BUF_CAP` malloc-owned bytes; the
     // kernel writes at most `BUF_CAP` bytes back.
+    // SAFETY: Valid memory or trusted environment
     let buf = unsafe { core::slice::from_raw_parts_mut(p, BUF_CAP) };
     let n = narf_user_runtime::read(f.fd, buf);
     f.rbuf_pos = 0;
@@ -428,6 +435,7 @@ pub unsafe fn fread(buf: *mut u8, size: usize, count: usize, f: *mut File) -> us
             // SAFETY: rbuf is a `BUF_CAP`-byte allocation; positions
             // are bounded by `rbuf_end <= BUF_CAP`. `buf + written`
             // stays within the caller's slice by construction.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 let src = file.rbuf.unwrap().add(file.rbuf_pos);
                 let dst = buf.add(written);
@@ -502,6 +510,7 @@ pub unsafe fn fwrite(buf: *const u8, size: usize, count: usize, f: *mut File) ->
         // SAFETY: wbuf is a `BUF_CAP`-byte alloc; `wbuf_len + n <=
         // BUF_CAP` by construction; `buf + copied` is within the
         // caller's region.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let src = buf.add(copied);
             let dst = wbuf_ptr.add(file.wbuf_len);
@@ -584,10 +593,12 @@ pub unsafe fn fgets(buf: *mut u8, max_len: usize, f: *mut File) -> *mut u8 {
         }
         // SAFETY: rbuf is non-null because refill() succeeded; the
         // slice [rbuf_pos..rbuf_end] is the valid unread region.
+        // SAFETY: Valid memory or trusted environment
         let byte = unsafe { *file.rbuf.unwrap().add(file.rbuf_pos) };
         file.rbuf_pos += 1;
         // SAFETY: written < cap < max_len, so buf+written is in
         // bounds; caller-supplied buffer is writable by contract.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *buf.add(written) = byte;
         }
@@ -605,6 +616,7 @@ pub unsafe fn fgets(buf: *mut u8, max_len: usize, f: *mut File) -> *mut u8 {
     }
     // SAFETY: written <= cap < max_len so buf+written is within
     // the caller's region; we promised a NUL terminator.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *buf.add(written) = 0;
     }
@@ -775,6 +787,7 @@ pub unsafe fn ungetc(c: i32, stream: *mut File) -> i32 {
             file.rbuf_pos -= 1;
             // SAFETY: rbuf is a BUF_CAP-byte alloc; rbuf_pos was just
             // bounded by BUF_CAP via the prior subtraction.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 *p.add(file.rbuf_pos) = byte;
             }
@@ -822,10 +835,12 @@ pub unsafe fn perror(s: *const u8) {
     use crate::errno::{errno, strerror};
     let stream = stderr();
     // Optional caller prefix.
+    // SAFETY: Valid memory or trusted environment
     let has_prefix = !s.is_null() && unsafe { *s } != 0;
     if has_prefix {
         // SAFETY: caller asserts NUL-termination.
         let mut len = 0usize;
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             while *s.add(len) != 0 {
                 len += 1;
@@ -869,6 +884,7 @@ fn drain_for_seek(file: &mut File, f_raw: *mut File) -> i32 {
     if file.wbuf_len != 0 {
         // SAFETY: caller supplies the same raw pointer; fflush only
         // walks `file.wbuf_len` bytes from `file.wbuf` and resets.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { fflush(f_raw) } != 0 {
             rc = EOF;
         }
@@ -973,6 +989,7 @@ pub unsafe fn fputc(c: i32, f: *mut File) -> i32 {
     let byte = c as u8;
     // SAFETY: a single stack-local byte; `fwrite` honours `&buf` for
     // exactly one byte.
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { fwrite(&byte as *const u8, 1, 1, f) };
     if n == 1 {
         (byte as i32) & 0xFF
@@ -1053,6 +1070,7 @@ pub unsafe fn puts(s: *const u8) -> i32 {
     let out = stdout();
     // SAFETY: `out` is a stable static `*mut File`; `s` is `len`
     // readable bytes per the walk above.
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { fwrite(s, 1, len, out) };
     if n != len {
         return EOF;

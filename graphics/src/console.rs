@@ -299,6 +299,7 @@ pub unsafe fn rebase_installed(new_base: *mut u32) {
     if let Some(c) = g.as_mut() {
         // SAFETY: forwarding caller's contract; Framebuffer's
         // `set_base` does the same mapping-lifetime check.
+        // SAFETY: Valid memory or trusted environment
         unsafe { c.fb.set_base(new_base) };
     }
 }

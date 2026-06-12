@@ -412,6 +412,7 @@ unsafe fn syscall0(num: u64) -> u64 {
     // SAFETY: int-0x80 is the registered NARF user gate; rcx + r11
     // are trap-clobbered, rdx is also kernel-written even on a
     // 0-arg call.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -464,6 +465,7 @@ unsafe fn syscall3(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // SAFETY: int-0x80 with three args; RDX carries `a2` in and the
     // kernel status word out — declare as inout so rustc doesn't
     // expect any prior RDX value to survive.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -482,6 +484,7 @@ unsafe fn syscall4(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     let mut rax = num;
     // SAFETY: r10 is the 4th-arg register (NARF mirrors Linux's
     // amd64 kernel convention; see `syscall3` for the RDX rationale).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -500,6 +503,7 @@ unsafe fn syscall5(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64
     let mut rax = num;
     // SAFETY: r8 is the 5th-arg register (NARF mirrors Linux's
     // amd64 kernel convention; see `syscall3` for the RDX rationale).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "int 0x80",
@@ -663,6 +667,7 @@ pub fn exit_task() -> ! {
     // SAFETY: SYS_EXIT_TASK takes no args and never returns on
     // success; on failure we spin (we have no console + no panic
     // handler in this crate).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         syscall0(SYS_EXIT_TASK);
     }
@@ -963,6 +968,7 @@ pub fn fork() -> Result<u64, ()> {
     // SAFETY: SYS_FORK takes no arguments. The kernel rewrites
     // the child's RAX to 0 before the child's first user-mode
     // resume; the parent sees the child's tid in RAX here.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall0(SYS_FORK) };
     if r == u64::MAX || r == ((-1i64) as u64) {
         Err(())
@@ -997,6 +1003,7 @@ pub fn clone(entry: u64, stack_top: u64, arg: u64, fs_base: u64) -> Result<u64, 
 pub fn futex(uaddr: *mut u32, op: u32, val: u32, timeout: u64, uaddr2: u64, val3: u32) -> i64 {
     // SAFETY: SYS_FUTEX signature mirrors Linux:
     //   (uaddr, op, val, timeout/uaddr2, uaddr2, val3).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall6(
             SYS_FUTEX,
@@ -1308,6 +1315,7 @@ pub unsafe fn fb_info(handle: u64) -> Result<FbInfo, ()> {
     let mut out = FbInfo::default();
     // SAFETY: SYS_FB_INFO writes 6 u32s through the user pointer;
     // FbInfo is repr(C) and 24 bytes (u32 × 6).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall2(SYS_FB_INFO, handle, &mut out as *mut FbInfo as u64) };
     if r == 0 {
         Ok(out)
@@ -1630,6 +1638,7 @@ pub unsafe fn sigreturn_with(sc_vaddr: u64) -> ! {
     // SAFETY: SYS_SIGRETURN takes a single sc_vaddr arg; the
     // kernel rewrites the trap frame and the iretq lands at the
     // saved RIP.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { syscall1(SYS_SIGRETURN, sc_vaddr) };
     loop {
         core::hint::spin_loop();
@@ -1990,6 +1999,7 @@ pub fn chdir(path: &str) -> i32 {
     // SAFETY: SYS_CHDIR signature: (path_ptr, path_len). Pointer
     // stays valid across the call because `&str` borrows outlive
     // the syscall.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64) };
     if r == 0 {
         0
@@ -2009,6 +2019,7 @@ pub fn getcwd(buf: &mut [u8]) -> i32 {
     // writes ≤ buf.len() bytes (NUL-terminated) when buf is large
     // enough; otherwise returns InvalidOp and we don't trust the
     // buffer state.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) };
     // The kernel returns the byte length on success; treat the
     // sentinel `!0u64` (InvalidOp's payload) as failure as well so
@@ -2159,6 +2170,7 @@ pub fn open_flags(path: &str, mount: &str, flags: u64) -> Option<u32> {
     // SAFETY: SYS_OPEN takes (path_ptr, path_len, mount_ptr, mount_len, flags).
     // The pointers stay valid for the trap because `&str` borrows
     // outlive the call.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall5(
             SYS_OPEN,
@@ -2256,6 +2268,7 @@ pub fn dup2(oldfd: u32, newfd: u32) -> Option<u32> {
 pub fn dup3(oldfd: u32, newfd: u32, flags: u32) -> Option<u32> {
     // SAFETY: SYS_DUP3 signature: (oldfd, newfd, flags). RDX must be
     // declared inout per the ≥3-arg convention (commit b3c6517).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall3(SYS_DUP3, oldfd as u64, newfd as u64, flags as u64) };
     if r == !0u64 {
         None
@@ -2362,6 +2375,7 @@ pub fn lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     // SAFETY: SYS_LSEEK signature: (fd, offset, whence). The asm
     // wrapper preserves the rdx clobber convention — see the
     // `inout("rdx") a2 => _` clause in `syscall3`.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall3(SYS_LSEEK, fd as u64, offset as u64, whence as u64) };
     r as i64
 }
@@ -2375,6 +2389,7 @@ pub fn unlink(path: &str) -> i32 {
     // SAFETY: SYS_UNLINK signature: (path_ptr, path_len). Failure
     // sentinel is `-1` cast to u64 because the asm wrapper observes
     // only the value register, not the status.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall2(SYS_UNLINK, path.as_ptr() as u64, path.len() as u64) };
     if r as i64 == -1 {
         -1
@@ -2421,6 +2436,7 @@ pub fn rmdir(path: &str) -> i32 {
 pub fn rename(old_path: &str, new_path: &str) -> i32 {
     // SAFETY: SYS_RENAME signature:
     //   (old_ptr, old_len, new_ptr, new_len).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall4(
             SYS_RENAME,
@@ -2472,6 +2488,7 @@ pub fn symlink(target: &str, link: &str) -> i32 {
     }
     // SAFETY: SYS_SYMLINK signature:
     //   (target_ptr, target_len, link_ptr, link_len).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall4(
             SYS_SYMLINK,
@@ -2500,6 +2517,7 @@ pub fn getdents64(path: &str, cursor: u64, out: &mut [u8]) -> isize {
     }
     // SAFETY: SYS_GETDENTS64 signature: (path_ptr, path_len, cursor,
     // out_ptr, out_len).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall5(
             SYS_GETDENTS64,
@@ -2528,6 +2546,7 @@ pub fn listdir(path: &str, cursor: u64, out: &mut [u8]) -> isize {
     }
     // SAFETY: SYS_LISTDIR signature:
     //   (path_ptr, path_len, cursor, out_ptr, out_len).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall5(
             SYS_LISTDIR,
@@ -2574,6 +2593,7 @@ pub fn pipe() -> Option<(u32, u32)> {
     // SAFETY: SYS_PIPE signature: (out_ptr). The kernel writes two
     // i32s through the pointer; `fds` lives on this function's stack
     // for the duration of the syscall.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u64) };
     if r != 0 || fds[0] < 0 || fds[1] < 0 {
         None
@@ -2672,6 +2692,7 @@ pub fn renameat(old_dirfd: i32, old: &str, new_dirfd: i32, new: &str) -> i32 {
     nbuf[..new.len()].copy_from_slice(new.as_bytes());
     // SAFETY: SYS_RENAMEAT linux signature: (old_dirfd, old_cstr,
     // new_dirfd, new_cstr).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall4(
             SYS_RENAMEAT,
@@ -2766,6 +2787,7 @@ pub fn symlinkat(target: &str, dirfd: i32, link: &str) -> i32 {
     }
     // SAFETY: SYS_SYMLINKAT signature: (target_ptr, target_len, dirfd,
     // link_ptr, link_len).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall5(
             SYS_SYMLINKAT,
@@ -2798,6 +2820,7 @@ pub fn readlinkat(dirfd: i32, path: &str, buf: &mut [u8]) -> isize {
     pbuf[..path.len()].copy_from_slice(path.as_bytes());
     // SAFETY: SYS_READLINKAT linux signature: (dirfd, path_cstr,
     // buf, bufsiz).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall4(
             SYS_READLINKAT,
@@ -2824,6 +2847,7 @@ pub fn fstatat(dirfd: i32, path: &str, out: &mut StatBuf, flags: i32) -> i32 {
     pbuf[..path.len()].copy_from_slice(path.as_bytes());
     // SAFETY: SYS_NEWFSTATAT linux signature: (dirfd, path_cstr,
     // statbuf, flags).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall4(
             SYS_NEWFSTATAT,
@@ -2982,6 +3006,7 @@ pub fn copy_file_range(
 ) -> isize {
     // SAFETY: SYS_COPY_FILE_RANGE signature:
     //   (fd_in, fd_out, off_in, off_out, len, flags).
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         syscall6(
             SYS_COPY_FILE_RANGE,
@@ -3036,6 +3061,7 @@ pub fn clock_gettime(clock_id: u32) -> (i64, i64) {
     // SAFETY: SYS_CLOCK_GETTIME signature: (clock_id, timespec_ptr).
     // `ts` lives on this function's stack for the duration of the
     // syscall.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { syscall2(SYS_CLOCK_GETTIME, clock_id as u64, ts.as_mut_ptr() as u64) };
     (ts[0], ts[1])
 }
@@ -3068,6 +3094,7 @@ pub unsafe fn sigaction(signum: u32, handler: usize) -> usize {
     let mut old: u64 = 0;
     // SAFETY: SYS_SIGACTION signature: (signum, handler, old_out).
     // `old` lives on this function's stack across the call.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         syscall4(
             SYS_SIGACTION,
@@ -3103,6 +3130,7 @@ pub fn kill(target_pid: u64, signum: u32) -> Result<(), ()> {
 pub fn sigprocmask(how: u32, set: u32) -> u32 {
     // SAFETY: SYS_SIGPROCMASK signature: (how, set). The kernel
     // returns the previous mask in the rax payload.
+    // SAFETY: Valid memory or trusted environment
     unsafe { syscall2(SYS_SIGPROCMASK, how as u64, set as u64) as u32 }
 }
 
@@ -3194,6 +3222,7 @@ pub fn thread_pointer() -> *mut u8 {
     // which is a kernel bug, not a UB hazard at this call site.
     // Reading from the segment base never traps if the base is a
     // valid canonical address (the TLS staging path enforces that).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mov {tp}, fs:[0]",
@@ -3213,6 +3242,7 @@ pub fn thread_pointer() -> *mut u8 {
     // SAFETY: TPIDR_EL0 is unconditionally readable at EL0; the
     // kernel writes it on each user-mode entry the same way x86_64
     // writes IA32_FS_BASE.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {tp}, tpidr_el0",

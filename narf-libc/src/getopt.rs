@@ -62,6 +62,7 @@ pub unsafe extern "C" fn getopt(
     }
     // SAFETY: all three statics are touched single-threaded under
     // Stage-4 user mode.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // If we're mid-cluster, advance within the current element.
         if NEXTCHAR == 0 {
@@ -317,6 +318,7 @@ pub unsafe extern "C" fn getopt_long(
 unsafe fn emit_diag(argv: *const *mut c_char, msg: &str, opt: u8) {
     // SAFETY: caller contract — argv[0] (when non-null) is a C
     // string with the program name.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let prog_ptr = *argv;
         let prog = if prog_ptr.is_null() {

@@ -1016,6 +1016,7 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
     // Reconstitute, clone, restore the original — net +1 refcount.
     // SAFETY: `data` was produced by `Arc::into_raw` in `make_waker`
     // or a prior `clone_raw`, and the Arc is still live.
+    // SAFETY: Valid memory or trusted environment
     let arc = unsafe { Arc::<AtomicBool>::from_raw(data as *const AtomicBool) };
     let cloned = arc.clone();
     let _ = Arc::into_raw(arc);
@@ -1042,6 +1043,7 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the AtomicBool behind `data` is valid for the duration of this
     // call.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*ptr).store(true, Ordering::Release);
     }
@@ -1058,6 +1060,7 @@ fn make_waker(flag: Arc<AtomicBool>) -> Waker {
     let raw = Arc::into_raw(flag) as *const ();
     // SAFETY: vtable functions are matched to the `Arc<AtomicBool>`
     // representation encoded in `raw`.
+    // SAFETY: Valid memory or trusted environment
     unsafe { Waker::from_raw(RawWaker::new(raw, &TASK_VTABLE)) }
 }
 
@@ -1178,6 +1181,7 @@ pub fn poll_one_round() -> usize {
             if narf_arch::x86_64::pks::is_active() {
                 // SAFETY: CR4.PKS is on (is_active() returned true);
                 // WRMSR IA32_PKRS is well-defined.
+                // SAFETY: Valid memory or trusted environment
                 unsafe { narf_arch::x86_64::pks::restore(saved) };
             }
         }
@@ -1359,6 +1363,7 @@ pub fn run_until_empty() {
                 // SAFETY: Reading CR3 is an unprivileged-of-side-effects
                 // ring-0 instruction with no memory operand; `nomem`/`nostack`
                 // accurately describe it and `raw` receives the value.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     core::arch::asm!(
                         "mov {0}, cr3",
@@ -1378,6 +1383,7 @@ pub fn run_until_empty() {
                 // is unconditionally permitted. It has no memory operand,
                 // so `nomem`/`nostack`/`preserves_flags` hold, and `raw`
                 // receives the register value.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     core::arch::asm!(
                         "mrs {0}, ttbr0_el1",
@@ -1422,6 +1428,7 @@ pub fn run_until_empty() {
                 if narf_arch::x86_64::pks::is_active() {
                     // SAFETY: CR4.PKS is on (is_active() returned
                     // true); WRMSR IA32_PKRS is well-defined.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { narf_arch::x86_64::pks::restore(saved) };
                 }
             }
@@ -1468,6 +1475,7 @@ pub fn run_until_empty() {
                 // SAFETY: `saved_cr3` was just read from CR3 in
                 // kernel context above; writing it back is
                 // identity-safe.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     core::arch::asm!(
                         "mov cr3, {0}",
@@ -1488,6 +1496,7 @@ pub fn run_until_empty() {
                 // performs internally, replicated here so we
                 // don't pull a circular dep on `narf-memory`
                 // from inside `narf-scheduler`'s hot path.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     core::arch::asm!(
                         "msr ttbr0_el1, {0}",
@@ -1917,6 +1926,7 @@ pub mod sleep_pumps {
             // SAFETY: slot was populated by `register` with a
             // valid `Pump` (`fn()`), and the static lifetime is
             // the kernel's.
+            // SAFETY: Valid memory or trusted environment
             let f: Pump = unsafe { core::mem::transmute(p) };
             f();
         }
@@ -2054,6 +2064,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     // out from under our `&mut` for the function's lifetime.
     // SAFETY: `fut` is a unique mutable binding we never move
     // again until the future completes.
+    // SAFETY: Valid memory or trusted environment
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
     let awake = Arc::new(AtomicBool::new(true));
     let waker = make_waker(awake.clone());

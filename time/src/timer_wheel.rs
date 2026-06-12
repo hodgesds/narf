@@ -150,6 +150,7 @@ fn invoke_arm(deadline: u64) {
     }
     // SAFETY: only set via `set_arm_callback`, which takes
     // `fn(u64)`. Round-trip is sound for a non-zero value.
+    // SAFETY: Valid memory or trusted environment
     let f: fn(u64) = unsafe { core::mem::transmute(raw) };
     f(deadline);
 }

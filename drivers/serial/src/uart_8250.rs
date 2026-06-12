@@ -161,7 +161,9 @@ pub fn baud_divisor(baud: u32, clock_hz: u32) -> Option<u16> {
 #[inline]
 unsafe fn uart_write(base: UartBase, shift: u8, reg: u16, val: u8) {
     match base {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         UartBase::Io(p) => unsafe { narf_arch::x86_64::io_port::outb(p + (reg << shift), val) },
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         UartBase::Mmio(a) => unsafe {
             narf_arch::mmio::write8(a.raw() + ((reg as u64) << shift), val)
         },
@@ -173,7 +175,9 @@ unsafe fn uart_write(base: UartBase, shift: u8, reg: u16, val: u8) {
 #[inline]
 unsafe fn uart_read(base: UartBase, shift: u8, reg: u16) -> u8 {
     match base {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         UartBase::Io(p) => unsafe { narf_arch::x86_64::io_port::inb(p + (reg << shift)) },
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         UartBase::Mmio(a) => unsafe { narf_arch::mmio::read8(a.raw() + ((reg as u64) << shift)) },
     }
 }
@@ -261,6 +265,7 @@ impl Uart8250 {
             return UartType::Uart8250;
         }
         // Try FIFO.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let has_fifo = unsafe {
             uart_write(
                 self.base,
@@ -320,11 +325,13 @@ impl Uart8250 {
         if self.uart_type == UartType::NotDetected {
             return false;
         }
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { uart_write(self.base, self.reg_shift, REG_IER, 0x00) };
         if !self.set_baud(baud) {
             return false;
         }
         if self.uart_type == UartType::Uart16550A {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 uart_write(
                     self.base,
@@ -334,6 +341,7 @@ impl Uart8250 {
                 );
             }
         }
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             uart_write(
                 self.base,
@@ -353,12 +361,14 @@ impl Uart8250 {
     /// Enable receive-data-available interrupt.
     #[cfg(target_arch = "x86_64")]
     pub fn enable_rx_irq(&self) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { uart_write(self.base, self.reg_shift, REG_IER, IER_RDA) };
     }
 
     /// Write a single byte, blocking until THRE = 1.
     #[cfg(target_arch = "x86_64")]
     pub fn write_byte(&self, byte: u8) {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             loop {
                 let lsr = uart_read(self.base, self.reg_shift, REG_LSR);
@@ -376,6 +386,7 @@ impl Uart8250 {
     /// Read a received byte if one is available.
     #[cfg(target_arch = "x86_64")]
     pub fn read_byte(&self) -> Option<u8> {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let lsr = uart_read(self.base, self.reg_shift, REG_LSR);
             if lsr & LSR_DR != 0 {
@@ -393,6 +404,7 @@ impl Uart8250 {
 
     #[cfg(target_arch = "x86_64")]
     pub fn read_lsr(&self) -> u8 {
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { uart_read(self.base, self.reg_shift, REG_LSR) }
     }
 

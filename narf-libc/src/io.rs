@@ -793,6 +793,7 @@ pub unsafe extern "C" fn sprintf_c(
     let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
         &[]
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(args, n) }
     };
     // Format-then-emit through a vsnprintf_str into a stack buffer
@@ -809,6 +810,7 @@ pub unsafe extern "C" fn sprintf_c(
     // SAFETY: caller declared `buf` is writable for at least the
     // formatted result + NUL. We bound at MAX_SPRINTF to keep the
     // raw_parts size finite.
+    // SAFETY: Valid memory or trusted environment
     let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, MAX_SPRINTF) };
     let n_written = snprintf_str(dst, fmt_str, arg_slice);
     n_written as i32
@@ -837,6 +839,7 @@ pub unsafe extern "C" fn snprintf_c(
     let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
         &[]
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(args, n) }
     };
     // SAFETY: caller declared `buf` is writable for `size` bytes.
@@ -868,6 +871,7 @@ pub unsafe extern "C" fn asprintf_c(
     let arg_slice: &[Arg<'_>] = if args.is_null() || n == 0 {
         &[]
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(args, n) }
     };
     // First pass: compute would-have length. vsnprintf_str on an

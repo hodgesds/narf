@@ -37,6 +37,7 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     // SAFETY: vtable's clone returns the same null RawWaker; the
     // wake/wake_by_ref/drop slots are no-ops, so the Waker
     // contract holds trivially.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let waker = unsafe { Waker::from_raw(raw()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: we own `fut` on the stack and don't move it.

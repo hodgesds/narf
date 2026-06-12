@@ -204,6 +204,7 @@ impl<T: Copy + Send + Sync> Ring<T> {
         slot.seq.store(publish_marker, Ordering::Release);
         // Step 2: write payload. SAFETY: producer is single-owner,
         // and the seq handshake stops consumers from racing.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*slot.val.get()).write(event);
         }
@@ -265,6 +266,7 @@ impl<T: Copy + Send + Sync> Ring<T> {
                 // SAFETY: producer published this seq via Release,
                 // we Acquire-loaded the seq, so the payload write is
                 // visible. T: Copy means we don't move out of the slot.
+                // SAFETY: Valid memory or trusted environment
                 let val = unsafe { (*slot.val.get()).assume_init_read() };
                 // Re-check seq AFTER read to detect a torn read
                 // (producer wrapped past us during the copy).

@@ -549,6 +549,7 @@ impl VirtioInputPci {
         let (name, axis_info, led_bits) = match device_cfg.as_ref() {
             // SAFETY: device-cfg region was just mapped; read_cfg
             // bounds-checks every offset.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             Some(r) => unsafe { read_device_metadata(r) },
             None => (alloc::string::String::new(), [None; ABS_BOUNDS_LEN], 0u8),
         };

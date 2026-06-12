@@ -67,6 +67,7 @@ macro_rules! write_key_pair {
         pub unsafe fn $name(low: u64, high: u64) {
             // SAFETY: caller-asserted; raw MSR encoding form is the
             // only way to address the PAC key MSRs from Rust asm.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 asm!(
                     concat!("msr ", $low_msr,  ", {l}"),

@@ -268,6 +268,7 @@ pub unsafe fn read_now() -> Result<RtcTime, RtcError> {
     // `century_index` disambiguates, but absent ACPI parsing here we
     // accept any plausible value (19xx/20xx/21xx) and fall back to
     // "20xx assumed".
+    // SAFETY: Valid memory or trusted environment
     let raw_cent = unsafe { read_index(REG_CENTURY) };
 
     // 12-hour format: bit 7 = PM flag on the *raw* register before

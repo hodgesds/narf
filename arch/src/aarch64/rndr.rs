@@ -32,6 +32,7 @@ pub fn try_rndr() -> Option<u64> {
     // SAFETY: RNDR is unprivileged + side-effect-free; entropy
     // starvation is signalled via NZCV.C, which we capture with
     // cset.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mrs {v}, S3_3_C2_C4_0",

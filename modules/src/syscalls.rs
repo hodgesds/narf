@@ -36,6 +36,7 @@ pub fn sys_init_module(bytes: &[u8]) -> Result<Arc<Module>, ModuleSyscallError> 
 
     // Call the init function; if it fails, unregister and surface the
     // error. SAFETY: we just loaded the module and own its placements.
+    // SAFETY: Valid memory or trusted environment
     let invoke = unsafe { loader::invoke_init(&module) };
     if let Err(e) = invoke {
         registry::remove(module.name());
@@ -68,6 +69,7 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     // SAFETY: registry::lookup gave us an Arc<Module> that owns its
     // placements; we hold it until invoke_exit returns, after which
     // registry::remove drops the registry's reference.
+    // SAFETY: Valid memory or trusted environment
     unsafe { loader::invoke_exit(&module) }.map_err(ModuleSyscallError::ExitFailed)?;
 
     // Sweep all KSYMTAB entries registered by this module during its

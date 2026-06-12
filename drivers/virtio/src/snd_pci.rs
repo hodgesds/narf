@@ -254,6 +254,7 @@ impl VirtioSoundPci {
 
         // SAFETY: Virtqueue::new wipes the layout regions; the
         // backing pages may be recycled (alloc_frame doesn't zero).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let control_q = unsafe { Virtqueue::new(ctrl_layout) };
         // SAFETY: same.
         let event_q = unsafe { Virtqueue::new(event_layout) };

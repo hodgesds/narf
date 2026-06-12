@@ -374,6 +374,7 @@ impl TxQueue {
         // `tfds.add(slot)` stays within the `TX_RING_SIZE`-element ring that
         // `tfds` points at; the slot is `Tfd`-aligned and owned by this queue,
         // so the write does not alias the device's in-flight reads.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             *self.tfds.add(slot) = tfd;
         }

@@ -208,6 +208,7 @@ impl AmdFchI2c {
         debug_assert!(off + 4 <= self.mmio_len);
         // SAFETY: caller holds bus lock or this is a single-thread
         // probe path; offset bounds-checked above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { narf_arch::mmio::read32(self.mmio_base.raw() + off) }
     }
 
@@ -225,6 +226,7 @@ impl AmdFchI2c {
     pub fn probe_component_type(&self) -> Result<(), I2cError> {
         // SAFETY: probe-time, exclusive access to the MMIO window
         // (no transfers in flight before start()).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ct = unsafe { self.read32(IC_COMP_TYPE) };
         if ct == DW_COMP_TYPE_MAGIC {
             Ok(())
@@ -241,6 +243,7 @@ impl AmdFchI2c {
         // while ENABLE=1.
         // SAFETY: bus mutex held externally during start; here the
         // probe sequence runs serially before any transfer.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.write32(IC_ENABLE, 0);
             // Wait for ENABLE_STATUS bit 0 to clear so the disable

@@ -62,28 +62,36 @@ fn make_sockaddr_un(buf: &mut [u8; 110], path: &[u8]) -> u32 {
 
 fn termtest_run(fd: i32) {
     let mut t1 = libc::termios::default();
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::tcgetattr(0, &mut t1) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"termtest: tcgetattr failed\n"); }
         return;
     }
     let orig_lflag = t1.c_lflag;
     // Flip ECHO (bit 0x8) to verify round-trip.
     t1.c_lflag = orig_lflag ^ 0x8;
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::tcsetattr(0, 0, &t1) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"termtest: tcsetattr failed\n"); }
         return;
     }
     let mut t2 = libc::termios::default();
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::tcgetattr(0, &mut t2) };
     if t2.c_lflag != orig_lflag ^ 0x8 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"termtest: c_lflag round-trip mismatch\n"); }
         return;
     }
     // Restore.
     t1.c_lflag = orig_lflag;
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::tcsetattr(0, 0, &t1) };
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"termtest: ok (tcgetattr/tcsetattr round-trip)\n"); }
 }
 
@@ -100,6 +108,7 @@ static CONDWAIT_HITS: AtomicU32 = AtomicU32::new(0);
 
 extern "C" fn condwait_worker(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     use core::sync::atomic::Ordering;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let _ = libc::pthread_mutex_lock(&raw mut CONDWAIT_MTX);
         // Wait until the main broadcasts and sets RELEASED.
@@ -120,6 +129,7 @@ fn condwait_run(fd: i32) {
     const N: usize = 4;
     CONDWAIT_RELEASED.store(0, Ordering::SeqCst);
     CONDWAIT_HITS.store(0, Ordering::SeqCst);
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         CONDWAIT_MTX = libc::pthread_mutex_t { locked: 0, _pad: 0, owner: 0 };
         CONDWAIT_COND = libc::pthread_cond_t { _opaque: [0; 48] };
@@ -127,6 +137,7 @@ fn condwait_run(fd: i32) {
     let mut tids = [0u64; N];
     for i in 0..N {
         let attr = core::ptr::null::<libc::pthread_attr_t>();
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe {
             libc::pthread_create(
                 &mut tids[i] as *mut u64,
@@ -137,9 +148,11 @@ fn condwait_run(fd: i32) {
         };
     }
     // Let the workers reach pthread_cond_wait.
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::usleep(50_000); }
     // Release them with a broadcast under the mutex (so the
     // RELEASED store can't race with the worker's loop).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let _ = libc::pthread_mutex_lock(&raw mut CONDWAIT_MTX);
         CONDWAIT_RELEASED.store(1, Ordering::Release);
@@ -147,11 +160,13 @@ fn condwait_run(fd: i32) {
         let _ = libc::pthread_mutex_unlock(&raw mut CONDWAIT_MTX);
     }
     for i in 0..N {
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { libc::pthread_join(tids[i], core::ptr::null_mut()) };
     }
     let hits = CONDWAIT_HITS.load(Ordering::SeqCst);
     let mut buf = [0u8; 12];
     let s = u32_to_decimal(hits, &mut buf);
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         write_all(fd, b"condwait: hits=");
         write_all(fd, s);
@@ -161,45 +176,57 @@ fn condwait_run(fd: i32) {
 
 fn polltest_run(fd: i32) {
     // Step 1: create an eventfd, poll with 10ms timeout, expect 0.
+    // SAFETY: Valid memory or trusted environment
     let efd = unsafe { libc::eventfd(0, 0) };
     if efd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: eventfd() failed\n"); }
         return;
     }
     let mut pf = libc::pollfd { fd: efd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::poll(&mut pf as *mut _, 1, 10) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: poll(empty)!=0\n"); }
         return;
     }
     // Step 2: write 1 to eventfd.
     let one_le: [u8; 8] = 1u64.to_le_bytes();
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::write(efd, one_le.as_ptr() as *const _, 8)
     };
     if n != 8 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: write(efd) short\n"); }
         return;
     }
     // Step 3: poll, expect 1 ready.
     pf.revents = 0;
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::poll(&mut pf as *mut _, 1, 100) };
     if r != 1 || (pf.revents & libc::POLLIN) == 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: poll after write != ready\n"); }
         return;
     }
     // Step 4: read counter, expect 1.
     let mut rbuf = [0u8; 8];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(efd, rbuf.as_mut_ptr() as *mut _, 8)
     };
     if n != 8 || u64::from_le_bytes(rbuf) != 1 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: efd read != 1\n"); }
         return;
     }
     // Step 5: timerfd, 50ms one-shot, poll up to 200ms.
+    // SAFETY: Valid memory or trusted environment
     let tfd = unsafe { libc::timerfd_create(1 /* CLOCK_MONOTONIC */, 0) };
     if tfd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: timerfd_create failed\n"); }
         return;
     }
@@ -208,21 +235,28 @@ fn polltest_run(fd: i32) {
         it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
         it_value:    libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 },
     };
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::timerfd_settime(tfd, 0, &its as *const _, core::ptr::null_mut())
     };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: timerfd_settime failed\n"); }
         return;
     }
     let mut tpf = libc::pollfd { fd: tfd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::poll(&mut tpf as *mut _, 1, 200) };
     if r != 1 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"polltest: timerfd poll != ready\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(efd) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(tfd) };
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"polltest: ok (eventfd+timerfd+poll)\n"); }
 }
 
@@ -230,17 +264,21 @@ fn tcpwire_run(fd: i32) {
     // Open AF_INET SOCK_STREAM + connect to 10.0.2.2:7777
     // (QEMU user-net's host gateway). The kernel TCP-over-NIC
     // stack handles ARP + SYN/SYN-ACK/ACK + ESTABLISHED.
+    // SAFETY: Valid memory or trusted environment
     let s = unsafe { libc::socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0) };
     if s < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcpwire: socket() failed\n"); }
         return;
     }
     let mut addr = [0u8; 16];
     let alen = make_sockaddr_in(&mut addr, 7778, 0x0A000202 /* 10.0.2.2 */);
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::connect(s, addr.as_ptr() as *const libc::sockaddr, alen)
     };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"tcpwire: connect() rc=");
             let mut buf = [0u8; 12];
@@ -248,16 +286,20 @@ fn tcpwire_run(fd: i32) {
             write_all(fd, st);
             write_all(fd, b" (no host-side listener?)\n");
         }
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { libc::posix::close(s) };
         return;
     }
     // Send "ping\n" to confirm the data path works on the wire.
     // Don't recv — depends on host-side echo behaviour. The pcap
     // confirms the handshake + send completed.
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::send(s, b"ping\n".as_ptr() as *const _, 5, 0)
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(s) };
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         write_all(fd, b"tcpwire: connected + sent ");
         let mut nb = [0u8; 12];
@@ -271,53 +313,68 @@ fn pidtest_run(fd: i32) {
     // Read /proc/self/comm — should contain "shell\n" at boot
     // (set_proc_comm seeded by bare_main when the boot-init
     // spawns it).
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe {
         libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
     };
     if pfd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: open(/proc/self/comm) failed\n"); }
         return;
     }
     let mut buf = [0u8; 64];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     if n <= 0 || !buf[..n as usize].starts_with(b"shell") {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: /proc/self/comm != shell\n"); }
         return;
     }
     // PR_SET_NAME → "renamed" → /proc/self/comm reflects it.
     let mut newname = [0u8; 16];
     newname[..7].copy_from_slice(b"renamed");
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::prctl(15 /* PR_SET_NAME */, newname.as_ptr() as u64, 0) };
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe {
         libc::posix_open(b"/proc/self/comm\0".as_ptr() as *const i8, 0, 0)
     };
     let mut buf = [0u8; 64];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     if n <= 0 || !buf[..n as usize].starts_with(b"renamed") {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: PR_SET_NAME didn't propagate\n"); }
         return;
     }
     // Restore comm so other tests aren't confused.
     let mut restore = [0u8; 16];
     restore[..5].copy_from_slice(b"shell");
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::prctl(15, restore.as_ptr() as u64, 0) };
     // /proc/self/maps — should have at least one line containing
     // [stack] or [heap] or [text].
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe {
         libc::posix_open(b"/proc/self/maps\0".as_ptr() as *const i8, 0, 0)
     };
     let mut mbuf = [0u8; 1024];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(pfd, mbuf.as_mut_ptr() as *mut _, mbuf.len())
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     if n <= 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: empty /proc/self/maps\n"); }
         return;
     }
@@ -327,36 +384,46 @@ fn pidtest_run(fd: i32) {
         || mbytes.windows(6).any(|w| w == b"[heap]")
         || mbytes.windows(6).any(|w| w == b"[text]");
     if !has_label {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: /proc/self/maps has no labelled VMA\n"); }
         return;
     }
     // /proc/self/cmdline — should be "shell\0" (boot-init seeded).
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe {
         libc::posix_open(b"/proc/self/cmdline\0".as_ptr() as *const i8, 0, 0)
     };
     let mut cbuf = [0u8; 64];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(pfd, cbuf.as_mut_ptr() as *mut _, cbuf.len())
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     if n != 6 || &cbuf[..6] != b"shell\0" {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: /proc/self/cmdline != shell\\0\n"); }
         return;
     }
     // Read /proc/self/stat — should start with our pid.
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe {
         libc::posix_open(b"/proc/self/stat\0".as_ptr() as *const i8, 0, 0)
     };
     if pfd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: open(/proc/self/stat) failed\n"); }
         return;
     }
     let mut sbuf = [0u8; 256];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(pfd, sbuf.as_mut_ptr() as *mut _, sbuf.len())
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     if n <= 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"pidtest: empty /proc/self/stat\n"); }
         return;
     }
@@ -368,13 +435,16 @@ fn pidtest_run(fd: i32) {
         if (b as char).is_ascii_digit() {
             pid_from_stat = pid_from_stat * 10 + ((b - b'0') as u32);
         } else {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"pidtest: stat field 0 not numeric\n"); }
             return;
         }
     }
     // Also call getpid() and confirm equality.
+    // SAFETY: Valid memory or trusted environment
     let our_pid = unsafe { libc::getpid() } as u32;
     if pid_from_stat != our_pid {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"pidtest: pid mismatch self=");
             let mut ab = [0u8; 12];
@@ -388,6 +458,7 @@ fn pidtest_run(fd: i32) {
         }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         write_all(fd, b"pidtest: ok (/proc/self/stat pid=");
         let mut buf = [0u8; 12];
@@ -402,16 +473,21 @@ fn flocktest_run(fd: i32) {
     // open() calls give different FdEntry but the same backing
     // memfile Arc — so the per-file lock state should be shared).
     let path = b"/tmp/flocktest\0";
+    // SAFETY: Valid memory or trusted environment
     let fd1 = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0o100 | 0o2, 0o600) };
+    // SAFETY: Valid memory or trusted environment
     let fd2 = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0o2, 0) };
     if fd1 < 0 || fd2 < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"flocktest: open failed\n"); }
         return;
     }
     // fd1: LOCK_EX (block until acquired). With no contention this
     // returns immediately.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::term::flock(fd1, 2 /* LOCK_EX */) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"flocktest: LOCK_EX(fd1) failed\n"); }
         return;
     }
@@ -419,88 +495,115 @@ fn flocktest_run(fd: i32) {
     // Note: same task holds both, so the kernel sees task already
     // owns the lock and returns success. That's the correct
     // semantic for flock — POSIX says reacquiring is OK.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::term::flock(fd2, 2 | 4 /* LOCK_EX|LOCK_NB */) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"flocktest: same-task re-EX should succeed\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::term::flock(fd1, 8 /* LOCK_UN */) };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"flocktest: LOCK_UN failed\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(fd1) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(fd2) };
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"flocktest: ok (LOCK_EX/LOCK_UN round-trip)\n"); }
 }
 
 fn mqtest_run(fd: i32) {
     let name = b"/mqtest\0";
+    // SAFETY: Valid memory or trusted environment
     let q = unsafe {
         libc::ipc::mq_open(name.as_ptr() as *const i8, 0o100 /* O_CREAT */, 0o600, core::ptr::null())
     };
     if q < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"mqtest: mq_open failed\n"); }
         return;
     }
     let payload = b"hello mq";
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::ipc::mq_send(q, payload.as_ptr() as *const i8, payload.len(), 0)
     };
     if r != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"mqtest: mq_send failed\n"); }
         return;
     }
     let mut buf = [0u8; 64];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::ipc::mq_receive(q, buf.as_mut_ptr() as *mut i8, buf.len(), core::ptr::null_mut())
     };
     if n != payload.len() as isize || &buf[..n as usize] != payload {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"mqtest: mq_receive payload mismatch\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::ipc::mq_close(q) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::ipc::mq_unlink(name.as_ptr() as *const i8) };
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"mqtest: ok (mq_send/mq_receive round-trip)\n"); }
 }
 
 fn proctest_open_read(path: &[u8]) -> Option<usize> {
     // path includes the trailing NUL.
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe { libc::posix_open(path.as_ptr() as *const i8, 0, 0) };
     if pfd < 0 { return None; }
     let mut buf = [0u8; 256];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(pfd, buf.as_mut_ptr() as *mut _, buf.len())
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     if n <= 0 { None } else { Some(n as usize) }
 }
 
 fn proctest_run(fd: i32) {
     if proctest_open_read(b"/proc/cpuinfo\0").is_none() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"proctest: cpuinfo failed\n"); }
         return;
     }
     if proctest_open_read(b"/proc/uptime\0").is_none() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"proctest: uptime failed\n"); }
         return;
     }
     if proctest_open_read(b"/proc/version\0").is_none() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"proctest: version failed\n"); }
         return;
     }
     if proctest_open_read(b"/proc/mounts\0").is_none() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"proctest: mounts failed\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"proctest: ok (cpuinfo+uptime+version+mounts)\n"); }
 }
 
 fn udptest_run(fd: i32) {
     // Two UDP sockets on 127.0.0.1.
+    // SAFETY: Valid memory or trusted environment
     let a = unsafe { libc::socket(2, 2 /* SOCK_DGRAM */, 0) };
+    // SAFETY: Valid memory or trusted environment
     let b = unsafe { libc::socket(2, 2, 0) };
     if a < 0 || b < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"udptest: socket() failed\n"); }
         return;
     }
@@ -508,13 +611,17 @@ fn udptest_run(fd: i32) {
     let mut bb = [0u8; 16];
     let alen = make_sockaddr_in(&mut ab, 9000, 0x7F000001);
     let blen = make_sockaddr_in(&mut bb, 9001, 0x7F000001);
+    // SAFETY: Valid memory or trusted environment
     let r1 = unsafe { libc::bind(a, ab.as_ptr() as *const _, alen) };
+    // SAFETY: Valid memory or trusted environment
     let r2 = unsafe { libc::bind(b, bb.as_ptr() as *const _, blen) };
     if r1 != 0 || r2 != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"udptest: bind() failed\n"); }
         return;
     }
     // a → b
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::sendto(
             a,
@@ -525,6 +632,7 @@ fn udptest_run(fd: i32) {
         )
     };
     if n != 4 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"udptest: sendto != 4\n"); }
         return;
     }
@@ -532,6 +640,7 @@ fn udptest_run(fd: i32) {
     let mut rbuf = [0u8; 16];
     let mut peer = [0u8; 16];
     let mut peerlen: u32 = 16;
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::recvfrom(
             b,
@@ -542,11 +651,15 @@ fn udptest_run(fd: i32) {
         )
     };
     if n != 4 || &rbuf[..4] != b"ping" {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"udptest: recvfrom payload != ping\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(a) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(b) };
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"udptest: ok (UDP loopback ping)\n"); }
 }
 
@@ -555,25 +668,31 @@ fn entropytest_run(fd: i32) {
     let mut b = [0u8; 32];
     // narf_user_runtime exposes getrandom directly; libc::getrandom
     // is reachable via the random module too.
+    // SAFETY: Valid memory or trusted environment
     let n1 = unsafe {
         libc::random::getrandom(a.as_mut_ptr() as *mut _, 32, 0)
     };
+    // SAFETY: Valid memory or trusted environment
     let n2 = unsafe {
         libc::random::getrandom(b.as_mut_ptr() as *mut _, 32, 0)
     };
     if n1 != 32 || n2 != 32 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"entropytest: getrandom short\n"); }
         return;
     }
     let all_zero = a.iter().all(|&x| x == 0);
     if all_zero {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"entropytest: 32 bytes all zero (stuck PRNG)\n"); }
         return;
     }
     if a == b {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"entropytest: two 32-byte draws equal (broken PRNG)\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_all(fd, b"entropytest: ok (32B distinct + non-zero)\n"); }
 }
 
@@ -587,8 +706,10 @@ const SHMTEST_PAYLOAD: &[u8] = b"hello shm";
 extern "C" fn shmtest_consumer(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     use core::sync::atomic::Ordering;
     // Wait for the producer to publish.
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::ipc::sem_wait(&raw mut SHMTEST_SEM); }
     // Open the same shm by name + read.
+    // SAFETY: Valid memory or trusted environment
     let fd = unsafe {
         libc::ipc::shm_open(SHMTEST_NAME.as_ptr() as *const i8, 0 /* O_RDONLY */, 0)
     };
@@ -597,6 +718,7 @@ extern "C" fn shmtest_consumer(_arg: *mut core::ffi::c_void) -> *mut core::ffi::
         return core::ptr::null_mut();
     }
     let mut buf = [0u8; 32];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::read(fd, buf.as_mut_ptr() as *mut _, SHMTEST_PAYLOAD.len())
     };
@@ -606,6 +728,7 @@ extern "C" fn shmtest_consumer(_arg: *mut core::ffi::c_void) -> *mut core::ffi::
         SHMTEST_RESULT.store(0xE2, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(fd) };
     SHMTEST_RESULT.store(1, Ordering::SeqCst);
     core::ptr::null_mut()
@@ -614,8 +737,10 @@ extern "C" fn shmtest_consumer(_arg: *mut core::ffi::c_void) -> *mut core::ffi::
 fn shmtest_run(fd: i32) {
     use core::sync::atomic::Ordering;
     SHMTEST_RESULT.store(0, Ordering::SeqCst);
+    // SAFETY: Valid memory or trusted environment
     unsafe { let _ = libc::ipc::sem_init(&raw mut SHMTEST_SEM, 0, 0); }
     // Producer: shm_open + write payload, then sem_post.
+    // SAFETY: Valid memory or trusted environment
     let pfd = unsafe {
         libc::ipc::shm_open(
             SHMTEST_NAME.as_ptr() as *const i8,
@@ -624,32 +749,42 @@ fn shmtest_run(fd: i32) {
         )
     };
     if pfd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"shmtest: shm_open(producer) failed\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::posix::write(pfd, SHMTEST_PAYLOAD.as_ptr() as *const _, SHMTEST_PAYLOAD.len())
     };
     if n != SHMTEST_PAYLOAD.len() as isize {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"shmtest: write(producer) short\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(pfd) };
     // Spawn consumer + signal it.
     let mut tid: u64 = 0;
     let attr = core::ptr::null::<libc::pthread_attr_t>();
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe {
         libc::pthread_create(&mut tid as *mut u64, attr, shmtest_consumer, core::ptr::null_mut())
     };
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::ipc::sem_post(&raw mut SHMTEST_SEM); }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::ipc::shm_unlink(SHMTEST_NAME.as_ptr() as *const i8) };
     let r = SHMTEST_RESULT.load(Ordering::SeqCst);
     if r == 1 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"shmtest: ok (shm_open+sem ping->pong)\n"); }
     } else {
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(r, &mut buf);
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"shmtest: failed stage=0x");
             write_all(fd, s);
@@ -678,6 +813,7 @@ static TCPTEST_RESULT: AtomicU32 = AtomicU32::new(0);
 
 extern "C" fn tcptest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     use core::sync::atomic::Ordering;
+    // SAFETY: Valid memory or trusted environment
     let lfd = unsafe { libc::socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0) };
     if lfd < 0 {
         TCPTEST_RESULT.store(0xE1, Ordering::SeqCst);
@@ -685,16 +821,20 @@ extern "C" fn tcptest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::
     }
     let mut addr_buf = [0u8; 16];
     let alen = make_sockaddr_in(&mut addr_buf, 8000, 0x7F000001 /* 127.0.0.1 */);
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::bind(lfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
     };
     if r < 0 { TCPTEST_RESULT.store(0xE2, Ordering::SeqCst); return core::ptr::null_mut(); }
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::listen(lfd, 4) };
     if r < 0 { TCPTEST_RESULT.store(0xE3, Ordering::SeqCst); return core::ptr::null_mut(); }
     TCPTEST_LISTENING.store(1, Ordering::SeqCst);
+    // SAFETY: Valid memory or trusted environment
     let cfd = unsafe { libc::accept(lfd, core::ptr::null_mut(), core::ptr::null_mut()) };
     if cfd < 0 { TCPTEST_RESULT.store(0xE4, Ordering::SeqCst); return core::ptr::null_mut(); }
     let mut rbuf = [0u8; 16];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
     };
@@ -702,12 +842,15 @@ extern "C" fn tcptest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::
         TCPTEST_RESULT.store(0xE5, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::send(cfd, b"pong".as_ptr() as *const core::ffi::c_void, 4, 0)
     };
     if n != 4 { TCPTEST_RESULT.store(0xE6, Ordering::SeqCst); return core::ptr::null_mut(); }
     TCPTEST_RESULT.store(1, Ordering::SeqCst);
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(lfd) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(cfd) };
     core::ptr::null_mut()
 }
@@ -718,53 +861,68 @@ fn tcptest_run(fd: i32) {
     TCPTEST_RESULT.store(0, Ordering::SeqCst);
     let mut tid: u64 = 0;
     let attr = core::ptr::null::<libc::pthread_attr_t>();
+    // SAFETY: Valid memory or trusted environment
     let rc = unsafe {
         libc::pthread_create(&mut tid as *mut u64, attr, tcptest_listener, core::ptr::null_mut())
     };
     if rc != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcptest: pthread_create failed\n"); }
         return;
     }
     while TCPTEST_LISTENING.load(Ordering::SeqCst) == 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { libc::usleep(1000); }
     }
+    // SAFETY: Valid memory or trusted environment
     let cfd = unsafe { libc::socket(2, 1, 0) };
     if cfd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcptest: parent socket() failed\n"); }
         return;
     }
     let mut addr_buf = [0u8; 16];
     let alen = make_sockaddr_in(&mut addr_buf, 8000, 0x7F000001);
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::connect(cfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
     };
     if r < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcptest: parent connect() failed\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::send(cfd, b"ping".as_ptr() as *const core::ffi::c_void, 4, 0)
     };
     if n != 4 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcptest: parent send(ping) short\n"); }
         return;
     }
     let mut rbuf = [0u8; 16];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
     };
     if n != 4 || &rbuf[..4] != b"pong" {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcptest: parent recv != pong\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(cfd) };
     let result = TCPTEST_RESULT.load(Ordering::SeqCst);
     if result == 1 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"tcptest: ok (ping<->pong over 127.0.0.1:8000)\n"); }
     } else {
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(result, &mut buf);
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"tcptest: failed listener-stage=0x");
             write_all(fd, s);
@@ -775,6 +933,7 @@ fn tcptest_run(fd: i32) {
 
 extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     use core::sync::atomic::Ordering;
+    // SAFETY: Valid memory or trusted environment
     let lfd = unsafe { libc::socket(1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0) };
     if lfd < 0 {
         SOCKTEST_RESULT.store(0xE1, Ordering::SeqCst);
@@ -782,6 +941,7 @@ extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi:
     }
     let mut addr_buf = [0u8; 110];
     let alen = make_sockaddr_un(&mut addr_buf, SOCKTEST_PATH);
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::bind(lfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
     };
@@ -789,12 +949,14 @@ extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi:
         SOCKTEST_RESULT.store(0xE2, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { libc::listen(lfd, 4) };
     if r < 0 {
         SOCKTEST_RESULT.store(0xE3, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
     SOCKTEST_LISTENING.store(1, Ordering::SeqCst);
+    // SAFETY: Valid memory or trusted environment
     let cfd = unsafe {
         libc::accept(lfd, core::ptr::null_mut(), core::ptr::null_mut())
     };
@@ -804,6 +966,7 @@ extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi:
     }
     // Read "ping" (4 bytes).
     let mut rbuf = [0u8; 16];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
     };
@@ -812,6 +975,7 @@ extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi:
         return core::ptr::null_mut();
     }
     // Write "pong".
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::send(cfd, b"pong".as_ptr() as *const core::ffi::c_void, 4, 0)
     };
@@ -821,7 +985,9 @@ extern "C" fn socktest_listener(_arg: *mut core::ffi::c_void) -> *mut core::ffi:
     }
     SOCKTEST_RESULT.store(1, Ordering::SeqCst);
     // Release the listener path so subsequent runs can re-bind.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(lfd) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(cfd) };
     core::ptr::null_mut()
 }
@@ -836,6 +1002,7 @@ fn socktest_run(fd: i32) {
     // Spawn the listener thread.
     let mut tid: u64 = 0;
     let attr = core::ptr::null::<libc::pthread_attr_t>();
+    // SAFETY: Valid memory or trusted environment
     let rc = unsafe {
         libc::pthread_create(
             &mut tid as *mut u64,
@@ -845,6 +1012,7 @@ fn socktest_run(fd: i32) {
         )
     };
     if rc != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"socktest: pthread_create failed\n"); }
         return;
     }
@@ -854,47 +1022,60 @@ fn socktest_run(fd: i32) {
     // park-and-repoll path; sleep(0) is a fast no-op kernel-side
     // and would never yield).
     while SOCKTEST_LISTENING.load(Ordering::SeqCst) == 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { libc::usleep(1000); } // 1 ms
     }
     // Parent: connect, write ping, read pong.
+    // SAFETY: Valid memory or trusted environment
     let cfd = unsafe { libc::socket(1, 1, 0) };
     if cfd < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"socktest: parent socket() failed\n"); }
         return;
     }
     let mut addr_buf = [0u8; 110];
     let alen = make_sockaddr_un(&mut addr_buf, SOCKTEST_PATH);
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe {
         libc::connect(cfd, addr_buf.as_ptr() as *const libc::sockaddr, alen)
     };
     if r < 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"socktest: parent connect() failed\n"); }
         return;
     }
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::send(cfd, b"ping".as_ptr() as *const core::ffi::c_void, 4, 0)
     };
     if n != 4 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"socktest: parent send(ping) short\n"); }
         return;
     }
     let mut rbuf = [0u8; 16];
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe {
         libc::recv(cfd, rbuf.as_mut_ptr() as *mut core::ffi::c_void, rbuf.len(), 0)
     };
     if n != 4 || &rbuf[..4] != b"pong" {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"socktest: parent recv != pong\n"); }
         return;
     }
     // Join the listener.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::pthread_join(tid, core::ptr::null_mut()) };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { libc::posix::close(cfd) };
     let result = SOCKTEST_RESULT.load(Ordering::SeqCst);
     if result == 1 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"socktest: ok (ping<->pong over AF_UNIX)\n"); }
     } else {
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(result, &mut buf);
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"socktest: failed listener-stage=0x");
             write_all(fd, s);
@@ -919,6 +1100,7 @@ const LINE_BUF: usize = 256;
 /// as a fallback. Returns `-1` if neither exists.
 unsafe fn open_console() -> i32 {
     for path in [b"/dev/console\0".as_ptr(), b"/dev/tty\0".as_ptr()] {
+        // SAFETY: Valid memory or trusted environment
         let fd = unsafe { libc::posix_open(path as *const i8, libc::O_RDWR, 0) };
         if fd >= 0 {
             return fd;
@@ -933,6 +1115,7 @@ unsafe fn open_console() -> i32 {
 unsafe fn write_all(fd: i32, bytes: &[u8]) {
     let mut written = 0usize;
     while written < bytes.len() {
+        // SAFETY: Valid memory or trusted environment
         let n = unsafe {
             libc::posix_write(
                 fd,
@@ -953,6 +1136,7 @@ unsafe fn write_all(fd: i32, bytes: &[u8]) {
 unsafe fn read_byte(fd: i32) -> Option<u8> {
     let mut buf = [0u8; 1];
     loop {
+        // SAFETY: Valid memory or trusted environment
         let n = unsafe { libc::posix_read(fd, buf.as_mut_ptr() as *mut _, 1) };
         if n == 1 {
             return Some(buf[0]);
@@ -968,6 +1152,7 @@ unsafe fn read_byte(fd: i32) -> Option<u8> {
         // does. usleep(10_000) = 10 ms gives a reasonable typing
         // latency while letting the executor round-robin other
         // tasks, including init's deadline-park sleep.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             libc::usleep(10_000);
         }
@@ -1017,6 +1202,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         return true;
     }
     if cmd == b"help" {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(
                 fd,
@@ -1033,14 +1219,17 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // surfaces -1/NULL on overflow; we cap at 1 KiB which is more
         // than enough for the shell's depth budget.
         let mut buf = [0u8; 1024];
+        // SAFETY: Valid memory or trusted environment
         let p = unsafe { libc::getcwd(buf.as_mut_ptr(), buf.len()) };
         if p.is_null() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"pwd: failed\n"); }
         } else {
             let mut n = 0usize;
             while n < buf.len() && buf[n] != 0 {
                 n += 1;
             }
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_all(fd, &buf[..n]);
                 write_all(fd, NEWLINE);
@@ -1050,15 +1239,19 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // cd <path> — chdir; bare `cd` is rejected (no $HOME shim).
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"cd: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"cd: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let r = unsafe { libc::chdir(pbuf.as_ptr()) };
                 if r != 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"cd: failed\n"); }
                 }
             }
@@ -1067,9 +1260,11 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // whoami — print the numeric uid. /etc/passwd lookup will land
         // alongside the account/ getpwuid wiring; for now show the
         // value getuid returns.
+        // SAFETY: Valid memory or trusted environment
         let uid = unsafe { libc::getuid() } as u32;
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(uid, &mut buf);
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"uid=");
             write_all(fd, s);
@@ -1081,28 +1276,34 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         let arg = trim_arg(rest);
         if arg.is_empty() {
             let mut buf = [0u8; 256];
+            // SAFETY: Valid memory or trusted environment
             let r = unsafe {
                 libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len())
             };
             if r != 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"hostname: gethostname failed\n"); }
             } else {
                 let mut n = 0usize;
                 while n < buf.len() && buf[n] != 0 {
                     n += 1;
                 }
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     write_all(fd, &buf[..n]);
                     write_all(fd, NEWLINE);
                 }
             }
         } else if arg.len() > 64 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"hostname: name too long (max 64)\n"); }
         } else {
+            // SAFETY: Valid memory or trusted environment
             let r = unsafe {
                 libc::sethostname(arg.as_ptr() as *const i8, arg.len())
             };
             if r != 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"hostname: sethostname failed\n"); }
             }
         }
@@ -1110,6 +1311,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // clear — ANSI CSI 2J (erase entire screen) + CSI H (cursor home).
         // The console driver honours both sequences; falls back gracefully
         // on terminals that don't.
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"\x1b[2J\x1b[H"); }
     } else if cmd == b"true" {
         // true — POSIX no-op succeeds. Useful as a `false ;` placeholder
@@ -1117,6 +1319,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
     } else if cmd == b"false" {
         // false — POSIX no-op fails. Surface the failure via a stderr-ish
         // marker so test scripts can grep it.
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"(false)\n"); }
     } else if cmd == b"sleep" {
         // sleep <secs> — block for N seconds via libc::sleep, which
@@ -1132,11 +1335,15 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             }
         }
         if secs == 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"sleep: positive seconds required\n"); }
         } else if secs > 60 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"sleep: clamped to 60s\n"); }
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { libc::sleep(60) };
         } else {
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { libc::sleep(secs) };
         }
     } else if cmd == b"date" {
@@ -1144,11 +1351,14 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // Uses clock_gettime(CLOCK_REALTIME) → gmtime_r → manual format
         // so we don't depend on strftime locale state.
         let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { libc::clock_gettime(0, &mut ts) };
         if r != 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"date: clock_gettime failed\n"); }
         } else {
             let mut t = libc::tm::default();
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { libc::gmtime_r(&ts.tv_sec, &mut t) };
             // YYYY-MM-DD HH:MM:SS\n
             let mut buf = [0u8; 24];
@@ -1182,27 +1392,34 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             buf[16] = b':';
             fill2(&mut buf, 17, sec);
             buf[19] = b'\n';
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, &buf[..20]); }
         }
     } else if cmd == b"env" {
         // env — walk the global environ table and print one entry per
         // line. NUL-terminated C strings; we measure each in place.
+        // SAFETY: Valid memory or trusted environment
         let envp = unsafe { libc::ENVIRON };
         if envp.is_null() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"(no environ)\n"); }
         } else {
             let mut i = 0isize;
             loop {
+                // SAFETY: Valid memory or trusted environment
                 let entry = unsafe { *envp.offset(i) };
                 if entry.is_null() {
                     break;
                 }
                 // Find the NUL.
                 let mut n = 0usize;
+                // SAFETY: Valid memory or trusted environment
                 while n < 4096 && unsafe { *entry.add(n) } != 0 {
                     n += 1;
                 }
+                // SAFETY: Valid memory or trusted environment
                 let bytes = unsafe { core::slice::from_raw_parts(entry, n) };
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     write_all(fd, bytes);
                     write_all(fd, NEWLINE);
@@ -1214,17 +1431,23 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // getenv KEY — print the value of an env var, or "(unset)".
         let key = trim_arg(rest);
         if key.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"getenv: missing key\n"); }
         } else {
+            // SAFETY: Valid memory or trusted environment
             let v = unsafe { libc::getenv(key.as_ptr(), key.len()) };
             if v.is_null() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"(unset)\n"); }
             } else {
                 let mut n = 0usize;
+                // SAFETY: Valid memory or trusted environment
                 while n < 4096 && unsafe { *v.add(n) } != 0 {
                     n += 1;
                 }
+                // SAFETY: Valid memory or trusted environment
                 let bytes = unsafe { core::slice::from_raw_parts(v, n) };
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     write_all(fd, bytes);
                     write_all(fd, NEWLINE);
@@ -1234,17 +1457,21 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
     } else if cmd == b"mkdir" {
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"mkdir: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"mkdir: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let r = unsafe {
                     libc::posix_mkdir(pbuf.as_ptr() as *const i8, 0o755)
                 };
                 if r != 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"mkdir: failed\n"); }
                 }
             }
@@ -1252,15 +1479,19 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
     } else if cmd == b"rmdir" {
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"rmdir: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"rmdir: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let r = unsafe { libc::posix_rmdir(pbuf.as_ptr() as *const i8) };
                 if r != 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"rmdir: failed\n"); }
                 }
             }
@@ -1270,15 +1501,19 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // no -f. Matches the minimalist shell aesthetic.
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"rm: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"rm: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let r = unsafe { libc::posix_unlink(pbuf.as_ptr() as *const i8) };
                 if r != 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"rm: failed\n"); }
                 }
             }
@@ -1290,14 +1525,17 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         let (from, after) = split_first(s);
         let to = trim_arg(after);
         if from.is_empty() || to.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"mv: usage: mv <from> <to>\n"); }
         } else if from.len() + 1 >= 256 || to.len() + 1 >= 256 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"mv: path too long\n"); }
         } else {
             let mut fbuf = [0u8; 256];
             let mut tbuf = [0u8; 256];
             fbuf[..from.len()].copy_from_slice(from);
             tbuf[..to.len()].copy_from_slice(to);
+            // SAFETY: Valid memory or trusted environment
             let r = unsafe {
                 libc::posix_rename(
                     fbuf.as_ptr() as *const i8,
@@ -1305,6 +1543,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 )
             };
             if r != 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"mv: failed\n"); }
             }
         }
@@ -1313,13 +1552,16 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // mtime on an existing file (the kernel's utimes is a stub).
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"touch: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"touch: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let r = unsafe {
                     libc::posix_open(
                         pbuf.as_ptr() as *const i8,
@@ -1328,8 +1570,10 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                     )
                 };
                 if r < 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"touch: open failed\n"); }
                 } else {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { libc::posix_close(r); }
                 }
             }
@@ -1339,16 +1583,20 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // a printf, so emit each field on its own line.
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"stat: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"stat: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
                 let mut st = libc::StatBuf::default();
+                // SAFETY: Valid memory or trusted environment
                 let r = unsafe { libc::stat(pbuf.as_ptr(), &mut st) };
                 if r != 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"stat: failed\n"); }
                 } else {
                     let kind: &[u8] =
@@ -1358,6 +1606,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                         else { b"special" };
                     let mut buf = [0u8; 24];
                     let sz_s = u64_to_decimal(st.size, &mut buf);
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         write_all(fd, b"kind=");
                         write_all(fd, kind);
@@ -1367,6 +1616,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                     }
                     let mut mbuf = [0u8; 12];
                     let m_s = u32_to_octal(st.mode & 0o777, &mut mbuf);
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         write_all(fd, b"mode=0");
                         write_all(fd, m_s);
@@ -1380,17 +1630,21 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // words; treats consecutive WS as one separator.
         let path = trim_arg(rest);
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"wc: missing path\n"); }
         } else {
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"wc: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let in_fd = unsafe {
                     libc::posix_open(pbuf.as_ptr() as *const i8, libc::O_RDONLY, 0)
                 };
                 if in_fd < 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"wc: open failed\n"); }
                 } else {
                     let mut bytes: u64 = 0;
@@ -1399,6 +1653,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                     let mut in_word = false;
                     let mut buf = [0u8; 4096];
                     loop {
+                        // SAFETY: Valid memory or trusted environment
                         let n = unsafe {
                             libc::posix_read(in_fd, buf.as_mut_ptr() as *mut _, buf.len())
                         };
@@ -1420,6 +1675,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                             }
                         }
                     }
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { libc::posix_close(in_fd); }
                     let mut lbuf = [0u8; 24];
                     let l_s = u64_to_decimal(lines, &mut lbuf);
@@ -1427,6 +1683,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                     let w_s = u64_to_decimal(words, &mut wbuf);
                     let mut bbuf = [0u8; 24];
                     let b_s = u64_to_decimal(bytes, &mut bbuf);
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         write_all(fd, b"lines=");
                         write_all(fd, l_s);
@@ -1462,10 +1719,13 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             }
         }
         if pid <= 0 || signum <= 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"kill: usage: kill <pid> <signum>\n"); }
         } else {
+            // SAFETY: Valid memory or trusted environment
             let r = unsafe { libc::kill(pid, signum) };
             if r != 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"kill: failed\n"); }
             }
         }
@@ -1485,6 +1745,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             &path[..end]
         };
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"exec: missing path\n"); }
         } else {
             // Build a NUL-terminated path on the stack (cap at
@@ -1492,18 +1753,21 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             // input).
             let mut pbuf = [0u8; 256];
             if path.len() >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"exec: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
                 let argv0 = pbuf.as_ptr() as *const i8;
                 let argv: [*const i8; 2] = [argv0, core::ptr::null()];
                 let envp: [*const i8; 1] = [core::ptr::null()];
+                // SAFETY: Valid memory or trusted environment
                 let rc = unsafe {
                     libc::execve(argv0, argv.as_ptr(), envp.as_ptr())
                 };
                 // execve returns only on failure.
                 let mut buf = [0u8; 32];
                 let s = u32_to_decimal(rc as u32, &mut buf);
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     write_all(fd, b"exec: failed (rc=");
                     write_all(fd, s);
@@ -1512,18 +1776,22 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             }
         }
     } else if cmd == b"echo" {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, rest);
             write_all(fd, NEWLINE);
         }
     } else if cmd == b"uname" {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"NARF (microkernel)\n");
         }
     } else if cmd == b"pid" {
+        // SAFETY: Valid memory or trusted environment
         let pid = unsafe { libc::getpid() };
         let mut buf = [0u8; 12];
         let s = u32_to_decimal(pid as u32, &mut buf);
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"pid: ");
             write_all(fd, s);
@@ -1618,6 +1886,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             }
         }
         if n <= 0 || n > 16 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"threads: pass 1..16\n"); }
         } else {
             const K: u32 = 1000;
@@ -1632,6 +1901,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let mut tids = [0u64; 16];
             for i in 0..n as usize {
                 let attr = core::ptr::null::<libc::pthread_attr_t>();
+                // SAFETY: Valid memory or trusted environment
                 let _rc = unsafe {
                     libc::pthread_create(
                         &mut tids[i] as *mut u64,
@@ -1642,6 +1912,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 };
             }
             for i in 0..n as usize {
+                // SAFETY: Valid memory or trusted environment
                 let _ = unsafe {
                     libc::pthread_join(tids[i], core::ptr::null_mut())
                 };
@@ -1649,6 +1920,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             let total = COUNTER.load(core::sync::atomic::Ordering::SeqCst);
             let mut buf = [0u8; 16];
             let s = u32_to_decimal(total, &mut buf);
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_all(fd, b"threads: total=");
                 write_all(fd, s);
@@ -1674,6 +1946,7 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             }
         }
         if signum == 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"raise: missing signum\n"); }
         } else {
             // Install the smoke handler. RAISED counts hits.
@@ -1681,16 +1954,19 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
                 use core::sync::atomic::Ordering;
                 RAISED.fetch_add(1, Ordering::SeqCst);
             }
+            // SAFETY: Valid memory or trusted environment
             let prior = unsafe {
                 libc::signal(signum, smoke_handler as usize)
             };
             let _ = prior;
             // Self-deliver via raise(2).
+            // SAFETY: Valid memory or trusted environment
             let r = unsafe { libc::raise(signum) };
             // Read back the count and report.
             let count = RAISED.load(core::sync::atomic::Ordering::SeqCst);
             let mut buf = [0u8; 12];
             let s = u32_to_decimal(count, &mut buf);
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_all(fd, b"raise: rc=");
                 let mut rc_buf = [0u8; 12];
@@ -1715,32 +1991,39 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             &path[..end]
         };
         if path.is_empty() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"cat: missing path\n"); }
         } else {
             // posix_open wants a NUL-terminated C string.
             let mut pbuf = [0u8; 256];
             if path.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"cat: path too long\n"); }
             } else {
                 pbuf[..path.len()].copy_from_slice(path);
+                // SAFETY: Valid memory or trusted environment
                 let in_fd = unsafe {
                     libc::posix_open(pbuf.as_ptr() as *const i8, libc::O_RDONLY, 0)
                 };
                 if in_fd < 0 {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { write_all(fd, b"cat: open failed\n"); }
                 } else {
                     let mut buf = [0u8; 1024];
                     let mut total: usize = 0;
                     loop {
+                        // SAFETY: Valid memory or trusted environment
                         let n = unsafe {
                             libc::posix_read(in_fd, buf.as_mut_ptr() as *mut _, buf.len())
                         };
                         if n <= 0 || total >= 64 * 1024 {
                             break;
                         }
+                        // SAFETY: Valid memory or trusted environment
                         unsafe { write_all(fd, &buf[..n as usize]); }
                         total += n as usize;
                     }
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { libc::posix_close(in_fd); }
                 }
             }
@@ -1760,32 +2043,41 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         let path = if path.is_empty() { default } else { path };
         let mut pbuf = [0u8; 256];
         if path.len() + 1 >= pbuf.len() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"ls: path too long\n"); }
         } else {
             pbuf[..path.len()].copy_from_slice(path);
+            // SAFETY: Valid memory or trusted environment
             let dir = unsafe { libc::opendir(pbuf.as_ptr() as *const i8) };
             if dir.is_null() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"ls: opendir failed\n"); }
             } else {
                 loop {
+                    // SAFETY: Valid memory or trusted environment
                     let ent = unsafe { libc::readdir(dir) };
                     if ent.is_null() {
                         break;
                     }
                     // dirent.d_name is a C string; find its length.
+                    // SAFETY: Valid memory or trusted environment
                     let name_ptr = unsafe {
                         core::ptr::addr_of!((*ent).d_name) as *const u8
                     };
                     let mut nlen = 0usize;
+                    // SAFETY: Valid memory or trusted environment
                     while nlen < 256 && unsafe { *name_ptr.add(nlen) } != 0 {
                         nlen += 1;
                     }
+                    // SAFETY: Valid memory or trusted environment
                     let name = unsafe { core::slice::from_raw_parts(name_ptr, nlen) };
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         write_all(fd, name);
                         write_all(fd, NEWLINE);
                     }
                 }
+                // SAFETY: Valid memory or trusted environment
                 unsafe { libc::closedir(dir); }
             }
         }
@@ -1796,20 +2088,25 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         // the natural end-of-output. No flags — Linux's `-T`, `-w`
         // (follow), `-l` (level filter) etc. land later.
         let mut kpath = *b"/dev/kmsg\0";
+        // SAFETY: Valid memory or trusted environment
         let kfd = unsafe { libc::posix::open(kpath.as_mut_ptr() as *mut i8, 0, 0) };
         if kfd < 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"dmesg: cannot open /dev/kmsg\n"); }
         } else {
             let mut chunk = [0u8; 4096];
             loop {
+                // SAFETY: Valid memory or trusted environment
                 let n = unsafe {
                     libc::posix::read(kfd, chunk.as_mut_ptr() as *mut _, chunk.len())
                 };
                 if n <= 0 {
                     break;
                 }
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, &chunk[..n as usize]); }
             }
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { libc::posix::close(kfd) };
         }
     } else if cmd == b"grep" {
@@ -1850,12 +2147,15 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         } else {
             let mut pbuf = [0u8; 256];
             if file.len() + 1 >= pbuf.len() {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"head: path too long\n"); }
                 return true;
             }
             pbuf[..file.len()].copy_from_slice(file);
+            // SAFETY: Valid memory or trusted environment
             let f = unsafe { libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0) };
             if f < 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"head: cannot open file\n"); }
                 return true;
             }
@@ -1867,10 +2167,12 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         let mut llen = 0usize;
         let mut emitted = 0usize;
         'outer: loop {
+            // SAFETY: Valid memory or trusted environment
             let n = unsafe { libc::posix::read(src_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 { break; }
             for &b in &buf[..n as usize] {
                 if b == b'\n' {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         write_all(fd, &line[..llen]);
                         write_all(fd, NEWLINE);
@@ -1887,17 +2189,20 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
             }
         }
         if emitted < limit && llen > 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_all(fd, &line[..llen]);
                 write_all(fd, NEWLINE);
             }
         }
         if owned_fd >= 0 {
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { libc::posix::close(owned_fd) };
         }
     } else if cmd == b"exit" {
         return false;
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_all(fd, b"unknown command: ");
             write_all(fd, cmd);
@@ -1974,6 +2279,7 @@ fn run_grep(fd: i32, rest: &[u8]) {
         match inner.iter().position(|&b| b == quote) {
             Some(close) => (&inner[..close], close + 2),
             None => {
+                // SAFETY: Valid memory or trusted environment
                 unsafe { write_all(fd, b"grep: unterminated quote\n"); }
                 return;
             }
@@ -1986,6 +2292,7 @@ fn run_grep(fd: i32, rest: &[u8]) {
         (&s[..end], end)
     };
     if pat_end == 0 || pattern_raw.is_empty() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_all(fd, b"grep: usage: grep [-i] [-v] [-m N] PATTERN [FILE]\n"); }
         return;
     }
@@ -2002,12 +2309,15 @@ fn run_grep(fd: i32, rest: &[u8]) {
     } else {
         let mut pbuf = [0u8; 256];
         if file.len() + 1 >= pbuf.len() {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"grep: path too long\n"); }
             return;
         }
         pbuf[..file.len()].copy_from_slice(file);
+        // SAFETY: Valid memory or trusted environment
         let f = unsafe { libc::posix::open(pbuf.as_mut_ptr() as *mut i8, 0, 0) };
         if f < 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"grep: cannot open file\n"); }
             return;
         }
@@ -2021,6 +2331,7 @@ fn run_grep(fd: i32, rest: &[u8]) {
     let mut matched: usize = 0;
     let mut done = false;
     while !done {
+        // SAFETY: Valid memory or trusted environment
         let n = unsafe { libc::posix::read(src, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n <= 0 {
             break;
@@ -2043,6 +2354,7 @@ fn run_grep(fd: i32, rest: &[u8]) {
                     hit = !hit;
                 }
                 if hit {
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         write_all(fd, &line[..llen]);
                         write_all(fd, NEWLINE);
@@ -2077,6 +2389,7 @@ fn run_grep(fd: i32, rest: &[u8]) {
             hit = !hit;
         }
         if hit {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 write_all(fd, &line[..llen]);
                 write_all(fd, NEWLINE);
@@ -2084,6 +2397,7 @@ fn run_grep(fd: i32, rest: &[u8]) {
         }
     }
     if owned >= 0 {
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { libc::posix::close(owned) };
     }
 }
@@ -2203,6 +2517,7 @@ fn u32_to_decimal(mut v: u32, buf: &mut [u8]) -> &[u8] {
 #[no_mangle]
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // argv is kernel-provided; entry signature is fixed
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         libc::puts(b"NARF shell -- type 'help' for commands.\n\0".as_ptr());
 

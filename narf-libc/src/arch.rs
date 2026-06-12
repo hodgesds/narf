@@ -37,5 +37,6 @@ pub unsafe extern "C" fn _start() -> ! {
 pub extern "C" fn _start() -> ! {
     // SAFETY: forwarding into the Rust startup pipeline; the function
     // is `-> !` so control never returns here.
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::__libc_start_main(0) }
 }

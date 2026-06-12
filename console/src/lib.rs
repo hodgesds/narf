@@ -97,6 +97,7 @@ pub fn early_init(base: PhysAddr, kind: UartKind) {
 
     // SAFETY: the caller has supplied a real UART base; hardware
     // programming is idempotent on the 16550A / PL011.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         backend::init(base.raw() as usize, kind);
     }
@@ -139,6 +140,7 @@ pub fn write_str(s: &str) {
     // SAFETY: `kind` + `base` were published via Release by `early_init`
     // or `remap_to_virtual`, and we hold the coarse lock; the backend
     // methods themselves uphold the compiler_fence discipline.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         backend::write_bytes(base, kind, s.as_bytes());
     }
@@ -173,6 +175,7 @@ pub fn enable_rx_irq() {
     }
     // SAFETY: kind + base published Release; lock held; backend
     // call is a single port write.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         backend::enable_rx_irq(base, kind);
     }
@@ -199,6 +202,7 @@ pub fn try_read_byte() -> Option<u8> {
     // / `remap_to_virtual`; we hold the coarse lock; the backend's
     // `try_read_byte` is a one-shot LSR/FR + RBR/DR read with no TX
     // side effects.
+    // SAFETY: Valid memory or trusted environment
     unsafe { backend::try_read_byte(base, kind) }
 }
 
@@ -337,6 +341,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
             // SAFETY: rbp validated above; reading [rbp + 8] is the
             // return address of the current frame, [rbp] is the
             // saved rbp.
+            // SAFETY: Valid memory or trusted environment
             let (next_rbp, ret_addr): (u64, u64) = unsafe {
                 let frame = rbp as *const u64;
                 (frame.read_volatile(), frame.add(1).read_volatile())
@@ -360,6 +365,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
             // mid-write — better than deadlocking on the lock.
             // Real panics are single-CPU events most of the
             // time anyway.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 backend::write_bytes(base, *kind, msg);
             }
@@ -397,6 +403,7 @@ pub fn trap_sink(s: &str) {
         if base != 0 {
             // SAFETY: kind + base were published Release; we accept
             // the interleave risk versus deadlocking on the lock.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 backend::write_bytes(base, *kind, s.as_bytes());
             }

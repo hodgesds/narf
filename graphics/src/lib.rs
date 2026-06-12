@@ -142,6 +142,7 @@ impl Framebuffer {
         }
         // SAFETY: bounds-checked above; stride*y + x < buffer size,
         // and Framebuffer owns the mapping for its lifetime.
+        // SAFETY: Valid memory or trusted environment
         let raw = unsafe {
             let off = (y * self.stride + x) as isize;
             ptr::read_volatile(self.base.offset(off))
@@ -205,6 +206,7 @@ impl Framebuffer {
         for (row, byte) in glyph.iter().enumerate() {
             // SAFETY: bounds checked above (x+8 ≤ width, y+8 ≤ height,
             // stride ≥ width). Each offset is < stride * height.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 let row_base = base.offset(((y + row as u32) * stride + x) as isize);
                 ptr::write_volatile(

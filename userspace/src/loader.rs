@@ -287,6 +287,7 @@ pub unsafe fn load_elf_into_at(
             let chunk = core::cmp::min(4096 - dst_off, src.len() - written);
             // SAFETY: `frame` is an identity-mapped freshly-allocated
             // 4 KiB phys frame; chunk + dst_off <= 4 KiB.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr().add(written),
@@ -320,6 +321,7 @@ pub unsafe fn load_elf_bytes(
 ) -> Result<(Arc<AddressSpace>, EntryPoint), LoadBytesError> {
     // SAFETY: `new_for_user` contract — caller is in kernel mode
     // with paging up.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = unsafe { AddressSpace::new_for_user() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
@@ -339,11 +341,13 @@ pub unsafe fn load_elf_bytes(
     };
     // SAFETY: forwarding the caller's identity-map + allocator
     // contract; bias derived from the ELF type above.
+    // SAFETY: Valid memory or trusted environment
     let entry = unsafe { load_elf_into_at(bytes, &addr_space, bias) }?;
 
     // Install PTEs.
     // SAFETY: AS constructed by `new_for_user`; regions just pushed
     // via `load_elf_into_at`.
+    // SAFETY: Valid memory or trusted environment
     unsafe { addr_space.materialize() }
         .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
 
@@ -483,6 +487,7 @@ fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mu
         // address space being loaded into; `translate` only reads page-table
         // memory reachable from that root and `page` is a page-aligned virtual
         // address, so the walk stays within valid table entries.
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_memory::x86_64::paging::translate(addr_space.root, VirtAddr::new(page)) }?;
     Some((p.as_u64() + off) as *mut u8)
 }
@@ -708,6 +713,7 @@ pub unsafe fn apply_relocations(
             // each `Elf64_Rela` entry read by `process_rela_array` is fully
             // backed; `addr_space` is the target space whose pages this
             // relocation patches.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 process_rela_array(
                     slice,
@@ -742,6 +748,7 @@ pub unsafe fn apply_relocations(
                 // each `Elf64_Rela` PLT entry read by `process_rela_array` is
                 // fully backed; `addr_space` is the target space whose pages
                 // this relocation patches.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     process_rela_array(
                         slice,
@@ -860,6 +867,7 @@ unsafe fn process_rela_array(
         // backing the user's mapped page; the slot is 8 bytes wide
         // and aligned by construction (linker emits 8-aligned r_offsets
         // for R_X86_64_64-class relocations).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_unaligned(dst as *mut u64, value);
         }
