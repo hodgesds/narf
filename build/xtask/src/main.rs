@@ -1460,6 +1460,18 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("schedattr_smoke", "schedattr-ok"),
         ("adjtimex_smoke", "adjtimex-ok"),
         ("introspect_smoke", "introspect-ok"),
+        // Linux-compat round 10: vectored + extended I/O.
+        ("vio_smoke", "vio-ok"),
+        // Linux-compat round 11: System V semaphores + message queues.
+        ("sysvipc_smoke", "sysvipc-ok"),
+        // Linux-compat round 12: System V shared memory.
+        ("shm_smoke", "shm-ok"),
+        // Linux-compat round 13: xattr l*/f*/remove variants.
+        ("xattr2_smoke", "xattr2-ok"),
+        // Linux-compat round 14: filesystem misc (creat/lchown/utime/utimes).
+        ("fsmisc_smoke", "fsmisc-ok"),
+        // Linux-compat round 15: credential gaps (real/effective/fs ids).
+        ("creds2_smoke", "creds2-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

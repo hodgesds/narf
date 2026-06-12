@@ -4485,16 +4485,19 @@ fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
     copy_user_cstr(ptr, 4096).map(|s| apply_chroot(&s))
 }
 
-/// `setxattr(path, name, value, size, flags)`.
-fn sys_setxattr(ctx: &mut dyn TrapContext) {
+/// Resolve the fd argument of an `f*xattr` syscall to a side-table key.
+/// NARF has no fd→pathname cache yet, so `fd_path_of` returns a stable
+/// per-fd `anon_inode:[Type]` placeholder: `f*xattr` calls round-trip
+/// against each other on the same fd, but do NOT share storage with the
+/// path-keyed `*xattr` family (a documented limitation).
+fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
+    fd_path_of(current_task_id(), fd)
+}
+
+/// `setxattr` / `lsetxattr` / `fsetxattr` core (name/value/size/flags at
+/// arg1..arg4; the key path is resolved by the caller).
+fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match xattr_user_path(a.arg0) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
     let name = match copy_user_cstr(a.arg1, 256) {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -4506,8 +4509,7 @@ fn sys_setxattr(ctx: &mut dyn TrapContext) {
     let value = if size == 0 {
         alloc::vec::Vec::new()
     } else {
-        // SAFETY: size != 0 here; copy_from_user_vec range-validates a.arg2
-        // before the SMAP-bracketed read.
+        // SAFETY: size != 0; copy_from_user_vec range-validates a.arg2.
         match unsafe { copy_from_user_vec(a.arg2, size) } {
             Ok(v) => v,
             Err(_) => {
@@ -4533,17 +4535,10 @@ fn sys_setxattr(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// `getxattr(path, name, value, size)`. With `size == 0` returns the
-/// attribute length without copying; ERANGE if the buffer is too small.
-fn sys_getxattr(ctx: &mut dyn TrapContext) {
+/// `getxattr` / `lgetxattr` / `fgetxattr` core (name at arg1, value at
+/// arg2, size at arg3).
+fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match xattr_user_path(a.arg0) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
     let name = match copy_user_cstr(a.arg1, 256) {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -4578,17 +4573,9 @@ fn sys_getxattr(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(value.len() as u64));
 }
 
-/// `listxattr(path, list, size)` — NUL-separated attribute names for
-/// `path`. With `size == 0` returns the total length without copying.
-fn sys_listxattr(ctx: &mut dyn TrapContext) {
+/// `listxattr` / `llistxattr` / `flistxattr` core (list at arg1, size at arg2).
+fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let path = match xattr_user_path(a.arg0) {
-        Some(p) => p,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-            return;
-        }
-    };
     let size = a.arg2 as usize;
     let mut names: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     {
@@ -4616,6 +4603,168 @@ fn sys_listxattr(ctx: &mut dyn TrapContext) {
         return;
     }
     ctx.set_return(SyscallReturn::ok(names.len() as u64));
+}
+
+/// `removexattr` / `lremovexattr` / `fremovexattr` core (name at arg1).
+fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let name = match copy_user_cstr(a.arg1, 256) {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+    let removed = {
+        let mut g = XATTR_TABLE.lock();
+        g.as_mut().map(|m| m.remove(&(path, name)).is_some())
+    };
+    if removed == Some(true) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+    }
+}
+
+/// `setxattr(path, name, value, size, flags)`.
+fn sys_setxattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_set_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `getxattr(path, name, value, size)`.
+fn sys_getxattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_get_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `listxattr(path, list, size)`.
+fn sys_listxattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_list_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `removexattr(path, name)`.
+fn sys_removexattr(ctx: &mut dyn TrapContext) {
+    match xattr_user_path(ctx.args().arg0) {
+        Some(p) => xattr_remove_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `fsetxattr(fd, name, value, size, flags)`.
+fn sys_fsetxattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_set_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `fgetxattr(fd, name, value, size)`.
+fn sys_fgetxattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_get_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `flistxattr(fd, list, size)`.
+fn sys_flistxattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_list_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `fremovexattr(fd, name)`.
+fn sys_fremovexattr(ctx: &mut dyn TrapContext) {
+    match xattr_fd_key(ctx.args().arg0 as u32) {
+        Some(p) => xattr_remove_core(p, ctx),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `creat(path, mode)` — equivalent to
+/// `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`. Reshapes into `sys_open`'s
+/// `(path_ptr, path_len, mnt_ptr, mnt_len, flags)` ABI, mirroring sys_openat.
+fn sys_creat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let path_uptr = a.arg0;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
+    };
+    const O_CREAT_WRONLY_TRUNC: u64 = 0o100 | 0o1 | 0o1000;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args: SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
+        }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: O_CREAT_WRONLY_TRUNC,
+        arg5: 0,
+    };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_open(&mut proxy);
+}
+
+/// `utime(path, times)` / `utimes(path, times)` — set a file's access and
+/// modification times. NARF's in-memory FSes don't track precise file
+/// times yet, so this validates the path and accepts (no-op).
+fn sys_utime_noop(ctx: &mut dyn TrapContext) {
+    match copy_user_cstr(ctx.args().arg0, 4096) {
+        Some(_) => ctx.set_return(SyscallReturn::ok(0)),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `utimensat(dirfd, path, times, flags)` — modern entry that musl routes
+/// utime/utimes/futimens through. `path` (arg1) may be NULL (the
+/// futimens-on-dirfd form), which we accept; otherwise validate it.
+/// Accept (no-op) since file times aren't tracked yet.
+fn sys_utimensat(ctx: &mut dyn TrapContext) {
+    let path_ptr = ctx.args().arg1;
+    if path_ptr == 0 {
+        ctx.set_return(SyscallReturn::ok(0)); // futimens(dirfd) form
+        return;
+    }
+    match copy_user_cstr(path_ptr, 4096) {
+        Some(_) => ctx.set_return(SyscallReturn::ok(0)),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
 }
 
 /// `readahead(fd, offset, count)` — page-cache populate hint. NARF's
@@ -5547,6 +5696,184 @@ fn sys_preadv(ctx: &mut dyn TrapContext) {
 /// `pwritev(fd, iov, iovcnt, offset)` — positioned vectored write.
 fn sys_pwritev(ctx: &mut dyn TrapContext) {
     preadv_pwritev(ctx, true);
+}
+
+/// `readv(fd, iov, iovcnt)` — vectored read at the current file offset,
+/// advancing it (the position-tracking counterpart to `writev`).
+fn sys_readv(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let iov_ptr = args.arg1;
+    let iovcnt = args.arg2 as usize;
+    const IOV_MAX: usize = 1024;
+    if iovcnt > IOV_MAX {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
+    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iovcnt.saturating_mul(16)) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
+    let task = current_task_id();
+    let mut total: usize = 0;
+    for i in 0..iovcnt {
+        let o = i * 16;
+        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
+        if len == 0 {
+            continue;
+        }
+        let mut kbuf = alloc::vec![0u8; len];
+        let outcome = fd::with_table(task, |t| {
+            let entry = t.get_mut(fd).ok_or(())?;
+            let cur = entry.offset;
+            let res = poll_blocking(entry.ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
+            match res {
+                Ok(n) => {
+                    entry.offset = cur.saturating_add(n as u64);
+                    Ok(n)
+                }
+                Err(_) => Err(()),
+            }
+        });
+        match outcome {
+            Some(Ok(n)) => {
+                // SAFETY: `base` is the user iovec destination; copy_to_user
+                // validates the `n`-byte write.
+                let _ = unsafe { copy_to_user(base, &kbuf[..n]) };
+                total = total.saturating_add(n);
+                if n < len {
+                    break; // short read / EOF
+                }
+            }
+            _ => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
+
+/// `preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned vectored
+/// read with a flags word. On LP64 `pos_h` is zero and the offset is
+/// `pos_l` (arg3), so the core matches `preadv`; the RWF_* flags (arg5)
+/// are accepted but not specially honoured.
+fn sys_preadv2(ctx: &mut dyn TrapContext) {
+    preadv_pwritev(ctx, false);
+}
+
+/// `pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned vectored
+/// write with a flags word. See `sys_preadv2`.
+fn sys_pwritev2(ctx: &mut dyn TrapContext) {
+    preadv_pwritev(ctx, true);
+}
+
+/// `tee(fd_in, fd_out, len, flags)` — copy up to `len` bytes from one
+/// pipe to another WITHOUT consuming the input. `fd_in` must be a pipe
+/// read end (peekable); `fd_out` receives the duplicated bytes.
+fn sys_tee(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let fd_in = a.arg0 as u32;
+    let fd_out = a.arg1 as u32;
+    let len = a.arg2 as usize;
+    let task = current_task_id();
+    let peeked =
+        fd::with_table(task, |t| t.get(fd_in).and_then(|e| e.ops.pipe_peek(len))).flatten();
+    let data = match peeked {
+        Some(d) => d,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL (not a pipe read end)
+            return;
+        }
+    };
+    if data.is_empty() {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let w = fd::with_table(task, |t| {
+        let entry = t.get_mut(fd_out).ok_or(())?;
+        poll_blocking(entry.ops.write(0, &data))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+            .map_err(|_| ())
+    });
+    match w {
+        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+    }
+}
+
+/// `vmsplice(fd, iov, nr_segs, flags)` — gather user memory described by
+/// `iov` into the pipe referenced by `fd` (the write-to-pipe direction,
+/// which is the common use). Flags (arg3) are accepted but unused.
+fn sys_vmsplice(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let fd = a.arg0 as u32;
+    let iov_ptr = a.arg1;
+    let nr = a.arg2 as usize;
+    const IOV_MAX: usize = 1024;
+    if nr > IOV_MAX {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
+    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, nr.saturating_mul(16)) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
+    let task = current_task_id();
+    let mut total: usize = 0;
+    for i in 0..nr {
+        let o = i * 16;
+        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: `base` is a user VA; copy_from_user_vec validates it.
+        let kbuf = match unsafe { copy_from_user_vec(base, len) } {
+            Ok(b) => b,
+            Err(_) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    return;
+                }
+                break;
+            }
+        };
+        let w = fd::with_table(task, |t| {
+            let entry = t.get_mut(fd).ok_or(())?;
+            poll_blocking(entry.ops.write(0, &kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+                .map_err(|_| ())
+        });
+        match w {
+            Some(Ok(n)) => {
+                total = total.saturating_add(n);
+                if n < len {
+                    break;
+                }
+            }
+            _ => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
 }
 
 // ── FB syscalls ────────────────────────────────────────────────────
@@ -8239,8 +8566,17 @@ pub fn set_controlling_tty(pty_index: u32) {
 
 #[derive(Copy, Clone, Default)]
 struct UidGid {
+    /// Real uid/gid.
     uid: u32,
     gid: u32,
+    /// Effective uid/gid (geteuid/getegid). No separate saved-id is
+    /// tracked; getres*id reports the effective id as the saved id too.
+    euid: u32,
+    egid: u32,
+    /// Filesystem uid/gid (setfsuid/setfsgid). Tracks the effective id
+    /// unless overridden by setfs*id.
+    fsuid: u32,
+    fsgid: u32,
 }
 
 static UIDGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>> =
@@ -8289,7 +8625,12 @@ fn sys_setuid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let uid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    if write_uidgid(task, |e| e.uid = uid) {
+    // A (notionally privileged) setuid sets real, effective, and fs uids.
+    if write_uidgid(task, |e| {
+        e.uid = uid;
+        e.euid = uid;
+        e.fsuid = uid;
+    }) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
@@ -8300,11 +8641,92 @@ fn sys_setgid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let gid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    if write_uidgid(task, |e| e.gid = gid) {
+    if write_uidgid(task, |e| {
+        e.gid = gid;
+        e.egid = gid;
+        e.fsgid = gid;
+    }) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
     }
+}
+
+fn sys_geteuid(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(
+        read_uidgid(current_task_id()).euid as u64,
+    ));
+}
+
+fn sys_getegid(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(
+        read_uidgid(current_task_id()).egid as u64,
+    ));
+}
+
+/// `getpgrp()` — the calling process's process-group id (legacy; takes
+/// no argument, so it always targets self).
+fn sys_getpgrp(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(read_pgid(current_task_id())));
+}
+
+/// `setreuid(ruid, euid)` — set the real and/or effective uid; `-1`
+/// leaves a field unchanged. The fs uid follows the new effective uid.
+fn sys_setreuid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let ruid = a.arg0 as u32;
+    let euid = a.arg1 as u32;
+    let ok = write_uidgid(current_task_id(), |e| {
+        if ruid != u32::MAX {
+            e.uid = ruid;
+        }
+        if euid != u32::MAX {
+            e.euid = euid;
+            e.fsuid = euid;
+        }
+    });
+    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
+}
+
+/// `setregid(rgid, egid)`.
+fn sys_setregid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let rgid = a.arg0 as u32;
+    let egid = a.arg1 as u32;
+    let ok = write_uidgid(current_task_id(), |e| {
+        if rgid != u32::MAX {
+            e.gid = rgid;
+        }
+        if egid != u32::MAX {
+            e.egid = egid;
+            e.fsgid = egid;
+        }
+    });
+    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
+}
+
+/// `setfsuid(fsuid)` — set the filesystem uid and return the PREVIOUS
+/// one. Always "succeeds" (the return is the old fsuid, never an errno),
+/// matching Linux. `-1` queries without changing.
+fn sys_setfsuid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    let new = ctx.args().arg0 as u32;
+    let old = read_uidgid(task).fsuid;
+    if new != u32::MAX {
+        let _ = write_uidgid(task, |e| e.fsuid = new);
+    }
+    ctx.set_return(SyscallReturn::ok(old as u64));
+}
+
+/// `setfsgid(fsgid)` — set the filesystem gid, return the previous one.
+fn sys_setfsgid(ctx: &mut dyn TrapContext) {
+    let task = current_task_id();
+    let new = ctx.args().arg0 as u32;
+    let old = read_uidgid(task).fsgid;
+    if new != u32::MAX {
+        let _ = write_uidgid(task, |e| e.fsgid = new);
+    }
+    ctx.set_return(SyscallReturn::ok(old as u64));
 }
 
 /// Write `val` into each of the (up to three) user `u32` out-pointers
@@ -8353,7 +8775,18 @@ fn sys_setresuid(ctx: &mut dyn TrapContext) {
         None
     };
     if let Some(u) = new {
-        let _ = write_uidgid(current_task_id(), |e| e.uid = u);
+        // arg1 is the requested euid; set real+effective+fs coherently so
+        // a later geteuid/setfsuid sees the change.
+        let euid = if a.arg1 as u32 != u32::MAX {
+            a.arg1 as u32
+        } else {
+            u
+        };
+        let _ = write_uidgid(current_task_id(), |e| {
+            e.uid = u;
+            e.euid = euid;
+            e.fsuid = euid;
+        });
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -8369,7 +8802,16 @@ fn sys_setresgid(ctx: &mut dyn TrapContext) {
         None
     };
     if let Some(g) = new {
-        let _ = write_uidgid(current_task_id(), |e| e.gid = g);
+        let egid = if a.arg1 as u32 != u32::MAX {
+            a.arg1 as u32
+        } else {
+            g
+        };
+        let _ = write_uidgid(current_task_id(), |e| {
+            e.gid = g;
+            e.egid = egid;
+            e.fsgid = egid;
+        });
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -9364,7 +9806,7 @@ fn sys_shmget(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ns.shmget(key) as u64));
 }
 
-#[cfg(feature = "container")]
+#[cfg(all(feature = "container", not(feature = "linux-compat")))]
 fn sys_semget(ctx: &mut dyn TrapContext) {
     let key = ctx.args().arg0 as u32;
     let task = current_task_id();
@@ -9372,12 +9814,227 @@ fn sys_semget(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ns.semget(key) as u64));
 }
 
-#[cfg(feature = "container")]
+#[cfg(all(feature = "container", not(feature = "linux-compat")))]
 fn sys_msgget(ctx: &mut dyn TrapContext) {
     let key = ctx.args().arg0 as u32;
     let task = current_task_id();
     let ns = current_or_default_ipc_ns(task);
     ctx.set_return(SyscallReturn::ok(ns.msgget(key) as u64));
+}
+
+// ── System V shared memory (linux-compat) ────────────────────────────
+//
+// Real shared segments backed by the narf-shmem frame registry (reached
+// through the syscall vtable). `shmat` maps a segment's physical frames
+// into the caller's address space; a second attach of the same id maps
+// the same frames, so writes through one attachment are visible through
+// the other — genuine sharing, exactly like Linux. Supersedes the
+// container id-by-key `shmget` in a linux-compat build.
+
+#[cfg(feature = "linux-compat")]
+struct ShmSegment {
+    handle: u64,
+    key: u32,
+    len: u64,
+}
+
+#[cfg(feature = "linux-compat")]
+static SHM_SEGMENTS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, ShmSegment>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "linux-compat")]
+const IPC_CREAT: u64 = 0o1000;
+#[cfg(feature = "linux-compat")]
+const IPC_EXCL: u64 = 0o2000;
+#[cfg(feature = "linux-compat")]
+const IPC_RMID: u64 = 0;
+#[cfg(feature = "linux-compat")]
+const IPC_64: u64 = 0x100;
+#[cfg(feature = "linux-compat")]
+const SHM_RDONLY: u64 = 0o10000;
+
+/// `shmget(key, size, shmflg)` — create or look up a shared segment with
+/// real frame backing.
+#[cfg(feature = "linux-compat")]
+fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let key = a.arg0 as u32;
+    let size = a.arg1;
+    let flg = a.arg2;
+    let mut g = SHM_SEGMENTS.lock();
+    let segs = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    if key != 0 {
+        if let Some((id, _)) = segs.iter().find(|(_, s)| s.key == key) {
+            let id = *id;
+            if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
+                ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(id));
+            return;
+        }
+        if flg & IPC_CREAT == 0 {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // ENOENT
+            return;
+        }
+    }
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let handle = (v.create)(current_task_id(), size);
+    if handle == 0 {
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        return;
+    }
+    let shmid = SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    segs.insert(
+        shmid,
+        ShmSegment {
+            handle,
+            key,
+            len: size,
+        },
+    );
+    ctx.set_return(SyscallReturn::ok(shmid));
+}
+
+/// `shmat(shmid, shmaddr, shmflg)` — map the segment's frames into the AS.
+#[cfg(feature = "linux-compat")]
+fn sys_shmat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let shmid = a.arg0;
+    let flg = a.arg2;
+    let (handle, len) = {
+        let g = SHM_SEGMENTS.lock();
+        match g.as_ref().and_then(|m| m.get(&shmid)) {
+            Some(s) => (s.handle, s.len),
+            None => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+        }
+    };
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    if !(v.frames)(handle, &mut frames_raw) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
+        .into_iter()
+        .map(narf_memory::PhysAddr::new)
+        .collect();
+    // SHARED marks the frames as borrowed (narf-shmem owns them), so a
+    // second shmat of the same segment may alias them and neither unmap
+    // nor AS-drop frees them.
+    let mut perms = RegionPerms::READ | RegionPerms::SHARED;
+    if flg & SHM_RDONLY == 0 {
+        perms = perms | RegionPerms::WRITE;
+    }
+    let base = as_ref.reserve_mmap_va(len);
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len,
+            perms,
+            phys: phys_list,
+        })
+        .is_err()
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
+    // region was just registered, so materialize installs only its PTEs.
+    if unsafe { as_ref.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(base));
+}
+
+/// `shmdt(shmaddr)` — detach (unmap) a previously-attached segment.
+#[cfg(feature = "linux-compat")]
+fn sys_shmdt(ctx: &mut dyn TrapContext) {
+    let addr = ctx.args().arg0;
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    match as_ref.unmap_region(VirtAddr::new(addr)) {
+        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+    }
+}
+
+/// `shmctl(shmid, cmd, buf)`. IPC_RMID destroys the segment; IPC_STAT
+/// reports the segment size; others are accepted.
+#[cfg(feature = "linux-compat")]
+fn sys_shmctl(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let shmid = a.arg0;
+    let cmd = a.arg1 & !IPC_64;
+    match cmd {
+        IPC_RMID => {
+            let removed = {
+                let mut g = SHM_SEGMENTS.lock();
+                g.as_mut().and_then(|m| m.remove(&shmid))
+            };
+            match removed {
+                Some(seg) => {
+                    if let Some(v) = shmem_vtable() {
+                        (v.destroy)(seg.handle);
+                    }
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                None => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+            }
+        }
+        2 => {
+            // IPC_STAT: report shm_segsz. On x86_64 the kernel's
+            // shmid64_ds places shm_segsz right after struct ipc64_perm
+            // (48 bytes). We fill just the size; the rest stays
+            // caller-zeroed.
+            let len = {
+                let g = SHM_SEGMENTS.lock();
+                g.as_ref().and_then(|m| m.get(&shmid)).map(|s| s.len)
+            };
+            match len {
+                Some(len) if a.arg2 != 0 => {
+                    // SAFETY: a.arg2 is the user struct shmid_ds*; copy_to_user
+                    // validates the 8-byte shm_segsz write at offset 48.
+                    let _ = unsafe { copy_to_user(a.arg2.wrapping_add(48), &len.to_le_bytes()) };
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                Some(_) => ctx.set_return(SyscallReturn::ok(0)),
+                None => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+            }
+        }
+        _ => ctx.set_return(SyscallReturn::ok(0)),
+    }
 }
 
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
@@ -15266,8 +15923,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     #[cfg(feature = "container")]
     {
         table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget));
-        table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
-        table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
+        // The self-contained sysvipc module supersedes the id-by-key
+        // semget/msgget in any linux-compat build; only register the
+        // container-namespace versions when linux-compat is absent.
+        #[cfg(not(feature = "linux-compat"))]
+        {
+            table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
+            table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
+        }
     }
     table.install_raw(Syscall::Getrlimit, "getrlimit", RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit, "setrlimit", RawFnHandler(sys_setrlimit));
@@ -15416,6 +16079,56 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             "inotify_rm_watch",
             RawFnHandler(crate::mqueue::sys_inotify_rm_watch),
         );
+        // Batch 11: System V semaphores + message queues. These override
+        // the container-only id-by-key `semget`/`msgget` (registered
+        // earlier) with self-contained backing that works without the
+        // container feature.
+        table.install_raw(
+            Syscall::Semget,
+            "semget",
+            RawFnHandler(crate::sysvipc::sys_semget),
+        );
+        table.install_raw(
+            Syscall::Semop,
+            "semop",
+            RawFnHandler(crate::sysvipc::sys_semop),
+        );
+        table.install_raw(
+            Syscall::Semctl,
+            "semctl",
+            RawFnHandler(crate::sysvipc::sys_semctl),
+        );
+        table.install_raw(
+            Syscall::Semtimedop,
+            "semtimedop",
+            RawFnHandler(crate::sysvipc::sys_semtimedop),
+        );
+        table.install_raw(
+            Syscall::Msgget,
+            "msgget",
+            RawFnHandler(crate::sysvipc::sys_msgget),
+        );
+        table.install_raw(
+            Syscall::Msgsnd,
+            "msgsnd",
+            RawFnHandler(crate::sysvipc::sys_msgsnd),
+        );
+        table.install_raw(
+            Syscall::Msgrcv,
+            "msgrcv",
+            RawFnHandler(crate::sysvipc::sys_msgrcv),
+        );
+        table.install_raw(
+            Syscall::Msgctl,
+            "msgctl",
+            RawFnHandler(crate::sysvipc::sys_msgctl),
+        );
+        // Batch 12: System V shared memory with real frame backing. The
+        // linux-compat shmget supersedes the container id-by-key version.
+        table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget_compat));
+        table.install_raw(Syscall::Shmat, "shmat", RawFnHandler(sys_shmat));
+        table.install_raw(Syscall::Shmdt, "shmdt", RawFnHandler(sys_shmdt));
+        table.install_raw(Syscall::Shmctl, "shmctl", RawFnHandler(sys_shmctl));
     }
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
     table.install_raw(
@@ -15665,6 +16378,57 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setxattr, "setxattr", RawFnHandler(sys_setxattr));
     table.install_raw(Syscall::Getxattr, "getxattr", RawFnHandler(sys_getxattr));
     table.install_raw(Syscall::Listxattr, "listxattr", RawFnHandler(sys_listxattr));
+    // Batch 13: xattr l*/f*/remove variants. NARF has no symlink-follow
+    // distinction, so the l* variants alias the path handlers.
+    table.install_raw(Syscall::Lsetxattr, "lsetxattr", RawFnHandler(sys_setxattr));
+    table.install_raw(Syscall::Lgetxattr, "lgetxattr", RawFnHandler(sys_getxattr));
+    table.install_raw(
+        Syscall::Llistxattr,
+        "llistxattr",
+        RawFnHandler(sys_listxattr),
+    );
+    table.install_raw(
+        Syscall::Removexattr,
+        "removexattr",
+        RawFnHandler(sys_removexattr),
+    );
+    table.install_raw(
+        Syscall::Lremovexattr,
+        "lremovexattr",
+        RawFnHandler(sys_removexattr),
+    );
+    table.install_raw(Syscall::Fsetxattr, "fsetxattr", RawFnHandler(sys_fsetxattr));
+    table.install_raw(Syscall::Fgetxattr, "fgetxattr", RawFnHandler(sys_fgetxattr));
+    table.install_raw(
+        Syscall::Flistxattr,
+        "flistxattr",
+        RawFnHandler(sys_flistxattr),
+    );
+    table.install_raw(
+        Syscall::Fremovexattr,
+        "fremovexattr",
+        RawFnHandler(sys_fremovexattr),
+    );
+    // Batch 14: filesystem misc (legacy x86_64-only entries).
+    table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
+    // lchown shares the chmod/chown path handler (no symlink-follow
+    // distinction in NARF).
+    table.install_raw(
+        Syscall::Lchown,
+        "lchown",
+        RawFnHandler(sys_access_chmod_chown),
+    );
+    table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime_noop));
+    table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utime_noop));
+    table.install_raw(Syscall::Utimensat, "utimensat", RawFnHandler(sys_utimensat));
+    // Batch 15: credential gaps (real/effective/fs uid+gid).
+    table.install_raw(Syscall::Geteuid, "geteuid", RawFnHandler(sys_geteuid));
+    table.install_raw(Syscall::Getegid, "getegid", RawFnHandler(sys_getegid));
+    table.install_raw(Syscall::Getpgrp, "getpgrp", RawFnHandler(sys_getpgrp));
+    table.install_raw(Syscall::Setreuid, "setreuid", RawFnHandler(sys_setreuid));
+    table.install_raw(Syscall::Setregid, "setregid", RawFnHandler(sys_setregid));
+    table.install_raw(Syscall::Setfsuid, "setfsuid", RawFnHandler(sys_setfsuid));
+    table.install_raw(Syscall::Setfsgid, "setfsgid", RawFnHandler(sys_setfsgid));
     table.install_raw(Syscall::Readahead, "readahead", RawFnHandler(sys_readahead));
     table.install_raw(
         Syscall::SyncFileRange,
@@ -15727,6 +16491,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_pidfd_getfd),
     );
     table.install_raw(Syscall::Kcmp, "kcmp", RawFnHandler(sys_kcmp));
+    // Batch 10: vectored + extended I/O.
+    table.install_raw(Syscall::Readv, "readv", RawFnHandler(sys_readv));
+    table.install_raw(Syscall::Preadv2, "preadv2", RawFnHandler(sys_preadv2));
+    table.install_raw(Syscall::Pwritev2, "pwritev2", RawFnHandler(sys_pwritev2));
+    table.install_raw(Syscall::Tee, "tee", RawFnHandler(sys_tee));
+    table.install_raw(Syscall::Vmsplice, "vmsplice", RawFnHandler(sys_vmsplice));
     table.install_raw(
         Syscall::Select,
         "select",

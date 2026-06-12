@@ -3473,6 +3473,18 @@ fn boot_userspace_init() {
                     "introspect_smoke",
                     narf_verification::NARF_INTROSPECT_SMOKE_ELF,
                 ),
+                // Linux-compat round 10: vectored + extended I/O.
+                ("vio_smoke", narf_verification::NARF_VIO_SMOKE_ELF),
+                // Linux-compat round 11: System V semaphores + message queues.
+                ("sysvipc_smoke", narf_verification::NARF_SYSVIPC_SMOKE_ELF),
+                // Linux-compat round 12: System V shared memory.
+                ("shm_smoke", narf_verification::NARF_SHM_SMOKE_ELF),
+                // Linux-compat round 13: xattr l*/f*/remove variants.
+                ("xattr2_smoke", narf_verification::NARF_XATTR2_SMOKE_ELF),
+                // Linux-compat round 14: filesystem misc (creat/lchown/utime/utimes).
+                ("fsmisc_smoke", narf_verification::NARF_FSMISC_SMOKE_ELF),
+                // Linux-compat round 15: credential gaps (real/effective/fs ids).
+                ("creds2_smoke", narf_verification::NARF_CREDS2_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

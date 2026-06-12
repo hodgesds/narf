@@ -160,6 +160,14 @@ impl FileOps for PipeRead {
         }
         mask
     }
+
+    fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
+        let q = self.shared.queue.lock();
+        let n = core::cmp::min(max, q.len());
+        // Copy the front `n` bytes without consuming them — tee(2)
+        // duplicates pipe data, leaving the source readable.
+        Some(q.iter().copied().take(n).collect())
+    }
 }
 
 impl FileOps for PipeWrite {

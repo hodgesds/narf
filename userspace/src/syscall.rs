@@ -1861,6 +1861,137 @@ pub enum Syscall {
     /// `kcmp(pid1, pid2, type, idx1, idx2)` — compare whether two
     /// processes share a kernel resource. Linux (x86_64=312, aarch64=272).
     Kcmp,
+
+    /// `readv(fd, iov, iovcnt)` — vectored read at the file offset.
+    /// Linux (x86_64=19, aarch64=65).
+    Readv,
+
+    /// `preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned
+    /// vectored read with flags. Linux (x86_64=327, aarch64=286).
+    Preadv2,
+
+    /// `pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned
+    /// vectored write with flags. Linux (x86_64=328, aarch64=287).
+    Pwritev2,
+
+    /// `tee(fd_in, fd_out, len, flags)` — copy between two pipes without
+    /// consuming the input. Linux (x86_64=276, aarch64=77).
+    Tee,
+
+    /// `vmsplice(fd, iov, nr_segs, flags)` — splice user memory to/from a
+    /// pipe. Linux (x86_64=278, aarch64=75).
+    Vmsplice,
+
+    /// `semop(semid, sops, nsops)` — System V semaphore operations.
+    /// Linux (x86_64=65, aarch64=193).
+    Semop,
+
+    /// `semctl(semid, semnum, cmd, arg)` — System V semaphore control.
+    /// Linux (x86_64=66, aarch64=191).
+    Semctl,
+
+    /// `semtimedop(semid, sops, nsops, timeout)` — `semop` with a timeout.
+    /// Linux (x86_64=220, aarch64=192).
+    Semtimedop,
+
+    /// `msgsnd(msqid, msgp, msgsz, msgflg)` — send a System V message.
+    /// Linux (x86_64=69, aarch64=189).
+    Msgsnd,
+
+    /// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)` — receive a System V
+    /// message. Linux (x86_64=70, aarch64=188).
+    Msgrcv,
+
+    /// `msgctl(msqid, cmd, buf)` — System V message-queue control.
+    /// Linux (x86_64=71, aarch64=187).
+    Msgctl,
+
+    /// `shmat(shmid, shmaddr, shmflg)` — attach a System V shared-memory
+    /// segment into the address space. Linux (x86_64=30, aarch64=196).
+    Shmat,
+
+    /// `shmdt(shmaddr)` — detach a shared-memory segment.
+    /// Linux (x86_64=67, aarch64=197).
+    Shmdt,
+
+    /// `shmctl(shmid, cmd, buf)` — System V shared-memory control.
+    /// Linux (x86_64=31, aarch64=195).
+    Shmctl,
+
+    /// `lsetxattr(path, name, value, size, flags)` — set an xattr without
+    /// following a final symlink. Linux (x86_64=189, aarch64=6).
+    Lsetxattr,
+
+    /// `fsetxattr(fd, name, value, size, flags)` — set an xattr by fd.
+    /// Linux (x86_64=190, aarch64=7).
+    Fsetxattr,
+
+    /// `lgetxattr(path, name, value, size)`. Linux (x86_64=192, aarch64=9).
+    Lgetxattr,
+
+    /// `fgetxattr(fd, name, value, size)`. Linux (x86_64=193, aarch64=10).
+    Fgetxattr,
+
+    /// `llistxattr(path, list, size)`. Linux (x86_64=195, aarch64=12).
+    Llistxattr,
+
+    /// `flistxattr(fd, list, size)`. Linux (x86_64=196, aarch64=13).
+    Flistxattr,
+
+    /// `removexattr(path, name)`. Linux (x86_64=197, aarch64=14).
+    Removexattr,
+
+    /// `lremovexattr(path, name)`. Linux (x86_64=198, aarch64=15).
+    Lremovexattr,
+
+    /// `fremovexattr(fd, name)`. Linux (x86_64=199, aarch64=16).
+    Fremovexattr,
+
+    /// `creat(path, mode)` — create+open for writing (legacy; aarch64
+    /// uses openat). Linux (x86_64=85).
+    Creat,
+
+    /// `lchown(path, uid, gid)` — chown without following a final
+    /// symlink (legacy). Linux (x86_64=94).
+    Lchown,
+
+    /// `utime(path, times)` — set file access/modification times
+    /// (legacy). Linux (x86_64=132).
+    Utime,
+
+    /// `utimes(path, times)` — set file times with microsecond
+    /// granularity (legacy). Linux (x86_64=235).
+    Utimes,
+
+    /// `utimensat(dirfd, path, times, flags)` — set file times; modern
+    /// musl routes utime/utimes/futimens through this. Linux
+    /// (x86_64=280, aarch64=88).
+    Utimensat,
+
+    /// `geteuid()` — effective uid (== real uid in NARF).
+    /// Linux (x86_64=107, aarch64=175).
+    Geteuid,
+
+    /// `getegid()` — effective gid. Linux (x86_64=108, aarch64=177).
+    Getegid,
+
+    /// `getpgrp()` — the calling process's process-group id (legacy).
+    /// Linux (x86_64=111).
+    Getpgrp,
+
+    /// `setreuid(ruid, euid)`. Linux (x86_64=113, aarch64=145).
+    Setreuid,
+
+    /// `setregid(rgid, egid)`. Linux (x86_64=114, aarch64=143).
+    Setregid,
+
+    /// `setfsuid(fsuid)` — set filesystem uid, return the previous one.
+    /// Linux (x86_64=122, aarch64=151).
+    Setfsuid,
+
+    /// `setfsgid(fsgid)` — set filesystem gid, return the previous one.
+    /// Linux (x86_64=123, aarch64=152).
+    Setfsgid,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1981,6 +2112,41 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::ClockAdjtime, 305),
     (Syscall::PidfdGetfd, 438),
     (Syscall::Kcmp, 312),
+    (Syscall::Readv, 19),
+    (Syscall::Preadv2, 327),
+    (Syscall::Pwritev2, 328),
+    (Syscall::Tee, 276),
+    (Syscall::Vmsplice, 278),
+    (Syscall::Semop, 65),
+    (Syscall::Semctl, 66),
+    (Syscall::Semtimedop, 220),
+    (Syscall::Msgsnd, 69),
+    (Syscall::Msgrcv, 70),
+    (Syscall::Msgctl, 71),
+    (Syscall::Shmat, 30),
+    (Syscall::Shmdt, 67),
+    (Syscall::Shmctl, 31),
+    (Syscall::Lsetxattr, 189),
+    (Syscall::Fsetxattr, 190),
+    (Syscall::Lgetxattr, 192),
+    (Syscall::Fgetxattr, 193),
+    (Syscall::Llistxattr, 195),
+    (Syscall::Flistxattr, 196),
+    (Syscall::Removexattr, 197),
+    (Syscall::Lremovexattr, 198),
+    (Syscall::Fremovexattr, 199),
+    (Syscall::Creat, 85),
+    (Syscall::Lchown, 94),
+    (Syscall::Utime, 132),
+    (Syscall::Utimes, 235),
+    (Syscall::Utimensat, 280),
+    (Syscall::Geteuid, 107),
+    (Syscall::Getegid, 108),
+    (Syscall::Getpgrp, 111),
+    (Syscall::Setreuid, 113),
+    (Syscall::Setregid, 114),
+    (Syscall::Setfsuid, 122),
+    (Syscall::Setfsgid, 123),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2116,14 +2282,16 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // it requires the per-task NS infrastructure; reading the
     // uts struct works on every NARF build.
     (Syscall::Uname, 63),
-    // setdomainname works on every build (global domainname slot);
-    // the SysV IPC get-by-key syscalls below need the container NS.
+    // setdomainname works on every build (global domainname slot).
     (Syscall::Setdomainname, 171),
-    #[cfg(feature = "container")]
+    // SysV IPC get-by-key: the container build backs these with the IPC
+    // namespace; the linux-compat build backs them (plus the full op
+    // surface) with the self-contained `sysvipc` module.
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 29),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Semget, 64),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Msgget, 68),
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
     #[cfg(feature = "linux-compat")]
@@ -2333,6 +2501,36 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::ClockAdjtime, 266),
     (Syscall::PidfdGetfd, 438),
     (Syscall::Kcmp, 272),
+    (Syscall::Readv, 65),
+    (Syscall::Preadv2, 286),
+    (Syscall::Pwritev2, 287),
+    (Syscall::Tee, 77),
+    (Syscall::Vmsplice, 75),
+    (Syscall::Semop, 193),
+    (Syscall::Semctl, 191),
+    (Syscall::Semtimedop, 192),
+    (Syscall::Msgsnd, 189),
+    (Syscall::Msgrcv, 188),
+    (Syscall::Msgctl, 187),
+    (Syscall::Shmat, 196),
+    (Syscall::Shmdt, 197),
+    (Syscall::Shmctl, 195),
+    (Syscall::Lsetxattr, 6),
+    (Syscall::Fsetxattr, 7),
+    (Syscall::Lgetxattr, 9),
+    (Syscall::Fgetxattr, 10),
+    (Syscall::Llistxattr, 12),
+    (Syscall::Flistxattr, 13),
+    (Syscall::Removexattr, 14),
+    (Syscall::Lremovexattr, 15),
+    (Syscall::Fremovexattr, 16),
+    (Syscall::Utimensat, 88),
+    (Syscall::Geteuid, 175),
+    (Syscall::Getegid, 177),
+    (Syscall::Setreuid, 145),
+    (Syscall::Setregid, 143),
+    (Syscall::Setfsuid, 151),
+    (Syscall::Setfsgid, 152),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -2363,11 +2561,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // Wave-72 — UTS/IPC syscalls (gated `container`).
     (Syscall::Uname, 160),
     (Syscall::Setdomainname, 162),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 194),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Semget, 190),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Msgget, 186),
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
     #[cfg(feature = "linux-compat")]
