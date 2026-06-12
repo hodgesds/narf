@@ -1685,6 +1685,32 @@ pub enum Syscall {
     /// `personality(persona)` — report/accept the execution domain
     /// (always PER_LINUX). Linux (x86_64=135, aarch64=92).
     Personality,
+
+    /// `fadvise64(fd, offset, len, advice)` — access-pattern hint
+    /// (accepted, no-op). Linux (x86_64=221, aarch64=223).
+    Fadvise64,
+
+    /// `mlock2(addr, len, flags)` — like mlock with MLOCK_ONFAULT.
+    /// Linux (x86_64=325, aarch64=284).
+    Mlock2,
+
+    /// `set_robust_list(head, len)` — register the per-thread robust
+    /// futex list head. Linux (x86_64=273, aarch64=99).
+    SetRobustList,
+
+    /// `get_robust_list(pid, head_ptr, len_ptr)` — read it back.
+    /// Linux (x86_64=274, aarch64=100).
+    GetRobustList,
+
+    /// `renameat2(olddirfd, old, newdirfd, new, flags)` — rename with
+    /// RENAME_NOREPLACE / RENAME_EXCHANGE. Linux (x86_64=316,
+    /// aarch64=276).
+    Renameat2,
+
+    /// `pidfd_send_signal(pidfd, sig, info, flags)` — deliver a signal
+    /// to the process referenced by `pidfd`. Linux (424 on both
+    /// arches).
+    PidfdSendSignal,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1762,6 +1788,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Sync, 162),
     (Syscall::Syncfs, 306),
     (Syscall::Personality, 135),
+    (Syscall::Fadvise64, 221),
+    (Syscall::Mlock2, 325),
+    (Syscall::SetRobustList, 273),
+    (Syscall::GetRobustList, 274),
+    (Syscall::Renameat2, 316),
+    (Syscall::PidfdSendSignal, 424),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2070,6 +2102,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Sync, 81),
     (Syscall::Syncfs, 267),
     (Syscall::Personality, 92),
+    (Syscall::Fadvise64, 223),
+    (Syscall::Mlock2, 284),
+    (Syscall::SetRobustList, 99),
+    (Syscall::GetRobustList, 100),
+    (Syscall::Renameat2, 276),
+    (Syscall::PidfdSendSignal, 424),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

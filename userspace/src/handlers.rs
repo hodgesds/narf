@@ -1160,10 +1160,14 @@ fn sys_dup3(ctx: &mut dyn TrapContext) {
         let clone = crate::fd::FdEntry {
             ops: entry.ops.clone(),
             offset: 0,
-            // O_CLOEXEC (Linux) is bit 0x80000 in `flags`; Stage-4
-            // accepts the lower-bit shape (FD_CLOEXEC = 1) directly
-            // since narf-libc's `dup3` already passes FD_CLOEXEC.
-            flags: flags & crate::fd::FD_CLOEXEC,
+            // Set FD_CLOEXEC when the caller passes O_CLOEXEC (stock
+            // glibc/musl, bit 0x80000) OR the bare FD_CLOEXEC bit
+            // (narf-libc). Either way the slot bit is FD_CLOEXEC.
+            flags: if flags & (crate::fd::O_CLOEXEC | crate::fd::FD_CLOEXEC) != 0 {
+                crate::fd::FD_CLOEXEC
+            } else {
+                0
+            },
             status_flags: 0,
         };
         t.set(newfd, clone);
@@ -2137,6 +2141,75 @@ fn sys_renameat(ctx: &mut dyn TrapContext) {
         args: proxy_args,
     };
     sys_rename(&mut proxy);
+}
+
+/// `renameat2(olddirfd, old, newdirfd, new, flags)` — rename with
+/// RENAME_NOREPLACE (fail if the destination exists). RENAME_EXCHANGE
+/// and RENAME_WHITEOUT aren't supported (EINVAL). dirfds are treated
+/// as AT_FDCWD — paths must be absolute, matching `sys_rename`.
+fn sys_renameat2(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let old_uptr = args.arg1;
+    let new_uptr = args.arg3;
+    let flags = args.arg4 as u32;
+    const RENAME_NOREPLACE: u32 = 1;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if flags & !RENAME_NOREPLACE != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let old_path = match copy_user_cstr(old_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let new_path = match copy_user_cstr(new_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    // Same-parent constraint (cross-directory rename isn't supported
+    // by the DirOps surface yet — mirrors sys_rename).
+    let old_split = match old_path.rfind('/') {
+        Some(i) => i,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let new_split = match new_path.rfind('/') {
+        Some(i) => i,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    if old_path[..old_split] != new_path[..new_split] {
+        ctx.set_return(fail);
+        return;
+    }
+    let new_leaf = &new_path[new_split + 1..];
+    if flags & RENAME_NOREPLACE != 0 {
+        let exists = narf_filesystem::registry()
+            .resolve_parent_absolute(&new_path, |_fs, parent, leaf| parent.lookup(leaf).is_some())
+            .unwrap_or(false);
+        if exists {
+            ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+            return;
+        }
+    }
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
+            poll_blocking(parent.rename(old_leaf, new_leaf))
+        });
+    match outcome {
+        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        _ => ctx.set_return(fail),
+    }
 }
 
 // ── symlinkat / readlinkat — *at-keyed symlink ops ─────────────────
@@ -4117,6 +4190,140 @@ fn sys_syncfs(ctx: &mut dyn TrapContext) {
 /// `personality(persona)` — NARF only implements the default Linux
 /// execution domain (PER_LINUX = 0); report it and ignore changes.
 fn sys_personality(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `fadvise64(fd, offset, len, advice)` — access-pattern hint. NARF's
+/// in-memory FSes ignore it; accept for a valid fd, EBADF otherwise.
+fn sys_fadvise64(ctx: &mut dyn TrapContext) {
+    let fd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let valid = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+    if valid {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+    }
+}
+
+/// `mlock2(addr, len, flags)` — like mlock with the MLOCK_ONFAULT
+/// flag. NARF force-backs the range either way, so the flag is
+/// accepted but doesn't change behaviour.
+fn sys_mlock2(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    const MLOCK_ONFAULT: u32 = 1;
+    if a.arg2 as u32 & !MLOCK_ONFAULT != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(x) => x,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    match as_ref.mlock_range(VirtAddr::new(a.arg0), a.arg1) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+/// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).
+/// Stored verbatim — NARF is single-threaded so there is no robust-list
+/// walk on thread exit, but the pointers round-trip faithfully.
+static ROBUST_LIST_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, (u64, u64)>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `set_robust_list(head, len)` — register the calling thread's robust
+/// futex list head.
+fn sys_set_robust_list(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let task = current_task_id();
+    let mut g = ROBUST_LIST_TABLE.lock();
+    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    m.insert(task, (a.arg0, a.arg1));
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `get_robust_list(pid, head_ptr, len_ptr)` — read back the robust
+/// futex list head registered for `pid` (0 = the caller).
+fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let head_out = a.arg1;
+    let len_out = a.arg2;
+    let task = if a.arg0 == 0 {
+        current_task_id()
+    } else {
+        a.arg0
+    };
+    let (head, len) = {
+        let g = ROBUST_LIST_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task).copied())
+            .unwrap_or((0, 0))
+    };
+    if head_out != 0 {
+        // SAFETY: `head_out` is the user `void**` out-pointer; copy_to_user
+        // range-validates the 8-byte write.
+        if unsafe { copy_to_user(head_out, &head.to_ne_bytes()) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    }
+    if len_out != 0 {
+        // SAFETY: `len_out` is the user `size_t*` out-pointer; copy_to_user
+        // range-validates the 8-byte write.
+        let _ = unsafe { copy_to_user(len_out, &len.to_ne_bytes()) };
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `pidfd_send_signal(pidfd, sig, info, flags)` — deliver `sig` to the
+/// process referenced by `pidfd` (resolved via the FileOps hook),
+/// reusing the same pending-signal queue as `kill(2)`.
+fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let pidfd = a.arg0 as u32;
+    let signum = a.arg1 as u32;
+    if signum >= 32 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let task = current_task_id();
+    let pid = fd::with_table(task, |t| {
+        t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
+    })
+    .flatten();
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            return;
+        }
+    };
+    // sig 0 is an existence/permission probe — don't queue anything.
+    if signum == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // SIGNAL_PENDING is keyed by TaskId; translate pid → tid.
+    let mut target = pid;
+    if let Some(tid) = pid_to_task_raw(target) {
+        target = tid;
+    }
+    {
+        let mut g = SIGNAL_PENDING.lock();
+        match g.as_mut() {
+            Some(map) => *map.entry(target).or_insert(0) |= 1u32 << signum,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                return;
+            }
+        }
+    }
+    wake_signal(target);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -14029,6 +14236,24 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::Personality,
         "personality",
         RawFnHandler(sys_personality),
+    );
+    table.install_raw(Syscall::Fadvise64, "fadvise64", RawFnHandler(sys_fadvise64));
+    table.install_raw(Syscall::Mlock2, "mlock2", RawFnHandler(sys_mlock2));
+    table.install_raw(
+        Syscall::SetRobustList,
+        "set_robust_list",
+        RawFnHandler(sys_set_robust_list),
+    );
+    table.install_raw(
+        Syscall::GetRobustList,
+        "get_robust_list",
+        RawFnHandler(sys_get_robust_list),
+    );
+    table.install_raw(Syscall::Renameat2, "renameat2", RawFnHandler(sys_renameat2));
+    table.install_raw(
+        Syscall::PidfdSendSignal,
+        "pidfd_send_signal",
+        RawFnHandler(sys_pidfd_send_signal),
     );
     table.install_raw(
         Syscall::Select,

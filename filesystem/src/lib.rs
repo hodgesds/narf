@@ -417,6 +417,13 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this file is a pidfd (from `pidfd_open`), return the target
+    /// process's pid. Used by `pidfd_send_signal(2)` to resolve the
+    /// fd to a pid without a downcast / Any dance. Default: `None`.
+    fn pidfd_target_pid(&self) -> Option<u64> {
+        None
+    }
+
     /// PTY-layer: true on the `/dev/ptmx` clone-on-open file. When
     /// `sys_open` sees this it allocates a fresh `Pty` pair and
     /// installs the master in the caller's fd table instead of the
