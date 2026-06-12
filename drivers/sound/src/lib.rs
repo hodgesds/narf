@@ -465,10 +465,10 @@ pub fn sound_fs_initcall() {
 }
 
 pub fn register_initcalls() {
-    intel8x0::register_initcalls();
+    intel8x0::register_pci_driver();
     max98357a::register_initcalls();
     rt5645::register_initcalls();
-    snd_sof::register_initcalls();
+    snd_sof::register_pci_driver();
 }
 
 // ── Test support ────────────────────────────────────────────────────────
