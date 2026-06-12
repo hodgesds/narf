@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+// Note: I2C HID or direct I2C registration logic goes here.
+// Currently acts as a placeholder module in the input subsys.
 pub fn register_initcalls() {
-    // Placeholder for I2C registration
+    // We would use an I2C device registry here matching the ACPI ID "GDIX1001"
 }
