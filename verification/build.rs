@@ -315,6 +315,7 @@ fn main() {
         "shm_smoke",
         "xattr2_smoke",
         "fsmisc_smoke",
+        "creds2_smoke",
     ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));

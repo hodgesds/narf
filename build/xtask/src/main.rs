@@ -1470,6 +1470,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("xattr2_smoke", "xattr2-ok"),
         // Linux-compat round 14: filesystem misc (creat/lchown/utime/utimes).
         ("fsmisc_smoke", "fsmisc-ok"),
+        // Linux-compat round 15: credential gaps (real/effective/fs ids).
+        ("creds2_smoke", "creds2-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
