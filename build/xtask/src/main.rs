@@ -1468,6 +1468,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("shm_smoke", "shm-ok"),
         // Linux-compat round 13: xattr l*/f*/remove variants.
         ("xattr2_smoke", "xattr2-ok"),
+        // Linux-compat round 14: filesystem misc (creat/lchown/utime/utimes).
+        ("fsmisc_smoke", "fsmisc-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
