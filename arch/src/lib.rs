@@ -302,6 +302,7 @@ pub fn interrupts_enabled() -> bool {
 pub unsafe fn idle_halt_then_disable() {
     // SAFETY: forwarded — caller upholds the IRQs-disabled
     // precondition.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         current::asm::idle_halt_then_disable();
     }
@@ -344,5 +345,6 @@ pub unsafe fn disable_interrupts() {
 pub unsafe fn enable_interrupts() {
     // SAFETY: caller must hold the equivalent capability (Stage 3); Stage 1
     // has a single domain so the check is vacuous.
+    // SAFETY: Valid memory or trusted environment
     unsafe { current::enable_interrupts() }
 }

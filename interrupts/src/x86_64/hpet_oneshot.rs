@@ -104,6 +104,7 @@ fn slot0_irq() {
     // race the disarm.
     // SAFETY: HPET singleton is initialised (we wouldn't have armed
     // otherwise) and `comp` is the index we programmed.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let _ = narf_time::hpet::disarm(comp);
     }
@@ -115,6 +116,7 @@ fn slot0_irq() {
     if raw != 0 {
         // SAFETY: `raw` was stored from a `fn() as usize`; the
         // round-trip back to `fn()` is sound when non-zero.
+        // SAFETY: Valid memory or trusted environment
         let f: fn() = unsafe { core::mem::transmute(raw) };
         f();
     }
@@ -248,6 +250,7 @@ pub unsafe fn arm_oneshot(deadline_ticks: u64, handler: fn()) -> Result<(), Hpet
     // hardware default).
     // SAFETY: vector freshly allocated; handler installed above;
     // dest_apic from a checksummed MADT entry.
+    // SAFETY: Valid memory or trusted environment
     let routed = unsafe {
         ioapic::route_gsi_to_vector(
             gsi as u32,
@@ -268,6 +271,7 @@ pub unsafe fn arm_oneshot(deadline_ticks: u64, handler: fn()) -> Result<(), Hpet
     // SAFETY: HPET window is live (is_present check above); the
     // IDT vector + IOAPIC redirection are now in place so a
     // delivery is safe to take.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { narf_time::hpet::arm_oneshot(0, gsi, deadline_ticks) };
     if r.is_err() {
         SLOT0.armed.store(false, Ordering::Release);
@@ -275,6 +279,7 @@ pub unsafe fn arm_oneshot(deadline_ticks: u64, handler: fn()) -> Result<(), Hpet
         // can't land at the now-released vector.
         // SAFETY: vector + handler still installed; mask alone is
         // a no-side-effect op.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe {
             ioapic::route_gsi_to_vector(
                 gsi as u32,

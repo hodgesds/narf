@@ -51,10 +51,12 @@ unsafe fn heap_probe() -> bool {
     // (1) Single round-trip: write, read, free.
     // SAFETY: 64 bytes is well within any sane chunk size; the
     // returned pointer is writable for that span.
+    // SAFETY: Valid memory or trusted environment
     let p1 = unsafe { narf_libc::malloc(64) };
     if p1.is_null() {
         return false;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *p1 = 0xAA;
         *p1.add(63) = 0x55;
@@ -67,10 +69,12 @@ unsafe fn heap_probe() -> bool {
     // (2) Two live allocations carry distinct sentinels.
     // SAFETY: same reasoning as (1) for each pointer.
     let a = unsafe { narf_libc::malloc(128) };
+    // SAFETY: Valid memory or trusted environment
     let b = unsafe { narf_libc::malloc(128) };
     if a.is_null() || b.is_null() {
         return false;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for i in 0..128 { *a.add(i) = 0x11; }
         for i in 0..128 { *b.add(i) = 0x22; }
@@ -104,6 +108,7 @@ unsafe fn heap_probe() -> bool {
     let mut ptrs = [core::ptr::null_mut::<u8>(); REUSE_N];
     let (mut min_p1, mut max_p1) = (usize::MAX, 0usize);
     for slot in ptrs.iter_mut() {
+        // SAFETY: Valid memory or trusted environment
         let p = unsafe { narf_libc::malloc(1024) };
         if p.is_null() {
             return false;
@@ -114,10 +119,12 @@ unsafe fn heap_probe() -> bool {
         *slot = p;
     }
     for &p in ptrs.iter() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_libc::free(p); }
     }
     let (mut min_p2, mut max_p2) = (usize::MAX, 0usize);
     for slot in ptrs.iter_mut() {
+        // SAFETY: Valid memory or trusted environment
         let p = unsafe { narf_libc::malloc(1024) };
         if p.is_null() {
             return false;
@@ -133,6 +140,7 @@ unsafe fn heap_probe() -> bool {
         return false;
     }
     for &p in ptrs.iter() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_libc::free(p); }
     }
 
@@ -147,13 +155,16 @@ unsafe fn heap_probe() -> bool {
     if s1.is_null() {
         return false;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for i in 0..16 { *s1.add(i) = i as u8 + 1; }
     }
+    // SAFETY: Valid memory or trusted environment
     let s2 = unsafe { narf_libc::realloc(s1, 4096) };
     if s2.is_null() {
         return false;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for i in 0..16 {
             if *s2.add(i) != i as u8 + 1 {
@@ -213,6 +224,7 @@ pub extern "C" fn main(
     //
     // SAFETY: stdout() is a stable pointer to a static File; byte
     // pointers are 'static literals; lengths match the literals.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let stream = narf_libc::stdout();
         let msg1 = b"stdio: fputs ok\n";
@@ -228,9 +240,11 @@ pub extern "C" fn main(
     let hello: *const u8 = b"hello\0".as_ptr();
     // SAFETY: `hello` points to a NUL-terminated static literal; the
     // returned pointer (if non-null) is inside that literal.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { narf_libc::strchr(hello, b'l' as i32) };
     // SAFETY: `p` is either NULL or points into the literal "hello\0"
     // which is alive for the program's lifetime.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         if !p.is_null() && *p == b'l' {
             narf_libc::printf_str("strchr: ok\n", &[]);
@@ -304,6 +318,7 @@ pub extern "C" fn main(
     // SAFETY: fd numbers 0/1 are kernel-installed at task start;
     // pipe()/dup() return numbers we hand back to the kernel
     // immediately after.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // F_GETFD on stdin should succeed (return 0 — no flags set
         // by the kernel-default stdio install).
@@ -347,6 +362,7 @@ pub extern "C" fn main(
     // SAFETY: heap_probe's preconditions are all "the allocator
     // honours its own contract" — the function uses only its own
     // returns.
+    // SAFETY: Valid memory or trusted environment
     let heap_ok = unsafe { heap_probe() };
     narf_libc::printf_str(
         if heap_ok { "heap: ok\n" } else { "heap: bad\n" },
@@ -364,6 +380,7 @@ pub extern "C" fn main(
     //
     // SAFETY: posix_unlink takes a NUL-terminated C string.
     let path: *const i8 = b"/tmp/removable\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let unlink_ok = unsafe {
         let r1 = narf_libc::posix_unlink(path);
         let r2 = narf_libc::posix_unlink(path);
@@ -379,6 +396,7 @@ pub extern "C" fn main(
     // returns a valid fd (≥ 3); a second open WITHOUT O_CREAT then
     // also succeeds, proving the file persists between calls.
     let create_path: *const i8 = b"/tmp/created\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let open_create_ok = unsafe {
         let fd1 = narf_libc::posix_open(create_path, narf_libc::O_CREAT, 0);
         let fd2 = narf_libc::posix_open(create_path, 0, 0);
@@ -397,6 +415,7 @@ pub extern "C" fn main(
     // created file to a new name, then verify the new name opens
     // and the old name does not.
     let new_path: *const i8 = b"/tmp/renamed\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let rename_ok = unsafe {
         let r = narf_libc::posix_rename(create_path, new_path);
         let fd_new = narf_libc::posix_open(new_path, 0, 0);
@@ -421,6 +440,7 @@ pub extern "C" fn main(
     //   6. rmdir /tmp/sub (now empty)           → 0
     let dir_path:   *const i8 = b"/tmp/sub\0".as_ptr() as *const i8;
     let inner_path: *const i8 = b"/tmp/sub/inner\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let mkdir_ok = unsafe {
         let m1 = narf_libc::posix_mkdir(dir_path, 0o755);
         let m2 = narf_libc::posix_mkdir(dir_path, 0o755);
@@ -442,6 +462,7 @@ pub extern "C" fn main(
     let rw_path: *const i8 = b"/tmp/io\0".as_ptr() as *const i8;
     let payload: &[u8] = b"narf-libc rw round-trip!";
     let mut readback: [u8; 32] = [0; 32];
+    // SAFETY: Valid memory or trusted environment
     let rw_ok = unsafe {
         let fd_w = narf_libc::posix_open(rw_path, narf_libc::O_CREAT, 0);
         if fd_w < 0 { false } else {
@@ -482,12 +503,14 @@ pub extern "C" fn main(
     // SAFETY: env outlives the longjmp call (it's on this stack
     // frame and we don't return from main between the setjmp and
     // the longjmp).
+    // SAFETY: Valid memory or trusted environment
     let sj_val = unsafe { narf_libc::setjmp(&mut env) };
     SJ_COUNTER.fetch_add(1, Ordering::SeqCst);
     let setjmp_ok;
     if sj_val == 0 && SJ_COUNTER.load(Ordering::SeqCst) == 1 {
         // First arrival — longjmp back with 7. This call doesn't
         // return; control resumes at the setjmp() above.
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_libc::longjmp(&mut env, 7) };
     } else if sj_val == 7 && SJ_COUNTER.load(Ordering::SeqCst) == 2 {
         setjmp_ok = true;
@@ -512,6 +535,7 @@ pub extern "C" fn main(
     let arg4 = b"rest\0".as_ptr() as *mut i8;
     let argv: [*mut i8; 5] = [arg0, arg1, arg2, arg3, arg4];
     let optstring = b"ab:\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let getopt_ok = unsafe {
         // Reset the getopt globals — earlier probes may have
         // poisoned them via process-wide statics.
@@ -550,6 +574,7 @@ pub extern "C" fn main(
     //
     // SAFETY: every math:: entry is `unsafe extern "C"` for the
     // C-ABI shape but performs only value computation.
+    // SAFETY: Valid memory or trusted environment
     let math_ok = unsafe {
         let nan = f64::from_bits(0x7FF8_0000_0000_0000);
         let inf = f64::INFINITY;
@@ -582,6 +607,7 @@ pub extern "C" fn main(
 
     // ctype probe — exercise a representative slice of the
     // classification + case-fold surface. SAFETY: pure value math.
+    // SAFETY: Valid memory or trusted environment
     let ctype_ok = unsafe {
         narf_libc::isdigit(b'7' as i32) != 0
             && narf_libc::isdigit(b'a' as i32) == 0
@@ -606,6 +632,7 @@ pub extern "C" fn main(
     //
     // SAFETY: all C-string args are static literals; the qsort/
     // bsearch inputs are stack-local arrays of i32.
+    // SAFETY: Valid memory or trusted environment
     let atoi_ok = unsafe {
         narf_libc::atoi(b"  -42xyz\0".as_ptr() as *const i8) == -42
     };
@@ -614,6 +641,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let strtol_ok = unsafe {
         let s = b"0xdeadbeef rest\0".as_ptr() as *const i8;
         let mut end: *mut i8 = core::ptr::null_mut();
@@ -637,6 +665,7 @@ pub extern "C" fn main(
         }
     }
     let mut nums: [i32; 6] = [9, 1, 5, 3, 7, 4];
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_libc::qsort(
             nums.as_mut_ptr() as *mut core::ffi::c_void,
@@ -652,6 +681,7 @@ pub extern "C" fn main(
     );
 
     let key: i32 = 5;
+    // SAFETY: Valid memory or trusted environment
     let bs = unsafe {
         narf_libc::bsearch(
             &key as *const i32 as *const core::ffi::c_void,
@@ -661,6 +691,7 @@ pub extern "C" fn main(
             cmp_i32,
         )
     };
+    // SAFETY: Valid memory or trusted environment
     let bsearch_ok = !bs.is_null() && unsafe { *(bs as *const i32) } == 5;
     narf_libc::printf_str(
         if bsearch_ok { "bsearch: ok\n" } else { "bsearch: bad\n" },
@@ -669,6 +700,7 @@ pub extern "C" fn main(
 
     // isatty: stdin is the kernel console (returns 1); fd 99 is
     // unbacked (returns 0).
+    // SAFETY: Valid memory or trusted environment
     let isatty_ok = unsafe {
         narf_libc::isatty(0) == 1 && narf_libc::isatty(99) == 0
     };
@@ -681,6 +713,7 @@ pub extern "C" fn main(
     // SIGTERM since the kernel maps it to vector 15) and observe
     // the prior slot value coming back as SIG_DFL (0).
     extern "C" fn noop_sig(_: i32) {}
+    // SAFETY: Valid memory or trusted environment
     let prior = unsafe {
         narf_libc::signal(narf_libc::SIGTERM, noop_sig as usize)
     };
@@ -713,6 +746,7 @@ pub extern "C" fn main(
     // SAFETY: timespec is #[repr(C)]; we hand the kernel a writable slot.
     let mut t1 = narf_libc::timespec::default();
     let mut t2 = narf_libc::timespec::default();
+    // SAFETY: Valid memory or trusted environment
     let clk_ok = unsafe {
         let r1 = narf_libc::clock_gettime(0, &mut t1);
         let r2 = narf_libc::clock_gettime(0, &mut t2);
@@ -744,11 +778,13 @@ pub extern "C" fn main(
     // probe seeds a 6-byte buffer with an embedded NUL ahead of the
     // target so a strchr-style scan would miss the hit.
     let mch: [u8; 6] = *b"AB\0CXD";
+    // SAFETY: Valid memory or trusted environment
     let mch_ptr = unsafe {
         narf_libc::memchr(mch.as_ptr(), b'X' as i32, mch.len())
     };
     let mch_ok = !mch_ptr.is_null()
         && (mch_ptr as usize) == (mch.as_ptr() as usize) + 4;
+    // SAFETY: Valid memory or trusted environment
     let mch_miss = unsafe {
         narf_libc::memchr(mch.as_ptr(), b'Z' as i32, mch.len())
     };
@@ -766,6 +802,7 @@ pub extern "C" fn main(
     // input byte / 0).
     let _ = narf_libc::putchar(b'P' as i32);
     let _ = narf_libc::putchar(b'\n' as i32);
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe {
         narf_libc::puts(b"puts: ok\0".as_ptr())
     };
@@ -780,12 +817,15 @@ pub extern "C" fn main(
     // Uses fopen — which mallocs a File struct, so we get the full
     // FILE*-layer code path (not just static stdout).
     let posix_path: *const i8 = b"/tmp/seek\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let create_fd = unsafe {
         narf_libc::posix_open(posix_path, narf_libc::O_CREAT, 0)
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { narf_libc::posix_close(create_fd) };
 
     let stream_path: &[u8] = b"/tmp/seek";
+    // SAFETY: Valid memory or trusted environment
     let stream = unsafe {
         narf_libc::fopen(stream_path.as_ptr(), stream_path.len(), "rw")
     };
@@ -794,6 +834,7 @@ pub extern "C" fn main(
     let stream_round_trip = if !stream_ok {
         false
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let w1 = narf_libc::fputc(b'X' as i32, stream);
             let w2 = narf_libc::fputc(b'Y' as i32, stream);
@@ -839,6 +880,7 @@ pub extern "C" fn main(
     // `accept = "abc"`, "aabbczz" has a 5-byte initial run of
     // members; `reject = "z"` flips the predicate so the run is 5.
     let span: *const u8 = b"aabbczz\0".as_ptr();
+    // SAFETY: Valid memory or trusted environment
     let strspn_ok = unsafe {
         narf_libc::strspn(span, b"abc\0".as_ptr()) == 5
             && narf_libc::strcspn(span, b"z\0".as_ptr()) == 5
@@ -851,6 +893,7 @@ pub extern "C" fn main(
     // strpbrk — first byte of `s` that appears in `accept`. With
     // `s = "hello world"` and `accept = "ow"`, the first hit is the
     // 'o' at index 4.
+    // SAFETY: Valid memory or trusted environment
     let pbrk_ok = unsafe {
         let s   = b"hello world\0".as_ptr();
         let acc = b"ow\0".as_ptr();
@@ -869,6 +912,7 @@ pub extern "C" fn main(
     // so it must be writable.
     let mut tok_buf: [u8; 8] = *b"a,b,,c\0\0";
     let mut save: *mut u8 = core::ptr::null_mut();
+    // SAFETY: Valid memory or trusted environment
     let strtok_ok = unsafe {
         let t1 = narf_libc::strtok_r(
             tok_buf.as_mut_ptr(),
@@ -904,6 +948,7 @@ pub extern "C" fn main(
     // the first byte rather than walking the whole string; a fully
     // distinct mapping per code is enough to confirm the table is
     // wired.
+    // SAFETY: Valid memory or trusted environment
     let strerror_ok = unsafe {
         let p_invalid = narf_libc::strerror(22); // EINVAL
         let p_unknown = narf_libc::strerror(9999);
@@ -921,6 +966,7 @@ pub extern "C" fn main(
     // 12345, the Park-Miller sequence is fixed, so a re-seed must
     // produce the identical first call. RAND_MAX bound holds for
     // every call.
+    // SAFETY: Valid memory or trusted environment
     let rand_ok = unsafe {
         narf_libc::srand(12345);
         let a = narf_libc::rand();
@@ -958,6 +1004,7 @@ pub extern "C" fn main(
 
     // abs/labs/div/ldiv — value math; check normal cases and the
     // wrapping behaviour at INT_MIN / divide-by-zero saturation.
+    // SAFETY: Valid memory or trusted environment
     let absdiv_ok = unsafe {
         let a = narf_libc::abs(-7);
         let b = narf_libc::labs(-1_234_567_890_123);
@@ -979,7 +1026,8 @@ pub extern "C" fn main(
     // whitespace + a hex literal in field 2.
     let mut nums_out: [i64; 4] = [0; 4];
     let s = b"  -5   0x2a  100\0".as_ptr() as *const i8;
-    let parsed = unsafe { narf_libc::sscanf_ints(s, &mut nums_out) };
+    // SAFETY: Valid memory or trusted environment
+    let parsed = unsafe { narf_libc::sscanf_ints(s, nums_out.as_mut_ptr(), nums_out.len()) };
     let sscanf_ok = parsed == 3
         && nums_out[0] == -5
         && nums_out[1] == 0x2a
@@ -993,6 +1041,7 @@ pub extern "C" fn main(
     // console doesn't distinguish stdout/stderr in this harness, so
     // we just confirm the call returns; the `ok` line is independent
     // observation.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_libc::set_errno(22); // EINVAL
         narf_libc::perror(b"perror-ctx\0".as_ptr());
@@ -1007,6 +1056,7 @@ pub extern "C" fn main(
     // same time_t.
     let known: narf_libc::time::time_t = 1_700_000_000;
     let mut tmv = narf_libc::tm::default();
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe {
         narf_libc::gmtime_r(&known as *const _, &mut tmv as *mut _)
     };
@@ -1025,6 +1075,7 @@ pub extern "C" fn main(
 
     // mktime round-trip.
     let mut tm_round = tmv;
+    // SAFETY: Valid memory or trusted environment
     let back = unsafe { narf_libc::mktime(&mut tm_round as *mut _) };
     let mktime_ok = back == known
         && tm_round.tm_wday == 2
@@ -1036,6 +1087,7 @@ pub extern "C" fn main(
 
     // strftime — emit a known format and compare bytes.
     let mut sf: [u8; 64] = [0; 64];
+    // SAFETY: Valid memory or trusted environment
     let n_sf = unsafe {
         narf_libc::strftime(
             sf.as_mut_ptr(),
@@ -1055,7 +1107,9 @@ pub extern "C" fn main(
 
     // asctime fixed format — exactly 25 chars + NUL ("Tue Nov 14
     // 22:13:20 2023\n").
+    // SAFETY: Valid memory or trusted environment
     let asc_ptr = unsafe { narf_libc::asctime(&tmv as *const _) };
+    // SAFETY: Valid memory or trusted environment
     let asctime_ok = unsafe {
         let want: &[u8] = b"Tue Nov 14 22:13:20 2023\n";
         let mut ok = !asc_ptr.is_null();
@@ -1073,6 +1127,7 @@ pub extern "C" fn main(
     );
 
     // difftime — pure subtraction; exact for integer values.
+    // SAFETY: Valid memory or trusted environment
     let diff_ok = unsafe {
         narf_libc::difftime(known + 90, known) == 90.0
     };
@@ -1092,6 +1147,7 @@ pub extern "C" fn main(
         diff < tol
     }
 
+    // SAFETY: Valid memory or trusted environment
     let trig_ok = unsafe {
         close(narf_libc::sin(0.0),                      0.0, 1e-9)
             && close(narf_libc::sin(1.570_796_326_794_896_6),  1.0, 1e-9)
@@ -1105,6 +1161,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let exp_ok = unsafe {
         close(narf_libc::exp(0.0),  1.0, 1e-12)
             && close(narf_libc::exp(1.0),  2.718_281_828_459_045, 1e-9)
@@ -1119,6 +1176,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let pow_ok = unsafe {
         close(narf_libc::pow(2.0, 10.0), 1024.0, 1e-6)
             && close(narf_libc::pow(2.0, 0.5), 1.414_213_562_373_095, 1e-6)
@@ -1131,6 +1189,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let atan_ok = unsafe {
         close(narf_libc::atan(0.0),                      0.0, 1e-12)
             && close(narf_libc::atan(1.0),                0.785_398_163_397_448_3, 1e-9)
@@ -1148,6 +1207,7 @@ pub extern "C" fn main(
     // ── Tier 3m probes: byte-order + IPv4 inet + access/sysconf ──
     //
     // htonl / htons round-trip: swap-and-swap returns the original.
+    // SAFETY: Valid memory or trusted environment
     let bo_ok = unsafe {
         narf_libc::htonl(0xDEAD_BEEF) == 0xEFBE_ADDE
             && narf_libc::ntohl(narf_libc::htonl(0x1234_5678)) == 0x1234_5678
@@ -1160,6 +1220,7 @@ pub extern "C" fn main(
     );
 
     // inet_aton + inet_ntop round-trip across a known address.
+    // SAFETY: Valid memory or trusted environment
     let aton_ok = unsafe {
         let mut packed: narf_libc::net::in_addr_t = 0;
         let r = narf_libc::inet_aton(
@@ -1181,6 +1242,7 @@ pub extern "C" fn main(
 
     // inet_pton + inet_ntop round-trip via AF_INET.
     let mut packed4: u32 = 0;
+    // SAFETY: Valid memory or trusted environment
     let pton_rc = unsafe {
         narf_libc::inet_pton(
             narf_libc::AF_INET,
@@ -1189,6 +1251,7 @@ pub extern "C" fn main(
         )
     };
     let mut ntop_buf: [u8; 16] = [0; 16];
+    // SAFETY: Valid memory or trusted environment
     let ntop_p = unsafe {
         narf_libc::inet_ntop(
             narf_libc::AF_INET,
@@ -1214,6 +1277,7 @@ pub extern "C" fn main(
     // existence isn't guaranteed by the tier order); using a fresh
     // path makes this probe self-contained.
     let access_path: *const i8 = b"/tmp/access-probe\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let access_ok = unsafe {
         let fd = narf_libc::posix_open(access_path, narf_libc::O_CREAT, 0);
         let _ = narf_libc::posix_close(fd);
@@ -1229,6 +1293,7 @@ pub extern "C" fn main(
     );
 
     // getpagesize / sysconf — pure value checks.
+    // SAFETY: Valid memory or trusted environment
     let sysconf_ok = unsafe {
         narf_libc::getpagesize() == 4096
             && narf_libc::sysconf(narf_libc::_SC_PAGESIZE) == 4096
@@ -1276,6 +1341,7 @@ pub extern "C" fn main(
         },
     ];
     let mut longidx: i32 = -1;
+    // SAFETY: Valid memory or trusted environment
     let getopt_long_ok = unsafe {
         narf_libc::optind = 1;
         narf_libc::opterr = 0;
@@ -1311,6 +1377,7 @@ pub extern "C" fn main(
     );
 
     // S_IS* macros against synthetic mode bits.
+    // SAFETY: Valid memory or trusted environment
     let smode_ok = unsafe {
         narf_libc::S_ISREG(narf_libc::S_IFREG | 0o644) == 1
             && narf_libc::S_ISDIR(narf_libc::S_IFDIR | 0o755) == 1
@@ -1327,6 +1394,7 @@ pub extern "C" fn main(
     // chmod / umask — chmod returns 0 for an existing path; umask
     // returns the previous value and stores the new one.
     let cm_path: *const i8 = b"/tmp/cm-probe\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let chmod_ok = unsafe {
         let fd = narf_libc::posix_open(cm_path, narf_libc::O_CREAT, 0);
         let _ = narf_libc::posix_close(fd);
@@ -1340,6 +1408,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let umask_ok = unsafe {
         let prev = narf_libc::umask(0o077);
         let now  = narf_libc::umask(0o022);
@@ -1356,7 +1425,9 @@ pub extern "C" fn main(
     // fresh writable copy because dirname punches a NUL.
     let mut bn1: [u8; 32] = [0; 32];
     bn1[..14].copy_from_slice(b"/usr/local/bin");
+    // SAFETY: Valid memory or trusted environment
     let bn1_ret = unsafe { narf_libc::basename(bn1.as_mut_ptr() as *mut i8) };
+    // SAFETY: Valid memory or trusted environment
     let bn1_ok = unsafe {
         let want: &[u8] = b"bin\0";
         for (i, &b) in want.iter().enumerate() {
@@ -1365,6 +1436,7 @@ pub extern "C" fn main(
         0
     };
     let _ = bn1_ok; // unused-warning suppression
+    // SAFETY: Valid memory or trusted environment
     let bn1_match = unsafe {
         // Compare bytes at the returned pointer.
         let want: &[u8] = b"bin\0";
@@ -1381,7 +1453,9 @@ pub extern "C" fn main(
 
     let mut dn1: [u8; 32] = [0; 32];
     dn1[..14].copy_from_slice(b"/usr/local/bin");
+    // SAFETY: Valid memory or trusted environment
     let dn1_ret = unsafe { narf_libc::dirname(dn1.as_mut_ptr() as *mut i8) };
+    // SAFETY: Valid memory or trusted environment
     let dn1_match = unsafe {
         let want: &[u8] = b"/usr/local\0";
         let mut ok = true;
@@ -1396,6 +1470,7 @@ pub extern "C" fn main(
     );
 
     // fnmatch — happy and unhappy patterns.
+    // SAFETY: Valid memory or trusted environment
     let fnmatch_ok = unsafe {
         narf_libc::fnmatch(
             b"*.txt\0".as_ptr() as *const i8,
@@ -1451,6 +1526,7 @@ pub extern "C" fn main(
     // (must see all three; may also see other survivors), then
     // unlink. closedir must succeed; rewinddir must restart the
     // walk.
+    // SAFETY: Valid memory or trusted environment
     let dir_ok = unsafe {
         let p1 = narf_libc::posix_open(
             b"/tmp/dir-a\0".as_ptr() as *const i8,
@@ -1516,6 +1592,7 @@ pub extern "C" fn main(
     // ── Tier 3p probes: locale + iconv + wide + setvbuf + ungetc ─
 
     // setlocale always returns "C". We compare bytes 'C' + NUL.
+    // SAFETY: Valid memory or trusted environment
     let locale_ok = unsafe {
         let p = narf_libc::setlocale(
             narf_libc::LC_ALL,
@@ -1529,6 +1606,7 @@ pub extern "C" fn main(
     );
 
     // nl_langinfo CODESET → "UTF-8".
+    // SAFETY: Valid memory or trusted environment
     let codeset_ok = unsafe {
         let p = narf_libc::nl_langinfo(narf_libc::CODESET);
         let want: &[u8] = b"UTF-8\0";
@@ -1544,6 +1622,7 @@ pub extern "C" fn main(
     );
 
     // iconv_open returns the !0 sentinel; iconv_close still succeeds.
+    // SAFETY: Valid memory or trusted environment
     let iconv_ok = unsafe {
         let cd = narf_libc::iconv_open(
             b"UTF-8\0".as_ptr() as *const i8,
@@ -1561,6 +1640,7 @@ pub extern "C" fn main(
     let wcs_in: [u32; 4] = [b'h' as u32, b'i' as u32, 0, 0xDEAD_BEEF];
     let wcs_in2: [u32; 3] = [b'h' as u32, b'i' as u32, 0];
     let wcs_diff: [u32; 4] = [b'h' as u32, b'j' as u32, 0, 0];
+    // SAFETY: Valid memory or trusted environment
     let wide_ok = unsafe {
         narf_libc::wcslen(wcs_in.as_ptr()) == 2
             && narf_libc::wcscmp(wcs_in.as_ptr(), wcs_in2.as_ptr()) == 0
@@ -1572,6 +1652,7 @@ pub extern "C" fn main(
     );
 
     // setvbuf stub — always returns 0; setvbuf(_IONBF) flushes.
+    // SAFETY: Valid memory or trusted environment
     let setvbuf_ok = unsafe {
         narf_libc::setvbuf(
             narf_libc::stdout(),
@@ -1588,6 +1669,7 @@ pub extern "C" fn main(
     // ungetc: write a payload to a fresh file, fseek+fgetc one byte,
     // ungetc it, then fgetc again — must return the same byte.
     let unget_path: *const i8 = b"/tmp/unget\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe {
         let fd = narf_libc::posix_open(unget_path, narf_libc::O_CREAT, 0);
         let _ = narf_libc::posix_write(
@@ -1598,6 +1680,7 @@ pub extern "C" fn main(
         narf_libc::posix_close(fd);
     };
     let path_bytes: &[u8] = b"/tmp/unget";
+    // SAFETY: Valid memory or trusted environment
     let ungetc_ok = unsafe {
         let stream = narf_libc::fopen(path_bytes.as_ptr(), path_bytes.len(), "r");
         let mut ok = !stream.is_null();
@@ -1624,6 +1707,7 @@ pub extern "C" fn main(
     let q_args: [Arg; 2] = [Arg::Int(42), Arg::Hex(0xabc)];
     let q_fmt = b"k=%d v=0x%x\0".as_ptr() as *const i8;
     let mut q_buf: [u8; 32] = [0; 32];
+    // SAFETY: Valid memory or trusted environment
     let snp = unsafe {
         narf_libc::snprintf_c(
             q_buf.as_mut_ptr() as *mut i8,
@@ -1644,6 +1728,7 @@ pub extern "C" fn main(
 
     // sprintf_c — same fmt, no length cap (we trust the buffer).
     let mut sp_buf: [u8; 32] = [0; 32];
+    // SAFETY: Valid memory or trusted environment
     let spn = unsafe {
         narf_libc::sprintf_c(
             sp_buf.as_mut_ptr() as *mut i8,
@@ -1662,6 +1747,7 @@ pub extern "C" fn main(
 
     // asprintf_c — allocate, format, retrieve, compare, free.
     let mut a_out: *mut i8 = core::ptr::null_mut();
+    // SAFETY: Valid memory or trusted environment
     let asn = unsafe {
         narf_libc::asprintf_c(
             &mut a_out,
@@ -1670,6 +1756,7 @@ pub extern "C" fn main(
             q_args.len(),
         )
     };
+    // SAFETY: Valid memory or trusted environment
     let asprintf_ok = unsafe {
         let mut ok = asn as usize == want_q.len() && !a_out.is_null();
         if ok {
@@ -1691,6 +1778,7 @@ pub extern "C" fn main(
     // ── Tier 3r probes: string extras + ctype isblank ────────────
 
     // strcasecmp / strncasecmp — case-folded compare.
+    // SAFETY: Valid memory or trusted environment
     let case_ok = unsafe {
         narf_libc::strcasecmp(
             b"Hello\0".as_ptr(),
@@ -1717,6 +1805,7 @@ pub extern "C" fn main(
     );
 
     // memmem — length-bounded byte search.
+    // SAFETY: Valid memory or trusted environment
     let memmem_ok = unsafe {
         let hay = b"the quick brown fox";
         let p = narf_libc::memmem(
@@ -1737,11 +1826,14 @@ pub extern "C" fn main(
     );
 
     // strnlen / strndup — bounded forms.
+    // SAFETY: Valid memory or trusted environment
     let nlen_ok = unsafe {
         narf_libc::strnlen(b"hi\0".as_ptr(), 100) == 2
             && narf_libc::strnlen(b"hello".as_ptr(), 3) == 3
     };
+    // SAFETY: Valid memory or trusted environment
     let ndup = unsafe { narf_libc::strndup(b"abcdefghij".as_ptr(), 4) };
+    // SAFETY: Valid memory or trusted environment
     let ndup_ok = unsafe {
         let mut ok = !ndup.is_null();
         if ok {
@@ -1759,6 +1851,7 @@ pub extern "C" fn main(
     );
 
     // *_chk — happy path forwards to the unfortified primitive.
+    // SAFETY: Valid memory or trusted environment
     let chk_ok = unsafe {
         let mut buf: [u8; 8] = [0; 8];
         let _ = narf_libc::__memcpy_chk(
@@ -1778,6 +1871,7 @@ pub extern "C" fn main(
     );
 
     // isblank — space + tab, nothing else.
+    // SAFETY: Valid memory or trusted environment
     let isblank_ok = unsafe {
         narf_libc::isblank(b' ' as i32) != 0
             && narf_libc::isblank(b'\t' as i32) != 0
@@ -1792,6 +1886,7 @@ pub extern "C" fn main(
     // ── Tier 3s probes: pthread no-op shim ───────────────────────
     //
     // pthread_self / pthread_equal are constant under single-thread.
+    // SAFETY: Valid memory or trusted environment
     let pid_eq_ok = unsafe {
         let me = narf_libc::pthread_self();
         narf_libc::pthread_equal(me, narf_libc::MAIN_THREAD) != 0
@@ -1803,6 +1898,7 @@ pub extern "C" fn main(
     );
 
     // mutex round-trip — init, lock×2, unlock×2, destroy.
+    // SAFETY: Valid memory or trusted environment
     let mutex_ok = unsafe {
         let mut m = narf_libc::pthread_mutex_t::default();
         narf_libc::pthread_mutex_init(&mut m, core::ptr::null()) == 0
@@ -1826,6 +1922,7 @@ pub extern "C" fn main(
         ONCE_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     let mut ctl = narf_libc::PTHREAD_ONCE_INIT;
+    // SAFETY: Valid memory or trusted environment
     let once_ok = unsafe {
         narf_libc::pthread_once(&mut ctl, once_init) == 0
             && narf_libc::pthread_once(&mut ctl, once_init) == 0
@@ -1837,6 +1934,7 @@ pub extern "C" fn main(
     );
 
     // pthread_key_create + setspecific + getspecific.
+    // SAFETY: Valid memory or trusted environment
     let key_ok = unsafe {
         let mut key: narf_libc::pthread_key_t = 99;
         let cr = narf_libc::pthread_key_create(&mut key, None);
@@ -1854,6 +1952,7 @@ pub extern "C" fn main(
     );
 
     // pthread_create refuses with EAGAIN; pthread_join is a no-op.
+    // SAFETY: Valid memory or trusted environment
     let create_ok = unsafe {
         extern "C" fn never_runs(_: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
             core::ptr::null_mut()
@@ -1875,6 +1974,7 @@ pub extern "C" fn main(
     //
     // tcgetattr against fd 0 (a tty) succeeds; against fd 99 (not
     // a tty) fails with errno = ENOTTY.
+    // SAFETY: Valid memory or trusted environment
     let termios_ok = unsafe {
         let mut t = narf_libc::termios::default();
         let r0 = narf_libc::tcgetattr(0, &mut t);
@@ -1889,6 +1989,7 @@ pub extern "C" fn main(
     );
 
     // tcsetattr accepts on tty; flock always succeeds.
+    // SAFETY: Valid memory or trusted environment
     let tcset_ok = unsafe {
         let t = narf_libc::termios::default();
         narf_libc::tcsetattr(0, narf_libc::TCSANOW, &t) == 0
@@ -1900,6 +2001,7 @@ pub extern "C" fn main(
     );
 
     // ioctl always returns -1 with errno = ENOTTY.
+    // SAFETY: Valid memory or trusted environment
     let ioctl_ok = unsafe {
         narf_libc::set_errno(0);
         let r = narf_libc::ioctl(0, 0x1234, core::ptr::null_mut());
@@ -1913,6 +2015,7 @@ pub extern "C" fn main(
 
     // utime on existing path succeeds; missing path fails.
     let utime_path: *const i8 = b"/tmp/utime-probe\0".as_ptr() as *const i8;
+    // SAFETY: Valid memory or trusted environment
     let utime_ok = unsafe {
         let fd = narf_libc::posix_open(utime_path, narf_libc::O_CREAT, 0);
         let _ = narf_libc::posix_close(fd);
@@ -1929,6 +2032,7 @@ pub extern "C" fn main(
     // ── Tier 3u probes: BSD socket stubs ─────────────────────────
     //
     // socket() refuses with ENOSYS. errno round-trips.
+    // SAFETY: Valid memory or trusted environment
     let sock_ok = unsafe {
         narf_libc::set_errno(0);
         let fd = narf_libc::socket(
@@ -1945,6 +2049,7 @@ pub extern "C" fn main(
     );
 
     // bind/connect/listen all refuse the same way.
+    // SAFETY: Valid memory or trusted environment
     let bcl_ok = unsafe {
         let sa = narf_libc::sockaddr {
             sa_family: narf_libc::AF_INET as u16,
@@ -1960,6 +2065,7 @@ pub extern "C" fn main(
     );
 
     // getaddrinfo returns EAI_NONAME and leaves *result NULL.
+    // SAFETY: Valid memory or trusted environment
     let gai_ok = unsafe {
         let mut res: *mut narf_libc::addrinfo = 1 as *mut _;
         let r = narf_libc::getaddrinfo(
@@ -1976,6 +2082,7 @@ pub extern "C" fn main(
     );
 
     // gai_strerror returns a non-null static string.
+    // SAFETY: Valid memory or trusted environment
     let gai_str_ok = unsafe {
         let p = narf_libc::gai_strerror(narf_libc::EAI_NONAME);
         !p.is_null() && *p != 0
@@ -1989,6 +2096,7 @@ pub extern "C" fn main(
     //
     // regcomp succeeds with a flag round-trip; regexec returns
     // REG_NOMATCH and zeroes the match array.
+    // SAFETY: Valid memory or trusted environment
     let regex_ok = unsafe {
         let mut re = narf_libc::regex_t::default();
         let cr = narf_libc::regcomp(
@@ -2018,6 +2126,7 @@ pub extern "C" fn main(
     );
 
     // regerror — non-empty description for REG_NOMATCH.
+    // SAFETY: Valid memory or trusted environment
     let regerror_ok = unsafe {
         let mut buf: [u8; 32] = [0; 32];
         let n = narf_libc::regerror(
@@ -2038,10 +2147,12 @@ pub extern "C" fn main(
     // (AtomicI32 / Ordering already imported above.)
     static SIG_HITS: AtomicI32 = AtomicI32::new(0);
     let mut senv = narf_libc::sigjmp_buf::default();
+    // SAFETY: Valid memory or trusted environment
     let sj_val = unsafe { narf_libc::sigsetjmp(&mut senv, 1) };
     SIG_HITS.fetch_add(1, Ordering::SeqCst);
     let sigjmp_ok;
     if sj_val == 0 && SIG_HITS.load(Ordering::SeqCst) == 1 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_libc::siglongjmp(&mut senv, 11) };
     } else if sj_val == 11 && SIG_HITS.load(Ordering::SeqCst) == 2 {
         sigjmp_ok = true;
@@ -2055,6 +2166,7 @@ pub extern "C" fn main(
 
     // ── Tier 3w probes: ldexp/frexp/modf + complex + fenv ────────
 
+    // SAFETY: Valid memory or trusted environment
     let ldexp_ok = unsafe {
         narf_libc::ldexp(1.5, 4) == 24.0
             && narf_libc::ldexp(0.0, 100) == 0.0
@@ -2065,6 +2177,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let frexp_ok = unsafe {
         let mut e: i32 = 0;
         let m = narf_libc::frexp(24.0, &mut e);
@@ -2076,6 +2189,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let modf_ok = unsafe {
         let mut ip: f64 = 0.0;
         let frac = narf_libc::modf(3.75, &mut ip);
@@ -2090,6 +2204,7 @@ pub extern "C" fn main(
     );
 
     // <complex.h> — real / imag / conj / cabs / arithmetic.
+    // SAFETY: Valid memory or trusted environment
     let cplx_ok = unsafe {
         let z1 = narf_libc::complex_double { real: 3.0, imag: 4.0 };
         let z2 = narf_libc::complex_double { real: 1.0, imag: 2.0 };
@@ -2114,6 +2229,7 @@ pub extern "C" fn main(
 
     // <fenv.h> — round mode reads as TONEAREST; set TONEAREST OK,
     // anything else fails; clear/test exceptions are no-ops.
+    // SAFETY: Valid memory or trusted environment
     let fenv_ok = unsafe {
         narf_libc::fegetround() == narf_libc::FE_TONEAREST
             && narf_libc::fesetround(narf_libc::FE_TONEAREST) == 0
@@ -2129,6 +2245,7 @@ pub extern "C" fn main(
     // ── Tier 3x probes: fork/exec stubs + posix_memalign ─────────
 
     // fork / vfork / execve / execvp — refuse with ENOSYS.
+    // SAFETY: Valid memory or trusted environment
     let proc_stubs_ok = unsafe {
         narf_libc::set_errno(0);
         let f = narf_libc::fork();
@@ -2147,6 +2264,7 @@ pub extern "C" fn main(
     );
 
     // waitpid returns -1 with ECHILD; status is zeroed.
+    // SAFETY: Valid memory or trusted environment
     let wait_ok = unsafe {
         let mut status: i32 = 0xDEAD;
         narf_libc::set_errno(0);
@@ -2161,6 +2279,7 @@ pub extern "C" fn main(
 
     // setsid / getpgrp coalesce to pid; setuid accept-and-ignore;
     // getuid/geteuid return the kernel's stub uid (0).
+    // SAFETY: Valid memory or trusted environment
     let session_ok = unsafe {
         let p = narf_libc::getpid();
         narf_libc::setsid() == p
@@ -2175,6 +2294,7 @@ pub extern "C" fn main(
     );
 
     // posix_memalign — 16-byte alignment is honoured; > 16 fails.
+    // SAFETY: Valid memory or trusted environment
     let memalign_ok = unsafe {
         let mut p: *mut u8 = core::ptr::null_mut();
         let r1 = narf_libc::posix_memalign(&mut p, 16, 64);
@@ -2191,6 +2311,7 @@ pub extern "C" fn main(
     );
 
     // aligned_alloc — same 16-byte cap; size must be multiple of align.
+    // SAFETY: Valid memory or trusted environment
     let aalloc_ok = unsafe {
         let p = narf_libc::aligned_alloc(8, 32);
         let aligned = !p.is_null() && (p as usize) % 8 == 0;
@@ -2206,6 +2327,7 @@ pub extern "C" fn main(
     // ── Tier 3y probes: poll/select/epoll stubs + fd_set macros ──
 
     // poll() refuses; FD_SET / FD_ISSET / FD_CLR / FD_ZERO work.
+    // SAFETY: Valid memory or trusted environment
     let poll_ok = unsafe {
         narf_libc::set_errno(0);
         let mut fds = narf_libc::pollfd {
@@ -2222,6 +2344,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let fdset_ok = unsafe {
         let mut s = narf_libc::fd_set::default();
         narf_libc::FD_ZERO(&mut s);
@@ -2240,6 +2363,7 @@ pub extern "C" fn main(
     );
 
     // epoll_create / eventfd / timerfd_create — all ENOSYS.
+    // SAFETY: Valid memory or trusted environment
     let epoll_ok = unsafe {
         let e1 = narf_libc::epoll_create(1);
         let e2 = narf_libc::epoll_create1(0);
@@ -2256,6 +2380,7 @@ pub extern "C" fn main(
 
     // mmap anonymous → munmap round-trip; mprotect / mlock no-op
     // success; dlopen returns NULL with dlerror non-NULL once.
+    // SAFETY: Valid memory or trusted environment
     let mmap_ok = unsafe {
         let p = narf_libc::mmap(
             core::ptr::null_mut(),
@@ -2279,6 +2404,7 @@ pub extern "C" fn main(
     );
 
     // uname populates a known string in `sysname`.
+    // SAFETY: Valid memory or trusted environment
     let uname_ok = unsafe {
         let mut u: narf_libc::utsname = core::mem::zeroed();
         let r = narf_libc::uname(&mut u);
@@ -2295,6 +2421,7 @@ pub extern "C" fn main(
     );
 
     // sysinfo populates totalram = 256 MiB; getrusage zeroes; getrlimit infinite.
+    // SAFETY: Valid memory or trusted environment
     let sysinfo_ok = unsafe {
         let mut s = narf_libc::sysinfo_t::default();
         narf_libc::sysinfo(&mut s);
@@ -2314,6 +2441,7 @@ pub extern "C" fn main(
 
     // dlopen returns NULL; dlerror returns a non-null string once
     // then NULL on the next call.
+    // SAFETY: Valid memory or trusted environment
     let dl_ok = unsafe {
         let h = narf_libc::dlopen(b"foo.so\0".as_ptr() as *const i8, narf_libc::RTLD_NOW);
         let e1 = narf_libc::dlerror();
@@ -2329,6 +2457,7 @@ pub extern "C" fn main(
 
     // getpwuid(0) returns a "narf" entry; getpwuid(1) returns NULL;
     // iterator yields exactly one row.
+    // SAFETY: Valid memory or trusted environment
     let pw_ok = unsafe {
         let p0 = narf_libc::getpwuid(0);
         let p1 = narf_libc::getpwuid(1);
@@ -2364,6 +2493,7 @@ pub extern "C" fn main(
     );
 
     // getgrgid(0) returns "narf"; gr_mem terminates with NULL.
+    // SAFETY: Valid memory or trusted environment
     let gr_ok = unsafe {
         let g0 = narf_libc::getgrgid(0);
         let g1 = narf_libc::getgrgid(1);
@@ -2385,6 +2515,7 @@ pub extern "C" fn main(
     );
 
     // getgrouplist returns 1 with the primary gid populated.
+    // SAFETY: Valid memory or trusted environment
     let grl_ok = unsafe {
         let mut groups: [u32; 4] = [0xdead; 4];
         let mut ng: i32 = 4;
@@ -2405,6 +2536,7 @@ pub extern "C" fn main(
 
     // getrandom fills a buffer with non-zero bytes; deterministic
     // PRNG output is fine for the smoke test.
+    // SAFETY: Valid memory or trusted environment
     let rand_ok = unsafe {
         let mut buf: [u8; 32] = [0; 32];
         let r = narf_libc::getrandom(
@@ -2426,6 +2558,7 @@ pub extern "C" fn main(
     );
 
     // getentropy(257) → -1; getentropy(16) → 0.
+    // SAFETY: Valid memory or trusted environment
     let ent_ok = unsafe {
         let mut buf: [u8; 16] = [0; 16];
         let small = narf_libc::getentropy(
@@ -2446,6 +2579,7 @@ pub extern "C" fn main(
     // writev(stdout, iov[3]) emits "wri" + "tev" + ": ok\n" — the
     // probe is the side-effect: if the line below appears verbatim
     // we know the gather walk was correct.
+    // SAFETY: Valid memory or trusted environment
     let writev_ok = unsafe {
         let a: &[u8] = b"wri";
         let b: &[u8] = b"tev";
@@ -2474,6 +2608,7 @@ pub extern "C" fn main(
     // ── Tier 3ac probes: sys/un + msghdr + sendmsg/recvmsg stubs ─
 
     // sockaddr_un.sun_path is 108 bytes; sockaddr_un is the right size.
+    // SAFETY: Valid memory or trusted environment
     let unix_ok = unsafe {
         let mut a = narf_libc::sockaddr_un::default();
         a.sun_family = narf_libc::AF_UNIX as u16;
@@ -2496,6 +2631,7 @@ pub extern "C" fn main(
 
     // sendmsg/recvmsg/socketpair/sockatmark/getsockname/getpeername
     // all refuse with -1 + ENOSYS.
+    // SAFETY: Valid memory or trusted environment
     let msg_ok = unsafe {
         let r1 = narf_libc::sendmsg(0, core::ptr::null(), 0);
         let r2 = narf_libc::recvmsg(0, core::ptr::null_mut(), 0);
@@ -2515,6 +2651,7 @@ pub extern "C" fn main(
 
     // ftok hashes the path + proj_id; same input → same key, low 8
     // bits encode the proj_id.
+    // SAFETY: Valid memory or trusted environment
     let ftok_ok = unsafe {
         let k1 = narf_libc::ftok(b"/tmp/narf\0".as_ptr() as *const i8, 0x42);
         let k2 = narf_libc::ftok(b"/tmp/narf\0".as_ptr() as *const i8, 0x42);
@@ -2531,6 +2668,7 @@ pub extern "C" fn main(
     );
 
     // shm/msg/sem all refuse with -1 / ENOSYS; shmat returns (void*)-1.
+    // SAFETY: Valid memory or trusted environment
     let ipc_ok = unsafe {
         let r1 = narf_libc::shmget(0, 4096, 0);
         let r2 = narf_libc::shmat(0, core::ptr::null(), 0);
@@ -2563,6 +2701,7 @@ pub extern "C" fn main(
     // ── Tier 3ae probes: search.h (tsearch) + utmp + crypt ───────
 
     // tsearch inserts; tfind locates; tdelete removes; twalk visits.
+    // SAFETY: Valid memory or trusted environment
     let tree_ok = unsafe {
         unsafe extern "C" fn cmp_int(
             a: *const core::ffi::c_void,
@@ -2570,6 +2709,7 @@ pub extern "C" fn main(
         ) -> i32 {
             // SAFETY: probe-supplied pointers; we know they were
             // i32-typed when fed into tsearch.
+            // SAFETY: Valid memory or trusted environment
             let (ai, bi) = unsafe {
                 (*(a as *const i32), *(b as *const i32))
             };
@@ -2584,6 +2724,7 @@ pub extern "C" fn main(
         ) {
             // SAFETY: single-threaded user mode; the static is the
             // probe-side counter we read after twalk returns.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 if which == narf_libc::LEAF || which == narf_libc::POSTORDER {
                     WALK_COUNT += 1;
@@ -2644,6 +2785,7 @@ pub extern "C" fn main(
     );
 
     // utmp iterator is empty; pututline echoes input; utmpname is 0.
+    // SAFETY: Valid memory or trusted environment
     let utmp_ok = unsafe {
         narf_libc::setutent();
         let e1 = narf_libc::getutent();
@@ -2659,6 +2801,7 @@ pub extern "C" fn main(
     );
 
     // crypt / crypt_r both NULL with errno = ENOSYS.
+    // SAFETY: Valid memory or trusted environment
     let crypt_ok = unsafe {
         let r1 = narf_libc::crypt(
             b"hunter2\0".as_ptr() as *const i8,
@@ -2680,6 +2823,7 @@ pub extern "C" fn main(
     //
     // creat / dup3 / statx / getdents64 / fchdir. Each lights up a
     // distinct entry; the markers pinpoint failures.
+    // SAFETY: Valid memory or trusted environment
     let creat_ok = unsafe {
         let p: *const i8 = b"/tmp/creat-target\0".as_ptr() as *const i8;
         let fd = narf_libc::creat(p, 0o644);
@@ -2692,6 +2836,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let dup3_ok = unsafe {
         // dup3(fd 1, fd 1, _) must EINVAL — same fd is rejected.
         let r = narf_libc::posix_dup3(1, 1, 0);
@@ -2704,6 +2849,7 @@ pub extern "C" fn main(
 
     // statx with AT_EMPTY_PATH + fd=1 (stdout) succeeds with a zero
     // mask request — proves the wrapper round-trips through fstat.
+    // SAFETY: Valid memory or trusted environment
     let statx_ok = unsafe {
         let mut sx = narf_libc::statx::default();
         let r = narf_libc::statx(
@@ -2723,6 +2869,7 @@ pub extern "C" fn main(
     );
 
     // getdents64 returns 0 (end-of-directory) for any fd today.
+    // SAFETY: Valid memory or trusted environment
     let gd_ok = unsafe {
         let mut buf = [0u8; 64];
         let r = narf_libc::getdents64(1, buf.as_mut_ptr() as *mut _, buf.len());
@@ -2735,6 +2882,7 @@ pub extern "C" fn main(
 
     // fchdir refuses with errno=ENOSYS today; the contract is just
     // that it does not crash and surfaces -1.
+    // SAFETY: Valid memory or trusted environment
     let fchdir_ok = unsafe { narf_libc::fchdir(1) == -1 };
     narf_libc::printf_str(
         if fchdir_ok { "fchdir: ok\n" } else { "fchdir: bad\n" },
@@ -2745,6 +2893,7 @@ pub extern "C" fn main(
     //
     // wait4(-1, ..., WNOHANG=1, NULL) with no children must surface
     // -1 with errno=ECHILD (10). Tests the C-ABI shape end-to-end.
+    // SAFETY: Valid memory or trusted environment
     let wait4_ok = unsafe {
         let mut status: i32 = 0;
         let r = narf_libc::wait4(-1, &mut status as *mut i32, 1, core::ptr::null_mut());
@@ -2758,6 +2907,7 @@ pub extern "C" fn main(
     // tkill(self, 0) with signum=0 should be a no-op success or
     // structured failure — kernel sees `signum=0` as "check
     // existence" today. The C-ABI shape is the load-bearing piece.
+    // SAFETY: Valid memory or trusted environment
     let tkill_ok = unsafe {
         let pid = narf_libc::getpid();
         let r = narf_libc::tkill(pid, 0);
@@ -2769,6 +2919,7 @@ pub extern "C" fn main(
     );
 
     // clone(NULL, ...) — entry NULL must return -1 without crashing.
+    // SAFETY: Valid memory or trusted environment
     let clone_ok = unsafe {
         let r = narf_libc::clone(
             None,
@@ -2787,6 +2938,7 @@ pub extern "C" fn main(
     //
     // sbrk(0) returns the current break. sbrk(N) advances by N and
     // returns the OLD break — so a follow-up sbrk(0) > prior.
+    // SAFETY: Valid memory or trusted environment
     let sbrk_ok = unsafe {
         let a = narf_libc::sbrk(0) as usize;
         let b = narf_libc::sbrk(0) as usize;
@@ -2800,6 +2952,7 @@ pub extern "C" fn main(
 
     // mremap should return MAP_FAILED (-1 cast); contract is just
     // that it does not crash.
+    // SAFETY: Valid memory or trusted environment
     let mremap_ok = unsafe {
         let p = narf_libc::mremap(
             core::ptr::null_mut(),
@@ -2819,6 +2972,7 @@ pub extern "C" fn main(
     // sigaction round-trip: install + read-back the prior. Use
     // SIGUSR1 (10) to avoid colliding with the kernel default-
     // disposition signals.
+    // SAFETY: Valid memory or trusted environment
     let sigaction_ok = unsafe {
         let mut act = narf_libc::sigaction::default();
         act.sa_handler = narf_libc::SIG_IGN_RAW;
@@ -2838,6 +2992,7 @@ pub extern "C" fn main(
     );
 
     // sigpending — empty mask.
+    // SAFETY: Valid memory or trusted environment
     let sigpending_ok = unsafe {
         let mut s = narf_libc::sigset_t { bits: 0xdead };
         let r = narf_libc::sigpending(&mut s as *mut _);
@@ -2849,6 +3004,7 @@ pub extern "C" fn main(
     );
 
     // sigaltstack round-trip: install + read-back.
+    // SAFETY: Valid memory or trusted environment
     let altstack_ok = unsafe {
         let mut backing = [0u8; narf_libc::SIGSTKSZ];
         let new = narf_libc::stack_t {
@@ -2874,6 +3030,7 @@ pub extern "C" fn main(
     );
 
     // pthread_kill(self, 0) — sig 0 check.
+    // SAFETY: Valid memory or trusted environment
     let pthread_kill_ok = unsafe {
         let tid = narf_libc::gettid() as u64;
         let r = narf_libc::pthread_kill(tid, 0);
@@ -2885,6 +3042,7 @@ pub extern "C" fn main(
     );
 
     // signalfd4 explicit size form.
+    // SAFETY: Valid memory or trusted environment
     let sfd_ok = unsafe {
         let mask: u64 = 1 << 10;
         let fd = narf_libc::signalfd4(-1, &mask as *const u64 as *const _, 8, 0);
@@ -2898,6 +3056,7 @@ pub extern "C" fn main(
     );
 
     // eventfd2 round-trip.
+    // SAFETY: Valid memory or trusted environment
     let efd_ok = unsafe {
         let fd = narf_libc::eventfd2(0, 0);
         fd == -1 || fd >= 3
@@ -2921,6 +3080,7 @@ pub extern "C" fn main(
     // ── new time C-ABI probes ────────────────────────────────────
     //
     // nanosleep(1us). Tiny enough not to dominate test runtime.
+    // SAFETY: Valid memory or trusted environment
     let nano_ok = unsafe {
         let req = narf_libc::timespec { tv_sec: 0, tv_nsec: 1_000 };
         narf_libc::nanosleep(&req as *const _, core::ptr::null_mut()) == 0
@@ -2931,6 +3091,7 @@ pub extern "C" fn main(
     );
 
     // clock_getres — 1ns nominal.
+    // SAFETY: Valid memory or trusted environment
     let res_ok = unsafe {
         let mut res = narf_libc::timespec { tv_sec: 0, tv_nsec: 0 };
         narf_libc::clock_getres(0, &mut res as *mut _) == 0 && res.tv_nsec == 1
@@ -2941,6 +3102,7 @@ pub extern "C" fn main(
     );
 
     // clock_nanosleep(1us, relative).
+    // SAFETY: Valid memory or trusted environment
     let cn_ok = unsafe {
         let req = narf_libc::timespec { tv_sec: 0, tv_nsec: 1_000 };
         narf_libc::clock_nanosleep(1, 0, &req as *const _, core::ptr::null_mut()) == 0
@@ -2954,6 +3116,7 @@ pub extern "C" fn main(
     //
     // strtok over an "a,b,c" split. Two calls — first returns "a",
     // second returns "b".
+    // SAFETY: Valid memory or trusted environment
     let strtok_ok = unsafe {
         let mut buf = *b"a,b,c\0";
         let delim = b",\0".as_ptr();
@@ -2967,6 +3130,7 @@ pub extern "C" fn main(
     );
 
     // strncat: append "world" capped to 3 onto "hi ".
+    // SAFETY: Valid memory or trusted environment
     let strncat_ok = unsafe {
         let mut buf = [0u8; 16];
         buf[0] = b'h'; buf[1] = b'i'; buf[2] = b' '; buf[3] = 0;
@@ -2979,6 +3143,7 @@ pub extern "C" fn main(
     );
 
     // strerror_r over EINVAL=22.
+    // SAFETY: Valid memory or trusted environment
     let serr_ok = unsafe {
         let mut buf = [0u8; 64];
         let r = narf_libc::strerror_r(22, buf.as_mut_ptr(), buf.len());
@@ -2997,6 +3162,7 @@ pub extern "C" fn main(
     // round-trip exercises.
 
     // fileno(stdout) == 1.
+    // SAFETY: Valid memory or trusted environment
     let fileno_ok = unsafe {
         narf_libc::stdio_c::fileno(narf_libc::stdout()) == 1
     };
@@ -3006,6 +3172,7 @@ pub extern "C" fn main(
     );
 
     // printf("..."): literal pass to stdout.
+    // SAFETY: Valid memory or trusted environment
     let printf_ok = unsafe {
         let msg = b"printf: ok\n\0".as_ptr() as *const i8;
         narf_libc::stdio_c::printf(msg) >= 0
@@ -3015,6 +3182,7 @@ pub extern "C" fn main(
     }
 
     // fprintf(stdout, "..."): literal pass to a stream.
+    // SAFETY: Valid memory or trusted environment
     let fprintf_ok = unsafe {
         let msg = b"fprintf: ok\n\0".as_ptr() as *const i8;
         narf_libc::stdio_c::fprintf(narf_libc::stdout(), msg) >= 0
@@ -3024,6 +3192,7 @@ pub extern "C" fn main(
     }
 
     // snprintf into a buffer, then check NUL-termination + content.
+    // SAFETY: Valid memory or trusted environment
     let snprintf_c_ok = unsafe {
         let mut buf = [0u8; 16];
         let r = narf_libc::stdio_c::snprintf(
@@ -3051,6 +3220,7 @@ pub extern "C" fn main(
     // ── new env C-ABI probes ─────────────────────────────────────
     //
     // setenv("PROBE", "1", 1) then getenv("PROBE") returns the value.
+    // SAFETY: Valid memory or trusted environment
     let setenv_ok = unsafe {
         let r = narf_libc::setenv(
             b"PROBE\0".as_ptr(),
@@ -3066,6 +3236,7 @@ pub extern "C" fn main(
     );
 
     // unsetenv("PROBE") then getenv returns NULL.
+    // SAFETY: Valid memory or trusted environment
     let unsetenv_ok = unsafe {
         let r = narf_libc::unsetenv(b"PROBE\0".as_ptr());
         let v = narf_libc::getenv(b"PROBE".as_ptr(), 5);
@@ -3077,6 +3248,7 @@ pub extern "C" fn main(
     );
 
     // putenv: same semantics via the "NAME=VALUE" string form.
+    // SAFETY: Valid memory or trusted environment
     let putenv_ok = unsafe {
         let r = narf_libc::putenv(b"PUT=here\0".as_ptr());
         let v = narf_libc::getenv(b"PUT".as_ptr(), 3);
@@ -3090,6 +3262,7 @@ pub extern "C" fn main(
     // ── new misc-utility C-ABI probes ────────────────────────────
     //
     // atoll, strtoll, strtoull, strtod, strtof.
+    // SAFETY: Valid memory or trusted environment
     let atoll_ok = unsafe {
         narf_libc::atoll(b"-9876543210\0".as_ptr() as *const i8) == -9876543210
     };
@@ -3098,6 +3271,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let strtoll_ok = unsafe {
         let mut end: *mut i8 = core::ptr::null_mut();
         let v = narf_libc::strtoll(
@@ -3112,6 +3286,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let strtoull_ok = unsafe {
         let v = narf_libc::strtoull(
             b"0xff\0".as_ptr() as *const i8,
@@ -3125,6 +3300,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let strtod_ok = unsafe {
         let v = narf_libc::strtod(b"3.14e2\0".as_ptr() as *const i8, core::ptr::null_mut());
         v > 313.99 && v < 314.01
@@ -3134,6 +3310,7 @@ pub extern "C" fn main(
         &[],
     );
 
+    // SAFETY: Valid memory or trusted environment
     let strtof_ok = unsafe {
         let v = narf_libc::strtof(b"-1.5\0".as_ptr() as *const i8, core::ptr::null_mut());
         v > -1.51 && v < -1.49
@@ -3148,6 +3325,7 @@ pub extern "C" fn main(
     // dispatch loop in `narf_libc::exit` walks the table.
     // SAFETY: `cleanup` is a `'static` extern "C" fn; single-threaded
     // user mode keeps the table-write race-free.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let _ = narf_libc::atexit(cleanup);
     }

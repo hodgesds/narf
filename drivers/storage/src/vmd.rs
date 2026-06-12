@@ -133,6 +133,7 @@ impl Vmd {
         _cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, VmdError> {
         // Map BAR0 (CFGBAR). SAFETY: caller-authority over the device.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let cfgbar = unsafe { map_bar(device, VMD_CFGBAR) }.map_err(|_| VmdError::BarMapFailed)?;
 
         // BAR size determines how many child buses we can cover.
@@ -154,6 +155,7 @@ impl Vmd {
         // function 4 KiB stride, same vendor-ID sentinel checks.
         // SAFETY: cfgbar.phys is identity-mapped (Stage-3 invariant)
         // and we promised it's a real config window above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let children = unsafe { narf_bus::pcie::enumerate_segment(cfgbar.phys, n_buses, segment) };
 
         Ok(Self {
@@ -210,6 +212,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
 
     // SAFETY: probe owns the device's cfg space + BARs for the
     // duration of this call.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let vmd = match unsafe { Vmd::bring_up(&device, &cap) } {
         Ok(v) => v,
         Err(_) => return Err(ProbeError::BadDevice),

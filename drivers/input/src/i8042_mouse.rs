@@ -187,6 +187,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: 0x64 cmd write; input buffer drained above so the controller
     // accepts `CMD_READ_CONFIG` (0x20), which queues config byte to 0x60.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
@@ -198,12 +199,14 @@ pub unsafe fn init() -> Result<(), InitError> {
     // SAFETY: 0x64 cmd write; input buffer drained above so `CMD_WRITE_CONFIG`
     // (0x60) is accepted, telling the controller the next 0x60 write is the
     // new config byte.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: 0x60 data write; input buffer drained above. Delivers the
     // recomputed config byte that the preceding `CMD_WRITE_CONFIG` is awaiting.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_DATA, conf);
     }
@@ -214,12 +217,14 @@ pub unsafe fn init() -> Result<(), InitError> {
     let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
     // SAFETY: 0x64 cmd write; `CMD_WRITE_AUX` (0xD4) routes the next 0x60 byte
     // to the AUX (mouse) channel instead of the keyboard.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_WRITE_AUX);
     }
     let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
     // SAFETY: 0x60 data write; the preceding 0xD4 forwards this 0xFF (mouse
     // reset) to the AUX device.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_DATA, 0xFF);
     }
@@ -238,12 +243,14 @@ pub unsafe fn init() -> Result<(), InitError> {
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
         // SAFETY: 0x64 cmd write; `CMD_WRITE_AUX` (0xD4) routes the next 0x60
         // byte to the AUX (mouse) channel.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             outb(PS2_CMD, CMD_WRITE_AUX);
         }
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
         // SAFETY: 0x60 data write; the preceding 0xD4 forwards this 0xF6 (set
         // defaults) to the AUX device.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             outb(PS2_DATA, 0xF6);
         }
@@ -258,12 +265,14 @@ pub unsafe fn init() -> Result<(), InitError> {
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
         // SAFETY: 0x64 cmd write; `CMD_WRITE_AUX` (0xD4) routes the next 0x60
         // byte to the AUX (mouse) channel.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             outb(PS2_CMD, CMD_WRITE_AUX);
         }
         let _ = wait_input_clear_ms(MOUSE_REPLY_MS);
         // SAFETY: 0x60 data write; the preceding 0xD4 forwards this 0xF4 (enable
         // data reporting) to the AUX device.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             outb(PS2_DATA, 0xF4);
         }
@@ -369,6 +378,7 @@ pub unsafe fn on_irq12() {
         // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
         // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
         // so the pointee outlives this borrow. Non-null checked just above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let node_ref: &DeviceNode = unsafe { &*raw };
         dispatch_rel_to_node(node_ref, dx, dy);
     }

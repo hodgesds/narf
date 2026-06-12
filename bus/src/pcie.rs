@@ -66,6 +66,7 @@ pub unsafe fn enumerate_segment(ecam_base: PhysAddr, n_buses: u16, segment: u16)
             let cfg0 = phys_for(ecam_base, addr0);
             // SAFETY: ecam_base + offset is inside the ECAM region per
             // the MAX_BUSES bound; reads are 4-byte aligned.
+            // SAFETY: Valid memory or trusted environment
             let vendor_device = unsafe { ecam_read32(cfg0) };
             let v0 = vendor_device & 0xFFFF;
             // PCI Local Bus 3.0: vendor ID `0xFFFF` means "no

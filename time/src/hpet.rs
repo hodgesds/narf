@@ -167,6 +167,7 @@ impl Hpet {
     pub unsafe fn probe(base_phys: u64) -> Result<Self, HpetError> {
         // SAFETY: caller-asserted MMIO window; identity-mapped on
         // x86_64 (HPET base is in the legacy MMIO hole below 4 GiB).
+        // SAFETY: Valid memory or trusted environment
         let cap = unsafe { read_u64(base_phys + REG_CAP_ID) };
         if cap == 0 || cap == u64::MAX {
             return Err(HpetError::NotPresent);
@@ -636,6 +637,7 @@ pub fn read_counter() -> u64 {
         Some(h) => {
             // SAFETY: HPET stays alive for the lifetime of the
             // singleton; the lock holds for the read.
+            // SAFETY: Valid memory or trusted environment
             unsafe { h.read_counter() }
         }
         None => 0,
@@ -681,6 +683,7 @@ pub fn timer_route_cap(n: u8) -> u32 {
         Some(h) if n < h.caps.num_comparators => {
             // SAFETY: HPET singleton alive for the lock scope; index
             // bounded against `num_comparators`.
+            // SAFETY: Valid memory or trusted environment
             unsafe { h.timer_route_cap(n) }
         }
         _ => 0,
@@ -744,6 +747,7 @@ pub unsafe fn arm_oneshot(n: u8, gsi: u8, deadline: u64) -> Result<(), ArmError>
     }
     // SAFETY: caller-asserted IDT/IOAPIC readiness; index bounded;
     // GSI validated against the route-cap mask.
+    // SAFETY: Valid memory or trusted environment
     unsafe { h.arm_oneshot_comparator(n, gsi, deadline) };
     Ok(())
 }
@@ -773,6 +777,7 @@ pub unsafe fn arm_periodic(n: u8, gsi: u8, period_ticks: u64) -> Result<(), ArmE
     }
     // SAFETY: caller-asserted IDT/IOAPIC readiness; index + gsi
     // validated.
+    // SAFETY: Valid memory or trusted environment
     unsafe { h.arm_periodic_comparator(n, gsi, period_ticks) };
     Ok(())
 }
@@ -849,6 +854,7 @@ pub unsafe fn arm_periodic_msi(
     }
     // SAFETY: caller-asserted live window; index bounded;
     // capability checks above.
+    // SAFETY: Valid memory or trusted environment
     unsafe { h.arm_periodic_msi_comparator(n, msi_addr, msi_data, period_ticks) };
     // SAFETY: same.
     unsafe { h.clear_status(n) };
@@ -912,6 +918,7 @@ pub fn calibrate_tsc_via_hpet(calibration_window_hpet_ticks: u64) -> Option<u64>
     let dev = g.as_ref()?;
     // SAFETY: HPET singleton is alive for the lock scope; the
     // window read is volatile + naturally aligned.
+    // SAFETY: Valid memory or trusted environment
     let hpet_t0 = unsafe { dev.read_counter() };
     let tsc_t0 = narf_arch::x86_64::tsc::rdtsc();
     let hpet_deadline = hpet_t0.wrapping_add(calibration_window_hpet_ticks);

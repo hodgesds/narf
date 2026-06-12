@@ -74,6 +74,7 @@ unsafe fn write_cr4(v: u64) {
     // SAFETY: caller-asserted CPL=0; writing CR4 is architecturally
     // legal but careful: enabling reserved bits faults. We only
     // OR in CR4_CET so this is benign.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov cr4, {}", in(reg) v, options(nomem, nostack));
     }

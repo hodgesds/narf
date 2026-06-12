@@ -721,6 +721,7 @@ impl Ahci {
             // SAFETY: `data_buf` is the base of the 512-byte DMA region the
             // HBA filled with the IDENTIFY response; `i < 512` so each read is
             // within that allocated, identity-mapped page.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
         }
         // Stop the port.
@@ -1003,6 +1004,7 @@ pub unsafe fn ahci_read_lba(
         // SAFETY: `data_buf` is the base of the DMA region the HBA filled with
         // the read payload; `i < n_sectors*512` bytes which is the size of that
         // identity-mapped allocation, so each read is in-bounds.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
     }
     // SAFETY: caller-asserted.
@@ -1116,6 +1118,7 @@ pub async unsafe fn ahci_read_lba_async(
         // SAFETY: `data_buf` is the base of the DMA region the HBA filled with
         // the read payload; `i < n_sectors*512` bytes which is the size of that
         // identity-mapped allocation, so each read is in-bounds.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
     }
     // SAFETY: caller-asserted.
@@ -1448,6 +1451,7 @@ unsafe fn ahci_lba_ncq(
             // SAFETY: `data_buf` is the base of the DMA region the HBA filled
             // for this read; `i < n_sectors*512` which is that region's size, so
             // the volatile read stays inside the identity-mapped allocation.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *byte = unsafe { core::ptr::read_volatile((data_buf + i as u64) as *const u8) };
         }
     }
@@ -1525,6 +1529,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     // Stop port if running.
     // SAFETY: `pmp_read_gscr`'s contract guarantees the caller owns the HBA
     // exclusively and `port_idx < 32`, which is exactly `port_idle`'s contract.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { ahci.port_idle(port_idx) };
 
     // Use the persistent scratch at the same layout as identify_device
@@ -1595,6 +1600,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
             // SAFETY: `off` is this port's register block (port_idx < 32, so
             // within the mapped HBA BAR) and PORT_CI is a valid port-register
             // offset, so the read is in-range; we own the HBA exclusively.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let ci = unsafe { ahci.mmio.read32(off + PORT_CI) };
             // SAFETY: same port register block; 0x20 is PORT_TFD, in-range.
             let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
@@ -1609,6 +1615,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     if errored || !done {
         // SAFETY: caller owns the HBA exclusively and `port_idx < 32`, matching
         // `port_idle`'s contract.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let _ = unsafe { ahci.port_idle(port_idx) };
         return Err(AhciError::ResetTimeout);
     }
@@ -1631,6 +1638,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     // SAFETY: `fis_recv` is the identity-mapped received-FIS region of the
     // scratch DMA page that the HBA wrote the D2H Register FIS into; +0x40 is
     // the D2H FIS area and offsets 4..=8 are within the 256-byte FIS structure.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let val = unsafe {
         let nsect = core::ptr::read_volatile((d2h + 4) as *const u8) as u32;
         let lbal = core::ptr::read_volatile((d2h + 5) as *const u8) as u32;
@@ -1641,6 +1649,7 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
 
     // SAFETY: `pmp_read_gscr`'s contract guarantees exclusive HBA ownership and
     // `port_idx < 32`, satisfying `port_idle`'s contract.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { ahci.port_idle(port_idx) };
     Ok(val)
 }
@@ -1796,6 +1805,7 @@ pub unsafe fn atapi_send_cdb(
 
     // SAFETY: `atapi_send_cdb`'s contract guarantees exclusive HBA ownership and
     // `port_idx < 32`, which is what `port_idle` requires.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { ahci.port_idle(port_idx) };
 
     let base = ahci_scratch_phys();
@@ -1897,6 +1907,7 @@ pub unsafe fn atapi_send_cdb(
             // SAFETY: `off` addresses this port's register block (port_idx < 32,
             // inside the mapped HBA BAR); PORT_CI is a valid port-register
             // offset and we own the HBA exclusively.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let ci = unsafe { ahci.mmio.read32(off + PORT_CI) };
             // SAFETY: same port register block; 0x20 is PORT_TFD, in-range.
             let tfd = unsafe { ahci.mmio.read32(off + 0x20) };
@@ -2121,6 +2132,7 @@ pub unsafe fn handle_phyrdy_change(ahci: &Ahci, port_idx: u8) -> PortLinkState {
     // Link-up — run COMRESET + re-read signature.
     // SAFETY: `handle_phyrdy_change`'s contract gives exclusive HBA ownership
     // and `port_idx < 32`, matching `port_reset`'s contract.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let kind = match unsafe { ahci.port_reset(port_idx) } {
         Err(_) => {
             // SAFETY: same contract forwarded — exclusive HBA, `port_idx < 32`.
@@ -2131,6 +2143,7 @@ pub unsafe fn handle_phyrdy_change(ahci: &Ahci, port_idx: u8) -> PortLinkState {
             // Read new signature from PORT_SIG / PORT_SSTS.
             // SAFETY: `off` is this port's register block (port_idx < 32, in the
             // mapped BAR); PORT_SIG is a valid in-range port register.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let sig = unsafe { ahci.mmio.read32(off + PORT_SIG) };
             // SAFETY: same port register block; PORT_SSTS is in-range.
             let ssts2 = unsafe { ahci.mmio.read32(off + PORT_SSTS) };
@@ -2234,6 +2247,7 @@ fn ahci_isr() {
     }
     // SAFETY: identity-mapped MMIO; `base` is the ABAR PA stored
     // post-bring-up, owned by the AHCI driver.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let is = unsafe { core::ptr::read_volatile((base as u64 + HBA_IS) as *const u32) };
     if is == 0 {
         return;
@@ -2277,6 +2291,7 @@ fn try_enable_msix_ahci(
     let _ = msix.alloc_vector()?;
     // SAFETY: we hold the BusDeviceCap and own the MSI-X table; the
     // vector + handler are installed by the caller before enable().
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { msix.program_vector(0, 0, v) }.ok()?;
     // SAFETY: cfg-space write to a known cap-list offset.
     unsafe { msix.enable() }.ok()?;

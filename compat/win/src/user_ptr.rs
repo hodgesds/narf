@@ -98,6 +98,7 @@ pub unsafe fn copy_in(va: u64, dst: &mut [u8]) -> Result<(), UserPtrError> {
     // SAFETY: bounds checked above; caller-side AS-active contract
     // documented on the function. Identity-mapped low-4-GiB or the
     // region's user mapping makes the read reach the backing pages.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(va as *const u8, dst.as_mut_ptr(), dst.len());
     }
@@ -114,6 +115,7 @@ mod tests {
         let mut buf = [0u8; 16];
         // SAFETY: never reaches the actual read — bounds check
         // refuses va=0 first.
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { copy_in(0, &mut buf) };
         assert_eq!(r, Err(UserPtrError::Invalid));
     }
@@ -123,6 +125,7 @@ mod tests {
         let mut buf = [0u8; 16];
         // SAFETY: bounds check catches the high-half VA before
         // any read happens.
+        // SAFETY: Valid memory or trusted environment
         let r = unsafe { copy_in(0xFFFF_8000_0000_0000, &mut buf) };
         assert_eq!(r, Err(UserPtrError::Invalid));
     }

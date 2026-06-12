@@ -173,6 +173,7 @@ impl Nhi {
         // SAFETY: bar0 is identity-mapped MMIO; REG_CAPS verified in
         // range above; the NHI cfg block tolerates a 32-bit read at
         // every register documented in `nhi_regs.h`.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let caps = unsafe { bar0.read32(REG_CAPS) };
 
         let nhi_version = ((caps & REG_CAPS_VERSION_MASK) >> REG_CAPS_VERSION_SHIFT) as u8;
@@ -224,6 +225,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), Pro
 
     // SAFETY: probe owns the device's cfg space + BARs for the
     // duration of this call.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let nhi = match unsafe { Nhi::bring_up(&device, &cap) } {
         Ok(n) => n,
         Err(_) => return Err(ProbeError::BadDevice),

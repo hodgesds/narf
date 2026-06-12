@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod goodix;
 pub mod hid_elan;
 pub mod hid_mt_features;
 pub mod hid_multitouch;
@@ -23,7 +24,10 @@ pub mod i2c_hid_touch;
 pub mod i8042;
 #[cfg(target_arch = "x86_64")]
 pub mod i8042_mouse;
+#[cfg(target_arch = "x86_64")]
+pub mod psmouse;
 pub mod rmi4_core;
+pub mod wacom;
 pub mod wbdi;
 
 /// Stage::Device initcalls for this driver crate.
@@ -65,6 +69,9 @@ pub fn register_initcalls() {
     // vendor-specific report formats (HP Pavilion X2, Toshiba Click,
     // and a slice of Lenovo/Acer/MSI laptops).
     hid_elan::register_initcalls();
+
+    wacom::register_usb_driver();
+    goodix::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();
@@ -110,6 +117,8 @@ fn register_i8042_initcalls() {
             );
             return InitResult::NotPresent;
         }
+        // SAFETY: Same as keyboard, safe at module level through the
+        // dispatch table.
         let irq_ok = install_isa_irq(12, on_irq12_safe);
         narf_input::I8042_MOUSE_IRQ_ROUTED.store(irq_ok, core::sync::atomic::Ordering::Release);
         let _ = writeln!(
@@ -117,6 +126,10 @@ fn register_i8042_initcalls() {
             "  i8042-mouse: init=ok irq12={}",
             if irq_ok { "routed" } else { "ROUTING_FAILED" },
         );
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Device, "psmouse-extensions", || {
+        psmouse::register_initcalls();
         InitResult::Ok
     });
 }
@@ -128,6 +141,7 @@ fn on_irq1_safe() {
     // SAFETY: dispatch context — ISR runs with IRQs masked,
     // single-CPU ownership of the i8042 ports for the duration
     // of one handler invocation.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         i8042::on_irq1();
     }
@@ -215,6 +229,7 @@ fn install_isa_irq(isa_irq: u8, handler: fn()) -> bool {
     }
     // SAFETY: vector + handler installed before the IOAPIC
     // unmasks the line.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, v, 0, flags) }
 }
 

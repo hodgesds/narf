@@ -84,6 +84,7 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
         if !base.is_null() {
             // SAFETY: caller promise — `base` covers at least
             // `sizeof(FdtHeader)`. `read_header` validates magic.
+            // SAFETY: Valid memory or trusted environment
             if let Some(hdr) = unsafe { read_header(base) } {
                 // SAFETY: `hdr` validated, base still live.
                 unsafe { walk_fdt(base, hdr, &mut out) };
@@ -181,6 +182,7 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                         // the header we validated, `base` is still live, and
                         // `hdr` was copied by value, satisfying
                         // `scan_reg_in_node`'s contract.
+                        // SAFETY: Valid memory or trusted environment
                         unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
                     {
                         // cursor is now at END_NODE; account depth-wise.
@@ -188,6 +190,7 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                         // SAFETY: probe does a volatile 4-byte read of
                         // the transport's magic register at an
                         // identity-mapped MMIO address.
+                        // SAFETY: Valid memory or trusted environment
                         if let Some(dev) = unsafe { probe_virtio_mmio(base_addr, len) } {
                             out.push(dev);
                         }
@@ -213,6 +216,7 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                         // `struct_slice` stays in-range of the validated FDT,
                         // `base` is live, and `hdr` is a by-value copy, so
                         // `scan_reg_in_node`'s contract is upheld.
+                        // SAFETY: Valid memory or trusted environment
                         unsafe { scan_reg_in_node(struct_slice, &mut cursor, hdr, base) }
                     {
                         depth += 1;
@@ -225,6 +229,7 @@ unsafe fn walk_fdt(base: *const u8, hdr: FdtHeader, out: &mut Vec<BusDevice>) {
                             // boot stub for low-4-GiB addresses; the
                             // walker only does aligned 4-byte reads
                             // and skips unpopulated slots.
+                            // SAFETY: Valid memory or trusted environment
                             let pcie = unsafe {
                                 crate::pcie::enumerate_n(PhysAddr::new(ecam_base), n_buses)
                             };
@@ -277,6 +282,7 @@ unsafe fn read_header(base: *const u8) -> Option<FdtHeader> {
     let raw: [u8; core::mem::size_of::<FdtHeader>()] =
         // SAFETY: caller promises `base` points at readable memory for
         // the header's extent.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::ptr::read(base as *const [u8; core::mem::size_of::<FdtHeader>()]) };
     compiler_fence(Ordering::SeqCst);
 
@@ -339,6 +345,7 @@ unsafe fn scan_reg_in_node(
                 // Resolve property name from the strings block.
                 // SAFETY: nameoff is bound-checked below; base+off_dt_strings
                 // remains within the FDT per the header.
+                // SAFETY: Valid memory or trusted environment
                 let name = unsafe { fdt_string(base, &hdr, nameoff) };
                 if name == Some(b"reg") && found.is_none() && plen >= 16 {
                     let addr = ((be32(&data[0..4]) as u64) << 32) | (be32(&data[4..8]) as u64);

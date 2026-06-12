@@ -53,6 +53,7 @@ pub unsafe fn set_user_fs_base(fs_base: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: IA32_FS_BASE is unconditional on x86_64-long-mode; the
     // caller owns the canonical-vaddr precondition.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "wrmsr",
@@ -93,6 +94,7 @@ pub unsafe fn set_user_gs_base(gs_base: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: IA32_KERNEL_GS_BASE is unconditional on long-mode
     // x86_64; caller owns the canonical-vaddr precondition.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "wrmsr",

@@ -126,6 +126,7 @@ impl InputEventFile {
                     let dst = &mut buf[i * EVDEV_EVENT_SIZE..(i + 1) * EVDEV_EVENT_SIZE];
                     // SAFETY: EvdevEvent is repr(C), size_of matches EVDEV_EVENT_SIZE,
                     // and we're copying exactly that many bytes into a properly sized slice.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             &ev as *const EvdevEvent as *const u8,
@@ -186,6 +187,7 @@ impl FileOps for InputEventFile {
                     let dst = &mut buf[..EVDEV_EVENT_SIZE];
                     // SAFETY: `EvdevEvent` is `repr(C)` and exactly
                     // `EVDEV_EVENT_SIZE` bytes; `dst` is that size.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             &ev as *const EvdevEvent as *const u8,

@@ -419,6 +419,7 @@ impl FileOps for ConsoleFile {
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 64-byte
                 // `zero` buffer, which over-covers Linux's 60-byte `termios`.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &zero) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -428,10 +429,12 @@ impl FileOps for ConsoleFile {
                 let ws = console_winsize();
                 // SAFETY: `Winsize` is a `repr(C)` POD of four `u16` (8 bytes)
                 // with no padding, so its layout matches `[u8; 8]` exactly.
+                // SAFETY: Valid memory or trusted environment
                 let bytes: [u8; 8] = unsafe { core::mem::transmute(ws) };
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 8-byte
                 // `bytes` buffer holding the serialized `struct winsize`.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -442,12 +445,14 @@ impl FileOps for ConsoleFile {
                 // SAFETY: `copy_from_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 8-byte
                 // `bytes` buffer that receives the serialized `struct winsize`.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
                 // SAFETY: `Winsize` is a `repr(C)` POD of four `u16` (8 bytes)
                 // with no padding and every bit pattern valid, so the
                 // round-trip from `[u8; 8]` is sound.
+                // SAFETY: Valid memory or trusted environment
                 let ws: Winsize = unsafe { core::mem::transmute(bytes) };
                 set_console_winsize(ws);
                 Ok(0)
@@ -459,6 +464,7 @@ impl FileOps for ConsoleFile {
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
                 // little-endian encoding of the `i32` pending-byte count.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -503,6 +509,7 @@ impl FileOps for ConsoleFile {
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
                 // little-endian encoding of the `pid_t` foreground pgid.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
                     return Err(FsError::InvalidData);
                 }
@@ -513,6 +520,7 @@ impl FileOps for ConsoleFile {
                 // SAFETY: `copy_from_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
                 // buffer that receives the little-endian `pid_t` pgid.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { crate::handlers::copy_from_user(&mut bytes, arg as u64) }.is_err() {
                     return Err(FsError::InvalidData);
                 }

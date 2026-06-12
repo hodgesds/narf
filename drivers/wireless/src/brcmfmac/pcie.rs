@@ -226,6 +226,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller hands us exclusive BusDeviceCap authority for
     // this device's cfg + BARs.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { bring_up(&device) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),

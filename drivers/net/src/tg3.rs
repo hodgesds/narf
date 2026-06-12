@@ -591,6 +591,7 @@ impl Tg3Nic {
             };
             // SAFETY: ring is a DmaBuffer of RX_STD_RING_BYTES, i is
             // bounded by RX_STD_RING_LEN.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 let slot = (rx_ring_phys + (i * core::mem::size_of::<RxBufferDesc>()) as u64)
                     as *mut RxBufferDesc;
@@ -603,6 +604,7 @@ impl Tg3Nic {
         for i in 0..TX_RING_LEN {
             // SAFETY: ring is a DmaBuffer of TX_RING_BYTES, i is
             // bounded by TX_RING_LEN.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 let slot = (tx_ring_phys + (i * core::mem::size_of::<TxBufferDesc>()) as u64)
                     as *mut TxBufferDesc;
@@ -901,6 +903,7 @@ impl Tg3Nic {
             // `rx_pool[slot]`; `i < copy_len <= RX_BUF_LEN`, so `buf_phys + i`
             // stays within that frame. A byte read is naturally aligned, and
             // `read_volatile` forces the chip-written DMA bytes to be observed.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
         }
 
@@ -1005,6 +1008,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // driver has bound this function yet (guarded by the `CONTROLLER` check
     // above) — so we hold the device's BAR + cfg windows for the duration of
     // `bring_up`, satisfying its safety contract.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { Tg3Nic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -1016,6 +1020,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // pointer to a live, exclusively-owned `Tg3Nic`. The `&mut` borrow is
         // confined to this block and only touches the lock-guarded IPC-ring
         // fields, so no aliasing `&`/`&mut` exists concurrently.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Tg3Nic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

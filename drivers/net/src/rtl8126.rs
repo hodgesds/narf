@@ -961,6 +961,7 @@ impl Rtl8126Nic {
                 // SAFETY: `buf_phys` is the identity-mapped physical base
                 // of this slot's RX DMA buffer (RX_BUF_LEN bytes); `i <
                 // copy_len <= RX_BUF_LEN`, so the byte read is in bounds.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -1041,6 +1042,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // (CONTROLLER is set below, no clones exist yet), so its Arc
         // refcount is 1 and this is the only reference — forming a unique
         // `&mut Rtl8126Nic` from the as_ptr pointer does not alias.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut Rtl8126Nic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

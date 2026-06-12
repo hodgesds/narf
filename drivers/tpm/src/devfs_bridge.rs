@@ -114,6 +114,7 @@ fn flush_context_cmd(handle: u32) -> Vec<u8> {
 
 /// State shared by all `read`/`write`/`poll_readiness` calls on one
 /// node.  Linux `file_priv` holds equivalent fields (tpm-dev.h:32).
+#[derive(Debug)]
 struct TpmDevState {
     /// Pending response bytes (empty = no response queued).
     response: Vec<u8>,
@@ -135,6 +136,7 @@ impl TpmDevState {
 /// `/dev/tpm0` — raw TPM access without resource management.
 ///
 /// Linux ref: `drivers/char/tpm/tpm-dev.c`.
+#[derive(Debug)]
 pub struct DevTpm0 {
     state: IrqSafeSpinLock<TpmDevState>,
 }
@@ -271,6 +273,7 @@ impl FileOps for DevTpm0 {
 /// handle remapping is deferred.
 ///
 /// Linux ref: `drivers/char/tpm/tpm2-space.c`.
+#[derive(Debug)]
 pub struct DevTpmRm0 {
     state: IrqSafeSpinLock<TpmDevState>,
     /// Transient handles allocated during this open fd's lifetime.

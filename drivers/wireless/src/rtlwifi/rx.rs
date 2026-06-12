@@ -44,6 +44,7 @@ pub fn peek_descriptor(ring: &RxRing, slot: u16) -> Option<RxDesc> {
     // `slot`-th `RX_DESC_SIZE` descriptor. Each read is 4-byte aligned
     // (offset is a multiple of 4) and `read_volatile` is required to
     // observe HW-written descriptor state.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         for i in 0..desc.dwords.len() {
             desc.dwords[i] = core::ptr::read_volatile(base.add(offset + i * 4).cast::<u32>());

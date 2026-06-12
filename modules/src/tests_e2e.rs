@@ -453,6 +453,7 @@ fn e2e_symbol_export_visible() -> TestResult {
     // round-trips. SAFETY: we just registered this address ourselves
     // pointing at `smoke_alive`, which is a kernel-resident extern
     // "C" fn returning u32.
+    // SAFETY: Valid memory or trusted environment
     let f: extern "C" fn() -> u32 = unsafe { core::mem::transmute(resolved.addr) };
     if f() != TEST_MODULE_ALIVE_MAGIC {
         return TestResult::Fail("looked-up export returned wrong magic");

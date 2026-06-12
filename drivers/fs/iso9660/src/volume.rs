@@ -117,6 +117,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
             // SAFETY: VolumeDescriptorHeader is 7 bytes,
             // `#[repr(C, packed)]`, and the layout matches §8.1.
             // We just read a full 2048-byte sector into `sector_buf`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let header: VolumeDescriptorHeader = unsafe {
                 core::ptr::read_unaligned(sector_buf.as_ptr() as *const VolumeDescriptorHeader)
             };
@@ -132,6 +133,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
                     // SAFETY: PVD is `#[repr(C, packed)]`, exactly
                     // 2048 bytes (compile-time asserted in
                     // `descriptor.rs`), and the layout matches §8.4.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     let p: PrimaryVolumeDescriptor = unsafe {
                         core::ptr::read_unaligned(
                             sector_buf.as_ptr() as *const PrimaryVolumeDescriptor
@@ -201,6 +203,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
         // the outer spinlock so no other CPU/task is racing the
         // buffer bytes during this copy. Identity-mapped phys backs
         // the read.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), SECTOR_SIZE) };
         dst.copy_from_slice(src);
         Ok(())

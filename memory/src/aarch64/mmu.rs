@@ -20,6 +20,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // SAFETY: `mrs` reading `TTBR0_EL1` is a privileged but side-effect-free
     // read; the caller guarantees EL1+ (see `# Safety`), and `out(reg)` binds
     // a fresh local for the destination register.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mrs {v}, ttbr0_el1", v = out(reg) ttbr0);
     }

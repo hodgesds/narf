@@ -264,11 +264,13 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     // drop. This satisfies RawWakerVTable's contract (clone yields a
     // waker that wakes the same task; wake/drop are sound), so the
     // resulting Waker is valid.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is a local owned by this stack frame and is never
     // moved again — it is only accessed through `pinned` and dropped in
     // place when the frame returns — so the Pin's no-move invariant holds.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

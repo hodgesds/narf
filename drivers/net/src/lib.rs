@@ -31,8 +31,12 @@
 extern crate alloc;
 
 pub mod atheros;
+pub mod bnxt;
+pub mod cxgb4;
 pub mod e1000;
+pub mod enic;
 pub mod forcedeth;
+pub mod i40e;
 pub mod igc;
 pub mod ixgbe;
 pub mod mlx5;
@@ -53,8 +57,16 @@ mod tests;
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    narf_init::register(Stage::Subsys, "cxgb4", || {
+        cxgb4::register_pci_driver();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "e1000", || {
         e1000::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "i40e", || {
+        i40e::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "r8169", || {
@@ -99,6 +111,14 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "forcedeth", || {
         forcedeth::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "bnxt", || {
+        bnxt::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "enic", || {
+        enic::register_pci_driver();
         InitResult::Ok
     });
 }

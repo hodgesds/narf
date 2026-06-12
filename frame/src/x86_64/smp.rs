@@ -68,6 +68,7 @@ unsafe fn install_trampoline() {
     let end = core::ptr::addr_of!(_ap_trampoline_end);
     // SAFETY: both symbols are within the same .text section so
     // pointer subtraction is sound.
+    // SAFETY: Valid memory or trusted environment
     let len = unsafe { end.offset_from(src) } as usize;
 
     // Dest: identity-mapped phys 0x8000.
@@ -75,6 +76,7 @@ unsafe fn install_trampoline() {
 
     // SAFETY: src/dst are well-formed and non-overlapping (src is
     // in the kernel high half, dst is at low phys 0x8000).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(src, dst, len);
     }
@@ -89,6 +91,7 @@ unsafe fn install_trampoline() {
 
     // SAFETY: writes target identity-mapped phys 0x8000+; the BSP's
     // 1 GiB identity mapping covers the trampoline page as RW.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // CR3: read current PML4 base.
         let cr3: u64;
@@ -164,6 +167,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     per-core MSRs, not core-cluster-shared, so each AP
     //     needs the write itself. SAFETY: CPL=0; per-entry SAFETY
     //     notes apply.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let _ = narf_arch::x86_64::errata::apply_for_current_cpu();
     }
@@ -171,6 +175,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // 2. Load the BSP-built IDT register on this CPU.
     // SAFETY: BSP populated IDT during init_traps; per-CPU IDTR
     // load is required even when entries are shared.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         super::idt::load_idtr_ap();
     }
@@ -179,6 +184,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //    mask the timer LVT until the scheduler asks for it.
     // SAFETY: x2APIC is BSP-confirmed via CPUID; this AP just turns
     // it on for itself.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_interrupts::x86_64::apic::init_ap();
     }
@@ -198,6 +204,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     place + the affinity defaults having flipped.
     // SAFETY: init_ap above already enabled x2APIC + spurious;
     // LAPIC timer programming is per-CPU MSR/MMIO.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let feats = narf_arch::x86_64::Features::probe();
         if feats.tsc_deadline {
@@ -320,6 +327,7 @@ pub unsafe fn start_aps() -> u32 {
         }
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*core::ptr::addr_of_mut!(AP_STACKS))[logical as usize] = stack_top;
         }
@@ -346,6 +354,7 @@ pub unsafe fn start_aps() -> u32 {
         // SAFETY: x2APIC was enabled by init_bsp, so the INIT-IPI MSR
         // write in send_init_ipi targets a valid x2APIC; `logical` is a
         // viable APIC id selected above.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             narf_interrupts::x86_64::apic::send_init_ipi(logical);
         }
@@ -356,6 +365,7 @@ pub unsafe fn start_aps() -> u32 {
         // SAFETY: x2APIC enabled by init_bsp; send_startup_ipi writes the
         // SIPI MSR to a valid x2APIC. `logical` is a viable APIC id and
         // SIPI_VECTOR_PAGE is the page-aligned trampoline vector at 0x8000.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
         }
@@ -366,6 +376,7 @@ pub unsafe fn start_aps() -> u32 {
         // SAFETY: x2APIC enabled by init_bsp; this is the second (retry)
         // SIPI to the same valid APIC id with the same page-aligned
         // trampoline vector, per the Intel-recommended INIT-SIPI-SIPI.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             narf_interrupts::x86_64::apic::send_startup_ipi(logical, SIPI_VECTOR_PAGE);
         }

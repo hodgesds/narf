@@ -415,6 +415,7 @@ fn smoke_fb_console_writes_line_to_expected_scanline() -> TestResult {
     let mut pixels: alloc::vec::Vec<u32> = alloc::vec![0u32; (W * H) as usize];
     // SAFETY: pixels Vec<u32> owns the backing memory; the Framebuffer lives
     // entirely within this test's stack frame and will not outlive `pixels`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let fb = unsafe { Framebuffer::new(pixels.as_mut_ptr(), W, H, W) };
 
     let fg = Pixel32::WHITE;

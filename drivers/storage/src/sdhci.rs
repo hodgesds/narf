@@ -326,6 +326,7 @@ impl Sdhci {
         // SAFETY: `me.mmio` is the identity-mapped SDHCI register window set
         // up above and `identify_sequence` runs exactly once here at
         // bring-up, satisfying its single-call ownership precondition.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let card = unsafe { me.identify_sequence() }?;
         *me.card.lock() = Some(card);
         Ok(me)
@@ -431,6 +432,7 @@ impl Sdhci {
             // SAFETY: identity-mapped MMIO; `REG_RESPONSE_0 + i*4` for
             // `i` in 0..4 covers the four contiguous 32-bit response
             // registers (`R2`/CID/CSD).
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *slot = unsafe { self.mmio.read32(REG_RESPONSE_0 + (i as u64) * 4) };
         }
         r

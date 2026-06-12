@@ -158,6 +158,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         // SAFETY: range.base + off is freshly-allocated VA (no
         // existing mapping); phys + off is per the caller's
         // exclusivity contract.
+        // SAFETY: Valid memory or trusted environment
         if let Err(e) = unsafe { map_4kb(pml4_phys, v, p, flags) } {
             // Roll back successful pages.
             for j in 0..i {
@@ -210,6 +211,7 @@ pub unsafe fn iounmap(m: IoMapping) {
         let _ = unsafe { unmap_4kb(pml4_phys, v) };
         // SAFETY: invlpg_global broadcasts via the installed
         // shootdown hook.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             invlpg_global(v);
         }

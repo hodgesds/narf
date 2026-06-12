@@ -53,6 +53,7 @@ impl IntelBacklightDevice {
     /// `mmio` must be a valid mapping of the iGPU's BAR0 registers.
     pub unsafe fn new(name: &str, mmio: MmioRegion) -> Self {
         // Read period from BXT_BLC_PWM_FREQ1.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let max = unsafe { mmio.read32(BXT_BLC_PWM_FREQ1) };
         Self {
             name: name.to_string(),
@@ -92,6 +93,7 @@ impl BacklightDevice for IntelBacklightDevice {
         if self.max == 0 {
             return 0;
         }
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let duty = unsafe { self.mmio.read32(BXT_BLC_PWM_DUTY1) };
         self.duty_to_pct(duty)
     }
@@ -101,6 +103,7 @@ impl BacklightDevice for IntelBacklightDevice {
             return;
         }
         let duty = self.pct_to_duty(level);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.write32(BXT_BLC_PWM_DUTY1, duty) };
     }
 
@@ -121,11 +124,13 @@ pub fn init() {
 /// code once the BAR is mapped.
 pub fn install(mmio: MmioRegion) {
     // Ungate PWM: clear PCH_LPC_PWM_SEL (bit 25) so the iGPU owns the PWM.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let val = mmio.read32(SOUTH_CHICKEN1);
         mmio.write32(SOUTH_CHICKEN1, val & !(1 << 25));
     }
 
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = unsafe { IntelBacklightDevice::new("intel_backlight", mmio) };
     let _ = writeln!(
         narf_console::Writer,

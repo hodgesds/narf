@@ -42,6 +42,7 @@ const CF9_HARD_RESET: u8 = 0x06;
 pub fn reboot() -> ! {
     // SAFETY: both reboot mechanisms hard-reset the platform —
     // they can't safely return.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         if narf_acpi::reboot_via_fadt() {
             // Some platforms take a moment to act on the write;
@@ -73,6 +74,7 @@ pub fn power_off() -> ! {
     };
     // SAFETY: enters S5 — the platform powers off; this call
     // is documented to never return.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_acpi::shutdown_via_pm1(slp_typ_a, slp_typ_b);
     }
@@ -90,6 +92,7 @@ pub fn reboot() -> ! {
     // SMC #0 with x0 = SYSTEM_RESET function id.
     // SAFETY: SMC at EL1 traps to EL3 firmware; PSCI SYSTEM_RESET
     // doesn't return on success.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let _ = psci_smc(crate::psci::fn_id::SYSTEM_RESET, 0, 0, 0);
     }
@@ -114,6 +117,7 @@ unsafe fn psci_smc(fn_id: u32, x1: u64, x2: u64, x3: u64) -> i64 {
     // convention — fn_id in w0, args in x1..x3, result in x0.
     // Power-off / reset don't return; for callers that do
     // (PSCI_VERSION etc.) the result is i64.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "smc #0",

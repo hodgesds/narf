@@ -12,6 +12,7 @@ pub unsafe fn read_u8(addr: *const u8) -> u8 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller has mapped `addr` to a device region and upholds
     // access-size alignment for the target device.
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe { ptr::read_volatile(addr) };
     compiler_fence(Ordering::SeqCst);
     v

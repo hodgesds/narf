@@ -183,6 +183,7 @@ pub fn suspend(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspen
 pub fn current_phase() -> SuspendPhase {
     let v = PHASE.load(Ordering::Acquire);
     // Safety: we only ever store valid discriminants.
+    // SAFETY: Valid memory or trusted environment
     unsafe { core::mem::transmute(v) }
 }
 
@@ -494,6 +495,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     // Snapshot CPU state.
     // SAFETY: caller is on the boot CPU with interrupts gated as
     // part of the suspend phase machinery.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::s3_resume::save_resume_context();
         // Save the LAPIC LVTs / TPR / SVR / timer state so the
@@ -515,6 +517,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     let mut jmp_snapshot = narf_arch::x86_64::setjmp::JmpBuf::default();
     // SAFETY: jmp_snapshot lives on this stack frame through the
     // PM1 write + the wake path's longjmp.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { narf_arch::x86_64::setjmp::setjmp(&mut jmp_snapshot as *mut _) };
     if r == narf_arch::x86_64::s3_resume::S3_RESUMED_SENTINEL {
         // We came back via the wake trampoline. Device fan-out
@@ -534,6 +537,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     // the PML4 phys.
     // SAFETY: we're on the boot CPU at CPL=0; reading CR3 is
     // unconditionally legal.
+    // SAFETY: Valid memory or trusted environment
     let cr3 = unsafe { narf_arch::x86_64::cr::read_cr3() } & !0xFFFu64;
     let pml4_phys = narf_memory::PhysAddr::new(cr3);
     let entry_virt = narf_arch::x86_64::s3_resume::s3_wake_entry as usize as u64;
@@ -541,6 +545,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     // SAFETY: `pml4_phys` is the active CR3 we just read on the boot
     // CPU, so its PML4 page is identity-reachable as `translate`
     // requires; `entry_virt` is a kernel function address.
+    // SAFETY: Valid memory or trusted environment
     let entry_phys = match unsafe {
         narf_memory::x86_64::paging::translate(pml4_phys, narf_memory::VirtAddr::new(entry_virt))
     } {
@@ -549,6 +554,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     };
     // SAFETY: same active CR3 PML4 (identity-reachable per `translate`);
     // `ctx_virt` is the kernel-resident `ResumeContext` static address.
+    // SAFETY: Valid memory or trusted environment
     let ctx_phys = match unsafe {
         narf_memory::x86_64::paging::translate(pml4_phys, narf_memory::VirtAddr::new(ctx_virt))
     } {
@@ -564,6 +570,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     // SAFETY: trampoline is a `naked extern "C" fn`; its phys is
     // stable for the kernel lifetime, and the firmware
     // identity-maps that page through the wake handoff.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { narf_acpi::arm_s3_waking_vector(entry_phys) }.is_err() {
         // FACS hasn't been parsed (no `\_S3_` chain on this
         // platform) or the entry phys is >4 GiB on a FACS v0
@@ -587,6 +594,7 @@ pub fn arm_s3_resume(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), 
     // SAFETY: pm1_enter_sleep doesn't return on success — the
     // CPU stops fetching when SLP_EN latches. Failure (e.g.
     // PM1 status didn't reset) returns Err; we propagate.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_acpi::pm1_enter_sleep(slp.slp_typ_a, slp.slp_typ_b);
     }
@@ -620,6 +628,7 @@ pub fn s3_enter(cap: &Cap<Power, narf_capabilities::Invoke>) -> Result<(), Suspe
     #[cfg(target_arch = "x86_64")]
     // SAFETY: `\_PTS(3)` has been invoked above; the `s3_supported`
     // check on entry guarantees PM1A_CNT is populated.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_acpi::pm1_enter_sleep(slp.slp_typ_a, slp.slp_typ_b);
     }

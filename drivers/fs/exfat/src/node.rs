@@ -135,6 +135,7 @@ fn read_file_entry(buf: &[u8], offset: usize) -> FileDirectoryEntry {
     // was just read off disk into a heap buffer we own; the type
     // byte at `buf[offset]` was already confirmed to be 0x85 by
     // the caller.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FileDirectoryEntry) }
 }
 
@@ -142,6 +143,7 @@ fn read_stream_entry(buf: &[u8], offset: usize) -> StreamExtensionEntry {
     debug_assert!(offset + DIR_ENTRY_SIZE <= buf.len());
     // SAFETY: §7.6 — 32-byte packed stream extension entry; same
     // packed-layout argument as `read_file_entry`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const StreamExtensionEntry) }
 }
 
@@ -149,6 +151,7 @@ fn read_filename_entry(buf: &[u8], offset: usize) -> FileNameEntry {
     debug_assert!(offset + DIR_ENTRY_SIZE <= buf.len());
     // SAFETY: §7.7 — 32-byte packed file-name entry; same packed-
     // layout argument as `read_file_entry`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FileNameEntry) }
 }
 

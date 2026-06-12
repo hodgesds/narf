@@ -172,6 +172,7 @@ impl NvidiaGpu {
         let bar1 =
             // SAFETY: `bring_up`'s contract gives us exclusive ownership of
             // BAR1; `map_bar` maps that one BAR's window for the same `device`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { map_bar(device, BAR_BAR1) }.map_err(|_| NvidiaGpuError::BarMapFailed)?;
         // BAR3 (FB aperture) is best-effort — some integrated
         // parts don't expose it.

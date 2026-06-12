@@ -403,6 +403,7 @@ pub fn detect() -> Option<PmuBackend> {
         // AMD: check CPUID 0x80000001.ECX bit 23 (PerfCtrExtCore).
         // SAFETY: leaf 0 validated; extended leaf always >= 0x80000001
         // on x86_64 AMD64 silicon.
+        // SAFETY: Valid memory or trusted environment
         let max_ext = unsafe { cpuid(0x8000_0000, 0).0 };
         if max_ext < 0x8000_0001 {
             return None;

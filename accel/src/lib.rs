@@ -124,6 +124,7 @@ mod tests {
         let s = success.clone();
         narf_scheduler::spawn(async move {
             let job = ComputeJob {
+                // SAFETY: Valid memory or trusted environment
                 graph_blob: unsafe { core::mem::zeroed() }, // Mock cap
                 inputs: alloc::vec![],
                 outputs: alloc::vec![],

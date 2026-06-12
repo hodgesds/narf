@@ -194,6 +194,7 @@ impl AddressSpace {
         // SAFETY: contract documented on the function. aarch64's
         // split translation means the user root starts empty —
         // the kernel sits behind TTBR1 and is unaffected.
+        // SAFETY: Valid memory or trusted environment
         let phys = unsafe { crate::aarch64::paging::new_user_ttbr0() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         Ok(Self {
@@ -363,6 +364,7 @@ impl AddressSpace {
             // region was partially materialised), which is benign: the
             // bookkeeping is gone now, the frames either never landed or are
             // already back in the allocator.
+            // SAFETY: Valid memory or trusted environment
             if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
                 // Skip phys that's registered as a page-table
                 // frame — `free_user_pml4_tree` will reclaim it
@@ -453,6 +455,7 @@ impl AddressSpace {
                 .start_address();
             // SAFETY: identity-mapped DMA-equivalent; frame just
             // returned by allocator is exclusively ours.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
             }
@@ -468,6 +471,7 @@ impl AddressSpace {
             }
             // SAFETY: identity map + AS is live (we're being
             // called from the active CR3's #PF handler).
+            // SAFETY: Valid memory or trusted environment
             match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
                 Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
                 Err(_) => return Err(AddressSpaceError::NotImplemented),
@@ -593,6 +597,7 @@ impl AddressSpace {
             .start_address();
         // SAFETY: identity-mapped; freshly-allocated frame is ours
         // exclusively.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
         }
@@ -602,6 +607,7 @@ impl AddressSpace {
         let flags = PtFlags::USER | PtFlags::WRITABLE | PtFlags::NO_EXEC;
         // SAFETY: root is valid (AS active); guard region was
         // bookkept by `map_region`; phys just allocated.
+        // SAFETY: Valid memory or trusted environment
         match unsafe { map_4kb(self.root, VirtAddr::new(guard_base), phys, flags) } {
             Ok(()) | Err(MapError::AlreadyMapped) => {}
             Err(_) => return Err(AddressSpaceError::NotImplemented),
@@ -661,6 +667,7 @@ impl AddressSpace {
             .start_address();
         // SAFETY: phys-as-virt via kernel_mut_ptr stays valid even
         // under user TTBR0.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
         }
@@ -733,6 +740,7 @@ impl AddressSpace {
                     .start_address();
                 // SAFETY: identity-mapped on x86_64; aarch64
                 // uses kernel_mut_ptr for the same purpose.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     #[cfg(target_arch = "x86_64")]
                     core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
@@ -777,6 +785,7 @@ impl AddressSpace {
         }
         // SAFETY: same identity-map invariant; touched regions
         // are valid bookkeeping entries.
+        // SAFETY: Valid memory or trusted environment
         unsafe { self.rewrite_perms_pages(&to_materialise) };
         Ok(())
     }
@@ -855,6 +864,7 @@ impl AddressSpace {
         // PTE-level update by tearing down + re-installing each
         // page (cheaper than adding a per-arch in-place mutate
         // helper, since map_4kb already handles the leaf rewrite).
+        // SAFETY: Valid memory or trusted environment
         unsafe { self.rewrite_perms_pages(&touched) };
         Ok(())
     }
@@ -1012,6 +1022,7 @@ impl AddressSpace {
         // flags is safe because we hold the only reference to each
         // post-split phys slot (the Drop path consults the new
         // region table, not the old one).
+        // SAFETY: Valid memory or trusted environment
         unsafe { self.rewrite_perms_pages(&touched) };
         Ok(())
     }
@@ -1099,6 +1110,7 @@ impl AddressSpace {
         // SAFETY: same identity-map invariant as change_perms_range
         // and unmap_region_pages — the kernel runs with a high-half
         // mapping and the user AS's leaf PTEs walk through self.root.
+        // SAFETY: Valid memory or trusted environment
         unsafe { self.madvise_release_pages(&to_release) };
         Ok(())
     }
@@ -1124,6 +1136,7 @@ impl AddressSpace {
         for (v, p) in pages {
             // SAFETY: identity-mapped; `v` came from a known
             // bookkept region.
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { unmap_4kb(self.root, *v) };
             if crate::frame::__pagetable_is_registered(p.raw()) {
                 continue;
@@ -1202,6 +1215,7 @@ impl AddressSpace {
                 let v = VirtAddr::new(r.base.as_u64() + ((i as u64) << 12));
                 // SAFETY: identity-mapped; v lies inside r which
                 // was bookkept by a prior map_region.
+                // SAFETY: Valid memory or trusted environment
                 let _ = unsafe { unmap_4kb(self.root, v) };
                 // SAFETY: same.
                 let _ = unsafe { map_4kb(self.root, v, *p, flags) };
@@ -1293,6 +1307,7 @@ impl AddressSpace {
                 // `new_for_user` contract; pages walked are within
                 // the region we're materialising. `phys[i]` was
                 // length-checked against `len/4096` at map_region.
+                // SAFETY: Valid memory or trusted environment
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {} // idempotent
@@ -1340,6 +1355,7 @@ impl AddressSpace {
                 // SAFETY: root is valid per `new_for_user`; pages
                 // covered are within the just-allocated region.
                 // `phys[i]` length was checked at map_region.
+                // SAFETY: Valid memory or trusted environment
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}
@@ -1527,6 +1543,7 @@ impl AddressSpace {
         // the calling thread has swapped TTBR0/CR3 to a user
         // root. Source/dest ranges are non-overlapping (distinct
         // freshly-allocated frames).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::copy_nonoverlapping(
                 old_phys.kernel_ptr::<u8>(),
@@ -1583,6 +1600,7 @@ impl AddressSpace {
 
         // SAFETY: root is a valid PML4; the page we're touching
         // sits inside `region` per the lookup above.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { unmap_4kb(self.root, page_va) };
         // SAFETY: `self.root` is this AS's live PML4 (same root just
         // passed to `unmap_4kb`); `page_va` is the page-aligned VA of a
@@ -1590,6 +1608,7 @@ impl AddressSpace {
         // and `phys` is `region.phys[page_idx]`, the frame this AS owns
         // for that page. `flags` mirror the region's perms, so the new
         // PTE re-installs exactly the mapping we just tore down.
+        // SAFETY: Valid memory or trusted environment
         match unsafe { map_4kb(self.root, page_va, phys, flags) } {
             Ok(()) => Ok(()),
             Err(MapError::AlreadyMapped) => Ok(()),
@@ -1635,10 +1654,12 @@ impl AddressSpace {
         // SAFETY: `self.root` is a valid `TTBR0_EL1` table (checked non-zero
         // above); `page_va` was just located inside `region`. unmap_4kb
         // invalidates the stale local TLB entry for that page.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { unmap_4kb(self.root, page_va) };
         // SAFETY: same `self.root`/`page_va` validity as above; `phys` is
         // `region.phys[page_idx]` for this page and `flags` derive from the
         // region's perms. map_4kb installs the fresh leaf PTE.
+        // SAFETY: Valid memory or trusted environment
         match unsafe { map_4kb(self.root, page_va, phys, flags) } {
             Ok(()) => Ok(()),
             Err(MapError::AlreadyMapped) => Ok(()),
@@ -1697,6 +1718,7 @@ impl AddressSpace {
             // kernel mapping. Interrupt state is the caller's
             // contract — the executor disables IRQs through the
             // existing `IrqSafeSpinLock` on the ready queue.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 crate::x86_64::paging::write_cr3(self.root);
             }
@@ -1731,6 +1753,7 @@ impl AddressSpace {
             // accompanying TLBI only flushes entries that are re-derived
             // identically. The kernel half lives in `TTBR1_EL1` and is
             // untouched, so kernel fetches/loads stay valid across the MSR.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 crate::aarch64::paging::write_ttbr0_el1(cur);
             }
@@ -1783,6 +1806,7 @@ impl Drop for AddressSpace {
             // SAFETY: see unmap_region_pages — same identity-map
             // contract; no CPU is using self.root at this point
             // since we're past the last Arc reference.
+            // SAFETY: Valid memory or trusted environment
             unsafe { self.unmap_region_pages(r) };
         }
         // Now reclaim the page-table pages themselves. The

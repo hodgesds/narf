@@ -755,6 +755,7 @@ impl Xhci {
         let ir0 = self.rts_off + IR_BASE_OFF;
         // SAFETY: same. LOW-then-HIGH order on ERDP/ERSTBA — see
         // the matching comment in `bring_up`.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             mmio.write32(ir0 + IR_ERSTSZ, 1);
             mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
@@ -1216,6 +1217,7 @@ impl Xhci {
         //   +12 reserved
         // SAFETY: identity-mapped DMA page — fresh from
         // alloc_coherent, exclusive to this driver.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(erst_phys as *mut u64, er_phys);
             core::ptr::write_volatile((erst_phys + 8) as *mut u32, ER_SEG_TRBS as u32);
@@ -1240,6 +1242,7 @@ impl Xhci {
         // (erstba=0 ⇒ er_size=0), so transfer events never reach
         // the driver and every command times out. Same hazard as
         // CRCR earlier.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             mmio.write32(ir0 + IR_ERSTSZ, 1);
             mmio.write32(ir0 + IR_ERDP_LO, er_phys as u32);
@@ -1285,6 +1288,7 @@ impl Xhci {
             let port_off = op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
             // SAFETY: identity-mapped MMIO; port range bounded by
             // HCSPARAMS1.MaxPorts.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let cur = unsafe { mmio.read32(port_off) };
             // Mask change bits AND PED so the PP-set write doesn't
             // double as an accidental "port enabled" write. PED
@@ -1318,6 +1322,7 @@ impl Xhci {
                     let port_off = op_off + OP_PORTSC_BASE + ((port as u64 - 1) * PORT_REGS_STRIDE);
                     // SAFETY: identity-mapped MMIO; port range
                     // bounded by HCSPARAMS1.MaxPorts.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     let v = unsafe { mmio.read32(port_off) };
                     if v & PORTSC_CCS != 0 {
                         return true;
@@ -1452,6 +1457,7 @@ impl Xhci {
         if msix.is_some() {
             // SAFETY: identity-mapped MMIO; same offset as the
             // earlier write.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 let cur = mmio.read32(ir0 + IR_IMAN);
                 mmio.write32(ir0 + IR_IMAN, cur | IMAN_IE);
@@ -1528,6 +1534,7 @@ impl Xhci {
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| XhciError::NoMemory)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         unsafe { msix.enable() }.map_err(|_| XhciError::NoMemory)?;
@@ -1857,6 +1864,7 @@ impl Xhci {
     fn ring_command_doorbell(&self) {
         // SAFETY: identity-mapped MMIO; doorbell array sized to
         // (MAX_SLOTS + 1) * 4 bytes — entry 0 always exists.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(self.db_off, DB_HC_COMMAND);
         }
@@ -1886,6 +1894,7 @@ impl Xhci {
             // SAFETY: identity-mapped DMA, in-page; only the cycle
             // bit + TC bit need rewriting — the address dwords were
             // planted at init time and don't change.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
             }
@@ -2352,6 +2361,7 @@ impl Xhci {
         // (validated at slot-enable) so `slot_id*8` stays inside the
         // page, giving an aligned, in-range 8-byte slot we exclusively
         // own.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(
                 (dcbaa_phys + (slot_id as u64) * 8) as *mut u64,
@@ -2595,6 +2605,7 @@ impl Xhci {
         let off = self.db_off + (slot_id as u64) * 4;
         // SAFETY: identity-mapped MMIO; slot_id < MaxSlots so the
         // doorbell array entry exists.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(off, dci);
         }
@@ -2776,6 +2787,7 @@ impl Xhci {
             // SAFETY: `data_phys` is this slot's identity-mapped DMA
             // page; `i < copy ≤ xferred ≤ w_length ≤ 4096` keeps the
             // byte read inside that page, aligned for a `u8`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *slot = unsafe { core::ptr::read_volatile((data_phys + i as u64) as *const u8) };
         }
         Ok(xferred)
@@ -3068,6 +3080,7 @@ impl Xhci {
         // state, breaking later control transfers.
         // SAFETY: identity-mapped DCBAA[slot_id] points at the
         // slot's device context.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let dev_ctx_phys = unsafe {
             let dcbaa_phys = self.dcbaa.phys_addr().raw();
             core::ptr::read_volatile((dcbaa_phys + (slot_id as u64) * 8) as *const u64)
@@ -3078,6 +3091,7 @@ impl Xhci {
         // and was zeroed by the page-zero above.
         // SAFETY: identity-mapped DMA on both ends; both regions
         // owned and 4 KiB.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for off in 0..4u64 {
                 let v = core::ptr::read_volatile((dev_ctx_phys + off * 4) as *const u32);
@@ -3334,6 +3348,7 @@ impl Xhci {
             // SAFETY: `phys` is this endpoint's identity-mapped DMA
             // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
             // read inside that page, aligned for a `u8`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         Ok(xferred)
@@ -3353,6 +3368,7 @@ impl Xhci {
         // be confused with a 0-length response from the device.
         // SAFETY: identity-mapped DMA page; bounds-checked by the
         // upstream `out.len() > 4096` guard.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_bytes(phys as *mut u8, 0, out.len());
         }
@@ -3383,6 +3399,7 @@ impl Xhci {
             // SAFETY: `phys` is this endpoint's identity-mapped DMA
             // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
             // read inside that page, aligned for a `u8`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         Ok(xferred)
@@ -3476,6 +3493,7 @@ impl Xhci {
             // SAFETY: `phys` is this endpoint's identity-mapped DMA
             // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
             // read inside that page, aligned for a `u8`.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
         }
         // Re-arm for the next report.
@@ -3833,6 +3851,7 @@ fn xhci_isr() {
     let ir0 = xhci.rts_off + IR_BASE_OFF;
     // SAFETY: identity-mapped MMIO; xhci stays alive for the
     // duration of the lock guard.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let cur = xhci.mmio.read32(ir0 + IR_IMAN);
         // Mask to (IE | IP) to W1C the IP bit while keeping IE set.

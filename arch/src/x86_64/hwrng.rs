@@ -38,6 +38,7 @@ pub unsafe fn try_rdseed_u32() -> Option<u32> {
     // SAFETY: RDSEED is defined on leaf 7 EBX:18 parts; absent on older
     // silicon it #UD — callers must gate on `Features::rdseed`.  We
     // capture CF via SETC into a byte register.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "rdseed {val:e}",

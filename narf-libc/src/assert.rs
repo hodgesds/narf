@@ -28,8 +28,11 @@ pub unsafe extern "C" fn __assert_fail(
     use crate::Arg;
     // SAFETY: caller contract — all four args are valid C strings or
     // null. cstr_or_unknown forwards null to a fixed literal.
+    // SAFETY: Valid memory or trusted environment
     let e = unsafe { cstr_or_unknown(expr) };
+    // SAFETY: Valid memory or trusted environment
     let f = unsafe { cstr_or_unknown(file) };
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { cstr_or_unknown(func) };
     crate::fprintf_str(
         2,

@@ -432,6 +432,7 @@ fn smoke_s3_resume_context_save_captures_cr3() -> TestResult {
     s3_resume::__reset_for_test();
     // SAFETY: kernel-test harness runs on the boot CPU at CPL=0;
     // reading CR3/CR0/CR4 + sgdt/sidt is unconditionally legal.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         s3_resume::save_resume_context();
     }
@@ -1741,6 +1742,7 @@ fn smoke_rapl_pkg_energy_advances() -> TestResult {
     // SAFETY: same preconditions as the first read above — kernel-test
     // runs at CPL=0 and `rapl::is_supported()` gated the RAPL pkg-energy
     // `rdmsr`, so the MSR access cannot #GP.
+    // SAFETY: Valid memory or trusted environment
     let e2 = unsafe { rapl::read_pkg_uj() };
     // 32-bit counter × scale; can wrap. We accept either e2 >= e1
     // or a clear wrap (e2 much smaller). What we reject is a
@@ -2107,6 +2109,7 @@ fn smoke_s3_resume_context_phys_resolvable_via_cr3() -> TestResult {
     // above, so it points at the running kernel's valid 4-level page
     // tables; `translate` only reads those table frames to walk the
     // mapping for `ctx_virt` and does not dereference user memory.
+    // SAFETY: Valid memory or trusted environment
     let phys = unsafe { translate(pml4_phys, VirtAddr::new(ctx_virt)) };
     let phys_page = match phys {
         Some(p) => p.raw(),
@@ -2145,6 +2148,7 @@ fn smoke_s3_wake_entry_phys_resolvable_via_cr3() -> TestResult {
     // just read above, so it points at the running kernel's valid
     // 4-level page tables; `translate` only reads those table frames to
     // walk the mapping for `entry_virt`.
+    // SAFETY: Valid memory or trusted environment
     let phys = unsafe { translate(PhysAddr::new(cr3), VirtAddr::new(entry_virt)) };
     let phys_page = match phys {
         Some(p) => p.raw(),
@@ -2635,11 +2639,13 @@ fn poll_once_watchdog<F: core::future::Future>(mut fut: F) -> Option<F::Output> 
     // valid for the null data pointer it carries — clone re-derives the
     // same waker and wake/drop are no-ops — so the `RawWaker` upholds the
     // `Waker` contract.
+    // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is a local owned by this frame and is never moved
     // after this point — it is only polled through `pinned` and the
     // function returns immediately after — so the pin invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

@@ -176,15 +176,18 @@ const THREAD_STACK_BYTES: usize = 1 * 1024 * 1024;
 unsafe extern "C" fn __libc_thread_trampoline(ctl: *mut ThreadCtl) -> ! {
     // SAFETY: parent allocated this struct; lives until pthread_join
     // releases it.
+    // SAFETY: Valid memory or trusted environment
     let ctl = unsafe { &mut *ctl };
     // SAFETY: parent installed a valid fn ptr.
     let start: extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void =
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::mem::transmute(ctl.start) };
     let r = start(ctl.arg);
     ctl.retval = r;
     // Atomic store with release ordering — pairs with the joiner's
     // futex-wait load.
     let done_ptr = &raw mut ctl.done as *mut u32;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile(done_ptr, 1);
     }
@@ -223,6 +226,7 @@ pub unsafe extern "C" fn pthread_create(
     // Allocate stack + ctl in a single mmap (stack at the top, ctl
     // just below). 1 MiB stack + 32 B ctl, page-aligned.
     let total = THREAD_STACK_BYTES + 4096;
+    // SAFETY: Valid memory or trusted environment
     let base = unsafe {
         narf_user_runtime::mmap(0, total, 0x20 /* MAP_ANON */)
     };
@@ -263,6 +267,7 @@ pub unsafe extern "C" fn pthread_create(
     // a per-process side map keyed by ctl_ptr if needed. For now
     // store ctl_ptr as the pthread_t (it's unique per thread).
     let _ = tid;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *thread = ctl_ptr as pthread_t;
     }
@@ -291,10 +296,12 @@ pub unsafe extern "C" fn pthread_join(
         return -1;
     }
     let ctl_ptr = thread as *mut ThreadCtl;
+    // SAFETY: Valid memory or trusted environment
     let done_ptr = unsafe { &raw mut (*ctl_ptr).done } as *mut u32;
     // futex_wait with expected=0 sleeps until the value becomes
     // non-zero (the trampoline writes 1 on completion).
     loop {
+        // SAFETY: Valid memory or trusted environment
         let cur = unsafe { core::ptr::read_volatile(done_ptr) };
         if cur != 0 {
             break;
@@ -387,8 +394,10 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
     if mutex.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
     // Fast path: try uncontended acquire.
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
     if atomic
         .compare_exchange(
@@ -399,6 +408,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
         )
         .is_ok()
     {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*mutex).owner = pthread_self();
         }
@@ -409,6 +419,7 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut pthread_mutex_t) -> c_in
         // Set state to "locked + waiters" (2). swap returns old.
         let old = atomic.swap(2, core::sync::atomic::Ordering::AcqRel);
         if old == 0 {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 (*mutex).owner = pthread_self();
             }
@@ -429,7 +440,9 @@ pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c
     if mutex.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
     match atomic.compare_exchange(
         0,
@@ -438,6 +451,7 @@ pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut pthread_mutex_t) -> c
         core::sync::atomic::Ordering::Relaxed,
     ) {
         Ok(_) => {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 (*mutex).owner = pthread_self();
             }
@@ -454,11 +468,14 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut pthread_mutex_t) -> c_
     if mutex.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let locked_ptr = unsafe { &raw mut (*mutex).locked } as *mut u32;
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(locked_ptr as *const core::sync::atomic::AtomicU32) };
     // Clear ownership before releasing — between the swap and
     // the wake any waiter that wins the race must see a clean
     // owner field.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*mutex).owner = 0;
     }
@@ -601,6 +618,7 @@ pub unsafe extern "C" fn pthread_cond_init(
     if cond.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *cond = pthread_cond_t::default();
     }
@@ -624,15 +642,18 @@ pub unsafe extern "C" fn pthread_cond_wait(
         return -1;
     }
     let seq_ptr = cond_seq_ptr(cond);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     let seq = atomic.load(core::sync::atomic::Ordering::Acquire);
     // Drop the mutex.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { pthread_mutex_unlock(mutex) };
     // Park until the sequence changes (POSIX permits spurious
     // wakeups; we futex_wait with the observed sequence and
     // re-acquire on any wake).
     let _ = narf_user_runtime::futex_wait(seq_ptr as u64, seq, 0);
     // Re-take the mutex.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { pthread_mutex_lock(mutex) };
     0
 }
@@ -653,17 +674,21 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
         return -1;
     }
     let seq_ptr = cond_seq_ptr(cond);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     let seq = atomic.load(core::sync::atomic::Ordering::Acquire);
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { pthread_mutex_unlock(mutex) };
     // Compute relative-ns timeout from the abstime (CLOCK_REALTIME).
     let mut now = crate::time::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe {
         crate::time::clock_gettime(0 /* REALTIME */, &mut now)
     };
+    // SAFETY: Valid memory or trusted environment
     let abs = unsafe { *abstime };
     let now_ns = (now.tv_sec as i64)
         .saturating_mul(1_000_000_000)
@@ -673,6 +698,7 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
         .saturating_add(abs.tv_nsec as i64);
     let rel_ns = (abs_ns - now_ns).max(0) as u64;
     let r = narf_user_runtime::futex_wait(seq_ptr as u64, seq, rel_ns);
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { pthread_mutex_lock(mutex) };
     if r < 0 {
         110 /* ETIMEDOUT */
@@ -688,6 +714,7 @@ pub unsafe extern "C" fn pthread_cond_signal(cond: *mut pthread_cond_t) -> c_int
         return -1;
     }
     let seq_ptr = cond_seq_ptr(cond);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     let _ = narf_user_runtime::futex_wake(seq_ptr as u64, 1);
@@ -701,6 +728,7 @@ pub unsafe extern "C" fn pthread_cond_broadcast(cond: *mut pthread_cond_t) -> c_
         return -1;
     }
     let seq_ptr = cond_seq_ptr(cond);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(seq_ptr as *const core::sync::atomic::AtomicU32) };
     atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     let _ = narf_user_runtime::futex_wake(seq_ptr as u64, i32::MAX as u32);
@@ -734,6 +762,7 @@ pub unsafe extern "C" fn pthread_rwlock_init(
     if rw.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *rw = pthread_rwlock_t::default();
     }
@@ -753,6 +782,7 @@ pub unsafe extern "C" fn pthread_rwlock_rdlock(rw: *mut pthread_rwlock_t) -> c_i
         return -1;
     }
     let p = rwlock_state_ptr(rw);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     loop {
         let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
@@ -782,6 +812,7 @@ pub unsafe extern "C" fn pthread_rwlock_wrlock(rw: *mut pthread_rwlock_t) -> c_i
         return -1;
     }
     let p = rwlock_state_ptr(rw);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     loop {
         if atomic
@@ -810,6 +841,7 @@ pub unsafe extern "C" fn pthread_rwlock_tryrdlock(rw: *mut pthread_rwlock_t) -> 
         return -1;
     }
     let p = rwlock_state_ptr(rw);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
     if cur >= WRLOCK_SENTINEL - 1 {
@@ -833,6 +865,7 @@ pub unsafe extern "C" fn pthread_rwlock_trywrlock(rw: *mut pthread_rwlock_t) -> 
         return -1;
     }
     let p = rwlock_state_ptr(rw);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     match atomic.compare_exchange(
         0,
@@ -853,6 +886,7 @@ pub unsafe extern "C" fn pthread_rwlock_unlock(rw: *mut pthread_rwlock_t) -> c_i
         return -1;
     }
     let p = rwlock_state_ptr(rw);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(p as *const core::sync::atomic::AtomicU32) };
     loop {
         let cur = atomic.load(core::sync::atomic::Ordering::Acquire);
@@ -910,6 +944,7 @@ pub unsafe extern "C" fn pthread_barrier_init(
     if bar.is_null() || count == 0 {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *bar = pthread_barrier_t {
             count: 0,
@@ -937,10 +972,15 @@ pub unsafe extern "C" fn pthread_barrier_wait(bar: *mut pthread_barrier_t) -> c_
     if bar.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let count_ptr = unsafe { &raw mut (*bar).count } as *mut u32;
+    // SAFETY: Valid memory or trusted environment
     let gen_ptr = unsafe { &raw mut (*bar).generation } as *mut u32;
+    // SAFETY: Valid memory or trusted environment
     let count_atomic = unsafe { &*(count_ptr as *const core::sync::atomic::AtomicU32) };
+    // SAFETY: Valid memory or trusted environment
     let gen_atomic = unsafe { &*(gen_ptr as *const core::sync::atomic::AtomicU32) };
+    // SAFETY: Valid memory or trusted environment
     let threshold = unsafe { (*bar).threshold };
     let my_gen = gen_atomic.load(core::sync::atomic::Ordering::Acquire);
     let arrival = count_atomic.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;

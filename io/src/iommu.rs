@@ -199,6 +199,7 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
         // belongs to an AMD-Vi unit. IOMMU MMIO is identity-mapped
         // (HPET-style); `read_amd_caps` validates the read and
         // returns `None` if the BIOS-reported base is dead (0/!0).
+        // SAFETY: Valid memory or trusted environment
         IommuVendor::AmdVi => unsafe { read_amd_caps(mmio_base) },
         // SAFETY: `mmio_base` is `buf[0].register_base` copied from
         // the DMAR table parsed by `narf_acpi`, reached only on the
@@ -207,6 +208,7 @@ pub fn init() -> Result<IommuMode, IommuInitError> {
         // register window is identity-mapped MMIO; `read_vtd_caps`
         // validates the version register and returns `None` on a
         // dead window.
+        // SAFETY: Valid memory or trusted environment
         IommuVendor::IntelVtd => unsafe { read_vtd_caps(mmio_base) },
         IommuVendor::None => unreachable!(),
     };
@@ -327,6 +329,7 @@ unsafe fn read_amd_caps(base: u64) -> Option<IommuCaps> {
     // SAFETY: caller-asserted identity-mapped MMIO. EFR is always
     // present on any AMD-Vi unit since rev 1.0 (the bit is
     // architectural).
+    // SAFETY: Valid memory or trusted environment
     let efr = unsafe { read_u64(base + AMD_REG_EFR) };
     if efr == 0 || efr == u64::MAX {
         return None;

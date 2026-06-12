@@ -178,6 +178,7 @@ pub fn prepare_i2s0_tx() -> Result<(), PcmError> {
 fn program_dma_registers(dev: &AcpDevice, ring_phys: u64, ring_bytes: u32) {
     // SAFETY: BAR0 mapped + exclusively owned by the singleton
     // ACP controller for its lifetime.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         // Ring buffer base — phys. Linux writes low then high; the
         // engine latches on the size write.

@@ -405,6 +405,7 @@ impl MipiHciI3cMaster {
         // HCI BAR 0 region mapped by `map_bar(&device, 0)` in `probe`. This
         // `MipiHciI3cMaster` owns that BAR exclusively, so the 32-bit
         // register read is in-bounds, aligned, and side-effect-free.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.read32(reg) }
     }
 
@@ -414,6 +415,7 @@ impl MipiHciI3cMaster {
         // offsets defined in this module, all within BAR 0 mapped in `probe`.
         // This driver owns the device exclusively, so the aligned in-bounds
         // 32-bit register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.write32(reg, val) }
     }
 
@@ -423,6 +425,7 @@ impl MipiHciI3cMaster {
         // `self.pio_offset` is the PIO sub-block base read from PIO_SECTION
         // in `probe`; their sum stays within the BAR 0 region. The driver
         // owns the device exclusively, so this aligned register read is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.read32(self.pio_offset + reg) }
     }
 
@@ -432,6 +435,7 @@ impl MipiHciI3cMaster {
         // the PIO sub-block base `self.pio_offset`; the sum stays within BAR 0
         // mapped in `probe`. The driver owns the device exclusively, so this
         // aligned in-bounds register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { self.mmio.write32(self.pio_offset + reg, val) }
     }
 
@@ -528,6 +532,7 @@ impl MipiHciI3cMaster {
         // (checked above); `rhs_offset + 0x04` is the 4-byte-aligned RH0 offset
         // word within BAR 0. The driver owns the device exclusively, so this
         // aligned register read is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let rh_offset_val = unsafe { self.mmio.read32(rhs_offset + 0x04) };
         let rh_base = rh_offset_val as u64;
 
@@ -541,6 +546,7 @@ impl MipiHciI3cMaster {
         // 4-byte-aligned per-ring-header register offsets (all <= 0x4C) and so
         // lies within BAR 0 mapped in `probe`. The driver owns the device
         // exclusively, so each aligned in-bounds 32-bit register write is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio
                 .write32(rh_base + RH_CMD_RING_BASE_LO, cr_phys as u32);
@@ -711,6 +717,7 @@ pub fn probe(
     // SAFETY: PIO_SECTION (0x3C) is a fixed 4-byte-aligned global register
     // offset within BAR 0, which `map_bar` just mapped above; we own the
     // device exclusively here, so the aligned register read is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let pio_section_val = unsafe { mmio.read32(PIO_SECTION) };
     let pio_offset = (pio_section_val & 0xFFFF) as u64;
 

@@ -360,15 +360,18 @@ fn smoke_fb_cmd_ring_round_trip() -> TestResult {
     // `MaybeUninit<DrawCmd>` slots — every field accepts an all-zero bit
     // pattern (atomics zero-init, `MaybeUninit` holds any bits), so
     // `zeroed()` is a valid value; `init_in` below sets up the header.
+    // SAFETY: Valid memory or trusted environment
     let mut ring: Box<DrawRing> = Box::new(unsafe { core::mem::zeroed() });
     // SAFETY: zero-init via mem::zeroed is exactly what init_in
     // expects (sets head/tail/closed to 0).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         cmd_ring::init_in(&mut *ring as *mut DrawRing);
     }
 
     // SAFETY: SPSC contract upheld; only one producer + one
     // consumer constructed.
+    // SAFETY: Valid memory or trusted environment
     let (mut prod, mut cons) = unsafe { cmd_ring::split(&mut *ring as *mut DrawRing) };
 
     // Enqueue a Fill at (4,4, 2x2) with a recognisable pixel.
@@ -416,6 +419,7 @@ fn smoke_fb_client_drives_drain_to_pixel() -> TestResult {
 
     // SAFETY: SPSC contract — we keep the producer + consumer
     // exclusive to this test scope.
+    // SAFETY: Valid memory or trusted environment
     let (_ring, producer, mut consumer) = unsafe { allocate_singleton_ring() };
     let mut client = FbClient::new(producer);
 
@@ -620,6 +624,7 @@ fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
         // SAFETY: SPSC contract — kernel side only constructs the
         // producer here; the consumer was retained by the registry
         // when attach() ran.
+        // SAFETY: Valid memory or trusted environment
         unsafe { SharedProducer::from_raw(ring_ptr) };
     let cmd = DrawCmd::fill(Rect::new(0, 0, 2, 2), Pixel32::rgb(0xAA, 0xBB, 0xCC).raw());
     if cmd_ring::try_send(&mut producer, cmd).is_err() {

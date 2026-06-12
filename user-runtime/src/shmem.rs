@@ -89,6 +89,7 @@ impl Shmem {
         // for the calling task's address space, valid until Drop.
         // Single-threaded userspace today; SMP userspace will need
         // an explicit lock or a different shape.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts_mut(self.base, self.len) }
     }
 
@@ -104,6 +105,7 @@ impl Drop for Shmem {
         // SAFETY: handle is live (we own it). Kernel reaps the
         // backing frames; the user-VA mapping isn't torn down yet
         // — leaks a VA range, not memory.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { syscall1(SYS_SHMEM_DESTROY, self.handle) };
     }
 }

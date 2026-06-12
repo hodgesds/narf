@@ -109,6 +109,7 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     }
     // SAFETY: raw_waker() returns a vtable whose functions are all no-ops;
     // the waker never dereferences its data pointer.
+    // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: fut is a local owned future that is not moved after this point.

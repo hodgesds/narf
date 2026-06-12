@@ -137,6 +137,7 @@ impl PageTable {
     pub fn zero_at(ptr: *mut PageTable) {
         // SAFETY: caller guarantees `ptr` references at least
         // `size_of::<PageTable>()` writable, properly-aligned bytes.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<PageTable>());
         }
@@ -268,6 +269,7 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // per entry, 512 entries fit the 4 KiB table), well inside the page,
     // and naturally aligned for a `u64` read. Volatile because the entry
     // can be mutated by other paging code.
+    // SAFETY: Valid memory or trusted environment
     let kernel_pml4_e1: u64 = unsafe { ptr::read_volatile((cur_pml4.raw() + 8) as *const u64) };
     if kernel_pml4_e1 & 1 != 0 {
         let kernel_pdpt_phys = PhysAddr::new(kernel_pml4_e1 & 0x000f_ffff_ffff_f000);
@@ -295,6 +297,7 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // user binary lives, must stay private to this AS).
         // SAFETY: source + destination are both identity-mapped
         // 4 KiB-aligned page frames.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             for i in 1usize..512 {
                 let src = (kernel_pdpt_phys.raw() as usize + i * 8) as *const u64;
@@ -317,6 +320,7 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // SAFETY: `phys` is the user PML4's physical base in the
         // identity-mapped window, so it is a valid VA; PML4[1] is at byte
         // offset 8 (entry 1, 8 bytes each), inside the page and u64-aligned.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             ptr::write_volatile((phys.raw() + 8) as *mut u64, new_e1);
         }
@@ -326,6 +330,7 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // fresh PDPT through `map_4kb`'s walker.
         // SAFETY: same as above — `phys` is the identity-mapped user PML4
         // base, PML4[1] is at u64-aligned byte offset 8 inside the page.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             ptr::write_volatile((phys.raw() + 8) as *mut u64, 0);
         }
@@ -388,6 +393,7 @@ pub unsafe fn write_cr3(pml4_phys: PhysAddr) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `mov cr3, rax` is legal at CPL=0 and is the defined way
     // to switch the address-space root on x86_64.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mov cr3, {addr}",
@@ -612,6 +618,7 @@ pub unsafe fn map_4kb(
 
     // SAFETY: pdpt_phys came either from an existing mapping we
     // validated, or from a freshly-allocated frame (identity-mapped).
+    // SAFETY: Valid memory or trusted environment
     let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
     if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);

@@ -160,6 +160,7 @@ where
         // SAFETY: `alloc_coherent(payload.len())` returned `virt`, a valid
         // writable buffer of exactly `payload.len()` bytes; `payload` is a
         // distinct, non-overlapping firmware-blob slice of the same length.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), virt, payload.len());
         }
@@ -175,6 +176,7 @@ where
         // SAFETY: `alloc_coherent(payload.len())` returned `virt`, a valid
         // writable buffer of exactly `payload.len()` bytes; `payload` is a
         // distinct, non-overlapping firmware-blob slice of the same length.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), virt, payload.len());
         }
@@ -256,6 +258,7 @@ where
     // SAFETY: `alloc_coherent(iml_bytes.len())` returned `iml_virt`, a valid
     // writable buffer of exactly `iml_bytes.len()` bytes; `iml_bytes` is a
     // distinct, non-overlapping firmware-blob slice of the same length.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         core::ptr::copy_nonoverlapping(iml_bytes.as_ptr(), iml_virt, iml_bytes.len());
     }
@@ -279,6 +282,7 @@ where
         // writable buffer; `sec.payload` is a distinct, non-overlapping
         // firmware-blob slice and `entry.byte_count == sec.payload.len()`, so
         // the copy stays within the allocation.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::copy_nonoverlapping(sec.payload.as_ptr(), virt, sec.payload.len());
         }
@@ -289,6 +293,7 @@ where
     // SAFETY: `table_virt` came from `alloc_coherent(table_bytes.max(64))`, so
     // it is a valid writable buffer of at least `table_bytes` bytes; `table` is
     // a live, non-overlapping `Vec` whose byte length is exactly `table_bytes`.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let src = table.as_ptr() as *const u8;
         core::ptr::copy_nonoverlapping(src, table_virt, table_bytes);
@@ -319,6 +324,7 @@ where
     // SAFETY: `ctxt_virt` came from `alloc_coherent(size_of::<CtxtInfoV2>())`,
     // a valid writable buffer of exactly that many bytes; `ctxt` is a live,
     // non-overlapping stack value of the same type whose bytes we copy in full.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         let src = &ctxt as *const CtxtInfoV2 as *const u8;
         core::ptr::copy_nonoverlapping(src, ctxt_virt, core::mem::size_of::<CtxtInfoV2>());
@@ -428,6 +434,7 @@ pub mod tests {
             let aligned = (size + 63) & !63;
             let remaining = self.buf.len() - self.offset;
             let actual = aligned.min(remaining);
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let ptr = unsafe { self.buf.as_mut_ptr().add(self.offset) };
             let phys = self.base_phys + self.offset as u64;
             self.offset += actual;
@@ -663,6 +670,7 @@ pub mod tests {
             return TestResult::Fail("DmaAllocatorImpl returned zero phys address");
         }
         // Verify we can write into the buffer without fault.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             vptr.write_bytes(0xAB, 4096);
         }

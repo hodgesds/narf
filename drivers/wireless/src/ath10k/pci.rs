@@ -145,6 +145,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: bus dispatch hands us exclusive BusDeviceCap authority
     // for this device's cfg + BARs for the lifetime of this call.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let result = unsafe { bring_up(&device, hw_rev) };
     let dev = match result {
         Ok(d) => d,
@@ -210,6 +211,7 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
     let chip_id_off = soc_chip_id_address(hw_rev);
     // SAFETY: identity-mapped MMIO; `chip_id_off` < 0x100, well inside
     // BAR0 even on the smallest chip.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let pre_reset_chip_id = unsafe { mmio_bar0.read32(chip_id_off) };
     if pre_reset_chip_id == READ_GONE_U32 {
         return Err(ProbeError::DeviceGone);
@@ -255,6 +257,7 @@ pub unsafe fn bring_up(device: &BusDevice, hw_rev: HwRev) -> Result<Ath10kDevice
 pub unsafe fn soft_reset(mmio: &MmioRegion) -> Result<(), ProbeError> {
     // SAFETY: `SOC_GLOBAL_RESET_ADDRESS = 0x0008` < BAR0 size on
     // every ath10k part.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         mmio.write32(SOC_GLOBAL_RESET_ADDRESS, SOC_GLOBAL_RESET_PULSE);
     }

@@ -19,6 +19,7 @@ fn make_block_request(op: crate::BlockOp, user_tag: u64) -> crate::BlockRequest 
     // slot is built here with `type_tag = CapKind::DmaBuffer` and `rights =
     // Read::BITS`, which exactly match `Cap::<DmaBuffer, Read>`, so the
     // type/rights coherence invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let cap = unsafe {
         Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
             1,

@@ -23,11 +23,15 @@
 
 extern crate alloc;
 
+pub mod applesmc;
 pub mod coretemp;
 pub mod dell_smm;
+pub mod it87;
+pub mod jc42;
 pub mod k10temp;
 pub mod nct6775;
 pub mod registry;
+#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 
 mod tests;
@@ -71,9 +75,18 @@ pub fn register_initcalls() {
         nct6775::register_isa_driver();
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "hwmon-it87", || {
+        it87::register_isa_driver();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "hwmon-coretemp", || {
         #[cfg(target_arch = "x86_64")]
         coretemp::register_msr_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "hwmon-applesmc", || {
+        #[cfg(target_arch = "x86_64")]
+        applesmc::register_smc_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "hwmon-dell-smm", || {
@@ -81,7 +94,12 @@ pub fn register_initcalls() {
         dell_smm::register_smm_driver();
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "hwmon-jc42", || {
+        jc42::register_initcalls();
+        InitResult::Ok
+    });
     // Stage::Late: sysfs bridge runs after all Stage::Subsys driver probes.
+    #[cfg(feature = "linux-compat")]
     narf_init::register(Stage::Late, "hwmon-sysfs-bridge", || {
         sysfs_bridge::populate_hwmon_class();
         InitResult::Ok

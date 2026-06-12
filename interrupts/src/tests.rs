@@ -117,6 +117,7 @@ fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
     WOKEN.store(false, Ordering::Release);
     // SAFETY: vtable functions are non-null; we're constructing a
     // local Waker for a one-shot poll.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
@@ -125,6 +126,7 @@ fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
     // SAFETY: `fut` lives on this stack frame and is never moved
     // after this point — we only poll it through `pinned` — so the
     // pinning invariant required by `Pin::new_unchecked` holds.
+    // SAFETY: Valid memory or trusted environment
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
     if !matches!(pinned.as_mut().poll(&mut cx), Poll::Pending) {
         return TestResult::Fail("wait_for_irq returned Ready before any IRQ");
@@ -443,6 +445,7 @@ fn smoke_dispatch_in_irq_observed_inside_handler() -> TestResult {
     // instrumentation under test.
     // SAFETY: handler installed above; vector is unallocated
     // outside this test.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("int {v}", v = const TEST_VEC, options(nomem, nostack));
     }
@@ -673,6 +676,7 @@ fn smoke_dispatch_clear_waker_prevents_wake() -> TestResult {
     WOKEN.store(false, Ordering::Release);
     // SAFETY: `VTABLE`'s clone/wake/drop fns are all valid for the
     // null data pointer they ignore, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let w_clone = w.clone();
     crate::dispatch::set_waker(SCRATCH_VEC_DROP_CLEARS, w);
@@ -719,6 +723,7 @@ fn smoke_dispatch_clear_waker_targets_only_own() -> TestResult {
 
     // SAFETY: VTABLE_A/B's fns ignore the data pointer and are valid
     // for the null pointer passed, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w_a = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE_A)) };
     // SAFETY: see above — VTABLE_B is a valid no-data waker vtable.
     let w_b = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE_B)) };
@@ -854,12 +859,14 @@ fn smoke_wait_for_irq_baseline_ignores_prior_fires() -> TestResult {
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
     // SAFETY: VTABLE's fns ignore the data pointer and are valid for
     // the null pointer passed, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
     let mut fut = crate::wait_for_irq(SCRATCH_VEC_BASELINE);
     // SAFETY: `fut` is a local that is never moved while `pinned`
     // borrows it, so the Pin invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Pending => {
@@ -867,6 +874,7 @@ fn smoke_wait_for_irq_baseline_ignores_prior_fires() -> TestResult {
             crate::on_irq(SCRATCH_VEC_BASELINE);
             // SAFETY: `fut` is still pinned in place on this frame and
             // has not moved since the previous poll.
+            // SAFETY: Valid memory or trusted environment
             let pinned = unsafe { Pin::new_unchecked(&mut fut) };
             match pinned.poll(&mut cx) {
                 Poll::Ready(_) => TestResult::Pass,
@@ -906,6 +914,7 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
     WOKEN.store(false, Ordering::Release);
     // SAFETY: VTABLE's fns ignore the data pointer and are valid for
     // the null pointer passed, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
@@ -913,6 +922,7 @@ fn smoke_wait_for_irq_drop_clears_waker() -> TestResult {
         let mut fut = crate::wait_for_irq(120);
         // SAFETY: `fut` is a local in this block that is never moved
         // while `pinned` borrows it, so the Pin invariant holds.
+        // SAFETY: Valid memory or trusted environment
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         let _ = pinned.poll(&mut cx); // installs waker
                                       // fut drops here → WaitForIrq::Drop clears the slot.
@@ -1116,6 +1126,7 @@ fn smoke_wait_for_irq_until_succeeds_before_deadline() -> TestResult {
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
     // SAFETY: VTABLE's fns ignore the data pointer and are valid for
     // the null pointer passed, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
@@ -1123,6 +1134,7 @@ fn smoke_wait_for_irq_until_succeeds_before_deadline() -> TestResult {
     let mut fut = crate::wait_for_irq_until(SCRATCH_VEC_TIMEOUT_A, deadline);
     // SAFETY: `fut` is a local that is not moved while `pinned`
     // borrows it, so the Pin invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
         return TestResult::Fail("first poll should be Pending");
@@ -1158,6 +1170,7 @@ fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
     // SAFETY: VTABLE's fns ignore the data pointer and are valid for
     // the null pointer passed, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
@@ -1168,6 +1181,7 @@ fn smoke_wait_for_irq_until_times_out_when_no_irq() -> TestResult {
     let mut fut = crate::wait_for_irq_until(SCRATCH_VEC_TIMEOUT_B, deadline);
     // SAFETY: `fut` is a local that is not moved while `pinned`
     // borrows it, so the Pin invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     // The timeout future may or may not return Elapsed on the first
     // poll depending on how `after_ns(0)` rounds; loop a few polls
@@ -1208,6 +1222,7 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
         RawWakerVTable::new(noop_clone, noop_wake, noop_wake, noop_drop);
     // SAFETY: VTABLE's fns ignore the data pointer and are valid for
     // the null pointer passed, satisfying the RawWaker contract.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
     let mut cx = Context::from_waker(&w);
 
@@ -1215,6 +1230,7 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
     let mut fut1 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
     // SAFETY: `fut1` is a local that is not moved while `pinned`
     // borrows it, so the Pin invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut1) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
         return TestResult::Fail("first wait first poll should be Pending");
@@ -1232,6 +1248,7 @@ fn smoke_wait_for_irq_can_be_used_sequentially() -> TestResult {
     let mut fut2 = crate::wait_for_irq(SCRATCH_VEC_WAIT_RETRY);
     // SAFETY: `fut2` is a local that is not moved while `pinned`
     // borrows it, so the Pin invariant holds.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut2) };
     if !matches!(pinned.poll(&mut cx), Poll::Pending) {
         return TestResult::Fail(
@@ -1303,6 +1320,7 @@ fn smoke_ipi_handler_bumps_counters_on_self() -> TestResult {
     let ev_before = ever_received(cpu);
     // SAFETY: called from kernel-test context at CPL=0 with no
     // pending VA — handler skips the INVLPG path.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         on_shootdown_irq();
     }

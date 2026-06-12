@@ -367,6 +367,7 @@ fn ec_wait_ibf_clear() -> Result<(), FieldAccessError> {
     let done = narf_scheduler::responsive_spin_until(
         // SAFETY: cmd port owned by this driver, validated at EC
         // discovery time.
+        // SAFETY: Valid memory or trusted environment
         || unsafe { io_in(cmd, 1) } as u8 & EC_SC_IBF == 0,
         narf_time::Deadline::after_ms(EC_TIMEOUT_MS),
     );
@@ -548,6 +549,7 @@ fn gsb_dispatch(region_path: &str, byte_offset: u64, op: GsbOp) -> u64 {
     }
     // SAFETY: p was stored via `set_gsb_dispatcher` from a valid
     // GsbDispatcher fn pointer; static lifetime is the kernel's.
+    // SAFETY: Valid memory or trusted environment
     let f: GsbDispatcher = unsafe { core::mem::transmute(p) };
     f(region_path, byte_offset, op)
 }
@@ -931,6 +933,7 @@ fn write_unit(
                 // accessible. `byte_offset_in_region` is the field's offset
                 // within that device's 4 KiB config space and `width` is the
                 // access-unit width (1/2/4/8) validated by the field decoder.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     mmio_write(addr + byte_offset_in_region, width, val);
                 }
@@ -997,6 +1000,7 @@ fn cmos_read(offset: u64, width: usize) -> u64 {
         // by the firmware-CMOS handler (this code). NMI-disable
         // bit (0x80) on the index port is preserved by reading
         // back the current value and OR'ing in the new index.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cur_idx = io_in(CMOS_INDEX_PORT, 1) as u8;
             let nmi_bit = cur_idx & 0x80;

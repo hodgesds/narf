@@ -160,6 +160,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
         // SAFETY: registry holds the only `Arc<DmaBuffer>` outside this
         // clone; MINIX serialises sector ops via the outer spinlock.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
         dst.copy_from_slice(src);
         Ok(())
@@ -182,6 +183,7 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             // SAFETY: see `read_sector`. The cap → registry resolve
             // guarantees the buffer is alive; the spinlock serialises
             // ops, so no concurrent user.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
             dst.copy_from_slice(src);
         }

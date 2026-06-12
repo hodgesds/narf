@@ -211,6 +211,7 @@ fn read_dir_entry(buf: &[u8], offset: usize) -> RawDirEntry {
     // * 32 <= buf.len()) guarantees `offset + 32 <= buf.len()`, so the
     // unaligned 32-byte read stays in-bounds, and read_unaligned tolerates
     // the packed layout's lack of alignment.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const RawDirEntry) }
 }
 
@@ -220,6 +221,7 @@ fn read_lfn_entry(buf: &[u8], offset: usize) -> LfnEntry {
     // we only call this after `RawDirEntry::is_lfn()` returns true
     // for the same offset, so the bytes really do encode an LFN
     // entry per FATGEN §7.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const LfnEntry) }
 }
 

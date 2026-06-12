@@ -215,6 +215,7 @@ pub fn fan_count_to_rpm(count: u16) -> Option<u32> {
 pub unsafe fn sio_enter(index_port: u16) {
     // SAFETY: caller ensures we are in kernel context (CPL-0) and that
     // index_port is 0x2E or 0x4E — standard Super-I/O ports.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         narf_arch::x86_64::io_port::outb(index_port, 0x87);
         narf_arch::x86_64::io_port::outb(index_port, 0x87);
@@ -277,6 +278,7 @@ pub unsafe fn sio_write(index_port: u16, data_port: u16, reg: u8, val: u8) {
 pub fn detect_chip(index_port: u16, data_port: u16) -> Option<(NctChip, u16)> {
     // SAFETY: EFM entry/exit are paired; the SIO is read-only here
     // (chip detect only — we do not write any configuration).
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let chip_id = unsafe {
         sio_enter(index_port);
         let hi = sio_read(index_port, data_port, SIO_CHIP_ID_HIGH);

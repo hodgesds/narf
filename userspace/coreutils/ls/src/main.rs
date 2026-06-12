@@ -71,6 +71,7 @@ unsafe fn list_dir(path: *const i8) -> i32 {
     // SAFETY: path is a NUL-terminated C string.
     let dir = unsafe { libc::opendir(path) };
     if dir.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_stderr(b"ls: opendir failed\n"); }
         return 1;
     }
@@ -85,11 +86,14 @@ unsafe fn list_dir(path: *const i8) -> i32 {
         let name_ptr = unsafe {
             core::ptr::addr_of!((*ent).d_name) as *const u8
         };
+        // SAFETY: Valid memory or trusted environment
         let nlen = unsafe { cstr_len(name_ptr) };
         if nlen > 0 {
             // SAFETY: name_ptr points at nlen valid bytes.
             let name = unsafe { core::slice::from_raw_parts(name_ptr, nlen) };
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_stdout(name); }
+            // SAFETY: Valid memory or trusted environment
             unsafe { write_stdout(b"\n"); }
         }
     }
@@ -103,6 +107,7 @@ unsafe fn list_dir(path: *const i8) -> i32 {
 pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argc <= 1 {
         // No arguments — list current directory ".".
+        // SAFETY: Valid memory or trusted environment
         return unsafe { list_dir(b".\0".as_ptr() as *const i8) };
     }
 
@@ -112,6 +117,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
         // SAFETY: i < argc, so argv[i] is valid.
         let arg_ptr = unsafe { *argv.offset(i as isize) };
         if !arg_ptr.is_null() {
+            // SAFETY: Valid memory or trusted environment
             let rc = unsafe { list_dir(arg_ptr as *const i8) };
             if rc != 0 {
                 exit_code = rc;

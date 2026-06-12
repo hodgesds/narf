@@ -237,10 +237,12 @@ impl IntelGpu {
         let gtt_mmadr =
             // SAFETY: `bring_up`'s contract gives us exclusive ownership of
             // BAR0 (`GTTMMADR`); `map_bar` maps the PCI BAR `device` advertises.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { map_bar(device, BAR_GTTMMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
         let gmadr =
             // SAFETY: same contract grants exclusive ownership of BAR2 (`GMADR`);
             // `map_bar` maps the PCI BAR `device` advertises.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { map_bar(device, BAR_GMADR) }.map_err(|_| IntelGpuError::BarMapFailed)?;
 
         // Presence smoke test: read `GMD_ID`. All-ones means the
@@ -398,6 +400,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // plane block; each `PLANE_*_OFFSET` is a known in-range register
         // within that block, so every `write32` targets a valid 32-bit
         // aligned plane register.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             dev.gtt_mmadr.write32(
                 plane_base + crate::intel_gpu_pipes::PLANE_STRIDE_OFFSET,

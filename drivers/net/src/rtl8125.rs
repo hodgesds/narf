@@ -1004,6 +1004,7 @@ impl RtlNic {
                 // SAFETY: `buf_phys` is the identity-mapped DMA buffer the NIC
                 // just filled for this slot; `i < copy_len <= RX_BUF_LEN`, so
                 // `buf_phys + i` stays inside the buffer.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
             }
         }
@@ -1091,6 +1092,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: probe holds exclusive authority over `device` and its cfg `cap`
     // for the duration of `bring_up`, satisfying its `# Safety` contract.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { RtlNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -1101,6 +1103,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // cloned into `CONTROLLER` only after this block), so `Arc::as_ptr`
         // yields a valid, uniquely-owned, properly-aligned pointer and the
         // exclusive `&mut` borrow lives only within this scope.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut RtlNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

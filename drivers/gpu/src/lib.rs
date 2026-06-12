@@ -42,6 +42,12 @@ pub enum GpuFamily {
     /// Nvidia (nouveau or proprietary, via the command-stream
     /// interface).
     Nvidia,
+    /// ASPEED AST2400/2500 BMC basic display.
+    Aspeed,
+    /// QXL Virtual GPU.
+    Qxl,
+    /// VMware SVGA II Virtual GPU.
+    VmwareSvga,
 }
 
 /// Display mode descriptor.
@@ -154,6 +160,7 @@ pub mod amdgpu_ucode_header;
 pub mod amdgpu_video;
 pub mod amdgpu_vmhub_regs;
 pub mod amdgpu_vmid;
+pub mod aspeed;
 pub mod atombios;
 pub mod backlight;
 pub mod dmabuf;
@@ -183,6 +190,8 @@ pub mod nvidia_gpu_falcon;
 pub mod nvidia_gpu_fifo;
 pub mod nvidia_gpu_gsp;
 pub mod nvidia_gpu_pmc;
+pub mod qxl;
+pub mod vmware_svga;
 
 mod tests;
 
@@ -208,12 +217,24 @@ pub fn register_initcalls() {
         amdgpu::register_pci_driver();
         InitResult::Ok
     });
+    narf_init::register(Stage::Subsys, "aspeed-pci", || {
+        aspeed::register_pci_driver();
+        InitResult::Ok
+    });
     narf_init::register(Stage::Subsys, "intel-gpu-pci", || {
         intel_gpu::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "nvidia-gpu-pci", || {
         nvidia_gpu::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "qxl-gpu-pci", || {
+        qxl::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "vmware-svga-pci", || {
+        vmware_svga::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "intel-gpu-dp-bridge", || {

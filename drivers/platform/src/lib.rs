@@ -15,6 +15,10 @@ extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
 pub mod ac_adapter;
+#[cfg(target_arch = "x86_64")]
+pub mod acer_wmi;
+#[cfg(target_arch = "x86_64")]
+pub mod alienware_wmi;
 /// AMD AOAC (Always-On / Modern-Standby D-state control), x86-64 only.
 #[cfg(target_arch = "x86_64")]
 pub mod amd_aoac;
@@ -39,6 +43,8 @@ pub mod ec;
 pub mod ec_hotkeys;
 pub mod fan;
 pub mod intel_hid;
+pub mod ipmi;
+pub mod itco_wdt;
 #[cfg(target_arch = "x86_64")]
 pub mod lid;
 pub mod smbus;
@@ -91,12 +97,22 @@ pub mod ideapad_laptop;
 /// SABI SMI interface, hotkeys, performance mode, USB charge in sleep.
 #[cfg(target_arch = "x86_64")]
 pub mod samsung_laptop;
+#[cfg(target_arch = "x86_64")]
+pub mod surface_acpi;
+#[cfg(target_arch = "x86_64")]
+pub mod system76_acpi;
 
 mod tests;
 
 /// Stage::Subsys initcalls for this driver crate.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    #[cfg(target_arch = "x86_64")]
+    alienware_wmi::register_initcalls();
+    #[cfg(target_arch = "x86_64")]
+    surface_acpi::register_initcalls();
+    #[cfg(target_arch = "x86_64")]
+    system76_acpi::register_initcalls();
     narf_init::register(Stage::Subsys, "smbus", || {
         smbus::register_pci_driver();
         InitResult::Ok
@@ -158,6 +174,14 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "amd-asf", || {
         amd_asf::init();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "ipmi", || {
+        ipmi::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "itco_wdt", || {
+        itco_wdt::register_initcalls();
         InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]

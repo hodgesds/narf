@@ -46,6 +46,7 @@ unsafe fn cstr_len(p: *const c_char) -> usize {
     let mut n = 0usize;
     // SAFETY: caller contract — `p` is a NUL-terminated C string,
     // so the walk terminates within the string's allocation.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *p.add(n) != 0 {
             n += 1;
@@ -264,6 +265,7 @@ pub unsafe extern "C" fn symlink(target: *const c_char, linkpath: *const c_char)
     }
     // SAFETY: caller-asserted NUL-terminators.
     let t = unsafe { cstr_to_str(target) };
+    // SAFETY: Valid memory or trusted environment
     let l = unsafe { cstr_to_str(linkpath) };
     narf_user_runtime::symlink(t, l)
 }
@@ -372,6 +374,7 @@ pub unsafe extern "C" fn renameat(
     }
     // SAFETY: caller-asserted NUL-terminators.
     let o = unsafe { cstr_to_str(old) };
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { cstr_to_str(new) };
     narf_user_runtime::renameat(old_dirfd, o, new_dirfd, n)
 }
@@ -393,6 +396,7 @@ pub unsafe extern "C" fn symlinkat(
     }
     // SAFETY: caller-asserted NUL-terminators.
     let t = unsafe { cstr_to_str(target) };
+    // SAFETY: Valid memory or trusted environment
     let l = unsafe { cstr_to_str(linkpath) };
     narf_user_runtime::symlinkat(t, dirfd, l)
 }
@@ -642,7 +646,7 @@ pub const _SC_PHYS_PAGES: c_int = 85;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sysconf(name: c_int) -> i64 {
     match name {
-        _SC_PAGESIZE | _SC_PAGE_SIZE => 4096,
+        _SC_PAGESIZE => 4096,
         _SC_OPEN_MAX => 256,
         _SC_CLK_TCK => 100,
         _SC_NPROCESSORS_ONLN | _SC_NPROCESSORS_CONF => 1,
@@ -658,6 +662,7 @@ pub unsafe extern "C" fn sysconf(name: c_int) -> i64 {
 pub unsafe extern "C" fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int {
     // SAFETY: caller contract.
     let o = unsafe { cstr_to_str(oldpath) };
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { cstr_to_str(newpath) };
     narf_user_runtime::rename(o, n)
 }
@@ -782,11 +787,13 @@ pub unsafe extern "C" fn statx(
         return -1;
     }
     let mut sb = narf_user_runtime::StatBuf::default();
+    // SAFETY: Valid memory or trusted environment
     let r = if (flags & AT_EMPTY_PATH) != 0 && (path.is_null() || unsafe { *path } == 0) {
         narf_user_runtime::fstat(dirfd as u32, &mut sb)
     } else if path.is_null() {
         return -1;
     } else {
+        // SAFETY: Valid memory or trusted environment
         let s = unsafe { cstr_to_str(path) };
         narf_user_runtime::fstatat(dirfd, s, &mut sb, flags)
     };

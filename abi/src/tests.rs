@@ -1080,6 +1080,7 @@ fn smoke_abi_dispatcher_inflight_cancel_during_bridge() -> TestResult {
             // so this shared `&` does not alias any concurrent `&mut`, and
             // `request_inflight_cancel` only touches the spinlock-guarded
             // cancel state.
+            // SAFETY: Valid memory or trusted environment
             let d = unsafe { &*(raw as *const Dispatcher<4>) };
             d.request_inflight_cancel(Tag::new(args.a0));
         }
@@ -1178,6 +1179,7 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
             // so this shared `&` does not alias any concurrent `&mut`, and
             // `request_inflight_cancel` only touches the spinlock-guarded
             // cancel state.
+            // SAFETY: Valid memory or trusted environment
             let d = unsafe { &*(raw as *const Dispatcher<4>) };
             d.request_inflight_cancel(Tag::new(args.a0));
         }
@@ -1214,6 +1216,7 @@ fn smoke_abi_dispatcher_inflight_cancel_non_cancellable_marks_request() -> TestR
         // spawned task is the sole owner that calls `run`, so the `&mut`
         // is unique; the bridge only ever takes shared `&` references via
         // DISPATCHER_PTR while this task is parked inside `dispatch_one`.
+        // SAFETY: Valid memory or trusted environment
         let d = unsafe { &mut *(dispatcher_addr as *mut Dispatcher<4>) };
         d.run().await;
     });

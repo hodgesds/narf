@@ -71,6 +71,7 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     // SAFETY: `frame` is a freshly-allocated 4 KiB frame whose identity
     // vaddr (`frame.raw()`) is writable for its full `4096` bytes, so
     // zero-filling the whole page is in-bounds.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
     }
@@ -86,6 +87,7 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     // points at >= `size_bytes()` writable (zeroed) bytes, and the page
     // outlives the producer/consumer built below — satisfying
     // `init_in`'s contract.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         SharedRing::<u64, 8>::init_in(kernel_view);
     }
@@ -98,10 +100,12 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     // SAFETY: `kernel_view` points at the `init_in`-initialised ring and
     // this is the only producer constructed for it, upholding the SPSC
     // contract of `SharedProducer::from_raw`.
+    // SAFETY: Valid memory or trusted environment
     let mut prod = unsafe { SharedProducer::<u64, 8>::from_raw(kernel_view) };
     // SAFETY: `user_view` aliases the same initialised ring and this is
     // the only consumer constructed for it, upholding the SPSC contract
     // of `SharedConsumer::from_raw`.
+    // SAFETY: Valid memory or trusted environment
     let mut cons = unsafe { SharedConsumer::<u64, 8>::from_raw(user_view) };
 
     for v in 0u64..8 {
@@ -277,6 +281,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         // low-RAM frames, so the precondition holds.
         // SAFETY: buf is exclusively owned here; we write its full
         // allocated length at byte granularity.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let dst = buf.phys_addr().as_mut_ptr::<u8>();
             for (i, b) in PATTERN.iter().enumerate() {
@@ -307,6 +312,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         // frame is identity-mapped low RAM (alloc_coherent guarantees),
         // and we read exactly `PATTERN.len()` bytes, which is `buf`'s
         // allocated length — every `src.add(i)` is in-bounds.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let src = buf.phys_addr().as_ptr::<u8>();
             for (i, expected) in PATTERN.iter().enumerate() {
@@ -692,6 +698,7 @@ fn smoke_ipc_shared_ring_wrap_around() -> TestResult {
     // SAFETY: `frame.raw()` is the page's 8-aligned identity vaddr,
     // writable for its full 4096 bytes (so the zero-fill is in-bounds)
     // and large enough to hold the ring; `init_in`'s contract is met.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
         SharedRing::<u32, 4>::init_in(frame.raw() as *mut SharedRing<u32, 4>);
@@ -699,6 +706,7 @@ fn smoke_ipc_shared_ring_wrap_around() -> TestResult {
     let view = frame.raw() as *mut SharedRing<u32, 4>;
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
+    // SAFETY: Valid memory or trusted environment
     let mut prod = unsafe { SharedProducer::<u32, 4>::from_raw(view) };
     // SAFETY: same ring, sole consumer — `from_raw`'s SPSC contract.
     let mut cons = unsafe { SharedConsumer::<u32, 4>::from_raw(view) };
@@ -742,6 +750,7 @@ fn smoke_ipc_shared_ring_close_from_consumer() -> TestResult {
     // SAFETY: `frame.raw()` is the page's 8-aligned identity vaddr,
     // writable for its full 4096 bytes (so the zero-fill is in-bounds)
     // and large enough to hold the ring; `init_in`'s contract is met.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
         SharedRing::<u64, 4>::init_in(frame.raw() as *mut SharedRing<u64, 4>);
@@ -749,6 +758,7 @@ fn smoke_ipc_shared_ring_close_from_consumer() -> TestResult {
     let view = frame.raw() as *mut SharedRing<u64, 4>;
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
+    // SAFETY: Valid memory or trusted environment
     let mut prod = unsafe { SharedProducer::<u64, 4>::from_raw(view) };
     // SAFETY: same ring, sole consumer — `from_raw`'s SPSC contract.
     let mut cons = unsafe { SharedConsumer::<u64, 4>::from_raw(view) };
@@ -781,6 +791,7 @@ fn smoke_ipc_shared_ring_volatile_payload_persists() -> TestResult {
     // SAFETY: `frame.raw()` is the page's 8-aligned identity vaddr,
     // writable for its full 4096 bytes (so the zero-fill is in-bounds)
     // and large enough to hold the ring; `init_in`'s contract is met.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
         SharedRing::<u64, 4>::init_in(frame.raw() as *mut SharedRing<u64, 4>);
@@ -788,6 +799,7 @@ fn smoke_ipc_shared_ring_volatile_payload_persists() -> TestResult {
     let view = frame.raw() as *mut SharedRing<u64, 4>;
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
+    // SAFETY: Valid memory or trusted environment
     let mut prod = unsafe { SharedProducer::<u64, 4>::from_raw(view) };
     if prod.try_send(0xDEAD_BEEF_CAFE_F00D).is_err() {
         return TestResult::Fail("try_send failed");
@@ -800,6 +812,7 @@ fn smoke_ipc_shared_ring_volatile_payload_persists() -> TestResult {
     // payload sits at `frame.raw() + 64`, well within the 4 KiB page and
     // 8-aligned (frame base is page-aligned). The producer's volatile
     // store above published a fully-initialised `u64` there.
+    // SAFETY: Valid memory or trusted environment
     let v = unsafe { core::ptr::read_volatile((frame.raw() + 64) as *const u64) };
     if v == 0xDEAD_BEEF_CAFE_F00D {
         TestResult::Pass
@@ -821,6 +834,7 @@ fn smoke_ipc_shared_ring_full_then_drain_then_send_again() -> TestResult {
     // SAFETY: `frame.raw()` is the page's 8-aligned identity vaddr,
     // writable for its full 4096 bytes (so the zero-fill is in-bounds)
     // and large enough to hold the ring; `init_in`'s contract is met.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
         SharedRing::<u32, 2>::init_in(frame.raw() as *mut SharedRing<u32, 2>);
@@ -828,6 +842,7 @@ fn smoke_ipc_shared_ring_full_then_drain_then_send_again() -> TestResult {
     let view = frame.raw() as *mut SharedRing<u32, 2>;
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
+    // SAFETY: Valid memory or trusted environment
     let mut prod = unsafe { SharedProducer::<u32, 2>::from_raw(view) };
     // SAFETY: same ring, sole consumer — `from_raw`'s SPSC contract.
     let mut cons = unsafe { SharedConsumer::<u32, 2>::from_raw(view) };
@@ -1352,6 +1367,7 @@ fn smoke_arch_mte_irg_stg_round_trip() -> TestResult {
     // SAFETY: supported() gated; IRG/STG/LDG operate on a stack
     // buffer the kernel owns; tag-storage is mapped for kernel RAM
     // when SCTLR_EL1.ATA=1 (boot.S precondition).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let tagged = mte::irg(raw);
         mte::stg(tagged);

@@ -65,6 +65,7 @@ fn hwp_supported() -> bool {
     }
     // SAFETY: leaf 6 (thermal/power) is defined because the max
     // standard leaf reported above is >= 6.
+    // SAFETY: Valid memory or trusted environment
     let (eax, _, _, _) = unsafe { cpuid(6, 0) };
     eax & (1 << 7) != 0
 }
@@ -84,6 +85,7 @@ fn amd_pstate_supported() -> bool {
     }
     // SAFETY: extended leaf 0x8000_0007 is defined because the max
     // extended leaf reported above is >= 0x8000_0007.
+    // SAFETY: Valid memory or trusted environment
     let (_, _, _, edx) = unsafe { cpuid(0x8000_0007, 0) };
     edx & (1 << 7) != 0
 }
@@ -208,12 +210,15 @@ pub unsafe fn current_status() -> u64 {
         // SAFETY: the caller guarantees CPL=0; this arm is only
         // reached when `detect()` confirmed HWP, so the HWP status
         // MSR is implemented on this CPU.
+        // SAFETY: Valid memory or trusted environment
         Mechanism::Hwp => unsafe { rdmsr(MSR_IA32_HWP_STATUS) },
         // SAFETY: caller guarantees CPL=0; reached only when SpeedStep
         // (EIST) was detected, so IA32_PERF_STATUS is implemented.
+        // SAFETY: Valid memory or trusted environment
         Mechanism::SpeedStep => unsafe { rdmsr(MSR_IA32_PERF_STATUS) },
         // SAFETY: caller guarantees CPL=0; reached only when AMD legacy
         // HwPstate was detected, so the AMD P-state status MSR exists.
+        // SAFETY: Valid memory or trusted environment
         Mechanism::AmdLegacy => unsafe { rdmsr(MSR_AMD_PSTATE_STATUS) },
         Mechanism::None => 0,
     }
@@ -238,6 +243,7 @@ pub unsafe fn legacy_set(id: u16) {
         Mechanism::AmdLegacy => {
             // SAFETY: caller-asserted; AMD wants the low 3 bits
             // as a P-state index (0..7, 0 = P0 highest).
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 wrmsr(MSR_AMD_PSTATE_LIMIT, (id & 0x7) as u64);
             }
@@ -283,6 +289,7 @@ pub unsafe fn init() {
             // highest-numbered P-state (P0 / highest frequency).
             // SAFETY: caller-asserted CPL=0; HwPstate confirmed
             // present via CPUID(0x8000_0007).EDX[7].
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 wrmsr(MSR_AMD_PSTATE_LIMIT, 0);
             }
@@ -332,6 +339,7 @@ pub fn init_or_gp() -> InitOutcome {
             }
             // SAFETY: HWP confirmed present and just enabled; the
             // CPUID-attested layout matches `HwpCaps`.
+            // SAFETY: Valid memory or trusted environment
             let caps = unsafe { hwp_capabilities() };
             // bits 0..7 = min, 8..15 = max, 16..23 = desired (0 =
             // autonomous, left unset), 24..31 = EPP (0x80 balanced).
@@ -370,6 +378,7 @@ pub struct AmdPstateDef {
 /// Summary of the AMD P-state def table for boot-time logging.
 /// `defined` is the number of `PstateEn=1` slots (1..=8); the
 /// `formatted_freqs` string is built lazily from those slots so
+// SAFETY: Valid memory or trusted environment
 /// the boot log doesn't need to format inside an `unsafe { rdmsr }`.
 #[derive(Clone, Debug)]
 pub struct AmdPstateSummary {

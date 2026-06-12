@@ -430,6 +430,7 @@ pub fn call_wait_child_check(parent_id: u64, want_pid: i64, out_status: *mut i32
     }
     // SAFETY: p was stored by `register_wait_child_check` with a valid
     // WaitChildCheckFn; the static lifetime outlives any call.
+    // SAFETY: Valid memory or trusted environment
     let f: WaitChildCheckFn = unsafe { core::mem::transmute(p) };
     f(parent_id, want_pid, out_status)
 }
@@ -496,6 +497,7 @@ pub(crate) fn yield_hook() -> Option<ExitHook> {
         // as `hook as *mut ()` from a real `ExitHook` fn pointer; the
         // round-trip back to `ExitHook` recovers the original fn ptr
         // (same ABI, pointer-sized).
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
     }
 }
@@ -510,6 +512,7 @@ pub(crate) fn exit_hook() -> Option<ExitHook> {
         // as `hook as *mut ()` from a real `ExitHook` fn pointer; the
         // round-trip recovers the original fn ptr (same ABI,
         // pointer-sized).
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
     }
 }
@@ -524,6 +527,7 @@ pub fn execve_hook() -> Option<ExitHook> {
         // as `hook as *mut ()` from a real `ExitHook` fn pointer; the
         // round-trip recovers the original fn ptr (same ABI,
         // pointer-sized).
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { core::mem::transmute::<*mut (), ExitHook>(p) })
     }
 }
@@ -596,6 +600,7 @@ unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
     // routine published in `CURRENT_JMP`; `longjmp` restores that
     // routine's setjmp context, which is live for the whole user-mode
     // round-trip. The null case is handled above.
+    // SAFETY: Valid memory or trusted environment
     unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_YIELDED as u64) }
 }
 
@@ -632,6 +637,7 @@ pub unsafe fn user_task_execve_hook(_uctx: *mut UserTaskCtx) -> ! {
     }
     // SAFETY: see exit_hook — CURRENT_JMP points at a live
     // JmpBuf for the duration of the user-mode round-trip.
+    // SAFETY: Valid memory or trusted environment
     unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_EXECVE as u64) }
 }
 
@@ -721,6 +727,7 @@ impl UserTaskFuture {
         let ctx = UserTaskCtx::new();
         // SAFETY: we just constructed `ctx` and own the only handle
         // to it; nobody else can race the cell write.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *ctx.state.get() = state;
         }
@@ -770,6 +777,7 @@ impl core::future::Future for UserTaskFuture {
         // address for `self.ctx` and `self.jmp`.
         // SAFETY: we don't move out of the Pin; we only project &mut
         // to fields whose address stability we own.
+        // SAFETY: Valid memory or trusted environment
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.state == TaskState::Exited {
@@ -894,6 +902,7 @@ impl core::future::Future for UserTaskFuture {
                     // backing this future's saved frame; we own it
                     // (Pin-stable) and no other handle aliases it in
                     // this scope.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         #[cfg(target_arch = "x86_64")]
                         {
@@ -976,6 +985,7 @@ impl core::future::Future for UserTaskFuture {
             // SAFETY: writing IA32_FS_BASE is unconditional at
             // CPL=0 long-mode; `fs_base` is a canonical user vaddr
             // (came from `stage_tls` or arch_prctl).
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_scheduler::set_user_fs_base(fs_base);
             }
@@ -997,6 +1007,7 @@ impl core::future::Future for UserTaskFuture {
         // duration of this `poll` body (Pin guarantees stable
         // address; UnsafeCell gives interior mutability without
         // creating an aliased &mut while the longjmp executes).
+        // SAFETY: Valid memory or trusted environment
         let saved = unsafe { narf_scheduler::setjmp(this.jmp.get()) };
 
         if saved == 0 {
@@ -1027,11 +1038,13 @@ impl core::future::Future for UserTaskFuture {
                         // (`load_user_process_with` mapped them); `arg`
                         // is the clone(2) start argument delivered in
                         // RDI. Never returns — control reaches CPL=3.
+                        // SAFETY: Valid memory or trusted environment
                         unsafe { narf_scheduler::enter_user_mode_with_arg(entry, rsp, arg) }
                     } else {
                         // SAFETY: as above — AS activated, `entry`/`rsp`
                         // mapped by construction; never returns (iretq
                         // into CPL=3).
+                        // SAFETY: Valid memory or trusted environment
                         unsafe { narf_scheduler::enter_user_mode(entry, rsp) }
                     }
                 }
@@ -1049,6 +1062,7 @@ impl core::future::Future for UserTaskFuture {
                                                                  // shared `&*` read is of an initialised, aligned
                                                                  // frame with no aliasing `&mut` live here.
                     #[cfg(target_arch = "x86_64")]
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         let _us = &*(this.ctx.state.get() as *const narf_scheduler::UserState);
                     }
@@ -1057,6 +1071,7 @@ impl core::future::Future for UserTaskFuture {
                     // the AS is re-activated and kernel state (TSS rsp0,
                     // GS) is still correct from first entry. Never
                     // returns — iretq resumes the saved user frame.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
@@ -1074,6 +1089,7 @@ impl core::future::Future for UserTaskFuture {
         let cr3 = this.saved_cr3.get().expect("saved_cr3 set on entry");
         // SAFETY: CR3 came from a `mov cr3` snapshot taken on the
         // same kernel root; restoring it is safe.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
                 options(nostack, preserves_flags));
@@ -1121,6 +1137,7 @@ impl core::future::Future for UserTaskFuture {
                 // `Box::into_raw(Box::new(ExecRequest{..}))` and
                 // published the pointer into `pending_exec` before
                 // longjmp'ing here; we're the sole consumer.
+                // SAFETY: Valid memory or trusted environment
                 let req = unsafe { alloc::boxed::Box::from_raw(req_ptr) };
                 this.process.address_space = req.new_as;
                 this.process.entry = crate::EntryPoint(narf_memory::VirtAddr::new(req.entry));
@@ -1239,6 +1256,7 @@ impl core::future::Future for UserTaskFuture {
     ) -> core::task::Poll<()> {
         // SAFETY: don't move out of Pin; only project to fields
         // whose address stability we own.
+        // SAFETY: Valid memory or trusted environment
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.state == TaskState::Exited {
@@ -1286,6 +1304,7 @@ impl core::future::Future for UserTaskFuture {
                 // (== `*mut narf_scheduler::UserState`) backing this
                 // future's saved frame; we own it (Pin-stable) and no
                 // other handle aliases it here.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     #[cfg(target_arch = "aarch64")]
                     {
@@ -1314,6 +1333,7 @@ impl core::future::Future for UserTaskFuture {
                     // SAFETY: `state.get()` is the `*mut UserState`
                     // backing this future's saved frame; we own it
                     // (Pin-stable) and no other handle aliases it here.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         #[cfg(target_arch = "aarch64")]
                         {
@@ -1368,6 +1388,7 @@ impl core::future::Future for UserTaskFuture {
         if let Some(tls_base) = this.process.fs_base {
             // SAFETY: writing TPIDR_EL0 at EL1 is unconditional
             // and has no side effects on EL1 state.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_scheduler::set_user_tls_base(tls_base);
             }
@@ -1388,6 +1409,7 @@ impl core::future::Future for UserTaskFuture {
         // longjmp back here with a non-zero EXIT_REASON_*.
         // SAFETY: jmp is a valid JmpBuf for the duration of this
         // poll body; Pin pins the address.
+        // SAFETY: Valid memory or trusted environment
         let saved = unsafe { narf_scheduler::setjmp(this.jmp.get()) };
 
         if saved == 0 {
@@ -1398,11 +1420,13 @@ impl core::future::Future for UserTaskFuture {
                     let sp = this.process.stack_top.as_u64();
                     // SAFETY: AS is activated; the user mappings
                     // for pc + sp live in the now-active TTBR0.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode(pc, sp) }
                 }
                 TaskState::Running => {
                     // SAFETY: a prior poll's trap path populated
                     // ctx.state via TrapContext::save_user_state.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
@@ -1415,6 +1439,7 @@ impl core::future::Future for UserTaskFuture {
         let ttbr0 = this.saved_ttbr0.get().expect("saved_ttbr0 set on entry");
         // SAFETY: ttbr0 came from a prior MSR snapshot of the
         // active kernel root; restoring is symmetric.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "msr TTBR0_EL1, {v}",
@@ -1460,6 +1485,7 @@ unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
     // SAFETY: same contract as the x86_64 sibling — the polling
     // routine guarantees CURRENT_JMP points at a live JmpBuf for
     // the duration of the user-mode round-trip.
+    // SAFETY: Valid memory or trusted environment
     unsafe { narf_scheduler::longjmp(p as *const _, EXIT_REASON_YIELDED as u64) }
 }
 

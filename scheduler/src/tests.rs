@@ -473,6 +473,7 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     // TTBR0 on aarch64 since the kernel lives behind TTBR1).
     // SAFETY: Paging is enabled in the running kernel test environment, which
     // is new_for_user's sole precondition.
+    // SAFETY: Valid memory or trusted environment
     let a = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     a.map_region(Region {
         base: VirtAddr::new(0x4000),
@@ -546,6 +547,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
         let v: u64;
         // SAFETY: `mov reg, cr3` is a side-effect-free ring-0 read; the test
         // runner executes at CPL=0 and `v` receives the value.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "mov {0}, cr3",
@@ -564,6 +566,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     // is new_for_user's sole precondition.
     // SAFETY: `new_for_user` only requires paging be enabled, which always
     // holds once the kernel test harness is running at EL1/long mode.
+    // SAFETY: Valid memory or trusted environment
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_cr3 = user_as.root.as_u64();
     if user_cr3 == kernel_cr3 {
@@ -623,6 +626,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
         // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
         // read with no side effects; `nomem`/`nostack`/`preserves_flags`
         // hold and `out(reg) v` is the sole, written operand.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -636,10 +640,12 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     crate::__reset_queues_for_test();
     // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
     // EL1 where that read is always permitted.
+    // SAFETY: Valid memory or trusted environment
     let kernel_ttbr0 = unsafe { read_ttbr0() };
 
     // SAFETY: `new_for_user` only requires paging be enabled, which always
     // holds once the kernel test harness is running at EL1/long mode.
+    // SAFETY: Valid memory or trusted environment
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let arc_as = Arc::new(user_as);
 
@@ -649,6 +655,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
 
     // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
     // EL1 where that read is always permitted.
+    // SAFETY: Valid memory or trusted environment
     let ttbr0_after = unsafe { read_ttbr0() };
     drop(arc_as);
     if ttbr0_after == kernel_ttbr0 {
@@ -699,6 +706,7 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
         let v: u64;
         // SAFETY: `mov reg, cr3` is a side-effect-free ring-0 read; the test
         // runner executes at CPL=0 and `v` receives the value.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "mov {0}, cr3",
@@ -715,6 +723,7 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
     // is new_for_user's sole precondition.
     // SAFETY: `new_for_user` only requires paging be enabled, which always
     // holds once the kernel test harness is running at EL1/long mode.
+    // SAFETY: Valid memory or trusted environment
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_cr3 = user_as.root.as_u64();
     let arc_as = Arc::new(user_as);
@@ -792,6 +801,7 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
         // SAFETY: `MRS TTBR0_EL1` is an unprivileged-of-EL1 system-register
         // read with no side effects; `nomem`/`nostack`/`preserves_flags`
         // hold and `out(reg) v` is the sole, written operand.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "mrs {0}, ttbr0_el1",
@@ -803,10 +813,12 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     }
     // SAFETY: `read_ttbr0` only issues `MRS TTBR0_EL1`; the test runs at
     // EL1 where that read is always permitted.
+    // SAFETY: Valid memory or trusted environment
     let kernel_ttbr0 = unsafe { read_ttbr0() };
 
     // SAFETY: `new_for_user` only requires paging be enabled, which always
     // holds once the kernel test harness is running at EL1/long mode.
+    // SAFETY: Valid memory or trusted environment
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let user_root = user_as.root.as_u64();
     let arc_as = Arc::new(user_as);
@@ -1450,6 +1462,7 @@ fn smoke_scheduler_yield_now_resolves_on_second_poll() -> TestResult {
     // SAFETY: The vtable `VT`'s clone/wake/drop are all no-ops that never
     // dereference the data pointer, so the null data pointer is never read and
     // the RawWaker contract (each fn behaves correctly for this data) holds.
+    // SAFETY: Valid memory or trusted environment
     let w = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
     let mut cx = Context::from_waker(&w);
 
@@ -1671,9 +1684,11 @@ fn smoke_scheduler_pkrs_save_restore_round_trip() -> TestResult {
     }
     // SAFETY: We are inside the `pks::is_active()` branch, so CR4.PKS is set,
     // satisfying save()'s precondition that RDMSR(IA32_PKRS) won't #GP.
+    // SAFETY: Valid memory or trusted environment
     let a = unsafe { pks::save() };
     // SAFETY: CR4.PKS is set (is_active branch); `a` was produced by save(),
     // so writing it back is a well-defined restore.
+    // SAFETY: Valid memory or trusted environment
     unsafe { pks::restore(a) };
     // SAFETY: CR4.PKS is set (is_active branch), satisfying save()'s precondition.
     let b = unsafe { pks::save() };

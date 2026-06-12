@@ -454,12 +454,14 @@ impl AliveSink for PollingAliveSink {
             // `PollingAliveSink::new`; `CSR_INT` is a 32-bit device CSR within
             // that BAR, so the volatile MMIO read is to a valid, in-range,
             // 4-byte-aligned register.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let intr = unsafe { self.region.read32(regs::CSR_INT as u64) };
             if intr & csr_int::ALIVE != 0 {
                 // Acknowledge the interrupt.
                 // SAFETY: `self.region` is the live BAR0 mapping; `CSR_INT` is a
                 // writable 32-bit device CSR within that BAR, and writing the
                 // `ALIVE` bit is the documented way to acknowledge the interrupt.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe { self.region.write32(regs::CSR_INT as u64, csr_int::ALIVE) };
 
                 // On many Intel chips, the ALIVE status is written to
@@ -467,6 +469,7 @@ impl AliveSink for PollingAliveSink {
                 // SAFETY: `self.region` is the live BAR0 mapping; `CSR_UCODE_DRV_GP2`
                 // (0x60) is a 32-bit device CSR within that BAR, so the volatile
                 // MMIO read targets a valid, in-range, 4-byte-aligned register.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let status = unsafe { self.region.read32(regs::CSR_UCODE_DRV_GP2 as u64) };
                 if status == regs::IWL_ALIVE_STATUS_OK {
                     return Some(status);
@@ -684,7 +687,7 @@ pub mod tests {
         // sees a clean slate.
         m.stage_read(regs::CSR_CTXT_INFO_BOOT_CTRL, 0);
         let regions = Gen3BootRegions {
-            ctxt_info_phys: 0xC0FFEE_DEAD_BEEFu64 & 0xFFFF_FFFF_FFFF,
+            ctxt_info_phys: 0x00C0_FFEE_DEAD_BEEF_u64 & 0xFFFF_FFFF_FFFF,
             iml_phys: 0x1234_5678_9ABCu64,
             iml_size: 0x4000,
         };

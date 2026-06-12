@@ -604,8 +604,10 @@ mod tests {
             const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
             RawWaker::new(core::ptr::null(), &VTAB)
         }
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),

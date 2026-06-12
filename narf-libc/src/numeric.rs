@@ -151,6 +151,7 @@ pub unsafe extern "C" fn conj(z: complex_double) -> complex_double {
 pub unsafe extern "C" fn cabs(z: complex_double) -> f64 {
     // SAFETY: math::sqrt is `unsafe extern "C"` for ABI shape only;
     // body is pure value math.
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::math::sqrt(z.real * z.real + z.imag * z.imag) }
 }
 

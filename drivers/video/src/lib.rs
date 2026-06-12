@@ -50,6 +50,7 @@ pub mod devfs_bridge;
 pub mod sensor;
 
 // ── Per-sensor drivers ──────────────────────────────────────────────
+pub mod imx219;
 pub mod ov01a1s;
 pub mod ov02c10;
 pub mod ov05c10;
@@ -265,4 +266,5 @@ pub fn register_initcalls() {
         amd_mp2_isp::register_pci_driver();
         InitResult::Ok
     });
+    imx219::register_initcalls();
 }

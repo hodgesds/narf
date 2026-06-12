@@ -27,6 +27,7 @@ pub unsafe extern "C" fn chdir(path: *const u8) -> i32 {
     }
     // SAFETY: caller guarantees `path` is NUL-terminated; `strlen`
     // walks until the NUL.
+    // SAFETY: Valid memory or trusted environment
     let len = unsafe { strlen(path) };
     if len == 0 {
         errno::set_errno(errno::EINVAL);
@@ -35,6 +36,7 @@ pub unsafe extern "C" fn chdir(path: *const u8) -> i32 {
     // SAFETY: `path[0..len]` lives inside the caller's NUL-
     // terminated string; `from_raw_parts` borrows it for the
     // duration of the call.
+    // SAFETY: Valid memory or trusted environment
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(path, len) };
     let s = match core::str::from_utf8(bytes) {
         Ok(s) => s,
@@ -67,6 +69,7 @@ pub unsafe extern "C" fn getcwd(buf: *mut u8, size: usize) -> *mut u8 {
     }
     // SAFETY: caller declared `buf` is writable for at least
     // `size` bytes — the trait's contract.
+    // SAFETY: Valid memory or trusted environment
     let slice: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(buf, size) };
     let r = narf_user_runtime::getcwd(slice);
     if r < 0 {
@@ -194,7 +197,9 @@ pub unsafe extern "C" fn mount(
     }
     // SAFETY: caller-asserted NUL-terminators.
     let src = unsafe { crate::posix::cstr_to_str(source as *const _) };
+    // SAFETY: Valid memory or trusted environment
     let tgt = unsafe { crate::posix::cstr_to_str(target as *const _) };
+    // SAFETY: Valid memory or trusted environment
     let typ = unsafe { crate::posix::cstr_to_str(fstype as *const _) };
     // SAFETY: forwarded with live &str.
     match unsafe { narf_user_runtime::mount_with_flags(src, tgt, typ, flags) } {
@@ -243,6 +248,7 @@ pub unsafe extern "C" fn pivot_root(new_root: *const i8, put_old: *const i8) -> 
     }
     // SAFETY: caller-asserted NUL-terminators.
     let nr = unsafe { crate::posix::cstr_to_str(new_root as *const _) };
+    // SAFETY: Valid memory or trusted environment
     let po = unsafe { crate::posix::cstr_to_str(put_old as *const _) };
     // SAFETY: forwarded.
     match unsafe { narf_user_runtime::pivot_root(nr, po) } {

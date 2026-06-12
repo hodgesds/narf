@@ -243,6 +243,7 @@ fn smoke_ahci_hba_bring_up() -> TestResult {
     // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
     // QEMU q35's known-good ECAM window and the enumerator only reads config
     // space (rejecting all-1s), so re-running init here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -291,6 +292,7 @@ fn smoke_ahci_identify_device() -> TestResult {
     // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
     // QEMU q35's known-good ECAM window and the enumerator only reads config
     // space (rejecting all-1s), so re-running init here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {
@@ -343,6 +345,7 @@ fn smoke_ahci_read_lba() -> TestResult {
     // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
     // QEMU q35's known-good ECAM window and the enumerator only reads config
     // space (rejecting all-1s), so re-running init here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -398,6 +401,7 @@ fn smoke_ahci_write_then_read_lba() -> TestResult {
     // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
     // QEMU q35's known-good ECAM window and the enumerator only reads config
     // space (rejecting all-1s), so re-running init here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -462,6 +466,7 @@ fn smoke_ahci_ncq_write_then_read_lba() -> TestResult {
     // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
     // QEMU q35's known-good ECAM window and the enumerator only reads config
     // space (rejecting all-1s), so re-running init here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     if !devs.iter().any(|d| {
@@ -676,6 +681,7 @@ fn smoke_vmd_not_present_on_qemu_tcg() -> TestResult {
     // online and the bootloader handoff is complete; `ECAM_DEFAULT_BASE` is
     // QEMU q35's known-good ECAM window and the enumerator only reads config
     // space (rejecting all-1s), so re-running init here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_vmd = devs.iter().any(|d| {

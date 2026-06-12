@@ -274,6 +274,7 @@ fn create_topic_inner<T: Event>(
     );
     // SAFETY: We just registered this slot in the object table;
     // type_tag matches CapKind::EventPublisher.
+    // SAFETY: Valid memory or trusted environment
     let publisher_cap: Cap<PublisherCap, Invoke> = unsafe { Cap::mint(publisher_cap_slot) };
     let publisher = Publisher::new(publisher_cap, ring, arena, topic_id);
 

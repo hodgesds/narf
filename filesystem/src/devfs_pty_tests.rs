@@ -30,10 +30,12 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     // SAFETY: the RawWaker's vtable (no_clone/no_op) never dereferences the
     // null data pointer and the clone fn returns an equivalently-valid waker,
     // so this RawWaker upholds the Waker contract.
+    // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is owned by this function and never moved again after this
     // line (it is only polled through `pinned`), so pinning it in place is sound.
+    // SAFETY: Valid memory or trusted environment
     let pinned = unsafe { Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

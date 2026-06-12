@@ -305,6 +305,7 @@ fn probe_log(name: &str, vid: u16, did: u16, pre: bool, err: Option<ProbeError>)
     }
     // SAFETY: `h` was stored as `ProbeLogHook as usize` via
     // `set_probe_log_hook`.
+    // SAFETY: Valid memory or trusted environment
     let f: ProbeLogHook = unsafe { core::mem::transmute(h) };
     let mut buf = [0u8; 256];
     let mut w = TruncatingWriter::new(&mut buf);
@@ -339,6 +340,7 @@ impl<'a> TruncatingWriter<'a> {
     fn as_str(&self) -> &str {
         // SAFETY: `cur` only advances over written ASCII via
         // `write_str`, which performs UTF-8 validation.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::str::from_utf8_unchecked(&self.buf[..self.cur]) }
     }
 }

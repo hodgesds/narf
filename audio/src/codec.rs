@@ -404,6 +404,7 @@ pub fn send_verb(cad: u8, nid: u8, verb_id: u16, payload: u8) -> Result<u32, Cod
     let result = hda::with_controller(|c|
         // SAFETY: controller singleton owns BAR0 for its lifetime; verb
         // dispatch is the documented use of the public `send_verb` API.
+        // SAFETY: Valid memory or trusted environment
         unsafe { c.send_verb(packed) })
     .ok_or(CodecError::ControllerNotProbed)?;
     result.map_err(|_| CodecError::TransportFailed)

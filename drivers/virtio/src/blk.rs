@@ -269,6 +269,7 @@ impl VirtioBlkDevice {
             // `q_buf`, a freshly allocated DMA-coherent page that we own and
             // keep alive in `self.queue_buf`, so the memory it describes is
             // device-accessible for the queue's lifetime.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             queue: unsafe { Virtqueue::new(layout) },
             requests: BTreeMap::new(),
         });
@@ -313,6 +314,7 @@ impl VirtioBlkDevice {
             // SAFETY: caller-owned device; common is a freshly mapped
             // BAR-backed region we exclusively reference through the local
             // `common` binding.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { crate::pci::enable_msix_queue(&common, cap, device, REQUEST_QUEUE) }
                 .map_err(map_msix_err)?;
 
@@ -343,6 +345,7 @@ impl VirtioBlkDevice {
                 // is held for this whole function, serialising every path that
                 // touches `self.pool`; thus this raw &mut to the Option is the
                 // only live mutable access. The pointer is to our own field.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let pool_slot = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() };
                 if let Some(ref mut pool) = pool_slot {
                     pool.free(req.pool_idx);
@@ -445,6 +448,7 @@ impl BlockDevice for VirtioBlkDevice {
             // SAFETY: `inner_guard` is held for the rest of `submit`, serialising
             // all access to `self.pool`; this raw &mut to our own field's Option is
             // therefore the only live mutable borrow.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() }
         {
             if let Some(idx) = pool.alloc() {
@@ -472,6 +476,7 @@ impl BlockDevice for VirtioBlkDevice {
         // compute in-bounds, correctly aligned offsets (idx*64 / idx*64+16)
         // into the DMA-coherent pool page we own, and the lock guarantees no
         // other writer touches this slot.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let h_ptr = pool.header_ptr(pool_idx);
             *h_ptr = VirtioBlkHeader {
@@ -489,6 +494,7 @@ impl BlockDevice for VirtioBlkDevice {
                 // SAFETY: `inner_guard` is still held, serialising all
                 // access to `self.pool`; this raw &mut to our own field is the
                 // only live mutable borrow as we roll back the allocation.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let pool_slot = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() };
                 if let Some(ref mut pool) = pool_slot {
                     pool.free(pool_idx);
@@ -543,6 +549,7 @@ impl BlockDevice for VirtioBlkDevice {
             // SAFETY: `inner_guard` is still held, serialising all access to
             // `self.pool`; this raw &mut to our own field is the only live
             // mutable borrow as we roll back the allocation.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             if let Some(ref mut pool) = unsafe { &mut *core::ptr::addr_of!(self.pool).cast_mut() } {
                 pool.free(pool_idx);
             }

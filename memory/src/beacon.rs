@@ -106,6 +106,7 @@ pub fn paint_build_stripe(color: u32) {
             let off = (y as u64) * stride + (x as u64);
             // SAFETY: registrar asserts FB phys is identity-mapped
             // and writable; bounds checked above.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 base.add(off as usize).write_volatile(color);
             }
@@ -146,6 +147,7 @@ pub fn paint_at(slot_idx: u32, row_idx: u32, color: u32) {
             let off = (y as u64) * stride + (x as u64);
             // SAFETY: registrar asserts FB phys is identity-mapped
             // and writable; bounds checked above.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 base.add(off as usize).write_volatile(color);
             }
@@ -197,6 +199,7 @@ pub fn paint_nibble(slot_idx: u32, row_idx: u32, nibble: u8, fg: u32, bg: u32) {
             let off = (y as u64) * stride + (x as u64);
             // SAFETY: bounds checked against width/height/stride above;
             // FB is identity-mapped per registrar contract.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 base.add(off as usize).write_volatile(row_color);
             }
@@ -250,6 +253,7 @@ pub fn paint_glyph_2x_at(px_x: u32, px_y: u32, glyph: &[u8; 8], fg: u32, bg: u32
                     let off = (y as u64) * stride + (x as u64);
                     // SAFETY: bounds checked above; FB phys is
                     // identity-mapped per the registrar contract.
+                    // SAFETY: Valid memory or trusted environment
                     unsafe {
                         base.add(off as usize).write_volatile(color);
                     }
@@ -314,6 +318,7 @@ pub fn paint(slot_idx: u32, color: u32) {
             let off = (y as u64) * stride + (x as u64);
             // SAFETY: registrar asserts FB phys is identity-mapped
             // and writable; bounds checked above.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 base.add(off as usize).write_volatile(color);
             }

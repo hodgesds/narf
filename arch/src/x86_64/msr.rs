@@ -37,6 +37,7 @@ pub unsafe fn enable_nxe() {
     // CPUID gate. `EDX.NX = bit 20` of extended leaf 0x80000001.
     // SAFETY: leaf 0x80000000 always defined; result drives whether
     // we even attempt the wrmsr.
+    // SAFETY: Valid memory or trusted environment
     let max_ext = unsafe { crate::x86_64::cpuid::cpuid(0x8000_0000, 0).0 };
     if max_ext < 0x8000_0001 {
         return;
@@ -48,12 +49,14 @@ pub unsafe fn enable_nxe() {
     }
     // SAFETY: IA32_EFER is always present on long-mode x86_64; we're
     // in long mode by the time anyone calls `enable_nxe()`.
+    // SAFETY: Valid memory or trusted environment
     let efer = unsafe { rdmsr(IA32_EFER) };
     if efer & IA32_EFER_NXE != 0 {
         return;
     }
     // SAFETY: setting NXE on a CPU that exposes NX is documented as
     // always legal at CPL=0.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(IA32_EFER, efer | IA32_EFER_NXE);
     }
@@ -99,6 +102,7 @@ pub unsafe fn wrmsr(index: u32, value: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller verified the MSR exists and that writing `value`
     // is a defined operation for this MSR.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "wrmsr",
@@ -151,6 +155,7 @@ pub fn rdmsr_or_gp(index: u32) -> Result<u64, MsrFault> {
     // SAFETY: probe-armed rdmsr; on #GP the trap handler redirects
     // RIP to label 99 below, where low/high stay uninit but get
     // overwritten by the `Err` arm.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "rdmsr",

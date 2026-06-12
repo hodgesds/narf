@@ -103,6 +103,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             // covers the leading bytes of an exFAT main boot sector
             // exactly per §3.1; we just read those bytes off disk into
             // a heap buffer we own.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { core::ptr::read_unaligned(boot_bytes.as_ptr() as *const ExfatBootSector) };
 
         if !boot.has_exfat_signature() || !boot.shifts_in_range() {
@@ -181,6 +182,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
         // SAFETY: Same single-CPU cooperative serialisation as the
         // FAT driver's read_sector — outer spinlock guards the
         // bytes for the duration of the copy.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
         dst.copy_from_slice(src);
         Ok(())
@@ -202,6 +204,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                 .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
             // SAFETY: same single-CPU cooperative serialisation as
             // read_sector.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
             dst.copy_from_slice(src);
         }
@@ -411,6 +414,7 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
                     // SAFETY: 32-byte packed layout from §7.2;
                     // the bytes were just read off disk into a
                     // heap buffer we own.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     let upcase: UpcaseTableEntry = unsafe {
                         core::ptr::read_unaligned(
                             sector_buf.as_ptr().add(off) as *const UpcaseTableEntry

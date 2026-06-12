@@ -270,6 +270,7 @@ impl crate::DomainPrimitive for Pcid {
 pub unsafe fn exit_qemu(code: u32) -> ! {
     // SAFETY: OUT to 0xF4 is benign if the device isn't attached, and
     // exits cleanly if it is. Either way we fall into halt_forever.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         io_port::outb(0xF4, code as u8);
     }

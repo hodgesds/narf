@@ -150,6 +150,7 @@ fn wait_input_clear_ms(ms: u64) -> Result<(), InitError> {
     while narf_time::now_cycles() < deadline {
         // SAFETY: I/O port read at CPL=0 is always defined; 0x64 is
         // the i8042 status register.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         if unsafe { inb(PS2_STATUS) } & STATUS_INPUT_FULL == 0 {
             return Ok(());
         }
@@ -205,6 +206,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     // SAFETY: `out` to cmd port `0x64`; CPL0 + the fn's `# Safety`
     // contract gives us exclusive ownership of the 8042 ports, and
     // the input buffer was just drained.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_DISABLE_AUX);
     }
@@ -216,6 +218,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
     // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
@@ -224,6 +227,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
     // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
@@ -231,6 +235,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     // SAFETY: `out` to data port `0x60` delivering the config byte
     // for the WRITE_CONFIG command issued above; CPL0 + exclusive
     // ownership; input buffer cleared by the wait.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_DATA, conf);
     }
@@ -239,6 +244,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
     // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_SELF_TEST);
     }
@@ -251,6 +257,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
     // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_ENABLE_KBD);
     }
@@ -258,6 +265,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
     // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_READ_CONFIG);
     }
@@ -277,6 +285,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     wait_input_clear_ms(CONFIG_WAIT_MS)?;
     // SAFETY: `out` to cmd port `0x64`; CPL0 + exclusive-ownership
     // contract; input buffer cleared by the wait above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_CMD, CMD_WRITE_CONFIG);
     }
@@ -284,6 +293,7 @@ pub unsafe fn init() -> Result<(), InitError> {
     // SAFETY: `out` to data port `0x60` delivering `conf2` for the
     // WRITE_CONFIG command above; CPL0 + exclusive ownership; input
     // buffer cleared by the wait.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         outb(PS2_DATA, conf2);
     }
@@ -330,6 +340,7 @@ pub unsafe fn init() -> Result<(), InitError> {
         // SAFETY: `out` to data port `0x60` (keyboard "set scancode
         // set" command 0xF0); CPL0 + exclusive ownership; input
         // buffer cleared by the wait above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             outb(PS2_DATA, 0xF0);
         }
@@ -341,6 +352,7 @@ pub unsafe fn init() -> Result<(), InitError> {
             // SAFETY: `out` to data port `0x60` (the 0x01 argument
             // selecting scancode set 1); CPL0 + exclusive ownership;
             // input buffer cleared by the wait above.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 outb(PS2_DATA, 0x01);
             }
@@ -358,6 +370,7 @@ pub unsafe fn init() -> Result<(), InitError> {
         // SAFETY: `out` to data port `0x60` (keyboard ENABLE_SCANNING
         // command 0xF4); CPL0 + exclusive ownership; input buffer
         // cleared by the wait above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             outb(PS2_DATA, 0xF4);
         }
@@ -442,6 +455,7 @@ pub unsafe fn on_irq1() {
         // armed) as `Arc::as_ptr` of the node, just null-checked, and
         // the Arc is kept alive by KBD_EVDEV_NODE + ROUTER for the
         // device's lifetime — so the borrow is valid and aligned.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let node_ref: &DeviceNode = unsafe { &*raw };
         dispatch_key_to_node(node_ref, code as u16, pressed);
     }

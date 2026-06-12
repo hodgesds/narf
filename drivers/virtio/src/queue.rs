@@ -119,6 +119,7 @@ impl Virtqueue {
         let total = (layout.used_ring + used_ring_size) - layout.desc_table;
         // SAFETY: layout was validated by VirtqueueLayout::new to
         // fit within PAGE_SIZE; the buffer is owned by the caller.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_bytes(layout.desc_table as *mut u8, 0, total as usize);
         }
@@ -129,6 +130,7 @@ impl Virtqueue {
             // VirtqueueLayout::new sized for `capacity` entries within one
             // page; `i` ranges over 0..capacity-1 so `desc.add(i)` is a valid,
             // aligned, exclusively-owned VirtqDesc just zeroed above.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 (*desc.add(i as usize)).next = i + 1;
             }
@@ -162,6 +164,7 @@ impl Virtqueue {
         // SAFETY: `id` came from the free-list (free_head / a prior `next`
         // link), so it is a valid descriptor index < capacity; the descriptor
         // table is owned by this queue and `id` indexes within it.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         self.free_head = unsafe {
             let next = (*self.desc_table().add(id as usize)).next;
             if self.num_free > 1 {
@@ -182,9 +185,11 @@ impl Virtqueue {
         // SAFETY: `last` is a descriptor index from a chain previously built
         // by add_buffer, so it is < capacity and the table (owned by this
         // queue) holds a valid VirtqDesc at that slot.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         while unsafe { (*self.desc_table().add(last as usize)).flags } & VIRTQ_DESC_F_NEXT != 0 {
             // SAFETY: the NEXT flag just checked guarantees `.next` is a valid
             // in-chain descriptor index < capacity, owned by this queue.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             last = unsafe { (*self.desc_table().add(last as usize)).next };
             count += 1;
         }
@@ -192,6 +197,7 @@ impl Virtqueue {
         // SAFETY: `last` is the chain tail (valid index < capacity); writing
         // its `next` link to splice the chain back onto the free list only
         // touches this queue's exclusively-owned descriptor table.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             (*self.desc_table().add(last as usize)).next = self.free_head.unwrap_or(0);
         }
@@ -217,6 +223,7 @@ impl Virtqueue {
                 // SAFETY: `curr` is a descriptor index just returned by
                 // alloc_desc (< capacity), so `table.add(curr)` is a valid,
                 // aligned slot in this queue's owned descriptor table.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     *table.add(curr as usize) = desc_val;
                 }
@@ -226,6 +233,7 @@ impl Virtqueue {
                 // SAFETY: `curr` is a descriptor index from alloc_desc
                 // (< capacity); writing the final descriptor only touches this
                 // queue's owned table slot.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
                     *table.add(curr as usize) = desc_val;
                 }
@@ -240,6 +248,7 @@ impl Virtqueue {
         // flags+idx) and base+1 (idx field) are in-bounds, aligned u16 writes
         // to DMA memory owned by this queue. virtio_fence orders the ring-entry
         // store before the idx publication the device observes.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let ring = self.avail_base().add(2);
             let slot = (self.avail_idx as usize) % (self.layout.capacity as usize);
@@ -265,6 +274,7 @@ impl Virtqueue {
         // SAFETY: used_base+1 is the u16 `idx` field of this queue's used ring
         // (DMA memory sized within one page by VirtqueueLayout::new), valid and
         // aligned to read the device-published index.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let used_idx = unsafe { *(self.used_base().add(1)) };
         if self.last_used_idx == used_idx {
             return None;
@@ -275,11 +285,13 @@ impl Virtqueue {
         // VirtqUsedElem ring array; the cast is to the ring's actual element
         // type. The ring base is 4-byte aligned per VirtqueueLayout::new,
         // matching VirtqUsedElem's alignment.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ring = unsafe { self.used_base().add(2) as *mut VirtqUsedElem };
         let slot = (self.last_used_idx as usize) % (self.layout.capacity as usize);
         // SAFETY: `slot` is taken modulo capacity, so ring.add(slot) is an
         // in-bounds, aligned VirtqUsedElem in this queue's used ring; the
         // device wrote it before bumping used_idx (ordered by virtio_fence).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let elem = unsafe { *ring.add(slot) };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);

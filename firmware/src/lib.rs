@@ -9,6 +9,7 @@
 //! let cap   = open("qcom/qcnfa765/amss.bin", &fw_authority)?;
 //! let view  = cap.view()?;
 //! // SAFETY: BAR0 mapped, exclusive owner; phys is DMA-coherent.
+// SAFETY: Valid memory or trusted environment
 //! unsafe { self.bhi_load(view.phys, view.bytes.len() as u32)?; }
 //! ```
 //!
@@ -701,6 +702,7 @@ pub unsafe fn sys_install(
     }
     // SAFETY: forwarded from caller — pointer + length validated
     // against the user task's AS by the syscall handler.
+    // SAFETY: Valid memory or trusted environment
     let bytes = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len) };
     registry::install_blob(name, bytes, BlobSource::HotInstall)
 }

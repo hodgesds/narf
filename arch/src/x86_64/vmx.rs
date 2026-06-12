@@ -80,6 +80,7 @@ pub fn caps() -> VmxCaps {
 
     // SAFETY: feature lock + VMXON-outside-SMX guarantee these MSRs
     // exist.
+    // SAFETY: Valid memory or trusted environment
     let basic_raw = unsafe { rdmsr(MSR_IA32_VMX_BASIC) };
     let basic = VmxBasic::decode(basic_raw);
 

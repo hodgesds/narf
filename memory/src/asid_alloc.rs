@@ -39,6 +39,7 @@ fn max_tag_runtime() -> u16 {
     // architecturally-defined feature ID register, always legal at
     // EL1 with no side effects; `nomem`/`nostack` hold and the only
     // output is the register value moved into `v`.
+    // SAFETY: Valid memory or trusted environment
     let bits = unsafe {
         // narf-arch dependency would create a cycle; read directly.
         let v: u64;

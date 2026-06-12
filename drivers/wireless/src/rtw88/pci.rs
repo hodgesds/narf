@@ -172,6 +172,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller (the bus dispatch layer) hands us exclusive
     // BusDeviceCap authority for this device's cfg + BARs.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let result = unsafe { bring_up(&device) };
     let dev = match result {
         Ok(d) => d,
@@ -237,6 +238,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
         // `mmio_bar2` (if `Some`) the owned BAR2 mapping from `map_bar`;
         // `download_firmware` only touches those device registers, and the
         // `auth` token gates this to firmware the trusted loader vouched for.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         match unsafe {
             super::fw::download_firmware(&mmio_bar0, mmio_bar2.as_ref(), device.id.device, &auth)
         } {

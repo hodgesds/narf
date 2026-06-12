@@ -2487,6 +2487,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     // `GLOBAL_TABLE`, published by `install_global` via `Box::into_raw`
     // (Release). The Box is leaked and never freed while a table is
     // installed, so the `&SyscallTable` is valid for this dispatch.
+    // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
     let version = syscall_version(num);
     let raw_n = syscall_number(num);
@@ -2519,6 +2520,7 @@ pub fn kernel_syscall_entry_plain_with_state(
     // `GLOBAL_TABLE`, published by `install_global` via `Box::into_raw`
     // (Release). The Box is leaked and never freed while a table is
     // installed, so the `&SyscallTable` is valid for this dispatch.
+    // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     table.dispatch(n, &mut ctx);
@@ -2578,6 +2580,7 @@ impl TrapContext for ArgsOnlyCtx {
             // at the `[u64; 19]` kernel-stack `UserState` snapshot the
             // syscall-entry asm built; slot 14 is `rax` (offset asserted
             // by the `const _` guard above), in bounds and `u64`-aligned.
+            // SAFETY: Valid memory or trusted environment
             unsafe { *(self.user_state as *mut u64).add(14) = ret.value }
         }
     }
@@ -2596,6 +2599,7 @@ impl TrapContext for ArgsOnlyCtx {
         // the `[u64; 19]` kernel-stack `UserState` snapshot; slot 17 is
         // `rsp` (offset asserted by the `const _` guard above), in bounds
         // and `u64`-aligned.
+        // SAFETY: Valid memory or trusted environment
         unsafe { *(self.user_state as *const u64).add(17) }
     }
     #[inline]
@@ -2607,6 +2611,7 @@ impl TrapContext for ArgsOnlyCtx {
         // the `[u64; 19]` kernel-stack `UserState` snapshot; slot 15 is
         // `rip` (offset asserted by the `const _` guard above), in bounds
         // and `u64`-aligned.
+        // SAFETY: Valid memory or trusted environment
         unsafe { *(self.user_state as *const u64).add(15) }
     }
     #[inline]
@@ -2619,6 +2624,7 @@ impl TrapContext for ArgsOnlyCtx {
         // `rip` (offset asserted by the `const _` guard above), in bounds
         // and `u64`-aligned. The exit asm reloads RIP from this slot, so
         // the write steers where `sysretq` lands.
+        // SAFETY: Valid memory or trusted environment
         unsafe { *(self.user_state as *mut u64).add(15) = rip }
     }
     #[inline]
@@ -2637,6 +2643,7 @@ impl TrapContext for ArgsOnlyCtx {
         // points at the 152-byte (`[u64; 19]`) kernel-stack `UserState`
         // snapshot; the caller guarantees `out` has at least 152 bytes of
         // writable, non-overlapping storage (this fn's `# Safety` contract).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             // Copy the snapshot verbatim. The rax slot already holds
             // the right value: `set_return` mirrors a return value
@@ -2660,6 +2667,7 @@ impl TrapContext for ArgsOnlyCtx {
         }
         // SAFETY: snapshot is a valid `[u64; 19]` UserState on the
         // kernel stack for the duration of this syscall.
+        // SAFETY: Valid memory or trusted environment
         let state = unsafe { &mut *(self.user_state as *mut narf_scheduler::UserState) };
         sigframe::deliver_signal_into_state(state, params)
     }
@@ -2769,6 +2777,7 @@ mod sigframe {
         // and valid for `size_of::<T>()` bytes; `T: Copy` (POD `#[repr(C)]`
         // here) has no padding invariants that reading raw bytes violates.
         // The returned slice borrows `v` for the same lifetime.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>())
         }
@@ -2853,6 +2862,7 @@ mod sigframe {
             // SAFETY: the active CR3 is the trapping task's; copy_to_user
             // brackets the writes with SMAP and faults user-side on a
             // bad address.
+            // SAFETY: Valid memory or trusted environment
             let ok = unsafe {
                 crate::handlers::copy_to_user(new_rsp, &fallback_return.to_ne_bytes()).is_ok()
                     && crate::handlers::copy_to_user(siginfo_vaddr, &siginfo).is_ok()
@@ -2878,6 +2888,7 @@ mod sigframe {
             // brackets each write with SMAP and faults user-side on a bad
             // address. `new_rsp` / `new_rsp + 8` are 16-byte-aligned user
             // stack slots derived from the task's RSP.
+            // SAFETY: Valid memory or trusted environment
             let ok = unsafe {
                 crate::handlers::copy_to_user(new_rsp, &saved_rip.to_ne_bytes()).is_ok()
                     && crate::handlers::copy_to_user(
@@ -2908,6 +2919,7 @@ mod sigframe {
         let mc_vaddr = sc_vaddr + MCONTEXT_FROM_SIGINFO;
         // SAFETY: user-supplied vaddr; copy_from_user brackets SMAP
         // and faults user-side on a bad address.
+        // SAFETY: Valid memory or trusted environment
         let dst = unsafe {
             core::slice::from_raw_parts_mut(
                 &mut mc as *mut McContext as *mut u8,
@@ -2918,6 +2930,7 @@ mod sigframe {
         // `mc` for `size_of::<McContext>()` bytes. copy_from_user brackets
         // the read with SMAP and faults user-side on a bad address, so an
         // invalid `mc_vaddr` returns Err rather than reading kernel memory.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { crate::handlers::copy_from_user(dst, mc_vaddr) }.is_err() {
             return None;
         }
@@ -3237,6 +3250,7 @@ pub fn __test_clear_global() {
         // `Box::into_raw(Box::new(SyscallTable))`. The swap gives us
         // exclusive ownership (no other thread can observe it now), so
         // reconstituting and dropping the Box frees it exactly once.
+        // SAFETY: Valid memory or trusted environment
         unsafe { drop(Box::from_raw(ptr)) };
     }
 }

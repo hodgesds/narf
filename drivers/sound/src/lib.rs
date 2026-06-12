@@ -72,10 +72,14 @@ pub mod codec;
 pub mod devfs_bridge;
 pub mod format;
 pub mod hda;
+pub mod intel8x0;
+pub mod max98357a;
 pub mod mixer;
 pub mod pcm;
 #[cfg(feature = "linux-compat")]
 pub mod procfs_bridge;
+pub mod rt5645;
+pub mod snd_sof;
 pub mod sysfs_bridge;
 
 mod tests;
@@ -460,6 +464,13 @@ pub fn sound_fs_initcall() {
     crate::procfs_bridge::register_procfs_asound();
 }
 
+pub fn register_initcalls() {
+    intel8x0::register_pci_driver();
+    max98357a::register_initcalls();
+    rt5645::register_initcalls();
+    snd_sof::register_pci_driver();
+}
+
 // ── Test support ────────────────────────────────────────────────────────
 
 /// Helpers used by `devfs_bridge` and `sysfs_bridge` unit tests to
@@ -485,6 +496,7 @@ pub mod tests_support {
         // `RawWaker`, and `wake`/`wake_by_ref`/`drop` are no-ops. The data
         // pointer is null and is never dereferenced by any vtable function,
         // so there is no aliasing or lifetime hazard.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
         let mut boxed = alloc::boxed::Box::pin(fut);

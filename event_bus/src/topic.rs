@@ -109,6 +109,7 @@ impl TopicName {
     pub fn as_str(&self) -> &str {
         // SAFETY: `parse` rejects non-ASCII. The buffer is initialised
         // to 0 outside `[0..len]` and we slice to `len`.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
     }
 

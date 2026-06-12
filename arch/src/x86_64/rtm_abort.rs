@@ -39,6 +39,7 @@ pub unsafe fn read_force_abort() -> u64 {
 pub unsafe fn write_force_abort(v: u64) {
     // SAFETY: caller asserts the feature is supported and CPL=0, so writing
     // the architectural TSX_FORCE_ABORT MSR is well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(MSR_IA32_TSX_FORCE_ABORT, v);
     }

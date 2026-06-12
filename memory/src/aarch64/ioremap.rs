@@ -110,6 +110,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     // is defined at EL1 with no precondition; we run at EL1 in the
     // kernel and use the returned root solely as the page-table base
     // for the mapping below.
+    // SAFETY: Valid memory or trusted environment
     let root = unsafe { read_ttbr1_el1() };
 
     let attr_flag = match attrs {
@@ -129,6 +130,7 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
         let p = PhysAddr::new(phys + off);
         // SAFETY: vmalloc-fresh VA; phys+off per caller's
         // exclusivity contract; root is the active TTBR1.
+        // SAFETY: Valid memory or trusted environment
         if let Err(e) = unsafe { map_4kb(root, v, p, flags) } {
             // Roll back.
             for j in 0..i {

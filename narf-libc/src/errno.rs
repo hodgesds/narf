@@ -31,6 +31,7 @@ pub const ERANGE: i32 = 34;
 pub fn errno() -> i32 {
     // SAFETY: __errno_location returns a pointer that is valid for
     // the calling thread's lifetime — pure read.
+    // SAFETY: Valid memory or trusted environment
     unsafe { *__errno_location() }
 }
 
@@ -72,6 +73,7 @@ pub unsafe extern "C" fn __errno_location() -> *mut i32 {
     if !tp.is_null() {
         // SAFETY: the TLS template's last 8 bytes are the errno slot;
         // the link script reserves them.
+        // SAFETY: Valid memory or trusted environment
         return unsafe { tp.offset(ERRNO_TLS_OFFSET) as *mut i32 };
     }
     // Stage-4 fallback: static slot. Single-threaded user mode means

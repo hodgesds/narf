@@ -107,6 +107,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         // on-disk byte order. The bytes were just read from disk
         // into a heap buffer we own, so the read is a plain memcpy
         // through a properly-aligned u8 source.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let bpb: Bpb = unsafe { core::ptr::read_unaligned(bpb_bytes.as_ptr() as *const Bpb) };
 
         let fat32_ext = if bpb.fat_sz_16 == 0 {
@@ -114,6 +115,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             // FAT32 volume; we only enter this branch when fat_sz_16
             // is zero, which the spec calls out as the FAT32 marker.
             // The packed layout matches FATGEN §3 verbatim.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let ext: Fat32ExtBpb = unsafe {
                 core::ptr::read_unaligned(bpb_bytes.as_ptr().add(36) as *const Fat32ExtBpb)
             };
@@ -223,6 +225,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         // outer spinlock so no other CPU/task is racing the buffer
         // bytes during this copy. Identity-mapped phys backs the
         // read.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
         dst.copy_from_slice(src);
         Ok(())
@@ -243,6 +246,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
                 .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
             // SAFETY: see read_sector — same single-CPU
             // cooperative serialisation.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
             dst.copy_from_slice(src);
             g.cap
@@ -392,6 +396,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
         // SAFETY: FsInfo is `#[repr(C, packed)]` with size <= one
         // sector; the packed layout is the on-disk format. Source
         // is a stack copy we just took, dest is a fresh heap slice.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let info_bytes = unsafe {
             core::slice::from_raw_parts(
                 &snapshot as *const FsInfo as *const u8,

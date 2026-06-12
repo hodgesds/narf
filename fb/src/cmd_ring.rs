@@ -167,9 +167,11 @@ pub unsafe fn split(
 ) {
     // SAFETY: per the fn contract `ring` was `init_in`-initialised and this is
     // the sole producer; we hand out exactly one producer half here.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { SharedProducer::from_raw(ring) };
     // SAFETY: same `init_in`-initialised `ring`; this is the sole consumer
     // half, upholding the SPSC contract.
+    // SAFETY: Valid memory or trusted environment
     let c = unsafe { SharedConsumer::from_raw(ring) };
     (p, c)
 }

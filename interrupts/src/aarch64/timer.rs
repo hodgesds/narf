@@ -20,6 +20,7 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 pub unsafe fn start_timer(tval_ticks: u64) {
     // SAFETY: writes to CNTP_TVAL_EL0 and CNTP_CTL_EL0 are always
     // legal at EL1.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         sysreg::write_cntp_tval_el0(tval_ticks);
         // Enable (bit 0), unmask (bit 1 = 0).

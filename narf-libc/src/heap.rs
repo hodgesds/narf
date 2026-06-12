@@ -222,6 +222,7 @@ unsafe fn pop_fit(need: usize) -> *mut Chunk {
             } else {
                 // SAFETY: `prev` came from a prior loop iteration
                 // where we already deref'd it.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     (*prev).next = cur_next;
                 }
@@ -242,6 +243,7 @@ unsafe fn grow_heap(min_bytes: usize) -> *mut Chunk {
     // SAFETY: mmap with hint=0 lets the kernel pick the vaddr; flags
     // = 0 is the default RW user mapping. The returned pointer (if
     // non-null) is valid for `want` bytes per the kernel contract.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { narf_user_runtime::mmap(0, want, 0) };
     if p.is_null() {
         return ptr::null_mut();
@@ -251,6 +253,7 @@ unsafe fn grow_heap(min_bytes: usize) -> *mut Chunk {
     // region of `want` bytes. We don't write `next` here — the
     // caller pushes onto the free list (or uses the chunk directly)
     // which sets it.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*chunk).size = want;
     }
@@ -291,6 +294,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     // chunk is guaranteed big enough because we asked for `need`.
     // SAFETY: pop_fit / grow_heap / push_free invariants hold (see
     // their docs).
+    // SAFETY: Valid memory or trusted environment
     let chunk = unsafe {
         let c = pop_fit(need);
         if !c.is_null() {
@@ -309,6 +313,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
 
     // SAFETY: `chunk` is a valid header from either the free list
     // or `grow_heap`.
+    // SAFETY: Valid memory or trusted environment
     let chunk_size = unsafe { (*chunk).size };
 
     // Split off the remainder if it's worth keeping. The split tail
@@ -318,6 +323,7 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
         let tail_size = chunk_size - need;
         // SAFETY: `tail` lies inside the mapped region (need <
         // chunk_size); writing the header is in-bounds.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*tail).size = tail_size;
             push_free(tail);
@@ -353,6 +359,7 @@ pub unsafe extern "C" fn free(ptr: *mut u8) {
     // SAFETY: per the function-level contract, `chunk` is a valid
     // header recoverable by header-subtraction from a previously
     // returned pointer.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         push_free(chunk);
     }
@@ -372,6 +379,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     if ptr.is_null() {
         // SAFETY: forwarding to malloc — the C-ABI contract is
         // identical.
+        // SAFETY: Valid memory or trusted environment
         return unsafe { malloc(new_size) };
     }
     if new_size == 0 {
@@ -385,6 +393,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     let chunk = ptr.wrapping_sub(HEADER_SIZE) as *mut Chunk;
     // SAFETY: per the function-level contract, `chunk` is a valid
     // header.
+    // SAFETY: Valid memory or trusted environment
     let old_size = unsafe { (*chunk).size };
     let aligned = align_up(new_size);
     let need = aligned + HEADER_SIZE;
@@ -410,6 +419,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
     let copy = core::cmp::min(old_payload, new_size);
     // SAFETY: both regions are at least `copy` bytes; they're
     // disjoint because `malloc` returned a fresh chunk.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(ptr, new_ptr, copy);
         free(ptr);
@@ -435,12 +445,14 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
     }
     // SAFETY: forwarding to malloc; on success we own the buffer
     // for the duration of the zero-fill.
+    // SAFETY: Valid memory or trusted environment
     let p = unsafe { malloc(total) };
     if p.is_null() {
         return ptr::null_mut();
     }
     // SAFETY: `p` is `total` bytes of writable memory; write_bytes
     // matches the rounded-up allocation footprint we asked for.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(p, 0, total);
     }

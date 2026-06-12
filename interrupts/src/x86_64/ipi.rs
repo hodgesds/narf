@@ -364,6 +364,7 @@ pub fn install() {
         // SAFETY: handler is invoked from the IRQ-dispatch path where
         // the trap stub already saved registers and ack'd the LAPIC
         // is the caller's responsibility — we EOI at the end.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             on_shootdown_irq();
         }

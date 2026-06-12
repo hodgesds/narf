@@ -14,17 +14,23 @@ pub mod blk;
 pub mod blk_pci;
 pub mod class_blk;
 pub mod console_pci;
+pub mod crypto_pci;
 pub mod fs_pci;
+pub mod gpio_pci;
 pub mod gpu_pci;
+pub mod i2c_pci;
 pub mod input_pci;
 pub mod iommu_pci;
+pub mod mem_pci;
 pub mod net_pci;
 pub mod p9_pci;
 pub mod pci;
+pub mod pmem_pci;
 pub mod queue;
 pub mod rng_pci;
 pub mod scsi_pci;
 pub mod snd_pci;
+pub mod video_pci;
 pub mod vsock_pci;
 
 mod e2e_tests;
@@ -57,6 +63,30 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-gpu-pci", || {
         gpu_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-i2c-pci", || {
+        i2c_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-gpio-pci", || {
+        gpio_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-crypto-pci", || {
+        crypto_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-mem-pci", || {
+        mem_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-pmem-pci", || {
+        pmem_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-video-pci", || {
+        video_pci::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "virtio-snd-pci", || {
@@ -214,6 +244,7 @@ impl VirtioMmioDevice {
         // SAFETY: `base` came from the bus enumerator's VirtioMmio descriptor,
         // and the caller's contract guarantees it is a live mapped register
         // window, which is exactly probe_raw's requirement.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { Self::probe_raw(base.raw()) }
     }
 
@@ -228,6 +259,7 @@ impl VirtioMmioDevice {
         // window large enough for the four 4-byte register reads below; each
         // offset (0, REG_VERSION, REG_DEVICE_ID, REG_VENDOR_ID) is a 4-byte
         // aligned MMIO register defined by the virtio-mmio layout.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let magic = core::ptr::read_volatile(base_raw as *const u32);
             if magic != Self::MAGIC {
@@ -276,6 +308,7 @@ impl VirtioMmioDevice {
         // SAFETY: `self.base` was validated by `probe_raw` to be a live mapped
         // virtio-mmio window; callers pass a 4-byte-aligned register `offset`
         // within that window, so this volatile read targets valid MMIO.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let val = unsafe { core::ptr::read_volatile((self.base.raw() + offset) as *const u32) };
         compiler_fence(Ordering::SeqCst);
         val
@@ -287,6 +320,7 @@ impl VirtioMmioDevice {
         // SAFETY: `self.base` was validated by `probe_raw` to be a live mapped
         // virtio-mmio window; callers pass a 4-byte-aligned register `offset`
         // within that window, so this volatile write targets valid MMIO.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile((self.base.raw() + offset) as *mut u32, val);
         }
@@ -339,6 +373,7 @@ impl VirtioSkeletonDriver {
             // SAFETY: `d` is enumerated from the kernel bus registry, so a
             // VirtioMmio device carries a base the bus layer already mapped;
             // probe only does volatile reads of the transport ID registers.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             if let Ok(_v) = unsafe { VirtioMmioDevice::probe(&d) } {
                 self.probed.fetch_add(1, Ordering::Relaxed);
             }

@@ -457,6 +457,7 @@ impl Mlx5Hca {
         for (i, b) in raw.iter_mut().enumerate() {
             // SAFETY: identity-mapped MMIO; offset `i` is bounded by
             // `INIT_SEGMENT_LEN`, the documented init-segment window in BAR0.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { mmio.read8(i as u64) };
         }
         let segment = decode_init_segment(&raw);
@@ -549,6 +550,7 @@ impl Mlx5Hca {
         let slot_phys = self.cmdq.phys_addr().raw();
         // SAFETY: identity-mapped DMA; cmdq is exclusively owned by
         // this driver.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
                 core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
@@ -577,6 +579,7 @@ impl Mlx5Hca {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // allocated for this command; `i < CQE_LEN` keeps the byte read
             // within the slot.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
         }
         // Sanity check + decode.
@@ -719,6 +722,7 @@ impl Mlx5Hca {
         for (i, b) in completed.iter_mut().enumerate() {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // for this command; `i < CQE_LEN` bounds the read to the slot.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
         }
         debug_assert!(is_complete(&completed));
@@ -733,6 +737,7 @@ impl Mlx5Hca {
                 // SAFETY: `phys` is the identity-mapped DMA mailbox-block buffer
                 // from `out_blocks`; `i < MAILBOX_BLOCK_LEN` bounds the read to
                 // that block.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 *b = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
             }
             blocks.push(block);
@@ -809,6 +814,7 @@ impl Mlx5Hca {
         for (i, b) in completed.iter_mut().enumerate() {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // for this command; `i < CQE_LEN` bounds the read to the slot.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
         }
         debug_assert!(is_complete(&completed));
@@ -856,6 +862,7 @@ impl Mlx5Hca {
             // SAFETY: `phys` is the identity-mapped DMA EQ buffer; `off` is the
             // in-range entry offset and `i < eqe::EQE_LEN`, so the read stays
             // within the EQE.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { core::ptr::read_volatile((phys + off as u64 + i as u64) as *const u8) };
         }
         if eqe::is_hw_owned(&bytes) {
@@ -883,6 +890,7 @@ impl Mlx5Hca {
         let abs = self.uar_base + (uar_page as u64) * 4096 + byte_offset as u64;
         // SAFETY: identity-mapped MMIO; caller asserts uar_page is
         // owned.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.mmio.write32(abs, value.swap_bytes());
         }
@@ -1105,6 +1113,7 @@ impl Mlx5Hca {
                 // SAFETY: `cq_phys` is the identity-mapped DMA CQ buffer; `off` is
                 // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
                 // stays within the CQE.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe { core::ptr::read_volatile((cq_phys + off as u64 + i as u64) as *const u8) };
         }
         if cqe::is_hw_owned(&bytes) {
@@ -1269,6 +1278,7 @@ impl Mlx5Hca {
         // SAFETY: `table` is the MSI-X table mapped from this device's MSI-X
         // BAR by `enable_msix`; slot 0 was just reserved via `alloc_vector`,
         // so programming/enabling it writes only registers this driver owns.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             table
                 .program_vector(0, 0, irq_vec)
@@ -1491,6 +1501,7 @@ pub(crate) fn program_cmdq_registers(mmio: &MmioRegion, cmdq_phys: u64, log_size
     let low_sz = low_aligned | ((log_size as u32) & 0xF);
     // SAFETY: identity-mapped MMIO; offsets bounded; caller has
     // exclusive ownership of the device.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         mmio.write32(ISEG_CMDQ_ADDR_HIGH as u64, high.swap_bytes());
         mmio.write32(ISEG_CMDQ_ADDR_LO_SZ as u64, low_sz.swap_bytes());

@@ -473,8 +473,8 @@ mod tests {
         // NumberOfRvaAndSizes @ +0x6C.
         buf[oh + 0x6C..oh + 0x70].copy_from_slice(&16u32.to_le_bytes());
         // DataDirectory[1] = Import: RVA 0x2000, size 0x60.
-        buf[oh + 0x70 + 1 * 8..oh + 0x70 + 1 * 8 + 4].copy_from_slice(&0x2000u32.to_le_bytes());
-        buf[oh + 0x70 + 1 * 8 + 4..oh + 0x70 + 1 * 8 + 8].copy_from_slice(&0x60u32.to_le_bytes());
+        buf[oh + 0x70 + 8..oh + 0x70 + 8 + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        buf[oh + 0x70 + 8 + 4..oh + 0x70 + 8 + 8].copy_from_slice(&0x60u32.to_le_bytes());
         // DataDirectory[5] = BaseReloc: RVA 0x2100, size 0x10.
         buf[oh + 0x70 + 5 * 8..oh + 0x70 + 5 * 8 + 4].copy_from_slice(&0x2100u32.to_le_bytes());
         buf[oh + 0x70 + 5 * 8 + 4..oh + 0x70 + 5 * 8 + 8].copy_from_slice(&0x10u32.to_le_bytes());

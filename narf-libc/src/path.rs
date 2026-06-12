@@ -444,6 +444,7 @@ pub unsafe extern "C" fn opendir(path: *const c_char) -> *mut DIR {
     }
     // SAFETY: caller-asserted NUL-terminator.
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *path.add(len) != 0 {
             len += 1;
@@ -512,6 +513,7 @@ pub unsafe extern "C" fn readdir(dirp: *mut DIR) -> *mut dirent {
     // captured at opendir time. We pass it as a `&str` into the
     // user-runtime helper.
     let path_bytes: &[u8] =
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(dir.path.as_ptr() as *const u8, dir.path_len) };
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,

@@ -91,6 +91,7 @@ pub fn halt_until_irq() {
         // SAFETY: WFI at EL1 is always safe; it stalls the CPU until
         // a wake condition. With DAIF.I=0 and the GIC delivering the
         // generic-timer PPI, the wake fires on each IRQ.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             wfi_once();
         }
@@ -115,6 +116,7 @@ pub unsafe fn idle_halt_then_disable() {
     // SAFETY: caller-asserted DAIF.I=1 entering. The unmask + wfi
     // + remask sequence is atomic with respect to IRQ delivery on
     // aarch64.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("msr DAIFClr, #0x2", "wfi", "msr DAIFSet, #0x2", options(),);
     }
@@ -146,6 +148,7 @@ pub unsafe fn cas128(ptr: *mut u128, old: u128, new: u128) -> Result<u128, u128>
     // SAFETY: CASP (with acquire-release semantics: CASPAL) is valid
     // on ARMv8.1+ CPUs. NARF's aarch64 baseline includes LSE.
     // ptr alignment is the caller's responsibility.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "caspal x0, x1, x2, x3, [{ptr}]",
@@ -189,6 +192,7 @@ pub unsafe fn patch_word(addr: *mut u32, new: u32) {
     //                     new word
     // SAFETY: DSB/IC IVAU/ISB are the cache-maintenance ops for SMC at
     // EL1; `addr` is the just-written word.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "dsb ish",

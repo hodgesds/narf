@@ -93,7 +93,7 @@ pub mod tests {
 
     fn smoke_pci_class_no_match() -> TestResult {
         // NVMe = 0x010802; USB = 0x0C0330 — neither is SDHCI.
-        for class in [0x0108_02u32, 0x0C03_30u32, 0x0000_00u32] {
+        for class in [0x0001_0802_u32, 0x000C_0330_u32, 0x0000_0000_u32] {
             if is_sdhci_class(class) {
                 return TestResult::Fail("non-SDHCI class matched");
             }

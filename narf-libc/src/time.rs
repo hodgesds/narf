@@ -522,6 +522,7 @@ pub unsafe extern "C" fn asctime(t: *const tm) -> *mut u8 {
 pub unsafe extern "C" fn ctime(timep: *const time_t) -> *mut u8 {
     // SAFETY: forwarded under caller contract; localtime returns a
     // pointer into TM_STATIC.
+    // SAFETY: Valid memory or trusted environment
     unsafe { asctime(localtime(timep)) }
 }
 

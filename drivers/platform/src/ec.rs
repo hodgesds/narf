@@ -103,6 +103,7 @@ impl AcpiEc {
         // the ACPI standard 0x66). Writing EC_CMD_READ after IBF is clear is
         // the spec-defined start of the EC read protocol (ACPI §12.3) and has
         // no effect on host memory.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             narf_arch::x86_64::io_port::outb(self.control_port, EC_CMD_READ);
         }
@@ -110,6 +111,7 @@ impl AcpiEc {
         // SAFETY: data_port is the EC data register (0x62). Writing the target
         // EC address after IBF is clear is the second step of the read
         // protocol; the port is a fixed peripheral register, not memory.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             narf_arch::x86_64::io_port::outb(self.data_port, addr);
         }
@@ -117,6 +119,7 @@ impl AcpiEc {
         // SAFETY: OBF is set, so the EC has published the result byte in its
         // data register; reading data_port here returns that byte. Port reads
         // touch only the EC peripheral, never host memory.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         Ok(unsafe { narf_arch::x86_64::io_port::inb(self.data_port) })
     }
 
@@ -125,12 +128,14 @@ impl AcpiEc {
         // SAFETY: control_port is the EC command register. Writing EC_CMD_WRITE
         // once IBF is clear begins the EC write protocol (ACPI §12.3); the port
         // is a fixed peripheral register and the write touches no host memory.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             narf_arch::x86_64::io_port::outb(self.control_port, EC_CMD_WRITE);
         }
         self.wait_ibf_empty()?;
         // SAFETY: data_port is the EC data register. Writing the target EC
         // address after IBF is clear is the second step of the write protocol.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             narf_arch::x86_64::io_port::outb(self.data_port, addr);
         }
@@ -138,6 +143,7 @@ impl AcpiEc {
         // SAFETY: data_port is the EC data register. Writing the value byte
         // after IBF is clear completes the write protocol; only the EC
         // peripheral is affected.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             narf_arch::x86_64::io_port::outb(self.data_port, val);
         }
@@ -666,6 +672,7 @@ pub fn init_sci(ec_gpe_bit: Option<u8>) {
         // Route the GSI through the IOAPIC owning it. Dest = BSP
         // (APIC id 0). SAFETY: vector + handler installed above
         // before this routes the line.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ok = unsafe { narf_acpi::ioapic::route_gsi_to_vector(gsi, vector, 0, ioapic_flags) };
         if !ok {
             let _ = writeln!(

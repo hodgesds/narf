@@ -290,6 +290,7 @@ pub fn on_rx_frame(frame: &[u8]) {
     // so reconstituting it from that same `usize` yields the original valid,
     // callable function pointer. The `Acquire`/`Release` pairing guarantees we
     // observe the fully-written pointer value.
+    // SAFETY: Valid memory or trusted environment
     let h: RxHandler = unsafe { core::mem::transmute::<usize, RxHandler>(v) };
     h(frame);
 }

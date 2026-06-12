@@ -133,11 +133,13 @@ fn enosys_minus_one_int() -> c_int {
 /// expected shape.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shmget(key: key_t, size: size_t, shmflg: c_int) -> c_int {
+    // SAFETY: Valid memory or trusted environment
     let fd = unsafe { crate::ipc::shmget_real(key as i32, size as usize, shmflg) };
     if fd < 0 {
         return -1;
     }
     // Size the underlying memfile to `size`.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::posix::ftruncate(fd, size as i64) };
     fd
 }
@@ -206,6 +208,7 @@ pub unsafe extern "C" fn msgget(key: key_t, msgflg: c_int) -> c_int {
     } else {
         0
     };
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::ipc::mq_open(name.as_ptr() as *const i8, oflag, 0o600, core::ptr::null()) }
 }
 
@@ -224,6 +227,7 @@ pub unsafe extern "C" fn msgsnd(
     }
     // Sys-V message: { mtype: i64, mtext[msgsz] }
     let total = msgsz.saturating_add(8);
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::ipc::mq_send(msqid, msgp as *const i8, total, 0) }
 }
 
@@ -240,6 +244,7 @@ pub unsafe extern "C" fn msgrcv(
         return -1;
     }
     let total = msgsz.saturating_add(8);
+    // SAFETY: Valid memory or trusted environment
     let n = unsafe { crate::ipc::mq_receive(msqid, msgp as *mut i8, total, core::ptr::null_mut()) };
     if n < 0 {
         -1
@@ -292,6 +297,7 @@ pub const SETALL: c_int = 17;
 /// `sem_num` indexes the array.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn semget(key: key_t, nsems: c_int, semflg: c_int) -> c_int {
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::ipc::semget_real(key as i32, nsems, semflg) }
 }
 

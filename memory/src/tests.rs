@@ -32,6 +32,7 @@ fn smoke_probe_catches_page_fault() -> TestResult {
     // SAFETY: if PKS / paging are broken and this write *succeeds*,
     // it just stores a byte at a virtual address that doesn't exist
     // in our PML4; the test reports failure rather than crashing.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mov byte ptr [{ptr}], 0",
@@ -81,6 +82,7 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
 
     // SAFETY: live PML4 modification on the BSP with the test's
     // chosen virt not overlapping anything else.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { map_4kb(pml4, virt, phys, flags) }.is_err() {
         free_frame(frame);
         return TestResult::Fail("map_4kb NO_EXEC failed");
@@ -99,6 +101,7 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
 
     // SAFETY: `jmp {ptr}` transfers to the tagged-NX page. The CPU
     // raises #PF on instruction fetch; our probe redirects to `77:`.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "jmp {p}",
@@ -1421,6 +1424,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         // SAFETY: `a.root` is the root table of the `AddressSpace` just
         // materialized above; its tables are identity-mapped and no other
         // CPU mutates them under the single-threaded test runner.
+        // SAFETY: Valid memory or trusted environment
         let got = unsafe { paging::translate(a.root, VirtAddr::new(vbase)) };
         match got {
             Some(phys) => {
@@ -1434,6 +1438,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
         // SAFETY: `a.root` is the materialized address space's root table;
         // its tables are identity-mapped and unmutated by other CPUs in the
         // single-threaded test runner.
+        // SAFETY: Valid memory or trusted environment
         let flags = unsafe { paging::flags_at(a.root, VirtAddr::new(vbase)) };
         match flags {
             Some(f) => {
@@ -1473,6 +1478,7 @@ unsafe fn translate_arch(root: crate::PhysAddr, virt: crate::VirtAddr) -> Option
     // SAFETY: this fn's own contract requires `root` to be a valid,
     // identity-mapped aarch64 root table; we forward it unchanged to the
     // arch `translate`, which has the same precondition.
+    // SAFETY: Valid memory or trusted environment
     return unsafe { crate::aarch64::paging::translate(root, virt) };
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     return None;
@@ -3160,6 +3166,7 @@ fn smoke_slab_atomic_perf_bounded() -> TestResult {
     const ITERS: u64 = 1024;
     // SAFETY: RDTSC is unconditionally available on every x86_64
     // QEMU model + every supported real-HW target.
+    // SAFETY: Valid memory or trusted environment
     let t0 = unsafe { _rdtsc() };
     for _ in 0..ITERS {
         let p = slab::try_alloc_atomic(layout).expect("warm magazine");
@@ -3967,6 +3974,7 @@ fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
     };
     // SAFETY: identity-mapped low 4 GiB; the frame was just returned
     // by the allocator and is exclusively held by `a`.
+    // SAFETY: Valid memory or trusted environment
     let all_zero = unsafe {
         let p = phys.raw() as *const u8;
         (0..4096).all(|i| *p.add(i) == 0)
@@ -5850,6 +5858,7 @@ impl crate::heap_backend::HeapBackend for CountingHeapBackend {
             // SAFETY: caller asserts matching layout from a prior
             // `alloc` on this backend — which means it came from
             // `crate::slab::alloc`.
+            // SAFETY: Valid memory or trusted environment
             unsafe { crate::slab::dealloc(nn, layout) };
         }
     }

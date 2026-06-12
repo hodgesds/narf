@@ -29,6 +29,7 @@ fn id_aa64zfr0() -> u64 {
     // Reading without SVE raises UNDEF — caller must gate. Raw
     // encoding `S3_0_C0_C4_4` because the assembler in
     // aarch64-unknown-none lacks +sve target-feature awareness.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("mrs {}, S3_0_C0_C4_4", out(reg) v, options(nomem, nostack));
     }

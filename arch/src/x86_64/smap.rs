@@ -75,6 +75,7 @@ pub unsafe fn enable() {
         // SAFETY: bit 21 reserved/preserved for non-SMAP CPUs is
         // unchanged by `read | CR4_SMAP` on a CPU that has the bit
         // (the caller proved `supported()`).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             write_cr4(v | CR4_SMAP);
         }
@@ -142,6 +143,7 @@ pub unsafe fn with_user_access<R>(f: impl FnOnce() -> R) -> R {
     // SAFETY: STAC is a NOP on non-SMAP CPUs and a single-instruction
     // EFLAGS.AC toggle on SMAP CPUs. Either way it doesn't touch
     // memory or other regs.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         stac();
     }

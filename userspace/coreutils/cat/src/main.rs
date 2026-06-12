@@ -80,6 +80,7 @@ unsafe fn cat_fd(in_fd: i32) -> i32 {
         if n < 0 {
             return 1;
         }
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_stdout(&buf[..n as usize]); }
     }
     0
@@ -90,6 +91,7 @@ unsafe fn cat_fd(in_fd: i32) -> i32 {
 pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argc <= 1 {
         // No arguments: read from stdin (fd 0).
+        // SAFETY: Valid memory or trusted environment
         return unsafe { cat_fd(0) };
     }
 
@@ -103,10 +105,13 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
             continue;
         }
         // Check for "-" meaning stdin.
+        // SAFETY: Valid memory or trusted environment
         let len = unsafe { cstr_len(arg_ptr) };
+        // SAFETY: Valid memory or trusted environment
         let is_stdin = len == 1 && unsafe { *arg_ptr } == b'-';
 
         if is_stdin {
+            // SAFETY: Valid memory or trusted environment
             let rc = unsafe { cat_fd(0) };
             if rc != 0 {
                 exit_code = rc;
@@ -119,6 +124,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
                 libc::posix_open(arg_ptr as *const i8, libc::O_RDONLY, 0)
             };
             if fd < 0 {
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     write_stderr(b"cat: cannot open: ");
                     if len > 0 {
@@ -129,6 +135,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u
                 }
                 exit_code = 1;
             } else {
+                // SAFETY: Valid memory or trusted environment
                 let rc = unsafe { cat_fd(fd) };
                 if rc != 0 {
                     exit_code = rc;

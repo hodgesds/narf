@@ -79,6 +79,7 @@ impl crate::DomainPrimitive for Mte {
     unsafe fn save() -> Self::SavedState {
         // SAFETY: MRS SCTLR_EL1 always legal; MRS GCR_EL1 legal once
         // SCTLR_EL1.ATA=1 (set at boot when MTE is present).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             SavedMteState {
                 sctlr: sysreg::read_sctlr_el1(),
@@ -168,6 +169,7 @@ pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
     // memory traffic. The `memtag` arch extension is opt-in at the
     // assembler level so the kernel build doesn't have to pass
     // `-C target-feature=+mte` globally.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             ".arch_extension memtag",
@@ -195,6 +197,7 @@ pub unsafe fn stg(ptr: *mut u8) {
     // 16-byte aligned; STG itself ignores the low 4 bits of the
     // operand. Caller proves the granule is part of a tag-storage
     // mapping.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             ".arch_extension memtag",

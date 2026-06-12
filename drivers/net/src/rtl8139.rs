@@ -147,6 +147,7 @@ impl Rtl8139 {
         // SAFETY: caller-asserted. RTL8139 advertises both BAR0
         // (IO) and BAR1 (MMIO); MMIO is more portable + cross-arch
         // friendly.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let mmio = unsafe { map_bar(device, 1) }.map_err(|_| Rtl8139Error::BarMapFailed)?;
 
         // 1. Power on + take out of low-power mode (CONFIG1 = 0).
@@ -165,6 +166,7 @@ impl Rtl8139 {
         // CR.RST self-clears within tens of microseconds typical;
         // 100 ms is the "real wedge" threshold.
         narf_scheduler::responsive_spin_until(
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             || unsafe { mmio.read8(REG_CR) } & CR_RST == 0,
             narf_time::Deadline::after_ms(100),
         );
@@ -179,6 +181,7 @@ impl Rtl8139 {
         for (i, b) in mac.iter_mut().enumerate() {
             // SAFETY: `mmio` is the BAR mapping established above; `REG_IDR0 +
             // i` (i in 0..6) addresses the 6 ID-register bytes inside that BAR.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe { mmio.read8(REG_IDR0 + i as u64) };
         }
 
@@ -346,6 +349,7 @@ impl Rtl8139 {
             // SAFETY: `ring_phys` is the identity-mapped DMA address of the RX
             // ring; the frame payload starts at `off + 4` and `copy` is bounded
             // by `frame_len`, so `off + 4 + i` stays within the mapped ring.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe {
                 core::ptr::read_volatile((ring_phys + (off + 4 + i) as u64) as *const u8)
             };

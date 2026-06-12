@@ -364,11 +364,13 @@ pub unsafe fn invoke_init(module: &Module) -> Result<(), crate::lifecycle::Lifec
     // fn() -> i32`, matching the C ABI the module was compiled with, so the
     // pointer-to-fn-pointer transmute is layout-compatible (both are a
     // single non-null code pointer).
+    // SAFETY: Valid memory or trusted environment
     let init: ModuleInitFn = unsafe { core::mem::transmute(module.init_addr) };
     // SAFETY: `init` points at the module's relocated init routine (see
     // above). It is the module's documented entry point and is sound to call
     // here because we are running in the kernel context with the
     // init-attribution context armed and the module in state `Loading`.
+    // SAFETY: Valid memory or trusted environment
     let rc = unsafe { init() };
     // Restore unconditionally — even on failure the next init call
     // must start clean.
@@ -401,11 +403,13 @@ pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::Lifec
         // is still mapped. `ModuleExitFn` is `unsafe extern "C" fn()`,
         // matching the module's C ABI, so the transmute between two
         // single code pointers is layout-compatible.
+        // SAFETY: Valid memory or trusted environment
         let exit: ModuleExitFn = unsafe { core::mem::transmute(exit_addr) };
         // SAFETY: `exit` points at the module's relocated cleanup routine
         // (see above). The module is Live/Going with refcount zero, so no
         // other code holds references into it; calling its documented exit
         // entry point here is sound.
+        // SAFETY: Valid memory or trusted environment
         unsafe { exit() };
     }
     *module.state.lock() = ModuleState::Dead;

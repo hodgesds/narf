@@ -141,6 +141,7 @@ pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
             // BOOTSTRAP_CAPACITY`. `base` points at the start of the
             // `BOOTSTRAP_CAPACITY`-byte HEAP arena, so `base.add(aligned)`
             // stays within (or one past the end of) that same allocation.
+            // SAFETY: Valid memory or trusted environment
             return unsafe { base.add(aligned) };
         }
     }
@@ -174,6 +175,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // SAFETY: caller upholds `GlobalAlloc::alloc` contract,
         // which is the same contract `HeapBackend::alloc`
         // forwards.
+        // SAFETY: Valid memory or trusted environment
         unsafe { backend.alloc(layout) }
     }
 
@@ -196,6 +198,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
         // a prior `alloc`. The `in_bootstrap` check above
         // guarantees `ptr` is NOT a stranded bump-era pointer, so
         // it's safe to hand to the current backend.
+        // SAFETY: Valid memory or trusted environment
         unsafe { backend.dealloc(ptr, layout) }
     }
 }

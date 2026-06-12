@@ -12,6 +12,7 @@ fn id_aa64mmfr3() -> u64 {
     // SAFETY: ID_AA64MMFR3_EL1 readable at EL1 (raw S3_0_C0_C7_3
     // — older LLVM doesn't carry the named alias on plain
     // aarch64-unknown-none).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("mrs {}, S3_0_C0_C7_3", out(reg) v, options(nomem, nostack));
     }

@@ -148,6 +148,7 @@ pub unsafe fn enable_pcide() {
     //
     // SAFETY: `__cpuid` is always legal at CPL=0; leaf 1 exists
     // on every x86_64 CPU.
+    // SAFETY: Valid memory or trusted environment
     let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
     crate::beacon_paint(28, 0x00C0FFC0); // post-CPUID
     if leaf1.ecx & (1u32 << 17) == 0 {
@@ -261,6 +262,7 @@ pub unsafe fn restore(s: SavedPcid) {
     }
     // SAFETY: write back the snapshot CR3 with NOFLUSH set so the
     // outer domain's TLB does not get nuked.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         cr::write_cr3(s.0 | NOFLUSH);
     }

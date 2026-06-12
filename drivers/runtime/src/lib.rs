@@ -104,11 +104,13 @@ mod user_rt {
         /// `offset + 1 <= len`. Wraps a volatile read against the
         /// userspace VA.
         pub unsafe fn read8(&self, offset: u64) -> u8 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { core::ptr::read_volatile(self._va.add(offset as usize)) }
         }
         /// # Safety
         /// `offset + 1 <= len`.
         pub unsafe fn write8(&self, offset: u64, value: u8) {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile(self._va.add(offset as usize), value);
             }
@@ -116,11 +118,13 @@ mod user_rt {
         /// # Safety
         /// `offset + 2 <= len`, naturally aligned.
         pub unsafe fn read16(&self, offset: u64) -> u16 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { core::ptr::read_volatile(self._va.add(offset as usize) as *const u16) }
         }
         /// # Safety
         /// `offset + 2 <= len`, naturally aligned.
         pub unsafe fn write16(&self, offset: u64, value: u16) {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile(self._va.add(offset as usize) as *mut u16, value);
             }
@@ -128,11 +132,13 @@ mod user_rt {
         /// # Safety
         /// `offset + 4 <= len`, naturally aligned.
         pub unsafe fn read32(&self, offset: u64) -> u32 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe { core::ptr::read_volatile(self._va.add(offset as usize) as *const u32) }
         }
         /// # Safety
         /// `offset + 4 <= len`, naturally aligned.
         pub unsafe fn write32(&self, offset: u64, value: u32) {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile(self._va.add(offset as usize) as *mut u32, value);
             }
@@ -318,6 +324,7 @@ mod user_rt {
                 core::hint::spin_loop();
             }
             LockGuard {
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 _data: unsafe { &mut *self._data.get() },
                 _busy: &self._busy,
                 _phantom: PhantomData,

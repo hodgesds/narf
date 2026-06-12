@@ -86,6 +86,7 @@ impl Features {
     pub fn probe() -> Self {
         // SAFETY: ID_AA64ISAR0_EL1 is readable from EL1 (ARM ARM
         // §D17.2.71). Architectural register, no side effects.
+        // SAFETY: Valid memory or trusted environment
         let isar0 = unsafe { read_id_aa64isar0_el1() };
         Self {
             aes: ((isar0 >> 4) & 0xF) >= 1,
@@ -117,6 +118,7 @@ unsafe fn read_id_aa64isar0_el1() -> u64 {
     let mut v: u64;
     // SAFETY: caller-guaranteed EL1 + register architecturally
     // readable from EL1.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {x}, ID_AA64ISAR0_EL1",
@@ -139,6 +141,7 @@ pub fn aes_round_forward(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
     let mut out = [0u8; 16];
     // SAFETY: AESENC operates on aligned XMM regs — both inputs
     // come in as `[u8; 16]` arrays loaded into XMM via MOVDQU.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "movdqu xmm0, [{s}]",
@@ -166,6 +169,7 @@ pub fn aes_round_forward(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
     // `aes` in `--target-cpu`'s feature set; the runtime feature
     // probe (`Features::probe()`) is the actual gate against
     // executing on a CPU that lacks FEAT_AES.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             ".arch_extension aes",

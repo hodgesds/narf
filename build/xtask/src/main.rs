@@ -667,8 +667,8 @@ fn ahci_image_path() -> PathBuf {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut buf = vec![0u8; 1024 * 1024];
-        for i in 0..512usize {
-            buf[i] = (i as u8).wrapping_mul(0x6D) ^ 0x42;
+        for (i, b) in buf.iter_mut().enumerate().take(512usize) {
+            *b = (i as u8).wrapping_mul(0x6D) ^ 0x42;
         }
         let _ = std::fs::write(&path, &buf);
     }

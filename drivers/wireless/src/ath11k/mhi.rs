@@ -51,6 +51,7 @@ pub unsafe fn mhi_init(
     // 1. Reset the MHI controller.
     // SAFETY: `mmio` is the caller-asserted live BAR0 mapping; `MHICTRL`
     // is a writable chip register reached via the sliding window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { write_via_window(mmio, MHICTRL, MHICTRL_RESET_MASK) };
 
     // 2. Poll MHISTATUS until READY bit (bit 0) is set.
@@ -59,6 +60,7 @@ pub unsafe fn mhi_init(
     for _ in 0..2000 {
         // SAFETY: `mmio` is the caller-asserted live BAR0 mapping;
         // `MHISTATUS` is a readable chip register via the window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let status = unsafe { read_via_window(mmio, MHISTATUS) };
         if status & 0x1 != 0 {
             ready = true;
@@ -79,11 +81,13 @@ pub unsafe fn mhi_init(
     // 4. Set MHI state to M0.
     // SAFETY: `mmio` is the caller-asserted live BAR0 mapping; `MHICTRL`
     // is a readable chip register via the window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let mut ctrl = unsafe { read_via_window(mmio, MHICTRL) };
     ctrl &= !MHICTRL_MHISTATE_MASK;
     ctrl |= MHI_STATE_M0 << MHICTRL_MHISTATE_SHIFT;
     // SAFETY: `mmio` is the caller-asserted live BAR0 mapping; `MHICTRL`
     // is a writable chip register via the window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { write_via_window(mmio, MHICTRL, ctrl) };
 
     // 5. Poll MHISTATUS until state is M0 (bits 15:8 == 2).
@@ -91,6 +95,7 @@ pub unsafe fn mhi_init(
     for _ in 0..2000 {
         // SAFETY: `mmio` is the caller-asserted live BAR0 mapping;
         // `MHISTATUS` is a readable chip register via the window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let status = unsafe { read_via_window(mmio, MHISTATUS) };
         let state = (status >> 8) & 0xFF;
         if state == MHI_STATE_M0 {
@@ -147,12 +152,14 @@ fn load_amss_firmware(
     // Read the BHI offset from BAR0+0x28.
     // SAFETY: `mmio` is the live BAR0 mapping passed down from
     // `mhi_init`; `BHIOFF` is a readable chip register via the window.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let bhi_off = unsafe { read_via_window(mmio, BHIOFF) };
 
     // Program BHI registers.
     // SAFETY: `mmio` is the live BAR0 mapping passed down from
     // `mhi_init`; `bhi_off + BHI_*` address the writable BHI image
     // descriptor + doorbell registers within the chip register file.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         write_via_window(mmio, bhi_off + BHI_IMGADDR_LOW, phys as u32);
         write_via_window(mmio, bhi_off + BHI_IMGADDR_HIGH, (phys >> 32) as u32);
@@ -166,6 +173,7 @@ fn load_amss_firmware(
     for _ in 0..5000 {
         // SAFETY: `mmio` is the live BAR0 mapping passed down from
         // `mhi_init`; `bhi_off + BHI_STATUS` is a readable chip register.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let status = unsafe { read_via_window(mmio, bhi_off + BHI_STATUS) };
         if status == BHI_STATUS_SUCCESS {
             success = true;

@@ -85,6 +85,7 @@ pub unsafe fn init_bsp() {
     // SAFETY: writing GS_BASE and KERNEL_GS_BASE at CPL=0 is a
     // documented operation. `msr::wrmsr` carries the
     // `compiler_fence(SeqCst)` pair from arch/ §4.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         msr::wrmsr(IA32_GS_BASE, addr);
         msr::wrmsr(IA32_KERNEL_GS_BASE, 0);

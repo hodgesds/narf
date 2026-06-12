@@ -197,6 +197,7 @@ unsafe fn check_rsdp(phys: u64) -> bool {
     for i in 0..20 {
         // SAFETY: the signature matched above, so `phys` points at an RSDP whose
         // first 20 bytes (the revision-1 structure) are readable; `i < 20`.
+        // SAFETY: Valid memory or trusted environment
         sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
     }
     if sum != 0 {
@@ -211,6 +212,7 @@ unsafe fn check_rsdp(phys: u64) -> bool {
             sum = sum
                 // SAFETY: revision >= 2 means the RSDP is the 36-byte extended
                 // form, so bytes 0..36 at `phys` are all readable; `i < 36`.
+                // SAFETY: Valid memory or trusted environment
                 .wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
         }
         if sum != 0 {
@@ -231,6 +233,7 @@ pub unsafe fn decode_rsdp(phys: u64) -> Rsdp {
     for (i, byte) in oem_id.iter_mut().enumerate() {
         // SAFETY: `check_rsdp` validated this RSDP, so bytes 9..15 (the 6-byte
         // OEMID field) lie within the readable RSDP region at `phys`.
+        // SAFETY: Valid memory or trusted environment
         *byte = unsafe { core::ptr::read_volatile((phys + 9 + i as u64) as *const u8) };
     }
     // SAFETY: same.

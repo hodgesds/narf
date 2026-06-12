@@ -89,6 +89,7 @@ pub unsafe fn init_bsp() {
     // unconditional on long-mode x86_64. The EXTD write below is
     // CPUID-gated because CPUs without x2APIC support raise #GP
     // on that bit.
+    // SAFETY: Valid memory or trusted environment
     let base = unsafe { rdmsr(IA32_APIC_BASE) };
     if base & APIC_BASE_EN == 0 {
         // SAFETY: enabling APIC is always safe at CPL=0.
@@ -117,6 +118,7 @@ pub unsafe fn init_bsp() {
         // SAFETY: CPL=0; reading IA32_APIC_BASE is unconditional on
         // long mode. We re-read here to OR the EXTD bit onto the
         // current value rather than clobbering the APIC base address.
+        // SAFETY: Valid memory or trusted environment
         let after_en = unsafe { rdmsr(IA32_APIC_BASE) };
         // SAFETY: CPUID-gated above; CPU supports the EXTD bit.
         unsafe {
@@ -133,6 +135,7 @@ pub unsafe fn init_bsp() {
     // mode. Reading back the just-written value tells us whether the
     // EXTD bit actually stuck (it silently drops on QEMU TCG / locked
     // firmware).
+    // SAFETY: Valid memory or trusted environment
     let confirm = unsafe { rdmsr(IA32_APIC_BASE) };
     if confirm & APIC_BASE_EXTD == 0 {
         // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB).
@@ -202,6 +205,7 @@ unsafe fn init_lapic_xapic() {
     let lvt_error = (XAPIC_MMIO_BASE + 0x370) as *mut u32;
     // SAFETY: caller upholds MMIO + EN preconditions. Each write
     // is an aligned 32-bit write to an architected LVT register.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile(
             sivr,
@@ -245,6 +249,7 @@ fn apic_error_handler() {
         // SAFETY: this handler only runs in x2APIC mode here, so the
         // APIC_ESR MSR is accessible at CPL=0; the write-then-read
         // drain sequence is the architected way to sample ESR.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             wrmsr(APIC_ESR_MSR, 0);
             rdmsr(APIC_ESR_MSR)
@@ -255,6 +260,7 @@ fn apic_error_handler() {
         // SAFETY: in xAPIC mode the LAPIC MMIO window is identity-mapped
         // (low 4 GiB) and EN is set, so this 32-bit aligned write/read
         // to the architected ESR register at base+0x280 is valid.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_volatile(esr_reg, 0);
             core::ptr::read_volatile(esr_reg) as u64
@@ -314,6 +320,7 @@ pub unsafe fn start_timer(timer_vector: u8, initial_count: u32) {
     let div_conf = (XAPIC_MMIO_BASE + 0x3E0) as *mut u32;
     // SAFETY: LAPIC MMIO is identity-mapped (low 4 GiB) per init_bsp
     // contract. Writes are aligned 32-bit to architected registers.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile(div_conf, DIV_16 as u32);
         core::ptr::write_volatile(
@@ -391,6 +398,7 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
         // SAFETY: BSP, IRQs masked at the caller (clockevent
         // select_primary runs with IRQs disabled outside the
         // probe window).
+        // SAFETY: Valid memory or trusted environment
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
         if feats.tsc_deadline {
             // Period in TSC cycles for the requested IRQ rate.
@@ -399,6 +407,7 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             let period_cycles = period_ns.saturating_mul(cpns).max(1);
             // SAFETY: caller upholds exclusive LAPIC access; we
             // gated on CPUID for TSC-deadline support.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 start_timer_tsc_deadline(vector, period_cycles);
             }
@@ -525,6 +534,7 @@ pub unsafe fn eoi() {
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // SAFETY: x2APIC live; EOI MSR write clears the highest in-
         // service register bit, unblocking same/lower-priority IRQs.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             wrmsr(APIC_EOI_MSR, 0);
         }
@@ -539,6 +549,7 @@ pub unsafe fn eoi() {
         // (low 4 GiB) with EN set, so this 32-bit aligned write to the
         // architected EOI register at base+0xB0 is valid and has no
         // side effect beyond acknowledging the in-service IRQ.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_volatile(eoi_reg, 0);
         }
@@ -566,6 +577,7 @@ pub unsafe fn self_ipi(vector: u8) {
         let icr_low: u32 = (vector as u32) | (1 << 14) | (1 << 18);
         // SAFETY: LAPIC MMIO identity-mapped; high half irrelevant
         // for self-shorthand but Intel mandates writing it first.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let icr_hi_reg = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
             let icr_lo_reg = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
@@ -597,6 +609,7 @@ pub unsafe fn wrmsr_icr(icr: u64) {
     if X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         // SAFETY: x2APIC live; single 64-bit MSR write atomically
         // composes the ICR + sends.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             wrmsr(APIC_ICR_MSR, icr);
         }
@@ -610,6 +623,7 @@ pub unsafe fn wrmsr_icr(icr: u64) {
         let icr_low = (icr & 0xFFFF_FFFF) as u32;
         // SAFETY: LAPIC MMIO identity-mapped; spec mandates writing
         // ICR_HIGH before ICR_LOW (LOW write triggers send).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let icr_hi_reg = (XAPIC_MMIO_BASE + 0x310) as *mut u32;
             let icr_lo_reg = (XAPIC_MMIO_BASE + 0x300) as *mut u32;
@@ -645,6 +659,7 @@ pub unsafe fn apic_id() -> u32 {
         // SAFETY: caller guarantees init_bsp ran, so the LAPIC MMIO
         // window is identity-mapped; this 32-bit aligned read of the
         // architected APIC_ID register at base+0x20 has no side effects.
+        // SAFETY: Valid memory or trusted environment
         let raw = unsafe { core::ptr::read_volatile(id_reg) };
         // xAPIC APIC_ID occupies bits[31:24].
         raw >> 24
@@ -789,6 +804,7 @@ pub fn on_timer_tick() {
         // SAFETY: _rdtsc compiles to the RDTSC instruction, which is
         // unconditionally available in long mode at CPL=0 and only
         // reads the time-stamp counter — no memory or fault risk.
+        // SAFETY: Valid memory or trusted environment
         let now = unsafe { core::arch::x86_64::_rdtsc() };
         // If we've fallen behind (e.g. long handler), snap forward
         // to now + period rather than slipping forever.
@@ -810,6 +826,7 @@ pub fn on_timer_tick() {
         // around the IA32_TSC_DEADLINE WRMSR; AMD APM is silent,
         // but the fence is cheap and Linux applies it
         // unconditionally on TSC-deadline chips.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!("mfence", options(nostack, preserves_flags));
             wrmsr(IA32_TSC_DEADLINE, next);

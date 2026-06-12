@@ -99,8 +99,8 @@ fn smoke_rtl8xxxu_efuse_decode_round_trip() -> TestResult {
     decode_efuse_map(raw, &mut map);
 
     // Section 0 (bytes 0..8) should be 0x01..0x08.
-    for i in 0..8usize {
-        if map[i] != (i as u8 + 1) {
+    for (i, val) in map.iter().enumerate().take(8) {
+        if *val != (i as u8 + 1) {
             return TestResult::Fail("section 0 decode mismatch");
         }
     }
@@ -199,9 +199,7 @@ fn smoke_rtl8xxxu_per_chip_register_bank_decode() -> TestResult {
     if bank_8188.is_empty() {
         return TestResult::Fail("rtl8188e stage0 bank empty");
     }
-    let has_aps_8188 = bank_8188
-        .iter()
-        .any(|&(r, _)| r == REG_APS_FSMCO as u16 + 1);
+    let has_aps_8188 = bank_8188.iter().any(|&(r, _)| r == REG_APS_FSMCO + 1);
     let has_cr_8188 = bank_8188.iter().any(|&(r, _)| r == REG_CR);
     if !has_aps_8188 {
         return TestResult::Fail("rtl8188e missing APS_FSMCO+1");
@@ -969,6 +967,7 @@ kernel_test_in!("drivers/wireless/rtl8xxxu", smoke_rtl8xxxu_channel_5180_mhz);
 
 // ── 17. Shared IQ preamble + LC cal sequence shape ─────────────────
 
+#[allow(clippy::const_is_empty)]
 fn smoke_rtl8xxxu_iqk_lc_shapes() -> TestResult {
     use super::phy::{
         lc_calibrate_rf_writes, lssi_encode, IQK_POLL_MAX, IQK_PREAMBLE_GEN1, IQK_RESTORE_GEN1,

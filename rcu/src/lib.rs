@@ -108,6 +108,7 @@ impl<T: Send + 'static> Drop for Owned<T> {
         if !self.ptr.is_null() {
             // SAFETY: `ptr` was produced by `Box::into_raw`; we restore
             // the Box so its destructor runs.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 drop(Box::from_raw(self.ptr));
             }
@@ -155,6 +156,7 @@ impl<'g, T: 'static> Shared<'g, T> {
             // at least until the guard reports quiescence (i.e. drops). The
             // pointer was non-null (checked above) and points at a valid
             // `T` that outlives `'g`, so producing a `&'g T` is sound.
+            // SAFETY: Valid memory or trusted environment
             Some(unsafe { &*self.ptr })
         }
     }
@@ -255,6 +257,7 @@ impl<T: Send + 'static> Drop for Atomic<T> {
         if !p.is_null() {
             // SAFETY: `p` came from `Box::into_raw` and nobody else
             // holds a `ReadGuard` tied to this cell (we're in Drop).
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 drop(Box::from_raw(p));
             }

@@ -120,6 +120,7 @@ impl Iterator for ExtCapIter {
         }
         // SAFETY: extended-config window is identity-mapped; the
         // bounded `next` keeps us inside the 4 KiB cfg page.
+        // SAFETY: Valid memory or trusted environment
         let hdr = unsafe { cfg_read32(self.cfg, self.next) };
         // All-zero or all-one header = end / unsupported.
         if hdr == 0 || hdr == 0xFFFF_FFFF {
@@ -421,6 +422,7 @@ pub fn clear_aer_status(
     };
     // SAFETY: AER cap offset comes from the validated walker; cfg
     // page is identity-mapped.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         cfg_write32(cfg, hdr.offset + off, bits);
     }

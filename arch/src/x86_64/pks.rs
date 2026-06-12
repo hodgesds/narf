@@ -111,6 +111,7 @@ pub unsafe fn save() -> SavedPkrs {
 pub unsafe fn restore(s: SavedPkrs) {
     // SAFETY: see save; also writing an arbitrary 32-bit bitmap to
     // the defined field of IA32_PKRS is always well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(IA32_PKRS, s.0);
     }

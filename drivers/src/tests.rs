@@ -216,6 +216,7 @@ fn smoke_drivers_release_and_reuse_domain_va() -> TestResult {
     // `release`'s contract that the `(va_base, len)` pair correspond to a
     // prior live claim in this same `domain`. The mapping is not used
     // after this point, so releasing it here is sound.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { release_domain_mmio(domain, va2, 4096) };
     TestResult::Pass
 }

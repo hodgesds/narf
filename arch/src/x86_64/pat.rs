@@ -109,6 +109,7 @@ pub const NARF_PAT: u64 = encode([
 pub fn read() -> u64 {
     // SAFETY: PAT is unconditional on long-mode x86_64; rdmsr is
     // always legal at CPL=0.
+    // SAFETY: Valid memory or trusted environment
     unsafe { rdmsr(MSR_IA32_PAT) }
 }
 

@@ -206,6 +206,7 @@ impl<T: Send + 'static + Retag, const N: usize> transport::RingTransport<T> for 
         // publishes it; the consumer cannot observe the slot before
         // that store. `retag_on_publish` is identity for types whose
         // `Retag` impl is the blanket default.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let slots = &mut *self.slots.get();
             slots[idx].write(retag::retag_on_publish(val));
@@ -227,6 +228,7 @@ impl<T: Send + 'static + Retag, const N: usize> transport::RingTransport<T> for 
         // SAFETY: caller upholds the SPSC invariant. The slot at `idx`
         // was published by a release-store of `head` observed by our
         // acquire-load above.
+        // SAFETY: Valid memory or trusted environment
         let msg = unsafe {
             let slots = &mut *self.slots.get();
             core::mem::replace(&mut slots[idx], MaybeUninit::uninit()).assume_init()
@@ -263,6 +265,7 @@ impl<T, const N: usize> Drop for Ring<T, N> {
             // SAFETY: indices in [tail, head) were published by the
             // producer but not consumed; their payloads are live
             // `MaybeUninit<T>` initialised values.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::mem::replace(&mut slots[idx], MaybeUninit::uninit()).assume_init_drop();
             }
@@ -350,6 +353,7 @@ impl<T: Send + 'static + Retag, const N: usize> Producer<T, N> {
         // types not implementing `Retag`; opt-in types (e.g. payloads
         // carrying raw pointers crossing aarch64 MTE domains) get
         // their `Retag::retag` invoked here.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let slots = &mut *self.ring.slots.get();
             slots[idx].write(retag::retag_on_publish(msg));
@@ -485,6 +489,7 @@ impl<T: Send + 'static + Retag, const N: usize> Consumer<T, N> {
         let idx = (tail & Ring::<T, N>::MASK) as usize;
         // SAFETY: the slot was published by a release-store of `head`
         // that our acquire-load just observed; consumer is sole reader.
+        // SAFETY: Valid memory or trusted environment
         let msg = unsafe {
             let slots = &mut *self.ring.slots.get();
             core::mem::replace(&mut slots[idx], MaybeUninit::uninit()).assume_init()

@@ -414,6 +414,7 @@ impl AtlNic {
             // SAFETY: `rfd_phys` is the identity-mapped base of the freshly
             // allocated RFD ring; `i < RFD_RING_LEN` (loop bound) so the slot
             // at `rfd_phys + i*8` lies within the ring's mapped 8-byte stride.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
                 core::ptr::write_volatile((rfd_phys + (i * 8) as u64) as *mut Rfd, d);
             }
@@ -474,6 +475,7 @@ impl AtlNic {
         // SAFETY: `mmio` is the BAR0 mapping this `bring_up` owns exclusively
         // (per its `# Safety` contract), satisfying `read_phy`'s requirement
         // that the caller own the device's MMIO BAR.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let bmsr = unsafe { read_phy(&mmio, MII_BMSR) }.unwrap_or(0);
         let link_up = bmsr & BMSR_LINK_STATUS != 0;
         let an_complete = bmsr & BMSR_AUTONEG_COMPLETE != 0;
@@ -605,6 +607,7 @@ impl AtlNic {
             // DMA buffer; `i < copy_len <= RX_BUF_LEN`, so each byte read stays
             // within that DMA-coherent allocation. Volatile because the NIC
             // wrote the bytes via DMA.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
         }
 
@@ -786,6 +789,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // (MEM_SPACE | BUS_MASTER | INTX_DISABLE) and is the sole owner of
     // `device` for the duration of the call, satisfying `bring_up`'s
     // exclusive-ownership requirement over the BAR + cfg windows.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { AtlNic::bring_up(&device, &cap) } {
         Ok(d) => Arc::new(d),
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
@@ -797,6 +801,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         // `CONTROLLER` install below), so `Arc::as_ptr` yields a pointer to a
         // live, exclusively-owned `AtlNic` and the `&mut` borrow ends before
         // any clone is published.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let d = unsafe { &mut *(Arc::as_ptr(&dev) as *mut AtlNic) };
         *d.rx_ipc_ring.lock() = Some(rx_cons);
         *d.tx_ipc_ring.lock() = Some(tx_prod);

@@ -17,9 +17,12 @@ extern crate alloc;
 
 pub mod ahci;
 pub mod emmc;
+pub mod megaraid;
+pub mod mpt3sas;
 pub mod rtsx;
 pub mod sd_proto;
 pub mod sdhci;
+pub mod smartpqi;
 pub mod ufs;
 pub mod vmd;
 
@@ -34,6 +37,18 @@ pub fn register_initcalls() {
     // Linux ref: `drivers/mmc/core/block.c:mmc_blk_alloc_req`.
     narf_init::register(Stage::Subsys, "ahci", || {
         ahci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "megaraid", || {
+        megaraid::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "smartpqi", || {
+        smartpqi::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "mpt3sas", || {
+        mpt3sas::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "sdhci", || {

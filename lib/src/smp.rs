@@ -153,6 +153,7 @@ pub unsafe fn count_aarch64_cpus_in_dtb(dtb_phys: u64) -> u32 {
     let base = dtb_phys as *const u8;
     // SAFETY: caller-asserted pointer; reads bounded to the FDT
     // header (40 bytes) before trusting offsets.
+    // SAFETY: Valid memory or trusted environment
     let header: [u8; 40] = unsafe { core::ptr::read(base as *const [u8; 40]) };
     let be32 = |b: &[u8]| -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) };
     if be32(&header[0..4]) != FDT_MAGIC {

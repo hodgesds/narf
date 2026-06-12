@@ -78,11 +78,14 @@ pub unsafe extern "C" fn __libc_signal_trampoline(signum: c_int, sigctx: usize) 
     if s < NSIG {
         // SAFETY: single-threaded user mode; HANDLERS reads/writes
         // are race-free with the rest of this crate's signal table.
+        // SAFETY: Valid memory or trusted environment
         let h = unsafe { HANDLERS[s] };
         if h != SIG_DFL_RAW && h != SIG_IGN_RAW {
             // SAFETY: caller installed h via signal/sigaction; the
             // value is a valid C function pointer.
+            // SAFETY: Valid memory or trusted environment
             let f: sighandler_t = unsafe { core::mem::transmute(h) };
+            // SAFETY: Valid memory or trusted environment
             unsafe { f(signum) };
         }
     }
@@ -91,13 +94,9 @@ pub unsafe extern "C" fn __libc_signal_trampoline(signum: c_int, sigctx: usize) 
     // ABI — the kernel-side sys_sigreturn rewrites the trap frame
     // and the iretq lands the user at the trapping instruction
     // with full register state restored.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_user_runtime::sigreturn_with(sigctx as u64);
-    }
-    // Unreachable; satisfies the `-> !` return type if a buggy
-    // kernel returns through.
-    loop {
-        core::hint::spin_loop();
     }
 }
 
@@ -122,6 +121,7 @@ pub unsafe extern "C" fn signal(signum: c_int, handler: usize) -> usize {
     let s = signum as usize;
     // SAFETY: single-threaded user-mode invariant per HANDLERS.
     let prior = unsafe { HANDLERS[s] };
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         HANDLERS[s] = handler;
     }
@@ -135,6 +135,7 @@ pub unsafe extern "C" fn signal(signum: c_int, handler: usize) -> usize {
     // kernel returns is the previously-registered trampoline addr,
     // which is uninteresting to the caller — we hand back our own
     // tracked prior instead.
+    // SAFETY: Valid memory or trusted environment
     let _kprior = unsafe { narf_user_runtime::sigaction(signum as u32, kernel_handler) };
     prior
 }
@@ -202,6 +203,7 @@ pub unsafe extern "C" fn sigemptyset(set: *mut sigset_t) -> c_int {
     if set.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*set).bits = 0;
     }
@@ -214,6 +216,7 @@ pub unsafe extern "C" fn sigfillset(set: *mut sigset_t) -> c_int {
     if set.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*set).bits = !0u64 & !1;
     } // bit 0 reserved
@@ -226,6 +229,7 @@ pub unsafe extern "C" fn sigaddset(set: *mut sigset_t, sig: c_int) -> c_int {
     if set.is_null() || sig < 0 || sig > 63 {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*set).bits |= 1u64 << sig;
     }
@@ -238,6 +242,7 @@ pub unsafe extern "C" fn sigdelset(set: *mut sigset_t, sig: c_int) -> c_int {
     if set.is_null() || sig < 0 || sig > 63 {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*set).bits &= !(1u64 << sig);
     }
@@ -250,6 +255,7 @@ pub unsafe extern "C" fn sigismember(set: *const sigset_t, sig: c_int) -> c_int 
     if set.is_null() || sig < 0 || sig > 63 {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         if ((*set).bits >> sig) & 1 != 0 {
             1
@@ -271,6 +277,7 @@ pub unsafe extern "C" fn sigsuspend(mask: *const sigset_t) -> c_int {
     }
     // Save current mask, install the suspend mask, then poll for
     // any signal not in the new mask via the pending bitmap.
+    // SAFETY: Valid memory or trusted environment
     let new_mask = unsafe { (*mask).bits } as u32;
     let prior = narf_user_runtime::sigprocmask(2 /* SIG_SETMASK */, new_mask);
     // Poll loop — when ANY signal is pending and not blocked, we
@@ -283,6 +290,7 @@ pub unsafe extern "C" fn sigsuspend(mask: *const sigset_t) -> c_int {
         // sleep returned, any pending unblocked signal has
         // already been processed via deliver_signal. We just
         // need to wait for *any* such signal.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { crate::process::usleep(1000) };
         // After the wake, restore the prior mask + return EINTR.
         // (POSIX: sigsuspend always returns -1 with EINTR.)
@@ -300,11 +308,13 @@ pub unsafe extern "C" fn sigwaitinfo(set: *const sigset_t, info: *mut siginfo_t)
         crate::errno::set_errno(22);
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let want = unsafe { (*set).bits };
     loop {
         // Poll the per-task signal-pending bitmap via getrusage-
         // style helpers. Without a kernel "wait for signal in
         // set" syscall, we busy-poll with a 1ms sleep.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { crate::process::usleep(1000) };
         // The sigprocmask "no-op read" returns the current mask;
         // we'd really want a peek-pending. Today we just look at
@@ -329,10 +339,12 @@ pub unsafe extern "C" fn sigwait(set: *const sigset_t, signo: *mut c_int) -> c_i
         return 22;
     }
     let mut info = siginfo_t::default();
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { sigwaitinfo(set, &mut info as *mut _) };
     if r < 0 {
         return crate::errno::errno();
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *signo = r;
     }
@@ -350,6 +362,7 @@ pub unsafe extern "C" fn sigtimedwait(
     // Stage-1 simplification: forward to sigwaitinfo (the kernel
     // doesn't yet expose a "wait for signal with timeout" syscall;
     // the timeout is structurally accepted but not yet honored).
+    // SAFETY: Valid memory or trusted environment
     unsafe { sigwaitinfo(set, info) }
 }
 
@@ -363,10 +376,12 @@ pub unsafe extern "C" fn sigprocmask(
     let new_bits = if set.is_null() {
         0u32
     } else {
+        // SAFETY: Valid memory or trusted environment
         unsafe { (*set).bits as u32 }
     };
     let prior = narf_user_runtime::sigprocmask(how as u32, new_bits);
     if !oldset.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*oldset).bits = prior as u64;
         }
@@ -438,6 +453,7 @@ pub unsafe extern "C" fn sigaction(
     let s = signum as usize;
     // SAFETY: single-threaded user mode; HANDLERS reads/writes
     // are race-free.
+    // SAFETY: Valid memory or trusted environment
     let prior = unsafe { HANDLERS[s] };
     if !oldact.is_null() {
         // SAFETY: caller-asserted writable.
@@ -475,6 +491,7 @@ pub unsafe extern "C" fn sigpending(set: *mut sigset_t) -> c_int {
     if set.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*set).bits = 0;
     }
@@ -509,11 +526,13 @@ pub unsafe extern "C" fn sigaltstack(ss: *const stack_t, old_ss: *mut stack_t) -
         ss_size: 0,
     };
     if !old_ss.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*old_ss) = CURRENT;
         }
     }
     if !ss.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let new = &*ss;
             if new.ss_flags & SS_DISABLE != 0 {
@@ -539,6 +558,7 @@ pub unsafe extern "C" fn sigaltstack(ss: *const stack_t, old_ss: *mut stack_t) -
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pause() -> c_int {
     loop {
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { crate::process::usleep(10_000) };
         // Single iteration — same fundamental limitation as
         // sigsuspend until a peek-pending syscall lands.

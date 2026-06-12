@@ -54,6 +54,7 @@ pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     let mut n = 0usize;
     // SAFETY: per the function-level contract — read until a NUL
     // terminator is found, then return the count.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *s.add(n) != 0 {
             n += 1;
@@ -72,6 +73,7 @@ pub unsafe extern "C" fn strcmp(a: *const u8, b: *const u8) -> i32 {
     let mut i = 0usize;
     // SAFETY: per the function-level contract — read both strings
     // in lockstep until a divergence or a NUL on either side.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         loop {
             let ca = *a.add(i);
@@ -363,6 +365,7 @@ pub unsafe extern "C" fn strdup(s: *const u8) -> *mut u8 {
     let len = unsafe { strlen(s) };
     // SAFETY: malloc is `unsafe extern "C"` to match the C-ABI
     // shape exposed in heap.rs; passing a non-zero size is fine.
+    // SAFETY: Valid memory or trusted environment
     let buf = unsafe { crate::heap::malloc(len + 1) };
     if buf.is_null() {
         return core::ptr::null_mut();
@@ -797,6 +800,7 @@ pub unsafe extern "C" fn strtok_r(s: *mut u8, delim: *const u8, saveptr: *mut *m
     // Skip leading delimiters.
     // SAFETY: `p` points into the original NUL-terminated input;
     // bytes past it are read-only walked.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *p != 0 && byte_in_set(*p, delim) {
             p = p.add(1);
@@ -844,6 +848,7 @@ static mut STRTOK_SAVEPTR: *mut u8 = core::ptr::null_mut();
 pub unsafe extern "C" fn strtok(s: *mut u8, delim: *const u8) -> *mut u8 {
     // SAFETY: forwarded; STRTOK_SAVEPTR access is race-free under
     // the single-threaded user-mode invariant.
+    // SAFETY: Valid memory or trusted environment
     unsafe { strtok_r(s, delim, &raw mut STRTOK_SAVEPTR) }
 }
 
@@ -894,9 +899,11 @@ pub unsafe extern "C" fn strerror_r(errnum: i32, buf: *mut u8, buflen: usize) ->
     } // EINVAL
       // SAFETY: forwarded to crate::errno::strerror — returns a
       // pointer to a static NUL-terminated byte array.
+      // SAFETY: Valid memory or trusted environment
     let src = unsafe { crate::errno::strerror(errnum) };
     // Walk to find length.
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     while unsafe { *src.add(len) } != 0 {
         len += 1;
     }

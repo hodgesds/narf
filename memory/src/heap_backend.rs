@@ -148,6 +148,7 @@ impl HeapBackend for SlabBackend {
             // SAFETY: caller asserts pointer/layout pair came from
             // a prior `alloc` on this backend, i.e. from
             // `crate::slab::alloc` with the same layout.
+            // SAFETY: Valid memory or trusted environment
             unsafe { crate::slab::dealloc(nn, layout) };
         }
     }

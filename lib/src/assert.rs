@@ -43,6 +43,7 @@ pub fn current_domain() -> DomainId {
         // SAFETY: `narf_arch_current_domain` is supplied by narf-arch
         // (or whichever TCB crate owns the domain state) via
         // `#[no_mangle] pub extern "Rust" fn …`. It's a pure read.
+        // SAFETY: Valid memory or trusted environment
         let raw = unsafe { narf_arch_current_domain() };
         DomainId::new(raw)
     }

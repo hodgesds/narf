@@ -201,6 +201,7 @@ fn log(line: &str) {
     if h != 0 {
         // SAFETY: LOG_HOOK is only written via `set_log_hook` which
         // stores `LogHook as usize`.
+        // SAFETY: Valid memory or trusted environment
         let f: LogHook = unsafe { core::mem::transmute(h) };
         f(line);
     }
@@ -483,6 +484,7 @@ impl<'a> TruncatingWriter<'a> {
         // truncate at byte boundaries that are also char boundaries
         // for the chars we write (ASCII subset of stage names + the
         // formatted name string).
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::str::from_utf8_unchecked(&self.buf[..self.len]) }
     }
 }

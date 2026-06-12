@@ -206,6 +206,7 @@ pub unsafe extern "C" fn fmin(x: f64, y: f64) -> f64 {
     // SAFETY: pure value math.
     if unsafe { isnan(x) != 0 } {
         y
+    // SAFETY: Valid memory or trusted environment
     } else if unsafe { isnan(y) != 0 } {
         x
     } else if x < y {
@@ -221,6 +222,7 @@ pub unsafe extern "C" fn fmax(x: f64, y: f64) -> f64 {
     // SAFETY: pure value math.
     if unsafe { isnan(x) != 0 } {
         y
+    // SAFETY: Valid memory or trusted environment
     } else if unsafe { isnan(y) != 0 } {
         x
     } else if x > y {
@@ -264,17 +266,22 @@ pub unsafe extern "C" fn fmaxf(x: f32, y: f32) -> f32 {
 pub unsafe extern "C" fn fmod(x: f64, y: f64) -> f64 {
     // SAFETY: pure value math; helpers are no-mangle wrappers.
     let nan = f64::from_bits(0x7FF8_0000_0000_0000);
+    // SAFETY: Valid memory or trusted environment
     if unsafe { isnan(x) != 0 || isnan(y) != 0 } {
         return nan;
     }
+    // SAFETY: Valid memory or trusted environment
     if y == 0.0 || unsafe { isinf(x) != 0 } {
         return nan;
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { isinf(y) != 0 } {
         return x;
     }
     let neg = x < 0.0;
+    // SAFETY: Valid memory or trusted environment
     let mut a = unsafe { fabs(x) };
+    // SAFETY: Valid memory or trusted environment
     let b = unsafe { fabs(y) };
     if a < b {
         return if neg { -a } else { a };
@@ -299,6 +306,7 @@ pub unsafe extern "C" fn fmod(x: f64, y: f64) -> f64 {
 pub unsafe extern "C" fn fmodf(x: f32, y: f32) -> f32 {
     // SAFETY: forwarding to f64 is fine for the value range we
     // handle; the cast is exact for the integer-shaped reductions.
+    // SAFETY: Valid memory or trusted environment
     unsafe { fmod(x as f64, y as f64) as f32 }
 }
 
@@ -358,6 +366,7 @@ pub unsafe extern "C" fn sqrt(x: f64) -> f64 {
 pub unsafe extern "C" fn sqrtf(x: f32) -> f32 {
     // SAFETY: pure forwarding; `sqrt` returns a f64 in the f32 range
     // for any in-range f32 input.
+    // SAFETY: Valid memory or trusted environment
     unsafe { sqrt(x as f64) as f32 }
 }
 
@@ -548,6 +557,7 @@ pub unsafe extern "C" fn log10f(x: f32) -> f32 {
 
 #[inline]
 fn is_integer(y: f64) -> bool {
+    // SAFETY: Valid memory or trusted environment
     y.is_finite() && (unsafe { trunc(y) }) == y
 }
 

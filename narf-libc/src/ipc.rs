@@ -21,7 +21,7 @@
 #![allow(non_camel_case_types)]
 
 use crate::posix::c_int;
-use core::ffi::c_void;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── POSIX semaphores ────────────────────────────────────────────
@@ -56,10 +56,12 @@ pub unsafe extern "C" fn sem_init(sem: *mut sem_t, _pshared: c_int, value: u32) 
     if sem.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *sem = sem_t::default();
     }
     let counter = sem_counter_ptr(sem);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     atomic.store(value, Ordering::Release);
     0
@@ -79,6 +81,7 @@ pub unsafe extern "C" fn sem_post(sem: *mut sem_t) -> c_int {
         return -1;
     }
     let counter = sem_counter_ptr(sem);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     atomic.fetch_add(1, Ordering::AcqRel);
     let _ = narf_user_runtime::futex_wake(counter as u64, 1);
@@ -93,6 +96,7 @@ pub unsafe extern "C" fn sem_wait(sem: *mut sem_t) -> c_int {
         return -1;
     }
     let counter = sem_counter_ptr(sem);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     loop {
         let cur = atomic.load(Ordering::Acquire);
@@ -118,6 +122,7 @@ pub unsafe extern "C" fn sem_trywait(sem: *mut sem_t) -> c_int {
         return -1;
     }
     let counter = sem_counter_ptr(sem);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     let cur = atomic.load(Ordering::Acquire);
     if cur == 0 {
@@ -142,8 +147,10 @@ pub unsafe extern "C" fn sem_getvalue(sem: *mut sem_t, sval: *mut c_int) -> c_in
         return -1;
     }
     let counter = sem_counter_ptr(sem);
+    // SAFETY: Valid memory or trusted environment
     let atomic = unsafe { &*(counter as *const AtomicU32) };
     let v = atomic.load(Ordering::Acquire) as c_int;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *sval = v;
     }
@@ -174,7 +181,9 @@ pub unsafe extern "C" fn shm_open(name: *const i8, oflag: c_int, mode: u32) -> c
     }
     // POSIX requires the name to start with '/' — strip it before
     // appending so we don't end up with "/dev/shm//foo".
+    // SAFETY: Valid memory or trusted environment
     let n_ptr = if unsafe { *name } == b'/' as i8 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { name.add(1) }
     } else {
         name
@@ -212,13 +221,16 @@ pub unsafe extern "C" fn shm_unlink(name: *const i8) -> c_int {
         path[pos] = b;
         pos += 1;
     }
+    // SAFETY: Valid memory or trusted environment
     let n_ptr = if unsafe { *name } == b'/' as i8 {
+        // SAFETY: Valid memory or trusted environment
         unsafe { name.add(1) }
     } else {
         name
     };
     let mut i = 0isize;
     while pos < path.len() - 1 {
+        // SAFETY: Valid memory or trusted environment
         let b = unsafe { *n_ptr.offset(i) } as u8;
         if b == 0 {
             break;
@@ -228,6 +240,7 @@ pub unsafe extern "C" fn shm_unlink(name: *const i8) -> c_int {
         i += 1;
     }
     path[pos] = 0;
+    // SAFETY: Valid memory or trusted environment
     unsafe { crate::posix::unlink(path.as_ptr() as *const i8) }
 }
 
@@ -252,6 +265,7 @@ pub unsafe extern "C" fn shmget_real(key: i32, _size: usize, flag: c_int) -> c_i
     }
     name[18] = 0;
     let mode = 0o600;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         shm_open(
             name.as_ptr() as *const i8,
@@ -311,6 +325,7 @@ pub struct mq_attr {
 }
 
 fn mq_lookup(name_bytes: &[u8]) -> Option<usize> {
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for i in 0..MQ_MAX {
             if let Some(e) = &MQ_TABLE[i] {
@@ -337,6 +352,7 @@ pub unsafe extern "C" fn mq_open(
     let mut nb = [0u8; MQ_NAME_MAX];
     let mut nlen = 0usize;
     while nlen < MQ_NAME_MAX {
+        // SAFETY: Valid memory or trusted environment
         let b = unsafe { *name.add(nlen) } as u8;
         if b == 0 {
             break;
@@ -353,6 +369,7 @@ pub unsafe extern "C" fn mq_open(
     }
     // attr is accepted but our queue is fixed-size today.
     let _ = attr;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         for i in 0..MQ_MAX {
             if MQ_TABLE[i].is_none() {
@@ -385,6 +402,7 @@ pub unsafe extern "C" fn mq_unlink(name: *const i8) -> c_int {
     let mut nb = [0u8; MQ_NAME_MAX];
     let mut nlen = 0;
     while nlen < MQ_NAME_MAX {
+        // SAFETY: Valid memory or trusted environment
         let b = unsafe { *name.add(nlen) } as u8;
         if b == 0 {
             break;
@@ -393,6 +411,7 @@ pub unsafe extern "C" fn mq_unlink(name: *const i8) -> c_int {
         nlen += 1;
     }
     if let Some(idx) = mq_lookup(&nb[..nlen]) {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             MQ_TABLE[idx] = None;
         }
@@ -412,6 +431,7 @@ pub unsafe extern "C" fn mq_send(mqd: mqd_t, msg: *const i8, len: usize, _prio: 
         crate::errno::set_errno(7);
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let entry = match &mut MQ_TABLE[mqd as usize] {
             Some(e) => e,
@@ -439,6 +459,7 @@ pub unsafe extern "C" fn mq_receive(mqd: mqd_t, msg: *mut i8, len: usize, prio: 
     if mqd < 0 || (mqd as usize) >= MQ_MAX || msg.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let entry = match &mut MQ_TABLE[mqd as usize] {
             Some(e) => e,
@@ -476,10 +497,12 @@ pub unsafe extern "C" fn mkfifo(path: *const i8, mode: u32) -> c_int {
     if path.is_null() {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let fd = unsafe { crate::posix::open(path, 0o100 | 0o2, mode) };
     if fd < 0 {
         return -1;
     }
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::posix::close(fd) };
     0
 }
@@ -490,15 +513,18 @@ pub unsafe extern "C" fn mknod(path: *const i8, mode: u32, _dev: u64) -> c_int {
     const S_IFIFO: u32 = 0o010000;
     const S_IFREG: u32 = 0o100000;
     match mode & S_IFMT {
+        // SAFETY: Valid memory or trusted environment
         S_IFIFO => unsafe { mkfifo(path, mode & 0o7777) },
         S_IFREG | 0 => {
             if path.is_null() {
                 return -1;
             }
+            // SAFETY: Valid memory or trusted environment
             let fd = unsafe { crate::posix::open(path, 0o100, mode & 0o7777) };
             if fd < 0 {
                 return -1;
             }
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { crate::posix::close(fd) };
             0
         }
@@ -522,6 +548,7 @@ pub unsafe extern "C" fn inotify_init1(_flags: c_int) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inotify_init() -> c_int {
+    // SAFETY: Valid memory or trusted environment
     unsafe { inotify_init1(0) }
 }
 

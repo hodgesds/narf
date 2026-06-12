@@ -121,6 +121,7 @@ impl<T, const N: usize> SharedRing<T, N> {
         // and points at writable storage of at least `size_bytes()`
         // bytes, so the `head`/`tail`/`closed` atomics (the first 12
         // bytes of the `#[repr(C)]` layout) are valid to store into.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*ptr).head.store(0, Ordering::Relaxed);
             (*ptr).tail.store(0, Ordering::Relaxed);
@@ -213,6 +214,7 @@ impl<T, const N: usize> SharedProducer<T, N> {
         // write as architecturally observable, matching the actual
         // contract: the slot is a wire-format mailbox shared with
         // another execution context the compiler can't see.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_volatile(r.slots[idx].get(), MaybeUninit::new(msg));
         }
@@ -275,6 +277,7 @@ impl<T, const N: usize> SharedConsumer<T, N> {
         // wire-format page shared with an execution context LLVM
         // can't see, so non-volatile reads were eligible for
         // load forwarding from a stale "uninitialized" lattice.
+        // SAFETY: Valid memory or trusted environment
         let msg = unsafe {
             core::ptr::read_volatile(r.slots[idx].get() as *const MaybeUninit<T>).assume_init()
         };

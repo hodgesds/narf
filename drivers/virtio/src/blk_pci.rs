@@ -219,6 +219,7 @@ impl VirtioBlkPci {
 
         // SAFETY: Virtqueue::new wipes the layout regions; the
         // backing pages may be recycled (alloc_frame doesn't zero).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let queue = unsafe { Virtqueue::new(layout) };
 
         Ok(Self {
@@ -263,6 +264,7 @@ impl VirtioBlkPci {
         // Hardcoded `target_apic_id=0` here was wrong: with -smp >1
         // sockets, the BSP's APIC ID may not be 0, and the MSI-X
         // would route to a CPU that isn't running the driver.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let target_apic = unsafe { narf_interrupts::current_cpu_target_id() };
         // SAFETY: caller-authority, exclusive ownership.
         let _ = unsafe { table.program_vector(0, target_apic, v) }
@@ -313,6 +315,7 @@ impl VirtioBlkPci {
         let payload_phys = payload.phys_addr().raw();
         // SAFETY: page-sized DMA buffer; fill the first 512 bytes
         // with the caller's data.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, &byte) in data.iter().enumerate() {
                 core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, byte);
@@ -421,6 +424,7 @@ impl VirtioBlkPci {
         // SAFETY: page-sized DMA buffer; zero the first 512 bytes so
         // a stale read shows up clearly if the device misses our
         // request.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for i in 0..512usize {
                 core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, 0);
@@ -460,6 +464,7 @@ impl VirtioBlkPci {
         compiler_fence(Ordering::SeqCst);
         // SAFETY: notify cap region is identity-mapped MMIO; offset
         // bounded by the device's queue_notify_off.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.notify.write16(notify_off, 0);
         }
@@ -1031,6 +1036,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // SAFETY: caller-authority, exclusive ownership of the device's
     // cfg + BAR windows for the duration of bring_up.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let dev = match unsafe { VirtioBlkPci::bring_up(&device, &cap) } {
         Ok(d) => d,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),

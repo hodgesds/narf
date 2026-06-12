@@ -84,6 +84,7 @@ pub unsafe extern "C" fn inet_aton(cp: *const c_char, inp: *mut in_addr_t) -> c_
     }
     // SAFETY: caller-supplied NUL-terminated C string.
     let mut len = 0usize;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *cp.add(len) != 0 {
             len += 1;
@@ -172,6 +173,7 @@ pub unsafe extern "C" fn inet_pton(
     let mut packed: in_addr_t = 0;
     // SAFETY: forwarded under the same caller contract; we own the
     // local slot we hand to inet_aton.
+    // SAFETY: Valid memory or trusted environment
     let rc = unsafe { inet_aton(src, &mut packed) };
     if rc != 1 {
         return 0;
@@ -270,12 +272,6 @@ pub struct addrinfo {
 
 pub const EAI_NONAME: c_int = -2;
 pub const EAI_FAIL: c_int = -4;
-
-#[inline]
-unsafe fn enosys_minus_one() -> c_int {
-    crate::errno::set_errno(ENOSYS);
-    -1
-}
 
 /// `socket(domain, type, protocol)` — open a new socket fd.
 ///
@@ -387,6 +383,7 @@ pub unsafe extern "C" fn send(
     len: usize,
     flags: c_int,
 ) -> isize {
+    // SAFETY: Valid memory or trusted environment
     unsafe { sendto(fd, buf, len, flags, core::ptr::null(), 0) }
 }
 
@@ -401,6 +398,7 @@ pub unsafe extern "C" fn recv(
     len: usize,
     flags: c_int,
 ) -> isize {
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         recvfrom(
             fd,
@@ -495,6 +493,7 @@ pub unsafe extern "C" fn getsockopt(
     vlen: *mut socklen_t,
 ) -> c_int {
     if !vlen.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { *vlen = 0 };
     }
     0

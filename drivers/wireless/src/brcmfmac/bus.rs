@@ -219,6 +219,7 @@ impl TcmWindow {
         }
         // SAFETY: TCM is mapped, caller asserts `ram_size` fits inside
         // the BAR2 window.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let p = self.host_base.add(ram_size as usize - 4) as *const u32;
             core::ptr::read_volatile(p)

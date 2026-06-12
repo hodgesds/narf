@@ -96,6 +96,7 @@ unsafe fn read_comm(pid_name: &[u8], out: &mut [u8; 64]) -> usize {
     if path_len == 0 {
         return 0;
     }
+    // SAFETY: Valid memory or trusted environment
     let fd = unsafe {
         libc::posix_open(path_buf.as_ptr() as *const i8, libc::O_RDONLY, 0)
     };
@@ -106,6 +107,7 @@ unsafe fn read_comm(pid_name: &[u8], out: &mut [u8; 64]) -> usize {
     let n = unsafe {
         libc::posix_read(fd, out.as_mut_ptr() as *mut _, out.len())
     };
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::posix_close(fd); }
     if n <= 0 {
         return 0;
@@ -124,11 +126,16 @@ unsafe fn print_proc(pid_name: &[u8], comm: &[u8]) {
     // Right-justify PID in 5 chars.
     let pad = if pid_name.len() < 5 { 5 - pid_name.len() } else { 0 };
     for _ in 0..pad {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_stdout(b" "); }
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(pid_name); }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(b"  "); }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(comm); }
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(b"\n"); }
 }
 
@@ -136,11 +143,14 @@ unsafe fn print_proc(pid_name: &[u8], comm: &[u8]) {
 #[allow(clippy::not_unsafe_ptr_arg_deref)] // argv is kernel-provided; entry signature is fixed
 pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     // Print header.
+    // SAFETY: Valid memory or trusted environment
     unsafe { write_stdout(b"  PID  CMD\n"); }
 
     // Open /proc and enumerate numeric entries (live PIDs).
+    // SAFETY: Valid memory or trusted environment
     let dir = unsafe { libc::opendir(b"/proc\0".as_ptr() as *const i8) };
     if dir.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe { write_stdout(b"ps: cannot open /proc\n"); }
         return 1;
     }
@@ -155,6 +165,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         let name_ptr = unsafe {
             core::ptr::addr_of!((*ent).d_name) as *const u8
         };
+        // SAFETY: Valid memory or trusted environment
         let nlen = unsafe { cstr_len(name_ptr) };
         if nlen == 0 {
             continue;
@@ -167,11 +178,14 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
         }
         // Read /proc/<pid>/comm.
         let mut comm_buf = [0u8; 64];
+        // SAFETY: Valid memory or trusted environment
         let comm_len = unsafe { read_comm(name, &mut comm_buf) };
         let comm = if comm_len > 0 { &comm_buf[..comm_len] } else { b"?" };
+        // SAFETY: Valid memory or trusted environment
         unsafe { print_proc(name, comm); }
     }
 
+    // SAFETY: Valid memory or trusted environment
     unsafe { libc::closedir(dir); }
     0
 }

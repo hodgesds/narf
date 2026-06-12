@@ -120,6 +120,7 @@ fn smoke_initramfs_pvh_module_parser() -> TestResult {
     // SAFETY: hdr points at a fully-initialized PVH struct;
     // modlist + cmdline addresses inside it are leaked-into-static
     // pointers within the same address space.
+    // SAFETY: Valid memory or trusted environment
     let result = unsafe { initramfs_module(hdr.as_ptr() as usize) };
     match result {
         Some((start, size)) => {

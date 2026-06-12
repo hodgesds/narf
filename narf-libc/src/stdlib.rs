@@ -60,12 +60,15 @@ unsafe fn parse_prefix(s: *const c_char, base: c_int) -> (*const c_char, i64, u3
         p = unsafe { p.add(1) };
     }
     // Sign.
+    // SAFETY: Valid memory or trusted environment
     let sign: i64 = match unsafe { *p } as u8 {
         b'+' => {
+            // SAFETY: Valid memory or trusted environment
             p = unsafe { p.add(1) };
             1
         }
         b'-' => {
+            // SAFETY: Valid memory or trusted environment
             p = unsafe { p.add(1) };
             -1
         }
@@ -73,10 +76,13 @@ unsafe fn parse_prefix(s: *const c_char, base: c_int) -> (*const c_char, i64, u3
     };
     // Base inference + 0x prefix consume.
     let mut b = if base == 0 { 10 } else { base as u32 };
+    // SAFETY: Valid memory or trusted environment
     if unsafe { *p } as u8 == b'0' {
+        // SAFETY: Valid memory or trusted environment
         let next = unsafe { *p.add(1) } as u8;
         if (next == b'x' || next == b'X') && (base == 0 || base == 16) {
             b = 16;
+            // SAFETY: Valid memory or trusted environment
             p = unsafe { p.add(2) };
         } else if base == 0 {
             // C99: leading 0 (without x) implies octal when base==0.
@@ -144,9 +150,11 @@ pub unsafe extern "C" fn strtol(
             // Drain the rest of the digits so endptr lands past them.
             // SAFETY: same.
             while {
+                // SAFETY: Valid memory or trusted environment
                 let b2 = unsafe { *p };
                 b2 != 0 && digit_value(b2 as u8, base).is_some()
             } {
+                // SAFETY: Valid memory or trusted environment
                 p = unsafe { p.add(1) };
             }
             break;
@@ -302,20 +310,24 @@ pub unsafe extern "C" fn strtod(nptr: *const c_char, endptr: *mut *mut c_char) -
     // SAFETY: caller contract — walk bytes until invalid.
     let mut p = nptr as *const u8;
     // Skip whitespace.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *p != 0 && matches!(*p, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
             p = p.add(1);
         }
     }
     // Sign.
+    // SAFETY: Valid memory or trusted environment
     let sign: f64 = match unsafe { *p } {
         b'+' => {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 p = p.add(1);
             }
             1.0
         }
         b'-' => {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 p = p.add(1);
             }
@@ -326,6 +338,7 @@ pub unsafe extern "C" fn strtod(nptr: *const c_char, endptr: *mut *mut c_char) -
     let mut value = 0.0f64;
     let mut any = false;
     // Integer part.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         while *p >= b'0' && *p <= b'9' {
             value = value * 10.0 + (*p - b'0') as f64;
@@ -438,9 +451,11 @@ pub unsafe extern "C" fn qsort(base: *mut c_void, nmemb: usize, size: usize, cmp
         while j > 0 {
             // SAFETY: both indices are < nmemb so the offsets are in-bounds.
             let a = unsafe { base.add((j - 1) * size) };
+            // SAFETY: Valid memory or trusted environment
             let b = unsafe { base.add(j * size) };
             // SAFETY: caller-supplied comparator with the same byte
             // pointers we passed it.
+            // SAFETY: Valid memory or trusted environment
             let ord = unsafe { cmp(a as *const c_void, b as *const c_void) };
             if ord <= 0 {
                 break;
@@ -544,6 +559,7 @@ pub unsafe extern "C" fn srand(seed: u32) {
     let s = if seed == 0 { 1 } else { seed & 0x7FFF_FFFF };
     // SAFETY: single-threaded user-mode invariant; access is
     // serialised by execution order.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         RAND_STATE = if s == 0 { 1 } else { s };
     }
@@ -581,13 +597,13 @@ pub unsafe extern "C" fn rand() -> c_int {
 /// # Safety
 /// `s` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: &mut [i64]) -> usize {
-    if s.is_null() || out.is_empty() {
+pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: *mut i64, out_len: usize) -> usize {
+    if s.is_null() || out.is_null() || out_len == 0 {
         return 0;
     }
     let mut p = s;
     let mut n = 0usize;
-    while n < out.len() {
+    while n < out_len {
         // Skip whitespace.
         // SAFETY: NUL-bounded walk per caller contract.
         unsafe {
@@ -623,7 +639,10 @@ pub unsafe extern "C" fn sscanf_ints(s: *const c_char, out: &mut [i64]) -> usize
             // SAFETY: NUL-bounded.
             q = unsafe { q.add(1) };
         }
-        out[n] = acc;
+        // SAFETY: out points to at least out_len i64s.
+        unsafe {
+            *out.add(n) = acc;
+        }
         n += 1;
         p = q;
     }

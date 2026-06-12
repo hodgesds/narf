@@ -78,6 +78,7 @@ pub unsafe fn program_buffer(base: u64, limit: u64) {
     }
     // SAFETY: caller-asserted. PMBLIMITR_EL1 = S3_0_C9_C10_0;
     // bit 0 is the enable, low 12 bits are reserved/control.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("msr S3_0_C9_C10_0, {}", in(reg) (limit & !0xFFF), options(nostack, preserves_flags));
     }

@@ -217,6 +217,8 @@ pub fn run_command<M: CrbMmio>(mmio: &mut M) -> Result<u32, CrbError> {
 
 // ── Test support (mock MMIO) ─────────────────────────────────────────
 
+pub type ReadHook = Option<fn(&mut [u32; 256])>;
+
 /// Mock MMIO registers for unit tests. Reads come from `regs`
 /// (zero-initialised); writes land in `regs` AND are appended to
 /// `writes` so tests can assert ordering. `read_hooks` lets a test
@@ -229,7 +231,7 @@ pub struct MockCrb {
     /// Per-register read hook. Indexed by `offset / 4`. When present
     /// the hook is called before the read returns, allowing the test
     /// to flip simulated TPM bits into `regs`.
-    pub read_hooks: [Option<fn(&mut [u32; 256])>; 256],
+    pub read_hooks: [ReadHook; 256],
 }
 
 impl MockCrb {

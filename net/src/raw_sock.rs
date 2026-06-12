@@ -146,6 +146,7 @@ pub fn raw_packet_set_depth(sock: &Arc<RawPacketSocket>, depth: usize) {
     let ptr = sock.as_ref() as *const RawPacketSocket as *mut RawPacketSocket;
     // SAFETY: We hold the only lock that serialises queue writes; this
     // field is only mutated here and read under the same lock path.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         (*ptr).max_depth = depth;
     }

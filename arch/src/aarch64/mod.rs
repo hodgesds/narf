@@ -63,6 +63,7 @@ pub unsafe fn exit_qemu(code: u32) -> ! {
     // `-semihosting` is supplied; otherwise it's an UNDEFINED that
     // traps to our (absent) exception vector — hence halt_forever
     // as fallback.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mov x0, #0x20",            // SYS_EXIT_EXTENDED

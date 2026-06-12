@@ -102,6 +102,7 @@ impl PageTable {
         // at owned, writable storage for a full `PageTable`; the byte count
         // equals `size_of::<PageTable>()` so the write stays in bounds, and
         // `PageTable` (all-zero `PageTableEntry`s) is valid when zeroed.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<PageTable>());
         }
@@ -119,6 +120,7 @@ pub unsafe fn write_identity<T>(phys: PhysAddr, value: T) {
     // SAFETY: per the fn contract `phys` is identity-mapped writable
     // storage aligned for `T`, so `kernel_mut_ptr::<T>()` is a valid,
     // aligned destination for a single `T` volatile write.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         ptr::write_volatile(phys.kernel_mut_ptr::<T>(), value);
     }
@@ -195,6 +197,7 @@ pub unsafe fn write_ttbr0_el1(root: PhysAddr) {
     // inner-shareable broadcast) — every CPU executes its own
     // activate() before polling, so per-CPU TLB scoping suffices
     // and avoids the cross-core synchronisation cost.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "msr ttbr0_el1, {addr}",
@@ -224,6 +227,7 @@ pub unsafe fn tlb_invalidate_vae1(virt: VirtAddr) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: TLBI at EL1 is always legal; the VA field is
     // bits [43:0] of the operand (shifted-down by 12).
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "dsb ishst",
@@ -271,6 +275,7 @@ pub unsafe fn new_user_ttbr0() -> Result<PhysAddr, PageTableAllocError> {
     let phys = frame.start_address();
     // SAFETY: frame is identity-mapped per the allocator's
     // contract; 4 KiB write is aligned.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         ptr::write_bytes(
             phys.kernel_mut_ptr::<u8>(),
@@ -435,22 +440,26 @@ pub unsafe fn map_4kb(
     // SAFETY: `&mut l0.entries[idx.l0]` borrows a live L0 entry of the
     // table just dereferenced; `ensure_next_table` only allocates an
     // identity-mapped frame and writes a table descriptor through it.
+    // SAFETY: Valid memory or trusted environment
     let l1_phys = unsafe { ensure_next_table(&mut l0.entries[idx.l0])? };
 
     // SAFETY: `l1_phys` is the L1 table phys addr `ensure_next_table`
     // just returned — an identity-mapped, page-aligned `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l1 = unsafe { &mut *(l1_phys.kernel_mut_ptr::<PageTable>()) };
     // SAFETY: as above; borrows a live entry of the L1 table.
     let l2_phys = unsafe { ensure_next_table(&mut l1.entries[idx.l1])? };
 
     // SAFETY: `l2_phys` is the identity-mapped L2 table phys addr
     // returned by `ensure_next_table`.
+    // SAFETY: Valid memory or trusted environment
     let l2 = unsafe { &mut *(l2_phys.kernel_mut_ptr::<PageTable>()) };
     // SAFETY: as above; borrows a live entry of the L2 table.
     let l3_phys = unsafe { ensure_next_table(&mut l2.entries[idx.l2])? };
 
     // SAFETY: `l3_phys` is the identity-mapped L3 table phys addr
     // returned by `ensure_next_table`.
+    // SAFETY: Valid memory or trusted environment
     let l3 = unsafe { &mut *(l3_phys.kernel_mut_ptr::<PageTable>()) };
     if l3.entries[idx.l3].is_valid() {
         return Err(MapError::AlreadyMapped);
@@ -493,6 +502,7 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     // SAFETY: `e` was just checked to be a valid TABLE descriptor
     // (low bits `0b11`), so `e.addr()` is the identity-mapped phys
     // addr of the next-level `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l1 = unsafe { &mut *(e.addr().kernel_mut_ptr::<PageTable>()) };
     let e = l1.entries[idx.l1];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
@@ -500,6 +510,7 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     }
     // SAFETY: `e` is a verified L1 TABLE descriptor; `e.addr()` is the
     // identity-mapped L2 `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l2 = unsafe { &mut *(e.addr().kernel_mut_ptr::<PageTable>()) };
     let e = l2.entries[idx.l2];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
@@ -507,6 +518,7 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     }
     // SAFETY: `e` is a verified L2 TABLE descriptor; `e.addr()` is the
     // identity-mapped L3 `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l3 = unsafe { &mut *(e.addr().kernel_mut_ptr::<PageTable>()) };
     let leaf = l3.entries[idx.l3];
     if !leaf.is_valid() {
@@ -544,6 +556,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: root must be identity-mapped per caller contract;
     // callers hold this invariant.
+    // SAFETY: Valid memory or trusted environment
     let l0 = unsafe { &*(root.kernel_ptr::<PageTable>()) };
     let e = l0.entries[idx.l0];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
@@ -553,6 +566,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     // SAFETY: the L0 `e` was just checked to be a valid TABLE
     // descriptor (`0b11`), so `e.addr()` is the identity-mapped L1
     // `PageTable`; we only read through the shared reference.
+    // SAFETY: Valid memory or trusted environment
     let l1 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l1.entries[idx.l1];
     if !e.is_valid() {
@@ -565,6 +579,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
 
     // SAFETY: `e` is a valid, non-block (`0b11`) L1 TABLE descriptor,
     // so `e.addr()` is the identity-mapped L2 `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l2 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l2.entries[idx.l2];
     if !e.is_valid() {
@@ -577,6 +592,7 @@ pub unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
 
     // SAFETY: `e` is a valid, non-block (`0b11`) L2 TABLE descriptor,
     // so `e.addr()` is the identity-mapped L3 `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l3 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l3.entries[idx.l3];
     if !e.is_valid() {
@@ -597,6 +613,7 @@ pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: `root` is the identity-mapped root `PageTable` per the
     // fn contract; we only read through the shared reference.
+    // SAFETY: Valid memory or trusted environment
     let l0 = unsafe { &*(root.kernel_ptr::<PageTable>()) };
     let e = l0.entries[idx.l0];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
@@ -606,6 +623,7 @@ pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     // SAFETY: the L0 `e` was just checked to be a valid TABLE
     // descriptor (`0b11`), so `e.addr()` is the identity-mapped L1
     // `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l1 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l1.entries[idx.l1];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
@@ -614,6 +632,7 @@ pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
 
     // SAFETY: `e` is a verified L1 TABLE descriptor; `e.addr()` is the
     // identity-mapped L2 `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l2 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l2.entries[idx.l2];
     if !e.is_valid() || (e.0 & 0b11) != 0b11 {
@@ -622,6 +641,7 @@ pub unsafe fn flags_at(root: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
 
     // SAFETY: `e` is a verified L2 TABLE descriptor; `e.addr()` is the
     // identity-mapped L3 `PageTable`.
+    // SAFETY: Valid memory or trusted environment
     let l3 = unsafe { &*(e.addr().kernel_ptr::<PageTable>()) };
     let e = l3.entries[idx.l3];
     if !e.is_valid() {

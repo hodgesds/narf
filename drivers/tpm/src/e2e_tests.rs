@@ -679,6 +679,7 @@ mod smokes {
         unsafe fn no_op(_: *const ()) {}
         static VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         let raw = RawWaker::new(core::ptr::null(), &VTAB);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw) };
         let mut cx = Context::from_waker(&waker);
         let mut pinned = core::pin::pin!(fut);

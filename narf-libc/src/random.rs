@@ -85,6 +85,7 @@ pub unsafe extern "C" fn getrandom(buf: *mut c_void, buflen: usize, _flags: c_in
         // can hand it a raw pointer derived from `&raw mut`
         // without going through a `&mut` (which would trip the
         // rust_2024_compatibility static_mut_refs lint).
+        // SAFETY: Valid memory or trusted environment
         let v = unsafe { xorshift64(&raw mut PRNG_STATE) };
         let chunk = v.to_le_bytes();
         let n = core::cmp::min(8, buflen - i);

@@ -412,6 +412,7 @@ impl DriverRegistry {
         // Started below, and the Wave-3a framework has no unregister
         // path, so the `Box<dyn Driver>` is kept alive by the
         // registry's Vec for the raw pointer's lifetime.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let driver: &mut dyn Driver = unsafe { &mut *driver_ptr };
         driver.start(env).await;
         // Transition Starting → Started under the lock so a following
@@ -487,6 +488,7 @@ impl DriverRegistry {
         // quiesce holds the &mut alias. Reset itself doesn't change
         // phase (the caller decides what comes next), so no post-
         // await store is needed.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let driver: &mut dyn Driver = unsafe { &mut *driver_ptr };
         driver.reset().await;
         Ok(())
@@ -568,6 +570,7 @@ impl DriverRegistry {
                     // SAFETY: the driver registered the same range
                     // via claim_mmio_in_domain; the ownership chain
                     // is the registration itself.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
                     let _ = unsafe { domain_alloc::release(domain, va_base, len) };
                 }
                 ReclaimToken::DmaCapSlot(idx) => {

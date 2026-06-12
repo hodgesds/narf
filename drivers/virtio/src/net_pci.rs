@@ -407,6 +407,7 @@ impl VirtioNetPci {
             if let Some(r) = device_cfg.as_ref() {
                 // SAFETY: device-cfg region was just mapped; u16
                 // at offset 8 per §5.1.4.
+                // SAFETY: Valid MMIO bounds or trusted driver environment
                 let p = unsafe { r.read16(CFG_MAX_VIRTQUEUE_PAIRS) };
                 if p >= 1 {
                     max_pairs = p.min(MAX_QUEUE_PAIRS);
@@ -491,6 +492,7 @@ impl VirtioNetPci {
             let tx_qidx = 2 * n as u16 + 1;
             // SAFETY: Virtqueue::new wipes the layout regions; the
             // backing pages may be recycled (alloc_frame doesn't zero).
+            // SAFETY: Valid MMIO bounds or trusted driver environment
             let mut rx_q = unsafe { Virtqueue::new(rx_layout) };
             // SAFETY: same.
             let tx_q = unsafe { Virtqueue::new(tx_layout) };
@@ -755,6 +757,7 @@ impl VirtioNetPci {
         let hdr_phys = pair.tx_hdr_buf.phys_addr().raw();
         // SAFETY: identity-mapped DMA buffer; offset 0..12 within
         // the 4 KiB tx_hdr_buf page.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for i in 0..12u64 {
                 core::ptr::write_volatile((hdr_phys + i) as *mut u8, 0);
@@ -874,6 +877,7 @@ impl VirtioNetPci {
         };
         // SAFETY: device-cfg region was mapped at bring_up; field
         // at offset 6 stays valid for the controller's lifetime.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let s = unsafe { r.read16(CFG_STATUS) };
         s & VIRTIO_NET_S_LINK_UP != 0
     }
@@ -912,6 +916,7 @@ impl VirtioNetPci {
         let phys = g.buf.phys_addr().raw();
         // SAFETY: identity-mapped DMA buffer; the offsets stay
         // within the 4 KiB page allocated above.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(phys as *mut u8, class);
             core::ptr::write_volatile((phys + 1) as *mut u8, cmd);
@@ -950,6 +955,7 @@ impl VirtioNetPci {
         // SAFETY: identity-mapped notify region. Notify the runtime
         // controlq index — it shifts based on `num_pairs` when F_MQ
         // is negotiated (§5.1.2).
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             self.notify.write16(notify_off, self.ctrl_qidx);
         }
@@ -964,6 +970,7 @@ impl VirtioNetPci {
         g.q.free_chain(head);
         // SAFETY: device wrote the ack byte before publishing the
         // used-ring entry; identity-mapped read.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let ack = unsafe { core::ptr::read_volatile((phys + 256) as *const u8) };
         Ok(ack)
     }
@@ -1127,6 +1134,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: probe-time caller owns the device. Best-effort —
     // failure leaves the polled fallback in place inside the
     // forwarder.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { dev.enable_msix(&cap, &device) };
     let idx = {
         let mut g = CONTROLLERS.lock();

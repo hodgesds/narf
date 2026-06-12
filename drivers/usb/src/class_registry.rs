@@ -57,12 +57,22 @@ pub struct UsbClassMatch {
 }
 
 impl UsbClassMatch {
-    /// Construct a plain VID/PID match with no class restriction.
     pub const fn vid_pid(vendor_id: u16, product_id: u16) -> Self {
         Self {
             vendor_id,
             product_id,
             class: None,
+            subclass: None,
+            protocol: None,
+        }
+    }
+
+    /// Construct a class-only match.
+    pub const fn class_only(class: u8) -> Self {
+        Self {
+            vendor_id: 0,
+            product_id: 0,
+            class: Some(class),
             subclass: None,
             protocol: None,
         }

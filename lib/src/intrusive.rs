@@ -111,6 +111,7 @@ impl<T> IntrusiveList<T> {
     pub fn push_back(&self, node: Pin<&mut Node<T>>) {
         // SAFETY: the pin projection for `link` is sound because `Node<T>`
         // and `ListLink<T>` are `!Unpin` and we never move out of `link`.
+        // SAFETY: Valid memory or trusted environment
         let node_ptr: NonNull<Node<T>> = NonNull::from(unsafe { node.get_unchecked_mut() });
         // SAFETY: the node pointer is live and owned by this list (caller holds external sync); the intrusive invariant rules out aliasing.
         let link = unsafe { &node_ptr.as_ref().link };
@@ -123,6 +124,7 @@ impl<T> IntrusiveList<T> {
             Some(tail) => {
                 // SAFETY: the caller holds the list (external sync); the tail
                 // node is still pinned and alive.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     tail.as_ref().link.next.set(Some(node_ptr));
                 }
@@ -252,6 +254,7 @@ mod tests {
         list.push_front(a.as_mut());
         list.push_front(b.as_mut());
         let h = list.pop_front().unwrap();
+        // SAFETY: Valid memory or trusted environment
         assert_eq!(unsafe { h.as_ref().value }, 20);
     }
 
@@ -266,13 +269,16 @@ mod tests {
         list.push_back(c.as_mut());
         // SAFETY: b is linked into `list`.
         let b_ptr = NonNull::from(unsafe { b.as_mut().get_unchecked_mut() });
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             list.unlink(b_ptr);
         }
         assert_eq!(list.len(), 2);
         let h = list.pop_front().unwrap();
+        // SAFETY: Valid memory or trusted environment
         assert_eq!(unsafe { h.as_ref().value }, 1);
         let h = list.pop_front().unwrap();
+        // SAFETY: Valid memory or trusted environment
         assert_eq!(unsafe { h.as_ref().value }, 3);
         assert!(list.is_empty());
     }

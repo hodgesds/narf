@@ -107,9 +107,11 @@ impl NvidiaDevice {
 
         // SAFETY: per this fn's `# Safety`, the caller owns `device`'s BARs
         // exclusively for the device lifetime, so mapping BAR_REGS is sound.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| ProbeError::BarMapFailed)?;
         // SAFETY: same caller-asserted exclusive BAR ownership; BAR_BAR1 is a
         // distinct BAR of the same `device` and is mapped at most once here.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let bar1 = unsafe { map_bar(device, BAR_BAR1) }.map_err(|_| ProbeError::BarMapFailed)?;
         // BAR3 is best-effort — older Maxwell/Pascal parts don't
         // expose a separate instance window via BAR3.
@@ -119,6 +121,7 @@ impl NvidiaDevice {
         // Sample PMC_BOOT_0. Read-only.
         // SAFETY: regs is an identity-mapped MMIO window we just
         // captured; offset 0 is the universal PMC_BOOT_0 register.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let boot0_raw = unsafe { regs.read32(crate::mc::PMC_BOOT_0) };
         compiler_fence(Ordering::SeqCst);
         if !Boot0::looks_present(boot0_raw) {

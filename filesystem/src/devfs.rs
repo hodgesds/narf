@@ -227,6 +227,7 @@ fn rfcomm_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     // via `as usize`. A function-pointer round-trip through `usize` is valid
     // because they have identical size/alignment, and we transmute back to the
     // exact same signature, so the resulting `f` points at a live function.
+    // SAFETY: Valid memory or trusted environment
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
@@ -241,6 +242,7 @@ fn rfcomm_enumerate() -> Vec<(String, FileType)> {
     // `as usize`. The transmute back to the identical signature is valid: a
     // `fn` pointer and `usize` share size/alignment and the value names a live
     // function.
+    // SAFETY: Valid memory or trusted environment
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -269,6 +271,7 @@ fn tty_usb_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     // via `as usize`. Transmuting back to the identical signature is valid
     // because `fn` pointers and `usize` share size/alignment and the value
     // names a live function.
+    // SAFETY: Valid memory or trusted environment
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
@@ -283,6 +286,7 @@ fn tty_usb_enumerate() -> Vec<(String, FileType)> {
     // `as usize`. Transmuting back to the identical signature is valid because
     // `fn` pointers and `usize` share size/alignment and the value names a live
     // function.
+    // SAFETY: Valid memory or trusted environment
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -311,6 +315,7 @@ fn video_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
     // via `as usize`. Transmuting back to the identical signature is valid
     // because `fn` pointers and `usize` share size/alignment and the value
     // names a live function.
+    // SAFETY: Valid memory or trusted environment
     let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
     f(name)
 }
@@ -325,6 +330,7 @@ fn video_enumerate() -> Vec<(String, FileType)> {
     // `as usize`. Transmuting back to the identical signature is valid because
     // `fn` pointers and `usize` share size/alignment and the value names a live
     // function.
+    // SAFETY: Valid memory or trusted environment
     let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
     f()
 }
@@ -658,6 +664,7 @@ impl FileOps for DevConsole {
                                 let hook: fn(u8) -> bool =
                                     // SAFETY: hook ptr installed at boot; signature
                                     // matches `fn(u8) -> bool`.
+                                    // SAFETY: Valid memory or trusted environment
                                     unsafe { core::mem::transmute(signal_hook) };
                                 hook(b)
                             } else {
@@ -681,6 +688,7 @@ impl FileOps for DevConsole {
                         // `fn(u8) -> bool` stored through `as usize`; transmuting
                         // back to that identical signature is valid because `fn`
                         // pointers and `usize` share size/alignment.
+                        // SAFETY: Valid memory or trusted environment
                         let hook: fn(u8) -> bool = unsafe { core::mem::transmute(signal_hook) };
                         hook(b)
                     } else {
@@ -718,6 +726,7 @@ impl FileOps for DevConsole {
                     // slice `from_ref(&b)` contains one byte < 0x80, which is
                     // always valid UTF-8; `from_utf8_unchecked` therefore has no
                     // invalid sequence to misinterpret.
+                    // SAFETY: Valid memory or trusted environment
                     narf_console::write_str(unsafe {
                         core::str::from_utf8_unchecked(core::slice::from_ref(&b))
                     });

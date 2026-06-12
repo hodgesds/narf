@@ -270,6 +270,7 @@ impl Ring {
         // SAFETY: `desc_mem` is a 4 KiB page; `depth * MT76_DESC_SIZE`
         // is bounded by `MT7921_BASELINE_RING_DEPTH * 16` = 256 bytes,
         // far less than the page.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::slice::from_raw_parts_mut(ptr, self.depth) }
     }
 
@@ -484,6 +485,7 @@ pub unsafe fn dma_disable(mmio: &MmioRegion) -> Result<(), DmaError> {
     let v = unsafe { mmio.read32(MT_WFDMA0_GLO_CFG as u64) };
     // SAFETY: BAR0 mapped + owned per `# Safety`; `MT_WFDMA0_GLO_CFG`
     // is a 32-bit register in range, written read-modify-write.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         mmio.write32(
             MT_WFDMA0_GLO_CFG as u64,

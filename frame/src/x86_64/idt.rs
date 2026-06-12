@@ -357,6 +357,7 @@ fn install_full(vec: usize, handler: unsafe extern "C" fn(), ist: u8, gate: u8) 
     // SAFETY: IDT is accessed only on the BSP during Stage-1 bring-up, before
     // any other CPU or interrupt handler can observe it. The write happens
     // before `lidt`, and the entry layout matches the hardware spec.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::addr_of_mut!(IDT)
             .cast::<IdtEntry>()
@@ -647,6 +648,7 @@ pub unsafe fn init() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: `lidt` with a valid 10-byte pseudo-descriptor installs the
     // IDT. The compiler_fence pair follows arch/ §4.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("lidt [{p}]", p = in(reg) &ptr, options(readonly, nostack, preserves_flags));
     }
@@ -667,6 +669,7 @@ pub unsafe fn load_idtr_ap() {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: same as init's lidt — IDT is BSP-built and immutable
     // post-init.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("lidt [{p}]", p = in(reg) &ptr, options(readonly, nostack, preserves_flags));
     }

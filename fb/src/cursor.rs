@@ -109,6 +109,7 @@ fn snapshot(fb: &FbWriter, x: u32, y: u32) -> Vec<Pixel32> {
     let mut pixels = Vec::with_capacity((W * H) as usize);
     // SAFETY: FbWriter::new validated the cap; framebuffer() is
     // exclusive for the lifetime of `fbm`.
+    // SAFETY: Valid memory or trusted environment
     let fbm = unsafe { fb.scanout_for_cursor() };
     for row in 0..H {
         for col in 0..W {

@@ -238,6 +238,7 @@ fn smoke_rcu_hazard_publish_retire() -> TestResult {
     fn drop_canary(p: *mut Canary) {
         // SAFETY: the test owns the pointer; retire's contract is that
         // we'll be invoked once no hazard slot names it.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             drop(Box::from_raw(p));
         }

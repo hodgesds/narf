@@ -68,6 +68,7 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -294,6 +295,7 @@ fn smoke_userspace_spawn_dispatcher_for_helper() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -424,6 +426,7 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user"),
@@ -483,6 +486,7 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // SAFETY: `pair.sq_phys` is the identity-mapped phys base of the SQ ring the
     // Bootstrap syscall just allocated with `BOOTSTRAP_SHARED_RING_DEPTH`, so it is
     // a valid, uniquely-owned `SqRing` for this producer to wrap.
+    // SAFETY: Valid memory or trusted environment
     let mut sq_prod = unsafe {
         SharedProducer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
             pair.sq_phys.raw() as *mut SqRing
@@ -510,6 +514,7 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // SAFETY: `pair.cq_phys` is the identity-mapped phys base of the CQ ring the
     // Bootstrap syscall just allocated with `BOOTSTRAP_SHARED_RING_DEPTH`, so it is
     // a valid, uniquely-owned `CqRingT` for this consumer to wrap.
+    // SAFETY: Valid memory or trusted environment
     let mut cq_cons = unsafe {
         SharedConsumer::<CqRing, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
             pair.cq_phys.raw() as *mut CqRingT
@@ -571,6 +576,7 @@ fn smoke_userspace_bootstrap_rings_round_trip() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -713,6 +719,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -774,6 +781,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // SAFETY: `addr_space.root` is the freshly built user root for this Bootstrap
     // test, identity-reachable as `translate` requires; the walk only reads its
     // table entries for `user_vaddr`.
+    // SAFETY: Valid memory or trusted environment
     let phys = match unsafe { paging::translate(addr_space.root, VirtAddr::new(user_vaddr)) } {
         Some(p) => p,
         None => {
@@ -803,6 +811,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // SAFETY: `phys` is the identity-mapped frame `translate` resolved for the
     // config page; the kernel wrote a `BootstrapHeader` there, whose layout `Hdr`
     // mirrors `#[repr(C)]`, so a single volatile struct read is valid and aligned.
+    // SAFETY: Valid memory or trusted environment
     let hdr = unsafe { core::ptr::read_volatile(phys.raw() as *const Hdr) };
 
     if hdr.magic != 0x4E_41_52_46 {
@@ -848,6 +857,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // SAFETY: `addr_space.root` is the live user root for this test, identity-
     // reachable as `translate` requires; this only walks its tables for the SQ
     // vaddr reported by the header.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { paging::translate(addr_space.root, VirtAddr::new(hdr.shared_sq_vaddr)) }.is_none() {
         *USER_AS_BS.lock() = None;
         __test_clear_global();
@@ -855,6 +865,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     }
     // SAFETY: same live user root as above; only walks its tables for the CQ
     // vaddr reported by the header.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { paging::translate(addr_space.root, VirtAddr::new(hdr.shared_cq_vaddr)) }.is_none() {
         *USER_AS_BS.lock() = None;
         __test_clear_global();
@@ -3322,6 +3333,7 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process(&bytes) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process failed"),
@@ -3352,6 +3364,7 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     // SAFETY: `proc.address_space.root` is the live root the loader just built,
     // identity-reachable as `translate` requires; this only walks its tables for
     // the code segment vaddr.
+    // SAFETY: Valid memory or trusted environment
     let code_phys = unsafe {
         paging::translate(
             proc.address_space.root,
@@ -3365,6 +3378,7 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     // Stack PTE installed — check the first page.
     // SAFETY: same live loader-built root as above; only walks its tables for the
     // stack-base vaddr.
+    // SAFETY: Valid memory or trusted environment
     let stack_phys = unsafe {
         paging::translate(
             proc.address_space.root,
@@ -3426,6 +3440,7 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(&bytes, &argv, &envp, &aux) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
@@ -3451,10 +3466,12 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
             // SAFETY: `proc.address_space.root` is this test process's live page-table
             // root, identity-reachable as `translate` requires; the walk only reads
             // table entries for the page-aligned `vaddr`.
+            // SAFETY: Valid memory or trusted environment
             unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         // SAFETY: `p` is the phys frame `translate` just resolved for this page;
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let argc = match read_u64(new_rsp) {
@@ -3478,6 +3495,7 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
         // SAFETY: `proc.address_space.root` is the live top-level page-table frame
         // for this test process; `translate` only reads that hierarchy and the
         // page-aligned `VirtAddr` is a plain table walk with no aliasing.
+        // SAFETY: Valid memory or trusted environment
         let p = match unsafe {
             paging::translate(proc.address_space.root, VirtAddr::new(v & !0xFFF))
         } {
@@ -3489,12 +3507,14 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
             // SAFETY: `p` is the physical/identity-mapped address that `translate`
             // returned for this user `VirtAddr`, so it points at the mapped page;
             // `i < want_b.len()` keeps the read within the resolved string buffer.
+            // SAFETY: Valid memory or trusted environment
             if unsafe { *((p + i as u64) as *const u8) } != b {
                 return false;
             }
         }
         // SAFETY: same mapped page as above; `want_b.len()` is the byte just past
         // the compared bytes, still within the page checked by `translate`.
+        // SAFETY: Valid memory or trusted environment
         unsafe { *((p + want_b.len() as u64) as *const u8) == 0 }
     };
     if !resolve(argv0, "one") {
@@ -3634,6 +3654,7 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `prog_bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(&prog_bytes, &[], &[], &[]) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
@@ -3657,6 +3678,7 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     // Both program and interpreter pages must be materialised.
     // SAFETY: `proc.address_space.root` is the live loader-built root, identity-
     // reachable as `translate` requires; only walks its tables for `PROG_CODE_VA`.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { paging::translate(proc.address_space.root, VirtAddr::new(PROG_CODE_VA)) }.is_none()
     {
         return TestResult::Fail("program code not materialised");
@@ -3668,6 +3690,7 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
     }
     // SAFETY: same live loader-built root; only walks its tables for the
     // bias-relocated interpreter code vaddr.
+    // SAFETY: Valid memory or trusted environment
     if unsafe {
         paging::translate(
             proc.address_space.root,
@@ -3689,10 +3712,12 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
             // SAFETY: `proc.address_space.root` is this test process's live page-table
             // root, identity-reachable as `translate` requires; the walk only reads
             // table entries for the page-aligned `vaddr`.
+            // SAFETY: Valid memory or trusted environment
             unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         // SAFETY: `p` is the phys frame `translate` just resolved for this page;
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let rsp = proc.stack_top.as_u64();
@@ -3984,6 +4009,7 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
@@ -3999,10 +4025,12 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
             // SAFETY: `proc.address_space.root` is this test process's live page-table
             // root, identity-reachable as `translate` requires; the walk only reads
             // table entries for the page-aligned `vaddr`.
+            // SAFETY: Valid memory or trusted environment
             unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         // SAFETY: `p` is the phys frame `translate` just resolved for this page;
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let got = match read_u64(RELOC_VA) {
@@ -4129,6 +4157,7 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
@@ -4142,10 +4171,12 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
             // SAFETY: `proc.address_space.root` is this test process's live page-table
             // root, identity-reachable as `translate` requires; the walk only reads
             // table entries for the page-aligned `vaddr`.
+            // SAFETY: Valid memory or trusted environment
             unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
         // SAFETY: `p` is the phys frame `translate` just resolved for this page;
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
+        // SAFETY: Valid memory or trusted environment
         Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
     };
     let got = match read_u64(RELOC_VA) {
@@ -4249,6 +4280,7 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
             // No DT_STRTAB + st_name=0 → name buffer must be empty.
@@ -4277,6 +4309,7 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
             if &name[..6] != b"printf" {
@@ -4314,6 +4347,7 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
             // First 32 bytes must equal the source's first 32 bytes,
@@ -4353,6 +4387,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let as_ = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
@@ -4364,6 +4399,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // SAFETY: `frame` is a freshly allocated 4 KiB frame, identity-mapped so
     // `frame.raw()` is a writable kernel pointer; zeroing exactly its 4096 bytes
     // stays in bounds and the frame is not aliased yet.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
     }
@@ -4385,6 +4421,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     }
     // SAFETY: `as_` was built via `new_for_user`, so its `root` is a valid user
     // root, satisfying `materialize`'s `# Safety` precondition.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { as_.materialize() }.is_err() {
         return TestResult::Fail("materialize");
     }
@@ -4395,6 +4432,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // SAFETY: the single page `[user_base, stack_top)` was just mapped READ|WRITE
     // and materialised above, and the low-4-GiB identity map is live, meeting
     // `init_sysv_stack`'s `# Safety` contract.
+    // SAFETY: Valid memory or trusted environment
     let rsp_v = match unsafe { init_sysv_stack(&as_, stack_top, 4096, &argv, &envp, &aux) } {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("init_sysv_stack overflowed unexpectedly"),
@@ -4410,12 +4448,14 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     let read_u64 = |vaddr: u64| -> u64 {
         // SAFETY: `as_.root` is the live user root for this test, identity-reachable
         // as `translate` requires; only walks its tables for the page-aligned vaddr.
+        // SAFETY: Valid memory or trusted environment
         let p = unsafe { paging::translate(as_.root, VirtAddr::new(vaddr & !0xFFF)) }
             .map(|p| p.as_u64() | (vaddr & 0xFFF))
             .unwrap();
         // SAFETY: `p` is the identity-mapped phys for that mapped stack page; the
         // helper writes 8-byte-aligned words there, so this `u64` read is aligned
         // and in-bounds.
+        // SAFETY: Valid memory or trusted environment
         unsafe { *(p as *const u64) }
     };
 
@@ -4448,6 +4488,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         // SAFETY: `as_.root` is the live top-level page-table frame for this test
         // address space; `translate` only walks that hierarchy for the page-aligned
         // `VirtAddr`, reading table entries with no aliasing.
+        // SAFETY: Valid memory or trusted environment
         let kp = match unsafe { paging::translate(as_.root, VirtAddr::new(user_p & !0xFFF)) } {
             Some(p) => p.as_u64() | (user_p & 0xFFF),
             None => return false,
@@ -4456,12 +4497,14 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         for (i, &b) in ebytes.iter().enumerate() {
             // SAFETY: `kp` is the kernel-mapped address `translate` returned for this
             // user page; `i < ebytes.len()` keeps the read inside that mapped page.
+            // SAFETY: Valid memory or trusted environment
             if unsafe { *((kp + i as u64) as *const u8) } != b {
                 return false;
             }
         }
         // SAFETY: same mapped page as above; reading the terminating byte at
         // `ebytes.len()`, still within the page resolved by `translate`.
+        // SAFETY: Valid memory or trusted environment
         unsafe { *((kp + ebytes.len() as u64) as *const u8) == 0 }
     };
     if !check_str(argv_p0, "argv0") {
@@ -4526,6 +4569,7 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let (as_arc, entry) = match unsafe { load_elf_bytes(&bytes) } {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("load_elf_bytes failed on minimal ELF"),
@@ -4542,6 +4586,7 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // read back the first 7 bytes via the phys address.
     // SAFETY: `as_arc.root` is the live root `load_elf_bytes` just built, identity-
     // reachable as `translate` requires; only walks its tables for the segment base.
+    // SAFETY: Valid memory or trusted environment
     let phys = match unsafe { paging::translate(as_arc.root, VirtAddr::new(0x0000_0080_0000_1000)) }
     {
         Some(p) => p,
@@ -4551,6 +4596,7 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // SAFETY: `phys` is the identity-mapped frame `translate` resolved for the
     // segment base; the loader copied the segment there, so reading the leading
     // 7 bytes is in-bounds, and a `[u8; 7]` has alignment 1.
+    // SAFETY: Valid memory or trusted environment
     let payload: [u8; 7] = unsafe { core::ptr::read_volatile(phys.raw() as *const [u8; 7]) };
     if payload != [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x69, 0x01] {
         return TestResult::Fail("segment payload bytes did not land in the mapped frame");
@@ -4636,6 +4682,7 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     // SAFETY: the test harness keeps the low 4 GiB identity-mapped and the
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed on multi-segment ELF"),
@@ -4657,12 +4704,14 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     for &(va, want) in checks.iter() {
         // SAFETY: `root` is the live loader-built root, identity-reachable as
         // `translate` requires; only walks its tables for this segment-page vaddr.
+        // SAFETY: Valid memory or trusted environment
         let phys = match unsafe { paging::translate(root, VirtAddr::new(va)) } {
             Some(p) => p,
             None => return TestResult::Fail("translate returned None for a mapped page"),
         };
         // SAFETY: `phys` is the identity-mapped frame `translate` resolved; the
         // loader stored the per-page sentinel byte there, so a 1-byte read is valid.
+        // SAFETY: Valid memory or trusted environment
         let got: u8 = unsafe { core::ptr::read_volatile(phys.raw() as *const u8) };
         if got != want {
             return TestResult::Fail("per-page sentinel mismatch — scatter list not honoured");
@@ -4675,15 +4724,18 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     // multi-page R+W segment is independently mapped — not aliased.
     // SAFETY: `root` is the live loader-built root, identity-reachable as
     // `translate` requires; only walks its tables for the .data page-1 vaddr.
+    // SAFETY: Valid memory or trusted environment
     let data_p1_phys = unsafe { paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000)) }
         .expect("data page 1 mapped");
     // SAFETY: `data_p1_phys` is the identity-mapped frame for that mapped R+W page;
     // it is 4 KiB-aligned so a `u32` write at offset 0 is aligned and in-bounds.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile(data_p1_phys.raw() as *mut u32, 0xCAFEBABE);
     }
     // SAFETY: re-translating the same vaddr yields the identity-mapped phys of the
     // page just written; reading the `u32` back at offset 0 is aligned and in-bounds.
+    // SAFETY: Valid memory or trusted environment
     let echo: u32 = unsafe {
         let p = paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000)).expect("re-translate");
         core::ptr::read_volatile(p.raw() as *const u32)
@@ -5625,6 +5677,7 @@ fn smoke_userspace_ftruncate_grows_and_shrinks_memfile() -> TestResult {
         // SAFETY: `raw_waker()` pairs a null data pointer with a static vtable whose
         // clone/wake/wake_by_ref/drop are all no-ops that never dereference the data
         // pointer, so the `RawWaker` upholds the `Waker` contract.
+        // SAFETY: Valid memory or trusted environment
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
         // SAFETY: future is on this stack frame and not moved.
@@ -6566,10 +6619,12 @@ fn smoke_userspace_fallocate_extends_and_zero_ranges_memfile() -> TestResult {
         // SAFETY: `raw_waker()` pairs a null data pointer with a static vtable whose
         // clone/wake/wake_by_ref/drop are all no-ops that never dereference the data
         // pointer, so the `RawWaker` upholds the `Waker` contract.
+        // SAFETY: Valid memory or trusted environment
         let waker = unsafe { Waker::from_raw(raw_waker()) };
         let mut cx = Context::from_waker(&waker);
         // SAFETY: `fut` lives in this stack frame and is never moved before the poll
         // completes, so pinning a mutable reference to it is sound.
+        // SAFETY: Valid memory or trusted environment
         let pinned = unsafe { Pin::new_unchecked(&mut fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(v) => Some(v),
@@ -7753,6 +7808,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -7861,6 +7917,7 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
         // (Rust 2024) avoids the rust_2024_compatibility
         // static_mut_refs lint by going through a raw pointer
         // instead of a `&` reference.
+        // SAFETY: Valid memory or trusted environment
         let buf = unsafe { &*core::ptr::addr_of!(READ_BUF) };
         if &buf[..n] == FILE_BYTES {
             OUTCOME.store(1, Ordering::Relaxed);
@@ -7917,6 +7974,7 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -8165,6 +8223,7 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -8257,6 +8316,7 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     // SAFETY: `addr_space.root` is the live user root for this brk test, identity-
     // reachable as `translate` requires; only walks its tables for the page-aligned
     // `initial` break vaddr.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { paging::translate(addr_space.root, VirtAddr::new(initial)) }.is_none() {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
@@ -8317,6 +8377,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as_inner = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -8339,6 +8400,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     }
     // SAFETY: `parent_as_inner` was built via `new_for_user`, so its `root` is a
     // valid user root, satisfying `materialize`'s `# Safety` precondition.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { parent_as_inner.materialize() }.is_err() {
         return TestResult::Fail("materialize parent");
     }
@@ -8418,6 +8480,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // SAFETY: `parent_region.phys[0]` is the identity-mapped COW frame the parent
     // stamped; it is 4 KiB-aligned so reading the `u32` sentinel at offset 0 is
     // aligned and in-bounds.
+    // SAFETY: Valid memory or trusted environment
     let shared_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
     if shared_word != 0xCAFEBABE {
         return TestResult::Fail("shared COW frame lost the sentinel");
@@ -8429,6 +8492,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // SAFETY: the low-4-GiB identity map is live and the frame allocator + COW
     // refcount table are initialised in the test harness, meeting
     // `cow_split_on_write`'s `# Safety` contract.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { child_as.cow_split_on_write(VirtAddr::new(SENTINEL_VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write failed");
     }
@@ -8448,17 +8512,20 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // SAFETY: `post_split_child.phys[0]` is the identity-mapped private frame the
     // split just allocated and memcpy'd into; 4 KiB-aligned, so the `u32` read at
     // offset 0 is aligned and in-bounds.
+    // SAFETY: Valid memory or trusted environment
     let child_word = unsafe { *(post_split_child.phys[0].raw() as *const u32) };
     if child_word != 0xCAFEBABE {
         return TestResult::Fail("split didn't memcpy the parent's bytes");
     }
     // SAFETY: same private child frame as above; writing a `u32` at offset 0 is
     // aligned, in-bounds, and only the child owns this post-split frame.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *(post_split_child.phys[0].raw() as *mut u32) = 0xDEADBEEF;
     }
     // SAFETY: `parent_region.phys[0]` is the parent's still-owned identity-mapped
     // frame; reading the `u32` at offset 0 is aligned and in-bounds.
+    // SAFETY: Valid memory or trusted environment
     let parent_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
     if parent_word != 0xCAFEBABE {
         return TestResult::Fail("mutating child's split frame leaked into parent");
@@ -8487,6 +8554,7 @@ fn smoke_userspace_fork_inherits_fd_table() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -8597,6 +8665,7 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -8658,6 +8727,7 @@ fn smoke_userspace_fork_resumes_child_with_rax_zero() -> TestResult {
             // least size_of::<UserState>() bytes — the trait's
             // contract; the test passes a freshly-zeroed
             // MaybeUninit<UserState> stack slot.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::write(out as *mut UserState, self.snapshot);
             }
@@ -8937,6 +9007,7 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -9072,6 +9143,7 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -9166,6 +9238,7 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -9250,6 +9323,7 @@ fn smoke_userspace_fork_multiple_distinct_address_spaces() -> TestResult {
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
     // inherits the kernel half, leaving the active address space untouched.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
@@ -9564,6 +9638,7 @@ fn smoke_init_initramfs_not_staged_yields_clear_error() -> TestResult {
     }
     // SAFETY: function is safe to call when initramfs isn't staged;
     // bails out before any unsafe code path runs.
+    // SAFETY: Valid memory or trusted environment
     let r = unsafe { crate::init::spawn_pid1_from_initramfs("/sbin/init") };
     match r {
         Err(crate::init::InitError::InitramfsNotStaged) => TestResult::Pass,
@@ -11448,6 +11523,7 @@ fn smoke_wave64_eventfd_write_read_roundtrip() -> TestResult {
         // SAFETY: `raw` pairs a null data pointer with the static `VT` vtable whose
         // clone returns the same null waker and wake/drop are no-ops that never
         // dereference the data pointer, so it upholds the `Waker` contract.
+        // SAFETY: Valid memory or trusted environment
         let waker = unsafe { Waker::from_raw(raw) };
         let mut cx = Context::from_waker(&waker);
 
@@ -11683,6 +11759,7 @@ fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
         // SAFETY: the `RawWaker` pairs a null data pointer with the static `VT`
         // vtable whose clone returns the same null waker and wake/drop are no-ops
         // that never dereference the data pointer, so it upholds the `Waker` contract.
+        // SAFETY: Valid memory or trusted environment
         let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
         let mut cx = Context::from_waker(&waker);
         let ops = crate::fd::with_table(task, |t| t.get(efd).map(|e| e.ops.clone()))

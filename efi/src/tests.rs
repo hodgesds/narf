@@ -167,8 +167,8 @@ fn smoke_table_header_verifies_signature_and_checksum() -> TestResult {
     buf[8..12].copy_from_slice(&((2u32 << 16) | 100).to_le_bytes()); // 2.10
     buf[12..16].copy_from_slice(&24u32.to_le_bytes()); // header size
     let mut tmp = buf;
-    for i in 16..20 {
-        tmp[i] = 0;
+    for val in tmp[16..20].iter_mut() {
+        *val = 0;
     }
     let crc = crc32_ieee(&tmp);
     buf[16..20].copy_from_slice(&crc.to_le_bytes());

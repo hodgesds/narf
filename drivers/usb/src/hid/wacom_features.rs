@@ -817,6 +817,8 @@ pub fn needs_pen_mode(features: &WacomFeatures) -> bool {
     !matches!(features.device_type, _ if false /* keep all */)
 }
 
+extern crate alloc;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,5 +892,3 @@ mod tests {
         );
     }
 }
-
-extern crate alloc;

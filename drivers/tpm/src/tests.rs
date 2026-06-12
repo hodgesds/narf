@@ -639,6 +639,7 @@ mod smokes {
         unsafe fn no_op(_: *const ()) {}
         static VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
         let raw = RawWaker::new(core::ptr::null(), &VTAB);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw) };
         let mut cx = Context::from_waker(&waker);
         let mut pinned = core::pin::pin!(fut);
@@ -888,6 +889,7 @@ mod smokes {
 
     /// Null transport: always fails. Used to verify static attributes
     /// (version, enabled, active) that don't require a live TPM.
+    #[allow(dead_code)]
     struct NullTransport;
     impl crate::devfs_bridge::TpmTransport for NullTransport {
         fn submit(&self, _cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
@@ -925,6 +927,7 @@ mod smokes {
 
     /// PCR transport: returns a canned PCR_Read response with 20-byte
     /// SHA-1 and 32-byte SHA-256 digests (all-zeros).
+    #[allow(dead_code)]
     struct PcrTransport;
     impl crate::devfs_bridge::TpmTransport for PcrTransport {
         fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {
@@ -1031,6 +1034,7 @@ mod smokes {
     kernel_test_in!("drivers/tpm/sysfs", smoke_sysfs_pcrs_format);
 
     /// Manufacturer transport: returns 0x494E4643 ("INFC") for PT_MANUFACTURER.
+    #[allow(dead_code)]
     struct MfrTransport;
     impl crate::devfs_bridge::TpmTransport for MfrTransport {
         fn submit(&self, cmd: &[u8]) -> Result<alloc::vec::Vec<u8>, ()> {

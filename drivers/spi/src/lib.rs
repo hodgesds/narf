@@ -48,7 +48,9 @@
 extern crate alloc;
 
 pub mod amd_fch;
+pub mod cadence;
 pub mod intel_lpss;
+pub mod pl022;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -241,6 +243,22 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Device, "intel-lpss-spi", || {
         let n = intel_lpss::probe_all();
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
+    narf_init::register(Stage::Device, "cadence-spi", || {
+        let n = cadence::probe_all();
+        if n == 0 {
+            InitResult::NotPresent
+        } else {
+            InitResult::Ok
+        }
+    });
+    narf_init::register(Stage::Device, "pl022-spi", || {
+        let n = pl022::probe_all();
         if n == 0 {
             InitResult::NotPresent
         } else {

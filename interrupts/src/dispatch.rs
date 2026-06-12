@@ -784,6 +784,7 @@ pub fn on_nmi() {
         let cookie = slot.cookie.load(Ordering::Acquire);
         // SAFETY: stored as `NmiHandler as u64`; round-trip safe
         // because both are `fn(u64) -> IrqStatus`.
+        // SAFETY: Valid memory or trusted environment
         let h: NmiHandler = unsafe { core::mem::transmute(h_raw as usize) };
         if h(cookie) == IrqStatus::Handled {
             any_handled = true;

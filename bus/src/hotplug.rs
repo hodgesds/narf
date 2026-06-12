@@ -376,6 +376,7 @@ impl SlotCaps {
 pub unsafe fn find_pcie_cap_offset(cfg_phys: u64) -> Option<u8> {
     // SAFETY: caller-asserted live config space; offset 0x34 is
     // the standard Capabilities Pointer.
+    // SAFETY: Valid memory or trusted environment
     let mut off = unsafe { core::ptr::read_volatile((cfg_phys + 0x34) as *const u8) };
     for _ in 0..48 {
         if off < 0x40 {
@@ -479,6 +480,7 @@ pub fn hotplug_isr() {
         };
         // SAFETY: cfg_phys from ECAM enumeration; cap walker
         // bounded.
+        // SAFETY: Valid memory or trusted environment
         let pcie_off = match unsafe { find_pcie_cap_offset(cfg_phys) } {
             Some(o) => o,
             None => continue,

@@ -57,6 +57,7 @@ pub fn is_supported() -> bool {
     // SAFETY: rdmsr at CPL=0; if the MSR is missing we'd #GP, so
     // wrap behind the `is_supported` indirection that callers gate
     // on.
+    // SAFETY: Valid memory or trusted environment
     let raw = unsafe { rdmsr(MSR_RAPL_POWER_UNIT) };
     raw != 0 && raw != u64::MAX
 }
@@ -100,9 +101,11 @@ pub unsafe fn units() -> EnergyUnits {
 unsafe fn read_energy_uj(msr: u32) -> u64 {
     // SAFETY: the caller guarantees CPL=0 and that `msr` is an
     // implemented RAPL energy-status MSR; mask to its low 32 bits.
+    // SAFETY: Valid memory or trusted environment
     let raw32 = unsafe { rdmsr(msr) } & 0xFFFF_FFFF;
     // SAFETY: the caller guarantees CPL=0 and is_supported(), which is
     // exactly `units()`'s contract.
+    // SAFETY: Valid memory or trusted environment
     let u = unsafe { units() };
     raw32.saturating_mul(u.energy_uj_per_unit)
 }

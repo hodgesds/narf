@@ -167,6 +167,7 @@ pub unsafe fn stage_tls(
         let p = f.start_address();
         // SAFETY: identity-mapped low 4 GiB; freshly allocated frame
         // is exclusively ours until we hand it to `map_region`.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
         }
@@ -188,6 +189,7 @@ pub unsafe fn stage_tls(
 
     // SAFETY: AS came from `new_for_user`; map_region succeeded so
     // the regions list now includes our TLS span.
+    // SAFETY: Valid memory or trusted environment
     unsafe { address_space.materialize() }.map_err(TlsError::Materialize)?;
 
     // Layout (low → high): `[ template image (mem_size_aligned) ][ TCB ]`.
@@ -210,10 +212,12 @@ pub unsafe fn stage_tls(
         // every vaddr in `[region_base, region_base + mapped_bytes)`
         // resolves to a phys that's identity-mapped in the low 4
         // GiB of the kernel's view.
+        // SAFETY: Valid memory or trusted environment
         let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
             .ok_or(TlsError::Translate)?;
         // SAFETY: identity-mapped phys; exclusive ownership through
         // the duration of staging (no other CPU is in this AS yet).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             *((phys.as_u64() + off) as *mut u8) = b;
         }
@@ -229,6 +233,7 @@ pub unsafe fn stage_tls(
         // SAFETY: same reasoning as the image-copy loop above; the
         // TCB sits inside the just-mapped region by construction
         // (`fs_base + 8 <= region_base + mapped_bytes`).
+        // SAFETY: Valid memory or trusted environment
         let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
             .ok_or(TlsError::Translate)?;
         // The TCB self-pointer is 8 bytes; `fs_base` is `align`-

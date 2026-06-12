@@ -416,9 +416,9 @@ fn smoke_ath10k_default_pipe_config_shape() -> TestResult {
     if p5.pipe != 5 || p5.is_src || p5.nentries != 512 {
         return TestResult::Fail("default pipe 5 (HTT RX) wrong");
     }
-    for i in 0..DEFAULT_PIPE_CONFIG.len() {
-        for j in (i + 1)..DEFAULT_PIPE_CONFIG.len() {
-            if DEFAULT_PIPE_CONFIG[i].pipe == DEFAULT_PIPE_CONFIG[j].pipe {
+    for (i, p_i) in DEFAULT_PIPE_CONFIG.iter().enumerate() {
+        for p_j in DEFAULT_PIPE_CONFIG.iter().skip(i + 1) {
+            if p_i.pipe == p_j.pipe {
                 return TestResult::Fail("duplicate pipe id in default config");
             }
         }
@@ -741,7 +741,7 @@ fn smoke_ath10k_wmi_vdev_create_cmd_encode() -> TestResult {
     if vdev_type != VdevType::Sta as u32 {
         return TestResult::Fail("vdev_type != STA(2)");
     }
-    if &frame[16..22] != &mac {
+    if frame[16..22] != mac {
         return TestResult::Fail("mac_addr bytes wrong");
     }
     TestResult::Pass

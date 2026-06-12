@@ -892,7 +892,7 @@ fn smoke_brcmfmac_shared_info_decode_v6() -> TestResult {
     if !parsed.hostrdy_db1() {
         return TestResult::Fail("hostrdy_db1() should be true");
     }
-    if parsed.pre_v7() != true {
+    if !parsed.pre_v7() {
         return TestResult::Fail("v6 firmware is pre_v7()");
     }
     buf[34..36].copy_from_slice(&0u16.to_le_bytes());
@@ -1141,7 +1141,7 @@ fn smoke_brcmfmac_nvram_appends_default_boardrev() -> TestResult {
         .bytes
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
-        .last()
+        .next_back()
         .unwrap_or(&[]);
     if last_entry != NVRAM_DEFAULT_BOARDREV {
         return TestResult::Fail("default boardrev entry not appended");

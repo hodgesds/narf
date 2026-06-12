@@ -74,6 +74,7 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     }
     // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
     // single-threaded test poll; the RawWaker is not used after this scope.
+    // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.

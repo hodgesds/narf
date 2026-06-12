@@ -830,10 +830,8 @@ pub mod tests {
             if pos + ie_len > body.len() {
                 break;
             }
-            if tag == 0x30 {
-                if body[pos..pos + ie_len] == rsn_body[..] {
-                    found_rsn = true;
-                }
+            if tag == 0x30 && body[pos..pos + ie_len] == rsn_body[..] {
+                found_rsn = true;
             }
             pos += ie_len;
         }

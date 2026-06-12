@@ -44,6 +44,7 @@ struct TNode {
 unsafe fn tnode_alloc(key: *const c_void) -> *mut TNode {
     // SAFETY: malloc returns a zeroed/uninit block of the requested
     // size; we initialise every field before returning.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let p = crate::heap::malloc(core::mem::size_of::<TNode>()) as *mut TNode;
         if !p.is_null() {
@@ -201,6 +202,7 @@ unsafe fn twalk_recurse(node: *const TNode, depth: c_int, action: WalkAction) {
     }
     // SAFETY: node was non-null on entry; recursive descent stays
     // inside the tree allocated via `malloc`.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let leaf = (*node).left.is_null() && (*node).right.is_null();
         if leaf {

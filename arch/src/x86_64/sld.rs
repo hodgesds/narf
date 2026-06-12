@@ -20,6 +20,7 @@ const CORE_CAPS_SLD: u64 = 1 << 5;
 /// `true` iff CPUID(7, 0).EDX[5] is set (CORE_CAPABILITIES MSR
 /// present) **and** `IA32_CORE_CAPABILITIES.SPLIT_LOCK_DETECT`
 /// is reported. CORE_CAPABILITIES read needs CPL = 0; we avoid
+// SAFETY: Valid memory or trusted environment
 /// it here and let `unsafe { supported_unsafe() }` do the MSR
 /// probe in privileged paths.
 pub fn cpuid_gate() -> bool {
@@ -57,6 +58,7 @@ pub unsafe fn read_test_ctrl() -> u64 {
 pub unsafe fn write_test_ctrl(v: u64) {
     // SAFETY: caller asserts SLD is supported and CPL=0, so writing the
     // architectural IA32_TEST_CTRL MSR is well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(MSR_IA32_TEST_CTRL, v);
     }

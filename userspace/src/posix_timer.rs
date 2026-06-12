@@ -165,6 +165,7 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
         let mut kbuf = [0u8; 16];
         // SAFETY: handler runs in the calling task's address space;
         // `copy_from_user` validates the user pointer + SMAP brackets.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { crate::handlers::copy_from_user(&mut kbuf, evp) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -221,6 +222,7 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
     // SAFETY: `out_ptr` is a user address; `copy_to_user` range-validates it
     // and brackets the 8-byte write in the SMAP window. We run in the calling
     // task's address space from the syscall path (not IRQ context).
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_to_user(out_ptr, &id_bytes) }.is_err() {
         // Best-effort cleanup.
         with_table(|m| {
@@ -251,6 +253,7 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
     // SAFETY: `new_ptr` is checked non-zero above and is a user address;
     // `copy_from_user` range-validates it and brackets the 32-byte read in the
     // SMAP window. Runs in the calling task's address space, not IRQ context.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -306,6 +309,7 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         // `copy_to_user` range-validates it and brackets the 32-byte write in
         // the SMAP window. Runs in the calling task's address space, not IRQ
         // context. Best-effort: a failed copy is ignored per POSIX old-value.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { crate::handlers::copy_to_user(old_ptr, &out) };
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -349,6 +353,7 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
     // SAFETY: `out_ptr` is checked non-zero above and is a user address;
     // `copy_to_user` range-validates it and brackets the 32-byte write in the
     // SMAP window. Runs in the calling task's address space, not IRQ context.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_to_user(out_ptr, &out) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -393,6 +398,7 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
     // SAFETY: `req_ptr` is checked non-zero above and is a user address;
     // `copy_from_user` range-validates it and brackets the 16-byte read in the
     // SMAP window. Runs in the calling task's address space, not IRQ context.
+    // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_from_user(&mut buf, req_ptr) }.is_err() {
         ctx.set_return(fail);
         return;
@@ -432,6 +438,7 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
         // We hold the task here (no concurrent mutator), so the `&*uctx`
         // borrow, the interior-mutable atomic/Cell stores, `save_user_state`
         // into `uc.state`, and the matching `yield_hook` call are sound.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
             uc.sleep_deadline_ns

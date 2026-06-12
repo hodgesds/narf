@@ -148,6 +148,7 @@ pub fn read_descriptor_tag(buf: &[u8], offset: usize) -> DescriptorTag {
     // SAFETY: `DescriptorTag` is `#[repr(C, packed)]` and 16 bytes,
     // matching ECMA-167 §3/7.2 exactly. The caller has bounded
     // `offset` and the buffer is a freshly-read sector copy we own.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const DescriptorTag) }
 }
 
@@ -240,6 +241,7 @@ pub fn read_anchor(buf: &[u8]) -> AnchorVolumeDescriptorPointer {
     debug_assert!(buf.len() >= core::mem::size_of::<AnchorVolumeDescriptorPointer>());
     // SAFETY: `AnchorVolumeDescriptorPointer` is `#[repr(C, packed)]`
     // with the 512-byte layout matching ECMA-167 §3/10.2.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const AnchorVolumeDescriptorPointer) }
 }
 
@@ -300,6 +302,7 @@ pub fn read_partition(buf: &[u8], offset: usize) -> PartitionDescriptor {
     debug_assert!(offset + core::mem::size_of::<PartitionDescriptor>() <= buf.len());
     // SAFETY: `PartitionDescriptor` is `#[repr(C, packed)]`,
     // 512 bytes, matching ECMA-167 §3/10.5.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const PartitionDescriptor) }
 }
 
@@ -363,6 +366,7 @@ pub fn read_lvd_header(buf: &[u8], offset: usize) -> LogicalVolumeDescriptorHead
     debug_assert!(offset + core::mem::size_of::<LogicalVolumeDescriptorHeader>() <= buf.len());
     // SAFETY: the type is `#[repr(C, packed)]` with the 440-byte
     // layout from ECMA-167 §3/10.6.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const LogicalVolumeDescriptorHeader)
     }
@@ -433,5 +437,6 @@ pub fn read_file_set(buf: &[u8], offset: usize) -> FileSetDescriptor {
     debug_assert!(offset + core::mem::size_of::<FileSetDescriptor>() <= buf.len());
     // SAFETY: `FileSetDescriptor` is `#[repr(C, packed)]` with the
     // 512-byte ECMA-167 §4/14.1 layout.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { core::ptr::read_unaligned(buf.as_ptr().add(offset) as *const FileSetDescriptor) }
 }

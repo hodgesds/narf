@@ -66,12 +66,14 @@ fn default_resched_handler() {
 fn default_panic_halt_handler() -> ! {
     // SAFETY: called from IRQ context on the receiving CPU; we
     // never want to leave halt, so masking IRQs is permanent here.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::disable_interrupts();
     }
     loop {
         // SAFETY: WFI in EL1 is always defined; with IRQs masked
         // we never wake.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!("wfi", options(nostack, preserves_flags));
         }
@@ -153,6 +155,7 @@ pub fn on_sgi(intid: u8) {
     if h != 0 {
         // SAFETY: stored as `SgiHandler as usize`; round-trip back
         // to the function pointer is sound when `h != 0`.
+        // SAFETY: Valid memory or trusted environment
         let f: SgiHandler = unsafe { core::mem::transmute(h) };
         f();
     }

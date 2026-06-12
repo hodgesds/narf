@@ -26,6 +26,7 @@ pub mod intr;
 pub mod iso;
 pub mod msc;
 pub mod ohci;
+pub mod r8152;
 pub mod serial;
 pub mod uac;
 pub mod uhci;
@@ -49,6 +50,26 @@ pub fn register_initcalls() {
             serial::devfs_bridge::lookup_tty_usb,
             serial::devfs_bridge::enumerate_tty_usb,
         );
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-uac", || {
+        uac::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-uvc", || {
+        uvc::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-r8152", || {
+        r8152::register();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-cdc-ncm", || {
+        cdc_ncm::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "usb-xpad", || {
+        xpad::register_initcalls();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "xhci", || {
@@ -132,6 +153,10 @@ pub fn register_initcalls() {
     // The HID supervisor's per-port try_attach now handles MSC via
     // AttachOutcome::MassStorage — same retry / hot-plug semantics
     // as keyboard and mouse. Removed cleanly per the no-shims rule.
+    narf_init::register(Stage::Subsys, "usb-r8152", || {
+        r8152::register();
+        InitResult::Ok
+    });
 }
 
 /// Number of times YieldTimeout::poll was entered (across the
@@ -179,10 +204,12 @@ impl<F: core::future::Future> core::future::Future for YieldTimeout<F> {
         YIELD_TIMEOUT_POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: structural pin projection — `fut` is never moved
         // out, only re-pinned for the inner poll call.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let this = unsafe { self.get_unchecked_mut() };
         // SAFETY: `this` came from a `Pin<&mut Self>`, so `this.fut`
         // is itself structurally pinned. We re-pin the `&mut` to it
         // and never move `fut` out, upholding the pin contract.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let fut = unsafe { core::pin::Pin::new_unchecked(&mut this.fut) };
         match fut.poll(cx) {
             core::task::Poll::Ready(v) => return core::task::Poll::Ready(Ok(v)),

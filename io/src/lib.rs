@@ -86,6 +86,7 @@ pub fn register_with_cap(mut buf: DmaBuffer) -> Cap<DmaBuffer, narf_capabilities
     // entry we wrote into REGISTRY a moment ago — same index, live
     // epoch, DmaBuffer kind. `Cap::mint` only requires that the
     // slot describe an authority the caller actually holds.
+    // SAFETY: Valid memory or trusted environment
     unsafe { Cap::mint(slot) }
 }
 
@@ -234,6 +235,7 @@ impl DmaBuffer {
         // (aarch64), so the slice stays valid across user-task
         // TTBR0/CR3 swaps. `len` is the buffer's true length and
         // `&self` keeps the buffer alive across this borrow.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(self.phys.kernel_ptr::<u8>(), self.len) }
     }
 
@@ -242,6 +244,7 @@ impl DmaBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: see `as_slice` — the unique-mut borrow comes from
         // `&mut self`, so no aliasing is possible.
+        // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts_mut(self.phys.kernel_mut_ptr::<u8>(), self.len) }
     }
 
@@ -329,6 +332,7 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
     // (`kernel_mut_ptr`) — identity on x86_64, TTBR1 high-half on
     // aarch64 — so the write stays valid even when the calling
     // thread is in a user-task TTBR0/CR3 context.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, page);
     }

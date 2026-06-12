@@ -202,6 +202,7 @@ fn smoke_tb_not_present_on_qemu_tcg() -> TestResult {
     use narf_bus::{devices, BusKind};
     // SAFETY: the QEMU q35 smoke target maps PCIe ECAM at the default base;
     // init() only reads the config space mapped there during enumeration.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has_tb = devs.iter().any(|d| {

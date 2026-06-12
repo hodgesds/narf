@@ -162,6 +162,7 @@ pub unsafe fn claim_mmio_in_domain(
         let p = PhysAddr::new(pa + (i as u64) * 4096);
         // SAFETY: caller-asserted pa validity; va is freshly bumped
         // (no prior mapping at it); flags chosen by caller.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             map_domain_private(domain, va, p, flags)?;
         }
@@ -297,5 +298,6 @@ pub unsafe fn claim_mmio_for_driver(
     // and `flags` are passed through unchanged; the caller has asserted
     // (per this function's `# Safety`) that `pa..pa+len` is MMIO owned
     // by this driver, which is exactly `claim_mmio_in_domain`'s contract.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe { claim_mmio_in_domain(domain, pa, len, flags) }
 }

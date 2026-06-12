@@ -49,6 +49,7 @@ pub unsafe fn read_info_base() -> u64 {
 pub unsafe fn write_info_base(base: u64) {
     // SAFETY: caller asserts RAR is supported and CPL=0, so writing the
     // architectural RAR info-base MSR is well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(MSR_IA32_RAR_INFO_BASE, base);
     }
@@ -59,6 +60,7 @@ pub unsafe fn write_info_base(base: u64) {
 pub unsafe fn read_ctrl() -> u64 {
     // SAFETY: caller asserts RAR is supported and CPL=0, so reading the
     // architectural RAR control MSR is well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe { rdmsr(MSR_IA32_RAR_CTRL) }
 }
 
@@ -68,6 +70,7 @@ pub unsafe fn read_ctrl() -> u64 {
 pub unsafe fn write_ctrl(v: u64) {
     // SAFETY: caller asserts RAR is supported and CPL=0, so writing the
     // architectural RAR control MSR is well-defined.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(MSR_IA32_RAR_CTRL, v);
     }

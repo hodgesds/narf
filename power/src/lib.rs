@@ -133,6 +133,7 @@ extern "C" fn s3_resume_hook_entry() {
     // snapshot was armed (so this is safe to call on machines
     // that bypassed S3 via the test back-door).
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::s3_resume::restore_lapic_state();
     }

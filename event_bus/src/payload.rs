@@ -109,6 +109,7 @@ impl Arena {
         // duration of the copy, so no other producer or reader touches these
         // bytes concurrently; `bytes` is an independent caller-owned slice
         // and cannot overlap `buf`, satisfying `copy_nonoverlapping`.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(start), written);
         }
@@ -143,6 +144,7 @@ impl Arena {
         let ptr = self.buf.as_ptr();
         // SAFETY: idx < num_slots and we hold the slot lock so the
         // bytes aren't being concurrently written.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::copy_nonoverlapping(ptr.add(start), out.as_mut_ptr(), want);
         }

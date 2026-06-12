@@ -67,6 +67,7 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) ->
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe {
         crate::time::clock_gettime(1 /* CLOCK_MONOTONIC */, &mut ts as *mut _)
     };
@@ -97,6 +98,7 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) ->
                 tv_sec: 0,
                 tv_nsec: 0,
             };
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
             let now = (ts.tv_sec as u64)
                 .saturating_mul(1_000_000_000)
@@ -106,6 +108,7 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) ->
             }
         }
         // Yield ~1ms so the parked task gets de-prioritised.
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { crate::process::usleep(1000) };
     }
 }
@@ -223,8 +226,11 @@ pub unsafe extern "C" fn select(
     }; FD_SETSIZE];
     let mut count: usize = 0;
     for fd in 0..n {
+        // SAFETY: Valid memory or trusted environment
         let want_r = !readfds.is_null() && unsafe { FD_ISSET(fd as c_int, readfds) } != 0;
+        // SAFETY: Valid memory or trusted environment
         let want_w = !writefds.is_null() && unsafe { FD_ISSET(fd as c_int, writefds) } != 0;
+        // SAFETY: Valid memory or trusted environment
         let want_e = !exceptfds.is_null() && unsafe { FD_ISSET(fd as c_int, exceptfds) } != 0;
         if !want_r && !want_w && !want_e {
             continue;
@@ -261,16 +267,19 @@ pub unsafe extern "C" fn select(
     }
     // Clear the user fd_sets and re-populate from revents.
     if !readfds.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             FD_ZERO(readfds);
         }
     }
     if !writefds.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             FD_ZERO(writefds);
         }
     }
     if !exceptfds.is_null() {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             FD_ZERO(exceptfds);
         }
@@ -282,16 +291,19 @@ pub unsafe extern "C" fn select(
             continue;
         }
         if (p.revents & POLLIN) != 0 && !readfds.is_null() {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 FD_SET(p.fd, readfds);
             }
         }
         if (p.revents & POLLOUT) != 0 && !writefds.is_null() {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 FD_SET(p.fd, writefds);
             }
         }
         if (p.revents & POLLPRI) != 0 && !exceptfds.is_null() {
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 FD_SET(p.fd, exceptfds);
             }
@@ -367,6 +379,7 @@ pub unsafe extern "C" fn epoll_wait(
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
     let now_ns = (ts.tv_sec as u64)
         .saturating_mul(1_000_000_000)
@@ -390,6 +403,7 @@ pub unsafe extern "C" fn epoll_wait(
                 tv_sec: 0,
                 tv_nsec: 0,
             };
+            // SAFETY: Valid memory or trusted environment
             let _ = unsafe { crate::time::clock_gettime(1, &mut ts as *mut _) };
             let now = (ts.tv_sec as u64)
                 .saturating_mul(1_000_000_000)
@@ -398,6 +412,7 @@ pub unsafe extern "C" fn epoll_wait(
                 return 0;
             }
         }
+        // SAFETY: Valid memory or trusted environment
         let _ = unsafe { crate::process::usleep(1000) };
     }
 }

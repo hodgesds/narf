@@ -214,6 +214,7 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     // `ECAM_DEFAULT_BASE` is the standard MMCONFIG ECAM base for the QEMU
     // q35 machine these tests run under, which is the region `init`
     // enumerates.
+    // SAFETY: Valid memory or trusted environment
     let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     let devs = devices();
     let has = devs.iter().any(|d| {

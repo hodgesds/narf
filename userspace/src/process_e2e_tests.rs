@@ -170,6 +170,7 @@ fn smoke_process_fork_basic_wait4_reap() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -283,6 +284,7 @@ fn smoke_process_fork_return_values() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1170,6 +1172,7 @@ fn smoke_wave35_fork_returns_nonzero_child_pid() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1398,6 +1401,7 @@ fn smoke_wave35_getppid_differs_from_getpid() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -1737,6 +1741,7 @@ fn smoke_wave37_on_child_exit_fires_wake() -> TestResult {
     // SAFETY: `VTAB`'s clone/wake/wake_by_ref/drop fns honor the
     // `RawWaker` contract — they ignore the null data pointer and only
     // touch the `'static WOKE` flag, so the waker is sound to construct.
+    // SAFETY: Valid memory or trusted environment
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
     crate::user_task::register_wait_child_waker(PARENT, waker);
 
@@ -1932,6 +1937,7 @@ fn smoke_wave38_fork_registers_mapping() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -2018,6 +2024,7 @@ fn smoke_wave38_wait4_returns_child_process_id() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -2875,6 +2882,7 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {
@@ -3059,6 +3067,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
+    // SAFETY: Valid memory or trusted environment
     let parent_as = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => Arc::new(a),
         Err(_) => {

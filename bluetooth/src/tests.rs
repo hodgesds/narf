@@ -525,7 +525,7 @@ fn smoke_smp_initiator_just_works_walk() -> TestResult {
         payload: peer_pk,
     };
     let after_pk = init.feed(&peer_pk_smp).expect("peer PK");
-    if !after_pk.is_none() || init.state != PairingState::WaitConfirm {
+    if after_pk.is_some() || init.state != PairingState::WaitConfirm {
         return TestResult::Fail("after peer PK we should be in WaitConfirm");
     }
 
@@ -1127,7 +1127,7 @@ fn smoke_l2cap_wrap_bframe_fragments_across_acl_packets() -> TestResult {
     // of 27 forces 4 ACL packets.
     let frame = BFrame::new(CID_ATT, vec![0xAB; 100]);
     let acl = wrap_frame_into_acl(0x0100, &frame, 27, /*le=*/ true);
-    if acl.len() != ((104 + 26) / 27) {
+    if acl.len() != 104_usize.div_ceil(27) {
         return TestResult::Fail("expected 4 ACL fragments for 104-byte frame at MTU 27");
     }
     if acl[0].pb_flag != PB_FIRST_FLUSHABLE {
@@ -1913,7 +1913,7 @@ fn smoke_avdtp_set_configuration_command_layout() -> TestResult {
     if bytes[3] != 0x24 {
         return TestResult::Fail("INT SEID encoding wrong");
     }
-    if &bytes[4..] != &[0xAA, 0xBB] {
+    if bytes[4..] != [0xAA, 0xBB] {
         return TestResult::Fail("trailing capability blob lost");
     }
     TestResult::Pass
@@ -2181,7 +2181,7 @@ fn smoke_sdp_service_attribute_request_record_handle() -> TestResult {
         return TestResult::Fail("opcode mismatch");
     }
     // First 4 bytes after the header are the record handle, big-endian.
-    if &req[5..9] != &[0xCA, 0xFE, 0xBE, 0xEF] {
+    if req[5..9] != [0xCA, 0xFE, 0xBE, 0xEF] {
         return TestResult::Fail("record handle should be big-endian");
     }
     TestResult::Pass
@@ -2208,7 +2208,7 @@ fn smoke_mesh_network_header_round_trip() -> TestResult {
         nid: 0x42,
         ctl: false,
         ttl: 7,
-        seq: 0xCAFE_BE,
+        seq: 0x00CA_FEBE,
         src: 0x1234,
         dst: 0xFFFF,
     };
@@ -3394,7 +3394,7 @@ fn smoke_profiles_a2dp_source_sbc_encode_streaming() -> TestResult {
 
     // 16 blocks × 8 subbands × 2 channels = 256 i16 samples.
     let pcm: alloc::vec::Vec<i16> = (0..(16 * 8 * 2))
-        .map(|i| ((i as i32 * 256) - 32768) as i16)
+        .map(|i| ((i * 256) - 32768) as i16)
         .collect();
     let frame = match src.encode_pcm(&pcm) {
         Some(f) => f,
@@ -4173,7 +4173,7 @@ kernel_test_in!("bluetooth/l2cap", smoke_l2cap_well_known_psms);
 
 /// Mounting the GAP service emits a Primary Service decl + Device Name
 /// + Appearance characteristics. Walk the resulting database and
-/// assert all three slots are present with the right UUIDs.
+///   assert all three slots are present with the right UUIDs.
 fn smoke_services_gap_mount() -> TestResult {
     use crate::gatt::Uuid;
     use crate::gatt_server::AttributeDatabase;

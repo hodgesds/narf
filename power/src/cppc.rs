@@ -157,6 +157,7 @@ mod x86 {
         }
         // SAFETY: extended leaf 0x8000_0008 is defined because the max
         // extended leaf reported above is >= 0x8000_0008.
+        // SAFETY: Valid memory or trusted environment
         let (_, ebx, _, _) = unsafe { cpuid(0x8000_0008, 0) };
         ebx & (1 << 27) != 0
     }

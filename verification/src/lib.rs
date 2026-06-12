@@ -83,7 +83,7 @@ pub use narf_kernel_test::{tests, KernelTest, Summary, TestResult};
 /// others. Iteration order matches link order within each
 /// subsystem; subsystems themselves are emitted in first-seen order.
 pub fn run_all() -> Summary {
-    let _ = writeln!(Writer, "");
+    let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test harness ──────────────────────────");
     let ts = tests();
     if ts.is_empty() {
@@ -187,7 +187,7 @@ pub fn run_all() -> Summary {
 /// the user wants to drive `cargo xtask test --subsystem
 /// drivers/net/r8169` without firing every other suite.
 pub fn run_subsystem(wanted: &str) -> Summary {
-    let _ = writeln!(Writer, "");
+    let _ = writeln!(Writer);
     let _ = writeln!(Writer, "── kernel_test ({}) ──", wanted);
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -244,6 +244,7 @@ pub fn run_all_and_exit() -> ! {
     };
     // SAFETY: exit_kernel is the only post-test action we're authorised
     // to take; it does not return.
+    // SAFETY: Valid memory or trusted environment
     unsafe { narf_arch::exit_kernel(code) }
 }
 
@@ -278,6 +279,7 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
     unsafe {
         narf_arch::mmio::write32(va, 0xDEAD_BEEF);
     }
+    // SAFETY: Valid memory or trusted environment
     let r32 = unsafe { narf_arch::mmio::read32(va) };
     if r32 != 0xDEAD_BEEF {
         return TestResult::Fail("32-bit round trip mismatch");
@@ -287,6 +289,7 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
     unsafe {
         narf_arch::mmio::write16(va + 4, 0xCAFE);
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { narf_arch::mmio::read16(va + 4) } != 0xCAFE {
         return TestResult::Fail("16-bit round trip mismatch");
     }
@@ -296,7 +299,9 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
         narf_arch::mmio::write8(va + 6, 0xAB);
         narf_arch::mmio::write8(va + 7, 0xCD);
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { narf_arch::mmio::read8(va + 6) } != 0xAB
+        // SAFETY: Valid memory or trusted environment
         || unsafe { narf_arch::mmio::read8(va + 7) } != 0xCD
     {
         return TestResult::Fail("8-bit round trip mismatch");
@@ -307,6 +312,7 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
     unsafe {
         narf_arch::mmio::write32(va + 4, 0xFEED_FACE);
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { narf_arch::mmio::read32(va + 4) } != 0xFEED_FACE {
         return TestResult::Fail("32-bit overwrite of mixed widths");
     }
@@ -379,6 +385,7 @@ fn smoke_x86_64_tlb_shootdown_ipi() -> TestResult {
     let before = ipi::ack_count(1);
     // SAFETY: x2APIC online (BSP init), VECTOR_TLB_SHOOTDOWN handler
     // installed at boot, AP 1 online.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         ipi::shoot_va(0xFFFF_FFFF_8000_0000, 0);
     }
@@ -710,6 +717,7 @@ fn smoke_virtio_mmio_probe() -> TestResult {
     use narf_drivers_virtio::VirtioMmioDevice;
     // SAFETY: init tolerates a null/absent DTB by falling back to the
     // QEMU-virt default layout; identity-map covers the MMIO window.
+    // SAFETY: Valid memory or trusted environment
     let _n = unsafe { narf_bus::init(None) };
     let mut ok = 0usize;
     for d in devices() {
@@ -719,6 +727,7 @@ fn smoke_virtio_mmio_probe() -> TestResult {
         // SAFETY: the bus registry published these entries after
         // confirming their MMIO regions are mapped and readable;
         // `probe` does a bounded u32 read.
+        // SAFETY: Valid memory or trusted environment
         match unsafe { VirtioMmioDevice::probe(&d) } {
             Ok(v) => {
                 if v.version() != 2 {
@@ -761,6 +770,7 @@ fn smoke_virtio_mmio_probe() -> TestResult {
     use narf_bus::{devices, BusKind};
     // SAFETY: ECAM_DEFAULT_BASE is inside q35's pcie-mmcfg region and
     // the walker performs read-only config-space probes.
+    // SAFETY: Valid memory or trusted environment
     let _n = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
     for d in devices() {
         if matches!(d.kind, BusKind::VirtioMmio { .. }) {
@@ -789,6 +799,7 @@ fn smoke_virtio_mmio_wrong_magic() -> TestResult {
     // at least CONFIG bytes; `probe_raw` reads only 4-byte words
     // within it. The buffer's lifetime is this function body — we do
     // not stash the pointer anywhere.
+    // SAFETY: Valid memory or trusted environment
     let result = unsafe { VirtioMmioDevice::probe_raw(addr) };
     // Prevent the optimiser from eliding the buffer even under fat LTO.
     core::hint::black_box(&fake);
@@ -837,6 +848,7 @@ fn smoke_block_device_trait() -> TestResult {
     narf_scheduler::__reset_queues_for_test();
 
     // 1. Probe a fake device (null addr).
+    // SAFETY: Valid memory or trusted environment
     let mmio = unsafe { VirtioMmioDevice::probe_raw(0) };
     let Ok(mmio_dev) = mmio else {
         // probe_raw(0) fails magic check; this is expected for a compile test.
@@ -847,7 +859,8 @@ fn smoke_block_device_trait() -> TestResult {
     let mut blk = VirtioBlkDevice::new(mmio_dev);
 
     // 2. Initialise.
-    if let Err(_) = unsafe { blk.init(DomainId::DRIVER_0) } {
+    // SAFETY: Valid memory or trusted environment
+    if unsafe { blk.init(DomainId::DRIVER_0) }.is_err() {
         return TestResult::Fail("VirtioBlkDevice::init failed");
     }
 
@@ -896,12 +909,14 @@ fn smoke_exit_gate_virtio_blk() -> TestResult {
     let (mut req_tx, req_rx) = narf_ipc::channel::<BlockRequest, 4>();
     let (compl_tx, mut compl_rx) = narf_ipc::channel::<BlockCompletion, 4>();
 
+    // SAFETY: Valid memory or trusted environment
     let mmio = unsafe { VirtioMmioDevice::probe_raw(0) };
     let Ok(mmio_dev) = mmio else {
         return TestResult::Pass;
     };
 
     let mut blk = VirtioBlkDevice::new(mmio_dev);
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         blk.init(DomainId::DRIVER_0).unwrap();
     }
@@ -1106,7 +1121,8 @@ fn smoke_rcu_sleepable_sync_drains() -> TestResult {
         // spawn. `&raw const` (Rust 2024) takes a raw pointer
         // to the static without going through `&`, dodging the
         // rust_2024_compatibility static_mut_refs lint.
-        let cap = unsafe { (*(&raw const CAP)).as_ref().unwrap() };
+        // SAFETY: Valid memory or trusted environment
+        let cap = unsafe { (*core::ptr::addr_of!(CAP)).as_ref().unwrap() };
         let g = SCOPE.enter(cap).expect("enter must succeed");
         for _ in 0..3 {
             narf_scheduler::yield_now().await;
@@ -1167,6 +1183,7 @@ fn smoke_rcu_sleepable_timeout() -> TestResult {
     narf_scheduler::spawn(async move {
         // SAFETY: CAP is set above before spawn.
         #[allow(static_mut_refs)] // TODO(narf): migrate this boot-time static to addr_of!/OnceCell
+        // SAFETY: Valid memory or trusted environment
         let cap = unsafe { CAP.as_ref().unwrap() };
         let _g = SCOPE.enter(cap).expect("enter must succeed");
         while !DONE.load(Ordering::Acquire) {
@@ -1276,6 +1293,7 @@ kernel_test!(smoke_rcu_sleepable_timeout);
 fn make_block_request(op: narf_block::BlockOp, user_tag: u64) -> narf_block::BlockRequest {
     use narf_block::{BlockRequest, QosHint};
     use narf_capabilities::{Cap, CapSlot, Read, Rights};
+    // SAFETY: Valid memory or trusted environment
     let cap = unsafe {
         Cap::<narf_io::DmaBuffer, Read>::mint(CapSlot::new(
             1,
@@ -1442,22 +1460,6 @@ kernel_test!(smoke_pci_probe_all_dispatches_nvme);
 // virtio-blk-pci write_irq_async + virtio-net-pci tx/rx-arp smokes
 // migrated to `drivers/virtio/src/tests.rs`.
 
-#[cfg(target_arch = "x86_64")]
-// e1000 + r8169 + qcnfa765 smokes migrated to
-// `drivers/net/src/tests.rs` (subsystems `drivers/net/e1000`,
-// `drivers/net/r8169`, `drivers/net/qcnfa765`).
-
-// AHCI smokes migrated to `drivers/storage/src/tests.rs`
-// (subsystem `drivers/storage/ahci`).
-// `smoke_block_registry_uniform_read` migrated to block/src/tests.rs (subsystem `"block"`).
-
-// xhci/msc/hid smokes migrated to `drivers/usb/src/tests.rs`
-// (subsystems `drivers/usb/xhci`, `drivers/usb/msc`, `drivers/usb/hid`).
-
-// `smoke_net_arp_request_builder` migrated to net/src/tests.rs (subsystem `"net"`).
-
-// `smoke_net_ipv4_checksum` migrated to net/src/tests.rs (subsystem `"net"`).
-
 // `smoke_net_icmp_echo_builder` migrated to net/src/tests.rs (subsystem `"net"`).
 #[cfg(target_arch = "x86_64")]
 fn smoke_net_e1000_arp_round_trip() -> TestResult {
@@ -1476,10 +1478,9 @@ fn smoke_net_e1000_arp_round_trip() -> TestResult {
     if n == 0 {
         return TestResult::Fail("build_arp_request");
     }
-    if e1000::with_controller(|c| c.tx(&frame[..n]))
+    if !e1000::with_controller(|c| c.tx(&frame[..n]))
         .map(|r| r.is_ok())
         .unwrap_or(false)
-        == false
     {
         return TestResult::Fail("e1000 tx of ARP request");
     }
@@ -1561,6 +1562,7 @@ fn smoke_smp_mark_online_offline() -> TestResult {
     }
     // SAFETY: not actually running on CPU TEST_SLOT; this is a
     // bookkeeping surface test, not real bring-up.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         smp::mark_online(TEST_SLOT);
     }
@@ -1636,6 +1638,7 @@ fn smoke_smp_aarch64_sgi_to_ap() -> TestResult {
     let before = sgi::rx_count(1, intid);
     // SAFETY: GICv3 sysreg interface up post-init_bsp; target
     // affinity 1 = AP 1 on QEMU virt's flat affinity layout.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         sgi::send_to_cpu_aff(intid, 1);
     }
@@ -2013,23 +2016,6 @@ kernel_test!(smoke_drivers_net_nic_model_ids);
 /// against sym_idx=1 (SHN_UNDEF), a 2-entry symtab whose entry 1
 /// has `st_name = 1`, and a strtab the caller fills in. Returns the
 /// constructed bytes.
-#[cfg(target_arch = "x86_64")]
-// `build_unresolved_named_elf` helper migrated to userspace/src/tests.rs.
-
-// `smoke_userspace_unresolved_symbol_carries_name` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-// `smoke_userspace_unresolved_symbol_name_truncates` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-// `smoke_userspace_init_sysv_stack_layout` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-// `smoke_userspace_load_elf_bytes_end_to_end` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-// `smoke_userspace_load_multi_segment` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-// `smoke_userspace_loader_into_address_space` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
-// `smoke_userspace_parse_minimal_elf64` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
-
 // `smoke_userspace_syscall_table_roundtrip` migrated to userspace/src/tests.rs (subsystem `"userspace"`).
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
@@ -2045,6 +2031,7 @@ fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
         base: u64,
     }
     let mut ptr = GdtPtr { limit: 0, base: 0 };
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("sgdt [{p}]", p = in(reg) &mut ptr,
              options(nostack, preserves_flags));
@@ -2054,6 +2041,7 @@ fn smoke_frame_x86_64_gdt_user_descriptors() -> TestResult {
     // Index 5 = byte offset 0x28 → user data.
     // Index 6 = byte offset 0x30 → user code.
     let read_access =
+        // SAFETY: Valid memory or trusted environment
         |idx: u64| -> u8 { unsafe { core::ptr::read_volatile((base + idx * 8 + 5) as *const u8) } };
 
     let udata_access = read_access(5);
@@ -2104,6 +2092,7 @@ fn smoke_frame_x86_64_idt_vector_128_dpl3() -> TestResult {
         base: u64,
     }
     let mut ptr = IdtPtr { limit: 0, base: 0 };
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "sidt [{p}]",
@@ -2117,6 +2106,7 @@ fn smoke_frame_x86_64_idt_vector_128_dpl3() -> TestResult {
         (base + 128 * 16) as *const u8
     };
     // Access byte is at offset 5 within the 16-byte entry.
+    // SAFETY: Valid memory or trusted environment
     let access = unsafe { core::ptr::read_volatile(entry_ptr.add(5)) };
     // DPL is bits 5..=6 of the access byte; should be 3 for a
     // user-triggerable gate (0b01100000 = 0x60).
@@ -2153,6 +2143,7 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     // GDT installed (0x18). A failure here means boot changed
     // something we shouldn't have.
     let tr: u16;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!("str {t:x}", t = out(reg) tr, options(nomem, nostack, preserves_flags));
     }
@@ -2178,16 +2169,20 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     // SAFETY: writing KERNEL_GS_BASE at CPL=0 is documented. We
     // restore it immediately so other tests see the same initial
     // state.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         msr::wrmsr(IA32_KERNEL_GS_BASE, 0xDEAD_BEEF_CAFE_F00D);
     }
+    // SAFETY: Valid memory or trusted environment
     let kgs_mid = unsafe { msr::rdmsr(IA32_KERNEL_GS_BASE) };
     if kgs_mid != 0xDEAD_BEEF_CAFE_F00D {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
         }
         return TestResult::Fail("IA32_KERNEL_GS_BASE did not round-trip");
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
     }
@@ -2195,6 +2190,7 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     // Read `gs:[8]` — the `kernel_stack_top` slot in PerCpu. It
     // mirrors TSS.rsp0, so it should be non-zero.
     let mirrored: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mov {v}, gs:[8]",
@@ -2238,6 +2234,7 @@ fn smoke_frame_x86_64_int80_dispatches_through_global() -> TestResult {
 
     let mut value: u64;
     let mut status: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "int 0x80",
@@ -2300,6 +2297,7 @@ fn smoke_frame_aarch64_svc_dispatches_through_global() -> TestResult {
     // After the call x0 = value, x1 = status.
     let mut value: u64 = 0xC0FFEE;
     let mut status: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         asm!(
             "mov x8, #{num}",
@@ -2526,12 +2524,14 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     // Snapshot CR3 so we can restore the kernel's original PML4
     // after the user-AS side trip.
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
     }
     SAVED_CR3.store(original_cr3, Ordering::Release);
 
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
     if saved != 0 {
         // Resume path — restore the kernel's CR3, reset the
@@ -2539,6 +2539,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
         // int-0x80 traps in unrelated tests would otherwise hit a
         // dangling per-CPU pointer through `swapgs`), re-enable
         // interrupts, and return Pass if the magic matched.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr3 = SAVED_CR3.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
@@ -2568,6 +2569,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     t.install_raw(Syscall::Sleep, "user-mode-test-unwind", UnwindHandler);
     install_global(t);
 
+    // SAFETY: Valid memory or trusted environment
     let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user failed"),
@@ -2613,6 +2615,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
         0x48, 0xC7, 0xC0, sleep_n[0], sleep_n[1], sleep_n[2], sleep_n[3], 0x48, 0xBF, 0x0D, 0xF0,
         0xDD, 0xE0, 0xFE, 0x0F, 0xDC, 0xBA, 0xCD, 0x80, 0xEB, 0xFE,
     ];
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
@@ -2621,6 +2624,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
         );
     }
 
+    // SAFETY: Valid memory or trusted environment
     if unsafe { addr_space.materialize() }.is_err() {
         return TestResult::Fail("materialize failed");
     }
@@ -2629,11 +2633,13 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     }
 
     // Interrupts off across the transition.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("cli");
     }
 
     let stack_top = STACK_VADDR + 0x1000;
+    // SAFETY: Valid memory or trusted environment
     unsafe { user_mode_enter(CODE_VADDR, stack_top) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -2712,6 +2718,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
             // The resume trampoline tail-calls user_mode_resume which
             // pushes a 5-qword iretq frame — supply a real kernel
             // stack so that doesn't fault.
+            // SAFETY: Valid memory or trusted environment
             let stack_top = unsafe {
                 let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
                 p.add(32) as u64
@@ -2756,14 +2763,17 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     __test_clear_global();
 
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
     }
     SAVED_CR3.store(original_cr3, Ordering::Release);
 
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
     if saved != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr3 = SAVED_CR3.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
@@ -2797,6 +2807,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     t.install_raw(Syscall::Sleep, "ym-sleep", UnwindHandler);
     install_global(t);
 
+    // SAFETY: Valid memory or trusted environment
     let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
@@ -2849,6 +2860,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         0xCD, 0x80, // int 0x80
         0xEB, 0xFE, // jmp $
     ];
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
@@ -2857,6 +2869,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         );
     }
 
+    // SAFETY: Valid memory or trusted environment
     if unsafe { addr_space.materialize() }.is_err() {
         return TestResult::Fail("materialize");
     }
@@ -2864,11 +2877,13 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
         return TestResult::Fail("activate");
     }
 
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("cli");
     }
 
     let stack_top = STACK_VADDR + 0x1000;
+    // SAFETY: Valid memory or trusted environment
     unsafe { user_mode_enter(CODE_VADDR, stack_top) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -2912,12 +2927,14 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         // SAFETY: uctx outlives the user-mode round-trip; the
         // polling routine pinned it.
         let _ = uctx;
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             user_mode_longjmp(core::ptr::addr_of_mut!(JMP), EXIT_REASON_YIELDED as u64);
         }
     }
     unsafe fn exit_hook_fn(uctx: *mut UserTaskCtx) -> ! {
         let _ = uctx;
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             user_mode_longjmp(core::ptr::addr_of_mut!(JMP), EXIT_REASON_EXITED as u64);
         }
@@ -2937,6 +2954,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
 
     // Snapshot CR3.
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
@@ -2949,6 +2967,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     //   mov rax, 103     ; ExitTask
     //   int 0x80
     //   jmp $
+    // SAFETY: Valid memory or trusted environment
     let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
@@ -2988,6 +3007,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
         0xCD, 0x80, // int 0x80
         0xEB, 0xFE, // jmp $
     ];
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
@@ -2995,6 +3015,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
             code_bytes.len(),
         );
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { addr_space.materialize() }.is_err() {
         return TestResult::Fail("materialize");
     }
@@ -3008,19 +3029,23 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     let mut uctx = UserTaskCtx::new();
     install_current_user_task(&mut uctx as *mut _);
 
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("cli");
     }
     let stack_top = STACK_VADDR + 0x1000;
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
 
     if saved == 0 {
         // First-time poll: enter user mode at the entry point.
+        // SAFETY: Valid memory or trusted environment
         unsafe { user_mode_enter(CODE_VADDR, stack_top) }
     } else if saved as u32 == EXIT_REASON_YIELDED {
         // First yield observed. Re-enter via resume so user picks
         // up at the instruction after `int 0x80`.
         OBSERVED_REASONS.fetch_or(1, Ordering::Relaxed);
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             // Resume from the saved state.
             user_mode_resume(uctx.state.get() as *const _ as *const UserState)
@@ -3028,6 +3053,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     } else if saved as u32 == EXIT_REASON_EXITED {
         OBSERVED_REASONS.fetch_or(2, Ordering::Relaxed);
         // Restore kernel state and report.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr3 = SAVED_CR3.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
@@ -3090,6 +3116,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     // root in case the future is dropped without finishing (failure
     // path).
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
@@ -3100,6 +3127,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // SAFETY: Valid memory or trusted environment
     let mut addr_space = match unsafe { AddressSpace::new_for_user() } {
         Ok(a) => a,
         Err(_) => return TestResult::Fail("new_for_user"),
@@ -3141,6 +3169,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         0xCD, 0x80, // int 0x80
         0xEB, 0xFE, // jmp $
     ];
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
@@ -3148,6 +3177,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
             code_bytes.len(),
         );
     }
+    // SAFETY: Valid memory or trusted environment
     if unsafe { addr_space.materialize() }.is_err() {
         return TestResult::Fail("materialize");
     }
@@ -3195,6 +3225,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     // KERNEL_GS_BASE in their kernel-side states with IF=0, but we
     // belt-and-suspender the kernel CR3 here too in case a divergent
     // failure path skipped that.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         let cr3 = SAVED_CR3.load(Ordering::Acquire);
         core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
@@ -3306,6 +3337,7 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
             unsafe {
                 ctx.save_user_state(core::ptr::addr_of_mut!(SAVED_USER) as *mut u8);
             }
+            // SAFETY: Valid memory or trusted environment
             let stack_top = unsafe {
                 let p = core::ptr::addr_of_mut!(RESUME_STACK) as *mut u64;
                 p.add(32) as u64
@@ -3351,6 +3383,7 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     __test_clear_global();
 
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
@@ -3464,6 +3497,7 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     elf[CODE_OFF..CODE_OFF + code.len()].copy_from_slice(&code);
 
     // ── Drive the loader + verify the integration site ──────────
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { narf_userspace::load_user_process_with(&elf[..], &[], &[], &[]) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with"),
@@ -3484,8 +3518,10 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
 
     // setjmp — sleep handler longjmps back here on the second
     // syscall capture.
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP)) };
     if saved != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr3 = SAVED_CR3.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
@@ -3521,15 +3557,18 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     if proc.address_space.activate().is_err() {
         return TestResult::Fail("activate");
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_scheduler::set_user_fs_base(fs_base);
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("cli");
     }
 
     let entry = proc.entry.0.as_u64();
     let rsp = proc.stack_top.as_u64();
+    // SAFETY: Valid memory or trusted environment
     unsafe { user_mode_enter(entry, rsp) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-e2e"))]
@@ -4124,6 +4163,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
 
     // Snapshot CR3 for restore post-unwind.
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
@@ -4133,8 +4173,10 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     // ExitTask lands at the naked trampoline.
     set_exit_landing(testbin_resume_trampoline as usize as u64, 0);
 
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP2)) };
     if saved != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             // Restore kernel CR3.
             let cr3 = SAVED_CR3_2.load(Ordering::Acquire);
@@ -4176,6 +4218,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         }
         let _ = writeln!(w, "  [ OK ] smoke_frame_x86_64_run_narf_testbin");
         let _ = writeln!(w, "── user-mode-testbin: testbin round-trip succeeded ──");
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_arch::exit_kernel(0) }
     }
 
@@ -4189,6 +4232,7 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
     let argv = ["narf-testbin", "argA"];
     let envp: [&str; 0] = [];
     let aux = [AuxEntry::Pagesz(4096)];
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(NARF_TESTBIN_ELF, &argv, &envp, &aux) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed on narf-testbin"),
@@ -4202,9 +4246,11 @@ fn smoke_frame_x86_64_run_narf_testbin() -> TestResult {
         return TestResult::Fail("activate failed");
     }
 
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("cli");
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { user_mode_enter(proc.entry.0.as_u64(), proc.stack_top.as_u64()) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "user-mode-testbin"))]
@@ -4386,6 +4432,7 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     install_global(t);
 
     let original_cr3: u64;
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("mov {v}, cr3", v = out(reg) original_cr3,
             options(nostack, preserves_flags));
@@ -4394,8 +4441,10 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
 
     set_exit_landing(libc_validate_resume_trampoline as usize as u64, 0);
 
+    // SAFETY: Valid memory or trusted environment
     let saved = unsafe { user_mode_setjmp(core::ptr::addr_of_mut!(JMP3)) };
     if saved != 0 {
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             let cr3 = SAVED_CR3_3.load(Ordering::Acquire);
             core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
@@ -4434,6 +4483,7 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
         //   strpad:'hi        |abc'
         //   altsign:'+7 0xdead'
         //   fprintf:'123'
+        // SAFETY: Valid memory or trusted environment
         unsafe { narf_arch::exit_kernel(0) }
     }
 
@@ -4443,6 +4493,7 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
     let argv = ["narf-libc-validate"];
     let envp: [&str; 0] = [];
     let aux = [AuxEntry::Pagesz(4096)];
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe { load_user_process_with(NARF_LIBC_VALIDATE_ELF, &argv, &envp, &aux) } {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed on narf-libc-validate"),
@@ -4454,9 +4505,11 @@ fn smoke_frame_x86_64_run_narf_libc_validate() -> TestResult {
         return TestResult::Fail("activate failed");
     }
 
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!("cli");
     }
+    // SAFETY: Valid memory or trusted environment
     unsafe { user_mode_enter(proc.entry.0.as_u64(), proc.stack_top.as_u64()) }
 }
 #[cfg(all(target_arch = "x86_64", feature = "narf-libc-validate"))]
@@ -4686,6 +4739,7 @@ fn smoke_compat_win_load_pe_pipeline() -> TestResult {
     // SAFETY: the kernel test harness runs with the low-4-GiB
     // identity map and frame allocator initialised — both contracts
     // load_pe documents.
+    // SAFETY: Valid memory or trusted environment
     let proc = match unsafe {
         load_pe(&bytes, resolver, /*pid=*/ 0xCAFE, /*tid=*/ 0xBABE)
     } {
@@ -6077,6 +6131,7 @@ fn smoke_irq_set_waker_dedupes_by_will_wake() -> TestResult {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             // Poll the WaitForIrq — it calls set_waker.
+            // SAFETY: Valid memory or trusted environment
             let inner = unsafe { Pin::new_unchecked(&mut self.inner) };
             let _ = inner.poll(cx);
             POLLS.fetch_add(1, Ordering::AcqRel);

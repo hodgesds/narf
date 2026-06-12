@@ -40,6 +40,8 @@ pub enum OemVendor {
     Asus,
     /// Samsung laptop (Notebook 9, Galaxy Book).
     Samsung,
+    /// Acer laptop (Aspire, Predator, Swift).
+    Acer,
     /// Unknown / not a laptop vendor we handle.
     Unknown,
 }
@@ -69,6 +71,9 @@ impl OemVendor {
         }
         if v.contains("SAMSUNG") {
             return OemVendor::Samsung;
+        }
+        if v.eq_ignore_ascii_case("Acer") {
+            return OemVendor::Acer;
         }
         OemVendor::Unknown
     }
@@ -181,6 +186,10 @@ pub fn probe_and_register() -> Result<OemVendor, RegistryError> {
         }
         OemVendor::Samsung => {
             crate::samsung_laptop::init();
+            DRIVERS_INIT.fetch_add(1, Ordering::Relaxed);
+        }
+        OemVendor::Acer => {
+            crate::acer_wmi::init();
             DRIVERS_INIT.fetch_add(1, Ordering::Relaxed);
         }
         OemVendor::Unknown => return Err(RegistryError::UnknownVendor),

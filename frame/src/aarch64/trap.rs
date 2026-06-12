@@ -196,6 +196,7 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
                 let v = narf_memory::VirtAddr::new(far);
                 // SAFETY: low-RAM phys-as-virt window is live;
                 // AS is the active user AS by construction.
+                // SAFETY: Valid memory or trusted environment
                 if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
                     return;
                 }
@@ -212,10 +213,12 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
                 // allocator + COW refcount table initialised at
                 // boot; AS is the active user AS by construction
                 // (the trap arrived from EL0).
+                // SAFETY: Valid memory or trusted environment
                 let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
                 if split_ok {
                     // SAFETY: same identity-map argument; the
                     // region was just touched by the split.
+                    // SAFETY: Valid memory or trusted environment
                     let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
                     if remap_ok {
                         return;
@@ -346,6 +349,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         use narf_userspace::user_task::UserState;
         // SAFETY: caller declared `out` is writable for at least
         // `size_of::<UserState>()` bytes — the trait's contract.
+        // SAFETY: Valid memory or trusted environment
         let s = unsafe { &mut *(out as *mut UserState) };
         let f = &self.frame;
         // x0..=x30 (31 registers).
@@ -393,6 +397,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         let sp_el0: u64;
         // SAFETY: reading SP_EL0 at EL1 is unconditionally
         // defined; it has no side effects on EL1 state.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "mrs {v}, SP_EL0",
@@ -467,6 +472,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
         let user_sp: u64;
         // SAFETY: mrs SP_EL0 at EL1 is unconditionally valid with no
         // side effects (Arm ARM DDI0487 D7.2.138).
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             core::arch::asm!(
                 "mrs {v}, SP_EL0",
@@ -559,6 +565,7 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
             // demand-paged pages is below the trap-frame). Writes to
             // fresh pages surface via the translation-fault handler
             // registered in rust_aarch64_sync_dispatch above.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 core::ptr::write_volatile(new_sp as *mut u64, fallback_return);
                 let info_p = siginfo_vaddr as *mut u8;
@@ -774,6 +781,7 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
     let prior_sp_el0: u64;
     // SAFETY: SP_EL0 read/write at EL1 is unconditional and has
     // no side effects when EL0 is not currently executing.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -788,12 +796,14 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
     let mut buf = MaybeUninit::<UserState>::zeroed();
     // SAFETY: destination is a freshly-zeroed `UserState`-sized
     // stack slot — the trait's contract.
+    // SAFETY: Valid memory or trusted environment
     let ok = unsafe { ctx.save_user_state(buf.as_mut_ptr() as *mut u8) };
 
     // Restore the prior SP_EL0 immediately so any later test
     // that depends on it observes the boot-state value.
     // SAFETY: `msr SP_EL0` at EL1 is unconditional and side-effect-free
     // while EL0 is not executing; `prior_sp_el0` is the value read above.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "msr SP_EL0, {p}",
@@ -807,6 +817,7 @@ fn smoke_aarch64_trap_save_user_state_round_trip() -> TestResult {
     }
     // SAFETY: save_user_state returned true → it wrote a valid
     // UserState into the buffer.
+    // SAFETY: Valid memory or trusted environment
     let s = unsafe { buf.assume_init() };
 
     if s.x[0] != 0x0000_0000_0000_0000 {
@@ -938,6 +949,7 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
     // SAFETY: `mrs`/`msr SP_EL0` at EL1 read/write the EL0 stack pointer
     // unconditionally with no side effects while EL0 is not executing;
     // `stack.top()` is a kernel-mapped scratch-buffer address.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -953,6 +965,7 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
 
     // SAFETY: `msr SP_EL0` at EL1 restores the EL0 stack pointer
     // unconditionally; `prior_sp` is the value read above.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "msr SP_EL0, {p}",
@@ -1013,6 +1026,7 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
     // SAFETY: `mrs`/`msr SP_EL0` at EL1 read/write the EL0 stack pointer
     // unconditionally with no side effects while EL0 is not executing;
     // `user_stack.top()` is a kernel-mapped scratch-buffer address.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -1030,6 +1044,7 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
     // SAFETY: `mrs SP_EL0` captures the EL0 SP that deliver_signal wrote
     // and `msr SP_EL0` restores the prior value; both are unconditional
     // EL1 accesses with no side effects while EL0 is not executing.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {v}, SP_EL0",
@@ -1082,6 +1097,7 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
     // SAFETY: `mrs`/`msr SP_EL0` at EL1 read/write the EL0 stack pointer
     // unconditionally with no side effects while EL0 is not executing;
     // `stack.top()` is a kernel-mapped scratch-buffer address.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {p}, SP_EL0",
@@ -1098,6 +1114,7 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
     // SAFETY: `mrs SP_EL0` captures the EL0 SP that deliver_signal wrote
     // and `msr SP_EL0` restores the prior value; both are unconditional
     // EL1 accesses with no side effects while EL0 is not executing.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         core::arch::asm!(
             "mrs {v}, SP_EL0",

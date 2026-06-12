@@ -147,6 +147,7 @@ impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for S
         }
         // SAFETY: caller upholds single-producer invariant; the slot
         // is exclusively ours until our release-store of `seq` below.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*slot.val.get()).write(val);
         }
@@ -185,6 +186,7 @@ impl<T: Send + 'static, const N: usize> crate::transport::RingTransport<T> for S
                     // SAFETY: we won the claim CAS; we are the sole
                     // consumer of this slot until our release-store
                     // of `seq` below.
+                    // SAFETY: Valid memory or trusted environment
                     let msg = unsafe {
                         let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
                         v.assume_init()
@@ -219,6 +221,7 @@ impl<T, const N: usize> Drop for SpmcRing<T, N> {
         // SAFETY: `drop` has `&mut self`, so we hold exclusive access to
         // the ring; no producer or consumer can be touching `slots`
         // concurrently, making the `UnsafeCell` deref to `&mut` sound.
+        // SAFETY: Valid memory or trusted environment
         let slots = unsafe { &mut *self.slots.0.get() };
         let mut i = head;
         while i != tail {
@@ -227,6 +230,7 @@ impl<T, const N: usize> Drop for SpmcRing<T, N> {
             if *slot.seq.get_mut() == i.wrapping_add(1) {
                 // SAFETY: producer published slot at `i + 1`; no
                 // consumer ever claimed it. Payload is live.
+                // SAFETY: Valid memory or trusted environment
                 unsafe {
                     let mut v = core::mem::replace(slot.val.get_mut(), MaybeUninit::uninit());
                     v.assume_init_drop();
@@ -292,6 +296,7 @@ impl<T: Send + 'static, const N: usize> SpmcRingProducer<T, N> {
         // SAFETY: as the sole producer, we own this slot exclusively
         // between its release-store of `seq = pos + N` from the last
         // consumer and our own release-store of `seq = pos + 1`.
+        // SAFETY: Valid memory or trusted environment
         unsafe {
             (*slot.val.get()).write(msg);
         }
@@ -419,6 +424,7 @@ impl<T: Send + 'static, const N: usize> SpmcRingConsumer<T, N> {
                     Ok(_) => {
                         // SAFETY: we are now the sole owner of this
                         // slot until we mark it reusable.
+                        // SAFETY: Valid memory or trusted environment
                         let msg = unsafe {
                             let v = core::mem::replace(&mut *slot.val.get(), MaybeUninit::uninit());
                             v.assume_init()

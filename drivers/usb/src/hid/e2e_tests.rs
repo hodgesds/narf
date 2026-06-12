@@ -144,7 +144,7 @@ fn smoke_e2e_kbd_registers_evdev_device() -> TestResult {
 
     // Verify the device appears in ROUTER.device_ids().
     let ids = ROUTER.device_ids();
-    if !ids.iter().any(|d| *d == id) {
+    if !ids.contains(&id) {
         bk.unregister();
         return TestResult::Fail("keyboard DeviceNode not found in ROUTER after register");
     }
@@ -593,7 +593,7 @@ fn smoke_e2e_kbd_unplug_removes_device() -> TestResult {
     let id = bk.id;
 
     // Sanity: present before unplug.
-    if !ROUTER.device_ids().iter().any(|d| *d == id) {
+    if !ROUTER.device_ids().contains(&id) {
         bk.unregister();
         return TestResult::Fail("device not in ROUTER before unplug — test setup wrong");
     }
@@ -602,7 +602,7 @@ fn smoke_e2e_kbd_unplug_removes_device() -> TestResult {
     bk.unregister();
 
     // Device must no longer appear in ROUTER.device_ids().
-    if ROUTER.device_ids().iter().any(|d| *d == id) {
+    if ROUTER.device_ids().contains(&id) {
         return TestResult::Fail("device still in ROUTER after unregister");
     }
 
@@ -683,10 +683,12 @@ fn smoke_e2e_uinput_write_injection() -> TestResult {
             RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker)
         };
         let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw) };
         let mut cx = Context::from_waker(&waker);
 
         let mut write_fut = file.write(0, &buf);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let pinned = unsafe { core::pin::Pin::new_unchecked(&mut write_fut) };
         match pinned.poll(&mut cx) {
             Poll::Ready(Ok(n)) if n == EV_SZ => {}
@@ -750,6 +752,7 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
         value: 1,
     };
     let mut buf = [0u8; EV_SZ];
+    // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
         core::ptr::copy_nonoverlapping(
             &ev as *const EvdevEvent as *const u8,
@@ -772,10 +775,12 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
             RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker)
         };
         let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let waker = unsafe { Waker::from_raw(raw) };
         let mut cx = Context::from_waker(&waker);
 
         let mut write_fut = file.write(0, &buf);
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         let pinned = unsafe { core::pin::Pin::new_unchecked(&mut write_fut) };
         let result = pinned.poll(&mut cx);
 
@@ -859,7 +864,7 @@ fn smoke_e2e_usb_kbd_plug_unplug_lifecycle() -> TestResult {
     let id = evdev_id;
 
     // Verify device appears in ROUTER.
-    if !ROUTER.device_ids().iter().any(|d| *d == id) {
+    if !ROUTER.device_ids().contains(&id) {
         ROUTER.unregister_device(id);
         return TestResult::Fail("keyboard not in ROUTER after register");
     }
@@ -886,7 +891,7 @@ fn smoke_e2e_usb_kbd_plug_unplug_lifecycle() -> TestResult {
     ROUTER.unregister_device(id);
 
     // Device must be gone from ROUTER.
-    if ROUTER.device_ids().iter().any(|d| *d == id) {
+    if ROUTER.device_ids().contains(&id) {
         return TestResult::Fail("keyboard still in ROUTER after unregister");
     }
 

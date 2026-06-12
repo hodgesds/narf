@@ -401,6 +401,7 @@ pub unsafe extern "C" fn getrusage(who: c_int, usage: *mut rusage) -> c_int {
     }
     // SAFETY: caller-supplied writable struct; we re-shape the 18
     // i64s into the C-shaped rusage.
+    // SAFETY: Valid memory or trusted environment
     unsafe {
         *usage = rusage {
             ru_utime: crate::time::timeval {

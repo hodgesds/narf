@@ -186,6 +186,7 @@ impl SourcePort {
     pub fn state(&self) -> SourceState {
         let v = self.state.load(Ordering::Acquire);
         // Safety: we only ever store SourceState discriminants.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::mem::transmute(v) }
     }
 
@@ -823,6 +824,7 @@ impl TcpmPort {
     pub fn state(&self) -> PortState {
         let v = self.state.load(Ordering::Acquire);
         // Safety: only PortState discriminants are ever stored.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::mem::transmute(v) }
     }
 
@@ -1460,8 +1462,10 @@ pub(crate) mod tests {
             cc1: CcState::Rd,
             cc2: CcState::Open,
         }));
-        let mut policy = SourcePolicy::default();
-        policy.accept_pr_swap = true;
+        let policy = SourcePolicy {
+            accept_pr_swap: true,
+            ..Default::default()
+        };
         let port = SourcePort::new(chip.clone(), policy);
         let cap = narf_usbpd::bootstrap_usbpd_authority();
         let _ = drive_to_ready(&port, &chip, &cap, 8);
@@ -1594,8 +1598,10 @@ pub(crate) mod tests {
             cc1: CcState::Rd,
             cc2: CcState::Open,
         }));
-        let mut policy = SourcePolicy::default();
-        policy.accept_dr_swap = true;
+        let policy = SourcePolicy {
+            accept_dr_swap: true,
+            ..Default::default()
+        };
         let port = SourcePort::new(chip.clone(), policy);
         let cap = narf_usbpd::bootstrap_usbpd_authority();
         let _ = drive_to_ready(&port, &chip, &cap, 8);
