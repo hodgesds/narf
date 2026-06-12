@@ -26,6 +26,7 @@
 extern crate alloc;
 
 pub mod intel_lpss;
+pub mod pl011;
 pub mod probe;
 pub mod registry;
 pub mod uart_8250;
@@ -45,6 +46,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "serial-acpi", || {
         probe::enumerate_acpi_uarts();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "serial-pl011", || {
+        pl011::register_initcalls();
         InitResult::Ok
     });
 }

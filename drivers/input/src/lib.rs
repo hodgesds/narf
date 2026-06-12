@@ -26,6 +26,7 @@ pub mod i8042_mouse;
 #[cfg(target_arch = "x86_64")]
 pub mod psmouse;
 pub mod rmi4_core;
+pub mod wacom;
 pub mod wbdi;
 
 /// Stage::Device initcalls for this driver crate.
@@ -67,6 +68,8 @@ pub fn register_initcalls() {
     // vendor-specific report formats (HP Pavilion X2, Toshiba Click,
     // and a slice of Lenovo/Acer/MSI laptops).
     hid_elan::register_initcalls();
+
+    wacom::register_usb_driver();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();
