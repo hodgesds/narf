@@ -1430,6 +1430,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("sysinfo_smoke", "sysinfo-ok"),
         ("splice_smoke", "splice-ok"),
         ("barrier_smoke", "barrier-ok"),
+        // Linux-compat round 4: close_range, sched-policy, msync+mincore, sync+syncfs+personality.
+        ("closerange_smoke", "closerange-ok"),
+        ("sched_smoke", "sched-ok"),
+        ("mcore_smoke", "mcore-ok"),
+        ("sync_smoke", "sync-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

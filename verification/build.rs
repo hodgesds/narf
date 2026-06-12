@@ -286,6 +286,10 @@ fn main() {
         "sysinfo_smoke",
         "splice_smoke",
         "barrier_smoke",
+        "closerange_smoke",
+        "sched_smoke",
+        "mcore_smoke",
+        "sync_smoke",
     ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));

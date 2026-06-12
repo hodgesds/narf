@@ -3387,6 +3387,14 @@ fn boot_userspace_init() {
                 ("sysinfo_smoke", narf_verification::NARF_SYSINFO_SMOKE_ELF),
                 ("splice_smoke", narf_verification::NARF_SPLICE_SMOKE_ELF),
                 ("barrier_smoke", narf_verification::NARF_BARRIER_SMOKE_ELF),
+                // Linux-compat round 4: close_range / sched-policy / msync+mincore / sync+syncfs+personality.
+                (
+                    "closerange_smoke",
+                    narf_verification::NARF_CLOSERANGE_SMOKE_ELF,
+                ),
+                ("sched_smoke", narf_verification::NARF_SCHED_SMOKE_ELF),
+                ("mcore_smoke", narf_verification::NARF_MCORE_SMOKE_ELF),
+                ("sync_smoke", narf_verification::NARF_SYNC_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
