@@ -3473,6 +3473,8 @@ fn boot_userspace_init() {
                     "introspect_smoke",
                     narf_verification::NARF_INTROSPECT_SMOKE_ELF,
                 ),
+                // Linux-compat round 10: vectored + extended I/O.
+                ("vio_smoke", narf_verification::NARF_VIO_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

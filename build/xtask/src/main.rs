@@ -1460,6 +1460,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("schedattr_smoke", "schedattr-ok"),
         ("adjtimex_smoke", "adjtimex-ok"),
         ("introspect_smoke", "introspect-ok"),
+        // Linux-compat round 10: vectored + extended I/O.
+        ("vio_smoke", "vio-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

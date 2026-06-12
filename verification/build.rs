@@ -310,6 +310,7 @@ fn main() {
         "schedattr_smoke",
         "adjtimex_smoke",
         "introspect_smoke",
+        "vio_smoke",
     ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));
