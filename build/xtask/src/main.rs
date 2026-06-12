@@ -1455,6 +1455,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("inotify_smoke", "inotify-ok"),
         ("pkey_smoke", "pkey-ok"),
         ("pvm_smoke", "pvm-ok"),
+        // Linux-compat round 9: mempolicy, sched_attr, adjtimex, introspection.
+        ("mempolicy_smoke", "mpol-ok"),
+        ("schedattr_smoke", "schedattr-ok"),
+        ("adjtimex_smoke", "adjtimex-ok"),
+        ("introspect_smoke", "introspect-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
