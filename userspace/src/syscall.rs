@@ -1711,6 +1711,26 @@ pub enum Syscall {
     /// to the process referenced by `pidfd`. Linux (424 on both
     /// arches).
     PidfdSendSignal,
+
+    /// `sendmmsg(fd, mmsghdr*, vlen, flags)` — send multiple messages
+    /// in one call. Linux (x86_64=307, aarch64=269).
+    Sendmmsg,
+
+    /// `recvmmsg(fd, mmsghdr*, vlen, flags, timeout)` — receive
+    /// multiple messages in one call. Linux (x86_64=299, aarch64=243).
+    Recvmmsg,
+
+    /// `openat2(dirfd, path, open_how*, size)` — openat with the
+    /// extensible `open_how` struct. Linux (437 on both arches).
+    Openat2,
+
+    /// `preadv(fd, iov, iovcnt, offset)` — positioned vectored read.
+    /// Linux (x86_64=295, aarch64=69).
+    Preadv,
+
+    /// `pwritev(fd, iov, iovcnt, offset)` — positioned vectored write.
+    /// Linux (x86_64=296, aarch64=70).
+    Pwritev,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1794,6 +1814,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRobustList, 274),
     (Syscall::Renameat2, 316),
     (Syscall::PidfdSendSignal, 424),
+    (Syscall::Sendmmsg, 307),
+    (Syscall::Recvmmsg, 299),
+    (Syscall::Openat2, 437),
+    (Syscall::Preadv, 295),
+    (Syscall::Pwritev, 296),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -1929,8 +1954,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // it requires the per-task NS infrastructure; reading the
     // uts struct works on every NARF build.
     (Syscall::Uname, 63),
-    // Wave-72 — UTS-mutating syscalls (gated `container`).
-    #[cfg(feature = "container")]
+    // setdomainname works on every build (global domainname slot);
+    // the SysV IPC get-by-key syscalls below need the container NS.
     (Syscall::Setdomainname, 171),
     #[cfg(feature = "container")]
     (Syscall::Shmget, 29),
@@ -2108,6 +2133,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::GetRobustList, 100),
     (Syscall::Renameat2, 276),
     (Syscall::PidfdSendSignal, 424),
+    (Syscall::Sendmmsg, 269),
+    (Syscall::Recvmmsg, 243),
+    (Syscall::Openat2, 437),
+    (Syscall::Preadv, 69),
+    (Syscall::Pwritev, 70),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -2136,9 +2166,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::DeleteModule, 106),
     (Syscall::FinitModule, 273),
     // Wave-72 — UTS/IPC syscalls (gated `container`).
-    #[cfg(feature = "container")]
     (Syscall::Uname, 160),
-    #[cfg(feature = "container")]
     (Syscall::Setdomainname, 162),
     #[cfg(feature = "container")]
     (Syscall::Shmget, 194),

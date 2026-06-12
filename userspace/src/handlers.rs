@@ -4327,6 +4327,286 @@ fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+/// `openat2(dirfd, path, open_how*, size)` — openat with the
+/// extensible `open_how { u64 flags; u64 mode; u64 resolve; }` struct.
+/// Reads `flags` from the struct and routes through the openat/open
+/// path; `mode` and `resolve` are accepted but not enforced.
+fn sys_openat2(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_uptr = args.arg1;
+    let how_ptr = args.arg2;
+    let size = args.arg3 as usize;
+    let fail = SyscallReturn::ok(!0u64);
+    if how_ptr == 0 || size < 24 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: `how_ptr` is the user `struct open_how*`; copy_from_user_vec
+    // range-validates the 24-byte read.
+    let how = match unsafe { copy_from_user_vec(how_ptr, 24) } {
+        Ok(b) => b,
+        Err(_) => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let flags = u64::from_ne_bytes(how[0..8].try_into().unwrap());
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let proxy_args = SyscallArgs {
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: flags,
+        arg5: 0,
+    };
+    let mut proxy = ReshapeArgs {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_open(&mut proxy);
+}
+
+/// Minimal `TrapContext` proxy that overrides the argument tuple and
+/// forwards everything else to the inner context (reshape-and-delegate
+/// handlers like openat2).
+struct ReshapeArgs<'a> {
+    inner: &'a mut dyn TrapContext,
+    args: SyscallArgs,
+}
+impl TrapContext for ReshapeArgs<'_> {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.inner.set_return(ret);
+    }
+    fn user_rsp(&self) -> u64 {
+        self.inner.user_rsp()
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        self.inner.redirect_to_kernel(rip, rsp)
+    }
+}
+
+/// `TrapContext` proxy that captures the sub-handler's return value
+/// instead of forwarding it (sendmmsg/recvmmsg loop a single
+/// sendmsg/recvmsg per message and read each result).
+struct CaptureCtx<'a> {
+    inner: &'a mut dyn TrapContext,
+    args: SyscallArgs,
+    ret_value: u64,
+}
+impl TrapContext for CaptureCtx<'_> {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.ret_value = ret.value;
+    }
+    fn user_rsp(&self) -> u64 {
+        self.inner.user_rsp()
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        self.inner.redirect_to_kernel(rip, rsp)
+    }
+}
+
+/// `struct mmsghdr { struct msghdr msg_hdr; unsigned msg_len; }` is 64
+/// bytes on LP64 (msghdr is 56); msg_len sits at offset 56.
+const MMSGHDR_SZ: u64 = 64;
+const MMSGHDR_MSGLEN_OFF: u64 = 56;
+
+/// `sendmmsg(fd, mmsghdr*, vlen, flags)` — send up to `vlen` messages,
+/// writing each message's transmitted byte count into its `msg_len`.
+/// Stops at the first failing message; returns the count sent.
+fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let fd = a.arg0;
+    let mmsg_ptr = a.arg1;
+    let vlen = a.arg2 as usize;
+    let flags = a.arg3;
+    let mut sent = 0usize;
+    for i in 0..vlen {
+        let hdr_ptr = mmsg_ptr + (i as u64) * MMSGHDR_SZ;
+        let mut cap = CaptureCtx {
+            inner: ctx,
+            args: SyscallArgs {
+                arg0: fd,
+                arg1: hdr_ptr,
+                arg2: flags,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret_value: 0,
+        };
+        sys_socket_sendmsg(&mut cap);
+        if (cap.ret_value as i64) < 0 {
+            break;
+        }
+        write_user_u32(hdr_ptr + MMSGHDR_MSGLEN_OFF, cap.ret_value as u32);
+        sent += 1;
+    }
+    ctx.set_return(SyscallReturn::ok(sent as u64));
+}
+
+/// `recvmmsg(fd, mmsghdr*, vlen, flags, timeout)` — receive up to
+/// `vlen` messages, writing each received length into its `msg_len`.
+/// Stops when a recv would block; returns the count received.
+fn sys_socket_recvmmsg(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let fd = a.arg0;
+    let mmsg_ptr = a.arg1;
+    let vlen = a.arg2 as usize;
+    let flags = a.arg3;
+    let mut recvd = 0usize;
+    for i in 0..vlen {
+        let hdr_ptr = mmsg_ptr + (i as u64) * MMSGHDR_SZ;
+        let mut cap = CaptureCtx {
+            inner: ctx,
+            args: SyscallArgs {
+                arg0: fd,
+                arg1: hdr_ptr,
+                arg2: flags,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret_value: 0,
+        };
+        sys_socket_recvmsg(&mut cap);
+        if (cap.ret_value as i64) < 0 {
+            break; // would block — no more messages ready
+        }
+        write_user_u32(hdr_ptr + MMSGHDR_MSGLEN_OFF, cap.ret_value as u32);
+        recvd += 1;
+    }
+    ctx.set_return(SyscallReturn::ok(recvd as u64));
+}
+
+/// Shared core for `preadv(2)` / `pwritev(2)` — vectored I/O at an
+/// explicit offset that does NOT advance the fd's own offset.
+fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool) {
+    let a = *ctx.args();
+    let fd = a.arg0 as u32;
+    let iov_ptr = a.arg1;
+    let iovcnt = a.arg2 as usize;
+    let mut off = a.arg3;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    const IOV_MAX: usize = 1024;
+    if iovcnt > IOV_MAX {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: single-threaded syscall; the AS is active. copy_from_user_vec
+    // range-validates the iovec array.
+    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iovcnt.saturating_mul(16)) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
+    let task = current_task_id();
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let o = i * 16;
+        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
+        if len == 0 {
+            continue;
+        }
+        if is_write {
+            // SAFETY: `base` is a user VA; copy_from_user_vec validates it.
+            let kbuf = match unsafe { copy_from_user_vec(base, len) } {
+                Ok(b) => b,
+                Err(_) => {
+                    if total == 0 {
+                        ctx.set_return(fail);
+                        return;
+                    }
+                    break;
+                }
+            };
+            let w = fd::with_table(task, |t| {
+                let entry = t.get_mut(fd).ok_or(())?;
+                poll_blocking(entry.ops.write(off, &kbuf))
+                    .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+                    .map_err(|_| ())
+            });
+            match w {
+                Some(Ok(written)) => {
+                    total += written;
+                    off = off.saturating_add(written as u64);
+                    if written < len {
+                        break;
+                    }
+                }
+                _ => {
+                    if total == 0 {
+                        ctx.set_return(fail);
+                        return;
+                    }
+                    break;
+                }
+            }
+        } else {
+            let mut kbuf = alloc::vec![0u8; len];
+            let r = fd::with_table(task, |t| {
+                let entry = t.get_mut(fd).ok_or(())?;
+                poll_blocking(entry.ops.read(off, &mut kbuf))
+                    .unwrap_or(Ok(0))
+                    .map_err(|_| ())
+            });
+            match r {
+                Some(Ok(n)) => {
+                    // SAFETY: `base` is the user iovec destination; copy_to_user
+                    // validates the `n`-byte write.
+                    let _ = unsafe { copy_to_user(base, &kbuf[..n]) };
+                    total += n;
+                    off = off.saturating_add(n as u64);
+                    if n < len {
+                        break; // short read / EOF
+                    }
+                }
+                _ => {
+                    if total == 0 {
+                        ctx.set_return(fail);
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
+
+/// `preadv(fd, iov, iovcnt, offset)` — positioned vectored read.
+fn sys_preadv(ctx: &mut dyn TrapContext) {
+    preadv_pwritev(ctx, false);
+}
+
+/// `pwritev(fd, iov, iovcnt, offset)` — positioned vectored write.
+fn sys_pwritev(ctx: &mut dyn TrapContext) {
+    preadv_pwritev(ctx, true);
+}
+
 // ── FB syscalls ────────────────────────────────────────────────────
 //
 // Five syscalls (Connect/Info/RingMap/FlushWait/Disconnect) form the
@@ -7878,6 +8158,12 @@ const HOSTNAME_MAX: usize = 64;
 static HOSTNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
 
+/// Global NIS/UTS domain name (set_domainname / read by uname). Empty
+/// by default (Linux reports "(none)"); the container UTS-namespace
+/// path overrides per-task when that feature is on.
+static DOMAINNAME: narf_lib::sync::IrqSafeSpinLock<alloc::string::String> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::string::String::new());
+
 /// Initialise the hostname slot to `"narf"`. Idempotent so the
 /// boot path can call this without coordination.
 pub fn hostname_init() {
@@ -8003,10 +8289,8 @@ fn sys_uname(ctx: &mut dyn TrapContext) {
         (ns.hostname(), ns.domainname())
     };
     #[cfg(not(feature = "container"))]
-    let (hostname, domainname): (alloc::string::String, alloc::string::String) = (
-        alloc::string::String::from("narf"),
-        alloc::string::String::new(),
-    );
+    let (hostname, domainname): (alloc::string::String, alloc::string::String) =
+        (HOSTNAME.lock().clone(), DOMAINNAME.lock().clone());
     let mut kbuf = alloc::vec![0u8; UTSNAME_STRUCT_LEN];
     let mut off = 0usize;
     // sysname / nodename / release / version / machine / domainname.
@@ -8037,26 +8321,36 @@ fn sys_uname(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-#[cfg(feature = "container")]
 fn sys_setdomainname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let buf = args.arg0 as u64;
+    let buf = args.arg0;
     let len = args.arg1 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    if len == 0 || len > crate::namespaces::UTS_NAME_MAX {
+    if len == 0 || len > HOSTNAME_MAX {
         ctx.set_return(fail);
         return;
     }
-    let s = match copy_user_path_raw(buf, len) {
+    let s = match copy_user_path(buf, len) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let task = current_task_id();
-    let ns = crate::namespaces::current_uts_ns(task);
-    ns.set_domainname(&s);
+    // If the caller has an explicit UTS namespace, write there; else
+    // fall through to the global domainname slot (mirrors sethostname).
+    #[cfg(feature = "container")]
+    {
+        let task = current_task_id();
+        if let Some(ns) = crate::namespaces::uts_ns_of(task) {
+            ns.set_domainname(&s);
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+    }
+    let mut g = DOMAINNAME.lock();
+    g.clear();
+    g.push_str(&s);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -13924,13 +14218,13 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     // POSIX uname(2) — always present. Reads the UTS struct only;
     // doesn't depend on per-task UTS-namespace infrastructure.
     table.install_raw(Syscall::Uname, "uname", RawFnHandler(sys_uname));
+    table.install_raw(
+        Syscall::Setdomainname,
+        "setdomainname",
+        RawFnHandler(sys_setdomainname),
+    );
     #[cfg(feature = "container")]
     {
-        table.install_raw(
-            Syscall::Setdomainname,
-            "setdomainname",
-            RawFnHandler(sys_setdomainname),
-        );
         table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget));
         table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
         table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
@@ -14255,6 +14549,19 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "pidfd_send_signal",
         RawFnHandler(sys_pidfd_send_signal),
     );
+    table.install_raw(
+        Syscall::Sendmmsg,
+        "sendmmsg",
+        RawFnHandler(sys_socket_sendmmsg),
+    );
+    table.install_raw(
+        Syscall::Recvmmsg,
+        "recvmmsg",
+        RawFnHandler(sys_socket_recvmmsg),
+    );
+    table.install_raw(Syscall::Openat2, "openat2", RawFnHandler(sys_openat2));
+    table.install_raw(Syscall::Preadv, "preadv", RawFnHandler(sys_preadv));
+    table.install_raw(Syscall::Pwritev, "pwritev", RawFnHandler(sys_pwritev));
     table.install_raw(
         Syscall::Select,
         "select",
