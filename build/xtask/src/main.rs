@@ -1420,6 +1420,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("getrandom_smoke", "getrandom-ok"),
         ("sockpair_smoke", "sockpair-ok"),
         ("accept4_smoke", "accept4-ok"),
+        // Linux-compat round 2: mremap, sendfile, creds, waitid.
+        ("mremap_smoke", "mremap-ok"),
+        ("sendfile_smoke", "sendfile-ok"),
+        ("creds_smoke", "creds-ok"),
+        ("waitid_smoke", "waitid-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

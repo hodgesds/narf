@@ -3790,6 +3790,26 @@ define_smoke_elf!(
     "NARF_ACCEPT4_SMOKE_ELF_X86_64",
     "NARF_ACCEPT4_SMOKE_ELF_AARCH64"
 );
+define_smoke_elf!(
+    NARF_MREMAP_SMOKE_ELF,
+    "NARF_MREMAP_SMOKE_ELF_X86_64",
+    "NARF_MREMAP_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_SENDFILE_SMOKE_ELF,
+    "NARF_SENDFILE_SMOKE_ELF_X86_64",
+    "NARF_SENDFILE_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_CREDS_SMOKE_ELF,
+    "NARF_CREDS_SMOKE_ELF_X86_64",
+    "NARF_CREDS_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_WAITID_SMOKE_ELF,
+    "NARF_WAITID_SMOKE_ELF_X86_64",
+    "NARF_WAITID_SMOKE_ELF_AARCH64"
+);
 
 #[cfg(all(
     target_arch = "x86_64",

@@ -278,6 +278,10 @@ fn main() {
         "getrandom_smoke",
         "sockpair_smoke",
         "accept4_smoke",
+        "mremap_smoke",
+        "sendfile_smoke",
+        "creds_smoke",
+        "waitid_smoke",
     ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));
