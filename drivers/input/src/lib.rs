@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+pub mod goodix;
 pub mod hid_elan;
 pub mod hid_mt_features;
 pub mod hid_multitouch;
@@ -70,6 +71,7 @@ pub fn register_initcalls() {
     hid_elan::register_initcalls();
 
     wacom::register_usb_driver();
+    goodix::register_initcalls();
 
     #[cfg(target_arch = "x86_64")]
     register_i8042_initcalls();

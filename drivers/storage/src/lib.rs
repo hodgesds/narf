@@ -18,6 +18,7 @@ extern crate alloc;
 pub mod ahci;
 pub mod emmc;
 pub mod megaraid;
+pub mod mpt3sas;
 pub mod rtsx;
 pub mod sd_proto;
 pub mod sdhci;
@@ -44,6 +45,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "smartpqi", || {
         smartpqi::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "mpt3sas", || {
+        mpt3sas::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "sdhci", || {
