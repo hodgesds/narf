@@ -269,7 +269,16 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_UNIX_SMOKE_ELF_AARCH64=/dev/null");
 
-    for test in ["fork_pipe_smoke", "epoll_smoke", "signal_smoke", "fs_smoke"] {
+    for test in [
+        "fork_pipe_smoke",
+        "epoll_smoke",
+        "signal_smoke",
+        "fs_smoke",
+        "eventfd_smoke",
+        "getrandom_smoke",
+        "sockpair_smoke",
+        "accept4_smoke",
+    ] {
         println!("cargo:rerun-if-changed=data/musl-demo/{}_x86_64", test);
         let path = manifest_dir.join(format!("data/musl-demo/{}_x86_64", test));
         println!(

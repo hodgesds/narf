@@ -1415,6 +1415,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
         ("epoll_smoke", "epoll-ok"),
+        // Linux-compat round: eventfd2, getrandom, socketpair, accept4.
+        ("eventfd_smoke", "eventfd-ok"),
+        ("getrandom_smoke", "getrandom-ok"),
+        ("sockpair_smoke", "sockpair-ok"),
+        ("accept4_smoke", "accept4-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

@@ -3368,6 +3368,15 @@ fn boot_userspace_init() {
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
                 ("fs_smoke", narf_verification::NARF_FS_SMOKE_ELF),
+                // Linux-compat round: eventfd2 / getrandom / socketpair
+                // / accept4 exercised end-to-end by real musl binaries.
+                ("eventfd_smoke", narf_verification::NARF_EVENTFD_SMOKE_ELF),
+                (
+                    "getrandom_smoke",
+                    narf_verification::NARF_GETRANDOM_SMOKE_ELF,
+                ),
+                ("sockpair_smoke", narf_verification::NARF_SOCKPAIR_SMOKE_ELF),
+                ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
