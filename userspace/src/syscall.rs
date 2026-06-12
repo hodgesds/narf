@@ -1572,6 +1572,19 @@ pub enum Syscall {
     /// arg3 = remain `timespec*` (may be 0).
     /// Linux `clock_nanosleep` (x86_64=230, aarch64=115).
     ClockNanosleep,
+
+    /// `socketpair(domain, type, protocol, int sv[2])` — create a
+    /// connected pair of AF_UNIX sockets. arg0 = domain, arg1 = type
+    /// (SOCK_STREAM, optionally OR'd with SOCK_CLOEXEC/SOCK_NONBLOCK),
+    /// arg2 = protocol, arg3 = user `int sv[2]` out-pointer.
+    /// Linux `socketpair` (x86_64=53, aarch64=199).
+    SocketPair,
+
+    /// `accept4(fd, addr, addrlen, flags)` — like accept(2) but with
+    /// SOCK_CLOEXEC / SOCK_NONBLOCK applied to the returned fd.
+    /// arg0 = fd, arg1 = addr out, arg2 = addrlen out, arg3 = flags.
+    /// Linux `accept4` (x86_64=288, aarch64=242).
+    SocketAccept4,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1624,6 +1637,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketListen, 50),
     (Syscall::SocketGetSockName, 51),
     (Syscall::SocketGetPeerName, 52),
+    (Syscall::SocketPair, 53),
+    (Syscall::SocketAccept4, 288),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -1716,7 +1731,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setns, 308),
     (Syscall::Signalfd, 282), // signalfd / signalfd4 share name
     (Syscall::TimerfdCreate, 283),
-    (Syscall::Eventfd, 284), // eventfd / eventfd2 share name
+    (Syscall::Eventfd, 284), // eventfd (legacy 1-arg form)
+    // eventfd2(initval, flags) is a DIFFERENT x86_64 number (290) from
+    // the legacy eventfd (284). glibc/musl's `eventfd()` wrapper always
+    // issues eventfd2, so map 290 to the same (eventfd2-shaped) handler.
+    (Syscall::Eventfd, 290),
     (Syscall::Fallocate, 285),
     (Syscall::TimerfdSettime, 286),
     (Syscall::TimerfdGettime, 287),
@@ -1904,6 +1923,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketShutdown, 210),
     (Syscall::SocketSendMsg, 211),
     (Syscall::SocketRecvMsg, 212),
+    (Syscall::SocketPair, 199),
+    (Syscall::SocketAccept4, 242),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
