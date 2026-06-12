@@ -1425,6 +1425,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("sendfile_smoke", "sendfile-ok"),
         ("creds_smoke", "creds-ok"),
         ("waitid_smoke", "waitid-ok"),
+        // Linux-compat round 3: ppoll, sysinfo, splice, membarrier+clock_getres.
+        ("ppoll_smoke", "ppoll-ok"),
+        ("sysinfo_smoke", "sysinfo-ok"),
+        ("splice_smoke", "splice-ok"),
+        ("barrier_smoke", "barrier-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

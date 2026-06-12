@@ -3382,6 +3382,11 @@ fn boot_userspace_init() {
                 ("sendfile_smoke", narf_verification::NARF_SENDFILE_SMOKE_ELF),
                 ("creds_smoke", narf_verification::NARF_CREDS_SMOKE_ELF),
                 ("waitid_smoke", narf_verification::NARF_WAITID_SMOKE_ELF),
+                // Linux-compat round 3: ppoll / sysinfo / splice / membarrier+clock_getres.
+                ("ppoll_smoke", narf_verification::NARF_PPOLL_SMOKE_ELF),
+                ("sysinfo_smoke", narf_verification::NARF_SYSINFO_SMOKE_ELF),
+                ("splice_smoke", narf_verification::NARF_SPLICE_SMOKE_ELF),
+                ("barrier_smoke", narf_verification::NARF_BARRIER_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
