@@ -5549,6 +5549,184 @@ fn sys_pwritev(ctx: &mut dyn TrapContext) {
     preadv_pwritev(ctx, true);
 }
 
+/// `readv(fd, iov, iovcnt)` — vectored read at the current file offset,
+/// advancing it (the position-tracking counterpart to `writev`).
+fn sys_readv(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let iov_ptr = args.arg1;
+    let iovcnt = args.arg2 as usize;
+    const IOV_MAX: usize = 1024;
+    if iovcnt > IOV_MAX {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
+    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iovcnt.saturating_mul(16)) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
+    let task = current_task_id();
+    let mut total: usize = 0;
+    for i in 0..iovcnt {
+        let o = i * 16;
+        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
+        if len == 0 {
+            continue;
+        }
+        let mut kbuf = alloc::vec![0u8; len];
+        let outcome = fd::with_table(task, |t| {
+            let entry = t.get_mut(fd).ok_or(())?;
+            let cur = entry.offset;
+            let res = poll_blocking(entry.ops.read(cur, &mut kbuf)).unwrap_or(Ok(0));
+            match res {
+                Ok(n) => {
+                    entry.offset = cur.saturating_add(n as u64);
+                    Ok(n)
+                }
+                Err(_) => Err(()),
+            }
+        });
+        match outcome {
+            Some(Ok(n)) => {
+                // SAFETY: `base` is the user iovec destination; copy_to_user
+                // validates the `n`-byte write.
+                let _ = unsafe { copy_to_user(base, &kbuf[..n]) };
+                total = total.saturating_add(n);
+                if n < len {
+                    break; // short read / EOF
+                }
+            }
+            _ => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
+
+/// `preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned vectored
+/// read with a flags word. On LP64 `pos_h` is zero and the offset is
+/// `pos_l` (arg3), so the core matches `preadv`; the RWF_* flags (arg5)
+/// are accepted but not specially honoured.
+fn sys_preadv2(ctx: &mut dyn TrapContext) {
+    preadv_pwritev(ctx, false);
+}
+
+/// `pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned vectored
+/// write with a flags word. See `sys_preadv2`.
+fn sys_pwritev2(ctx: &mut dyn TrapContext) {
+    preadv_pwritev(ctx, true);
+}
+
+/// `tee(fd_in, fd_out, len, flags)` — copy up to `len` bytes from one
+/// pipe to another WITHOUT consuming the input. `fd_in` must be a pipe
+/// read end (peekable); `fd_out` receives the duplicated bytes.
+fn sys_tee(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let fd_in = a.arg0 as u32;
+    let fd_out = a.arg1 as u32;
+    let len = a.arg2 as usize;
+    let task = current_task_id();
+    let peeked =
+        fd::with_table(task, |t| t.get(fd_in).and_then(|e| e.ops.pipe_peek(len))).flatten();
+    let data = match peeked {
+        Some(d) => d,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL (not a pipe read end)
+            return;
+        }
+    };
+    if data.is_empty() {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let w = fd::with_table(task, |t| {
+        let entry = t.get_mut(fd_out).ok_or(())?;
+        poll_blocking(entry.ops.write(0, &data))
+            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+            .map_err(|_| ())
+    });
+    match w {
+        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+    }
+}
+
+/// `vmsplice(fd, iov, nr_segs, flags)` — gather user memory described by
+/// `iov` into the pipe referenced by `fd` (the write-to-pipe direction,
+/// which is the common use). Flags (arg3) are accepted but unused.
+fn sys_vmsplice(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let fd = a.arg0 as u32;
+    let iov_ptr = a.arg1;
+    let nr = a.arg2 as usize;
+    const IOV_MAX: usize = 1024;
+    if nr > IOV_MAX {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: single-threaded syscall; AS active. Validates the iovec array.
+    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, nr.saturating_mul(16)) } {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+            return;
+        }
+    };
+    let task = current_task_id();
+    let mut total: usize = 0;
+    for i in 0..nr {
+        let o = i * 16;
+        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
+        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: `base` is a user VA; copy_from_user_vec validates it.
+        let kbuf = match unsafe { copy_from_user_vec(base, len) } {
+            Ok(b) => b,
+            Err(_) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    return;
+                }
+                break;
+            }
+        };
+        let w = fd::with_table(task, |t| {
+            let entry = t.get_mut(fd).ok_or(())?;
+            poll_blocking(entry.ops.write(0, &kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+                .map_err(|_| ())
+        });
+        match w {
+            Some(Ok(n)) => {
+                total = total.saturating_add(n);
+                if n < len {
+                    break;
+                }
+            }
+            _ => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
+
 // ── FB syscalls ────────────────────────────────────────────────────
 //
 // Five syscalls (Connect/Info/RingMap/FlushWait/Disconnect) form the
@@ -15727,6 +15905,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_pidfd_getfd),
     );
     table.install_raw(Syscall::Kcmp, "kcmp", RawFnHandler(sys_kcmp));
+    // Batch 10: vectored + extended I/O.
+    table.install_raw(Syscall::Readv, "readv", RawFnHandler(sys_readv));
+    table.install_raw(Syscall::Preadv2, "preadv2", RawFnHandler(sys_preadv2));
+    table.install_raw(Syscall::Pwritev2, "pwritev2", RawFnHandler(sys_pwritev2));
+    table.install_raw(Syscall::Tee, "tee", RawFnHandler(sys_tee));
+    table.install_raw(Syscall::Vmsplice, "vmsplice", RawFnHandler(sys_vmsplice));
     table.install_raw(
         Syscall::Select,
         "select",

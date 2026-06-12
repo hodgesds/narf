@@ -446,6 +446,14 @@ pub trait FileOps: Send + Sync {
     fn inotify_instance(&self) -> Option<u64> {
         None
     }
+
+    /// If this file is the read end of a pipe, copy up to `max` queued
+    /// bytes WITHOUT consuming them and return them. Used by `tee(2)` to
+    /// duplicate pipe data between two pipes. Default `None` ⇒ not a
+    /// peekable pipe read end.
+    fn pipe_peek(&self, _max: usize) -> Option<alloc::vec::Vec<u8>> {
+        None
+    }
 }
 
 // ── POSIX poll(2) event bits ────────────────────────────────────

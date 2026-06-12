@@ -1861,6 +1861,26 @@ pub enum Syscall {
     /// `kcmp(pid1, pid2, type, idx1, idx2)` — compare whether two
     /// processes share a kernel resource. Linux (x86_64=312, aarch64=272).
     Kcmp,
+
+    /// `readv(fd, iov, iovcnt)` — vectored read at the file offset.
+    /// Linux (x86_64=19, aarch64=65).
+    Readv,
+
+    /// `preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned
+    /// vectored read with flags. Linux (x86_64=327, aarch64=286).
+    Preadv2,
+
+    /// `pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)` — positioned
+    /// vectored write with flags. Linux (x86_64=328, aarch64=287).
+    Pwritev2,
+
+    /// `tee(fd_in, fd_out, len, flags)` — copy between two pipes without
+    /// consuming the input. Linux (x86_64=276, aarch64=77).
+    Tee,
+
+    /// `vmsplice(fd, iov, nr_segs, flags)` — splice user memory to/from a
+    /// pipe. Linux (x86_64=278, aarch64=75).
+    Vmsplice,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1981,6 +2001,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::ClockAdjtime, 305),
     (Syscall::PidfdGetfd, 438),
     (Syscall::Kcmp, 312),
+    (Syscall::Readv, 19),
+    (Syscall::Preadv2, 327),
+    (Syscall::Pwritev2, 328),
+    (Syscall::Tee, 276),
+    (Syscall::Vmsplice, 278),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2333,6 +2358,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::ClockAdjtime, 266),
     (Syscall::PidfdGetfd, 438),
     (Syscall::Kcmp, 272),
+    (Syscall::Readv, 65),
+    (Syscall::Preadv2, 286),
+    (Syscall::Pwritev2, 287),
+    (Syscall::Tee, 77),
+    (Syscall::Vmsplice, 75),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
