@@ -1572,6 +1572,295 @@ pub enum Syscall {
     /// arg3 = remain `timespec*` (may be 0).
     /// Linux `clock_nanosleep` (x86_64=230, aarch64=115).
     ClockNanosleep,
+
+    /// `socketpair(domain, type, protocol, int sv[2])` — create a
+    /// connected pair of AF_UNIX sockets. arg0 = domain, arg1 = type
+    /// (SOCK_STREAM, optionally OR'd with SOCK_CLOEXEC/SOCK_NONBLOCK),
+    /// arg2 = protocol, arg3 = user `int sv[2]` out-pointer.
+    /// Linux `socketpair` (x86_64=53, aarch64=199).
+    SocketPair,
+
+    /// `accept4(fd, addr, addrlen, flags)` — like accept(2) but with
+    /// SOCK_CLOEXEC / SOCK_NONBLOCK applied to the returned fd.
+    /// arg0 = fd, arg1 = addr out, arg2 = addrlen out, arg3 = flags.
+    /// Linux `accept4` (x86_64=288, aarch64=242).
+    SocketAccept4,
+
+    /// `sendfile(out_fd, in_fd, off*, count)` — copy up to `count`
+    /// bytes from `in_fd` to `out_fd`. arg0 = out_fd, arg1 = in_fd,
+    /// arg2 = `off_t*` (may be 0 → use in_fd's offset), arg3 = count.
+    /// Linux `sendfile` (x86_64=40, aarch64=71).
+    Sendfile,
+
+    /// `mremap(old, old_len, new_len, flags, new_addr)` — resize an
+    /// existing anonymous mapping (in-place grow). arg0 = old addr,
+    /// arg1 = old len, arg2 = new len, arg3 = flags.
+    /// Linux `mremap` (x86_64=25, aarch64=216).
+    Mremap,
+
+    /// `waitid(idtype, id, infop, options, rusage)` — wait for a child
+    /// returning a `siginfo_t`. arg0 = idtype (P_ALL/P_PID/P_PGID),
+    /// arg1 = id, arg2 = `siginfo_t*`, arg3 = options.
+    /// Linux `waitid` (x86_64=247, aarch64=95).
+    Waitid,
+
+    /// `getgroups(size, list)` / `setgroups(size, list)` — supplementary
+    /// group list. NARF carries no supplementary groups, so getgroups
+    /// returns 0 and setgroups is accepted. Linux getgroups
+    /// (x86_64=115, aarch64=158), setgroups (x86_64=116, aarch64=159).
+    Getgroups,
+    Setgroups,
+
+    /// `getresuid(r,e,s)` / `setresuid(r,e,s)` — real/effective/saved
+    /// uid triple. NARF tracks a single uid, surfaced as all three.
+    /// Linux getresuid (x86_64=118, aarch64=148), setresuid
+    /// (x86_64=117, aarch64=147).
+    Getresuid,
+    Setresuid,
+
+    /// `getresgid(r,e,s)` / `setresgid(r,e,s)` — gid triple, mirrors
+    /// the uid forms. Linux getresgid (x86_64=120, aarch64=150),
+    /// setresgid (x86_64=119, aarch64=149).
+    Getresgid,
+    Setresgid,
+
+    /// `ppoll(fds, nfds, timespec*, sigmask, sigsetsize)` — poll(2)
+    /// with a `timespec` timeout (NULL = block) and an ignored
+    /// sigmask. Linux `ppoll` (x86_64=271, aarch64=73 — the generic
+    /// ABI has no plain poll).
+    Ppoll,
+
+    /// `sysinfo(struct sysinfo*)` — system statistics (uptime, RAM).
+    /// Linux `sysinfo` (x86_64=99, aarch64=179).
+    Sysinfo,
+
+    /// `splice(fd_in, off_in*, fd_out, off_out*, len, flags)` — move
+    /// data between two fds (one a pipe) without a userspace copy.
+    /// Linux `splice` (x86_64=275, aarch64=76).
+    Splice,
+
+    /// `membarrier(cmd, flags, cpu_id)` — process-wide memory barrier.
+    /// QUERY returns the supported-command mask; barrier commands are
+    /// no-ops on the cooperative single-CPU kernel. Linux `membarrier`
+    /// (x86_64=324, aarch64=283).
+    Membarrier,
+
+    /// `clock_getres(clockid, timespec*)` — report a clock's
+    /// resolution. Linux `clock_getres` (x86_64=229, aarch64=114).
+    ClockGetres,
+
+    /// `close_range(first, last, flags)` — close every open fd in
+    /// `[first, last]` (or set FD_CLOEXEC with CLOSE_RANGE_CLOEXEC).
+    /// Linux `close_range` (436 on both arches).
+    CloseRange,
+
+    /// `sched_getscheduler(pid)` — report the scheduling policy
+    /// (always SCHED_OTHER here). Linux (x86_64=145, aarch64=120).
+    SchedGetScheduler,
+
+    /// `sched_setscheduler(pid, policy, param)` — accept a normal
+    /// policy. Linux (x86_64=144, aarch64=119).
+    SchedSetScheduler,
+
+    /// `sched_rr_get_interval(pid, timespec*)` — RR quantum (0 for the
+    /// cooperative policy). Linux (x86_64=148, aarch64=127).
+    SchedRrGetInterval,
+
+    /// `msync(addr, len, flags)` — flush a mapping. Anonymous mappings
+    /// have nothing to write back. Linux (x86_64=26, aarch64=227).
+    Msync,
+
+    /// `mincore(addr, len, vec)` — report page residency for a mapped
+    /// range. Linux (x86_64=27, aarch64=232).
+    Mincore,
+
+    /// `sync()` — flush all filesystems (no-op). Linux
+    /// (x86_64=162, aarch64=81).
+    Sync,
+
+    /// `syncfs(fd)` — flush one filesystem (no-op). Linux
+    /// (x86_64=306, aarch64=267).
+    Syncfs,
+
+    /// `personality(persona)` — report/accept the execution domain
+    /// (always PER_LINUX). Linux (x86_64=135, aarch64=92).
+    Personality,
+
+    /// `fadvise64(fd, offset, len, advice)` — access-pattern hint
+    /// (accepted, no-op). Linux (x86_64=221, aarch64=223).
+    Fadvise64,
+
+    /// `mlock2(addr, len, flags)` — like mlock with MLOCK_ONFAULT.
+    /// Linux (x86_64=325, aarch64=284).
+    Mlock2,
+
+    /// `set_robust_list(head, len)` — register the per-thread robust
+    /// futex list head. Linux (x86_64=273, aarch64=99).
+    SetRobustList,
+
+    /// `get_robust_list(pid, head_ptr, len_ptr)` — read it back.
+    /// Linux (x86_64=274, aarch64=100).
+    GetRobustList,
+
+    /// `renameat2(olddirfd, old, newdirfd, new, flags)` — rename with
+    /// RENAME_NOREPLACE / RENAME_EXCHANGE. Linux (x86_64=316,
+    /// aarch64=276).
+    Renameat2,
+
+    /// `pidfd_send_signal(pidfd, sig, info, flags)` — deliver a signal
+    /// to the process referenced by `pidfd`. Linux (424 on both
+    /// arches).
+    PidfdSendSignal,
+
+    /// `sendmmsg(fd, mmsghdr*, vlen, flags)` — send multiple messages
+    /// in one call. Linux (x86_64=307, aarch64=269).
+    Sendmmsg,
+
+    /// `recvmmsg(fd, mmsghdr*, vlen, flags, timeout)` — receive
+    /// multiple messages in one call. Linux (x86_64=299, aarch64=243).
+    Recvmmsg,
+
+    /// `openat2(dirfd, path, open_how*, size)` — openat with the
+    /// extensible `open_how` struct. Linux (437 on both arches).
+    Openat2,
+
+    /// `preadv(fd, iov, iovcnt, offset)` — positioned vectored read.
+    /// Linux (x86_64=295, aarch64=69).
+    Preadv,
+
+    /// `pwritev(fd, iov, iovcnt, offset)` — positioned vectored write.
+    /// Linux (x86_64=296, aarch64=70).
+    Pwritev,
+
+    /// `capget(hdrp, datap)` — read a task's capability sets.
+    /// Linux (x86_64=125, aarch64=90).
+    Capget,
+
+    /// `capset(hdrp, datap)` — set a task's capability sets.
+    /// Linux (x86_64=126, aarch64=91).
+    Capset,
+
+    /// `setitimer(which, new, old)` — arm an interval timer (ITIMER_REAL
+    /// delivers SIGALRM). Linux (x86_64=38, aarch64=103).
+    Setitimer,
+
+    /// `getitimer(which, cur)` — read an interval timer.
+    /// Linux (x86_64=36, aarch64=102).
+    Getitimer,
+
+    /// `alarm(seconds)` — arm ITIMER_REAL for SIGALRM after `seconds`.
+    /// Linux (x86_64=37); not in the aarch64 generic ABI.
+    Alarm,
+
+    /// `setxattr(path, name, value, size, flags)` — set an extended
+    /// attribute. Linux (x86_64=188, aarch64=5).
+    Setxattr,
+
+    /// `getxattr(path, name, value, size)` — read an extended attribute.
+    /// Linux (x86_64=191, aarch64=8).
+    Getxattr,
+
+    /// `listxattr(path, list, size)` — list extended-attribute names.
+    /// Linux (x86_64=194, aarch64=11).
+    Listxattr,
+
+    /// `readahead(fd, offset, count)` — populate the page cache (no-op).
+    /// Linux (x86_64=187, aarch64=213).
+    Readahead,
+
+    /// `sync_file_range(fd, offset, nbytes, flags)` — flush a file range
+    /// (no-op). Linux (x86_64=277, aarch64=84).
+    SyncFileRange,
+
+    /// `mq_open(name, oflag, mode, attr)` — open/create a POSIX message
+    /// queue. Linux (x86_64=240, aarch64=180).
+    MqOpen,
+
+    /// `mq_unlink(name)` — remove a named message queue.
+    /// Linux (x86_64=241, aarch64=181).
+    MqUnlink,
+
+    /// `mq_timedsend(mqd, msg, len, prio, timeout)` — enqueue a message.
+    /// Linux (x86_64=242, aarch64=182).
+    MqTimedsend,
+
+    /// `mq_timedreceive(mqd, msg, len, prio, timeout)` — dequeue the
+    /// highest-priority message. Linux (x86_64=243, aarch64=183).
+    MqTimedreceive,
+
+    /// `mq_getsetattr(mqd, newattr, oldattr)` — read/replace queue attrs.
+    /// Linux (x86_64=245, aarch64=185).
+    MqGetsetattr,
+
+    /// `inotify_init1(flags)` — create an inotify instance fd.
+    /// Linux (x86_64=294, aarch64=26).
+    InotifyInit1,
+
+    /// `inotify_add_watch(fd, path, mask)` — add/modify a watch.
+    /// Linux (x86_64=254, aarch64=27).
+    InotifyAddWatch,
+
+    /// `inotify_rm_watch(fd, wd)` — remove a watch.
+    /// Linux (x86_64=255, aarch64=28).
+    InotifyRmWatch,
+
+    /// `pkey_mprotect(addr, len, prot, pkey)` — mprotect tagging a range
+    /// with a protection key. Linux (x86_64=329, aarch64=288).
+    PkeyMprotect,
+
+    /// `pkey_alloc(flags, access_rights)` — allocate a protection key.
+    /// Linux (x86_64=330, aarch64=289).
+    PkeyAlloc,
+
+    /// `pkey_free(pkey)` — free a protection key.
+    /// Linux (x86_64=331, aarch64=290).
+    PkeyFree,
+
+    /// `process_vm_readv(pid, liov, liovcnt, riov, riovcnt, flags)` —
+    /// copy from a target process's address space into local iovecs.
+    /// Linux (x86_64=310, aarch64=270).
+    ProcessVmReadv,
+
+    /// `process_vm_writev(pid, liov, liovcnt, riov, riovcnt, flags)` —
+    /// copy local iovecs into a target process's address space.
+    /// Linux (x86_64=311, aarch64=271).
+    ProcessVmWritev,
+
+    /// `mbind(addr, len, mode, nodemask, maxnode, flags)` — set a NUMA
+    /// memory policy for a range. Linux (x86_64=237, aarch64=235).
+    Mbind,
+
+    /// `set_mempolicy(mode, nodemask, maxnode)` — set the task's default
+    /// NUMA policy. Linux (x86_64=238, aarch64=237).
+    SetMempolicy,
+
+    /// `get_mempolicy(mode, nodemask, maxnode, addr, flags)` — query a
+    /// NUMA policy. Linux (x86_64=239, aarch64=236).
+    GetMempolicy,
+
+    /// `sched_setattr(pid, attr, flags)` — set extended scheduling attrs.
+    /// Linux (x86_64=314, aarch64=274).
+    SchedSetattr,
+
+    /// `sched_getattr(pid, attr, size, flags)` — read extended scheduling
+    /// attrs. Linux (x86_64=315, aarch64=275).
+    SchedGetattr,
+
+    /// `adjtimex(timex)` — read/adjust kernel clock discipline.
+    /// Linux (x86_64=159, aarch64=171).
+    Adjtimex,
+
+    /// `clock_adjtime(clockid, timex)` — per-clock adjtimex.
+    /// Linux (x86_64=305, aarch64=266).
+    ClockAdjtime,
+
+    /// `pidfd_getfd(pidfd, targetfd, flags)` — clone an fd out of the
+    /// process referenced by `pidfd`. Linux (x86_64=438, aarch64=438).
+    PidfdGetfd,
+
+    /// `kcmp(pid1, pid2, type, idx1, idx2)` — compare whether two
+    /// processes share a kernel resource. Linux (x86_64=312, aarch64=272).
+    Kcmp,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1624,6 +1913,74 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketListen, 50),
     (Syscall::SocketGetSockName, 51),
     (Syscall::SocketGetPeerName, 52),
+    (Syscall::SocketPair, 53),
+    (Syscall::SocketAccept4, 288),
+    (Syscall::Sendfile, 40),
+    (Syscall::Mremap, 25),
+    (Syscall::Waitid, 247),
+    (Syscall::Getgroups, 115),
+    (Syscall::Setgroups, 116),
+    (Syscall::Setresuid, 117),
+    (Syscall::Getresuid, 118),
+    (Syscall::Setresgid, 119),
+    (Syscall::Getresgid, 120),
+    (Syscall::Ppoll, 271),
+    (Syscall::Sysinfo, 99),
+    (Syscall::Splice, 275),
+    (Syscall::Membarrier, 324),
+    (Syscall::ClockGetres, 229),
+    (Syscall::CloseRange, 436),
+    (Syscall::SchedGetScheduler, 145),
+    (Syscall::SchedSetScheduler, 144),
+    (Syscall::SchedRrGetInterval, 148),
+    (Syscall::Msync, 26),
+    (Syscall::Mincore, 27),
+    (Syscall::Sync, 162),
+    (Syscall::Syncfs, 306),
+    (Syscall::Personality, 135),
+    (Syscall::Fadvise64, 221),
+    (Syscall::Mlock2, 325),
+    (Syscall::SetRobustList, 273),
+    (Syscall::GetRobustList, 274),
+    (Syscall::Renameat2, 316),
+    (Syscall::PidfdSendSignal, 424),
+    (Syscall::Sendmmsg, 307),
+    (Syscall::Recvmmsg, 299),
+    (Syscall::Openat2, 437),
+    (Syscall::Preadv, 295),
+    (Syscall::Pwritev, 296),
+    (Syscall::Capget, 125),
+    (Syscall::Capset, 126),
+    (Syscall::Setitimer, 38),
+    (Syscall::Getitimer, 36),
+    (Syscall::Alarm, 37),
+    (Syscall::Setxattr, 188),
+    (Syscall::Getxattr, 191),
+    (Syscall::Listxattr, 194),
+    (Syscall::Readahead, 187),
+    (Syscall::SyncFileRange, 277),
+    (Syscall::MqOpen, 240),
+    (Syscall::MqUnlink, 241),
+    (Syscall::MqTimedsend, 242),
+    (Syscall::MqTimedreceive, 243),
+    (Syscall::MqGetsetattr, 245),
+    (Syscall::InotifyInit1, 294),
+    (Syscall::InotifyAddWatch, 254),
+    (Syscall::InotifyRmWatch, 255),
+    (Syscall::PkeyMprotect, 329),
+    (Syscall::PkeyAlloc, 330),
+    (Syscall::PkeyFree, 331),
+    (Syscall::ProcessVmReadv, 310),
+    (Syscall::ProcessVmWritev, 311),
+    (Syscall::Mbind, 237),
+    (Syscall::SetMempolicy, 238),
+    (Syscall::GetMempolicy, 239),
+    (Syscall::SchedSetattr, 314),
+    (Syscall::SchedGetattr, 315),
+    (Syscall::Adjtimex, 159),
+    (Syscall::ClockAdjtime, 305),
+    (Syscall::PidfdGetfd, 438),
+    (Syscall::Kcmp, 312),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -1716,7 +2073,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setns, 308),
     (Syscall::Signalfd, 282), // signalfd / signalfd4 share name
     (Syscall::TimerfdCreate, 283),
-    (Syscall::Eventfd, 284), // eventfd / eventfd2 share name
+    (Syscall::Eventfd, 284), // eventfd (legacy 1-arg form)
+    // eventfd2(initval, flags) is a DIFFERENT x86_64 number (290) from
+    // the legacy eventfd (284). glibc/musl's `eventfd()` wrapper always
+    // issues eventfd2, so map 290 to the same (eventfd2-shaped) handler.
+    (Syscall::Eventfd, 290),
     (Syscall::Fallocate, 285),
     (Syscall::TimerfdSettime, 286),
     (Syscall::TimerfdGettime, 287),
@@ -1755,8 +2116,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // it requires the per-task NS infrastructure; reading the
     // uts struct works on every NARF build.
     (Syscall::Uname, 63),
-    // Wave-72 — UTS-mutating syscalls (gated `container`).
-    #[cfg(feature = "container")]
+    // setdomainname works on every build (global domainname slot);
+    // the SysV IPC get-by-key syscalls below need the container NS.
     (Syscall::Setdomainname, 171),
     #[cfg(feature = "container")]
     (Syscall::Shmget, 29),
@@ -1904,6 +2265,74 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketShutdown, 210),
     (Syscall::SocketSendMsg, 211),
     (Syscall::SocketRecvMsg, 212),
+    (Syscall::SocketPair, 199),
+    (Syscall::SocketAccept4, 242),
+    (Syscall::Sendfile, 71),
+    (Syscall::Mremap, 216),
+    (Syscall::Waitid, 95),
+    (Syscall::Getgroups, 158),
+    (Syscall::Setgroups, 159),
+    (Syscall::Setresuid, 147),
+    (Syscall::Getresuid, 148),
+    (Syscall::Setresgid, 149),
+    (Syscall::Getresgid, 150),
+    (Syscall::Sysinfo, 179),
+    (Syscall::Splice, 76),
+    (Syscall::Membarrier, 283),
+    (Syscall::ClockGetres, 114),
+    (Syscall::CloseRange, 436),
+    (Syscall::SchedGetScheduler, 120),
+    (Syscall::SchedSetScheduler, 119),
+    (Syscall::SchedRrGetInterval, 127),
+    (Syscall::Msync, 227),
+    (Syscall::Mincore, 232),
+    (Syscall::Sync, 81),
+    (Syscall::Syncfs, 267),
+    (Syscall::Personality, 92),
+    (Syscall::Fadvise64, 223),
+    (Syscall::Mlock2, 284),
+    (Syscall::SetRobustList, 99),
+    (Syscall::GetRobustList, 100),
+    (Syscall::Renameat2, 276),
+    (Syscall::PidfdSendSignal, 424),
+    (Syscall::Sendmmsg, 269),
+    (Syscall::Recvmmsg, 243),
+    (Syscall::Openat2, 437),
+    (Syscall::Preadv, 69),
+    (Syscall::Pwritev, 70),
+    (Syscall::Capget, 90),
+    (Syscall::Capset, 91),
+    (Syscall::Setitimer, 103),
+    (Syscall::Getitimer, 102),
+    // alarm has no aarch64 generic-ABI number; libc emulates it via
+    // setitimer, so NARF maps no wire number for it on aarch64.
+    (Syscall::Setxattr, 5),
+    (Syscall::Getxattr, 8),
+    (Syscall::Listxattr, 11),
+    (Syscall::Readahead, 213),
+    (Syscall::SyncFileRange, 84),
+    (Syscall::MqOpen, 180),
+    (Syscall::MqUnlink, 181),
+    (Syscall::MqTimedsend, 182),
+    (Syscall::MqTimedreceive, 183),
+    (Syscall::MqGetsetattr, 185),
+    (Syscall::InotifyInit1, 26),
+    (Syscall::InotifyAddWatch, 27),
+    (Syscall::InotifyRmWatch, 28),
+    (Syscall::PkeyMprotect, 288),
+    (Syscall::PkeyAlloc, 289),
+    (Syscall::PkeyFree, 290),
+    (Syscall::ProcessVmReadv, 270),
+    (Syscall::ProcessVmWritev, 271),
+    (Syscall::Mbind, 235),
+    (Syscall::SetMempolicy, 237),
+    (Syscall::GetMempolicy, 236),
+    (Syscall::SchedSetattr, 274),
+    (Syscall::SchedGetattr, 275),
+    (Syscall::Adjtimex, 171),
+    (Syscall::ClockAdjtime, 266),
+    (Syscall::PidfdGetfd, 438),
+    (Syscall::Kcmp, 272),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -1925,16 +2354,14 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Statfs, 43),
     (Syscall::Fstatfs, 44),
     (Syscall::Pselect6, 72), // pselect6
-    (Syscall::Poll, 73),     // ppoll
+    (Syscall::Ppoll, 73),    // ppoll (generic ABI has no plain poll)
     // Loadable kernel modules — aarch64 generic ABI numbers.
     // init_module = 105, delete_module = 106, finit_module = 273.
     (Syscall::InitModule, 105),
     (Syscall::DeleteModule, 106),
     (Syscall::FinitModule, 273),
     // Wave-72 — UTS/IPC syscalls (gated `container`).
-    #[cfg(feature = "container")]
     (Syscall::Uname, 160),
-    #[cfg(feature = "container")]
     (Syscall::Setdomainname, 162),
     #[cfg(feature = "container")]
     (Syscall::Shmget, 194),

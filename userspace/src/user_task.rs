@@ -146,7 +146,14 @@ pub struct UserTaskCtx {
     pub wait_child_want_pid: AtomicI64,
 
     /// on a successful reap. `0` = caller passed NULL (discard).
+    /// For a `waitid(2)` wait this instead holds the `siginfo_t*`.
     pub wait_child_status_ptr: AtomicU64,
+
+    /// Distinguishes `waitid(2)` from `wait4(2)` for the blocking
+    /// path: when set, the reap writes a `siginfo_t` to
+    /// `wait_child_status_ptr` and the syscall returns 0 rather than
+    /// writing a wstatus `int` and returning the reaped pid.
+    pub wait_child_is_waitid: AtomicBool,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -175,6 +182,7 @@ impl UserTaskCtx {
             wait_child_pending: AtomicBool::new(false),
             wait_child_want_pid: AtomicI64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
+            wait_child_is_waitid: AtomicBool::new(false),
         }
     }
 }
@@ -403,7 +411,7 @@ pub fn __test_clear_hooks() {
 /// fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64
 ///   Returns reaped child pid (> 0) if a matching entry was drained
 ///   from the pending-exits queue, or 0 if the queue is empty.
-pub type WaitChildCheckFn = fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64;
+pub type WaitChildCheckFn = fn(parent_id: u64, want_pid: i64, out_status: *mut i32) -> i64;
 
 static WAIT_CHILD_CHECK_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -415,7 +423,7 @@ pub fn register_wait_child_check(f: WaitChildCheckFn) {
 
 /// Invoke the registered check callback.  Returns 0 if no callback
 /// is installed (test/fallback context without real wait4 tables).
-pub fn call_wait_child_check(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
+pub fn call_wait_child_check(parent_id: u64, want_pid: i64, out_status: *mut i32) -> i64 {
     let p = WAIT_CHILD_CHECK_FN.load(Ordering::Acquire);
     if p.is_null() {
         return 0;
@@ -423,7 +431,7 @@ pub fn call_wait_child_check(parent_id: u64, want_pid: i64, status_ptr: u64) -> 
     // SAFETY: p was stored by `register_wait_child_check` with a valid
     // WaitChildCheckFn; the static lifetime outlives any call.
     let f: WaitChildCheckFn = unsafe { core::mem::transmute(p) };
-    f(parent_id, want_pid, status_ptr)
+    f(parent_id, want_pid, out_status)
 }
 
 /// Per-task Waker slots for tasks parked in a blocking wait4.
@@ -791,7 +799,18 @@ impl core::future::Future for UserTaskFuture {
         let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
-            if now < deadline {
+            // An asynchronously-raised signal (e.g. SIGALRM from an
+            // interval timer that fired via a sleep-pump) must break an
+            // *infinite* park — pause(2), or a blocking poll/epoll/futex
+            // wait — so the task takes delivery on its next yield-point
+            // syscall. We restrict this to `deadline == u64::MAX`: a
+            // finite sleep(2) already wakes at its own deadline, and
+            // un-parking it on a pending *ignored* signal (which no
+            // syscall would then clear) would busy-spin. The pump still
+            // runs at least once below before the signal becomes pending.
+            let signal_pending = deadline == u64::MAX
+                && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
+            if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;
                 let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
                 while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
@@ -801,9 +820,10 @@ impl core::future::Future for UserTaskFuture {
                 cx.waker().wake_by_ref();
                 return core::task::Poll::Pending;
             }
-            // Deadline reached — clear so the next sys_sleep
-            // call doesn't see stale state, then fall through
-            // to the normal resume path.
+            // Deadline reached or a signal is pending — clear so the next
+            // sys_sleep call doesn't see stale state, then fall through
+            // to the normal resume path (which re-enters user mode; the
+            // pending signal is delivered on the next yield syscall).
             this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
 
@@ -824,25 +844,31 @@ impl core::future::Future for UserTaskFuture {
             // parent's TaskId (`current_task_id()`) into PARENT_OF and
             // PENDING_EXITS, so the lookup key must also be the TaskId.
             let task_pid = crate::handlers::current_task_id();
-            let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
+            let mut child_status = 0i32;
+            let reaped = call_wait_child_check(task_pid, want_pid, &mut child_status);
             if reaped > 0 {
-                // Reap succeeded — write child pid into saved RAX
-                // so user mode sees it as the wait4 return value,
-                // then clear the pending flag and fall through to
-                // the normal resume path.
-                // SAFETY: ctx.state is a valid, aligned UserState;
-                // we own it and hold Pin guarantees on the future.
-                // `state.get()` is the `*mut UserState` (== `*mut
-                // narf_scheduler::UserState`) backing this future's
-                // saved frame; no other handle aliases it here.
+                // Reap succeeded — write the wstatus (wait4) or
+                // siginfo_t (waitid) to the user pointer and put the
+                // syscall result (reaped pid for wait4, 0 for waitid)
+                // into the saved RAX, then clear the pending flags.
+                let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                let rax =
+                    crate::handlers::finish_wait_child(status_ptr, is_waitid, reaped, child_status);
+                // SAFETY: `state.get()` is the `*mut UserState` (== `*mut
+                // narf_scheduler::UserState`) backing this future's saved
+                // frame; we own it (Pin-stable) and no other handle
+                // aliases it here.
                 unsafe {
                     #[cfg(target_arch = "x86_64")]
                     {
                         let us = &mut *this.ctx.state.get();
-                        us.rax = reaped as u64;
+                        us.rax = rax;
                     }
                 }
                 this.ctx.wait_child_pending.store(false, Ordering::Release);
+                this.ctx
+                    .wait_child_is_waitid
+                    .store(false, Ordering::Release);
                 // Fall through to re-enter user mode with the result.
             } else {
                 // No child has exited yet — register our waker so
@@ -850,13 +876,20 @@ impl core::future::Future for UserTaskFuture {
                 // Double-check after registering (race: child exits
                 // between the reap check above and registering here).
                 register_wait_child_waker(task_pid, cx.waker().clone());
-                let reaped2 = call_wait_child_check(task_pid, want_pid, status_ptr);
+                let mut child_status2 = 0i32;
+                let reaped2 = call_wait_child_check(task_pid, want_pid, &mut child_status2);
                 if reaped2 > 0 {
                     // Child exited in the window — remove the waker
                     // we just stored (no spurious self-wake needed),
                     // write the result, clear pending, fall through.
                     drop_wait_child_waker(task_pid);
-                    // Write reaped pid into saved RAX.
+                    let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                    let rax = crate::handlers::finish_wait_child(
+                        status_ptr,
+                        is_waitid,
+                        reaped2,
+                        child_status2,
+                    );
                     // SAFETY: `state.get()` is the `*mut UserState`
                     // backing this future's saved frame; we own it
                     // (Pin-stable) and no other handle aliases it in
@@ -865,10 +898,13 @@ impl core::future::Future for UserTaskFuture {
                         #[cfg(target_arch = "x86_64")]
                         {
                             let us = &mut *this.ctx.state.get();
-                            us.rax = reaped2 as u64;
+                            us.rax = rax;
                         }
                     }
                     this.ctx.wait_child_pending.store(false, Ordering::Release);
+                    this.ctx
+                        .wait_child_is_waitid
+                        .store(false, Ordering::Release);
                     // Fall through to re-enter user mode.
                 } else {
                     // Truly no child yet — park until `on_child_exit`
@@ -1214,7 +1250,11 @@ impl core::future::Future for UserTaskFuture {
         let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
-            if now < deadline {
+            // Break an infinite park on an async pending signal — see the
+            // sibling poll body for the rationale.
+            let signal_pending = deadline == u64::MAX
+                && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
+            if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;
                 let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
                 while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
@@ -1236,8 +1276,12 @@ impl core::future::Future for UserTaskFuture {
             // parent's TaskId (`current_task_id()`) into PARENT_OF and
             // PENDING_EXITS, so the lookup key must also be the TaskId.
             let task_pid = crate::handlers::current_task_id();
-            let reaped = call_wait_child_check(task_pid, want_pid, status_ptr);
+            let mut child_status = 0i32;
+            let reaped = call_wait_child_check(task_pid, want_pid, &mut child_status);
             if reaped > 0 {
+                let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                let rax =
+                    crate::handlers::finish_wait_child(status_ptr, is_waitid, reaped, child_status);
                 // SAFETY: `state.get()` is the `*mut UserState`
                 // (== `*mut narf_scheduler::UserState`) backing this
                 // future's saved frame; we own it (Pin-stable) and no
@@ -1247,15 +1291,26 @@ impl core::future::Future for UserTaskFuture {
                     {
                         // On aarch64 x0 is the return register.
                         let us = &mut *this.ctx.state.get();
-                        us.x[0] = reaped as u64;
+                        us.x[0] = rax;
                     }
                 }
                 this.ctx.wait_child_pending.store(false, Ordering::Release);
+                this.ctx
+                    .wait_child_is_waitid
+                    .store(false, Ordering::Release);
             } else {
                 register_wait_child_waker(task_pid, cx.waker().clone());
-                let reaped2 = call_wait_child_check(task_pid, want_pid, status_ptr);
+                let mut child_status2 = 0i32;
+                let reaped2 = call_wait_child_check(task_pid, want_pid, &mut child_status2);
                 if reaped2 > 0 {
                     drop_wait_child_waker(task_pid);
+                    let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                    let rax = crate::handlers::finish_wait_child(
+                        status_ptr,
+                        is_waitid,
+                        reaped2,
+                        child_status2,
+                    );
                     // SAFETY: `state.get()` is the `*mut UserState`
                     // backing this future's saved frame; we own it
                     // (Pin-stable) and no other handle aliases it here.
@@ -1263,10 +1318,13 @@ impl core::future::Future for UserTaskFuture {
                         #[cfg(target_arch = "aarch64")]
                         {
                             let us = &mut *this.ctx.state.get();
-                            us.x[0] = reaped2 as u64;
+                            us.x[0] = rax;
                         }
                     }
                     this.ctx.wait_child_pending.store(false, Ordering::Release);
+                    this.ctx
+                        .wait_child_is_waitid
+                        .store(false, Ordering::Release);
                 } else {
                     return core::task::Poll::Pending;
                 }

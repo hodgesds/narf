@@ -417,6 +417,13 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this file is a pidfd (from `pidfd_open`), return the target
+    /// process's pid. Used by `pidfd_send_signal(2)` to resolve the
+    /// fd to a pid without a downcast / Any dance. Default: `None`.
+    fn pidfd_target_pid(&self) -> Option<u64> {
+        None
+    }
+
     /// PTY-layer: true on the `/dev/ptmx` clone-on-open file. When
     /// `sys_open` sees this it allocates a fresh `Pty` pair and
     /// installs the master in the caller's fd table instead of the
@@ -424,6 +431,20 @@ pub trait FileOps: Send + Sync {
     /// the equivalent path `ptmx_open` in `drivers/tty/pty.c`.
     fn is_ptmx_clone(&self) -> bool {
         false
+    }
+
+    /// If this file is a POSIX message-queue descriptor (from
+    /// `mq_open`), return its queue id. Used by the `mq_*` syscalls to
+    /// resolve the mqd to a queue without a downcast. Default: `None`.
+    fn mq_queue_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// If this file is an inotify instance (from `inotify_init1`),
+    /// return its instance id. Used by `inotify_add_watch` /
+    /// `inotify_rm_watch` to resolve the fd. Default: `None`.
+    fn inotify_instance(&self) -> Option<u64> {
+        None
     }
 }
 

@@ -1415,6 +1415,51 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
         ("epoll_smoke", "epoll-ok"),
+        // Linux-compat round: eventfd2, getrandom, socketpair, accept4.
+        ("eventfd_smoke", "eventfd-ok"),
+        ("getrandom_smoke", "getrandom-ok"),
+        ("sockpair_smoke", "sockpair-ok"),
+        ("accept4_smoke", "accept4-ok"),
+        // Linux-compat round 2: mremap, sendfile, creds, waitid.
+        ("mremap_smoke", "mremap-ok"),
+        ("sendfile_smoke", "sendfile-ok"),
+        ("creds_smoke", "creds-ok"),
+        ("waitid_smoke", "waitid-ok"),
+        // Linux-compat round 3: ppoll, sysinfo, splice, membarrier+clock_getres.
+        ("ppoll_smoke", "ppoll-ok"),
+        ("sysinfo_smoke", "sysinfo-ok"),
+        ("splice_smoke", "splice-ok"),
+        ("barrier_smoke", "barrier-ok"),
+        // Linux-compat round 4: close_range, sched-policy, msync+mincore, sync+syncfs+personality.
+        ("closerange_smoke", "closerange-ok"),
+        ("sched_smoke", "sched-ok"),
+        ("mcore_smoke", "mcore-ok"),
+        ("sync_smoke", "sync-ok"),
+        // Linux-compat round 5: dup3+fadvise64+mlock2, robust lists, renameat2, pidfd_send_signal.
+        ("dup3fam_smoke", "dup3-ok"),
+        ("robust_smoke", "robust-ok"),
+        ("renameat2_smoke", "renameat2-ok"),
+        ("pidfdsig_smoke", "pidfdsig-ok"),
+        // Linux-compat round 6: sethostname+setdomainname, sendmmsg+recvmmsg, openat2, preadv+pwritev.
+        ("host_smoke", "host-ok"),
+        ("mmsg_smoke", "mmsg-ok"),
+        ("openat2_smoke", "openat2-ok"),
+        ("pv_smoke", "pv-ok"),
+        // Linux-compat round 7: capget+capset, setitimer+getitimer+alarm, xattr, readahead+sync_file_range.
+        ("cap_smoke", "cap-ok"),
+        ("itimer_smoke", "itimer-ok"),
+        ("xattr_smoke", "xattr-ok"),
+        ("fhint_smoke", "fhint-ok"),
+        // Linux-compat round 8: mq_*, inotify, pkey_*, process_vm_*.
+        ("mq_smoke", "mq-ok"),
+        ("inotify_smoke", "inotify-ok"),
+        ("pkey_smoke", "pkey-ok"),
+        ("pvm_smoke", "pvm-ok"),
+        // Linux-compat round 9: mempolicy, sched_attr, adjtimex, introspection.
+        ("mempolicy_smoke", "mpol-ok"),
+        ("schedattr_smoke", "schedattr-ok"),
+        ("adjtimex_smoke", "adjtimex-ok"),
+        ("introspect_smoke", "introspect-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

@@ -75,6 +75,7 @@ static PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
 /// `timer_create`. Idempotent.
 pub fn posix_timer_init() {
     *TIMERS.lock() = Some(BTreeMap::new());
+    *ITIMERS.lock() = Some(BTreeMap::new());
     if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         // Register a sleep-pump so timer expiries fire even while a
         // user task is parked in `sys_sleep` / `sys_clock_nanosleep`.
@@ -86,6 +87,7 @@ pub fn posix_timer_init() {
 #[doc(hidden)]
 pub fn __test_reset() {
     *TIMERS.lock() = Some(BTreeMap::new());
+    *ITIMERS.lock() = Some(BTreeMap::new());
 }
 
 fn with_table<R>(f: impl FnOnce(&mut BTreeMap<u64, TimerTable>) -> R) -> Option<R> {
@@ -448,6 +450,242 @@ pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── setitimer / getitimer / alarm (ITIMER_REAL → SIGALRM) ────────────
+//
+// BSD-derived interval timers. Linux has three `which` slots:
+//   ITIMER_REAL    (0) — wall-clock; delivers SIGALRM.
+//   ITIMER_VIRTUAL (1) — user CPU time; delivers SIGVTALRM.
+//   ITIMER_PROF    (2) — user+sys CPU time; delivers SIGPROF.
+// NARF fully wires ITIMER_REAL (driven by the same `sleep_pumps` pump
+// as the POSIX timers above). VIRTUAL/PROF have no CPU-time accounting
+// yet, so they round-trip through set/getitimer but never fire.
+
+const ITIMER_REAL: u64 = 0;
+const ITIMER_PROF: u64 = 2;
+
+/// One `which` slot's armed state. `itimerval` carries microseconds,
+/// not nanoseconds — converted to ns on the way in.
+#[derive(Debug, Clone, Copy, Default)]
+struct Itimer {
+    /// Absolute monotonic-ns deadline for the next fire; 0 = disarmed.
+    next_fire_ns: u64,
+    /// Re-arm interval in ns; 0 = one-shot.
+    interval_ns: u64,
+}
+
+/// Per-task `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`.
+static ITIMERS: IrqSafeSpinLock<Option<BTreeMap<u64, [Itimer; 3]>>> = IrqSafeSpinLock::new(None);
+
+fn with_itimers<R>(f: impl FnOnce(&mut BTreeMap<u64, [Itimer; 3]>) -> R) -> R {
+    // Lazily initialise — `posix_timer_init` is only called from the
+    // in-kernel test harness, not the boot path, so the real-boot
+    // arming syscalls must stand up the table themselves.
+    let mut g = ITIMERS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    f(m)
+}
+
+/// Ensure the `sleep_pumps` callback that fires interval timers is
+/// registered. Idempotent — the boot path never calls
+/// `posix_timer_init`, so the first armed itimer wires the pump.
+fn ensure_pump_registered() {
+    if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
+        narf_scheduler::sleep_pumps::register(posix_timer_pump);
+    }
+}
+
+fn read_timeval(buf: &[u8; 16]) -> (i64, i64) {
+    let s = i64::from_le_bytes(buf[..8].try_into().unwrap());
+    let us = i64::from_le_bytes(buf[8..].try_into().unwrap());
+    (s, us)
+}
+
+fn write_timeval(out: &mut [u8; 16], sec: i64, usec: i64) {
+    out[..8].copy_from_slice(&sec.to_le_bytes());
+    out[8..].copy_from_slice(&usec.to_le_bytes());
+}
+
+fn timeval_to_ns(sec: i64, usec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return None;
+    }
+    Some(
+        (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((usec as u64).saturating_mul(1000)),
+    )
+}
+
+fn ns_to_timeval(ns: u64) -> (i64, i64) {
+    (
+        (ns / 1_000_000_000) as i64,
+        ((ns % 1_000_000_000) / 1000) as i64,
+    )
+}
+
+/// Snapshot a slot's remaining-value + interval into a 32-byte
+/// `struct itimerval` (it_interval then it_value).
+fn write_itimerval(out: &mut [u8; 32], slot: Itimer, now: u64) {
+    let remaining = if slot.next_fire_ns == 0 {
+        0
+    } else {
+        slot.next_fire_ns.saturating_sub(now)
+    };
+    let (is, iu) = ns_to_timeval(slot.interval_ns);
+    let (vs, vu) = ns_to_timeval(remaining);
+    write_timeval((&mut out[0..16]).try_into().unwrap(), is, iu);
+    write_timeval((&mut out[16..32]).try_into().unwrap(), vs, vu);
+}
+
+/// setitimer(which, new, old)
+pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let which = args.arg0;
+    let new_ptr = args.arg1;
+    let old_ptr = args.arg2;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if which > ITIMER_PROF || new_ptr == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let mut buf = [0u8; 32];
+    // SAFETY: `new_ptr` is checked non-zero above and is a user address;
+    // `copy_from_user` range-validates it and brackets the 32-byte read in the
+    // SMAP window. Runs in the calling task's address space, not IRQ context.
+    if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    let (int_s, int_us) = read_timeval(buf[0..16].try_into().unwrap());
+    let (val_s, val_us) = read_timeval(buf[16..32].try_into().unwrap());
+    let (interval_ns, value_ns) = match (timeval_to_ns(int_s, int_us), timeval_to_ns(val_s, val_us))
+    {
+        (Some(i), Some(v)) => (i, v),
+        _ => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+
+    let task = current_task_id();
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let next_fire = if value_ns == 0 {
+        0
+    } else {
+        now.saturating_add(value_ns)
+    };
+
+    ensure_pump_registered();
+    let prev = with_itimers(|m| {
+        let slots = m.entry(task).or_default();
+        let prev = slots[which as usize];
+        slots[which as usize] = Itimer {
+            next_fire_ns: next_fire,
+            interval_ns,
+        };
+        prev
+    });
+
+    if old_ptr != 0 {
+        let mut out = [0u8; 32];
+        write_itimerval(&mut out, prev, now);
+        // SAFETY: `old_ptr` is checked non-zero above and is a user address;
+        // `copy_to_user` range-validates it and brackets the 32-byte write in
+        // the SMAP window. Runs in the calling task's address space, not IRQ
+        // context. Best-effort: a failed copy is ignored per the old-value API.
+        let _ = unsafe { crate::handlers::copy_to_user(old_ptr, &out) };
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// getitimer(which, cur)
+pub fn sys_getitimer(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let which = args.arg0;
+    let out_ptr = args.arg1;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    if which > ITIMER_PROF || out_ptr == 0 {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let slot = with_itimers(|m| m.get(&task).map(|s| s[which as usize]).unwrap_or_default());
+    let mut out = [0u8; 32];
+    write_itimerval(&mut out, slot, now);
+    // SAFETY: `out_ptr` is checked non-zero above and is a user address;
+    // `copy_to_user` range-validates it and brackets the 32-byte write in the
+    // SMAP window. Runs in the calling task's address space, not IRQ context.
+    if unsafe { crate::handlers::copy_to_user(out_ptr, &out) }.is_err() {
+        ctx.set_return(fail);
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// alarm(seconds) — convenience wrapper over ITIMER_REAL with no
+/// interval. Returns the previous alarm's remaining whole seconds
+/// (rounded up), or 0 if none was armed.
+pub fn sys_alarm(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let secs = args.arg0;
+    let task = current_task_id();
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let next_fire = if secs == 0 {
+        0
+    } else {
+        now.saturating_add(secs.saturating_mul(1_000_000_000))
+    };
+
+    ensure_pump_registered();
+    let prev = with_itimers(|m| {
+        let slots = m.entry(task).or_default();
+        let prev = slots[ITIMER_REAL as usize];
+        slots[ITIMER_REAL as usize] = Itimer {
+            next_fire_ns: next_fire,
+            interval_ns: 0,
+        };
+        prev
+    });
+
+    let prev_remaining = if prev.next_fire_ns == 0 {
+        0
+    } else {
+        // Round up to whole seconds, like Linux.
+        prev.next_fire_ns
+            .saturating_sub(now)
+            .saturating_add(999_999_999)
+            / 1_000_000_000
+    };
+    ctx.set_return(SyscallReturn::ok(prev_remaining));
+}
+
+/// Sleep-pump half for ITIMER_REAL — collect SIGALRM deliveries for
+/// every task whose real-timer slot has expired, re-arming periodic
+/// timers. Called from `posix_timer_pump` under no lock nesting.
+fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32)>) {
+    let mut g = ITIMERS.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => return,
+    };
+    for (task, slots) in map.iter_mut() {
+        let slot = &mut slots[ITIMER_REAL as usize];
+        if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
+            continue;
+        }
+        deliveries.push((*task, SIGALRM));
+        if slot.interval_ns == 0 {
+            slot.next_fire_ns = 0;
+        } else {
+            let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
+            slot.next_fire_ns = slot
+                .next_fire_ns
+                .saturating_add(slot.interval_ns.saturating_mul(fires));
+        }
+    }
+}
+
 /// Sleep-pump: walks every per-task timer table, fires expired
 /// signals via the existing `raise_signal_pending` path. Re-arms
 /// periodic timers. Counts missed expiries into `overrun`.
@@ -457,37 +695,40 @@ fn posix_timer_pump() {
     // releasing it so we don't nest SIGNAL_PENDING under TIMERS.
     let mut deliveries: Vec<(u64, u32)> = Vec::new();
     {
+        // The POSIX-timer table may be uninitialised in a real boot
+        // (`posix_timer_init` only runs in the test harness). Skip its
+        // walk when absent rather than aborting the whole pump — the
+        // itimer half below stands up its own table on first use.
         let mut g = TIMERS.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => return,
-        };
-        for (_task, table) in map.iter_mut() {
-            for (_id, t) in table.by_id.iter_mut() {
-                if t.next_fire_ns == 0 || now < t.next_fire_ns {
-                    continue;
-                }
-                let fires = if t.interval_ns == 0 {
-                    1
-                } else {
-                    ((now - t.next_fire_ns) / t.interval_ns).saturating_add(1)
-                };
-                t.overrun = t.overrun.saturating_add(fires.saturating_sub(1) as u32);
-                if t.signum != 0 {
-                    // Queue one signal — POSIX collapses missed
-                    // expiries into a single signal + overrun count.
-                    deliveries.push((t.task, t.signum));
-                }
-                if t.interval_ns == 0 {
-                    t.next_fire_ns = 0;
-                } else {
-                    t.next_fire_ns = t
-                        .next_fire_ns
-                        .saturating_add(t.interval_ns.saturating_mul(fires));
+        if let Some(map) = g.as_mut() {
+            for (_task, table) in map.iter_mut() {
+                for (_id, t) in table.by_id.iter_mut() {
+                    if t.next_fire_ns == 0 || now < t.next_fire_ns {
+                        continue;
+                    }
+                    let fires = if t.interval_ns == 0 {
+                        1
+                    } else {
+                        ((now - t.next_fire_ns) / t.interval_ns).saturating_add(1)
+                    };
+                    t.overrun = t.overrun.saturating_add(fires.saturating_sub(1) as u32);
+                    if t.signum != 0 {
+                        // Queue one signal — POSIX collapses missed
+                        // expiries into a single signal + overrun count.
+                        deliveries.push((t.task, t.signum));
+                    }
+                    if t.interval_ns == 0 {
+                        t.next_fire_ns = 0;
+                    } else {
+                        t.next_fire_ns = t
+                            .next_fire_ns
+                            .saturating_add(t.interval_ns.saturating_mul(fires));
+                    }
                 }
             }
         }
     }
+    itimer_pump_collect(now, &mut deliveries);
     for (task, signum) in deliveries {
         raise_signal_pending(task, signum);
     }

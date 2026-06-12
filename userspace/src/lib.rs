@@ -52,6 +52,8 @@ pub mod init;
 pub mod interp;
 pub mod io_mux;
 pub mod loader;
+#[cfg(feature = "linux-compat")]
+pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;
 #[cfg(feature = "container")]

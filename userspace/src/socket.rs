@@ -439,6 +439,27 @@ impl SocketFile {
         })
     }
 
+    /// Create a pre-connected AF_UNIX SOCK_STREAM pair for
+    /// `socketpair(2)`. Mints two ring buffers and crosses tx/rx so
+    /// each end's `tx` is the other end's `rx` — the same wiring the
+    /// `connect()`/`accept()` handshake produces, minus the named
+    /// listener lookup. Both ends come back already `UnixConnected`.
+    pub fn unix_stream_pair() -> (Arc<Self>, Arc<Self>) {
+        let a = Self::new(AF_UNIX, SOCK_STREAM);
+        let b = Self::new(AF_UNIX, SOCK_STREAM);
+        let a_to_b = Arc::new(RingBuf::new());
+        let b_to_a = Arc::new(RingBuf::new());
+        *a.state.lock() = SocketState::UnixConnected {
+            tx: a_to_b.clone(),
+            rx: b_to_a.clone(),
+        };
+        *b.state.lock() = SocketState::UnixConnected {
+            tx: b_to_a,
+            rx: a_to_b,
+        };
+        (a, b)
+    }
+
     /// Toggle the O_NONBLOCK flag (fcntl F_SETFL path).
     pub fn set_nonblock(&self, on: bool) {
         self.nonblock.store(on, Ordering::Release);

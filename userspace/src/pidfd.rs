@@ -148,4 +148,8 @@ impl FileOps for PidFdFile {
             0
         }
     }
+
+    fn pidfd_target_pid(&self) -> Option<u64> {
+        Some(self.state.pid)
+    }
 }

@@ -3368,6 +3368,70 @@ fn boot_userspace_init() {
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
                 ("fs_smoke", narf_verification::NARF_FS_SMOKE_ELF),
+                // Linux-compat round: eventfd2 / getrandom / socketpair
+                // / accept4 exercised end-to-end by real musl binaries.
+                ("eventfd_smoke", narf_verification::NARF_EVENTFD_SMOKE_ELF),
+                (
+                    "getrandom_smoke",
+                    narf_verification::NARF_GETRANDOM_SMOKE_ELF,
+                ),
+                ("sockpair_smoke", narf_verification::NARF_SOCKPAIR_SMOKE_ELF),
+                ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
+                // Linux-compat round 2: mremap / sendfile / creds / waitid.
+                ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),
+                ("sendfile_smoke", narf_verification::NARF_SENDFILE_SMOKE_ELF),
+                ("creds_smoke", narf_verification::NARF_CREDS_SMOKE_ELF),
+                ("waitid_smoke", narf_verification::NARF_WAITID_SMOKE_ELF),
+                // Linux-compat round 3: ppoll / sysinfo / splice / membarrier+clock_getres.
+                ("ppoll_smoke", narf_verification::NARF_PPOLL_SMOKE_ELF),
+                ("sysinfo_smoke", narf_verification::NARF_SYSINFO_SMOKE_ELF),
+                ("splice_smoke", narf_verification::NARF_SPLICE_SMOKE_ELF),
+                ("barrier_smoke", narf_verification::NARF_BARRIER_SMOKE_ELF),
+                // Linux-compat round 4: close_range / sched-policy / msync+mincore / sync+syncfs+personality.
+                (
+                    "closerange_smoke",
+                    narf_verification::NARF_CLOSERANGE_SMOKE_ELF,
+                ),
+                ("sched_smoke", narf_verification::NARF_SCHED_SMOKE_ELF),
+                ("mcore_smoke", narf_verification::NARF_MCORE_SMOKE_ELF),
+                ("sync_smoke", narf_verification::NARF_SYNC_SMOKE_ELF),
+                // Linux-compat round 5: dup3+fadvise64+mlock2 / robust lists / renameat2 / pidfd_send_signal.
+                ("dup3fam_smoke", narf_verification::NARF_DUP3FAM_SMOKE_ELF),
+                ("robust_smoke", narf_verification::NARF_ROBUST_SMOKE_ELF),
+                (
+                    "renameat2_smoke",
+                    narf_verification::NARF_RENAMEAT2_SMOKE_ELF,
+                ),
+                ("pidfdsig_smoke", narf_verification::NARF_PIDFDSIG_SMOKE_ELF),
+                // Linux-compat round 6: sethostname+setdomainname / sendmmsg+recvmmsg / openat2 / preadv+pwritev.
+                ("host_smoke", narf_verification::NARF_HOST_SMOKE_ELF),
+                ("mmsg_smoke", narf_verification::NARF_MMSG_SMOKE_ELF),
+                ("openat2_smoke", narf_verification::NARF_OPENAT2_SMOKE_ELF),
+                ("pv_smoke", narf_verification::NARF_PV_SMOKE_ELF),
+                // Linux-compat round 7: capget+capset / setitimer+getitimer+alarm / xattr / readahead+sync_file_range.
+                ("cap_smoke", narf_verification::NARF_CAP_SMOKE_ELF),
+                ("itimer_smoke", narf_verification::NARF_ITIMER_SMOKE_ELF),
+                ("xattr_smoke", narf_verification::NARF_XATTR_SMOKE_ELF),
+                ("fhint_smoke", narf_verification::NARF_FHINT_SMOKE_ELF),
+                // Linux-compat round 8: mq_* / inotify / pkey_* / process_vm_*.
+                ("mq_smoke", narf_verification::NARF_MQ_SMOKE_ELF),
+                ("inotify_smoke", narf_verification::NARF_INOTIFY_SMOKE_ELF),
+                ("pkey_smoke", narf_verification::NARF_PKEY_SMOKE_ELF),
+                ("pvm_smoke", narf_verification::NARF_PVM_SMOKE_ELF),
+                // Linux-compat round 9: mempolicy / sched_attr / adjtimex / introspection.
+                (
+                    "mempolicy_smoke",
+                    narf_verification::NARF_MEMPOLICY_SMOKE_ELF,
+                ),
+                (
+                    "schedattr_smoke",
+                    narf_verification::NARF_SCHEDATTR_SMOKE_ELF,
+                ),
+                ("adjtimex_smoke", narf_verification::NARF_ADJTIMEX_SMOKE_ELF),
+                (
+                    "introspect_smoke",
+                    narf_verification::NARF_INTROSPECT_SMOKE_ELF,
+                ),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
