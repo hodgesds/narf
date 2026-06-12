@@ -14,7 +14,10 @@ use narf_console::Writer;
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "jc42", || {
-        let _ = writeln!(Writer, "  hwmon: JEDEC JC-42.4 DIMM thermal sensor driver registered");
+        let _ = writeln!(
+            Writer,
+            "  hwmon: JEDEC JC-42.4 DIMM thermal sensor driver registered"
+        );
         // Placeholder: parse SMBus for I2C addresses 0x18-0x1f
         InitResult::Ok
     });

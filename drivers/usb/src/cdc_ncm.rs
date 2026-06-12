@@ -1181,7 +1181,9 @@ pub static CDC_NCM_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
     },
 ];
 
-pub fn probe(_device: alloc::sync::Arc<crate::device::USBDevice>) -> Result<(), crate::class_registry::UsbProbeError> {
+pub fn probe(
+    _device: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
     use core::fmt::Write;
     let _ = writeln!(narf_console::Writer, "  usb: CDC-NCM device bound!");
     Ok(())
@@ -1190,4 +1192,3 @@ pub fn probe(_device: alloc::sync::Arc<crate::device::USBDevice>) -> Result<(), 
 pub fn register_initcalls() {
     let _ = crate::class_registry::register_class_driver("cdc-ncm", &CDC_NCM_MATCH, probe);
 }
-

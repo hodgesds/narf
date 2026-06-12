@@ -14,6 +14,11 @@ use narf_capabilities::{Cap, Write};
 const ATHEROS_PCI_VENDOR: u16 = 0x168C;
 const ATHEROS_AR9285_DEVICE: u16 = 0x002B;
 
+// Basic ATH9K registers
+const AR_RC: u64 = 0x4000;
+const AR_RC_AHB: u32 = 1 << 0;
+const AR_INTR_SYNC_CAUSE: u64 = 0x4010;
+
 #[derive(Debug)]
 pub struct Ath9k {
     mmio: MmioRegion,
@@ -21,16 +26,46 @@ pub struct Ath9k {
 
 impl Ath9k {
     pub fn new(mmio: MmioRegion) -> Self {
-        Self { mmio }
+        let nic = Self { mmio };
+        nic.init();
+        nic
+    }
+
+    fn read_u32(&self, offset: u64) -> u32 {
+        unsafe { self.mmio.read32(offset) }
+    }
+
+    fn write_u32(&self, offset: u64, val: u32) {
+        unsafe { self.mmio.write32(offset, val) }
+    }
+
+    fn init(&self) {
+        // Assert AHB reset
+        self.write_u32(AR_RC, AR_RC_AHB);
+        let mut timeout = 10_000;
+        while timeout > 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+        }
+
+        // Deassert AHB reset
+        self.write_u32(AR_RC, 0);
+
+        // Clear sync cause
+        self.write_u32(AR_INTR_SYNC_CAUSE, 0xFFFFFFFF);
     }
 }
 
-pub fn probe(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } { // ath9k uses BAR0
+pub fn probe(
+    device: BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
+        // ath9k uses BAR0
         Ok(m) => m,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    
+
     let _nic = Arc::new(Ath9k::new(mmio));
     // Register to wireless subsystem
     Ok(())

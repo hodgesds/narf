@@ -9,23 +9,23 @@ extern crate alloc;
 
 use alloc::string::String;
 
-use narf_memory::PhysAddr;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::PhysAddr;
 
 use crate::{SpiBus, SpiError, SpiMode};
 
 // ── Register offsets ───────────────────────────────────────────────
 
-const PL022_CR0: u64  = 0x00; // Control Register 0
-const PL022_CR1: u64  = 0x04; // Control Register 1
-const PL022_DR: u64   = 0x08; // Data Register
-const PL022_SR: u64   = 0x0C; // Status Register
+const PL022_CR0: u64 = 0x00; // Control Register 0
+const PL022_CR1: u64 = 0x04; // Control Register 1
+const PL022_DR: u64 = 0x08; // Data Register
+const PL022_SR: u64 = 0x0C; // Status Register
 const PL022_CPSR: u64 = 0x10; // Clock Prescale Register
 const PL022_IMSC: u64 = 0x14; // Interrupt Mask Set and Clear
 
 const PL022_CR0_DSS_8BIT: u32 = 0x07; // 8-bit data
-const PL022_CR0_SPO: u32      = 1 << 6;
-const PL022_CR0_SPH: u32      = 1 << 7;
+const PL022_CR0_SPO: u32 = 1 << 6;
+const PL022_CR0_SPH: u32 = 1 << 7;
 
 const PL022_CR1_SSE: u32 = 1 << 1; // SSP Enable
 
@@ -93,11 +93,11 @@ impl SpiBus for Pl022Spi {
 
     fn transfer(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), SpiError> {
         let _guard = self.state.lock();
-        
+
         let len = core::cmp::max(tx.len(), rx.len());
         for i in 0..len {
             let out_byte = if i < tx.len() { tx[i] } else { 0 };
-            
+
             // Wait for TX room
             let mut timeout = 100_000;
             while (self.read_u32(PL022_SR) & PL022_SR_TNF) == 0 {
@@ -107,9 +107,9 @@ impl SpiBus for Pl022Spi {
                 }
                 core::hint::spin_loop();
             }
-            
+
             self.write_tx(out_byte as u32);
-            
+
             // Wait for RX ready
             timeout = 100_000;
             while (self.read_u32(PL022_SR) & PL022_SR_RNE) == 0 {
@@ -119,13 +119,13 @@ impl SpiBus for Pl022Spi {
                 }
                 core::hint::spin_loop();
             }
-            
+
             let in_byte = self.read_rx() as u8;
             if i < rx.len() {
                 rx[i] = in_byte;
             }
         }
-        
+
         // Wait until totally idle
         let mut timeout = 100_000;
         while (self.read_u32(PL022_SR) & PL022_SR_BSY) != 0 {
@@ -135,7 +135,7 @@ impl SpiBus for Pl022Spi {
             }
             core::hint::spin_loop();
         }
-        
+
         Ok(())
     }
 
@@ -146,27 +146,27 @@ impl SpiBus for Pl022Spi {
 
     fn set_mode(&self, mode: SpiMode) -> Result<(), SpiError> {
         let _guard = self.state.lock();
-        
+
         // Must disable SSP before changing CR0
         let cr1 = self.read_u32(PL022_CR1);
         self.write_u32(PL022_CR1, cr1 & !PL022_CR1_SSE);
-        
+
         let mut cr0 = self.read_u32(PL022_CR0);
-        
+
         if mode.cpol() {
             cr0 |= PL022_CR0_SPO;
         } else {
             cr0 &= !PL022_CR0_SPO;
         }
-        
+
         if mode.cpha() {
             cr0 |= PL022_CR0_SPH;
         } else {
             cr0 &= !PL022_CR0_SPH;
         }
-        
+
         self.write_u32(PL022_CR0, cr0);
-        
+
         // Re-enable SSP
         self.write_u32(PL022_CR1, cr1);
         Ok(())

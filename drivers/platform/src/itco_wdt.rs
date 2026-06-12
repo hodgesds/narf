@@ -15,7 +15,10 @@ use narf_console::Writer;
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "itco_wdt", || {
-        let _ = writeln!(Writer, "  platform: Intel TCO Watchdog Timer driver registered");
+        let _ = writeln!(
+            Writer,
+            "  platform: Intel TCO Watchdog Timer driver registered"
+        );
         // Placeholder: parse SMBus base address or LPC bridge to find TCObase.
         InitResult::Ok
     });

@@ -13,9 +13,9 @@
 
 extern crate alloc;
 
+use core::fmt::Write;
 use narf_aml::wmi;
 use narf_console::Writer;
-use core::fmt::Write;
 
 pub const LEGACY_CONTROL_GUID: &str = "A90597CE-A997-11DA-B012-B622A1EF5492";
 pub const LEGACY_POWER_CONTROL_GUID: &str = "A80593CE-A997-11DA-B012-B622A1EF5492";

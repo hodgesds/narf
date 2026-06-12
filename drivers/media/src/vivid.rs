@@ -12,6 +12,9 @@ use narf_console::Writer;
 
 /// Register the vivid driver initcalls.
 pub fn register_initcalls() {
-    let _ = writeln!(Writer, "  media: Virtual Video Test (vivid) driver registered");
+    let _ = writeln!(
+        Writer,
+        "  media: Virtual Video Test (vivid) driver registered"
+    );
     // Placeholder for software device creation
 }

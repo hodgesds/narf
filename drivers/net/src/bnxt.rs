@@ -14,6 +14,11 @@ use narf_capabilities::{Cap, Write};
 const BNXT_PCI_VENDOR: u16 = 0x14E4;
 const BNXT_PCI_DEVICE_BCM57414: u16 = 0x16D7;
 
+// Basic BNXT registers
+const BNXT_VER: u64 = 0x00;
+const BNXT_MAC_CTRL: u64 = 0x04;
+const BNXT_MAC_RESET: u32 = 1 << 0;
+
 #[derive(Debug)]
 pub struct BnxtNic {
     mmio: MmioRegion,
@@ -21,16 +26,47 @@ pub struct BnxtNic {
 
 impl BnxtNic {
     pub fn new(mmio: MmioRegion) -> Self {
-        Self { mmio }
+        let nic = Self { mmio };
+        nic.init();
+        nic
+    }
+
+    fn read_u32(&self, offset: u64) -> u32 {
+        unsafe { self.mmio.read32(offset) }
+    }
+
+    fn write_u32(&self, offset: u64, val: u32) {
+        unsafe { self.mmio.write32(offset, val) }
+    }
+
+    fn init(&self) {
+        // Read version/ID
+        let _ver = self.read_u32(BNXT_VER);
+
+        // Assert MAC reset
+        let ctrl = self.read_u32(BNXT_MAC_CTRL);
+        self.write_u32(BNXT_MAC_CTRL, ctrl | BNXT_MAC_RESET);
+
+        let mut timeout = 100_000;
+        while (self.read_u32(BNXT_MAC_CTRL) & BNXT_MAC_RESET) != 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
-pub fn probe(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
+pub fn probe(
+    device: BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
     let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
         Ok(m) => m,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    
+
     let _nic = Arc::new(BnxtNic::new(mmio));
     // Would normally register to net registry here
     Ok(())

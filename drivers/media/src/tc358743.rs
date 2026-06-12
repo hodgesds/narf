@@ -14,7 +14,10 @@ pub const TC358743_I2C_ADDR: u16 = 0x0f;
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "media-tc358743", || {
-        let _ = writeln!(Writer, "  media: Registered Toshiba TC358743 HDMI capture bridge");
+        let _ = writeln!(
+            Writer,
+            "  media: Registered Toshiba TC358743 HDMI capture bridge"
+        );
         InitResult::Ok
     });
 }

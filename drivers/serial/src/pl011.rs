@@ -14,7 +14,10 @@ use narf_console::Writer;
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "pl011", || {
-        let _ = writeln!(Writer, "  serial: ARM PrimeCell PL011 UART driver registered");
+        let _ = writeln!(
+            Writer,
+            "  serial: ARM PrimeCell PL011 UART driver registered"
+        );
         // Placeholder: parse DeviceTree for `arm,pl011` compatible strings.
         InitResult::Ok
     });

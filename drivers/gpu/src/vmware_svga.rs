@@ -12,6 +12,9 @@ use narf_console::Writer;
 
 /// Register the VMware SVGA PCI driver.
 pub fn register_pci_driver() {
-    let _ = writeln!(Writer, "  gpu: VMware SVGA II Virtual GPU driver registered");
+    let _ = writeln!(
+        Writer,
+        "  gpu: VMware SVGA II Virtual GPU driver registered"
+    );
     // Placeholder for PCI vendor=0x15ad, device=0x0405 match
 }

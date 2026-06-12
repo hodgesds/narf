@@ -1046,13 +1046,19 @@ pub enum ReassemblerOutcome {
     Skipped,
 }
 
-pub static UVC_MATCH: [crate::class_registry::UsbClassMatch; 1] = [
-    crate::class_registry::UsbClassMatch::class_only(USB_CLASS_VIDEO),
-];
+pub static UVC_MATCH: [crate::class_registry::UsbClassMatch; 1] =
+    [crate::class_registry::UsbClassMatch::class_only(
+        USB_CLASS_VIDEO,
+    )];
 
-pub fn probe(_device: alloc::sync::Arc<crate::device::USBDevice>) -> Result<(), crate::class_registry::UsbProbeError> {
+pub fn probe(
+    _device: alloc::sync::Arc<crate::device::USBDevice>,
+) -> Result<(), crate::class_registry::UsbProbeError> {
     use core::fmt::Write;
-    let _ = writeln!(narf_console::Writer, "  usb: USB Video Class (UVC) device bound!");
+    let _ = writeln!(
+        narf_console::Writer,
+        "  usb: USB Video Class (UVC) device bound!"
+    );
     Ok(())
 }
 

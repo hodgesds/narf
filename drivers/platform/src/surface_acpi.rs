@@ -19,8 +19,8 @@ pub fn register_initcalls() {
             return InitResult::NotPresent;
         }
 
-        use narf_console::Writer;
         use core::fmt::Write;
+        use narf_console::Writer;
         let _ = writeln!(Writer, "  surface-acpi: Found Surface ACPI Button device");
 
         InitResult::Ok

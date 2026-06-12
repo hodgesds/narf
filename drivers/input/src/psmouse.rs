@@ -23,7 +23,10 @@ pub fn probe_protocol() {
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "psmouse", || {
-        let _ = writeln!(Writer, "  psmouse: PS/2 Trackpad protocol extensions loaded");
+        let _ = writeln!(
+            Writer,
+            "  psmouse: PS/2 Trackpad protocol extensions loaded"
+        );
         probe_protocol();
         InitResult::Ok
     });

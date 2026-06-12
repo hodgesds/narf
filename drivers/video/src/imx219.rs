@@ -7,8 +7,8 @@
 
 extern crate alloc;
 
-use narf_console::Writer;
 use core::fmt::Write;
+use narf_console::Writer;
 
 use crate::{BufferQueue, Camera, CameraError, PixelFormat, Result};
 
@@ -38,7 +38,7 @@ pub struct Imx219 {
 
 impl Imx219 {
     pub fn new(i2c_bus: u16) -> Self {
-        Self { 
+        Self {
             i2c_bus,
             format: Imx219Format::FHD,
             streaming: false,
@@ -47,11 +47,14 @@ impl Imx219 {
     }
 
     pub fn probe(&self) -> bool {
-        let _ = writeln!(Writer, "  imx219: Probing sensor on I2C bus {}", self.i2c_bus);
+        let _ = writeln!(
+            Writer,
+            "  imx219: Probing sensor on I2C bus {}",
+            self.i2c_bus
+        );
         // In a real implementation we would read the chip ID register over I2C here.
         true
     }
-    
 }
 
 impl Camera for Imx219 {

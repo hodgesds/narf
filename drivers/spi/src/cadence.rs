@@ -9,38 +9,38 @@ extern crate alloc;
 
 use alloc::string::String;
 
-use narf_memory::PhysAddr;
 use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::PhysAddr;
 
 use crate::{SpiBus, SpiError, SpiMode};
 
 // ── Register offsets ───────────────────────────────────────────────
 
-const CDNS_SPI_CR: u64   = 0x00; // Configuration Register
-const CDNS_SPI_ISR: u64  = 0x04; // Interrupt Status Register
-const CDNS_SPI_IER: u64  = 0x08; // Interrupt Enable Register
-const CDNS_SPI_IDR: u64  = 0x0c; // Interrupt Disable Register
-const CDNS_SPI_IMR: u64  = 0x10; // Interrupt Enabled Mask
-const CDNS_SPI_ER: u64   = 0x14; // Enable/Disable Register
-const CDNS_SPI_DR: u64   = 0x18; // Delay Register
-const CDNS_SPI_TXD: u64  = 0x1C; // Data Transmit Register
-const CDNS_SPI_RXD: u64  = 0x20; // Data Receive Register
+const CDNS_SPI_CR: u64 = 0x00; // Configuration Register
+const CDNS_SPI_ISR: u64 = 0x04; // Interrupt Status Register
+const CDNS_SPI_IER: u64 = 0x08; // Interrupt Enable Register
+const CDNS_SPI_IDR: u64 = 0x0c; // Interrupt Disable Register
+const CDNS_SPI_IMR: u64 = 0x10; // Interrupt Enabled Mask
+const CDNS_SPI_ER: u64 = 0x14; // Enable/Disable Register
+const CDNS_SPI_DR: u64 = 0x18; // Delay Register
+const CDNS_SPI_TXD: u64 = 0x1C; // Data Transmit Register
+const CDNS_SPI_RXD: u64 = 0x20; // Data Receive Register
 const CDNS_SPI_SICR: u64 = 0x24; // Slave Idle Count Register
 const CDNS_SPI_THLD: u64 = 0x28; // Transmit FIFO Watermark
 
-const CDNS_SPI_CR_MANSTRT: u32   = 0x0001_0000;
-const CDNS_SPI_CR_CPHA: u32      = 0x0000_0004;
-const CDNS_SPI_CR_CPOL: u32      = 0x0000_0002;
-const CDNS_SPI_CR_SSCTRL: u32    = 0x0000_3C00;
-const CDNS_SPI_CR_MSTREN: u32    = 0x0000_0001;
+const CDNS_SPI_CR_MANSTRT: u32 = 0x0001_0000;
+const CDNS_SPI_CR_CPHA: u32 = 0x0000_0004;
+const CDNS_SPI_CR_CPOL: u32 = 0x0000_0002;
+const CDNS_SPI_CR_SSCTRL: u32 = 0x0000_3C00;
+const CDNS_SPI_CR_MSTREN: u32 = 0x0000_0001;
 const CDNS_SPI_CR_MANSTRTEN: u32 = 0x0000_8000;
-const CDNS_SPI_CR_SSFORCE: u32   = 0x0000_4000;
-const CDNS_SPI_CR_BAUD_DIV: u32  = 0x0000_0038;
+const CDNS_SPI_CR_SSFORCE: u32 = 0x0000_4000;
+const CDNS_SPI_CR_BAUD_DIV: u32 = 0x0000_0038;
 
-const CDNS_SPI_ER_ENABLE: u32  = 0x0000_0001;
+const CDNS_SPI_ER_ENABLE: u32 = 0x0000_0001;
 const CDNS_SPI_ER_DISABLE: u32 = 0x0000_0000;
 
-const CDNS_SPI_IXR_TXOW: u32    = 0x0000_0004; // TX FIFO Overwater
+const CDNS_SPI_IXR_TXOW: u32 = 0x0000_0004; // TX FIFO Overwater
 const CDNS_SPI_IXR_RXNEMTY: u32 = 0x0000_0010; // RX FIFO Not Empty
 
 // ── Controller struct ──────────────────────────────────────────────
@@ -61,11 +61,11 @@ impl CadenceSpi {
         };
         // Initial reset
         spi.write_u32(CDNS_SPI_ER, CDNS_SPI_ER_DISABLE);
-        
+
         let mut cr = spi.read_u32(CDNS_SPI_CR);
         cr |= CDNS_SPI_CR_MSTREN | CDNS_SPI_CR_SSFORCE | CDNS_SPI_CR_MANSTRTEN;
         spi.write_u32(CDNS_SPI_CR, cr);
-        
+
         spi.write_u32(CDNS_SPI_ER, CDNS_SPI_ER_ENABLE);
         spi
     }
@@ -94,11 +94,11 @@ impl SpiBus for CadenceSpi {
 
     fn transfer(&self, tx: &[u8], rx: &mut [u8]) -> Result<(), SpiError> {
         let _guard = self.state.lock();
-        
+
         let len = core::cmp::max(tx.len(), rx.len());
         for i in 0..len {
             let out_byte = if i < tx.len() { tx[i] } else { 0 };
-            
+
             // Wait for TX room (naive poll)
             let mut timeout = 100_000;
             while (self.read_u32(CDNS_SPI_ISR) & CDNS_SPI_IXR_TXOW) == 0 {
@@ -108,9 +108,9 @@ impl SpiBus for CadenceSpi {
                 }
                 core::hint::spin_loop();
             }
-            
+
             self.write_tx(out_byte as u32);
-            
+
             // Manual start
             let cr = self.read_u32(CDNS_SPI_CR);
             self.write_u32(CDNS_SPI_CR, cr | CDNS_SPI_CR_MANSTRT);
@@ -124,13 +124,13 @@ impl SpiBus for CadenceSpi {
                 }
                 core::hint::spin_loop();
             }
-            
+
             let in_byte = self.read_rx() as u8;
             if i < rx.len() {
                 rx[i] = in_byte;
             }
         }
-        
+
         Ok(())
     }
 
@@ -142,19 +142,19 @@ impl SpiBus for CadenceSpi {
     fn set_mode(&self, mode: SpiMode) -> Result<(), SpiError> {
         let _guard = self.state.lock();
         let mut cr = self.read_u32(CDNS_SPI_CR);
-        
+
         if mode.cpol() {
             cr |= CDNS_SPI_CR_CPOL;
         } else {
             cr &= !CDNS_SPI_CR_CPOL;
         }
-        
+
         if mode.cpha() {
             cr |= CDNS_SPI_CR_CPHA;
         } else {
             cr &= !CDNS_SPI_CR_CPHA;
         }
-        
+
         self.write_u32(CDNS_SPI_CR, cr);
         Ok(())
     }
@@ -171,12 +171,12 @@ impl SpiBus for CadenceSpi {
         let _guard = self.state.lock();
         let mut cr = self.read_u32(CDNS_SPI_CR);
         cr &= !CDNS_SPI_CR_SSCTRL;
-        
+
         // Cadence uses inverted CS select or fully decoded?
         // Let's use basic shifting for now.
         let ss_mask = !(1 << cs) & 0xF;
         cr |= (ss_mask << 10) & CDNS_SPI_CR_SSCTRL;
-        
+
         self.write_u32(CDNS_SPI_CR, cr);
         Ok(())
     }

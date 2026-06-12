@@ -14,6 +14,11 @@ use narf_capabilities::{Cap, Write};
 const INTEL_PCI_VENDOR: u16 = 0x8086;
 const INTEL_ICH_AC97: u16 = 0x2415;
 
+// Basic INTEL8X0 registers
+const GLOB_CNT: u64 = 0x2C;
+const GLOB_STA: u64 = 0x30;
+const GLOB_CNT_AC97COLD: u32 = 1 << 1;
+
 #[derive(Debug)]
 pub struct Intel8x0 {
     mmio: MmioRegion,
@@ -21,16 +26,56 @@ pub struct Intel8x0 {
 
 impl Intel8x0 {
     pub fn new(mmio: MmioRegion) -> Self {
-        Self { mmio }
+        let audio = Self { mmio };
+        audio.init();
+        audio
+    }
+
+    fn read_u32(&self, offset: u64) -> u32 {
+        unsafe { self.mmio.read32(offset) }
+    }
+
+    fn write_u32(&self, offset: u64, val: u32) {
+        unsafe { self.mmio.write32(offset, val) }
+    }
+
+    fn init(&self) {
+        // Perform AC97 cold reset
+        let mut cnt = self.read_u32(GLOB_CNT);
+        cnt &= !GLOB_CNT_AC97COLD;
+        self.write_u32(GLOB_CNT, cnt);
+
+        let mut timeout = 10_000;
+        while timeout > 0 {
+            core::hint::spin_loop();
+            timeout -= 1;
+        }
+
+        cnt |= GLOB_CNT_AC97COLD;
+        self.write_u32(GLOB_CNT, cnt);
+
+        // Wait for ready
+        timeout = 100_000;
+        while (self.read_u32(GLOB_STA) & 0x1) == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
-pub fn probe(device: BusDevice, _cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
-    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } { // intel8x0 uses BAR0
+pub fn probe(
+    device: BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), narf_bus::ProbeError> {
+    let mmio = match unsafe { narf_bus::map_bar(&device, 0) } {
+        // intel8x0 uses BAR0
         Ok(m) => m,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
-    
+
     let _audio = Arc::new(Intel8x0::new(mmio));
     // Would normally register to ALSA/sound registry here
     Ok(())

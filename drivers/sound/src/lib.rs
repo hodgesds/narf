@@ -72,14 +72,14 @@ pub mod codec;
 pub mod devfs_bridge;
 pub mod format;
 pub mod hda;
-pub mod mixer;
-pub mod pcm;
 pub mod intel8x0;
 pub mod max98357a;
-pub mod rt5645;
-pub mod snd_sof;
+pub mod mixer;
+pub mod pcm;
 #[cfg(feature = "linux-compat")]
 pub mod procfs_bridge;
+pub mod rt5645;
+pub mod snd_sof;
 pub mod sysfs_bridge;
 
 mod tests;
