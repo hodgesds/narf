@@ -1946,6 +1946,27 @@ pub enum Syscall {
 
     /// `fremovexattr(fd, name)`. Linux (x86_64=199, aarch64=16).
     Fremovexattr,
+
+    /// `creat(path, mode)` — create+open for writing (legacy; aarch64
+    /// uses openat). Linux (x86_64=85).
+    Creat,
+
+    /// `lchown(path, uid, gid)` — chown without following a final
+    /// symlink (legacy). Linux (x86_64=94).
+    Lchown,
+
+    /// `utime(path, times)` — set file access/modification times
+    /// (legacy). Linux (x86_64=132).
+    Utime,
+
+    /// `utimes(path, times)` — set file times with microsecond
+    /// granularity (legacy). Linux (x86_64=235).
+    Utimes,
+
+    /// `utimensat(dirfd, path, times, flags)` — set file times; modern
+    /// musl routes utime/utimes/futimens through this. Linux
+    /// (x86_64=280, aarch64=88).
+    Utimensat,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2089,6 +2110,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Removexattr, 197),
     (Syscall::Lremovexattr, 198),
     (Syscall::Fremovexattr, 199),
+    (Syscall::Creat, 85),
+    (Syscall::Lchown, 94),
+    (Syscall::Utime, 132),
+    (Syscall::Utimes, 235),
+    (Syscall::Utimensat, 280),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2466,6 +2492,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Removexattr, 14),
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
+    (Syscall::Utimensat, 88),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

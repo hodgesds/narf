@@ -4690,6 +4690,83 @@ fn sys_fremovexattr(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// `creat(path, mode)` — equivalent to
+/// `open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)`. Reshapes into `sys_open`'s
+/// `(path_ptr, path_len, mnt_ptr, mnt_len, flags)` ABI, mirroring sys_openat.
+fn sys_creat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let path_uptr = a.arg0;
+    let path_str = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
+    };
+    const O_CREAT_WRONLY_TRUNC: u64 = 0o100 | 0o1 | 0o1000;
+    struct Reshape<'a> {
+        inner: &'a mut dyn TrapContext,
+        args: SyscallArgs,
+    }
+    impl<'a> TrapContext for Reshape<'a> {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, ret: SyscallReturn) {
+            self.inner.set_return(ret);
+        }
+        fn user_rsp(&self) -> u64 {
+            self.inner.user_rsp()
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+            self.inner.redirect_to_kernel(rip, rsp)
+        }
+    }
+    let proxy_args = SyscallArgs {
+        arg0: path_uptr,
+        arg1: path_str.len() as u64,
+        arg2: 0,
+        arg3: 0,
+        arg4: O_CREAT_WRONLY_TRUNC,
+        arg5: 0,
+    };
+    let mut proxy = Reshape {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_open(&mut proxy);
+}
+
+/// `utime(path, times)` / `utimes(path, times)` — set a file's access and
+/// modification times. NARF's in-memory FSes don't track precise file
+/// times yet, so this validates the path and accepts (no-op).
+fn sys_utime_noop(ctx: &mut dyn TrapContext) {
+    match copy_user_cstr(ctx.args().arg0, 4096) {
+        Some(_) => ctx.set_return(SyscallReturn::ok(0)),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
+/// `utimensat(dirfd, path, times, flags)` — modern entry that musl routes
+/// utime/utimes/futimens through. `path` (arg1) may be NULL (the
+/// futimens-on-dirfd form), which we accept; otherwise validate it.
+/// Accept (no-op) since file times aren't tracked yet.
+fn sys_utimensat(ctx: &mut dyn TrapContext) {
+    let path_ptr = ctx.args().arg1;
+    if path_ptr == 0 {
+        ctx.set_return(SyscallReturn::ok(0)); // futimens(dirfd) form
+        return;
+    }
+    match copy_user_cstr(path_ptr, 4096) {
+        Some(_) => ctx.set_return(SyscallReturn::ok(0)),
+        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    }
+}
+
 /// `readahead(fd, offset, count)` — page-cache populate hint. NARF's
 /// in-memory FSes need no readahead; accept for a valid fd, EBADF
 /// otherwise.
@@ -16217,6 +16294,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "fremovexattr",
         RawFnHandler(sys_fremovexattr),
     );
+    // Batch 14: filesystem misc (legacy x86_64-only entries).
+    table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
+    // lchown shares the chmod/chown path handler (no symlink-follow
+    // distinction in NARF).
+    table.install_raw(
+        Syscall::Lchown,
+        "lchown",
+        RawFnHandler(sys_access_chmod_chown),
+    );
+    table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime_noop));
+    table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utime_noop));
+    table.install_raw(Syscall::Utimensat, "utimensat", RawFnHandler(sys_utimensat));
     table.install_raw(Syscall::Readahead, "readahead", RawFnHandler(sys_readahead));
     table.install_raw(
         Syscall::SyncFileRange,
