@@ -1435,6 +1435,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("sched_smoke", "sched-ok"),
         ("mcore_smoke", "mcore-ok"),
         ("sync_smoke", "sync-ok"),
+        // Linux-compat round 5: dup3+fadvise64+mlock2, robust lists, renameat2, pidfd_send_signal.
+        ("dup3fam_smoke", "dup3-ok"),
+        ("robust_smoke", "robust-ok"),
+        ("renameat2_smoke", "renameat2-ok"),
+        ("pidfdsig_smoke", "pidfdsig-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

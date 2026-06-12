@@ -3395,6 +3395,14 @@ fn boot_userspace_init() {
                 ("sched_smoke", narf_verification::NARF_SCHED_SMOKE_ELF),
                 ("mcore_smoke", narf_verification::NARF_MCORE_SMOKE_ELF),
                 ("sync_smoke", narf_verification::NARF_SYNC_SMOKE_ELF),
+                // Linux-compat round 5: dup3+fadvise64+mlock2 / robust lists / renameat2 / pidfd_send_signal.
+                ("dup3fam_smoke", narf_verification::NARF_DUP3FAM_SMOKE_ELF),
+                ("robust_smoke", narf_verification::NARF_ROBUST_SMOKE_ELF),
+                (
+                    "renameat2_smoke",
+                    narf_verification::NARF_RENAMEAT2_SMOKE_ELF,
+                ),
+                ("pidfdsig_smoke", narf_verification::NARF_PIDFDSIG_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
