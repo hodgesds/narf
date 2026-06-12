@@ -1648,6 +1648,43 @@ pub enum Syscall {
     /// `clock_getres(clockid, timespec*)` — report a clock's
     /// resolution. Linux `clock_getres` (x86_64=229, aarch64=114).
     ClockGetres,
+
+    /// `close_range(first, last, flags)` — close every open fd in
+    /// `[first, last]` (or set FD_CLOEXEC with CLOSE_RANGE_CLOEXEC).
+    /// Linux `close_range` (436 on both arches).
+    CloseRange,
+
+    /// `sched_getscheduler(pid)` — report the scheduling policy
+    /// (always SCHED_OTHER here). Linux (x86_64=145, aarch64=120).
+    SchedGetScheduler,
+
+    /// `sched_setscheduler(pid, policy, param)` — accept a normal
+    /// policy. Linux (x86_64=144, aarch64=119).
+    SchedSetScheduler,
+
+    /// `sched_rr_get_interval(pid, timespec*)` — RR quantum (0 for the
+    /// cooperative policy). Linux (x86_64=148, aarch64=127).
+    SchedRrGetInterval,
+
+    /// `msync(addr, len, flags)` — flush a mapping. Anonymous mappings
+    /// have nothing to write back. Linux (x86_64=26, aarch64=227).
+    Msync,
+
+    /// `mincore(addr, len, vec)` — report page residency for a mapped
+    /// range. Linux (x86_64=27, aarch64=232).
+    Mincore,
+
+    /// `sync()` — flush all filesystems (no-op). Linux
+    /// (x86_64=162, aarch64=81).
+    Sync,
+
+    /// `syncfs(fd)` — flush one filesystem (no-op). Linux
+    /// (x86_64=306, aarch64=267).
+    Syncfs,
+
+    /// `personality(persona)` — report/accept the execution domain
+    /// (always PER_LINUX). Linux (x86_64=135, aarch64=92).
+    Personality,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1716,6 +1753,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Splice, 275),
     (Syscall::Membarrier, 324),
     (Syscall::ClockGetres, 229),
+    (Syscall::CloseRange, 436),
+    (Syscall::SchedGetScheduler, 145),
+    (Syscall::SchedSetScheduler, 144),
+    (Syscall::SchedRrGetInterval, 148),
+    (Syscall::Msync, 26),
+    (Syscall::Mincore, 27),
+    (Syscall::Sync, 162),
+    (Syscall::Syncfs, 306),
+    (Syscall::Personality, 135),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2015,6 +2061,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Splice, 76),
     (Syscall::Membarrier, 283),
     (Syscall::ClockGetres, 114),
+    (Syscall::CloseRange, 436),
+    (Syscall::SchedGetScheduler, 120),
+    (Syscall::SchedSetScheduler, 119),
+    (Syscall::SchedRrGetInterval, 127),
+    (Syscall::Msync, 227),
+    (Syscall::Mincore, 232),
+    (Syscall::Sync, 81),
+    (Syscall::Syncfs, 267),
+    (Syscall::Personality, 92),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

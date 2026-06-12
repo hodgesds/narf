@@ -3986,6 +3986,140 @@ fn sys_membarrier(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(r));
 }
 
+/// `close_range(first, last, flags)` — close every open fd in the
+/// inclusive range, or mark them FD_CLOEXEC with CLOSE_RANGE_CLOEXEC.
+fn sys_close_range(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let first = a.arg0 as u32;
+    let last = a.arg1 as u32;
+    let flags = a.arg2 as u32;
+    const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+    const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+    if first > last || flags & !(CLOSE_RANGE_CLOEXEC | CLOSE_RANGE_UNSHARE) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let cloexec = flags & CLOSE_RANGE_CLOEXEC != 0;
+    let task = current_task_id();
+    fd::with_table(task, |t| t.close_range(first, last, cloexec));
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `sched_getscheduler(pid)` — NARF runs one cooperative policy,
+/// reported as SCHED_OTHER (0).
+fn sys_sched_getscheduler(_ctx: &mut dyn TrapContext) {
+    _ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `sched_setscheduler(pid, policy, param)` — accept any of the
+/// standard policy numbers (the cooperative scheduler doesn't
+/// distinguish them); reject unknown ones with EINVAL.
+fn sys_sched_setscheduler(ctx: &mut dyn TrapContext) {
+    let policy = ctx.args().arg1 as i32;
+    // SCHED_OTHER=0, FIFO=1, RR=2, BATCH=3, IDLE=5.
+    if matches!(policy, 0 | 1 | 2 | 3 | 5) {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+    }
+}
+
+/// `sched_rr_get_interval(pid, timespec*)` — the cooperative policy
+/// has no round-robin quantum, so report `{0, 0}`.
+fn sys_sched_rr_get_interval(ctx: &mut dyn TrapContext) {
+    let buf = ctx.args().arg1;
+    if buf != 0 {
+        let kbuf = [0u8; 16]; // tv_sec = 0, tv_nsec = 0
+                              // SAFETY: `buf` is the user `timespec*` (non-zero); copy_to_user
+                              // range-validates the 16-byte write.
+        if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `msync(addr, len, flags)` — anonymous mappings have nothing to
+/// write back; just validate the range starts inside a mapping.
+fn sys_msync(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let addr = a.arg0;
+    if addr & 0xFFF != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let mapped = current_address_space()
+        .map(|as_ref| as_ref.lookup(VirtAddr::new(addr)).is_some())
+        .unwrap_or(false);
+    if mapped {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+    }
+}
+
+/// `mincore(addr, len, vec)` — write one residency byte per page into
+/// `vec` (bit 0 set when the page is backed by a frame). Returns
+/// ENOMEM if any page in the range is unmapped.
+fn sys_mincore(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let addr = a.arg0;
+    let len = a.arg1 as usize;
+    let vec_ptr = a.arg2;
+    if addr & 0xFFF != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(x) => x,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let pages = len.div_ceil(4096);
+    let mut out = alloc::vec![0u8; pages];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let va = VirtAddr::new(addr + (i as u64) * 4096);
+        match as_ref.lookup(va) {
+            Some(region) => {
+                let idx = ((va.as_u64() - region.base.as_u64()) >> 12) as usize;
+                let resident = region.phys.get(idx).map(|p| p.raw() != 0).unwrap_or(false);
+                *slot = resident as u8;
+            }
+            None => {
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                return;
+            }
+        }
+    }
+    // SAFETY: `vec_ptr` is the user residency-vector pointer; copy_to_user
+    // range-validates the `pages`-byte write.
+    if unsafe { copy_to_user(vec_ptr, &out) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `sync()` — flush all filesystems. NARF's in-memory FSes have no
+/// write-back, so this is a no-op.
+fn sys_sync(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `syncfs(fd)` — flush the filesystem backing `fd`. No-op (see sync).
+fn sys_syncfs(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `personality(persona)` — NARF only implements the default Linux
+/// execution domain (PER_LINUX = 0); report it and ignore changes.
+fn sys_personality(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── FB syscalls ────────────────────────────────────────────────────
 //
 // Five syscalls (Connect/Info/RingMap/FlushWait/Disconnect) form the
@@ -13866,6 +14000,35 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::ClockGetres,
         "clock_getres",
         RawFnHandler(sys_clock_getres),
+    );
+    table.install_raw(
+        Syscall::CloseRange,
+        "close_range",
+        RawFnHandler(sys_close_range),
+    );
+    table.install_raw(
+        Syscall::SchedGetScheduler,
+        "sched_getscheduler",
+        RawFnHandler(sys_sched_getscheduler),
+    );
+    table.install_raw(
+        Syscall::SchedSetScheduler,
+        "sched_setscheduler",
+        RawFnHandler(sys_sched_setscheduler),
+    );
+    table.install_raw(
+        Syscall::SchedRrGetInterval,
+        "sched_rr_get_interval",
+        RawFnHandler(sys_sched_rr_get_interval),
+    );
+    table.install_raw(Syscall::Msync, "msync", RawFnHandler(sys_msync));
+    table.install_raw(Syscall::Mincore, "mincore", RawFnHandler(sys_mincore));
+    table.install_raw(Syscall::Sync, "sync", RawFnHandler(sys_sync));
+    table.install_raw(Syscall::Syncfs, "syncfs", RawFnHandler(sys_syncfs));
+    table.install_raw(
+        Syscall::Personality,
+        "personality",
+        RawFnHandler(sys_personality),
     );
     table.install_raw(
         Syscall::Select,

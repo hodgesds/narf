@@ -146,6 +146,30 @@ impl FdTable {
         }
     }
 
+    /// `close_range(first, last, flags)` — close every open fd in the
+    /// inclusive range `[first, last]`. With `cloexec` set
+    /// (CLOSE_RANGE_CLOEXEC) the fds are marked FD_CLOEXEC instead of
+    /// being closed. Out-of-range bounds are clamped to the table.
+    pub fn close_range(&mut self, first: u32, last: u32, cloexec: bool) {
+        let lo = first as usize;
+        if lo >= self.slots.len() {
+            return;
+        }
+        let hi = (last as usize).min(self.slots.len() - 1);
+        if hi < lo {
+            return;
+        }
+        for slot in self.slots[lo..=hi].iter_mut() {
+            if let Some(entry) = slot {
+                if cloexec {
+                    entry.flags |= FD_CLOEXEC;
+                } else {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
     /// Borrow the entry at `fd` without removing it.
     pub fn get(&self, fd: u32) -> Option<&FdEntry> {
         self.slots.get(fd as usize).and_then(Option::as_ref)
