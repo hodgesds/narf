@@ -1450,6 +1450,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("itimer_smoke", "itimer-ok"),
         ("xattr_smoke", "xattr-ok"),
         ("fhint_smoke", "fhint-ok"),
+        // Linux-compat round 8: mq_*, inotify, pkey_*, process_vm_*.
+        ("mq_smoke", "mq-ok"),
+        ("inotify_smoke", "inotify-ok"),
+        ("pkey_smoke", "pkey-ok"),
+        ("pvm_smoke", "pvm-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

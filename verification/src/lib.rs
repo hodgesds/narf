@@ -3910,6 +3910,26 @@ define_smoke_elf!(
     "NARF_FHINT_SMOKE_ELF_X86_64",
     "NARF_FHINT_SMOKE_ELF_AARCH64"
 );
+define_smoke_elf!(
+    NARF_MQ_SMOKE_ELF,
+    "NARF_MQ_SMOKE_ELF_X86_64",
+    "NARF_MQ_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_INOTIFY_SMOKE_ELF,
+    "NARF_INOTIFY_SMOKE_ELF_X86_64",
+    "NARF_INOTIFY_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_PKEY_SMOKE_ELF,
+    "NARF_PKEY_SMOKE_ELF_X86_64",
+    "NARF_PKEY_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_PVM_SMOKE_ELF,
+    "NARF_PVM_SMOKE_ELF_X86_64",
+    "NARF_PVM_SMOKE_ELF_AARCH64"
+);
 
 #[cfg(all(
     target_arch = "x86_64",

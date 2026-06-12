@@ -3413,6 +3413,11 @@ fn boot_userspace_init() {
                 ("itimer_smoke", narf_verification::NARF_ITIMER_SMOKE_ELF),
                 ("xattr_smoke", narf_verification::NARF_XATTR_SMOKE_ELF),
                 ("fhint_smoke", narf_verification::NARF_FHINT_SMOKE_ELF),
+                // Linux-compat round 8: mq_* / inotify / pkey_* / process_vm_*.
+                ("mq_smoke", narf_verification::NARF_MQ_SMOKE_ELF),
+                ("inotify_smoke", narf_verification::NARF_INOTIFY_SMOKE_ELF),
+                ("pkey_smoke", narf_verification::NARF_PKEY_SMOKE_ELF),
+                ("pvm_smoke", narf_verification::NARF_PVM_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
