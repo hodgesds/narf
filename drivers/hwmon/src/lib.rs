@@ -27,6 +27,7 @@ pub mod applesmc;
 pub mod coretemp;
 pub mod dell_smm;
 pub mod it87;
+pub mod jc42;
 pub mod k10temp;
 pub mod nct6775;
 pub mod registry;
@@ -91,6 +92,10 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "hwmon-dell-smm", || {
         #[cfg(target_arch = "x86_64")]
         dell_smm::register_smm_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "hwmon-jc42", || {
+        jc42::register_initcalls();
         InitResult::Ok
     });
     // Stage::Late: sysfs bridge runs after all Stage::Subsys driver probes.

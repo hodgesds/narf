@@ -44,6 +44,7 @@ pub mod ec_hotkeys;
 pub mod fan;
 pub mod intel_hid;
 pub mod ipmi;
+pub mod itco_wdt;
 #[cfg(target_arch = "x86_64")]
 pub mod lid;
 pub mod smbus;
@@ -177,6 +178,10 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "ipmi", || {
         ipmi::register_initcalls();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "itco_wdt", || {
+        itco_wdt::register_initcalls();
         InitResult::Ok
     });
     #[cfg(target_arch = "x86_64")]
