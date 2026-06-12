@@ -3477,6 +3477,8 @@ fn boot_userspace_init() {
                 ("vio_smoke", narf_verification::NARF_VIO_SMOKE_ELF),
                 // Linux-compat round 11: System V semaphores + message queues.
                 ("sysvipc_smoke", narf_verification::NARF_SYSVIPC_SMOKE_ELF),
+                // Linux-compat round 12: System V shared memory.
+                ("shm_smoke", narf_verification::NARF_SHM_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
