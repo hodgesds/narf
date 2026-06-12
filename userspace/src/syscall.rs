@@ -1771,6 +1771,60 @@ pub enum Syscall {
     /// `sync_file_range(fd, offset, nbytes, flags)` — flush a file range
     /// (no-op). Linux (x86_64=277, aarch64=84).
     SyncFileRange,
+
+    /// `mq_open(name, oflag, mode, attr)` — open/create a POSIX message
+    /// queue. Linux (x86_64=240, aarch64=180).
+    MqOpen,
+
+    /// `mq_unlink(name)` — remove a named message queue.
+    /// Linux (x86_64=241, aarch64=181).
+    MqUnlink,
+
+    /// `mq_timedsend(mqd, msg, len, prio, timeout)` — enqueue a message.
+    /// Linux (x86_64=242, aarch64=182).
+    MqTimedsend,
+
+    /// `mq_timedreceive(mqd, msg, len, prio, timeout)` — dequeue the
+    /// highest-priority message. Linux (x86_64=243, aarch64=183).
+    MqTimedreceive,
+
+    /// `mq_getsetattr(mqd, newattr, oldattr)` — read/replace queue attrs.
+    /// Linux (x86_64=245, aarch64=185).
+    MqGetsetattr,
+
+    /// `inotify_init1(flags)` — create an inotify instance fd.
+    /// Linux (x86_64=294, aarch64=26).
+    InotifyInit1,
+
+    /// `inotify_add_watch(fd, path, mask)` — add/modify a watch.
+    /// Linux (x86_64=254, aarch64=27).
+    InotifyAddWatch,
+
+    /// `inotify_rm_watch(fd, wd)` — remove a watch.
+    /// Linux (x86_64=255, aarch64=28).
+    InotifyRmWatch,
+
+    /// `pkey_mprotect(addr, len, prot, pkey)` — mprotect tagging a range
+    /// with a protection key. Linux (x86_64=329, aarch64=288).
+    PkeyMprotect,
+
+    /// `pkey_alloc(flags, access_rights)` — allocate a protection key.
+    /// Linux (x86_64=330, aarch64=289).
+    PkeyAlloc,
+
+    /// `pkey_free(pkey)` — free a protection key.
+    /// Linux (x86_64=331, aarch64=290).
+    PkeyFree,
+
+    /// `process_vm_readv(pid, liov, liovcnt, riov, riovcnt, flags)` —
+    /// copy from a target process's address space into local iovecs.
+    /// Linux (x86_64=310, aarch64=270).
+    ProcessVmReadv,
+
+    /// `process_vm_writev(pid, liov, liovcnt, riov, riovcnt, flags)` —
+    /// copy local iovecs into a target process's address space.
+    /// Linux (x86_64=311, aarch64=271).
+    ProcessVmWritev,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1869,6 +1923,19 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Listxattr, 194),
     (Syscall::Readahead, 187),
     (Syscall::SyncFileRange, 277),
+    (Syscall::MqOpen, 240),
+    (Syscall::MqUnlink, 241),
+    (Syscall::MqTimedsend, 242),
+    (Syscall::MqTimedreceive, 243),
+    (Syscall::MqGetsetattr, 245),
+    (Syscall::InotifyInit1, 294),
+    (Syscall::InotifyAddWatch, 254),
+    (Syscall::InotifyRmWatch, 255),
+    (Syscall::PkeyMprotect, 329),
+    (Syscall::PkeyAlloc, 330),
+    (Syscall::PkeyFree, 331),
+    (Syscall::ProcessVmReadv, 310),
+    (Syscall::ProcessVmWritev, 311),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2199,6 +2266,19 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Listxattr, 11),
     (Syscall::Readahead, 213),
     (Syscall::SyncFileRange, 84),
+    (Syscall::MqOpen, 180),
+    (Syscall::MqUnlink, 181),
+    (Syscall::MqTimedsend, 182),
+    (Syscall::MqTimedreceive, 183),
+    (Syscall::MqGetsetattr, 185),
+    (Syscall::InotifyInit1, 26),
+    (Syscall::InotifyAddWatch, 27),
+    (Syscall::InotifyRmWatch, 28),
+    (Syscall::PkeyMprotect, 288),
+    (Syscall::PkeyAlloc, 289),
+    (Syscall::PkeyFree, 290),
+    (Syscall::ProcessVmReadv, 270),
+    (Syscall::ProcessVmWritev, 271),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

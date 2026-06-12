@@ -432,6 +432,20 @@ pub trait FileOps: Send + Sync {
     fn is_ptmx_clone(&self) -> bool {
         false
     }
+
+    /// If this file is a POSIX message-queue descriptor (from
+    /// `mq_open`), return its queue id. Used by the `mq_*` syscalls to
+    /// resolve the mqd to a queue without a downcast. Default: `None`.
+    fn mq_queue_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// If this file is an inotify instance (from `inotify_init1`),
+    /// return its instance id. Used by `inotify_add_watch` /
+    /// `inotify_rm_watch` to resolve the fd. Default: `None`.
+    fn inotify_instance(&self) -> Option<u64> {
+        None
+    }
 }
 
 // ── POSIX poll(2) event bits ────────────────────────────────────
