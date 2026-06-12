@@ -9558,6 +9558,221 @@ fn sys_msgget(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ns.msgget(key) as u64));
 }
 
+// ── System V shared memory (linux-compat) ────────────────────────────
+//
+// Real shared segments backed by the narf-shmem frame registry (reached
+// through the syscall vtable). `shmat` maps a segment's physical frames
+// into the caller's address space; a second attach of the same id maps
+// the same frames, so writes through one attachment are visible through
+// the other — genuine sharing, exactly like Linux. Supersedes the
+// container id-by-key `shmget` in a linux-compat build.
+
+#[cfg(feature = "linux-compat")]
+struct ShmSegment {
+    handle: u64,
+    key: u32,
+    len: u64,
+}
+
+#[cfg(feature = "linux-compat")]
+static SHM_SEGMENTS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, ShmSegment>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "linux-compat")]
+const IPC_CREAT: u64 = 0o1000;
+#[cfg(feature = "linux-compat")]
+const IPC_EXCL: u64 = 0o2000;
+#[cfg(feature = "linux-compat")]
+const IPC_RMID: u64 = 0;
+#[cfg(feature = "linux-compat")]
+const IPC_64: u64 = 0x100;
+#[cfg(feature = "linux-compat")]
+const SHM_RDONLY: u64 = 0o10000;
+
+/// `shmget(key, size, shmflg)` — create or look up a shared segment with
+/// real frame backing.
+#[cfg(feature = "linux-compat")]
+fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let key = a.arg0 as u32;
+    let size = a.arg1;
+    let flg = a.arg2;
+    let mut g = SHM_SEGMENTS.lock();
+    let segs = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    if key != 0 {
+        if let Some((id, _)) = segs.iter().find(|(_, s)| s.key == key) {
+            let id = *id;
+            if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
+                ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(id));
+            return;
+        }
+        if flg & IPC_CREAT == 0 {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // ENOENT
+            return;
+        }
+    }
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let handle = (v.create)(current_task_id(), size);
+    if handle == 0 {
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        return;
+    }
+    let shmid = SHM_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    segs.insert(
+        shmid,
+        ShmSegment {
+            handle,
+            key,
+            len: size,
+        },
+    );
+    ctx.set_return(SyscallReturn::ok(shmid));
+}
+
+/// `shmat(shmid, shmaddr, shmflg)` — map the segment's frames into the AS.
+#[cfg(feature = "linux-compat")]
+fn sys_shmat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let shmid = a.arg0;
+    let flg = a.arg2;
+    let (handle, len) = {
+        let g = SHM_SEGMENTS.lock();
+        match g.as_ref().and_then(|m| m.get(&shmid)) {
+            Some(s) => (s.handle, s.len),
+            None => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+        }
+    };
+    let v = match shmem_vtable() {
+        Some(v) => v,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    if !(v.frames)(handle, &mut frames_raw) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
+        .into_iter()
+        .map(narf_memory::PhysAddr::new)
+        .collect();
+    // SHARED marks the frames as borrowed (narf-shmem owns them), so a
+    // second shmat of the same segment may alias them and neither unmap
+    // nor AS-drop frees them.
+    let mut perms = RegionPerms::READ | RegionPerms::SHARED;
+    if flg & SHM_RDONLY == 0 {
+        perms = perms | RegionPerms::WRITE;
+    }
+    let base = as_ref.reserve_mmap_va(len);
+    if as_ref
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len,
+            perms,
+            phys: phys_list,
+        })
+        .is_err()
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // SAFETY: `as_ref` is the calling task's AddressSpace (valid root); the
+    // region was just registered, so materialize installs only its PTEs.
+    if unsafe { as_ref.materialize() }.is_err() {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(base));
+}
+
+/// `shmdt(shmaddr)` — detach (unmap) a previously-attached segment.
+#[cfg(feature = "linux-compat")]
+fn sys_shmdt(ctx: &mut dyn TrapContext) {
+    let addr = ctx.args().arg0;
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    match as_ref.unmap_region(VirtAddr::new(addr)) {
+        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+    }
+}
+
+/// `shmctl(shmid, cmd, buf)`. IPC_RMID destroys the segment; IPC_STAT
+/// reports the segment size; others are accepted.
+#[cfg(feature = "linux-compat")]
+fn sys_shmctl(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let shmid = a.arg0;
+    let cmd = a.arg1 & !IPC_64;
+    match cmd {
+        IPC_RMID => {
+            let removed = {
+                let mut g = SHM_SEGMENTS.lock();
+                g.as_mut().and_then(|m| m.remove(&shmid))
+            };
+            match removed {
+                Some(seg) => {
+                    if let Some(v) = shmem_vtable() {
+                        (v.destroy)(seg.handle);
+                    }
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                None => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+            }
+        }
+        2 => {
+            // IPC_STAT: report shm_segsz. On x86_64 the kernel's
+            // shmid64_ds places shm_segsz right after struct ipc64_perm
+            // (48 bytes). We fill just the size; the rest stays
+            // caller-zeroed.
+            let len = {
+                let g = SHM_SEGMENTS.lock();
+                g.as_ref().and_then(|m| m.get(&shmid)).map(|s| s.len)
+            };
+            match len {
+                Some(len) if a.arg2 != 0 => {
+                    // SAFETY: a.arg2 is the user struct shmid_ds*; copy_to_user
+                    // validates the 8-byte shm_segsz write at offset 48.
+                    let _ = unsafe { copy_to_user(a.arg2.wrapping_add(48), &len.to_le_bytes()) };
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                Some(_) => ctx.set_return(SyscallReturn::ok(0)),
+                None => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
+            }
+        }
+        _ => ctx.set_return(SyscallReturn::ok(0)),
+    }
+}
+
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
@@ -15644,6 +15859,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             "msgctl",
             RawFnHandler(crate::sysvipc::sys_msgctl),
         );
+        // Batch 12: System V shared memory with real frame backing. The
+        // linux-compat shmget supersedes the container id-by-key version.
+        table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget_compat));
+        table.install_raw(Syscall::Shmat, "shmat", RawFnHandler(sys_shmat));
+        table.install_raw(Syscall::Shmdt, "shmdt", RawFnHandler(sys_shmdt));
+        table.install_raw(Syscall::Shmctl, "shmctl", RawFnHandler(sys_shmctl));
     }
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
     table.install_raw(

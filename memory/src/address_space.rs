@@ -53,6 +53,17 @@ impl RegionPerms {
     /// strips it the same way.
     pub const STACK_GUARD: RegionPerms = RegionPerms(1 << 9);
 
+    /// Internal flag: this region's frames are *borrowed*, not owned by
+    /// the address space — they belong to an external registry (e.g. the
+    /// narf-shmem store backing System V `shmat`). Two regions in the
+    /// same AS may legitimately alias the same borrowed frames (a second
+    /// `shmat` of the same segment), so `map_region` skips its
+    /// duplicate-phys guard, and neither `unmap_region_pages` nor the AS
+    /// drop frees the frames (the owning registry does, on `IPC_RMID` /
+    /// process-exit). Bit 10; stripped by the POSIX prot mask like the
+    /// other internal flags.
+    pub const SHARED: RegionPerms = RegionPerms(1 << 10);
+
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
     /// Used by callers that want to compare permissions without
     /// caring about the internal LOCKED bit.
@@ -237,7 +248,13 @@ impl AddressSpace {
             // Diagnostic: catch the source of the double-free we
             // see in `AddressSpace::drop` — two regions in the
             // same AS pointing at the same physical frame would
-            // be unmapped twice, double-freeing the phys.
+            // be unmapped twice, double-freeing the phys. SHARED
+            // regions borrow their frames (the registry owns them and
+            // never lets the AS free them), so aliasing is expected and
+            // safe — skip the guard for them.
+            if region.perms.contains(RegionPerms::SHARED) {
+                continue;
+            }
             for new_p in &region.phys {
                 if new_p.raw() == 0 {
                     continue;
@@ -366,6 +383,11 @@ impl AddressSpace {
             // already back in the allocator.
             // SAFETY: Valid memory or trusted environment
             if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+                // Borrowed (SHARED) frames belong to an external
+                // registry — unmap the PTE but never free the phys.
+                if region.perms.contains(RegionPerms::SHARED) {
+                    continue;
+                }
                 // Skip phys that's registered as a page-table
                 // frame — `free_user_pml4_tree` will reclaim it
                 // on its own walk. Freeing here would double-free.
@@ -389,6 +411,11 @@ impl AddressSpace {
             let v = VirtAddr::new(region.base.as_u64() + (i << 12));
             // SAFETY: see x86_64 variant.
             if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+                // Borrowed (SHARED) frames belong to an external registry
+                // — unmap the PTE but never free the phys.
+                if region.perms.contains(RegionPerms::SHARED) {
+                    continue;
+                }
                 free_frame(PhysFrame::new(phys));
             }
         }

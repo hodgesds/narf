@@ -1905,6 +1905,18 @@ pub enum Syscall {
     /// `msgctl(msqid, cmd, buf)` — System V message-queue control.
     /// Linux (x86_64=71, aarch64=187).
     Msgctl,
+
+    /// `shmat(shmid, shmaddr, shmflg)` — attach a System V shared-memory
+    /// segment into the address space. Linux (x86_64=30, aarch64=196).
+    Shmat,
+
+    /// `shmdt(shmaddr)` — detach a shared-memory segment.
+    /// Linux (x86_64=67, aarch64=197).
+    Shmdt,
+
+    /// `shmctl(shmid, cmd, buf)` — System V shared-memory control.
+    /// Linux (x86_64=31, aarch64=195).
+    Shmctl,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2036,6 +2048,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Msgsnd, 69),
     (Syscall::Msgrcv, 70),
     (Syscall::Msgctl, 71),
+    (Syscall::Shmat, 30),
+    (Syscall::Shmdt, 67),
+    (Syscall::Shmctl, 31),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2401,6 +2416,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Msgsnd, 189),
     (Syscall::Msgrcv, 188),
     (Syscall::Msgctl, 187),
+    (Syscall::Shmat, 196),
+    (Syscall::Shmdt, 197),
+    (Syscall::Shmctl, 195),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
