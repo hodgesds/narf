@@ -16,6 +16,8 @@ pub mod class_blk;
 pub mod console_pci;
 pub mod fs_pci;
 pub mod gpu_pci;
+pub mod i2c_pci;
+pub mod gpio_pci;
 pub mod input_pci;
 pub mod iommu_pci;
 pub mod net_pci;
@@ -57,6 +59,14 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-gpu-pci", || {
         gpu_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-i2c-pci", || {
+        i2c_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-gpio-pci", || {
+        gpio_pci::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "virtio-snd-pci", || {

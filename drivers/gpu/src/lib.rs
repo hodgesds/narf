@@ -44,6 +44,10 @@ pub enum GpuFamily {
     Nvidia,
     /// ASPEED AST2400/2500 BMC basic display.
     Aspeed,
+    /// QXL Virtual GPU.
+    Qxl,
+    /// VMware SVGA II Virtual GPU.
+    VmwareSvga,
 }
 
 /// Display mode descriptor.
@@ -186,6 +190,8 @@ pub mod nvidia_gpu_falcon;
 pub mod nvidia_gpu_fifo;
 pub mod nvidia_gpu_gsp;
 pub mod nvidia_gpu_pmc;
+pub mod qxl;
+pub mod vmware_svga;
 
 mod tests;
 
@@ -221,6 +227,14 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "nvidia-gpu-pci", || {
         nvidia_gpu::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "qxl-gpu-pci", || {
+        qxl::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "vmware-svga-pci", || {
+        vmware_svga::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Late, "intel-gpu-dp-bridge", || {
