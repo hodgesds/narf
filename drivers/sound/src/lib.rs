@@ -74,6 +74,10 @@ pub mod format;
 pub mod hda;
 pub mod mixer;
 pub mod pcm;
+pub mod intel8x0;
+pub mod max98357a;
+pub mod rt5645;
+pub mod snd_sof;
 #[cfg(feature = "linux-compat")]
 pub mod procfs_bridge;
 pub mod sysfs_bridge;
@@ -458,6 +462,13 @@ pub fn sound_fs_initcall() {
     crate::devfs_bridge::register_devfs_snd();
     #[cfg(feature = "linux-compat")]
     crate::procfs_bridge::register_procfs_asound();
+}
+
+pub fn register_initcalls() {
+    intel8x0::register_initcalls();
+    max98357a::register_initcalls();
+    rt5645::register_initcalls();
+    snd_sof::register_initcalls();
 }
 
 // ── Test support ────────────────────────────────────────────────────────
