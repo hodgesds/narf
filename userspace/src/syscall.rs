@@ -1881,6 +1881,30 @@ pub enum Syscall {
     /// `vmsplice(fd, iov, nr_segs, flags)` — splice user memory to/from a
     /// pipe. Linux (x86_64=278, aarch64=75).
     Vmsplice,
+
+    /// `semop(semid, sops, nsops)` — System V semaphore operations.
+    /// Linux (x86_64=65, aarch64=193).
+    Semop,
+
+    /// `semctl(semid, semnum, cmd, arg)` — System V semaphore control.
+    /// Linux (x86_64=66, aarch64=191).
+    Semctl,
+
+    /// `semtimedop(semid, sops, nsops, timeout)` — `semop` with a timeout.
+    /// Linux (x86_64=220, aarch64=192).
+    Semtimedop,
+
+    /// `msgsnd(msqid, msgp, msgsz, msgflg)` — send a System V message.
+    /// Linux (x86_64=69, aarch64=189).
+    Msgsnd,
+
+    /// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)` — receive a System V
+    /// message. Linux (x86_64=70, aarch64=188).
+    Msgrcv,
+
+    /// `msgctl(msqid, cmd, buf)` — System V message-queue control.
+    /// Linux (x86_64=71, aarch64=187).
+    Msgctl,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2006,6 +2030,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Pwritev2, 328),
     (Syscall::Tee, 276),
     (Syscall::Vmsplice, 278),
+    (Syscall::Semop, 65),
+    (Syscall::Semctl, 66),
+    (Syscall::Semtimedop, 220),
+    (Syscall::Msgsnd, 69),
+    (Syscall::Msgrcv, 70),
+    (Syscall::Msgctl, 71),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2141,14 +2171,16 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // it requires the per-task NS infrastructure; reading the
     // uts struct works on every NARF build.
     (Syscall::Uname, 63),
-    // setdomainname works on every build (global domainname slot);
-    // the SysV IPC get-by-key syscalls below need the container NS.
+    // setdomainname works on every build (global domainname slot).
     (Syscall::Setdomainname, 171),
-    #[cfg(feature = "container")]
+    // SysV IPC get-by-key: the container build backs these with the IPC
+    // namespace; the linux-compat build backs them (plus the full op
+    // surface) with the self-contained `sysvipc` module.
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 29),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Semget, 64),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Msgget, 68),
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
     #[cfg(feature = "linux-compat")]
@@ -2363,6 +2395,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Pwritev2, 287),
     (Syscall::Tee, 77),
     (Syscall::Vmsplice, 75),
+    (Syscall::Semop, 193),
+    (Syscall::Semctl, 191),
+    (Syscall::Semtimedop, 192),
+    (Syscall::Msgsnd, 189),
+    (Syscall::Msgrcv, 188),
+    (Syscall::Msgctl, 187),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -2393,11 +2431,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // Wave-72 — UTS/IPC syscalls (gated `container`).
     (Syscall::Uname, 160),
     (Syscall::Setdomainname, 162),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 194),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Semget, 190),
-    #[cfg(feature = "container")]
+    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Msgget, 186),
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
     #[cfg(feature = "linux-compat")]

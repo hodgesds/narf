@@ -9542,7 +9542,7 @@ fn sys_shmget(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ns.shmget(key) as u64));
 }
 
-#[cfg(feature = "container")]
+#[cfg(all(feature = "container", not(feature = "linux-compat")))]
 fn sys_semget(ctx: &mut dyn TrapContext) {
     let key = ctx.args().arg0 as u32;
     let task = current_task_id();
@@ -9550,7 +9550,7 @@ fn sys_semget(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(ns.semget(key) as u64));
 }
 
-#[cfg(feature = "container")]
+#[cfg(all(feature = "container", not(feature = "linux-compat")))]
 fn sys_msgget(ctx: &mut dyn TrapContext) {
     let key = ctx.args().arg0 as u32;
     let task = current_task_id();
@@ -15444,8 +15444,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     #[cfg(feature = "container")]
     {
         table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget));
-        table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
-        table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
+        // The self-contained sysvipc module supersedes the id-by-key
+        // semget/msgget in any linux-compat build; only register the
+        // container-namespace versions when linux-compat is absent.
+        #[cfg(not(feature = "linux-compat"))]
+        {
+            table.install_raw(Syscall::Semget, "semget", RawFnHandler(sys_semget));
+            table.install_raw(Syscall::Msgget, "msgget", RawFnHandler(sys_msgget));
+        }
     }
     table.install_raw(Syscall::Getrlimit, "getrlimit", RawFnHandler(sys_getrlimit));
     table.install_raw(Syscall::Setrlimit, "setrlimit", RawFnHandler(sys_setrlimit));
@@ -15593,6 +15599,50 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::InotifyRmWatch,
             "inotify_rm_watch",
             RawFnHandler(crate::mqueue::sys_inotify_rm_watch),
+        );
+        // Batch 11: System V semaphores + message queues. These override
+        // the container-only id-by-key `semget`/`msgget` (registered
+        // earlier) with self-contained backing that works without the
+        // container feature.
+        table.install_raw(
+            Syscall::Semget,
+            "semget",
+            RawFnHandler(crate::sysvipc::sys_semget),
+        );
+        table.install_raw(
+            Syscall::Semop,
+            "semop",
+            RawFnHandler(crate::sysvipc::sys_semop),
+        );
+        table.install_raw(
+            Syscall::Semctl,
+            "semctl",
+            RawFnHandler(crate::sysvipc::sys_semctl),
+        );
+        table.install_raw(
+            Syscall::Semtimedop,
+            "semtimedop",
+            RawFnHandler(crate::sysvipc::sys_semtimedop),
+        );
+        table.install_raw(
+            Syscall::Msgget,
+            "msgget",
+            RawFnHandler(crate::sysvipc::sys_msgget),
+        );
+        table.install_raw(
+            Syscall::Msgsnd,
+            "msgsnd",
+            RawFnHandler(crate::sysvipc::sys_msgsnd),
+        );
+        table.install_raw(
+            Syscall::Msgrcv,
+            "msgrcv",
+            RawFnHandler(crate::sysvipc::sys_msgrcv),
+        );
+        table.install_raw(
+            Syscall::Msgctl,
+            "msgctl",
+            RawFnHandler(crate::sysvipc::sys_msgctl),
         );
     }
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
