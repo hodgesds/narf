@@ -1992,6 +1992,14 @@ pub enum Syscall {
     /// `setfsgid(fsgid)` — set filesystem gid, return the previous one.
     /// Linux (x86_64=123, aarch64=152).
     Setfsgid,
+
+    /// `rt_sigqueueinfo(pid, sig, info)` — queue a signal (with siginfo)
+    /// to a process. Linux (x86_64=129, aarch64=138).
+    RtSigqueueinfo,
+
+    /// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue a signal to a
+    /// specific thread. Linux (x86_64=297, aarch64=240).
+    RtTgsigqueueinfo,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2147,6 +2155,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setregid, 114),
     (Syscall::Setfsuid, 122),
     (Syscall::Setfsgid, 123),
+    (Syscall::RtSigqueueinfo, 129),
+    (Syscall::RtTgsigqueueinfo, 297),
+    // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
+    // map it to the same handler so signalfd is reachable on x86_64.
+    (Syscall::Signalfd, 289),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2531,6 +2544,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setregid, 143),
     (Syscall::Setfsuid, 151),
     (Syscall::Setfsgid, 152),
+    (Syscall::RtSigqueueinfo, 138),
+    (Syscall::RtTgsigqueueinfo, 240),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

@@ -12595,6 +12595,36 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+/// `rt_sigqueueinfo(pid, sig, info)` — queue `sig` to `pid`. NARF's
+/// pending-signal model is a per-task bitmask, so the accompanying
+/// `siginfo_t` payload isn't preserved, but the signal is delivered
+/// exactly like `kill(2)`/`tkill(2)`.
+fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let sig = a.arg1 as u32;
+    if sig >= 32 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let target = pid_to_task_raw(a.arg0).unwrap_or(a.arg0);
+    raise_signal_pending(target, sig); // ORs the pending bit + wakes
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue `sig` to thread
+/// `tid`. Same pending-bitmask delivery as `rt_sigqueueinfo`.
+fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let sig = a.arg2 as u32;
+    if sig >= 32 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let target = pid_to_task_raw(a.arg1).unwrap_or(a.arg1);
+    raise_signal_pending(target, sig);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── futex — minimal scaffold ────────────────────────────────────────
 //
 // Linux futex(2) is the kernel-side primitive backing pthread
@@ -15282,7 +15312,11 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_ok() {
-            mask = u64::from_le_bytes(bytes);
+            // A userspace sigset_t puts signal N at bit (N-1), but NARF's
+            // internal SIGNAL_PENDING bitmap uses bit N (raise_signal_pending
+            // ORs `1<<signum`). Shift so the signalfd mask lines up with the
+            // pending bits it is intersected against.
+            mask = u64::from_le_bytes(bytes) << 1;
         }
     }
     let task = current_task_id();
@@ -16140,6 +16174,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Pause, "pause", RawFnHandler(sys_pause));
     table.install_raw(Syscall::Tgkill, "tgkill", RawFnHandler(sys_tgkill));
     table.install_raw(Syscall::Tkill, "tkill", RawFnHandler(sys_tkill));
+    // Batch 16: signal queueing with siginfo (delivered via the pending
+    // bitmask; the siginfo payload isn't preserved yet).
+    table.install_raw(
+        Syscall::RtSigqueueinfo,
+        "rt_sigqueueinfo",
+        RawFnHandler(sys_rt_sigqueueinfo),
+    );
+    table.install_raw(
+        Syscall::RtTgsigqueueinfo,
+        "rt_tgsigqueueinfo",
+        RawFnHandler(sys_rt_tgsigqueueinfo),
+    );
     table.install_raw(Syscall::Ptrace, "ptrace", RawFnHandler(sys_ptrace));
     table.install_raw(Syscall::Futex, "futex", RawFnHandler(sys_futex));
     table.install_raw(
