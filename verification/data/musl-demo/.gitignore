@@ -46,3 +46,4 @@ shm_smoke_x86_64
 xattr2_smoke_x86_64
 fsmisc_smoke_x86_64
 creds2_smoke_x86_64
+sig2_smoke_x86_64
