@@ -1825,6 +1825,42 @@ pub enum Syscall {
     /// copy local iovecs into a target process's address space.
     /// Linux (x86_64=311, aarch64=271).
     ProcessVmWritev,
+
+    /// `mbind(addr, len, mode, nodemask, maxnode, flags)` — set a NUMA
+    /// memory policy for a range. Linux (x86_64=237, aarch64=235).
+    Mbind,
+
+    /// `set_mempolicy(mode, nodemask, maxnode)` — set the task's default
+    /// NUMA policy. Linux (x86_64=238, aarch64=237).
+    SetMempolicy,
+
+    /// `get_mempolicy(mode, nodemask, maxnode, addr, flags)` — query a
+    /// NUMA policy. Linux (x86_64=239, aarch64=236).
+    GetMempolicy,
+
+    /// `sched_setattr(pid, attr, flags)` — set extended scheduling attrs.
+    /// Linux (x86_64=314, aarch64=274).
+    SchedSetattr,
+
+    /// `sched_getattr(pid, attr, size, flags)` — read extended scheduling
+    /// attrs. Linux (x86_64=315, aarch64=275).
+    SchedGetattr,
+
+    /// `adjtimex(timex)` — read/adjust kernel clock discipline.
+    /// Linux (x86_64=159, aarch64=171).
+    Adjtimex,
+
+    /// `clock_adjtime(clockid, timex)` — per-clock adjtimex.
+    /// Linux (x86_64=305, aarch64=266).
+    ClockAdjtime,
+
+    /// `pidfd_getfd(pidfd, targetfd, flags)` — clone an fd out of the
+    /// process referenced by `pidfd`. Linux (x86_64=438, aarch64=438).
+    PidfdGetfd,
+
+    /// `kcmp(pid1, pid2, type, idx1, idx2)` — compare whether two
+    /// processes share a kernel resource. Linux (x86_64=312, aarch64=272).
+    Kcmp,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1936,6 +1972,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::PkeyFree, 331),
     (Syscall::ProcessVmReadv, 310),
     (Syscall::ProcessVmWritev, 311),
+    (Syscall::Mbind, 237),
+    (Syscall::SetMempolicy, 238),
+    (Syscall::GetMempolicy, 239),
+    (Syscall::SchedSetattr, 314),
+    (Syscall::SchedGetattr, 315),
+    (Syscall::Adjtimex, 159),
+    (Syscall::ClockAdjtime, 305),
+    (Syscall::PidfdGetfd, 438),
+    (Syscall::Kcmp, 312),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2279,6 +2324,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::PkeyFree, 290),
     (Syscall::ProcessVmReadv, 270),
     (Syscall::ProcessVmWritev, 271),
+    (Syscall::Mbind, 235),
+    (Syscall::SetMempolicy, 237),
+    (Syscall::GetMempolicy, 236),
+    (Syscall::SchedSetattr, 274),
+    (Syscall::SchedGetattr, 275),
+    (Syscall::Adjtimex, 171),
+    (Syscall::ClockAdjtime, 266),
+    (Syscall::PidfdGetfd, 438),
+    (Syscall::Kcmp, 272),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

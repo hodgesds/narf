@@ -4866,6 +4866,337 @@ fn sys_process_vm_writev(ctx: &mut dyn TrapContext) {
     process_vm_transfer(ctx, true);
 }
 
+// ── NUMA memory policy: set_mempolicy / get_mempolicy / mbind ─────────
+//
+// NARF has no NUMA-aware allocator yet, so memory policy is advisory:
+// the per-task default policy round-trips through a side table and mbind
+// validates-and-accepts. The mode's low bits select the policy; the high
+// bits carry MPOL_F_* flags which we ignore but preserve in the stored
+// value so get_mempolicy reflects them.
+
+const MPOL_MAX: u32 = 5; // DEFAULT/PREFERRED/BIND/INTERLEAVE/LOCAL
+const MPOL_MODE_FLAGS: u32 = 0xc000_0000; // MPOL_F_STATIC_NODES | _RELATIVE_NODES
+
+/// Per-task (mode_with_flags, first-word nodemask) default policy.
+static MEMPOLICY_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, (u32, u64)>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn mpol_mode_valid(mode: u32) -> bool {
+    (mode & !MPOL_MODE_FLAGS) < MPOL_MAX
+}
+
+/// `set_mempolicy(mode, nodemask, maxnode)`.
+fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let mode = a.arg0 as u32;
+    if !mpol_mode_valid(mode) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let nodemask = if a.arg1 != 0 {
+        read_user_u64(a.arg1)
+    } else {
+        0
+    };
+    let task = current_task_id();
+    let mut g = MEMPOLICY_TABLE.lock();
+    g.get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(task, (mode, nodemask));
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `get_mempolicy(mode, nodemask, maxnode, addr, flags)` — report the
+/// task's default policy (the MPOL_F_ADDR per-address query degrades to
+/// the same default here).
+fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let mode_ptr = a.arg0;
+    let nodemask_ptr = a.arg1;
+    let task = current_task_id();
+    let (mode, nodemask) = MEMPOLICY_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or((0, 0)); // MPOL_DEFAULT
+    if mode_ptr != 0 {
+        // `mode` is written as an int.
+        // SAFETY: mode_ptr is the user int out-pointer; copy_to_user validates it.
+        if unsafe { copy_to_user(mode_ptr, &(mode as i32).to_le_bytes()) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    }
+    if nodemask_ptr != 0 {
+        // SAFETY: nodemask_ptr is the user unsigned-long array; copy_to_user validates it.
+        let _ = unsafe { copy_to_user(nodemask_ptr, &nodemask.to_le_bytes()) };
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `mbind(addr, len, mode, nodemask, maxnode, flags)` — set a range
+/// policy. Validated and accepted; NARF applies no per-range NUMA
+/// binding yet.
+fn sys_mbind(ctx: &mut dyn TrapContext) {
+    let mode = ctx.args().arg2 as u32;
+    if !mpol_mode_valid(mode) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── sched_setattr / sched_getattr ────────────────────────────────────
+//
+// Extended scheduling attributes. NARF's scheduler doesn't honour the
+// deadline params, but the whole `struct sched_attr` round-trips through
+// a per-task side table so getattr reflects setattr.
+
+/// `SCHED_ATTR_SIZE_VER0` — the smallest valid `struct sched_attr`.
+const SCHED_ATTR_SIZE: usize = 48;
+
+static SCHED_ATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, [u8; SCHED_ATTR_SIZE]>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `sched_setattr(pid, attr, flags)`.
+fn sys_sched_setattr(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let attr_ptr = a.arg1;
+    if a.arg2 != 0 || attr_ptr == 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // The first u32 is the caller-declared struct size.
+    let size = read_user_u32(attr_ptr) as usize;
+    if size < SCHED_ATTR_SIZE {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL / E2BIG
+        return;
+    }
+    let to_read = size.min(SCHED_ATTR_SIZE);
+    // SAFETY: attr_ptr is non-zero; copy_from_user_vec range-validates the read.
+    let bytes = match unsafe { copy_from_user_vec(attr_ptr, to_read) } {
+        Ok(b) => b,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let mut buf = [0u8; SCHED_ATTR_SIZE];
+    buf[..to_read].copy_from_slice(&bytes);
+    let pid = a.arg0;
+    let task = if pid == 0 { current_task_id() } else { pid };
+    SCHED_ATTR_TABLE
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(task, buf);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `sched_getattr(pid, attr, size, flags)`.
+fn sys_sched_getattr(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let attr_ptr = a.arg1;
+    let size = a.arg2 as usize;
+    if a.arg3 != 0 || attr_ptr == 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if size < SCHED_ATTR_SIZE {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL (buffer too small)
+        return;
+    }
+    let pid = a.arg0;
+    let task = if pid == 0 { current_task_id() } else { pid };
+    let mut buf = SCHED_ATTR_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or([0u8; SCHED_ATTR_SIZE]);
+    // The kernel always reports the actual struct size in the first word.
+    buf[0..4].copy_from_slice(&(SCHED_ATTR_SIZE as u32).to_le_bytes());
+    // SAFETY: attr_ptr is non-zero and size >= SCHED_ATTR_SIZE; copy_to_user
+    // validates and SMAP-brackets the write.
+    if unsafe { copy_to_user(attr_ptr, &buf) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── adjtimex / clock_adjtime ─────────────────────────────────────────
+//
+// Kernel clock-discipline interface. NARF runs no NTP discipline, so a
+// query (`modes == 0`) reports a steady, synchronised clock: TIME_OK with
+// the default tick (10000 µs ⇒ 100 Hz) and zero frequency offset.
+
+// `struct timex` field byte offsets (LP64, shared x86_64/aarch64).
+const TIMEX_OFF_MODES: u64 = 0;
+const TIMEX_OFF_FREQ: u64 = 16;
+const TIMEX_OFF_STATUS: u64 = 40;
+const TIMEX_OFF_TICK: u64 = 88;
+const TIME_OK: u64 = 0;
+const DEFAULT_TICK_US: i64 = 10_000;
+
+/// Shared core: read `modes`, and for a read-only query fill the steady
+/// state fields. Returns the clock state (TIME_OK) or a negative errno.
+fn adjtimex_core(timex_ptr: u64) -> i64 {
+    if timex_ptr == 0 {
+        return -14; // EFAULT
+    }
+    let modes = read_user_u32(timex_ptr.wrapping_add(TIMEX_OFF_MODES));
+    // We accept any modes word but apply nothing; report the steady state.
+    let _ = modes;
+    // freq = 0, status = 0 (synchronised), tick = default.
+    // SAFETY: timex_ptr is non-zero; each copy_to_user validates the field
+    // write against the user struct (well within sizeof(struct timex)).
+    unsafe {
+        if copy_to_user(timex_ptr.wrapping_add(TIMEX_OFF_FREQ), &0i64.to_le_bytes()).is_err()
+            || copy_to_user(
+                timex_ptr.wrapping_add(TIMEX_OFF_STATUS),
+                &0i32.to_le_bytes(),
+            )
+            .is_err()
+            || copy_to_user(
+                timex_ptr.wrapping_add(TIMEX_OFF_TICK),
+                &DEFAULT_TICK_US.to_le_bytes(),
+            )
+            .is_err()
+        {
+            return -14; // EFAULT
+        }
+    }
+    TIME_OK as i64
+}
+
+/// `adjtimex(timex)`.
+fn sys_adjtimex(ctx: &mut dyn TrapContext) {
+    let r = adjtimex_core(ctx.args().arg0);
+    ctx.set_return(SyscallReturn::ok(r as u64));
+}
+
+/// `clock_adjtime(clockid, timex)` — per-clock adjtimex. Only the
+/// settable system clocks are accepted.
+fn sys_clock_adjtime(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let clockid = a.arg0;
+    // CLOCK_REALTIME(0)/MONOTONIC(1)/BOOTTIME(7)/TAI(11) are accepted.
+    match clockid {
+        0 | 1 | 7 | 11 => {}
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    }
+    let r = adjtimex_core(a.arg1);
+    ctx.set_return(SyscallReturn::ok(r as u64));
+}
+
+// ── pidfd_getfd / kcmp ───────────────────────────────────────────────
+
+/// `pidfd_getfd(pidfd, targetfd, flags)` — clone an fd out of the
+/// process referenced by `pidfd` into the caller's fd table. Since an
+/// `FdEntry` holds an `Arc<dyn FileOps>`, the clone shares the same open
+/// file description, exactly like Linux.
+fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let pidfd = a.arg0 as u32;
+    let targetfd = a.arg1 as u32;
+    if a.arg2 != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let task = current_task_id();
+    let target_pid = match fd::with_table(task, |t| {
+        t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
+    })
+    .flatten()
+    {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF (not a pidfd)
+            return;
+        }
+    };
+    let target_tid = if target_pid == task {
+        task
+    } else {
+        match pid_to_task_raw(target_pid) {
+            Some(t) => t,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                return;
+            }
+        }
+    };
+    let entry = fd::with_table(target_tid, |t| t.get(targetfd).cloned()).flatten();
+    let entry = match entry {
+        Some(e) => e,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            return;
+        }
+    };
+    match fd::with_table(task, |t| t.open(entry)) {
+        Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+    }
+}
+
+/// `kcmp(pid1, pid2, type, idx1, idx2)` — compare whether two processes
+/// share a kernel resource. Returns 0 (equal), 1/2 (a kernel-pointer
+/// ordering), or a negative errno. NARF compares address-space identity
+/// for KCMP_VM and otherwise orders by task id.
+fn sys_kcmp(ctx: &mut dyn TrapContext) {
+    const KCMP_VM: u64 = 1;
+    const KCMP_TYPES: u64 = 8;
+    let a = *ctx.args();
+    let kind = a.arg2;
+    if kind >= KCMP_TYPES {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let me = current_task_id();
+    let resolve = |pid: u64| -> Option<u64> {
+        if pid == me {
+            Some(me)
+        } else {
+            pid_to_task_raw(pid)
+        }
+    };
+    let (t1, t2) = match (resolve(a.arg0), resolve(a.arg1)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            return;
+        }
+    };
+    if t1 == t2 {
+        // The same task shares every resource with itself.
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let result: u64 = if kind == KCMP_VM {
+        let a1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t1));
+        let a2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t2));
+        match (a1, a2) {
+            (Some(x), Some(y)) if Arc::ptr_eq(&x, &y) => 0,
+            _ => {
+                if t1 < t2 {
+                    1
+                } else {
+                    2
+                }
+            }
+        }
+    } else if t1 < t2 {
+        1
+    } else {
+        2
+    };
+    ctx.set_return(SyscallReturn::ok(result));
+}
+
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — deliver `sig` to the
 /// process referenced by `pidfd` (resolved via the FileOps hook),
 /// reusing the same pending-signal queue as `kill(2)`.
@@ -15243,6 +15574,40 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "process_vm_writev",
         RawFnHandler(sys_process_vm_writev),
     );
+    // Batch 9: NUMA mempolicy, extended scheduling, clock adjust, introspection.
+    table.install_raw(Syscall::Mbind, "mbind", RawFnHandler(sys_mbind));
+    table.install_raw(
+        Syscall::SetMempolicy,
+        "set_mempolicy",
+        RawFnHandler(sys_set_mempolicy),
+    );
+    table.install_raw(
+        Syscall::GetMempolicy,
+        "get_mempolicy",
+        RawFnHandler(sys_get_mempolicy),
+    );
+    table.install_raw(
+        Syscall::SchedSetattr,
+        "sched_setattr",
+        RawFnHandler(sys_sched_setattr),
+    );
+    table.install_raw(
+        Syscall::SchedGetattr,
+        "sched_getattr",
+        RawFnHandler(sys_sched_getattr),
+    );
+    table.install_raw(Syscall::Adjtimex, "adjtimex", RawFnHandler(sys_adjtimex));
+    table.install_raw(
+        Syscall::ClockAdjtime,
+        "clock_adjtime",
+        RawFnHandler(sys_clock_adjtime),
+    );
+    table.install_raw(
+        Syscall::PidfdGetfd,
+        "pidfd_getfd",
+        RawFnHandler(sys_pidfd_getfd),
+    );
+    table.install_raw(Syscall::Kcmp, "kcmp", RawFnHandler(sys_kcmp));
     table.install_raw(
         Syscall::Select,
         "select",
