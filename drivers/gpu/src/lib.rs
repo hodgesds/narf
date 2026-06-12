@@ -42,6 +42,8 @@ pub enum GpuFamily {
     /// Nvidia (nouveau or proprietary, via the command-stream
     /// interface).
     Nvidia,
+    /// ASPEED AST2400/2500 BMC basic display.
+    Aspeed,
 }
 
 /// Display mode descriptor.
@@ -154,6 +156,7 @@ pub mod amdgpu_ucode_header;
 pub mod amdgpu_video;
 pub mod amdgpu_vmhub_regs;
 pub mod amdgpu_vmid;
+pub mod aspeed;
 pub mod atombios;
 pub mod backlight;
 pub mod dmabuf;
@@ -206,6 +209,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "amdgpu-pci", || {
         amdgpu::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "aspeed-pci", || {
+        aspeed::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "intel-gpu-pci", || {

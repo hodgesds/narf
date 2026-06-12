@@ -33,6 +33,7 @@ extern crate alloc;
 pub mod atheros;
 pub mod e1000;
 pub mod forcedeth;
+pub mod i40e;
 pub mod igc;
 pub mod ixgbe;
 pub mod mlx5;
@@ -55,6 +56,10 @@ pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
     narf_init::register(Stage::Subsys, "e1000", || {
         e1000::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "i40e", || {
+        i40e::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "r8169", || {
