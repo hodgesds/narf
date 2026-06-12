@@ -257,6 +257,56 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Grow an existing region in place to `new_len` (the `mremap(2)`
+    /// no-move path). Extends the region's per-page scatter list with
+    /// lazy (zero) pages and bumps `len`; the appended pages
+    /// demand-page on first access exactly like a fresh anonymous
+    /// `mmap`, so no copy and no extra `materialize` is needed — the
+    /// original pages keep their frames at the same virtual address.
+    ///
+    /// Fails with `Overlap` if the grown tail would collide with
+    /// another region, `Unmapped` if no region starts at `base`, or
+    /// `AlignmentMismatch` if `new_len` isn't page-aligned. Shrinking
+    /// is a no-op here (returns `Ok` leaving the region unchanged).
+    pub fn grow_region(&self, base: VirtAddr, new_len: u64) -> Result<(), AddressSpaceError> {
+        if new_len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let mut regions = self.regions.lock();
+        let idx = regions
+            .iter()
+            .position(|r| r.base == base)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        let old_len = regions[idx].len;
+        if new_len <= old_len {
+            return Ok(());
+        }
+        let new_end = base
+            .as_u64()
+            .checked_add(new_len)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        // The grown tail [base+old_len, base+new_len) must not collide
+        // with any OTHER region.
+        let grow_lo = base.as_u64() + old_len;
+        for (i, r) in regions.iter().enumerate() {
+            if i == idx {
+                continue;
+            }
+            let rb = r.base.as_u64();
+            let re = rb + r.len;
+            if rb < new_end && grow_lo < re {
+                return Err(AddressSpaceError::Overlap);
+            }
+        }
+        let add_pages = ((new_len - old_len) >> 12) as usize;
+        let region = &mut regions[idx];
+        for _ in 0..add_pages {
+            region.phys.push(PhysAddr::new(0));
+        }
+        region.len = new_len;
+        Ok(())
+    }
+
     /// Remove a region whose base address matches `base` AND release
     /// every page it owned: walk the per-page PTEs via the per-arch
     /// `unmap_4kb`, and return each underlying physical frame to the

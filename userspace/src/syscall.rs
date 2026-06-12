@@ -1585,6 +1585,44 @@ pub enum Syscall {
     /// arg0 = fd, arg1 = addr out, arg2 = addrlen out, arg3 = flags.
     /// Linux `accept4` (x86_64=288, aarch64=242).
     SocketAccept4,
+
+    /// `sendfile(out_fd, in_fd, off*, count)` — copy up to `count`
+    /// bytes from `in_fd` to `out_fd`. arg0 = out_fd, arg1 = in_fd,
+    /// arg2 = `off_t*` (may be 0 → use in_fd's offset), arg3 = count.
+    /// Linux `sendfile` (x86_64=40, aarch64=71).
+    Sendfile,
+
+    /// `mremap(old, old_len, new_len, flags, new_addr)` — resize an
+    /// existing anonymous mapping (in-place grow). arg0 = old addr,
+    /// arg1 = old len, arg2 = new len, arg3 = flags.
+    /// Linux `mremap` (x86_64=25, aarch64=216).
+    Mremap,
+
+    /// `waitid(idtype, id, infop, options, rusage)` — wait for a child
+    /// returning a `siginfo_t`. arg0 = idtype (P_ALL/P_PID/P_PGID),
+    /// arg1 = id, arg2 = `siginfo_t*`, arg3 = options.
+    /// Linux `waitid` (x86_64=247, aarch64=95).
+    Waitid,
+
+    /// `getgroups(size, list)` / `setgroups(size, list)` — supplementary
+    /// group list. NARF carries no supplementary groups, so getgroups
+    /// returns 0 and setgroups is accepted. Linux getgroups
+    /// (x86_64=115, aarch64=158), setgroups (x86_64=116, aarch64=159).
+    Getgroups,
+    Setgroups,
+
+    /// `getresuid(r,e,s)` / `setresuid(r,e,s)` — real/effective/saved
+    /// uid triple. NARF tracks a single uid, surfaced as all three.
+    /// Linux getresuid (x86_64=118, aarch64=148), setresuid
+    /// (x86_64=117, aarch64=147).
+    Getresuid,
+    Setresuid,
+
+    /// `getresgid(r,e,s)` / `setresgid(r,e,s)` — gid triple, mirrors
+    /// the uid forms. Linux getresgid (x86_64=120, aarch64=150),
+    /// setresgid (x86_64=119, aarch64=149).
+    Getresgid,
+    Setresgid,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1639,6 +1677,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketGetPeerName, 52),
     (Syscall::SocketPair, 53),
     (Syscall::SocketAccept4, 288),
+    (Syscall::Sendfile, 40),
+    (Syscall::Mremap, 25),
+    (Syscall::Waitid, 247),
+    (Syscall::Getgroups, 115),
+    (Syscall::Setgroups, 116),
+    (Syscall::Setresuid, 117),
+    (Syscall::Getresuid, 118),
+    (Syscall::Setresgid, 119),
+    (Syscall::Getresgid, 120),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -1925,6 +1972,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketRecvMsg, 212),
     (Syscall::SocketPair, 199),
     (Syscall::SocketAccept4, 242),
+    (Syscall::Sendfile, 71),
+    (Syscall::Mremap, 216),
+    (Syscall::Waitid, 95),
+    (Syscall::Getgroups, 158),
+    (Syscall::Setgroups, 159),
+    (Syscall::Setresuid, 147),
+    (Syscall::Getresuid, 148),
+    (Syscall::Setresgid, 149),
+    (Syscall::Getresgid, 150),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

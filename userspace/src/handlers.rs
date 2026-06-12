@@ -3791,6 +3791,134 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(base));
 }
 
+/// `mremap(old_addr, old_len, new_len, flags, new_addr)` — resize an
+/// existing anonymous mapping. NARF implements the in-place grow path:
+/// the region keeps its frames at `old_addr` and the grown tail is
+/// lazily backed (demand-paged) like a fresh mmap, so contents are
+/// preserved with no copy. Shrink / no-op returns `old_addr`
+/// unchanged; a grow that would collide with another region returns
+/// `-ENOMEM` (we don't relocate even with MREMAP_MAYMOVE today).
+fn sys_mremap(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let old_addr = args.arg0;
+    let old_len = (args.arg1 + 0xFFF) & !0xFFFu64;
+    let new_len = (args.arg2 + 0xFFF) & !0xFFFu64;
+    let _flags = args.arg3 as u32;
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    if old_addr & 0xFFF != 0 || new_len == 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if new_len <= old_len {
+        // Shrink / unchanged — keep the mapping where it is.
+        ctx.set_return(SyscallReturn::ok(old_addr));
+        return;
+    }
+    match as_ref.grow_region(VirtAddr::new(old_addr), new_len) {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(old_addr)),
+        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)), // ENOMEM
+    }
+}
+
+/// `sendfile(out_fd, in_fd, off*, count)` — copy up to `count` bytes
+/// from `in_fd` to `out_fd` entirely in the kernel (no user buffer).
+/// If `off` is non-NULL it is a pread-style start offset that is
+/// updated and does NOT advance `in_fd`'s own file offset; NULL uses
+/// and advances the fd offset. Returns the number of bytes copied.
+fn sys_sendfile(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let out_fd = a.arg0 as u32;
+    let in_fd = a.arg1 as u32;
+    let off_ptr = a.arg2;
+    let count = a.arg3 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let task = current_task_id();
+
+    let use_off_ptr = off_ptr != 0;
+    let mut in_off: u64 = if use_off_ptr {
+        // SAFETY: `off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
+        // range-validates the 8-byte read.
+        match unsafe { copy_from_user_vec(off_ptr, 8) } {
+            Ok(b) => u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            Err(_) => {
+                ctx.set_return(fail);
+                return;
+            }
+        }
+    } else {
+        0
+    };
+
+    let mut total = 0usize;
+    const CHUNK: usize = 4096;
+    while total < count {
+        let want = core::cmp::min(CHUNK, count - total);
+        // Read up to `want` bytes from in_fd into a kernel buffer.
+        let read_out: Option<alloc::vec::Vec<u8>> = fd::with_table(task, |t| {
+            let entry = t.get_mut(in_fd)?;
+            let off = if use_off_ptr { in_off } else { entry.offset };
+            let mut kbuf = alloc::vec![0u8; want];
+            let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
+                Some(Ok(n)) => n,
+                _ => 0,
+            };
+            kbuf.truncate(n);
+            if !use_off_ptr {
+                entry.offset = off.saturating_add(n as u64);
+            }
+            Some(kbuf)
+        })
+        .flatten();
+        let kbuf = match read_out {
+            Some(b) => b,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        if kbuf.is_empty() {
+            break; // EOF on in_fd
+        }
+        in_off = in_off.saturating_add(kbuf.len() as u64);
+        // Write the chunk to out_fd.
+        let wrote: Option<usize> = fd::with_table(task, |t| {
+            let entry = t.get_mut(out_fd)?;
+            let off = entry.offset;
+            let w = match poll_blocking(entry.ops.write(off, &kbuf)) {
+                Some(Ok(w)) => w,
+                _ => 0,
+            };
+            entry.offset = off.saturating_add(w as u64);
+            Some(w)
+        })
+        .flatten();
+        let w = match wrote {
+            Some(w) => w,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        total += w;
+        if w < kbuf.len() {
+            break; // short write (e.g. pipe full) — stop here
+        }
+    }
+
+    if use_off_ptr {
+        // SAFETY: `off_ptr` is the user `off_t*` (non-zero); copy_to_user
+        // range-validates the 8-byte write-back of the advanced offset.
+        let _ = unsafe { copy_to_user(off_ptr, &in_off.to_ne_bytes()) };
+    }
+    ctx.set_return(SyscallReturn::ok(total as u64));
+}
+
 // ── FB syscalls ────────────────────────────────────────────────────
 //
 // Five syscalls (Connect/Info/RingMap/FlushWait/Disconnect) form the
@@ -5756,7 +5884,7 @@ fn take_pending_termination(task: u64) -> Option<i32> {
 /// holds no matching entry.  If `status_ptr != 0`, writes the POSIX
 /// wstatus into the user-space pointer (same as `sys_wait4` does on the
 /// fast path).
-fn wait_child_check_fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
+fn wait_child_check_fn(parent_id: u64, want_pid: i64, out_status: *mut i32) -> i64 {
     let entry = {
         let mut g = PENDING_EXITS.lock();
         let m = match g.as_mut() {
@@ -5781,14 +5909,170 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64 {
         q.remove(idx)
     };
     let (child_pid, status) = entry;
-    if status_ptr != 0 {
-        // SAFETY: `status_ptr` is the user wstatus pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
-        let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+    // Hand the raw wstatus back to the caller (the poll routine), which
+    // writes either the wait4 wstatus `int` or the waitid `siginfo_t`
+    // into user space depending on which syscall parked.
+    if !out_status.is_null() {
+        // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
+        // poll routine's stack frame for the duration of this call.
+        unsafe {
+            *out_status = status;
+        }
     }
     // Wave-61: PID pool — reaped child's PID returns to the free pool.
     crate::release_pid(crate::ProcessId(child_pid));
     child_pid as i64
+}
+
+/// Write the result of a completed child reap into user space and
+/// return the value the syscall should place in the result register.
+/// For `wait4` this writes the wstatus `int` to `status_ptr` and
+/// returns the reaped pid; for `waitid` it writes a `siginfo_t` and
+/// returns 0. Called from the poll routine (which owns the saved
+/// register frame) for the blocking path.
+pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, status: i32) -> u64 {
+    if status_ptr != 0 {
+        if is_waitid {
+            let si = encode_waitid_siginfo(reaped, status);
+            // SAFETY: `status_ptr` is the user `siginfo_t*` (non-zero);
+            // copy_to_user range-validates the 128-byte write.
+            let _ = unsafe { copy_to_user(status_ptr, &si) };
+        } else {
+            // SAFETY: `status_ptr` is the user wstatus `int*` (non-zero);
+            // copy_to_user range-validates the 4-byte write.
+            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+        }
+    }
+    if is_waitid {
+        0
+    } else {
+        reaped as u64
+    }
+}
+
+/// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a
+/// child state change for `waitid(2)`. Fills si_signo = SIGCHLD,
+/// si_code (CLD_EXITED / CLD_KILLED / CLD_DUMPED), si_pid, si_uid (0),
+/// and si_status decoded from the POSIX wstatus.
+fn encode_waitid_siginfo(child_pid: i64, wstatus: i32) -> [u8; 128] {
+    const SIGCHLD: i32 = 17;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    let mut si = [0u8; 128];
+    let (code, code_status) = if wstatus & 0x7f == 0 {
+        // WIFEXITED: low 7 bits zero; exit code in bits 8..16.
+        (CLD_EXITED, (wstatus >> 8) & 0xff)
+    } else {
+        // WIFSIGNALED: low 7 bits = signum, bit 7 = core-dumped.
+        let signum = wstatus & 0x7f;
+        let code = if wstatus & 0x80 != 0 {
+            CLD_DUMPED
+        } else {
+            CLD_KILLED
+        };
+        (code, signum)
+    };
+    // si_signo @0, si_errno @4 (0), si_code @8, then the union: si_pid
+    // @16, si_uid @20, si_status @24 on the LP64 siginfo layout.
+    si[0..4].copy_from_slice(&SIGCHLD.to_ne_bytes());
+    si[8..12].copy_from_slice(&code.to_ne_bytes());
+    si[16..20].copy_from_slice(&(child_pid as i32).to_ne_bytes());
+    si[24..28].copy_from_slice(&code_status.to_ne_bytes());
+    si
+}
+
+/// `waitid(idtype, id, infop, options, rusage)` — wait for a child and
+/// report its state via a `siginfo_t`. Reuses the wait4 reap machinery;
+/// the blocking path is driven by `UserTaskCtx::wait_child_is_waitid`
+/// so the poll routine writes a siginfo and returns 0.
+fn sys_waitid(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let idtype = args.arg0 as u32;
+    let id = args.arg1 as i64;
+    let infop = args.arg2;
+    let options = args.arg3 as u32;
+    const P_ALL: u32 = 0;
+    const P_PID: u32 = 1;
+    const P_PGID: u32 = 2;
+    const WNOHANG: u32 = 1;
+
+    // Translate (idtype, id) to the wait4-style want_pid: P_ALL → -1
+    // (any child), P_PID → the pid. P_PGID collapses to -1 until
+    // process groups are real (same simplification as wait4).
+    let want_pid: i64 = match idtype {
+        P_ALL => -1,
+        P_PID => id,
+        P_PGID => -1,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+
+    let parent = current_task_id();
+
+    // Try an immediate reap first.
+    let reaped = {
+        let mut g = PENDING_EXITS.lock();
+        g.as_mut().and_then(|m| {
+            let q = m.get_mut(&parent)?;
+            let idx = if want_pid > 0 {
+                q.iter().position(|&(p, _)| p == want_pid as u64)?
+            } else if q.is_empty() {
+                return None;
+            } else {
+                0
+            };
+            Some(q.remove(idx))
+        })
+    };
+    if let Some((child_pid, status)) = reaped {
+        if infop != 0 {
+            let si = encode_waitid_siginfo(child_pid as i64, status);
+            // SAFETY: `infop` is the user `siginfo_t*` (non-zero); copy_to_user
+            // range-validates the 128-byte write.
+            let _ = unsafe { copy_to_user(infop, &si) };
+        }
+        crate::release_pid(crate::ProcessId(child_pid));
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    if options & WNOHANG != 0 {
+        // No child ready: POSIX leaves infop's si_signo as 0 (the
+        // caller pre-zeros it). Return success.
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    // Blocking: park via the shared wait machinery with the waitid
+    // flag set so the poll routine writes a siginfo + returns 0.
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        // SAFETY: `uctx` is the live per-task UserTaskCtx; we hold the
+        // only reference while staging the wait state and saving CPU
+        // state before the yield hook hands the task to the executor.
+        unsafe {
+            let uc = &*uctx;
+            uc.wait_child_is_waitid
+                .store(true, core::sync::atomic::Ordering::Release);
+            uc.wait_child_want_pid
+                .store(want_pid, core::sync::atomic::Ordering::Release);
+            uc.wait_child_status_ptr
+                .store(infop, core::sync::atomic::Ordering::Release);
+            uc.wait_child_pending
+                .store(true, core::sync::atomic::Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+    }
+    // Fallback (no polling future, e.g. kernel-test context): report no
+    // child rather than spin.
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
 /// Test hook: directly register a parent-of relationship without going
@@ -6056,6 +6340,9 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
                 .store(want_pid, core::sync::atomic::Ordering::Release);
             uc.wait_child_status_ptr
                 .store(status_ptr, core::sync::atomic::Ordering::Release);
+            // wait4 writes a wstatus int, not a waitid siginfo.
+            uc.wait_child_is_waitid
+                .store(false, core::sync::atomic::Ordering::Release);
             // Save user-mode register state.  The RAX written here
             // is a placeholder; UserTaskFuture::poll overwrites it
             // with the reaped child pid before re-entering user mode.
@@ -6355,6 +6642,86 @@ fn sys_setgid(ctx: &mut dyn TrapContext) {
     } else {
         ctx.set_return(fail);
     }
+}
+
+/// Write `val` into each of the (up to three) user `u32` out-pointers
+/// `p0/p1/p2`, skipping NULLs. Returns 0 on success, -1 (EFAULT shape)
+/// if any copy_to_user fails. Shared by getresuid / getresgid.
+fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32) {
+    let buf = val.to_ne_bytes();
+    for p in [p0, p1, p2] {
+        if p != 0 {
+            // SAFETY: `p` is a user `uid_t*`/`gid_t*` out-pointer;
+            // copy_to_user range-validates the 4-byte write.
+            if unsafe { copy_to_user(p, &buf) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                return;
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `getresuid(ruid, euid, suid)` — NARF tracks a single uid, returned
+/// as all three id slots.
+fn sys_getresuid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let uid = read_uidgid(current_task_id()).uid;
+    write_res_ids(ctx, a.arg0, a.arg1, a.arg2, uid);
+}
+
+/// `getresgid(rgid, egid, sgid)` — mirror of getresuid for the gid.
+fn sys_getresgid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let gid = read_uidgid(current_task_id()).gid;
+    write_res_ids(ctx, a.arg0, a.arg1, a.arg2, gid);
+}
+
+/// `setresuid(ruid, euid, suid)` — collapse onto NARF's single uid.
+/// A `(uid_t)-1` slot means "leave unchanged"; we adopt the effective
+/// uid (or the real uid if effective is -1).
+fn sys_setresuid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let new = if a.arg1 as u32 != u32::MAX {
+        Some(a.arg1 as u32)
+    } else if a.arg0 as u32 != u32::MAX {
+        Some(a.arg0 as u32)
+    } else {
+        None
+    };
+    if let Some(u) = new {
+        let _ = write_uidgid(current_task_id(), |e| e.uid = u);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `setresgid(rgid, egid, sgid)` — mirror of setresuid for the gid.
+fn sys_setresgid(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let new = if a.arg1 as u32 != u32::MAX {
+        Some(a.arg1 as u32)
+    } else if a.arg0 as u32 != u32::MAX {
+        Some(a.arg0 as u32)
+    } else {
+        None
+    };
+    if let Some(g) = new {
+        let _ = write_uidgid(current_task_id(), |e| e.gid = g);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `getgroups(size, list)` — NARF carries no supplementary groups, so
+/// the count is always 0 (whether querying the count with size==0 or
+/// filling the list).
+fn sys_getgroups(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `setgroups(size, list)` — accepted; NARF does not track a
+/// supplementary group list, so this is structural-only.
+fn sys_setgroups(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
 }
 
 // ── Per-task rlimit table ──────────────────────────────────────────
@@ -12893,6 +13260,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
+    table.install_raw(Syscall::Mremap, "mremap", RawFnHandler(sys_mremap));
+    table.install_raw(Syscall::Sendfile, "sendfile", RawFnHandler(sys_sendfile));
     table.install_raw(Syscall::MProtect, "mprotect", RawFnHandler(sys_mprotect));
     table.install_raw(Syscall::MLock, "mlock", RawFnHandler(sys_mlock));
     table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
@@ -12900,6 +13269,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Madvise, "madvise", RawFnHandler(sys_madvise));
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
     table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
+    table.install_raw(Syscall::Waitid, "waitid", RawFnHandler(sys_waitid));
     table.install_raw(Syscall::Mount, "mount", RawFnHandler(sys_mount));
     table.install_raw(Syscall::Umount2, "umount2", RawFnHandler(sys_umount2));
     table.install_raw(Syscall::Statfs, "statfs", RawFnHandler(sys_statfs));
@@ -13091,6 +13461,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::GetGid, "getgid", RawFnHandler(sys_getgid));
     table.install_raw(Syscall::SetUid, "setuid", RawFnHandler(sys_setuid));
     table.install_raw(Syscall::SetGid, "setgid", RawFnHandler(sys_setgid));
+    table.install_raw(Syscall::Getresuid, "getresuid", RawFnHandler(sys_getresuid));
+    table.install_raw(Syscall::Setresuid, "setresuid", RawFnHandler(sys_setresuid));
+    table.install_raw(Syscall::Getresgid, "getresgid", RawFnHandler(sys_getresgid));
+    table.install_raw(Syscall::Setresgid, "setresgid", RawFnHandler(sys_setresgid));
+    table.install_raw(Syscall::Getgroups, "getgroups", RawFnHandler(sys_getgroups));
+    table.install_raw(Syscall::Setgroups, "setgroups", RawFnHandler(sys_setgroups));
     table.install_raw(Syscall::Getpgid, "getpgid", RawFnHandler(sys_getpgid));
     table.install_raw(Syscall::Setpgid, "setpgid", RawFnHandler(sys_setpgid));
     table.install_raw(Syscall::Getsid, "getsid", RawFnHandler(sys_getsid));
