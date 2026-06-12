@@ -4280,6 +4280,347 @@ fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+// ── capget / capset ──────────────────────────────────────────────────
+//
+// Linux capability sets, stored per-task as three 64-bit masks
+// (effective / permitted / inheritable). NARF does not *enforce*
+// capabilities — there is no privilege separation in the microkernel
+// yet — but it round-trips them faithfully so libcap-style code works.
+//
+//   struct __user_cap_header_struct { __u32 version; int pid; };
+//   struct __user_cap_data_struct   { __u32 effective, permitted, inheritable; };
+//
+// Versions: _LINUX_CAPABILITY_VERSION_1 (1 data element, 32-bit caps),
+// _2 / _3 (2 data elements, 64-bit caps split lo/hi across the array).
+
+const CAP_VERSION_1: u32 = 0x1998_0330;
+const CAP_VERSION_2: u32 = 0x2007_1026;
+const CAP_VERSION_3: u32 = 0x2008_0522;
+
+/// Per-task [effective, permitted, inheritable] capability masks.
+static CAP_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, [u64; 3]>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Data-element count for a capability version; None if unsupported.
+fn cap_ndata(version: u32) -> Option<usize> {
+    match version {
+        CAP_VERSION_1 => Some(1),
+        CAP_VERSION_2 | CAP_VERSION_3 => Some(2),
+        _ => None,
+    }
+}
+
+/// `capget(hdrp, datap)` — read a task's capability sets.
+fn sys_capget(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let hdrp = a.arg0;
+    let datap = a.arg1;
+    if hdrp == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    let mut hdr = [0u8; 8];
+    // SAFETY: hdrp checked non-zero; copy_from_user range-validates the read.
+    if unsafe { copy_from_user(&mut hdr, hdrp) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    let version = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(hdr[4..].try_into().unwrap());
+    let ndata = match cap_ndata(version) {
+        Some(n) => n,
+        None => {
+            // Linux rewrites the header to the preferred version and
+            // returns EINVAL so the caller can retry.
+            hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+            // SAFETY: hdrp validated by the read above; same 8-byte range.
+            let _ = unsafe { copy_to_user(hdrp, &hdr) };
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+    // datap == NULL is a version probe — succeed without writing data.
+    if datap == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let task = if pid == 0 {
+        current_task_id()
+    } else {
+        pid as u64
+    };
+    let caps = {
+        let g = CAP_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task).copied())
+            .unwrap_or([0; 3])
+    };
+    let mut out = alloc::vec![0u8; ndata * 12];
+    for (field, &val) in caps.iter().enumerate() {
+        // data[0] carries the low 32 bits; data[1] (v2/v3) the high.
+        out[field * 4..field * 4 + 4].copy_from_slice(&(val as u32).to_le_bytes());
+        if ndata == 2 {
+            let hi = (val >> 32) as u32;
+            out[12 + field * 4..12 + field * 4 + 4].copy_from_slice(&hi.to_le_bytes());
+        }
+    }
+    // SAFETY: datap checked non-zero; copy_to_user range-validates the write.
+    if unsafe { copy_to_user(datap, &out) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `capset(hdrp, datap)` — set a task's capability sets.
+fn sys_capset(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let hdrp = a.arg0;
+    let datap = a.arg1;
+    if hdrp == 0 || datap == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    let mut hdr = [0u8; 8];
+    // SAFETY: hdrp checked non-zero; copy_from_user range-validates the read.
+    if unsafe { copy_from_user(&mut hdr, hdrp) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    let version = u32::from_le_bytes(hdr[..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(hdr[4..].try_into().unwrap());
+    let ndata = match cap_ndata(version) {
+        Some(n) => n,
+        None => {
+            hdr[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+            // SAFETY: hdrp validated by the read above; same 8-byte range.
+            let _ = unsafe { copy_to_user(hdrp, &hdr) };
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+    // capset only operates on the calling thread (pid 0 or self).
+    let task = current_task_id();
+    if pid != 0 && pid as u64 != task {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM-ish
+        return;
+    }
+    // SAFETY: datap checked non-zero above; copy_from_user_vec range-validates
+    // the read before copying within the SMAP window.
+    let buf = match unsafe { copy_from_user_vec(datap, ndata * 12) } {
+        Ok(b) => b,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let mut caps = [0u64; 3];
+    for (field, slot) in caps.iter_mut().enumerate() {
+        let lo = u32::from_le_bytes(buf[field * 4..field * 4 + 4].try_into().unwrap()) as u64;
+        let hi = if ndata == 2 {
+            u32::from_le_bytes(buf[12 + field * 4..12 + field * 4 + 4].try_into().unwrap()) as u64
+        } else {
+            0
+        };
+        *slot = lo | (hi << 32);
+    }
+    {
+        let mut g = CAP_TABLE.lock();
+        let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+        m.insert(task, caps);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── setxattr / getxattr / listxattr ──────────────────────────────────
+//
+// Extended attributes, stored in a side table keyed by (resolved path,
+// attribute name). NARF's in-memory FSes have no on-disk xattr store,
+// so this gives a faithful round-trip without touching the inodes.
+
+/// `(path, name) -> value` extended-attribute store.
+#[allow(clippy::type_complexity)]
+static XATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<
+        alloc::collections::BTreeMap<
+            (alloc::string::String, alloc::string::String),
+            alloc::vec::Vec<u8>,
+        >,
+    >,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+const XATTR_CREATE: u64 = 1;
+const XATTR_REPLACE: u64 = 2;
+
+/// Resolve a bare NUL-terminated user path pointer (no length arg) the
+/// same way the FS path syscalls do: copy the C string, then apply the
+/// chroot rewrite so the xattr key matches the file's canonical path.
+fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
+    copy_user_cstr(ptr, 4096).map(|s| apply_chroot(&s))
+}
+
+/// `setxattr(path, name, value, size, flags)`.
+fn sys_setxattr(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let path = match xattr_user_path(a.arg0) {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let name = match copy_user_cstr(a.arg1, 256) {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+    let size = a.arg3 as usize;
+    let value = if size == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        // SAFETY: size != 0 here; copy_from_user_vec range-validates a.arg2
+        // before the SMAP-bracketed read.
+        match unsafe { copy_from_user_vec(a.arg2, size) } {
+            Ok(v) => v,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+        }
+    };
+    let flags = a.arg4;
+    let key = (path, name);
+    let mut g = XATTR_TABLE.lock();
+    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    let exists = m.contains_key(&key);
+    if flags & XATTR_CREATE != 0 && exists {
+        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+        return;
+    }
+    if flags & XATTR_REPLACE != 0 && !exists {
+        ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+        return;
+    }
+    m.insert(key, value);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `getxattr(path, name, value, size)`. With `size == 0` returns the
+/// attribute length without copying; ERANGE if the buffer is too small.
+fn sys_getxattr(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let path = match xattr_user_path(a.arg0) {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let name = match copy_user_cstr(a.arg1, 256) {
+        Some(n) if !n.is_empty() => n,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
+        }
+    };
+    let size = a.arg3 as usize;
+    let value = {
+        let g = XATTR_TABLE.lock();
+        match g.as_ref().and_then(|m| m.get(&(path, name)).cloned()) {
+            Some(v) => v,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+                return;
+            }
+        }
+    };
+    if size == 0 {
+        ctx.set_return(SyscallReturn::ok(value.len() as u64));
+        return;
+    }
+    if size < value.len() {
+        ctx.set_return(SyscallReturn::ok((-34i64) as u64)); // ERANGE
+        return;
+    }
+    // SAFETY: a.arg2 is the user buffer; copy_to_user range-validates the write.
+    if unsafe { copy_to_user(a.arg2, &value) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(value.len() as u64));
+}
+
+/// `listxattr(path, list, size)` — NUL-separated attribute names for
+/// `path`. With `size == 0` returns the total length without copying.
+fn sys_listxattr(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let path = match xattr_user_path(a.arg0) {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let size = a.arg2 as usize;
+    let mut names: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    {
+        let g = XATTR_TABLE.lock();
+        if let Some(m) = g.as_ref() {
+            for (p, n) in m.keys() {
+                if *p == path {
+                    names.extend_from_slice(n.as_bytes());
+                    names.push(0);
+                }
+            }
+        }
+    }
+    if size == 0 {
+        ctx.set_return(SyscallReturn::ok(names.len() as u64));
+        return;
+    }
+    if size < names.len() {
+        ctx.set_return(SyscallReturn::ok((-34i64) as u64)); // ERANGE
+        return;
+    }
+    // SAFETY: a.arg1 is the user list buffer; copy_to_user range-validates it.
+    if !names.is_empty() && unsafe { copy_to_user(a.arg1, &names) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(names.len() as u64));
+}
+
+/// `readahead(fd, offset, count)` — page-cache populate hint. NARF's
+/// in-memory FSes need no readahead; accept for a valid fd, EBADF
+/// otherwise.
+fn sys_readahead(ctx: &mut dyn TrapContext) {
+    let fd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let valid = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+    if valid {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+    }
+}
+
+/// `sync_file_range(fd, offset, nbytes, flags)` — flush a file range to
+/// disk. NARF's in-memory FSes are always coherent; accept for a valid
+/// fd, EBADF otherwise.
+fn sys_sync_file_range(ctx: &mut dyn TrapContext) {
+    let fd = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let valid = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+    if valid {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+    }
+}
+
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — deliver `sig` to the
 /// process referenced by `pidfd` (resolved via the FileOps hook),
 /// reusing the same pending-signal queue as `kill(2)`.
@@ -5412,6 +5753,10 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             // Block forever by setting deadline to u64::MAX.
             // Any signal delivery will wake the task via wake_signal().
+            // Bake EINTR into the saved frame so that when the poll loop
+            // breaks the park on a pending signal and re-enters user mode,
+            // pause(2) returns -EINTR; the next pause re-issue delivers it.
+            ctx.set_return(SyscallReturn::ok((-4i64) as u64));
             uc.sleep_deadline_ns
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -10853,6 +11198,11 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     };
     let slot = map.entry(task).or_insert(0);
     *slot |= 1u32 << signum;
+    drop(g);
+    // Wake the task if it is parked (sleep/pause) so an asynchronously
+    // raised signal — e.g. SIGALRM from an interval timer — is taken
+    // promptly rather than only at the next self-driven re-poll.
+    wake_signal(task);
 }
 
 /// Clear the pending bit for `signum` on `task`. Used by signalfd
@@ -14319,6 +14669,22 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             "clock_nanosleep",
             RawFnHandler(crate::posix_timer::sys_clock_nanosleep),
         );
+        // Batch 7: BSD interval timers (ITIMER_REAL → SIGALRM) + alarm.
+        table.install_raw(
+            Syscall::Setitimer,
+            "setitimer",
+            RawFnHandler(crate::posix_timer::sys_setitimer),
+        );
+        table.install_raw(
+            Syscall::Getitimer,
+            "getitimer",
+            RawFnHandler(crate::posix_timer::sys_getitimer),
+        );
+        table.install_raw(
+            Syscall::Alarm,
+            "alarm",
+            RawFnHandler(crate::posix_timer::sys_alarm),
+        );
     }
     table.install_raw(Syscall::Sigaction, "sigaction", RawFnHandler(sys_sigaction));
     table.install_raw(
@@ -14562,6 +14928,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Openat2, "openat2", RawFnHandler(sys_openat2));
     table.install_raw(Syscall::Preadv, "preadv", RawFnHandler(sys_preadv));
     table.install_raw(Syscall::Pwritev, "pwritev", RawFnHandler(sys_pwritev));
+    // Batch 7: capabilities, extended attributes, file-range hints.
+    table.install_raw(Syscall::Capget, "capget", RawFnHandler(sys_capget));
+    table.install_raw(Syscall::Capset, "capset", RawFnHandler(sys_capset));
+    table.install_raw(Syscall::Setxattr, "setxattr", RawFnHandler(sys_setxattr));
+    table.install_raw(Syscall::Getxattr, "getxattr", RawFnHandler(sys_getxattr));
+    table.install_raw(Syscall::Listxattr, "listxattr", RawFnHandler(sys_listxattr));
+    table.install_raw(Syscall::Readahead, "readahead", RawFnHandler(sys_readahead));
+    table.install_raw(
+        Syscall::SyncFileRange,
+        "sync_file_range",
+        RawFnHandler(sys_sync_file_range),
+    );
     table.install_raw(
         Syscall::Select,
         "select",

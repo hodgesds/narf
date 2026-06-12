@@ -1731,6 +1731,46 @@ pub enum Syscall {
     /// `pwritev(fd, iov, iovcnt, offset)` — positioned vectored write.
     /// Linux (x86_64=296, aarch64=70).
     Pwritev,
+
+    /// `capget(hdrp, datap)` — read a task's capability sets.
+    /// Linux (x86_64=125, aarch64=90).
+    Capget,
+
+    /// `capset(hdrp, datap)` — set a task's capability sets.
+    /// Linux (x86_64=126, aarch64=91).
+    Capset,
+
+    /// `setitimer(which, new, old)` — arm an interval timer (ITIMER_REAL
+    /// delivers SIGALRM). Linux (x86_64=38, aarch64=103).
+    Setitimer,
+
+    /// `getitimer(which, cur)` — read an interval timer.
+    /// Linux (x86_64=36, aarch64=102).
+    Getitimer,
+
+    /// `alarm(seconds)` — arm ITIMER_REAL for SIGALRM after `seconds`.
+    /// Linux (x86_64=37); not in the aarch64 generic ABI.
+    Alarm,
+
+    /// `setxattr(path, name, value, size, flags)` — set an extended
+    /// attribute. Linux (x86_64=188, aarch64=5).
+    Setxattr,
+
+    /// `getxattr(path, name, value, size)` — read an extended attribute.
+    /// Linux (x86_64=191, aarch64=8).
+    Getxattr,
+
+    /// `listxattr(path, list, size)` — list extended-attribute names.
+    /// Linux (x86_64=194, aarch64=11).
+    Listxattr,
+
+    /// `readahead(fd, offset, count)` — populate the page cache (no-op).
+    /// Linux (x86_64=187, aarch64=213).
+    Readahead,
+
+    /// `sync_file_range(fd, offset, nbytes, flags)` — flush a file range
+    /// (no-op). Linux (x86_64=277, aarch64=84).
+    SyncFileRange,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -1819,6 +1859,16 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Openat2, 437),
     (Syscall::Preadv, 295),
     (Syscall::Pwritev, 296),
+    (Syscall::Capget, 125),
+    (Syscall::Capset, 126),
+    (Syscall::Setitimer, 38),
+    (Syscall::Getitimer, 36),
+    (Syscall::Alarm, 37),
+    (Syscall::Setxattr, 188),
+    (Syscall::Getxattr, 191),
+    (Syscall::Listxattr, 194),
+    (Syscall::Readahead, 187),
+    (Syscall::SyncFileRange, 277),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2138,6 +2188,17 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Openat2, 437),
     (Syscall::Preadv, 69),
     (Syscall::Pwritev, 70),
+    (Syscall::Capget, 90),
+    (Syscall::Capset, 91),
+    (Syscall::Setitimer, 103),
+    (Syscall::Getitimer, 102),
+    // alarm has no aarch64 generic-ABI number; libc emulates it via
+    // setitimer, so NARF maps no wire number for it on aarch64.
+    (Syscall::Setxattr, 5),
+    (Syscall::Getxattr, 8),
+    (Syscall::Listxattr, 11),
+    (Syscall::Readahead, 213),
+    (Syscall::SyncFileRange, 84),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

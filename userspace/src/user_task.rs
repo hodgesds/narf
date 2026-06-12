@@ -799,7 +799,18 @@ impl core::future::Future for UserTaskFuture {
         let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
-            if now < deadline {
+            // An asynchronously-raised signal (e.g. SIGALRM from an
+            // interval timer that fired via a sleep-pump) must break an
+            // *infinite* park — pause(2), or a blocking poll/epoll/futex
+            // wait — so the task takes delivery on its next yield-point
+            // syscall. We restrict this to `deadline == u64::MAX`: a
+            // finite sleep(2) already wakes at its own deadline, and
+            // un-parking it on a pending *ignored* signal (which no
+            // syscall would then clear) would busy-spin. The pump still
+            // runs at least once below before the signal becomes pending.
+            let signal_pending = deadline == u64::MAX
+                && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
+            if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;
                 let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
                 while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
@@ -809,9 +820,10 @@ impl core::future::Future for UserTaskFuture {
                 cx.waker().wake_by_ref();
                 return core::task::Poll::Pending;
             }
-            // Deadline reached — clear so the next sys_sleep
-            // call doesn't see stale state, then fall through
-            // to the normal resume path.
+            // Deadline reached or a signal is pending — clear so the next
+            // sys_sleep call doesn't see stale state, then fall through
+            // to the normal resume path (which re-enters user mode; the
+            // pending signal is delivered on the next yield syscall).
             this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
 
@@ -1238,7 +1250,11 @@ impl core::future::Future for UserTaskFuture {
         let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
-            if now < deadline {
+            // Break an infinite park on an async pending signal — see the
+            // sibling poll body for the rationale.
+            let signal_pending = deadline == u64::MAX
+                && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
+            if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;
                 let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
                 while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
