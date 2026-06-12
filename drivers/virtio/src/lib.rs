@@ -14,19 +14,23 @@ pub mod blk;
 pub mod blk_pci;
 pub mod class_blk;
 pub mod console_pci;
+pub mod crypto_pci;
 pub mod fs_pci;
 pub mod gpu_pci;
 pub mod i2c_pci;
 pub mod gpio_pci;
 pub mod input_pci;
 pub mod iommu_pci;
+pub mod mem_pci;
 pub mod net_pci;
 pub mod p9_pci;
 pub mod pci;
+pub mod pmem_pci;
 pub mod queue;
 pub mod rng_pci;
 pub mod scsi_pci;
 pub mod snd_pci;
+pub mod video_pci;
 pub mod vsock_pci;
 
 mod e2e_tests;
@@ -67,6 +71,22 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Subsys, "virtio-gpio-pci", || {
         gpio_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-crypto-pci", || {
+        crypto_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-mem-pci", || {
+        mem_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-pmem-pci", || {
+        pmem_pci::register_pci_driver();
+        InitResult::Ok
+    });
+    narf_init::register(Stage::Subsys, "virtio-video-pci", || {
+        video_pci::register_pci_driver();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "virtio-snd-pci", || {
