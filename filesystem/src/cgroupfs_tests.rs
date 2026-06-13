@@ -300,7 +300,14 @@ kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_subtree_control);
 // enable it on the root, operate on a root child (which then carries
 // the files), and always disable it again so the shared root is left
 // pristine for other tests.
-#[cfg(any(feature = "cgroup-pids", feature = "cgroup-misc"))]
+#[cfg(any(
+    feature = "cgroup-pids",
+    feature = "cgroup-misc",
+    feature = "cgroup-memory",
+    feature = "cgroup-io",
+    feature = "cgroup-cpu",
+    feature = "cgroup-cpuset"
+))]
 fn with_root_controller(
     ctrl: &str,
     child: &str,
@@ -400,3 +407,51 @@ fn smoke_cgroup_psi() -> TestResult {
 }
 #[cfg(feature = "cgroup-psi")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_psi);
+
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::memory::MemoryController));
+    with_root_controller("memory", "t_mem", |cg| {
+        if cg.lookup("memory.max").is_none() || cg.lookup("memory.current").is_none() {
+            return TestResult::Fail("memory.* files absent after enabling memory");
+        }
+        if write_attr(cg, "memory.max", b"4096").is_err() {
+            return TestResult::Fail("set memory.max failed");
+        }
+        let max = read_attr(cg, "memory.max").unwrap_or_default();
+        let cur = read_attr(cg, "memory.current").unwrap_or_default();
+        // "max" round-trips; current is 0 with no charging in the test.
+        if max.trim() == "4096" && cur.trim() == "0" {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("memory.max/current unexpected")
+        }
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_memory);
+
+#[cfg(feature = "cgroup-io")]
+fn smoke_cgroup_io() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::io::IoController));
+    with_root_controller("io", "t_io", |cg| {
+        if cg.lookup("io.weight").is_none() || cg.lookup("io.max").is_none() {
+            return TestResult::Fail("io.* files absent after enabling io");
+        }
+        if write_attr(cg, "io.weight", b"default 200").is_err() {
+            return TestResult::Fail("set io.weight failed");
+        }
+        let w = read_attr(cg, "io.weight").unwrap_or_default();
+        if write_attr(cg, "io.max", b"8:0 wbps=1048576").is_err() {
+            return TestResult::Fail("set io.max failed");
+        }
+        let m = read_attr(cg, "io.max").unwrap_or_default();
+        if w.contains("200") && m.contains("8:0") && m.contains("wbps=1048576") {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("io.weight/io.max round-trip failed")
+        }
+    })
+}
+#[cfg(feature = "cgroup-io")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_io);
