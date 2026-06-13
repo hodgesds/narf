@@ -354,6 +354,111 @@ impl AddressSpace {
         Ok(region)
     }
 
+    /// MAP_FIXED "punch": drop the `[base, base+len)` sub-range from any
+    /// overlapping region — unmapping + freeing ONLY those pages — while
+    /// preserving the rest of each region (prefix `[rb, base)` and suffix
+    /// `[base+len, re)`) with their existing frames and PTEs intact.
+    ///
+    /// After this the window is unmapped and free, so the caller can
+    /// `map_region` a fresh mapping over it. The dynamic linker relies on
+    /// exactly this: it maps a whole DSO file, then `MAP_FIXED`-overlays
+    /// individual segments — the non-overlaid pages (e.g. the ELF header)
+    /// must survive.
+    pub fn punch_fixed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        if base.as_u64() & 0xFFF != 0 || len & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let lo = base.as_u64();
+        let hi = lo.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
+
+        let mut middle: Vec<(VirtAddr, bool)> = Vec::new();
+        {
+            let mut regions = self.regions.lock();
+            let old_regions = core::mem::take(&mut *regions);
+            let mut kept: Vec<Region> = Vec::with_capacity(old_regions.len());
+            for old in old_regions {
+                let rb = old.base.as_u64();
+                let re = rb + old.len;
+                if re <= lo || rb >= hi {
+                    kept.push(old); // no overlap
+                    continue;
+                }
+                let shared = old.perms.contains(RegionPerms::SHARED);
+                let total = (old.len >> 12) as usize;
+                for pg in 0..total {
+                    let pv = rb + (pg as u64) * 4096;
+                    if pv >= lo && pv < hi {
+                        middle.push((VirtAddr::new(pv), shared));
+                    }
+                }
+                // Prefix [rb, lo) keeps its frames + already-installed PTEs.
+                if rb < lo {
+                    let n = ((lo - rb) >> 12) as usize;
+                    kept.push(Region {
+                        base: VirtAddr::new(rb),
+                        len: (n as u64) * 4096,
+                        perms: old.perms,
+                        phys: old.phys[..n].to_vec(),
+                    });
+                }
+                // Suffix [hi, re) likewise.
+                if re > hi {
+                    let start = ((hi - rb) >> 12) as usize;
+                    kept.push(Region {
+                        base: VirtAddr::new(hi),
+                        len: old.len - (start as u64) * 4096,
+                        perms: old.perms,
+                        phys: old.phys[start..].to_vec(),
+                    });
+                }
+            }
+            *regions = kept;
+        }
+        // Unmap + free only the punched-out middle pages (lock released).
+        for (v, shared) in middle {
+            // SAFETY: `v` was covered by a region we just removed from the
+            // table; its PTE is ours to clear, its frame ours to free
+            // (unless SHARED — borrowed from a registry).
+            unsafe { self.unmap_free_page(v, shared) };
+        }
+        Ok(())
+    }
+
+    /// Clear one page's PTE and return its frame to the allocator (unless
+    /// SHARED or a registered page-table frame). Used by `punch_fixed`.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn unmap_free_page(&self, v: VirtAddr, shared: bool) {
+        use crate::frame::{free_frame, PhysFrame};
+        use crate::x86_64::paging::unmap_4kb;
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        // SAFETY: same identity-mapping precondition as `materialize`.
+        if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+            if shared || crate::frame::__pagetable_is_registered(phys.raw()) {
+                return;
+            }
+            free_frame(PhysFrame::new(phys));
+        }
+    }
+
+    /// aarch64 counterpart of `unmap_free_page`.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn unmap_free_page(&self, v: VirtAddr, shared: bool) {
+        use crate::aarch64::paging::unmap_4kb;
+        use crate::frame::{free_frame, PhysFrame};
+        if self.root.as_u64() == 0 {
+            return;
+        }
+        // SAFETY: same identity-mapping precondition as `materialize`.
+        if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+            if shared || crate::frame::__pagetable_is_registered(phys.raw()) {
+                return;
+            }
+            free_frame(PhysFrame::new(phys));
+        }
+    }
+
     /// Walk a region's per-page PTEs, unmap each, and return its
     /// frame to the allocator. Used by `unmap_region` and by
     /// `Drop for AddressSpace`.

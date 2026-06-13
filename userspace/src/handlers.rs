@@ -4048,11 +4048,64 @@ fn sys_close(ctx: &mut dyn TrapContext) {
 // AS.
 static MMAP_CURSOR: AtomicU64 = AtomicU64::new(0x0000_4080_0000_0000);
 
+/// Translate POSIX `PROT_*` bits into NARF region perms. `PROT_NONE`
+/// (a bare reservation) maps to a present READ region — NARF has no
+/// no-access mapping, and the reservation is typically overwritten by a
+/// later MAP_FIXED segment anyway.
+fn perms_of_prot(prot: u32) -> RegionPerms {
+    const PROT_READ: u32 = 0x1;
+    const PROT_WRITE: u32 = 0x2;
+    const PROT_EXEC: u32 = 0x4;
+    let mut p = RegionPerms::default();
+    if prot & PROT_READ != 0 {
+        p = p | RegionPerms::READ;
+    }
+    if prot & PROT_WRITE != 0 {
+        p = p | RegionPerms::WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        p = p | RegionPerms::EXEC;
+    }
+    if !p.contains(RegionPerms::READ)
+        && !p.contains(RegionPerms::WRITE)
+        && !p.contains(RegionPerms::EXEC)
+    {
+        p = RegionPerms::READ;
+    }
+    p
+}
+
+/// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
+/// zero-padding past EOF (the BSS tail of a file-backed segment).
+fn mmap_read_file(fd: i32, offset: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    if fd < 0 {
+        return None;
+    }
+    let task = current_task_id();
+    let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()?;
+    let mut buf = alloc::vec![0u8; len];
+    let mut done = 0usize;
+    while done < len {
+        match poll_blocking(ops.read(offset + done as u64, &mut buf[done..])) {
+            Some(Ok(0)) | None => break, // EOF / error — rest stays zero
+            Some(Ok(n)) => done += n,
+            Some(Err(_)) => break,
+        }
+    }
+    Some(buf)
+}
+
 fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let hint = args.arg0;
     let len = ((args.arg1 + 0xFFF) & !0xFFFu64).max(0x1000);
-    let flags = args.arg2 as u32;
+    // Standard 6-arg mmap ABI: arg2 prot, arg3 flags, arg4 fd, arg5 offset.
+    // narf_user_runtime::mmap issues this same shape for NARF-native
+    // anonymous maps (prot=RW, fd=-1), so the kernel decodes one layout.
+    let prot = args.arg2 as u32;
+    let flags = args.arg3 as u32;
+    let fd = args.arg4 as i64 as i32;
+    let offset = args.arg5;
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -4061,66 +4114,78 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     };
 
-    // POSIX mmap flag bits — pinned in narf-libc::sys, mirrored
-    // here so the kernel can decode without a libc dep:
-    //   MAP_FIXED     = 0x10  — use `hint` as the actual base
-    //                   (must be page-aligned, must not collide
-    //                   with an existing region in the AS).
-    //   MAP_ANONYMOUS = 0x20  — currently the only mode supported.
-    //                   File-backed mmap returns InvalidOp at the
-    //                   libc shim before we ever see the syscall.
     const MAP_FIXED: u32 = 0x10;
+    const MAP_ANONYMOUS: u32 = 0x20;
+    let pages = (len >> 12) as usize;
+    let perms = perms_of_prot(prot);
 
-    // Pick a fresh user virt. With MAP_FIXED honour the caller's
-    // hint (page-aligned, no collision with an existing region);
-    // otherwise bump the per-AS cursor (NOT the legacy global —
-    // pre-fix, two processes mmap'ing in parallel would race-bump
-    // the same atomic and end up with overlapping virts in
-    // distinct PML4s).
-    let pages = len >> 12;
+    // Base selection. MAP_FIXED uses `hint` and REPLACES any overlapping
+    // mappings (POSIX semantics) — the dynamic linker reserves a DSO range
+    // PROT_NONE then MAP_FIXED-maps each segment over it. Otherwise bump the
+    // per-AS mmap cursor.
     let base = if flags & MAP_FIXED != 0 {
         if hint == 0 || hint & 0xFFF != 0 {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
-        // Reject if any existing region overlaps the requested
-        // [hint, hint + len) window. POSIX.1-2017 §3.3.3 leaves
-        // overlap behaviour implementation-defined: some systems
-        // silently replace the prior mapping, but we choose to
-        // fail loudly since the caller explicitly asked for this
-        // exact vaddr — silent overwrite hides bugs.
-        let snap = as_ref.regions_snapshot();
-        let lo = hint;
-        let hi = hint.saturating_add(len);
-        if snap.iter().any(|r| {
-            let rb = r.base.as_u64();
-            let re = rb.saturating_add(r.len);
-            !(re <= lo || rb >= hi)
-        }) {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
+        // Punch out exactly [hint, hint+len), splitting (not destroying)
+        // any region it overlaps so the non-replaced pages survive — the
+        // dynamic linker overlays DSO segments onto its whole-file mapping
+        // this way, and the ELF-header page between them must stay mapped.
+        let _ = as_ref.punch_fixed(VirtAddr::new(hint), len);
         hint
     } else {
         as_ref.reserve_mmap_va(len)
     };
 
-    // Lazy-back: install the region with `phys[i] == 0` for every
-    // page. The first user-mode access to each page faults with
-    // P=0 + U=1; the kernel #PF handler invokes
-    // `AddressSpace::demand_alloc_page` to allocate + zero + map
-    // a frame on the spot. Old behaviour (eager-back every page
-    // up front) is no longer the default — `mlock` provides the
-    // explicit force-back for callers that need it.
-    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> =
-        alloc::vec![narf_memory::PhysAddr::new(0); pages as usize];
+    let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
+    let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
+        // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros
+        // each page on first access.
+        alloc::vec![narf_memory::PhysAddr::new(0); pages]
+    } else {
+        // File-backed MAP_PRIVATE: eagerly copy the file's [offset, offset+
+        // len) bytes into private frames (zero past EOF). ld-musl maps each
+        // PT_LOAD segment of a DSO this way.
+        let len_bytes = len as usize;
+        let bytes = match mmap_read_file(fd, offset, len_bytes) {
+            Some(b) => b,
+            None => {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+        };
+        let mut frames = alloc::vec::Vec::with_capacity(pages);
+        for i in 0..pages {
+            let frame = match narf_memory::alloc_frame() {
+                Ok(f) => f.start_address(),
+                Err(_) => {
+                    ctx.set_return(SyscallReturn::invalid_op());
+                    return;
+                }
+            };
+            let off = i * 4096;
+            let chunk = core::cmp::min(4096, len_bytes - off);
+            // SAFETY: freshly-allocated identity-mapped frame; zero then copy
+            // the (<=4096-byte) file chunk in.
+            unsafe {
+                core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(off),
+                    frame.raw() as *mut u8,
+                    chunk,
+                );
+            }
+            frames.push(frame);
+        }
+        frames
+    };
 
-    // Install + materialise.
     if as_ref
         .map_region(Region {
             base: VirtAddr::new(base),
             len,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms,
             phys: phys_list,
         })
         .is_err()
