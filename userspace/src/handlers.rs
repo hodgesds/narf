@@ -3261,29 +3261,24 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
 fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _dirfd = args.arg0;
-    let ptr = args.arg1;
-    let len = args.arg2 as usize;
+    let path_uptr = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_path(ptr, len) {
+    // Linux ABI: faccessat/fchmodat/fchownat take a NUL-terminated path
+    // in arg1 — arg2 is mode/owner, NOT a length. (Reading arg2 as a
+    // length truncated the path to mode-many bytes: `access("/dev/shm/
+    // nums", R_OK)` opened "/dev/s" and failed, breaking busybox grep.)
+    let raw = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    if !path.starts_with('/') {
-        // Relative paths require dirfd resolution we don't have.
-        ctx.set_return(fail);
-        return;
-    }
-    // Existence check: any FileOps lookup returning Some is enough.
-    let exists = narf_filesystem::registry()
-        .resolve_absolute(&path, |fs, rel| {
-            narf_filesystem::resolve(fs.root(), rel).ok()
-        })
-        .flatten()
-        .is_some();
-    if exists {
+    let path = resolve_cwd_path(current_task_id(), &raw);
+    // Existence check over files AND directories. mode/uid/gid are
+    // structural-only state NARF doesn't enforce, so report success iff
+    // the path exists (covers access(2) F_OK and grants R/W/X).
+    if stat_path_dir_aware(&path).is_some() {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
