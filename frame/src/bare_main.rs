@@ -3505,6 +3505,8 @@ fn boot_userspace_init() {
                 ("inotify2_smoke", narf_verification::NARF_INOTIFY2_SMOKE_ELF),
                 // Linux-compat round 23: fanotify (init/mark + fd events).
                 ("fanotify_smoke", narf_verification::NARF_FANOTIFY_SMOKE_ELF),
+                // Linux-compat round 24: Landlock path-rule enforcement.
+                ("landlock_smoke", narf_verification::NARF_LANDLOCK_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

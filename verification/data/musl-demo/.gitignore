@@ -53,3 +53,4 @@ futex2_smoke_x86_64
 keyring_smoke_x86_64
 inotify2_smoke_x86_64
 fanotify_smoke_x86_64
+landlock_smoke_x86_64

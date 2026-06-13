@@ -1486,6 +1486,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("inotify2_smoke", "inotify2-ok"),
         // Linux-compat round 23: fanotify (init/mark + fd events).
         ("fanotify_smoke", "fanotify-ok"),
+        // Linux-compat round 24: Landlock path-rule enforcement.
+        ("landlock_smoke", "landlock-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
