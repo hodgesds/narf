@@ -912,6 +912,10 @@ impl DirOps for ProcRoot {
                 name: "sched",
                 gen: gen_sched,
             })),
+            "stat" => Some(Arc::new(ProcStaticFile {
+                name: "stat",
+                gen: gen_stat,
+            })),
             "self" => Some(Arc::new(ProcDirMarker)),
             _ => {
                 // Dynamic registry — file or directory marker. The
@@ -1261,6 +1265,36 @@ fn gen_filesystems() -> String {
     s
 }
 
+/// `/proc/stat` — system-wide kernel/scheduler stats. `top`, `uptime`,
+/// `vmstat` and most monitors read this. NARF doesn't account per-task CPU
+/// time, so the busy fields are 0 and the elapsed time is reported as idle
+/// (the TCG system is mostly idle); the structure is what tools parse.
+fn gen_stat() -> String {
+    use core::fmt::Write as _;
+    let mut s = String::new();
+    let up_ns = narf_time::monotonic_ns();
+    // USER_HZ = 100 → jiffies are centiseconds.
+    let idle = up_ns / 10_000_000;
+    let depths = narf_scheduler::cpu_queue_depths();
+    let ncpu = depths.len().max(1) as u64;
+    // Aggregate: user nice system idle iowait irq softirq steal guest gnice.
+    let _ = writeln!(s, "cpu  0 0 0 {} 0 0 0 0 0 0", idle);
+    for (cpu, _) in &depths {
+        let _ = writeln!(s, "cpu{} 0 0 0 {} 0 0 0 0 0 0", cpu, idle / ncpu);
+    }
+    let _ = writeln!(s, "intr 0");
+    let _ = writeln!(s, "ctxt 0");
+    // btime = wall-now minus uptime (UNIX seconds the system booted).
+    let btime = (narf_time::now_wall().secs as u64).saturating_sub(up_ns / 1_000_000_000);
+    let _ = writeln!(s, "btime {}", btime);
+    let tasks = narf_scheduler::all_task_ids().len();
+    let _ = writeln!(s, "processes {}", tasks);
+    let running: usize = depths.iter().map(|(_, n)| *n).sum();
+    let _ = writeln!(s, "procs_running {}", running.max(1));
+    let _ = writeln!(s, "procs_blocked 0");
+    s
+}
+
 fn gen_sched() -> String {
     use core::fmt::Write as _;
     let mut s = String::new();
@@ -1340,15 +1374,33 @@ fn render_status(info: &ProcTaskInfo) -> String {
             },
         ),
     );
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Tgid:\t{}\n", info.pid));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Ngid:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
-    let _ = core::fmt::Write::write_fmt(
-        &mut s,
-        format_args!("VmStk:\t{} kB\n", info.stack_top / 1024),
-    );
+    // NARF tracks no parent link in ProcTaskInfo yet → PPid 0.
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t0\n"));
+    // Total mapped size from the VMA list. NARF doesn't separate resident
+    // from virtual, so VmRSS/VmPeak/VmHWM mirror VmSize (best-effort, but
+    // enough for ps/top to sort and display).
+    let vm_kb: u64 = info
+        .vmas
+        .iter()
+        .map(|v| v.end.saturating_sub(v.start) / 1024)
+        .sum();
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmPeak:\t{} kB\n", vm_kb));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmSize:\t{} kB\n", vm_kb));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmHWM:\t{} kB\n", vm_kb));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("VmRSS:\t{} kB\n", vm_kb));
     let _ = core::fmt::Write::write_fmt(
         &mut s,
         format_args!("VmData:\t{} kB\n", info.brk_top / 1024),
     );
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("VmStk:\t{} kB\n", info.stack_top / 1024),
+    );
+    // Single-threaded processes (NARF threads aren't surfaced per-tid here).
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Threads:\t1\n"));
     s
 }
 

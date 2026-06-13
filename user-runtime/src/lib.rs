@@ -1267,8 +1267,24 @@ pub fn sethostname(s: &str) -> i32 {
 /// per-task address-space rules.
 #[inline]
 pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
-    // SAFETY: SYS_MMAP signature: arg0 hint, arg1 len, arg2 flags.
-    let r = unsafe { syscall3(SYS_MMAP, hint as u64, len as u64, flags as u64) };
+    // Standard POSIX/musl 6-arg mmap ABI so the kernel decodes one shape
+    // for both NARF-native and musl callers: arg0 addr, arg1 len, arg2
+    // prot, arg3 flags, arg4 fd, arg5 offset. NARF-native callers only do
+    // anonymous read/write maps, so prot=READ|WRITE, fd=-1, offset=0.
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    // SAFETY: SYS_MMAP with the documented 6-arg layout.
+    let r = unsafe {
+        syscall6(
+            SYS_MMAP,
+            hint as u64,
+            len as u64,
+            PROT_READ | PROT_WRITE,
+            flags as u64,
+            !0u64, // fd = -1 (anonymous)
+            0,     // offset
+        )
+    };
     if r == 0 || r == !0u64 {
         core::ptr::null_mut()
     } else {

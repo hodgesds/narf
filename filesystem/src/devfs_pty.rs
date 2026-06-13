@@ -188,25 +188,59 @@ impl<const N: usize> core::fmt::Debug for ByteRing<N> {
 
 // ── Termios ───────────────────────────────────────────────────────────────────
 
-/// Minimal termios state.
-///
-/// Full POSIX termios (c_iflag / c_oflag / c_cflag / c_lflag + c_cc[])
-/// is a Stage-4 item.  For v1 we track only ICANON and ECHO.
+/// Wire length of the userspace `struct termios` exchanged by
+/// TCGETS/TCSETS on x86_64 (glibc/musl: 4 flag words + c_line + c_cc[32] +
+/// 2 speeds, padded to 60).
+pub const TERMIOS_WIRE_LEN: usize = 60;
+
+// `c_lflag` bits we honour (asm-generic termbits).
+const L_ICANON: u32 = 0x0000_0002;
+const L_ECHO: u32 = 0x0000_0008;
+
+/// Full termios state. We keep the userspace `struct termios` wire image
+/// verbatim so TCGETS/TCSETS round-trip every field a program sets, and
+/// derive the line-discipline knobs (ICANON / ECHO / ISIG) from `c_lflag`.
 #[derive(Copy, Clone, Debug)]
 pub struct Termios {
+    /// Raw `struct termios` wire image (c_iflag@0, c_oflag@4, c_cflag@8,
+    /// c_lflag@12, c_line@16, c_cc[]@17, speeds@52..60).
+    pub raw: [u8; TERMIOS_WIRE_LEN],
+}
+
+impl Termios {
+    fn lflag(&self) -> u32 {
+        u32::from_ne_bytes(self.raw[12..16].try_into().unwrap())
+    }
     /// Canonical mode (line-buffered): slave reads wait for `\n` or `^D`.
-    pub icanon: bool,
-    /// Echo: bytes written to slave are echoed back to the master.
-    pub echo: bool,
+    pub fn icanon(&self) -> bool {
+        self.lflag() & L_ICANON != 0
+    }
+    /// Echo: bytes the slave reads are echoed back to the master.
+    pub fn echo(&self) -> bool {
+        self.lflag() & L_ECHO != 0
+    }
 }
 
 impl Default for Termios {
     fn default() -> Self {
-        // Default matches Linux's `n_tty_set_termios` initial state.
-        Self {
-            icanon: true,
-            echo: true,
-        }
+        // Cooked-mode default matching Linux's `n_tty_set_termios` initial
+        // state: ICRNL|IXON in, OPOST|ONLCR out, CS8|CREAD control,
+        // ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN local, sane control chars.
+        let mut raw = [0u8; TERMIOS_WIRE_LEN];
+        raw[0..4].copy_from_slice(&0x0000_0500u32.to_ne_bytes()); // c_iflag: ICRNL|IXON
+        raw[4..8].copy_from_slice(&0x0000_0005u32.to_ne_bytes()); // c_oflag: OPOST|ONLCR
+        raw[8..12].copy_from_slice(&0x0000_00bfu32.to_ne_bytes()); // c_cflag: B38400|CS8|CREAD
+        raw[12..16].copy_from_slice(&0x0000_803bu32.to_ne_bytes()); // c_lflag
+                                                                    // c_cc[] begins at offset 17 (after c_line@16). Indices:
+                                                                    // VINTR=0 VQUIT=1 VERASE=2 VKILL=3 VEOF=4 VTIME=5 VMIN=6.
+        let cc = 17;
+        raw[cc] = 0x03; // VINTR  = ^C
+        raw[cc + 1] = 0x1c; // VQUIT  = ^\
+        raw[cc + 2] = 0x7f; // VERASE = DEL
+        raw[cc + 3] = 0x15; // VKILL  = ^U
+        raw[cc + 4] = 0x04; // VEOF   = ^D
+        raw[cc + 6] = 0x01; // VMIN   = 1
+        Self { raw }
     }
 }
 
@@ -524,42 +558,68 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
     Ok(())
 }
 
-/// Zero-fill an opaque 60-byte `struct termios` into user memory.
-/// musl's `isatty()` and similar checks only care that `tcgetattr`
-/// succeeds; the field contents aren't consulted by anything inside
-/// this kernel. Linux's `struct termios` is 60 bytes on x86_64
-/// (c_iflag/c_oflag/c_cflag/c_lflag/c_line/c_cc[19]/c_ispeed/c_ospeed).
+/// Copy a pty's `struct termios` wire image (60 bytes) out to user memory
+/// for TCGETS. Mirrors what the program last set via TCSETS, so
+/// tcgetattr(tcsetattr(x)) round-trips.
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
+unsafe fn write_user_termios(uptr: usize, src: &[u8; TERMIOS_WIRE_LEN]) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
-    let zero = [0u8; 60];
-    // SAFETY: caller guarantees uptr is a valid user-space pointer; with_user_access
-    // enables SMAP; zero.as_ptr() and uptr point to non-overlapping regions of
-    // exactly 60 bytes each.
-    // SAFETY: Valid memory or trusted environment
+    let v = *src;
+    // SAFETY: caller guarantees uptr is a valid user pointer; with_user_access
+    // brackets the access with SMAP and write_unaligned emits inline stores
+    // (a copy_nonoverlapping memcpy libcall escapes the STAC/CLAC window).
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60);
+            core::ptr::write_unaligned(uptr as *mut [u8; TERMIOS_WIRE_LEN], v);
         });
     }
     Ok(())
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn write_user_termios_zero(uptr: usize) -> Result<(), FsError> {
+unsafe fn write_user_termios(uptr: usize, src: &[u8; TERMIOS_WIRE_LEN]) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
-    let zero = [0u8; 60];
-    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
-    // (its fn contract) and is non-null per the check above; the local
-    // `zero` buffer and `uptr` are non-overlapping regions of exactly
-    // 60 bytes each.
-    // SAFETY: Valid memory or trusted environment
-    unsafe { core::ptr::copy_nonoverlapping(zero.as_ptr(), uptr as *mut u8, 60) };
+    // SAFETY: caller guarantees uptr is a valid user pointer; src and uptr
+    // are non-overlapping 60-byte regions.
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), uptr as *mut u8, TERMIOS_WIRE_LEN) };
     Ok(())
+}
+
+/// Read a `struct termios` wire image (60 bytes) in from user memory for
+/// TCSETS.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees uptr is a valid user pointer; with_user_access
+    // brackets the access with SMAP and read_unaligned emits inline loads (a
+    // copy_nonoverlapping memcpy libcall escapes the STAC/CLAC window and
+    // faults supervisor-reading the user page).
+    let v = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::read_unaligned(uptr as *const [u8; TERMIOS_WIRE_LEN])
+        })
+    };
+    Ok(v)
+}
+
+#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut out = [0u8; TERMIOS_WIRE_LEN];
+    // SAFETY: caller guarantees uptr is a valid user pointer; out and uptr
+    // are non-overlapping 60-byte regions.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uptr as *const u8, out.as_mut_ptr(), TERMIOS_WIRE_LEN)
+    };
+    Ok(out)
 }
 
 // ── PtyMaster FileOps ─────────────────────────────────────────────────────────
@@ -696,15 +756,17 @@ impl FileOps for PtyMaster {
                 Ok(0)
             }
             TCGETS => {
+                let t = *self.pty.termios.lock();
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
-                unsafe { write_user_termios_zero(arg)? };
+                unsafe { write_user_termios(arg, &t.raw)? };
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
-                // Accept any termios write — we don't model the full
-                // line discipline, so the caller's settings are
-                // recorded as a no-op. Linux semantics: success.
-                let _ = arg;
+                // Store the caller's termios so it round-trips and the
+                // ICANON/ECHO knobs take effect in the line discipline.
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
+                let raw = unsafe { read_user_termios(arg)? };
+                self.pty.termios.lock().raw = raw;
                 Ok(0)
             }
             FIONREAD => {
@@ -766,7 +828,7 @@ impl FileOps for PtySlave {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let termios = *self.pty.termios.lock();
 
-        if termios.icanon {
+        if termios.icanon() {
             // Look for ^D (EOF) at the start of the input.
             // A real implementation would check `c_cc[VEOF]`; we hardcode 0x04.
             let mut tmp = [0u8; 1];
@@ -796,7 +858,7 @@ impl FileOps for PtySlave {
     /// Linux ref: `pty.c pty_write` for the echo side via
     ///   `n_tty_receive_buf_common → n_tty_echo`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let echo = self.pty.termios.lock().echo;
+        let echo = self.pty.termios.lock().echo();
         // Push slave output so master can read it.
         self.pty.slave_tx_to_master.push(buf);
         // Echo: if ECHO flag is on, also copy to slave_tx_to_master so
@@ -886,12 +948,15 @@ impl FileOps for PtySlave {
                 Ok(0)
             }
             TCGETS => {
+                let t = *self.pty.termios.lock();
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
-                unsafe { write_user_termios_zero(arg)? };
+                unsafe { write_user_termios(arg, &t.raw)? };
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
-                let _ = arg;
+                // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
+                let raw = unsafe { read_user_termios(arg)? };
+                self.pty.termios.lock().raw = raw;
                 Ok(0)
             }
             FIONREAD => {

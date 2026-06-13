@@ -377,6 +377,8 @@ fn main() {
         "vdso_smoke",
         "fhandle_smoke",
         "mountapi_smoke",
+        "jobctl_smoke",
+        "procfs2_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
@@ -472,6 +474,97 @@ fn main() {
             };
             println!("cargo:rustc-env=NARF_VDSO_ELF_{arch}={path}");
         }
+    }
+
+    // ── multi-DSO dynamic-linking test (x86_64) ─────────────────────
+    // liba.so (leaf) + libb.so (needs liba) + the dynamic main (dso_smoke,
+    // needs libb + liba + libc). The kernel seeds liba/libb into /lib so
+    // ld-musl resolves the two-deep DT_NEEDED chain via file-backed mmap.
+    {
+        let dso_dir = manifest_dir.join("data/dsotest");
+        for f in ["liba.c", "libb.c", "dso_smoke.c"] {
+            println!("cargo:rerun-if-changed={}", dso_dir.join(f).display());
+        }
+        let (liba, libb, main) = match which("musl-gcc") {
+            Some(cc) => {
+                let liba = out_dir.join("liba.so");
+                let libb = out_dir.join("libb.so");
+                let main = out_dir.join("dso_smoke_x86_64");
+                let outs = out_dir.display().to_string();
+                let run = |args: &[&str], what: &str| {
+                    let o = Command::new(&cc)
+                        .current_dir(&dso_dir)
+                        .args(args)
+                        .output()
+                        .unwrap_or_else(|e| panic!("dsotest: spawn musl-gcc for {what}: {e}"));
+                    if !o.status.success() {
+                        panic!(
+                            "dsotest: {what} failed:\n{}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                    }
+                };
+                run(
+                    &[
+                        "-shared",
+                        "-fPIC",
+                        "-O2",
+                        "-Wl,-soname,liba.so",
+                        "liba.c",
+                        "-o",
+                        &liba.display().to_string(),
+                    ],
+                    "liba.so",
+                );
+                run(
+                    &[
+                        "-shared",
+                        "-fPIC",
+                        "-O2",
+                        "-Wl,-soname,libb.so",
+                        "libb.c",
+                        "-L",
+                        &outs,
+                        "-la",
+                        "-Wl,-rpath,/lib",
+                        "-o",
+                        &libb.display().to_string(),
+                    ],
+                    "libb.so",
+                );
+                run(
+                    &[
+                        "-O2",
+                        "-fPIE",
+                        "-pie",
+                        "-mcmodel=large",
+                        "dso_smoke.c",
+                        "-L",
+                        &outs,
+                        "-lb",
+                        "-la",
+                        "-Wl,-rpath,/lib",
+                        "-o",
+                        &main.display().to_string(),
+                    ],
+                    "dso_smoke",
+                );
+                (
+                    liba.display().to_string(),
+                    libb.display().to_string(),
+                    main.display().to_string(),
+                )
+            }
+            None => (
+                "/dev/null".to_string(),
+                "/dev/null".to_string(),
+                "/dev/null".to_string(),
+            ),
+        };
+        println!("cargo:rustc-env=NARF_LIBA_SO={liba}");
+        println!("cargo:rustc-env=NARF_LIBB_SO={libb}");
+        println!("cargo:rustc-env=NARF_DSO_SMOKE_ELF_X86_64={main}");
+        println!("cargo:rustc-env=NARF_DSO_SMOKE_ELF_AARCH64=/dev/null");
     }
 
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else

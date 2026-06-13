@@ -234,7 +234,7 @@ fn smoke_pty_slave_echo_to_master() -> TestResult {
     // Verify ECHO is on by default.
     {
         let t = slave_arc.termios.lock();
-        if !t.echo {
+        if !t.echo() {
             return TestResult::Fail("ECHO not on by default");
         }
     }

@@ -201,7 +201,11 @@ narf-libc-validate = ["user-mode-e2e", "narf-verification/narf-libc-validate"]
 # Build init+shell ELFs and load + spawn `init` from the production
 # `run_async_demo` boot path. On by default (see `default` above);
 # strip with `--no-default-features` for a minimal kernel.
-boot-init = ["dep:narf-verification", "narf-verification/boot-init"]
+# A real boot brings up the full Linux-shaped syscall surface, including
+# the per-pid /proc hooks installed in cross_crate_init (gated on the frame
+# crate's own `linux-compat`, which must therefore be on — not just
+# transitively via narf-verification).
+boot-init = ["dep:narf-verification", "narf-verification/boot-init", "linux-compat"]
 
 [lints]
 workspace = true
