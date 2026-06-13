@@ -79,6 +79,8 @@ pub mod root_selector;
 pub mod sysfs;
 pub mod uevent;
 
+#[cfg(feature = "cgroup")]
+mod cgroupfs_tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
 mod e2e_tests;
