@@ -34,8 +34,13 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         RawWaker::new(core::ptr::null(), &VTAB)
     }
     const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+    // SAFETY: the vtable's clone/wake/drop are all no-ops over a null
+    // data pointer, so the Waker is inert — sound to construct and
+    // never observed after this single-threaded poll.
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local owned by this frame and never moved
+    // again before the pinned poll below completes.
     let pinned = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(v) => Some(v),

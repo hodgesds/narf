@@ -60,14 +60,14 @@
 
 extern crate alloc;
 
+#[cfg(feature = "cgroup")]
+pub mod cgroupfs;
 pub mod csprng;
 pub mod devfs;
 pub mod devfs_block;
 pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
-#[cfg(feature = "cgroup")]
-pub mod cgroupfs;
 pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
@@ -79,7 +79,6 @@ pub mod root_selector;
 pub mod sysfs;
 pub mod uevent;
 
-#[cfg(feature = "cgroup")]
 mod cgroupfs_tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
@@ -91,6 +90,8 @@ mod sysfs_e2e_tests;
 mod sysfs_tests;
 mod tests;
 mod uevent_e2e_tests;
+#[cfg(feature = "cgroup")]
+pub use cgroupfs::CgroupFs;
 pub use devfs::{
     install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks,
     mount_default as mount_devfs_default, register_dri_dir, register_snd_dir, register_tpm,
@@ -101,8 +102,6 @@ pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
-#[cfg(feature = "cgroup")]
-pub use cgroupfs::CgroupFs;
 pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]

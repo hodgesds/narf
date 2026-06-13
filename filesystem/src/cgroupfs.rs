@@ -354,7 +354,10 @@ fn render(cg: &Arc<Cgroup>, attr: Attr) -> String {
         }
         Attr::Type => "domain\n".to_string(),
         Attr::Stat => {
-            format!("nr_descendants {}\nnr_dying_descendants 0\n", cg.nr_descendants())
+            format!(
+                "nr_descendants {}\nnr_dying_descendants 0\n",
+                cg.nr_descendants()
+            )
         }
         Attr::Freeze => "0\n".to_string(),
         Attr::MaxDepth | Attr::MaxDescendants => "max\n".to_string(),
