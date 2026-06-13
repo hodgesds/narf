@@ -16,6 +16,8 @@ pub mod asid_alloc;
 pub mod atomic_pool;
 pub mod beacon;
 pub mod buddy;
+#[cfg(feature = "cgroup")]
+pub mod cgroup_charge;
 pub mod compress;
 pub mod compressed_ramdisk;
 pub mod context;
@@ -51,6 +53,9 @@ pub mod aarch64;
 pub use aarch64::{ioremap, mmu, paging};
 
 pub use addr::{PhysAddr, VirtAddr};
+
+#[cfg(feature = "cgroup")]
+pub use cgroup_charge::{install_cgroup_charge_hook, install_cgroup_pid_provider};
 
 /// Per-arch offset that maps a physical RAM address to its
 /// **kernel** virtual address. The kernel uses this to access

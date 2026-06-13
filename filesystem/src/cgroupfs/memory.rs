@@ -1,10 +1,42 @@
 //! `memory` controller — memory accounting + limits.
 //!
-//! SCAFFOLD: presents the full v2 memory interface with zero usage and
-//! accepts limit writes. Real charge/uncharge accounting (wired to the
-//! page/frame allocator via a hook installed into `narf-memory`) and
-//! `memory.max`/OOM enforcement land in the controller-implementation
-//! pass.
+//! Real charge/uncharge accounting wired to the page/frame allocator
+//! (`narf-memory`) via the fn-pointer charge hook this module installs
+//! the first time a `memory` cgroup state is created. The allocator
+//! calls the hook on every user-facing frame allocation (positive byte
+//! delta) and free (negative delta); the hook walks the allocating
+//! task's cgroup chain and charges/uncharges every level.
+//!
+//! # What is enforced vs accounting-only
+//!
+//! * **`memory.max` — ENFORCED.** A positive charge that would push any
+//!   level over its `memory.max` is rejected: the hook returns `false`,
+//!   and `narf-memory`'s `alloc_frame*` / `alloc_pages_on` fail the
+//!   allocation (returning `FrameAllocError::Exhausted`). The breaching
+//!   level's `memory.events` `max` counter is bumped, and `oom` /
+//!   `oom_kill` are bumped to record that the allocation was refused.
+//!   (NARF has no OOM-killer task-reaper yet; we record the OOM event
+//!   but do not actually kill a task — the allocation simply fails,
+//!   which the caller surfaces as ENOMEM. This is honest v2 semantics
+//!   for `memory.oom.group` unset.)
+//! * **`memory.high` — ACCOUNTING-ONLY.** v2 `memory.high` is a
+//!   throttle/reclaim trigger, never a hard wall. We have no reclaim
+//!   path here, so crossing `high` bumps the `high` event counter for
+//!   visibility but never denies the charge.
+//! * **`memory.current` / `memory.peak` — REAL.** Live charged-byte
+//!   totals, summed from actual frame allocations attributed to the
+//!   cgroup's tasks (no fabricated numbers).
+//! * **`memory.min` / `memory.low` — STORED, NOT ACTED ON.** These are
+//!   reclaim-protection knobs; with no reclaim path they are accepted
+//!   and echoed back but have no runtime effect.
+//! * **`memory.stat` — single honest bucket.** We can attribute charged
+//!   bytes to the cgroup but cannot (yet) distinguish anon vs file vs
+//!   kernel at the frame allocator, so the total lands in `anon` and
+//!   the categories we can't back are reported as `0` rather than
+//!   invented.
+//! * **swap — accounting-only zero.** No swap accounting seam exists in
+//!   the allocator; `memory.swap.current` stays `0` and `memory.swap.max`
+//!   stores its limit without effect.
 //!
 //! Linux ref: `mm/memcontrol.c`,
 //! `Documentation/admin-guide/cgroup-v2.rst` §"Memory".
@@ -12,8 +44,9 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -34,6 +67,79 @@ const FILES: &[&str] = &[
     "memory.swap.max",
 ];
 
+/// Guards the one-time install of the allocator charge hook. Set the
+/// first time any `memory` cgroup state is created (`new_state`), so no
+/// external boot wiring is required.
+static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// The charge hook `narf-memory` calls on every user-facing frame
+/// allocation (`delta_bytes > 0`) and free (`delta_bytes < 0`).
+///
+/// Returns `true` if the (positive) charge is allowed, `false` if it
+/// would push some level over its `memory.max` — in which case the
+/// allocation is denied. Negative deltas always return `true`.
+///
+/// Two-phase for positive deltas: pre-check every level against its
+/// `max` (charging nothing), and only commit if all levels pass, so a
+/// rejected allocation leaves accounting untouched.
+fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
+    // Collect the chain's `MemoryState`s once (clone the `Arc`s so we
+    // can iterate them twice without holding the chain lock across the
+    // closure body).
+    let mut states: Vec<Arc<dyn ControllerState>> = Vec::new();
+    super::with_chain_states(pid, "memory", |s| states.push(s.clone()));
+
+    if delta_bytes < 0 {
+        let amount = delta_bytes.unsigned_abs();
+        for s in &states {
+            if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
+                m.uncharge(amount);
+            }
+        }
+        return true;
+    }
+
+    let amount = delta_bytes as u64;
+
+    // Phase 1: pre-check every level against memory.max.
+    for s in &states {
+        if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
+            if !m.can_charge(amount) {
+                // Record the breach on the level that rejected it. No
+                // level has been charged yet, so this is consistent.
+                m.note_max_event();
+                return false;
+            }
+        }
+    }
+
+    // Phase 2: commit on every level (also notes `high` crossings).
+    for s in &states {
+        if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
+            m.commit_charge(amount);
+        }
+    }
+    true
+}
+
+/// Install the allocator charge hook into `narf-memory` exactly once.
+///
+/// DOCUMENTED LAZY INSTALL: called from `MemoryController::new_state`
+/// the first time any `memory` cgroup acquires state, so cgroup memory
+/// accounting comes online with no external boot wiring. (The
+/// allocator's PID provider — "which task is allocating now" — is
+/// installed by the task/scheduler layer via
+/// `narf_memory::install_cgroup_pid_provider`; until it is, allocations
+/// are simply unattributed and this hook is a no-op.)
+fn ensure_hook_installed() {
+    if HOOK_INSTALLED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        narf_memory::install_cgroup_charge_hook(charge_hook);
+    }
+}
+
 #[derive(Debug)]
 pub struct MemoryController;
 
@@ -43,6 +149,7 @@ impl Controller for MemoryController {
     }
 
     fn new_state(&self, _parent: Option<Arc<dyn ControllerState>>) -> Arc<dyn ControllerState> {
+        ensure_hook_installed();
         Arc::new(MemoryState {
             current: AtomicU64::new(0),
             peak: AtomicU64::new(0),
@@ -52,13 +159,20 @@ impl Controller for MemoryController {
             high: IrqSafeSpinLock::new(None),
             max: IrqSafeSpinLock::new(None),
             swap_max: IrqSafeSpinLock::new(None),
+            events_low: AtomicU64::new(0),
+            events_high: AtomicU64::new(0),
+            events_max: AtomicU64::new(0),
+            events_oom: AtomicU64::new(0),
+            events_oom_kill: AtomicU64::new(0),
         })
     }
 }
 
 #[derive(Debug)]
 pub struct MemoryState {
+    /// `memory.current` — live charged bytes for this level.
     current: AtomicU64,
+    /// `memory.peak` — high-water mark of `current`.
     peak: AtomicU64,
     swap_current: AtomicU64,
     min: IrqSafeSpinLock<u64>,
@@ -67,6 +181,12 @@ pub struct MemoryState {
     high: IrqSafeSpinLock<Option<u64>>,
     max: IrqSafeSpinLock<Option<u64>>,
     swap_max: IrqSafeSpinLock<Option<u64>>,
+    /// `memory.events` counters (this cgroup's own — i.e. `.local`).
+    events_low: AtomicU64,
+    events_high: AtomicU64,
+    events_max: AtomicU64,
+    events_oom: AtomicU64,
+    events_oom_kill: AtomicU64,
 }
 
 fn max_line(v: &Option<u64>) -> String {
@@ -95,6 +215,89 @@ fn parse_u64(buf: &[u8]) -> Result<u64, FsError> {
         .map_err(|_| FsError::InvalidData)
 }
 
+impl MemoryState {
+    /// Would charging `amount` more bytes keep this level at or below
+    /// `memory.max`? `None` max ⇒ unlimited ⇒ always true.
+    fn can_charge(&self, amount: u64) -> bool {
+        match *self.max.lock() {
+            None => true,
+            Some(limit) => {
+                let cur = self.current.load(Ordering::Acquire);
+                cur.saturating_add(amount) <= limit
+            }
+        }
+    }
+
+    /// Commit a charge of `amount` bytes: bump `current`, advance
+    /// `peak`, and note a `memory.high` crossing if one occurs.
+    fn commit_charge(&self, amount: u64) {
+        let now = self.current.fetch_add(amount, Ordering::AcqRel) + amount;
+        self.peak.fetch_max(now, Ordering::AcqRel);
+        if let Some(high) = *self.high.lock() {
+            if now > high {
+                // high is a throttle, not a wall: record only.
+                self.events_high.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Uncharge `amount` bytes, saturating at 0 so a free that races a
+    /// fresh/zeroed state can never underflow.
+    fn uncharge(&self, amount: u64) {
+        let mut cur = self.current.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(amount);
+            match self
+                .current
+                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Record that a charge was rejected for exceeding `memory.max`.
+    /// Bumps `max`, and — since the allocation is failed outright (no
+    /// reclaim, no task-reaper) — `oom` and `oom_kill` too, mirroring
+    /// the v2 path where an unrecoverable `max` breach is an OOM.
+    fn note_max_event(&self) {
+        self.events_max.fetch_add(1, Ordering::Relaxed);
+        self.events_oom.fetch_add(1, Ordering::Relaxed);
+        self.events_oom_kill.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Charge (`delta > 0`) or uncharge (`delta < 0`) this single level,
+    /// enforcing `memory.max` on a positive delta. Returns `false` iff a
+    /// positive delta is rejected for exceeding `max`. Exposed for tests
+    /// and direct accounting; the allocator hook drives the chain-wide
+    /// two-phase path in `charge_hook`.
+    pub fn charge(&self, delta: i64) -> bool {
+        if delta < 0 {
+            self.uncharge(delta.unsigned_abs());
+            return true;
+        }
+        let amount = delta as u64;
+        if !self.can_charge(amount) {
+            self.note_max_event();
+            return false;
+        }
+        self.commit_charge(amount);
+        true
+    }
+
+    fn events_block(&self) -> String {
+        format!(
+            "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill 0\n",
+            self.events_low.load(Ordering::Acquire),
+            self.events_high.load(Ordering::Acquire),
+            self.events_max.load(Ordering::Acquire),
+            self.events_oom.load(Ordering::Acquire),
+            self.events_oom_kill.load(Ordering::Acquire),
+        )
+    }
+}
+
 impl ControllerState for MemoryState {
     fn files(&self) -> &'static [&'static str] {
         FILES
@@ -110,11 +313,15 @@ impl ControllerState for MemoryState {
             "memory.max" => max_line(&self.max.lock()),
             "memory.swap.current" => format!("{}\n", self.swap_current.load(Ordering::Acquire)),
             "memory.swap.max" => max_line(&self.swap_max.lock()),
-            "memory.events" => "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n".into(),
-            "memory.events.local" => {
-                "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n".into()
-            }
-            "memory.stat" => "anon 0\nfile 0\nkernel 0\nslab 0\nsock 0\n".into(),
+            // We charge each level directly, so this cgroup's own
+            // counters ARE its local counters: events == events.local.
+            "memory.events" | "memory.events.local" => self.events_block(),
+            // Single honest bucket: charged bytes land in `anon`; the
+            // categories the frame allocator can't distinguish are 0.
+            "memory.stat" => format!(
+                "anon {}\nfile 0\nkernel 0\nslab 0\nsock 0\n",
+                self.current.load(Ordering::Acquire)
+            ),
             _ => String::new(),
         }
     }

@@ -361,14 +361,40 @@ fn alloc_below_ceiling(zone: &mut BuddyZone) -> Option<PhysFrame> {
 /// Allocate one 4 KiB frame, preferring `node`'s zone. Dispatches
 /// through the installed `FrameAlloc` impl — see `install_frame_alloc`.
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
-    with_installed(|a| a.alloc_frame_on(node))
+    // cgroup memory accounting: charge one page to the current task's
+    // cgroup chain *before* the allocation commits. A `false` return
+    // means a `memory.max` would be exceeded, so the allocation is
+    // denied (enforced). This is the order-0 user-facing entry point
+    // (`alloc_frame` delegates here), so the charge happens exactly once
+    // per page handed out.
+    #[cfg(feature = "cgroup")]
+    if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
+        return Err(FrameAllocError::Exhausted);
+    }
+    let r = with_installed(|a| a.alloc_frame_on(node));
+    #[cfg(feature = "cgroup")]
+    if r.is_err() {
+        // Allocation failed after charging — refund so accounting stays
+        // balanced with the actual page population.
+        crate::cgroup_charge::uncharge(PAGE_SIZE);
+    }
+    r
 }
 
 /// Allocate a frame from any node. Useful for boot-time allocations
 /// that don't care about locality. Dispatches through the installed
 /// `FrameAlloc` impl.
 pub fn alloc_frame_anywhere() -> Result<PhysFrame, FrameAllocError> {
-    with_installed(|a| a.alloc_frame_anywhere())
+    #[cfg(feature = "cgroup")]
+    if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
+        return Err(FrameAllocError::Exhausted);
+    }
+    let r = with_installed(|a| a.alloc_frame_anywhere());
+    #[cfg(feature = "cgroup")]
+    if r.is_err() {
+        crate::cgroup_charge::uncharge(PAGE_SIZE);
+    }
+    r
 }
 
 /// Buddy-backed implementation of `alloc_frame_on`. The default
@@ -422,6 +448,23 @@ pub fn alloc_pages_on(node: usize, order: u8) -> Result<PhysFrame, FrameAllocErr
     if order > MAX_ORDER {
         return Err(FrameAllocError::Exhausted);
     }
+    // cgroup memory accounting: charge the whole `1 << order` block up
+    // front (enforced — deny if over `memory.max`), refund on failure.
+    #[cfg(feature = "cgroup")]
+    let charge_bytes = PAGE_SIZE << order;
+    #[cfg(feature = "cgroup")]
+    if !crate::cgroup_charge::try_charge(charge_bytes) {
+        return Err(FrameAllocError::Exhausted);
+    }
+    let r = alloc_pages_on_inner(node, order);
+    #[cfg(feature = "cgroup")]
+    if r.is_err() {
+        crate::cgroup_charge::uncharge(charge_bytes);
+    }
+    r
+}
+
+fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocError> {
     let mut g = ALLOC.lock();
     if !g.initialised {
         return Err(FrameAllocError::Uninitialised);
@@ -457,6 +500,9 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
     if order > MAX_ORDER {
         return;
     }
+    // cgroup memory uncharge: mirror the `alloc_pages_on` charge.
+    #[cfg(feature = "cgroup")]
+    crate::cgroup_charge::uncharge(PAGE_SIZE << order);
     let phys = frame.start_address().raw();
     if phys < LOW_RESERVED_BYTES {
         // Refusing the free is safer than corrupting the buddy by
@@ -506,6 +552,14 @@ fn buddy_free_frame(f: PhysFrame) {
         // Other ASes still reference this frame; don't return it.
         return;
     }
+    // cgroup memory uncharge: only here, where the frame is genuinely
+    // returned to the buddy — i.e. the COW refcount has reached 0 — does
+    // it balance the single charge taken at `alloc_frame_on`. The
+    // intermediate `dec_ref > 0` frees above (fork-shared pages) take no
+    // uncharge, matching the fact that `clone_for_fork` `inc_ref`s
+    // rather than re-allocating (no second charge was ever taken).
+    #[cfg(feature = "cgroup")]
+    crate::cgroup_charge::uncharge(PAGE_SIZE);
     let node = phys_to_node(f.start_address().raw());
     let mut g = ALLOC.lock();
     if !g.initialised {
