@@ -466,6 +466,19 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this file is a filesystem context (from `fsopen` / `fspick`),
+    /// return its context id. Used by `fsconfig` / `fsmount`. Default:
+    /// `None`.
+    fn fs_context_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// If this file is a detached mount (from `fsmount` / `open_tree`),
+    /// return its mount-object id. Used by `move_mount`. Default: `None`.
+    fn mount_object_id(&self) -> Option<u64> {
+        None
+    }
+
     /// If this file is the read end of a pipe, copy up to `max` queued
     /// bytes WITHOUT consuming them and return them. Used by `tee(2)` to
     /// duplicate pipe data between two pipes. Default `None` ⇒ not a
@@ -1163,6 +1176,27 @@ impl VfsRegistry {
         // problem — `resolve` rejects empty paths).
         let rel = rel.strip_prefix('/').unwrap_or(rel);
         Some(f(&*m.fs, rel))
+    }
+
+    /// Clone the `Arc<dyn FsInstance>` of the mount covering `abs` (the
+    /// longest-prefix match). Used by the new mount API's `open_tree` /
+    /// `fspick` to grab an existing mount's filesystem object.
+    pub fn fs_arc_at(&self, abs: &str) -> Option<Arc<dyn FsInstance>> {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+        let q = self.inner.lock();
+        let mut best: Option<&Mount> = None;
+        for m in q.iter() {
+            let is_match = abs == m.path
+                || m.path == "/"
+                || (abs.starts_with(m.path.as_str())
+                    && abs.as_bytes().get(m.path.len()) == Some(&b'/'));
+            if is_match && best.map(|b| b.path.len()).unwrap_or(0) < m.path.len() {
+                best = Some(m);
+            }
+        }
+        best.map(|m| m.fs.clone())
     }
 
     /// Resolve `abs` to its parent directory + leaf name and run

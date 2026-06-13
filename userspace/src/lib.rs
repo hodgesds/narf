@@ -59,6 +59,8 @@ pub mod loader;
 #[cfg(feature = "linux-compat")]
 pub mod lsm;
 #[cfg(feature = "linux-compat")]
+pub mod mount_api;
+#[cfg(feature = "linux-compat")]
 pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;

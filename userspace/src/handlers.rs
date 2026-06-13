@@ -17047,6 +17047,42 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             "open_by_handle_at",
             RawFnHandler(sys_open_by_handle_at),
         );
+        // New mount API round 2: fsopen/fsconfig/fsmount/move_mount/...
+        table.install_raw(
+            Syscall::Fsopen,
+            "fsopen",
+            RawFnHandler(crate::mount_api::sys_fsopen),
+        );
+        table.install_raw(
+            Syscall::Fsconfig,
+            "fsconfig",
+            RawFnHandler(crate::mount_api::sys_fsconfig),
+        );
+        table.install_raw(
+            Syscall::Fsmount,
+            "fsmount",
+            RawFnHandler(crate::mount_api::sys_fsmount),
+        );
+        table.install_raw(
+            Syscall::MoveMount,
+            "move_mount",
+            RawFnHandler(crate::mount_api::sys_move_mount),
+        );
+        table.install_raw(
+            Syscall::OpenTree,
+            "open_tree",
+            RawFnHandler(crate::mount_api::sys_open_tree),
+        );
+        table.install_raw(
+            Syscall::Fspick,
+            "fspick",
+            RawFnHandler(crate::mount_api::sys_fspick),
+        );
+        table.install_raw(
+            Syscall::MountSetattr,
+            "mount_setattr",
+            RawFnHandler(crate::mount_api::sys_mount_setattr),
+        );
         // Batch 21: keyrings — a real in-kernel key store.
         table.install_raw(
             Syscall::AddKey,
