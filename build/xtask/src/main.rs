@@ -480,10 +480,21 @@ impl Arch {
                         "-device".into(),
                         "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                     ]);
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    // virtio-balloon bring-up (feature negotiation +
+                    // queue programming) SIGSEGVs some QEMU builds —
+                    // notably the qemu-system-x86 packaged on GitHub
+                    // Actions' ubuntu-latest — even though it works on
+                    // current upstream/local QEMU. A guest cannot fix a
+                    // host crash, so let CI opt the device out via
+                    // XTASK_QEMU_NO_BALLOON; the balloon smokes then
+                    // `Skip` (no device present) and init skips the
+                    // probe. Local/dev runs keep it for live coverage.
+                    if std::env::var_os("XTASK_QEMU_NO_BALLOON").is_none() {
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
+                        ]);
+                    }
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
@@ -567,10 +578,21 @@ impl Arch {
                         "-device".into(),
                         "virtio-rng-pci,rng=rng0,disable-legacy=on,disable-modern=off".into(),
                     ]);
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    // virtio-balloon bring-up (feature negotiation +
+                    // queue programming) SIGSEGVs some QEMU builds —
+                    // notably the qemu-system-x86 packaged on GitHub
+                    // Actions' ubuntu-latest — even though it works on
+                    // current upstream/local QEMU. A guest cannot fix a
+                    // host crash, so let CI opt the device out via
+                    // XTASK_QEMU_NO_BALLOON; the balloon smokes then
+                    // `Skip` (no device present) and init skips the
+                    // probe. Local/dev runs keep it for live coverage.
+                    if std::env::var_os("XTASK_QEMU_NO_BALLOON").is_none() {
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
+                        ]);
+                    }
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),

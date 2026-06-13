@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: ""
+  # GHA's packaged qemu-system-x86 SIGSEGVs during virtio-balloon
+  # bring-up (a host bug; works on local/upstream QEMU). Drop the
+  # balloon device from every QEMU boot here so boot-smoke / musl-demo /
+  # kernel-test don't crash the emulator; the balloon smokes Skip and
+  # init skips the probe. See build/xtask/src/main.rs::qemu_args.
+  XTASK_QEMU_NO_BALLOON: "1"
 
 jobs:
   fmt:
