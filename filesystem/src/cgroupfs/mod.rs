@@ -281,6 +281,25 @@ fn cgroup_of(pid: u64) -> Arc<Cgroup> {
     TASK_CGROUP.lock().get(&pid).cloned().unwrap_or_else(root)
 }
 
+/// Invoke `f` with each active `ControllerState` named `name` along the
+/// cgroup chain of `pid` (its cgroup up to the root). For controllers
+/// whose accounting is driven by an external subsystem — the memory
+/// allocator charging pages, the block layer attributing I/O — rather
+/// than by membership. The callee downcasts via
+/// [`ControllerState::as_any`].
+pub fn with_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
+    pid: u64,
+    name: &'static str,
+    mut f: F,
+) {
+    let cg = cgroup_of(pid);
+    for node in charge_chain(&cg) {
+        if let Some(s) = node.ctrl_state.lock().get(name) {
+            f(s);
+        }
+    }
+}
+
 /// `cg` plus every ancestor up to the root, bottom-up — the levels that
 /// membership charging walks.
 fn charge_chain(cg: &Arc<Cgroup>) -> Vec<Arc<Cgroup>> {
