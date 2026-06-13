@@ -103,6 +103,11 @@ linux-compat = ["narf-userspace/linux-compat"]
 # Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
 container = ["narf-userspace/container"]
 
+# cgroup-v2 unified hierarchy. Forwarded from narf-userspace; the
+# boot path also places init/shell into the root cgroup. Mounts
+# cgroupfs at /sys/fs/cgroup.
+cgroup = ["narf-userspace/cgroup", "narf-filesystem/cgroup"]
+
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
 idt-selftest = []

@@ -24,5 +24,10 @@ narf-kernel-test  = { path = "../verification/kernel-test" }
 [features]
 kernel-test = []
 
+# cgroup-v2 cpu + cpuset controller seam: exposes hooks the cgroupfs
+# `cpu` / `cpuset` controllers install at boot to apply per-cgroup
+# weight/bandwidth and cpu/mems affinity to member tasks.
+cgroup = []
+
 [lints]
 workspace = true

@@ -6997,7 +6997,6 @@ fn sys_getpid(ctx: &mut dyn TrapContext) {
         let outer = task_to_pid_raw(task).unwrap_or(task);
         let inner = crate::pid_ns::self_inner_pid(task, outer);
         ctx.set_return(SyscallReturn::ok(inner));
-        return;
     }
     #[cfg(not(feature = "container"))]
     ctx.set_return(SyscallReturn::ok(task));
@@ -7538,6 +7537,21 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         register_task_to_pid(child_tid.raw(), child_visible_pid);
     } else {
         register_pid_task_mapping(child_visible_pid, child_tid.raw());
+        // A clone() that creates a new process (not a thread) joins
+        // the parent's cgroup. Threads share the process's membership
+        // and are never placed individually in the base feature.
+        #[cfg(feature = "cgroup")]
+        narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_visible_pid);
+        // cgroup-namespace inheritance, and CLONE_NEWCGROUP → the child
+        // gets a fresh cgroup-ns rooted at its current cgroup.
+        #[cfg(all(feature = "cgroup", feature = "container"))]
+        {
+            const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+            narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_visible_pid);
+            if flags & CLONE_NEWCGROUP != 0 {
+                narf_filesystem::cgroupfs::unshare_cgroup_ns(child_visible_pid);
+            }
+        }
     }
 
     // POSIX-shaped inheritance for the non-shared resources.
@@ -7928,6 +7942,13 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         let _ = crate::pid_ns::inherit_into_child(parent_pid, child_pid.raw());
         mount_ns_inherit(parent_pid, child_tid.raw());
     }
+    // A forked child joins its parent's cgroup. Keyed by ProcessId
+    // (cgroup membership is per-process in v2), matching cgroup.procs.
+    #[cfg(feature = "cgroup")]
+    narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_pid.raw());
+    // Inherit the parent's cgroup-namespace root (if any).
+    #[cfg(all(feature = "cgroup", feature = "container"))]
+    narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
     // Parent-of bookkeeping for waitpid: keyed by the child's
     // ProcessId so `on_child_exit(child_pid)` can resolve the
     // parent. `notify_task_exited` uses `this.process.pid.raw()`
@@ -8013,6 +8034,47 @@ pub fn wait_init() {
     {
         clear_child_tid_init();
         install_clear_child_tid_observer();
+    }
+    // cgroup-v2: drop a process's membership when it exits so the
+    // `populated` state of its cgroup chain can fall to 0 — the edge
+    // an init system's empty-cgroup notification keys on. Also wire the
+    // freeze/kill hooks so cgroup.freeze / cgroup.kill deliver real
+    // signals through the signal subsystem.
+    #[cfg(feature = "cgroup")]
+    {
+        crate::user_task::register_exit_observer(cgroup_exit_observer);
+        narf_filesystem::cgroupfs::install_kill_hook(cgroup_kill_hook);
+        narf_filesystem::cgroupfs::install_freeze_hook(cgroup_freeze_hook);
+    }
+}
+
+/// Exit-observer that removes an exiting *process* from its cgroup.
+/// Fires for every task, but only acts on the process leader (when the
+/// dying TaskId is the one bound to the pid) so a short-lived worker
+/// thread exiting doesn't prematurely vacate the whole process's
+/// membership.
+#[cfg(feature = "cgroup")]
+fn cgroup_exit_observer(pid: u64, tid: u64) {
+    if pid_to_task_raw(pid) == Some(tid) {
+        narf_filesystem::cgroupfs::task_exited(pid);
+    }
+}
+
+/// `cgroup.kill` hook — SIGKILL (9) the named process.
+#[cfg(feature = "cgroup")]
+fn cgroup_kill_hook(pid: u64) {
+    if let Some(task) = pid_to_task_raw(pid) {
+        raise_signal_pending(task, 9);
+    }
+}
+
+/// `cgroup.freeze` hook — SIGSTOP (19) to freeze, SIGCONT (18) to thaw.
+/// Real freezing relies on the scheduler honouring the SIGSTOP default
+/// action (Stop); thaw resumes via SIGCONT.
+#[cfg(feature = "cgroup")]
+fn cgroup_freeze_hook(pid: u64, freeze: bool) {
+    if let Some(task) = pid_to_task_raw(pid) {
+        raise_signal_pending(task, if freeze { 19 } else { 18 });
     }
 }
 
@@ -11684,6 +11746,19 @@ fn sys_unshare(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // CLONE_NEWCGROUP — pin the calling process's current cgroup as its
+    // cgroup-namespace root so /proc/self/cgroup renders relative to it.
+    #[cfg(all(feature = "cgroup", feature = "container"))]
+    {
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        if flags & CLONE_NEWCGROUP != 0 {
+            let task = current_task_id();
+            let pid = task_to_pid_raw(task).unwrap_or(task);
+            narf_filesystem::cgroupfs::unshare_cgroup_ns(pid);
+            any = true;
+        }
+    }
+
     // Honour the no-op path (no NS bits set) as success — Linux unshare
     // returns 0 with flags=0.
     let _ = any;
@@ -11786,7 +11861,6 @@ fn sys_setns(ctx: &mut dyn TrapContext) {
             return;
         }
         ctx.set_return(SyscallReturn::ok(0));
-        return;
     }
     #[cfg(not(feature = "container"))]
     {
@@ -11929,14 +12003,14 @@ fn sys_chroot(ctx: &mut dyn TrapContext) {
 fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let new_root = match copy_user_path_raw(args.arg0 as u64, args.arg1 as usize) {
+    let new_root = match copy_user_path_raw(args.arg0, args.arg1 as usize) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let put_old = match copy_user_path_raw(args.arg2 as u64, args.arg3 as usize) {
+    let put_old = match copy_user_path_raw(args.arg2, args.arg3 as usize) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);

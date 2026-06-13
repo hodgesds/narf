@@ -20,5 +20,11 @@ narf-scheduler = { path = "../scheduler" }
 async-trait = "0.1"
 narf-kernel-test = { path = "../verification/kernel-test" }
 
+[features]
+# cgroup-v2 io controller seam: exposes a hook the cgroupfs `io`
+# controller installs at boot to attribute/throttle block requests by
+# the submitting task's cgroup.
+cgroup = []
+
 [lints]
 workspace = true

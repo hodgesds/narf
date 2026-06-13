@@ -174,9 +174,17 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
         PidExtField::Mountstats => render_mountstats(pid).into_bytes(),
         PidExtField::Personality => b"00000000\n".to_vec(),
         PidExtField::Cgroup => {
-            // Linux shape: "hierarchy_id:subsystems:path\n" per cgroup.
-            // NARF has no cgroups; report the single default hierarchy.
-            b"0::/\n".to_vec()
+            // Linux v2 shape: "0::<path>\n". With the cgroup feature
+            // this reports the process's real cgroup; otherwise the
+            // single default hierarchy (no cgroups present).
+            #[cfg(feature = "cgroup")]
+            {
+                crate::cgroupfs::proc_pid_cgroup(pid)
+            }
+            #[cfg(not(feature = "cgroup"))]
+            {
+                b"0::/\n".to_vec()
+            }
         }
     }
 }

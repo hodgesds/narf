@@ -60,6 +60,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "cgroup")]
+pub mod cgroupfs;
 pub mod csprng;
 pub mod devfs;
 pub mod devfs_block;
@@ -77,6 +79,7 @@ pub mod root_selector;
 pub mod sysfs;
 pub mod uevent;
 
+mod cgroupfs_tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
 mod e2e_tests;
@@ -87,6 +90,8 @@ mod sysfs_e2e_tests;
 mod sysfs_tests;
 mod tests;
 mod uevent_e2e_tests;
+#[cfg(feature = "cgroup")]
+pub use cgroupfs::CgroupFs;
 pub use devfs::{
     install_console_signal_hook, install_rfcomm_hooks, install_tty_usb_hooks, install_video_hooks,
     mount_default as mount_devfs_default, register_dri_dir, register_snd_dir, register_tpm,
@@ -1811,6 +1816,51 @@ pub fn register_initcalls() {
         sysfs::populate_all();
         InitResult::Ok
     });
+
+    // /sys/fs/cgroup — cgroup-v2 unified hierarchy. Mounted as an
+    // independent prefix; `resolve_absolute` longest-prefix matching
+    // routes /sys/fs/cgroup/* here and other /sys/* to sysfs, so this
+    // does not require sysfs (linux-compat) to be present.
+    #[cfg(feature = "cgroup")]
+    narf_init::register(Stage::Fs, "cgroupfs-mount", || {
+        cgroupfs::register_builtin_controllers();
+        let auth = bootstrap_mount_authority();
+        let _ = registry().mount(&auth, "/sys/fs/cgroup", cgroupfs::CgroupFs::new());
+        InitResult::Ok
+    });
+
+    // /proc/pressure/{cpu,memory,io} — system-wide PSI. Needs procfs
+    // (linux-compat) to register.
+    #[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+    narf_init::register(Stage::Fs, "proc-pressure", || {
+        use cgroupfs::psi::Resource;
+        procfs::register_proc(
+            "pressure/cpu",
+            alloc::sync::Arc::new(PressureFile(Resource::Cpu)),
+        );
+        procfs::register_proc(
+            "pressure/memory",
+            alloc::sync::Arc::new(PressureFile(Resource::Memory)),
+        );
+        procfs::register_proc(
+            "pressure/io",
+            alloc::sync::Arc::new(PressureFile(Resource::Io)),
+        );
+        InitResult::Ok
+    });
+}
+
+/// `/proc/pressure/<axis>` backing — system-wide PSI, delegating to the
+/// cgroup PSI renderer.
+#[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+#[derive(Debug)]
+struct PressureFile(cgroupfs::psi::Resource);
+
+#[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+impl procfs::ProcFile for PressureFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        cgroupfs::psi::proc_pressure(self.0)
+    }
 }
 
 /// Stage 3 placeholder for a virtiofs mount. Stage 4 wires the DAX

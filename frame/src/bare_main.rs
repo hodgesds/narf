@@ -3259,6 +3259,12 @@ fn boot_userspace_init() {
         // Register PID <-> TID mapping so syscalls like kill(pid) work.
         narf_userspace::handlers::register_pid_task_mapping(pid.raw(), tid.raw());
 
+        // Place the boot-spawned process into the root cgroup so it
+        // appears in /sys/fs/cgroup/cgroup.procs. Children inherit
+        // this at fork/clone.
+        #[cfg(feature = "cgroup")]
+        narf_filesystem::cgroupfs::attach_to_root(pid.raw());
+
         // /proc/[pid]/cmdline + comm seed for the boot-spawned
         // process. argv = ["init"] / ["shell"] is the convention
         // load_user_process_with uses above.

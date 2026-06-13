@@ -57,5 +57,11 @@ linux-compat = ["narf-memory/linux-compat", "narf-filesystem/linux-compat"]
 # requires both linux-compat and container.
 container = []
 
+# cgroup-v2 unified hierarchy. Wires fork-inheritance + exit-cleanup
+# of process cgroup membership into the task lifecycle. Forwards to
+# narf-filesystem, which owns the cgroupfs tree. Orthogonal to
+# linux-compat and container.
+cgroup = ["narf-filesystem/cgroup"]
+
 [lints]
 workspace = true

@@ -102,17 +102,60 @@ runtime can use namespaces without the full Linux syscall surface.
 
 ---
 
+## cgroup
+
+**Feature flag:** `cgroup` (base) + per-controller sub-features
+
+**Crates that carry it:** `narf-filesystem` (the `cgroupfs` tree),
+`narf-userspace` + `narf-frame` (membership lifecycle), and
+`narf-memory` / `narf-scheduler` / `narf-block` (controller seams)
+
+The cgroup-v2 unified hierarchy, mounted at `/sys/fs/cgroup`.  The base
+`cgroup` feature is the organizational layer an init system (systemd)
+needs to reach PID 1:
+
+- the cgroup tree (`mkdir`/`rmdir`), with per-process membership
+  (`cgroup.procs`), fork-inheritance and exit-cleanup
+- `cgroup.controllers` / `cgroup.subtree_control` (enable controllers
+  for children), `cgroup.events` (populated/frozen), `cgroup.stat`,
+  `cgroup.type`, `cgroup.max.depth` / `cgroup.max.descendants`
+- real `cgroup.kill` (SIGKILL subtree) and `cgroup.freeze`
+  (SIGSTOP/SIGCONT subtree) via the signal subsystem
+- the no-internal-process constraint
+- `/proc/cgroups` + `/proc/[pid]/cgroup`
+- `CLONE_NEWCGROUP` (with `container`) — namespace-relative
+  `/proc/[pid]/cgroup`
+
+Resource controllers are **additive sub-features**, each implying
+`cgroup`; `cgroup-all` turns on every one:
+
+| sub-feature     | controller | enforcement |
+|-----------------|------------|-------------|
+| `cgroup-pids`   | pids       | **real** — `pids.max` vetoes attach |
+| `cgroup-misc`   | misc       | **real** — keyed scalar resources |
+| `cgroup-memory` | memory     | **real** `memory.max` (page-charge against the frame allocator; needs the task layer to install the pid-provider to attribute charges); `memory.high`/min/low accounting-only (no reclaim) |
+| `cgroup-cpu`    | cpu        | `cpu.weight`→scheduler priority (real under PriorityScheduler); `cpu.max` accepted, not throttled (cooperative executor) |
+| `cgroup-cpuset` | cpuset     | **real** — `cpuset.cpus.effective` pushed as task affinity; `cpuset.mems` parsed not applied (no NUMA seam) |
+| `cgroup-io`     | io         | **real** per-device accounting (`io.stat`); `io.max` stored, not throttled (no block rate-limit seam) |
+| `cgroup-psi`    | PSI        | interface complete (`*.pressure` + `/proc/pressure`); stall data zero pending cross-subsystem accounting |
+
+`cgroup` is **orthogonal** to both `linux-compat` and `container`.
+
+---
+
 ## Composition rules
 
-| Use case                        | Features                        |
-|---------------------------------|---------------------------------|
-| Native NARF binary              | *(none)*                        |
-| Linux binary, no containers     | `linux-compat`                  |
-| NARF container runtime          | `container`                     |
-| Full container runtime (OCI)    | `linux-compat` + `container`    |
+| Use case                        | Features                                    |
+|---------------------------------|---------------------------------------------|
+| Native NARF binary              | *(none)*                                    |
+| Linux binary, no containers     | `linux-compat`                              |
+| NARF container runtime          | `container`                                 |
+| Full container runtime (OCI)    | `linux-compat` + `container`                |
+| systemd / resource control      | `linux-compat` + `container` + `cgroup-all` |
 
 `linux-compat + container` is the combination needed to run an OCI container
-runtime (runc, crun, containerd-shim) on top of NARF.
+runtime (runc, crun, containerd-shim) on top of NARF; add `cgroup-all`
+for an init system that manages resources via the cgroup hierarchy.
 
 ---
 
