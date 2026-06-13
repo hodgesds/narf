@@ -2070,6 +2070,19 @@ pub enum Syscall {
     /// `futex_requeue(waiters, flags, nr_wake, nr_requeue)` — futex2
     /// requeue. Linux (x86_64=456, aarch64=456).
     FutexRequeue,
+
+    /// `add_key(type, description, payload, plen, keyring)` — add a key to
+    /// the in-kernel key store. Linux (x86_64=248, aarch64=217).
+    AddKey,
+
+    /// `request_key(type, description, callout_info, dest_keyring)` — look
+    /// a key up by type+description. Linux (x86_64=249, aarch64=218).
+    RequestKey,
+
+    /// `keyctl(operation, arg2, arg3, arg4, arg5)` — operate on a key by
+    /// serial (read/update/revoke/describe/...).
+    /// Linux (x86_64=250, aarch64=219).
+    Keyctl,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2243,6 +2256,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::FutexWake, 454),
     (Syscall::FutexWait, 455),
     (Syscall::FutexRequeue, 456),
+    (Syscall::AddKey, 248),
+    (Syscall::RequestKey, 249),
+    (Syscall::Keyctl, 250),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2647,6 +2663,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::FutexWake, 454),
     (Syscall::FutexWait, 455),
     (Syscall::FutexRequeue, 456),
+    (Syscall::AddKey, 217),
+    (Syscall::RequestKey, 218),
+    (Syscall::Keyctl, 219),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

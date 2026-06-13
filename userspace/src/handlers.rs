@@ -16739,6 +16739,22 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             "inotify_rm_watch",
             RawFnHandler(crate::mqueue::sys_inotify_rm_watch),
         );
+        // Batch 21: keyrings — a real in-kernel key store.
+        table.install_raw(
+            Syscall::AddKey,
+            "add_key",
+            RawFnHandler(crate::keyring::sys_add_key),
+        );
+        table.install_raw(
+            Syscall::RequestKey,
+            "request_key",
+            RawFnHandler(crate::keyring::sys_request_key),
+        );
+        table.install_raw(
+            Syscall::Keyctl,
+            "keyctl",
+            RawFnHandler(crate::keyring::sys_keyctl),
+        );
         // Batch 11: System V semaphores + message queues. These override
         // the container-only id-by-key `semget`/`msgget` (registered
         // earlier) with self-contained backing that works without the

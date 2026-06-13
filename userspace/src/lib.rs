@@ -51,6 +51,8 @@ pub mod handlers;
 pub mod init;
 pub mod interp;
 pub mod io_mux;
+#[cfg(feature = "linux-compat")]
+pub mod keyring;
 pub mod loader;
 #[cfg(feature = "linux-compat")]
 pub mod mqueue;
