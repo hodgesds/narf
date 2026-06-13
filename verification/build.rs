@@ -381,6 +381,8 @@ fn main() {
         "jobctl2_smoke",
         "navfs_smoke",
         "pipeof_smoke",
+        "relpaths_smoke",
+        "consoletty_smoke",
         "procfs2_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));

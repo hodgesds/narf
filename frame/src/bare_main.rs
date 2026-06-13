@@ -3532,6 +3532,15 @@ fn boot_userspace_init() {
                 // Pipe blocking-read + EOF on writer exit (fd teardown on
                 // exit) — the mechanism behind shell `$(...)` substitution.
                 ("pipeof_smoke", narf_verification::NARF_PIPEOF_SMOKE_ELF),
+                // Relative-path *at resolution: mkdir/rename/symlink/unlink/
+                // rmdir against the cwd — `mkdir foo`/`mv a b`/`rm foo` work.
+                ("relpaths_smoke", narf_verification::NARF_RELPATHS_SMOKE_ELF),
+                // Console is a tty: isatty + cooked tcgetattr + tcsetattr
+                // round-trip, so an interactive shell line-edits + prompts.
+                (
+                    "consoletty_smoke",
+                    narf_verification::NARF_CONSOLETTY_SMOKE_ELF,
+                ),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // multi-DSO dynamic linking: main -> libb -> liba -> libc.

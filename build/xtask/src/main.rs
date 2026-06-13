@@ -1571,6 +1571,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("navfs_smoke", "navfs-ok"),
         // Pipe blocking-read + EOF on writer exit (fd teardown on exit).
         ("pipeof_smoke", "pipeof-ok"),
+        // Relative-path *at resolution (mkdir/rename/symlink/unlink/rmdir).
+        ("relpaths_smoke", "relpaths-ok"),
+        // Console is a tty: isatty + cooked tcgetattr + tcsetattr round-trip.
+        ("consoletty_smoke", "consoletty-ok"),
         // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
         ("procfs2_smoke", "procfs2-ok"),
         // multi-DSO dynamic linking: main -> libb -> liba -> libc.

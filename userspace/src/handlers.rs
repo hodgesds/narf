@@ -3581,6 +3581,7 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let path = resolve_cwd_path(current_task_id(), &path);
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| {
             poll_blocking(parent.unlink(leaf))
@@ -3613,6 +3614,7 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let path = resolve_cwd_path(current_task_id(), &path);
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.mkdir(leaf)));
     match outcome {
@@ -3636,6 +3638,7 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let path = resolve_cwd_path(current_task_id(), &path);
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
     match outcome {
@@ -3667,6 +3670,9 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let task = current_task_id();
+    let old_path = resolve_cwd_path(task, &old_path);
+    let new_path = resolve_cwd_path(task, &new_path);
     // Both paths must split into the same parent directory — cross-
     // directory rename isn't supported by the DirOps surface today
     // (would need a registry-aware version that locks both parents).
@@ -3734,7 +3740,7 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path = apply_chroot(&raw);
+    let path = apply_chroot(&resolve_cwd_path(current_task_id(), &raw));
     // resolve_parent_absolute returns Option<Option<Arc<dyn FileOps>>>:
     // outer None = no mount covers the path, inner None = parent walk
     // hit a missing component or the leaf is absent. Flatten both
@@ -3797,6 +3803,9 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Resolve the link location against the cwd (the symlink *target*
+    // stays verbatim — symlink targets may legitimately be relative).
+    let link_path = resolve_cwd_path(current_task_id(), &link_path);
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&link_path, |_fs, parent, leaf| {
             poll_blocking(parent.symlink(leaf, &target_str))
@@ -12060,7 +12069,7 @@ const MAX_USER_COPY: usize = 16 * 1024 * 1024;
 /// which similarly trusts the user-range upper bound and the HW
 /// enforcement rather than hard-checking the kernel half at this layer.
 #[inline]
-fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
+pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if len > MAX_USER_COPY {
         return Err(EINVAL_CODE);
     }

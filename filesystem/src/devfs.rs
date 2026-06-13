@@ -630,6 +630,19 @@ fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Optio
     })
 }
 
+/// `/dev/console` terminal attributes. The console is a singleton, so
+/// its termios + window size live in process-globals shared by every
+/// open fd. A successful `TCGETS` here is what makes `isatty(0)` true,
+/// so an interactive shell (busybox `sh`) draws a prompt and reads
+/// line-by-line instead of treating stdin as a non-tty script.
+#[cfg(feature = "linux-compat")]
+static CONSOLE_TERMIOS: IrqSafeSpinLock<Option<crate::devfs_pty::Termios>> =
+    IrqSafeSpinLock::new(None);
+
+/// `(rows, cols)` for `TIOCGWINSZ`. 24x80 default; `TIOCSWINSZ` updates it.
+#[cfg(feature = "linux-compat")]
+static CONSOLE_WINSIZE: IrqSafeSpinLock<(u16, u16)> = IrqSafeSpinLock::new((24, 80));
+
 impl FileOps for DevConsole {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         // Pull bytes from the per-class input rings (audit #6 —
@@ -747,6 +760,52 @@ impl FileOps for DevConsole {
                 perms: 0o666,
             },
             mtime_cycles: 0,
+        }
+    }
+
+    /// Terminal ioctls so `/dev/console` looks like a real tty: a
+    /// successful `TCGETS` (returning a cooked-mode termios) makes
+    /// `isatty(0)` true, which is what flips a shell into interactive
+    /// mode. `TCSETS*` round-trips the caller's termios (so a program
+    /// can switch raw/cooked); `TIOCGWINSZ` reports the window size.
+    /// Other requests fall through to `-ENOTTY`.
+    #[cfg(feature = "linux-compat")]
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
+        use crate::devfs_pty::{
+            read_user_termios, write_user_termios, write_user_winsize, Termios, WireWinsize,
+            TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGWINSZ,
+        };
+        match cmd {
+            TCGETS => {
+                let mut g = CONSOLE_TERMIOS.lock();
+                let t = g.get_or_insert_with(Termios::default);
+                // SAFETY: `arg` is the user `struct termios *` the ioctl
+                // syscall path validated before dispatch.
+                unsafe { write_user_termios(arg, &t.raw)? };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                // SAFETY: `arg` is the validated user `struct termios *`.
+                let raw = unsafe { read_user_termios(arg)? };
+                CONSOLE_TERMIOS
+                    .lock()
+                    .get_or_insert_with(Termios::default)
+                    .raw = raw;
+                Ok(0)
+            }
+            TIOCGWINSZ => {
+                let (rows, cols) = *CONSOLE_WINSIZE.lock();
+                let ws = WireWinsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                // SAFETY: `arg` is the validated user `struct winsize *`.
+                unsafe { write_user_winsize(arg, ws)? };
+                Ok(0)
+            }
+            _ => Err(crate::FsError::Unsupported),
         }
     }
 }

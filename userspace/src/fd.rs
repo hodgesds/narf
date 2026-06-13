@@ -247,6 +247,77 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
 /// shares fg_pgrp across the three slots — that matches POSIX: stdio
 /// inherits from the controlling tty, so tcsetpgrp on fd 0 is visible
 /// on fd 1/2 of the same shell.
+/// Shared `/dev/console` terminal attributes (`struct termios`, 60-byte
+/// Linux x86_64 wire image). The boot console is a singleton, so its
+/// termios is process-global — TCSETS on fd 0 must be visible to TCGETS
+/// on fd 1/2 of the same shell. `None` until first queried; initialised
+/// to a cooked-mode default (ICANON|ECHO|ISIG) — a real tty, so an
+/// interactive shell line-edits + echoes through the terminal.
+static CONSOLE_TERMIOS: IrqSafeSpinLock<Option<[u8; 60]>> = IrqSafeSpinLock::new(None);
+
+/// SMAP-safe read of a 60-byte `struct termios` from a user pointer.
+/// Uses `read_unaligned` inside the SMAP window deliberately: a
+/// `copy_nonoverlapping`/memcpy (what `copy_from_user` inlines to for a
+/// const-size buffer) escapes the STAC/CLAC bracket and faults the
+/// kernel supervisor-reading the user page.
+unsafe fn read_user_termios(uptr: u64) -> Result<[u8; 60], FsError> {
+    if uptr == 0 || crate::handlers::validate_user_range(uptr, 60).is_err() {
+        return Err(FsError::InvalidData);
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: range-validated; with_user_access brackets SMAP and
+    // read_unaligned emits inline loads.
+    let v = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::read_unaligned(uptr as *const [u8; 60])
+        })
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: range-validated; no SMAP off x86_64.
+    let v = unsafe { core::ptr::read_unaligned(uptr as *const [u8; 60]) };
+    Ok(v)
+}
+
+/// SMAP-safe write of a 60-byte `struct termios` to a user pointer.
+unsafe fn write_user_termios(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
+    if uptr == 0 || crate::handlers::validate_user_range(uptr, 60).is_err() {
+        return Err(FsError::InvalidData);
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: range-validated; with_user_access brackets SMAP and
+    // write_unaligned emits inline stores.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::write_unaligned(uptr as *mut [u8; 60], src)
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: range-validated; no SMAP off x86_64.
+    unsafe {
+        core::ptr::write_unaligned(uptr as *mut [u8; 60], src);
+    }
+    Ok(())
+}
+
+/// Linux x86_64 cooked-mode `struct termios` wire image (matches
+/// n_tty's initial state): ICRNL|IXON in, OPOST|ONLCR out, CS8|CREAD
+/// control, ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN local, sane c_cc.
+fn cooked_termios() -> [u8; 60] {
+    let mut raw = [0u8; 60];
+    raw[0..4].copy_from_slice(&0x0000_0500u32.to_ne_bytes()); // c_iflag ICRNL|IXON
+    raw[4..8].copy_from_slice(&0x0000_0005u32.to_ne_bytes()); // c_oflag OPOST|ONLCR
+    raw[8..12].copy_from_slice(&0x0000_00bfu32.to_ne_bytes()); // c_cflag B38400|CS8|CREAD
+    raw[12..16].copy_from_slice(&0x0000_803bu32.to_ne_bytes()); // c_lflag
+    let cc = 17; // c_cc[] starts after c_line@16
+    raw[cc] = 0x03; // VINTR  ^C
+    raw[cc + 1] = 0x1c; // VQUIT  ^\
+    raw[cc + 2] = 0x7f; // VERASE DEL
+    raw[cc + 3] = 0x15; // VKILL  ^U
+    raw[cc + 4] = 0x04; // VEOF   ^D
+    raw[cc + 6] = 0x01; // VMIN = 1
+    raw
+}
+
 pub struct ConsoleFile {
     /// Foreground process group for this tty. 0 = unset; a job-
     /// control shell calls `tcsetpgrp` (TIOCSPGRP) at startup.
@@ -291,6 +362,14 @@ impl core::fmt::Debug for ConsoleFile {
 /// `puts` / `printf` output never flushes on \n and a short-lived
 /// program (busybox pwd, uname, etc.) exits before fflush runs.
 pub const TCGETS: u32 = 0x5401;
+/// `ioctl(fd, TCSETS, &termios)` — set terminal attributes (immediate).
+pub const TCSETS: u32 = 0x5402;
+/// `ioctl(fd, TCSETSW, &termios)` — set terminal attributes (drain output).
+pub const TCSETSW: u32 = 0x5403;
+/// `ioctl(fd, TCSETSF, &termios)` — set terminal attributes (drain + flush).
+pub const TCSETSF: u32 = 0x5404;
+/// `ioctl(fd, TIOCSCTTY, 0)` — make this the caller's controlling tty.
+pub const TIOCSCTTY: u32 = 0x540E;
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
@@ -409,20 +488,29 @@ impl FileOps for ConsoleFile {
         // for ABI purposes since the wire shape is the same).
         match cmd {
             TCGETS => {
-                // Return a zeroed `struct termios`. We're not a
-                // real tty, but musl's isatty just checks success;
-                // the actual termios fields aren't consulted by
-                // anything that runs inside this kernel. Buffer
-                // is 60 bytes on Linux x86_64 — overshoot to 64
-                // for safety.
-                let zero = [0u8; 64];
-                // SAFETY: `copy_to_user` validates `arg` as a user address
-                // through the SMAP window; the length is the fixed 64-byte
-                // `zero` buffer, which over-covers Linux's 60-byte `termios`.
-                // SAFETY: Valid memory or trusted environment
-                if unsafe { crate::handlers::copy_to_user(arg as u64, &zero) }.is_err() {
-                    return Err(FsError::InvalidData);
-                }
+                // Return the current termios (cooked default until a
+                // program TCSETS its own), so isatty(0) succeeds AND an
+                // interactive shell sees a real cooked tty (ICANON|ECHO)
+                // rather than the old all-zero image (which read as raw).
+                let raw = *CONSOLE_TERMIOS.lock().get_or_insert_with(cooked_termios);
+                // SAFETY: `arg` is the user `struct termios *` from ioctl;
+                // write_user_termios range-validates + SMAP-brackets it.
+                unsafe { write_user_termios(arg as u64, raw)? };
+                Ok(0)
+            }
+            TCSETS | TCSETSW | TCSETSF => {
+                // Round-trip the caller's termios so a program can switch
+                // raw/cooked and read it back (the boot console doesn't
+                // enforce the flags in its line discipline yet, but the
+                // state is coherent — what vi/less/readline rely on).
+                // SAFETY: `arg` is the validated user `struct termios *`.
+                let raw = unsafe { read_user_termios(arg as u64)? };
+                *CONSOLE_TERMIOS.lock() = Some(raw);
+                Ok(0)
+            }
+            TIOCSCTTY => {
+                // Accept "make this our controlling tty" — the boot
+                // console already is everyone's controlling terminal.
                 Ok(0)
             }
             TIOCGWINSZ => {
