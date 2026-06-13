@@ -66,6 +66,8 @@ extern crate alloc;
 
 pub mod affinity;
 pub mod budget;
+#[cfg(feature = "cgroup")]
+pub mod cgroup;
 pub mod cpu_lifecycle;
 pub mod donation;
 pub mod policy;
@@ -77,6 +79,12 @@ mod tests;
 
 pub use affinity::{Affinity, CpuId, CpuSet};
 pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
+#[cfg(feature = "cgroup")]
+pub use cgroup::{
+    apply_affinity, apply_priority, cgroup_cycles_for, cgroup_set_affinity, cgroup_set_priority,
+    cpu_set_from_bits, install_cgroup_affinity_hook, install_cgroup_cpu_hook, AffinityHook,
+    CpuPriorityHook,
+};
 pub use cpu_lifecycle::{
     cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,
 };
