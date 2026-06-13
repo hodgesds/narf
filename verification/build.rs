@@ -345,6 +345,7 @@ fn main() {
         "vdso_smoke",
         "fhandle_smoke",
         "mountapi_smoke",
+        "jobctl_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
