@@ -29,6 +29,11 @@ linux-compat = []
 # Per-namespace address-space tagging.  Orthogonal to linux-compat.
 container = []
 
+# cgroup-v2 memory controller accounting seam: exposes a charge/
+# uncharge hook the cgroupfs `memory` controller installs at boot, so
+# the page/frame allocator can attribute usage to the current cgroup.
+cgroup = []
+
 
 [lints]
 workspace = true

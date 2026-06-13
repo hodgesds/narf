@@ -37,13 +37,31 @@ linux-compat = []
 container = []
 
 # cgroup-v2 unified hierarchy (`cgroupfs`, mounted at /sys/fs/cgroup).
-# Provides the organizational tree + process-membership tracking that
-# an init system (systemd) needs to reach PID 1, with an *empty*
-# controller set — no resource accounting/enforcement. Resource
-# controllers land later as additive sub-features (cgroup-pids,
-# cgroup-memory, cgroup-cpu). Orthogonal to linux-compat and
-# container.
+# Base feature: organizational tree + process-membership tracking +
+# freeze/kill/events. Resource controllers are additive sub-features
+# below, each implying `cgroup`. `cgroup-all` turns on everything.
+# Orthogonal to linux-compat and container.
 cgroup = []
+
+# Resource controllers (each implies the base `cgroup`).
+cgroup-pids   = ["cgroup"]
+cgroup-misc   = ["cgroup"]
+cgroup-memory = ["cgroup", "narf-memory/cgroup"]
+cgroup-cpu    = ["cgroup", "narf-scheduler/cgroup"]
+cgroup-cpuset = ["cgroup", "narf-scheduler/cgroup"]
+cgroup-io     = ["cgroup", "narf-block/cgroup"]
+cgroup-psi    = ["cgroup"]
+
+# Everything.
+cgroup-all = [
+    "cgroup-pids",
+    "cgroup-misc",
+    "cgroup-memory",
+    "cgroup-cpu",
+    "cgroup-cpuset",
+    "cgroup-io",
+    "cgroup-psi",
+]
 
 [lints]
 workspace = true

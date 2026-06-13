@@ -29,6 +29,21 @@
 
 pub mod controller;
 
+#[cfg(feature = "cgroup-cpu")]
+pub mod cpu;
+#[cfg(feature = "cgroup-cpuset")]
+pub mod cpuset;
+#[cfg(feature = "cgroup-io")]
+pub mod io;
+#[cfg(feature = "cgroup-memory")]
+pub mod memory;
+#[cfg(feature = "cgroup-misc")]
+pub mod misc;
+#[cfg(feature = "cgroup-pids")]
+pub mod pids;
+#[cfg(feature = "cgroup-psi")]
+pub mod psi;
+
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -43,6 +58,24 @@ use narf_lib::sync::{IrqSafeSpinLock, OnceLock};
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 pub use controller::{register_controller, Controller, ControllerState};
+
+/// Register every compiled-in resource controller. Call once at boot,
+/// before cgroupfs is mounted, so the root's `cgroup.controllers`
+/// advertises them. No-op for controllers whose sub-feature is off.
+pub fn register_builtin_controllers() {
+    #[cfg(feature = "cgroup-pids")]
+    register_controller(Arc::new(pids::PidsController));
+    #[cfg(feature = "cgroup-misc")]
+    register_controller(Arc::new(misc::MiscController));
+    #[cfg(feature = "cgroup-memory")]
+    register_controller(Arc::new(memory::MemoryController));
+    #[cfg(feature = "cgroup-cpu")]
+    register_controller(Arc::new(cpu::CpuController));
+    #[cfg(feature = "cgroup-cpuset")]
+    register_controller(Arc::new(cpuset::CpuSetController));
+    #[cfg(feature = "cgroup-io")]
+    register_controller(Arc::new(io::IoController));
+}
 
 // ── Cgroup type (v2 §"Threads") ─────────────────────────────────────
 
@@ -882,6 +915,14 @@ impl DirOps for CgroupDir {
             }
             return None;
         }
+        // PSI pressure files are present in every non-root cgroup,
+        // independent of subtree_control.
+        #[cfg(feature = "cgroup-psi")]
+        if !self.cg.is_root() {
+            if let Some(f) = psi::pressure_file(name) {
+                return Some(f);
+            }
+        }
         let (ctrl, file) = self.ctrl_file(name)?;
         Some(Arc::new(CgroupAttrFile {
             cg: self.cg.clone(),
@@ -907,6 +948,12 @@ impl DirOps for CgroupDir {
         }
         for state in self.cg.ctrl_state.lock().values() {
             for f in state.files() {
+                out.push((f.to_string(), FileType::File));
+            }
+        }
+        #[cfg(feature = "cgroup-psi")]
+        if !self.cg.is_root() {
+            for f in psi::file_names() {
                 out.push((f.to_string(), FileType::File));
             }
         }

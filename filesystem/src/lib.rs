@@ -1823,6 +1823,7 @@ pub fn register_initcalls() {
     // does not require sysfs (linux-compat) to be present.
     #[cfg(feature = "cgroup")]
     narf_init::register(Stage::Fs, "cgroupfs-mount", || {
+        cgroupfs::register_builtin_controllers();
         let auth = bootstrap_mount_authority();
         let _ = registry().mount(&auth, "/sys/fs/cgroup", cgroupfs::CgroupFs::new());
         InitResult::Ok
