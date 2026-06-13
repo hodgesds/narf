@@ -364,6 +364,30 @@ unsafe fn irq_save_disable() -> IrqSavedState {
 #[inline(always)]
 unsafe fn irq_restore(_: IrqSavedState) {}
 
+/// Run `f` with maskable interrupts disabled on the current CPU,
+/// restoring the caller's prior IRQ state (IF / DAIF.I) afterward.
+///
+/// Use to protect a **CPU-local** critical section that an IRQ handler
+/// on the same CPU could otherwise re-enter — e.g. a per-CPU allocator
+/// magazine. This is the non-locking sibling of [`IrqSafeSpinLock`]:
+/// same save/disable/restore sequence, no spin-lock. Nests correctly
+/// with `IrqSafeSpinLock` (an inner lock's restore returns to "still
+/// masked"; this call's restore returns to the original state).
+///
+/// Bounded, non-blocking work only — never `.await` or spin on another
+/// CPU while masked. There is no unwinding in the kernel (panic
+/// aborts), so a straight-line restore after `f` is sufficient.
+#[inline]
+pub fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: save+disable / restore is the canonical local IRQ mask
+    // on each arch; it touches only the running CPU's IF / DAIF.I.
+    let saved = unsafe { irq_save_disable() };
+    let r = f();
+    // SAFETY: pairs with the save above.
+    unsafe { irq_restore(saved) };
+    r
+}
+
 impl<T: ?Sized + fmt::Debug> fmt::Debug for IrqSafeSpinLock<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IrqSafeSpinLock").finish_non_exhaustive()
