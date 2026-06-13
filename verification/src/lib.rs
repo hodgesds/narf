@@ -3628,6 +3628,13 @@ pub const NARF_LIBB_SO: &[u8] = include_bytes!(env!("NARF_LIBB_SO"));
 #[cfg(target_arch = "aarch64")]
 pub const NARF_LIBB_SO: &[u8] = &[];
 
+/// Per-DSO TLS test library (x86_64 only) seeded into /lib; `tls_smoke`
+/// links it to exercise general-dynamic thread-locals in a shared library.
+#[cfg(target_arch = "x86_64")]
+pub const NARF_LIBTLS_SO: &[u8] = include_bytes!(env!("NARF_LIBTLS_SO"));
+#[cfg(target_arch = "aarch64")]
+pub const NARF_LIBTLS_SO: &[u8] = &[];
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")
@@ -4127,6 +4134,11 @@ define_smoke_elf!(
     NARF_DSO_SMOKE_ELF,
     "NARF_DSO_SMOKE_ELF_X86_64",
     "NARF_DSO_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_TLS_SMOKE_ELF,
+    "NARF_TLS_SMOKE_ELF_X86_64",
+    "NARF_TLS_SMOKE_ELF_AARCH64"
 );
 
 #[cfg(all(

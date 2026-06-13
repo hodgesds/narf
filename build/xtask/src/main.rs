@@ -1569,6 +1569,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("procfs2_smoke", "procfs2-ok"),
         // multi-DSO dynamic linking: main -> libb -> liba -> libc.
         ("dso_smoke", "dso-ok"),
+        // per-DSO TLS: thread-locals in a shared library (libtls).
+        ("tls_smoke", "tls-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

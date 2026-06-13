@@ -567,6 +567,71 @@ fn main() {
         println!("cargo:rustc-env=NARF_DSO_SMOKE_ELF_AARCH64=/dev/null");
     }
 
+    // ── per-DSO TLS test (x86_64) ───────────────────────────────────
+    // libtls.so carries thread-local state reached via general-dynamic TLS
+    // (__tls_get_addr); tls_smoke links it dynamically. The kernel seeds
+    // libtls.so into /lib so ld-musl loads it (file-backed mmap) and sets
+    // up the per-module TLS block at runtime.
+    {
+        let tls_dir = manifest_dir.join("data/tlstest");
+        for f in ["libtls.c", "tls_smoke.c"] {
+            println!("cargo:rerun-if-changed={}", tls_dir.join(f).display());
+        }
+        let (libtls, main) = match which("musl-gcc") {
+            Some(cc) => {
+                let libtls = out_dir.join("libtls.so");
+                let main = out_dir.join("tls_smoke_x86_64");
+                let outs = out_dir.display().to_string();
+                let run = |args: &[&str], what: &str| {
+                    let o = Command::new(&cc)
+                        .current_dir(&tls_dir)
+                        .args(args)
+                        .output()
+                        .unwrap_or_else(|e| panic!("tlstest: spawn musl-gcc for {what}: {e}"));
+                    if !o.status.success() {
+                        panic!(
+                            "tlstest: {what} failed:\n{}",
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                    }
+                };
+                run(
+                    &[
+                        "-shared",
+                        "-fPIC",
+                        "-O2",
+                        "-Wl,-soname,libtls.so",
+                        "libtls.c",
+                        "-o",
+                        &libtls.display().to_string(),
+                    ],
+                    "libtls.so",
+                );
+                run(
+                    &[
+                        "-O2",
+                        "-fPIE",
+                        "-pie",
+                        "-mcmodel=large",
+                        "tls_smoke.c",
+                        "-L",
+                        &outs,
+                        "-ltls",
+                        "-Wl,-rpath,/lib",
+                        "-o",
+                        &main.display().to_string(),
+                    ],
+                    "tls_smoke",
+                );
+                (libtls.display().to_string(), main.display().to_string())
+            }
+            None => ("/dev/null".to_string(), "/dev/null".to_string()),
+        };
+        println!("cargo:rustc-env=NARF_LIBTLS_SO={libtls}");
+        println!("cargo:rustc-env=NARF_TLS_SMOKE_ELF_X86_64={main}");
+        println!("cargo:rustc-env=NARF_TLS_SMOKE_ELF_AARCH64=/dev/null");
+    }
+
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else
     // /lib/ld-musl-x86_64.so.1 (Arch's path; same default xtask
     // image uses). If absent on the host, point at /dev/null so
