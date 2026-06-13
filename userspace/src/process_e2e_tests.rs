@@ -1658,7 +1658,7 @@ fn smoke_wave37_wait_child_check_fn_contract() -> TestResult {
     crate::handlers::__test_inject_parent_of(CHILD, PARENT);
 
     // (A) Queue empty → check returns 0.
-    let r0 = crate::user_task::call_wait_child_check(PARENT, -1, core::ptr::null_mut());
+    let r0 = crate::user_task::call_wait_child_check(PARENT, -1, 0, core::ptr::null_mut());
     if r0 != 0 {
         teardown_process_state();
         return TestResult::Fail("check_fn on empty queue should return 0");
@@ -1668,14 +1668,14 @@ fn smoke_wave37_wait_child_check_fn_contract() -> TestResult {
     crate::user_task::notify_task_exited(CHILD, CHILD);
 
     // (B) Queue has entry → returns child pid.
-    let r1 = crate::user_task::call_wait_child_check(PARENT, -1, core::ptr::null_mut());
+    let r1 = crate::user_task::call_wait_child_check(PARENT, -1, 0, core::ptr::null_mut());
     if r1 != CHILD as i64 {
         teardown_process_state();
         return TestResult::Fail("check_fn should return child pid after exit");
     }
 
     // (C) Queue was drained → second call returns 0.
-    let r2 = crate::user_task::call_wait_child_check(PARENT, -1, core::ptr::null_mut());
+    let r2 = crate::user_task::call_wait_child_check(PARENT, -1, 0, core::ptr::null_mut());
     if r2 != 0 {
         teardown_process_state();
         return TestResult::Fail("check_fn should return 0 after queue was drained");
@@ -2722,11 +2722,11 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
 
     // Reap them via the wait_child_check_fn path.
     let r1 =
-        crate::user_task::call_wait_child_check(PARENT, c1.raw() as i64, core::ptr::null_mut());
+        crate::user_task::call_wait_child_check(PARENT, c1.raw() as i64, 0, core::ptr::null_mut());
     let r2 =
-        crate::user_task::call_wait_child_check(PARENT, c2.raw() as i64, core::ptr::null_mut());
+        crate::user_task::call_wait_child_check(PARENT, c2.raw() as i64, 0, core::ptr::null_mut());
     let r3 =
-        crate::user_task::call_wait_child_check(PARENT, c3.raw() as i64, core::ptr::null_mut());
+        crate::user_task::call_wait_child_check(PARENT, c3.raw() as i64, 0, core::ptr::null_mut());
 
     if r1 as u64 != c1.raw() || r2 as u64 != c2.raw() || r3 as u64 != c3.raw() {
         crate::__test_reset_pid_pool();

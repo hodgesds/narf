@@ -5719,6 +5719,7 @@ fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     if let Some(tid) = pid_to_task_raw(target) {
         target = tid;
     }
+    signal_stopcont_interaction(target, signum);
     {
         let mut g = SIGNAL_PENDING.lock();
         match g.as_mut() {
@@ -8317,6 +8318,221 @@ type PendingExitMap = BTreeMap<u64, alloc::vec::Vec<(u64, i32)>>;
 static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<Option<PendingExitMap>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+// ── Job control: stop / continue ───────────────────────────────────
+//
+// A task hit by a STOP-class signal (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU)
+// whose default action is `Stop` parks itself (sleep_deadline_ns =
+// u64::MAX) and records its TaskId here with the stop signum. The
+// `UserTaskFuture::poll` loop consults `is_task_stopped` and keeps a
+// stopped task parked — never re-entering user mode — until SIGCONT
+// clears the entry and wakes it (SIGKILL also breaks through).
+//
+// `TASK_STOPPED`: TaskId → stop signum (for WSTOPSIG in the parent's
+// wait4 status word).
+static TASK_STOPPED: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// parent_pid → queued job-control notifications consumed by
+/// `wait4`/`waitid` when WUNTRACED/WCONTINUED is set. Unlike
+/// PENDING_EXITS these do NOT release the child PID — the child is
+/// alive, merely stopped or continued. Entries: `(child_pid, wstatus,
+/// is_continued)`; `wstatus` is `(sig << 8) | 0x7f` for a stop
+/// (WIFSTOPPED) or `0xffff` for a continue (WIFCONTINUED).
+type StopContMap = BTreeMap<u64, alloc::vec::Vec<(u64, i32, bool)>>;
+static PENDING_STOPCONT: narf_lib::sync::IrqSafeSpinLock<Option<StopContMap>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// wait4/waitid `options` bits (Linux uapi).
+const WUNTRACED: u32 = 2;
+const WCONTINUED: u32 = 8;
+
+/// True if `task` is currently job-control stopped.
+pub fn is_task_stopped(task: u64) -> bool {
+    TASK_STOPPED
+        .lock()
+        .as_ref()
+        .map(|m| m.contains_key(&task))
+        .unwrap_or(false)
+}
+
+/// Raw pending-signal bitmask for `task` (no mask applied). Used by
+/// the poll loop to let SIGKILL break a job-control stop.
+pub fn signal_pending_bits(task: u64) -> u32 {
+    SIGNAL_PENDING
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// AND-out the given signal bits from `task`'s pending set.
+fn clear_pending_signal_bits(task: u64, mask: u32) {
+    if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
+        if let Some(slot) = m.get_mut(&task) {
+            *slot &= !mask;
+        }
+    }
+}
+
+/// WIFSTOPPED-shaped wstatus carrying `sig` as WSTOPSIG.
+fn stopped_wstatus(sig: u32) -> i32 {
+    ((sig as i32) << 8) | 0x7f
+}
+
+/// WIFCONTINUED-shaped wstatus.
+const CONTINUED_WSTATUS: i32 = 0xffff;
+
+/// Queue a stop/continue notification to `child_task`'s parent and
+/// nudge it: stage SIGCHLD and wake any blocking wait4. Does NOT
+/// release the child PID — the child is still alive.
+fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: bool) {
+    let child_pid = task_to_pid_raw(child_task).unwrap_or(child_task);
+    let parent = match parent_of_get(child_pid) {
+        Some(p) => p,
+        None => return,
+    };
+    {
+        let mut g = PENDING_STOPCONT.lock();
+        if let Some(m) = g.as_mut() {
+            m.entry(parent).or_insert_with(alloc::vec::Vec::new).push((
+                child_pid,
+                wstatus,
+                is_continued,
+            ));
+        }
+    }
+    // Linux notifies the parent with SIGCHLD on stop/continue too.
+    {
+        let mut g = SIGNAL_PENDING.lock();
+        if let Some(m) = g.as_mut() {
+            *m.entry(parent).or_insert(0) |= 1u32 << 17;
+        }
+    }
+    crate::user_task::wake_wait_child(parent);
+}
+
+/// Pop a matching stop/continue notification for `parent`, honouring
+/// the wait `options` (WUNTRACED selects stops, WCONTINUED selects
+/// continues) and the `want` pid filter. Returns `(child_pid,
+/// wstatus)` WITHOUT releasing the PID.
+fn reap_stopcont(parent: u64, want: i64, options: u32) -> Option<(u64, i32)> {
+    let want_stop = options & WUNTRACED != 0;
+    let want_cont = options & WCONTINUED != 0;
+    if !want_stop && !want_cont {
+        return None;
+    }
+    let mut g = PENDING_STOPCONT.lock();
+    let q = g.as_mut()?.get_mut(&parent)?;
+    let idx = q.iter().position(|&(p, _w, cont)| {
+        (want <= 0 || p == want as u64) && ((cont && want_cont) || (!cont && want_stop))
+    })?;
+    let (pid, w, _) = q.remove(idx);
+    Some((pid, w))
+}
+
+/// Stop/continue mutual-cancellation and SIGCONT resume. Call
+/// whenever `signum` is about to become pending on `task`.
+///
+/// - SIGCONT (18): discards any pending stop signals, and if `task`
+///   is currently stopped, clears the stopped state, reports
+///   WIFCONTINUED to the parent, and un-parks the task.
+/// - A stop signal (19..=22): discards a pending SIGCONT.
+fn signal_stopcont_interaction(task: u64, signum: u32) {
+    match signum {
+        18 => {
+            // SIGCONT cancels pending stops (19..=22).
+            clear_pending_signal_bits(task, 0b1111u32 << 19);
+            let was_stopped = TASK_STOPPED
+                .lock()
+                .as_mut()
+                .and_then(|m| m.remove(&task))
+                .is_some();
+            if was_stopped {
+                push_stopcont_report(task, CONTINUED_WSTATUS, true);
+                // Un-park the stopped UserTaskFuture: wake_signal clears
+                // a u64::MAX deadline and fires the registered waker, so
+                // the poll loop re-runs, sees the task no longer stopped,
+                // and re-enters user mode.
+                wake_signal(task);
+            }
+        }
+        19..=22 => {
+            // A stop signal cancels a pending SIGCONT.
+            clear_pending_signal_bits(task, 1u32 << 18);
+        }
+        _ => {}
+    }
+}
+
+/// Put the current task into the job-control stopped state and park it
+/// until SIGCONT. Records the stop signum (for WSTOPSIG), cancels any
+/// pending SIGCONT, notifies the parent (wait4 WUNTRACED + SIGCHLD),
+/// then — mirroring sys_pause — stashes an infinite deadline, saves the
+/// user frame, and longjmps back to the executor via the yield hook.
+/// The poll loop keeps the task parked (is_task_stopped) until SIGCONT
+/// clears the entry and wakes it; the interrupted syscall then resumes
+/// returning 0. With no executor wired (kernel-test context) it returns
+/// without parking so the caller can consume the signal.
+fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
+    clear_pending_signal_bits(task, 1u32 << signum);
+    if let Some(m) = TASK_STOPPED.lock().as_mut() {
+        m.insert(task, signum);
+    }
+    clear_pending_signal_bits(task, 1u32 << 18);
+    push_stopcont_report(task, stopped_wstatus(signum), false);
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        // SAFETY: `uctx` is the live per-task UserTaskCtx from
+        // current_user_task(); we hold the only reference while stashing
+        // the deadline and saving CPU state, then the yield hook hands the
+        // task to the executor (never returns).
+        unsafe {
+            let uc = &*uctx;
+            ctx.set_return(SyscallReturn::ok(0));
+            uc.sleep_deadline_ns
+                .store(u64::MAX, core::sync::atomic::Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+}
+
+/// Narrow signal delivery for the `syscall`-instruction return path:
+/// deliver ONLY a pending, unmasked, un-handled STOP-class signal
+/// (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU) by stopping the task now.
+///
+/// NARF delivers ordinary (handled) signals lazily, at explicit yield
+/// points; the signal model and existing smokes rely on that timing, so
+/// this deliberately leaves handled signals alone. A STOP with no
+/// handler is different — a process cannot meaningfully defer being
+/// stopped — so it must take effect on syscall return, like Linux. The
+/// int 0x80 path already stops promptly via `default_signal_delivery`;
+/// this brings the `syscall` path (the one musl uses) to parity for the
+/// stop case only. May longjmp out via `enter_stopped` (never returns).
+pub fn deliver_pending_stop(ctx: &mut dyn TrapContext, _syscall_no: u32) -> bool {
+    if !ctx.returning_to_user() {
+        return false;
+    }
+    let task = current_task_id();
+    let mask = signal_mask_of(task);
+    let stop_bits = (0b1111u32 << 19) & signal_pending_bits(task) & !mask;
+    if stop_bits == 0 {
+        return false;
+    }
+    let signum = stop_bits.trailing_zeros();
+    // SIGSTOP can never be caught, but SIGTSTP/SIGTTIN/SIGTTOU can — if a
+    // user handler is installed, leave delivery to the normal lazy path.
+    if sigaction_lookup_full(task, signum as usize).is_some() {
+        return false;
+    }
+    enter_stopped(ctx, task, signum);
+    true
+}
+
 /// task_pid → wstatus staged by the signal-delivery path when a
 /// signal with a Terminate/CoreDump default action is about to kill
 /// the task. The exit observer (`on_child_exit`) drains this and
@@ -8332,6 +8548,8 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    *TASK_STOPPED.lock() = Some(BTreeMap::new());
+    *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::register_exit_observer(on_child_exit);
@@ -8397,6 +8615,8 @@ fn cgroup_freeze_hook(pid: u64, freeze: bool) {
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    *TASK_STOPPED.lock() = Some(BTreeMap::new());
+    *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::__test_wait_child_waker_reset();
@@ -8437,44 +8657,52 @@ fn take_pending_termination(task: u64) -> Option<i32> {
 /// holds no matching entry.  If `status_ptr != 0`, writes the POSIX
 /// wstatus into the user-space pointer (same as `sys_wait4` does on the
 /// fast path).
-fn wait_child_check_fn(parent_id: u64, want_pid: i64, out_status: *mut i32) -> i64 {
+fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: *mut i32) -> i64 {
+    // First try a real exit reap (releases the child PID).
     let entry = {
         let mut g = PENDING_EXITS.lock();
-        let m = match g.as_mut() {
-            Some(m) => m,
-            None => return 0,
-        };
-        let q = match m.get_mut(&parent_id) {
-            Some(q) => q,
-            None => return 0,
-        };
-        let idx = if want_pid > 0 {
-            match q.iter().position(|&(p, _)| p == want_pid as u64) {
-                Some(i) => i,
-                None => return 0,
-            }
-        } else {
-            if q.is_empty() {
-                return 0;
-            }
-            0
-        };
-        q.remove(idx)
+        let reaped = g.as_mut().and_then(|m| {
+            let q = m.get_mut(&parent_id)?;
+            let idx = if want_pid > 0 {
+                q.iter().position(|&(p, _)| p == want_pid as u64)?
+            } else {
+                if q.is_empty() {
+                    return None;
+                }
+                0
+            };
+            Some(q.remove(idx))
+        });
+        reaped
     };
-    let (child_pid, status) = entry;
-    // Hand the raw wstatus back to the caller (the poll routine), which
-    // writes either the wait4 wstatus `int` or the waitid `siginfo_t`
-    // into user space depending on which syscall parked.
-    if !out_status.is_null() {
-        // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
-        // poll routine's stack frame for the duration of this call.
-        unsafe {
-            *out_status = status;
+    if let Some((child_pid, status)) = entry {
+        // Hand the raw wstatus back to the caller (the poll routine),
+        // which writes either the wait4 wstatus `int` or the waitid
+        // `siginfo_t` into user space depending on which syscall parked.
+        if !out_status.is_null() {
+            // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
+            // poll routine's stack frame for the duration of this call.
+            unsafe {
+                *out_status = status;
+            }
         }
+        // Wave-61: PID pool — reaped child's PID returns to the free pool.
+        crate::release_pid(crate::ProcessId(child_pid));
+        return child_pid as i64;
     }
-    // Wave-61: PID pool — reaped child's PID returns to the free pool.
-    crate::release_pid(crate::ProcessId(child_pid));
-    child_pid as i64
+    // No exit available — try a job-control stop/continue notification
+    // if the caller asked for one (WUNTRACED/WCONTINUED). These do NOT
+    // release the PID: the child is alive.
+    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, options) {
+        if !out_status.is_null() {
+            // SAFETY: see above — kernel-side slot owned by the poll frame.
+            unsafe {
+                *out_status = status;
+            }
+        }
+        return child_pid as i64;
+    }
+    0
 }
 
 /// Write the result of a completed child reap into user space and
@@ -8512,8 +8740,16 @@ fn encode_waitid_siginfo(child_pid: i64, wstatus: i32) -> [u8; 128] {
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
     const CLD_DUMPED: i32 = 3;
+    const CLD_STOPPED: i32 = 5;
+    const CLD_CONTINUED: i32 = 6;
     let mut si = [0u8; 128];
-    let (code, code_status) = if wstatus & 0x7f == 0 {
+    let (code, code_status) = if wstatus == CONTINUED_WSTATUS {
+        // WIFCONTINUED: 0xffff. si_status = SIGCONT.
+        (CLD_CONTINUED, 18)
+    } else if wstatus & 0xff == 0x7f {
+        // WIFSTOPPED: low byte 0x7f, WSTOPSIG in bits 8..16.
+        (CLD_STOPPED, (wstatus >> 8) & 0xff)
+    } else if wstatus & 0x7f == 0 {
         // WIFEXITED: low 7 bits zero; exit code in bits 8..16.
         (CLD_EXITED, (wstatus >> 8) & 0xff)
     } else {
@@ -8592,6 +8828,17 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Job-control stop/continue (WUNTRACED/WCONTINUED). No PID release.
+    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, options) {
+        if infop != 0 {
+            let si = encode_waitid_siginfo(child_pid as i64, status);
+            // SAFETY: `infop` non-zero; copy_to_user range-validates the write.
+            let _ = unsafe { copy_to_user(infop, &si) };
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
     if options & WNOHANG != 0 {
         // No child ready: POSIX leaves infop's si_signo as 0 (the
         // caller pre-zeros it). Return success.
@@ -8616,6 +8863,8 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
                 .store(want_pid, core::sync::atomic::Ordering::Release);
             uc.wait_child_status_ptr
                 .store(infop, core::sync::atomic::Ordering::Release);
+            uc.wait_child_options
+                .store(options, core::sync::atomic::Ordering::Release);
             uc.wait_child_pending
                 .store(true, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -8750,7 +8999,13 @@ pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
 /// `default_sync_signal_delivery` when no handler is installed and
 /// the default action is Terminate/CoreDump); we drain it here and
 /// publish the WIFSIGNALED-shaped wstatus to wait4.
-fn on_child_exit(child_pid: u64, _child_tid: u64) {
+fn on_child_exit(child_pid: u64, child_tid: u64) {
+    // Job control: a task that dies while stopped (e.g. SIGKILL'd) must
+    // not leave a stale TASK_STOPPED entry — the TaskId could later be
+    // recycled. The exit observer carries the dying task's TaskId.
+    if let Some(m) = TASK_STOPPED.lock().as_mut() {
+        m.remove(&child_tid);
+    }
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
     crate::pidfd::notify_exit(child_pid);
@@ -8853,6 +9108,18 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Job-control: collect a stop/continue notification if requested
+    // (WUNTRACED/WCONTINUED). Does NOT release the PID — child lives.
+    if let Some((child, status)) = reap_stopcont(parent, want_pid, options) {
+        if status_ptr != 0 {
+            // SAFETY: `status_ptr` non-zero; copy_to_user range-validates
+            // and SMAP-brackets the 4-byte write.
+            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+        }
+        ctx.set_return(SyscallReturn::ok(child));
+        return;
+    }
+
     if options & WNOHANG != 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -8898,6 +9165,10 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // wait4 writes a wstatus int, not a waitid siginfo.
             uc.wait_child_is_waitid
                 .store(false, core::sync::atomic::Ordering::Release);
+            // Carry WUNTRACED/WCONTINUED so the poll-loop reap check
+            // can also collect job-control stop/continue notifications.
+            uc.wait_child_options
+                .store(options, core::sync::atomic::Ordering::Release);
             // Save user-mode register state.  The RAX written here
             // is a placeholder; UserTaskFuture::poll overwrites it
             // with the reaped child pid before re-entering user mode.
@@ -13208,6 +13479,9 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     if signum >= 32 {
         return;
     }
+    // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
+    // mutual cancellation) runs before the pending bit is set.
+    signal_stopcont_interaction(task, signum);
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -13277,6 +13551,8 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
         target = tid;
     }
 
+    // Job-control stop/continue bookkeeping before the bit is set.
+    signal_stopcont_interaction(target, signum);
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -13688,6 +13964,7 @@ fn sys_tgkill(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    signal_stopcont_interaction(tid, signum);
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -13898,6 +14175,7 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    signal_stopcont_interaction(tid, signum);
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -14240,13 +14518,19 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bo
                     terminate_current_task(ctx, task, signum, true);
                     // unreachable when a UserTaskFuture is in flight.
                 }
-                DefaultAction::Stop | DefaultAction::Continue => {
-                    // Wave 51 scope. Restore the pending bit so a
-                    // future cut that wires job control can pick it up.
-                    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-                        let slot = map.entry(task).or_insert(0);
-                        *slot |= 1u32 << signum;
-                    }
+                DefaultAction::Stop => {
+                    // Job control: actually stop the task (the pending bit
+                    // was cleared above). enter_stopped records the stopped
+                    // state, notifies the parent, and parks until SIGCONT.
+                    enter_stopped(ctx, task, signum);
+                    // No executor wired (kernel-test context): enter_stopped
+                    // returns without parking — fall through and consume.
+                }
+                DefaultAction::Continue => {
+                    // A SIGCONT with no handler. The actual resume of a
+                    // stopped task happens eagerly in the raise path
+                    // (signal_stopcont_interaction); here there is just
+                    // nothing left to do — consume it.
                 }
             }
             return true;

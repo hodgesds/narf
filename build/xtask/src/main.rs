@@ -1565,6 +1565,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("mountapi_smoke", "mountapi-ok"),
         // Job control + termios: pty termios round-trip + SIGTTIN.
         ("jobctl_smoke", "jobctl-ok"),
+        // Job control stop/resume: SIGSTOP + SIGCONT via wait4 WUNTRACED.
+        ("jobctl2_smoke", "jobctl2-ok"),
         // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
         ("procfs2_smoke", "procfs2-ok"),
         // multi-DSO dynamic linking: main -> libb -> liba -> libc.
