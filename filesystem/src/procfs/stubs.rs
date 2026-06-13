@@ -54,7 +54,17 @@ impl ProcFile for CgroupsFile {
     fn read(&self) -> Vec<u8> {
         // Header only — no subsystem entries.
         // Linux ref: kernel/cgroup/cgroup.c::proc_cgroupstats_show.
-        b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n".to_vec()
+        // With the cgroup feature this routes through cgroupfs (which
+        // lists available controllers — none in the base feature, so
+        // the output is identical until a controller sub-feature lands).
+        #[cfg(feature = "cgroup")]
+        {
+            crate::cgroupfs::proc_cgroups()
+        }
+        #[cfg(not(feature = "cgroup"))]
+        {
+            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n".to_vec()
+        }
     }
 }
 

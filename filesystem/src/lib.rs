@@ -1815,6 +1815,17 @@ pub fn register_initcalls() {
         sysfs::populate_all();
         InitResult::Ok
     });
+
+    // /sys/fs/cgroup — cgroup-v2 unified hierarchy. Mounted as an
+    // independent prefix; `resolve_absolute` longest-prefix matching
+    // routes /sys/fs/cgroup/* here and other /sys/* to sysfs, so this
+    // does not require sysfs (linux-compat) to be present.
+    #[cfg(feature = "cgroup")]
+    narf_init::register(Stage::Fs, "cgroupfs-mount", || {
+        let auth = bootstrap_mount_authority();
+        let _ = registry().mount(&auth, "/sys/fs/cgroup", cgroupfs::CgroupFs::new());
+        InitResult::Ok
+    });
 }
 
 /// Stage 3 placeholder for a virtiofs mount. Stage 4 wires the DAX

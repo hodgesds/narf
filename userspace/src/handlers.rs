@@ -7538,6 +7538,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         register_task_to_pid(child_tid.raw(), child_visible_pid);
     } else {
         register_pid_task_mapping(child_visible_pid, child_tid.raw());
+        // A clone() that creates a new process (not a thread) joins
+        // the parent's cgroup. Threads share the process's membership
+        // and are never placed individually in the base feature.
+        #[cfg(feature = "cgroup")]
+        narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_visible_pid);
     }
 
     // POSIX-shaped inheritance for the non-shared resources.
@@ -7928,6 +7933,10 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         let _ = crate::pid_ns::inherit_into_child(parent_pid, child_pid.raw());
         mount_ns_inherit(parent_pid, child_tid.raw());
     }
+    // A forked child joins its parent's cgroup. Keyed by ProcessId
+    // (cgroup membership is per-process in v2), matching cgroup.procs.
+    #[cfg(feature = "cgroup")]
+    narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_pid.raw());
     // Parent-of bookkeeping for waitpid: keyed by the child's
     // ProcessId so `on_child_exit(child_pid)` can resolve the
     // parent. `notify_task_exited` uses `this.process.pid.raw()`
@@ -8013,6 +8022,23 @@ pub fn wait_init() {
     {
         clear_child_tid_init();
         install_clear_child_tid_observer();
+    }
+    // cgroup-v2: drop a process's membership when it exits so the
+    // `populated` state of its cgroup chain can fall to 0 — the edge
+    // an init system's empty-cgroup notification keys on.
+    #[cfg(feature = "cgroup")]
+    crate::user_task::register_exit_observer(cgroup_exit_observer);
+}
+
+/// Exit-observer that removes an exiting *process* from its cgroup.
+/// Fires for every task, but only acts on the process leader (when the
+/// dying TaskId is the one bound to the pid) so a short-lived worker
+/// thread exiting doesn't prematurely vacate the whole process's
+/// membership.
+#[cfg(feature = "cgroup")]
+fn cgroup_exit_observer(pid: u64, tid: u64) {
+    if pid_to_task_raw(pid) == Some(tid) {
+        narf_filesystem::cgroupfs::task_exited(pid);
     }
 }
 
