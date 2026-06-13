@@ -1494,6 +1494,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("vdso_smoke", "vdso-ok"),
         // New mount API round 1: file handles.
         ("fhandle_smoke", "fhandle-ok"),
+        // New mount API round 2: fsopen/fsconfig/fsmount/move_mount.
+        ("mountapi_smoke", "mountapi-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
