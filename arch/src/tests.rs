@@ -1796,10 +1796,17 @@ fn smoke_x86_cache_levels_present() -> TestResult {
     use crate::x86_64::cache_topology;
     let mut count = 0u32;
     cache_topology::levels(|_| count += 1);
-    if count == 0 {
-        return TestResult::Fail("no cache levels enumerated");
+    if count > 0 {
+        return TestResult::Pass;
     }
-    TestResult::Pass
+    // Zero levels: distinguish "CPU has no cache-topology CPUID leaf"
+    // (QEMU qemu64 / CI's TCG runner — nothing to enumerate, skip) from
+    // "the leaf exists but yielded nothing" (a real enumeration fault).
+    if cache_topology::leaf_supported() {
+        TestResult::Fail("no cache levels enumerated")
+    } else {
+        TestResult::Skip("CPU exposes no cache-topology CPUID leaf")
+    }
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/cache_topology", smoke_x86_cache_levels_present);

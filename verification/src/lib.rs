@@ -376,10 +376,17 @@ fn smoke_x86_64_tlb_shootdown_ipi() -> TestResult {
     // advances. Doesn't actually need a mapped VA — the handler
     // INVLPGs whatever the sender publishes, which is harmless on
     // any address.
-    use narf_interrupts::x86_64::ipi;
+    use narf_interrupts::x86_64::{apic, ipi};
     use narf_lib::smp;
     if !smp::is_online(1) {
         return TestResult::Skip("AP CPU 1 offline");
+    }
+    // The shootdown IPI path writes the x2APIC ICR MSR and has no xAPIC
+    // fallback; on a CPU that fell back to xAPIC (QEMU qemu64 / CI's TCG
+    // runner) the IPI is never delivered. Skip rather than report a
+    // delivery failure that isn't a kernel bug.
+    if !apic::x2apic_active() {
+        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
 
     let before = ipi::ack_count(1);
@@ -407,13 +414,18 @@ fn smoke_x86_64_unmap_triggers_shootdown() -> TestResult {
     // path's invlpg_global call should fan out to AP 1 (and any other
     // online APs). The AP's ack counter should advance.
     use narf_arch::x86_64::pcid;
-    use narf_interrupts::x86_64::ipi;
+    use narf_interrupts::x86_64::{apic, ipi};
     use narf_lib::smp;
     use narf_memory::frame::alloc_frame;
     use narf_memory::{paging, PhysAddr, VirtAddr};
 
     if !smp::is_online(1) {
         return TestResult::Skip("AP CPU 1 offline");
+    }
+    // unmap_4kb fans the shootdown out via the x2APIC ICR MSR (no xAPIC
+    // fallback); skip when x2APIC isn't live (CI's qemu64/xAPIC fallback).
+    if !apic::x2apic_active() {
+        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
 
     // Use the bootstrap PML4 (CR3) since QEMU's `-cpu max` runs the
@@ -476,10 +488,13 @@ kernel_test!(smoke_x86_64_unmap_triggers_shootdown);
 fn smoke_x86_64_shoot_range_one_ipi() -> TestResult {
     // shoot_range(va, N) should advance AP 1's ack counter by exactly
     // 1 — proof that N contiguous pages cost only one IPI.
-    use narf_interrupts::x86_64::ipi;
+    use narf_interrupts::x86_64::{apic, ipi};
     use narf_lib::smp;
     if !smp::is_online(1) {
         return TestResult::Skip("AP CPU 1 offline");
+    }
+    if !apic::x2apic_active() {
+        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
     let before = ipi::ack_count(1);
     // SAFETY: x2APIC online; IPI handler installed at boot.

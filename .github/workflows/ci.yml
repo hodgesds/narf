@@ -269,14 +269,14 @@ jobs:
       # GHA's TCG QEMU is far slower than local KVM; bump the per-phase
       # QEMU timeouts so a slow boot under load doesn't false-fail.
       #
-      # MTTCG (tcg,thread=multi) is required: GHA has no KVM, and under
-      # single-threaded TCG a BSP busy-waiting on an AP's IPI ack starves
-      # the AP, so the TLB-shootdown / IPI smokes time out and AP-driven
-      # boot steps (cache-topology enumeration) never complete. One host
-      # thread per vCPU lets the APs make concurrent progress.
+      # The hardware tests that need capabilities GHA's old TCG qemu64
+      # CPU lacks — x2APIC (the TLB-shootdown / IPI smokes) and the
+      # cache-topology CPUID leaf — detect their absence and Skip, so no
+      # accel tuning is needed here. (`XTASK_QEMU_ACCEL=tcg,thread=multi`
+      # is available as an escape hatch if a future runner exposes
+      # x2APIC under TCG and the shootdown smokes start running.)
       - name: cargo xtask test --features cgroup-all
         env:
-          XTASK_QEMU_ACCEL: "tcg,thread=multi"
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
         run: cargo xtask test --arch=x86_64 --features cgroup-all

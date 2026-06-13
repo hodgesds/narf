@@ -381,15 +381,14 @@ impl Arch {
                     "-m".into(),
                     "512M".into(),
                 ];
-                // QEMU picks KVM when /dev/kvm exists (local) and falls
-                // back to single-threaded TCG otherwise (CI has no KVM).
-                // Single-threaded TCG round-robins vCPUs only at exit
-                // points, so a BSP spinning on an AP's IPI ack starves
-                // the AP and the TLB-shootdown / IPI smokes time out.
-                // `XTASK_QEMU_ACCEL=tcg,thread=multi` (set by the
-                // kernel-test CI job) runs each vCPU on its own host
-                // thread so APs make concurrent progress. Unset locally
-                // ⇒ QEMU auto-selects KVM, unchanged.
+                // Optional accel override. Unset ⇒ QEMU auto-selects
+                // (KVM when /dev/kvm exists, else single-threaded TCG).
+                // Escape hatch: `XTASK_QEMU_ACCEL=tcg,thread=multi` runs
+                // each vCPU on its own host thread, so a BSP spinning on
+                // an AP's IPI ack doesn't starve the AP under TCG —
+                // needed only if a runner exposes x2APIC under TCG and
+                // the x2APIC-gated shootdown smokes actually run (CI's
+                // qemu64 falls back to xAPIC, so they Skip instead).
                 if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
                     args.push("-accel".into());
                     args.push(accel);

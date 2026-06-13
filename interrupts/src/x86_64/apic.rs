@@ -72,6 +72,18 @@ static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 pub static X2APIC_ACTIVE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// True once the BSP confirmed x2APIC came up (see [`X2APIC_ACTIVE`]).
+/// The IPI shootdown path (`ipi::shoot_va` / `shoot_range`) writes the
+/// x2APIC ICR MSR and has no xAPIC fallback, so callers that need
+/// shootdown delivery — and the smokes that assert it — gate on this.
+/// Real targets always bring up x2APIC; it returns `false` only on
+/// CPUs/emulators that fall back to xAPIC (e.g. QEMU's qemu64 model,
+/// which is what GitHub Actions' TCG runner exposes).
+#[inline]
+pub fn x2apic_active() -> bool {
+    X2APIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Initialise the BSP's LAPIC in x2APIC mode (no timer yet).
 ///
 /// Also masks both legacy 8259 PICs so their IRQs can't land on our
