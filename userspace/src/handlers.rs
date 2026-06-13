@@ -1127,14 +1127,52 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
             Ok(n) => {
+                // Block decision: a 0-byte read on a pipe whose writer is
+                // still open must wait for data (POSIX), not return a
+                // spurious EOF — unless the fd is O_NONBLOCK.
+                let nonblock = entry.status_flags & crate::fd::O_NONBLOCK != 0;
+                let should_block = n == 0 && !nonblock && entry.ops.read_should_block();
                 entry.offset = off.saturating_add(n as u64);
-                Ok(n)
+                Ok((n, should_block))
             }
             Err(_) => Err(()),
         }
     });
     match outcome {
-        Some(Ok(n)) => {
+        Some(Ok((0, true))) => {
+            // Empty pipe, writer still open: park ~1ms and RE-EXECUTE the
+            // read on resume (rewind RIP, leave the syscall number in
+            // place — do NOT set a return value) so the read blocks until
+            // data arrives or the last writer closes (which now happens
+            // via fd::detach on the writer's exit), rather than handing
+            // userspace a 0 it would mis-read as end-of-file.
+            if let (Some(uctx), Some(hook)) = (
+                crate::user_task::current_user_task(),
+                crate::user_task::yield_hook(),
+            ) {
+                let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+                // Rewind past the 2-byte `syscall`/`int 0x80` instruction so
+                // re-entry re-runs this syscall with its original args.
+                let resume_rip = ctx.rip().wrapping_sub(2);
+                ctx.set_rip(resume_rip);
+                // SAFETY: `uctx` is the live per-task UserTaskCtx from
+                // current_user_task(); we hold the only reference while
+                // setting the deadline + saving the (RIP-rewound) CPU state
+                // before the yield hook hands the task to the executor.
+                unsafe {
+                    let uc = &*uctx;
+                    uc.sleep_deadline_ns
+                        .store(dl, core::sync::atomic::Ordering::Release);
+                    ctx.save_user_state(uc.state.get() as *mut u8);
+                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    hook(uctx);
+                }
+                // unreachable — hook() longjmps to the executor
+            }
+            // No executor (kernel-test context): fall back to a 0 read.
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        Some(Ok((n, _))) => {
             // SAFETY: ptr validated above; AS still active.
             if let Err(e) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
                 ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
@@ -8993,6 +9031,12 @@ pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
 /// the default action is Terminate/CoreDump); we drain it here and
 /// publish the WIFSIGNALED-shaped wstatus to wait4.
 fn on_child_exit(child_pid: u64, child_tid: u64) {
+    // Release the exiting task's fd table so every FileOps `Arc` it held
+    // drops. This is what lets a pipe's write end actually close when its
+    // last writer exits — without it `writer_closed` never flips and a
+    // reader (a shell's `$(...)` capture) never sees EOF. Also frees
+    // file/socket handles so they don't leak across the task's lifetime.
+    crate::fd::detach(child_tid);
     // Job control: a task that dies while stopped (e.g. SIGKILL'd) must
     // not leave a stale TASK_STOPPED entry — the TaskId could later be
     // recycled. The exit observer carries the dying task's TaskId.

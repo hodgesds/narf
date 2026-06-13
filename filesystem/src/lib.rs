@@ -430,6 +430,12 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// True when a blocking read on this fd (a pipe with an open writer
+    /// and empty buffer) should park rather than return a spurious 0.
+    fn read_should_block(&self) -> bool {
+        false
+    }
+
     /// If this file is a pidfd (from `pidfd_open`), return the target
     /// process's pid. Used by `pidfd_send_signal(2)` to resolve the
     /// fd to a pid without a downcast / Any dance. Default: `None`.

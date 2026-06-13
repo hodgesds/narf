@@ -1569,6 +1569,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("jobctl2_smoke", "jobctl2-ok"),
         // Filesystem navigation: chdir + getcwd + opendir/getdents64.
         ("navfs_smoke", "navfs-ok"),
+        // Pipe blocking-read + EOF on writer exit (fd teardown on exit).
+        ("pipeof_smoke", "pipeof-ok"),
         // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
         ("procfs2_smoke", "procfs2-ok"),
         // multi-DSO dynamic linking: main -> libb -> liba -> libc.

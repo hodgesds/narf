@@ -7300,6 +7300,32 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_getdents64_writes_linux_records);
 
+fn smoke_userspace_pipe_read_should_block_on_open_writer() -> TestResult {
+    // The blocking-read decision behind shell `$(...)` substitution: a
+    // pipe read end whose buffer is empty but whose writer is still open
+    // must report `read_should_block` (so sys_read parks and waits for
+    // data) — and must STOP reporting it once the last writer drops (so
+    // the read returns a real EOF instead of blocking forever). The
+    // writer drops here via the `Arc<PipeWrite>` going out of scope,
+    // mirroring what `fd::detach` does when a writer task exits.
+    use narf_filesystem::FileOps;
+    let (r, w) = crate::pipe::pipe_pair();
+    // Empty buffer + writer open → should block.
+    if !r.read_should_block() {
+        return TestResult::Fail("empty pipe with open writer should block");
+    }
+    // Last writer closes → EOF; a read must NOT block (returns 0).
+    drop(w);
+    if r.read_should_block() {
+        return TestResult::Fail("closed writer should not block (EOF expected)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pipe_read_should_block_on_open_writer
+);
+
 fn smoke_userspace_init_per_task_state_is_idempotent() -> TestResult {
     use crate::{
         init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,

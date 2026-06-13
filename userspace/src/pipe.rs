@@ -161,6 +161,10 @@ impl FileOps for PipeRead {
         mask
     }
 
+    fn read_should_block(&self) -> bool {
+        self.shared.queue.lock().is_empty() && !self.shared.writer_closed.load(Ordering::Acquire)
+    }
+
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
         let q = self.shared.queue.lock();
         let n = core::cmp::min(max, q.len());

@@ -169,8 +169,37 @@ impl AddressSpace {
     /// page-rounded by the caller; this routine just bumps.
     #[inline]
     pub fn reserve_mmap_va(&self, bytes: u64) -> u64 {
+        // O(1): the cursor is kept past every region ever mapped into the
+        // mmap range (see `bump_mmap_cursor_past`, called from
+        // `map_region`), so a plain bump never collides with an existing
+        // mapping — including regions placed out-of-band (bootstrap
+        // channel buffers, MAP_FIXED overlays) that didn't go through here.
         self.mmap_cursor
-            .fetch_add(bytes, core::sync::atomic::Ordering::Relaxed)
+            .fetch_add(bytes.max(0x1000), core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Keep the mmap-allocation cursor past `region_end` when a region is
+    /// mapped into (or above) the mmap range, so the next
+    /// `reserve_mmap_va` can't hand back a colliding VA. No-op for
+    /// regions that live below the mmap window (program image, stack).
+    fn bump_mmap_cursor_past(&self, region_base: u64, region_len: u64) {
+        use core::sync::atomic::Ordering;
+        if region_base < Self::MMAP_CURSOR_BASE {
+            return;
+        }
+        let region_end = region_base.saturating_add(region_len);
+        let mut cur = self.mmap_cursor.load(Ordering::Relaxed);
+        while region_end > cur {
+            match self.mmap_cursor.compare_exchange(
+                cur,
+                region_end,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Allocate a fresh user-mode PML4 (x86_64) or TTBR0 page-table
@@ -271,7 +300,12 @@ impl AddressSpace {
                 }
             }
         }
+        let (rb, rl) = (region.base.as_u64(), region.len);
         regions.push(region);
+        drop(regions);
+        // Keep the mmap-allocation cursor past anything mapped into the
+        // mmap range so a later `reserve_mmap_va` can't collide with it.
+        self.bump_mmap_cursor_past(rb, rl);
         Ok(())
     }
 

@@ -3529,6 +3529,9 @@ fn boot_userspace_init() {
                 // Filesystem navigation: chdir + getcwd + opendir/getdents64
                 // (directory fds) — what makes `cd` and `ls` work.
                 ("navfs_smoke", narf_verification::NARF_NAVFS_SMOKE_ELF),
+                // Pipe blocking-read + EOF on writer exit (fd teardown on
+                // exit) — the mechanism behind shell `$(...)` substitution.
+                ("pipeof_smoke", narf_verification::NARF_PIPEOF_SMOKE_ELF),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // multi-DSO dynamic linking: main -> libb -> liba -> libc.
