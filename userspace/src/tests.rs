@@ -1393,6 +1393,22 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // chdir now validates that the target is a real directory, so back
+    // `/foo` with a mounted MemFs. Capture the handle so we can unmount
+    // on every exit — a leaked MemFs grows the shared kernel-test heap.
+    let foo_mount = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(&auth, "/foo", MemFs::with_seeds("foo-test", &[]))
+            .ok()
+    };
+    let unmount_foo = || {
+        if let Some(h) = &foo_mount {
+            let _ = narf_filesystem::registry().unmount(h, "/foo");
+        }
+    };
+
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -1421,15 +1437,16 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     if cwd_of(FAKE_TASK.load(Ordering::Relaxed)).as_str() != "/" {
         __test_clear_global();
         crate::handlers::__test_cwd_reset();
+        unmount_foo();
         return TestResult::Fail("default cwd was not /");
     }
 
-    // Chdir("/foo")
-    let target: &str = "/foo";
+    // Chdir("/foo") — Linux ABI: a single NUL-terminated path in arg0
+    // (no length arg).
+    let target: &str = "/foo\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: target.as_ptr() as u64,
-            arg1: target.len() as u64,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -1438,6 +1455,7 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
         __test_clear_global();
         crate::handlers::__test_cwd_reset();
+        unmount_foo();
         return TestResult::Fail("Chdir(/foo) did not Ok");
     }
 
@@ -1469,23 +1487,21 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     kernel_syscall_entry(Syscall::Getcwd.raw(), &mut ctx);
     let small_invalid = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::INVALID_OP);
 
-    // Relative path rejected (Stage-4 first cut: absolute paths only).
-    let bad: &str = "relative";
+    // Nonexistent directory rejected. (Relative paths are now resolved
+    // against the cwd; an absolute path with no backing dir fails the
+    // existence check.) sys_chdir surfaces failure as `ok((-1i64) as
+    // u64)` rather than `invalid_op`: the user-runtime asm wrapper only
+    // observes the value register, so the -1 sentinel is the
+    // wire-visible "no" the libc shim sees.
+    let bad: &str = "/nonexistent\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: bad.as_ptr() as u64,
-            arg1: bad.len() as u64,
             ..SyscallArgs::default()
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Chdir.raw(), &mut ctx);
-    // sys_chdir now mirrors sys_unlink/sys_mkdir/etc. and surfaces
-    // failure as `ok((-1i64) as u64)` rather than `invalid_op`. The
-    // user-runtime asm wrapper only observes the value register, so
-    // a separate INVALID_OP status is invisible to the user side
-    // (success and failure both rax=0). The -1 sentinel is the
-    // wire-visible "no" the libc shim sees.
     let rel_rejected = matches!(
         ctx.ret,
         Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
@@ -1493,6 +1509,7 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
 
     __test_clear_global();
     crate::handlers::__test_cwd_reset();
+    unmount_foo();
 
     if !len_ok {
         return TestResult::Fail("Getcwd did not return length 4");
@@ -7179,40 +7196,73 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
         fn set_rip(&mut self, _rip: u64) {}
     }
 
+    use crate::install_task_id_lookup;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static GD_TID: AtomicU64 = AtomicU64::new(0x6D70);
+    fn gd_task() -> u64 {
+        GD_TID.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(gd_task);
+
     __test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
     let auth = bootstrap_mount_authority();
-    let _ = registry().mount(
-        &auth,
-        "/gd",
-        MemFs::with_seeds(
-            "gd-test",
-            &[("alpha", b"a"), ("beta", b"b"), ("gamma", b"c")],
-        ),
-    );
+    let gd_mount = registry()
+        .mount(
+            &auth,
+            "/gd",
+            MemFs::with_seeds(
+                "gd-test",
+                &[("alpha", b"a"), ("beta", b"b"), ("gamma", b"c")],
+            ),
+        )
+        .ok();
+    let cleanup_gd = || {
+        if let Some(h) = &gd_mount {
+            let _ = registry().unmount(h, "/gd");
+        }
+        crate::fd::__test_reset();
+    };
+
+    // getdents64 is now fd-based (Linux ABI). Open the directory to get
+    // a dir fd, then read it.
+    let fd = match crate::handlers::__test_open_dir_fd(gd_task(), "/gd") {
+        Some(f) => f,
+        None => {
+            crate::handlers::__test_reset_task_id_lookup();
+            cleanup_gd();
+            return TestResult::Fail("could not open /gd as a directory fd");
+        }
+    };
 
     let mut buf = [0u8; 256];
-    let path = "/gd";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
-            arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: 0,
-            arg3: buf.as_mut_ptr() as u64,
-            arg4: buf.len() as u64,
+            arg0: fd as u64,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
             ..SyscallArgs::default()
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getdents64.raw(), &mut ctx);
+    // Done with the task-id lookup; reset so it doesn't leak into
+    // sibling kernel_test cases that assume the default id.
+    crate::handlers::__test_reset_task_id_lookup();
     let written = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value as usize,
-        _ => return TestResult::Fail("getdents64 did not return OK"),
+        _ => {
+            cleanup_gd();
+            return TestResult::Fail("getdents64 did not return OK");
+        }
     };
     if written == 0 {
+        cleanup_gd();
         return TestResult::Fail("getdents64 returned 0 bytes");
     }
 
@@ -7235,13 +7285,16 @@ fn smoke_userspace_getdents64_writes_linux_records() -> TestResult {
         pos += reclen;
     }
     if pos != written {
+        cleanup_gd();
         return TestResult::Fail("walk did not cover the written length exactly");
     }
     names.sort();
     if names.as_slice() != ["alpha", "beta", "gamma"] {
+        cleanup_gd();
         return TestResult::Fail("getdents64 didn't enumerate all entries");
     }
 
+    cleanup_gd();
     __test_clear_global();
     TestResult::Pass
 }
@@ -9160,10 +9213,30 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+    // chdir validates the target is a real directory — back it with a
+    // mounted MemFs at the (nested) mount path. Capture the handle so we
+    // can unmount on every exit (a leaked MemFs grows the shared heap).
+    let ulc_mount = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(
+                &auth,
+                "/usr/local/tests",
+                MemFs::with_seeds("ulctests", &[]),
+            )
+            .ok()
+    };
+    let unmount_ulc = || {
+        if let Some(h) = &ulc_mount {
+            let _ = narf_filesystem::registry().unmount(h, "/usr/local/tests");
+        }
+    };
+    // chdir reads a NUL-terminated path from arg0 (Linux ABI); arg1 is
+    // ignored.
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64 - 1, // exclude trailing NUL
             ..SyscallArgs::default()
         },
         ret: None,
@@ -9172,6 +9245,8 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
     let parent_tid = FAKE_TID.load(Ordering::Relaxed);
     let parent_cwd = crate::handlers::cwd_of(parent_tid);
     if parent_cwd != "/usr/local/tests" {
+        *PARENT_AS.lock() = None;
+        unmount_ulc();
         return TestResult::Fail("parent's Chdir didn't take");
     }
 
@@ -9186,6 +9261,7 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
             *PARENT_AS.lock() = None;
+            unmount_ulc();
             return TestResult::Fail("fork failed");
         }
     };
@@ -9194,6 +9270,7 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
         Some(t) => t,
         None => {
             *PARENT_AS.lock() = None;
+            unmount_ulc();
             return TestResult::Fail("no PID→TaskId mapping after fork");
         }
     };
@@ -9201,6 +9278,7 @@ fn smoke_userspace_fork_inherits_cwd() -> TestResult {
     *PARENT_AS.lock() = None;
     crate::handlers::__test_cwd_reset();
     crate::syscall::__test_clear_global();
+    unmount_ulc();
     if child_cwd == parent_cwd {
         TestResult::Pass
     } else {

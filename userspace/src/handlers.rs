@@ -11355,6 +11355,24 @@ impl narf_filesystem::FileOps for DirFdFile {
     }
 }
 
+/// Test-only: install a directory fd for `path` in `task`'s fd table
+/// and return it. Mirrors `sys_open`'s directory-fd fallback without
+/// going through the open syscall (whose native-vs-linux ABI differs by
+/// build feature). Returns `None` if `path` is not a directory or the
+/// fd table is unavailable.
+#[doc(hidden)]
+pub fn __test_open_dir_fd(task: u64, path: &str) -> Option<u32> {
+    let dirops = resolve_dir_absolute(path)?;
+    fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    })
+}
+
 fn sys_chdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0;
