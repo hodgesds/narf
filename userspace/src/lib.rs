@@ -57,6 +57,8 @@ pub mod keyring;
 pub mod landlock;
 pub mod loader;
 #[cfg(feature = "linux-compat")]
+pub mod lsm;
+#[cfg(feature = "linux-compat")]
 pub mod mqueue;
 #[cfg(feature = "container")]
 pub mod namespaces;

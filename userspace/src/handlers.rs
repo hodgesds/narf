@@ -16885,6 +16885,22 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             "landlock_restrict_self",
             RawFnHandler(crate::landlock::sys_landlock_restrict_self),
         );
+        // Batch 25: generic LSM self-attribute syscalls.
+        table.install_raw(
+            Syscall::LsmGetSelfAttr,
+            "lsm_get_self_attr",
+            RawFnHandler(crate::lsm::sys_lsm_get_self_attr),
+        );
+        table.install_raw(
+            Syscall::LsmSetSelfAttr,
+            "lsm_set_self_attr",
+            RawFnHandler(crate::lsm::sys_lsm_set_self_attr),
+        );
+        table.install_raw(
+            Syscall::LsmListModules,
+            "lsm_list_modules",
+            RawFnHandler(crate::lsm::sys_lsm_list_modules),
+        );
         // Batch 21: keyrings — a real in-kernel key store.
         table.install_raw(
             Syscall::AddKey,

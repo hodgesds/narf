@@ -2103,6 +2103,18 @@ pub enum Syscall {
     /// `landlock_restrict_self(ruleset_fd, flags)` — apply a ruleset to the
     /// calling task (irreversible). Linux (x86_64=446, aarch64=446).
     LandlockRestrictSelf,
+
+    /// `lsm_get_self_attr(attr, ctx, size, flags)` — read a task security
+    /// attribute. Linux (x86_64=459, aarch64=459).
+    LsmGetSelfAttr,
+
+    /// `lsm_set_self_attr(attr, ctx, size, flags)` — set a task security
+    /// attribute. Linux (x86_64=460, aarch64=460).
+    LsmSetSelfAttr,
+
+    /// `lsm_list_modules(ids, size, flags)` — list active LSM ids.
+    /// Linux (x86_64=461, aarch64=461).
+    LsmListModules,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2284,6 +2296,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::LandlockCreateRuleset, 444),
     (Syscall::LandlockAddRule, 445),
     (Syscall::LandlockRestrictSelf, 446),
+    (Syscall::LsmGetSelfAttr, 459),
+    (Syscall::LsmSetSelfAttr, 460),
+    (Syscall::LsmListModules, 461),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2696,6 +2711,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::LandlockCreateRuleset, 444),
     (Syscall::LandlockAddRule, 445),
     (Syscall::LandlockRestrictSelf, 446),
+    (Syscall::LsmGetSelfAttr, 459),
+    (Syscall::LsmSetSelfAttr, 460),
+    (Syscall::LsmListModules, 461),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
