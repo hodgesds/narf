@@ -1482,6 +1482,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("futex2_smoke", "futex2-ok"),
         // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
         ("keyring_smoke", "keyring-ok"),
+        // Linux-compat round 22: inotify real event delivery.
+        ("inotify2_smoke", "inotify2-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

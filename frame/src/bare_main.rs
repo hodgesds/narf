@@ -3501,6 +3501,8 @@ fn boot_userspace_init() {
                 ("futex2_smoke", narf_verification::NARF_FUTEX2_SMOKE_ELF),
                 // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
                 ("keyring_smoke", narf_verification::NARF_KEYRING_SMOKE_ELF),
+                // Linux-compat round 22: inotify real event delivery.
+                ("inotify2_smoke", narf_verification::NARF_INOTIFY2_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
