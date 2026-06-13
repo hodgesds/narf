@@ -12951,7 +12951,13 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // fail that check while it's the very task asking. Treat any
     // pid that matches the caller OR a queued task as live.
     let current = current_task_id();
-    let live = pid == current || narf_scheduler::all_task_ids().iter().any(|t| t.0 == pid);
+    // A task is live if it is the caller (the running task is popped off its
+    // ready queue while polling, so it wouldn't match the queue scan), is on
+    // a ready queue, or simply has an address space registered (covers
+    // parked/sleeping processes like init).
+    let live = pid == current
+        || narf_scheduler::all_task_ids().iter().any(|t| t.0 == pid)
+        || narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).is_some();
     if !live {
         return None;
     }

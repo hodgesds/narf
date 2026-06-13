@@ -1,11 +1,7 @@
-// procfs breadth smoke: /proc/stat — the system-wide kernel/scheduler
-// stats top, uptime and vmstat parse. Confirms the cpu / btime / processes
-// / procs_running lines are present and well-formed. Success token
-// "procfs2-ok".
-//
-// (Fuller /proc/<pid>/status fields are also added in this change, but the
-// per-pid /proc read path has a separate liveness gap — task_info() returns
-// None for the running reader — so they aren't exercised here.)
+// procfs breadth smoke: the nodes ps/top/free read. Confirms /proc/stat
+// (system-wide cpu / btime / processes lines top + uptime parse) and that
+// /proc/self/status carries the memory + thread fields ps/top sort on
+// (VmSize, VmRSS, Threads, VmPeak). Success token "procfs2-ok".
 //
 // Build: see REGEN_procfs2_smoke.sh (musl-gcc, static-PIE).
 #define _GNU_SOURCE
@@ -34,6 +30,14 @@ int main(void) {
     if (!has(buf, "btime ")) { w("procfs2-fail: stat-btime\n"); return 1; }
     if (!has(buf, "processes ")) { w("procfs2-fail: stat-processes\n"); return 1; }
     if (!has(buf, "procs_running ")) { w("procfs2-fail: stat-running\n"); return 1; }
+
+    // /proc/self/status — the ps/top memory + thread fields.
+    if (slurp("/proc/self/status", buf, sizeof buf) <= 0) { w("procfs2-fail: status-open\n"); return 1; }
+    if (!has(buf, "VmSize:")) { w("procfs2-fail: vmsize\n"); return 1; }
+    if (!has(buf, "VmRSS:")) { w("procfs2-fail: vmrss\n"); return 1; }
+    if (!has(buf, "Threads:")) { w("procfs2-fail: threads\n"); return 1; }
+    if (!has(buf, "VmPeak:")) { w("procfs2-fail: vmpeak\n"); return 1; }
+
     w("procfs2-ok\n");
     return 0;
 }
