@@ -1474,6 +1474,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("creds2_smoke", "creds2-ok"),
         // Linux-compat round 16: signal queueing + signalfd4.
         ("sig2_smoke", "sig2-ok"),
+        // Linux-compat round 18: mlockall/memfd_secret/NUMA/process_madvise.
+        ("mem2_smoke", "mem2-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
