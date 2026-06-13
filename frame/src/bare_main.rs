@@ -3527,6 +3527,8 @@ fn boot_userspace_init() {
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // multi-DSO dynamic linking: main -> libb -> liba -> libc.
                 ("dso_smoke", narf_verification::NARF_DSO_SMOKE_ELF),
+                // per-DSO TLS: thread-locals in a shared library (libtls).
+                ("tls_smoke", narf_verification::NARF_TLS_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
@@ -3561,6 +3563,7 @@ fn boot_userspace_init() {
                     ("ld-musl-x86_64.so.1", narf_verification::NARF_LD_MUSL),
                     ("liba.so", narf_verification::NARF_LIBA_SO),
                     ("libb.so", narf_verification::NARF_LIBB_SO),
+                    ("libtls.so", narf_verification::NARF_LIBTLS_SO),
                 ],
             );
             let lib_count = lib_fs.file_count();
