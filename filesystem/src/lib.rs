@@ -1828,6 +1828,39 @@ pub fn register_initcalls() {
         let _ = registry().mount(&auth, "/sys/fs/cgroup", cgroupfs::CgroupFs::new());
         InitResult::Ok
     });
+
+    // /proc/pressure/{cpu,memory,io} — system-wide PSI. Needs procfs
+    // (linux-compat) to register.
+    #[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+    narf_init::register(Stage::Fs, "proc-pressure", || {
+        use cgroupfs::psi::Resource;
+        procfs::register_proc(
+            "pressure/cpu",
+            alloc::sync::Arc::new(PressureFile(Resource::Cpu)),
+        );
+        procfs::register_proc(
+            "pressure/memory",
+            alloc::sync::Arc::new(PressureFile(Resource::Memory)),
+        );
+        procfs::register_proc(
+            "pressure/io",
+            alloc::sync::Arc::new(PressureFile(Resource::Io)),
+        );
+        InitResult::Ok
+    });
+}
+
+/// `/proc/pressure/<axis>` backing — system-wide PSI, delegating to the
+/// cgroup PSI renderer.
+#[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+#[derive(Debug)]
+struct PressureFile(cgroupfs::psi::Resource);
+
+#[cfg(all(feature = "cgroup-psi", feature = "linux-compat"))]
+impl procfs::ProcFile for PressureFile {
+    fn read(&self) -> alloc::vec::Vec<u8> {
+        cgroupfs::psi::proc_pressure(self.0)
+    }
 }
 
 /// Stage 3 placeholder for a virtiofs mount. Stage 4 wires the DAX
