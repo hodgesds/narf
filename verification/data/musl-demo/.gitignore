@@ -49,3 +49,4 @@ creds2_smoke_x86_64
 sig2_smoke_x86_64
 mem2_smoke_x86_64
 psched_smoke_x86_64
+futex2_smoke_x86_64

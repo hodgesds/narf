@@ -336,6 +336,7 @@ fn main() {
         "sig2_smoke",
         "mem2_smoke",
         "psched_smoke",
+        "futex2_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

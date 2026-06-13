@@ -1478,6 +1478,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("mem2_smoke", "mem2-ok"),
         // Linux-compat round 19: process & scheduling.
         ("psched_smoke", "psched-ok"),
+        // Linux-compat round 20: futex2 wait/wake/requeue/waitv.
+        ("futex2_smoke", "futex2-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
