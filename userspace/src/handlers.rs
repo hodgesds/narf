@@ -749,13 +749,17 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // creation, route through the parent directory's `create()`. The
     // explicit-mount form is rare on the create path and not yet
     // wired; absolute paths are the supported entry.
+    let mut created = false;
     let ops = match ops {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
             match narf_filesystem::registry().resolve_parent_absolute(path, |_fs, parent, leaf| {
                 poll_blocking(parent.create(leaf))
             }) {
-                Some(Some(Ok(o))) => o,
+                Some(Some(Ok(o))) => {
+                    created = true;
+                    o
+                }
                 _ => {
                     ctx.set_return(fail);
                     return;
@@ -829,6 +833,16 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // inotify: record the fd's path (so a later write can fire IN_MODIFY)
+    // and emit IN_CREATE (new file) + IN_OPEN against any matching watch.
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::mqueue::register_fd_path(task, new_fd, path);
+        if created {
+            crate::mqueue::notify_create(path, false);
+        }
+        crate::mqueue::notify_open(path);
+    }
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
 
@@ -935,7 +949,12 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         }
     });
     match outcome {
-        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        Some(Ok(n)) => {
+            // inotify: a successful write is IN_MODIFY on the fd's file.
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_modify_fd(task, fd);
+            ctx.set_return(SyscallReturn::ok(n as u64));
+        }
         _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
@@ -3321,7 +3340,11 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
             poll_blocking(parent.unlink(leaf))
         });
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_delete(&path, false);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3347,7 +3370,11 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.mkdir(leaf)));
     match outcome {
-        Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(_))) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_create(&path, true);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3366,7 +3393,11 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_delete(&path, true);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3417,7 +3448,12 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
             poll_blocking(parent.rename(old_leaf, new_leaf))
         });
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => {
+            // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_moved(&old_path, &new_path);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3775,6 +3811,13 @@ fn sys_close(ctx: &mut dyn TrapContext) {
                 map.remove(&(raw as usize));
             }
         }
+    }
+    // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
+    // then forget the fd → path mapping.
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::mqueue::notify_close_fd(task, fd);
+        crate::mqueue::forget_fd_path(task, fd);
     }
     let ok = fd::with_table(task, |t| t.close(fd)).unwrap_or(false);
     if ok {

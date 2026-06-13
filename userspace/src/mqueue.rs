@@ -16,7 +16,7 @@
 //! line in `lib.rs`.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -421,9 +421,30 @@ pub fn sys_mq_getsetattr(ctx: &mut dyn TrapContext) {
 // inotify
 // ════════════════════════════════════════════════════════════════════
 
+// inotify event mask bits (subset; see <sys/inotify.h>).
+pub(crate) const IN_MODIFY: u32 = 0x0000_0002;
+pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub(crate) const IN_OPEN: u32 = 0x0000_0020;
+pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
+pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
+pub(crate) const IN_CREATE: u32 = 0x0000_0100;
+pub(crate) const IN_DELETE: u32 = 0x0000_0200;
+const IN_ISDIR: u32 = 0x4000_0000;
+
+/// One registered watch: the absolute path it covers and the mask of
+/// events the caller asked to be told about.
+struct Watch {
+    path: String,
+    mask: u32,
+}
+
 struct InotifyState {
     next_wd: i32,
-    watches: BTreeMap<i32, String>,
+    watches: BTreeMap<i32, Watch>,
+    /// Pre-serialized `struct inotify_event` records awaiting read(2).
+    events: VecDeque<Vec<u8>>,
+    /// Monotonic cookie source for pairing IN_MOVED_FROM/IN_MOVED_TO.
+    next_cookie: u32,
 }
 
 static INOTIFY: IrqSafeSpinLock<Option<BTreeMap<u64, InotifyState>>> = IrqSafeSpinLock::new(None);
@@ -434,14 +455,220 @@ fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
     f(g.get_or_insert_with(BTreeMap::new))
 }
 
+// ── fd → path side table ────────────────────────────────────────────
+// The fd table stores only an `Arc<dyn FileOps>`, so sys_write (which has
+// just an fd) can't recover the file's path to fire IN_MODIFY. We record
+// (task, fd) → absolute path at open and consult it on write; close drops
+// the entry. This is best-effort (dup/dup2 don't propagate it), which is
+// all inotify needs.
+static FD_PATHS: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), String>>> = IrqSafeSpinLock::new(None);
+
+fn with_fd_paths<R>(f: impl FnOnce(&mut BTreeMap<(u64, u32), String>) -> R) -> R {
+    let mut g = FD_PATHS.lock();
+    f(g.get_or_insert_with(BTreeMap::new))
+}
+
+/// Record the absolute path an fd was opened on (for later IN_MODIFY).
+pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str) {
+    with_fd_paths(|m| {
+        m.insert((task, fd), String::from(path));
+    });
+}
+
+/// Drop an fd → path mapping on close.
+pub(crate) fn forget_fd_path(task: u64, fd: u32) {
+    with_fd_paths(|m| {
+        m.remove(&(task, fd));
+    });
+}
+
+fn parent_and_base(abs: &str) -> (&str, &str) {
+    match abs.rfind('/') {
+        Some(0) => ("/", &abs[1..]),
+        Some(i) => (&abs[..i], &abs[i + 1..]),
+        None => ("", abs),
+    }
+}
+
+/// Serialize one `struct inotify_event` (16-byte header + padded name).
+fn serialize_event(wd: i32, mask: u32, cookie: u32, name: &str) -> Vec<u8> {
+    // Name field is NUL-terminated and padded so the record length is a
+    // multiple of sizeof(struct inotify_event) = 16 (Linux's `len`).
+    let name_len = if name.is_empty() {
+        0
+    } else {
+        (name.len() + 1).div_ceil(16) * 16
+    };
+    let mut buf = Vec::with_capacity(16 + name_len);
+    buf.extend_from_slice(&wd.to_ne_bytes());
+    buf.extend_from_slice(&mask.to_ne_bytes());
+    buf.extend_from_slice(&cookie.to_ne_bytes());
+    buf.extend_from_slice(&(name_len as u32).to_ne_bytes());
+    if name_len > 0 {
+        buf.extend_from_slice(name.as_bytes());
+        buf.resize(16 + name_len, 0);
+    }
+    buf
+}
+
+/// Central filesystem-change dispatch. Called from the syscall handlers
+/// after a successful mutation. For every inotify instance, every watch
+/// whose mask includes `mask` and whose path is either the object itself
+/// (no name in the event) or the object's parent directory (name = the
+/// leaf) gets a serialized event queued.
+fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
+    // Cheap early-out: nothing watching → nothing to do.
+    {
+        let g = INOTIFY.lock();
+        match g.as_ref() {
+            Some(m) if !m.is_empty() => {}
+            _ => return,
+        }
+    }
+    let full_mask = if is_dir { mask | IN_ISDIR } else { mask };
+    let (parent, base) = parent_and_base(abs_path);
+    with_inotify(|m| {
+        for st in m.values_mut() {
+            let cookie = 0u32;
+            let matched: Vec<(i32, &'static str, bool)> = st
+                .watches
+                .iter()
+                .filter_map(|(wd, w)| {
+                    if w.mask & mask == 0 {
+                        None
+                    } else if w.path == abs_path {
+                        Some((*wd, "", false)) // watch on the object: no name
+                    } else if w.path == parent {
+                        Some((*wd, "", true)) // watch on the parent: name = base
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (wd, _, use_base) in matched {
+                let name = if use_base { base } else { "" };
+                st.events
+                    .push_back(serialize_event(wd, full_mask, cookie, name));
+            }
+        }
+    });
+}
+
+/// IN_CREATE on `abs_path` (a newly created file or, with `is_dir`, dir).
+pub(crate) fn notify_create(abs_path: &str, is_dir: bool) {
+    fs_notify(abs_path, IN_CREATE, is_dir);
+}
+
+/// IN_DELETE on `abs_path`.
+pub(crate) fn notify_delete(abs_path: &str, is_dir: bool) {
+    fs_notify(abs_path, IN_DELETE, is_dir);
+}
+
+/// IN_OPEN on `abs_path`.
+pub(crate) fn notify_open(abs_path: &str) {
+    fs_notify(abs_path, IN_OPEN, false);
+}
+
+/// IN_MODIFY for the file behind `fd`, looked up via the fd → path table.
+pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
+    let path = with_fd_paths(|m| m.get(&(task, fd)).cloned());
+    if let Some(p) = path {
+        fs_notify(&p, IN_MODIFY, false);
+    }
+}
+
+/// IN_CLOSE_WRITE for the file behind `fd`.
+pub(crate) fn notify_close_fd(task: u64, fd: u32) {
+    let path = with_fd_paths(|m| m.get(&(task, fd)).cloned());
+    if let Some(p) = path {
+        fs_notify(&p, IN_CLOSE_WRITE, false);
+    }
+}
+
+/// Paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie, for a rename.
+pub(crate) fn notify_moved(from: &str, to: &str) {
+    // Allocate one cookie per rename and stamp both legs with it.
+    let (fp, fb) = parent_and_base(from);
+    let (tp, tb) = parent_and_base(to);
+    with_inotify(|m| {
+        for st in m.values_mut() {
+            let cookie = st.next_cookie.wrapping_add(1);
+            st.next_cookie = cookie;
+            let from_hits: Vec<(i32, bool)> = st
+                .watches
+                .iter()
+                .filter_map(|(wd, w)| {
+                    if w.mask & IN_MOVED_FROM == 0 {
+                        None
+                    } else if w.path == from {
+                        Some((*wd, false))
+                    } else if w.path == fp {
+                        Some((*wd, true))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (wd, use_base) in from_hits {
+                let name = if use_base { fb } else { "" };
+                st.events
+                    .push_back(serialize_event(wd, IN_MOVED_FROM, cookie, name));
+            }
+            let to_hits: Vec<(i32, bool)> = st
+                .watches
+                .iter()
+                .filter_map(|(wd, w)| {
+                    if w.mask & IN_MOVED_TO == 0 {
+                        None
+                    } else if w.path == to {
+                        Some((*wd, false))
+                    } else if w.path == tp {
+                        Some((*wd, true))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (wd, use_base) in to_hits {
+                let name = if use_base { tb } else { "" };
+                st.events
+                    .push_back(serialize_event(wd, IN_MOVED_TO, cookie, name));
+            }
+        }
+    });
+}
+
 struct InotifyFile {
     id: u64,
 }
 
 impl FileOps for InotifyFile {
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // No change-notification source yet — never any events to read.
-        Box::pin(async { Ok(0) })
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let id = self.id;
+        Box::pin(async move {
+            // Drain whole events that fit; inotify never returns a partial
+            // event. If the first queued event is larger than the buffer,
+            // Linux returns EINVAL — mirror that.
+            with_inotify(|m| {
+                let st = match m.get_mut(&id) {
+                    Some(s) => s,
+                    None => return Ok(0),
+                };
+                let mut written = 0usize;
+                while let Some(front) = st.events.front() {
+                    if written == 0 && front.len() > buf.len() {
+                        return Err(FsError::InvalidData);
+                    }
+                    if written + front.len() > buf.len() {
+                        break;
+                    }
+                    let ev = st.events.pop_front().unwrap();
+                    buf[written..written + ev.len()].copy_from_slice(&ev);
+                    written += ev.len();
+                }
+                Ok(written)
+            })
+        })
     }
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async { Err(FsError::InvalidData) })
@@ -479,6 +706,8 @@ pub fn sys_inotify_init1(ctx: &mut dyn TrapContext) {
             InotifyState {
                 next_wd: 1,
                 watches: BTreeMap::new(),
+                events: VecDeque::new(),
+                next_cookie: 0,
             },
         )
     });
@@ -517,15 +746,18 @@ pub fn sys_inotify_add_watch(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let mask = a.arg2 as u32;
     let wd = with_inotify(|m| {
         let st = m.get_mut(&id)?;
-        // Re-adding an already-watched path returns the existing wd.
-        if let Some((wd, _)) = st.watches.iter().find(|(_, p)| **p == path) {
+        // Re-adding an already-watched path returns the existing wd and
+        // refreshes its mask (Linux replaces the mask unless IN_MASK_ADD).
+        if let Some((wd, w)) = st.watches.iter_mut().find(|(_, w)| w.path == path) {
+            w.mask = mask;
             return Some(*wd);
         }
         let wd = st.next_wd;
         st.next_wd = st.next_wd.wrapping_add(1);
-        st.watches.insert(wd, path);
+        st.watches.insert(wd, Watch { path, mask });
         Some(wd)
     });
     match wd {
