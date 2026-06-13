@@ -2960,6 +2960,20 @@ pub fn kernel_syscall_entry_plain_with_state(
     let table = unsafe { &*p };
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     table.dispatch(n, &mut ctx);
+    // Job-control STOP delivery on the `syscall`-instruction return path.
+    // Musl tasks issue `syscall`, never `int 0x80`, and NARF otherwise
+    // delivers signals only at explicit yield points (pause/sched_yield/
+    // nanosleep). That deferral is fine for handled signals — the rest of
+    // the signal model relies on it — but a STOP-class signal (SIGSTOP/
+    // SIGTSTP/SIGTTIN/SIGTTOU with no handler) cannot be meaningfully
+    // deferred: a self-directed or mid-syscall stop must halt the task
+    // now, like Linux. `deliver_pending_stop` touches ONLY those signals
+    // (leaving handled-signal timing unchanged) and may longjmp out to
+    // park the task, exactly as the sys_sleep path does through this same
+    // ArgsOnlyCtx. The null-state plain path self-checks out.
+    if !user_state.is_null() {
+        crate::handlers::deliver_pending_stop(&mut ctx, num);
+    }
     ctx.ret
 }
 

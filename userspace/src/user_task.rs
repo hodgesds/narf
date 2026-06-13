@@ -31,7 +31,7 @@
 #![allow(dead_code)]
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use alloc::collections::BTreeMap;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -154,6 +154,12 @@ pub struct UserTaskCtx {
     /// `wait_child_status_ptr` and the syscall returns 0 rather than
     /// writing a wstatus `int` and returning the reaped pid.
     pub wait_child_is_waitid: AtomicBool,
+
+    /// `options` argument forwarded from `sys_wait4`/`sys_waitid` for
+    /// the blocking path. Carries WUNTRACED/WCONTINUED so the poll
+    /// loop's reap check can also collect job-control stop/continue
+    /// notifications, not just exits.
+    pub wait_child_options: AtomicU32,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -183,6 +189,7 @@ impl UserTaskCtx {
             wait_child_want_pid: AtomicI64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_is_waitid: AtomicBool::new(false),
+            wait_child_options: AtomicU32::new(0),
         }
     }
 }
@@ -411,7 +418,8 @@ pub fn __test_clear_hooks() {
 /// fn(parent_id: u64, want_pid: i64, status_ptr: u64) -> i64
 ///   Returns reaped child pid (> 0) if a matching entry was drained
 ///   from the pending-exits queue, or 0 if the queue is empty.
-pub type WaitChildCheckFn = fn(parent_id: u64, want_pid: i64, out_status: *mut i32) -> i64;
+pub type WaitChildCheckFn =
+    fn(parent_id: u64, want_pid: i64, options: u32, out_status: *mut i32) -> i64;
 
 static WAIT_CHILD_CHECK_FN: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -423,7 +431,12 @@ pub fn register_wait_child_check(f: WaitChildCheckFn) {
 
 /// Invoke the registered check callback.  Returns 0 if no callback
 /// is installed (test/fallback context without real wait4 tables).
-pub fn call_wait_child_check(parent_id: u64, want_pid: i64, out_status: *mut i32) -> i64 {
+pub fn call_wait_child_check(
+    parent_id: u64,
+    want_pid: i64,
+    options: u32,
+    out_status: *mut i32,
+) -> i64 {
     let p = WAIT_CHILD_CHECK_FN.load(Ordering::Acquire);
     if p.is_null() {
         return 0;
@@ -432,7 +445,7 @@ pub fn call_wait_child_check(parent_id: u64, want_pid: i64, out_status: *mut i32
     // WaitChildCheckFn; the static lifetime outlives any call.
     // SAFETY: Valid memory or trusted environment
     let f: WaitChildCheckFn = unsafe { core::mem::transmute(p) };
-    f(parent_id, want_pid, out_status)
+    f(parent_id, want_pid, options, out_status)
 }
 
 /// Per-task Waker slots for tasks parked in a blocking wait4.
@@ -787,6 +800,23 @@ impl core::future::Future for UserTaskFuture {
             return core::task::Poll::Ready(());
         }
 
+        // Job-control stop: a task halted by SIGSTOP/SIGTSTP/SIGTTIN/
+        // SIGTTOU stays parked — never re-entering user mode — until
+        // SIGCONT clears its stopped flag and fires the signal waker.
+        // SIGKILL still breaks through so a stop can't make a task
+        // un-killable. We register the signal waker (consumed +
+        // fired by `wake_signal`) and return Pending without a
+        // wake_by_ref, so the task truly idles until woken.
+        {
+            let tp = crate::handlers::current_task_id();
+            if crate::handlers::is_task_stopped(tp)
+                && (crate::handlers::signal_pending_bits(tp) & (1 << 9)) == 0
+            {
+                crate::handlers::register_signal_waker(tp, cx.waker().clone());
+                return core::task::Poll::Pending;
+            }
+        }
+
         // sys_sleep parks the task by stashing an absolute deadline
         // here and longjmp'ing back. Until the deadline fires,
         // re-poll without re-entering user mode — that gives the
@@ -846,6 +876,7 @@ impl core::future::Future for UserTaskFuture {
         // user mode.
         if this.ctx.wait_child_pending.load(Ordering::Acquire) {
             let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
+            let wait_options = this.ctx.wait_child_options.load(Ordering::Acquire);
             let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
             // Use the scheduler TaskId (set by CURRENT_TASK before this poll)
             // as the key to look up PENDING_EXITS. `sys_fork` stores the
@@ -853,7 +884,7 @@ impl core::future::Future for UserTaskFuture {
             // PENDING_EXITS, so the lookup key must also be the TaskId.
             let task_pid = crate::handlers::current_task_id();
             let mut child_status = 0i32;
-            let reaped = call_wait_child_check(task_pid, want_pid, &mut child_status);
+            let reaped = call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status);
             if reaped > 0 {
                 // Reap succeeded — write the wstatus (wait4) or
                 // siginfo_t (waitid) to the user pointer and put the
@@ -885,7 +916,8 @@ impl core::future::Future for UserTaskFuture {
                 // between the reap check above and registering here).
                 register_wait_child_waker(task_pid, cx.waker().clone());
                 let mut child_status2 = 0i32;
-                let reaped2 = call_wait_child_check(task_pid, want_pid, &mut child_status2);
+                let reaped2 =
+                    call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status2);
                 if reaped2 > 0 {
                     // Child exited in the window — remove the waker
                     // we just stored (no spurious self-wake needed),
@@ -1263,6 +1295,18 @@ impl core::future::Future for UserTaskFuture {
             return core::task::Poll::Ready(());
         }
 
+        // Job-control stop: keep a stopped task parked until SIGCONT
+        // (or SIGKILL) — see the x86_64 sibling body for rationale.
+        {
+            let tp = crate::handlers::current_task_id();
+            if crate::handlers::is_task_stopped(tp)
+                && (crate::handlers::signal_pending_bits(tp) & (1 << 9)) == 0
+            {
+                crate::handlers::register_signal_waker(tp, cx.waker().clone());
+                return core::task::Poll::Pending;
+            }
+        }
+
         // sys_sleep park-via-deadline + throttle (mirrors x86_64 —
         // see the sibling poll body for the rationale).
         let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
@@ -1288,6 +1332,7 @@ impl core::future::Future for UserTaskFuture {
         // sys_wait4 cooperative parking (mirrors x86_64 poll body).
         if this.ctx.wait_child_pending.load(Ordering::Acquire) {
             let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
+            let wait_options = this.ctx.wait_child_options.load(Ordering::Acquire);
             let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
             // Use the scheduler TaskId (set by CURRENT_TASK before this poll)
             // as the key to look up PENDING_EXITS. `sys_fork` stores the
@@ -1295,7 +1340,7 @@ impl core::future::Future for UserTaskFuture {
             // PENDING_EXITS, so the lookup key must also be the TaskId.
             let task_pid = crate::handlers::current_task_id();
             let mut child_status = 0i32;
-            let reaped = call_wait_child_check(task_pid, want_pid, &mut child_status);
+            let reaped = call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status);
             if reaped > 0 {
                 let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
                 let rax =
@@ -1320,7 +1365,8 @@ impl core::future::Future for UserTaskFuture {
             } else {
                 register_wait_child_waker(task_pid, cx.waker().clone());
                 let mut child_status2 = 0i32;
-                let reaped2 = call_wait_child_check(task_pid, want_pid, &mut child_status2);
+                let reaped2 =
+                    call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status2);
                 if reaped2 > 0 {
                     drop_wait_child_waker(task_pid);
                     let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
