@@ -492,11 +492,11 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
 #[cfg(feature = "linux-compat")]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-struct WireWinsize {
-    ws_row: u16,
-    ws_col: u16,
-    ws_xpixel: u16,
-    ws_ypixel: u16,
+pub(crate) struct WireWinsize {
+    pub(crate) ws_row: u16,
+    pub(crate) ws_col: u16,
+    pub(crate) ws_xpixel: u16,
+    pub(crate) ws_ypixel: u16,
 }
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
@@ -516,7 +516,7 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
 }
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
+pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -545,7 +545,7 @@ unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
+pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -562,7 +562,10 @@ unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError>
 /// for TCGETS. Mirrors what the program last set via TCSETS, so
 /// tcgetattr(tcsetattr(x)) round-trips.
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn write_user_termios(uptr: usize, src: &[u8; TERMIOS_WIRE_LEN]) -> Result<(), FsError> {
+pub(crate) unsafe fn write_user_termios(
+    uptr: usize,
+    src: &[u8; TERMIOS_WIRE_LEN],
+) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -579,7 +582,10 @@ unsafe fn write_user_termios(uptr: usize, src: &[u8; TERMIOS_WIRE_LEN]) -> Resul
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn write_user_termios(uptr: usize, src: &[u8; TERMIOS_WIRE_LEN]) -> Result<(), FsError> {
+pub(crate) unsafe fn write_user_termios(
+    uptr: usize,
+    src: &[u8; TERMIOS_WIRE_LEN],
+) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -592,7 +598,7 @@ unsafe fn write_user_termios(uptr: usize, src: &[u8; TERMIOS_WIRE_LEN]) -> Resul
 /// Read a `struct termios` wire image (60 bytes) in from user memory for
 /// TCSETS.
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
+pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -609,7 +615,7 @@ unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsErr
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
+pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
