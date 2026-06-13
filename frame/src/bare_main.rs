@@ -3489,6 +3489,10 @@ fn boot_userspace_init() {
                 ("sig2_smoke", narf_verification::NARF_SIG2_SMOKE_ELF),
                 // Linux-compat round 18: mlockall/memfd_secret/NUMA/process_madvise.
                 ("mem2_smoke", narf_verification::NARF_MEM2_SMOKE_ELF),
+                // Linux-compat round 19: process & scheduling.
+                ("psched_smoke", narf_verification::NARF_PSCHED_SMOKE_ELF),
+                // Linux-compat round 20: futex2 wait/wake/requeue/waitv.
+                ("futex2_smoke", narf_verification::NARF_FUTEX2_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
