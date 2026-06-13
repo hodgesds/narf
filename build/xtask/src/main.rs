@@ -1484,6 +1484,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("keyring_smoke", "keyring-ok"),
         // Linux-compat round 22: inotify real event delivery.
         ("inotify2_smoke", "inotify2-ok"),
+        // Linux-compat round 23: fanotify (init/mark + fd events).
+        ("fanotify_smoke", "fanotify-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
