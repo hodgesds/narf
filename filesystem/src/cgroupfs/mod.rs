@@ -427,12 +427,69 @@ pub fn task_exited(pid: u64) {
         cg.members.lock().remove(&pid);
         cg.notify_events();
     }
+    TASK_NS_ROOT.lock().remove(&pid);
+}
+
+// ── cgroup namespace (CLONE_NEWCGROUP) ──────────────────────────────
+
+/// pid → its cgroup-namespace root. A process appears here once it
+/// unshares the cgroup namespace; absent ⇒ the root-namespace view
+/// (paths are absolute).
+static TASK_NS_ROOT: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// `CLONE_NEWCGROUP`: make `pid`'s *current* cgroup its
+/// cgroup-namespace root, so subsequent `/proc/[pid]/cgroup` paths
+/// render relative to it (the v2 cgroup-namespace contract).
+pub fn unshare_cgroup_ns(pid: u64) {
+    let cur = cgroup_of(pid);
+    TASK_NS_ROOT.lock().insert(pid, cur);
+}
+
+/// Inherit the cgroup-namespace root from parent to child at fork.
+pub fn fork_inherit_ns(parent_pid: u64, child_pid: u64) {
+    let r = TASK_NS_ROOT.lock().get(&parent_pid).cloned();
+    if let Some(r) = r {
+        TASK_NS_ROOT.lock().insert(child_pid, r);
+    }
+}
+
+/// Path of `cg` relative to a cgroup-namespace root (`/` when `cg` is
+/// the root). Falls back to the absolute path if `cg` is not within
+/// `nsroot`'s subtree.
+fn cgroup_path_relative(cg: &Arc<Cgroup>, nsroot: &Arc<Cgroup>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = cg.clone();
+    loop {
+        if Arc::ptr_eq(&cur, nsroot) {
+            if parts.is_empty() {
+                return "/".to_string();
+            }
+            parts.reverse();
+            let mut s = String::new();
+            for p in parts {
+                s.push('/');
+                s.push_str(&p);
+            }
+            return s;
+        }
+        match cur.parent.clone() {
+            Some(p) => {
+                parts.push(cur.name.clone());
+                cur = p;
+            }
+            None => return cgroup_path(cg), // not under nsroot
+        }
+    }
 }
 
 /// `/proc/[pid]/cgroup` content: the v2 single-line form `0::<path>\n`.
 pub fn proc_pid_cgroup(pid: u64) -> Vec<u8> {
     let cg = cgroup_of(pid);
-    let path = cgroup_path(&cg);
+    let path = match TASK_NS_ROOT.lock().get(&pid).cloned() {
+        Some(nsroot) => cgroup_path_relative(&cg, &nsroot),
+        None => cgroup_path(&cg),
+    };
     format!("0::{path}\n").into_bytes()
 }
 

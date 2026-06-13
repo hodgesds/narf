@@ -7542,6 +7542,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         // and are never placed individually in the base feature.
         #[cfg(feature = "cgroup")]
         narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_visible_pid);
+        // cgroup-namespace inheritance, and CLONE_NEWCGROUP → the child
+        // gets a fresh cgroup-ns rooted at its current cgroup.
+        #[cfg(all(feature = "cgroup", feature = "container"))]
+        {
+            const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+            narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_visible_pid);
+            if flags & CLONE_NEWCGROUP != 0 {
+                narf_filesystem::cgroupfs::unshare_cgroup_ns(child_visible_pid);
+            }
+        }
     }
 
     // POSIX-shaped inheritance for the non-shared resources.
@@ -7936,6 +7946,9 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     // (cgroup membership is per-process in v2), matching cgroup.procs.
     #[cfg(feature = "cgroup")]
     narf_filesystem::cgroupfs::fork_inherit(parent_pid, child_pid.raw());
+    // Inherit the parent's cgroup-namespace root (if any).
+    #[cfg(all(feature = "cgroup", feature = "container"))]
+    narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
     // Parent-of bookkeeping for waitpid: keyed by the child's
     // ProcessId so `on_child_exit(child_pid)` can resolve the
     // parent. `notify_task_exited` uses `this.process.pid.raw()`
@@ -11729,6 +11742,19 @@ fn sys_unshare(ctx: &mut dyn TrapContext) {
         }
         if flags & crate::namespaces::CLONE_NEWIPC != 0 {
             crate::namespaces::unshare_ipc(task);
+            any = true;
+        }
+    }
+
+    // CLONE_NEWCGROUP — pin the calling process's current cgroup as its
+    // cgroup-namespace root so /proc/self/cgroup renders relative to it.
+    #[cfg(all(feature = "cgroup", feature = "container"))]
+    {
+        const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+        if flags & CLONE_NEWCGROUP != 0 {
+            let task = current_task_id();
+            let pid = task_to_pid_raw(task).unwrap_or(task);
+            narf_filesystem::cgroupfs::unshare_cgroup_ns(pid);
             any = true;
         }
     }
