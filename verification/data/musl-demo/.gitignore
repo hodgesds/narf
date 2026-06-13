@@ -56,3 +56,5 @@ fanotify_smoke_x86_64
 landlock_smoke_x86_64
 lsm_smoke_x86_64
 vdso_smoke_x86_64
+fhandle_smoke_x86_64
+mountapi_smoke_x86_64

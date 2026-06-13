@@ -2115,6 +2115,43 @@ pub enum Syscall {
     /// `lsm_list_modules(ids, size, flags)` — list active LSM ids.
     /// Linux (x86_64=461, aarch64=461).
     LsmListModules,
+
+    /// `name_to_handle_at(dirfd, path, handle, mount_id, flags)` — encode a
+    /// file into an opaque handle. Linux (x86_64=303, aarch64=264).
+    NameToHandleAt,
+
+    /// `open_by_handle_at(mount_fd, handle, flags)` — open a file from a
+    /// handle produced by name_to_handle_at.
+    /// Linux (x86_64=304, aarch64=265).
+    OpenByHandleAt,
+
+    /// `open_tree(dfd, path, flags)` — clone a mount as an fd.
+    /// Linux (x86_64=428, aarch64=428).
+    OpenTree,
+
+    /// `move_mount(from_dfd, from_path, to_dfd, to_path, flags)` — attach a
+    /// detached mount. Linux (x86_64=429, aarch64=429).
+    MoveMount,
+
+    /// `fsopen(fsname, flags)` — open a filesystem context.
+    /// Linux (x86_64=430, aarch64=430).
+    Fsopen,
+
+    /// `fsconfig(fd, cmd, key, value, aux)` — configure / create a context.
+    /// Linux (x86_64=431, aarch64=431).
+    Fsconfig,
+
+    /// `fsmount(fs_fd, flags, attr_flags)` — create a detached mount.
+    /// Linux (x86_64=432, aarch64=432).
+    Fsmount,
+
+    /// `fspick(dfd, path, flags)` — context fd for an existing mount.
+    /// Linux (x86_64=433, aarch64=433).
+    Fspick,
+
+    /// `mount_setattr(dfd, path, flags, attr, size)` — change mount attrs.
+    /// Linux (x86_64=442, aarch64=442).
+    MountSetattr,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2299,6 +2336,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::LsmGetSelfAttr, 459),
     (Syscall::LsmSetSelfAttr, 460),
     (Syscall::LsmListModules, 461),
+    (Syscall::NameToHandleAt, 303),
+    (Syscall::OpenByHandleAt, 304),
+    (Syscall::OpenTree, 428),
+    (Syscall::MoveMount, 429),
+    (Syscall::Fsopen, 430),
+    (Syscall::Fsconfig, 431),
+    (Syscall::Fsmount, 432),
+    (Syscall::Fspick, 433),
+    (Syscall::MountSetattr, 442),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2714,6 +2760,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::LsmGetSelfAttr, 459),
     (Syscall::LsmSetSelfAttr, 460),
     (Syscall::LsmListModules, 461),
+    (Syscall::NameToHandleAt, 264),
+    (Syscall::OpenByHandleAt, 265),
+    (Syscall::OpenTree, 428),
+    (Syscall::MoveMount, 429),
+    (Syscall::Fsopen, 430),
+    (Syscall::Fsconfig, 431),
+    (Syscall::Fsmount, 432),
+    (Syscall::Fspick, 433),
+    (Syscall::MountSetattr, 442),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

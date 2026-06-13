@@ -1174,6 +1174,138 @@ fn fanotify_open_object(task: u64, abs: &str) -> i32 {
     }
 }
 
+// ── File handles: name_to_handle_at / open_by_handle_at ─────────────
+//
+// Linux file handles are an opaque, FS-defined encoding of a file's
+// identity that `open_by_handle_at` later resolves. NARF's Stat carries no
+// inode number, so instead of an inode/fid encoding we store the file's
+// absolute path directly in `f_handle[]` — a self-contained, stateless
+// handle that round-trips through both syscalls. `handle_type` carries a
+// NARF marker so a foreign handle is rejected with ESTALE.
+
+#[cfg(feature = "linux-compat")]
+const NARF_HANDLE_TYPE: i32 = 0x4e41; // "NA"
+
+/// True if `abs` resolves to an existing file/dir.
+#[cfg(feature = "linux-compat")]
+fn path_exists(abs: &str) -> bool {
+    let root_rel = narf_filesystem::registry()
+        .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
+    match root_rel {
+        Some((root, rel)) => {
+            matches!(
+                poll_blocking(narf_filesystem::resolve_async(root, &rel)),
+                Some(Ok(_))
+            )
+        }
+        None => false,
+    }
+}
+
+/// `name_to_handle_at(dirfd, pathname, handle, mount_id, flags)`.
+#[cfg(feature = "linux-compat")]
+fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
+    const EINVAL: i64 = 22;
+    const ENOENT: i64 = 2;
+    const EFAULT: i64 = 14;
+    const EOVERFLOW: i64 = 75;
+    let a = *ctx.args();
+    // dirfd (arg0) is honoured only as AT_FDCWD — NARF resolves absolute
+    // paths; relative paths resolve under the task's cwd/chroot.
+    let path = match copy_user_cstr(a.arg1, 4096) {
+        Some(p) if !p.is_empty() => apply_chroot(&p),
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            return;
+        }
+    };
+    if !path_exists(&path) {
+        ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
+        return;
+    }
+    // handle->handle_bytes (the caller's f_handle capacity) is the first u32.
+    let mut cap = [0u8; 4];
+    // SAFETY: copy_from_user validates the 4-byte read.
+    if unsafe { copy_from_user(&mut cap, a.arg2) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
+    }
+    let cap = u32::from_ne_bytes(cap) as usize;
+    let needed = path.len();
+    if cap < needed {
+        // Report the required size and fail — the caller retries bigger.
+        // SAFETY: copy_to_user validates the 4-byte destination.
+        let _ = unsafe { copy_to_user(a.arg2, &(needed as u32).to_ne_bytes()) };
+        ctx.set_return(SyscallReturn::ok((-EOVERFLOW) as u64));
+        return;
+    }
+    // Write the 8-byte header { handle_bytes, handle_type } then the path.
+    let mut hdr = [0u8; 8];
+    hdr[0..4].copy_from_slice(&(needed as u32).to_ne_bytes());
+    hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
+    // SAFETY: copy_to_user validates the 8-byte header destination.
+    let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
+    // SAFETY: copy_to_user validates the path destination range.
+    let h2 = unsafe { copy_to_user(a.arg2 + 8, path.as_bytes()) };
+    if h1.is_err() || h2.is_err() {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
+    }
+    // mount_id (arg3) — one filesystem namespace, so report 0.
+    if a.arg3 != 0 {
+        // SAFETY: copy_to_user validates the 4-byte destination.
+        let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `open_by_handle_at(mount_fd, handle, flags)`.
+#[cfg(feature = "linux-compat")]
+fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
+    const EINVAL: i64 = 22;
+    const ESTALE: i64 = 116;
+    const EFAULT: i64 = 14;
+    let a = *ctx.args();
+    // mount_fd (arg0) is ignored (single namespace; AT_FDCWD also accepted).
+    let mut hdr = [0u8; 8];
+    // SAFETY: copy_from_user validates the 8-byte header read.
+    if unsafe { copy_from_user(&mut hdr, a.arg1) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
+    }
+    let hbytes = u32::from_ne_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    let htype = i32::from_ne_bytes(hdr[4..8].try_into().unwrap());
+    if htype != NARF_HANDLE_TYPE {
+        ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
+        return;
+    }
+    if hbytes == 0 || hbytes > 4096 {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
+    // SAFETY: copy_from_user_vec validates the f_handle range.
+    let path_bytes = match unsafe { copy_from_user_vec(a.arg1 + 8, hbytes) } {
+        Ok(b) => b,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        }
+    };
+    let path = match alloc::string::String::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
+            return;
+        }
+    };
+    let fd = fanotify_open_object(current_task_id(), &path);
+    if fd < 0 {
+        ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(fd as u64));
+}
+
 // ── Dup family + fcntl ─────────────────────────────────────────────
 //
 // Stage-4 round 2: the dup'd fd is a *clone* of the source FdEntry —
@@ -16903,6 +17035,53 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::LsmListModules,
             "lsm_list_modules",
             RawFnHandler(crate::lsm::sys_lsm_list_modules),
+        );
+        // New mount API round 1: file handles.
+        table.install_raw(
+            Syscall::NameToHandleAt,
+            "name_to_handle_at",
+            RawFnHandler(sys_name_to_handle_at),
+        );
+        table.install_raw(
+            Syscall::OpenByHandleAt,
+            "open_by_handle_at",
+            RawFnHandler(sys_open_by_handle_at),
+        );
+        // New mount API round 2: fsopen/fsconfig/fsmount/move_mount/...
+        table.install_raw(
+            Syscall::Fsopen,
+            "fsopen",
+            RawFnHandler(crate::mount_api::sys_fsopen),
+        );
+        table.install_raw(
+            Syscall::Fsconfig,
+            "fsconfig",
+            RawFnHandler(crate::mount_api::sys_fsconfig),
+        );
+        table.install_raw(
+            Syscall::Fsmount,
+            "fsmount",
+            RawFnHandler(crate::mount_api::sys_fsmount),
+        );
+        table.install_raw(
+            Syscall::MoveMount,
+            "move_mount",
+            RawFnHandler(crate::mount_api::sys_move_mount),
+        );
+        table.install_raw(
+            Syscall::OpenTree,
+            "open_tree",
+            RawFnHandler(crate::mount_api::sys_open_tree),
+        );
+        table.install_raw(
+            Syscall::Fspick,
+            "fspick",
+            RawFnHandler(crate::mount_api::sys_fspick),
+        );
+        table.install_raw(
+            Syscall::MountSetattr,
+            "mount_setattr",
+            RawFnHandler(crate::mount_api::sys_mount_setattr),
         );
         // Batch 21: keyrings — a real in-kernel key store.
         table.install_raw(

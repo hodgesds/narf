@@ -4077,6 +4077,16 @@ define_smoke_elf!(
     "NARF_VDSO_SMOKE_ELF_X86_64",
     "NARF_VDSO_SMOKE_ELF_AARCH64"
 );
+define_smoke_elf!(
+    NARF_FHANDLE_SMOKE_ELF,
+    "NARF_FHANDLE_SMOKE_ELF_X86_64",
+    "NARF_FHANDLE_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_MOUNTAPI_SMOKE_ELF,
+    "NARF_MOUNTAPI_SMOKE_ELF_X86_64",
+    "NARF_MOUNTAPI_SMOKE_ELF_AARCH64"
+);
 
 #[cfg(all(
     target_arch = "x86_64",
