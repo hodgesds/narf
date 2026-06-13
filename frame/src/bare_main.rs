@@ -3517,6 +3517,8 @@ fn boot_userspace_init() {
                 ("lsm_smoke", narf_verification::NARF_LSM_SMOKE_ELF),
                 // vDSO: real fast-path linux-vdso.so.1 (clock_gettime).
                 ("vdso_smoke", narf_verification::NARF_VDSO_SMOKE_ELF),
+                // New mount API round 1: file handles.
+                ("fhandle_smoke", narf_verification::NARF_FHANDLE_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
