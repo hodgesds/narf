@@ -3594,6 +3594,14 @@ pub const NARF_INIT_ELF: &[u8] = include_bytes!(env!("NARF_INIT_ELF_X86_64"));
 ))]
 pub const NARF_INIT_ELF: &[u8] = include_bytes!(env!("NARF_INIT_ELF_AARCH64"));
 
+/// The per-arch vDSO image (`linux-vdso.so.1`). Empty when the build host
+/// lacked clang/lld — the kernel then maps no vDSO and libc falls back to
+/// plain syscalls. Always present (ungated) so the loader can reference it.
+#[cfg(target_arch = "x86_64")]
+pub const NARF_VDSO_ELF: &[u8] = include_bytes!(env!("NARF_VDSO_ELF_X86_64"));
+#[cfg(target_arch = "aarch64")]
+pub const NARF_VDSO_ELF: &[u8] = include_bytes!(env!("NARF_VDSO_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")
@@ -4063,6 +4071,11 @@ define_smoke_elf!(
     NARF_LSM_SMOKE_ELF,
     "NARF_LSM_SMOKE_ELF_X86_64",
     "NARF_LSM_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_VDSO_SMOKE_ELF,
+    "NARF_VDSO_SMOKE_ELF_X86_64",
+    "NARF_VDSO_SMOKE_ELF_AARCH64"
 );
 
 #[cfg(all(

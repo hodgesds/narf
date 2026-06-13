@@ -12486,6 +12486,9 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let mono_ns = narf_scheduler::narf_time::monotonic_ns() as i128;
     let offset_ns = (target_ns - mono_ns) as i64;
     narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
+    // Republish the offset to the vDSO vvar so __vdso_clock_gettime
+    // (CLOCK_REALTIME) tracks the new wall time without a syscall.
+    crate::vdso::update_wall_offset(offset_ns);
     ctx.set_return(SyscallReturn::ok(0));
 }
 

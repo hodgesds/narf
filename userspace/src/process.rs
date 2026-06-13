@@ -290,6 +290,13 @@ pub unsafe fn load_user_process_with(
         })
         .map_err(|_| ProcessLoadError::StackMapFailed)?;
 
+    // Map the vDSO (+ its vvar page) read-only / RX into the process, so
+    // libc can read the clock without a syscall. `vdso_base` (the ELF
+    // header address) is published below as AT_SYSINFO_EHDR. `None` when no
+    // vDSO image is registered (build host lacked clang) — programs then
+    // fall back to plain syscalls.
+    let vdso_base = crate::vdso::map_into(&address_space);
+
     // SAFETY: AS is from `load_elf_bytes` (hence `new_for_user`)
     // and stack region was just pushed.
     // SAFETY: Valid memory or trusted environment
@@ -393,6 +400,17 @@ pub unsafe fn load_user_process_with(
     } else {
         aux.to_vec()
     };
+
+    // AT_SYSINFO_EHDR: hand libc the vDSO base so it can resolve the
+    // __vdso_* / __kernel_* symbols (added regardless of interpreter; a
+    // static binary that calls getauxval(AT_SYSINFO_EHDR) wants it too).
+    let mut final_aux = final_aux;
+    if let Some(base) = vdso_base {
+        let tag = AuxEntry::SysInfoEhdr(0).tag();
+        if !final_aux.iter().any(|e| e.tag() == tag) {
+            final_aux.push(AuxEntry::SysInfoEhdr(base));
+        }
+    }
 
     // Lay out argc/argv/envp/auxv if anything was supplied; an
     // entirely empty (no-args) process keeps the all-zero stack.
@@ -703,6 +721,7 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
                 0
             }
         }
+        AuxEntry::SysInfoEhdr(v) => v,
     };
     (key, val)
 }

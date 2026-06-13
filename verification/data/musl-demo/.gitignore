@@ -55,3 +55,4 @@ inotify2_smoke_x86_64
 fanotify_smoke_x86_64
 landlock_smoke_x86_64
 lsm_smoke_x86_64
+vdso_smoke_x86_64

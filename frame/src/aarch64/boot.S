@@ -42,6 +42,16 @@ _start:
     msr  sctlr_el1, x0
     isb
 
+    /* Allow EL0 to read the virtual counter + frequency
+     * (CNTKCTL_EL1.EL0VCTEN, bit 1). The vDSO's __kernel_clock_gettime
+     * reads CNTVCT_EL0 from user mode; without this the MRS traps to EL1.
+     * (EL0PCTEN/bit 0 is left clear — the vDSO uses the virtual counter,
+     * which on QEMU equals the physical one.) */
+    mrs  x0, cntkctl_el1
+    orr  x0, x0, #(1 << 1)
+    msr  cntkctl_el1, x0
+    isb
+
     /* Stack in .boot.data. Physical base. */
     adrp x0, stack_top
     add  x0, x0, #:lo12:stack_top

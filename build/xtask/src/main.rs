@@ -1490,6 +1490,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("landlock_smoke", "landlock-ok"),
         // Linux-compat round 25: generic LSM self-attr syscalls.
         ("lsm_smoke", "lsm-ok"),
+        // vDSO: real fast-path linux-vdso.so.1 (clock_gettime).
+        ("vdso_smoke", "vdso-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
