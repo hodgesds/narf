@@ -82,8 +82,8 @@ pub use budget::{BudgetAccount, CpuBudget, OverrunPolicy, ResourceBudget};
 #[cfg(feature = "cgroup")]
 pub use cgroup::{
     apply_affinity, apply_priority, cgroup_cycles_for, cgroup_set_affinity, cgroup_set_priority,
-    cpu_set_from_bits, install_cgroup_affinity_hook, install_cgroup_cpu_hook, AffinityHook,
-    CpuPriorityHook,
+    cpu_set_from_bits, install_cgroup_affinity_hook, install_cgroup_cpu_hook,
+    install_memory_pid_provider, AffinityHook, CpuPriorityHook,
 };
 pub use cpu_lifecycle::{
     cpu_bring_up, cpu_online, cpu_take_offline, online_count, CpuLifecycle, HotPlugError,

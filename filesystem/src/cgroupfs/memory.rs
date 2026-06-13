@@ -122,21 +122,29 @@ fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
     true
 }
 
-/// Install the allocator charge hook into `narf-memory` exactly once.
+/// Install the allocator charge plumbing exactly once.
 ///
 /// DOCUMENTED LAZY INSTALL: called from `MemoryController::new_state`
 /// the first time any `memory` cgroup acquires state, so cgroup memory
-/// accounting comes online with no external boot wiring. (The
-/// allocator's PID provider — "which task is allocating now" — is
-/// installed by the task/scheduler layer via
-/// `narf_memory::install_cgroup_pid_provider`; until it is, allocations
-/// are simply unattributed and this hook is a no-op.)
+/// accounting comes online with no external boot wiring. Two halves:
+///
+///   * the **charge hook** (this module's [`charge_hook`]) — the
+///     allocator calls it on every user-facing frame alloc/free;
+///   * the **charge-PID provider** — installed via
+///     [`narf_scheduler::install_memory_pid_provider`], which answers
+///     "which task is allocating now" from the scheduler's current-task
+///     register (the allocator has no per-task context of its own).
+///
+/// With both installed, `memory.max` enforcement is live end-to-end: a
+/// frame allocation by a task whose cgroup chain is at its limit is
+/// charged, rejected, and failed back to the caller as ENOMEM.
 fn ensure_hook_installed() {
     if HOOK_INSTALLED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         narf_memory::install_cgroup_charge_hook(charge_hook);
+        narf_scheduler::install_memory_pid_provider();
     }
 }
 

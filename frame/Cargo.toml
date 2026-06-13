@@ -106,7 +106,32 @@ container = ["narf-userspace/container"]
 # cgroup-v2 unified hierarchy. Forwarded from narf-userspace; the
 # boot path also places init/shell into the root cgroup. Mounts
 # cgroupfs at /sys/fs/cgroup.
+#
+# Base feature = organizational tree + freeze/kill/events. Resource
+# controllers are additive sub-features that pass through to
+# narf-filesystem (which owns the cgroupfs tree and the controller
+# implementations); `cgroup-all` turns on everything. A kernel image
+# only enforces a controller it was built with — `memory.max`
+# enforcement, for instance, requires `cgroup-memory`.
 cgroup = ["narf-userspace/cgroup", "narf-filesystem/cgroup"]
+
+cgroup-pids   = ["cgroup", "narf-filesystem/cgroup-pids"]
+cgroup-misc   = ["cgroup", "narf-filesystem/cgroup-misc"]
+cgroup-memory = ["cgroup", "narf-filesystem/cgroup-memory"]
+cgroup-cpu    = ["cgroup", "narf-filesystem/cgroup-cpu"]
+cgroup-cpuset = ["cgroup", "narf-filesystem/cgroup-cpuset"]
+cgroup-io     = ["cgroup", "narf-filesystem/cgroup-io"]
+cgroup-psi    = ["cgroup", "narf-filesystem/cgroup-psi"]
+
+cgroup-all = [
+    "cgroup-pids",
+    "cgroup-misc",
+    "cgroup-memory",
+    "cgroup-cpu",
+    "cgroup-cpuset",
+    "cgroup-io",
+    "cgroup-psi",
+]
 
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.

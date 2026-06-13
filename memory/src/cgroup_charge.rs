@@ -46,6 +46,14 @@ pub fn install_cgroup_pid_provider(p: fn() -> Option<u64>) {
     PID_PROVIDER.store(p as usize, Ordering::Release);
 }
 
+/// Test-only: invoke the installed charge-PID provider directly, so a
+/// sibling crate (the scheduler, which installs it) can assert the
+/// wiring resolves the current task without driving a real allocation.
+#[doc(hidden)]
+pub fn __charge_pid_for_test() -> Option<u64> {
+    current_charge_pid()
+}
+
 /// Resolve the PID to charge for the current allocation, if any.
 fn current_charge_pid() -> Option<u64> {
     let ptr = PID_PROVIDER.load(Ordering::Acquire);
