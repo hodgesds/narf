@@ -1070,6 +1070,25 @@ fn sys_read(ctx: &mut dyn TrapContext) {
     // after the FileOps call, so FileOps never touches user memory.
     let mut kbuf = alloc::vec![0u8; len];
     let task = current_task_id();
+
+    // fanotify groups deliver fixed-size metadata records, each carrying a
+    // freshly-opened fd to the affected object. Installing that fd needs
+    // the fd-table lock — which the `with_table` block below holds across
+    // ops.read — so fanotify reads are handled here, before any lock is
+    // taken, to avoid a re-entrant deadlock.
+    #[cfg(feature = "linux-compat")]
+    if crate::mqueue::fanotify_active() {
+        if let Some(gid) = crate::mqueue::fanotify_instance_of(task, fd) {
+            let n = fanotify_read_into(task, gid, &mut kbuf);
+            // SAFETY: ptr validated above; AS still active.
+            match unsafe { copy_to_user(ptr, &kbuf[..n]) } {
+                Ok(()) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                Err(e) => ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64)),
+            }
+            return;
+        }
+    }
+
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
@@ -1096,6 +1115,54 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             }
         }
         _ => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+/// Drain a fanotify group's queued events into `buf` as
+/// `struct fanotify_event_metadata` records, opening a fresh fd to each
+/// affected object in `task`'s fd table. Called from sys_read with NO
+/// fd-table lock held (the install below needs it).
+#[cfg(feature = "linux-compat")]
+fn fanotify_read_into(task: u64, gid: u64, buf: &mut [u8]) -> usize {
+    let cap = buf.len() / crate::mqueue::FAN_EVENT_METADATA_LEN;
+    if cap == 0 {
+        return 0;
+    }
+    let events = crate::mqueue::fanotify_drain(gid, cap);
+    let mut written = 0usize;
+    for (path, mask, pid) in events {
+        let fd = fanotify_open_object(task, &path);
+        let meta = crate::mqueue::build_fan_metadata(mask, fd, pid);
+        buf[written..written + crate::mqueue::FAN_EVENT_METADATA_LEN].copy_from_slice(&meta);
+        written += crate::mqueue::FAN_EVENT_METADATA_LEN;
+    }
+    written
+}
+
+/// Resolve `abs` and install a fresh read fd for it in `task`'s table;
+/// returns the fd number, or FAN_NOFD (-1) on failure.
+#[cfg(feature = "linux-compat")]
+fn fanotify_open_object(task: u64, abs: &str) -> i32 {
+    let root_rel = narf_filesystem::registry()
+        .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
+    let (root, rel) = match root_rel {
+        Some(x) => x,
+        None => return -1,
+    };
+    let ops = match poll_blocking(narf_filesystem::resolve_async(root, &rel)) {
+        Some(Ok(o)) => o,
+        _ => return -1,
+    };
+    match fd::with_table(task, |t| {
+        t.open(fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    }) {
+        Some(n) => n as i32,
+        None => -1,
     }
 }
 
@@ -16781,6 +16848,18 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::InotifyRmWatch,
             "inotify_rm_watch",
             RawFnHandler(crate::mqueue::sys_inotify_rm_watch),
+        );
+        // Batch 23: fanotify — events delivered through the same fs_notify
+        // dispatch as inotify, each carrying an open fd to the object.
+        table.install_raw(
+            Syscall::FanotifyInit,
+            "fanotify_init",
+            RawFnHandler(crate::mqueue::sys_fanotify_init),
+        );
+        table.install_raw(
+            Syscall::FanotifyMark,
+            "fanotify_mark",
+            RawFnHandler(crate::mqueue::sys_fanotify_mark),
         );
         // Batch 21: keyrings — a real in-kernel key store.
         table.install_raw(

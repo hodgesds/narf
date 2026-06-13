@@ -20,7 +20,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -512,11 +512,19 @@ fn serialize_event(wd: i32, mask: u32, cookie: u32, name: &str) -> Vec<u8> {
 }
 
 /// Central filesystem-change dispatch. Called from the syscall handlers
-/// after a successful mutation. For every inotify instance, every watch
-/// whose mask includes `mask` and whose path is either the object itself
-/// (no name in the event) or the object's parent directory (name = the
-/// leaf) gets a serialized event queued.
+/// after a successful mutation; fans out to both the inotify and fanotify
+/// notification groups. The mask bits for the events we deliver
+/// (MODIFY/CLOSE_WRITE/OPEN/MOVED/CREATE/DELETE) are numerically identical
+/// between the two ABIs, so one `mask` drives both.
 fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
+    inotify_dispatch(abs_path, mask, is_dir);
+    fanotify_dispatch(abs_path, mask as u64);
+}
+
+/// inotify half of [`fs_notify`]: for every instance, every watch whose
+/// mask includes `mask` and whose path is the object itself (no name) or
+/// its parent directory (name = leaf) gets a serialized event queued.
+fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
     // Cheap early-out: nothing watching → nothing to do.
     {
         let g = INOTIFY.lock();
@@ -636,6 +644,9 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
             }
         }
     });
+    // fanotify sees the same move as two events on the affected objects.
+    fanotify_dispatch(from, IN_MOVED_FROM as u64);
+    fanotify_dispatch(to, IN_MOVED_TO as u64);
 }
 
 struct InotifyFile {
@@ -780,6 +791,238 @@ pub fn sys_inotify_rm_watch(ctx: &mut dyn TrapContext) {
     let wd = a.arg1 as i32;
     let removed = with_inotify(|m| m.get_mut(&id).map(|st| st.watches.remove(&wd).is_some()));
     match removed {
+        Some(true) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(false) => ctx.set_return(err(EINVAL)),
+        None => ctx.set_return(err(EBADF)),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// fanotify
+// ════════════════════════════════════════════════════════════════════
+//
+// A fanotify group is an fd-backed notification queue, like inotify, but
+// its events are fixed 24-byte `struct fanotify_event_metadata` records
+// that each carry an OPEN fd to the affected object (the default
+// FAN_CLASS_NOTIF behaviour). Marks live on absolute paths; when fs_notify
+// fires, every group with a matching inode mark queues an event. At read
+// time we resolve the stored path, install a fresh fd in the reading
+// task's table, and hand its number back in the metadata — the reader
+// owns and must close it, exactly as on Linux.
+//
+// The event mask bits we deliver (FAN_MODIFY/FAN_CLOSE_WRITE/FAN_OPEN/
+// FAN_MOVED_*/FAN_CREATE/FAN_DELETE) are numerically equal to the matching
+// IN_* bits, so the shared fs_notify mask drives both subsystems.
+
+// fanotify_init flags.
+const FAN_CLOEXEC: u64 = 0x0000_0001;
+const FAN_NONBLOCK: u64 = 0x0000_0002;
+// fanotify_mark flags.
+const FAN_MARK_ADD: u64 = 0x0000_0001;
+const FAN_MARK_REMOVE: u64 = 0x0000_0002;
+const FAN_MARK_FLUSH: u64 = 0x0000_0080;
+/// `struct fanotify_event_metadata` is a fixed 24 bytes.
+pub(crate) const FAN_EVENT_METADATA_LEN: usize = 24;
+const FANOTIFY_METADATA_VERSION: u8 = 3;
+
+struct FanGroup {
+    /// Absolute path → mark mask (inode marks only).
+    marks: BTreeMap<String, u64>,
+    /// Queued events: (affected path, event mask, causing pid).
+    events: VecDeque<(String, u64, i32)>,
+}
+
+static FANOTIFY: IrqSafeSpinLock<Option<BTreeMap<u64, FanGroup>>> = IrqSafeSpinLock::new(None);
+static FANOTIFY_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Set once any fanotify group exists; lets the fs_notify dispatch and
+/// sys_read skip fanotify work entirely on the common path.
+static FANOTIFY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn with_fanotify<R>(f: impl FnOnce(&mut BTreeMap<u64, FanGroup>) -> R) -> R {
+    let mut g = FANOTIFY.lock();
+    f(g.get_or_insert_with(BTreeMap::new))
+}
+
+/// fanotify half of [`fs_notify`]: queue an event on every group holding
+/// an inode mark for `abs_path` whose mark mask intersects the event.
+fn fanotify_dispatch(abs_path: &str, mask: u64) {
+    if !FANOTIFY_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let pid = current_task_id() as i32;
+    with_fanotify(|m| {
+        for group in m.values_mut() {
+            if let Some(&mark_mask) = group.marks.get(abs_path) {
+                let hit = mark_mask & mask;
+                if hit != 0 {
+                    group.events.push_back((String::from(abs_path), hit, pid));
+                }
+            }
+        }
+    });
+}
+
+struct FanotifyFile {
+    id: u64,
+}
+
+impl FileOps for FanotifyFile {
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // fanotify delivery installs an fd per event, which needs the
+        // fd-table lock — and the generic sys_read holds that lock across
+        // this call. So reads on a fanotify fd are intercepted up front in
+        // sys_read (see `fanotify_read_into`), never reaching here. This
+        // path is only hit by other read entry points; surface 0 (no
+        // events delivered) rather than risk the re-entrant lock.
+        let _ = (self.id, buf);
+        Box::pin(async { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        // Writing to a fanotify fd issues access-permission responses,
+        // which NARF's notify-class groups don't use.
+        Box::pin(async { Err(FsError::InvalidData) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
+    }
+    fn fanotify_instance(&self) -> Option<u64> {
+        Some(self.id)
+    }
+}
+
+/// Pop up to `max` queued events from a fanotify group as
+/// `(path, mask, pid)` tuples, WITHOUT opening fds — the caller
+/// (`sys_read`) installs the per-event fds once the fd-table lock is free.
+pub(crate) fn fanotify_drain(group_id: u64, max: usize) -> Vec<(String, u64, i32)> {
+    let mut out = Vec::new();
+    with_fanotify(|m| {
+        if let Some(g) = m.get_mut(&group_id) {
+            for _ in 0..max {
+                match g.events.pop_front() {
+                    Some(e) => out.push(e),
+                    None => break,
+                }
+            }
+        }
+    });
+    out
+}
+
+/// True once any fanotify group has been created — a cheap guard so
+/// sys_read skips the fd-table probe on the common (no-fanotify) path.
+pub(crate) fn fanotify_active() -> bool {
+    FANOTIFY_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Map an fd to its fanotify group id, if it is one.
+pub(crate) fn fanotify_instance_of(task: u64, fd_no: u32) -> Option<u64> {
+    fd::with_table(task, |t| {
+        t.get(fd_no).and_then(|e| e.ops.fanotify_instance())
+    })
+    .flatten()
+}
+
+/// Serialize one `struct fanotify_event_metadata` (24 bytes).
+pub(crate) fn build_fan_metadata(mask: u64, fd: i32, pid: i32) -> [u8; FAN_EVENT_METADATA_LEN] {
+    let mut meta = [0u8; FAN_EVENT_METADATA_LEN];
+    meta[0..4].copy_from_slice(&(FAN_EVENT_METADATA_LEN as u32).to_ne_bytes());
+    meta[4] = FANOTIFY_METADATA_VERSION;
+    meta[5] = 0; // reserved
+    meta[6..8].copy_from_slice(&(FAN_EVENT_METADATA_LEN as u16).to_ne_bytes());
+    meta[8..16].copy_from_slice(&mask.to_ne_bytes());
+    meta[16..20].copy_from_slice(&fd.to_ne_bytes());
+    meta[20..24].copy_from_slice(&pid.to_ne_bytes());
+    meta
+}
+
+/// `fanotify_init(flags, event_f_flags)` → group fd.
+pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
+    let flags = ctx.args().arg0;
+    let id = FANOTIFY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    FANOTIFY_ACTIVE.store(true, Ordering::Relaxed);
+    with_fanotify(|m| {
+        m.insert(
+            id,
+            FanGroup {
+                marks: BTreeMap::new(),
+                events: VecDeque::new(),
+            },
+        )
+    });
+    let file: Arc<dyn FileOps> = Arc::new(FanotifyFile { id });
+    let cloexec = if flags & FAN_CLOEXEC != 0 {
+        fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    let status = if flags & FAN_NONBLOCK != 0 {
+        fd::O_NONBLOCK
+    } else {
+        0
+    };
+    match task_open_call(task_open(file, cloexec, status)) {
+        Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        None => ctx.set_return(err(EBADF)),
+    }
+}
+
+/// `fanotify_mark(fanotify_fd, flags, mask, dirfd, pathname)`.
+pub fn sys_fanotify_mark(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let task = current_task_id();
+    let id = match fanotify_instance_of(task, a.arg0 as u32) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(EBADF));
+            return;
+        }
+    };
+    let flags = a.arg1;
+    let mask = a.arg2;
+    // dirfd (arg3) is ignored — NARF resolves absolute paths / AT_FDCWD.
+    if flags & FAN_MARK_FLUSH != 0 {
+        with_fanotify(|m| {
+            if let Some(g) = m.get_mut(&id) {
+                g.marks.clear();
+            }
+        });
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let path = match copy_user_cstr(a.arg4, 4096) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+    };
+    let r = with_fanotify(|m| {
+        let g = m.get_mut(&id)?;
+        if flags & FAN_MARK_ADD != 0 {
+            let e = g.marks.entry(path).or_insert(0);
+            *e |= mask;
+            Some(true)
+        } else if flags & FAN_MARK_REMOVE != 0 {
+            if let Some(cur) = g.marks.get_mut(&path) {
+                *cur &= !mask;
+                if *cur == 0 {
+                    g.marks.remove(&path);
+                }
+                Some(true)
+            } else {
+                Some(false)
+            }
+        } else {
+            // Neither ADD nor REMOVE nor FLUSH set.
+            Some(false)
+        }
+    });
+    match r {
         Some(true) => ctx.set_return(SyscallReturn::ok(0)),
         Some(false) => ctx.set_return(err(EINVAL)),
         None => ctx.set_return(err(EBADF)),

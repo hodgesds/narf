@@ -452,6 +452,13 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this file is a fanotify group (from `fanotify_init`), return its
+    /// group id. Used by `fanotify_mark` to resolve the fd. Default:
+    /// `None`.
+    fn fanotify_instance(&self) -> Option<u64> {
+        None
+    }
+
     /// If this file is the read end of a pipe, copy up to `max` queued
     /// bytes WITHOUT consuming them and return them. Used by `tee(2)` to
     /// duplicate pipe data between two pipes. Default `None` ⇒ not a

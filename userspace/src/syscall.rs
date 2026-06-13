@@ -2083,6 +2083,14 @@ pub enum Syscall {
     /// serial (read/update/revoke/describe/...).
     /// Linux (x86_64=250, aarch64=219).
     Keyctl,
+
+    /// `fanotify_init(flags, event_f_flags)` — create a fanotify group fd.
+    /// Linux (x86_64=300, aarch64=262).
+    FanotifyInit,
+
+    /// `fanotify_mark(fd, flags, mask, dirfd, pathname)` — add/remove/flush
+    /// a fanotify mark. Linux (x86_64=301, aarch64=263).
+    FanotifyMark,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2259,6 +2267,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::AddKey, 248),
     (Syscall::RequestKey, 249),
     (Syscall::Keyctl, 250),
+    (Syscall::FanotifyInit, 300),
+    (Syscall::FanotifyMark, 301),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2666,6 +2676,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::AddKey, 217),
     (Syscall::RequestKey, 218),
     (Syscall::Keyctl, 219),
+    (Syscall::FanotifyInit, 262),
+    (Syscall::FanotifyMark, 263),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
