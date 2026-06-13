@@ -3525,6 +3525,8 @@ fn boot_userspace_init() {
                 ("jobctl_smoke", narf_verification::NARF_JOBCTL_SMOKE_ELF),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
+                // multi-DSO dynamic linking: main -> libb -> liba -> libc.
+                ("dso_smoke", narf_verification::NARF_DSO_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
@@ -3549,9 +3551,17 @@ fn boot_userspace_init() {
         // through to its existing error path instead of seeding
         // /lib/ with a zero-byte file the user might try to exec.
         if !narf_verification::NARF_LD_MUSL.is_empty() {
+            // ld-musl plus the multi-DSO test libraries (empty placeholders
+            // when musl-gcc was absent at build time). liba/libb let
+            // dso_smoke exercise a real DT_NEEDED chain (main → libb → liba
+            // → libc), loaded by ld-musl via file-backed mmap.
             let lib_fs = MemFs::with_seeds(
                 "lib",
-                &[("ld-musl-x86_64.so.1", narf_verification::NARF_LD_MUSL)],
+                &[
+                    ("ld-musl-x86_64.so.1", narf_verification::NARF_LD_MUSL),
+                    ("liba.so", narf_verification::NARF_LIBA_SO),
+                    ("libb.so", narf_verification::NARF_LIBB_SO),
+                ],
             );
             let lib_count = lib_fs.file_count();
             let _ = registry().mount(&auth, "/lib", lib_fs);

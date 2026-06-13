@@ -3602,6 +3602,17 @@ pub const NARF_VDSO_ELF: &[u8] = include_bytes!(env!("NARF_VDSO_ELF_X86_64"));
 #[cfg(target_arch = "aarch64")]
 pub const NARF_VDSO_ELF: &[u8] = include_bytes!(env!("NARF_VDSO_ELF_AARCH64"));
 
+/// Multi-DSO test shared libraries seeded into /lib (x86_64 only; empty
+/// elsewhere / when musl-gcc was absent). `dso_smoke` links against them.
+#[cfg(target_arch = "x86_64")]
+pub const NARF_LIBA_SO: &[u8] = include_bytes!(env!("NARF_LIBA_SO"));
+#[cfg(target_arch = "aarch64")]
+pub const NARF_LIBA_SO: &[u8] = &[];
+#[cfg(target_arch = "x86_64")]
+pub const NARF_LIBB_SO: &[u8] = include_bytes!(env!("NARF_LIBB_SO"));
+#[cfg(target_arch = "aarch64")]
+pub const NARF_LIBB_SO: &[u8] = &[];
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")
@@ -4096,6 +4107,11 @@ define_smoke_elf!(
     NARF_PROCFS2_SMOKE_ELF,
     "NARF_PROCFS2_SMOKE_ELF_X86_64",
     "NARF_PROCFS2_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_DSO_SMOKE_ELF,
+    "NARF_DSO_SMOKE_ELF_X86_64",
+    "NARF_DSO_SMOKE_ELF_AARCH64"
 );
 
 #[cfg(all(
