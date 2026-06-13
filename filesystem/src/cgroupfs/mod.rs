@@ -133,8 +133,13 @@ pub struct Cgroup {
     /// `cgroup.max.depth` / `cgroup.max.descendants` (`None` = "max").
     max_depth: IrqSafeSpinLock<Option<u64>>,
     max_descendants: IrqSafeSpinLock<Option<u64>>,
-    /// Wakers parked on `cgroup.events` (poll), woken on a
-    /// populated/frozen transition.
+    /// Wakers parked on `cgroup.events`, woken on a populated/frozen
+    /// transition by `notify_events`. NOTE: the `FileOps` trait is
+    /// currently level-triggered (`poll_readiness` only) with no
+    /// waker-registration seam, so nothing pushes here yet — edge
+    /// notification (the inotify/poll signal systemd uses to detect an
+    /// emptied cgroup) lands once the VFS grows a poll-register hook.
+    /// The transition bookkeeping is kept ready for that.
     events_waiters: IrqSafeSpinLock<Vec<Waker>>,
     /// Last-published `populated` bit, to detect transitions for wakeups.
     last_populated: AtomicBool,
@@ -342,6 +347,13 @@ fn attach_chain(cg: &Arc<Cgroup>, pid: u64) -> Result<(), FsError> {
 /// Move `pid` into `dst`, honouring controller vetoes (`can_attach`);
 /// on rejection the process stays put. The `cgroup.procs`-write path.
 fn place(pid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
+    // No-internal-process constraint (v2 §"No Internal Process
+    // Constraint"): a non-root cgroup that distributes resources to its
+    // children (has a non-empty `subtree_control`) may not hold member
+    // processes directly. The root is exempt.
+    if !dst.is_root() && !dst.enabled.lock().is_empty() {
+        return Err(FsError::Busy);
+    }
     let prev = TASK_CGROUP.lock().get(&pid).cloned();
     if let Some(prev) = &prev {
         if Arc::ptr_eq(prev, dst) {
@@ -716,6 +728,13 @@ fn store_subtree_control(cg: &Arc<Cgroup>, text: &str) -> Result<(), FsError> {
             }
             _ => return Err(FsError::InvalidData),
         }
+    }
+
+    // No-internal-process constraint: can't start distributing
+    // resources to children while this (non-root) cgroup still holds
+    // member processes.
+    if !cg.is_root() && !adds.is_empty() && !cg.members.lock().is_empty() {
+        return Err(FsError::Busy);
     }
 
     let mut enabled = cg.enabled.lock();

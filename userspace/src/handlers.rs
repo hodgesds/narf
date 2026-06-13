@@ -8024,9 +8024,15 @@ pub fn wait_init() {
     }
     // cgroup-v2: drop a process's membership when it exits so the
     // `populated` state of its cgroup chain can fall to 0 — the edge
-    // an init system's empty-cgroup notification keys on.
+    // an init system's empty-cgroup notification keys on. Also wire the
+    // freeze/kill hooks so cgroup.freeze / cgroup.kill deliver real
+    // signals through the signal subsystem.
     #[cfg(feature = "cgroup")]
-    crate::user_task::register_exit_observer(cgroup_exit_observer);
+    {
+        crate::user_task::register_exit_observer(cgroup_exit_observer);
+        narf_filesystem::cgroupfs::install_kill_hook(cgroup_kill_hook);
+        narf_filesystem::cgroupfs::install_freeze_hook(cgroup_freeze_hook);
+    }
 }
 
 /// Exit-observer that removes an exiting *process* from its cgroup.
@@ -8038,6 +8044,24 @@ pub fn wait_init() {
 fn cgroup_exit_observer(pid: u64, tid: u64) {
     if pid_to_task_raw(pid) == Some(tid) {
         narf_filesystem::cgroupfs::task_exited(pid);
+    }
+}
+
+/// `cgroup.kill` hook — SIGKILL (9) the named process.
+#[cfg(feature = "cgroup")]
+fn cgroup_kill_hook(pid: u64) {
+    if let Some(task) = pid_to_task_raw(pid) {
+        raise_signal_pending(task, 9);
+    }
+}
+
+/// `cgroup.freeze` hook — SIGSTOP (19) to freeze, SIGCONT (18) to thaw.
+/// Real freezing relies on the scheduler honouring the SIGSTOP default
+/// action (Stop); thaw resumes via SIGCONT.
+#[cfg(feature = "cgroup")]
+fn cgroup_freeze_hook(pid: u64, freeze: bool) {
+    if let Some(task) = pid_to_task_raw(pid) {
+        raise_signal_pending(task, if freeze { 19 } else { 18 });
     }
 }
 
