@@ -1150,6 +1150,17 @@ use std::time::Duration;
 use wait_timeout::ChildExt;
 
 fn run_cmd(args: &BuildArgs) -> Result<()> {
+    run_cmd_inner(args, false)
+}
+
+/// Boot the kernel under QEMU. When `gate_exit` is set (the `test`
+/// subcommand's kernel-test phase), the QEMU exit status is checked
+/// against the all-pass status: the kernel-test runner calls
+/// `exit_kernel(0)` only when every smoke passed and `exit_kernel(1)`
+/// when any failed, so a failing suite (or a panic/hang) makes the
+/// command fail. Manual `Cmd::Run` passes `false` and never gates — the
+/// user drives it interactively and an arbitrary exit code is expected.
+fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
     let root = workspace_root()?;
     let out_dir = cargo_build(args, &root)?;
 
@@ -1175,14 +1186,36 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(600);
-    match child.wait_timeout(Duration::from_secs(secs))? {
-        Some(status) => {
-            println!("xtask: {qemu} exited with {status}");
-        }
+    let status = match child.wait_timeout(Duration::from_secs(secs))? {
+        Some(status) => status,
         None => {
             child.kill()?;
             child.wait()?;
             bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
+        }
+    };
+    println!("xtask: {qemu} exited with {status}");
+
+    if gate_exit {
+        // All-pass status mirrors boot-smoke's clean-exit encoding:
+        //  * x86_64 isa-debug-exit encodes `(code << 1) | 1`, so the
+        //    runner's exit_kernel(0) → QEMU status 1 (a failed suite
+        //    exits 1 → status 3).
+        //  * aarch64 shuts down via PSCI/semihosting and QEMU exits with
+        //    the kernel code directly: 0 on all-pass (1 on failure).
+        let expected = match args.arch {
+            Arch::X86_64 => Some(1),
+            Arch::Aarch64 => Some(0),
+        };
+        if status.code() != expected {
+            bail!(
+                "xtask test: kernel-test suite reported failures — QEMU exited \
+                 {:?} (all-pass is {:?} on {}). See the `── summary` / `── failing \
+                 tests ──` lines above.",
+                status.code(),
+                expected,
+                args.arch.triple(),
+            );
         }
     }
     Ok(())
@@ -3923,7 +3956,9 @@ fn main() -> Result<()> {
             } else if !smoke_args.features.contains("kernel-test") {
                 smoke_args.features.push_str(",kernel-test");
             }
-            run_cmd(&smoke_args)?;
+            // Gate on the kernel-test runner's exit status: a failing
+            // smoke makes the runner exit_kernel(1), which this fails on.
+            run_cmd_inner(&smoke_args, true)?;
             // Phase 2: boot-smoke without kernel-test. Catches
             // regressions that smokes miss because they exercise modules
             // in isolation, not the full init flow. Strip the
