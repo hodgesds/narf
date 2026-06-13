@@ -14,6 +14,28 @@
 #include <sys/uio.h>
 #include <sys/syscall.h>
 
+// Older musl-tools (CI) predate these syscall numbers in <sys/syscall.h>.
+// Pin the x86_64 wire numbers so the smoke builds regardless of header age;
+// NARF dispatches on the number, not the libc wrapper.
+#ifndef SYS_migrate_pages
+#define SYS_migrate_pages 256
+#endif
+#ifndef SYS_move_pages
+#define SYS_move_pages 279
+#endif
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_process_madvise
+#define SYS_process_madvise 440
+#endif
+#ifndef SYS_memfd_secret
+#define SYS_memfd_secret 447
+#endif
+#ifndef SYS_set_mempolicy_home_node
+#define SYS_set_mempolicy_home_node 450
+#endif
+
 static void w(const char *m) { write(1, m, strlen(m)); }
 
 #define MADV_DONTNEED 4

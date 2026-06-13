@@ -343,18 +343,26 @@ fn main() {
         let x86_path = match &musl_gcc {
             Some(cc) => {
                 let out = out_dir.join(format!("{test}_x86_64"));
-                let status = Command::new(cc)
+                let output = Command::new(cc)
                     .args(["-O2", "-Wall", "-fPIE", "-pie", "-mcmodel=large"])
                     .arg(&src)
                     .arg("-o")
                     .arg(&out)
-                    .status();
-                match status {
-                    Ok(s) if s.success() => out.display().to_string(),
-                    _ => {
-                        println!("cargo:warning=musl-demo: failed to build {test}; placeholder");
-                        "/dev/null".to_string()
-                    }
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => out.display().to_string(),
+                    // musl-gcc IS present but the source failed to compile —
+                    // that's a real bug, not a missing-toolchain fallback.
+                    // Hard-fail the build with the compiler's stderr so it
+                    // surfaces here, not as an "exec failed" + 900s timeout in
+                    // the musl-demo run. (A placeholder is only legitimate when
+                    // musl-gcc is absent — the `None` arm below.)
+                    Ok(o) => panic!(
+                        "musl-demo: failed to compile {test} ({}):\n{}",
+                        src.display(),
+                        String::from_utf8_lossy(&o.stderr)
+                    ),
+                    Err(e) => panic!("musl-demo: could not invoke musl-gcc for {test}: {e}"),
                 }
             }
             None => "/dev/null".to_string(),

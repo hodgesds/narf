@@ -11,6 +11,22 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 
+// Older musl-tools (CI) predate these syscall numbers in <sys/syscall.h>.
+// Pin the x86_64 wire numbers so the smoke builds regardless of header age;
+// NARF dispatches on the number, not the libc wrapper.
+#ifndef SYS_execveat
+#define SYS_execveat 322
+#endif
+#ifndef SYS_rseq
+#define SYS_rseq 334
+#endif
+#ifndef SYS_faccessat2
+#define SYS_faccessat2 439
+#endif
+#ifndef SYS_fchmodat2
+#define SYS_fchmodat2 452
+#endif
+
 static void w(const char *m) { write(1, m, strlen(m)); }
 
 #define ATFD AT_FDCWD
