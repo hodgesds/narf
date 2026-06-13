@@ -150,10 +150,15 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
     // `narf_memory::tlb_shootdown::shootdown` for a (tag, va) request
     // should advance every peer CPU's EVER_RECEIVED counter (the IPI
     // handler bumps it on every shootdown delivery).
-    use crate::x86_64::ipi;
+    use crate::x86_64::{apic, ipi};
     use narf_memory::tlb_shootdown;
     if narf_lib::smp::cpu_count() <= 1 {
         return TestResult::Skip("UP boot — no peer CPUs to shoot");
+    }
+    // The shootdown bridge delivers via the x2APIC ICR MSR with no xAPIC
+    // fallback; skip when x2APIC didn't come up (CI's qemu64/xAPIC).
+    if !apic::x2apic_active() {
+        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
     let total = narf_lib::smp::cpu_count();
@@ -1525,10 +1530,13 @@ fn smoke_ipi_shootdown_tag_only_request_routes() -> TestResult {
     // calls `shoot_tag_only` which broadcasts an IPI. Verify by
     // checking that every peer's EVER_RECEIVED counter advances
     // when we issue a tag-only ShootdownRequest.
-    use crate::x86_64::ipi;
+    use crate::x86_64::{apic, ipi};
     use narf_memory::tlb_shootdown;
     if narf_lib::smp::cpu_count() <= 1 {
         return TestResult::Skip("UP boot — no peer CPUs");
+    }
+    if !apic::x2apic_active() {
+        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
     }
     let self_cpu = narf_lib::percpu::current_cpu() as u32;
     let total = narf_lib::smp::cpu_count();

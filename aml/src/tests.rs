@@ -819,11 +819,14 @@ kernel_test_in!("aml", smoke_aml_oregion_bit_fields);
 fn smoke_aml_oregion_boot_regions_present() -> TestResult {
     // After parse_namespace at boot, QEMU's DSDT declares several
     // PNP0C02 / EC OpRegions. Verify that at least one was captured.
-    let mut count = 0usize;
-    crate::oregion::for_each_region(|_| {
-        count += 1;
-    });
-    if count > 0 {
+    //
+    // Consult the boot-time snapshot, NOT the live `oregion::REGIONS`
+    // table: earlier tests in this same shared-boot harness call
+    // `oregion::__reset_for_test()` (e.g. smoke_aml_oregion_bit_fields),
+    // which clears REGIONS and never repopulates the boot DSDT/SSDT
+    // regions. The snapshot is captured once by capture_boot_snapshot()
+    // immediately after the boot parse, before any test mutates state.
+    if crate::boot_opregion_count() > 0 {
         TestResult::Pass
     } else {
         TestResult::Fail("no OpRegion entries registered after boot namespace parse")

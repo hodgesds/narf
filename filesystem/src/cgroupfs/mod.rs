@@ -50,12 +50,13 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
-use core::task::Waker;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_lib::sync::{IrqSafeSpinLock, OnceLock};
 
-use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use crate::{
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN, POLL_PRI,
+};
 
 pub use controller::{register_controller, Controller, ControllerState};
 
@@ -133,15 +134,17 @@ pub struct Cgroup {
     /// `cgroup.max.depth` / `cgroup.max.descendants` (`None` = "max").
     max_depth: IrqSafeSpinLock<Option<u64>>,
     max_descendants: IrqSafeSpinLock<Option<u64>>,
-    /// Wakers parked on `cgroup.events`, woken on a populated/frozen
-    /// transition by `notify_events`. NOTE: the `FileOps` trait is
-    /// currently level-triggered (`poll_readiness` only) with no
-    /// waker-registration seam, so nothing pushes here yet — edge
-    /// notification (the inotify/poll signal systemd uses to detect an
-    /// emptied cgroup) lands once the VFS grows a poll-register hook.
-    /// The transition bookkeeping is kept ready for that.
-    events_waiters: IrqSafeSpinLock<Vec<Waker>>,
-    /// Last-published `populated` bit, to detect transitions for wakeups.
+    /// `cgroup.events` change generation. Bumped on every transition of
+    /// a field reported by `cgroup.events` (`populated`, `frozen`). An
+    /// open `cgroup.events` file (`CgroupAttrFile`) captures this value
+    /// and reports `POLLPRI` from `poll_readiness` while the live gen is
+    /// ahead of what that fd last read — the level-triggered, busy-poll
+    /// equivalent of the edge `kernfs_notify` systemd waits on to detect
+    /// an emptied (or frozen) cgroup. NARF's poll layer is poll-only
+    /// (no waker registration), so a generation an fd compares against
+    /// is the right shape rather than a parked `Waker` list.
+    events_gen: AtomicU64,
+    /// Last-published `populated` bit, to detect transitions.
     last_populated: AtomicBool,
 }
 
@@ -170,7 +173,7 @@ impl Cgroup {
             ctrl_state: IrqSafeSpinLock::new(BTreeMap::new()),
             max_depth: IrqSafeSpinLock::new(None),
             max_descendants: IrqSafeSpinLock::new(None),
-            events_waiters: IrqSafeSpinLock::new(Vec::new()),
+            events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
         })
     }
@@ -204,7 +207,7 @@ impl Cgroup {
             ctrl_state: IrqSafeSpinLock::new(state),
             max_depth: IrqSafeSpinLock::new(None),
             max_descendants: IrqSafeSpinLock::new(None),
-            events_waiters: IrqSafeSpinLock::new(Vec::new()),
+            events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
         })
     }
@@ -251,17 +254,22 @@ impl Cgroup {
         }
     }
 
-    /// Re-publish `populated` and wake `cgroup.events` pollers if it
+    /// Bump this cgroup's `cgroup.events` change generation, signalling
+    /// any fd polling its `cgroup.events` file (`POLLPRI`) that a
+    /// reported field changed. Called on `frozen` transitions and from
+    /// [`notify_events`] on `populated` transitions.
+    fn bump_events(&self) {
+        self.events_gen.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Re-publish `populated` and signal `cgroup.events` pollers if it
     /// transitioned, then walk up so an ancestor watching `events` also
-    /// wakes when a descendant empties.
+    /// signals when a descendant empties.
     fn notify_events(&self) {
         let now = self.populated();
         let was = self.last_populated.swap(now, Ordering::AcqRel);
         if now != was {
-            let mut w = self.events_waiters.lock();
-            for waker in w.drain(..) {
-                waker.wake();
-            }
+            self.bump_events();
         }
         if let Some(p) = &self.parent {
             p.notify_events();
@@ -852,7 +860,7 @@ fn subtree_pids(cg: &Arc<Cgroup>, out: &mut Vec<u64>) {
 
 /// `cgroup.freeze` — freeze or thaw every process in the subtree.
 fn set_frozen(cg: &Arc<Cgroup>, freeze: bool) {
-    cg.frozen.store(freeze, Ordering::Release);
+    let changed = cg.frozen.swap(freeze, Ordering::AcqRel) != freeze;
     let hook = *FREEZE_HOOK.lock();
     if let Some(h) = hook {
         let mut pids = Vec::new();
@@ -860,6 +868,11 @@ fn set_frozen(cg: &Arc<Cgroup>, freeze: bool) {
         for pid in pids {
             h(pid, freeze);
         }
+    }
+    // The `frozen` field of `cgroup.events` flipped: signal pollers.
+    // `notify_events` covers `populated`, which a freeze does not move.
+    if changed {
+        cg.bump_events();
     }
     cg.notify_events();
 }
@@ -889,6 +902,26 @@ enum FileKind {
 struct CgroupAttrFile {
     cg: Arc<Cgroup>,
     kind: FileKind,
+    /// For `cgroup.events`: the change generation this fd has observed.
+    /// Captured at open from `cg.events_gen` and re-synced on every
+    /// read; `poll_readiness` reports `POLLPRI` while `cg.events_gen` is
+    /// ahead of it. Unused (and untouched) for every other file.
+    seen_gen: AtomicU64,
+}
+
+impl CgroupAttrFile {
+    /// Open a fresh view, capturing the cgroup's current `cgroup.events`
+    /// generation so this fd starts level with the live state (no
+    /// spurious POLLPRI on the first poll after open).
+    fn open(cg: Arc<Cgroup>, kind: FileKind) -> Arc<dyn FileOps> {
+        let seen_gen = AtomicU64::new(cg.events_gen.load(Ordering::Acquire));
+        Arc::new(CgroupAttrFile { cg, kind, seen_gen })
+    }
+
+    /// True for the one file with edge-poll semantics (`cgroup.events`).
+    fn is_events(&self) -> bool {
+        matches!(self.kind, FileKind::Core(CoreFile::Events))
+    }
 }
 
 impl CgroupAttrFile {
@@ -921,6 +954,16 @@ impl CgroupAttrFile {
 
 impl FileOps for CgroupAttrFile {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Reading `cgroup.events` consumes the pending edge: re-sync this
+        // fd's observed generation to the live one so `poll_readiness`
+        // stops reporting POLLPRI until the next transition. Snapshot the
+        // gen before rendering so a transition racing the read leaves the
+        // fd one generation behind (POLLPRI stays set) rather than
+        // silently swallowing the edge.
+        if self.is_events() {
+            let gen = self.cg.events_gen.load(Ordering::Acquire);
+            self.seen_gen.store(gen, Ordering::Release);
+        }
         let content = self.content();
         Box::pin(async move {
             let bytes = content.as_bytes();
@@ -959,6 +1002,25 @@ impl FileOps for CgroupAttrFile {
                 Mode::FILE_RO
             },
             mtime_cycles: 0,
+        }
+    }
+
+    /// `cgroup.events` is the one cgroupfs file with edge-poll
+    /// semantics: it is always readable (POLLIN — like any regular
+    /// file) and additionally reports POLLPRI while a reported field
+    /// (`populated` / `frozen`) has changed since this fd last read it.
+    /// systemd waits on POLLPRI here to learn a cgroup emptied. Every
+    /// other cgroupfs file uses the always-ready default.
+    fn poll_readiness(&self) -> u32 {
+        if !self.is_events() {
+            return POLL_IN | crate::POLL_OUT;
+        }
+        let live = self.cg.events_gen.load(Ordering::Acquire);
+        let seen = self.seen_gen.load(Ordering::Acquire);
+        if live != seen {
+            POLL_IN | POLL_PRI
+        } else {
+            POLL_IN
         }
     }
 }
@@ -1003,10 +1065,7 @@ impl DirOps for CgroupDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         if let Some(f) = CoreFile::from_name(name) {
             if core_files_for(&self.cg).contains(&f) {
-                return Some(Arc::new(CgroupAttrFile {
-                    cg: self.cg.clone(),
-                    kind: FileKind::Core(f),
-                }));
+                return Some(CgroupAttrFile::open(self.cg.clone(), FileKind::Core(f)));
             }
             return None;
         }
@@ -1019,10 +1078,10 @@ impl DirOps for CgroupDir {
             }
         }
         let (ctrl, file) = self.ctrl_file(name)?;
-        Some(Arc::new(CgroupAttrFile {
-            cg: self.cg.clone(),
-            kind: FileKind::Ctrl(ctrl, file),
-        }))
+        Some(CgroupAttrFile::open(
+            self.cg.clone(),
+            FileKind::Ctrl(ctrl, file),
+        ))
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {

@@ -306,6 +306,49 @@ fn smoke_scheduler_current_task_id_during_poll() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_current_task_id_during_poll);
 
+#[cfg(feature = "cgroup")]
+fn smoke_scheduler_memory_pid_provider_resolves_current() -> TestResult {
+    // The `memory` cgroup controller installs this provider so the
+    // frame allocator can attribute a charge to the allocating task.
+    // Once installed, narf-memory must resolve the polling task's id
+    // during a poll and `None` outside one — the wiring `memory.max`
+    // enforcement rides on.
+    use crate::current_task_id;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    crate::install_memory_pid_provider();
+
+    // Outside any poll: unattributed.
+    if narf_memory::__charge_pid_for_test().is_some() {
+        return TestResult::Fail("charge pid attributed outside a poll context");
+    }
+
+    crate::__reset_queues_for_test();
+    static OBSERVED: AtomicU64 = AtomicU64::new(u64::MAX);
+    OBSERVED.store(u64::MAX, Ordering::Relaxed);
+
+    let tid = crate::spawn(async {
+        let pid = narf_memory::__charge_pid_for_test().unwrap_or(u64::MAX);
+        // Sanity: the provider agrees with current_task_id().
+        debug_assert_eq!(pid, current_task_id().raw());
+        OBSERVED.store(pid, Ordering::Relaxed);
+    });
+    crate::run_until_empty();
+
+    if OBSERVED.load(Ordering::Relaxed) != tid.raw() {
+        return TestResult::Fail("charge pid did not resolve to the allocating task");
+    }
+    if narf_memory::__charge_pid_for_test().is_some() {
+        return TestResult::Fail("charge pid not cleared after run_until_empty");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_memory_pid_provider_resolves_current
+);
+
 fn smoke_scheduler_donate_to_rejects_revoked_cap() -> TestResult {
     use crate::{donate_to, DonateError, Task, TaskId};
     use narf_capabilities::{Cap, Invoke};

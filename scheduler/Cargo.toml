@@ -26,8 +26,10 @@ kernel-test = []
 
 # cgroup-v2 cpu + cpuset controller seam: exposes hooks the cgroupfs
 # `cpu` / `cpuset` controllers install at boot to apply per-cgroup
-# weight/bandwidth and cpu/mems affinity to member tasks.
-cgroup = []
+# weight/bandwidth and cpu/mems affinity to member tasks. Also forwards
+# `narf-memory/cgroup` so the scheduler (which owns the current-task
+# register) can install the `memory` controller's charge-PID provider.
+cgroup = ["narf-memory/cgroup"]
 
 [lints]
 workspace = true

@@ -286,6 +286,38 @@ fn main() {
              placeholders (run via the musl-demo job, which installs musl-tools)"
         );
     }
+
+    // GCC ≥ 16's musl-gcc link spec emits an `-latomic_asneeded`
+    // placeholder library that does not exist on disk, so every
+    // musl-demo compile below fails at link with `cannot find
+    // -latomic_asneeded` on bleeding-edge toolchains (Arch/CachyOS).
+    // Older GCC (Ubuntu CI's musl-tools) never emits it. Drop an empty
+    // archive of that exact name into OUT_DIR and feed an explicit
+    // `-L OUT_DIR`: ld searches command-line `-L` dirs ahead of the
+    // spec's system dirs, so it resolves the placeholder to our empty
+    // archive where the spec emits it, and the flag is inert everywhere
+    // else. (An explicit `-L` is honoured even though the musl specs
+    // drop `LIBRARY_PATH`; an empty archive is a valid archive ld links
+    // zero members from.) The build script depends only on `ar`, which
+    // ships with the same binutils as the linker.
+    let atomic_stub_l: Option<String> = musl_gcc.as_ref().map(|_| {
+        let stub = out_dir.join("libatomic_asneeded.a");
+        let _ = std::fs::remove_file(&stub);
+        let ok = Command::new("ar")
+            .arg("rcs")
+            .arg(&stub)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            panic!(
+                "musl-demo: failed to create the libatomic_asneeded link stub at {} \
+                 (is `ar` on PATH?)",
+                stub.display()
+            );
+        }
+        format!("-L{}", out_dir.display())
+    });
     for test in [
         "fork_pipe_smoke",
         "epoll_smoke",
@@ -351,12 +383,12 @@ fn main() {
         let x86_path = match &musl_gcc {
             Some(cc) => {
                 let out = out_dir.join(format!("{test}_x86_64"));
-                let output = Command::new(cc)
-                    .args(["-O2", "-Wall", "-fPIE", "-pie", "-mcmodel=large"])
-                    .arg(&src)
-                    .arg("-o")
-                    .arg(&out)
-                    .output();
+                let mut cmd = Command::new(cc);
+                cmd.args(["-O2", "-Wall", "-fPIE", "-pie", "-mcmodel=large"]);
+                if let Some(l) = &atomic_stub_l {
+                    cmd.arg(l);
+                }
+                let output = cmd.arg(&src).arg("-o").arg(&out).output();
                 match output {
                     Ok(o) if o.status.success() => out.display().to_string(),
                     // musl-gcc IS present but the source failed to compile —

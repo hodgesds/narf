@@ -46,7 +46,7 @@ cgroup = []
 # Resource controllers (each implies the base `cgroup`).
 cgroup-pids   = ["cgroup"]
 cgroup-misc   = ["cgroup"]
-cgroup-memory = ["cgroup", "narf-memory/cgroup"]
+cgroup-memory = ["cgroup", "narf-memory/cgroup", "narf-scheduler/cgroup"]
 cgroup-cpu    = ["cgroup", "narf-scheduler/cgroup"]
 cgroup-cpuset = ["cgroup", "narf-scheduler/cgroup"]
 cgroup-io     = ["cgroup", "narf-block/cgroup"]

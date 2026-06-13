@@ -53,7 +53,44 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::affinity::{Affinity, CpuId, CpuSet};
 use crate::priority::Priority;
-use crate::{TaskId, READY};
+use crate::{current_task_id, TaskId, READY};
+
+// ── memory-controller charge-PID provider ───────────────────────────
+//
+// The page/frame allocator (`narf-memory`) has no per-task identity of
+// its own; the `memory` cgroup controller's charge hook needs "which
+// task is allocating right now". The scheduler owns that register
+// (`current_task_id`), and `narf-memory` is a dependency, so the
+// scheduler is the natural — and only — place that can answer it. The
+// `memory` controller calls [`install_memory_pid_provider`] from its
+// first-`new_state` lazy-install (the same indirection the cpu/cpuset
+// hooks use, just in the opposite direction), wiring the provider below
+// into the allocator. See `filesystem/src/cgroupfs/memory.rs`.
+
+/// Resolve the PID to charge for the in-flight allocation: the
+/// currently-polling task's id, or `None` outside any poll context
+/// (early boot, between rounds, kernel-internal allocations) so those
+/// allocations stay unattributed rather than charged to the wrong
+/// cgroup. The cgroup membership pid and the [`TaskId`] raw value share
+/// one namespace (see [`apply_priority`]).
+fn current_charge_pid() -> Option<u64> {
+    let id = current_task_id();
+    if id == TaskId::NONE {
+        None
+    } else {
+        Some(id.raw())
+    }
+}
+
+/// Install the `memory`-controller charge-PID provider into
+/// `narf-memory`. Idempotent at the allocator side (a second install
+/// just re-stores the same fn pointer). Called by the cgroupfs `memory`
+/// controller's lazy hook-install so no boot wiring is required; until
+/// it runs, the allocator's charge hook has no PID to attribute and
+/// memory accounting is simply inactive.
+pub fn install_memory_pid_provider() {
+    narf_memory::install_cgroup_pid_provider(current_charge_pid);
+}
 
 /// Apply a nice-style priority to the task whose raw id equals `pid`.
 ///

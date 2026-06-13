@@ -57,6 +57,35 @@ fn decode(eax: u32, ebx: u32, ecx: u32) -> Option<CacheLevel> {
     })
 }
 
+/// True if this CPU actually implements the cache-topology CPUID leaf
+/// that [`levels`] reads — Intel leaf `4`, AMD/Hygon leaf
+/// `0x8000_001D` (the latter gated on CPUID.8000_0001:ECX[22],
+/// TopologyExtensions). QEMU's `qemu64` TCG model (what GitHub Actions'
+/// runner exposes) implements neither, so cache enumeration there
+/// legitimately yields zero levels. Callers use this to tell "the CPU
+/// has no cache-topology leaf" (skip) apart from "the leaf exists but
+/// enumerated nothing" (a real fault).
+pub fn leaf_supported() -> bool {
+    match ident::read().vendor {
+        Vendor::Amd | Vendor::Hygon => {
+            // SAFETY: extended leaf 0x8000_0000 is always defined; it
+            // reports the highest supported extended leaf in EAX.
+            let (max_ext, _, _, _) = unsafe { cpuid(0x8000_0000, 0) };
+            if max_ext < 0x8000_001D {
+                return false;
+            }
+            // SAFETY: 0x8000_0001 is defined (max_ext ≥ 0x8000_001D).
+            let (_, _, ecx, _) = unsafe { cpuid(0x8000_0001, 0) };
+            ecx & (1 << 22) != 0 // TopologyExtensions
+        }
+        _ => {
+            // SAFETY: leaf 0 is always defined; EAX = highest basic leaf.
+            let (max_basic, _, _, _) = unsafe { cpuid(0, 0) };
+            max_basic >= 4
+        }
+    }
+}
+
 /// Iterate cache levels until the sentinel sub-leaf (cache type = 0).
 pub fn levels<F: FnMut(CacheLevel)>(mut f: F) {
     let leaf = match ident::read().vendor {

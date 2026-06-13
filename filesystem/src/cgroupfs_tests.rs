@@ -212,6 +212,68 @@ fn smoke_cgroup_events_populated() -> TestResult {
 }
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_events_populated);
 
+// ── 4b. cgroup.events POLLPRI edge notification ─────────────────────
+
+fn smoke_cgroup_events_pollpri_edge() -> TestResult {
+    use crate::{FileOps, POLL_IN, POLL_PRI};
+
+    let root = root_dir();
+    let name = "t_events_pri";
+    let pid: u64 = 3_300_000_009;
+    let child = match poll_once(root.mkdir(name)) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+
+    // A single, persistent open of cgroup.events — the fd whose edge
+    // state we track across transitions (re-looking-up would mint a
+    // fresh fd already level with the live generation).
+    let ev: Arc<dyn FileOps> = match child.lookup("cgroup.events") {
+        Some(f) => f,
+        None => {
+            let _ = poll_once(root.rmdir(name));
+            return TestResult::Fail("cgroup.events absent on child");
+        }
+    };
+
+    let fail = |msg: &'static str, pid: u64, name: &str| -> TestResult {
+        task_exited(pid);
+        let _ = poll_once(root_dir().rmdir(name));
+        TestResult::Fail(msg)
+    };
+
+    // Freshly opened, level with live state: readable, no pending edge.
+    if ev.poll_readiness() & POLL_PRI != 0 {
+        return fail("spurious POLLPRI on fresh events fd", pid, name);
+    }
+    if ev.poll_readiness() & POLL_IN == 0 {
+        return fail("events fd not reported readable", pid, name);
+    }
+
+    // populated 0 → 1 is an edge: POLLPRI must latch on the held fd.
+    let _ = attach_pid(&child, pid);
+    if ev.poll_readiness() & POLL_PRI == 0 {
+        return fail("POLLPRI not set after populated transition", pid, name);
+    }
+
+    // Reading consumes the edge: POLLPRI clears, POLLIN stays.
+    let mut buf = [0u8; 64];
+    let _ = poll_once(ev.read(0, &mut buf));
+    if ev.poll_readiness() & POLL_PRI != 0 {
+        return fail("POLLPRI not cleared after read", pid, name);
+    }
+
+    // populated 1 → 0 is a fresh edge on the same fd.
+    task_exited(pid);
+    if ev.poll_readiness() & POLL_PRI == 0 {
+        return fail("POLLPRI not re-armed after empty transition", pid, name);
+    }
+
+    let _ = poll_once(root.rmdir(name));
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_events_pollpri_edge);
+
 // ── 5. rmdir rules ──────────────────────────────────────────────────
 
 fn smoke_cgroup_rmdir_rules() -> TestResult {
