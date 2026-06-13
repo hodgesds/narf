@@ -12042,6 +12042,30 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
+/// sigqueue: `(task, signum) -> (si_code, si_value)`. The pending bitmask
+/// in `SIGNAL_PENDING` collapses duplicates, so standard signals coalesce
+/// (the latest queued payload wins); realtime-signal queue depth is not
+/// modeled. Drained on delivery (`default_signal_delivery`) or by a
+/// `signalfd` read so a stale payload never attaches to a later instance.
+/// `(task, signum) -> (si_code, si_value)`.
+type SigqueueMap = BTreeMap<(u64, u32), (i32, u64)>;
+static SIGQUEUE_INFO: narf_lib::sync::IrqSafeSpinLock<Option<SigqueueMap>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Record the `si_code` + `si_value` carried by a queued signal.
+pub(crate) fn store_sigqueue_info(task: u64, signum: u32, si_code: i32, si_value: u64) {
+    let mut g = SIGQUEUE_INFO.lock();
+    g.get_or_insert_with(BTreeMap::new)
+        .insert((task, signum), (si_code, si_value));
+}
+
+/// Remove and return a queued signal's `(si_code, si_value)`, if any.
+pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64)> {
+    let mut g = SIGQUEUE_INFO.lock();
+    g.as_mut().and_then(|m| m.remove(&(task, signum)))
+}
+
 pub fn is_signal_pending(task_id: u64) -> bool {
     let pending = {
         let g = SIGNAL_PENDING.lock();
@@ -12607,8 +12631,24 @@ fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         return;
     }
     let target = pid_to_task_raw(a.arg0).unwrap_or(a.arg0);
+    capture_queued_siginfo(target, sig, a.arg2);
     raise_signal_pending(target, sig); // ORs the pending bit + wakes
     ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// Copy `si_code` (offset 8) and `si_value` (the sigval union, offset 24)
+/// out of a user `siginfo_t` and stash them for delivery / signalfd.
+fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) {
+    if info_ptr == 0 {
+        return;
+    }
+    // SAFETY: info_ptr is non-zero; copy_from_user_vec range-validates the
+    // 32-byte read covering si_signo..si_value.
+    if let Ok(b) = unsafe { copy_from_user_vec(info_ptr, 32) } {
+        let si_code = i32::from_le_bytes(b[8..12].try_into().unwrap());
+        let si_value = u64::from_le_bytes(b[24..32].try_into().unwrap());
+        store_sigqueue_info(target, sig, si_code, si_value);
+    }
 }
 
 /// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue `sig` to thread
@@ -12621,6 +12661,7 @@ fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         return;
     }
     let target = pid_to_task_raw(a.arg1).unwrap_or(a.arg1);
+    capture_queued_siginfo(target, sig, a.arg3);
     raise_signal_pending(target, sig);
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -13266,6 +13307,7 @@ fn build_delivery_params(
     syscall_no: u32,
     si_code: i32,
     si_addr: u64,
+    si_value: u64,
 ) -> SigDeliveryParams {
     // Altstack: only honour if SA_ONSTACK is set AND the slot is
     // installed AND it's not SS_DISABLE. A misconfigured altstack
@@ -13286,6 +13328,7 @@ fn build_delivery_params(
         restartable_syscall: is_restartable_syscall(syscall_no),
         si_code,
         si_addr,
+        si_value,
     }
 }
 
@@ -13372,8 +13415,11 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bo
             return true;
         }
     };
-    // Async signals: si_code = SI_USER (0), si_addr = 0.
-    let params = build_delivery_params(task, action, signum, syscall_no, 0, 0);
+    // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
+    // instance was queued by rt_sigqueueinfo/sigqueue, in which case
+    // honour its si_code (SI_QUEUE) + si_value (the sigval payload).
+    let (si_code, si_value) = take_sigqueue_info(task, signum).unwrap_or((0, 0));
+    let params = build_delivery_params(task, action, signum, syscall_no, si_code, 0, si_value);
     if !ctx.deliver_signal(&params) {
         return false;
     }
@@ -13579,7 +13625,8 @@ pub fn default_sync_signal_delivery(
     };
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
-    let params = build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr);
+    // Synchronous faults carry si_addr, not a sigqueue sigval.
+    let params = build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr, 0);
     let delivered = ctx.deliver_signal(&params);
     if delivered {
         set_sigreturn_use_rsp(task, params.restorer != 0);

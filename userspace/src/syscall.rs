@@ -265,6 +265,12 @@ pub struct SigDeliveryParams {
     /// 0 for async signals where it has no meaning. The arch
     /// only writes this when `SA_SIGINFO` is set.
     pub si_addr: u64,
+    /// `si_value` (the `sigval` union) for queued signals
+    /// (`rt_sigqueueinfo` / `sigqueue`). 0 for everything else. The arch
+    /// writes it at the `_sifields._rt.si_sigval` offset (24) of the
+    /// user `siginfo_t` when `SA_SIGINFO` is set; harmless for other
+    /// signals since that union slot is unused by them.
+    pub si_value: u64,
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────
@@ -3071,6 +3077,8 @@ mod sigframe {
             siginfo[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
             siginfo[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
             siginfo[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
+            // _sifields._rt.si_sigval (sigqueue payload) at offset 24.
+            siginfo[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
 
             // SAFETY: the active CR3 is the trapping task's; copy_to_user
             // brackets the writes with SMAP and faults user-side on a
