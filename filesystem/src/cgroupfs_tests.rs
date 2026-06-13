@@ -455,3 +455,53 @@ fn smoke_cgroup_io() -> TestResult {
 }
 #[cfg(feature = "cgroup-io")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_io);
+
+#[cfg(feature = "cgroup-cpu")]
+fn smoke_cgroup_cpu() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::cpu::CpuController));
+    with_root_controller("cpu", "t_cpu", |cg| {
+        if cg.lookup("cpu.weight").is_none() || cg.lookup("cpu.max").is_none() {
+            return TestResult::Fail("cpu.* files absent after enabling cpu");
+        }
+        if write_attr(cg, "cpu.weight", b"200").is_err() {
+            return TestResult::Fail("set cpu.weight failed");
+        }
+        let w = read_attr(cg, "cpu.weight").unwrap_or_default();
+        if write_attr(cg, "cpu.max", b"50000 100000").is_err() {
+            return TestResult::Fail("set cpu.max failed");
+        }
+        let m = read_attr(cg, "cpu.max").unwrap_or_default();
+        let stat = read_attr(cg, "cpu.stat").unwrap_or_default();
+        if w.trim() == "200" && m.trim() == "50000 100000" && stat.contains("usage_usec") {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("cpu.weight/cpu.max/cpu.stat unexpected")
+        }
+    })
+}
+#[cfg(feature = "cgroup-cpu")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_cpu);
+
+#[cfg(feature = "cgroup-cpuset")]
+fn smoke_cgroup_cpuset() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::cpuset::CpuSetController));
+    with_root_controller("cpuset", "t_cpuset", |cg| {
+        if cg.lookup("cpuset.cpus").is_none() || cg.lookup("cpuset.cpus.effective").is_none() {
+            return TestResult::Fail("cpuset.* files absent after enabling cpuset");
+        }
+        // CPU 0 is always online, so requesting it yields a non-empty
+        // effective set regardless of the machine's CPU count.
+        if write_attr(cg, "cpuset.cpus", b"0").is_err() {
+            return TestResult::Fail("set cpuset.cpus failed");
+        }
+        let c = read_attr(cg, "cpuset.cpus").unwrap_or_default();
+        let eff = read_attr(cg, "cpuset.cpus.effective").unwrap_or_default();
+        if c.trim() == "0" && eff.contains('0') {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("cpuset.cpus / effective unexpected")
+        }
+    })
+}
+#[cfg(feature = "cgroup-cpuset")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_cpuset);
