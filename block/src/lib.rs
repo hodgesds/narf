@@ -27,6 +27,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "cgroup")]
+pub mod cgroup;
 pub mod deadline;
 pub mod encrypted;
 pub mod fs_detect;
@@ -49,6 +51,9 @@ pub use io_scheduler::{
 };
 pub use mq::{MqDeadlineScheduler, MAX_LANES};
 pub use noop::NoopScheduler;
+
+#[cfg(feature = "cgroup")]
+pub use cgroup::{dev_id_from_ptr, install_cgroup_io_hook, IoCgroupHook};
 pub use registry::{
     block_device_count, block_devices, find_block_device, register_block_device,
     unregister_block_device, BlockDeviceSync, BlockIoError, RegisteredBlockDevice, SyncBlock,
@@ -81,6 +86,44 @@ pub trait BlockDevice: Send + Sync {
 
     /// Cancel an in-flight request by kernel-assigned tag.
     fn cancel(&self, tag: u64) -> impl Future<Output = CancelResult> + Send;
+
+    /// Submit a request and charge its bytes to the submitting task's
+    /// cgroup-v2 `io` controller before dispatch.
+    ///
+    /// This is the cgroup-accounted submit seam. It reads the running
+    /// task (`narf_scheduler::current_task_id`) in its synchronous
+    /// prologue — the correct attribution point for every in-tree
+    /// device, whose `submit` performs the transfer synchronously
+    /// before the returned future is awaited (see `cgroup` module
+    /// docs) — then delegates to [`BlockDevice::submit`].
+    ///
+    /// `dev` is the synthetic-but-stable MAJ:MIN id for this device
+    /// (see [`crate::cgroup::dev_id_from_ptr`]); callers holding an
+    /// `Arc<dyn BlockDeviceSync>` derive it from the device pointer.
+    ///
+    /// LIMITATION (accounting wiring): in-tree filesystems currently
+    /// call [`BlockDevice::submit`] directly, so this accounted path
+    /// is dormant until those call sites migrate to it. Migrating them
+    /// touches the FS/driver crates (out of scope for the block-layer
+    /// seam); this method is the single point they migrate *to*. No
+    /// traffic is fabricated — only requests routed through here are
+    /// charged.
+    #[cfg(feature = "cgroup")]
+    fn submit_accounted(
+        &self,
+        dev: u64,
+        req: BlockRequest,
+    ) -> impl Future<Output = BlockCompletion> + Send {
+        // Charge in the synchronous prologue so `current_task_id` is
+        // still the submitting task, then build the delegated future.
+        let bytes = u64::from(req.blocks) * u64::from(self.logical_block_size());
+        let is_write = matches!(
+            req.op,
+            BlockOp::Write { .. } | BlockOp::WriteZeroes | BlockOp::Trim
+        );
+        crate::cgroup::charge_io(dev, bytes, is_write);
+        self.submit(req)
+    }
 }
 
 /// Optional block device features.
