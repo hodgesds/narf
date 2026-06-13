@@ -36,5 +36,14 @@ linux-compat = []
 # Stub for Waves 63-67.
 container = []
 
+# cgroup-v2 unified hierarchy (`cgroupfs`, mounted at /sys/fs/cgroup).
+# Provides the organizational tree + process-membership tracking that
+# an init system (systemd) needs to reach PID 1, with an *empty*
+# controller set — no resource accounting/enforcement. Resource
+# controllers land later as additive sub-features (cgroup-pids,
+# cgroup-memory, cgroup-cpu). Orthogonal to linux-compat and
+# container.
+cgroup = []
+
 [lints]
 workspace = true

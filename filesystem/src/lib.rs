@@ -66,6 +66,8 @@ pub mod devfs_block;
 pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
+#[cfg(feature = "cgroup")]
+pub mod cgroupfs;
 pub mod fuse;
 pub mod memfs;
 pub mod page_cache;
@@ -97,6 +99,8 @@ pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
+#[cfg(feature = "cgroup")]
+pub use cgroupfs::CgroupFs;
 pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
