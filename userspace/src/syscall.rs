@@ -2006,6 +2006,34 @@ pub enum Syscall {
     /// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue a signal to a
     /// specific thread. Linux (x86_64=297, aarch64=240).
     RtTgsigqueueinfo,
+
+    /// `mlockall(flags)` — lock the whole address space.
+    /// Linux (x86_64=151, aarch64=230).
+    Mlockall,
+
+    /// `munlockall()` — unlock the whole address space.
+    /// Linux (x86_64=152, aarch64=231).
+    Munlockall,
+
+    /// `memfd_secret(flags)` — anonymous fd-backed secret memory.
+    /// Linux (x86_64=447, aarch64=447).
+    MemfdSecret,
+
+    /// `process_madvise(pidfd, iov, iovcnt, advice, flags)` — madvise on
+    /// another process's memory. Linux (x86_64=440, aarch64=233).
+    ProcessMadvise,
+
+    /// `move_pages(pid, count, pages, nodes, status, flags)` — query or
+    /// move pages between NUMA nodes. Linux (x86_64=279, aarch64=239).
+    MovePages,
+
+    /// `set_mempolicy_home_node(addr, len, home_node, flags)` — set the
+    /// home NUMA node for a range. Linux (x86_64=450, aarch64=450).
+    SetMempolicyHomeNode,
+
+    /// `migrate_pages(pid, maxnode, old_nodes, new_nodes)` — migrate a
+    /// process's pages between node sets. Linux (x86_64=256, aarch64=238).
+    MigratePages,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2163,6 +2191,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setfsgid, 123),
     (Syscall::RtSigqueueinfo, 129),
     (Syscall::RtTgsigqueueinfo, 297),
+    (Syscall::Mlockall, 151),
+    (Syscall::Munlockall, 152),
+    (Syscall::MemfdSecret, 447),
+    (Syscall::ProcessMadvise, 440),
+    (Syscall::MovePages, 279),
+    (Syscall::SetMempolicyHomeNode, 450),
+    (Syscall::MigratePages, 256),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2552,6 +2587,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setfsgid, 152),
     (Syscall::RtSigqueueinfo, 138),
     (Syscall::RtTgsigqueueinfo, 240),
+    (Syscall::Mlockall, 230),
+    (Syscall::Munlockall, 231),
+    (Syscall::MemfdSecret, 447),
+    (Syscall::ProcessMadvise, 233),
+    (Syscall::MovePages, 239),
+    (Syscall::SetMempolicyHomeNode, 450),
+    (Syscall::MigratePages, 238),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),

@@ -6429,6 +6429,195 @@ fn sys_munlock(ctx: &mut dyn TrapContext) {
     }
 }
 
+// ── Batch 18: address-space-wide locking, secret memory, NUMA ────────
+
+/// `mlockall(flags)` — lock the whole address space. NARF force-backs a
+/// locked range; MCL_CURRENT pins every existing region. MCL_FUTURE /
+/// MCL_ONFAULT are accepted but not separately enforced (there is no
+/// lazy-eviction path to guard against).
+fn sys_mlockall(ctx: &mut dyn TrapContext) {
+    const MCL_CURRENT: u64 = 1;
+    const MCL_FUTURE: u64 = 2;
+    const MCL_ONFAULT: u64 = 4;
+    let flags = ctx.args().arg0;
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    if flags & MCL_CURRENT != 0 {
+        for r in as_ref.regions_snapshot() {
+            let _ = as_ref.mlock_range(r.base, r.len);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `munlockall()` — clear the LOCKED flag on every region.
+fn sys_munlockall(ctx: &mut dyn TrapContext) {
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    for r in as_ref.regions_snapshot() {
+        let _ = as_ref.munlock_range(r.base, r.len);
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `memfd_secret(flags)` — an anonymous fd-backed memory object. Linux
+/// also unmaps the pages from the kernel's direct map; NARF has no such
+/// map to hide them from, so it reuses the memfd backing. Only
+/// FD_CLOEXEC is honoured.
+fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
+    let flags = ctx.args().arg0 as u32;
+    let task = current_task_id();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    #[cfg(feature = "linux-compat")]
+    {
+        let mfd = crate::linux_compat::MemFdFile::new(0);
+        memfd_arc_register(&mfd);
+        // FD_CLOEXEC shares MFD_CLOEXEC's bit value (1).
+        let cloexec = (flags & crate::linux_compat::MFD_CLOEXEC) != 0;
+        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+        let fd = fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: mfd,
+                offset: 0,
+                flags: install_flags,
+                status_flags: 0,
+            })
+        });
+        match fd {
+            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            None => ctx.set_return(fail),
+        }
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        let _ = flags;
+        let ops = narf_filesystem::new_anon_memfile();
+        match fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        }) {
+            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            None => ctx.set_return(fail),
+        }
+    }
+}
+
+/// `process_madvise(pidfd, iov, iovcnt, advice, flags)` — apply `advice`
+/// to ranges in a target process's address space. NARF supports the
+/// caller's own AS (the common self-advise use); a foreign AS returns
+/// EPERM. Returns the number of bytes advised.
+fn sys_process_madvise(ctx: &mut dyn TrapContext) {
+    const MADV_DONTNEED: i32 = 4;
+    const MADV_FREE: i32 = 8;
+    let a = *ctx.args();
+    let pidfd = a.arg0 as u32;
+    let iovcnt = a.arg2 as usize;
+    let advice = a.arg3 as i32;
+    if iovcnt > 1024 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let task = current_task_id();
+    let target_pid = match fd::with_table(task, |t| {
+        t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
+    })
+    .flatten()
+    {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            return;
+        }
+    };
+    if target_pid != task {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM (foreign AS)
+        return;
+    }
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    let iov = match read_iovecs(a.arg1, iovcnt) {
+        Some(v) => v,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let mut total: u64 = 0;
+    for (base, len) in iov {
+        if advice == MADV_DONTNEED || advice == MADV_FREE {
+            let _ = as_ref.madvise_dontneed(VirtAddr::new(base), len);
+        }
+        total = total.saturating_add(len);
+    }
+    ctx.set_return(SyscallReturn::ok(total));
+}
+
+/// `move_pages(pid, count, pages, nodes, status, flags)` — query or move
+/// pages across NUMA nodes. NARF places everything on node 0, so a status
+/// query (or a move) reports node 0 for every page.
+fn sys_move_pages(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let count = a.arg1 as usize;
+    let status_ptr = a.arg4;
+    if count > (1 << 20) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    if status_ptr != 0 && count != 0 {
+        // i32 zeros => node 0 for each page.
+        let zeros = alloc::vec![0u8; count * 4];
+        // SAFETY: status_ptr is the user int[count] out-array; copy_to_user
+        // range-validates the write.
+        if unsafe { copy_to_user(status_ptr, &zeros) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `set_mempolicy_home_node(addr, len, home_node, flags)` — set a range's
+/// home NUMA node. Accepted (no per-range home binding yet); flags must
+/// be 0.
+fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    if a.arg3 != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// `migrate_pages(pid, maxnode, old_nodes, new_nodes)` — migrate a
+/// process's pages between node sets. NARF is effectively single-node for
+/// placement, so this is a no-op: 0 pages could not be migrated.
+fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 /// Shared core for `mprotect(2)` and `pkey_mprotect(2)`: translate the
 /// POSIX `prot` bits to `RegionPerms` and apply them to `[base, base+len)`.
 ///
@@ -15779,6 +15968,38 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::MUnlock, "munlock", RawFnHandler(sys_munlock));
     #[cfg(feature = "linux-compat")]
     table.install_raw(Syscall::Madvise, "madvise", RawFnHandler(sys_madvise));
+    // Batch 18: AS-wide locking, secret memory, NUMA placement.
+    table.install_raw(Syscall::Mlockall, "mlockall", RawFnHandler(sys_mlockall));
+    table.install_raw(
+        Syscall::Munlockall,
+        "munlockall",
+        RawFnHandler(sys_munlockall),
+    );
+    table.install_raw(
+        Syscall::MemfdSecret,
+        "memfd_secret",
+        RawFnHandler(sys_memfd_secret),
+    );
+    table.install_raw(
+        Syscall::ProcessMadvise,
+        "process_madvise",
+        RawFnHandler(sys_process_madvise),
+    );
+    table.install_raw(
+        Syscall::MovePages,
+        "move_pages",
+        RawFnHandler(sys_move_pages),
+    );
+    table.install_raw(
+        Syscall::SetMempolicyHomeNode,
+        "set_mempolicy_home_node",
+        RawFnHandler(sys_set_mempolicy_home_node),
+    );
+    table.install_raw(
+        Syscall::MigratePages,
+        "migrate_pages",
+        RawFnHandler(sys_migrate_pages),
+    );
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
     table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
     table.install_raw(Syscall::Waitid, "waitid", RawFnHandler(sys_waitid));
