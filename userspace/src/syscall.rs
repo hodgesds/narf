@@ -2115,6 +2115,15 @@ pub enum Syscall {
     /// `lsm_list_modules(ids, size, flags)` — list active LSM ids.
     /// Linux (x86_64=461, aarch64=461).
     LsmListModules,
+
+    /// `name_to_handle_at(dirfd, path, handle, mount_id, flags)` — encode a
+    /// file into an opaque handle. Linux (x86_64=303, aarch64=264).
+    NameToHandleAt,
+
+    /// `open_by_handle_at(mount_fd, handle, flags)` — open a file from a
+    /// handle produced by name_to_handle_at.
+    /// Linux (x86_64=304, aarch64=265).
+    OpenByHandleAt,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2299,6 +2308,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::LsmGetSelfAttr, 459),
     (Syscall::LsmSetSelfAttr, 460),
     (Syscall::LsmListModules, 461),
+    (Syscall::NameToHandleAt, 303),
+    (Syscall::OpenByHandleAt, 304),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2714,6 +2725,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::LsmGetSelfAttr, 459),
     (Syscall::LsmSetSelfAttr, 460),
     (Syscall::LsmListModules, 461),
+    (Syscall::NameToHandleAt, 264),
+    (Syscall::OpenByHandleAt, 265),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
