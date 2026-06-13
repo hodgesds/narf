@@ -24,9 +24,8 @@
 //! keyed by `current_task_id()`, mirroring how Wave-67's
 //! mount-namespace plumbing is wired in `handlers.rs`. The
 //! whole module is gated on `feature = "container"` so the
-//! default kernel build pays no cost.
-
-#![cfg(feature = "container")]
+//! default kernel build pays no cost (the `mod namespaces`
+//! declaration in `lib.rs` carries the `#[cfg]`).
 
 extern crate alloc;
 

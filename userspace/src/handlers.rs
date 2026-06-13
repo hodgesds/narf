@@ -6997,7 +6997,6 @@ fn sys_getpid(ctx: &mut dyn TrapContext) {
         let outer = task_to_pid_raw(task).unwrap_or(task);
         let inner = crate::pid_ns::self_inner_pid(task, outer);
         ctx.set_return(SyscallReturn::ok(inner));
-        return;
     }
     #[cfg(not(feature = "container"))]
     ctx.set_return(SyscallReturn::ok(task));
@@ -11812,7 +11811,6 @@ fn sys_setns(ctx: &mut dyn TrapContext) {
             return;
         }
         ctx.set_return(SyscallReturn::ok(0));
-        return;
     }
     #[cfg(not(feature = "container"))]
     {
@@ -11955,14 +11953,14 @@ fn sys_chroot(ctx: &mut dyn TrapContext) {
 fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let new_root = match copy_user_path_raw(args.arg0 as u64, args.arg1 as usize) {
+    let new_root = match copy_user_path_raw(args.arg0, args.arg1 as usize) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let put_old = match copy_user_path_raw(args.arg2 as u64, args.arg3 as usize) {
+    let put_old = match copy_user_path_raw(args.arg2, args.arg3 as usize) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
