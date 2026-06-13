@@ -1488,6 +1488,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("fanotify_smoke", "fanotify-ok"),
         // Linux-compat round 24: Landlock path-rule enforcement.
         ("landlock_smoke", "landlock-ok"),
+        // Linux-compat round 25: generic LSM self-attr syscalls.
+        ("lsm_smoke", "lsm-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command

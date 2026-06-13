@@ -3507,6 +3507,8 @@ fn boot_userspace_init() {
                 ("fanotify_smoke", narf_verification::NARF_FANOTIFY_SMOKE_ELF),
                 // Linux-compat round 24: Landlock path-rule enforcement.
                 ("landlock_smoke", narf_verification::NARF_LANDLOCK_SMOKE_ELF),
+                // Linux-compat round 25: generic LSM self-attr syscalls.
+                ("lsm_smoke", narf_verification::NARF_LSM_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the
