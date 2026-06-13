@@ -4092,6 +4092,11 @@ define_smoke_elf!(
     "NARF_JOBCTL_SMOKE_ELF_X86_64",
     "NARF_JOBCTL_SMOKE_ELF_AARCH64"
 );
+define_smoke_elf!(
+    NARF_PROCFS2_SMOKE_ELF,
+    "NARF_PROCFS2_SMOKE_ELF_X86_64",
+    "NARF_PROCFS2_SMOKE_ELF_AARCH64"
+);
 
 #[cfg(all(
     target_arch = "x86_64",

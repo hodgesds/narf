@@ -3523,6 +3523,8 @@ fn boot_userspace_init() {
                 ("mountapi_smoke", narf_verification::NARF_MOUNTAPI_SMOKE_ELF),
                 // Job control + termios: pty termios round-trip + SIGTTIN.
                 ("jobctl_smoke", narf_verification::NARF_JOBCTL_SMOKE_ELF),
+                // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
+                ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

@@ -1498,6 +1498,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("mountapi_smoke", "mountapi-ok"),
         // Job control + termios: pty termios round-trip + SIGTTIN.
         ("jobctl_smoke", "jobctl-ok"),
+        // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
+        ("procfs2_smoke", "procfs2-ok"),
     ];
     // Run every case in a SINGLE QEMU boot rather than one boot per
     // command — the TCG boot (especially on CI) dwarfs the per-command
