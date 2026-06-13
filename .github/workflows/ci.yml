@@ -208,6 +208,66 @@ jobs:
           XTASK_RI_ECHO_TIMEOUT_SECS: "900"
         run: cargo xtask musl-demo --arch=x86_64
 
+  kernel-test:
+    name: kernel-test (x86_64)
+    runs-on: ubuntu-latest
+    # The full in-kernel smoke suite (~5100 tests) runs in one QEMU boot
+    # under TCG (no KVM on GHA), plus a cold build of the kernel +
+    # verification crates and the phase-2 boot-smoke pass. Generous.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview rustfmt
+
+      - name: Install host build deps
+        # Same set as the musl-demo job: `cargo xtask test` builds the
+        # kernel-test image, which pulls the verification crate whose
+        # build.rs compiles the musl-demo smokes (needs musl-tools +
+        # linux-libc-dev). QEMU + OVMF boot the image.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            cpio \
+            mtools \
+            dosfstools \
+            e2fsprogs \
+            ovmf \
+            musl-tools \
+            linux-libc-dev
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-x86_64-kernel-test-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-x86_64-
+
+      # Phase 1 boots the kernel-test image and FAILS the job if any
+      # smoke fails (the runner exit_kernel(1)s on failure; xtask test
+      # gates on that status). Phase 2 boots real init and checks for
+      # panics. `cgroup-all` so every cgroup-v2 controller's smokes run.
+      # GHA's TCG QEMU is far slower than local KVM; bump the per-phase
+      # QEMU timeouts so a slow boot under load doesn't false-fail.
+      - name: cargo xtask test --features cgroup-all
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "2400"
+          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
+        run: cargo xtask test --arch=x86_64 --features cgroup-all
+
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
     runs-on: ubuntu-latest
