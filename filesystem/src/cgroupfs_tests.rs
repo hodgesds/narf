@@ -292,3 +292,111 @@ fn smoke_cgroup_subtree_control() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_subtree_control);
+
+// ── Controller smokes ───────────────────────────────────────────────
+//
+// A controller's interface files appear on a cgroup only when its name
+// is in the *parent's* subtree_control. To exercise a controller we
+// enable it on the root, operate on a root child (which then carries
+// the files), and always disable it again so the shared root is left
+// pristine for other tests.
+#[cfg(any(feature = "cgroup-pids", feature = "cgroup-misc"))]
+fn with_root_controller(
+    ctrl: &str,
+    child: &str,
+    f: impl FnOnce(&Arc<dyn DirOps>) -> TestResult,
+) -> TestResult {
+    let root = root_dir();
+    let mut plus = String::from("+");
+    plus.push_str(ctrl);
+    if write_attr(&root, "cgroup.subtree_control", plus.as_bytes()).is_err() {
+        return TestResult::Fail("could not enable controller on root");
+    }
+    let disable = |root: &Arc<dyn DirOps>| {
+        let mut minus = String::from("-");
+        minus.push_str(ctrl);
+        let _ = write_attr(root, "cgroup.subtree_control", minus.as_bytes());
+    };
+    let cg = match poll_once(root.mkdir(child)) {
+        Some(Ok(c)) => c,
+        _ => {
+            disable(&root);
+            return TestResult::Fail("mkdir failed");
+        }
+    };
+    let result = f(&cg);
+    let _ = poll_once(root.rmdir(child));
+    disable(&root);
+    result
+}
+
+#[cfg(feature = "cgroup-pids")]
+fn smoke_cgroup_pids() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::pids::PidsController));
+    with_root_controller("pids", "t_pids", |cg| {
+        if cg.lookup("pids.max").is_none() {
+            return TestResult::Fail("pids.max absent after enabling pids");
+        }
+        if write_attr(cg, "pids.max", b"1").is_err() {
+            return TestResult::Fail("set pids.max failed");
+        }
+        let a: u64 = 4_100_000_001;
+        let b: u64 = 4_100_000_002;
+        let r1 = attach_pid(cg, a); // within limit
+        let r2 = attach_pid(cg, b); // exceeds pids.max=1
+        let cur = read_attr(cg, "pids.current").unwrap_or_default();
+        task_exited(a);
+        task_exited(b);
+        match (r1, r2) {
+            (Ok(()), Err(())) if cur.trim() == "1" => TestResult::Pass,
+            (Ok(()), Ok(())) => TestResult::Fail("pids.max not enforced"),
+            _ => TestResult::Fail("unexpected pids attach result"),
+        }
+    })
+}
+#[cfg(feature = "cgroup-pids")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_pids);
+
+#[cfg(feature = "cgroup-misc")]
+fn smoke_cgroup_misc() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::misc::MiscController));
+    crate::cgroupfs::misc::register_misc_resource("testres", 100);
+    with_root_controller("misc", "t_misc", |cg| {
+        if cg.lookup("misc.max").is_none() {
+            return TestResult::Fail("misc.max absent after enabling misc");
+        }
+        let w1 = write_attr(cg, "misc.max", b"testres 50"); // known key
+        let body = read_attr(cg, "misc.max").unwrap_or_default();
+        let w2 = write_attr(cg, "misc.max", b"bogus 10"); // unknown key → EINVAL
+        match (w1, w2) {
+            (Ok(()), Err(())) if body.contains("testres 50") => TestResult::Pass,
+            (Ok(()), Ok(())) => TestResult::Fail("misc.max accepted unknown key"),
+            _ => TestResult::Fail("unexpected misc.max behavior"),
+        }
+    })
+}
+#[cfg(feature = "cgroup-misc")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_misc);
+
+#[cfg(feature = "cgroup-psi")]
+fn smoke_cgroup_psi() -> TestResult {
+    let root = root_dir();
+    let cg = match poll_once(root.mkdir("t_psi")) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let has = cg.lookup("cpu.pressure").is_some()
+        && cg.lookup("memory.pressure").is_some()
+        && cg.lookup("io.pressure").is_some();
+    let body = read_attr(&cg, "cpu.pressure").unwrap_or_default();
+    // PSI pressure files are non-root only.
+    let root_absent = root.lookup("cpu.pressure").is_none();
+    let _ = poll_once(root.rmdir("t_psi"));
+    if has && body.contains("some avg10=") && root_absent {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("psi pressure files missing or malformed")
+    }
+}
+#[cfg(feature = "cgroup-psi")]
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_psi);
