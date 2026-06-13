@@ -3526,6 +3526,9 @@ fn boot_userspace_init() {
                 // Job control stop/resume: SIGSTOP stop + SIGCONT resume,
                 // observed through wait4 WUNTRACED/WCONTINUED.
                 ("jobctl2_smoke", narf_verification::NARF_JOBCTL2_SMOKE_ELF),
+                // Filesystem navigation: chdir + getcwd + opendir/getdents64
+                // (directory fds) — what makes `cd` and `ls` work.
+                ("navfs_smoke", narf_verification::NARF_NAVFS_SMOKE_ELF),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // multi-DSO dynamic linking: main -> libb -> liba -> libc.

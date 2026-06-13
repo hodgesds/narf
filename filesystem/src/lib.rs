@@ -422,6 +422,14 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this open file is a *directory* handle (from opening a path
+    /// that resolves to a directory), return its [`DirOps`] so the
+    /// `getdents64(2)` path can enumerate it. The fd's own `offset`
+    /// field carries the read cursor. Default: not a directory.
+    fn as_dir(&self) -> Option<Arc<dyn DirOps>> {
+        None
+    }
+
     /// If this file is a pidfd (from `pidfd_open`), return the target
     /// process's pid. Used by `pidfd_send_signal(2)` to resolve the
     /// fd to a pid without a downcast / Any dance. Default: `None`.

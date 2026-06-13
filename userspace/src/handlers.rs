@@ -700,22 +700,21 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok(!0u64);
     // Copy path from userspace into kernel buffer under SMAP bracket.
     let path_owned = match copy_user_path(path_ptr, path_len) {
-        Some(s) => {
-            {
-                use core::fmt::Write as _;
-                let _ = writeln!(
-                    narf_console::Writer,
-                    "sys_open: path='{}' task={}",
-                    s,
-                    current_task_id()
-                );
-            }
-            s
-        }
+        Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
+    };
+    let task = current_task_id();
+    // Resolve relative paths against the task's cwd and collapse
+    // `.`/`..` (absolute-mount form only; the explicit-mount form below
+    // keeps its already-relative-to-the-mount path). This is what makes
+    // `ls` (which opens ".") and any relative open work from a shell.
+    let path_owned = if mnt_len == 0 {
+        resolve_cwd_path(task, &path_owned)
+    } else {
+        path_owned
     };
     let path: &str = &path_owned;
 
@@ -744,6 +743,28 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             })
             .flatten()
     };
+
+    // Directory open: if the path didn't resolve to a FileOps but does
+    // name a directory, hand back a directory fd (DirFdFile carrying the
+    // DirOps). This is what `opendir`/`getdents64` and `ls` rely on.
+    // Done before the O_CREAT branch so `open(dir, O_RDONLY)` succeeds.
+    if ops.is_none() && mnt_len == 0 {
+        if let Some(dirops) = resolve_dir_absolute(path) {
+            let new_fd = fd::with_table(task, |t| {
+                t.open(crate::fd::FdEntry {
+                    ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                })
+            });
+            match new_fd {
+                Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                None => ctx.set_return(fail),
+            }
+            return;
+        }
+    }
 
     // O_CREAT path: when the lookup misses and the caller asked for
     // creation, route through the parent directory's `create()`. The
@@ -779,7 +800,6 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // FSes report (uid=0, gid=0, perms=0o666) so non-root tasks see
     // the "other" triplet's rw bits and pass; the gate is structural
     // until ext2/minix start surfacing real owners.
-    let task = current_task_id();
     let stat = ops.stat();
     let (file_uid, file_gid) = ops.owners();
     let acc = read_uidgid(task);
@@ -2862,7 +2882,11 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path_owned = apply_chroot(&raw);
+    // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
+    // caller's cwd before chroot, so the stat family works from any
+    // working directory — not just absolute paths.
+    let abs = resolve_cwd_path(current_task_id(), &raw);
+    let path_owned = apply_chroot(&abs);
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     // `resolve_absolute` splits an absolute path into (mount, rel).
@@ -2870,21 +2894,7 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
-    let stat = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
-        if rel.is_empty() {
-            Some(narf_filesystem::Stat {
-                size: 0,
-                blocks: 0,
-                mode: narf_filesystem::Mode::DIR_RW,
-                mtime_cycles: 0,
-            })
-        } else {
-            narf_filesystem::resolve(fs.root(), rel)
-                .ok()
-                .map(|ops| ops.stat())
-        }
-    });
-    let s = match stat.flatten() {
+    let s = match stat_path_dir_aware(path) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -3054,19 +3064,10 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
-        let path_owned = apply_chroot(&raw);
-        if !path_owned.starts_with('/') {
-            // NARF has no per-task cwd; only absolute paths resolve.
-            ctx.set_return(fail);
-            return;
-        }
-        let path: &str = &path_owned;
-        narf_filesystem::registry()
-            .resolve_absolute(path, |fs, rel| {
-                narf_filesystem::resolve(fs.root(), rel).ok()
-            })
-            .flatten()
-            .map(|ops| ops.stat())
+        // Resolve relative paths against the caller's cwd, then chroot.
+        let abs = resolve_cwd_path(current_task_id(), &raw);
+        let path_owned = apply_chroot(&abs);
+        stat_path_dir_aware(&path_owned)
     };
 
     let s = match fs_stat {
@@ -3884,10 +3885,12 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(total as u64));
 }
 
-// ── Getdents64 — batched directory read in linux_dirent64 format ──
+// ── Getdents64 — fd-based batched directory read (linux_dirent64) ──
 //
-// arg0 = path string (path-based, not fd-based — NARF doesn't have
-// directory fds yet); arg1/2 = path len + cursor; arg3/4 = buf+len.
+// Linux ABI: `getdents64(unsigned int fd, void *dirp, unsigned int
+// count)`. arg0 = directory fd (from `open(path, O_DIRECTORY)` →
+// DirFdFile), arg1 = user buffer, arg2 = buffer size. The read cursor
+// lives in the fd's `offset` field, advanced across successive calls.
 //
 // linux_dirent64 wire layout:
 //   d_ino:    u64
@@ -3904,46 +3907,28 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
 
 fn sys_getdents64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let path_ptr = args.arg0;
-    let path_len = args.arg1 as usize;
-    let mut cursor = args.arg2 as usize;
-    let out_ptr = args.arg3 as *mut u8;
-    let out_len = args.arg4 as usize;
+    let fd = args.arg0 as u32;
+    let out_ptr = args.arg1 as *mut u8;
+    let out_len = args.arg2 as usize;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     if out_ptr.is_null() || out_len < 32 {
         ctx.set_return(fail);
         return;
     }
-    let path = match copy_user_path(path_ptr, path_len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
+    let task = current_task_id();
 
-    // Resolve to a DirOps once. We iterate by re-issuing
-    // enumerate_async(cursor, 1) per entry — simpler than threading a
-    // batch enumerator through the closure-typed registry walker,
-    // and the per-call cost is bounded by the small fan-out of a
-    // typical directory in our test FSes.
-    let dir = narf_filesystem::registry()
-        .resolve_absolute(&path, |fs, rel| {
-            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
-                fs.root()
-            } else {
-                let mut cur = fs.root();
-                for seg in rel.split('/').filter(|s| !s.is_empty()) {
-                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
-                }
-                cur
-            };
-            Some(dir)
-        })
-        .flatten();
-    let dir = match dir {
-        Some(d) => d,
+    // Pull the DirOps + current cursor off the fd. `as_dir()` is `Some`
+    // only for a DirFdFile (an opened directory); anything else is
+    // ENOTDIR / EBADF. The fd-table lock is released before we touch
+    // the FS (enumerate_async), per the no-reentrancy rule.
+    let dir_and_cursor = fd::with_table(task, |t| {
+        t.get(fd)
+            .and_then(|e| e.ops.as_dir().map(|d| (d, e.offset as usize)))
+    })
+    .flatten();
+    let (dir, mut cursor) = match dir_and_cursor {
+        Some(x) => x,
         None => {
             ctx.set_return(fail);
             return;
@@ -3995,6 +3980,14 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
         written += reclen;
         cursor = next_cursor;
     }
+
+    // Persist the advanced cursor so the next getdents64 on this fd
+    // resumes where we stopped (mid-directory if the buffer filled).
+    fd::with_table(task, |t| {
+        if let Some(e) = t.get_mut(fd) {
+            e.offset = cursor as u64;
+        }
+    });
 
     ctx.set_return(SyscallReturn::ok(written as u64));
 }
@@ -11243,30 +11236,166 @@ pub fn cwd_of(task: u64) -> alloc::string::String {
         .unwrap_or_else(|| alloc::string::String::from("/"))
 }
 
+/// Collapse `.`/`..`/empty segments into a clean absolute path.
+/// `normalize_abs("/a/./b/../c")` → `/c`; an empty result is `/`.
+fn normalize_abs(p: &str) -> alloc::string::String {
+    let mut out: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let mut r = alloc::string::String::from("/");
+    r.push_str(&out.join("/"));
+    r
+}
+
+/// Turn a user-supplied path (absolute or relative to `task`'s cwd)
+/// into a normalized absolute path. Relative paths are joined onto the
+/// task's current working directory; `.`/`..` are collapsed.
+fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        normalize_abs(path)
+    } else {
+        let mut joined = cwd_of(task);
+        if !joined.ends_with('/') {
+            joined.push('/');
+        }
+        joined.push_str(path);
+        normalize_abs(&joined)
+    }
+}
+
+/// Resolve an absolute path to a [`DirOps`] if (and only if) it names a
+/// directory. Mirrors the segment-walk in `sys_getdents64` /
+/// `sys_readdir`: pick the longest-matching mount, then descend by
+/// `lookup_dir_async` per path component.
+fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
+    narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
+                fs.root()
+            } else {
+                let mut cur = fs.root();
+                for seg in rel.split('/').filter(|s| !s.is_empty()) {
+                    cur = poll_blocking(cur.lookup_dir_async(seg)).and_then(|r| r.ok())?;
+                }
+                cur
+            };
+            Some(dir)
+        })
+        .flatten()
+}
+
+/// Stat an absolute path, handling both files and directories.
+/// Files come from the FileOps `stat()`; directories (mount roots and
+/// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
+/// see `S_IFDIR`. Returns `None` only when the path names nothing.
+fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
+    let file = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, rel| {
+            if rel.is_empty() {
+                None // mount root → treated as a directory below
+            } else {
+                narf_filesystem::resolve(fs.root(), rel)
+                    .ok()
+                    .map(|ops| ops.stat())
+            }
+        })
+        .flatten();
+    if file.is_some() {
+        return file;
+    }
+    if resolve_dir_absolute(path).is_some() {
+        return Some(narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::DIR_RW,
+            mtime_cycles: 0,
+        });
+    }
+    None
+}
+
+/// `FileOps` backing an open *directory* fd (from `open(path,
+/// O_DIRECTORY)` or opening a path that resolves to a directory).
+/// Read/write fail; `stat` reports a directory so `fstat(2)` sees
+/// `S_IFDIR`; `as_dir` hands the `DirOps` to `getdents64(2)`. The read
+/// cursor lives in the fd's `offset` field.
+struct DirFdFile {
+    dir: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+}
+
+impl narf_filesystem::FileOps for DirFdFile {
+    fn read<'a>(
+        &'a self,
+        _offset: u64,
+        _buf: &'a mut [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        // EISDIR — a directory fd can't be read(2), only getdents64'd.
+        alloc::boxed::Box::pin(async move { Err(narf_filesystem::FsError::InvalidPath) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        alloc::boxed::Box::pin(async move { Err(narf_filesystem::FsError::InvalidPath) })
+    }
+    fn stat(&self) -> narf_filesystem::Stat {
+        narf_filesystem::Stat {
+            size: 0,
+            blocks: 0,
+            mode: narf_filesystem::Mode::DIR_RW,
+            mtime_cycles: 0,
+        }
+    }
+    fn as_dir(&self) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
+        Some(self.dir.clone())
+    }
+}
+
+/// Test-only: install a directory fd for `path` in `task`'s fd table
+/// and return it. Mirrors `sys_open`'s directory-fd fallback without
+/// going through the open syscall (whose native-vs-linux ABI differs by
+/// build feature). Returns `None` if `path` is not a directory or the
+/// fd table is unavailable.
+#[doc(hidden)]
+pub fn __test_open_dir_fd(task: u64, path: &str) -> Option<u32> {
+    let dirops = resolve_dir_absolute(path)?;
+    fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    })
+}
+
 fn sys_chdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0;
-    let len = args.arg1 as usize;
-    // See sys_stat for the failure-sentinel rationale: the user-
-    // runtime asm wrapper observes only `value`, so success and
-    // invalid_op both surface as rax=0 without this.
+    // Linux ABI: `int chdir(const char *path)` — a single NUL-terminated
+    // path, no length arg. (Previously this read arg1 as a NARF-native
+    // length, so musl/busybox's chdir(path) hit us with garbage in arg1
+    // and failed every cd. Same fix as openat — see
+    // [[narf-mmap-no-file-backed]] / the *at ABI cutover.)
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_path(ptr, len) {
+    let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    // Stage-4 first cut: absolute paths only. Relative-path
-    // resolution joins with the *at(2) family in a follow-up; we
-    // reject early so callers don't accidentally rely on a
-    // half-implemented relative path being silently dropped.
-    if !path.starts_with('/') {
+    let task = current_task_id();
+    let abs = resolve_cwd_path(task, &path);
+    // Reject cd into a path that isn't a directory (ENOENT/ENOTDIR).
+    if resolve_dir_absolute(&abs).is_none() {
         ctx.set_return(fail);
         return;
     }
-    let task = current_task_id();
     let mut g = CWD_TABLE.lock();
     let map = match g.as_mut() {
         Some(m) => m,
@@ -11275,7 +11404,7 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    map.insert(task, path);
+    map.insert(task, abs);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
