@@ -3050,6 +3050,12 @@ fn boot_userspace_init() {
     signal_init();
     narf_userspace::handlers::init_per_task_state();
     narf_userspace::fd::init();
+    // Build the shared vDSO + vvar pages now that the TSC/counter scale is
+    // calibrated; every process maps them and gets AT_SYSINFO_EHDR.
+    narf_userspace::vdso::register_vdso_image(
+        narf_verification::NARF_VDSO_ELF,
+        narf_scheduler::narf_time::cycles_per_ns(),
+    );
     // Cross-crate fn-pointer wiring (console signal hook, /proc
     // per-pid hooks, kernel-side TCP stack + RX pump). One call
     // covers everything that used to be inline here.
@@ -3499,6 +3505,18 @@ fn boot_userspace_init() {
                 ("psched_smoke", narf_verification::NARF_PSCHED_SMOKE_ELF),
                 // Linux-compat round 20: futex2 wait/wake/requeue/waitv.
                 ("futex2_smoke", narf_verification::NARF_FUTEX2_SMOKE_ELF),
+                // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
+                ("keyring_smoke", narf_verification::NARF_KEYRING_SMOKE_ELF),
+                // Linux-compat round 22: inotify real event delivery.
+                ("inotify2_smoke", narf_verification::NARF_INOTIFY2_SMOKE_ELF),
+                // Linux-compat round 23: fanotify (init/mark + fd events).
+                ("fanotify_smoke", narf_verification::NARF_FANOTIFY_SMOKE_ELF),
+                // Linux-compat round 24: Landlock path-rule enforcement.
+                ("landlock_smoke", narf_verification::NARF_LANDLOCK_SMOKE_ELF),
+                // Linux-compat round 25: generic LSM self-attr syscalls.
+                ("lsm_smoke", narf_verification::NARF_LSM_SMOKE_ELF),
+                // vDSO: real fast-path linux-vdso.so.1 (clock_gettime).
+                ("vdso_smoke", narf_verification::NARF_VDSO_SMOKE_ELF),
                 // Wave-79: BusyBox static, built at workspace
                 // build time by `verification/busybox/build.rs`.
                 // Empty slice when the host lacked musl-gcc — the

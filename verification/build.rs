@@ -337,6 +337,12 @@ fn main() {
         "mem2_smoke",
         "psched_smoke",
         "futex2_smoke",
+        "keyring_smoke",
+        "inotify2_smoke",
+        "fanotify_smoke",
+        "landlock_smoke",
+        "lsm_smoke",
+        "vdso_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
@@ -370,6 +376,68 @@ fn main() {
         let upper = test.to_uppercase();
         println!("cargo:rustc-env=NARF_{upper}_ELF_X86_64={x86_path}");
         println!("cargo:rustc-env=NARF_{upper}_ELF_AARCH64=/dev/null");
+    }
+
+    // ── vDSO: real linux-vdso.so.1 for each arch ────────────────────
+    // A PIC shared object (clang + lld, no libc) the kernel maps into every
+    // process; its __vdso_* / __kernel_* functions read the CPU counter and
+    // the kernel-published vvar page to serve clock_gettime without a
+    // syscall. Built for BOTH arches (both are embedded via cfg in lib.rs).
+    // When clang/lld is absent the image is an empty placeholder and the
+    // kernel simply doesn't advertise a vDSO (libc falls back to syscalls).
+    {
+        let vdso_src = manifest_dir.join("data/vdso/vdso.c");
+        println!("cargo:rerun-if-changed={}", vdso_src.display());
+        let clang = which("clang");
+        let have_lld = which("ld.lld").is_some();
+        for (arch, triple) in [
+            ("X86_64", "x86_64-unknown-linux-gnu"),
+            ("AARCH64", "aarch64-unknown-linux-gnu"),
+        ] {
+            let lds = manifest_dir.join(format!("data/vdso/vdso_{}.lds", arch.to_lowercase()));
+            println!("cargo:rerun-if-changed={}", lds.display());
+            let path = match (&clang, have_lld) {
+                (Some(cc), true) => {
+                    let out = out_dir.join(format!("vdso_{}.so", arch.to_lowercase()));
+                    let o = Command::new(cc)
+                        .args([
+                            &format!("--target={triple}"),
+                            "-nostdlib",
+                            "-shared",
+                            "-fPIC",
+                            "-fno-stack-protector",
+                            "-fcf-protection=none",
+                            "-O2",
+                            "-ffreestanding",
+                        ])
+                        .arg(format!("-Wl,-T,{}", lds.display()))
+                        .args([
+                            "-Wl,--soname=linux-vdso.so.1",
+                            "-Wl,--no-undefined",
+                            "-Wl,-z,max-page-size=4096",
+                            "-Wl,--hash-style=both",
+                            "-Wl,-Bsymbolic",
+                            "-fuse-ld=lld",
+                        ])
+                        .arg(&vdso_src)
+                        .arg("-o")
+                        .arg(&out)
+                        .output();
+                    match o {
+                        Ok(o) if o.status.success() => out.display().to_string(),
+                        // clang IS present but the build broke — real bug.
+                        Ok(o) => panic!(
+                            "vdso: failed to build {arch} ({}):\n{}",
+                            vdso_src.display(),
+                            String::from_utf8_lossy(&o.stderr)
+                        ),
+                        Err(e) => panic!("vdso: could not invoke clang for {arch}: {e}"),
+                    }
+                }
+                _ => "/dev/null".to_string(),
+            };
+            println!("cargo:rustc-env=NARF_VDSO_ELF_{arch}={path}");
+        }
     }
 
     // ld-musl interpreter. Read from $LDMUSL_PATH if set, else

@@ -144,6 +144,8 @@ jobs:
             e2fsprogs \
             ovmf \
             musl-tools \
+            clang \
+            lld \
             linux-libc-dev
 
       - name: Cache cargo registry + git

@@ -51,7 +51,13 @@ pub mod handlers;
 pub mod init;
 pub mod interp;
 pub mod io_mux;
+#[cfg(feature = "linux-compat")]
+pub mod keyring;
+#[cfg(feature = "linux-compat")]
+pub mod landlock;
 pub mod loader;
+#[cfg(feature = "linux-compat")]
+pub mod lsm;
 #[cfg(feature = "linux-compat")]
 pub mod mqueue;
 #[cfg(feature = "container")]
@@ -72,6 +78,7 @@ pub mod sysvipc;
 #[cfg(target_arch = "x86_64")]
 pub mod tls;
 pub mod user_task;
+pub mod vdso;
 pub mod xdp_socket;
 
 mod mount_e2e_tests;
@@ -415,6 +422,9 @@ pub enum AuxEntry {
     Random(u64),
     /// Secure-execution flag (set-uid / set-gid context).
     Secure(bool),
+    /// Base address of the vDSO ELF header (`AT_SYSINFO_EHDR` = 33). libc
+    /// parses the vDSO from here to resolve `__vdso_*` / `__kernel_*`.
+    SysInfoEhdr(u64),
 }
 
 impl AuxEntry {
@@ -433,6 +443,7 @@ impl AuxEntry {
             AuxEntry::Hwcap(_) => 16,
             AuxEntry::Random(_) => 25,
             AuxEntry::Secure(_) => 23,
+            AuxEntry::SysInfoEhdr(_) => 33,
         }
     }
 }

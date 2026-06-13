@@ -749,13 +749,17 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // creation, route through the parent directory's `create()`. The
     // explicit-mount form is rare on the create path and not yet
     // wired; absolute paths are the supported entry.
+    let mut created = false;
     let ops = match ops {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
             match narf_filesystem::registry().resolve_parent_absolute(path, |_fs, parent, leaf| {
                 poll_blocking(parent.create(leaf))
             }) {
-                Some(Some(Ok(o))) => o,
+                Some(Some(Ok(o))) => {
+                    created = true;
+                    o
+                }
                 _ => {
                     ctx.set_return(fail);
                     return;
@@ -803,6 +807,14 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Landlock: a self-restricted task's open must be permitted by its
+    // active rulesets, else EACCES.
+    #[cfg(feature = "linux-compat")]
+    if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
+        ctx.set_return(denied);
+        return;
+    }
+
     // PTY clone-on-open: `/dev/ptmx` is a singleton FileOps that exists
     // only to be a lookup target; each `open()` allocates a fresh `Pty`
     // pair via `open_ptmx()` and installs the master here. Linux:
@@ -829,6 +841,16 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // inotify: record the fd's path (so a later write can fire IN_MODIFY)
+    // and emit IN_CREATE (new file) + IN_OPEN against any matching watch.
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::mqueue::register_fd_path(task, new_fd, path);
+        if created {
+            crate::mqueue::notify_create(path, false);
+        }
+        crate::mqueue::notify_open(path);
+    }
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
 
@@ -935,7 +957,12 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         }
     });
     match outcome {
-        Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),
+        Some(Ok(n)) => {
+            // inotify: a successful write is IN_MODIFY on the fd's file.
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_modify_fd(task, fd);
+            ctx.set_return(SyscallReturn::ok(n as u64));
+        }
         _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
@@ -1051,6 +1078,25 @@ fn sys_read(ctx: &mut dyn TrapContext) {
     // after the FileOps call, so FileOps never touches user memory.
     let mut kbuf = alloc::vec![0u8; len];
     let task = current_task_id();
+
+    // fanotify groups deliver fixed-size metadata records, each carrying a
+    // freshly-opened fd to the affected object. Installing that fd needs
+    // the fd-table lock — which the `with_table` block below holds across
+    // ops.read — so fanotify reads are handled here, before any lock is
+    // taken, to avoid a re-entrant deadlock.
+    #[cfg(feature = "linux-compat")]
+    if crate::mqueue::fanotify_active() {
+        if let Some(gid) = crate::mqueue::fanotify_instance_of(task, fd) {
+            let n = fanotify_read_into(task, gid, &mut kbuf);
+            // SAFETY: ptr validated above; AS still active.
+            match unsafe { copy_to_user(ptr, &kbuf[..n]) } {
+                Ok(()) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                Err(e) => ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64)),
+            }
+            return;
+        }
+    }
+
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
@@ -1077,6 +1123,54 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             }
         }
         _ => ctx.set_return(SyscallReturn::invalid_op()),
+    }
+}
+
+/// Drain a fanotify group's queued events into `buf` as
+/// `struct fanotify_event_metadata` records, opening a fresh fd to each
+/// affected object in `task`'s fd table. Called from sys_read with NO
+/// fd-table lock held (the install below needs it).
+#[cfg(feature = "linux-compat")]
+fn fanotify_read_into(task: u64, gid: u64, buf: &mut [u8]) -> usize {
+    let cap = buf.len() / crate::mqueue::FAN_EVENT_METADATA_LEN;
+    if cap == 0 {
+        return 0;
+    }
+    let events = crate::mqueue::fanotify_drain(gid, cap);
+    let mut written = 0usize;
+    for (path, mask, pid) in events {
+        let fd = fanotify_open_object(task, &path);
+        let meta = crate::mqueue::build_fan_metadata(mask, fd, pid);
+        buf[written..written + crate::mqueue::FAN_EVENT_METADATA_LEN].copy_from_slice(&meta);
+        written += crate::mqueue::FAN_EVENT_METADATA_LEN;
+    }
+    written
+}
+
+/// Resolve `abs` and install a fresh read fd for it in `task`'s table;
+/// returns the fd number, or FAN_NOFD (-1) on failure.
+#[cfg(feature = "linux-compat")]
+fn fanotify_open_object(task: u64, abs: &str) -> i32 {
+    let root_rel = narf_filesystem::registry()
+        .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
+    let (root, rel) = match root_rel {
+        Some(x) => x,
+        None => return -1,
+    };
+    let ops = match poll_blocking(narf_filesystem::resolve_async(root, &rel)) {
+        Some(Ok(o)) => o,
+        _ => return -1,
+    };
+    match fd::with_table(task, |t| {
+        t.open(fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    }) {
+        Some(n) => n as i32,
+        None => -1,
     }
 }
 
@@ -3321,7 +3415,11 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
             poll_blocking(parent.unlink(leaf))
         });
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_delete(&path, false);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3347,7 +3445,11 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.mkdir(leaf)));
     match outcome {
-        Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(_))) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_create(&path, true);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3366,7 +3468,11 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.rmdir(leaf)));
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_delete(&path, true);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3417,7 +3523,12 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
             poll_blocking(parent.rename(old_leaf, new_leaf))
         });
     match outcome {
-        Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(()))) => {
+            // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_moved(&old_path, &new_path);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -3775,6 +3886,13 @@ fn sys_close(ctx: &mut dyn TrapContext) {
                 map.remove(&(raw as usize));
             }
         }
+    }
+    // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
+    // then forget the fd → path mapping.
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::mqueue::notify_close_fd(task, fd);
+        crate::mqueue::forget_fd_path(task, fd);
     }
     let ok = fd::with_table(task, |t| t.close(fd)).unwrap_or(false);
     if ok {
@@ -12368,6 +12486,9 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let mono_ns = narf_scheduler::narf_time::monotonic_ns() as i128;
     let offset_ns = (target_ns - mono_ns) as i64;
     narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
+    // Republish the offset to the vDSO vvar so __vdso_clock_gettime
+    // (CLOCK_REALTIME) tracks the new wall time without a syscall.
+    crate::vdso::update_wall_offset(offset_ns);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -16738,6 +16859,66 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::InotifyRmWatch,
             "inotify_rm_watch",
             RawFnHandler(crate::mqueue::sys_inotify_rm_watch),
+        );
+        // Batch 23: fanotify — events delivered through the same fs_notify
+        // dispatch as inotify, each carrying an open fd to the object.
+        table.install_raw(
+            Syscall::FanotifyInit,
+            "fanotify_init",
+            RawFnHandler(crate::mqueue::sys_fanotify_init),
+        );
+        table.install_raw(
+            Syscall::FanotifyMark,
+            "fanotify_mark",
+            RawFnHandler(crate::mqueue::sys_fanotify_mark),
+        );
+        // Batch 24: Landlock — path-based access control, enforced at open.
+        table.install_raw(
+            Syscall::LandlockCreateRuleset,
+            "landlock_create_ruleset",
+            RawFnHandler(crate::landlock::sys_landlock_create_ruleset),
+        );
+        table.install_raw(
+            Syscall::LandlockAddRule,
+            "landlock_add_rule",
+            RawFnHandler(crate::landlock::sys_landlock_add_rule),
+        );
+        table.install_raw(
+            Syscall::LandlockRestrictSelf,
+            "landlock_restrict_self",
+            RawFnHandler(crate::landlock::sys_landlock_restrict_self),
+        );
+        // Batch 25: generic LSM self-attribute syscalls.
+        table.install_raw(
+            Syscall::LsmGetSelfAttr,
+            "lsm_get_self_attr",
+            RawFnHandler(crate::lsm::sys_lsm_get_self_attr),
+        );
+        table.install_raw(
+            Syscall::LsmSetSelfAttr,
+            "lsm_set_self_attr",
+            RawFnHandler(crate::lsm::sys_lsm_set_self_attr),
+        );
+        table.install_raw(
+            Syscall::LsmListModules,
+            "lsm_list_modules",
+            RawFnHandler(crate::lsm::sys_lsm_list_modules),
+        );
+        // Batch 21: keyrings — a real in-kernel key store.
+        table.install_raw(
+            Syscall::AddKey,
+            "add_key",
+            RawFnHandler(crate::keyring::sys_add_key),
+        );
+        table.install_raw(
+            Syscall::RequestKey,
+            "request_key",
+            RawFnHandler(crate::keyring::sys_request_key),
+        );
+        table.install_raw(
+            Syscall::Keyctl,
+            "keyctl",
+            RawFnHandler(crate::keyring::sys_keyctl),
         );
         // Batch 11: System V semaphores + message queues. These override
         // the container-only id-by-key `semget`/`msgget` (registered
