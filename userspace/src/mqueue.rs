@@ -482,6 +482,12 @@ pub(crate) fn forget_fd_path(task: u64, fd: u32) {
     });
 }
 
+/// Look up the absolute path an fd was opened on, if recorded. Used by
+/// `landlock_add_rule` to turn a `parent_fd` back into a path.
+pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
+    with_fd_paths(|m| m.get(&(task, fd)).cloned())
+}
+
 fn parent_and_base(abs: &str) -> (&str, &str) {
     match abs.rfind('/') {
         Some(0) => ("/", &abs[1..]),

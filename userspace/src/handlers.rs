@@ -807,6 +807,14 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Landlock: a self-restricted task's open must be permitted by its
+    // active rulesets, else EACCES.
+    #[cfg(feature = "linux-compat")]
+    if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
+        ctx.set_return(denied);
+        return;
+    }
+
     // PTY clone-on-open: `/dev/ptmx` is a singleton FileOps that exists
     // only to be a lookup target; each `open()` allocates a fresh `Pty`
     // pair via `open_ptmx()` and installs the master here. Linux:
@@ -16860,6 +16868,22 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::FanotifyMark,
             "fanotify_mark",
             RawFnHandler(crate::mqueue::sys_fanotify_mark),
+        );
+        // Batch 24: Landlock — path-based access control, enforced at open.
+        table.install_raw(
+            Syscall::LandlockCreateRuleset,
+            "landlock_create_ruleset",
+            RawFnHandler(crate::landlock::sys_landlock_create_ruleset),
+        );
+        table.install_raw(
+            Syscall::LandlockAddRule,
+            "landlock_add_rule",
+            RawFnHandler(crate::landlock::sys_landlock_add_rule),
+        );
+        table.install_raw(
+            Syscall::LandlockRestrictSelf,
+            "landlock_restrict_self",
+            RawFnHandler(crate::landlock::sys_landlock_restrict_self),
         );
         // Batch 21: keyrings — a real in-kernel key store.
         table.install_raw(

@@ -53,6 +53,8 @@ pub mod interp;
 pub mod io_mux;
 #[cfg(feature = "linux-compat")]
 pub mod keyring;
+#[cfg(feature = "linux-compat")]
+pub mod landlock;
 pub mod loader;
 #[cfg(feature = "linux-compat")]
 pub mod mqueue;

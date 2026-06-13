@@ -2091,6 +2091,18 @@ pub enum Syscall {
     /// `fanotify_mark(fd, flags, mask, dirfd, pathname)` — add/remove/flush
     /// a fanotify mark. Linux (x86_64=301, aarch64=263).
     FanotifyMark,
+
+    /// `landlock_create_ruleset(attr, size, flags)` — create a Landlock
+    /// ruleset fd. Linux (x86_64=444, aarch64=444).
+    LandlockCreateRuleset,
+
+    /// `landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags)` — add a
+    /// path_beneath rule. Linux (x86_64=445, aarch64=445).
+    LandlockAddRule,
+
+    /// `landlock_restrict_self(ruleset_fd, flags)` — apply a ruleset to the
+    /// calling task (irreversible). Linux (x86_64=446, aarch64=446).
+    LandlockRestrictSelf,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2269,6 +2281,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Keyctl, 250),
     (Syscall::FanotifyInit, 300),
     (Syscall::FanotifyMark, 301),
+    (Syscall::LandlockCreateRuleset, 444),
+    (Syscall::LandlockAddRule, 445),
+    (Syscall::LandlockRestrictSelf, 446),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2678,6 +2693,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Keyctl, 219),
     (Syscall::FanotifyInit, 262),
     (Syscall::FanotifyMark, 263),
+    (Syscall::LandlockCreateRuleset, 444),
+    (Syscall::LandlockAddRule, 445),
+    (Syscall::LandlockRestrictSelf, 446),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
