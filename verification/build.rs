@@ -333,6 +333,7 @@ fn main() {
         "xattr2_smoke",
         "fsmisc_smoke",
         "creds2_smoke",
+        "sig2_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

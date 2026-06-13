@@ -900,6 +900,9 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                     (info_p.add(4) as *mut i32).write_unaligned(0);
                     (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
                     (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
+                    // _sifields._rt.si_sigval (sigqueue payload). Unused by
+                    // non-queued signals, so writing 0 there is harmless.
+                    (info_p.add(24) as *mut u64).write_unaligned(params.si_value);
                     core::ptr::write_volatile(uctx_vaddr as *mut UContext, uctx);
                 });
             }
@@ -1339,6 +1342,7 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
         restartable_syscall: true,
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -1388,6 +1392,7 @@ fn smoke_x86_64_sa_restart_clear_does_not_rewind() -> TestResult {
         restartable_syscall: true,
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -1425,6 +1430,7 @@ fn smoke_x86_64_sa_restart_non_restartable_syscall() -> TestResult {
         restartable_syscall: false, // e.g. nanosleep — never restarts
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -1463,6 +1469,7 @@ fn smoke_x86_64_sa_onstack_uses_altstack_top() -> TestResult {
         restartable_syscall: false,
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -1505,6 +1512,7 @@ fn smoke_x86_64_sa_onstack_no_altstack_falls_back() -> TestResult {
         restartable_syscall: false,
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -1543,6 +1551,7 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
         restartable_syscall: false,
         si_code: 2, // SEGV_ACCERR
         si_addr: 0xBAD_AAAA,
+        si_value: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);

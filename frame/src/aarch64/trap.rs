@@ -574,6 +574,9 @@ impl<'a> TrapContext for Aarch64TrapContext<'a> {
                 (info_p.add(4) as *mut i32).write_unaligned(0);
                 (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
                 (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
+                // _sifields._rt.si_sigval (sigqueue payload). Unused by
+                // non-queued signals, so writing 0 there is harmless.
+                (info_p.add(24) as *mut u64).write_unaligned(params.si_value);
                 core::ptr::write_volatile(uctx_vaddr as *mut AArch64UContext, uctx);
             }
 
@@ -940,6 +943,7 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
         restartable_syscall: true,
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     // Set SP_EL0 to the scratch buffer top so deliver_signal has a
@@ -1020,6 +1024,7 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
         restartable_syscall: false,
         si_code: 0,
         si_addr: 0,
+        si_value: 0,
     };
 
     let prior_sp: u64;
@@ -1091,6 +1096,7 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
         restartable_syscall: false,
         si_code: 1, // SEGV_MAPERR
         si_addr: 0xDEAD_AAAA,
+        si_value: 0,
     };
 
     let prior_sp: u64;

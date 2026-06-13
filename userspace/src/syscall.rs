@@ -265,6 +265,12 @@ pub struct SigDeliveryParams {
     /// 0 for async signals where it has no meaning. The arch
     /// only writes this when `SA_SIGINFO` is set.
     pub si_addr: u64,
+    /// `si_value` (the `sigval` union) for queued signals
+    /// (`rt_sigqueueinfo` / `sigqueue`). 0 for everything else. The arch
+    /// writes it at the `_sifields._rt.si_sigval` offset (24) of the
+    /// user `siginfo_t` when `SA_SIGINFO` is set; harmless for other
+    /// signals since that union slot is unused by them.
+    pub si_value: u64,
 }
 
 // ── Numbers ─────────────────────────────────────────────────────────
@@ -1992,6 +1998,14 @@ pub enum Syscall {
     /// `setfsgid(fsgid)` — set filesystem gid, return the previous one.
     /// Linux (x86_64=123, aarch64=152).
     Setfsgid,
+
+    /// `rt_sigqueueinfo(pid, sig, info)` — queue a signal (with siginfo)
+    /// to a process. Linux (x86_64=129, aarch64=138).
+    RtSigqueueinfo,
+
+    /// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue a signal to a
+    /// specific thread. Linux (x86_64=297, aarch64=240).
+    RtTgsigqueueinfo,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2147,6 +2161,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setregid, 114),
     (Syscall::Setfsuid, 122),
     (Syscall::Setfsgid, 123),
+    (Syscall::RtSigqueueinfo, 129),
+    (Syscall::RtTgsigqueueinfo, 297),
+    // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
+    // map it to the same handler so signalfd is reachable on x86_64.
+    (Syscall::Signalfd, 289),
     (Syscall::SocketSetSockOpt, 54),
     (Syscall::SocketGetSockOpt, 55),
     (Syscall::Clone, 56),
@@ -2531,6 +2550,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setregid, 143),
     (Syscall::Setfsuid, 151),
     (Syscall::Setfsgid, 152),
+    (Syscall::RtSigqueueinfo, 138),
+    (Syscall::RtTgsigqueueinfo, 240),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
@@ -3056,6 +3077,8 @@ mod sigframe {
             siginfo[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
             siginfo[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
             siginfo[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
+            // _sifields._rt.si_sigval (sigqueue payload) at offset 24.
+            siginfo[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
 
             // SAFETY: the active CR3 is the trapping task's; copy_to_user
             // brackets the writes with SMAP and faults user-side on a

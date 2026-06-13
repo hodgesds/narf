@@ -92,7 +92,16 @@ impl FileOps for SignalFdFile {
             buf[..SIGNALFD_SIGINFO_LEN].fill(0);
             // ssi_signo: u32 at offset 0.
             buf[..4].copy_from_slice(&signum.to_le_bytes());
-            // ssi_errno (offset 4) and ssi_code (offset 8) left 0.
+            // ssi_errno (offset 4) left 0. If this instance was queued via
+            // rt_sigqueueinfo/sigqueue, surface its payload: ssi_code @8,
+            // ssi_int @44 (sival_int), ssi_ptr @48 (sival_ptr).
+            if let Some((si_code, si_value)) =
+                crate::handlers::take_sigqueue_info(self.owner_task, signum)
+            {
+                buf[8..12].copy_from_slice(&si_code.to_le_bytes());
+                buf[44..48].copy_from_slice(&(si_value as u32).to_le_bytes());
+                buf[48..56].copy_from_slice(&si_value.to_le_bytes());
+            }
             crate::handlers::clear_signal_pending(self.owner_task, signum);
             Ok(SIGNALFD_SIGINFO_LEN)
         })
