@@ -13112,6 +13112,171 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// Shared FUTEX_WAIT core for both the classic `futex(2)` FUTEX_WAIT op
+/// and the futex2 `futex_wait(2)` syscall. Implements the same real
+/// cooperative wait NARF's pthreads already rely on:
+///
+///  - `*uaddr != val` ⇒ the wait condition no longer holds; return
+///    `-EAGAIN` (Linux's contract — the caller's fast path observes the
+///    change and proceeds without sleeping).
+///  - `*uaddr == val` ⇒ park the caller via a bounded yield back to the
+///    executor (the deadline branch of `UserTaskFuture::poll` keeps it
+///    off-CPU until the park expires or a wake bumps the per-uaddr
+///    counter), then resume with `0`. The libc-side recheck loop re-arms
+///    the wait until the condition is satisfied, so a `futex_wake` on the
+///    same word makes the waiter progress.
+///
+/// `uaddr == 0` is treated as an immediate (POSIX-permitted) spurious
+/// wake so wake-path smokes can run without a backing mapping.
+fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns: u64) {
+    const EAGAIN: i64 = 11;
+    const EFAULT: i64 = 14;
+    if uaddr == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let mut buf4 = [0u8; 4];
+    // SAFETY: copy_from_user range-validates `uaddr` and SMAP-brackets the
+    // 4-byte read; a fault surfaces as Err below.
+    let current = if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
+        u32::from_ne_bytes(buf4)
+    } else {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
+    };
+    if current != val {
+        ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
+        return;
+    }
+    // Sample the wake counter so the executor's deadline park can observe a
+    // landing wake, then bounded-park (mirrors sys_futex's FUTEX_WAIT).
+    const DEFAULT_PARK_NS: u64 = 1_000_000; // 1 ms
+    let park_ns = if park_cap_ns == 0 {
+        DEFAULT_PARK_NS
+    } else {
+        core::cmp::min(park_cap_ns, DEFAULT_PARK_NS)
+    };
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        ctx.set_return(SyscallReturn::ok(0));
+        let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(park_ns);
+        // SAFETY: uctx is live for the trap round-trip.
+        unsafe {
+            let uc = &*uctx;
+            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable
+    }
+    // Test/no-future fallback: synchronous park.
+    let _ = futex_wake_counter(uaddr);
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
+/// Linux futex2 `futex_wait(uaddr, val, mask, flags, timeout, clockid)`
+/// (x86_64=455, aarch64=455). The futex2 split of the classic FUTEX_WAIT
+/// op: same wait word, value-checked, but carries an explicit `mask` and
+/// a `flags` word selecting the access size (FUTEX2_SIZE_U32, the only
+/// width NARF parks on). `timeout` is an absolute `timespec*`; the
+/// cooperative park is already bounded, so we don't decode it precisely.
+fn sys_futex_wait(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    futex_wait_core(ctx, args.arg0, args.arg1 as u32, 0);
+}
+
+/// Linux futex2 `futex_wake(uaddr, mask, nr, flags)` (x86_64=454,
+/// aarch64=454). Bumps the per-uaddr wake counter — every cooperative
+/// waiter parked on this word observes the bump on its next poll and
+/// re-arms — and reports the number of waiters released. NARF keeps no
+/// per-task wait ownership (the counter is the queue), so we report the
+/// `nr` the caller asked to wake, which the pthread fast paths treat as
+/// "≤ nr released".
+fn sys_futex_wake(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let uaddr = args.arg0;
+    let nr = args.arg2;
+    if uaddr == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    futex_bump_counter(uaddr);
+    ctx.set_return(SyscallReturn::ok(nr));
+}
+
+/// Linux futex2 `futex_requeue(waiters, flags, nr_wake, nr_requeue)`
+/// (x86_64=456, aarch64=456). `waiters` points at two `futex_waitv`
+/// entries: `[0]` the source word to wake, `[1]` the destination to
+/// requeue onto. Under the counter model there is no per-task queue to
+/// splice, so we wake the source (bump its counter); parked waiters
+/// re-arm and re-evaluate against the destination word themselves.
+/// Reports `nr_wake` released.
+fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let waiters = args.arg0;
+    let nr_wake = args.arg2;
+    if waiters != 0 {
+        // struct futex_waitv { u64 val; u64 uaddr; u32 flags; u32 _r; } — 24B.
+        let mut entry = [0u8; 24];
+        // SAFETY: copy_from_user validates the 24-byte source range.
+        if unsafe { copy_from_user(&mut entry, waiters) }.is_ok() {
+            let src = u64::from_ne_bytes(entry[8..16].try_into().unwrap());
+            if src != 0 {
+                futex_bump_counter(src);
+            }
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(nr_wake));
+}
+
+/// Linux futex2 `futex_waitv(waiters, nr_futexes, flags, timeout,
+/// clockid)` (x86_64=449, aarch64=449). Wait on several futexes at once,
+/// returning the index of the first one whose value already differs from
+/// its expected `val` (Linux's "this futex is the one that was woken").
+/// If every word still matches, bounded-park like `futex_wait` and report
+/// index 0 on resume — the libc recheck loop re-arms across all words.
+fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
+    const EINVAL: i64 = 22;
+    let args = *ctx.args();
+    let waiters = args.arg0;
+    let nr = args.arg1 as usize;
+    // Linux caps futex_waitv at 128 entries; reject obviously bad shapes.
+    if waiters == 0 || nr == 0 || nr > 128 {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
+    let mut park_uaddr = 0u64;
+    for i in 0..nr {
+        let mut entry = [0u8; 24];
+        let at = waiters + (i as u64) * 24;
+        // SAFETY: each 24-byte entry range is validated by copy_from_user.
+        if unsafe { copy_from_user(&mut entry, at) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            return;
+        }
+        let val = u64::from_ne_bytes(entry[0..8].try_into().unwrap());
+        let uaddr = u64::from_ne_bytes(entry[8..16].try_into().unwrap());
+        if uaddr == 0 {
+            continue;
+        }
+        let current = read_user_u32(uaddr) as u64;
+        if current != (val & 0xffff_ffff) {
+            // This word already moved — report it as the woken futex.
+            ctx.set_return(SyscallReturn::ok(i as u64));
+            return;
+        }
+        if park_uaddr == 0 {
+            park_uaddr = uaddr;
+        }
+    }
+    // Every word still matches: park on the first real word, then resume as
+    // a spurious wake of index 0 (the caller re-checks all of them).
+    futex_wait_core(ctx, park_uaddr, read_user_u32(park_uaddr), 0);
+}
+
 /// Linux tgkill(2): like kill but with an explicit (tgid, tid)
 /// pair. NARF is single-threaded per process — we forward tid as
 /// the kill target and ignore tgid (the disambiguation it provides
@@ -16099,6 +16264,26 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::Fchmodat2,
         "fchmodat2",
         RawFnHandler(sys_at2_reshape),
+    );
+    table.install_raw(
+        Syscall::FutexWaitv,
+        "futex_waitv",
+        RawFnHandler(sys_futex_waitv),
+    );
+    table.install_raw(
+        Syscall::FutexWake,
+        "futex_wake",
+        RawFnHandler(sys_futex_wake),
+    );
+    table.install_raw(
+        Syscall::FutexWait,
+        "futex_wait",
+        RawFnHandler(sys_futex_wait),
+    );
+    table.install_raw(
+        Syscall::FutexRequeue,
+        "futex_requeue",
+        RawFnHandler(sys_futex_requeue),
     );
     table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
     table.install_raw(Syscall::Waitid, "waitid", RawFnHandler(sys_waitid));

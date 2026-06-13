@@ -2054,6 +2054,22 @@ pub enum Syscall {
     /// `fchmodat2(dirfd, path, mode, flags)` — fchmodat with a flags
     /// word. Linux (x86_64=452, aarch64=452).
     Fchmodat2,
+
+    /// `futex_waitv(waiters, nr_futexes, flags, timeout, clockid)` — wait
+    /// on several futexes at once. Linux (x86_64=449, aarch64=449).
+    FutexWaitv,
+
+    /// `futex_wake(uaddr, mask, nr, flags)` — futex2 wake.
+    /// Linux (x86_64=454, aarch64=454).
+    FutexWake,
+
+    /// `futex_wait(uaddr, val, mask, flags, timeout, clockid)` — futex2
+    /// wait. Linux (x86_64=455, aarch64=455).
+    FutexWait,
+
+    /// `futex_requeue(waiters, flags, nr_wake, nr_requeue)` — futex2
+    /// requeue. Linux (x86_64=456, aarch64=456).
+    FutexRequeue,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2223,6 +2239,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Rseq, 334),
     (Syscall::Faccessat2, 439),
     (Syscall::Fchmodat2, 452),
+    (Syscall::FutexWaitv, 449),
+    (Syscall::FutexWake, 454),
+    (Syscall::FutexWait, 455),
+    (Syscall::FutexRequeue, 456),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2623,6 +2643,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Rseq, 293),
     (Syscall::Faccessat2, 439),
     (Syscall::Fchmodat2, 452),
+    (Syscall::FutexWaitv, 449),
+    (Syscall::FutexWake, 454),
+    (Syscall::FutexWait, 455),
+    (Syscall::FutexRequeue, 456),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
