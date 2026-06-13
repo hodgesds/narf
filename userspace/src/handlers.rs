@@ -10945,6 +10945,91 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::invalid_op());
 }
 
+/// A `TrapContext` proxy that overrides the syscall args while forwarding
+/// the return + control-flow hooks to the wrapped context. Used by the
+/// `*at`/`*at2` reshapers to call an existing handler with a different
+/// argument layout.
+struct ArgReshape<'a> {
+    inner: &'a mut dyn TrapContext,
+    args: SyscallArgs,
+}
+impl<'a> TrapContext for ArgReshape<'a> {
+    fn args(&self) -> &SyscallArgs {
+        &self.args
+    }
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.inner.set_return(ret);
+    }
+    fn user_rsp(&self) -> u64 {
+        self.inner.user_rsp()
+    }
+    fn rip(&self) -> u64 {
+        0
+    }
+    fn set_rip(&mut self, _rip: u64) {}
+    fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
+        self.inner.redirect_to_kernel(rip, rsp)
+    }
+}
+
+/// `execveat(dirfd, path, argv, envp, flags)` — execve relative to a
+/// dirfd. NARF resolves absolute paths (and AT_FDCWD) only, so the dirfd
+/// and flags are dropped and the call is forwarded to `sys_execve` with
+/// the `(path, argv, envp)` layout it expects.
+fn sys_execveat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let proxy_args = SyscallArgs {
+        arg0: a.arg1, // path
+        arg1: a.arg2, // argv
+        arg2: a.arg3, // envp
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    let mut proxy = ArgReshape {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_execve(&mut proxy);
+}
+
+/// `faccessat2(dirfd, path, mode, flags)` / `fchmodat2(dirfd, path, mode,
+/// flags)` — both reshape the Linux NUL-terminated `path` into the NARF
+/// `(dirfd, path_ptr, path_len)` shape and forward to the shared
+/// existence-checking handler (mode/flags are accepted but not enforced).
+fn sys_at2_reshape(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let path_len = match copy_user_cstr(a.arg1, 4096) {
+        Some(s) => s.len(),
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    let proxy_args = SyscallArgs {
+        arg0: a.arg0, // dirfd
+        arg1: a.arg1, // path ptr
+        arg2: path_len as u64,
+        arg3: 0,
+        arg4: 0,
+        arg5: 0,
+    };
+    let mut proxy = ArgReshape {
+        inner: ctx,
+        args: proxy_args,
+    };
+    sys_fchmodat_or_fchownat(&mut proxy);
+}
+
+/// `rseq(rseq, len, flags, sig)` — register/unregister a restartable-
+/// sequence area. NARF is a cooperative single-CPU kernel with no
+/// preemption mid-sequence, so there is nothing to restart; accept the
+/// registration (glibc registers rseq at thread start and expects
+/// success or a clean ENOSYS).
+fn sys_rseq(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 /// Parse a NUL-separated user-supplied string pack into a Vec of
 /// kernel-owned `String`s. Returns Err on any UTF-8 violation,
 /// pointer issue, or pack-too-long-without-terminator condition.
@@ -16001,6 +16086,20 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_migrate_pages),
     );
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
+    // Batch 19: process & scheduling.
+    table.install_raw(Syscall::Vfork, "vfork", RawFnHandler(sys_fork));
+    table.install_raw(Syscall::Execveat, "execveat", RawFnHandler(sys_execveat));
+    table.install_raw(Syscall::Rseq, "rseq", RawFnHandler(sys_rseq));
+    table.install_raw(
+        Syscall::Faccessat2,
+        "faccessat2",
+        RawFnHandler(sys_at2_reshape),
+    );
+    table.install_raw(
+        Syscall::Fchmodat2,
+        "fchmodat2",
+        RawFnHandler(sys_at2_reshape),
+    );
     table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
     table.install_raw(Syscall::Waitid, "waitid", RawFnHandler(sys_waitid));
     table.install_raw(Syscall::Mount, "mount", RawFnHandler(sys_mount));

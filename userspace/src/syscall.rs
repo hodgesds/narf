@@ -2034,6 +2034,26 @@ pub enum Syscall {
     /// `migrate_pages(pid, maxnode, old_nodes, new_nodes)` — migrate a
     /// process's pages between node sets. Linux (x86_64=256, aarch64=238).
     MigratePages,
+
+    /// `vfork()` — like fork; NARF aliases it to fork (a well-behaved
+    /// vfork child only execs or _exits). Linux (x86_64=58).
+    Vfork,
+
+    /// `execveat(dirfd, path, argv, envp, flags)` — execve relative to a
+    /// dirfd. Linux (x86_64=322, aarch64=281).
+    Execveat,
+
+    /// `rseq(rseq, len, flags, sig)` — register a restartable-sequence
+    /// area. Linux (x86_64=334, aarch64=293).
+    Rseq,
+
+    /// `faccessat2(dirfd, path, mode, flags)` — faccessat with a flags
+    /// word. Linux (x86_64=439, aarch64=439).
+    Faccessat2,
+
+    /// `fchmodat2(dirfd, path, mode, flags)` — fchmodat with a flags
+    /// word. Linux (x86_64=452, aarch64=452).
+    Fchmodat2,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2198,6 +2218,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MovePages, 279),
     (Syscall::SetMempolicyHomeNode, 450),
     (Syscall::MigratePages, 256),
+    (Syscall::Vfork, 58),
+    (Syscall::Execveat, 322),
+    (Syscall::Rseq, 334),
+    (Syscall::Faccessat2, 439),
+    (Syscall::Fchmodat2, 452),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2594,6 +2619,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::MovePages, 239),
     (Syscall::SetMempolicyHomeNode, 450),
     (Syscall::MigratePages, 238),
+    (Syscall::Execveat, 281),
+    (Syscall::Rseq, 293),
+    (Syscall::Faccessat2, 439),
+    (Syscall::Fchmodat2, 452),
     (Syscall::Brk, 214),
     (Syscall::Munmap, 215),
     (Syscall::Clone, 220),
