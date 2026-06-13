@@ -14368,8 +14368,10 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
     // the kill(pid=0) target; drop any lookup an earlier test leaked.
     crate::handlers::__test_reset_task_id_lookup();
 
-    // Mask = SIGUSR1 only (signum 10 = 1<<10).
-    let mask: u64 = 1u64 << 10;
+    // Mask = SIGUSR1 only. A userspace sigset_t puts signal N at bit
+    // (N-1) — sys_signalfd shifts `<< 1` to align with NARF's internal
+    // bit-N pending convention. So SIGUSR1 (10) is bit 9 here.
+    let mask: u64 = 1u64 << 9;
     let mask_bytes = mask.to_le_bytes();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -14481,8 +14483,10 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     // the kill(pid=0) target; drop any lookup an earlier test leaked.
     crate::handlers::__test_reset_task_id_lookup();
 
-    // Create signalfd watching SIGUSR2 (signum 12).
-    let mask: u64 = 1u64 << 12;
+    // Create signalfd watching SIGUSR2 (signum 12). Userspace sigset_t
+    // puts signal N at bit (N-1); sys_signalfd shifts `<< 1` to align
+    // with NARF's internal bit-N pending convention. So SIGUSR2 is bit 11.
+    let mask: u64 = 1u64 << 11;
     let mask_bytes = mask.to_le_bytes();
     let mut ctx = FakeCtx {
         args: SyscallArgs {

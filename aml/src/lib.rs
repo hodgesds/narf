@@ -279,6 +279,11 @@ static BOOT_PNP0C50_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::A
 /// re-walking the namespace each paint.
 static BOOT_I2C_CTRL_CHILDREN_COUNT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+/// Number of `OpRegion`s registered by the boot-time `parse_namespace`.
+/// Captured once in `capture_boot_snapshot` because later tests call
+/// `oregion::__reset_for_test()`, which clears the live `REGIONS`
+/// table and never repopulates it from the boot DSDT/SSDTs.
+static BOOT_OPREGION_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Capture the current namespace counts as the boot-time snapshot.
 /// Idempotent — first non-zero value sticks. Boot calls this after
@@ -358,10 +363,15 @@ pub fn capture_boot_snapshot() {
             pnp_n += 1;
         }
     }
+    let mut oregion_n = 0u32;
+    crate::oregion::for_each_region(|_| {
+        oregion_n += 1;
+    });
     BOOT_NODE_COUNT.store(n, core::sync::atomic::Ordering::Release);
     BOOT_DEVICE_COUNT.store(d, core::sync::atomic::Ordering::Release);
     BOOT_I2C_CTRL_COUNT.store(i2c_n, core::sync::atomic::Ordering::Release);
     BOOT_PNP0C50_COUNT.store(pnp_n, core::sync::atomic::Ordering::Release);
+    BOOT_OPREGION_COUNT.store(oregion_n, core::sync::atomic::Ordering::Release);
 }
 
 /// Real-HW bring-up diagnostic. Walks every AMDI* / AMD0* controller
@@ -579,6 +589,15 @@ pub fn boot_i2c_ctrl_count() -> u32 {
 /// Lock-free boot-snapshot count of PNP0C50 (HID-over-I2C) devices.
 pub fn boot_pnp0c50_count() -> u32 {
     BOOT_PNP0C50_COUNT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Lock-free boot-snapshot count of `OpRegion`s registered by the
+/// boot-time `parse_namespace`. The live `oregion::REGIONS` table is
+/// reset by later tests; this snapshot is the only reliable witness
+/// that the boot DSDT/SSDT parse registered any regions. `0` until
+/// `capture_boot_snapshot` runs.
+pub fn boot_opregion_count() -> u32 {
+    BOOT_OPREGION_COUNT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Lock-free count of direct children under any matched designware I2C
