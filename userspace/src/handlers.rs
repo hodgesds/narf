@@ -13205,21 +13205,6 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// Per-task bitmask of signals that should be delivered *preemptively* —
-/// on a timer-IRQ return to user, even to a task spinning in a tight loop
-/// with no syscalls — rather than only at the cooperative yield points
-/// the normal (deferred) delivery uses. Set by the timer ISR when it
-/// raises a timer-driven signal (e.g. SIGALRM from ITIMER_REAL).
-///
-/// This is the surgical boundary that lets preemptive delivery coexist
-/// with NARF's deliberately-deferred handled-signal delivery: a signal
-/// raised by `kill`/`tkill` is NOT eager, so the `tkill(self); pause()`
-/// pattern still parks-then-delivers (signal_smoke depends on this). Only
-/// eager (and unhandled-fatal) signals jump the queue. See
-/// [[narf-syscall-path-signal-delivery]].
-pub(crate) static EAGER_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
 /// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
 /// sigqueue: `(task, signum) -> (si_code, si_value)`. The pending bitmask
 /// in `SIGNAL_PENDING` collapses duplicates, so standard signals coalesce
@@ -13287,7 +13272,6 @@ fn sigreturn_use_rsp(task: u64) -> bool {
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
-    *EAGER_PENDING.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -13296,7 +13280,6 @@ pub fn signal_init() {
 #[doc(hidden)]
 pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
-    *EAGER_PENDING.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -13747,9 +13730,6 @@ pub fn ensure_signal_pending_slot(task: u64) {
     if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
         map.entry(task).or_insert(0);
     }
-    if let Some(map) = EAGER_PENDING.lock().as_mut() {
-        map.entry(task).or_insert(0);
-    }
 }
 
 /// Alloc-free, IRQ-safe variant of `raise_signal_pending`: OR the
@@ -13782,8 +13762,7 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
 /// CPU-bound task that never parks still receives e.g. SIGALRM from
 /// `alarm()` / `setitimer(ITIMER_REAL)`. Alloc-free — safe to call with
 /// interrupts disabled from the trap handler. The raised signal is then
-/// delivered by the preemptive `signal_delivery_hook` on the same trap's
-/// return to user mode.
+/// delivered by `signal_delivery_hook` on the same trap's return to user.
 pub fn timer_tick_raise_due_signals() {
     let task = current_task_id();
     if task == 0 {
@@ -13793,109 +13772,11 @@ pub fn timer_tick_raise_due_signals() {
     {
         let now = narf_scheduler::narf_time::monotonic_ns();
         if crate::posix_timer::itimer_real_check_due_irq(task, now) {
-            // SIGALRM (14). Slot was pre-created when the timer was armed.
-            if raise_signal_pending_irq(task, 14) {
-                // Mark it eager so the preemptive-delivery path will hand
-                // it to a CPU-bound (never-parking) task on this same trap
-                // return. A handled SIGALRM is otherwise deferred.
-                mark_signal_eager_irq(task, 14);
-            }
+            // SIGALRM (14). Slot was pre-created when the timer was armed;
+            // the full timer-IRQ delivery hook takes it on this trap return.
+            let _ = raise_signal_pending_irq(task, 14);
         }
     }
-}
-
-/// Alloc-free, IRQ-safe: mark `signum` for preemptive (eager) delivery
-/// on `task` by ORing into its EAGER_PENDING entry. No-op if the entry
-/// isn't pre-created (callers pair with `ensure_signal_pending_slot`).
-pub fn mark_signal_eager_irq(task: u64, signum: u32) {
-    if signum >= 32 {
-        return;
-    }
-    if let Some(map) = EAGER_PENDING.lock().as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
-            *slot |= 1u32 << signum;
-        }
-    }
-}
-
-/// Read `task`'s eager (preemptively-deliverable) signal bitmask.
-fn eager_pending_bits(task: u64) -> u32 {
-    EAGER_PENDING
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(0)
-}
-
-/// Drop eager marks for signals that are no longer pending on `task`
-/// (delivered or consumed), so a delivered eager signal isn't retried.
-fn prune_eager_to_pending(task: u64) {
-    let pending = signal_pending_of(task);
-    if let Some(map) = EAGER_PENDING.lock().as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
-            *slot &= pending;
-        }
-    }
-}
-
-/// Preemptive signal delivery for the timer-IRQ return path. Unlike the
-/// general `default_signal_delivery` (which would deliver ANY deliverable
-/// pending signal and thus break the deferred `tkill(self); pause()`
-/// contract that signal_smoke relies on — see
-/// [[narf-syscall-path-signal-delivery]]), this delivers only signals
-/// that legitimately preempt a CPU-bound task: eager-marked signals
-/// (timer-driven, e.g. SIGALRM); and unhandled fatal signals (no user
-/// handler installed and the default action is Terminate/CoreDump —
-/// SIGKILL, SIGTERM — so a spinning task can still be killed).
-///
-/// A handled, non-eager signal (the signal_smoke case) stays pending and
-/// is delivered later at a cooperative yield point.
-///
-/// Returns true if a signal was delivered. May not return at all when the
-/// delivered signal's default action terminates the task (longjmp).
-pub fn deliver_preemptible_signals(ctx: &mut dyn TrapContext) -> bool {
-    if !ctx.returning_to_user() {
-        return false;
-    }
-    let task = current_task_id();
-    if task == 0 {
-        return false;
-    }
-    let pending = signal_pending_of(task);
-    if pending == 0 {
-        return false;
-    }
-    let deliverable = pending & !signal_mask_of(task);
-    if deliverable == 0 {
-        return false;
-    }
-    // Compute the preemptible subset: eager OR (no handler AND fatal
-    // default action). Leave job-control Stop/Continue and Ignore to the
-    // existing deferred / deliver_pending_stop paths.
-    let eager = eager_pending_bits(task);
-    let mut fatal_unhandled = 0u32;
-    let mut bits = deliverable & !eager;
-    while bits != 0 {
-        let s = bits.trailing_zeros();
-        bits &= bits - 1;
-        if sigaction_lookup_full(task, s as usize).is_none()
-            && matches!(
-                default_signal_action(s),
-                DefaultAction::Terminate | DefaultAction::CoreDump
-            )
-        {
-            fatal_unhandled |= 1u32 << s;
-        }
-    }
-    let restrict = (eager | fatal_unhandled) & deliverable;
-    if restrict == 0 {
-        return false;
-    }
-    let delivered = default_signal_delivery_restricted(ctx, SYSCALL_NUM_NONE, restrict);
-    if delivered {
-        prune_eager_to_pending(task);
-    }
-    delivered
 }
 
 /// Preemptive time-slice: hand a CPU-bound user task back to the
