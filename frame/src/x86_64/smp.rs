@@ -180,6 +180,28 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         super::idt::load_idtr_ap();
     }
 
+    // 2a. Per-CPU user-mode entry setup. Each AP gets its OWN GDT+TSS
+    //     so a user→kernel trap (page fault, timer preemption, IST
+    //     fault) lands on this CPU's kernel stack — the BSP's shared
+    //     TSS.rsp0 would corrupt under two CPUs trapping concurrently.
+    //     Then a per-AP PerCpu (so the SYSCALL stub's `gs:8` kernel-
+    //     stack lookup resolves per-CPU) and the SYSCALL MSRs
+    //     (LSTAR/STAR/FMASK/EFER.SCE — programmed per-CPU). Without
+    //     this an AP cannot run user tasks: a `syscall` would #UD or
+    //     jump to a stale LSTAR, and a fault would triple-fault on a
+    //     null TR. Order mirrors the BSP `init_traps`: gdt → percpu
+    //     → syscall (gdt::init_ap reloads `gs`, zeroing GS.base, so
+    //     percpu::init_ap must follow to restore the per-CPU pointer).
+    //     IRQs are still masked here (enabled at step 4b), so the
+    //     LGDT/LTR window can't be interrupted before TR is valid.
+    // SAFETY: kernel mode, IRQs masked, global allocator up (heap was
+    // promoted to slab before start_aps); runs exactly once per AP.
+    unsafe {
+        let rsp0_top = super::gdt::init_ap();
+        super::percpu::init_ap(id, rsp0_top);
+        super::syscall::enable();
+    }
+
     // 3. Per-CPU LAPIC bring-up: enable x2APIC + spurious vector +
     //    mask the timer LVT until the scheduler asks for it.
     // SAFETY: x2APIC is BSP-confirmed via CPUID; this AP just turns

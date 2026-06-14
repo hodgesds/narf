@@ -16,6 +16,12 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+// Pull `alloc` into the crate's extern prelude so `alloc::` paths
+// resolve in every module (the per-arch `bare::x86_64` modules
+// heap-allocate per-CPU GDT/TSS/PerCpu blocks during AP bring-up).
+#[cfg(target_os = "none")]
+extern crate alloc;
+
 #[cfg(target_os = "none")]
 #[path = "bare_main.rs"]
 mod bare;

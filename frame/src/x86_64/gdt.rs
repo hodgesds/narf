@@ -264,6 +264,127 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// Per-AP GDT + TSS + trap stacks, heap-allocated and leaked for the
+/// lifetime of the system. Each AP that will run user tasks needs its
+/// *own* TSS so a user→kernel trap (page fault, timer preemption,
+/// IST fault) lands on this CPU's kernel stack rather than the shared
+/// BSP `TSS.rsp0` — two CPUs trapping onto one stack would corrupt
+/// each other. The GDT is a per-CPU copy because the TSS descriptor
+/// encodes the (per-CPU) TSS base address.
+#[repr(C, align(16))]
+struct ApCpuBlock {
+    gdt: [u64; 7],
+    tss: Tss,
+    rsp0_stack: [u8; KERNEL_RSP0_BYTES],
+    ist_stacks: [[u8; IST_STACK_BYTES]; 4],
+}
+
+/// Install a per-AP GDT + TSS on the calling CPU. Allocates this AP's
+/// own `ApCpuBlock` (leaked — lives forever), points `TSS.rsp0` and
+/// the four IST entries at this CPU's stacks, then `LGDT` + reloads
+/// the data segments + `LTR`. Returns the top of this CPU's `rsp0`
+/// stack so the caller can mirror it into `PerCpu.kernel_stack_top`
+/// for the SYSCALL entry path (which reads `gs:8`, not `TSS.rsp0`).
+///
+/// Mirrors [`init`] but writes a freshly-allocated per-CPU block
+/// instead of the BSP statics. Loading `gs` to the kernel-data
+/// selector here zeroes `GS.base`; the caller must run
+/// `percpu::init_ap` afterwards to program this CPU's per-CPU pointer
+/// into `IA32_GS_BASE`.
+///
+/// # Safety
+/// Must run once per AP, in kernel mode with IRQs masked, after the
+/// global allocator is up. The returned stack top stays valid for the
+/// lifetime of the system (the block is leaked).
+pub unsafe fn init_ap() -> u64 {
+    use alloc::alloc::{alloc_zeroed, Layout};
+
+    let layout = Layout::new::<ApCpuBlock>();
+    // SAFETY: non-zero-size layout; global allocator is up by AP
+    // bring-up (heap promoted to slab before start_aps).
+    let block = unsafe { alloc_zeroed(layout) } as *mut ApCpuBlock;
+    assert!(!block.is_null(), "AP per-CPU block allocation failed");
+
+    // SAFETY: `block` is a fresh, uniquely-owned, zeroed allocation
+    // sized for `ApCpuBlock`; all field writes below stay in bounds.
+    unsafe {
+        let tss_ptr = core::ptr::addr_of_mut!((*block).tss).cast::<u8>();
+
+        // IST stack tops (highest address of each 16 KiB stack).
+        let ist_base = core::ptr::addr_of_mut!((*block).ist_stacks).cast::<u8>();
+        for i in 0..4 {
+            let top = ist_base.add((i + 1) * IST_STACK_BYTES) as u64;
+            tss_ptr
+                .add(36 /* offset of ist[] within Tss */ + i * 8)
+                .cast::<u64>()
+                .write_unaligned(top);
+        }
+
+        // TSS.rsp0 — kernel stack for user→kernel trap entry on this AP.
+        let rsp0_top = core::ptr::addr_of_mut!((*block).rsp0_stack)
+            .cast::<u8>()
+            .add(KERNEL_RSP0_BYTES) as u64;
+        tss_ptr
+            .add(4 /* offset of rsp0 */)
+            .cast::<u64>()
+            .write_unaligned(rsp0_top);
+
+        // Build GDT descriptors — identical kernel/user code+data to
+        // the BSP GDT (so the live CS / reloaded SS stay valid), with
+        // a TSS descriptor pointing at *this AP's* TSS.
+        let tss_base = core::ptr::addr_of!((*block).tss) as u64;
+        let tss_limit = (core::mem::size_of::<Tss>() - 1) as u64;
+        let tss_lo: u64 = (tss_limit & 0xFFFF)
+            | ((tss_base & 0x00FF_FFFF) << 16)
+            | (0x9 << 40)
+            | (1 << 47)
+            | (((tss_limit >> 16) & 0xF) << 48)
+            | (((tss_base >> 24) & 0xFF) << 56);
+        let tss_hi: u64 = tss_base >> 32;
+
+        let gdt = core::ptr::addr_of_mut!((*block).gdt).cast::<u64>();
+        gdt.add(0).write(0);
+        gdt.add(1).write(0x00af_9a00_0000_ffff); // kernel code (0x08)
+        gdt.add(2).write(0x00cf_9200_0000_ffff); // kernel data (0x10)
+        gdt.add(3).write(tss_lo); // TSS lo      (0x18)
+        gdt.add(4).write(tss_hi); // TSS hi      (0x20)
+        gdt.add(5).write(0x00cf_f200_0000_ffff); // user data  (0x28|3)
+        gdt.add(6).write(0x00af_fa00_0000_ffff); // user code  (0x30|3)
+
+        // LGDT this AP's table.
+        let ptr = Pseudo {
+            limit: (7 * 8 - 1) as u16,
+            base: gdt as u64,
+        };
+        compiler_fence(Ordering::SeqCst);
+        asm!("lgdt [{p}]", p = in(reg) &ptr, options(readonly, nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
+
+        // Reload data segment registers against the new kernel-data
+        // descriptor (0x10). Loading `gs` here zeroes GS.base — the
+        // caller restores it via `percpu::init_ap`.
+        asm!(
+            "mov ax, 0x10",
+            "mov ds, ax",
+            "mov es, ax",
+            "mov ss, ax",
+            "mov fs, ax",
+            "mov gs, ax",
+            out("ax") _,
+            options(nostack, preserves_flags),
+        );
+
+        // LTR — load this AP's TSS so user→kernel traps and IST faults
+        // switch to this CPU's stacks.
+        compiler_fence(Ordering::SeqCst);
+        asm!("ltr {s:x}", s = in(reg) TSS_SEL,
+             options(nomem, nostack, preserves_flags));
+        compiler_fence(Ordering::SeqCst);
+
+        rsp0_top
+    }
+}
+
 /// Linear address of the BSP-built GDT. AP bring-up reads this to
 /// patch the AP trampoline's GDT-pointer parameter so the AP loads
 /// the same GDT the BSP uses.
