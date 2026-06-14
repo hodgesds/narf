@@ -1159,28 +1159,6 @@ unsafe fn read_byte(fd: i32) -> Option<u8> {
     }
 }
 
-/// Inspect a single byte for line-editing semantics. Returns the
-/// action the read loop should take.
-enum LineAction {
-    Append(u8),
-    Backspace,
-    Submit,
-    Ignore,
-}
-
-fn classify(b: u8) -> LineAction {
-    match b {
-        b'\n' | b'\r' => LineAction::Submit,
-        // Backspace = 0x7F (DEL) per the /dev/console translation.
-        // ^H = 0x08 from terminals that send it instead.
-        0x7F | 0x08 => LineAction::Backspace,
-        // Printable ASCII range. Tab is intentionally not allowed —
-        // shell built-ins don't take whitespace-quoted args.
-        0x20..=0x7E => LineAction::Append(b),
-        _ => LineAction::Ignore,
-    }
-}
-
 /// Strip leading whitespace + return the (command, rest) split.
 fn split_first<'a>(line: &'a [u8]) -> (&'a [u8], &'a [u8]) {
     let start = line.iter().position(|&b| b != b' ').unwrap_or(line.len());
@@ -2535,36 +2513,30 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const
             // Prompt.
             write_all(fd, PROMPT);
 
-            // Line editor.
+            // Line editor. The console is in cooked mode (ICANON|ECHO)
+            // by default, so the kernel line discipline (console_tty) now
+            // handles echo, backspace/^U editing, and line buffering —
+            // `read` returns a whole line terminated by '\n' and parks on
+            // the input IRQ until one is ready. We just accumulate the
+            // returned bytes up to the newline; no local echo (the kernel
+            // already echoed) and no per-byte backspace handling (the
+            // discipline already applied it).
             let mut len = 0usize;
             loop {
                 let b = match read_byte(fd) {
                     Some(b) => b,
                     None => return 0,
                 };
-                match classify(b) {
-                    LineAction::Append(c) if len < LINE_BUF => {
-                        line[len] = c;
+                match b {
+                    // End of a cooked line (the discipline echoed the \n).
+                    b'\n' | b'\r' => break,
+                    // Printable: append. The discipline already echoed it.
+                    0x20..=0x7e if len < LINE_BUF => {
+                        line[len] = b;
                         len += 1;
-                        // Local echo so the user sees what they typed
-                        // — `/dev/console` doesn't echo by itself.
-                        write_all(fd, &[c]);
                     }
-                    LineAction::Append(_) => {
-                        // Line full; ring the bell and drop the byte.
-                        write_all(fd, b"\x07");
-                    }
-                    LineAction::Backspace if len > 0 => {
-                        len -= 1;
-                        // Visual erase: BS, space, BS.
-                        write_all(fd, b"\x08 \x08");
-                    }
-                    LineAction::Backspace => {}
-                    LineAction::Submit => {
-                        write_all(fd, NEWLINE);
-                        break;
-                    }
-                    LineAction::Ignore => {}
+                    // Line full or non-printable control: drop.
+                    _ => {}
                 }
             }
 

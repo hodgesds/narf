@@ -541,23 +541,13 @@ impl FileOps for DevTpmRm0Proxy {
 /// against fd 1/2.
 struct DevConsole;
 
-/// Optional fn-ptr hook the userspace crate installs at boot so
-/// the console driver can ask "is this byte a signal-shaped
-/// control character that should be delivered to the foreground
-/// task instead of being returned through read?". Stored as a
-/// raw usize so this crate doesn't need a direct dep on
-/// userspace's signal-pending table. See
-/// `userspace::handlers::maybe_deliver_signal_for_input` for the
-/// canonical implementation.
-static CONSOLE_SIGNAL_HOOK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// Install the signal-character hook. Pass a `fn(u8) -> bool`
-/// whose return value is `true` iff the byte was consumed as a
-/// signal (and should NOT appear in the read buffer). NULL
-/// disables.
+/// Install the console's signal-character hook. Compatibility shim —
+/// the hook now lives in the unified `console_tty` module (one console,
+/// one hook); this forwards there so existing boot wiring keeps working.
+/// Pass a `fn(u8) -> bool` returning `true` iff the byte was consumed as
+/// a signal (and should NOT appear in the read buffer).
 pub fn install_console_signal_hook(hook: fn(u8) -> bool) {
-    CONSOLE_SIGNAL_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+    crate::console_tty::install_signal_hook(hook);
 }
 
 /// Translate one `KeyCode` (with live modifier state) into one
@@ -565,7 +555,7 @@ pub fn install_console_signal_hook(hook: fn(u8) -> bool) {
 /// (modifiers, function keys, navigation cluster). The shift map
 /// matches a US-QWERTY layout — internationalisation is a follow-up
 /// (real systems consult `/etc/keymaps`).
-fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Option<u8> {
+pub(crate) fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Option<u8> {
     use narf_input::{KeyCode as K, Modifiers as M};
     let shift = mods.contains(M::SHIFT) ^ mods.contains(M::CAPS_LOCK);
     let base = match code {
@@ -630,95 +620,22 @@ fn key_to_ascii(code: narf_input::KeyCode, mods: narf_input::Modifiers) -> Optio
     })
 }
 
-/// `/dev/console` terminal attributes. The console is a singleton, so
-/// its termios + window size live in process-globals shared by every
-/// open fd. A successful `TCGETS` here is what makes `isatty(0)` true,
-/// so an interactive shell (busybox `sh`) draws a prompt and reads
-/// line-by-line instead of treating stdin as a non-tty script.
-#[cfg(feature = "linux-compat")]
-static CONSOLE_TERMIOS: IrqSafeSpinLock<Option<crate::devfs_pty::Termios>> =
-    IrqSafeSpinLock::new(None);
-
-/// `(rows, cols)` for `TIOCGWINSZ`. 24x80 default; `TIOCSWINSZ` updates it.
-#[cfg(feature = "linux-compat")]
-static CONSOLE_WINSIZE: IrqSafeSpinLock<(u16, u16)> = IrqSafeSpinLock::new((24, 80));
-
 impl FileOps for DevConsole {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // Pull bytes from the per-class input rings (audit #6 —
-        // narf_input::pop_key + pop_ascii_byte). Pointer / Scroll
-        // events go to their own consumers; no re-push needed.
-        // Stop when the user buffer is full or both rings are dry.
-        // Non-blocking — callers wanting blocking behaviour loop
-        // in user space until n>0.
-        let mut written = 0usize;
-        // Note: an externally-installed signal hook (set by
-        // `userspace::handlers::install_console_signal_hook`)
-        // optionally intercepts ^C / ^\ / ^Z and turns them into
-        // a SIGINT/SIGQUIT/SIGTSTP delivery instead of letting
-        // the byte through. The hook is a fn ptr so this crate
-        // doesn't need a direct dep on userspace's signal table.
-        let signal_hook = CONSOLE_SIGNAL_HOOK.load(core::sync::atomic::Ordering::Acquire);
-        // Drain key presses + raw bytes in interleaved order so a
-        // burst of one class doesn't starve the other. Bound by
-        // ring capacity (256) per class to avoid pathological
-        // loops if a producer is faster than us.
-        let mut iters = 0usize;
-        while written < buf.len() && iters < 512 {
-            iters += 1;
-            let mut produced = false;
-            // Drain one Key event if present.
-            if written < buf.len() {
-                if let Some(k) = narf_input::pop_key() {
-                    if k.pressed {
-                        if let Some(b) = key_to_ascii(k.code, k.modifiers) {
-                            // Signal-shaped control char check.
-                            let consumed = if signal_hook != 0 {
-                                let hook: fn(u8) -> bool =
-                                    // SAFETY: hook ptr installed at boot; signature
-                                    // matches `fn(u8) -> bool`.
-                                    // SAFETY: Valid memory or trusted environment
-                                    unsafe { core::mem::transmute(signal_hook) };
-                                hook(b)
-                            } else {
-                                false
-                            };
-                            if !consumed {
-                                buf[written] = b;
-                                written += 1;
-                            }
-                        }
-                    }
-                    produced = true;
-                }
-            }
-            // Drain one AsciiByte if present.
-            if written < buf.len() {
-                if let Some(b) = narf_input::pop_ascii_byte() {
-                    let consumed = if signal_hook != 0 {
-                        // SAFETY: `signal_hook` is non-zero (checked) and was
-                        // installed via `install_console_signal_hook` as a
-                        // `fn(u8) -> bool` stored through `as usize`; transmuting
-                        // back to that identical signature is valid because `fn`
-                        // pointers and `usize` share size/alignment.
-                        // SAFETY: Valid memory or trusted environment
-                        let hook: fn(u8) -> bool = unsafe { core::mem::transmute(signal_hook) };
-                        hook(b)
-                    } else {
-                        false
-                    };
-                    if !consumed {
-                        buf[written] = b;
-                        written += 1;
-                    }
-                    produced = true;
-                }
-            }
-            if !produced {
-                break;
-            }
-        }
+        // Route through the single shared console line discipline
+        // (`console_tty`), which owns the termios + cooked/raw mode +
+        // the ^C/^\/^Z signal hook and drains both input rings (serial
+        // bytes + translated keys). fd 0/1/2's `ConsoleFile` reads the
+        // exact same stream, so there is one console, one termios.
+        let written = crate::console_tty::read_into(buf);
         Box::pin(async move { Ok(written) })
+    }
+
+    /// Park an empty `/dev/console` read on the input waker rather than
+    /// returning a spurious 0 (EOF). Mirrors fd-0 `ConsoleFile`; true
+    /// when the line discipline has no completed input buffered.
+    fn block_on_input(&self) -> bool {
+        crate::console_tty::block_on_input()
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -772,29 +689,27 @@ impl FileOps for DevConsole {
     #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
         use crate::devfs_pty::{
-            read_user_termios, write_user_termios, write_user_winsize, Termios, WireWinsize,
-            TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGWINSZ,
+            read_user_termios, write_user_termios, write_user_winsize, WireWinsize, TCGETS, TCSETS,
+            TCSETSF, TCSETSW, TIOCGWINSZ,
         };
+        // Termios + winsize are owned by the unified `console_tty` so a
+        // TCSETS on /dev/console is visible to TCGETS on fd 0 and vice versa.
         match cmd {
             TCGETS => {
-                let mut g = CONSOLE_TERMIOS.lock();
-                let t = g.get_or_insert_with(Termios::default);
+                let raw = crate::console_tty::termios();
                 // SAFETY: `arg` is the user `struct termios *` the ioctl
                 // syscall path validated before dispatch.
-                unsafe { write_user_termios(arg, &t.raw)? };
+                unsafe { write_user_termios(arg, &raw)? };
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: `arg` is the validated user `struct termios *`.
                 let raw = unsafe { read_user_termios(arg)? };
-                CONSOLE_TERMIOS
-                    .lock()
-                    .get_or_insert_with(Termios::default)
-                    .raw = raw;
+                crate::console_tty::set_termios(raw);
                 Ok(0)
             }
             TIOCGWINSZ => {
-                let (rows, cols) = *CONSOLE_WINSIZE.lock();
+                let (rows, cols) = crate::console_tty::winsize();
                 let ws = WireWinsize {
                     ws_row: rows,
                     ws_col: cols,

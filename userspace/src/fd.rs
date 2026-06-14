@@ -247,14 +247,6 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
 /// shares fg_pgrp across the three slots — that matches POSIX: stdio
 /// inherits from the controlling tty, so tcsetpgrp on fd 0 is visible
 /// on fd 1/2 of the same shell.
-/// Shared `/dev/console` terminal attributes (`struct termios`, 60-byte
-/// Linux x86_64 wire image). The boot console is a singleton, so its
-/// termios is process-global — TCSETS on fd 0 must be visible to TCGETS
-/// on fd 1/2 of the same shell. `None` until first queried; initialised
-/// to a cooked-mode default (ICANON|ECHO|ISIG) — a real tty, so an
-/// interactive shell line-edits + echoes through the terminal.
-static CONSOLE_TERMIOS: IrqSafeSpinLock<Option<[u8; 60]>> = IrqSafeSpinLock::new(None);
-
 /// SMAP-safe read of a 60-byte `struct termios` from a user pointer.
 /// Uses `read_unaligned` inside the SMAP window deliberately: a
 /// `copy_nonoverlapping`/memcpy (what `copy_from_user` inlines to for a
@@ -297,25 +289,6 @@ unsafe fn write_user_termios(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
         core::ptr::write_unaligned(uptr as *mut [u8; 60], src);
     }
     Ok(())
-}
-
-/// Linux x86_64 cooked-mode `struct termios` wire image (matches
-/// n_tty's initial state): ICRNL|IXON in, OPOST|ONLCR out, CS8|CREAD
-/// control, ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN local, sane c_cc.
-fn cooked_termios() -> [u8; 60] {
-    let mut raw = [0u8; 60];
-    raw[0..4].copy_from_slice(&0x0000_0500u32.to_ne_bytes()); // c_iflag ICRNL|IXON
-    raw[4..8].copy_from_slice(&0x0000_0005u32.to_ne_bytes()); // c_oflag OPOST|ONLCR
-    raw[8..12].copy_from_slice(&0x0000_00bfu32.to_ne_bytes()); // c_cflag B38400|CS8|CREAD
-    raw[12..16].copy_from_slice(&0x0000_803bu32.to_ne_bytes()); // c_lflag
-    let cc = 17; // c_cc[] starts after c_line@16
-    raw[cc] = 0x03; // VINTR  ^C
-    raw[cc + 1] = 0x1c; // VQUIT  ^\
-    raw[cc + 2] = 0x7f; // VERASE DEL
-    raw[cc + 3] = 0x15; // VKILL  ^U
-    raw[cc + 4] = 0x04; // VEOF   ^D
-    raw[cc + 6] = 0x01; // VMIN = 1
-    raw
 }
 
 pub struct ConsoleFile {
@@ -426,36 +399,24 @@ pub fn __test_reset_tty() {
 
 impl FileOps for ConsoleFile {
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // Non-blocking raw-mode read. Drains whatever bytes are in the
-        // BYTE_RING (serial RX / keyboard ASCII path) without blocking.
-        //
-        // Returns Ok(0) immediately when the ring is empty — callers that
-        // want blocking behaviour (the shell's `read_byte` loop) retry with
-        // a brief usleep(10_000) between attempts, matching the pattern that
-        // `devfs::DevConsole::read` already uses for /dev/console.
-        //
-        // Approach: raw mode (no line discipline). The shell's classify()
-        // function handles backspace / submit / ignore semantics per-byte.
-        let mut n = 0usize;
-        while n < buf.len() {
-            match narf_input::pop_ascii_byte() {
-                Some(b) => {
-                    buf[n] = b;
-                    n += 1;
-                }
-                None => break,
-            }
-        }
-        let result = Ok(n);
-        Box::pin(async move { result })
+        // Route through the single shared console line discipline
+        // (`narf_filesystem::console_tty`), the same path /dev/console
+        // uses. It owns the termios + cooked/raw mode and drains both
+        // input rings (serial bytes + translated keys), so fd 0 and
+        // /dev/console see one console with one termios. Cooked mode
+        // (the default) returns whole lines with echo + backspace;
+        // a program that TCSETSes raw gets byte-at-a-time.
+        let n = narf_filesystem::console_tty::read_into(buf);
+        Box::pin(async move { Ok(n) })
     }
     /// Block an empty console read on the input waker (woken by the
     /// serial/keyboard IRQ) instead of returning a spurious 0. This is what
     /// lets an interactive shell `read(stdin)` truly sleep until a keystroke
     /// rather than busy-poll. sys_read parks via the `console_read_pending`
-    /// path when this is true and the fd is blocking.
+    /// path when this is true and the fd is blocking. Delegates to the
+    /// shared discipline: park while no completed line/byte is buffered.
     fn block_on_input(&self) -> bool {
-        narf_input::pending_bytes() == 0
+        narf_filesystem::console_tty::block_on_input()
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let n = buf.len();
@@ -484,7 +445,7 @@ impl FileOps for ConsoleFile {
     /// as EOF and exits the moment the user gets to a prompt.
     fn poll_readiness(&self) -> u32 {
         let mut mask = narf_filesystem::POLL_OUT;
-        if narf_input::pending_bytes() > 0 {
+        if narf_filesystem::console_tty::readable_bytes() > 0 {
             mask |= narf_filesystem::POLL_IN;
         }
         mask
@@ -496,24 +457,25 @@ impl FileOps for ConsoleFile {
         // for ABI purposes since the wire shape is the same).
         match cmd {
             TCGETS => {
-                // Return the current termios (cooked default until a
-                // program TCSETS its own), so isatty(0) succeeds AND an
-                // interactive shell sees a real cooked tty (ICANON|ECHO)
-                // rather than the old all-zero image (which read as raw).
-                let raw = *CONSOLE_TERMIOS.lock().get_or_insert_with(cooked_termios);
+                // Return the current termios from the shared console_tty
+                // (cooked default until a program TCSETS its own), so
+                // isatty(0) succeeds AND an interactive shell sees a real
+                // cooked tty (ICANON|ECHO). The discipline now enforces it.
+                let raw = narf_filesystem::console_tty::termios();
                 // SAFETY: `arg` is the user `struct termios *` from ioctl;
                 // write_user_termios range-validates + SMAP-brackets it.
                 unsafe { write_user_termios(arg as u64, raw)? };
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
-                // Round-trip the caller's termios so a program can switch
-                // raw/cooked and read it back (the boot console doesn't
-                // enforce the flags in its line discipline yet, but the
-                // state is coherent — what vi/less/readline rely on).
+                // Round-trip the caller's termios into the shared state so
+                // a program can switch raw/cooked; the console_tty line
+                // discipline reads these flags on the next read (what
+                // vi/less/readline rely on). Visible to TCGETS on fd 1/2
+                // and /dev/console alike.
                 // SAFETY: `arg` is the validated user `struct termios *`.
                 let raw = unsafe { read_user_termios(arg as u64)? };
-                *CONSOLE_TERMIOS.lock() = Some(raw);
+                narf_filesystem::console_tty::set_termios(raw);
                 Ok(0)
             }
             TIOCSCTTY => {
@@ -554,8 +516,9 @@ impl FileOps for ConsoleFile {
                 Ok(0)
             }
             FIONREAD => {
-                // Best-effort: peek the input ring's current depth.
-                let n: i32 = narf_input::pending_bytes() as i32;
+                // Best-effort: bytes immediately readable through the
+                // shared discipline (completed lines + queued raw input).
+                let n: i32 = narf_filesystem::console_tty::readable_bytes() as i32;
                 let bytes = n.to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte

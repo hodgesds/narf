@@ -232,18 +232,10 @@ fn main() {
     println!("cargo:rustc-env=NARF_HELLO_PTHREAD_ELF_AARCH64=/dev/null");
 
     // Wave-PTY: PTY smoke. Exercises /dev/ptmx open + TIOCSPTLCK
-    // + TIOCGPTN + open(/dev/pts/N) + master↔slave round-trip.
-    // The `sys_open` Linux-ABI cutover landed in PR #26, so this
-    // now wires into the boot-init seed table like the other
-    // musl-demo binaries.
-    println!("cargo:rerun-if-changed=data/musl-demo/pty_smoke_x86_64.c");
-    println!("cargo:rerun-if-changed=data/musl-demo/pty_smoke_x86_64");
-    let pty_smoke = manifest_dir.join("data/musl-demo/pty_smoke_x86_64");
-    println!(
-        "cargo:rustc-env=NARF_PTY_SMOKE_ELF_X86_64={}",
-        pty_smoke.display()
-    );
-    println!("cargo:rustc-env=NARF_PTY_SMOKE_ELF_AARCH64=/dev/null");
+    // + TIOCGPTN + open(/dev/pts/N) + master↔slave round-trip (incl.
+    // ECHO mirror). Built from `pty_smoke_x86_64.c` via the uniform
+    // static-PIE recipe in the loop below (added to that list), so the
+    // `.c` is the single source of truth — no committed binary to drift.
 
     println!("cargo:rerun-if-changed=data/musl-demo/net_smoke_x86_64");
     let net_smoke = manifest_dir.join("data/musl-demo/net_smoke_x86_64");
@@ -277,8 +269,8 @@ fn main() {
     // (/dev/null) — only `boot-init` builds embed these, and only the
     // musl-demo job actually runs them, so the other jobs are unaffected.
     // The `REGEN_<name>.sh` scripts document the same recipe for manual
-    // regeneration. Non-uniform smokes (pty / hello_musl* / pthread) keep
-    // their committed binaries and individual handling above.
+    // regeneration. The remaining non-uniform smokes (hello_musl* / pthread)
+    // keep their committed binaries and individual handling above.
     let musl_gcc = which("musl-gcc");
     if musl_gcc.is_none() {
         println!(
@@ -386,6 +378,7 @@ fn main() {
         "alarmloop_smoke",
         "preemptsched_smoke",
         "procfs2_smoke",
+        "pty_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

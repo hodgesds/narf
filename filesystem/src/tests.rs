@@ -611,6 +611,11 @@ fn smoke_filesystem_devfs_console_keystrokes() -> TestResult {
     // events) so the assert below sees only what we push here.
     while narf_input::pop_global().is_some() {}
 
+    // The console line discipline is process-global; reset it to a clean
+    // cooked state so a prior test's leftover partial line / raw-mode
+    // termios can't perturb this canonical-mode assertion.
+    crate::console_tty::__test_reset_cooked();
+
     let auth = bootstrap_mount_authority();
     // /dev may already be mounted by an earlier smoke; mount_default
     // returns Busy in that case and we ignore — the existing mount

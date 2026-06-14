@@ -1020,7 +1020,10 @@ impl core::future::Future for UserTaskFuture {
         // keystroke, so the executor can halt instead of busy-polling.
         if this.ctx.console_read_pending.load(Ordering::Acquire) {
             narf_input::register_byte_waker(cx.waker());
-            if narf_input::pending_bytes() > 0 {
+            // pending_input() (serial bytes + keyboard keys), not
+            // pending_bytes() — the unified discipline drains both rings,
+            // so a keystroke alone must un-park a blocked console read.
+            if narf_input::pending_input() > 0 {
                 this.ctx
                     .console_read_pending
                     .store(false, Ordering::Release);

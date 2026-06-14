@@ -62,6 +62,7 @@ extern crate alloc;
 
 #[cfg(feature = "cgroup")]
 pub mod cgroupfs;
+pub mod console_tty;
 pub mod csprng;
 pub mod devfs;
 pub mod devfs_block;
@@ -70,6 +71,7 @@ pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod fuse;
 pub mod memfs;
+pub mod ntty;
 pub mod page_cache;
 #[cfg(feature = "linux-compat")]
 pub mod procfs;

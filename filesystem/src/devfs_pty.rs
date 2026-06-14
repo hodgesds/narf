@@ -22,10 +22,11 @@
 //!   userspace writer                  userspace reader
 //!        |                                   ^
 //!        v   PtyMaster::write               |
-//!   master_tx_to_slave  ──────────────>  PtySlave::read
-//!                                        (line discipline: ICANON, ECHO)
-//!
-//!   PtySlave::write  ──────────────>  master_rx_from_slave
+//!   ntty line discipline ───────────>  PtySlave::read
+//!   (ICANON, ECHO, ISIG → pty.input)
+//!        |
+//!        '— ECHO ─┐
+//!   PtySlave::write  ──────────────>  slave_tx_to_master
 //!                                         |
 //!                                         v   PtyMaster::read
 //! ```
@@ -45,7 +46,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -134,40 +135,6 @@ impl<const N: usize> ByteRing<N> {
         n
     }
 
-    /// Pop exactly one line (up to and including the first `\n`) or,
-    /// if `eof` is true, pop all available bytes (^D handling).
-    /// Returns the number of bytes copied.  Returns 0 if no complete
-    /// line is available and `eof` is false.
-    fn pop_line(&self, buf: &mut [u8], eof: bool) -> usize {
-        let mut g = self.inner.lock();
-        if g.len == 0 {
-            return 0;
-        }
-        // Find the newline position.
-        let newline_pos = (0..g.len).find(|&i| {
-            let idx = (g.head + i) % N;
-            g.buf[idx] == b'\n'
-        });
-        let consume = match newline_pos {
-            Some(pos) => pos + 1, // include the '\n'
-            None if eof => g.len,
-            None => return 0, // ICANON: block until newline
-        };
-        let n = consume.min(buf.len());
-        for slot in buf.iter_mut().take(n) {
-            *slot = g.buf[g.head];
-            g.head = (g.head + 1) % N;
-        }
-        // Consume the rest of the line if we couldn't fit it all.
-        let leftover = consume - n;
-        g.len -= n;
-        for _ in 0..leftover {
-            g.head = (g.head + 1) % N;
-            g.len -= 1;
-        }
-        n
-    }
-
     /// Returns the number of bytes currently in the ring.
     /// Used by tests to verify buffer state without popping.
     #[allow(dead_code)]
@@ -194,6 +161,7 @@ impl<const N: usize> core::fmt::Debug for ByteRing<N> {
 pub const TERMIOS_WIRE_LEN: usize = 60;
 
 // `c_lflag` bits we honour (asm-generic termbits).
+const L_ISIG: u32 = 0x0000_0001;
 const L_ICANON: u32 = 0x0000_0002;
 const L_ECHO: u32 = 0x0000_0008;
 
@@ -219,6 +187,19 @@ impl Termios {
     pub fn echo(&self) -> bool {
         self.lflag() & L_ECHO != 0
     }
+    /// Signal generation: ^C/^\/^Z (the `c_cc[VINTR/VQUIT/VSUSP]` chars)
+    /// raise SIGINT/SIGQUIT/SIGTSTP to the foreground pgrp instead of
+    /// being returned through `read`. Raw-mode programs (vi, readline)
+    /// clear ISIG to receive those bytes literally.
+    pub fn isig(&self) -> bool {
+        self.lflag() & L_ISIG != 0
+    }
+    /// A `c_cc[]` control character by index (VINTR=0, VQUIT=1, VERASE=2,
+    /// VKILL=3, VEOF=4, …). `c_cc[]` starts at wire offset 17 (after
+    /// c_line@16). Returns 0 for out-of-range indices.
+    pub fn cc(&self, idx: usize) -> u8 {
+        self.raw.get(17 + idx).copied().unwrap_or(0)
+    }
 }
 
 impl Default for Termios {
@@ -240,6 +221,7 @@ impl Default for Termios {
         raw[cc + 3] = 0x15; // VKILL  = ^U
         raw[cc + 4] = 0x04; // VEOF   = ^D
         raw[cc + 6] = 0x01; // VMIN   = 1
+        raw[cc + 10] = 0x1a; // VSUSP = ^Z
         Self { raw }
     }
 }
@@ -264,11 +246,15 @@ impl Default for WinSize {
 ///
 /// Linux ref: `drivers/tty/pty.c` `struct tty_struct` (paired)
 pub struct Pty {
-    /// Bytes written by the master, readable by the slave.
-    /// (Linux: `master->link->read_buf`)
-    pub(crate) master_tx_to_slave: ByteRing<4096>,
+    /// The slave's input queue, produced by running master writes through
+    /// the shared n_tty line discipline (cooked line-buffering + echo +
+    /// ISIG). The slave reads completed input from here.
+    /// (Linux: `master->link->read_buf` after `n_tty_receive_buf`)
+    pub(crate) input: IrqSafeSpinLock<crate::ntty::LineState>,
 
-    /// Bytes written by the slave, readable by the master.
+    /// Bytes written by the slave, readable by the master. The line
+    /// discipline's echo of master writes also lands here so the master
+    /// "sees" what was typed.
     /// (Linux: `tty->link->read_buf` from the slave's perspective)
     pub(crate) slave_tx_to_master: ByteRing<4096>,
 
@@ -318,7 +304,7 @@ impl core::fmt::Debug for Pty {
 impl Pty {
     fn new(index: u32) -> Self {
         Self {
-            master_tx_to_slave: ByteRing::new(),
+            input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
@@ -359,6 +345,52 @@ pub fn ptmx_open() -> (u32, Arc<Pty>) {
 pub fn ptmx_close(index: u32) {
     let mut tbl = PTY_TABLE.lock();
     tbl.retain(|(i, _)| *i != index);
+}
+
+/// `fn(pgrp: u64, signum: u32) -> bool` installed by userspace to deliver
+/// a terminal-generated signal (^C/^\/^Z) to a PTY's foreground process
+/// group. Stored as a raw `usize` so this crate needs no dep on
+/// userspace's signal table (mirrors the console's signal hook). Returns
+/// true if at least one task was signalled.
+static PTY_SIGNAL_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the PTY foreground-pgrp signal hook. See `PTY_SIGNAL_HOOK`.
+pub fn install_pty_signal_hook(hook: fn(u64, u32) -> bool) {
+    PTY_SIGNAL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Map an input byte to the signal its `c_cc` entry generates under ISIG:
+/// VINTR→SIGINT, VQUIT→SIGQUIT, VSUSP→SIGTSTP. `None` for non-signal bytes
+/// (and for an unset `c_cc[]` slot, which is 0).
+fn signal_for_cc(t: &Termios, b: u8) -> Option<u32> {
+    if b == 0 {
+        None
+    } else if b == t.cc(0) {
+        Some(2) // SIGINT
+    } else if b == t.cc(1) {
+        Some(3) // SIGQUIT
+    } else if b == t.cc(10) {
+        Some(20) // SIGTSTP
+    } else {
+        None
+    }
+}
+
+/// Deliver `signum` to PTY foreground process group `pgrp` via the
+/// installed hook. No-op (false) when no hook is installed or `pgrp` is 0.
+fn pty_deliver_signal(pgrp: u64, signum: u32) -> bool {
+    if pgrp == 0 {
+        return false;
+    }
+    let raw = PTY_SIGNAL_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: `raw` was stored by `install_pty_signal_hook` from a
+    // `fn(u64, u32) -> bool`; transmuting the identical signature back is
+    // sound (fn pointers and usize share size/alignment).
+    let hook: fn(u64, u32) -> bool = unsafe { core::mem::transmute(raw) };
+    hook(pgrp, signum)
 }
 
 /// Look up a PTY by its pts index.  Returns `None` if not found.
@@ -673,10 +705,41 @@ impl FileOps for PtyMaster {
         Box::pin(async move { Ok(n) })
     }
 
-    /// Write bytes to the slave's input.
-    /// Linux ref: `pty.c pty_write` → pushes into `tty->link`'s receive buf.
+    /// Write bytes to the slave's input — through the shared n_tty line
+    /// discipline. Cooked mode (ICANON) buffers into lines, ECHO mirrors
+    /// the bytes back to the master read side, and ISIG control chars
+    /// (^C/^\/^Z) raise a signal to this PTY's foreground process group.
+    /// Linux ref: `pty.c pty_write` → `n_tty_receive_buf` on `tty->link`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        self.pty.master_tx_to_slave.push(buf);
+        let t = *self.pty.termios.lock();
+        // Collect ISIG signals to deliver AFTER releasing the discipline
+        // lock (signal delivery allocates + takes the pgid/signal locks).
+        let mut sigs: Vec<u32> = Vec::new();
+        {
+            let pty = &*self.pty;
+            let mut state = pty.input.lock();
+            for &b in buf {
+                crate::ntty::feed_byte(
+                    &mut state,
+                    &t,
+                    b,
+                    &mut |c| pty.slave_tx_to_master.push(&[c]),
+                    &mut |bb| match signal_for_cc(&t, bb) {
+                        Some(sig) => {
+                            sigs.push(sig);
+                            true
+                        }
+                        None => false,
+                    },
+                );
+            }
+        }
+        if !sigs.is_empty() {
+            let pgrp = self.pty.fg_pgrp.load(Ordering::Acquire);
+            for sig in sigs {
+                pty_deliver_signal(pgrp, sig);
+            }
+        }
         let n = buf.len();
         Box::pin(async move { Ok(n) })
     }
@@ -823,39 +886,23 @@ impl PtySlave {
 }
 
 impl FileOps for PtySlave {
-    /// Read bytes from the master (i.e. from `master_tx_to_slave`).
-    ///
-    /// When ICANON is on (default) this blocks until a newline or
-    /// `^D` (0x04) appears in the buffer.  In NARF's synchronous
-    /// (non-blocking) model "blocks" means we return 0 bytes when
-    /// neither condition is met.
+    /// Read the slave's input. The shared n_tty line discipline already
+    /// processed the master's writes into `pty.input` — whole lines when
+    /// ICANON is set, raw bytes otherwise — so this just drains the ready
+    /// queue. A pending `^D` EOF on an empty queue surfaces as a 0-byte
+    /// read (end-of-file); an empty queue with no EOF returns 0 too
+    /// (NARF's synchronous "would block").
     ///
     /// Linux ref: `n_tty.c n_tty_read` → canonical buffer drain.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let termios = *self.pty.termios.lock();
-
-        if termios.icanon() {
-            // Look for ^D (EOF) at the start of the input.
-            // A real implementation would check `c_cc[VEOF]`; we hardcode 0x04.
-            let mut tmp = [0u8; 1];
-            {
-                let g = self.pty.master_tx_to_slave.inner.lock();
-                if g.len > 0 && g.buf[g.head] == 0x04 {
-                    drop(g);
-                    // Consume the ^D and signal EOF.
-                    self.pty.master_tx_to_slave.pop(&mut tmp);
-                    return Box::pin(async move { Ok(0) });
-                }
-            }
-            // Check if there's a newline (or data if EOF).
-            let eof = false; // ^D already handled above
-            let n = self.pty.master_tx_to_slave.pop_line(buf, eof);
-            Box::pin(async move { Ok(n) })
+        let mut state = self.pty.input.lock();
+        let n = if state.readable() == 0 {
+            state.take_eof();
+            0
         } else {
-            // RAW mode: return whatever is available.
-            let n = self.pty.master_tx_to_slave.pop(buf);
-            Box::pin(async move { Ok(n) })
-        }
+            state.drain_into(buf)
+        };
+        Box::pin(async move { Ok(n) })
     }
 
     /// Write bytes; with ECHO on, also copies them to `slave_tx_to_master`
@@ -966,8 +1013,9 @@ impl FileOps for PtySlave {
                 Ok(0)
             }
             FIONREAD => {
-                // Bytes the slave can read = bytes master has written.
-                let n = self.pty.master_tx_to_slave.len() as i32;
+                // Bytes the slave can read now = completed line-discipline
+                // output queued in `pty.input`.
+                let n = self.pty.input.lock().readable() as i32;
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, n)? };
                 Ok(0)
@@ -976,13 +1024,12 @@ impl FileOps for PtySlave {
         }
     }
 
-    /// POLLIN when the slave's input queue (master_tx_to_slave) has
-    /// at least one byte; POLLOUT always. Mirrors the ConsoleFile
-    /// pattern but reads from the per-PTY ring instead of the global
-    /// input ring.
+    /// POLLIN when the slave's input queue (`pty.input`) has at least one
+    /// readable byte; POLLOUT always. Mirrors the ConsoleFile pattern but
+    /// reads from the per-PTY discipline instead of the global input ring.
     fn poll_readiness(&self) -> u32 {
         let mut mask = crate::POLL_OUT;
-        if self.pty.master_tx_to_slave.len() > 0 {
+        if self.pty.input.lock().readable() > 0 {
             mask |= crate::POLL_IN;
         }
         mask
