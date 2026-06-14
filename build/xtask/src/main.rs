@@ -367,6 +367,18 @@ impl Arch {
                 // Unset (default) keeps the full layout the kernel NUMA
                 // tests expect, so other jobs and local runs are unchanged.
                 let smp = std::env::var("NARF_QEMU_SMP").ok();
+                // Total guest RAM in MiB. Default 1024 (512/NUMA node).
+                // The kernel-test suite sits near the buddy margin and a
+                // DMA-heavy smoke can crash QEMU when a node is pressured;
+                // CI ups this (e.g. NARF_QEMU_MEM_MB=2048) for headroom
+                // without slowing local runs. Must be even — the two NUMA
+                // nodes each get half.
+                let mem_mb: u64 = std::env::var("NARF_QEMU_MEM_MB")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&m| m >= 2 && m % 2 == 0)
+                    .unwrap_or(1024);
+                let node_mem_mb = mem_mb / 2;
                 let mut args = vec![
                     "-machine".into(),
                     if smp.is_some() {
@@ -379,13 +391,13 @@ impl Arch {
                     "-smp".into(),
                     smp.clone().unwrap_or_else(|| "16,sockets=2,cores=8".into()),
                     "-m".into(),
-                    // 1 GiB (512 MiB per NUMA node below). The kernel-test
-                    // suite runs ~5129 smokes on the slab/buddy and sits near
-                    // the margin; a DMA-heavy smoke (e.g. nvme multi-queue)
-                    // then crashes QEMU when a DMA-buffer allocation can't get
-                    // a valid contiguous frame from a pressured node. Doubling
-                    // the buddy backing keeps the suite comfortably in range.
-                    "1024M".into(),
+                    // Default 1 GiB (512 MiB per NUMA node below). The
+                    // kernel-test suite runs ~5129 smokes on the slab/buddy
+                    // and sits near the margin; a DMA-heavy smoke (e.g. nvme
+                    // multi-queue / virtio-snd) then crashes QEMU host-side
+                    // when a node is pressured. CI raises NARF_QEMU_MEM_MB
+                    // for headroom; locally the default keeps boot fast.
+                    format!("{mem_mb}M"),
                 ];
                 // Optional accel override. Unset ⇒ QEMU auto-selects
                 // (KVM when /dev/kvm exists, else single-threaded TCG).
@@ -403,8 +415,8 @@ impl Arch {
                     args.extend_from_slice(&[
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
                     "-numa".into(),    "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
-                    "-object".into(),  "memory-backend-ram,id=mem0,size=512M".into(),
-                    "-object".into(),  "memory-backend-ram,id=mem1,size=512M".into(),
+                    "-object".into(),  format!("memory-backend-ram,id=mem0,size={node_mem_mb}M"),
+                    "-object".into(),  format!("memory-backend-ram,id=mem1,size={node_mem_mb}M"),
                     "-numa".into(),    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
                     "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
