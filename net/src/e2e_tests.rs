@@ -318,6 +318,12 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
         }
     }
 
+    // Newly ESTABLISHED with no buffered data → not readable yet (the
+    // POLL_IN accessor that drives epoll/poll on kernel-TCP sockets).
+    if core::readable(server_id) {
+        return TestResult::Fail("readable() true before any data arrived");
+    }
+
     // ── Locate client TCB (created implicitly by the accept path) ──
     // We injected a bare SYN, so there is no "client TCB" in the table —
     // the test only has the server side. The send/recv path works by
@@ -345,6 +351,12 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     );
     let _ = drain_captured();
 
+    // The PSH+ACK landed in the recv buffer → readable() must now be
+    // true so epoll/poll/select on this kernel-TCP socket wakes.
+    if !core::readable(server_id) {
+        return TestResult::Fail("readable() false after data buffered");
+    }
+
     // Server recv should return the 16 bytes.
     let mut buf = [0u8; 64];
     let n = match recv(server_id, &mut buf) {
@@ -356,6 +368,12 @@ fn smoke_e2e_tcp_loopback_round_trip() -> TestResult {
     }
     if &buf[..16] != payload {
         return TestResult::Fail("recv payload mismatch");
+    }
+
+    // Buffer drained → readable() falls back to false (still ESTABLISHED,
+    // nothing to read), so a re-armed poll won't spuriously fire POLL_IN.
+    if core::readable(server_id) {
+        return TestResult::Fail("readable() true after recv drained the buffer");
     }
 
     // ── Shutdown + close server side ──

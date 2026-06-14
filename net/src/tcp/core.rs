@@ -547,6 +547,20 @@ pub fn recv(id: u32, buf: &mut [u8]) -> Result<usize, ()> {
     Ok(t.recv_buf.read(buf))
 }
 
+/// `true` if a `recv` on this TCB would return immediately — either
+/// inbound data is buffered, or the peer has closed / the connection
+/// is dead (so a read returns EOF/error rather than blocking). Drives
+/// `POLL_IN` for kernel-TCP (`InetWired`) sockets so epoll/poll/select
+/// can wake on incoming data. An unknown id (TCB already reaped) is
+/// reported readable so a poller proceeds to a read that returns EOF
+/// instead of hanging.
+pub fn readable(id: u32) -> bool {
+    match lookup_tcb(id) {
+        Some(arc) => arc.lock().user_can_read(),
+        None => true,
+    }
+}
+
 // ── Public API: shutdown / close ────────────────────────────────────
 
 pub fn shutdown(id: u32, how: Shutdown) -> Result<(), ()> {
