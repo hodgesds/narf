@@ -14309,10 +14309,7 @@ fn smoke_console_fg_pgrp_is_shared_singleton() -> TestResult {
 
     // And a write through B is visible through A — fully symmetric.
     let pgid2: i32 = 222;
-    if tty_b
-        .ioctl(TIOCSPGRP, &pgid2 as *const _ as usize)
-        .is_err()
-    {
+    if tty_b.ioctl(TIOCSPGRP, &pgid2 as *const _ as usize).is_err() {
         return TestResult::Fail("TIOCSPGRP on tty_b failed");
     }
     let mut got_a: i32 = -1;
