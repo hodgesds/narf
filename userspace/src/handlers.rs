@@ -1132,14 +1132,48 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                 // spurious EOF — unless the fd is O_NONBLOCK.
                 let nonblock = entry.status_flags & crate::fd::O_NONBLOCK != 0;
                 let should_block = n == 0 && !nonblock && entry.ops.read_should_block();
+                // Console fds park on the input waker (serial/keyboard IRQ)
+                // instead of the 1ms re-poll, so an interactive shell truly
+                // sleeps on `read(stdin)` rather than busy-polling.
+                let input_block = n == 0 && !nonblock && entry.ops.block_on_input();
                 entry.offset = off.saturating_add(n as u64);
-                Ok((n, should_block))
+                Ok((n, should_block, input_block))
             }
             Err(_) => Err(()),
         }
     });
     match outcome {
-        Some(Ok((0, true))) => {
+        Some(Ok((0, _, true))) => {
+            // Empty console input ring: park on the input waker (woken by
+            // the serial/keyboard IRQ via push_global → BYTE_RING_WAKER →
+            // deferred_wake) and RE-EXECUTE the read on resume (rewind RIP,
+            // no return value). The poll routine registers cx.waker() once
+            // `console_read_pending` is set and parks with NO wake-by-ref,
+            // so the task truly idles until a keystroke — no busy-poll.
+            if let (Some(uctx), Some(hook)) = (
+                crate::user_task::current_user_task(),
+                crate::user_task::yield_hook(),
+            ) {
+                let resume_rip = ctx.rip().wrapping_sub(2);
+                ctx.set_rip(resume_rip);
+                // SAFETY: `uctx` is the live per-task UserTaskCtx from
+                // current_user_task(); we hold the only reference while
+                // setting the flag + saving the RIP-rewound CPU state before
+                // the yield hook hands the task to the executor.
+                unsafe {
+                    let uc = &*uctx;
+                    uc.console_read_pending
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    ctx.save_user_state(uc.state.get() as *mut u8);
+                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    hook(uctx);
+                }
+                // unreachable — hook() longjmps to the executor
+            }
+            // No executor (kernel-test context): fall back to a 0 read.
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        Some(Ok((0, true, _))) => {
             // Empty pipe, writer still open: park ~1ms and RE-EXECUTE the
             // read on resume (rewind RIP, leave the syscall number in
             // place — do NOT set a return value) so the read blocks until
@@ -1172,7 +1206,7 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             // No executor (kernel-test context): fall back to a 0 read.
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Some(Ok((n, _))) => {
+        Some(Ok((n, _, _))) => {
             // SAFETY: ptr validated above; AS still active.
             if let Err(e) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
                 ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));

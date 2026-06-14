@@ -160,6 +160,15 @@ pub struct UserTaskCtx {
     /// loop's reap check can also collect job-control stop/continue
     /// notifications, not just exits.
     pub wait_child_options: AtomicU32,
+
+    /// Set by `sys_read` when a blocking read on the console fd finds the
+    /// input ring empty: instead of the 1ms re-poll used for pipes, the
+    /// task parks on the serial/keyboard IRQ's `BYTE_RING_WAKER`. The poll
+    /// routine registers `cx.waker()` there and returns `Pending` WITHOUT a
+    /// wake-by-ref, so the task truly idles (and the executor can halt)
+    /// until a keystroke arrives — no busy-poll. Cleared by the poll once
+    /// bytes are available, and the read re-executes (RIP was rewound).
+    pub console_read_pending: AtomicBool,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -190,6 +199,7 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
+            console_read_pending: AtomicBool::new(false),
         }
     }
 }
@@ -952,6 +962,26 @@ impl core::future::Future for UserTaskFuture {
                     // wakes us.  Do NOT call wake_by_ref here.
                     return core::task::Poll::Pending;
                 }
+            }
+        }
+
+        // Console blocking-read park: sys_read found the input ring empty
+        // and rewound RIP to re-execute the read on resume. Register our
+        // waker so the serial/keyboard IRQ (push_global → BYTE_RING_WAKER →
+        // deferred_wake) reschedules us. If a byte is already available
+        // (raced in, or this is the wake), clear the flag and fall through
+        // to re-enter user mode so the read re-runs and drains it. Else
+        // return Pending with NO wake_by_ref — the task truly idles until a
+        // keystroke, so the executor can halt instead of busy-polling.
+        if this.ctx.console_read_pending.load(Ordering::Acquire) {
+            narf_input::register_byte_waker(cx.waker());
+            if narf_input::pending_bytes() > 0 {
+                this.ctx
+                    .console_read_pending
+                    .store(false, Ordering::Release);
+                // fall through to resume + re-execute the read
+            } else {
+                return core::task::Poll::Pending;
             }
         }
 
