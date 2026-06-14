@@ -10,16 +10,17 @@
 //!                                    can read the tty without SIGTTIN.
 //!   4. login loop: prompt `login:`, read a username (echoed); prompt
 //!      `Password:`, read a password with ECHO disabled; verify against
-//!      `/etc/passwd`. Retry (with a delay) on failure.
+//!      `/etc/shadow`. Retry (with a delay) on failure.
 //!   5. `execve("/bin/shell")`      — the shell inherits session + ctty +
 //!                                    foreground pgrp.
 //!
-//! Credentials live in `/etc/passwd` (classic 7-field, password in field 2
-//! — pre-`/etc/shadow`, plaintext). This is an educational kernel with no
-//! crypto/`crypt(3)` and a capability-based authority model (POSIX uids are
-//! cosmetic), so the password is a real *gate on the login flow*, not a
-//! security boundary. An empty password field means "no password" (the
-//! login succeeds immediately for that user), mirroring historical Unix.
+//! Credentials live in `/etc/shadow` as salted SHA-256 hashes
+//! (`$n1$<salt>$<hexhash>`) — no plaintext on disk. The hashing + shadow
+//! parsing are in the host-unit-tested `login-core` crate; getty does the
+//! prompting + file I/O. This is an educational kernel with no `crypt(3)`
+//! and a capability-based authority model (POSIX uids are cosmetic), so the
+//! password gates the login *flow*, not a security boundary — see the
+//! honesty note in `login-core`.
 
 #![no_std]
 #![no_main]
@@ -105,34 +106,14 @@ unsafe fn set_echo(on: bool) {
     }
 }
 
-/// Split a `/etc/passwd` line into (username, password) — field 1 and the
-/// classic plaintext password in field 2. `None` if there is no `:`.
-fn split_user_pass(line: &[u8]) -> Option<(&[u8], &[u8])> {
-    let c1 = line.iter().position(|&b| b == b':')?;
-    let rest = &line[c1 + 1..];
-    let c2 = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
-    Some((&line[..c1], &rest[..c2]))
-}
-
-/// Length-checked, difference-accumulating byte compare (avoids an early
-/// `return` on the first mismatched byte).
-fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
-}
-
-/// Verify `(user, pass)` against `/etc/passwd`. Reads the file, scans for a
-/// line whose field 1 == `user`, and compares field 2 to `pass`. An empty
-/// stored password matches an empty entered password (no-password account).
+/// Verify `(user, pass)` against `/etc/shadow`. Reads the file and hands the
+/// bytes to `login_core::authenticate`, which looks up the user's stored
+/// `$n1$salt$hash` field, recomputes the salted SHA-256 of `pass`, and
+/// compares. The hashing/parse logic is host-unit-tested in `login-core`;
+/// getty only does the file I/O.
 unsafe fn check_credentials(user: &[u8], pass: &[u8]) -> bool {
     // SAFETY: NUL-terminated literal path; O_RDONLY = 0.
-    let fd = unsafe { libc::posix_open(b"/etc/passwd\0".as_ptr() as *const i8, 0, 0) };
+    let fd = unsafe { libc::posix_open(b"/etc/shadow\0".as_ptr() as *const i8, 0, 0) };
     if fd < 0 {
         return false;
     }
@@ -151,22 +132,7 @@ unsafe fn check_credentials(user: &[u8], pass: &[u8]) -> bool {
     // SAFETY: fd was opened above.
     unsafe { libc::posix_close(fd) };
 
-    let data = &buf[..total];
-    let mut line_start = 0usize;
-    let mut i = 0usize;
-    while i <= data.len() {
-        if i == data.len() || data[i] == b'\n' {
-            let line = &data[line_start..i];
-            line_start = i + 1;
-            if let Some((u, p)) = split_user_pass(line) {
-                if bytes_eq(u, user) && bytes_eq(p, pass) {
-                    return true;
-                }
-            }
-        }
-        i += 1;
-    }
-    false
+    login_core::authenticate(&buf[..total], user, pass)
 }
 
 #[no_mangle]

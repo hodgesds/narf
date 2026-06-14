@@ -3580,18 +3580,22 @@ fn boot_userspace_init() {
             count,
         );
 
-        // /etc/passwd — getty's credential store. Classic 7-field passwd
-        // with the password in field 2 (pre-shadow plaintext): user `root`,
-        // password `narf`. NARF has no crypt(3) and a capability-based
-        // authority model (uids are cosmetic), so this gates the login flow
-        // rather than enforcing a security boundary. Edit this seed (or an
-        // on-disk /etc/passwd, once writable) to change the credentials.
-        const ETC_PASSWD: &[u8] = b"root:narf:0:0:root:/root:/bin/shell\n";
-        let etc_fs = MemFs::with_seeds("etc", &[("passwd", ETC_PASSWD)]);
+        // /etc/passwd + /etc/shadow — getty's credential store. passwd is
+        // the 7-field record with `x` in field 2 (password is shadowed);
+        // shadow holds the salted SHA-256 hash `$n1$<salt>$<hexhash>` of the
+        // password (user `root`, password `narf`; salt `n4rf`). No plaintext
+        // on disk. NARF has no crypt(3) and a capability-based authority
+        // model (uids are cosmetic), so this gates the login flow rather than
+        // enforcing a security boundary. The hash is verified by login-core
+        // (host-unit-tested); regenerate it there if you change the password.
+        const ETC_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/shell\n";
+        const ETC_SHADOW: &[u8] =
+            b"root:$n1$n4rf$366fcdb3a40735e32d92d92d11fe1b9593d98d7e7546262e66cfeb72bd07ddec:0:0:99999:7:::\n";
+        let etc_fs = MemFs::with_seeds("etc", &[("passwd", ETC_PASSWD), ("shadow", ETC_SHADOW)]);
         let _ = registry().mount(&auth, "/etc", etc_fs);
         let _ = writeln!(
             console::Writer,
-            "  boot-init: mounted /etc (memfs) with passwd"
+            "  boot-init: mounted /etc (memfs) with passwd + shadow"
         );
 
         // Wave-78 follow-up 3: /lib MemFs carrying the ld-musl

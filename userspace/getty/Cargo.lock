@@ -7,6 +7,7 @@ name = "narf-getty"
 version = "0.1.0"
 dependencies = [
  "narf-libc",
+ "narf-login-core",
  "narf-user-runtime",
 ]
 
@@ -16,6 +17,10 @@ version = "0.0.0"
 dependencies = [
  "narf-user-runtime",
 ]
+
+[[package]]
+name = "narf-login-core"
+version = "0.1.0"
 
 [[package]]
 name = "narf-user-runtime"

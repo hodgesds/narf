@@ -31,6 +31,22 @@ jobs:
       - name: cargo fmt --all --check
         run: cargo fmt --all -- --check
 
+  userspace-tests:
+    name: userspace unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+
+      # login-core is host-testable pure logic (password hashing +
+      # /etc/shadow verification used by getty). Its isolated workspace
+      # builds with std under `cargo test`.
+      - name: login-core unit tests
+        run: cargo test --manifest-path userspace/login-core/Cargo.toml
+
   clippy-kernel:
     name: clippy-kernel / ${{ matrix.arch }}
     runs-on: ubuntu-latest

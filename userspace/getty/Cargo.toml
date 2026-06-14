@@ -13,6 +13,7 @@ license      = "GPL-2.0-or-later"
 [dependencies]
 narf-libc = { path = "../../narf-libc" }
 narf-user-runtime = { path = "../../user-runtime" }
+narf-login-core = { path = "../login-core" }
 
 [[bin]]
 name = "getty"
