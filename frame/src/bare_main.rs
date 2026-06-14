@@ -3376,6 +3376,9 @@ fn boot_userspace_init() {
                 ("cat", narf_verification::NARF_COREUTIL_CAT_ELF),
                 ("ls", narf_verification::NARF_COREUTIL_LS_ELF),
                 ("ps", narf_verification::NARF_COREUTIL_PS_ELF),
+                // The login shell, seeded so getty can `execve("/bin/shell")`
+                // after it establishes the session + controlling tty.
+                ("shell", narf_verification::NARF_SHELL_ELF),
                 // Wave-78: linux-compat demo binary. Direct-syscall
                 // hello-world built with stock binutils (no libc, no
                 // PT_INTERP). Type `hello` at the `narf>` shell
@@ -3615,7 +3618,12 @@ fn boot_userspace_init() {
     }
 
     spawn_one("init", baked_init);
-    spawn_one("shell", baked_shell);
+    // Spawn getty in place of the shell: it sets up a login session
+    // (setsid → controlling tty → foreground pgrp) and then execs
+    // `/bin/shell`, so the shell runs with real job control. `baked_shell`
+    // is seeded at `/bin/shell` (above) for getty's execve.
+    let _ = baked_shell;
+    spawn_one("getty", narf_verification::NARF_GETTY_ELF);
 }
 
 /// aarch64 boot-init stub.
