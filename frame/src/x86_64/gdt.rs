@@ -271,6 +271,7 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
 /// BSP `TSS.rsp0` — two CPUs trapping onto one stack would corrupt
 /// each other. The GDT is a per-CPU copy because the TSS descriptor
 /// encodes the (per-CPU) TSS base address.
+#[cfg(feature = "user-task-smp")]
 #[repr(C, align(16))]
 struct ApCpuBlock {
     gdt: [u64; 7],
@@ -296,6 +297,7 @@ struct ApCpuBlock {
 /// Must run once per AP, in kernel mode with IRQs masked, after the
 /// global allocator is up. The returned stack top stays valid for the
 /// lifetime of the system (the block is leaked).
+#[cfg(feature = "user-task-smp")]
 pub unsafe fn init_ap() -> u64 {
     use alloc::alloc::{alloc_zeroed, Layout};
 

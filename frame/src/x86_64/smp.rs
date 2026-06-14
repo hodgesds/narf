@@ -40,15 +40,21 @@ const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 #[unsafe(no_mangle)]
 static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percpu::MAX_CPUS];
 
-/// AP kernel stack order — order-4 = 16 frames = 64 KiB, allocated as
-/// one contiguous buddy block. The original 4 KiB was sized for the
-/// WFI parking loop, but once an AP runs the full executor it also
-/// dispatches USER tasks (`run_until_empty` → AS activate → setjmp →
-/// `enter_user_mode` → the deep longjmp-return path), which overflows
-/// 4 KiB and corrupts adjacent state — observed as a bogus victim
-/// index panicking in the work-steal path. Must be contiguous so the
-/// stack is one usable range (the trampoline loads its top as RSP).
+/// AP kernel stack order. With user-task SMP enabled, an AP runs the
+/// full executor INCLUDING user-task dispatch (`run_until_empty` → AS
+/// activate → setjmp → `enter_user_mode` → the deep longjmp-return
+/// path), which overflows the 4 KiB WFI-parking stack and corrupts
+/// adjacent state (observed as a bogus victim index panicking in the
+/// work-steal path) — so it needs a larger, contiguous stack
+/// (order-4 = 16 frames = 64 KiB). With the feature OFF (default) APs
+/// only ever run kernel tasks, which fit the original single page;
+/// keeping it at one frame avoids the extra boot-time buddy pressure
+/// (high-order blocks × every AP) that can starve a later driver's
+/// DMA allocation on a marginal buddy.
+#[cfg(feature = "user-task-smp")]
 const AP_STACK_ORDER: u8 = 4;
+#[cfg(not(feature = "user-task-smp"))]
+const AP_STACK_ORDER: u8 = 0;
 const AP_STACK_PAGES: usize = 1 << AP_STACK_ORDER;
 
 extern "C" {
@@ -188,22 +194,27 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         super::idt::load_idtr_ap();
     }
 
-    // 2a. Per-CPU user-mode entry setup. Each AP gets its OWN GDT+TSS
-    //     so a user→kernel trap (page fault, timer preemption, IST
-    //     fault) lands on this CPU's kernel stack — the BSP's shared
-    //     TSS.rsp0 would corrupt under two CPUs trapping concurrently.
-    //     Then a per-AP PerCpu (so the SYSCALL stub's `gs:8` kernel-
-    //     stack lookup resolves per-CPU) and the SYSCALL MSRs
-    //     (LSTAR/STAR/FMASK/EFER.SCE — programmed per-CPU). Without
-    //     this an AP cannot run user tasks: a `syscall` would #UD or
-    //     jump to a stale LSTAR, and a fault would triple-fault on a
-    //     null TR. Order mirrors the BSP `init_traps`: gdt → percpu
-    //     → syscall (gdt::init_ap reloads `gs`, zeroing GS.base, so
-    //     percpu::init_ap must follow to restore the per-CPU pointer).
-    //     IRQs are still masked here (enabled at step 4b), so the
-    //     LGDT/LTR window can't be interrupted before TR is valid.
+    // 2a. Per-CPU user-mode entry setup (only when user-task SMP is
+    //     built — otherwise APs run kernel tasks only and need none of
+    //     it, and skipping it avoids the per-AP GDT/TSS heap blocks
+    //     that add boot-time buddy pressure). Each AP gets its OWN
+    //     GDT+TSS so a user→kernel trap (page fault, timer preemption,
+    //     IST fault) lands on this CPU's kernel stack — the BSP's
+    //     shared TSS.rsp0 would corrupt under two CPUs trapping
+    //     concurrently. Then a per-AP PerCpu (so the SYSCALL stub's
+    //     `gs:8` kernel-stack lookup resolves per-CPU) and the SYSCALL
+    //     MSRs (LSTAR/STAR/FMASK/EFER.SCE — programmed per-CPU).
+    //     Without this an AP cannot run user tasks: a `syscall` would
+    //     #UD or jump to a stale LSTAR, and a fault would triple-fault
+    //     on a null TR. Order mirrors the BSP `init_traps`: gdt →
+    //     percpu → syscall (gdt::init_ap reloads `gs`, zeroing
+    //     GS.base, so percpu::init_ap must follow to restore the
+    //     per-CPU pointer). IRQs are still masked here (enabled at
+    //     step 4b), so the LGDT/LTR window can't be interrupted before
+    //     TR is valid.
     // SAFETY: kernel mode, IRQs masked, global allocator up (heap was
     // promoted to slab before start_aps); runs exactly once per AP.
+    #[cfg(feature = "user-task-smp")]
     unsafe {
         let rsp0_top = super::gdt::init_ap();
         super::percpu::init_ap(id, rsp0_top);
