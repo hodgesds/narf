@@ -1,0 +1,24 @@
+# Isolated workspace root — must NOT join the kernel workspace.
+# See userspace/init/Cargo.toml for the rationale.
+[workspace]
+
+[package]
+name         = "narf-getty"
+description  = "NARF getty/login: establish a session + controlling tty, then exec the shell."
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "GPL-2.0-or-later"
+
+[dependencies]
+narf-libc = { path = "../../narf-libc" }
+narf-user-runtime = { path = "../../user-runtime" }
+narf-login-core = { path = "../login-core" }
+
+[[bin]]
+name = "getty"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"

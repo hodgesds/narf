@@ -27,12 +27,54 @@
 
 use crate::devfs_pty::Termios;
 use crate::ntty::{self, LineState};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 static TERMIOS: IrqSafeSpinLock<Option<Termios>> = IrqSafeSpinLock::new(None);
 static WINSIZE: IrqSafeSpinLock<(u16, u16)> = IrqSafeSpinLock::new((24, 80));
 static DISCIPLINE: IrqSafeSpinLock<LineState> = IrqSafeSpinLock::new(LineState::new());
+
+/// The console's foreground process group (job control). Singleton, like
+/// the termios — shared by fd 0/1/2 (`ConsoleFile`) and `/dev/console`
+/// (`DevConsole`) so a `tcsetpgrp` on one is visible to the other, and the
+/// SIGTTIN/SIGTTOU background check sees one consistent value regardless of
+/// which console front-end a process reads. 0 = unset (no job control).
+static FG_PGRP: AtomicU64 = AtomicU64::new(0);
+
+/// Current console foreground process group (`tcgetpgrp`), 0 if unset.
+pub fn fg_pgrp() -> u64 {
+    FG_PGRP.load(Ordering::Acquire)
+}
+
+/// Set the console foreground process group (`tcsetpgrp` / TIOCSPGRP).
+pub fn set_fg_pgrp(pgrp: u64) {
+    FG_PGRP.store(pgrp, Ordering::Release);
+}
+
+/// TIOCGPGRP with POSIX auto-install: when no foreground group is set yet,
+/// CAS-install `caller_pgrp` (a session leader implicitly acquires the
+/// controlling tty's foreground group on first query — this is what lets
+/// a job-control shell's init loop converge). Returns the resulting fg
+/// pgrp. `caller_pgrp == 0` leaves it unset.
+pub fn fg_pgrp_or_install(caller_pgrp: u64) -> u64 {
+    let cur = FG_PGRP.load(Ordering::Acquire);
+    if cur != 0 {
+        return cur;
+    }
+    if caller_pgrp == 0 {
+        return 0;
+    }
+    match FG_PGRP.compare_exchange(0, caller_pgrp, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => caller_pgrp,
+        Err(observed) => observed,
+    }
+}
+
+/// True when the console termios has TOSTOP set (background writes raise
+/// SIGTTOU). Shared by both console front-ends.
+pub fn tostop() -> bool {
+    TERMIOS.lock().get_or_insert_with(Termios::default).tostop()
+}
 
 /// `fn(u8) -> bool` installed by userspace: given a control byte, returns
 /// `true` iff it was consumed as a signal (SIGINT/SIGQUIT/SIGTSTP to the
@@ -170,6 +212,7 @@ pub fn readable_bytes() -> usize {
 pub fn __test_reset_cooked() {
     *DISCIPLINE.lock() = LineState::new();
     *TERMIOS.lock() = Some(Termios::default());
+    FG_PGRP.store(0, Ordering::Release);
 }
 
 /// Test-only: clear the discipline and set a RAW termios (ICANON / ECHO /

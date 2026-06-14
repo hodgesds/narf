@@ -1,0 +1,21 @@
+# Isolated workspace root — must NOT join the kernel workspace.
+# See userspace/init/Cargo.toml for the rationale. Pure logic (no_std for
+# the userspace target, std for `cargo test` on the host), so it carries
+# its own unit tests — run `cargo test` in this directory.
+[workspace]
+
+[package]
+name         = "narf-login-core"
+description  = "Password hashing + /etc/shadow verification for NARF getty/login (host-testable)."
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "GPL-2.0-or-later"
+
+[lib]
+name = "login_core"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"

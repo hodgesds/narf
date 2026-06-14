@@ -960,6 +960,14 @@ fn sys_write(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
 
+    // Job control: a background process writing its controlling tty with
+    // TOSTOP set is stopped (SIGTTOU) before the write happens.
+    #[cfg(feature = "linux-compat")]
+    if let Some(ret) = tty_background_access(task, fd, true) {
+        ctx.set_return(SyscallReturn::ok(ret as u64));
+        return;
+    }
+
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
@@ -1087,6 +1095,14 @@ fn sys_read(ctx: &mut dyn TrapContext) {
     // staging buffer — EFAULT early rather than after the FileOps call.
     if let Err(e) = validate_user_range(ptr, len) {
         ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+        return;
+    }
+    // Job control: a background process reading its controlling tty is
+    // stopped (SIGTTIN) before the read runs — and before it is recorded
+    // as the foreground reader below.
+    #[cfg(feature = "linux-compat")]
+    if let Some(ret) = tty_background_access(current_task_id(), fd, false) {
+        ctx.set_return(SyscallReturn::ok(ret as u64));
         return;
     }
     // Track the foreground task: any read syscall counts as "this
@@ -7945,6 +7961,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // semantics for CLONE_FILES are deferred.
     crate::fd::fork(parent_pid, child_tid.raw());
 
+    // A child (process or thread) inherits its parent's process group,
+    // session, and controlling terminal (POSIX). pgid inheritance is what
+    // keeps a forked foreground job in the terminal's foreground pgrp so
+    // it does NOT trip the SIGTTIN/SIGTTOU background-access check on its
+    // first console read; a job-control shell moves it out via setpgid.
+    pgid_fork(parent_pid, child_tid.raw());
+    sid_fork(parent_pid, child_tid.raw());
+    #[cfg(feature = "linux-compat")]
+    ctty_fork(parent_pid, child_tid.raw());
+
     if !share_fs {
         cwd_fork(parent_pid, child_tid.raw());
     }
@@ -8318,6 +8344,13 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     cwd_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
+    // POSIX: inherit the parent's process group, session, and controlling
+    // terminal. pgid inheritance keeps a forked foreground job in the
+    // terminal's foreground pgrp (no spurious SIGTTIN on its first read).
+    pgid_fork(parent_pid, child_tid.raw());
+    sid_fork(parent_pid, child_tid.raw());
+    #[cfg(feature = "linux-compat")]
+    ctty_fork(parent_pid, child_tid.raw());
     // Wave-67 — propagate the parent's PID + mount namespaces into
     // the child. Tasks in the root namespace skip the rebind (no
     // translation needed) but inherit_into_child returns None
@@ -9406,6 +9439,27 @@ fn read_sid(target: u64) -> u64 {
         .unwrap_or(target) // default: sid == pid
 }
 
+/// Child inherits the parent's process-group id (POSIX fork semantics).
+/// Without this a forked child defaults to pgid == its own pid, which
+/// would place a shell-launched foreground job in a *different* group than
+/// the terminal's foreground pgrp and spuriously trip SIGTTIN on its first
+/// console read. A job-control shell still moves the child into a new
+/// group explicitly via setpgid.
+pub fn pgid_fork(parent: u64, child: u64) {
+    let pg = read_pgid(parent);
+    if let Some(m) = PGID_TABLE.lock().as_mut() {
+        m.insert(child, pg);
+    }
+}
+
+/// Child inherits the parent's session id (POSIX fork semantics).
+pub fn sid_fork(parent: u64, child: u64) {
+    let sid = read_sid(parent);
+    if let Some(m) = SID_TABLE.lock().as_mut() {
+        m.insert(child, sid);
+    }
+}
+
 fn sys_getsid(ctx: &mut dyn TrapContext) {
     let pid = ctx.args().arg0;
     let target = if pid == 0 { current_task_id() } else { pid };
@@ -9429,13 +9483,15 @@ fn sys_setsid(ctx: &mut dyn TrapContext) {
         }
     }
     // Wave-76: a new session leader has no controlling tty until it
-    // opens a tty without O_NOCTTY (or calls TIOCSCTTY). Drop any
-    // inherited reference here so the next open(tty) installs cleanly.
+    // opens a tty without O_NOCTTY (or calls TIOCSCTTY). Mark the slot
+    // DETACHED (not absent) — absent means "the boot-console default", so
+    // a leader that detached must be distinguishable from one that never
+    // touched its ctty. The next TIOCSCTTY installs a real one.
     #[cfg(feature = "linux-compat")]
     {
         let mut g = CTTY_TABLE.lock();
         if let Some(m) = g.as_mut() {
-            m.remove(&task);
+            m.insert(task, CTTY_DETACHED);
         }
     }
     ctx.set_return(SyscallReturn::ok(task));
@@ -9452,6 +9508,62 @@ fn sys_setsid(ctx: &mut dyn TrapContext) {
 #[cfg(feature = "linux-compat")]
 static CTTY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// CTTY_TABLE sentinel: the boot console (`/dev/console`). Equals
+/// `narf_filesystem::TTY_ID_CONSOLE` so a task's ctty value can be
+/// compared directly against a FileOps `tty_id()`. PTY entries store the
+/// small `/dev/pts/<N>` index, which never collides with this.
+#[cfg(feature = "linux-compat")]
+pub const CTTY_CONSOLE: u32 = narf_filesystem::TTY_ID_CONSOLE;
+
+/// CTTY_TABLE sentinel: explicitly no controlling tty (a session leader
+/// detached via setsid). Distinct from an absent entry, which means "the
+/// boot-console default".
+#[cfg(feature = "linux-compat")]
+pub const CTTY_DETACHED: u32 = 0xFFFF_FFFF;
+
+/// The controlling terminal of `task`, resolved against the boot default:
+/// absent → the boot console (every task starts attached to it);
+/// `CTTY_DETACHED` → none (setsid'd, not yet re-acquired); `CTTY_CONSOLE`
+/// → the console; any other value → that PTY index. `None` means the task
+/// has no controlling terminal.
+#[cfg(feature = "linux-compat")]
+pub fn task_ctty(task: u64) -> Option<u32> {
+    match CTTY_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+    {
+        None => Some(CTTY_CONSOLE),
+        Some(CTTY_DETACHED) => None,
+        Some(v) => Some(v),
+    }
+}
+
+/// Record the boot console as `task`'s controlling terminal — the console
+/// `TIOCSCTTY` path (mirrors `set_controlling_tty` for PTY slaves).
+#[cfg(feature = "linux-compat")]
+pub fn set_controlling_tty_console(task: u64) {
+    if let Some(m) = CTTY_TABLE.lock().as_mut() {
+        m.insert(task, CTTY_CONSOLE);
+    }
+}
+
+/// Child inherits the parent's controlling terminal (POSIX fork). Only an
+/// explicit entry needs copying — absence already resolves to the console
+/// default for both parent and child.
+#[cfg(feature = "linux-compat")]
+pub fn ctty_fork(parent: u64, child: u64) {
+    let raw = CTTY_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&parent).copied());
+    if let Some(v) = raw {
+        if let Some(m) = CTTY_TABLE.lock().as_mut() {
+            m.insert(child, v);
+        }
+    }
+}
 
 #[cfg(feature = "linux-compat")]
 pub fn ctty_init() {
@@ -13765,6 +13877,53 @@ pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
         raise_signal_pending(t, signum);
     }
     true
+}
+
+/// Job-control check for a read/write on a controlling terminal by a
+/// process in a *background* process group (POSIX):
+///   - a background READ of the controlling tty → SIGTTIN
+///   - a background WRITE, only when TOSTOP is set → SIGTTOU
+///
+/// If the generating signal is blocked or ignored by the caller the I/O
+/// fails with EIO instead (an un-stoppable process can't be made to wait);
+/// otherwise the signal goes to the caller's whole pgrp (default action:
+/// stop) and the syscall is interrupted with EINTR. Returns `Some(neg
+/// errno)` when the caller should abort the syscall with that value, or
+/// `None` to proceed with the I/O. The fd's tty identity / fg pgrp / TOSTOP
+/// are read in one short fd-table borrow; signal delivery happens after it
+/// is released (no fd-table reentrancy).
+#[cfg(feature = "linux-compat")]
+fn tty_background_access(task: u64, fd: u32, is_write: bool) -> Option<i64> {
+    let (tty_id, fg, tostop) = crate::fd::with_table(task, |t| {
+        t.get(fd).and_then(|e| {
+            e.ops
+                .tty_id()
+                .map(|id| (id, e.ops.tty_fg_pgrp().unwrap_or(0), e.ops.tty_tostop()))
+        })
+    })??;
+
+    if fg == 0 {
+        return None; // no job control configured on this tty
+    }
+    let caller_pgrp = read_pgid(task);
+    if caller_pgrp == 0 || caller_pgrp == fg {
+        return None; // foreground process group — proceed
+    }
+    if task_ctty(task) != Some(tty_id) {
+        return None; // not this process's controlling terminal — proceed
+    }
+    if is_write && !tostop {
+        return None; // background writes are allowed unless TOSTOP
+    }
+
+    let signum: u32 = if is_write { 22 } else { 21 }; // SIGTTOU / SIGTTIN
+    let blocked = (signal_mask_of(task) & (1u32 << signum)) != 0;
+    let ignored = sigaction_lookup_full(task, signum as usize).is_some_and(|sa| sa.handler == 1);
+    if blocked || ignored {
+        return Some(-5); // -EIO: signal can't stop the process
+    }
+    deliver_signal_to_pgrp(caller_pgrp, signum);
+    Some(-4) // -EINTR: the stopped pgrp restarts the read/write on continue
 }
 
 /// Pre-create `task`'s `SIGNAL_PENDING` entry (bits = 0) so a later

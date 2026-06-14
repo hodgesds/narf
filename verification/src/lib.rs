@@ -3647,6 +3647,20 @@ pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_X86_64"));
 ))]
 pub const NARF_SHELL_ELF: &[u8] = include_bytes!(env!("NARF_SHELL_ELF_AARCH64"));
 
+// getty/login: spawned in place of the shell at boot; it establishes a
+// session + controlling tty + foreground pgrp, then execs `/bin/shell`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_GETTY_ELF: &[u8] = include_bytes!(env!("NARF_GETTY_ELF_X86_64"));
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_GETTY_ELF: &[u8] = include_bytes!(env!("NARF_GETTY_ELF_AARCH64"));
+
 // Wave-49: baked coreutil ELFs. boot-init mounts a MemFs at /bin
 // and seeds these as files so the shell's fork+exec `/bin/<name>`
 // resolves under `qemu -kernel` (no Limine initramfs CPIO module

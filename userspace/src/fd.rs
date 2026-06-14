@@ -16,7 +16,6 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -291,17 +290,16 @@ unsafe fn write_user_termios(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
     Ok(())
 }
 
-pub struct ConsoleFile {
-    /// Foreground process group for this tty. 0 = unset; a job-
-    /// control shell calls `tcsetpgrp` (TIOCSPGRP) at startup.
-    fg_pgrp: AtomicU64,
-}
+/// The boot console behind fd 0/1/2. Stateless: the console is a
+/// singleton, so its terminal attributes (termios, winsize) and job-
+/// control foreground pgrp all live in `narf_filesystem::console_tty`,
+/// shared with `/dev/console` (`DevConsole`). A `tcsetpgrp` on fd 0 is
+/// therefore visible to the shell reading `/dev/console` and vice versa.
+pub struct ConsoleFile;
 
 impl ConsoleFile {
     pub const fn new() -> Self {
-        Self {
-            fg_pgrp: AtomicU64::new(0),
-        }
+        Self
     }
 }
 
@@ -313,9 +311,7 @@ impl Default for ConsoleFile {
 
 impl core::fmt::Debug for ConsoleFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ConsoleFile")
-            .field("fg_pgrp", &self.fg_pgrp.load(Ordering::Relaxed))
-            .finish()
+        f.debug_struct("ConsoleFile").finish()
     }
 }
 
@@ -385,8 +381,9 @@ pub fn set_console_winsize(ws: Winsize) {
     *CONSOLE_WINSIZE.lock() = ws;
 }
 
-/// Reset terminal state — test hook. Per-tty `fg_pgrp` drops with
-/// the `ConsoleFile` Arc when the test tears down its fd table.
+/// Reset terminal state — test hook. The console's foreground pgrp +
+/// termios + line discipline are singleton state in `console_tty` now, so
+/// clear them too (a leaked fg_pgrp would perturb later job-control tests).
 #[doc(hidden)]
 pub fn __test_reset_tty() {
     *CONSOLE_WINSIZE.lock() = Winsize {
@@ -395,6 +392,7 @@ pub fn __test_reset_tty() {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    narf_filesystem::console_tty::__test_reset_cooked();
 }
 
 impl FileOps for ConsoleFile {
@@ -450,6 +448,18 @@ impl FileOps for ConsoleFile {
         }
         mask
     }
+    /// Job control: the boot console's stable tty id.
+    fn tty_id(&self) -> Option<u32> {
+        Some(narf_filesystem::TTY_ID_CONSOLE)
+    }
+    /// Job control: the console's (singleton) foreground process group.
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        Some(narf_filesystem::console_tty::fg_pgrp())
+    }
+    /// Job control: TOSTOP from the shared console termios.
+    fn tty_tostop(&self) -> bool {
+        narf_filesystem::console_tty::tostop()
+    }
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         // Terminal ioctls. All return Ok(0) on success; any
         // user-pointer fault is reported as FsError::InvalidData
@@ -479,8 +489,12 @@ impl FileOps for ConsoleFile {
                 Ok(0)
             }
             TIOCSCTTY => {
-                // Accept "make this our controlling tty" — the boot
-                // console already is everyone's controlling terminal.
+                // Make the boot console the caller's controlling terminal.
+                // Needed after setsid() (which detaches): a getty/login that
+                // claims the console as its session's ctty records it here so
+                // the job-control SIGTTIN/SIGTTOU check recognises it.
+                #[cfg(feature = "linux-compat")]
+                crate::handlers::set_controlling_tty_console(crate::handlers::current_task_id());
                 Ok(0)
             }
             TIOCGWINSZ => {
@@ -546,24 +560,9 @@ impl FileOps for ConsoleFile {
                 // (`while tcgetpgrp(0) != getpgrp() { raise(SIGTTIN); }`)
                 // spins forever because tcgetpgrp returns 0 and
                 // getpgrp returns the shell's tid.
-                let mut pgrp = self.fg_pgrp.load(Ordering::Acquire);
-                if pgrp == 0 {
-                    let caller_pgrp = crate::handlers::current_task_pgid();
-                    if caller_pgrp != 0 {
-                        // CAS so two concurrent first-callers can't
-                        // race-install different pgrps; the loser
-                        // observes the winner's pgrp.
-                        match self.fg_pgrp.compare_exchange(
-                            0,
-                            caller_pgrp,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => pgrp = caller_pgrp,
-                            Err(observed) => pgrp = observed,
-                        }
-                    }
-                }
+                let pgrp = narf_filesystem::console_tty::fg_pgrp_or_install(
+                    crate::handlers::current_task_pgid(),
+                );
                 let bytes = (pgrp as i32).to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
                 // through the SMAP window; the length is the fixed 4-byte
@@ -587,7 +586,7 @@ impl FileOps for ConsoleFile {
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
                 }
-                self.fg_pgrp.store(pgrp as u64, Ordering::Release);
+                narf_filesystem::console_tty::set_fg_pgrp(pgrp as u64);
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),

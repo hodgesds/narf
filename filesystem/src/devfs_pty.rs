@@ -164,6 +164,7 @@ pub const TERMIOS_WIRE_LEN: usize = 60;
 const L_ISIG: u32 = 0x0000_0001;
 const L_ICANON: u32 = 0x0000_0002;
 const L_ECHO: u32 = 0x0000_0008;
+const L_TOSTOP: u32 = 0x0000_0100;
 
 /// Full termios state. We keep the userspace `struct termios` wire image
 /// verbatim so TCGETS/TCSETS round-trip every field a program sets, and
@@ -193,6 +194,10 @@ impl Termios {
     /// clear ISIG to receive those bytes literally.
     pub fn isig(&self) -> bool {
         self.lflag() & L_ISIG != 0
+    }
+    /// TOSTOP: a background process writing this tty raises SIGTTOU.
+    pub fn tostop(&self) -> bool {
+        self.lflag() & L_TOSTOP != 0
     }
     /// A `c_cc[]` control character by index (VINTR=0, VQUIT=1, VERASE=2,
     /// VKILL=3, VEOF=4, …). `c_cc[]` starts at wire offset 17 (after
@@ -433,7 +438,7 @@ pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
 // `[[project_user_cstr_page_safety]]` for the broader pattern.
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
+pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -447,7 +452,7 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
 }
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
+pub(crate) unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -482,7 +487,7 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
 // its own MTE/PAN dance but the FS layer here is still x86_64-only
 // in practice).
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
+pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -494,7 +499,7 @@ unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
+pub(crate) unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -1033,6 +1038,21 @@ impl FileOps for PtySlave {
             mask |= crate::POLL_IN;
         }
         mask
+    }
+
+    /// Job control: the slave's tty id is its `/dev/pts/<N>` index.
+    fn tty_id(&self) -> Option<u32> {
+        Some(self.pty.index)
+    }
+
+    /// Job control: this PTY's foreground process group (0 = unset).
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        Some(self.pty.fg_pgrp.load(Ordering::Acquire))
+    }
+
+    /// Job control: TOSTOP from this PTY's termios.
+    fn tty_tostop(&self) -> bool {
+        self.pty.termios.lock().tostop()
     }
 }
 

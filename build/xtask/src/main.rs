@@ -1755,11 +1755,55 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         let _ = tx_reader.send(Ev::Eof);
     });
 
-    // Stage 1: wait for the prompt.
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdin"))?;
+
+    // Stage 0: log in. getty prints "NARF login:" then "Password:" before
+    // the shell starts; credentials are seeded in /etc/passwd (root / narf).
+    // The reader thread only signals "narf> ", so poll the shared capture
+    // buffer for the login prompts directly.
+    {
+        let login_deadline = Duration::from_secs(prompt_secs);
+        for (needle, reply) in [
+            (&b"login: "[..], &b"root\n"[..]),
+            (&b"Password: "[..], &b"narf\n"[..]),
+        ] {
+            let start = std::time::Instant::now();
+            let mut seen = false;
+            while start.elapsed() < login_deadline {
+                if let Ok(g) = captured.lock() {
+                    if g.windows(needle.len()).any(|w| w == needle) {
+                        seen = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if !seen {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                bail!(
+                    "xtask run-interactive: did not see login prompt within {}s",
+                    prompt_secs
+                );
+            }
+            for &b in reply {
+                if stdin.write_all(&[b]).is_err() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader_handle.join();
+                    bail!("xtask run-interactive: stdin write failed during login");
+                }
+                let _ = stdin.flush();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    // Stage 1: wait for the prompt.
     let prompt_deadline = Duration::from_secs(prompt_secs);
     let mut got_prompt = false;
     let start = std::time::Instant::now();
@@ -2151,6 +2195,39 @@ fn run_interactive_multi(build_in: &BuildArgs, cases: &[(&str, &str)]) -> Result
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut cursor = 0usize; // buffer position consumed so far
+
+    // Log in first: getty shows "NARF login:" then "Password:" before the
+    // shell starts. Credentials are seeded in /etc/passwd (root / narf).
+    for (needle, reply) in [
+        (&b"login: "[..], &b"root\n"[..]),
+        (&b"Password: "[..], &b"narf\n"[..]),
+    ] {
+        match wait_for(cursor, needle, false, prompt_to) {
+            Wait::Found(end) => cursor = end,
+            Wait::TimedOut => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                bail!("xtask musl-demo: did not see login prompt within {prompt_secs}s");
+            }
+            Wait::Died(why) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                bail!("xtask musl-demo: {why} before login prompt");
+            }
+        }
+        for &b in reply {
+            if stdin.write_all(&[b]).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                bail!("xtask musl-demo: stdin write failed during login");
+            }
+            let _ = stdin.flush();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     // Initial prompt.
     match wait_for(cursor, b"narf> ", false, prompt_to) {

@@ -41,6 +41,12 @@ fn main() {
     println!("cargo:rerun-if-changed=../userspace/shell/src/parser.rs");
     println!("cargo:rerun-if-changed=../userspace/shell/shell.ld");
     println!("cargo:rerun-if-changed=../userspace/shell/Cargo.toml");
+    println!("cargo:rerun-if-changed=../userspace/getty/src/main.rs");
+    println!("cargo:rerun-if-changed=../userspace/getty/getty.ld");
+    println!("cargo:rerun-if-changed=../userspace/getty/Cargo.toml");
+    println!("cargo:rerun-if-changed=../userspace/login-core/src/lib.rs");
+    println!("cargo:rerun-if-changed=../userspace/login-core/src/sha256.rs");
+    println!("cargo:rerun-if-changed=../userspace/login-core/Cargo.toml");
     // Wave-49: coreutils baked alongside init/shell so the
     // boot-init path can seed /bin/<name> in a kernel-side MemFs
     // (no Limine initramfs CPIO module is delivered under
@@ -130,6 +136,28 @@ fn main() {
             None,
             "NARF_SHELL_ELF_AARCH64",
             "shell",
+        );
+
+        // getty/login — spawned in place of the shell; establishes the
+        // session + controlling tty + foreground pgrp, then execs the shell.
+        let getty_dir = workspace.join("userspace").join("getty");
+        build_arch(
+            &getty_dir,
+            &out_dir.join("getty-target-x86_64"),
+            "x86_64-unknown-none",
+            &getty_dir.join("getty.ld"),
+            Some("code-model=large"),
+            "NARF_GETTY_ELF_X86_64",
+            "getty",
+        );
+        build_arch(
+            &getty_dir,
+            &out_dir.join("getty-target-aarch64"),
+            "aarch64-unknown-none",
+            &testbin_dir.join("testbin-aarch64.ld"),
+            None,
+            "NARF_GETTY_ELF_AARCH64",
+            "getty",
         );
 
         // Wave-49: coreutils — per-arch env vars

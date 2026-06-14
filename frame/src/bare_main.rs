@@ -3376,6 +3376,9 @@ fn boot_userspace_init() {
                 ("cat", narf_verification::NARF_COREUTIL_CAT_ELF),
                 ("ls", narf_verification::NARF_COREUTIL_LS_ELF),
                 ("ps", narf_verification::NARF_COREUTIL_PS_ELF),
+                // The login shell, seeded so getty can `execve("/bin/shell")`
+                // after it establishes the session + controlling tty.
+                ("shell", narf_verification::NARF_SHELL_ELF),
                 // Wave-78: linux-compat demo binary. Direct-syscall
                 // hello-world built with stock binutils (no libc, no
                 // PT_INTERP). Type `hello` at the `narf>` shell
@@ -3577,6 +3580,24 @@ fn boot_userspace_init() {
             count,
         );
 
+        // /etc/passwd + /etc/shadow — getty's credential store. passwd is
+        // the 7-field record with `x` in field 2 (password is shadowed);
+        // shadow holds the salted SHA-256 hash `$n1$<salt>$<hexhash>` of the
+        // password (user `root`, password `narf`; salt `n4rf`). No plaintext
+        // on disk. NARF has no crypt(3) and a capability-based authority
+        // model (uids are cosmetic), so this gates the login flow rather than
+        // enforcing a security boundary. The hash is verified by login-core
+        // (host-unit-tested); regenerate it there if you change the password.
+        const ETC_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/shell\n";
+        const ETC_SHADOW: &[u8] =
+            b"root:$n1$n4rf$366fcdb3a40735e32d92d92d11fe1b9593d98d7e7546262e66cfeb72bd07ddec:0:0:99999:7:::\n";
+        let etc_fs = MemFs::with_seeds("etc", &[("passwd", ETC_PASSWD), ("shadow", ETC_SHADOW)]);
+        let _ = registry().mount(&auth, "/etc", etc_fs);
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: mounted /etc (memfs) with passwd + shadow"
+        );
+
         // Wave-78 follow-up 3: /lib MemFs carrying the ld-musl
         // interpreter. NARF_LD_MUSL is empty (0 bytes) when the
         // host build didn't have musl installed — in that case
@@ -3615,7 +3636,12 @@ fn boot_userspace_init() {
     }
 
     spawn_one("init", baked_init);
-    spawn_one("shell", baked_shell);
+    // Spawn getty in place of the shell: it sets up a login session
+    // (setsid → controlling tty → foreground pgrp) and then execs
+    // `/bin/shell`, so the shell runs with real job control. `baked_shell`
+    // is seeded at `/bin/shell` (above) for getty's execve.
+    let _ = baked_shell;
+    spawn_one("getty", narf_verification::NARF_GETTY_ELF);
 }
 
 /// aarch64 boot-init stub.
