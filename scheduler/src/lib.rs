@@ -1761,6 +1761,24 @@ pub fn run_until_empty() {
             // preemption + interval timers, and a HLT also wakes on ANY
             // other device IRQ, the same assumption the wheel-empty halt
             // already makes — so we trust it and let the CPU idle.)
+            // When user tasks run on APs (user-task SMP), an AP that
+            // reaches idle right after parking a user task inherits the
+            // IF=0 left by the pre-iretq `cli` discipline. With IF=0,
+            // `halt_until_irq` only `spin_loop()`s — it never enables
+            // interrupts — so the AP can't wake to service a peer's TLB
+            // shootdown IPI, and a BSP spinning on its shootdown ack
+            // deadlocks against it. Re-enable IRQs here so the halt
+            // actually halts-and-wakes on the IPI. Gated on user-task
+            // SMP: feature-off / kernel-test deliberately keep the IF=0
+            // spin (their executor wakes come from synchronous code, not
+            // IRQs, and a hlt there would wedge with no IRQ to wake it).
+            if user_task_smp_enabled() {
+                // SAFETY: enabling IRQs between polls is the executor's
+                // natural state; nothing here holds an IRQ-unsafe lock.
+                unsafe {
+                    narf_arch::enable_interrupts();
+                }
+            }
             match narf_time::timer_wheel::next_deadline_cycles() {
                 Some(deadline) => {
                     if narf_time::now_cycles() < deadline {
@@ -1931,6 +1949,15 @@ pub fn run_forever() -> ! {
         // between polls, and read guards may not span awaits per
         // rcu/ §3.7.
         narf_rcu::report_idle();
+        // See run_until_empty's idle path: under user-task SMP an AP
+        // must re-enable IRQs before halting so it can wake to service
+        // a peer's TLB-shootdown IPI (a parked user task left IF=0).
+        if user_task_smp_enabled() {
+            // SAFETY: between-polls idle; no IRQ-unsafe lock held.
+            unsafe {
+                narf_arch::enable_interrupts();
+            }
+        }
         narf_arch::halt_until_irq();
     }
 }
