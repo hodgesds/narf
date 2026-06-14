@@ -72,9 +72,45 @@ const SFMASK_BITS: u64 = RFLAGS_IF | RFLAGS_DF | RFLAGS_TF | RFLAGS_AC;
 ///   - `r11` = user RFLAGS (consumed by `sysretq`)
 ///
 /// # Safety
-/// Never call this from Rust: it is the raw `syscall` instruction
-/// landing pad installed in `IA32_LSTAR`. It assumes it was entered
-/// by `syscall` from CPL=3 with the kernel `GS` base in
+// `sti`/`cli` bracketing the syscall body is gated on user-task SMP:
+// only a MIGRATED user task needs IRQs on mid-syscall so a peer CPU can
+// service its broadcast TLB-shootdown IPI while the sender spins on the
+// ack. With the feature OFF, syscalls keep the historical
+// IRQs-off-during-syscall behaviour — which the default builds rely on
+// (notably the kernel-test build has no LAPIC timer, so an errant IF=1
+// reaching `halt_until_irq` wedges; see `user_task.rs`'s pre-iretq
+// `cli`). The macros expand to a no-op (empty) asm line when off, so
+// the feature-off code path is byte-identical to before.
+#[cfg(feature = "user-task-smp")]
+macro_rules! syscall_irq_on {
+    () => {
+        "sti"
+    };
+}
+#[cfg(not(feature = "user-task-smp"))]
+macro_rules! syscall_irq_on {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "user-task-smp")]
+macro_rules! syscall_irq_off {
+    () => {
+        "cli"
+    };
+}
+#[cfg(not(feature = "user-task-smp"))]
+macro_rules! syscall_irq_off {
+    () => {
+        ""
+    };
+}
+
+/// Raw `syscall` instruction landing pad installed in `IA32_LSTAR`.
+///
+/// # Safety
+/// Never call this from Rust. It assumes it was entered by the
+/// `syscall` instruction from CPL=3 with the kernel `GS` base in
 /// `IA32_KERNEL_GS_BASE`, executes `swapgs`, and switches to the
 /// per-CPU kernel stack. Invoking it in any other context corrupts
 /// `GS`/`rsp` and the user-state snapshot.
@@ -130,6 +166,21 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "push r13",                            // r13
         "push r14",                            // r14
         "push r15",                            // r15
+
+        // Re-enable interrupts for the body of the syscall. SYSCALL
+        // entry cleared IF via IA32_FMASK (SFMASK_BITS); now that the
+        // full UserState snapshot is safe on the kernel stack and we're
+        // on the per-CPU kernel stack with kernel GS, IRQs can fire
+        // again. This is REQUIRED for user-task SMP: a migrated task's
+        // mprotect/munmap does a broadcast TLB shootdown that spins
+        // waiting for every peer CPU to ACK the IPI — and a peer also
+        // in a syscall can only service that IPI if ITS interrupts are
+        // on. The AS-mutation shootdown paths hold no lock during the
+        // spin (the region lock is dropped first), and the timer-tick
+        // handler is CPL-gated (no preempt / signal-frame build while
+        // CPL=0), so running the syscall body with IRQs on is safe.
+        // `cli` is re-asserted before the return swapgs below.
+        syscall_irq_on!(),
 
         // SysV calling convention for
         // `dispatch_syscall(num, &state)`:
@@ -194,6 +245,14 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // honouring the slot here makes those rewrites take effect on
         // `sysretq`. Must read [rsp+136] BEFORE dropping the scratch.
         "mov rsp, [rsp + 136]",                // user RSP (from state)
+        // Clear IF before the swapgs/sysretq window. With IRQs left on
+        // (re-enabled at entry), an interrupt landing between `swapgs`
+        // (kernel→user GS) and `sysretq` would run a CPL=0 handler with
+        // the USER gs base — common_trap only swapgs'es for CPL=3, so
+        // it would read gs:[N] against user state. Masking here mirrors
+        // the user-entry path's "clear IF before swapgs/iretq"
+        // discipline; sysretq restores the user's RFLAGS (IF=1).
+        syscall_irq_off!(),
         "swapgs",
         "sysretq",
         dispatch = sym dispatch_syscall,

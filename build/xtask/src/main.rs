@@ -411,6 +411,16 @@ impl Arch {
                     args.push("-accel".into());
                     args.push(accel);
                 }
+                // Diagnostic escape hatch: append arbitrary QEMU args,
+                // whitespace-separated. E.g. `NARF_QEMU_EXTRA="-gdb tcp::1234"`
+                // attaches a gdb stub for hang debugging without touching
+                // the kernel binary (so the .text layout — and the
+                // marginal-buddy DMA probe it can tip — is unchanged).
+                if let Ok(extra) = std::env::var("NARF_QEMU_EXTRA") {
+                    for tok in extra.split_whitespace() {
+                        args.push(tok.to_string());
+                    }
+                }
                 if smp.is_none() {
                     args.extend_from_slice(&[
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
