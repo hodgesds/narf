@@ -449,6 +449,14 @@ impl FileOps for ConsoleFile {
         let result = Ok(n);
         Box::pin(async move { result })
     }
+    /// Block an empty console read on the input waker (woken by the
+    /// serial/keyboard IRQ) instead of returning a spurious 0. This is what
+    /// lets an interactive shell `read(stdin)` truly sleep until a keystroke
+    /// rather than busy-poll. sys_read parks via the `console_read_pending`
+    /// path when this is true and the fd is blocking.
+    fn block_on_input(&self) -> bool {
+        narf_input::pending_bytes() == 0
+    }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         let n = buf.len();
         // Eagerly write: the future just reports the count.

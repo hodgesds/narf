@@ -90,6 +90,31 @@ pub fn __test_reset() {
     *ITIMERS.lock() = Some(BTreeMap::new());
 }
 
+/// Test hook — directly arm a task's ITIMER_REAL slot, bypassing the
+/// `setitimer` syscall path (which needs a TrapContext + user-memory
+/// copy). Lets the in-kernel test drive `itimer_real_check_due_irq`
+/// deterministically.
+#[doc(hidden)]
+pub fn __test_arm_itimer_real(task: u64, next_fire_ns: u64, interval_ns: u64) {
+    with_itimers(|m| {
+        let slots = m.entry(task).or_default();
+        slots[ITIMER_REAL as usize] = Itimer {
+            next_fire_ns,
+            interval_ns,
+        };
+    });
+}
+
+/// Test hook — read a task's ITIMER_REAL next-fire deadline (0 = disarmed).
+#[doc(hidden)]
+pub fn __test_itimer_real_next_fire(task: u64) -> u64 {
+    with_itimers(|m| {
+        m.get(&task)
+            .map(|s| s[ITIMER_REAL as usize].next_fire_ns)
+            .unwrap_or(0)
+    })
+}
+
 fn with_table<R>(f: impl FnOnce(&mut BTreeMap<u64, TimerTable>) -> R) -> Option<R> {
     let mut g = TIMERS.lock();
     g.as_mut().map(f)
@@ -377,11 +402,30 @@ pub fn sys_timer_delete(ctx: &mut dyn TrapContext) {
 
 /// clock_nanosleep(clockid, flags, request, remain)
 pub fn sys_clock_nanosleep(ctx: &mut dyn TrapContext) {
+    // clock_nanosleep(clockid, flags, req, rem): arg0=clockid, arg1=flags,
+    // arg2=req, arg3=rem.
     let args = *ctx.args();
-    let clockid = args.arg0;
-    let flags = args.arg1;
-    let req_ptr = args.arg2;
-    let _rem_ptr = args.arg3;
+    nanosleep_common(ctx, args.arg0, args.arg1, args.arg2, args.arg3);
+}
+
+/// nanosleep(req, rem): the legacy 2-arg sleep (Linux syscall 35). POSIX
+/// measures the relative interval against the monotonic clock. This is
+/// NOT NARF's native `sys_sleep` (whose arg0 is a raw nanosecond count) —
+/// musl passes a `struct timespec *` in arg0, so it MUST parse the
+/// timespec like clock_nanosleep, or the req pointer gets misread as a
+/// (years-long) nanosecond duration and the task hangs forever.
+pub fn sys_nanosleep(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    nanosleep_common(ctx, CLOCK_MONOTONIC, 0, args.arg0, args.arg1);
+}
+
+fn nanosleep_common(
+    ctx: &mut dyn TrapContext,
+    clockid: u64,
+    flags: u64,
+    req_ptr: u64,
+    _rem_ptr: u64,
+) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {}
@@ -583,6 +627,11 @@ pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
     };
 
     ensure_pump_registered();
+    // Pre-create the task's SIGNAL_PENDING entry now (in syscall context,
+    // where allocation is fine) so the IRQ-context `itimer_real_check_due_irq`
+    // → `raise_signal_pending_irq` fast path only ever sets a bit in an
+    // existing entry — never allocates from the timer trap.
+    crate::handlers::ensure_signal_pending_slot(task);
     let prev = with_itimers(|m| {
         let slots = m.entry(task).or_default();
         let prev = slots[which as usize];
@@ -645,6 +694,9 @@ pub fn sys_alarm(ctx: &mut dyn TrapContext) {
     };
 
     ensure_pump_registered();
+    // See sys_setitimer: pre-create the pending slot so the IRQ fast path
+    // never allocates.
+    crate::handlers::ensure_signal_pending_slot(task);
     let prev = with_itimers(|m| {
         let slots = m.entry(task).or_default();
         let prev = slots[ITIMER_REAL as usize];
@@ -691,6 +743,46 @@ fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32)>) {
                 .saturating_add(slot.interval_ns.saturating_mul(fires));
         }
     }
+}
+
+/// IRQ-context fast path for ITIMER_REAL — the half that makes a
+/// CPU-bound task's `setitimer`/`alarm` actually fire. The sleep-pump
+/// above only runs when *some* task parks (sleep/pause); a task spinning
+/// in a tight loop with no syscalls never parks, so without this its
+/// real timer would never expire. Mirrors Linux's `it_real_fn` (the
+/// ITIMER_REAL hrtimer callback raises SIGALRM straight from hardirq).
+///
+/// Checks ONLY `task`'s ITIMER_REAL slot (the interrupted task — on a
+/// single CPU that's the only one that can be CPU-bound), re-arms a
+/// periodic timer / disarms a one-shot, and returns true when SIGALRM
+/// is due. Fully alloc-free: takes only the `IrqSafeSpinLock` and never
+/// inserts (a missing table / slot just returns false). The caller
+/// raises the pending bit via the alloc-free `raise_signal_pending_irq`.
+///
+/// Re-arming under the lock keeps the slow pump from double-firing: once
+/// this advances `next_fire_ns`, the pump sees a future deadline.
+pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
+    let mut g = ITIMERS.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => return false,
+    };
+    let slot = match map.get_mut(&task) {
+        Some(slots) => &mut slots[ITIMER_REAL as usize],
+        None => return false,
+    };
+    if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
+        return false;
+    }
+    if slot.interval_ns == 0 {
+        slot.next_fire_ns = 0;
+    } else {
+        let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
+        slot.next_fire_ns = slot
+            .next_fire_ns
+            .saturating_add(slot.interval_ns.saturating_mul(fires));
+    }
+    true
 }
 
 /// Sleep-pump: walks every per-task timer table, fires expired

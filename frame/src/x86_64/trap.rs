@@ -261,6 +261,58 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                     frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
                 narf_scheduler::stackful::try_preempt(&mut *sched_frame_ptr);
             }
+            // (a) Raise any timer-driven signal whose deadline has passed
+            // for the currently-running task (e.g. SIGALRM from
+            // alarm()/setitimer(ITIMER_REAL)). A CPU-bound task never
+            // parks, so the sleep-pump that normally fires interval timers
+            // never runs for it — this alloc-free ISR check is what makes
+            // its alarm fire. Done before the delivery hook below so the
+            // freshly-raised signal lands on this same return-to-user.
+            //
+            // Gated on CPL=3 (returning to a running user task): a PARKED
+            // itimer owner must be left to the sleep-pump, which both
+            // raises AND wakes it. Firing here (the alloc-free raise
+            // deliberately skips the wake) would advance the deadline and
+            // starve the pump's wake, hanging the sleeper.
+            if (frame.cs & 3) == 3 {
+                narf_userspace::handlers::timer_tick_raise_due_signals();
+            }
+        }
+        // Full Linux-style signal delivery on the timer-IRQ return to user.
+        // Linux takes any pending, unblocked signal at EVERY kernel→user
+        // return — including interrupt returns — so a task spinning in a
+        // tight loop with no syscalls still receives signals (a fired
+        // SIGALRM, a cross-task kill, SIGTERM/SIGKILL). This is the same
+        // `default_signal_delivery` hook the int 0x80 + syscall-instruction
+        // return paths run; SYSCALL_NUM_NONE because the interrupted
+        // instruction isn't a syscall (no SA_RESTART rewind). Now that the
+        // deferred-handled-signal model is gone (signal_smoke uses
+        // sigsuspend) this can be the full hook, not the old eager/fatal
+        // subset. Self-gates on returning_to_user (CS RPL=3) internally;
+        // IRQ vectors run on RSP0 (not an IST) so a default-action
+        // terminate that longjmps to the executor is on the same stack as
+        // the syscall path's.
+        if (frame.cs & 3) == 3 {
+            let mut ctx = X86TrapContext::from_int80(frame);
+            if let Some(hook) = narf_userspace::handlers::signal_delivery_hook() {
+                hook(&mut ctx, narf_userspace::handlers::SYSCALL_NUM_NONE);
+            }
+        }
+        // (b) Preemptive time-slice. On a timer tick that interrupted user
+        // mode, hand the running task back to the cooperative executor so
+        // a CPU-bound task can't monopolize the CPU and starve siblings
+        // (and their self-driven sleep deadlines). Gated on is_tick so
+        // only the scheduler tick slices (not every device IRQ), and on
+        // CPL=3 so a task interrupted mid-syscall (CPL=0) is never yanked.
+        // Runs AFTER signal delivery so a pending/just-raised signal is
+        // taken before we yield. timer_preempt_user_task does what
+        // sys_yield does — it longjmps to the executor and does NOT return
+        // when it preempts; the task resumes later via
+        // enter_user_mode_resume. It's a no-op (returns) when no polling
+        // executor is wired (kernel-test contexts).
+        if is_tick && (frame.cs & 3) == 3 {
+            let mut ctx = X86TrapContext::from_int80(frame);
+            narf_userspace::handlers::timer_preempt_user_task(&mut ctx);
         }
         return;
     }

@@ -436,6 +436,15 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// True when a blocking read on this fd should park on the *input
+    /// waker* (woken by the serial/keyboard IRQ) rather than the 1ms
+    /// re-poll used for pipes. The console (`/dev/console`, stdin) returns
+    /// true when its byte ring is empty so an interactive shell truly
+    /// sleeps until a keystroke instead of busy-polling with `read`+`usleep`.
+    fn block_on_input(&self) -> bool {
+        false
+    }
+
     /// If this file is a pidfd (from `pidfd_open`), return the target
     /// process's pid. Used by `pidfd_send_signal(2)` to resolve the
     /// fd to a pid without a downcast / Any dance. Default: `None`.

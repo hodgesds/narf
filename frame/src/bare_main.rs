@@ -3541,6 +3541,19 @@ fn boot_userspace_init() {
                     "consoletty_smoke",
                     narf_verification::NARF_CONSOLETTY_SMOKE_ELF,
                 ),
+                // (a) Preemptive SIGALRM: alarm()/setitimer fires on a
+                // CPU-bound task that never parks (raised from the timer
+                // ISR, delivered on the IRQ return to user).
+                (
+                    "alarmloop_smoke",
+                    narf_verification::NARF_ALARMLOOP_SMOKE_ELF,
+                ),
+                // (b) Preemptive scheduling: a CPU-bound child is time-
+                // sliced so the parent's timed sleep returns on time.
+                (
+                    "preemptsched_smoke",
+                    narf_verification::NARF_PREEMPTSCHED_SMOKE_ELF,
+                ),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // multi-DSO dynamic linking: main -> libb -> liba -> libc.

@@ -1208,6 +1208,110 @@ fn smoke_userspace_signal_delivery() -> TestResult {
 #[cfg(not(feature = "user-mode-e2e"))]
 kernel_test_in!("userspace", smoke_userspace_signal_delivery);
 
+// Preemptive-signals wave: the alloc-free IRQ raise path. A signal
+// raised from the timer ISR (e.g. SIGALRM for a CPU-bound task) must
+// never allocate, so `raise_signal_pending_irq` only ORs the bit into a
+// PRE-EXISTING SIGNAL_PENDING entry and reports false otherwise — the
+// arming syscall pre-creates the entry via `ensure_signal_pending_slot`.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_raise_signal_pending_irq_is_allocfree_and_gated() -> TestResult {
+    use crate::handlers::{
+        __test_signal_reset, ensure_signal_pending_slot, raise_signal_pending_irq,
+    };
+    use crate::{signal_init, signal_pending_of};
+
+    signal_init();
+    __test_signal_reset();
+    let task = 0x5A1A_5A1A_u64;
+
+    // No entry yet → raise refuses (allocating an entry is forbidden in
+    // IRQ context), sets nothing.
+    if raise_signal_pending_irq(task, 14) {
+        __test_signal_reset();
+        return TestResult::Fail("raise_signal_pending_irq set a bit with no pre-created slot");
+    }
+    if signal_pending_of(task) != 0 {
+        __test_signal_reset();
+        return TestResult::Fail("pending bits changed despite refused raise");
+    }
+
+    // Pre-create the slot (what setitimer/alarm do at arm time), then the
+    // alloc-free raise succeeds and ORs the SIGALRM (14) bit.
+    ensure_signal_pending_slot(task);
+    if !raise_signal_pending_irq(task, 14) {
+        __test_signal_reset();
+        return TestResult::Fail("raise_signal_pending_irq returned false after slot pre-created");
+    }
+    if signal_pending_of(task) & (1 << 14) == 0 {
+        __test_signal_reset();
+        return TestResult::Fail("SIGALRM pending bit not set");
+    }
+
+    __test_signal_reset();
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_raise_signal_pending_irq_is_allocfree_and_gated
+);
+
+// Preemptive-signals wave: the ITIMER_REAL IRQ fast path. A one-shot
+// past its deadline reports due once then disarms; a periodic one
+// re-arms to a future deadline so the slow sleep-pump can't double-fire
+// it. This is what makes a CPU-bound task's `setitimer(ITIMER_REAL)`
+// fire without the task ever parking.
+#[cfg(all(not(feature = "user-mode-e2e"), feature = "linux-compat"))]
+fn smoke_userspace_itimer_real_check_due_irq_fires_and_rearms() -> TestResult {
+    use crate::posix_timer::{
+        __test_arm_itimer_real, __test_itimer_real_next_fire, __test_reset,
+        itimer_real_check_due_irq,
+    };
+    __test_reset();
+    let task = 0x1772_1772_u64;
+    let now = 1_000_000_000_u64; // arbitrary monotonic point (1 s)
+
+    // One-shot already due → reports due once, then disarms.
+    __test_arm_itimer_real(task, now - 1, 0);
+    if !itimer_real_check_due_irq(task, now) {
+        __test_reset();
+        return TestResult::Fail("one-shot past deadline not reported due");
+    }
+    if __test_itimer_real_next_fire(task) != 0 {
+        __test_reset();
+        return TestResult::Fail("one-shot not disarmed after firing");
+    }
+    if itimer_real_check_due_irq(task, now) {
+        __test_reset();
+        return TestResult::Fail("disarmed one-shot reported due again");
+    }
+
+    // Periodic (100 ms): past deadline fires once and re-arms to a
+    // future deadline; it must NOT report due again before that deadline.
+    let interval = 100_000_000_u64;
+    __test_arm_itimer_real(task, now - 1, interval);
+    if !itimer_real_check_due_irq(task, now) {
+        __test_reset();
+        return TestResult::Fail("periodic past deadline not reported due");
+    }
+    if __test_itimer_real_next_fire(task) <= now {
+        __test_reset();
+        return TestResult::Fail("periodic timer did not re-arm to a future deadline");
+    }
+    if itimer_real_check_due_irq(task, now) {
+        __test_reset();
+        return TestResult::Fail("re-armed periodic reported due before its deadline");
+    }
+
+    __test_reset();
+    TestResult::Pass
+}
+#[cfg(all(not(feature = "user-mode-e2e"), feature = "linux-compat"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_itimer_real_check_due_irq_fires_and_rearms
+);
+
 #[cfg(not(feature = "user-mode-e2e"))]
 fn smoke_userspace_signal_delivery_lowest_first_multiple_pending() -> TestResult {
     // Two signals pending at once. The async delivery hook must pick
@@ -10082,8 +10186,9 @@ fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
     // sigprocmask BLOCK SIGUSR1. Linux ABI: arg0=how, arg1=set ptr,
-    // arg2=old ptr, arg3=sigsetsize (must be 8).
-    let block: u64 = 1 << 10;
+    // arg2=old ptr, arg3=sigsetsize (must be 8). A userspace `sigset_t`
+    // puts signal N at bit N-1, so SIGUSR1 (10) is bit 9.
+    let block: u64 = 1 << 9;
     let mut m = SigGapCtx {
         args: SyscallArgs {
             arg0: 0, /* SIG_BLOCK */
@@ -10111,8 +10216,10 @@ fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
     if !ok {
         return TestResult::Fail("rt_sigpending did not Ok");
     }
-    // pending = {10, 15}; mask = {10}; pending & mask = {10}.
-    if out != (1u64 << 10) {
+    // pending = {10, 15}; mask = {10}; pending & mask = {10}. rt_sigpending
+    // reports it back in the userspace sigset convention (signal N at bit
+    // N-1), so SIGUSR1 (10) is bit 9.
+    if out != (1u64 << 9) {
         return TestResult::Fail("rt_sigpending should report only blocked-and-pending bits");
     }
     TestResult::Pass
@@ -10148,7 +10255,9 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Sigprocmask.raw(), &mut m);
 
-    // rt_sigsuspend with set = 0xF0; mask must become 0xF0.
+    // rt_sigsuspend with set = 0xF0 (userspace sigset). NARF stores the
+    // mask shifted `<<1` to align signal N with bit N, so the internal mask
+    // becomes 0xF0 << 1 = 0x1E0.
     let new_set: u64 = 0xF0;
     let mut s = SigGapCtx {
         args: SyscallArgs {
@@ -10168,7 +10277,7 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
     if !returned_minus_one {
         return TestResult::Fail("rt_sigsuspend must return -1 (EINTR)");
     }
-    if mask_after != 0xF0 {
+    if mask_after != 0x1E0 {
         return TestResult::Fail("rt_sigsuspend did not replace mask");
     }
     TestResult::Pass
@@ -10204,8 +10313,9 @@ fn smoke_userspace_rt_sigtimedwait_returns_pending_signal() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
 
-    // rt_sigtimedwait waiting for SIGUSR2 should return 12.
-    let set_in: u64 = 1u64 << 12;
+    // rt_sigtimedwait waiting for SIGUSR2 (12) should return 12. Userspace
+    // sigset puts signal N at bit N-1, so SIGUSR2 is bit 11.
+    let set_in: u64 = 1u64 << 11;
     let mut siginfo = [0u8; 128];
     let mut w = SigGapCtx {
         args: SyscallArgs {
@@ -10303,8 +10413,8 @@ fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Make signals 5, 10, 15 pending. Wait on {5, 15}. Should
-    // return 5 (the lowest match).
+    // Make signals 5, 10, 15 pending. Wait on {5, 15} (userspace sigset:
+    // signal N at bit N-1, so bits 4 and 14). Should return 5 (lowest match).
     for s in [5u64, 10, 15] {
         let mut k = SigGapCtx {
             args: SyscallArgs {
@@ -10316,7 +10426,7 @@ fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
         };
         kernel_syscall_entry(Syscall::Kill.raw(), &mut k);
     }
-    let set_in: u64 = (1u64 << 5) | (1u64 << 15);
+    let set_in: u64 = (1u64 << 4) | (1u64 << 14);
     let mut w = SigGapCtx {
         args: SyscallArgs {
             arg0: &set_in as *const u64 as u64,

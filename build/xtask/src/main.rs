@@ -1575,6 +1575,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("relpaths_smoke", "relpaths-ok"),
         // Console is a tty: isatty + cooked tcgetattr + tcsetattr round-trip.
         ("consoletty_smoke", "consoletty-ok"),
+        // (a) Preemptive SIGALRM raised+delivered to a CPU-bound busy loop.
+        ("alarmloop_smoke", "alarmloop-ok"),
+        // (b) Timer-driven preemption: a CPU-bound child can't stall parent.
+        ("preemptsched_smoke", "preemptsched-ok"),
         // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
         ("procfs2_smoke", "procfs2-ok"),
         // multi-DSO dynamic linking: main -> libb -> liba -> libc.

@@ -160,6 +160,15 @@ pub struct UserTaskCtx {
     /// loop's reap check can also collect job-control stop/continue
     /// notifications, not just exits.
     pub wait_child_options: AtomicU32,
+
+    /// Set by `sys_read` when a blocking read on the console fd finds the
+    /// input ring empty: instead of the 1ms re-poll used for pipes, the
+    /// task parks on the serial/keyboard IRQ's `BYTE_RING_WAKER`. The poll
+    /// routine registers `cx.waker()` there and returns `Pending` WITHOUT a
+    /// wake-by-ref, so the task truly idles (and the executor can halt)
+    /// until a keystroke arrives — no busy-poll. Cleared by the poll once
+    /// bytes are available, and the read re-executes (RIP was rewound).
+    pub console_read_pending: AtomicBool,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -190,6 +199,7 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
+            console_read_pending: AtomicBool::new(false),
         }
     }
 }
@@ -687,6 +697,12 @@ pub struct UserTaskFuture {
     /// we can restore it on the return path. `None` until the first
     /// poll runs.
     saved_cr3: core::cell::Cell<Option<u64>>,
+    /// Timer-wheel slot this task is parked on while sleeping
+    /// (`sys_sleep`/`nanosleep` with a finite deadline). The poll
+    /// registers the slot once and refreshes it across spurious
+    /// re-polls instead of self-waking every 1ms; the wheel fires the
+    /// task's waker at the deadline. Cleared (cancelled) on wake.
+    sleep_handle: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -721,6 +737,7 @@ impl UserTaskFuture {
             jmp: UnsafeCell::new(JmpBuf::default()),
             state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
+            sleep_handle: None,
         }
     }
 
@@ -753,6 +770,7 @@ impl UserTaskFuture {
             // state instead of the (entry, stack_top) pair.
             state: TaskState::Running,
             saved_cr3: core::cell::Cell::new(None),
+            sleep_handle: None,
         }
     }
 
@@ -849,20 +867,57 @@ impl core::future::Future for UserTaskFuture {
             let signal_pending = deadline == u64::MAX
                 && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
             if now < deadline && !signal_pending {
-                const PARK_CHUNK_NS: u64 = 1_000_000;
-                let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
-                while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
-                    crate::handlers::sleep_pumps::run();
-                    core::hint::spin_loop();
+                if deadline == u64::MAX {
+                    // Infinite park (pause / blocking poll/epoll/futex wait):
+                    // a finite wake deadline doesn't apply, and we must keep
+                    // ticking the sleep pumps so an interval timer / kernel
+                    // async task can raise the signal that ends the wait.
+                    // Keep the bounded self-wake here (woken promptly by
+                    // wake_signal on a raise; this is rare and short-lived).
+                    const PARK_CHUNK_NS: u64 = 1_000_000;
+                    let chunk_end = now.saturating_add(PARK_CHUNK_NS);
+                    while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
+                        crate::handlers::sleep_pumps::run();
+                        core::hint::spin_loop();
+                    }
+                    cx.waker().wake_by_ref();
+                    return core::task::Poll::Pending;
                 }
-                cx.waker().wake_by_ref();
+                // Finite sleep (sys_sleep / nanosleep): PARK on the timer
+                // wheel instead of self-waking. The wheel fires our waker at
+                // the deadline (via the timer IRQ → take_due → deferred_wake,
+                // or the executor idle path's fire_due fallback), so the
+                // executor can round-robin other tasks / idle instead of
+                // re-polling us every 1ms. Register once; refresh across any
+                // spurious re-poll so we never leak a slot.
+                let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+                let deadline_cycles = deadline.saturating_mul(cpns);
+                let refreshed = this.sleep_handle.is_some_and(|h| {
+                    narf_scheduler::narf_time::timer_wheel::refresh_waker(h, cx.waker().clone())
+                });
+                if !refreshed {
+                    this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
+                        deadline_cycles,
+                        cx.waker().clone(),
+                    )
+                    .ok();
+                    if this.sleep_handle.is_none() {
+                        // Wheel full (>64 sleepers) or no arm callback: fall
+                        // back to a self-wake so the task still makes
+                        // progress (degraded, never wedged).
+                        cx.waker().wake_by_ref();
+                    }
+                }
                 return core::task::Poll::Pending;
             }
             // Deadline reached or a signal is pending — clear so the next
-            // sys_sleep call doesn't see stale state, then fall through
-            // to the normal resume path (which re-enters user mode; the
-            // pending signal is delivered on the next yield syscall).
+            // sys_sleep call doesn't see stale state, cancel any wheel slot,
+            // then fall through to the normal resume path (which re-enters
+            // user mode; a pending signal is delivered on the next return).
             this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
+            if let Some(h) = this.sleep_handle.take() {
+                narf_scheduler::narf_time::timer_wheel::cancel(h);
+            }
         }
 
         // sys_wait4 cooperative parking: when a blocking wait4 finds
@@ -952,6 +1007,26 @@ impl core::future::Future for UserTaskFuture {
                     // wakes us.  Do NOT call wake_by_ref here.
                     return core::task::Poll::Pending;
                 }
+            }
+        }
+
+        // Console blocking-read park: sys_read found the input ring empty
+        // and rewound RIP to re-execute the read on resume. Register our
+        // waker so the serial/keyboard IRQ (push_global → BYTE_RING_WAKER →
+        // deferred_wake) reschedules us. If a byte is already available
+        // (raced in, or this is the wake), clear the flag and fall through
+        // to re-enter user mode so the read re-runs and drains it. Else
+        // return Pending with NO wake_by_ref — the task truly idles until a
+        // keystroke, so the executor can halt instead of busy-polling.
+        if this.ctx.console_read_pending.load(Ordering::Acquire) {
+            narf_input::register_byte_waker(cx.waker());
+            if narf_input::pending_bytes() > 0 {
+                this.ctx
+                    .console_read_pending
+                    .store(false, Ordering::Release);
+                // fall through to resume + re-execute the read
+            } else {
+                return core::task::Poll::Pending;
             }
         }
 

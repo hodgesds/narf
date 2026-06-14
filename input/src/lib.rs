@@ -1061,6 +1061,17 @@ pub fn pending_bytes() -> usize {
     BYTE_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0)
 }
 
+/// Register `waker` in the `BYTE_RING_WAKER` slot so the next
+/// `push_global(AsciiByte(_))` (from the serial/keyboard IRQ via
+/// `deferred_wake`) wakes the caller. Unlike `WaitAsciiByteFuture` this
+/// does NOT pop — the caller (a parked `sys_read` re-executing on wake)
+/// drains the ring itself. The console is single-reader, so the single
+/// slot is sufficient. Callers MUST re-check `pending_bytes()` after
+/// registering to close the arrive-between-check-and-register race.
+pub fn register_byte_waker(waker: &core::task::Waker) {
+    *BYTE_RING_WAKER.lock() = Some(waker.clone());
+}
+
 /// Pop one raw byte from the AsciiByte stream.
 pub fn pop_ascii_byte() -> Option<u8> {
     let ev = BYTE_RING.lock().as_ref().and_then(|r| r.pop())?;
