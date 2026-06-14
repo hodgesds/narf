@@ -7931,7 +7931,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // clear_child_tid futex word after the slot is reaped.
     let child_as_root = child_as.root;
     let child_tid =
-        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::unthrottled(), child_as);
+        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::user_task(), child_as);
 
     // Register the (visible-pid → TaskId) binding. For
     // CLONE_THREAD children visible_pid == parent's pid, so the
@@ -8340,7 +8340,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         None => crate::user_task::UserTaskFuture::new(proc),
     };
     let child_tid =
-        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::unthrottled(), child_as);
+        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::user_task(), child_as);
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());

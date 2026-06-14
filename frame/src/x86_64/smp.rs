@@ -24,7 +24,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::fmt::Write;
 use narf_console::Writer;
 
-use narf_memory::alloc_frame;
+use narf_memory::alloc_pages_on;
 
 /// Where the AP trampoline lives at runtime. SIPI vector = 0x08
 /// → linear address 0x8000.
@@ -40,8 +40,16 @@ const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 #[unsafe(no_mangle)]
 static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percpu::MAX_CPUS];
 
-/// AP stack pages — 4 KiB is sufficient for the WFI parking loop.
-const AP_STACK_PAGES: usize = 1;
+/// AP kernel stack order — order-4 = 16 frames = 64 KiB, allocated as
+/// one contiguous buddy block. The original 4 KiB was sized for the
+/// WFI parking loop, but once an AP runs the full executor it also
+/// dispatches USER tasks (`run_until_empty` → AS activate → setjmp →
+/// `enter_user_mode` → the deep longjmp-return path), which overflows
+/// 4 KiB and corrupts adjacent state — observed as a bogus victim
+/// index panicking in the work-steal path. Must be contiguous so the
+/// stack is one usable range (the trampoline loads its top as RSP).
+const AP_STACK_ORDER: u8 = 4;
+const AP_STACK_PAGES: usize = 1 << AP_STACK_ORDER;
 
 extern "C" {
     static _ap_trampoline_start: u8;
@@ -329,24 +337,17 @@ pub unsafe fn start_aps() -> u32 {
     let mut viable_buf = [0u32; narf_lib::percpu::MAX_CPUS];
     let mut viable_len: usize = 0;
     for logical in 1..total {
-        let mut stack_top: u64 = 0;
-        for _ in 0..AP_STACK_PAGES {
-            match alloc_frame() {
-                Ok(f) => {
-                    let base = f.start_address().raw();
-                    if stack_top == 0 {
-                        stack_top = base + 4096;
-                    }
-                }
-                Err(_) => {
-                    let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
-                    break;
-                }
+        // One contiguous order-4 block (64 KiB). The previous per-page
+        // `alloc_frame` loop only used the first frame's top, silently
+        // assuming contiguity it never guaranteed — so it could never
+        // give more than 4 KiB. A single buddy block fixes both.
+        let stack_top: u64 = match alloc_pages_on(0, AP_STACK_ORDER) {
+            Ok(f) => f.start_address().raw() + (AP_STACK_PAGES as u64 * 4096),
+            Err(_) => {
+                let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
+                continue;
             }
-        }
-        if stack_top == 0 {
-            continue;
-        }
+        };
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.
         // SAFETY: Valid memory or trusted environment

@@ -213,6 +213,31 @@ pub fn disable_work_stealing() {
     STEAL_ENABLED.store(false, Ordering::Release);
 }
 
+/// Master switch for running *user* tasks on multiple CPUs. Off by
+/// default. Boot flips it on ONLY when cross-CPU TLB shootdown is
+/// wired (x2APIC active → the `invlpg_global` broadcast hook is
+/// installed), which is the soundness prerequisite: a thread group
+/// sharing an address space across cores needs every munmap /
+/// mprotect / madvise / COW-resolve to invalidate peer TLBs. Under
+/// xAPIC fallback the hook is absent, so this stays off and user
+/// tasks remain BOOT-pinned (see [`TaskSpec::user_task`] and the
+/// `addr_space` floor in `steal::StealStrategy::allow_steal`).
+static USER_SMP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable user-task SMP (migration + AP initial placement). Call once
+/// at boot, after confirming the TLB-shootdown broadcast hook is
+/// installed (x2APIC) and APs are online. Idempotent.
+pub fn enable_user_task_smp() {
+    USER_SMP_ENABLED.store(true, Ordering::Release);
+}
+
+/// Whether user tasks may run on application processors. Consulted by
+/// [`TaskSpec::user_task`] (initial affinity) and the steal floor.
+#[inline]
+pub fn user_task_smp_enabled() -> bool {
+    USER_SMP_ENABLED.load(Ordering::Acquire)
+}
+
 /// Id of the task currently being polled by the executor on each CPU,
 /// or `0` when that CPU is between polls. Syscall handlers read THIS
 /// CPU's slot to identify the caller — the syscall trap runs on the
@@ -397,6 +422,35 @@ impl TaskSpec {
     pub const fn kernel_any() -> Self {
         Self {
             affinity: Affinity::any(),
+            budget: ResourceBudget::unthrottled(),
+            budget_cap: None,
+            class: SchedClass::Normal,
+            priority: Priority::NORMAL,
+            smt: SmtSharePolicy::Avoid,
+        }
+    }
+
+    /// Spec for a USER task (one carrying an address space, spawned
+    /// via [`spawn_user`]). Eligible to run on any online CPU when
+    /// user-task SMP is enabled ([`enable_user_task_smp`] — set at
+    /// boot iff cross-CPU TLB shootdown is wired), otherwise BOOT-
+    /// pinned exactly like [`unthrottled`](Self::unthrottled). Unlike
+    /// `unthrottled()` (which stays pinned to protect un-audited
+    /// kernel spawn-and-forget tasks), user tasks are SMP-safe to
+    /// migrate: their per-in-flight state is per-CPU (`CURRENT`,
+    /// `CURRENT_TASK`, `ACTIVE_USER_AS`, the executor jmpbuf) and the
+    /// rest is per-task-keyed; the shared-AS TLB hazard is covered by
+    /// the broadcast shootdown that gates the enable flag.
+    ///
+    /// Not `const`: the affinity depends on the runtime enable flag.
+    pub fn user_task() -> Self {
+        let affinity = if user_task_smp_enabled() {
+            Affinity::any()
+        } else {
+            Affinity::pinned(crate::affinity::CpuId::BOOT)
+        };
+        Self {
+            affinity,
             budget: ResourceBudget::unthrottled(),
             budget_cap: None,
             class: SchedClass::Normal,

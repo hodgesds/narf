@@ -133,6 +133,19 @@ cgroup-all = [
     "cgroup-psi",
 ]
 
+# User-task SMP: let USER tasks migrate onto application processors.
+# OFF by default. The per-AP user-mode machinery (per-CPU GDT/TSS/
+# SYSCALL, larger AP stacks) and the cross-CPU TLB shootdown it relies
+# on are always built, but ACTUALLY enabling migration
+# (`enable_user_task_smp` at boot) is gated here because the broader
+# userspace isn't SMP-hardened yet: the interactive login shell
+# (console/job-control path) deadlocks, and dynamically-linked
+# programs hang in the mprotect-heavy dynamic-linker path (syscalls
+# run IRQ-masked via SFMASK, so a migrated task's broadcast shootdown
+# spins on peer acks). Single-process login is verified working under
+# migration; turn this on for continued SMP-hardening work.
+user-task-smp = []
+
 # Self-test: trigger a #UD at end-of-boot to prove the IDT dispatches.
 # Off by default; enable with `cargo xtask run --arch=x86_64 --features idt-selftest`.
 idt-selftest = []
