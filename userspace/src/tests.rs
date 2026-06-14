@@ -13520,6 +13520,74 @@ fn smoke_console_read_empty_ring_returns_zero() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_console_read_empty_ring_returns_zero);
 
+fn smoke_console_ctrlc_signals_foreground_pgrp() -> TestResult {
+    // ^C on the console (ISIG cooked mode) must deliver SIGINT to the
+    // ENTIRE foreground process group — proper job control — not just the
+    // single reading task. Drive the unified line discipline end-to-end:
+    // install the console signal hook, mark a leader task as the
+    // foreground console reader, put a second task in its group, push a
+    // ^C byte, then read the console (which pumps the discipline → hook →
+    // deliver_signal_to_pgrp). Assert BOTH tasks have SIGINT pending and
+    // the ^C was consumed (did not surface through read).
+    use crate::handlers::{
+        __test_pgid_reset, __test_reset_task_id_lookup, __test_set_pgid, __test_signal_reset,
+        maybe_deliver_signal_for_input, note_console_reader, pgid_init, signal_init,
+        signal_pending_of,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_00C1);
+    fn task_lookup() -> u64 {
+        TASK_ID.load(Ordering::Relaxed)
+    }
+    let leader = TASK_ID.load(Ordering::Relaxed);
+    let member: u64 = 0xC0_00C2;
+
+    __test_signal_reset();
+    signal_init();
+    __test_pgid_reset();
+    pgid_init();
+    crate::install_task_id_lookup(task_lookup);
+    narf_input::init_global_ring(256);
+    narf_input::__reset_global_ring_for_test();
+    narf_filesystem::console_tty::__test_reset_cooked();
+    // The kernel-test boot doesn't run cross_crate_init, so install the
+    // console signal hook explicitly.
+    narf_filesystem::console_tty::install_signal_hook(maybe_deliver_signal_for_input);
+
+    // `leader` is its own group (pgid defaults to pid); put `member` in it.
+    __test_set_pgid(member, leader);
+    // `leader` is the foreground console reader.
+    note_console_reader(leader);
+
+    // Push ^C (0x03) and pump the discipline by reading.
+    narf_input::push_global(narf_input::InputEvent::AsciiByte(0x03));
+    let mut buf = [0u8; 8];
+    let n = narf_filesystem::console_tty::read_into(&mut buf);
+
+    let lead_pending = signal_pending_of(leader);
+    let mem_pending = signal_pending_of(member);
+
+    // Clean up shared globals.
+    __test_signal_reset();
+    __test_pgid_reset();
+    narf_filesystem::console_tty::__test_reset_cooked();
+    __test_reset_task_id_lookup();
+
+    let sigint = 1u32 << 2; // SIGINT = 2 (NARF pending convention: bit == signum)
+    if n != 0 {
+        return TestResult::Fail("^C should be consumed as a signal, not returned by read");
+    }
+    if lead_pending & sigint == 0 {
+        return TestResult::Fail("foreground leader did not get SIGINT");
+    }
+    if mem_pending & sigint == 0 {
+        return TestResult::Fail("foreground group member did not get SIGINT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_console_ctrlc_signals_foreground_pgrp);
+
 // ── Wave 39: end-to-end `echo hello world` golden path ────────────────────
 //
 // The Wave-37/38/39 chain (serial RX → BYTE_RING → ConsoleFile::read →

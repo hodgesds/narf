@@ -9325,6 +9325,16 @@ pub fn __test_pgid_reset() {
     *PGID_TABLE.lock() = Some(BTreeMap::new());
 }
 
+/// Test-only: map `task` into process group `pgid` directly (bypassing
+/// the setpgid syscall plumbing) so a test can assemble a multi-member
+/// foreground group.
+#[doc(hidden)]
+pub fn __test_set_pgid(task: u64, pgid: u64) {
+    let mut g = PGID_TABLE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    m.insert(task, pgid);
+}
+
 fn read_pgid(target: u64) -> u64 {
     let g = PGID_TABLE.lock();
     g.as_ref()
@@ -13722,6 +13732,41 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     wake_signal(task);
 }
 
+/// Deliver `signum` to every task in process group `pgrp` (job-control
+/// terminal signals: ^C/^\/^Z → SIGINT/SIGQUIT/SIGTSTP go to the whole
+/// foreground group, not just one process). Members are the tasks mapped
+/// to `pgrp` in `PGID_TABLE` plus the group leader (`pid == pgrp`) when it
+/// has no divergent mapping. Returns true if at least one task was
+/// targeted. Syscall context only (allocates).
+pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
+    if pgrp == 0 || signum >= 32 {
+        return false;
+    }
+    let mut targets: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    {
+        let g = PGID_TABLE.lock();
+        if let Some(m) = g.as_ref() {
+            for (&task, &pg) in m.iter() {
+                if pg == pgrp {
+                    targets.push(task);
+                }
+            }
+        }
+    }
+    // The leader (pid == pgrp) defaults to pgid == pid when unmapped;
+    // include it unless it was explicitly moved to another group.
+    if !targets.contains(&pgrp) && read_pgid(pgrp) == pgrp {
+        targets.push(pgrp);
+    }
+    if targets.is_empty() {
+        return false;
+    }
+    for t in targets {
+        raise_signal_pending(t, signum);
+    }
+    true
+}
+
 /// Pre-create `task`'s `SIGNAL_PENDING` entry (bits = 0) so a later
 /// IRQ-context raise can be alloc-free. Called from syscall context
 /// (e.g. arming an interval timer), where allocation is allowed. No-op
@@ -16242,32 +16287,35 @@ pub fn foreground_task() -> u64 {
     FOREGROUND_TASK.load(Ordering::Acquire)
 }
 
-/// Console driver hook: called from DevConsole.read when the input
-/// byte stream contains a control character that the current
-/// foreground task's termios maps to a signal. ^C → SIGINT (2),
-/// ^\ → SIGQUIT (3), ^Z → SIGTSTP (20). Returns true if the byte
-/// was consumed as a signal (don't deliver to user); false otherwise.
+/// Console line-discipline hook: invoked by `console_tty` when ISIG is
+/// set on the console termios and an input byte matches a signal-
+/// generating control char. ^C → SIGINT (2), ^\ → SIGQUIT (3),
+/// ^Z → SIGTSTP (20). The signal goes to the entire FOREGROUND PROCESS
+/// GROUP (proper job control), which is the group of the task currently
+/// reading the console. Returns true iff the byte was consumed as a
+/// signal (so it is NOT returned through read).
+///
+/// ISIG gating + c_cc matching already happened in `console_tty`; this
+/// only maps the byte to a signal and fans it out to the pgrp. The
+/// trap-return signal-delivery hook takes it on each member's next
+/// return to user mode.
 pub fn maybe_deliver_signal_for_input(byte: u8) -> bool {
+    let signum = match byte {
+        0x03 => 2,  // SIGINT  (^C)
+        0x1C => 3,  // SIGQUIT (^\)
+        0x1A => 20, // SIGTSTP (^Z)
+        _ => return false,
+    };
     let task = foreground_task();
     if task == 0 {
         return false;
     }
-    let t = termios_of_task(task);
-    if t.c_lflag & ISIG == 0 {
-        return false;
+    let pgrp = read_pgid(task);
+    if deliver_signal_to_pgrp(pgrp, signum) {
+        return true;
     }
-    let signum = match byte {
-        0x03 => 2,  // SIGINT
-        0x1C => 3,  // SIGQUIT
-        0x1A => 20, // SIGTSTP
-        _ => return false,
-    };
-    // Set the pending bit; the trap-return signal-delivery hook
-    // picks it up next time the task returns to user mode.
-    let mut g = SIGNAL_PENDING.lock();
-    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    let slot = map.entry(task).or_insert(0);
-    *slot |= 1u32 << signum;
+    // Fallback: no pgrp members resolved — deliver to the reader itself.
+    raise_signal_pending(task, signum);
     true
 }
 

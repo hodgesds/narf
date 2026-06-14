@@ -155,8 +155,12 @@ fn pump(state: &mut LineDiscipline, t: &Termios) {
             Some(b) => b,
             None => break,
         };
-        // ISIG control chars (^C/^\/^Z) go to the foreground pgrp.
+        // ISIG control chars (^C/^\/^Z) go to the foreground pgrp. On a
+        // generated signal Linux flushes the pending input line (NOFLSH
+        // clear, the default), so drop the partial line being edited —
+        // otherwise it would prepend to whatever the user types next.
         if isig && signal_hook_consumes(b) {
+            state.line.clear();
             continue;
         }
         if !canon {
