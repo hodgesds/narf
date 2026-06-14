@@ -1615,6 +1615,15 @@ pub fn run_until_empty() {
         }
 
         if ready_this_round == 0 {
+            // All tasks parked this round. Tick the sleep pumps so the work
+            // that USED to ride the per-task 1ms sleep busy-wait still makes
+            // progress now that finite sleeps truly park on the timer wheel:
+            // POSIX interval timers (raise SIGALRM for a sleeping task),
+            // serial-input drain (push bytes → wake a blocked console
+            // reader), and kernel async stepping. Their wakes land in the
+            // deferred queue / signal wakers and are picked up by the
+            // drain + the next round.
+            sleep_pumps::run();
             // Drain any wakers that IRQ handlers stashed for
             // deferred execution. The IRQ paths (dispatch::on_irq's
             // vector-waker chain, timer_pump's pump_irq → wheel
