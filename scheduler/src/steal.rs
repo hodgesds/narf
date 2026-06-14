@@ -77,18 +77,22 @@ pub trait StealStrategy: Send + Sync + 'static {
     /// Permit/refuse stealing this specific task. Receives a
     /// read-only snapshot of the task's metadata
     /// (addr_space / affinity / class / priority / id). Default:
-    /// never steal an address-space-bearing (user) task — a hard
-    /// SMP-safety floor independent of affinity, because the global
-    /// single-in-flight-user-task assumptions (`CURRENT`,
-    /// `CURRENT_TASK`, `ACTIVE_USER_AS`) are not yet per-CPU — then
-    /// respect the task's affinity mask so pinned tasks are never
-    /// stolen across pins. Custom impls may broaden the affinity rule
-    /// (e.g. ignore affinity for a throughput-only workload) or
-    /// narrow it (e.g. only steal SchedClass::Normal tasks), but
-    /// should keep the `addr_space` refusal until full user-task SMP
-    /// lands.
+    /// refuse to steal an address-space-bearing (user) task UNTIL
+    /// user-task SMP is enabled at boot
+    /// ([`crate::enable_user_task_smp`], set iff cross-CPU TLB
+    /// shootdown is wired). The single-in-flight-user-task executor
+    /// state (`CURRENT`, `CURRENT_TASK`, `ACTIVE_USER_AS`, the poller
+    /// jmpbuf) is now per-CPU, and APs are user-mode-capable
+    /// (per-CPU GDT/TSS/SYSCALL), so once the flag is set user tasks
+    /// migrate subject to their affinity mask. When the flag is off
+    /// (xAPIC fallback) user tasks stay BOOT-pinned and this floor is
+    /// belt-and-suspenders. Either way, respect the affinity mask so
+    /// pinned tasks are never stolen across their pins. Custom impls
+    /// may broaden the affinity rule (e.g. ignore affinity for a
+    /// throughput-only workload) or narrow it (e.g. only steal
+    /// SchedClass::Normal tasks).
     fn allow_steal(&self, thief: CpuId, task: &TaskMeta) -> bool {
-        if task.addr_space {
+        if task.addr_space && !crate::user_task_smp_enabled() {
             return false;
         }
         task.affinity.allowed.contains(thief)

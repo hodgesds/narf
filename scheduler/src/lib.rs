@@ -213,29 +213,73 @@ pub fn disable_work_stealing() {
     STEAL_ENABLED.store(false, Ordering::Release);
 }
 
-/// Id of the task currently being polled by the executor, or
-/// `TaskId::NONE` when the executor is between polls. Syscall
-/// handlers read this to identify the caller; SMP bring-up will
-/// migrate to a per-CPU slot read via `gs:[offset]`.
-static CURRENT_TASK: AtomicU64 = AtomicU64::new(0);
+/// Master switch for running *user* tasks on multiple CPUs. Off by
+/// default. Boot flips it on ONLY when cross-CPU TLB shootdown is
+/// wired (x2APIC active → the `invlpg_global` broadcast hook is
+/// installed), which is the soundness prerequisite: a thread group
+/// sharing an address space across cores needs every munmap /
+/// mprotect / madvise / COW-resolve to invalidate peer TLBs. Under
+/// xAPIC fallback the hook is absent, so this stays off and user
+/// tasks remain BOOT-pinned (see [`TaskSpec::user_task`] and the
+/// `addr_space` floor in `steal::StealStrategy::allow_steal`).
+static USER_SMP_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Address space of the currently-polling task — published before
-/// `poll` so syscall handlers can resolve it without searching the
-/// run-queue (the slot has been popped and isn't visible to
-/// `address_space_of` during the poll body). Cleared on the way
-/// out. Lock-protected because boot establishes a kernel-only
-/// thread of control before any user task spawns; subsequent
-/// reads are infrequent (one per syscall) and writes are once per
-/// poll, so the lock cost is negligible.
-static ACTIVE_USER_AS: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Enable user-task SMP (migration + AP initial placement). Call once
+/// at boot, after confirming the TLB-shootdown broadcast hook is
+/// installed (x2APIC) and APs are online. Idempotent.
+pub fn enable_user_task_smp() {
+    USER_SMP_ENABLED.store(true, Ordering::Release);
+}
 
-/// Read the currently-polling task's id. Returns `TaskId::NONE`
-/// when called outside any `poll` context (e.g. from boot or
-/// between rounds).
+/// Whether user tasks may run on application processors. Consulted by
+/// [`TaskSpec::user_task`] (initial affinity) and the steal floor.
+#[inline]
+pub fn user_task_smp_enabled() -> bool {
+    USER_SMP_ENABLED.load(Ordering::Acquire)
+}
+
+/// Id of the task currently being polled by the executor on each CPU,
+/// or `0` when that CPU is between polls. Syscall handlers read THIS
+/// CPU's slot to identify the caller — the syscall trap runs on the
+/// same CPU as the task that issued it. Per-CPU is required once user
+/// tasks run on multiple CPUs concurrently; a single global would
+/// report the wrong task to a syscall on a different core.
+static CURRENT_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; narf_lib::percpu::MAX_CPUS]
+};
+
+/// This CPU's current-task cell.
+#[inline]
+fn current_task_slot() -> &'static AtomicU64 {
+    &CURRENT_TASK[narf_lib::percpu::current_cpu()]
+}
+
+/// Address space of the currently-polling task on each CPU — published
+/// before `poll` so syscall handlers can resolve it without searching
+/// the run-queue (the slot has been popped and isn't visible to
+/// `address_space_of` during the poll body). Cleared on the way out.
+/// Per-CPU for the same reason as `CURRENT_TASK`.
+static ACTIVE_USER_AS: [narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>;
+    narf_lib::percpu::MAX_CPUS] = {
+    const EMPTY: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    [EMPTY; narf_lib::percpu::MAX_CPUS]
+};
+
+/// This CPU's active-user-AS cell.
+#[inline]
+fn active_user_as_slot() -> &'static narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> {
+    &ACTIVE_USER_AS[narf_lib::percpu::current_cpu()]
+}
+
+/// Read the currently-polling task's id on this CPU. Returns
+/// `TaskId::NONE` when called outside any `poll` context (e.g. from
+/// boot or between rounds).
 #[inline]
 pub fn current_task_id() -> TaskId {
-    TaskId(CURRENT_TASK.load(Ordering::Acquire))
+    TaskId(current_task_slot().load(Ordering::Acquire))
 }
 
 /// Resolve the address space of the currently-polling task. This
@@ -245,7 +289,7 @@ pub fn current_task_id() -> TaskId {
 /// when the active task is kernel-only (no AS) or the executor
 /// isn't currently polling.
 pub fn current_address_space() -> Option<Arc<AddressSpace>> {
-    ACTIVE_USER_AS.lock().clone()
+    active_user_as_slot().lock().clone()
 }
 
 pub(crate) struct TaskSlot {
@@ -378,6 +422,35 @@ impl TaskSpec {
     pub const fn kernel_any() -> Self {
         Self {
             affinity: Affinity::any(),
+            budget: ResourceBudget::unthrottled(),
+            budget_cap: None,
+            class: SchedClass::Normal,
+            priority: Priority::NORMAL,
+            smt: SmtSharePolicy::Avoid,
+        }
+    }
+
+    /// Spec for a USER task (one carrying an address space, spawned
+    /// via [`spawn_user`]). Eligible to run on any online CPU when
+    /// user-task SMP is enabled ([`enable_user_task_smp`] — set at
+    /// boot iff cross-CPU TLB shootdown is wired), otherwise BOOT-
+    /// pinned exactly like [`unthrottled`](Self::unthrottled). Unlike
+    /// `unthrottled()` (which stays pinned to protect un-audited
+    /// kernel spawn-and-forget tasks), user tasks are SMP-safe to
+    /// migrate: their per-in-flight state is per-CPU (`CURRENT`,
+    /// `CURRENT_TASK`, `ACTIVE_USER_AS`, the executor jmpbuf) and the
+    /// rest is per-task-keyed; the shared-AS TLB hazard is covered by
+    /// the broadcast shootdown that gates the enable flag.
+    ///
+    /// Not `const`: the affinity depends on the runtime enable flag.
+    pub fn user_task() -> Self {
+        let affinity = if user_task_smp_enabled() {
+            Affinity::any()
+        } else {
+            Affinity::pinned(crate::affinity::CpuId::BOOT)
+        };
+        Self {
+            affinity,
             budget: ResourceBudget::unthrottled(),
             budget_cap: None,
             class: SchedClass::Normal,
@@ -716,10 +789,10 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
     //      addr_space field. The map is checked after the slot is
     //      popped; the override takes precedence over the slot's
     //      own field.
-    let id_now = CURRENT_TASK.load(Ordering::Acquire);
+    let id_now = current_task_slot().load(Ordering::Acquire);
     if id_now == id.raw() {
         {
-            let mut g = ACTIVE_USER_AS.lock();
+            let mut g = active_user_as_slot().lock();
             let _ = g.take();
             *g = Some(new_arc.clone());
         }
@@ -1198,10 +1271,10 @@ pub fn poll_one_round() -> usize {
         // kernel-only tasks (the user-task skip above), so the
         // ACTIVE_USER_AS clear is unconditional — kernel tasks
         // don't carry their own AS publication.
-        let outer_task = CURRENT_TASK.load(Ordering::Acquire);
-        let outer_as = ACTIVE_USER_AS.lock().clone();
-        CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
-        // No `*ACTIVE_USER_AS.lock() = ...` here because kernel
+        let outer_task = current_task_slot().load(Ordering::Acquire);
+        let outer_as = active_user_as_slot().lock().clone();
+        current_task_slot().store(slot.id.raw(), Ordering::Release);
+        // No `*active_user_as_slot().lock() = ...` here because kernel
         // tasks have `addr_space.is_none()` (we filtered above).
         // Stage-5 PKRS restore (Intel SDM Vol 3 §4.6.2.4):
         // re-establish the task's protection-key rights view
@@ -1218,8 +1291,8 @@ pub fn poll_one_round() -> usize {
             }
         }
         let poll_result = slot.task.as_mut().poll(&mut ctx);
-        CURRENT_TASK.store(outer_task, Ordering::Release);
-        *ACTIVE_USER_AS.lock() = outer_as;
+        current_task_slot().store(outer_task, Ordering::Release);
+        *active_user_as_slot().lock() = outer_as;
         let elapsed = Instant::now().cycles_since(start);
         let outcome = slot.account.charge(elapsed, &slot.spec.budget);
         // Apply any donor-side debit that `donate_to` staged
@@ -1450,8 +1523,8 @@ pub fn run_until_empty() {
             // by the time we'd otherwise look the slot up via
             // `address_space_of(id)` it's already been popped from
             // the queue and thus invisible to that scan.
-            CURRENT_TASK.store(slot.id.raw(), Ordering::Release);
-            *ACTIVE_USER_AS.lock() = slot.addr_space.clone();
+            current_task_slot().store(slot.id.raw(), Ordering::Release);
+            *active_user_as_slot().lock() = slot.addr_space.clone();
             // Stage-5 PKRS restore (Intel SDM Vol 3 §4.6.2.4):
             // re-establish the task's protection-key rights view
             // before re-entering its future.
@@ -1494,8 +1567,8 @@ pub fn run_until_empty() {
                 narf_memory::beacon::paint(18, PALETTE[(n as usize) & 7]);
             }
             let poll_result = slot.task.as_mut().poll(&mut ctx);
-            CURRENT_TASK.store(0, Ordering::Release);
-            *ACTIVE_USER_AS.lock() = None;
+            current_task_slot().store(0, Ordering::Release);
+            *active_user_as_slot().lock() = None;
             // Restore kernel per-AS register — see save comment
             // above. Without this, every kernel task polled after
             // a user task runs with stale user-AS CR3 (x86_64)
@@ -2068,7 +2141,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     // documented callers (panic dump, IRQ handlers, lock holders,
     // SMP startup, sleep_pump re-entry) may legitimately observe
     // CURRENT_TASK != 0.
-    if allow_halt && CURRENT_TASK.load(Ordering::Acquire) != 0 {
+    if allow_halt && current_task_slot().load(Ordering::Acquire) != 0 {
         panic!(
             "narf_scheduler::block_on called from inside executor poll \
              (CURRENT_TASK != 0) — would deadlock the polling loop. \

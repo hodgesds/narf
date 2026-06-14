@@ -92,6 +92,39 @@ pub unsafe fn init_bsp() {
     }
 }
 
+/// Initialise per-CPU state for an application processor (AP).
+///
+/// Allocates this AP's own `PerCpu` (leaked — lives for the lifetime
+/// of the system) and programs:
+/// - `IA32_GS_BASE` = &PerCpu (kernel-mode GS; the user-entry
+///   `swapgs` stashes it into `IA32_KERNEL_GS_BASE` so the trap path
+///   recovers it after a user→kernel `swapgs`).
+/// - `PerCpu.kernel_stack_top` = `kernel_stack_top` (the SYSCALL
+///   entry stub reads this at `gs:8`; must match this AP's
+///   `TSS.rsp0`).
+/// - `IA32_KERNEL_GS_BASE` = 0 (set to the user's desired GS.base
+///   when a user task is scheduled on this CPU).
+///
+/// # Safety
+/// Must run once per AP, in kernel mode, after `gdt::init_ap` has
+/// installed this AP's TSS *and reloaded `gs`* (which zeroes GS.base —
+/// this call restores it). `kernel_stack_top` must be the top of this
+/// AP's `rsp0` stack as returned by `gdt::init_ap`.
+#[cfg(feature = "user-task-smp")]
+pub unsafe fn init_ap(cpu_id: u32, kernel_stack_top: u64) {
+    let pc: &'static PerCpu = alloc::boxed::Box::leak(alloc::boxed::Box::new(PerCpu::new(cpu_id)));
+    pc.kernel_stack_top
+        .store(kernel_stack_top, Ordering::Release);
+    let addr = pc as *const PerCpu as u64;
+
+    // SAFETY: writing GS_BASE / KERNEL_GS_BASE at CPL=0 is always
+    // legal; `addr` points at this AP's own leaked PerCpu.
+    unsafe {
+        msr::wrmsr(IA32_GS_BASE, addr);
+        msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
+    }
+}
+
 /// Current per-CPU address (reads `IA32_GS_BASE`).
 ///
 /// Diagnostic: kernel code paths that genuinely need per-CPU state

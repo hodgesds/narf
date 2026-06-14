@@ -1648,6 +1648,36 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if started > 0 {
                         narf_scheduler::enable_work_stealing();
                         let _ = writeln!(console::Writer, "  smp: work-stealing enabled");
+                        // User-task SMP (feature-gated, OFF by default —
+                        // see frame Cargo.toml `user-task-smp`). The
+                        // per-AP user-mode machinery + cross-CPU TLB
+                        // shootdown are always built; flipping migration
+                        // ON awaits userspace SMP-hardening (interactive
+                        // shell + dynamic-linker paths). Enable only when
+                        // the TLB-shootdown broadcast hook is wired, which
+                        // is iff x2APIC is active (see the
+                        // `set_shootdown_hook` block above); under xAPIC
+                        // fallback unmap/mprotect can't invalidate peer
+                        // TLBs, so a thread group sharing an address space
+                        // across cores would use-after-unmap.
+                        #[cfg(feature = "user-task-smp")]
+                        {
+                            let x2apic_active = narf_interrupts::x86_64::apic::X2APIC_ACTIVE
+                                .load(core::sync::atomic::Ordering::Acquire);
+                            if x2apic_active {
+                                narf_scheduler::enable_user_task_smp();
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  smp: user-task SMP enabled (TLB shootdown wired)"
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  smp: user-task SMP disabled (xAPIC — no cross-CPU \
+                                     TLB shootdown); user tasks stay BOOT-pinned"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3257,6 +3287,13 @@ fn boot_userspace_init() {
             pid.raw(),
             entry
         );
+        // Boot-init's initial user tasks (init / getty / the login
+        // shell) stay BOOT-pinned: they live on the console / tty /
+        // job-control path, which isn't SMP-hardened (un-locked shared
+        // state, output-ordering the gates assert on). Their fork/exec
+        // CHILDREN — the actual workload — spawn with `user_task()` and
+        // migrate freely (see do_clone3 / sys_fork). `unthrottled()` is
+        // the BOOT-pinned spec.
         let tid = narf_scheduler::spawn_user(
             UserTaskFuture::new(proc),
             narf_scheduler::TaskSpec::unthrottled(),

@@ -24,7 +24,10 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::fmt::Write;
 use narf_console::Writer;
 
+#[cfg(not(feature = "user-task-smp"))]
 use narf_memory::alloc_frame;
+#[cfg(feature = "user-task-smp")]
+use narf_memory::alloc_pages_on;
 
 /// Where the AP trampoline lives at runtime. SIPI vector = 0x08
 /// → linear address 0x8000.
@@ -40,8 +43,22 @@ const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 #[unsafe(no_mangle)]
 static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percpu::MAX_CPUS];
 
-/// AP stack pages — 4 KiB is sufficient for the WFI parking loop.
-const AP_STACK_PAGES: usize = 1;
+/// AP kernel stack order. With user-task SMP enabled, an AP runs the
+/// full executor INCLUDING user-task dispatch (`run_until_empty` → AS
+/// activate → setjmp → `enter_user_mode` → the deep longjmp-return
+/// path), which overflows the 4 KiB WFI-parking stack and corrupts
+/// adjacent state (observed as a bogus victim index panicking in the
+/// work-steal path) — so it needs a larger, contiguous stack
+/// (order-4 = 16 frames = 64 KiB). With the feature OFF (default) APs
+/// only ever run kernel tasks, which fit the original single page;
+/// keeping it at one frame avoids the extra boot-time buddy pressure
+/// (high-order blocks × every AP) that can starve a later driver's
+/// DMA allocation on a marginal buddy.
+#[cfg(feature = "user-task-smp")]
+const AP_STACK_ORDER: u8 = 4;
+#[cfg(not(feature = "user-task-smp"))]
+const AP_STACK_ORDER: u8 = 0;
+const AP_STACK_PAGES: usize = 1 << AP_STACK_ORDER;
 
 extern "C" {
     static _ap_trampoline_start: u8;
@@ -180,6 +197,33 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         super::idt::load_idtr_ap();
     }
 
+    // 2a. Per-CPU user-mode entry setup (only when user-task SMP is
+    //     built — otherwise APs run kernel tasks only and need none of
+    //     it, and skipping it avoids the per-AP GDT/TSS heap blocks
+    //     that add boot-time buddy pressure). Each AP gets its OWN
+    //     GDT+TSS so a user→kernel trap (page fault, timer preemption,
+    //     IST fault) lands on this CPU's kernel stack — the BSP's
+    //     shared TSS.rsp0 would corrupt under two CPUs trapping
+    //     concurrently. Then a per-AP PerCpu (so the SYSCALL stub's
+    //     `gs:8` kernel-stack lookup resolves per-CPU) and the SYSCALL
+    //     MSRs (LSTAR/STAR/FMASK/EFER.SCE — programmed per-CPU).
+    //     Without this an AP cannot run user tasks: a `syscall` would
+    //     #UD or jump to a stale LSTAR, and a fault would triple-fault
+    //     on a null TR. Order mirrors the BSP `init_traps`: gdt →
+    //     percpu → syscall (gdt::init_ap reloads `gs`, zeroing
+    //     GS.base, so percpu::init_ap must follow to restore the
+    //     per-CPU pointer). IRQs are still masked here (enabled at
+    //     step 4b), so the LGDT/LTR window can't be interrupted before
+    //     TR is valid.
+    // SAFETY: kernel mode, IRQs masked, global allocator up (heap was
+    // promoted to slab before start_aps); runs exactly once per AP.
+    #[cfg(feature = "user-task-smp")]
+    unsafe {
+        let rsp0_top = super::gdt::init_ap();
+        super::percpu::init_ap(id, rsp0_top);
+        super::syscall::enable();
+    }
+
     // 3. Per-CPU LAPIC bring-up: enable x2APIC + spurious vector +
     //    mask the timer LVT until the scheduler asks for it.
     // SAFETY: x2APIC is BSP-confirmed via CPUID; this AP just turns
@@ -307,24 +351,46 @@ pub unsafe fn start_aps() -> u32 {
     let mut viable_buf = [0u32; narf_lib::percpu::MAX_CPUS];
     let mut viable_len: usize = 0;
     for logical in 1..total {
-        let mut stack_top: u64 = 0;
-        for _ in 0..AP_STACK_PAGES {
-            match alloc_frame() {
-                Ok(f) => {
-                    let base = f.start_address().raw();
-                    if stack_top == 0 {
-                        stack_top = base + 4096;
+        // With user-task SMP: one CONTIGUOUS order-4 block (64 KiB) —
+        // the AP runs deep user-task dispatch and needs a single
+        // usable stack range (the old per-page loop only used the
+        // first frame's top, assuming contiguity it never guaranteed).
+        #[cfg(feature = "user-task-smp")]
+        let stack_top: u64 = match alloc_pages_on(0, AP_STACK_ORDER) {
+            Ok(f) => f.start_address().raw() + (AP_STACK_PAGES as u64 * 4096),
+            Err(_) => {
+                let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
+                continue;
+            }
+        };
+        // Without it (default): APs run kernel tasks only — one page
+        // via the frame allocator, byte-for-byte the pre-branch path.
+        // Crucially this leaves the boot-time buddy state unchanged
+        // from `main`, since the kernel-test buddy is marginal and a
+        // shifted free-list tips a later driver's DMA probe into a
+        // host QEMU SIGSEGV.
+        #[cfg(not(feature = "user-task-smp"))]
+        let stack_top: u64 = {
+            let mut top: u64 = 0;
+            for _ in 0..AP_STACK_PAGES {
+                match alloc_frame() {
+                    Ok(f) => {
+                        let base = f.start_address().raw();
+                        if top == 0 {
+                            top = base + 4096;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
+                        break;
                     }
                 }
-                Err(_) => {
-                    let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
-                    break;
-                }
             }
-        }
-        if stack_top == 0 {
-            continue;
-        }
+            if top == 0 {
+                continue;
+            }
+            top
+        };
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.
         // SAFETY: Valid memory or trusted environment
