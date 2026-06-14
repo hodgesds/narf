@@ -1579,6 +1579,13 @@ pub enum Syscall {
     /// Linux `clock_nanosleep` (x86_64=230, aarch64=115).
     ClockNanosleep,
 
+    /// `nanosleep(request, remain)` — legacy 2-arg relative sleep.
+    /// arg0 = request `timespec*`, arg1 = remain `timespec*` (may be 0).
+    /// Distinct from NARF-native `Sleep` (arg0 = raw nanosecond count):
+    /// musl passes a `timespec*`, so the handler must parse it.
+    /// Linux `nanosleep` (x86_64=35, aarch64=101).
+    Nanosleep,
+
     /// `socketpair(domain, type, protocol, int sv[2])` — create a
     /// connected pair of AF_UNIX sockets. arg0 = domain, arg1 = type
     /// (SOCK_STREAM, optionally OR'd with SOCK_CLOEXEC/SOCK_NONBLOCK),
@@ -2189,8 +2196,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Yield, 24), // sched_yield
     (Syscall::Dup, 32),
     (Syscall::Dup2, 33),
-    (Syscall::Pause, 34), // pause
-    (Syscall::Sleep, 35), // nanosleep
+    (Syscall::Pause, 34),     // pause
+    (Syscall::Nanosleep, 35), // nanosleep (timespec* ABI, not native Sleep)
     (Syscall::GetPid, 39),
     (Syscall::SocketOpen, 41), // socket
     (Syscall::SocketConnect, 42),
@@ -2578,7 +2585,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // Wave-67 — Linux aarch64 setns = 268.
     (Syscall::Setns, 268),
     (Syscall::Futex, 98),
-    (Syscall::Sleep, 101), // nanosleep
+    (Syscall::Nanosleep, 101), // nanosleep (timespec* ABI, not native Sleep)
     (Syscall::ClockSetTime, 112),
     (Syscall::ClockGetTime, 113),
     (Syscall::Ptrace, 117),
@@ -2853,6 +2860,10 @@ const NARF_EXTENSION_TABLE: &[(Syscall, u32)] = &[
     // this NARF-internal form needs its own number to stay
     // dispatchable for narf-libc and the in-kernel signal tests.
     (Syscall::Sigaction, 0x4060),
+    // NARF-native sleep (arg0 = raw nanosecond count). Linux #35
+    // (nanosleep) takes a `timespec*` and now maps to `Syscall::Nanosleep`
+    // instead, so native `Sleep` needs its own extension number.
+    (Syscall::Sleep, 0x4061),
 ];
 
 impl Syscall {
@@ -2960,19 +2971,27 @@ pub fn kernel_syscall_entry_plain_with_state(
     let table = unsafe { &*p };
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     table.dispatch(n, &mut ctx);
-    // Job-control STOP delivery on the `syscall`-instruction return path.
-    // Musl tasks issue `syscall`, never `int 0x80`, and NARF otherwise
-    // delivers signals only at explicit yield points (pause/sched_yield/
-    // nanosleep). That deferral is fine for handled signals — the rest of
-    // the signal model relies on it — but a STOP-class signal (SIGSTOP/
-    // SIGTSTP/SIGTTIN/SIGTTOU with no handler) cannot be meaningfully
-    // deferred: a self-directed or mid-syscall stop must halt the task
-    // now, like Linux. `deliver_pending_stop` touches ONLY those signals
-    // (leaving handled-signal timing unchanged) and may longjmp out to
-    // park the task, exactly as the sys_sleep path does through this same
-    // ArgsOnlyCtx. The null-state plain path self-checks out.
+    // Linux-compatible signal delivery on the `syscall`-instruction return
+    // path. Musl tasks issue `syscall`, never `int 0x80`; Linux delivers
+    // any pending, unblocked signal at EVERY kernel→user return (see
+    // `exit_to_user_mode_loop` / `arch_do_signal`), so we do the same here.
+    // `ArgsOnlyCtx::deliver_signal` rewrites the kernel-stack `UserState`
+    // snapshot the exit asm reloads, so a handler entry / default-action
+    // terminate / job-control stop takes effect on the `sysretq`. This
+    // replaces the old deferred model (which only delivered at explicit
+    // yield points and forced the un-Linux `tkill(self); pause()` idiom);
+    // `default_signal_delivery` subsumes the previous stop-only path. A
+    // syscall that already parked (sleep/pause) longjmp'd away and never
+    // reaches here — those deliver at their own yield point. The null-state
+    // plain path (no user frame to rewrite) self-checks out.
+    //
+    // SYSCALL_NUM_NONE, not `num`: this syscall COMPLETED (returned a real
+    // value), so SA_RESTART must NOT rewind RIP to re-run it — that's only
+    // for syscalls *interrupted* mid-flight (which in NARF park at a yield
+    // point and restart there). A completed syscall's return value stands,
+    // exactly as Linux preserves it across a handler.
     if !user_state.is_null() {
-        crate::handlers::deliver_pending_stop(&mut ctx, num);
+        crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
     }
     ctx.ret
 }

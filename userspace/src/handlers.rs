@@ -8693,7 +8693,26 @@ fn take_pending_termination(task: u64) -> Option<i32> {
 /// wstatus into the user-space pointer (same as `sys_wait4` does on the
 /// fast path).
 fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: *mut i32) -> i64 {
-    // First try a real exit reap (releases the child PID).
+    // Job-control stop/continue notification FIRST. Linux reaps a child's
+    // state changes in order — a stop or continue is reported before the
+    // child's later exit — so a `waitpid(WCONTINUED)` after `kill(SIGCONT)`
+    // must see the continue even if the child has since run to exit (which
+    // it can do quickly now that signals are delivered on every syscall
+    // return). reap_stopcont only matches when WUNTRACED/WCONTINUED is set
+    // and a report is queued, so a plain wait falls straight through to the
+    // exit reap below. These do NOT release the PID: the child is alive (or
+    // its exit is still queued for the next wait).
+    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, options) {
+        if !out_status.is_null() {
+            // SAFETY: `out_status` is a kernel-side `i32` slot owned by the
+            // poll routine's stack frame for the duration of this call.
+            unsafe {
+                *out_status = status;
+            }
+        }
+        return child_pid as i64;
+    }
+    // Real exit reap (releases the child PID).
     let entry = {
         let mut g = PENDING_EXITS.lock();
         let reaped = g.as_mut().and_then(|m| {
@@ -8723,18 +8742,6 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(child_pid));
-        return child_pid as i64;
-    }
-    // No exit available — try a job-control stop/continue notification
-    // if the caller asked for one (WUNTRACED/WCONTINUED). These do NOT
-    // release the PID: the child is alive.
-    if let Some((child_pid, status)) = reap_stopcont(parent_id, want_pid, options) {
-        if !out_status.is_null() {
-            // SAFETY: see above — kernel-side slot owned by the poll frame.
-            unsafe {
-                *out_status = status;
-            }
-        }
         return child_pid as i64;
     }
     0
@@ -8836,7 +8843,21 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
 
     let parent = current_task_id();
 
-    // Try an immediate reap first.
+    // Job-control stop/continue FIRST (WUNTRACED/WCONTINUED) — a state
+    // change is reported before the child's later exit, in order, matching
+    // Linux. Only matches when the option + a queued report are present, so
+    // a plain wait falls through to the exit reap. No PID release.
+    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, options) {
+        if infop != 0 {
+            let si = encode_waitid_siginfo(child_pid as i64, status);
+            // SAFETY: `infop` non-zero; copy_to_user range-validates the write.
+            let _ = unsafe { copy_to_user(infop, &si) };
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    // Real exit reap (releases the child PID).
     let reaped = {
         let mut g = PENDING_EXITS.lock();
         g.as_mut().and_then(|m| {
@@ -8859,17 +8880,6 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
             let _ = unsafe { copy_to_user(infop, &si) };
         }
         crate::release_pid(crate::ProcessId(child_pid));
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Job-control stop/continue (WUNTRACED/WCONTINUED). No PID release.
-    if let Some((child_pid, status)) = reap_stopcont(parent, want_pid, options) {
-        if infop != 0 {
-            let si = encode_waitid_siginfo(child_pid as i64, status);
-            // SAFETY: `infop` non-zero; copy_to_user range-validates the write.
-            let _ = unsafe { copy_to_user(infop, &si) };
-        }
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -9135,6 +9145,23 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         Some(q.remove(idx))
     };
 
+    // Job-control stop/continue FIRST (WUNTRACED/WCONTINUED). A state
+    // change is reported before the child's later exit, in order, matching
+    // Linux — so `waitpid(WCONTINUED)` after `kill(SIGCONT)` sees the
+    // continue even if the child has already run to exit. Only matches when
+    // the option + a queued report are present; a plain wait falls straight
+    // through to the exit reap. Does NOT release the PID — child lives (or
+    // its exit stays queued for the next wait).
+    if let Some((child, status)) = reap_stopcont(parent, want_pid, options) {
+        if status_ptr != 0 {
+            // SAFETY: `status_ptr` non-zero; copy_to_user range-validates
+            // and SMAP-brackets the 4-byte write.
+            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+        }
+        ctx.set_return(SyscallReturn::ok(child));
+        return;
+    }
+
     if let Some((reaped, status)) = try_reap(parent, want_pid) {
         if status_ptr != 0 {
             // Write i32 status under the SMAP bracket.
@@ -9146,18 +9173,6 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(reaped));
         ctx.set_return(SyscallReturn::ok(reaped));
-        return;
-    }
-
-    // Job-control: collect a stop/continue notification if requested
-    // (WUNTRACED/WCONTINUED). Does NOT release the PID — child lives.
-    if let Some((child, status)) = reap_stopcont(parent, want_pid, options) {
-        if status_ptr != 0 {
-            // SAFETY: `status_ptr` non-zero; copy_to_user range-validates
-            // and SMAP-brackets the 4-byte write.
-            let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
-        }
-        ctx.set_return(SyscallReturn::ok(child));
         return;
     }
 
@@ -13156,6 +13171,21 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Per-task bitmask of signals that should be delivered *preemptively* —
+/// on a timer-IRQ return to user, even to a task spinning in a tight loop
+/// with no syscalls — rather than only at the cooperative yield points
+/// the normal (deferred) delivery uses. Set by the timer ISR when it
+/// raises a timer-driven signal (e.g. SIGALRM from ITIMER_REAL).
+///
+/// This is the surgical boundary that lets preemptive delivery coexist
+/// with NARF's deliberately-deferred handled-signal delivery: a signal
+/// raised by `kill`/`tkill` is NOT eager, so the `tkill(self); pause()`
+/// pattern still parks-then-delivers (signal_smoke depends on this). Only
+/// eager (and unhandled-fatal) signals jump the queue. See
+/// [[narf-syscall-path-signal-delivery]].
+pub(crate) static EAGER_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
 /// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
 /// sigqueue: `(task, signum) -> (si_code, si_value)`. The pending bitmask
 /// in `SIGNAL_PENDING` collapses duplicates, so standard signals coalesce
@@ -13223,6 +13253,7 @@ fn sigreturn_use_rsp(task: u64) -> bool {
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *EAGER_PENDING.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -13231,6 +13262,7 @@ pub fn signal_init() {
 #[doc(hidden)]
 pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
+    *EAGER_PENDING.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
 }
@@ -13671,6 +13703,211 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // raised signal — e.g. SIGALRM from an interval timer — is taken
     // promptly rather than only at the next self-driven re-poll.
     wake_signal(task);
+}
+
+/// Pre-create `task`'s `SIGNAL_PENDING` entry (bits = 0) so a later
+/// IRQ-context raise can be alloc-free. Called from syscall context
+/// (e.g. arming an interval timer), where allocation is allowed. No-op
+/// if the entry already exists or the table is uninitialised.
+pub fn ensure_signal_pending_slot(task: u64) {
+    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+        map.entry(task).or_insert(0);
+    }
+    if let Some(map) = EAGER_PENDING.lock().as_mut() {
+        map.entry(task).or_insert(0);
+    }
+}
+
+/// Alloc-free, IRQ-safe variant of `raise_signal_pending`: OR the
+/// `signum` bit into an *existing* `SIGNAL_PENDING` entry. Returns false
+/// (signal dropped) if `task` has no entry yet — callers that need this
+/// path must have pre-created the slot via `ensure_signal_pending_slot`.
+///
+/// Unlike `raise_signal_pending` it deliberately does NOT run
+/// `signal_stopcont_interaction` or `wake_signal` — both can allocate /
+/// take further locks, neither is needed for the timer-IRQ case (the
+/// interrupted task is running, not parked, and SIGALRM is not a
+/// stop/cont signal). The signal is taken on the same trap's
+/// return-to-user via the preemptive delivery hook.
+pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
+    if signum >= 32 {
+        return false;
+    }
+    let mut g = SIGNAL_PENDING.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot |= 1u32 << signum;
+            return true;
+        }
+    }
+    false
+}
+
+/// Timer-tick hook (called from the arch timer ISR). Raises any signal
+/// whose timer has expired for the *currently running* task, so a
+/// CPU-bound task that never parks still receives e.g. SIGALRM from
+/// `alarm()` / `setitimer(ITIMER_REAL)`. Alloc-free — safe to call with
+/// interrupts disabled from the trap handler. The raised signal is then
+/// delivered by the preemptive `signal_delivery_hook` on the same trap's
+/// return to user mode.
+pub fn timer_tick_raise_due_signals() {
+    let task = current_task_id();
+    if task == 0 {
+        return;
+    }
+    #[cfg(feature = "linux-compat")]
+    {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        if crate::posix_timer::itimer_real_check_due_irq(task, now) {
+            // SIGALRM (14). Slot was pre-created when the timer was armed.
+            if raise_signal_pending_irq(task, 14) {
+                // Mark it eager so the preemptive-delivery path will hand
+                // it to a CPU-bound (never-parking) task on this same trap
+                // return. A handled SIGALRM is otherwise deferred.
+                mark_signal_eager_irq(task, 14);
+            }
+        }
+    }
+}
+
+/// Alloc-free, IRQ-safe: mark `signum` for preemptive (eager) delivery
+/// on `task` by ORing into its EAGER_PENDING entry. No-op if the entry
+/// isn't pre-created (callers pair with `ensure_signal_pending_slot`).
+pub fn mark_signal_eager_irq(task: u64, signum: u32) {
+    if signum >= 32 {
+        return;
+    }
+    if let Some(map) = EAGER_PENDING.lock().as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot |= 1u32 << signum;
+        }
+    }
+}
+
+/// Read `task`'s eager (preemptively-deliverable) signal bitmask.
+fn eager_pending_bits(task: u64) -> u32 {
+    EAGER_PENDING
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// Drop eager marks for signals that are no longer pending on `task`
+/// (delivered or consumed), so a delivered eager signal isn't retried.
+fn prune_eager_to_pending(task: u64) {
+    let pending = signal_pending_of(task);
+    if let Some(map) = EAGER_PENDING.lock().as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot &= pending;
+        }
+    }
+}
+
+/// Preemptive signal delivery for the timer-IRQ return path. Unlike the
+/// general `default_signal_delivery` (which would deliver ANY deliverable
+/// pending signal and thus break the deferred `tkill(self); pause()`
+/// contract that signal_smoke relies on — see
+/// [[narf-syscall-path-signal-delivery]]), this delivers only signals
+/// that legitimately preempt a CPU-bound task: eager-marked signals
+/// (timer-driven, e.g. SIGALRM); and unhandled fatal signals (no user
+/// handler installed and the default action is Terminate/CoreDump —
+/// SIGKILL, SIGTERM — so a spinning task can still be killed).
+///
+/// A handled, non-eager signal (the signal_smoke case) stays pending and
+/// is delivered later at a cooperative yield point.
+///
+/// Returns true if a signal was delivered. May not return at all when the
+/// delivered signal's default action terminates the task (longjmp).
+pub fn deliver_preemptible_signals(ctx: &mut dyn TrapContext) -> bool {
+    if !ctx.returning_to_user() {
+        return false;
+    }
+    let task = current_task_id();
+    if task == 0 {
+        return false;
+    }
+    let pending = signal_pending_of(task);
+    if pending == 0 {
+        return false;
+    }
+    let deliverable = pending & !signal_mask_of(task);
+    if deliverable == 0 {
+        return false;
+    }
+    // Compute the preemptible subset: eager OR (no handler AND fatal
+    // default action). Leave job-control Stop/Continue and Ignore to the
+    // existing deferred / deliver_pending_stop paths.
+    let eager = eager_pending_bits(task);
+    let mut fatal_unhandled = 0u32;
+    let mut bits = deliverable & !eager;
+    while bits != 0 {
+        let s = bits.trailing_zeros();
+        bits &= bits - 1;
+        if sigaction_lookup_full(task, s as usize).is_none()
+            && matches!(
+                default_signal_action(s),
+                DefaultAction::Terminate | DefaultAction::CoreDump
+            )
+        {
+            fatal_unhandled |= 1u32 << s;
+        }
+    }
+    let restrict = (eager | fatal_unhandled) & deliverable;
+    if restrict == 0 {
+        return false;
+    }
+    let delivered = default_signal_delivery_restricted(ctx, SYSCALL_NUM_NONE, restrict);
+    if delivered {
+        prune_eager_to_pending(task);
+    }
+    delivered
+}
+
+/// Preemptive time-slice: hand a CPU-bound user task back to the
+/// cooperative executor from the timer ISR so sibling tasks make
+/// progress instead of being monopolized. Mirrors `sys_yield`'s
+/// polling-executor path exactly — save the interrupted register state
+/// into the task's `UserTaskCtx` and longjmp to the executor via the
+/// yield hook — but driven by the timer instead of an explicit syscall.
+///
+/// Why this is enough (no executor changes needed): a parked user task's
+/// sleep is *self-driven* — its `poll` re-checks `sleep_deadline_ns`,
+/// `wake_by_ref`s, and returns `Pending`, so it's re-polled every round.
+/// Without preemption a CPU-bound sibling never returns from its own
+/// `poll` (no syscall, no yield), so the executor never completes the
+/// round and never re-polls the sleeper. Yielding here lets the round
+/// finish, the sleeper's deadline fire on time, and other runnable tasks
+/// run.
+///
+/// Does NOT return when it preempts (the yield hook longjmps; the task
+/// resumes later via `enter_user_mode_resume`). Returns normally — a
+/// no-op — when no polling executor is wired or no user task is current
+/// (e.g. the in-kernel test harness), so those contexts are unaffected.
+///
+/// The caller MUST gate on returning-to-user (CPL=3): a task interrupted
+/// inside a syscall is at CPL=0 and must not be yanked mid-kernel.
+pub fn timer_preempt_user_task(ctx: &mut dyn TrapContext) {
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        // SAFETY: identical contract to sys_yield's hook path — `uctx` is
+        // the live per-task `UserTaskCtx` published by the executor before
+        // it entered user mode; we save the interrupted CPU state into
+        // `uc.state` and hand the task back to the executor via the yield
+        // hook, which longjmps to the executor's `setjmp` and does not
+        // return. The timer ISR has already EOI'd and exited the trap
+        // handler frame, so abandoning the IRQ frame here is clean (same
+        // as sys_yield abandoning its syscall frame).
+        unsafe {
+            let uc = &*uctx;
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            hook(uctx);
+        }
+        // unreachable when preempted
+    }
 }
 
 /// Clear the pending bit for `signum` on `task`. Used by signalfd
@@ -14181,10 +14418,15 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             .as_ref()
             .and_then(|m| m.get(&task).copied())
             .unwrap_or(0);
+        // NARF stores the mask with signal N at bit N (lined up with
+        // SIGNAL_PENDING); a userspace `sigset_t` puts signal N at bit N-1.
+        // Shift back so the caller sees the Linux convention (mirrors the
+        // `<<1` on the way in, and the same shift `signalfd` uses).
+        let user_mask = (mask as u64) >> 1;
         // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
         // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(old_ptr, &mask.to_ne_bytes()) }.is_err() {
+        if unsafe { copy_to_user(old_ptr, &user_mask.to_ne_bytes()) }.is_err() {
             ctx.set_return(fail);
             return;
         }
@@ -14199,7 +14441,11 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             ctx.set_return(fail);
             return;
         }
-        let set = u64::from_ne_bytes(buf);
+        // Userspace `sigset_t` bit N-1 == signal N; NARF's mask uses bit N to
+        // line up with SIGNAL_PENDING. Shift `<<1` (same as `signalfd`), or a
+        // block of e.g. SIGUSR1 (10) would set bit 9 and fail to mask the
+        // pending bit 10 — the signal would be delivered despite being blocked.
+        let set = u64::from_ne_bytes(buf) << 1;
         let mut g = SIGNAL_MASK.lock();
         let map = match g.as_mut() {
             Some(m) => m,
@@ -14393,9 +14639,12 @@ fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     let pending = signal_pending_of(task);
     let mask = signal_mask_of(task);
     let pending_and_blocked = pending & mask;
+    // NARF stores signal N at bit N; a userspace `sigset_t` puts it at bit
+    // N-1. Shift `>>1` so the caller reads the Linux convention.
+    let user_bits = (pending_and_blocked as u64) >> 1;
     // SAFETY: caller pointer; user-ABI trust same as sigaltstack.
     unsafe {
-        (set_out as *mut u64).write_unaligned(pending_and_blocked as u64);
+        (set_out as *mut u64).write_unaligned(user_bits);
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -14433,7 +14682,10 @@ fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    let mask = u64::from_ne_bytes(buf) as u32;
+    // Userspace `sigset_t` bit N-1 == signal N; NARF's mask uses bit N (see
+    // sys_sigprocmask / signalfd). Shift `<<1` so an unblocked signal here
+    // actually becomes deliverable while suspended.
+    let mask = (u64::from_ne_bytes(buf) << 1) as u32;
     let task = current_task_id();
 
     // Temporarily install the new mask.
@@ -14475,8 +14727,9 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64));
         return;
     }
-    // SAFETY: caller-supplied pointer.
-    let set = unsafe { (set_in as *const u64).read_unaligned() as u32 };
+    // SAFETY: caller-supplied pointer. `<<1`: userspace sigset bit N-1 ==
+    // signal N, NARF's pending bitmap uses bit N — align before intersecting.
+    let set = unsafe { ((set_in as *const u64).read_unaligned() << 1) as u32 };
     let task = current_task_id();
     let pending = signal_pending_of(task);
     let candidates = pending & set;
@@ -14581,6 +14834,8 @@ fn is_restartable_syscall(raw: u32) -> bool {
     !matches!(
         n,
         crate::syscall::Syscall::Sleep
+            | crate::syscall::Syscall::Nanosleep
+            | crate::syscall::Syscall::ClockNanosleep
             | crate::syscall::Syscall::RtSigtimedwait
             | crate::syscall::Syscall::RtSigsuspend
             | crate::syscall::Syscall::Poll
@@ -14649,6 +14904,21 @@ fn build_delivery_params(
 ///   push the 3-arg siginfo_t+ucontext frame (SA_SIGINFO), and
 ///   rewind RIP for re-execution (SA_RESTART).
 pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
+    // u32::MAX = no restriction: consider every deliverable signal. The
+    // timer-IRQ preemptive path calls the restricted form with a narrower
+    // mask (eager / fatal-unhandled only).
+    default_signal_delivery_restricted(ctx, syscall_no, u32::MAX)
+}
+
+/// Body of `default_signal_delivery`, but only signals whose bit is set in
+/// `restrict` are eligible. Picks the lowest eligible deliverable signal
+/// (`pending & !mask & restrict`) and delivers it through the same handler
+/// / default-action path.
+pub(crate) fn default_signal_delivery_restricted(
+    ctx: &mut dyn TrapContext,
+    syscall_no: u32,
+    restrict: u32,
+) -> bool {
     if !ctx.returning_to_user() {
         return false;
     }
@@ -14666,7 +14936,7 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bo
         .as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or(0);
-    let deliverable = pending & !mask;
+    let deliverable = pending & !mask & restrict;
     if deliverable == 0 {
         return false;
     }
@@ -17466,6 +17736,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             Syscall::ClockNanosleep,
             "clock_nanosleep",
             RawFnHandler(crate::posix_timer::sys_clock_nanosleep),
+        );
+        table.install_raw(
+            Syscall::Nanosleep,
+            "nanosleep",
+            RawFnHandler(crate::posix_timer::sys_nanosleep),
         );
         // Batch 7: BSD interval timers (ITIMER_REAL → SIGALRM) + alarm.
         table.install_raw(

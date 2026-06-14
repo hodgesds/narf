@@ -383,6 +383,8 @@ fn main() {
         "pipeof_smoke",
         "relpaths_smoke",
         "consoletty_smoke",
+        "alarmloop_smoke",
+        "preemptsched_smoke",
         "procfs2_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));

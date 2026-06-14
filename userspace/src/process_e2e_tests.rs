@@ -796,8 +796,9 @@ fn smoke_process_sa_mask_blocks_reentry() -> TestResult {
     // Unblock: clear the mask entry.
     LOOKUP_TASK.store(TASK, Ordering::Relaxed);
     // Linux rt_sigprocmask ABI: arg0=how, arg1=set ptr, arg2=old ptr,
-    // arg3=sigsetsize (must be 8).
-    let unblock_mask: u64 = 1u64 << SIGUSR1;
+    // arg3=sigsetsize (must be 8). Userspace sigset: signal N at bit N-1,
+    // so SIGUSR1 (10) is bit 9.
+    let unblock_mask: u64 = 1u64 << (SIGUSR1 - 1);
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 1u64, // SIG_UNBLOCK
@@ -864,8 +865,9 @@ fn smoke_process_sigprocmask_block_unblock() -> TestResult {
     kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
 
     // Block SIGUSR2. Linux rt_sigprocmask ABI: arg0=how, arg1=set ptr,
-    // arg2=old ptr, arg3=sigsetsize (must be 8).
-    let block_set: u64 = 1u64 << SIGUSR2;
+    // arg2=old ptr, arg3=sigsetsize (must be 8). A userspace `sigset_t`
+    // puts signal N at bit N-1, so SIGUSR2 (12) is bit 11.
+    let block_set: u64 = 1u64 << (SIGUSR2 - 1);
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 0, // SIG_BLOCK
