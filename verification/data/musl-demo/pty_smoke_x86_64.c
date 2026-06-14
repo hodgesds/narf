@@ -16,9 +16,10 @@
  *   4. snprintf("/dev/pts/%u", n) + open(slave_path, O_RDWR)
  *   5. write(master, "ping\n", 5)
  *   6. read(slave, buf, sizeof buf)    — expect "ping\n" (ICANON line)
- *   7. write(slave, "pong", 4)
- *   8. read(master, buf, sizeof buf)   — expect "pong"
- *   9. write(1, "pty-ok\n", 7)
+ *   7. read(master, buf, sizeof buf)   — expect "ping\n" (ECHO mirror)
+ *   8. write(slave, "pong", 4)
+ *   9. read(master, buf, sizeof buf)   — expect "pong"
+ *  10. write(1, "pty-ok\n", 7)
  *
  * If any step fails (open returns -1, ioctl errors, read returns the
  * wrong count or wrong bytes) the program writes "pty-fail-<step>\n"
@@ -85,7 +86,9 @@ int main(void) {
         return 5;
     }
 
-    /* Master writes a complete ICANON line; slave reads it back. */
+    /* Master writes a complete ICANON line; slave reads it back. The
+     * n_tty line discipline now also ECHOES the line back to the master
+     * (default ECHO), as a real tty does — verified at the next step. */
     const char ping[] = "ping\n";
     ssize_t wn = write(master, ping, sizeof ping - 1);
     if (wn != (ssize_t)(sizeof ping - 1)) {
@@ -100,19 +103,29 @@ int main(void) {
         return 7;
     }
 
+    /* ECHO: the master sees "ping\n" mirrored back by the line discipline.
+     * Drain it before the pong exchange below so the master read there is
+     * unambiguous. */
+    char echo[16] = {0};
+    rn = read(master, echo, sizeof echo);
+    if (rn != (ssize_t)(sizeof ping - 1) || memcmp(echo, ping, sizeof ping - 1) != 0) {
+        fail("read-echo");
+        return 8;
+    }
+
     /* Slave writes; master reads (raw on master side). */
     const char pong[] = "pong";
     wn = write(slave, pong, sizeof pong - 1);
     if (wn != (ssize_t)(sizeof pong - 1)) {
         fail("write-slave");
-        return 8;
+        return 9;
     }
 
     char buf2[16] = {0};
     rn = read(master, buf2, sizeof buf2);
     if (rn != (ssize_t)(sizeof pong - 1) || memcmp(buf2, pong, sizeof pong - 1) != 0) {
         fail("read-master");
-        return 9;
+        return 10;
     }
 
     w("pty-ok\n");

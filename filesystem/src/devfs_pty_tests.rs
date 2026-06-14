@@ -95,6 +95,51 @@ fn smoke_pty_master_write_slave_read() -> TestResult {
 }
 kernel_test_in!("filesystem/pty", smoke_pty_master_write_slave_read);
 
+// ── Test 2b: ECHO mirrors master writes back to the master ───────────────────
+
+fn smoke_pty_master_write_echoes_to_master() -> TestResult {
+    // With ECHO on (the cooked default), the shared n_tty discipline
+    // mirrors the master's writes back to the master read side — a real
+    // tty echoes typed input. The slave still reads the cooked line.
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    // Mirror the full pty_smoke round-trip exactly (master line → slave
+    // read → master reads its ECHO → slave reply → master read reply).
+    if !matches!(poll_once(master.write(0, b"ping\n")), Some(Ok(5))) {
+        return TestResult::Fail("master write didn't return 5");
+    }
+    // Slave reads the cooked line.
+    let mut sbuf = [0u8; 16];
+    match poll_once(slave.read(0, &mut sbuf)) {
+        Some(Ok(5)) if &sbuf[..5] == b"ping\n" => {}
+        _ => return TestResult::Fail("slave did not read the cooked line"),
+    }
+    // Master reads back the ECHO "ping\n".
+    let mut ebuf = [0u8; 16];
+    match poll_once(master.read(0, &mut ebuf)) {
+        Some(Ok(5)) if &ebuf[..5] == b"ping\n" => {}
+        _ => return TestResult::Fail("master did not read back the ECHO"),
+    }
+    // Slave replies; master reads it (raw on the master side).
+    if !matches!(poll_once(slave.write(0, b"pong")), Some(Ok(4))) {
+        return TestResult::Fail("slave write didn't return 4");
+    }
+    let mut pbuf = [0u8; 16];
+    match poll_once(master.read(0, &mut pbuf)) {
+        Some(Ok(4)) if &pbuf[..4] == b"pong" => {}
+        _ => return TestResult::Fail("master did not read the slave reply"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_master_write_echoes_to_master);
+
 // ── Test 3: slave write → master read (slave_tx_to_master) ───────────────────
 
 fn smoke_pty_slave_write_master_read() -> TestResult {
@@ -365,6 +410,61 @@ fn smoke_pty_slave_ctrl_d_eof() -> TestResult {
 }
 kernel_test_in!("filesystem/pty", smoke_pty_slave_ctrl_d_eof);
 
+// ── ISIG: ^C on the master raises SIGINT to the PTY's fg pgrp ─────────────────
+
+fn smoke_pty_ctrl_c_raises_fg_pgrp_signal() -> TestResult {
+    use crate::devfs_pty::install_pty_signal_hook;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static GOT_PGRP: AtomicU64 = AtomicU64::new(0);
+    static GOT_SIG: AtomicU64 = AtomicU64::new(0);
+    fn test_hook(pgrp: u64, signum: u32) -> bool {
+        GOT_PGRP.store(pgrp, Ordering::Release);
+        GOT_SIG.store(signum as u64, Ordering::Release);
+        true
+    }
+
+    __reset_for_test();
+    GOT_PGRP.store(0, Ordering::Release);
+    GOT_SIG.store(0, Ordering::Release);
+    install_pty_signal_hook(test_hook);
+
+    let master = open_ptmx();
+    let idx = master.index();
+    // Set this PTY's foreground process group (what tcsetpgrp installs).
+    pts_lookup(idx)
+        .expect("slave")
+        .fg_pgrp
+        .store(4242, Ordering::Release);
+
+    // Master writes ^C (ISIG on by default). The shared discipline must
+    // raise SIGINT (2) to the fg pgrp via the hook and consume the byte.
+    poll_once(master.write(0, &[0x03u8]));
+
+    let pgrp = GOT_PGRP.load(Ordering::Acquire);
+    let sig = GOT_SIG.load(Ordering::Acquire);
+
+    // The ^C must not surface to the slave.
+    let slave = PtySlave::new(pts_lookup(idx).expect("slave"));
+    let mut buf = [0u8; 4];
+    let n = match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => 99,
+    };
+
+    if pgrp != 4242 {
+        return TestResult::Fail("^C did not target the PTY fg pgrp");
+    }
+    if sig != 2 {
+        return TestResult::Fail("^C did not raise SIGINT");
+    }
+    if n != 0 {
+        return TestResult::Fail("^C should be consumed, not readable by the slave");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_ctrl_c_raises_fg_pgrp_signal);
+
 // ── Wave-76: ioctls ───────────────────────────────────────────────────────────
 //
 // On the kernel-test path the "user pointer" is just a kernel-owned
@@ -633,11 +733,13 @@ fn smoke_pty_fionread_reports_ring_depth() -> TestResult {
         return TestResult::Fail("master FIONREAD wrong count");
     }
 
-    // Master writes 4 bytes; slave FIONREAD should see 4.
-    poll_once(master.write(0, b"hiya"));
+    // Master writes a complete 5-byte line; in cooked mode only completed
+    // lines are readable, so the slave's FIONREAD reports the whole "hiya\n"
+    // (a partial line would correctly report 0, like Linux n_tty).
+    poll_once(master.write(0, b"hiya\n"));
     let mut got2: i32 = 0;
     let _ = slave.ioctl(FIONREAD, &mut got2 as *mut i32 as usize);
-    if got2 != 4 {
+    if got2 != 5 {
         return TestResult::Fail("slave FIONREAD wrong count");
     }
     TestResult::Pass

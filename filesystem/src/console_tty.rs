@@ -26,36 +26,13 @@
 //! Linux ref: `drivers/tty/n_tty.c` (`n_tty_receive_buf`, `n_tty_read`).
 
 use crate::devfs_pty::Termios;
-use alloc::collections::VecDeque;
-use alloc::vec::Vec;
+use crate::ntty::{self, LineState};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Cooked line-discipline buffers, guarded together so a pump and a drain
-/// never interleave a half-processed line.
-struct LineDiscipline {
-    /// Completed input ready to hand to `read()`: whole lines (cooked) or
-    /// raw bytes (non-canonical), in FIFO order.
-    ready: VecDeque<u8>,
-    /// The cooked-mode line currently being edited (before Enter).
-    line: Vec<u8>,
-    /// A `^D` on an empty line raised EOF; the next `read` returns 0.
-    eof: bool,
-}
-
-impl LineDiscipline {
-    const fn new() -> Self {
-        Self {
-            ready: VecDeque::new(),
-            line: Vec::new(),
-            eof: false,
-        }
-    }
-}
-
 static TERMIOS: IrqSafeSpinLock<Option<Termios>> = IrqSafeSpinLock::new(None);
 static WINSIZE: IrqSafeSpinLock<(u16, u16)> = IrqSafeSpinLock::new((24, 80));
-static DISCIPLINE: IrqSafeSpinLock<LineDiscipline> = IrqSafeSpinLock::new(LineDiscipline::new());
+static DISCIPLINE: IrqSafeSpinLock<LineState> = IrqSafeSpinLock::new(LineState::new());
 
 /// `fn(u8) -> bool` installed by userspace: given a control byte, returns
 /// `true` iff it was consumed as a signal (SIGINT/SIGQUIT/SIGTSTP to the
@@ -100,11 +77,6 @@ fn echo_byte(b: u8) {
     }
 }
 
-/// Erase one echoed column: backspace, space, backspace.
-fn echo_erase() {
-    narf_console::write_str("\x08 \x08");
-}
-
 /// Ask the installed signal hook whether `b` should be consumed as a
 /// signal. Returns `false` when no hook is installed.
 fn signal_hook_consumes(b: u8) -> bool {
@@ -138,14 +110,11 @@ fn next_input_byte() -> Option<u8> {
     None
 }
 
-/// Drain both input rings through the line discipline into `ready`.
-fn pump(state: &mut LineDiscipline, t: &Termios) {
-    let canon = t.icanon();
-    let echo = t.echo();
-    let isig = t.isig();
-    let verase = t.cc(2);
-    let vkill = t.cc(3);
-    let veof = t.cc(4);
+/// Drain both input rings through the shared n_tty discipline into the
+/// console's `LineState`. Echo goes to the UART; ISIG chars to the
+/// console's foreground process group via the installed signal hook.
+fn pump(state: &mut LineState) {
+    let t = *TERMIOS.lock().get_or_insert_with(Termios::default);
     // Bound the loop by the rings' combined capacity so a fast producer
     // can't wedge us; whatever's left is picked up on the next read.
     let mut budget = 1024usize;
@@ -155,65 +124,9 @@ fn pump(state: &mut LineDiscipline, t: &Termios) {
             Some(b) => b,
             None => break,
         };
-        // ISIG control chars (^C/^\/^Z) go to the foreground pgrp. On a
-        // generated signal Linux flushes the pending input line (NOFLSH
-        // clear, the default), so drop the partial line being edited —
-        // otherwise it would prepend to whatever the user types next.
-        if isig && signal_hook_consumes(b) {
-            state.line.clear();
-            continue;
-        }
-        if !canon {
-            // Raw / non-canonical: every byte is immediately readable.
-            state.ready.push_back(b);
-            if echo {
-                echo_byte(b);
-            }
-            continue;
-        }
-        // Canonical (cooked) line editing.
-        match b {
-            // CR is mapped to NL on input (ICRNL); either ends the line.
-            b'\r' | b'\n' => {
-                state.line.push(b'\n');
-                if echo {
-                    echo_byte(b'\n');
-                }
-                state.ready.extend(state.line.drain(..));
-            }
-            // VERASE (DEL/^H): rub out the last char.
-            _ if b == verase || b == 0x7f || b == 0x08 => {
-                if state.line.pop().is_some() && echo {
-                    echo_erase();
-                }
-            }
-            // VKILL (^U): erase the whole pending line.
-            _ if vkill != 0 && b == vkill => {
-                if echo {
-                    for _ in 0..state.line.len() {
-                        echo_erase();
-                    }
-                }
-                state.line.clear();
-            }
-            // VEOF (^D): flush a partial line, or signal EOF if empty.
-            _ if veof != 0 && b == veof => {
-                if state.line.is_empty() {
-                    state.eof = true;
-                } else {
-                    state.ready.extend(state.line.drain(..));
-                }
-            }
-            // Printable / accepted control (tab): buffer + echo.
-            _ if b >= 0x20 || b == b'\t' => {
-                state.line.push(b);
-                if echo {
-                    echo_byte(b);
-                }
-            }
-            // Other control bytes: drop in cooked mode.
-            _ => {}
-        }
+        ntty::feed_byte(state, &t, b, &mut |c| echo_byte(c), &mut |x| {
+            signal_hook_consumes(x)
+        });
     }
 }
 
@@ -224,38 +137,29 @@ pub fn read_into(buf: &mut [u8]) -> usize {
     if buf.is_empty() {
         return 0;
     }
-    let t = *TERMIOS.lock().get_or_insert_with(Termios::default);
     let mut state = DISCIPLINE.lock();
-    pump(&mut state, &t);
-    if state.ready.is_empty() {
+    pump(&mut state);
+    if state.readable() == 0 {
         // Distinguish a pending EOF (^D) from "no input yet": consume the
         // EOF latch and report 0 with no parking.
-        if state.eof {
-            state.eof = false;
-        }
+        state.take_eof();
         return 0;
     }
-    let n = core::cmp::min(buf.len(), state.ready.len());
-    for slot in buf.iter_mut().take(n) {
-        *slot = state.ready.pop_front().unwrap();
-    }
-    n
+    state.drain_into(buf)
 }
 
 /// Should a console `read` that produced 0 bytes park (vs. return EOF)?
 /// True when no completed input is buffered and no EOF is pending — i.e.
 /// the reader should sleep until the input waker fires.
 pub fn block_on_input() -> bool {
-    let state = DISCIPLINE.lock();
-    state.ready.is_empty() && !state.eof
+    DISCIPLINE.lock().would_block()
 }
 
 /// Bytes immediately readable without blocking — completed line-discipline
 /// output plus raw input still queued in the rings. Used by FIONREAD and
 /// `poll(2)` readiness.
 pub fn readable_bytes() -> usize {
-    let ready = DISCIPLINE.lock().ready.len();
-    ready + narf_input::pending_input()
+    DISCIPLINE.lock().readable() + narf_input::pending_input()
 }
 
 /// Test-only: clear the line-discipline buffers and set the console to a
@@ -264,7 +168,7 @@ pub fn readable_bytes() -> usize {
 /// `narf_input::__reset_global_ring_for_test`).
 #[doc(hidden)]
 pub fn __test_reset_cooked() {
-    *DISCIPLINE.lock() = LineDiscipline::new();
+    *DISCIPLINE.lock() = LineState::new();
     *TERMIOS.lock() = Some(Termios::default());
 }
 
@@ -273,7 +177,7 @@ pub fn __test_reset_cooked() {
 /// interception — the behaviour the byte-drain tests assert.
 #[doc(hidden)]
 pub fn __test_reset_raw() {
-    *DISCIPLINE.lock() = LineDiscipline::new();
+    *DISCIPLINE.lock() = LineState::new();
     let mut t = Termios::default();
     // Clear ISIG|ICANON|ECHO in c_lflag (wire offset 12).
     let mut lf = u32::from_ne_bytes(t.raw[12..16].try_into().unwrap());

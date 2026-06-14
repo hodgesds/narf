@@ -71,6 +71,7 @@ pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod fuse;
 pub mod memfs;
+pub mod ntty;
 pub mod page_cache;
 #[cfg(feature = "linux-compat")]
 pub mod procfs;

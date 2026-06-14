@@ -36,9 +36,15 @@ pub fn install_all_hooks() {
 fn install_console_signal_hook() {
     // ^C / ^\ / ^Z input-byte handling into the console driver
     // so they deliver SIGINT/SIGQUIT/SIGTSTP to the foreground
-    // task instead of bubbling up as ASCII bytes.
+    // process group instead of bubbling up as ASCII bytes.
     narf_filesystem::install_console_signal_hook(
         narf_userspace::handlers::maybe_deliver_signal_for_input,
+    );
+    // Same job-control signals for pseudoterminals: the shared n_tty
+    // discipline raises ^C/^\/^Z to a PTY's foreground process group via
+    // this hook (the PTY knows its own fg_pgrp, so it passes it directly).
+    narf_filesystem::devfs_pty::install_pty_signal_hook(
+        narf_userspace::handlers::deliver_signal_to_pgrp,
     );
 }
 
