@@ -240,25 +240,38 @@ pub struct ExecRequest {
     pub fs_base: Option<u64>,
 }
 
-/// Single-task slot the polling routine populates before transitioning
-/// to user mode. Trap handlers consult this to find the calling
-/// task's `UserTaskCtx`. SMP will replace this with a per-CPU
-/// pointer; until then the cooperative single-CPU executor
-/// guarantees only one task is ever in flight.
-static CURRENT: AtomicPtr<UserTaskCtx> = AtomicPtr::new(core::ptr::null_mut());
+/// Per-CPU in-flight-task slot. The polling routine on each CPU
+/// populates its own cell before transitioning to user mode; the trap
+/// handler — which always runs on the *same* CPU as the task that
+/// trapped — consults its own cell to find the calling task's
+/// `UserTaskCtx`. With user tasks able to run on multiple CPUs
+/// concurrently, this MUST be per-CPU: a single global slot would let
+/// one CPU's poller clobber another's in-flight pointer.
+static CURRENT: [AtomicPtr<UserTaskCtx>; narf_lib::percpu::MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const NULL: AtomicPtr<UserTaskCtx> = AtomicPtr::new(core::ptr::null_mut());
+    [NULL; narf_lib::percpu::MAX_CPUS]
+};
+
+/// This CPU's in-flight-task cell.
+#[inline]
+fn current_slot() -> &'static AtomicPtr<UserTaskCtx> {
+    &CURRENT[narf_lib::percpu::current_cpu()]
+}
 
 pub fn install_current(ctx: *mut UserTaskCtx) {
-    CURRENT.store(ctx, Ordering::Release);
+    current_slot().store(ctx, Ordering::Release);
 }
 
 pub fn clear_current() {
-    CURRENT.store(core::ptr::null_mut(), Ordering::Release);
+    current_slot().store(core::ptr::null_mut(), Ordering::Release);
 }
 
 pub fn current_user_task() -> Option<*mut UserTaskCtx> {
-    // The in-flight polling routine publishes its ctx in `CURRENT`
-    // right before entering user mode and clears it on the way back
-    // out, so it reflects exactly the task whose trap we're handling.
+    // The in-flight polling routine publishes its ctx in this CPU's
+    // `CURRENT` cell right before entering user mode and clears it on
+    // the way back out, so it reflects exactly the task whose trap we're
+    // handling on this CPU.
     // We deliberately do NOT fall back to the task-id registry here:
     // its entries point at the poller's stack-pinned `UserTaskCtx`,
     // which is only live while that task is the in-flight one — a
@@ -266,7 +279,7 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     // unwound (notably in the in-kernel test harness, where `CURRENT`
     // is never set). `wake_signal` consults the registry directly when
     // it genuinely needs to poke a parked task by id.
-    let p = CURRENT.load(Ordering::Acquire);
+    let p = current_slot().load(Ordering::Acquire);
     if p.is_null() {
         None
     } else {
@@ -601,8 +614,20 @@ pub enum TaskState {
 /// transitioning to user mode; consulted by the static yield/exit
 /// hooks to find the polling routine to longjmp into. Cleared on
 /// the trap-back path so a stale pointer can't be picked up by an
-/// unrelated trap.
-static CURRENT_JMP: AtomicPtr<JmpBuf> = AtomicPtr::new(core::ptr::null_mut());
+/// unrelated trap. Per-CPU because each CPU runs its own poller +
+/// in-flight task, and a yielding task longjmps back into *its* CPU's
+/// poll routine — the trap that drives the hook runs on the same CPU.
+static CURRENT_JMP: [AtomicPtr<JmpBuf>; narf_lib::percpu::MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const NULL: AtomicPtr<JmpBuf> = AtomicPtr::new(core::ptr::null_mut());
+    [NULL; narf_lib::percpu::MAX_CPUS]
+};
+
+/// This CPU's current-jmpbuf cell.
+#[inline]
+fn jmp_slot() -> &'static AtomicPtr<JmpBuf> {
+    &CURRENT_JMP[narf_lib::percpu::current_cpu()]
+}
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
@@ -610,7 +635,7 @@ unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
     // `*uctx.state` before tail-calling us. Our job is just to
     // longjmp back to the polling routine; the polling routine
     // reads `exit_reason` after setjmp returns non-zero.
-    let p = CURRENT_JMP.load(Ordering::Acquire);
+    let p = jmp_slot().load(Ordering::Acquire);
     // SAFETY: the polling routine guarantees CURRENT_JMP points at
     // a live JmpBuf for the duration of the user-mode round-trip.
     // If a hook fires without a polling routine in flight, that's
@@ -629,7 +654,7 @@ unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
-    let p = CURRENT_JMP.load(Ordering::Acquire);
+    let p = jmp_slot().load(Ordering::Acquire);
     if p.is_null() {
         narf_scheduler::halt_forever();
     }
@@ -654,7 +679,7 @@ unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
 /// valid. This function never returns — it longjmps into the poller.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn user_task_execve_hook(_uctx: *mut UserTaskCtx) -> ! {
-    let p = CURRENT_JMP.load(Ordering::Acquire);
+    let p = jmp_slot().load(Ordering::Acquire);
     if p.is_null() {
         narf_scheduler::halt_forever();
     }
@@ -1064,7 +1089,7 @@ impl core::future::Future for UserTaskFuture {
         // transition so a trap that lands mid-setup still finds
         // valid slots.
         install_current(&mut this.ctx as *mut _);
-        CURRENT_JMP.store(this.jmp.get(), Ordering::Release);
+        jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Activate the user AS. `addr_space.activate()` does the
         // MOV CR3 on x86_64.
@@ -1218,7 +1243,7 @@ impl core::future::Future for UserTaskFuture {
         // return to the executor; an unrelated trap on the next
         // round must not see this future's slots.
         clear_current();
-        CURRENT_JMP.store(core::ptr::null_mut(), Ordering::Release);
+        jmp_slot().store(core::ptr::null_mut(), Ordering::Release);
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
@@ -1503,7 +1528,7 @@ impl core::future::Future for UserTaskFuture {
 
         // Publish per-task pointers the trap path consults.
         install_current(&mut this.ctx as *mut _);
-        CURRENT_JMP.store(this.jmp.get(), Ordering::Release);
+        jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Program the per-task TLS thread pointer if the binary
         // staged a TLS block. AArch64 stores it in TPIDR_EL0;
@@ -1586,7 +1611,7 @@ impl core::future::Future for UserTaskFuture {
         }
 
         clear_current();
-        CURRENT_JMP.store(core::ptr::null_mut(), Ordering::Release);
+        jmp_slot().store(core::ptr::null_mut(), Ordering::Release);
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
@@ -1602,7 +1627,7 @@ impl core::future::Future for UserTaskFuture {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
-    let p = CURRENT_JMP.load(Ordering::Acquire);
+    let p = jmp_slot().load(Ordering::Acquire);
     if p.is_null() {
         narf_scheduler::halt_forever();
     }
@@ -1615,7 +1640,7 @@ unsafe fn user_task_yield_hook(_uctx: *mut UserTaskCtx) -> ! {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn user_task_exit_hook(_uctx: *mut UserTaskCtx) -> ! {
-    let p = CURRENT_JMP.load(Ordering::Acquire);
+    let p = jmp_slot().load(Ordering::Acquire);
     if p.is_null() {
         narf_scheduler::halt_forever();
     }
