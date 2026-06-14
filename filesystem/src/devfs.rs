@@ -638,6 +638,20 @@ impl FileOps for DevConsole {
         crate::console_tty::block_on_input()
     }
 
+    /// Job control: `/dev/console` is the boot console — same tty id,
+    /// foreground pgrp, and TOSTOP as fd 0 (all singleton `console_tty`
+    /// state), so a background process reading `/dev/console` is sent
+    /// SIGTTIN just like one reading fd 0.
+    fn tty_id(&self) -> Option<u32> {
+        Some(crate::TTY_ID_CONSOLE)
+    }
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        Some(crate::console_tty::fg_pgrp())
+    }
+    fn tty_tostop(&self) -> bool {
+        crate::console_tty::tostop()
+    }
+
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         // Same path as `sys_write` to fd 1/2: forward to the kernel
         // console (UART + framebuffer hook if installed). Treat
@@ -689,11 +703,13 @@ impl FileOps for DevConsole {
     #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
         use crate::devfs_pty::{
-            read_user_termios, write_user_termios, write_user_winsize, WireWinsize, TCGETS, TCSETS,
-            TCSETSF, TCSETSW, TIOCGWINSZ,
+            read_user_i32, read_user_termios, write_user_i32, write_user_termios,
+            write_user_winsize, WireWinsize, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP,
+            TIOCGWINSZ, TIOCSPGRP,
         };
-        // Termios + winsize are owned by the unified `console_tty` so a
-        // TCSETS on /dev/console is visible to TCGETS on fd 0 and vice versa.
+        // Termios + winsize + foreground pgrp are owned by the unified
+        // `console_tty` so a TCSETS / tcsetpgrp on /dev/console is visible
+        // to fd 0 and vice versa.
         match cmd {
             TCGETS => {
                 let raw = crate::console_tty::termios();
@@ -718,6 +734,25 @@ impl FileOps for DevConsole {
                 };
                 // SAFETY: `arg` is the validated user `struct winsize *`.
                 unsafe { write_user_winsize(arg, ws)? };
+                Ok(0)
+            }
+            TIOCGPGRP => {
+                // tcgetpgrp on /dev/console — the singleton fg pgrp. No
+                // auto-install here (the caller's pgrp isn't reachable from
+                // this crate); fd 0's TIOCGPGRP handles that fallback, and
+                // getty sets the fg pgrp explicitly via tcsetpgrp.
+                let pgrp = crate::console_tty::fg_pgrp() as i32;
+                // SAFETY: `arg` is the validated user `pid_t *`.
+                unsafe { write_user_i32(arg, pgrp)? };
+                Ok(0)
+            }
+            TIOCSPGRP => {
+                // SAFETY: `arg` is the validated user `pid_t *`.
+                let pgrp = unsafe { read_user_i32(arg)? };
+                if pgrp < 0 {
+                    return Err(crate::FsError::InvalidData);
+                }
+                crate::console_tty::set_fg_pgrp(pgrp as u64);
                 Ok(0)
             }
             _ => Err(crate::FsError::Unsupported),

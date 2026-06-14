@@ -13588,6 +13588,142 @@ fn smoke_console_ctrlc_signals_foreground_pgrp() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_console_ctrlc_signals_foreground_pgrp);
 
+#[cfg(feature = "linux-compat")]
+fn smoke_tty_background_read_raises_sigttin() -> TestResult {
+    // A process in a BACKGROUND process group that reads its controlling
+    // terminal must be sent SIGTTIN (default action: stop) and the read
+    // interrupted with -EINTR. Install a synthetic controlling-tty fd whose
+    // foreground pgrp differs from the caller's, drive sys_read through it,
+    // and assert SIGTTIN is pending + the syscall returned -EINTR.
+    use crate::fd::{self, FdEntry};
+    use crate::handlers::{
+        __test_pgid_reset, __test_reset_task_id_lookup, __test_signal_reset, ctty_init, pgid_init,
+        signal_init, signal_pending_of,
+    };
+    use crate::{
+        install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::{FileOps, FsFuture, Mode, Stat, TTY_ID_CONSOLE};
+
+    struct FakeTty {
+        fg: u64,
+    }
+    impl FileOps for FakeTty {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn tty_id(&self) -> Option<u32> {
+            Some(TTY_ID_CONSOLE)
+        }
+        fn tty_fg_pgrp(&self) -> Option<u64> {
+            Some(self.fg)
+        }
+    }
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC0_00D1);
+    fn task_lookup() -> u64 {
+        TASK_ID.load(Ordering::Relaxed)
+    }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    __test_signal_reset();
+    signal_init();
+    __test_pgid_reset();
+    pgid_init();
+    ctty_init();
+    fd::__test_reset();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Foreground pgrp 0x7777 ≠ caller's pgid (defaults to its own tid), so
+    // the caller is a background process on this tty. tty_id == the console
+    // sentinel and task_ctty defaults to the console, so it IS the ctty.
+    fd::with_table(task, |tbl| {
+        tbl.set(
+            5,
+            FdEntry {
+                ops: Arc::new(FakeTty { fg: 0x7777 }),
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        );
+    });
+
+    let mut buf = [0u8; 8];
+    struct Ctx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for Ctx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _r: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+    }
+    let mut ctx = Ctx {
+        args: SyscallArgs {
+            arg0: 5,
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut ctx);
+
+    let pending = signal_pending_of(task);
+    let ret = ctx.ret.map(|r| r.value as i64);
+
+    fd::__test_reset();
+    __test_signal_reset();
+    __test_pgid_reset();
+    __test_reset_task_id_lookup();
+
+    let sigttin = 1u32 << 21;
+    if pending & sigttin == 0 {
+        return TestResult::Fail("background console read did not raise SIGTTIN");
+    }
+    if ret != Some(-4) {
+        return TestResult::Fail("background read should return -EINTR");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_tty_background_read_raises_sigttin);
+
 // ── Wave 39: end-to-end `echo hello world` golden path ────────────────────
 //
 // The Wave-37/38/39 chain (serial RX → BYTE_RING → ConsoleFile::read →
@@ -14135,32 +14271,30 @@ fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_tiocspgrp_round_trip);
 
-// Wave-60: two ConsoleFile instances must not share fg_pgrp.
-// Pre-fix, TIOCSPGRP poked a single global, so any "second tty"
-// would be a thin alias of the first.
+// The boot console is a SINGLETON: every `ConsoleFile` (fd 0/1/2) and
+// `/dev/console` share one foreground process group, which lives in
+// `console_tty`. So a tcsetpgrp on one is visible on the others — that is
+// what lets getty's tcsetpgrp(fd 0) take effect for a shell reading
+// /dev/console. (Per-PTY isolation is provided separately, by each Pty's
+// own `fg_pgrp` — see the devfs_pty tests.)
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
-fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
+fn smoke_console_fg_pgrp_is_shared_singleton() -> TestResult {
     use crate::fd::{ConsoleFile, TIOCGPGRP, TIOCSPGRP};
     use narf_filesystem::FileOps;
 
-    // Drop any leaked current-task lookup from an earlier test so the
-    // TIOCGPGRP auto-install fallback (which reads current_task_pgid())
-    // sees 0 for an unset tty rather than an ambient pgid.
+    // Clear the singleton fg_pgrp + any leaked task-id lookup so the
+    // TIOCGPGRP auto-install path sees a clean unset console.
+    narf_filesystem::console_tty::__test_reset_cooked();
     crate::handlers::__test_reset_task_id_lookup();
 
     let tty_a = ConsoleFile::new();
     let tty_b = ConsoleFile::new();
 
-    // Set tty_a's fg_pgrp to 111.
-    let pgid_a: i32 = 111;
-    if tty_a
-        .ioctl(TIOCSPGRP, &pgid_a as *const _ as usize)
-        .is_err()
-    {
+    // tcsetpgrp on A is immediately visible through B — one console.
+    let pgid: i32 = 111;
+    if tty_a.ioctl(TIOCSPGRP, &pgid as *const _ as usize).is_err() {
         return TestResult::Fail("TIOCSPGRP on tty_a failed");
     }
-
-    // Read tty_b — must still be 0 (unset), not 111.
     let mut got_b: i32 = -1;
     if tty_b
         .ioctl(TIOCGPGRP, &mut got_b as *mut _ as usize)
@@ -14168,20 +14302,19 @@ fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
     {
         return TestResult::Fail("TIOCGPGRP on tty_b failed");
     }
-    if got_b != 0 {
-        return TestResult::Fail("tty_b fg_pgrp leaked from tty_a write");
+    if got_b != 111 {
+        narf_filesystem::console_tty::__test_reset_cooked();
+        return TestResult::Fail("console fg_pgrp not shared across ConsoleFile instances");
     }
 
-    // Set tty_b's fg_pgrp to 222.
-    let pgid_b: i32 = 222;
+    // And a write through B is visible through A — fully symmetric.
+    let pgid2: i32 = 222;
     if tty_b
-        .ioctl(TIOCSPGRP, &pgid_b as *const _ as usize)
+        .ioctl(TIOCSPGRP, &pgid2 as *const _ as usize)
         .is_err()
     {
         return TestResult::Fail("TIOCSPGRP on tty_b failed");
     }
-
-    // tty_a must still read back 111, not 222.
     let mut got_a: i32 = -1;
     if tty_a
         .ioctl(TIOCGPGRP, &mut got_a as *mut _ as usize)
@@ -14189,29 +14322,14 @@ fn smoke_console_per_tty_fg_pgrp_is_isolated() -> TestResult {
     {
         return TestResult::Fail("TIOCGPGRP on tty_a failed");
     }
-    if got_a != 111 {
-        return TestResult::Fail("tty_a fg_pgrp clobbered by tty_b write");
+    narf_filesystem::console_tty::__test_reset_cooked();
+    if got_a != 222 {
+        return TestResult::Fail("console fg_pgrp not shared (B→A)");
     }
-    if got_b != 0 {
-        return TestResult::Fail("tty_b earlier read was wrong");
-    }
-
-    // Confirm tty_b reads 222 now.
-    let mut got_b2: i32 = -1;
-    if tty_b
-        .ioctl(TIOCGPGRP, &mut got_b2 as *mut _ as usize)
-        .is_err()
-    {
-        return TestResult::Fail("TIOCGPGRP on tty_b (second) failed");
-    }
-    if got_b2 != 222 {
-        return TestResult::Fail("tty_b fg_pgrp did not round-trip");
-    }
-
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_console_per_tty_fg_pgrp_is_isolated);
+kernel_test_in!("userspace", smoke_console_fg_pgrp_is_shared_singleton);
 
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
@@ -16361,13 +16479,14 @@ kernel_test_in!(
 // PtySlave::ioctl(TIOCSCTTY) calls back into the userspace crate via
 // the function-pointer hook installed in `boot_init`. This smoke
 // pokes the hook directly (`set_controlling_tty(idx)`) and reads
-// the per-task table via `ctty_for(task)`. setsid() clears the slot.
+// the per-task table via `ctty_for(task)`. setsid() detaches the ctty
+// (DETACHED marker), which `task_ctty` resolves to "no controlling tty".
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
     use crate::handlers::{
         __test_ctty_reset, __test_pgid_reset, __test_sid_reset, ctty_for, current_task_id,
-        set_controlling_tty,
+        set_controlling_tty, task_ctty,
     };
     use crate::{
         init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
@@ -16423,7 +16542,9 @@ fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Setsid.raw(), &mut ctx);
 
-    if ctty_for(task).is_some() {
+    // setsid marks the slot DETACHED (a distinct state from the boot-console
+    // default), which `task_ctty` resolves to "no controlling terminal".
+    if task_ctty(task).is_some() {
         __test_clear_global();
         return TestResult::Fail("setsid did not clear controlling_tty");
     }

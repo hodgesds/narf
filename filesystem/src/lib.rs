@@ -424,6 +424,29 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this fd is a terminal a process can have as its controlling tty,
+    /// return its stable id: [`TTY_ID_CONSOLE`] for the boot console, or
+    /// the `/dev/pts/<N>` index for a PTY slave. `None` for non-ttys. Used
+    /// by the job-control SIGTTIN/SIGTTOU check to match the fd against the
+    /// caller's controlling terminal. Default: not a tty.
+    fn tty_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// If this fd is a tty, return its foreground process-group id (0 when
+    /// unset). A background process — one whose pgrp differs from this —
+    /// that reads (or, with TOSTOP, writes) its controlling tty is sent
+    /// SIGTTIN / SIGTTOU. Default: not a tty.
+    fn tty_fg_pgrp(&self) -> Option<u64> {
+        None
+    }
+
+    /// True when this tty has `TOSTOP` set (background writes raise
+    /// SIGTTOU). Default off — background writes are allowed.
+    fn tty_tostop(&self) -> bool {
+        false
+    }
+
     /// If this open file is a *directory* handle (from opening a path
     /// that resolves to a directory), return its [`DirOps`] so the
     /// `getdents64(2)` path can enumerate it. The fd's own `offset`
@@ -512,6 +535,14 @@ pub trait FileOps: Send + Sync {
         None
     }
 }
+
+// ── Controlling-tty ids ─────────────────────────────────────────
+
+/// Stable [`FileOps::tty_id`] for the boot console (`/dev/console`,
+/// stdin/out/err). A reserved high value so it never collides with a
+/// `/dev/pts/<N>` PTY index (those count up from 0). The userspace
+/// controlling-tty table uses the same value (`handlers::CTTY_CONSOLE`).
+pub const TTY_ID_CONSOLE: u32 = 0xFFFF_FFFE;
 
 // ── POSIX poll(2) event bits ────────────────────────────────────
 
