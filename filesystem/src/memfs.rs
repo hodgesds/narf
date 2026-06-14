@@ -27,13 +27,54 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
-/// In-memory file: a length-tracked byte buffer behind a lock.
+/// Default permission bits for a freshly minted `MemFile`: 0o666
+/// (rw-rw-rw-), owned by root (0, 0). This preserves the historical
+/// "root-can-do-anything, everyone has rw" behaviour so DAC enforcement
+/// only bites when a file is explicitly minted with tighter perms.
+const DEFAULT_PERMS: u16 = 0o666;
+
+/// In-memory file: a length-tracked byte buffer behind a lock, plus
+/// per-node DAC metadata (low-9 permission bits + owner uid/gid).
 struct MemFile {
     bytes: IrqSafeSpinLock<Vec<u8>>,
+    /// DAC metadata as lock-free atomics — kept deliberately small: a
+    /// MemFs node is created for every file in the kernel-test suite, so
+    /// three spinlocks here (vs three `AtomicU32`) measurably grew the
+    /// suite's heap footprint and tipped its margin. `perms` holds the
+    /// low-9 rwxrwxrwx bits; `uid`/`gid` the owner. Relaxed ordering is
+    /// fine — this is independent metadata, not a synchronisation point.
+    perms: AtomicU32,
+    uid: AtomicU32,
+    gid: AtomicU32,
+}
+
+impl MemFile {
+    /// Mint a `MemFile` with default perms (0o666) and owner (0, 0).
+    fn new(bytes: Vec<u8>) -> Self {
+        MemFile {
+            bytes: IrqSafeSpinLock::new(bytes),
+            perms: AtomicU32::new(DEFAULT_PERMS as u32),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
+        }
+    }
+
+    /// Mint a `MemFile` with explicit perms + owner. Used to seed files
+    /// that must enforce a real DAC boundary (e.g. /etc/shadow 0600).
+    fn with_perms_owner(bytes: Vec<u8>, perms: u16, uid: u32, gid: u32) -> Self {
+        MemFile {
+            bytes: IrqSafeSpinLock::new(bytes),
+            perms: AtomicU32::new((perms & 0o777) as u32),
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
+        }
+    }
 }
 
 /// Mint a fresh empty in-memory file outside any directory. The
@@ -42,9 +83,21 @@ struct MemFile {
 /// anonymous fd can back a real `MemFile` without occupying a
 /// VFS path.
 pub fn new_anon_file() -> Arc<dyn FileOps> {
-    Arc::new(MemFile {
-        bytes: IrqSafeSpinLock::new(Vec::new()),
-    })
+    Arc::new(MemFile::new(Vec::new()))
+}
+
+/// Mint a standalone in-memory file with explicit DAC metadata (initial
+/// contents + low-9 perm bits + owner uid/gid). The returned `FileOps`
+/// handle enforces those perms via `stat()`/`owners()`. Used by the DAC
+/// kernel tests to construct a 0600 root-owned file (or a 0o666 world-rw
+/// file) without going through a mounted FS.
+pub fn new_file_with_perms_owner(
+    bytes: Vec<u8>,
+    perms: u16,
+    uid: u32,
+    gid: u32,
+) -> Arc<dyn FileOps> {
+    Arc::new(MemFile::with_perms_owner(bytes, perms, uid, gid))
 }
 
 impl fmt::Debug for MemFile {
@@ -88,9 +141,35 @@ impl FileOps for MemFile {
         Stat {
             size: g.len() as u64,
             blocks: (g.len() as u64).div_ceil(512),
-            mode: Mode::FILE_RW,
+            mode: Mode {
+                file_type: FileType::File,
+                perms: (self.perms.load(Ordering::Relaxed) & 0o777) as u16,
+            },
             mtime_cycles: 0,
         }
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        (
+            self.uid.load(Ordering::Relaxed),
+            self.gid.load(Ordering::Relaxed),
+        )
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.uid.store(uid, Ordering::Relaxed);
+            self.gid.store(gid, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            // Persist only the low-9 rwxrwxrwx bits.
+            self.perms.store((perms & 0o777) as u32, Ordering::Relaxed);
+            Ok(())
+        })
     }
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
@@ -263,9 +342,7 @@ impl DirOps for MemDir {
             if g.contains_key(name) {
                 return Err(FsError::Busy);
             }
-            let f = Arc::new(MemFile {
-                bytes: IrqSafeSpinLock::new(Vec::new()),
-            });
+            let f = Arc::new(MemFile::new(Vec::new()));
             g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
             Ok(f as Arc<dyn FileOps>)
         })
@@ -369,9 +446,7 @@ impl MemFs {
         {
             let mut g = fs.root.entries.lock();
             for (n, c) in seeds {
-                let f = Arc::new(MemFile {
-                    bytes: IrqSafeSpinLock::new(c.to_vec()),
-                });
+                let f = Arc::new(MemFile::new(c.to_vec()));
                 g.insert((*n).to_string(), Entry::File(f));
             }
         }
@@ -382,6 +457,25 @@ impl MemFs {
     /// Subdirectory contents are not counted recursively.
     pub fn file_count(&self) -> usize {
         self.root.entries.lock().len()
+    }
+
+    /// Apply explicit DAC metadata (perms + owner) to a root-level file
+    /// previously seeded via [`MemFs::with_seeds`]. Returns `true` if a
+    /// regular file with `name` was found and updated, `false` otherwise
+    /// (missing, or the entry is a dir/symlink). Used by boot-init to
+    /// turn /etc/shadow into a real 0600 root-owned secret. Only the
+    /// low-9 perm bits are stored.
+    pub fn set_file_perms_owner(&self, name: &str, perms: u16, uid: u32, gid: u32) -> bool {
+        let g = self.root.entries.lock();
+        match g.get(name) {
+            Some(Entry::File(f)) => {
+                f.perms.store((perms & 0o777) as u32, Ordering::Relaxed);
+                f.uid.store(uid, Ordering::Relaxed);
+                f.gid.store(gid, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
     }
 }
 

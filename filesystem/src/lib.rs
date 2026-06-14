@@ -104,7 +104,10 @@ pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
 };
-pub use memfs::{new_anon_file as new_anon_memfile, MemFs};
+pub use memfs::{
+    new_anon_file as new_anon_memfile, new_file_with_perms_owner as new_memfile_with_perms_owner,
+    MemFs,
+};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
 pub use sysfs::{
