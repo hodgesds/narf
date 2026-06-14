@@ -3592,6 +3592,18 @@ fn boot_userspace_init() {
         const ETC_SHADOW: &[u8] =
             b"root:$n1$n4rf$366fcdb3a40735e32d92d92d11fe1b9593d98d7e7546262e66cfeb72bd07ddec:0:0:99999:7:::\n";
         let etc_fs = MemFs::with_seeds("etc", &[("passwd", ETC_PASSWD), ("shadow", ETC_SHADOW)]);
+        // DAC: /etc/shadow holds password hashes and must be a real
+        // root-only secret — 0600 owned by (0, 0). getty reads it as
+        // uid 0 at boot (it setsid's but never setuid's before the
+        // read), so the owner-rw bits suffice for it; any process that
+        // has dropped privilege is now denied by posix_access_ok. passwd
+        // stays world-readable 0o666 (the default).
+        if !etc_fs.set_file_perms_owner("shadow", 0o600, 0, 0) {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: WARNING failed to tighten /etc/shadow perms"
+            );
+        }
         let _ = registry().mount(&auth, "/etc", etc_fs);
         let _ = writeln!(
             console::Writer,

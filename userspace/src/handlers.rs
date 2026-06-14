@@ -814,8 +814,11 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             perms: stat.mode.perms,
         },
         narf_filesystem::Accessor {
-            uid: acc.uid,
-            gid: acc.gid,
+            // POSIX file-permission checks use the *filesystem* uid/gid
+            // (fsuid/fsgid), which tracks the effective id unless
+            // overridden by setfsuid/setfsgid — not the real uid/gid.
+            uid: acc.fsuid,
+            gid: acc.fsgid,
         },
         narf_filesystem::AccessRequest {
             read: want_r,
@@ -7974,6 +7977,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     if !share_fs {
         cwd_fork(parent_pid, child_tid.raw());
     }
+    // Credentials (uid/gid/euid/...) are copied to the child so a parent
+    // that dropped privilege stays dropped across fork/clone; a root
+    // parent stays root. Keyed by task id, so copy unconditionally.
+    uidgid_fork(parent_pid, child_tid.raw());
     if !share_vm {
         // brk and sigaction map onto AS state; only meaningful for
         // a non-VM clone (a true fork). For thread spawns the
@@ -8342,6 +8349,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
+    uidgid_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
     // POSIX: inherit the parent's process group, session, and controlling
@@ -9648,6 +9656,20 @@ fn read_uidgid(task: u64) -> UidGid {
     g.as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or_default()
+}
+
+/// Copy the parent's credential entry (uid/gid/euid/egid/fsuid/fsgid)
+/// to the child on fork/clone. Mirrors [`cwd_fork`]. If the parent has
+/// no explicit entry it is the default (all zero = root), so the child
+/// also defaults to root and we can skip the insert. This makes a
+/// dropped uid survive fork while leaving root parents as root.
+pub fn uidgid_fork(parent: u64, child: u64) {
+    let mut g = UIDGID_TABLE.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(v) = map.get(&parent).copied() {
+            map.insert(child, v);
+        }
+    }
 }
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {

@@ -16553,3 +16553,62 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_ctty_hook_roundtrip_and_setsid_clears
 );
+
+// DAC boundary (placed at end of file deliberately: this suite is at the
+// margin and inserting a test *earlier* shifts the fragile
+// `smoke_userspace_execve_with_envp_pack_accepts` and tips it — see the
+// kernel-test-suite marginal-heap notes). The kernel enforces DAC in
+// `sys_open` via `posix_access_ok` over the file's owner/perms against the
+// caller's (fs)uid/gid; this pins that decision for the /etc/shadow case.
+fn smoke_dac_shadow_denies_nonroot() -> TestResult {
+    use narf_filesystem::{posix_access_ok, AccessRequest, Accessor, FileOwner};
+    let rd = AccessRequest {
+        read: true,
+        write: false,
+        exec: false,
+    };
+    // /etc/shadow: 0600 owned by root.
+    let shadow = FileOwner {
+        uid: 0,
+        gid: 0,
+        perms: 0o600,
+    };
+    // A world-readable 0o666 file.
+    let public = FileOwner {
+        uid: 0,
+        gid: 0,
+        perms: 0o666,
+    };
+    // root reads the 0600 shadow.
+    if !posix_access_ok(shadow, Accessor { uid: 0, gid: 0 }, rd) {
+        return TestResult::Fail("root was denied the 0600 shadow");
+    }
+    // a dropped-privilege process (uid/gid 1000) may not.
+    if posix_access_ok(
+        shadow,
+        Accessor {
+            uid: 1000,
+            gid: 1000,
+        },
+        rd,
+    ) {
+        return TestResult::Fail("uid 1000 was allowed to read the 0600 shadow");
+    }
+    // and is still denied even sharing root's group (0600 group bits = ---).
+    if posix_access_ok(shadow, Accessor { uid: 1000, gid: 0 }, rd) {
+        return TestResult::Fail("a non-owner in gid 0 read the 0600 shadow");
+    }
+    // but the same process can read a world-rw 0o666 file.
+    if !posix_access_ok(
+        public,
+        Accessor {
+            uid: 1000,
+            gid: 1000,
+        },
+        rd,
+    ) {
+        return TestResult::Fail("uid 1000 was denied a world-rw 0o666 file");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_dac_shadow_denies_nonroot);
