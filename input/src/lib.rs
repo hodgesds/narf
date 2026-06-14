@@ -1005,9 +1005,14 @@ pub fn push_global(ev: InputEvent) -> bool {
             }
             if is_ascii {
                 ASCII_PUSH_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                // Wake the console reader. Drop the ring lock first so
-                // the waker lock is always taken after the ring — this
-                // matches the acquire order in `WaitAsciiByteFuture::poll`.
+            }
+            // Wake a parked console reader for any console-input event —
+            // a serial byte OR a keyboard key. The unified line discipline
+            // re-pumps both rings on wake, so a key press must wake it too
+            // (the old code only woke on AsciiByte and missed the keyboard).
+            // Drop the ring lock first so the waker lock is always taken
+            // after the ring — this matches `WaitAsciiByteFuture::poll`.
+            if is_ascii || is_key {
                 drop(g);
                 let maybe_waker = BYTE_RING_WAKER.lock().take();
                 if let Some(w) = maybe_waker {
@@ -1059,6 +1064,17 @@ pub fn pop_scroll() -> Option<ScrollEvent> {
 /// blocking?" and the right answer is what's in the ring right now.
 pub fn pending_bytes() -> usize {
     BYTE_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0)
+}
+
+/// Total console-input depth: queued serial bytes PLUS queued key
+/// events. The unified console line discipline drains both rings, so a
+/// parked `sys_read` must re-check both to decide whether new input has
+/// arrived. (`pending_bytes` alone misses keyboard input and would leave
+/// a keyboard-only reader parked forever.)
+pub fn pending_input() -> usize {
+    let bytes = BYTE_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0);
+    let keys = KEY_RING.lock().as_ref().map(|r| r.len()).unwrap_or(0);
+    bytes + keys
 }
 
 /// Register `waker` in the `BYTE_RING_WAKER` slot so the next

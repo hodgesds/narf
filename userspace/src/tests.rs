@@ -13291,6 +13291,11 @@ fn smoke_console_read_one_byte_in_ring() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // The console defaults to cooked (line-buffered) mode now; this test
+    // asserts raw byte-at-a-time surfacing, so put the shared discipline
+    // in raw mode (ICANON/ECHO/ISIG off) and clear any leftover buffers.
+    narf_filesystem::console_tty::__test_reset_raw();
+
     // Pre-load one byte ('A' = 0x41) into the ASCII ring.
     narf_input::push_global(narf_input::InputEvent::AsciiByte(b'A'));
 
@@ -13373,6 +13378,10 @@ fn smoke_console_read_drains_burst() -> TestResult {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+
+    // Raw mode so the 3-byte burst surfaces immediately (the shared
+    // console discipline defaults to cooked/line-buffered now).
+    narf_filesystem::console_tty::__test_reset_raw();
 
     // Pre-load "hi\n" (3 bytes) into the ASCII ring.
     for &b in b"hi\n" {

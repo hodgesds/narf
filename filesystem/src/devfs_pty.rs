@@ -194,6 +194,7 @@ impl<const N: usize> core::fmt::Debug for ByteRing<N> {
 pub const TERMIOS_WIRE_LEN: usize = 60;
 
 // `c_lflag` bits we honour (asm-generic termbits).
+const L_ISIG: u32 = 0x0000_0001;
 const L_ICANON: u32 = 0x0000_0002;
 const L_ECHO: u32 = 0x0000_0008;
 
@@ -218,6 +219,19 @@ impl Termios {
     /// Echo: bytes the slave reads are echoed back to the master.
     pub fn echo(&self) -> bool {
         self.lflag() & L_ECHO != 0
+    }
+    /// Signal generation: ^C/^\/^Z (the `c_cc[VINTR/VQUIT/VSUSP]` chars)
+    /// raise SIGINT/SIGQUIT/SIGTSTP to the foreground pgrp instead of
+    /// being returned through `read`. Raw-mode programs (vi, readline)
+    /// clear ISIG to receive those bytes literally.
+    pub fn isig(&self) -> bool {
+        self.lflag() & L_ISIG != 0
+    }
+    /// A `c_cc[]` control character by index (VINTR=0, VQUIT=1, VERASE=2,
+    /// VKILL=3, VEOF=4, …). `c_cc[]` starts at wire offset 17 (after
+    /// c_line@16). Returns 0 for out-of-range indices.
+    pub fn cc(&self, idx: usize) -> u8 {
+        self.raw.get(17 + idx).copied().unwrap_or(0)
     }
 }
 

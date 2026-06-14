@@ -62,6 +62,7 @@ extern crate alloc;
 
 #[cfg(feature = "cgroup")]
 pub mod cgroupfs;
+pub mod console_tty;
 pub mod csprng;
 pub mod devfs;
 pub mod devfs_block;
