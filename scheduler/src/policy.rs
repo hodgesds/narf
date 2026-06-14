@@ -84,6 +84,14 @@ pub struct TaskMeta {
     pub priority: Priority,
     pub class: SchedClass,
     pub affinity: Affinity,
+    /// True when the slot carries an address space (a user /
+    /// process-bearing task). Such tasks must never be stolen across
+    /// CPUs: the global single-in-flight-user-task assumptions
+    /// (`CURRENT`, `CURRENT_TASK`, `ACTIVE_USER_AS`) make full
+    /// user-task SMP a separate effort. The default steal strategy
+    /// refuses these unconditionally — a hard safety floor that holds
+    /// even if a user task were mis-pinned to `Affinity::any()`.
+    pub addr_space: bool,
 }
 
 /// Mutable borrow of one CPU's ready queue, scoped to a single
@@ -145,6 +153,7 @@ impl<'a> RunQueue<'a> {
                     priority: slot.spec.priority,
                     class: slot.spec.class,
                     affinity: slot.spec.affinity,
+                    addr_space: slot.addr_space.is_some(),
                 },
             )
         })

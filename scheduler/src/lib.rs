@@ -365,6 +365,27 @@ impl TaskSpec {
         }
     }
 
+    /// Like `unthrottled()` but eligible to run on ANY online CPU
+    /// (`Affinity::any()`) instead of BOOT-pinned. Use this ONLY for
+    /// kernel-side tasks that have been audited SMP-safe: leaf tasks
+    /// touching only `IrqSafeSpinLock`-guarded state, no per-CPU MMIO,
+    /// and never on the serial/console/framebuffer/USB path (whose
+    /// output ordering the boot-smoke / musl-demo gates assert on).
+    /// A task spawned with this spec can be work-stolen onto an AP.
+    /// `unthrottled()` intentionally stays BOOT-pinned — that pin is a
+    /// load-bearing safety property for the un-audited spawn-and-forget
+    /// tasks and for user tasks; do not collapse the two.
+    pub const fn kernel_any() -> Self {
+        Self {
+            affinity: Affinity::any(),
+            budget: ResourceBudget::unthrottled(),
+            budget_cap: None,
+            class: SchedClass::Normal,
+            priority: Priority::NORMAL,
+            smt: SmtSharePolicy::Avoid,
+        }
+    }
+
     /// Budgeted spec: charge every poll against `budget`, and
     /// `check_live` the cap each round.
     pub const fn budgeted(budget: ResourceBudget, cap: Cap<CpuBudget, Spend>) -> Self {
@@ -886,6 +907,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                             priority: d.spec.priority,
                             class: d.spec.class,
                             affinity: d.spec.affinity,
+                            addr_space: d.addr_space.is_some(),
                         },
                         true,
                     )
@@ -896,6 +918,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                             priority: crate::priority::Priority::NORMAL,
                             class: crate::priority::SchedClass::Normal,
                             affinity: crate::affinity::Affinity::any(),
+                            addr_space: false,
                         },
                         false,
                     )
@@ -907,6 +930,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                         priority: crate::priority::Priority::NORMAL,
                         class: crate::priority::SchedClass::Normal,
                         affinity: crate::affinity::Affinity::any(),
+                        addr_space: false,
                     },
                     false,
                 )
@@ -1791,6 +1815,11 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
                 priority: s.spec.priority,
                 class: s.spec.class,
                 affinity: s.spec.affinity,
+                // Hard safety floor: an address-space-bearing (user)
+                // task must never migrate across CPUs. The default
+                // strategy's `allow_steal` refuses on this flag even
+                // if the task were mis-pinned to `Affinity::any()`.
+                addr_space: s.addr_space.is_some(),
             };
             strategy.allow_steal(thief, &meta)
         });

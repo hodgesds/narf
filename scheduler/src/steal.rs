@@ -76,12 +76,21 @@ pub trait StealStrategy: Send + Sync + 'static {
 
     /// Permit/refuse stealing this specific task. Receives a
     /// read-only snapshot of the task's metadata
-    /// (affinity / class / priority / id). Default: respect the
-    /// task's affinity mask — pinned tasks are never stolen across
-    /// pins. Custom impls may broaden (e.g. ignore affinity for a
-    /// throughput-only workload) or narrow (e.g. only steal
-    /// SchedClass::Normal tasks).
+    /// (addr_space / affinity / class / priority / id). Default:
+    /// never steal an address-space-bearing (user) task — a hard
+    /// SMP-safety floor independent of affinity, because the global
+    /// single-in-flight-user-task assumptions (`CURRENT`,
+    /// `CURRENT_TASK`, `ACTIVE_USER_AS`) are not yet per-CPU — then
+    /// respect the task's affinity mask so pinned tasks are never
+    /// stolen across pins. Custom impls may broaden the affinity rule
+    /// (e.g. ignore affinity for a throughput-only workload) or
+    /// narrow it (e.g. only steal SchedClass::Normal tasks), but
+    /// should keep the `addr_space` refusal until full user-task SMP
+    /// lands.
     fn allow_steal(&self, thief: CpuId, task: &TaskMeta) -> bool {
+        if task.addr_space {
+            return false;
+        }
         task.affinity.allowed.contains(thief)
     }
 }
