@@ -379,7 +379,13 @@ impl Arch {
                     "-smp".into(),
                     smp.clone().unwrap_or_else(|| "16,sockets=2,cores=8".into()),
                     "-m".into(),
-                    "512M".into(),
+                    // 1 GiB (512 MiB per NUMA node below). The kernel-test
+                    // suite runs ~5129 smokes on the slab/buddy and sits near
+                    // the margin; a DMA-heavy smoke (e.g. nvme multi-queue)
+                    // then crashes QEMU when a DMA-buffer allocation can't get
+                    // a valid contiguous frame from a pressured node. Doubling
+                    // the buddy backing keeps the suite comfortably in range.
+                    "1024M".into(),
                 ];
                 // Optional accel override. Unset ⇒ QEMU auto-selects
                 // (KVM when /dev/kvm exists, else single-threaded TCG).
@@ -397,8 +403,8 @@ impl Arch {
                     args.extend_from_slice(&[
                     "-numa".into(),    "node,nodeid=0,cpus=0-7,memdev=mem0,initiator=0".into(),
                     "-numa".into(),    "node,nodeid=1,cpus=8-15,memdev=mem1,initiator=1".into(),
-                    "-object".into(),  "memory-backend-ram,id=mem0,size=256M".into(),
-                    "-object".into(),  "memory-backend-ram,id=mem1,size=256M".into(),
+                    "-object".into(),  "memory-backend-ram,id=mem0,size=512M".into(),
+                    "-object".into(),  "memory-backend-ram,id=mem1,size=512M".into(),
                     "-numa".into(),    "hmat-lb,initiator=0,target=0,hierarchy=memory,data-type=access-latency,latency=10".into(),
                     "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-latency,latency=20".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-latency,latency=20".into(),
