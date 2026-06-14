@@ -24,6 +24,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::fmt::Write;
 use narf_console::Writer;
 
+#[cfg(not(feature = "user-task-smp"))]
+use narf_memory::alloc_frame;
+#[cfg(feature = "user-task-smp")]
 use narf_memory::alloc_pages_on;
 
 /// Where the AP trampoline lives at runtime. SIPI vector = 0x08
@@ -348,16 +351,45 @@ pub unsafe fn start_aps() -> u32 {
     let mut viable_buf = [0u32; narf_lib::percpu::MAX_CPUS];
     let mut viable_len: usize = 0;
     for logical in 1..total {
-        // One contiguous order-4 block (64 KiB). The previous per-page
-        // `alloc_frame` loop only used the first frame's top, silently
-        // assuming contiguity it never guaranteed — so it could never
-        // give more than 4 KiB. A single buddy block fixes both.
+        // With user-task SMP: one CONTIGUOUS order-4 block (64 KiB) —
+        // the AP runs deep user-task dispatch and needs a single
+        // usable stack range (the old per-page loop only used the
+        // first frame's top, assuming contiguity it never guaranteed).
+        #[cfg(feature = "user-task-smp")]
         let stack_top: u64 = match alloc_pages_on(0, AP_STACK_ORDER) {
             Ok(f) => f.start_address().raw() + (AP_STACK_PAGES as u64 * 4096),
             Err(_) => {
                 let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
                 continue;
             }
+        };
+        // Without it (default): APs run kernel tasks only — one page
+        // via the frame allocator, byte-for-byte the pre-branch path.
+        // Crucially this leaves the boot-time buddy state unchanged
+        // from `main`, since the kernel-test buddy is marginal and a
+        // shifted free-list tips a later driver's DMA probe into a
+        // host QEMU SIGSEGV.
+        #[cfg(not(feature = "user-task-smp"))]
+        let stack_top: u64 = {
+            let mut top: u64 = 0;
+            for _ in 0..AP_STACK_PAGES {
+                match alloc_frame() {
+                    Ok(f) => {
+                        let base = f.start_address().raw();
+                        if top == 0 {
+                            top = base + 4096;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
+                        break;
+                    }
+                }
+            }
+            if top == 0 {
+                continue;
+            }
+            top
         };
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.
