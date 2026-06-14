@@ -3580,6 +3580,20 @@ fn boot_userspace_init() {
             count,
         );
 
+        // /etc/passwd — getty's credential store. Classic 7-field passwd
+        // with the password in field 2 (pre-shadow plaintext): user `root`,
+        // password `narf`. NARF has no crypt(3) and a capability-based
+        // authority model (uids are cosmetic), so this gates the login flow
+        // rather than enforcing a security boundary. Edit this seed (or an
+        // on-disk /etc/passwd, once writable) to change the credentials.
+        const ETC_PASSWD: &[u8] = b"root:narf:0:0:root:/root:/bin/shell\n";
+        let etc_fs = MemFs::with_seeds("etc", &[("passwd", ETC_PASSWD)]);
+        let _ = registry().mount(&auth, "/etc", etc_fs);
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: mounted /etc (memfs) with passwd"
+        );
+
         // Wave-78 follow-up 3: /lib MemFs carrying the ld-musl
         // interpreter. NARF_LD_MUSL is empty (0 bytes) when the
         // host build didn't have musl installed — in that case
