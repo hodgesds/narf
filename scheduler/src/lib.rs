@@ -1330,6 +1330,50 @@ pub fn poll_one_round() -> usize {
     ready_this_round
 }
 
+/// Idle the current CPU until there may be new work, honouring the
+/// reliability of the clock-event tick.
+///
+/// On a dependable tick (TSC-deadline self-rearming one-shot) we HLT and
+/// trust the periodic IRQ — or any device IRQ — to wake us; `next_deadline`
+/// lets us skip the halt when a wheel deadline has already passed.
+///
+/// On the uncalibrated InitialCount periodic fallback (CPUID reports no
+/// TSC-deadline, e.g. QEMU `qemu64` under TCG) a tick can be dropped or
+/// arrive late. Halting there risks stranding a CPU past a parked sleeper's
+/// deadline and — worse — stops the sleep-pumps from re-running, so a parked
+/// interval-timer owner's SIGALRM never fires (it's the pump, not the wheel,
+/// that raises it; see `frame`'s timer trap). We instead busy-wait a short
+/// bounded slice so the executor loop re-evaluates and re-pumps promptly,
+/// independent of IRQ delivery. Costs 100% CPU while idle on such hosts —
+/// the price of an undependable tick, paid only where TSC-deadline is
+/// unavailable. `narf_time::set_tick_reliable` publishes which case we're in.
+#[inline]
+fn idle_wait(next_deadline: Option<u64>) {
+    if narf_time::tick_reliable() {
+        if let Some(deadline) = next_deadline {
+            if narf_time::now_cycles() >= deadline {
+                return;
+            }
+        }
+        narf_arch::halt_until_irq();
+        return;
+    }
+    // ~1 ms re-pump cadence: fast enough that interval timers / short
+    // sleeps fire on time, slow enough not to pin the loop body tighter
+    // than necessary. Capped at the deadline so we never overshoot a wake.
+    const IDLE_POLL_SLICE_NS: u64 = 1_000_000;
+    let cpns = narf_time::cycles_per_ns().max(1) as u64;
+    let mut slice = IDLE_POLL_SLICE_NS.saturating_mul(cpns);
+    if let Some(deadline) = next_deadline {
+        let now = narf_time::now_cycles();
+        if now >= deadline {
+            return;
+        }
+        slice = slice.min(deadline - now);
+    }
+    narf_time::busy_wait_cycles(slice);
+}
+
 pub fn run_until_empty() {
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
@@ -1779,21 +1823,17 @@ pub fn run_until_empty() {
                     narf_arch::enable_interrupts();
                 }
             }
-            match narf_time::timer_wheel::next_deadline_cycles() {
-                Some(deadline) => {
-                    if narf_time::now_cycles() < deadline {
-                        narf_arch::halt_until_irq();
-                    }
-                    // After the wake (or if the deadline already passed),
-                    // fire any due wakers in this non-IRQ context.
-                    let _ = narf_time::timer_wheel::fire_due(narf_time::now_cycles());
-                }
-                None => {
-                    // Wheel empty + no ready tasks + no steal
-                    // target. Nothing the executor can do — wait
-                    // for an external IRQ to deliver new work.
-                    narf_arch::halt_until_irq();
-                }
+            let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            // Idle until a wake is plausible. On a reliable tick this HLTs
+            // (woken by the periodic tick, a peer's shootdown IPI, or any
+            // device IRQ); on the InitialCount fallback it bounded-spins so a
+            // dropped tick can't strand a parked sleeper or stall the
+            // sleep-pumps. See `idle_wait`.
+            idle_wait(next_deadline);
+            if next_deadline.is_some() {
+                // After the wake (or if the deadline already passed),
+                // fire any due wakers in this non-IRQ context.
+                let _ = narf_time::timer_wheel::fire_due(narf_time::now_cycles());
             }
         }
     }
@@ -2199,9 +2239,11 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
                 if allow_halt && !awake.load(Ordering::Acquire) {
                     // Cooperative path: idle until something
                     // fires an IRQ. IRQ handler (or the future's
-                    // own wake_by_ref) flips awake, then
-                    // halt_until_irq returns.
-                    narf_arch::halt_until_irq();
+                    // own wake_by_ref) flips awake, then we return.
+                    // `idle_wait` HLTs on a reliable tick and
+                    // bounded-spins on the InitialCount fallback, so
+                    // a dropped tick can't wedge a blocked caller.
+                    idle_wait(None);
                 } else {
                     // Spin path: re-poll immediately. Cheap
                     // back-off via spin_loop hint.

@@ -28,7 +28,36 @@ pub use wall::{
 
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
+
+/// Whether the periodic clock-event tick is delivered reliably.
+///
+/// `true` (the default) means the primary clock-event uses a self-rearming
+/// one-shot source — TSC-deadline on x86_64 — whose IRQ is dependable, so a
+/// CPU may halt indefinitely between deadlines and trust the next tick to
+/// wake it.
+///
+/// `false` means the tick fell back to an uncalibrated periodic source (the
+/// LAPIC InitialCount fixed-count fallback when CPUID reports no TSC-deadline,
+/// e.g. QEMU `qemu64` under TCG). There a tick can be dropped or arrive late,
+/// so a halted CPU can sleep past a near-term timer-wheel deadline. The
+/// executor consults this to spin-poll the wheel instead of halting when the
+/// tick is not dependable. See `scheduler`'s idle path.
+static TICK_RELIABLE: AtomicBool = AtomicBool::new(true);
+
+/// Publish whether the selected primary clock-event tick is reliable.
+/// Called by the clock-event backend once it has armed the primary tick.
+pub fn set_tick_reliable(reliable: bool) {
+    TICK_RELIABLE.store(reliable, Ordering::Release);
+}
+
+/// Read whether the primary clock-event tick is reliable. See
+/// [`set_tick_reliable`].
+#[inline]
+pub fn tick_reliable() -> bool {
+    TICK_RELIABLE.load(Ordering::Acquire)
+}
 
 /// Monotonic instant in raw CPU cycles. Operations are saturating to
 /// prevent wrap-around panics on very-long uptimes.

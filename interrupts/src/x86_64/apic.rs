@@ -423,6 +423,9 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             unsafe {
                 start_timer_tsc_deadline(vector, period_cycles);
             }
+            // Self-rearming one-shot: each IRQ writes the next deadline, so
+            // the tick is dependable and a halted CPU may trust it to wake.
+            narf_time::set_tick_reliable(true);
         } else {
             // Periodic-InitialCount fallback. See start_timer
             // commentary; 10_000 is safely fast on any plausible
@@ -433,6 +436,10 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
             unsafe {
                 start_timer(vector, initial_count);
             }
+            // Uncalibrated fixed-count periodic: under TCG (qemu64, no
+            // TSC-deadline) a tick can be dropped or late, so the executor
+            // must not halt indefinitely on a near-term wheel deadline.
+            narf_time::set_tick_reliable(false);
         }
         Ok(())
     }

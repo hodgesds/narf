@@ -762,12 +762,17 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
-            SocketState::InetWired { .. } => {
-                // Always-writable; readability is tracked
-                // implicitly inside the TCP stack — Stage-1 just
-                // reports POLL_OUT. POLL_IN gating lands once the
-                // stack exposes a per-TCB readability accessor.
-                narf_filesystem::POLL_OUT
+            SocketState::InetWired { tcb_id, .. } => {
+                // Kernel-TCP-over-NIC: always writable (the stack
+                // queues + flow-controls send), and POLL_IN when the
+                // TCB has buffered RX data or the peer has closed
+                // (read returns EOF). This is what makes epoll/poll/
+                // select on a kernel-TCP socket wake on inbound data.
+                let mut bits = narf_filesystem::POLL_OUT;
+                if narf_net::tcp_stack::readable(*tcb_id) {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
             }
             SocketState::InetRaw { inbox, .. } => {
                 let mut bits = narf_filesystem::POLL_OUT;
