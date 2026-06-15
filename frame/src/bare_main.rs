@@ -788,6 +788,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // → IPI fan-out hook so the asid/pcid-isolation surface
             // also benefits from cross-CPU dispatch.
             narf_interrupts::install_tlb_shootdown_bridge();
+            // Let a CPU spinning on an IrqSafeSpinLock (IRQs masked) drain a
+            // shootdown a peer published to it — otherwise the peer's ack-wait
+            // would spin to its cap and give up, stranding a stale TLB on a
+            // shared address space. Only meaningful with the IPI surface live
+            // (i.e. x2APIC), which is exactly this block.
+            narf_lib::sync::set_lock_spin_hook(|| {
+                // SAFETY: CPL=0; poll_pending_shootdown only consumes this
+                // CPU's pending shootdown cells and INVLPGs.
+                unsafe {
+                    narf_interrupts::x86_64::ipi::poll_pending_shootdown();
+                }
+            });
         }
     }
 
