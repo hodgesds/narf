@@ -110,6 +110,8 @@ linux-compat = ["narf-userspace/linux-compat"]
 #                          deadbeef signature). Wins over zero if both.
 frame-zero-on-free   = ["narf-memory/frame-zero-on-free"]
 frame-poison-on-free = ["narf-memory/frame-poison-on-free"]
+# Per-frame double-alloc/double-free audit (panics at the bad caller).
+frame-alloc-audit    = ["narf-memory/frame-alloc-audit"]
 
 # Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
 container = ["narf-userspace/container"]

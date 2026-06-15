@@ -48,6 +48,15 @@ cgroup = []
 frame-zero-on-free = []
 frame-poison-on-free = []
 
+# Per-frame allocation audit: a global 1-bit-per-frame map, marked on
+# every buddy alloc and cleared on every buddy free. Panics at the
+# SOURCE on a double-alloc (the buddy handing out an already-allocated
+# frame) or double-free. The tool for pinpointing the "marginal-buddy"
+# bad-free: the bad caller's backtrace is printed at the offending
+# alloc/free. Off by default — adds a 512 KiB static bitmap and an
+# atomic op per alloc/free.
+frame-alloc-audit = []
+
 
 [lints]
 workspace = true

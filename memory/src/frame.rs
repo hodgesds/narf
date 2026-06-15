@@ -525,7 +525,10 @@ pub fn free_pages(frame: PhysFrame, order: u8) {
 /// routes the frame to its NUMA node's zone; alternative impls
 /// (e.g. `BumpFrameAlloc`) may treat this as a no-op or return
 /// `NotSupported` via their `try_*` variant.
+#[cfg_attr(feature = "frame-alloc-audit", track_caller)]
 pub fn free_frame(f: PhysFrame) {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_free_caller(core::panic::Location::caller());
     if let Some(a) = current_alloc() {
         a.free_frame(f);
     }
