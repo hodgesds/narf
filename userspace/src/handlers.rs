@@ -8245,9 +8245,13 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     // tables still carry the old WRITE-set PTEs. Without this, the
     // parent continues writing to the shared physical frames without
     // triggering a COW fault, silently corrupting the child's copy.
+    // SMP note: this only invlpg's the local CPU, but every user-task
+    // resume reloads CR3 via `activate()` (flushing the non-global
+    // user TLB), so a migrated parent re-derives RO PTEs and faults
+    // into COW correctly on its next write.
     // SAFETY: identity map live; root valid; may be called while
     // the parent AS is the active CR3 — invlpg per page keeps the
-    // TLB coherent. Single-CPU BSP-only (Stage-4).
+    // TLB coherent.
     // SAFETY: Valid memory or trusted environment
     if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());

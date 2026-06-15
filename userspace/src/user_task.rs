@@ -704,6 +704,46 @@ pub fn install_user_task_hooks() {
     install_execve_hook(user_task_execve_hook);
 }
 
+/// Per-task x87/SSE register file for `FXSAVE`/`FXRSTOR`.
+///
+/// The kernel is built `+soft-float,-sse`, so it never reads or writes
+/// XMM / x87 registers — but USER tasks do (musl/busybox `memcpy` /
+/// `memset` / string ops are SSE). The user-task `UserState` snapshot
+/// only carries GPRs, so across a *preemptive* trap (timer IRQ) a
+/// task's live XMM state is left in the hardware registers and then
+/// clobbered by whatever user task the executor polls next. A task
+/// preempted mid-`memcpy` would resume with another task's XMM and
+/// write garbage — observed as a NULL-deref in musl `free()`'s bin
+/// unlink after a torn heap write, and (under user-task migration,
+/// where the resuming CPU's XMM are guaranteed to differ) the dominant
+/// cause of the busybox-pipe flake. `FXSAVE` on the way out of user
+/// mode and `FXRSTOR` on the way back in preserves it per task.
+///
+/// 512 bytes, 16-byte aligned per the `FXSAVE`/`FXRSTOR` memory-operand
+/// alignment requirement.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(16))]
+struct FpuArea([u8; 512]);
+
+#[cfg(target_arch = "x86_64")]
+impl FpuArea {
+    /// A canonical reset FPU image used for a task's first entry:
+    /// `FCW = 0x037F` (all x87 exceptions masked, 64-bit precision),
+    /// `MXCSR = 0x1F80` (all SSE exceptions masked). Everything else
+    /// zero. An all-zero buffer would `FXRSTOR` `MXCSR = 0` — SSE
+    /// exceptions UNmasked, so the first denormal/inexact in user SSE
+    /// would raise a spurious `#XF` — so the two control words are
+    /// seeded explicitly.
+    fn reset() -> Self {
+        let mut a = [0u8; 512];
+        a[0] = 0x7F; // FCW byte 0
+        a[1] = 0x03; // FCW byte 1  → 0x037F
+        a[24] = 0x80; // MXCSR byte 0
+        a[25] = 0x1F; // MXCSR byte 1 → 0x1F80
+        FpuArea(a)
+    }
+}
+
 /// Polling future that drives a user-mode process to completion via
 /// the scheduler's ready queue. Construct with [`UserTaskFuture::new`]
 /// and spawn via `narf_scheduler::spawn_user`.
@@ -728,6 +768,11 @@ pub struct UserTaskFuture {
     /// re-polls instead of self-waking every 1ms; the wheel fires the
     /// task's waker at the deadline. Cleared (cancelled) on wake.
     sleep_handle: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+    /// This task's saved x87/SSE register file. `FXRSTOR`'d before
+    /// every entry into user mode and `FXSAVE`'d on every trap-return,
+    /// so the task's XMM/x87 state survives preemption + migration.
+    /// See [`FpuArea`].
+    fpu: FpuArea,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -763,6 +808,7 @@ impl UserTaskFuture {
             state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
+            fpu: FpuArea::reset(),
         }
     }
 
@@ -796,6 +842,11 @@ impl UserTaskFuture {
             state: TaskState::Running,
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
+            // A `fork(2)` child resumes immediately after the `int 0x80`
+            // that issued the clone — XMM/x87 are caller-saved across the
+            // syscall per the SysV ABI, so a canonical reset image (not
+            // the parent's live FPU) is the correct seed.
+            fpu: FpuArea::reset(),
         }
     }
 
@@ -1146,6 +1197,24 @@ impl core::future::Future for UserTaskFuture {
         let saved = unsafe { narf_scheduler::setjmp(this.jmp.get()) };
 
         if saved == 0 {
+            // Restore this task's x87/SSE register file before re-entering
+            // user mode. Without this a task resuming after preemption
+            // (especially on a different CPU under migration) would run
+            // with whatever XMM/x87 the previously-polled user task left
+            // behind — corrupting an in-flight `memcpy`/`memset`. The
+            // kernel is `+soft-float` so nothing has touched the FPU since
+            // the matching `FXSAVE` on the last trap-return.
+            // SAFETY: `fpu` is a live 512-byte 16-byte-aligned FXSAVE image
+            // (Pin keeps the future's address stable); CR4.OSFXSR is set on
+            // every CPU; the buffer lives in kernel memory mapped in the
+            // active (user) AS's kernel half.
+            unsafe {
+                core::arch::asm!(
+                    "fxrstor [{p}]",
+                    p = in(reg) &this.fpu as *const FpuArea,
+                    options(nostack, preserves_flags),
+                );
+            }
             match this.state {
                 TaskState::Initial => {
                     this.state = TaskState::Running;
@@ -1214,6 +1283,25 @@ impl core::future::Future for UserTaskFuture {
         }
         #[cfg(target_arch = "x86_64")]
         narf_memory::beacon::paint(52, 0x0060_FF60); // pale green: post-trap, re-polled
+
+        // Save this task's x87/SSE register file. The trap left the
+        // user's live XMM/x87 in the hardware registers (the kernel is
+        // `+soft-float` and never touches them), and the executor is
+        // about to poll other user tasks that WILL clobber them. FXSAVE
+        // snapshots them so the next resume's FXRSTOR restores exactly
+        // this task's FPU state — the crux of preserving an in-flight
+        // user `memcpy` across preemption + migration.
+        // SAFETY: `fpu` is a live 512-byte 16-byte-aligned buffer; the
+        // user AS is still active here (CR3 restore is below) and `fpu`
+        // is in its kernel half; CR4.OSFXSR is set.
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!(
+                "fxsave [{p}]",
+                p = in(reg) &mut this.fpu as *mut FpuArea,
+                options(nostack, preserves_flags),
+            );
+        }
 
         // Longjmp path: a hook fired, control is back on the
         // kernel-side stack. Restore the kernel's saved CR3 + zero

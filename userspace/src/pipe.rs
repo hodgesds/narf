@@ -162,7 +162,15 @@ impl FileOps for PipeRead {
     }
 
     fn read_should_block(&self) -> bool {
-        self.shared.queue.lock().is_empty() && !self.shared.writer_closed.load(Ordering::Acquire)
+        // Block (retry the read) unless we are TRULY at EOF: the queue is empty
+        // AND the writer has gone. Reporting "don't block" merely because the
+        // queue is non-empty would drop data: sys_read calls read() and this
+        // check under *separate* lock acquisitions, so if a writer on another
+        // CPU pushes bytes in between, read() already returned 0 — and treating
+        // that 0 as EOF (instead of re-reading) loses the bytes. Keying EOF on
+        // (empty AND writer_closed) makes a data-arrived race re-read instead.
+        let q = self.shared.queue.lock();
+        !(q.is_empty() && self.shared.writer_closed.load(Ordering::Acquire))
     }
 
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
