@@ -513,6 +513,10 @@ impl Once {
             Err(ONCE_DONE) => {}
             Err(_) => {
                 while self.state.load(Ordering::Acquire) != ONCE_DONE {
+                    // Drain shootdowns in case this wait runs masked (the
+                    // caller may hold IRQs off) — same reasoning as the
+                    // IrqSafeSpinLock busy-wait. Cheap when nothing is pending.
+                    run_lock_spin_hook();
                     spin_loop();
                 }
             }
