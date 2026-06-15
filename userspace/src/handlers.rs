@@ -7766,6 +7766,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         }
     };
 
+    // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
+    // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
+    if !narf_scheduler::user_nproc_available() {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
+
     // CLONE_VM: share AS via Arc::clone. Without it, this would be a
     // full fork — but pthread always passes CLONE_VM so the no-VM
     // path is uncommon. We support both: no-VM falls back to
@@ -8208,6 +8215,15 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+
+    // Fork-bomb guard: refuse before the COW copy when we're at the live
+    // user-task cap. POSIX: fork(2) returns EAGAIN when RLIMIT_NPROC would be
+    // exceeded. Without this an uncapped fork loop floods the per-CPU ready
+    // queues + kernel heap (and, under SMP, every core + the shootdown path).
+    if !narf_scheduler::user_nproc_available() {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
 
     // SAFETY: clone_for_fork's contract — paging is live; the
     // frame allocator was initialised at boot.

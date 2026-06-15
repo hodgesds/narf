@@ -192,6 +192,48 @@ impl CapType for Task {
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Live user-task count (processes + threads) for the fork-bomb guard.
+static LIVE_USER_TASKS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Hard cap on concurrent user tasks. `fork`/`clone` return `EAGAIN` at the
+/// cap, containing a fork bomb before it exhausts kernel memory and the
+/// per-CPU ready queues (unbounded `VecDeque`s). Generous for real workloads;
+/// far below where that many forked address spaces would OOM. SMP makes an
+/// uncapped bomb worse — more cores to flood and more concurrent shootdowns.
+pub const MAX_USER_TASKS: usize = 1024;
+
+/// RAII decrement for a live user task, stored in the slot by `spawn_user`.
+/// Fires on the slot's final drop (completion / kill / budget-drop), so the
+/// count stays balanced no matter which removal path ran. Moving the slot
+/// between queues does not drop it, so the count tracks task lifetime.
+struct NprocGuard;
+impl NprocGuard {
+    #[inline]
+    fn new() -> Self {
+        LIVE_USER_TASKS.fetch_add(1, Ordering::Relaxed);
+        NprocGuard
+    }
+}
+impl Drop for NprocGuard {
+    #[inline]
+    fn drop(&mut self) {
+        LIVE_USER_TASKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Current number of live user tasks (processes + threads).
+pub fn live_user_task_count() -> usize {
+    LIVE_USER_TASKS.load(Ordering::Relaxed)
+}
+
+/// Whether another user task may be spawned under [`MAX_USER_TASKS`]. `fork`
+/// and `clone` consult this and return `EAGAIN` when it is false — the
+/// fork-bomb guard. A slight TOCTOU overshoot (bounded by concurrent forks)
+/// is harmless: this contains a runaway, it isn't a hard security boundary.
+pub fn user_nproc_available() -> bool {
+    live_user_task_count() < MAX_USER_TASKS
+}
+
 /// Master switch for cross-CPU work stealing. Off by default so the
 /// BSP-only test harness sees stable single-CPU FIFO semantics. Boot
 /// code (or a runtime toggle) flips it on once the system is past
@@ -328,6 +370,11 @@ pub(crate) struct TaskSlot {
     /// protection-key analogue.
     #[cfg(target_arch = "x86_64")]
     saved_pkrs: Option<narf_arch::x86_64::pks::SavedPkrs>,
+    /// RAII fork-bomb counter. `Some` for user tasks (decrements
+    /// `LIVE_USER_TASKS` on the slot's final drop), `None` for kernel tasks.
+    /// Held purely for its `Drop` side-effect — never read, hence the allow.
+    #[allow(dead_code)]
+    nproc_guard: Option<NprocGuard>,
 }
 
 /// One in-flight time-slice donation handed to a task by
@@ -612,6 +659,7 @@ where
         donation: None,
         #[cfg(target_arch = "x86_64")]
         saved_pkrs: None,
+        nproc_guard: None,
     };
     let cpu = target_cpu(&spec);
     enqueue_on(cpu, slot);
@@ -714,6 +762,7 @@ where
         donation: None,
         #[cfg(target_arch = "x86_64")]
         saved_pkrs: None,
+        nproc_guard: Some(NprocGuard::new()),
     };
     let cpu = target_cpu(&spec);
     enqueue_on(cpu, slot);
