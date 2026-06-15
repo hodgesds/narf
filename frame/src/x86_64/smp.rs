@@ -24,9 +24,9 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::fmt::Write;
 use narf_console::Writer;
 
-#[cfg(not(feature = "user-task-smp"))]
+#[cfg(not(usmp_active))]
 use narf_memory::alloc_frame;
-#[cfg(feature = "user-task-smp")]
+#[cfg(usmp_active)]
 use narf_memory::alloc_pages_on;
 
 /// Where the AP trampoline lives at runtime. SIPI vector = 0x08
@@ -49,14 +49,15 @@ static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percp
 /// path), which overflows the 4 KiB WFI-parking stack and corrupts
 /// adjacent state (observed as a bogus victim index panicking in the
 /// work-steal path) — so it needs a larger, contiguous stack
-/// (order-4 = 16 frames = 64 KiB). With the feature OFF (default) APs
-/// only ever run kernel tasks, which fit the original single page;
-/// keeping it at one frame avoids the extra boot-time buddy pressure
-/// (high-order blocks × every AP) that can starve a later driver's
-/// DMA allocation on a marginal buddy.
-#[cfg(feature = "user-task-smp")]
+/// (order-4 = 16 frames = 64 KiB). When `usmp_active` is off (the
+/// kernel-test harness, or a `--no-default-features` build) APs only
+/// ever run kernel tasks, which fit the original single page; keeping it
+/// at one frame avoids the extra boot-time buddy pressure (high-order
+/// blocks × every AP) that can starve a later driver's DMA allocation on
+/// a marginal buddy.
+#[cfg(usmp_active)]
 const AP_STACK_ORDER: u8 = 4;
-#[cfg(not(feature = "user-task-smp"))]
+#[cfg(not(usmp_active))]
 const AP_STACK_ORDER: u8 = 0;
 const AP_STACK_PAGES: usize = 1 << AP_STACK_ORDER;
 
@@ -217,7 +218,7 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     TR is valid.
     // SAFETY: kernel mode, IRQs masked, global allocator up (heap was
     // promoted to slab before start_aps); runs exactly once per AP.
-    #[cfg(feature = "user-task-smp")]
+    #[cfg(usmp_active)]
     unsafe {
         let rsp0_top = super::gdt::init_ap();
         super::percpu::init_ap(id, rsp0_top);
@@ -381,7 +382,7 @@ pub unsafe fn start_aps() -> u32 {
         // the AP runs deep user-task dispatch and needs a single
         // usable stack range (the old per-page loop only used the
         // first frame's top, assuming contiguity it never guaranteed).
-        #[cfg(feature = "user-task-smp")]
+        #[cfg(usmp_active)]
         let stack_top: u64 = match alloc_pages_on(0, AP_STACK_ORDER) {
             Ok(f) => f.start_address().raw() + (AP_STACK_PAGES as u64 * 4096),
             Err(_) => {
@@ -395,7 +396,7 @@ pub unsafe fn start_aps() -> u32 {
         // from `main`, since the kernel-test buddy is marginal and a
         // shifted free-list tips a later driver's DMA probe into a
         // host QEMU SIGSEGV.
-        #[cfg(not(feature = "user-task-smp"))]
+        #[cfg(not(usmp_active))]
         let stack_top: u64 = {
             let mut top: u64 = 0;
             for _ in 0..AP_STACK_PAGES {
