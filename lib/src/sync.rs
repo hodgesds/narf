@@ -217,6 +217,42 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
             _not_send: core::marker::PhantomData,
         }
     }
+
+    /// Non-blocking acquire. Disables IRQs, attempts the lock exactly
+    /// once; on failure restores the caller's IRQ state and returns
+    /// `None` instead of spinning with interrupts masked.
+    ///
+    /// Critical on the work-steal hot path: a blocking `lock()` that
+    /// loses the race spins with IRQs disabled, and on x86_64 a CPU with
+    /// IRQs masked cannot service an inbound TLB-shootdown IPI — the
+    /// shootdown sender then spins to its ack cap (observed: 10M spins
+    /// per shootdown, livelocking dynamically-linked user tasks under
+    /// `user-task-smp`). `try_lock` keeps the masked window to a single
+    /// CAS, so a contended victim queue is skipped rather than spun on.
+    #[inline]
+    pub fn try_lock(&self) -> Option<IrqSafeSpinLockGuard<'_, T>> {
+        // SAFETY: same canonical local IRQ save+disable as `lock`.
+        // SAFETY: Valid memory or trusted environment
+        let saved = unsafe { irq_save_disable() };
+        if self
+            .inner
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(IrqSafeSpinLockGuard {
+                lock: &self.inner,
+                saved,
+                _not_send: core::marker::PhantomData,
+            })
+        } else {
+            // SAFETY: pairs with the `irq_save_disable` above; we did not
+            // take the lock, so restore the caller's IRQ state.
+            // SAFETY: Valid memory or trusted environment
+            unsafe { irq_restore(saved) };
+            None
+        }
+    }
 }
 
 /// Guard for [`IrqSafeSpinLock`]. Restores the caller's IRQ state on

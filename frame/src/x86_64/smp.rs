@@ -222,6 +222,32 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         let rsp0_top = super::gdt::init_ap();
         super::percpu::init_ap(id, rsp0_top);
         super::syscall::enable();
+        // EFER.NXE — the BSP sets this in bare_main before userspace;
+        // each AP must set it too. Without it, every user data/stack PTE
+        // with NO_EXEC=1 (bit 63) is a reserved-bit set in the eyes of
+        // this CPU, so the first access to such a page when a migrated
+        // user task runs here faults with a reserved-bit #PF (error-code
+        // bit 3, cr2 = the page) — observed as a livelock/SIGSEGV on
+        // dynamically-linked binaries whose stack pages are NX. EFER is
+        // per-logical-processor, so the BSP's write does not cover APs.
+        narf_arch::x86_64::msr::enable_nxe();
+
+        // CR4 parity with the BSP (bare_main): these are per-CPU bits the
+        // BSP's writes don't cover, and a migrated user task hits every one:
+        //   - OSFXSR (bit 9): without it the first user SSE2 op — musl's
+        //     TLS-init `movq %xmm0` — #UDs (SIGILL before main).
+        //   - SMAP (bit 21): the STAC/CLAC bracketing copy_from_user/_to_user
+        //     #UD when CR4.SMAP=0, so a syscall faults reading the user
+        //     buffer (e.g. write(2) produces no output).
+        //   - SMEP (bit 20): kernel-side hardening parity.
+        // Gating mirrors the BSP — only flip a bit the CPU advertises.
+        if narf_arch::x86_64::smep::supported() {
+            narf_arch::x86_64::smep::enable();
+        }
+        if narf_arch::x86_64::smap::supported() {
+            narf_arch::x86_64::smap::enable();
+        }
+        narf_arch::x86_64::sse::enable();
     }
 
     // 3. Per-CPU LAPIC bring-up: enable x2APIC + spurious vector +

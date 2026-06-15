@@ -1932,7 +1932,16 @@ fn try_steal_one(cpu: usize) -> bool {
 fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealStrategy) -> bool {
     let thief = crate::affinity::CpuId(cpu as u32);
     let stolen = {
-        let mut g = READY[victim].lock();
+        // Non-blocking: a contended victim queue is skipped, never spun
+        // on. Spinning here holds IRQs masked (IrqSafeSpinLock), which on
+        // x86_64 stalls inbound TLB-shootdown IPIs — the sender then spins
+        // to its 10M ack cap, livelocking dynamically-linked user tasks
+        // under user-task-smp. Best-effort stealing makes "skip" correct:
+        // the slot stays for the lock holder or another thief.
+        let mut g = match READY[victim].try_lock() {
+            Some(g) => g,
+            None => return false,
+        };
         let q = match g.as_mut() {
             Some(q) => q,
             None => return false,
