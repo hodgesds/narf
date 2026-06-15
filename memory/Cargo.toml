@@ -34,6 +34,20 @@ container = []
 # the page/frame allocator can attribute usage to the current cgroup.
 cgroup = []
 
+# Scrub a frame's bytes when it returns to the buddy allocator. Opt-in
+# debug/hardening aids — each adds a 4 KiB write to the genuine-free
+# path (after the COW refcount reaches 0). Off by default.
+#
+# frame-zero-on-free: fill freed frames with zeros (info-leak hardening:
+#   a recycled frame can't expose its previous owner's bytes).
+# frame-poison-on-free: fill freed frames with 0xDEAD_BEEF_DEAD_BEEF so a
+#   use-after-free / uninitialised-pointer read of a recycled frame
+#   faults on an obviously-diagnostic value instead of stale bytes (the
+#   tool for the "marginal-buddy" execve #PF). Takes precedence over
+#   frame-zero-on-free when both are enabled.
+frame-zero-on-free = []
+frame-poison-on-free = []
+
 
 [lints]
 workspace = true

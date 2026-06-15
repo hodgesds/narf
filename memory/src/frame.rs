@@ -560,6 +560,11 @@ fn buddy_free_frame(f: PhysFrame) {
     // rather than re-allocating (no second charge was ever taken).
     #[cfg(feature = "cgroup")]
     crate::cgroup_charge::uncharge(PAGE_SIZE);
+    // Optional scrub of the frame's contents on its way back to the
+    // buddy. The frame's COW refcount just hit 0 and it is NOT yet on
+    // any free list, so we hold exclusive access — no lock needed and
+    // no allocator can hand it out mid-scrub.
+    scrub_freed_frame(f.start_address());
     let node = phys_to_node(f.start_address().raw());
     let mut g = ALLOC.lock();
     if !g.initialised {
@@ -567,6 +572,48 @@ fn buddy_free_frame(f: PhysFrame) {
     }
     let zone_idx = if g.numa_aware { node } else { 0 };
     g.zones[zone_idx].free(buddy::frame_no(f), 0);
+}
+
+/// Optionally overwrite a frame's bytes as it returns to the buddy
+/// allocator. Compiled out (zero cost) unless a scrub feature is set:
+///
+/// - `frame-zero-on-free`: fill with zeros. Info-leak hardening — a
+///   freed frame's stale data (which may be another task's user memory
+///   or kernel heap) can't be observed by the next owner of the frame.
+/// - `frame-poison-on-free`: fill with a recognizable non-canonical
+///   poison word (`0xDEAD_BEEF_DEAD_BEEF`). A use-after-free or
+///   uninitialised-pointer read of a recycled frame then faults on an
+///   obviously-diagnostic value (`cr2`/registers spell `deadbeef`)
+///   instead of whatever stale bytes happened to land there — the
+///   "marginal-buddy" execve `#PF` that reads the freed `tcp_congestion`
+///   name ("cubic") as a pointer is exactly this class. Poison takes
+///   precedence when both features are enabled.
+///
+/// Both add a 4 KiB write to the genuine-free path (after the COW
+/// refcount reaches 0), so they are opt-in debug/hardening aids rather
+/// than always-on.
+#[inline]
+fn scrub_freed_frame(phys: PhysAddr) {
+    #[cfg(any(feature = "frame-poison-on-free", feature = "frame-zero-on-free"))]
+    {
+        #[cfg(feature = "frame-poison-on-free")]
+        const FILL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        #[cfg(all(feature = "frame-zero-on-free", not(feature = "frame-poison-on-free")))]
+        const FILL: u64 = 0;
+        let dst = phys.kernel_mut_ptr::<u64>();
+        // SAFETY: exclusive access per the caller's contract (refcount 0,
+        // not yet on a free list). `kernel_mut_ptr` resolves through the
+        // kernel direct map (identity low-4-GiB + high-half RAM window),
+        // valid for any donated RAM frame. Writes stay within the 4 KiB
+        // frame. `write_volatile` keeps the fill from being elided as a
+        // dead store into about-to-be-freed memory.
+        unsafe {
+            for i in 0..(PAGE_SIZE as usize / 8) {
+                core::ptr::write_volatile(dst.add(i), FILL);
+            }
+        }
+    }
+    let _ = phys;
 }
 
 /// Page-table-frame registry. Every PT / PD / PDPT / PML4 page

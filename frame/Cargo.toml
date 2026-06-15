@@ -100,6 +100,17 @@ narf-verification    = { path = "../verification", optional = true }
 # narf-userspace.  Stub for Waves 63-67.
 linux-compat = ["narf-userspace/linux-compat"]
 
+# Frame-scrub-on-free debug/hardening aids, forwarded to narf-memory.
+# Off by default; each adds a 4 KiB write to the genuine-free path.
+#   frame-zero-on-free   — zero freed frames (info-leak hardening).
+#   frame-poison-on-free — fill freed frames with 0xDEAD_BEEF_DEAD_BEEF
+#                          so a use-after-free / stale-frame pointer read
+#                          faults on a diagnostic value (turns the
+#                          "marginal-buddy" execve #PF into an obvious
+#                          deadbeef signature). Wins over zero if both.
+frame-zero-on-free   = ["narf-memory/frame-zero-on-free"]
+frame-poison-on-free = ["narf-memory/frame-poison-on-free"]
+
 # Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
 container = ["narf-userspace/container"]
 
