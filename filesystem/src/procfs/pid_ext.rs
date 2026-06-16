@@ -385,10 +385,29 @@ fn render_limits(pid: u64) -> String {
 /// `/proc/<pid>/mountinfo` — per-task mount namespace view.
 ///
 /// Linux ref: `fs/proc_namespace.c:show_mountinfo`.
-/// NARF has no per-task mount namespaces yet; expose the global
-/// VfsRegistry.  Format per line:
+/// If the task has unshared its mount namespace, render that NS's
+/// view (via the `NS_MOUNTINFO_HOOK`); otherwise fall back to the
+/// global VfsRegistry.  Format per line:
 ///   `mount_id parent_id major:minor root mount_point opts - fstype source opts`
-fn render_mountinfo(_pid: u64) -> String {
+fn render_mountinfo(pid: u64) -> String {
+    // Per-ns view first. The hook returns the task's private mount-ns
+    // mount list (one "path\tfsname" line per mount) when it has
+    // unshared CLONE_NEWNS; None ⇒ fall back to the global registry.
+    if let Some(rows) = super::hook_ns_mountinfo(pid) {
+        let mut s = String::new();
+        let mut id = 1u32;
+        for line in rows.lines() {
+            let mut it = line.splitn(2, '\t');
+            let path = it.next().unwrap_or("/");
+            let fs_name = it.next().unwrap_or("rootfs");
+            let _ = writeln!(s, "{} 0 0:1 / {} rw - {} {} rw", id, path, fs_name, fs_name);
+            id += 1;
+        }
+        if s.is_empty() {
+            let _ = writeln!(s, "1 0 0:1 / / rw - rootfs rootfs rw");
+        }
+        return s;
+    }
     let mut s = String::new();
     let mut id = 1u32;
     for (path, fs_name) in crate::registry().list_with_names() {

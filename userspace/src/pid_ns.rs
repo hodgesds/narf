@@ -30,6 +30,9 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// of released ids.
 #[derive(Debug)]
 pub struct PidNamespace {
+    /// Stable namespace id (nsfs inode in Linux). Shared monotonic
+    /// counter across all namespace flavours.
+    id: crate::namespaces::NsId,
     /// Lowest inner id not yet minted.
     watermark: AtomicU64,
     /// Inner → outer translation.
@@ -45,11 +48,17 @@ impl PidNamespace {
     /// allocate inner pid 1.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            id: crate::namespaces::alloc_ns_id(),
             watermark: AtomicU64::new(1),
             inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
             outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),
             free: IrqSafeSpinLock::new(BTreeSet::new()),
         })
+    }
+
+    /// Stable namespace id (nsfs inode in Linux).
+    pub fn id(&self) -> crate::namespaces::NsId {
+        self.id
     }
 
     /// Register `outer` in this namespace, allocating the lowest free

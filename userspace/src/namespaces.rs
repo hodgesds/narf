@@ -29,15 +29,88 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+// ── Stable namespace identity (NsId) ─────────────────────────────
+//
+// Every namespace flavour (uts/net/ipc/pid/mount/cgroup/user) carries
+// a process-global, monotonically increasing `NsId`. Linux uses the
+// namespace's inode number in the nsfs filesystem for the same job —
+// it's what `readlink /proc/<pid>/ns/<flavour>` renders inside
+// `flavour:[<id>]` and what `stat().st_ino` reports on an open ns-fd,
+// so two fds naming the same namespace compare equal. A single shared
+// counter across all flavours keeps ids globally unique (matches
+// Linux nsfs, where the inode space is shared), which the ns-fd
+// equality check below relies on.
+
+/// A stable, process-global namespace identity. Minted from one shared
+/// monotonic counter so ids never collide across flavours.
+pub type NsId = u64;
+
+static NS_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh, never-reused namespace id.
+pub fn alloc_ns_id() -> NsId {
+    NS_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Linux ns-flavour tags used to render `readlink` text and to tag the
+/// ns-fd so `setns(fd, nstype)` can sanity-check the flavour.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NsFlavour {
+    Uts,
+    Net,
+    Ipc,
+    Pid,
+    Mnt,
+    Cgroup,
+    User,
+}
+
+impl NsFlavour {
+    /// The token Linux uses in `readlink` output (`uts:[…]`, `net:[…]`).
+    pub fn tag(self) -> &'static str {
+        match self {
+            NsFlavour::Uts => "uts",
+            NsFlavour::Net => "net",
+            NsFlavour::Ipc => "ipc",
+            NsFlavour::Pid => "pid",
+            NsFlavour::Mnt => "mnt",
+            NsFlavour::Cgroup => "cgroup",
+            NsFlavour::User => "user",
+        }
+    }
+
+    /// The `CLONE_NEW*` bit a `setns(fd, nstype)` would pass to select
+    /// this flavour. `0` means "any nstype is accepted" (Linux allows
+    /// `setns(fd, 0)` to join every namespace the fd names).
+    pub fn clone_flag(self) -> u64 {
+        match self {
+            NsFlavour::Uts => CLONE_NEWUTS,
+            NsFlavour::Net => CLONE_NEWNET,
+            NsFlavour::Ipc => CLONE_NEWIPC,
+            NsFlavour::Pid => CLONE_NEWPID,
+            NsFlavour::Mnt => CLONE_NEWNS,
+            NsFlavour::Cgroup => CLONE_NEWCGROUP,
+            NsFlavour::User => CLONE_NEWUSER,
+        }
+    }
+}
+
 // ── Linux clone(2) namespace flags we honour beyond CLONE_NEWNS ────
+
+/// `CLONE_NEWNS` (Linux) — fresh mount namespace.
+pub const CLONE_NEWNS: u64 = 0x0002_0000;
+
+/// `CLONE_NEWCGROUP` (Linux) — fresh cgroup namespace.
+pub const CLONE_NEWCGROUP: u64 = 0x0200_0000;
 
 /// `CLONE_NEWUTS` (Linux) — fresh UTS namespace (hostname +
 /// domainname).
@@ -45,6 +118,12 @@ pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 
 /// `CLONE_NEWIPC` (Linux) — fresh SysV/POSIX IPC namespace.
 pub const CLONE_NEWIPC: u64 = 0x0800_0000;
+
+/// `CLONE_NEWUSER` (Linux) — fresh user namespace (uid/gid maps).
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
+
+/// `CLONE_NEWPID` (Linux) — fresh PID namespace.
+pub const CLONE_NEWPID: u64 = 0x2000_0000;
 
 /// `CLONE_NEWNET` (Linux) — fresh network namespace.
 pub const CLONE_NEWNET: u64 = 0x4000_0000;
@@ -65,6 +144,7 @@ pub const DEFAULT_HOSTNAME: &str = "narf";
 /// a single lock — both are short strings, contention is non-issue.
 #[derive(Debug)]
 pub struct UtsNamespace {
+    id: NsId,
     inner: IrqSafeSpinLock<UtsInner>,
 }
 
@@ -78,11 +158,17 @@ impl UtsNamespace {
     /// Seed a fresh namespace with the boot defaults.
     pub fn new_default() -> Arc<Self> {
         Arc::new(Self {
+            id: alloc_ns_id(),
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: String::from(DEFAULT_HOSTNAME),
                 domainname: String::from("(none)"),
             }),
         })
+    }
+
+    /// Stable namespace id (nsfs inode in Linux).
+    pub fn id(&self) -> NsId {
+        self.id
     }
 
     /// Clone the current state into a new namespace — unshare(2)
@@ -91,6 +177,7 @@ impl UtsNamespace {
     pub fn clone_from(other: &Self) -> Arc<Self> {
         let g = other.inner.lock();
         Arc::new(Self {
+            id: alloc_ns_id(),
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: g.hostname.clone(),
                 domainname: g.domainname.clone(),
@@ -131,6 +218,7 @@ impl UtsNamespace {
 /// is observable.
 #[derive(Debug)]
 pub struct NetNamespace {
+    id: NsId,
     inner: IrqSafeSpinLock<NetInner>,
 }
 
@@ -159,10 +247,16 @@ impl NetNamespace {
             prefix_len: 8,
         };
         Arc::new(Self {
+            id: alloc_ns_id(),
             inner: IrqSafeSpinLock::new(NetInner {
                 ifaces: alloc::vec![lo],
             }),
         })
+    }
+
+    /// Stable namespace id (nsfs inode in Linux).
+    pub fn id(&self) -> NsId {
+        self.id
     }
 
     /// List interface names in this netns. Used by smoke tests and
@@ -198,6 +292,7 @@ impl NetNamespace {
 /// for real.
 #[derive(Debug)]
 pub struct IpcNamespace {
+    id: NsId,
     next_id: AtomicU32,
     inner: IrqSafeSpinLock<IpcInner>,
 }
@@ -215,9 +310,15 @@ impl IpcNamespace {
     /// in Linux) never collides with a real id.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            id: alloc_ns_id(),
             next_id: AtomicU32::new(1),
             inner: IrqSafeSpinLock::new(IpcInner::default()),
         })
+    }
+
+    /// Stable namespace id (nsfs inode in Linux).
+    pub fn id(&self) -> NsId {
+        self.id
     }
 
     fn alloc_id(&self) -> u32 {
@@ -428,6 +529,434 @@ pub fn setns_ipc(task: u64, ns: Arc<IpcNamespace>) {
     }
 }
 
+// ── fork(2)/clone(2) inheritance (UTS / NET / IPC / User) ─────────
+//
+// Mirrors Linux copy_*ns with no CLONE_NEW* flag: the child SHARES the
+// parent's namespace (an extra Arc ref to the SAME ns), not a fresh
+// copy. A parent still riding the global/default for a flavour has no
+// per-task entry; the child is left without one too so it shares that
+// same global default. CLONE_NEW* is layered on top by the caller.
+pub fn inherit_into_child(parent: u64, child: u64) {
+    if let Some(ns) = uts_ns_of(parent) {
+        setns_uts(child, ns);
+    }
+    if let Some(ns) = net_ns_of(parent) {
+        setns_net(child, ns);
+    }
+    if let Some(ns) = ipc_ns_of(parent) {
+        setns_ipc(child, ns);
+    }
+    if let Some(ns) = user_ns_of(parent) {
+        setns_user(child, ns);
+    }
+}
+
+// ── User namespace (CLONE_NEWUSER) ───────────────────────────────
+//
+// SECURITY-CRITICAL. A user namespace carries uid/gid id-maps and a
+// parent pointer. The map translates an *inner* id (what the process
+// inside the ns sees) to a *host-absolute* outer id (what the kernel
+// uses for DAC). The DAC funnel `crate::handlers::current_accessor`
+// MUST translate a task's in-ns fsuid/fsgid to host ids through this
+// map before building the `Accessor` it hands to `posix_access_ok`,
+// because that function treats uid==0 as omnipotent root — and inner-0
+// is host-root ONLY if the map maps inner-0 → outer-0.
+
+/// Linux "overflow" id returned for an unmapped translation
+/// (`/proc/sys/kernel/overflowuid`, default 65534 = `nobody`).
+pub const OVERFLOW_ID: u32 = 65534;
+
+/// One line of a uid_map / gid_map: a contiguous run mapping
+/// `[inner_start, inner_start+count)` ↔ `[outer_start, outer_start+count)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IdMapEntry {
+    pub inner_start: u32,
+    pub outer_start: u32,
+    pub count: u32,
+}
+
+impl IdMapEntry {
+    /// Translate an inner id to its outer id if it falls in this run.
+    fn inner_to_outer(&self, id: u32) -> Option<u32> {
+        if id >= self.inner_start && (id - self.inner_start) < self.count {
+            Some(self.outer_start + (id - self.inner_start))
+        } else {
+            None
+        }
+    }
+    /// Translate an outer id to its inner id if it falls in this run.
+    fn outer_to_inner(&self, id: u32) -> Option<u32> {
+        if id >= self.outer_start && (id - self.outer_start) < self.count {
+            Some(self.inner_start + (id - self.outer_start))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UserInner {
+    uid_map: Vec<IdMapEntry>,
+    gid_map: Vec<IdMapEntry>,
+    /// Linux one-shot rule: uid_map/gid_map may be written exactly
+    /// once. Tracked separately per map.
+    uid_map_written: bool,
+    gid_map_written: bool,
+}
+
+/// A user namespace. `parent` is `None` only for the initial (host)
+/// namespace, which by convention maps every id to itself (identity).
+#[derive(Debug)]
+pub struct UserNamespace {
+    id: NsId,
+    /// Parent user-ns. Translation that a map doesn't cover does NOT
+    /// chase the parent in this MVP (Linux does, recursively); see the
+    /// deferral note on `translate_uid_to_host`.
+    parent: Option<Arc<UserNamespace>>,
+    /// Host-absolute uid of the task that created this ns (the
+    /// owner). Linux uses it for the `CAP_*`-in-owner checks.
+    owner_uid: u32,
+    inner: IrqSafeSpinLock<UserInner>,
+}
+
+impl UserNamespace {
+    /// The initial (host/root) user namespace: identity map for the
+    /// full id range, no parent. Created lazily and shared.
+    pub fn new_initial() -> Arc<Self> {
+        Arc::new(Self {
+            id: alloc_ns_id(),
+            parent: None,
+            owner_uid: 0,
+            inner: IrqSafeSpinLock::new(UserInner {
+                uid_map: alloc::vec![IdMapEntry {
+                    inner_start: 0,
+                    outer_start: 0,
+                    count: u32::MAX,
+                }],
+                gid_map: alloc::vec![IdMapEntry {
+                    inner_start: 0,
+                    outer_start: 0,
+                    count: u32::MAX,
+                }],
+                uid_map_written: true,
+                gid_map_written: true,
+            }),
+        })
+    }
+
+    /// `unshare(CLONE_NEWUSER)` — a fresh user namespace owned by
+    /// `owner_uid` (the creator's host uid), child of `parent`. The
+    /// maps start EMPTY: until uid_map/gid_map is written, every id
+    /// translates to the overflow id, which is the Linux behaviour and
+    /// is the safe default (an unconfigured ns has no host authority).
+    pub fn new_child(parent: Arc<UserNamespace>, owner_uid: u32) -> Arc<Self> {
+        Arc::new(Self {
+            id: alloc_ns_id(),
+            parent: Some(parent),
+            owner_uid,
+            inner: IrqSafeSpinLock::new(UserInner::default()),
+        })
+    }
+
+    pub fn id(&self) -> NsId {
+        self.id
+    }
+
+    pub fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    pub fn is_initial(&self) -> bool {
+        self.parent.is_none()
+    }
+
+    /// Translate an inner uid to a host-absolute uid. Unmapped ids
+    /// return [`OVERFLOW_ID`] — the safe default that grants no host
+    /// authority. (Recursive parent translation is deferred: NARF
+    /// builds shallow, single-level user namespaces today, so a
+    /// uid_map entry's `outer_start` is already a host id. Nesting
+    /// would require walking `parent` here.)
+    pub fn translate_uid_to_host(&self, inner: u32) -> u32 {
+        let g = self.inner.lock();
+        for e in g.uid_map.iter() {
+            if let Some(o) = e.inner_to_outer(inner) {
+                return o;
+            }
+        }
+        OVERFLOW_ID
+    }
+
+    /// Translate an inner gid to a host-absolute gid.
+    pub fn translate_gid_to_host(&self, inner: u32) -> u32 {
+        let g = self.inner.lock();
+        for e in g.gid_map.iter() {
+            if let Some(o) = e.inner_to_outer(inner) {
+                return o;
+            }
+        }
+        OVERFLOW_ID
+    }
+
+    /// Translate a host uid to the id this ns sees, or `None` if the
+    /// host uid isn't mapped into this ns.
+    pub fn translate_uid_from_host(&self, host: u32) -> Option<u32> {
+        let g = self.inner.lock();
+        g.uid_map.iter().find_map(|e| e.outer_to_inner(host))
+    }
+
+    /// True if inner uid `id` is mapped (so e.g. setuid to it is OK).
+    pub fn uid_is_mapped(&self, inner: u32) -> bool {
+        let g = self.inner.lock();
+        g.uid_map.iter().any(|e| e.inner_to_outer(inner).is_some())
+    }
+
+    pub fn gid_is_mapped(&self, inner: u32) -> bool {
+        let g = self.inner.lock();
+        g.gid_map.iter().any(|e| e.inner_to_outer(inner).is_some())
+    }
+
+    /// Write the uid_map (Linux one-shot rule). Returns Err if already
+    /// written or the entries are malformed.
+    pub fn write_uid_map(&self, entries: Vec<IdMapEntry>) -> Result<(), ()> {
+        let mut g = self.inner.lock();
+        if g.uid_map_written || entries.is_empty() {
+            return Err(());
+        }
+        g.uid_map = entries;
+        g.uid_map_written = true;
+        Ok(())
+    }
+
+    pub fn write_gid_map(&self, entries: Vec<IdMapEntry>) -> Result<(), ()> {
+        let mut g = self.inner.lock();
+        if g.gid_map_written || entries.is_empty() {
+            return Err(());
+        }
+        g.gid_map = entries;
+        g.gid_map_written = true;
+        Ok(())
+    }
+
+    /// Render the uid_map / gid_map as Linux does:
+    /// `      0     1000          1\n`. `is_uid` selects which map.
+    pub fn render_map(&self, is_uid: bool) -> String {
+        use core::fmt::Write as _;
+        let g = self.inner.lock();
+        let map = if is_uid { &g.uid_map } else { &g.gid_map };
+        let mut s = String::new();
+        for e in map.iter() {
+            let _ = writeln!(
+                s,
+                "{:>10} {:>10} {:>10}",
+                e.inner_start, e.outer_start, e.count
+            );
+        }
+        s
+    }
+}
+
+type UserTable = BTreeMap<u64, Arc<UserNamespace>>;
+static USER_BY_TASK: IrqSafeSpinLock<Option<UserTable>> = IrqSafeSpinLock::new(None);
+static GLOBAL_USER: IrqSafeSpinLock<Option<Arc<UserNamespace>>> = IrqSafeSpinLock::new(None);
+
+fn global_user() -> Arc<UserNamespace> {
+    let mut g = GLOBAL_USER.lock();
+    if g.is_none() {
+        *g = Some(UserNamespace::new_initial());
+    }
+    g.as_ref().expect("just inserted").clone()
+}
+
+fn ensure_user_table() {
+    let mut g = USER_BY_TASK.lock();
+    if g.is_none() {
+        *g = Some(BTreeMap::new());
+    }
+}
+
+/// The user namespace the task belongs to (initial/host if none).
+pub fn current_user_ns(task: u64) -> Arc<UserNamespace> {
+    let g = USER_BY_TASK.lock();
+    if let Some(map) = g.as_ref() {
+        if let Some(arc) = map.get(&task) {
+            return arc.clone();
+        }
+    }
+    drop(g);
+    global_user()
+}
+
+/// The task's explicit user-ns, or None when it rides the host ns.
+pub fn user_ns_of(task: u64) -> Option<Arc<UserNamespace>> {
+    let g = USER_BY_TASK.lock();
+    g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+/// `unshare(CLONE_NEWUSER)` — mint a child user-ns owned by the
+/// caller's host uid and install it. Returns the new ns.
+pub fn unshare_user(task: u64, owner_host_uid: u32) -> Arc<UserNamespace> {
+    let parent = current_user_ns(task);
+    let fresh = UserNamespace::new_child(parent, owner_host_uid);
+    ensure_user_table();
+    let mut g = USER_BY_TASK.lock();
+    if let Some(map) = g.as_mut() {
+        map.insert(task, fresh.clone());
+    }
+    fresh
+}
+
+/// Install a user-ns for `task` (setns / inheritance).
+pub fn setns_user(task: u64, ns: Arc<UserNamespace>) {
+    ensure_user_table();
+    let mut g = USER_BY_TASK.lock();
+    if let Some(map) = g.as_mut() {
+        map.insert(task, ns);
+    }
+}
+
+// ── ns-fd: a FileOps that HOLDS a namespace Arc ──────────────────
+//
+// Opening `/proc/<pid>/ns/<flavour>` mints one of these. Holding the
+// namespace `Arc` keeps the namespace alive after the originating
+// task exits (Linux: an open ns-fd pins the namespace). `setns(fd,
+// nstype)` downcasts the fd's FileOps via `FileOps::as_any` and
+// installs the held namespace.
+
+/// The namespace an [`NsFd`] holds. One variant per flavour; each
+/// keeps the flavour's `Arc` so the namespace outlives its creator.
+#[derive(Clone, Debug)]
+pub enum HeldNs {
+    Uts(Arc<UtsNamespace>),
+    Net(Arc<NetNamespace>),
+    Ipc(Arc<IpcNamespace>),
+    Pid(Arc<crate::pid_ns::PidNamespace>),
+    Mnt(Arc<narf_filesystem::MountNamespace>),
+    User(Arc<UserNamespace>),
+}
+
+impl HeldNs {
+    pub fn flavour(&self) -> NsFlavour {
+        match self {
+            HeldNs::Uts(_) => NsFlavour::Uts,
+            HeldNs::Net(_) => NsFlavour::Net,
+            HeldNs::Ipc(_) => NsFlavour::Ipc,
+            HeldNs::Pid(_) => NsFlavour::Pid,
+            HeldNs::Mnt(_) => NsFlavour::Mnt,
+            HeldNs::User(_) => NsFlavour::User,
+        }
+    }
+    pub fn id(&self) -> NsId {
+        match self {
+            HeldNs::Uts(n) => n.id(),
+            HeldNs::Net(n) => n.id(),
+            HeldNs::Ipc(n) => n.id(),
+            HeldNs::Pid(n) => n.id(),
+            HeldNs::Mnt(n) => n.id(),
+            HeldNs::User(n) => n.id(),
+        }
+    }
+}
+
+/// A namespace file descriptor. `Arc<NsFd>` is installed in the fd
+/// table; `setns` recovers it through `FileOps::as_any`.
+#[derive(Debug)]
+pub struct NsFd {
+    held: HeldNs,
+}
+
+impl NsFd {
+    pub fn new(held: HeldNs) -> Arc<Self> {
+        Arc::new(Self { held })
+    }
+    pub fn held(&self) -> &HeldNs {
+        &self.held
+    }
+    /// `readlink` text Linux renders for `/proc/<pid>/ns/<flavour>`:
+    /// e.g. `uts:[4026531838]`.
+    pub fn link_text(&self) -> String {
+        let mut s = String::new();
+        use core::fmt::Write as _;
+        let _ = write!(s, "{}:[{}]", self.held.flavour().tag(), self.held.id());
+        s
+    }
+}
+
+impl narf_filesystem::FileOps for NsFd {
+    fn read<'a>(
+        &'a self,
+        _offset: u64,
+        _buf: &'a mut [u8],
+    ) -> narf_filesystem::FsFuture<'a, usize> {
+        // An ns-fd is not a readable byte stream — it exists only to be
+        // passed to setns(2). Linux read() on it returns EINVAL.
+        Box::pin(async move { Err(narf_filesystem::FsError::Unsupported) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+        Box::pin(async move { Err(narf_filesystem::FsError::ReadOnly) })
+    }
+    fn stat(&self) -> narf_filesystem::Stat {
+        // Report the ns id in `size` so `st_ino` (synthesised from
+        // size in the stat syscall) carries the namespace identity —
+        // two fds naming the same ns then stat() equal.
+        narf_filesystem::Stat {
+            size: self.held.id(),
+            blocks: 0,
+            mode: narf_filesystem::Mode {
+                file_type: narf_filesystem::FileType::Special,
+                perms: 0o444,
+            },
+            mtime_cycles: 0,
+        }
+    }
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+
+/// Mint an ns-fd for `task`'s current namespace of `flavour`. Returns
+/// `None` for flavours NARF doesn't track per-task yet for `task`
+/// (e.g. a mount-ns the task hasn't unshared). Used by the
+/// `/proc/<pid>/ns/<flavour>` open path.
+pub fn ns_fd_for(task: u64, flavour: NsFlavour) -> Option<Arc<NsFd>> {
+    let held = match flavour {
+        NsFlavour::Uts => HeldNs::Uts(current_uts_ns(task)),
+        NsFlavour::Net => HeldNs::Net(current_net_ns(task)?),
+        NsFlavour::Ipc => HeldNs::Ipc(current_ipc_ns(task)?),
+        NsFlavour::Pid => HeldNs::Pid(crate::pid_ns::ns_of(task)?),
+        NsFlavour::User => HeldNs::User(current_user_ns(task)),
+        // Mount-ns fd minting goes through the handlers layer (the
+        // mount-ns table lives there); not reachable from this module.
+        NsFlavour::Mnt | NsFlavour::Cgroup => return None,
+    };
+    Some(NsFd::new(held))
+}
+
+/// Install the namespace an ns-fd holds onto `caller`. The bridge
+/// from `setns(fd, nstype)` once the fd has been downcast to `NsFd`.
+/// `outer_pid` is the caller's outer pid (needed to bind into a PID
+/// namespace). Returns `false` if `nstype` is non-zero and doesn't
+/// match the held flavour.
+pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) -> bool {
+    if nstype != 0 && (nstype & held.flavour().clone_flag()) == 0 {
+        return false;
+    }
+    match held {
+        HeldNs::Uts(n) => setns_uts(caller, n.clone()),
+        HeldNs::Net(n) => setns_net(caller, n.clone()),
+        HeldNs::Ipc(n) => setns_ipc(caller, n.clone()),
+        HeldNs::User(n) => setns_user(caller, n.clone()),
+        HeldNs::Pid(n) => {
+            let _ = crate::pid_ns::attach_to_ns(caller, outer_pid, n.clone());
+        }
+        HeldNs::Mnt(_) => {
+            // Mount-ns install lives in the handlers layer
+            // (install_mount_namespace); the caller handles it.
+            return false;
+        }
+    }
+    true
+}
+
 // ── Test hooks ───────────────────────────────────────────────────
 
 #[doc(hidden)]
@@ -435,5 +964,7 @@ pub fn __test_reset_all() {
     *UTS_BY_TASK.lock() = None;
     *NET_BY_TASK.lock() = None;
     *IPC_BY_TASK.lock() = None;
+    *USER_BY_TASK.lock() = None;
     *GLOBAL_UTS.lock() = None;
+    *GLOBAL_USER.lock() = None;
 }

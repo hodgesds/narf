@@ -30,6 +30,22 @@ pub fn install_all_hooks() {
     install_net_stack();
     #[cfg(feature = "linux-compat")]
     install_procfs_net_hooks();
+    #[cfg(all(feature = "linux-compat", feature = "container"))]
+    install_ns_proc_hooks();
+}
+
+/// Wire the namespace procfs hooks so /proc/<pid>/ns/*, uid_map,
+/// gid_map, and the per-ns mountinfo view reach the userspace
+/// namespace tables. Gated on container (the source of the state)
+/// AND linux-compat (where the procfs nodes live).
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+fn install_ns_proc_hooks() {
+    narf_filesystem::procfs::install_ns_proc_hooks(
+        narf_userspace::handlers::proc_ns_readlink,
+        narf_userspace::handlers::proc_ns_mountinfo,
+        narf_userspace::handlers::proc_ns_idmap_render,
+        narf_userspace::handlers::proc_ns_idmap_write,
+    );
 }
 
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path

@@ -802,24 +802,21 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // until ext2/minix start surfacing real owners.
     let stat = ops.stat();
     let (file_uid, file_gid) = ops.owners();
-    let acc = read_uidgid(task);
     // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Bits 0..1 of flags.
     let access_mode = flags & 0o3;
     let want_r = access_mode == 0 || access_mode == 2;
     let want_w = access_mode == 1 || access_mode == 2;
+    // SECURITY: build the Accessor through the single translation
+    // funnel so a task inside a user-ns has its in-ns fsuid/fsgid mapped
+    // to HOST-absolute ids before posix_access_ok (which treats uid==0
+    // as host-root). File owners stay host-absolute. See current_accessor.
     if !narf_filesystem::posix_access_ok(
         narf_filesystem::FileOwner {
             uid: file_uid,
             gid: file_gid,
             perms: stat.mode.perms,
         },
-        narf_filesystem::Accessor {
-            // POSIX file-permission checks use the *filesystem* uid/gid
-            // (fsuid/fsgid), which tracks the effective id unless
-            // overridden by setfsuid/setfsgid — not the real uid/gid.
-            uid: acc.fsuid,
-            gid: acc.fsgid,
-        },
+        current_accessor(task),
         narf_filesystem::AccessRequest {
             read: want_r,
             write: want_w,
@@ -8005,6 +8002,55 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
     uidgid_fork(parent_pid, child_tid.raw());
+
+    // Namespace inheritance + CLONE_NEW* layering. A child — thread OR
+    // process — shares the parent's namespaces (Linux copy_*ns), unless
+    // clone3 requested a fresh one via CLONE_NEW*. The per-task NS
+    // tables are keyed per task id; threads share the process's ns.
+    #[cfg(feature = "container")]
+    {
+        let child = child_tid.raw();
+        // PID + mount namespaces (only meaningful for a new process).
+        if !share_thread {
+            let _ = crate::pid_ns::inherit_into_child(parent_pid, child_visible_pid);
+            mount_ns_inherit(parent_pid, child);
+            const CLONE_NEWNS: u64 = 0x00020000;
+            const CLONE_NEWPID: u64 = 0x20000000;
+            if flags & CLONE_NEWNS != 0 {
+                task_mount_ns_init();
+                let snap = narf_filesystem::MountNamespace::snapshot_global();
+                install_mount_namespace(child, snap);
+            }
+            if flags & CLONE_NEWPID != 0 {
+                let _ = crate::pid_ns::unshare_pid_ns(child, child_visible_pid);
+            }
+        }
+        // UTS / NET / IPC / User: shared by ref, then CLONE_NEW* mints
+        // a fresh one for the child.
+        crate::namespaces::inherit_into_child(parent_pid, child);
+        if flags & crate::namespaces::CLONE_NEWUSER != 0 {
+            let host_uid = read_uidgid(parent_pid).euid;
+            let _ = crate::namespaces::unshare_user(child, host_uid);
+            let _ = write_uidgid(child, |e| {
+                e.uid = 0;
+                e.gid = 0;
+                e.euid = 0;
+                e.egid = 0;
+                e.fsuid = 0;
+                e.fsgid = 0;
+            });
+        }
+        if flags & crate::namespaces::CLONE_NEWUTS != 0 {
+            crate::namespaces::unshare_uts(child);
+        }
+        if flags & crate::namespaces::CLONE_NEWNET != 0 {
+            crate::namespaces::unshare_net(child);
+        }
+        if flags & crate::namespaces::CLONE_NEWIPC != 0 {
+            crate::namespaces::unshare_ipc(child);
+        }
+    }
+
     if !share_vm {
         // brk and sigaction map onto AS state; only meaningful for
         // a non-VM clone (a true fork). For thread spawns the
@@ -8404,6 +8450,8 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     {
         let _ = crate::pid_ns::inherit_into_child(parent_pid, child_pid.raw());
         mount_ns_inherit(parent_pid, child_tid.raw());
+        // UTS / NET / IPC / User namespaces share the parent's Arc.
+        crate::namespaces::inherit_into_child(parent_pid, child_tid.raw());
     }
     // A forked child joins its parent's cgroup. Keyed by ProcessId
     // (cgroup membership is per-process in v2), matching cgroup.procs.
@@ -8726,6 +8774,11 @@ pub fn wait_init() {
         narf_filesystem::cgroupfs::install_kill_hook(cgroup_kill_hook);
         narf_filesystem::cgroupfs::install_freeze_hook(cgroup_freeze_hook);
     }
+    // Share the process-global NsId counter with the filesystem crate so
+    // a MountNamespace minted there (snapshot_global) draws an id from
+    // the same space as every other namespace flavour.
+    #[cfg(feature = "container")]
+    narf_filesystem::install_ns_id_alloc_hook(crate::namespaces::alloc_ns_id);
 }
 
 /// Exit-observer that removes an exiting *process* from its cgroup.
@@ -9688,11 +9741,66 @@ pub fn __test_uidgid_reset() {
     *UIDGID_TABLE.lock() = Some(BTreeMap::new());
 }
 
+/// Set a task's (fsuid, fsgid) — test hook for the DAC security smoke.
+#[doc(hidden)]
+pub fn __test_set_fsids(task: u64, fsuid: u32, fsgid: u32) {
+    let _ = write_uidgid(task, |e| {
+        e.uid = fsuid;
+        e.gid = fsgid;
+        e.euid = fsuid;
+        e.egid = fsgid;
+        e.fsuid = fsuid;
+        e.fsgid = fsgid;
+    });
+}
+
 fn read_uidgid(task: u64) -> UidGid {
     let g = UIDGID_TABLE.lock();
     g.as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or_default()
+}
+
+/// SECURITY-CRITICAL single funnel for every filesystem `Accessor`.
+///
+/// `posix_access_ok` treats `uid == 0` as omnipotent host-root. With
+/// user namespaces, a task's stored fsuid/fsgid are *in-namespace*
+/// ids: inner uid 0 is host-root ONLY if the user-ns maps inner-0 to
+/// host-0. So before the FS sees the accessor we translate the task's
+/// in-ns fsuid/fsgid to HOST-absolute ids through its user-ns map. An
+/// unmapped id becomes the overflow id (65534), which owns nothing —
+/// the safe default. File owners are kept host-absolute everywhere, so
+/// this is the only translation needed.
+///
+/// EVERY production code path that builds a `narf_filesystem::Accessor`
+/// for a real syscall MUST go through here. (Verified by grep: the
+/// open path is the sole call site; the only other `Accessor {…}`
+/// literals are in `tests.rs`.)
+fn current_accessor(task: u64) -> narf_filesystem::Accessor {
+    let acc = read_uidgid(task);
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial() {
+            return narf_filesystem::Accessor {
+                uid: uns.translate_uid_to_host(acc.fsuid),
+                gid: uns.translate_gid_to_host(acc.fsgid),
+            };
+        }
+    }
+    // Root (host) user-ns, or container feature off: identity.
+    narf_filesystem::Accessor {
+        uid: acc.fsuid,
+        gid: acc.fsgid,
+    }
+}
+
+/// Test-only window onto the DAC funnel so the security smoke can
+/// assert the exact host-id translation `sys_open` would use.
+#[cfg(feature = "container")]
+#[doc(hidden)]
+pub fn __test_current_accessor(task: u64) -> narf_filesystem::Accessor {
+    current_accessor(task)
 }
 
 /// Copy the parent's credential entry (uid/gid/euid/egid/fsuid/fsgid)
@@ -9733,6 +9841,16 @@ fn sys_setuid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let uid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
+    // In a non-root user-ns, setuid is only allowed to an id mapped in
+    // the ns (Linux EINVAL otherwise). The host root-ns is unrestricted.
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial() && !uns.uid_is_mapped(uid) {
+            ctx.set_return(fail);
+            return;
+        }
+    }
     // A (notionally privileged) setuid sets real, effective, and fs uids.
     if write_uidgid(task, |e| {
         e.uid = uid;
@@ -9749,6 +9867,14 @@ fn sys_setgid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let gid = ctx.args().arg0 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial() && !uns.gid_is_mapped(gid) {
+            ctx.set_return(fail);
+            return;
+        }
+    }
     if write_uidgid(task, |e| {
         e.gid = gid;
         e.egid = gid;
@@ -12687,6 +12813,103 @@ fn mount_ns_inherit(parent_task: u64, child_task: u64) {
     }
 }
 
+// ── procfs /proc/<pid>/ns/* + uid_map/gid_map + mountinfo hooks ──
+//
+// Installed via `narf_filesystem::procfs::install_ns_proc_hooks` at
+// boot so procfs can render namespace state without depending on the
+// namespaces module. All take an OUTER pid (what /proc/<pid> names)
+// and resolve it to a TaskId.
+
+/// `/proc/<pid>/ns/<flavour>` readlink text, e.g. "uts:[42]".
+#[cfg(all(feature = "container", feature = "linux-compat"))]
+pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
+    use narf_filesystem::procfs::ns_tag;
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let (label, id) = match tag {
+        ns_tag::UTS => ("uts", crate::namespaces::current_uts_ns(task).id()),
+        ns_tag::NET => ("net", crate::namespaces::current_net_ns(task)?.id()),
+        ns_tag::IPC => ("ipc", crate::namespaces::current_ipc_ns(task)?.id()),
+        ns_tag::PID => ("pid", crate::pid_ns::ns_of(task)?.id()),
+        ns_tag::MNT => ("mnt", mount_namespace_of(task)?.id()),
+        ns_tag::USER => ("user", crate::namespaces::current_user_ns(task).id()),
+        ns_tag::CGROUP => return None,
+        _ => return None,
+    };
+    let mut s = alloc::string::String::new();
+    use core::fmt::Write as _;
+    let _ = write!(s, "{}:[{}]", label, id);
+    Some(s)
+}
+
+/// `/proc/<pid>/mountinfo` per-ns view — None when the task rides the
+/// global mount registry (procfs then renders the global view).
+#[cfg(all(feature = "container", feature = "linux-compat"))]
+pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let ns = mount_namespace_of(task)?;
+    let mut s = alloc::string::String::new();
+    use core::fmt::Write as _;
+    for (path, name) in ns.list_with_names() {
+        let _ = writeln!(s, "{}\t{}", path, name);
+    }
+    Some(s)
+}
+
+/// `/proc/<pid>/{uid,gid}_map` render.
+#[cfg(all(feature = "container", feature = "linux-compat"))]
+pub fn proc_ns_idmap_render(pid: u64, is_uid: bool) -> Option<alloc::string::String> {
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    Some(crate::namespaces::current_user_ns(task).render_map(is_uid))
+}
+
+/// `/proc/<pid>/{uid,gid}_map` write — parses the Linux triple lines
+/// `inner outer count` and applies them under the one-shot rule.
+#[cfg(all(feature = "container", feature = "linux-compat"))]
+pub fn proc_ns_idmap_write(
+    pid: u64,
+    is_uid: bool,
+    bytes: &[u8],
+) -> Result<usize, narf_filesystem::FsError> {
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let text = core::str::from_utf8(bytes).map_err(|_| narf_filesystem::FsError::InvalidData)?;
+    let mut entries = alloc::vec::Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let inner: u32 = it
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or(narf_filesystem::FsError::InvalidData)?;
+        let outer: u32 = it
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or(narf_filesystem::FsError::InvalidData)?;
+        let count: u32 = it
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or(narf_filesystem::FsError::InvalidData)?;
+        if it.next().is_some() || count == 0 {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        entries.push(crate::namespaces::IdMapEntry {
+            inner_start: inner,
+            outer_start: outer,
+            count,
+        });
+    }
+    let uns = crate::namespaces::current_user_ns(task);
+    let r = if is_uid {
+        uns.write_uid_map(entries)
+    } else {
+        uns.write_gid_map(entries)
+    };
+    r.map(|_| bytes.len())
+        .map_err(|_| narf_filesystem::FsError::InvalidData)
+}
+
 fn sys_unshare(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0;
     const CLONE_NEWNS: u64 = 0x00020000;
@@ -12725,6 +12948,25 @@ fn sys_unshare(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "container")]
     {
         let task = current_task_id();
+        // CLONE_NEWUSER must be applied FIRST: Linux makes the caller
+        // uid 0 inside the new user-ns and (in a real cap model) grants
+        // a full cap set, which is what authorises the other unshares.
+        // We record the creator's HOST uid as the ns owner, then set
+        // the caller's in-ns uid/gid to 0 so it is root *inside*.
+        if flags & crate::namespaces::CLONE_NEWUSER != 0 {
+            let host_uid = read_uidgid(task).euid;
+            let _ns = crate::namespaces::unshare_user(task, host_uid);
+            // The caller becomes uid 0 inside the new namespace.
+            let _ = write_uidgid(task, |e| {
+                e.uid = 0;
+                e.gid = 0;
+                e.euid = 0;
+                e.egid = 0;
+                e.fsuid = 0;
+                e.fsgid = 0;
+            });
+            any = true;
+        }
         if flags & crate::namespaces::CLONE_NEWUTS != 0 {
             crate::namespaces::unshare_uts(task);
             any = true;
@@ -12778,6 +13020,44 @@ fn sys_setns(ctx: &mut dyn TrapContext) {
         let caller = current_task_id();
         let mut any = false;
 
+        // ── fd-based setns (Linux primary path) ──────────────────
+        //
+        // arg0 is normally an fd opened from /proc/<pid>/ns/<flavour>.
+        // If it resolves to an `NsFd` in the caller's fd table, install
+        // the held namespace and return. The held `Arc` keeps the ns
+        // alive even after its originator exited.
+        if let Some(held) = crate::fd::with_table(caller, |t| {
+            t.get(target as u32).and_then(|e| {
+                e.ops
+                    .as_any()
+                    .and_then(|a| a.downcast_ref::<crate::namespaces::NsFd>())
+                    .map(|nsfd| nsfd.held().clone())
+            })
+        })
+        .flatten()
+        {
+            let outer = task_to_pid_raw(caller).unwrap_or(caller);
+            // Mount-ns is held but installed through the handlers' mount
+            // table, not the namespaces module.
+            if let crate::namespaces::HeldNs::Mnt(mnt) = &held {
+                if nstype == 0 || nstype & CLONE_NEWNS != 0 {
+                    install_mount_namespace(caller, mnt.clone());
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
+                ctx.set_return(SyscallReturn::ok(!0u64));
+                return;
+            }
+            if crate::namespaces::install_held_ns(caller, outer, &held, nstype) {
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(SyscallReturn::ok(!0u64));
+            }
+            return;
+        }
+
+        // ── Legacy NARF TaskId path (kept for existing tests) ─────
+        //
         // Resolve target: prefer outer-pid lookup, fall back to
         // treating `target` as an outer TaskId directly.
         let target_task = pid_to_task_raw(target).unwrap_or(target);
@@ -12839,6 +13119,18 @@ fn sys_setns(ctx: &mut dyn TrapContext) {
             match crate::namespaces::ipc_ns_of(target_task) {
                 Some(ns) => {
                     crate::namespaces::setns_ipc(caller, ns);
+                    any = true;
+                }
+                None => {
+                    ctx.set_return(SyscallReturn::ok(!0u64));
+                    return;
+                }
+            }
+        }
+        if nstype & crate::namespaces::CLONE_NEWUSER != 0 {
+            match crate::namespaces::user_ns_of(target_task) {
+                Some(ns) => {
+                    crate::namespaces::setns_user(caller, ns);
                     any = true;
                 }
                 None => {
@@ -15559,6 +15851,16 @@ fn sys_socket(ctx: &mut dyn TrapContext) {
         return;
     }
     let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
+    // Net-namespace scoping: stamp the creator's net-ns id so the
+    // AF_INET bind/port tables are keyed per-ns (two processes in
+    // different net-ns can both bind the same addr:port). 0 = host ns.
+    #[cfg(feature = "container")]
+    {
+        let t = current_task_id();
+        if let Some(ns) = crate::namespaces::current_net_ns(t) {
+            sock.set_net_ns_id(ns.id());
+        }
+    }
     socket_arc_register(&sock);
     let task = current_task_id();
     let new_fd = match fd::with_table(task, |t| {
