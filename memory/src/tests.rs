@@ -2660,6 +2660,14 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write");
     }
+    // Mirror the production #PF flow: `cow_split_on_write` only repoints
+    // `region.phys`; the leaf PTE is rewritten by the paired `remap_page`.
+    // Splitting without it leaves the PTE pointing at the OLD (now
+    // dec_ref'd) frame.
+    // SAFETY: same identity-map contract as cow_split_on_write.
+    if unsafe { child.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+        return TestResult::Fail("remap_page");
+    }
     let c_split = child
         .lookup(VirtAddr::new(VADDR))
         .expect("child post-split");

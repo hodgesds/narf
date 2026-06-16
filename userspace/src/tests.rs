@@ -8679,6 +8679,13 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     if unsafe { child_as.cow_split_on_write(VirtAddr::new(SENTINEL_VADDR)) }.is_err() {
         return TestResult::Fail("cow_split_on_write failed");
     }
+    // Mirror the production #PF flow: split repoints region.phys; the
+    // leaf PTE is rewritten by the paired remap_page. Without it the PTE
+    // lags at the old (dec_ref'd) frame.
+    // SAFETY: same identity-map contract as cow_split_on_write.
+    if unsafe { child_as.remap_page(VirtAddr::new(SENTINEL_VADDR)) }.is_err() {
+        return TestResult::Fail("remap_page failed");
+    }
     let post_split_child = match child_as.lookup(VirtAddr::new(SENTINEL_VADDR)) {
         Some(r) => r,
         None => return TestResult::Fail("child region missing post-split"),

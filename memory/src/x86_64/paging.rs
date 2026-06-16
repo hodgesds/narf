@@ -778,29 +778,39 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     // `alloc_coherent` hands the freed PDPT to a driver, `memset`
     // zeros it, and the huge-page entries vanish mid-write — the
     // exact #PF that surfaced the audio probe regression.
-    // Walk user-owned PML4 slots only:
+    // Walk EVERY user-half PML4 slot (1..=255), not a hardcoded pair.
+    // A real process lights up far more than slots 1 + 129:
+    //   slot 1   — user binary  (0x0000_0080_0000_0000)
+    //   slot 128 — ELF interpreter / ld-musl bias (0x0000_4000_0000_0000)
+    //   slot 129 — mmap arena    (0x0000_4080_0000_0000)
+    //   slot 160 — vDSO + brk heap (0x0000_5000_0000_0000)
+    //   slot 255 — user stack    (0x0000_7FFF_FFFC_0000)
+    // The old `[1, 129]` list LEAKED the slot-128/160/255 page tables —
+    // and, worse, never `__pagetable_unregister`'d them, so their stale
+    // registrations accumulated in PT_REGISTRY and accelerated the
+    // ring-wrap clobber behind the "marginal-buddy" double-free.
     //
-    // - Slot 1: the user-binary subtree, allocated by
-    //   `new_user_pml4_on` (PDPT freshly alloc'd, PDPT[1..512]
-    //   copied from kernel as HUGE_PAGE entries which we skip).
-    // - Slot 129: the MMAP_CURSOR subtree at virt 0x4080_0000_0000,
-    //   populated by `materialize`'s `ensure_next_table` when
-    //   user mmap'd regions land. The PDPT here is entirely
-    //   AS-private and reclaimable.
-    //
-    // Slot 0 (kernel low-4-GiB identity) and slots 256..512
-    // (kernel-half) are SHARED with the kernel — the
-    // `new_user_pml4_on` full-copy duplicates the kernel PDPT
-    // pointer into the user PML4, so freeing them would return
-    // the kernel's page-table pages to the buddy. NEVER walk
-    // those.
-    for &slot in &[1usize, 129usize] {
+    // Slot 0 (kernel low-4-GiB identity) and slots 256..512 (kernel
+    // high-half) are SHARED — `new_user_pml4_on` bulk-copies the kernel
+    // PDPT pointers into them, so freeing them would return kernel page
+    // tables to the buddy. The loop bound (1..256) excludes both. As an
+    // extra guard against a future kernel mapping inside the user half,
+    // only AS-private PDPTs are walked: those are the ones recorded in
+    // PT_REGISTRY (`new_user_pml4_on` / `ensure_next_table` register
+    // every table they allocate); a kernel-shared PDPT is never
+    // registered, so the `__pagetable_is_registered` check below skips
+    // it.
+    for slot in 1usize..256 {
         let pml4e = pml4.entries[slot];
         if !pml4e.is_present() {
             continue;
         }
         let pdpt_pa = pml4e.addr();
         if pdpt_pa.raw() < 0x100000 {
+            continue;
+        }
+        // Only reclaim AS-private page tables; never a kernel-shared one.
+        if !crate::frame::__pagetable_is_registered(pdpt_pa.raw()) {
             continue;
         }
         // SAFETY: identity-reachable; PDPT is a page-table frame.
@@ -811,6 +821,15 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                 continue;
             }
             let pd_pa = pdpte.addr();
+            // Same AS-private guard as the PDPT level: slot 1's PDPT
+            // carries bulk-copied kernel PDPT[1..512] pointers. Those
+            // high-MMIO mappings are 1-GiB HUGE pages (skipped above), but
+            // guard against any non-huge kernel PD pointer slipping
+            // through — a kernel PD is never registered, so skip it rather
+            // than return a live kernel page table to the buddy.
+            if !crate::frame::__pagetable_is_registered(pd_pa.raw()) {
+                continue;
+            }
             // SAFETY: same.
             let pd = unsafe { &mut *pd_pa.as_mut_ptr::<PageTable>() };
             for pd_idx in 0..512usize {
@@ -819,8 +838,12 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                     continue;
                 }
                 // PT — leaf-level table; data frames already freed
-                // by AddressSpace::unmap_region_pages. Just reclaim
-                // the table page itself.
+                // by AddressSpace::unmap_region_pages. Reclaim the table
+                // page itself (always AS-private under a registered PD,
+                // but guard for symmetry / defence in depth).
+                if !crate::frame::__pagetable_is_registered(pde.addr().raw()) {
+                    continue;
+                }
                 crate::frame::__pagetable_unregister(pde.addr().raw());
                 free_frame(PhysFrame::new(pde.addr()));
             }

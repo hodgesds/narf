@@ -187,6 +187,15 @@ pub unsafe fn init_from_map(usable: &[UsableRegion], exclude: &[(u64, u64)]) {
     guard.total_frames = total;
     guard.reserved_frames = reserved;
     guard.numa_aware = false;
+    // Opt the LIVE allocator's zones into frame-alloc-audit (no-op unless
+    // the feature is set). Standalone unit-test `BuddyZone`s never call
+    // this, so their synthetic frame numbers stay out of the global audit
+    // bitmap (which would otherwise false-positive on their fabricated
+    // 0x100-style frames).
+    #[cfg(feature = "frame-alloc-audit")]
+    for z in guard.zones.iter_mut() {
+        z.enable_audit();
+    }
     // Drop the guard before installing the default `FrameAlloc` —
     // `install_frame_alloc_default` takes its own lock and we don't
     // want to risk an unrelated future reentrancy regression.
@@ -316,9 +325,12 @@ pub fn rebalance_to_topology() {
 /// Allocate one 4 KiB frame. NUMA-aware: prefers the current CPU's
 /// node, falls back round-robin to other nodes when the local bin
 /// is empty. Dispatches through the installed `FrameAlloc`.
+#[cfg_attr(feature = "frame-alloc-audit", track_caller)]
 pub fn alloc_frame() -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
     let preferred = current_cpu_node();
-    alloc_frame_on(preferred)
+    alloc_frame_on_inner(preferred)
 }
 
 /// Phys-address ceiling for early boot. While set, alloc_frame*
@@ -360,7 +372,19 @@ fn alloc_below_ceiling(zone: &mut BuddyZone) -> Option<PhysFrame> {
 
 /// Allocate one 4 KiB frame, preferring `node`'s zone. Dispatches
 /// through the installed `FrameAlloc` impl — see `install_frame_alloc`.
+#[cfg_attr(feature = "frame-alloc-audit", track_caller)]
 pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
+    alloc_frame_on_inner(node)
+}
+
+/// Core of `alloc_frame` / `alloc_frame_on` — does the cgroup charge +
+/// buddy dispatch. Kept separate (and NOT `#[track_caller]`) so the two
+/// public entry points each capture their OWN caller's source location
+/// for the `frame-alloc-audit` alloc-site map, instead of one shadowing
+/// the other.
+fn alloc_frame_on_inner(node: usize) -> Result<PhysFrame, FrameAllocError> {
     // cgroup memory accounting: charge one page to the current task's
     // cgroup chain *before* the allocation commits. A `false` return
     // means a `memory.max` would be exceeded, so the allocation is
@@ -630,24 +654,65 @@ fn scrub_freed_frame(phys: PhysAddr) {
 /// data path, once via the page-table walk), the region-side free
 /// is skipped and `free_user_pml4_tree` reclaims it.
 ///
-/// 4 K entries is sized generously for the working set of any
-/// realistic user task (a 4 KiB-mapped 1 GiB region needs at most
-/// ~256 PDs + 256 K PTs; the test suite never reaches that). The
-/// registry uses a flat fixed-size atomic array so it can be
-/// accessed without taking the buddy lock.
-const PT_REGISTRY_LEN: usize = 4096;
+/// Sized for the LIVE page-table-frame working set across all
+/// concurrently-mapped user address spaces — NOT the cumulative count.
+/// Entries are cleared on each AS's teardown (`__pagetable_unregister`
+/// via `free_user_pml4_tree`), so a correctly-drained registry only ever
+/// holds the page-table pages of currently-live ASes (a handful of
+/// processes × ~10 tables each). 16 K slots is generous headroom. The
+/// registry is a flat fixed-size atomic array so it can be consulted
+/// without taking the buddy lock (which `unmap_region_pages` would
+/// otherwise re-enter).
+const PT_REGISTRY_LEN: usize = 16384;
 static PT_REGISTRY: [core::sync::atomic::AtomicU64; PT_REGISTRY_LEN] = {
     const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     [Z; PT_REGISTRY_LEN]
 };
-static PT_REGISTRY_HEAD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub fn __pagetable_register(phys: u64) {
     use core::sync::atomic::Ordering;
-    let head = PT_REGISTRY_HEAD.fetch_add(1, Ordering::Relaxed) % PT_REGISTRY_LEN;
-    PT_REGISTRY[head].store(phys, Ordering::Relaxed);
+    // Dedup: a frame reused as a page-table page WITHOUT a prior
+    // unregister must not occupy two slots — `__pagetable_unregister`
+    // clears only the first match, which would leave a stale `true`.
+    if PT_REGISTRY
+        .iter()
+        .any(|s| s.load(Ordering::Relaxed) == phys)
+    {
+        return;
+    }
+    // Claim an EMPTY slot via CAS; NEVER clobber a live registration.
+    // The previous `head = fetch_add(1) % LEN; store(phys)` blindly
+    // overwrote slot `head` on every register, so after LEN cumulative
+    // registrations the ring wrapped and evicted the still-live
+    // registration of a different, running AS. `is_registered()` then
+    // returned a false-negative for that live page-table page, so
+    // `unmap_region_pages` freed it as region data while
+    // `free_user_pml4_tree` also freed it as a table page — the
+    // "marginal-buddy" double-free (rare because it needs LEN+ cumulative
+    // registrations to wrap).
+    for slot in PT_REGISTRY.iter() {
+        if slot
+            .compare_exchange(0, phys, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+    // Registry full — the live page-table working set exceeds LEN (only
+    // possible if address spaces are leaking their page tables). Leaving
+    // `phys` unregistered is the SAFE failure: `unmap_region_pages` may
+    // free it on the region path, a single (not double) free. Clobbering
+    // a live entry — the old behaviour — is the unsafe one. Count it so
+    // the overflow is observable rather than silent.
+    PT_REGISTRY_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Count of `__pagetable_register` calls that found no free slot. Stays
+/// 0 in healthy operation; a non-zero value means address spaces are
+/// leaking page tables faster than they're reclaimed.
+pub static PT_REGISTRY_OVERFLOWS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub fn __pagetable_unregister(phys: u64) {

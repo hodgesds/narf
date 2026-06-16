@@ -6440,7 +6440,12 @@ fn sys_fb_ring_map(ctx: &mut dyn TrapContext) {
         .map_region(Region {
             base: VirtAddr::new(base),
             len,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            // SHARED: `phys` is the framebuffer subsystem's ring-buffer
+            // frame, owned externally and never allocated by this AS.
+            // Without SHARED the teardown paths would `free_frame` this
+            // borrowed frame on munmap/exit and return it to the buddy —
+            // the same double-free class as `sys_shmem_map`.
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
             phys: alloc::vec![narf_memory::PhysAddr::new(phys)],
         })
         .is_err()
@@ -6637,7 +6642,19 @@ fn sys_shmem_map(ctx: &mut dyn TrapContext) {
         .map_region(Region {
             base: VirtAddr::new(base),
             len,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            // SHARED is load-bearing, not advisory: `phys_list` is the
+            // shmem registry's persistent backing frames (allocated once
+            // by `narf_shmem::create`, owned by the registry for the
+            // segment's life — `destroy` never frees them). Without the
+            // SHARED flag the AS teardown paths (`unmap_region_pages` /
+            // `unmap_free_page` / `Drop` / `madvise_dontneed`, which all
+            // special-case SHARED) treat these BORROWED frames as
+            // AS-owned and `free_frame` them on munmap/exit — returning a
+            // live, registry-owned (and not COW-refcounted) frame to the
+            // buddy, which re-hands it out as a page-table page → the
+            // cross-AS "marginal-buddy" double-free. The SysV `sys_shmat`
+            // twin already sets SHARED for the identical frames.
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
             phys: phys_list,
         })
         .is_err()

@@ -88,6 +88,42 @@ mod audit {
         LAST_FREE_LOC.store(loc as *const _ as *mut _, Ordering::Relaxed);
     }
 
+    // Per-frame alloc-site tracking (covers the first 1 GiB of phys =
+    // 256 Ki frames; the doubly-freed frame is always very low). Lets the
+    // double-free panic say WHERE the frame was allocated — the missing
+    // datum that distinguishes "this frame is a PML4/page-table page"
+    // (alloc site in paging.rs) from "this frame is region data" (alloc
+    // site in the loader / stack path).
+    const ALLOC_LOC_FRAMES: usize = 256 * 1024;
+    static LAST_ALLOC_LOC: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    static ALLOC_LOC: [AtomicPtr<Location<'static>>; ALLOC_LOC_FRAMES] = {
+        const Z: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+        [Z; ALLOC_LOC_FRAMES]
+    };
+
+    pub fn set_alloc_loc(loc: &'static Location<'static>) {
+        LAST_ALLOC_LOC.store(loc as *const _ as *mut _, Ordering::Relaxed);
+    }
+
+    fn record_alloc_loc(frame: u64) {
+        let f = frame as usize;
+        if f < ALLOC_LOC_FRAMES {
+            ALLOC_LOC[f].store(LAST_ALLOC_LOC.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    fn alloc_site(frame: u64) -> (&'static str, u32) {
+        let f = frame as usize;
+        if f < ALLOC_LOC_FRAMES {
+            let p = ALLOC_LOC[f].load(Ordering::Relaxed);
+            if !p.is_null() {
+                // SAFETY: only `&'static Location` pointers stored.
+                return unsafe { ((*p).file(), (*p).line()) };
+            }
+        }
+        ("<unknown>", 0)
+    }
+
     // Small ring of recent frees so a double-free can name the FIRST
     // free's site too, not just the offending second one.
     const RING: usize = 1024;
@@ -171,6 +207,7 @@ mod audit {
                     order
                 );
             }
+            record_alloc_loc(f);
         }
     }
 
@@ -183,12 +220,15 @@ mod audit {
             let bit = 1u64 << (f % 64);
             if BITS[idx].fetch_and(!bit, Ordering::Relaxed) & bit == 0 {
                 let (pf, pl) = ring_prior_free(f);
+                let (af, al) = alloc_site(f);
                 panic!(
                     "frame-alloc-audit: DOUBLE-FREE of frame {:#x} (phys {:#x}) order {}; \
-                     this free @ {}:{}; first free @ {}:{}",
+                     alloc'd @ {}:{}; this free @ {}:{}; first free @ {}:{}",
                     f,
                     f << 12,
                     order,
+                    af,
+                    al,
                     free_loc(),
                     free_line(),
                     pf,
@@ -200,22 +240,19 @@ mod audit {
     }
 }
 
-/// Record a buddy hand-out. No-op unless `frame-alloc-audit` is set.
+/// Record a buddy hand-out. Only compiled with `frame-alloc-audit`; the
+/// zone-gated `note_alloc` calls it solely inside its own feature cfg.
+#[cfg(feature = "frame-alloc-audit")]
 #[inline]
 fn audit_alloc(frame: u64, order: u8) {
-    #[cfg(feature = "frame-alloc-audit")]
     audit::mark_alloc(frame, order);
-    #[cfg(not(feature = "frame-alloc-audit"))]
-    let _ = (frame, order);
 }
 
-/// Record a buddy return. No-op unless `frame-alloc-audit` is set.
+/// Record a buddy return. Only compiled with `frame-alloc-audit`.
+#[cfg(feature = "frame-alloc-audit")]
 #[inline]
 fn audit_free(frame: u64, order: u8) {
-    #[cfg(feature = "frame-alloc-audit")]
     audit::mark_free(frame, order);
-    #[cfg(not(feature = "frame-alloc-audit"))]
-    let _ = (frame, order);
 }
 
 /// Stash the `free_frame` caller's source location for the audit's
@@ -224,6 +261,17 @@ fn audit_free(frame: u64, order: u8) {
 pub fn audit_note_free_caller(loc: &'static core::panic::Location<'static>) {
     #[cfg(feature = "frame-alloc-audit")]
     audit::set_free_loc(loc);
+    #[cfg(not(feature = "frame-alloc-audit"))]
+    let _ = loc;
+}
+
+/// Stash the allocating caller's source location so the audit can report
+/// where a doubly-freed frame was allocated. No-op unless
+/// `frame-alloc-audit` is set.
+#[inline]
+pub fn audit_note_alloc_caller(loc: &'static core::panic::Location<'static>) {
+    #[cfg(feature = "frame-alloc-audit")]
+    audit::set_alloc_loc(loc);
     #[cfg(not(feature = "frame-alloc-audit"))]
     let _ = loc;
 }
@@ -242,6 +290,14 @@ pub struct BuddyZone {
     /// Free frames in this zone (sum of `(order_frames(N) * len)` across
     /// all order-N free lists). Maintained incrementally.
     free_frames: usize,
+    /// When set, this zone's alloc/free feed the global `frame-alloc-audit`
+    /// map. Only the live allocator's NUMA zones opt in (via
+    /// `enable_audit`); standalone unit-test zones (`BuddyZone::new` +
+    /// synthetic `donate`) must NOT, since their fabricated frame numbers
+    /// (e.g. 0x100) collide with the global per-frame bitmap and would
+    /// false-positive as double-alloc/double-free.
+    #[cfg(feature = "frame-alloc-audit")]
+    audit: bool,
 }
 
 impl BuddyZone {
@@ -249,9 +305,42 @@ impl BuddyZone {
         const NEW_VEC: Vec<u64> = Vec::new();
         Self {
             free_lists: [NEW_VEC; NUM_ORDERS],
+            #[cfg(feature = "frame-alloc-audit")]
+            audit: false,
             total_frames: 0,
             free_frames: 0,
         }
+    }
+
+    /// Opt this zone into `frame-alloc-audit`. Called only on the live
+    /// allocator's NUMA zones (see `frame::init_from_map`), never on the
+    /// synthetic zones the buddy unit tests build.
+    #[cfg(feature = "frame-alloc-audit")]
+    #[inline]
+    pub fn enable_audit(&mut self) {
+        self.audit = true;
+    }
+
+    /// Record a buddy hand-out in the audit, iff this zone opted in.
+    #[inline]
+    fn note_alloc(&self, frame: u64, order: u8) {
+        #[cfg(feature = "frame-alloc-audit")]
+        if self.audit {
+            audit_alloc(frame, order);
+        }
+        #[cfg(not(feature = "frame-alloc-audit"))]
+        let _ = (frame, order);
+    }
+
+    /// Record a buddy return in the audit, iff this zone opted in.
+    #[inline]
+    fn note_free(&self, frame: u64, order: u8) {
+        #[cfg(feature = "frame-alloc-audit")]
+        if self.audit {
+            audit_free(frame, order);
+        }
+        #[cfg(not(feature = "frame-alloc-audit"))]
+        let _ = (frame, order);
     }
 
     /// Pre-allocate Vec capacity in every order's free list. Critical
@@ -360,7 +449,7 @@ impl BuddyZone {
             self.free_lists[found_order as usize].push(buddy);
         }
         self.free_frames -= order_frames(order) as usize;
-        audit_alloc(frame, order);
+        self.note_alloc(frame, order);
         Some(frame)
     }
 
@@ -378,7 +467,7 @@ impl BuddyZone {
         if let Some(idx) = self.find_below(order, max_frame_no_excl) {
             let frame = self.free_lists[order as usize].swap_remove(idx);
             self.free_frames -= need as usize;
-            audit_alloc(frame, order);
+            self.note_alloc(frame, order);
             return Some(frame);
         }
         // Fallback: walk higher orders for a block whose lower half
@@ -393,7 +482,7 @@ impl BuddyZone {
                     self.free_lists[cur as usize].push(buddy);
                 }
                 self.free_frames -= need as usize;
-                audit_alloc(frame, order);
+                self.note_alloc(frame, order);
                 return Some(frame);
             }
         }
@@ -414,7 +503,7 @@ impl BuddyZone {
     pub fn free(&mut self, frame: u64, order: u8) {
         debug_assert!(order <= MAX_ORDER);
         debug_assert_eq!(frame & (order_frames(order) - 1), 0);
-        audit_free(frame, order);
+        self.note_free(frame, order);
         // Defensive double-free guard: scan every free list and
         // bail out if `frame` overlaps an existing block. This is
         // a safety net — the in-tree AS-drop path no longer
