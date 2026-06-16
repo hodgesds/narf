@@ -16619,3 +16619,321 @@ fn smoke_dac_shadow_denies_nonroot() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_dac_shadow_denies_nonroot);
+
+// ════════════════════════════════════════════════════════════════
+//  Linux namespace stack — NsId, ns-fd + setns round-trip, user-ns
+//  uid_map translation, the DAC security gate, net-ns dual-bind.
+//  All container-gated; appended at the very end of the suite so the
+//  marginal-heap ordering of the earlier execve smokes is undisturbed
+//  (see kernel-test-suite notes).
+// ════════════════════════════════════════════════════════════════
+
+/// Every namespace flavour mints a distinct, monotonically-increasing
+/// NsId from the shared counter — the identity the ns-fd reports.
+#[cfg(feature = "container")]
+fn smoke_ns_id_unique_per_flavour() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    crate::pid_ns::__test_reset();
+    let a = crate::namespaces::UtsNamespace::new_default();
+    let b = crate::namespaces::NetNamespace::new_with_loopback();
+    let c = crate::namespaces::IpcNamespace::new();
+    let d = crate::pid_ns::PidNamespace::new();
+    let ids = [a.id(), b.id(), c.id(), d.id()];
+    for i in 0..ids.len() {
+        for j in (i + 1)..ids.len() {
+            if ids[i] == ids[j] {
+                return TestResult::Fail("two namespaces share an NsId");
+            }
+        }
+    }
+    crate::namespaces::__test_reset_all();
+    crate::pid_ns::__test_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_ns_id_unique_per_flavour);
+
+/// ns-fd open + setns round-trip: task A unshares a UTS ns and sets a
+/// hostname; an ns-fd minted for A is installed onto task B via the
+/// HeldNs install path; B then sees A's hostname.
+#[cfg(feature = "container")]
+fn smoke_ns_fd_setns_roundtrip() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    let a: u64 = 0xA11CE;
+    let b: u64 = 0xB0B;
+
+    crate::namespaces::unshare_uts(a);
+    crate::namespaces::current_uts_ns(a).set_hostname("container-a");
+
+    // Mint an ns-fd naming A's UTS ns (what /proc/A/ns/uts would).
+    let nsfd = match crate::namespaces::ns_fd_for(a, crate::namespaces::NsFlavour::Uts) {
+        Some(f) => f,
+        None => return TestResult::Fail("ns_fd_for(uts) returned None"),
+    };
+    // readlink text shape: uts:[<id>].
+    let link = nsfd.link_text();
+    if !link.starts_with("uts:[") || !link.ends_with(']') {
+        return TestResult::Fail("ns-fd link_text not uts:[id]");
+    }
+
+    // B joins via the held-ns install (nstype 0 = any).
+    let held = nsfd.held().clone();
+    if !crate::namespaces::install_held_ns(b, b, &held, 0) {
+        return TestResult::Fail("install_held_ns(uts) failed");
+    }
+    if crate::namespaces::current_uts_ns(b).hostname() != "container-a" {
+        return TestResult::Fail("B did not see A's hostname after setns");
+    }
+    // nstype mismatch is rejected.
+    if crate::namespaces::install_held_ns(b, b, &held, crate::namespaces::CLONE_NEWNET) {
+        return TestResult::Fail("install_held_ns accepted a wrong nstype");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_ns_fd_setns_roundtrip);
+
+/// An open ns-fd keeps the namespace alive after the originating task
+/// exits: dropping A's per-task entry leaves the ns reachable through
+/// the held Arc, and a later joiner sees the same id + state.
+#[cfg(feature = "container")]
+fn smoke_ns_fd_outlives_originator() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    let a: u64 = 0xDEAD;
+    crate::namespaces::unshare_uts(a);
+    crate::namespaces::current_uts_ns(a).set_hostname("ghost");
+    let id = crate::namespaces::current_uts_ns(a).id();
+    let nsfd = crate::namespaces::ns_fd_for(a, crate::namespaces::NsFlavour::Uts).unwrap();
+
+    // Simulate A exiting: wipe the per-task tables. The ns-fd still
+    // holds the Arc.
+    crate::namespaces::__test_reset_all();
+
+    let held = nsfd.held().clone();
+    if held.id() != id {
+        return TestResult::Fail("held ns id changed after originator exit");
+    }
+    let b: u64 = 0xF00D;
+    if !crate::namespaces::install_held_ns(b, b, &held, 0) {
+        return TestResult::Fail("install after originator exit failed");
+    }
+    if crate::namespaces::current_uts_ns(b).hostname() != "ghost" {
+        return TestResult::Fail("ns state lost after originator exit");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_ns_fd_outlives_originator);
+
+/// User-ns uid_map translation: inner ids in a mapped run translate to
+/// their host ids; unmapped inner ids fall to the overflow id; the
+/// one-shot write rule rejects a second write.
+#[cfg(feature = "container")]
+fn smoke_user_ns_uid_map_translation() -> TestResult {
+    use crate::namespaces::{IdMapEntry, UserNamespace, OVERFLOW_ID};
+    crate::namespaces::__test_reset_all();
+    let host = UserNamespace::new_initial();
+    let uns = UserNamespace::new_child(host, 1000);
+    // Map inner [0,5) → host [1000,1005).
+    let entries = alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 1000,
+        count: 5,
+    }];
+    if uns.write_uid_map(entries.clone()).is_err() {
+        return TestResult::Fail("first uid_map write rejected");
+    }
+    // One-shot rule: a second write fails.
+    if uns.write_uid_map(entries).is_ok() {
+        return TestResult::Fail("second uid_map write was allowed (one-shot rule)");
+    }
+    if uns.translate_uid_to_host(0) != 1000 {
+        return TestResult::Fail("inner 0 did not map to host 1000");
+    }
+    if uns.translate_uid_to_host(4) != 1004 {
+        return TestResult::Fail("inner 4 did not map to host 1004");
+    }
+    // Unmapped inner id → overflow.
+    if uns.translate_uid_to_host(9) != OVERFLOW_ID {
+        return TestResult::Fail("unmapped inner id did not become overflow");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_user_ns_uid_map_translation);
+
+/// SECURITY GATE (hard): a process that is root *inside* an
+/// unprivileged user-ns whose map does NOT include host-0 is DENIED a
+/// host-root-owned 0600 file; and a file owned by the mapped outer uid
+/// IS accessible as inner-0. Exercises the real DAC funnel
+/// `current_accessor` → `posix_access_ok`.
+#[cfg(feature = "container")]
+fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
+    use crate::namespaces::IdMapEntry;
+    use narf_filesystem::{posix_access_ok, AccessRequest, FileOwner};
+    crate::namespaces::__test_reset_all();
+    crate::handlers::__test_uidgid_reset();
+
+    let task: u64 = 0xC0FFEE;
+    // The task is inner uid 0 (root *inside* the ns).
+    crate::handlers::__test_set_fsids(task, 0, 0);
+    // Unprivileged user-ns owned by host uid 1000; map inner 0 → host
+    // 1000 (NOT host 0). So in-ns root is host uid 1000.
+    let host = crate::namespaces::UserNamespace::new_initial();
+    let uns = crate::namespaces::UserNamespace::new_child(host, 1000);
+    let _ = uns.write_uid_map(alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 1000,
+        count: 1,
+    }]);
+    let _ = uns.write_gid_map(alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 1000,
+        count: 1,
+    }]);
+    crate::namespaces::setns_user(task, uns);
+
+    // The DAC funnel must translate in-ns uid 0 to host uid 1000.
+    let acc = crate::handlers::__test_current_accessor(task);
+    if acc.uid != 1000 {
+        return TestResult::Fail("DAC funnel did not translate in-ns root to host 1000");
+    }
+
+    let rd = AccessRequest {
+        read: true,
+        write: false,
+        exec: false,
+    };
+    // Host-root-owned 0600 file: in-ns root (host 1000) is DENIED.
+    let host_shadow = FileOwner {
+        uid: 0,
+        gid: 0,
+        perms: 0o600,
+    };
+    if posix_access_ok(host_shadow, acc, rd) {
+        return TestResult::Fail("SECURITY: in-ns root read a host-root 0600 file");
+    }
+    // A file owned by the mapped outer uid (1000) at 0600 IS readable.
+    let owned = FileOwner {
+        uid: 1000,
+        gid: 1000,
+        perms: 0o600,
+    };
+    if !posix_access_ok(owned, acc, rd) {
+        return TestResult::Fail("in-ns root denied its own (mapped) file");
+    }
+
+    // Control: a user-ns that DOES map inner 0 → host 0 *is* host root.
+    let host2 = crate::namespaces::UserNamespace::new_initial();
+    let priv_ns = crate::namespaces::UserNamespace::new_child(host2, 0);
+    let _ = priv_ns.write_uid_map(alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 0,
+        count: 1,
+    }]);
+    let _ = priv_ns.write_gid_map(alloc::vec![IdMapEntry {
+        inner_start: 0,
+        outer_start: 0,
+        count: 1,
+    }]);
+    let task2: u64 = 0xBEEF;
+    crate::handlers::__test_set_fsids(task2, 0, 0);
+    crate::namespaces::setns_user(task2, priv_ns);
+    let acc2 = crate::handlers::__test_current_accessor(task2);
+    if acc2.uid != 0 || !posix_access_ok(host_shadow, acc2, rd) {
+        return TestResult::Fail("inner-0→host-0 mapping failed to grant host root");
+    }
+
+    crate::namespaces::__test_reset_all();
+    crate::handlers::__test_uidgid_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_user_ns_dac_no_host_root_escape);
+
+/// fork inheritance: a child shares the parent's UTS / IPC / User
+/// namespace Arc (not a fresh copy) when no CLONE_NEW* is requested.
+#[cfg(feature = "container")]
+fn smoke_ns_inherit_shares_parent_arc() -> TestResult {
+    crate::namespaces::__test_reset_all();
+    let parent: u64 = 0x1234;
+    let child: u64 = 0x5678;
+    crate::namespaces::unshare_uts(parent);
+    crate::namespaces::unshare_ipc(parent);
+    crate::namespaces::unshare_user(parent, 0);
+
+    crate::namespaces::inherit_into_child(parent, child);
+
+    let pu = crate::namespaces::uts_ns_of(parent).unwrap();
+    let cu = crate::namespaces::uts_ns_of(child).unwrap();
+    if !alloc::sync::Arc::ptr_eq(&pu, &cu) {
+        return TestResult::Fail("child UTS ns is not the parent's Arc");
+    }
+    let piu = crate::namespaces::user_ns_of(parent).unwrap();
+    let ciu = crate::namespaces::user_ns_of(child).unwrap();
+    if !alloc::sync::Arc::ptr_eq(&piu, &ciu) {
+        return TestResult::Fail("child user ns is not the parent's Arc");
+    }
+    crate::namespaces::__test_reset_all();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_ns_inherit_shares_parent_arc);
+
+/// net-ns dual-bind: two SocketFiles stamped with DIFFERENT net-ns ids
+/// can both bind the same UDP (addr, port); two in the SAME ns
+/// collide with EADDRINUSE.
+#[cfg(feature = "container")]
+fn smoke_net_ns_dual_bind_same_port() -> TestResult {
+    use crate::socket::{SockAddr, SocketFile, SocketOp, SocketOpResult};
+    use crate::socket::{AF_INET, SOCK_DGRAM};
+
+    // sockaddr_in body: port (BE) + ip (BE). Port 7777, 0.0.0.0.
+    let port: u16 = 7777;
+    let mut body = alloc::vec::Vec::new();
+    body.extend_from_slice(&port.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    let mk_addr = || SockAddr {
+        family: AF_INET,
+        body: body.clone(),
+    };
+
+    // ns 100 and ns 200 both bind 0.0.0.0:7777 — both succeed.
+    let s1 = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
+    s1.set_net_ns_id(100);
+    let s2 = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
+    s2.set_net_ns_id(200);
+    let r1 = s1.dispatch_op(SocketOp::Bind { addr: mk_addr() });
+    let r2 = s2.dispatch_op(SocketOp::Bind { addr: mk_addr() });
+    if !matches!(r1, SocketOpResult::Ok(_)) {
+        return TestResult::Fail("ns 100 bind failed");
+    }
+    if !matches!(r2, SocketOpResult::Ok(_)) {
+        return TestResult::Fail("ns 200 dual-bind same port was rejected");
+    }
+
+    // Same ns (300) collides on the second bind.
+    let s3 = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
+    s3.set_net_ns_id(300);
+    let s4 = SocketFile::with_protocol(AF_INET, SOCK_DGRAM, 0);
+    s4.set_net_ns_id(300);
+    let r3 = s3.dispatch_op(SocketOp::Bind { addr: mk_addr() });
+    let r4 = s4.dispatch_op(SocketOp::Bind { addr: mk_addr() });
+    if !matches!(r3, SocketOpResult::Ok(_)) {
+        return TestResult::Fail("ns 300 first bind failed");
+    }
+    if !matches!(r4, SocketOpResult::Err(_)) {
+        return TestResult::Fail("same-ns second bind did NOT collide");
+    }
+
+    // Cleanup the registry entries this test left behind.
+    s1.unregister();
+    s2.unregister();
+    s3.unregister();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!("userspace", smoke_net_ns_dual_bind_same_port);

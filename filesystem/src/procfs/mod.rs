@@ -205,6 +205,94 @@ pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {
     f(pid, fd)
 }
 
+// ── Namespace procfs hooks (container feature) ──────────────────
+//
+// Wired by userspace so procfs can render /proc/<pid>/ns/<flavour>
+// readlink text, the per-ns mountinfo view, and read/write the
+// user-ns uid_map/gid_map — without procfs depending on the
+// namespaces module (one-way dep via fn-pointers).
+
+/// `(pid, flavour) -> readlink text` e.g. "uts:[4026531838]".
+/// `flavour` is the [`crate::NsFlavourTag`] discriminant.
+type NsReadlinkFn = fn(u64, u8) -> Option<String>;
+/// `pid -> per-ns mountinfo body`. `None` ⇒ fall back to the global.
+type MountinfoFn = fn(u64) -> Option<String>;
+/// `(pid, is_uid) -> rendered uid_map/gid_map`.
+type IdMapRenderFn = fn(u64, bool) -> Option<String>;
+/// `(pid, is_uid, bytes) -> Ok(written) | Err`. Linux one-shot rule.
+type IdMapWriteFn = fn(u64, bool, &[u8]) -> Result<usize, FsError>;
+
+static NS_READLINK_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NS_MOUNTINFO_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NS_IDMAP_RENDER_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NS_IDMAP_WRITE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Stable u8 tags for namespace flavours, mirroring
+/// `userspace::namespaces::NsFlavour`. Kept here so the procfs ns
+/// nodes can name a flavour without importing the userspace enum.
+pub mod ns_tag {
+    pub const UTS: u8 = 0;
+    pub const NET: u8 = 1;
+    pub const IPC: u8 = 2;
+    pub const PID: u8 = 3;
+    pub const MNT: u8 = 4;
+    pub const CGROUP: u8 = 5;
+    pub const USER: u8 = 6;
+}
+
+/// Wire the namespace procfs hooks. Called once at boot (container).
+pub fn install_ns_proc_hooks(
+    readlink: NsReadlinkFn,
+    mountinfo: MountinfoFn,
+    idmap_render: IdMapRenderFn,
+    idmap_write: IdMapWriteFn,
+) {
+    NS_READLINK_HOOK.store(readlink as usize, Ordering::Release);
+    NS_MOUNTINFO_HOOK.store(mountinfo as usize, Ordering::Release);
+    NS_IDMAP_RENDER_HOOK.store(idmap_render as usize, Ordering::Release);
+    NS_IDMAP_WRITE_HOOK.store(idmap_write as usize, Ordering::Release);
+}
+
+pub(crate) fn hook_ns_readlink(pid: u64, flavour: u8) -> Option<String> {
+    let v = NS_READLINK_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_ns_proc_hooks as an NsReadlinkFn; non-zero confirms it.
+    let f: NsReadlinkFn = unsafe { core::mem::transmute(v) };
+    f(pid, flavour)
+}
+
+pub(crate) fn hook_ns_mountinfo(pid: u64) -> Option<String> {
+    let v = NS_MOUNTINFO_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_ns_proc_hooks as a MountinfoFn; non-zero confirms it.
+    let f: MountinfoFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+pub(crate) fn hook_ns_idmap_render(pid: u64, is_uid: bool) -> Option<String> {
+    let v = NS_IDMAP_RENDER_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: stored by install_ns_proc_hooks as an IdMapRenderFn; non-zero confirms it.
+    let f: IdMapRenderFn = unsafe { core::mem::transmute(v) };
+    f(pid, is_uid)
+}
+
+pub(crate) fn hook_ns_idmap_write(pid: u64, is_uid: bool, bytes: &[u8]) -> Result<usize, FsError> {
+    let v = NS_IDMAP_WRITE_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
+    // SAFETY: stored by install_ns_proc_hooks as an IdMapWriteFn; non-zero confirms it.
+    let f: IdMapWriteFn = unsafe { core::mem::transmute(v) };
+    f(pid, is_uid, bytes)
+}
+
 pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
     let v = RLIMITS_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -728,7 +816,23 @@ impl DirOps for ProcPidDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
-            "fd" | "fdinfo" | "task" => return Some(Arc::new(ProcDirMarker)),
+            "fd" | "fdinfo" | "task" | "ns" => return Some(Arc::new(ProcDirMarker)),
+            _ => {}
+        }
+        // user-ns id-map files (read + one-shot write).
+        match name {
+            "uid_map" => {
+                return Some(Arc::new(ProcIdMapFile {
+                    pid: self.pid,
+                    is_uid: true,
+                }))
+            }
+            "gid_map" => {
+                return Some(Arc::new(ProcIdMapFile {
+                    pid: self.pid,
+                    is_uid: false,
+                }))
+            }
             _ => {}
         }
         // Core flat files.
@@ -753,6 +857,7 @@ impl DirOps for ProcPidDir {
             "fd" => Some(Arc::new(pid_ext::ProcFdDir { pid: self.pid })),
             "fdinfo" => Some(Arc::new(pid_ext::ProcFdInfoDir { pid: self.pid })),
             "task" => Some(Arc::new(pid_ext::ProcTaskDir { pid: self.pid })),
+            "ns" => Some(Arc::new(ProcNsDir { pid: self.pid })),
             _ => None,
         }
     }
@@ -845,6 +950,15 @@ impl DirOps for ProcPidDir {
                     name: "cgroup",
                     file_type: FileType::File,
                 },
+                // user-ns id maps.
+                DirEntry {
+                    name: "uid_map",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "gid_map",
+                    file_type: FileType::File,
+                },
                 // Subdirectories.
                 DirEntry {
                     name: "fd",
@@ -858,9 +972,118 @@ impl DirOps for ProcPidDir {
                     name: "task",
                     file_type: FileType::Dir,
                 },
+                DirEntry {
+                    name: "ns",
+                    file_type: FileType::Dir,
+                },
             ]
             .into_iter(),
         )
+    }
+}
+
+// ── /proc/<pid>/ns/<flavour> + uid_map/gid_map ──────────────────
+
+/// `/proc/<pid>/ns` directory. Its children are the per-flavour ns
+/// magic nodes. Linux models these as symlinks whose target text is
+/// `flavour:[<id>]`; NARF makes them open()-able nodes (so they can
+/// mint an ns-fd for setns) that also render that text via readlink.
+#[derive(Debug)]
+struct ProcNsDir {
+    pid: u64,
+}
+
+/// One namespace magic node, e.g. `/proc/<pid>/ns/uts`. `read()`
+/// returns the `flavour:[<id>]` link text (so `cat`/`readlink` see
+/// it); opening it for setns is handled in the userspace open path
+/// which recognises the path and mints an [`NsFd`].
+#[derive(Debug)]
+struct ProcNsLink {
+    pid: u64,
+    /// `ns_tag::*` discriminant.
+    tag: u8,
+}
+
+const NS_NAMES: &[(&str, u8)] = &[
+    ("uts", ns_tag::UTS),
+    ("net", ns_tag::NET),
+    ("ipc", ns_tag::IPC),
+    ("pid", ns_tag::PID),
+    ("mnt", ns_tag::MNT),
+    ("cgroup", ns_tag::CGROUP),
+    ("user", ns_tag::USER),
+];
+
+impl DirOps for ProcNsDir {
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        let tag = NS_NAMES.iter().find(|(n, _)| *n == name)?.1;
+        Some(Arc::new(ProcNsLink { pid: self.pid, tag }))
+    }
+    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
+        None
+    }
+    fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
+        Box::new(NS_NAMES.iter().map(|(n, _)| DirEntry {
+            name: n,
+            file_type: FileType::Symlink,
+        }))
+    }
+}
+
+impl FileOps for ProcNsLink {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let pid = self.pid;
+        let tag = self.tag;
+        Box::pin(async move {
+            let s = hook_ns_readlink(pid, tag).unwrap_or_default();
+            slice_read(s.as_bytes(), offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
+/// `/proc/<pid>/uid_map` or `/proc/<pid>/gid_map`. Readable (renders
+/// the active user-ns map) and writable once (Linux one-shot rule).
+#[derive(Debug)]
+struct ProcIdMapFile {
+    pid: u64,
+    is_uid: bool,
+}
+
+impl FileOps for ProcIdMapFile {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let pid = self.pid;
+        let is_uid = self.is_uid;
+        Box::pin(async move {
+            let s = hook_ns_idmap_render(pid, is_uid).unwrap_or_default();
+            slice_read(s.as_bytes(), offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let pid = self.pid;
+        let is_uid = self.is_uid;
+        Box::pin(async move { hook_ns_idmap_write(pid, is_uid, buf) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RW,
+            mtime_cycles: 0,
+        }
     }
 }
 

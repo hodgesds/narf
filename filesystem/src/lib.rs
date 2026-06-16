@@ -537,6 +537,16 @@ pub trait FileOps: Send + Sync {
     fn pipe_peek(&self, _max: usize) -> Option<alloc::vec::Vec<u8>> {
         None
     }
+
+    /// Downcast hook. The default returns `None`; FileOps types that
+    /// need to be recovered from an `Arc<dyn FileOps>` (today: the
+    /// namespace-fd minted by `/proc/<pid>/ns/*`, so `setns(fd, …)` can
+    /// pull the held namespace `Arc` back out) override this to return
+    /// `Some(self)`. Kept out of the per-syscall hot path — only `setns`
+    /// reaches for it.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
 }
 
 // ── Controlling-tty ids ─────────────────────────────────────────
@@ -945,11 +955,37 @@ pub fn registry() -> &'static VfsRegistry {
 // per-task views (today every NARF task shares the global view —
 // the work is structural until a multi-namespace workload appears).
 
+/// Hook returning the next process-global namespace id. Installed by
+/// userspace (which owns the shared `NsId` counter) so a
+/// `MountNamespace` minted in this crate draws an id from the SAME
+/// space as every other namespace flavour — required for ns-fd
+/// identity. Until installed, mount namespaces report id 0.
+static NS_ID_ALLOC_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the shared `NsId` allocator (userspace `alloc_ns_id`).
+pub fn install_ns_id_alloc_hook(f: fn() -> u64) {
+    NS_ID_ALLOC_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn alloc_mount_ns_id() -> u64 {
+    let v = NS_ID_ALLOC_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return 0;
+    }
+    // SAFETY: v was stored by install_ns_id_alloc_hook as a `fn() -> u64`
+    // pointer; non-zero confirms it was installed.
+    let f: fn() -> u64 = unsafe { core::mem::transmute::<usize, fn() -> u64>(v) };
+    f()
+}
+
 /// Snapshot-shaped mount table. Holds an owned Vec of mounts so a
 /// per-task NS can diverge from the global registry without
 /// affecting it.
 #[derive(Debug)]
 pub struct MountNamespace {
+    /// Stable namespace id (nsfs inode in Linux), drawn from the
+    /// process-global `NsId` counter via `NS_ID_ALLOC_HOOK`.
+    id: u64,
     inner: IrqSafeSpinLock<Vec<Mount>>,
 }
 
@@ -971,8 +1007,14 @@ impl MountNamespace {
             })
             .collect();
         Arc::new(Self {
+            id: alloc_mount_ns_id(),
             inner: IrqSafeSpinLock::new(copied),
         })
+    }
+
+    /// Stable namespace id (nsfs inode in Linux).
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Resolve an absolute path against this namespace.

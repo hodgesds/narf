@@ -226,6 +226,12 @@ pub struct SocketFile {
     /// Pending async error. connect/send/recv set on failure;
     /// getsockopt(SO_ERROR) consumes (returns + clears) it.
     pending_error: IrqSafeSpinLock<Option<SockError>>,
+    /// Network-namespace id this socket belongs to (0 = host/default
+    /// netns). Stamped by `sys_socket` from the creator's net-ns at
+    /// socket() time. Used ONLY to key the AF_INET bind/port tables so
+    /// two processes in different net-ns can both bind the same
+    /// (addr, port); the per-packet NIC path is untouched.
+    net_ns_id: core::sync::atomic::AtomicU64,
 }
 
 /// Faithful per-socket storage for set/getsockopt values. Defaults
@@ -436,7 +442,19 @@ impl SocketFile {
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
+            net_ns_id: core::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Stamp this socket's network-namespace id (see field docs).
+    pub fn set_net_ns_id(&self, id: u64) {
+        self.net_ns_id
+            .store(id, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// This socket's network-namespace id (0 = host/default).
+    pub fn net_ns_id(&self) -> u64 {
+        self.net_ns_id.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create a pre-connected AF_UNIX SOCK_STREAM pair for
@@ -600,7 +618,7 @@ impl SocketFile {
             }
             Reg::Inet(a, p) => {
                 if let Some(map) = INET_LISTENERS.lock().as_mut() {
-                    map.remove(&(a, p));
+                    map.remove(&(self.net_ns_id(), a, p));
                 }
             }
             Reg::Inet6(a, p) => {
@@ -615,7 +633,7 @@ impl SocketFile {
             }
             Reg::InetDgram(a, p) => {
                 if let Some(map) = INET_DGRAM_BOUND.lock().as_mut() {
-                    map.remove(&(a, p));
+                    map.remove(&(self.net_ns_id(), a, p));
                 }
                 // Release any ephemeral reservation. clear() on an
                 // unset bit is a no-op, so an explicit bind() to a
@@ -1478,7 +1496,7 @@ impl SocketFile {
                 let mut state = self.state.lock();
                 match &*state {
                     SocketState::Fresh => {
-                        let key = (ip, port);
+                        let key = (self.net_ns_id(), ip, port);
                         let reuseaddr = self.options.lock().reuseaddr;
                         let mut listeners = INET_LISTENERS.lock();
                         let map = listeners.get_or_insert_with(BTreeMap::new);
@@ -1511,7 +1529,7 @@ impl SocketFile {
                         ..
                     } => {
                         *b = backlog;
-                        let key = (*addr, *port);
+                        let key = (self.net_ns_id(), *addr, *port);
                         drop(state);
                         let mut listeners = INET_LISTENERS.lock();
                         let map = listeners.get_or_insert_with(BTreeMap::new);
@@ -1547,9 +1565,14 @@ impl SocketFile {
                 // Look up the listener. Loopback (127.x.x.x) and
                 // 0.0.0.0 (INADDR_ANY) listeners both match.
                 let listener = {
+                    let ns = self.net_ns_id();
                     let listeners = INET_LISTENERS.lock();
                     let m = listeners.as_ref();
-                    m.and_then(|m| m.get(&(ip, port)).or_else(|| m.get(&(0, port))).cloned())
+                    m.and_then(|m| {
+                        m.get(&(ns, ip, port))
+                            .or_else(|| m.get(&(ns, 0, port)))
+                            .cloned()
+                    })
                 };
                 let listener = match listener {
                     Some(l) => l,
@@ -1671,10 +1694,11 @@ impl SocketFile {
                 let mut state = self.state.lock();
                 match &*state {
                     SocketState::Fresh => {
+                        let ns = self.net_ns_id();
                         let reuseaddr = self.options.lock().reuseaddr;
                         let mut bound = INET_DGRAM_BOUND.lock();
                         let map = bound.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(&(ip, port)) && !reuseaddr {
+                        if map.contains_key(&(ns, ip, port)) && !reuseaddr {
                             return SocketOpResult::Err(SockError::AddrInUse);
                         }
                         *state = SocketState::InetDgram {
@@ -1683,7 +1707,7 @@ impl SocketFile {
                             inbox: VecDeque::new(),
                             peer: None,
                         };
-                        map.insert((ip, port), self.clone());
+                        map.insert((ns, ip, port), self.clone());
                         SocketOpResult::Ok(0)
                     }
                     _ => SocketOpResult::Err(SockError::InvalidArg),
@@ -1760,12 +1784,17 @@ impl SocketFile {
                 if dest.0 == 0xFFFF_FFFF && !self.options.lock().broadcast {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                // Find the destination socket. Loopback + INADDR_ANY both match.
+                // Find the destination socket. Loopback + INADDR_ANY both
+                // match, scoped to THIS socket's net-ns (in-process
+                // loopback never crosses a netns boundary).
                 let dest_sock = {
+                    let ns = self.net_ns_id();
                     let bound = INET_DGRAM_BOUND.lock();
-                    bound
-                        .as_ref()
-                        .and_then(|m| m.get(&dest).or_else(|| m.get(&(0, dest.1))).cloned())
+                    bound.as_ref().and_then(|m| {
+                        m.get(&(ns, dest.0, dest.1))
+                            .or_else(|| m.get(&(ns, 0, dest.1)))
+                            .cloned()
+                    })
                 };
                 let dest_sock = match dest_sock {
                     Some(s) => s,
@@ -2231,8 +2260,12 @@ impl RingBuf {
 
 // ── Bound-listener registry ─────────────────────────────────────
 
-/// Registry map keyed by AF_INET (ipv4, port).
-type Inet4Map = BTreeMap<(u32, u16), Arc<SocketFile>>;
+/// Registry map keyed by AF_INET (net_ns_id, ipv4, port). The leading
+/// net-ns id scopes bind/port allocation so two processes in different
+/// network namespaces can both bind the same (addr, port); the host
+/// default netns is id 0. Loopback delivery looks up with the sender's
+/// own ns id, so in-process datagrams never cross a netns boundary.
+type Inet4Map = BTreeMap<(u64, u32, u16), Arc<SocketFile>>;
 /// Registry map keyed by AF_INET6 (ipv6, port).
 type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
 
