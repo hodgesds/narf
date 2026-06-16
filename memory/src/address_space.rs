@@ -184,13 +184,36 @@ impl AddressSpace {
     /// page-rounded by the caller; this routine just bumps.
     #[inline]
     pub fn reserve_mmap_va(&self, bytes: u64) -> u64 {
+        use core::sync::atomic::Ordering;
         // O(1): the cursor is kept past every region ever mapped into the
         // mmap range (see `bump_mmap_cursor_past`, called from
         // `map_region`), so a plain bump never collides with an existing
         // mapping — including regions placed out-of-band (bootstrap
         // channel buffers, MAP_FIXED overlays) that didn't go through here.
-        self.mmap_cursor
-            .fetch_add(bytes.max(0x1000), core::sync::atomic::Ordering::Relaxed)
+        //
+        // The cursor is monotonic (munmap does not reclaim VA), so it can
+        // only climb. CAS the bump against `MMAP_WINDOW_TOP` so it FAILS
+        // CLOSED at the ceiling: returning 0 (an invalid base the caller
+        // maps to -ENOMEM) instead of marching into the stack reserve and
+        // then across the non-canonical boundary — which would silently
+        // re-create the #GP-kill the window was introduced to prevent.
+        let bytes = bytes.max(0x1000);
+        let mut cur = self.mmap_cursor.load(Ordering::Relaxed);
+        loop {
+            let end = cur.saturating_add(bytes);
+            if end > Self::MMAP_WINDOW_TOP {
+                return 0; // arena exhausted → caller returns -ENOMEM
+            }
+            match self.mmap_cursor.compare_exchange_weak(
+                cur,
+                end,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return cur,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Keep the mmap-allocation cursor past `region_end` when a region is
@@ -788,6 +811,17 @@ impl AddressSpace {
             Some(b) => b,
             None => return Err(AddressSpaceError::OutOfRange),
         };
+        // Stack floor: the real user stack lives ABOVE the mmap window and
+        // its growth reserve ends at MMAP_WINDOW_TOP. Refuse to let such a
+        // stack grow past the floor (→ SIGSEGV) so it can never enter the
+        // mmap window, where a later reserve_mmap_va — which deliberately
+        // ignores the stack — could otherwise place an allocation under it.
+        // Only fires on the crossing page, and only for a stack currently
+        // above the window: low-address stacks (test arenas, alternate
+        // layouts) sit entirely below the window and are unaffected.
+        if guard_base >= Self::MMAP_WINDOW_TOP && new_guard_base < Self::MMAP_WINDOW_TOP {
+            return Err(AddressSpaceError::OutOfRange);
+        }
         for (i, r) in regions.iter().enumerate() {
             if i == idx {
                 continue;
@@ -860,6 +894,17 @@ impl AddressSpace {
             Some(b) => b,
             None => return Err(AddressSpaceError::OutOfRange),
         };
+        // Stack floor: the real user stack lives ABOVE the mmap window and
+        // its growth reserve ends at MMAP_WINDOW_TOP. Refuse to let such a
+        // stack grow past the floor (→ SIGSEGV) so it can never enter the
+        // mmap window, where a later reserve_mmap_va — which deliberately
+        // ignores the stack — could otherwise place an allocation under it.
+        // Only fires on the crossing page, and only for a stack currently
+        // above the window: low-address stacks (test arenas, alternate
+        // layouts) sit entirely below the window and are unaffected.
+        if guard_base >= Self::MMAP_WINDOW_TOP && new_guard_base < Self::MMAP_WINDOW_TOP {
+            return Err(AddressSpaceError::OutOfRange);
+        }
         for (i, r) in regions.iter().enumerate() {
             if i == idx {
                 continue;

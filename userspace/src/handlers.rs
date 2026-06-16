@@ -4222,6 +4222,15 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     } else {
         as_ref.reserve_mmap_va(len)
     };
+    // reserve_mmap_va returns 0 when the no-hint mmap arena is exhausted
+    // (the bump cursor would cross MMAP_WINDOW_TOP into the stack reserve).
+    // Fail closed with -ENOMEM rather than mapping at a bogus base.
+    // (MAP_FIXED takes the `hint` arm above, which is non-zero.)
+    if base == 0 {
+        const ENOMEM: i64 = 12;
+        ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
+        return;
+    }
 
     let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
     let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
@@ -11336,6 +11345,11 @@ fn sys_shmat(ctx: &mut dyn TrapContext) {
         perms = perms | RegionPerms::WRITE;
     }
     let base = as_ref.reserve_mmap_va(len);
+    if base == 0 {
+        // mmap arena exhausted (cursor at MMAP_WINDOW_TOP) — fail closed.
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        return;
+    }
     if as_ref
         .map_region(Region {
             base: VirtAddr::new(base),
