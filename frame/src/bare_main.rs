@@ -3598,6 +3598,11 @@ fn boot_userspace_init() {
                 ("psched_smoke", narf_verification::NARF_PSCHED_SMOKE_ELF),
                 // Linux-compat round 20: futex2 wait/wake/requeue/waitv.
                 ("futex2_smoke", narf_verification::NARF_FUTEX2_SMOKE_ELF),
+                // Contended futex: N-thread mutex + join + condvar ping-pong.
+                (
+                    "futex_contend_smoke",
+                    narf_verification::NARF_FUTEX_CONTEND_SMOKE_ELF,
+                ),
                 // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
                 ("keyring_smoke", narf_verification::NARF_KEYRING_SMOKE_ELF),
                 // Linux-compat round 22: inotify real event delivery.
