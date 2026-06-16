@@ -12,7 +12,44 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+// ──────────────────────────────────────────────────────────────────
+// Spin-wait hook — drain work that a masked spinner would otherwise
+// stall (TLB shootdowns).
+// ──────────────────────────────────────────────────────────────────
+
+/// Optional hook the `IrqSafeSpinLock` busy-wait calls while spinning with
+/// IRQs masked. `0` = none.
+///
+/// The x86_64 TLB-shootdown layer installs `ipi::poll_pending_shootdown` here
+/// (from the x2APIC boot block). A CPU spinning on a lock has interrupts
+/// disabled, so it can't take a shootdown IPI — a peer broadcasting a shootdown
+/// would spin to its ack cap and then *give up*, leaving this CPU with a stale
+/// TLB. On a shared address space (threads / migrated user tasks) that's a
+/// use-after-unmap. Draining the pending shootdown from the spin loop keeps a
+/// masked spinner responsive, so a shootdown is never stranded.
+static LOCK_SPIN_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the spin-wait hook (see [`LOCK_SPIN_HOOK`]). `hook` must be safe to
+/// call from any CPL=0 context with IRQs masked. Idempotent.
+pub fn set_lock_spin_hook(hook: fn()) {
+    LOCK_SPIN_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Run the installed spin-wait hook if any. Tiny by design — one acquire load
+/// and an early return when nothing is wired (kernel-test, pre-boot, or the
+/// xAPIC fallback where shootdowns aren't broadcast).
+#[inline(always)]
+fn run_lock_spin_hook() {
+    let h = LOCK_SPIN_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: only `set_lock_spin_hook` ever writes this cell, always with
+        // a valid `fn()` pointer; a non-zero value is therefore callable.
+        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+        f();
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────
 // IRQ-state typestate markers
@@ -201,6 +238,12 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
         // beyond the IF / DAIF.I bit of the running CPU.
         // SAFETY: Valid memory or trusted environment
         let saved = unsafe { irq_save_disable() };
+        // Spin count drives a throttled `run_lock_spin_hook` (every 256 pause
+        // iterations): we hold IRQs masked here, so without draining we can't
+        // service a peer's TLB-shootdown IPI — see LOCK_SPIN_HOOK. 256 pauses
+        // (~µs) is far under a shootdown sender's ack cap, so the peer never
+        // stalls, while uncontended locks (no inner spin) pay nothing.
+        let mut spins: u32 = 0;
         while self
             .inner
             .locked
@@ -209,12 +252,52 @@ impl<T: ?Sized> IrqSafeSpinLock<T> {
         {
             while self.inner.locked.load(Ordering::Relaxed) {
                 spin_loop();
+                spins = spins.wrapping_add(1);
+                if spins & 0xFF == 0 {
+                    run_lock_spin_hook();
+                }
             }
         }
         IrqSafeSpinLockGuard {
             lock: &self.inner,
             saved,
             _not_send: core::marker::PhantomData,
+        }
+    }
+
+    /// Non-blocking acquire. Disables IRQs, attempts the lock exactly
+    /// once; on failure restores the caller's IRQ state and returns
+    /// `None` instead of spinning with interrupts masked.
+    ///
+    /// Critical on the work-steal hot path: a blocking `lock()` that
+    /// loses the race spins with IRQs disabled, and on x86_64 a CPU with
+    /// IRQs masked cannot service an inbound TLB-shootdown IPI — the
+    /// shootdown sender then spins to its ack cap (observed: 10M spins
+    /// per shootdown, livelocking dynamically-linked user tasks under
+    /// `user-task-smp`). `try_lock` keeps the masked window to a single
+    /// CAS, so a contended victim queue is skipped rather than spun on.
+    #[inline]
+    pub fn try_lock(&self) -> Option<IrqSafeSpinLockGuard<'_, T>> {
+        // SAFETY: same canonical local IRQ save+disable as `lock`.
+        // SAFETY: Valid memory or trusted environment
+        let saved = unsafe { irq_save_disable() };
+        if self
+            .inner
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(IrqSafeSpinLockGuard {
+                lock: &self.inner,
+                saved,
+                _not_send: core::marker::PhantomData,
+            })
+        } else {
+            // SAFETY: pairs with the `irq_save_disable` above; we did not
+            // take the lock, so restore the caller's IRQ state.
+            // SAFETY: Valid memory or trusted environment
+            unsafe { irq_restore(saved) };
+            None
         }
     }
 }
@@ -430,6 +513,10 @@ impl Once {
             Err(ONCE_DONE) => {}
             Err(_) => {
                 while self.state.load(Ordering::Acquire) != ONCE_DONE {
+                    // Drain shootdowns in case this wait runs masked (the
+                    // caller may hold IRQs off) — same reasoning as the
+                    // IrqSafeSpinLock busy-wait. Cheap when nothing is pending.
+                    run_lock_spin_hook();
                     spin_loop();
                 }
             }

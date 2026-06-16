@@ -5478,18 +5478,34 @@ kernel_test_in!("memory", smoke_diag_phase_round_trip);
 
 fn smoke_diag_bump_irq_counts_total_and_last() -> TestResult {
     use crate::diag;
+    // `bump_irq` is also called by the live IRQ handler (interrupts::on_irq),
+    // and vector 32 is the timer tick — a real IRQ landing between the reset
+    // and the snapshot would push irq_total past 3 and flake this test. Mask
+    // IRQs across the reset → bump → snapshot window so the count reflects
+    // exactly our three bumps. (Restored to the caller's prior state after.)
+    let was_enabled = narf_arch::interrupts_enabled();
+    // SAFETY: a brief local IRQ mask in a synchronous test; restored below.
+    unsafe {
+        narf_arch::disable_interrupts();
+    }
     diag::__reset_for_test();
     diag::bump_irq(32);
     diag::bump_irq(33);
     diag::bump_irq(32);
     let s = diag::snapshot();
+    diag::__reset_for_test();
+    if was_enabled {
+        // SAFETY: restoring the IRQ state observed on entry.
+        unsafe {
+            narf_arch::enable_interrupts();
+        }
+    }
     if s.irq_total != 3 {
         return TestResult::Fail("irq_total not 3 after 3 bumps");
     }
     if s.last_irq_vector != 32 {
         return TestResult::Fail("last_irq_vector not the latest bump");
     }
-    diag::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_diag_bump_irq_counts_total_and_last);

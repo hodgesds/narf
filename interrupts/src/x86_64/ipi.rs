@@ -213,6 +213,37 @@ pub unsafe fn on_shootdown_irq() {
     ACK_COUNT[i].fetch_add(1, Ordering::Release);
 }
 
+/// Service a TLB shootdown a peer published to THIS cpu, if one is
+/// pending, WITHOUT going through the IRQ handler. Returns immediately
+/// when nothing is pending (so it never spuriously bumps the ack
+/// counter).
+///
+/// Called from `shoot_range`'s ack-wait spin: a CPU sending a shootdown
+/// spins for peer acks with IRQs masked (it is invoked while a
+/// page-table lock is held). If two CPUs shoot down concurrently, each
+/// would wait forever for the other's ack — the other can't take the
+/// IPI with IRQs masked. Polling here lets each spinning sender service
+/// the other's request directly, breaking the deadlock. A stray IPI that
+/// later delivers finds the slot already cleared and is a no-op flush.
+///
+/// # Safety
+/// CPL=0; consumes only this CPU's per-CPU `PENDING_*` cells.
+#[inline]
+pub unsafe fn poll_pending_shootdown() {
+    let cpu = narf_lib::percpu::current_cpu();
+    let i = cpu.min(MAX_CPUS - 1);
+    // A real request is signalled by a non-zero VA or tag (publish order
+    // is TAG → PAGES → VA, so observing either under acquire is enough).
+    if PENDING_VA[i].load(Ordering::Acquire) == 0 && PENDING_TAG[i].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    // SAFETY: same contract as the IRQ-path handler; the per-CPU cells
+    // are ours to consume and INVLPG/INVPCID at CPL=0 is always legal.
+    unsafe {
+        on_shootdown_irq();
+    }
+}
+
 /// x2APIC ICR with delivery mode = Fixed, destination shorthand =
 /// "all excluding self" (bits 19..=18 = 0b11), trigger = edge,
 /// vector = `VECTOR_TLB_SHOOTDOWN`. Bit 14 (level=assert) is set
@@ -290,6 +321,14 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
         }
         let i = (cpu as usize).min(MAX_CPUS - 1);
         while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
+            // Service any shootdown a peer published to US while we spin —
+            // we hold IRQs masked here (a page-table lock is held by the
+            // caller), so the IPI can't land, and a peer that is likewise
+            // spinning for OUR ack would otherwise deadlock against us.
+            // SAFETY: CPL=0; consumes only this CPU's pending cells.
+            unsafe {
+                poll_pending_shootdown();
+            }
             // PAUSE hint to release the resource for the other
             // hyperthread / power down the spin.
             core::hint::spin_loop();

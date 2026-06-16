@@ -788,6 +788,18 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // → IPI fan-out hook so the asid/pcid-isolation surface
             // also benefits from cross-CPU dispatch.
             narf_interrupts::install_tlb_shootdown_bridge();
+            // Let a CPU spinning on an IrqSafeSpinLock (IRQs masked) drain a
+            // shootdown a peer published to it — otherwise the peer's ack-wait
+            // would spin to its cap and give up, stranding a stale TLB on a
+            // shared address space. Only meaningful with the IPI surface live
+            // (i.e. x2APIC), which is exactly this block.
+            narf_lib::sync::set_lock_spin_hook(|| {
+                // SAFETY: CPL=0; poll_pending_shootdown only consumes this
+                // CPU's pending shootdown cells and INVLPGs.
+                unsafe {
+                    narf_interrupts::x86_64::ipi::poll_pending_shootdown();
+                }
+            });
         }
     }
 
@@ -1648,19 +1660,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if started > 0 {
                         narf_scheduler::enable_work_stealing();
                         let _ = writeln!(console::Writer, "  smp: work-stealing enabled");
-                        // User-task SMP (feature-gated, OFF by default —
-                        // see frame Cargo.toml `user-task-smp`). The
-                        // per-AP user-mode machinery + cross-CPU TLB
-                        // shootdown are always built; flipping migration
-                        // ON awaits userspace SMP-hardening (interactive
-                        // shell + dynamic-linker paths). Enable only when
-                        // the TLB-shootdown broadcast hook is wired, which
-                        // is iff x2APIC is active (see the
-                        // `set_shootdown_hook` block above); under xAPIC
-                        // fallback unmap/mprotect can't invalidate peer
-                        // TLBs, so a thread group sharing an address space
-                        // across cores would use-after-unmap.
-                        #[cfg(feature = "user-task-smp")]
+                        // User-task SMP migration — ON by default (the
+                        // `user-task-smp` feature is in frame's default set;
+                        // `usmp_active` = that feature AND not kernel-test).
+                        // The dynamic-linker / shootdown deadlock + AP
+                        // EFER/CR4 gaps are fixed, so we actually enable
+                        // migration here. Still gated on x2APIC: the cross-CPU
+                        // TLB-shootdown broadcast hook is only wired when
+                        // x2APIC is active (see the `set_shootdown_hook` block
+                        // above); under the xAPIC fallback unmap/mprotect
+                        // can't invalidate peer TLBs, so a thread group
+                        // sharing an address space across cores would
+                        // use-after-unmap — there we leave tasks BOOT-pinned.
+                        #[cfg(usmp_active)]
                         {
                             let x2apic_active = narf_interrupts::x86_64::apic::X2APIC_ACTIVE
                                 .load(core::sync::atomic::Ordering::Acquire);

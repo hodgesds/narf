@@ -110,7 +110,7 @@ pub unsafe fn init_bsp() {
 /// installed this AP's TSS *and reloaded `gs`* (which zeroes GS.base —
 /// this call restores it). `kernel_stack_top` must be the top of this
 /// AP's `rsp0` stack as returned by `gdt::init_ap`.
-#[cfg(feature = "user-task-smp")]
+#[cfg(usmp_active)]
 pub unsafe fn init_ap(cpu_id: u32, kernel_stack_top: u64) {
     let pc: &'static PerCpu = alloc::boxed::Box::leak(alloc::boxed::Box::new(PerCpu::new(cpu_id)));
     pc.kernel_stack_top
