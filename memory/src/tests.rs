@@ -2420,6 +2420,43 @@ fn smoke_memory_map_region_owns_its_phys_vec() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_map_region_owns_its_phys_vec);
 
+/// The no-hint mmap arena must FAIL CLOSED at `MMAP_WINDOW_TOP` rather
+/// than letting the monotonic cursor march into the stack reserve and
+/// across the non-canonical boundary (which would re-create the silent
+/// #GP-kill the window was introduced to prevent). A reservation that
+/// would cross the ceiling returns 0 (→ -ENOMEM at the syscall layer);
+/// in-window reservations succeed and stay below the ceiling.
+fn smoke_memory_mmap_arena_fails_closed_at_ceiling() -> TestResult {
+    use crate::AddressSpace;
+
+    let a = AddressSpace::empty();
+    // A normal reservation succeeds and lands inside the window.
+    let first = a.reserve_mmap_va(0x1000);
+    if !(AddressSpace::MMAP_CURSOR_BASE..AddressSpace::MMAP_WINDOW_TOP).contains(&first) {
+        return TestResult::Fail("first reservation outside the mmap window");
+    }
+    // Consume almost the entire window in one shot, parking the cursor a
+    // hair below the ceiling.
+    let window = AddressSpace::MMAP_WINDOW_TOP - AddressSpace::MMAP_CURSOR_BASE;
+    let near = a.reserve_mmap_va(window - 0x4000);
+    if near == 0 {
+        return TestResult::Fail("large in-window reservation wrongly failed");
+    }
+    // A reservation that would cross MMAP_WINDOW_TOP must fail closed (0),
+    // NOT hand back a base in the stack reserve / non-canonical half.
+    let over = a.reserve_mmap_va(0x1_0000_0000); // 4 GiB — does not fit
+    if over != 0 {
+        return TestResult::Fail("reservation past the ceiling did not fail closed");
+    }
+    // And a tiny reservation that still fits at the very top succeeds.
+    let last = a.reserve_mmap_va(0x1000);
+    if last == 0 || last >= AddressSpace::MMAP_WINDOW_TOP {
+        return TestResult::Fail("final in-window reservation failed or crossed ceiling");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_mmap_arena_fails_closed_at_ceiling);
+
 /// Buddy allocator invariant: a sequence of N back-to-back
 /// `alloc_frame` calls without any intervening `free_frame` MUST
 /// return N distinct physical frames. A failure here is the root
