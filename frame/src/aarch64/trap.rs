@@ -194,10 +194,16 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         if is_translation_fault {
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(far);
+                // Publish the faulting task's NUMA mempolicy for `far`
+                // so demand-paging steers the fresh frame
+                // (set_mempolicy/mbind enforcement). Cleared right after.
+                narf_userspace::publish_mempolicy_for_fault(far);
                 // SAFETY: low-RAM phys-as-virt window is live;
                 // AS is the active user AS by construction.
                 // SAFETY: Valid memory or trusted environment
-                if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
+                let r = unsafe { as_arc.demand_alloc_page(v) };
+                narf_userspace::clear_mempolicy_for_fault();
+                if r.is_ok() {
                     return;
                 }
                 // SAFETY: same.

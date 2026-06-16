@@ -368,10 +368,16 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         if p_clear && (from_user || cr2_in_user_half) {
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
+                // Publish the faulting task's NUMA mempolicy for `cr2`
+                // so the demand-paging allocator steers the fresh frame
+                // (set_mempolicy/mbind enforcement). Cleared right after.
+                narf_userspace::publish_mempolicy_for_fault(cr2);
                 // SAFETY: identity map live, AS belongs to the
                 // task whose CR3 is currently active.
                 // SAFETY: Valid memory or trusted environment
-                if unsafe { as_arc.demand_alloc_page(v) }.is_ok() {
+                let r = unsafe { as_arc.demand_alloc_page(v) };
+                narf_userspace::clear_mempolicy_for_fault();
+                if r.is_ok() {
                     return;
                 }
                 // Demand-alloc surfaced Unmapped: vaddr might land

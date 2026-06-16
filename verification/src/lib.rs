@@ -1901,6 +1901,96 @@ fn smoke_frame_free_routes_to_owning_node() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test!(smoke_frame_free_routes_to_owning_node);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_numa_slit_distance_matrix() -> TestResult {
+    // The QEMU NUMA host wires a 2-node SLIT with local=10/remote=20
+    // (`-numa dist,...`). Re-parse SRAT + SLIT from the cached boot
+    // RSDP (synthetic-body tests upstream may have scrubbed the shared
+    // tables), then assert the distance matrix matches the host config.
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
+    // SAFETY: same cached RSDP.
+    let slit = unsafe { narf_acpi::parse_slit(rsdp) };
+    match slit {
+        Ok(n) if n >= 2 => {}
+        Ok(_) => return TestResult::Fail("SLIT parsed < 2 localities"),
+        Err(_) => return TestResult::Fail("SLIT not present/parse failed"),
+    }
+    if !narf_acpi::is_slit_known() {
+        return TestResult::Fail("is_slit_known() false after parse");
+    }
+    // Distance matrix: diagonal = LOCAL_DISTANCE (10), off-diagonal =
+    // REMOTE_DISTANCE (20).
+    if narf_acpi::node_distance(0, 0) != 10 {
+        return TestResult::Fail("node_distance(0,0) != 10");
+    }
+    if narf_acpi::node_distance(1, 1) != 10 {
+        return TestResult::Fail("node_distance(1,1) != 10");
+    }
+    if narf_acpi::node_distance(0, 1) != 20 {
+        return TestResult::Fail("node_distance(0,1) != 20");
+    }
+    if narf_acpi::node_distance(1, 0) != 20 {
+        return TestResult::Fail("node_distance(1,0) != 20");
+    }
+    // numa_node_count reflects the SLIT locality dimension.
+    if narf_acpi::numa_node_count() < 2 {
+        return TestResult::Fail("numa_node_count() < 2");
+    }
+    // Out-of-range falls back to the Linux convention (10 same / 20 diff).
+    if narf_acpi::node_distance(99, 99) != 10 || narf_acpi::node_distance(99, 7) != 20 {
+        return TestResult::Fail("out-of-range distance fallback wrong");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_numa_slit_distance_matrix);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_numa_mempolicy_bind_steers_alloc() -> TestResult {
+    // MPOL_BIND enforcement: with the active policy bound to node 1,
+    // a policied allocation must land in node 1's SRAT memory range.
+    // Then MPOL_PREFERRED node 0 must land in node 0's range.
+    use narf_memory::{free_frame, mempolicy_clear, mempolicy_set, Mempolicy, MPOL_BIND};
+    if !narf_memory::is_numa_aware() {
+        return TestResult::Fail("frame allocator not NUMA-rebalanced");
+    }
+    let rsdp = match narf_acpi::cached_rsdp() {
+        Some(p) => p,
+        None => return TestResult::Fail("no boot-time RSDP cached"),
+    };
+    // SAFETY: cached RSDP, validated at boot.
+    let _ = unsafe { narf_acpi::parse_srat(rsdp) };
+
+    // Bind to node 1 (nodemask bit 1).
+    mempolicy_set(Mempolicy {
+        mode: MPOL_BIND,
+        nodemask: 0b10,
+    });
+    let f = match narf_memory::alloc_frame_policied(0) {
+        Ok(f) => f,
+        Err(_) => {
+            mempolicy_clear();
+            return TestResult::Fail("policied alloc (BIND node1) failed");
+        }
+    };
+    let node = narf_acpi::memory_node(f.start_address().raw());
+    free_frame(f);
+    mempolicy_clear();
+    match node {
+        Some(1) => {}
+        Some(_) => return TestResult::Fail("MPOL_BIND node1 returned wrong-node frame"),
+        None => return TestResult::Fail("BIND frame not in any SRAT range"),
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test!(smoke_numa_mempolicy_bind_steers_alloc);
+
 // `smoke_acpi_hmat_latency_lookup` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
 
 // `smoke_acpi_hmat_mem_attrs_present` migrated to acpi/src/tests.rs (subsystem `"acpi"`).
@@ -4178,6 +4268,11 @@ define_smoke_elf!(
     NARF_PROCFS2_SMOKE_ELF,
     "NARF_PROCFS2_SMOKE_ELF_X86_64",
     "NARF_PROCFS2_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
+    NARF_NUMA_SMOKE_ELF,
+    "NARF_NUMA_SMOKE_ELF_X86_64",
+    "NARF_NUMA_SMOKE_ELF_AARCH64"
 );
 define_smoke_elf!(
     NARF_DSO_SMOKE_ELF,

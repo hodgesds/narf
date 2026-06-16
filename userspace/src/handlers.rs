@@ -5442,22 +5442,89 @@ fn sys_process_vm_writev(ctx: &mut dyn TrapContext) {
 
 // ── NUMA memory policy: set_mempolicy / get_mempolicy / mbind ─────────
 //
-// NARF has no NUMA-aware allocator yet, so memory policy is advisory:
-// the per-task default policy round-trips through a side table and mbind
-// validates-and-accepts. The mode's low bits select the policy; the high
-// bits carry MPOL_F_* flags which we ignore but preserve in the stored
-// value so get_mempolicy reflects them.
+// Memory policy is *enforced*: the per-task default policy and per-range
+// (mbind) policies are stored here, and the page-fault path publishes
+// the policy in force for the faulting address into
+// `narf_memory::mempolicy` so the per-node buddy allocator steers the
+// fresh frame to the chosen node (see `publish_mempolicy_for_fault`).
+// The mode's low bits select the policy; the high bits carry MPOL_F_*
+// flags which we preserve in the stored value so get_mempolicy reflects
+// them, but they don't affect allocation steering.
 
 const MPOL_MAX: u32 = 5; // DEFAULT/PREFERRED/BIND/INTERLEAVE/LOCAL
 const MPOL_MODE_FLAGS: u32 = 0xc000_0000; // MPOL_F_STATIC_NODES | _RELATIVE_NODES
 
-/// Per-task (mode_with_flags, first-word nodemask) default policy.
+// Online NUMA node count via a weak hook (userspace avoids a direct
+// narf-acpi dep to keep the kernel image under lld's orphan-placement
+// threshold — see filesystem/src/sysfs.rs). `narf-frame` provides it.
+extern "Rust" {
+    fn narf_numa_node_count() -> u32;
+}
+
+#[inline]
+fn numa_node_count() -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    unsafe { narf_numa_node_count() }.max(1)
+}
+
+// get_mempolicy `flags` bits (uapi/linux/mempolicy.h).
+const MPOL_F_NODE: u32 = 1 << 0; // return the node id, not the mode
+const MPOL_F_ADDR: u32 = 1 << 1; // query the policy at `addr`
+const MPOL_F_MEMS_ALLOWED: u32 = 1 << 2; // return the allowed-nodes mask
+
+/// One stored policy: mode (with flags) + first-word nodemask.
+type StoredPolicy = (u32, u64);
+
+/// Per-task default policy (set_mempolicy).
 static MEMPOLICY_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, (u32, u64)>>,
+    Option<alloc::collections::BTreeMap<u64, StoredPolicy>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Per-task range policies (mbind), keyed by (task, range-start); each
+/// entry covers `[start, start+len)`.
+#[allow(clippy::type_complexity)]
+static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, u64, StoredPolicy)>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn mpol_mode_valid(mode: u32) -> bool {
     (mode & !MPOL_MODE_FLAGS) < MPOL_MAX
+}
+
+/// Resolve the policy in force for `task` at user address `va`: a
+/// covering mbind range wins, else the task default, else DEFAULT.
+fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
+    if let Some(ranges) = MBIND_TABLE.lock().as_ref().and_then(|m| m.get(&task)) {
+        for &(start, len, pol) in ranges.iter() {
+            if va >= start && va < start.saturating_add(len) {
+                return pol;
+            }
+        }
+    }
+    MEMPOLICY_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or((0, 0))
+}
+
+/// Publish the current task's mempolicy for the faulting address `va`
+/// into the memory crate's per-CPU active slot, so the demand-paging
+/// allocator steers the fresh frame. Called by the #PF handler right
+/// before `demand_alloc_page`. Returns nothing; the slot is cleared by
+/// `clear_mempolicy_for_fault` afterward.
+pub fn publish_mempolicy_for_fault(va: u64) {
+    let task = current_task_id();
+    let (mode, nodemask) = resolve_policy(task, va);
+    narf_memory::mempolicy_set(narf_memory::Mempolicy {
+        mode: mode & !MPOL_MODE_FLAGS,
+        nodemask,
+    });
+}
+
+/// Clear the per-CPU active mempolicy after a fault is serviced.
+pub fn clear_mempolicy_for_fault() {
+    narf_memory::mempolicy_clear();
 }
 
 /// `set_mempolicy(mode, nodemask, maxnode)`.
@@ -5481,22 +5548,56 @@ fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
 }
 
 /// `get_mempolicy(mode, nodemask, maxnode, addr, flags)` — report the
-/// task's default policy (the MPOL_F_ADDR per-address query degrades to
-/// the same default here).
+/// policy in force. Honors the query flags:
+/// - `MPOL_F_ADDR`: report the policy covering `addr` (an mbind range,
+///   else the task default).
+/// - `MPOL_F_NODE` (with `MPOL_F_ADDR`): write the node the page at
+///   `addr` would allocate from into `*mode`.
+/// - `MPOL_F_MEMS_ALLOWED`: write the set of allowed nodes into the
+///   nodemask (all online nodes here).
 fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let mode_ptr = a.arg0;
     let nodemask_ptr = a.arg1;
+    let addr = a.arg3;
+    let flags = a.arg4 as u32;
     let task = current_task_id();
-    let (mode, nodemask) = MEMPOLICY_TABLE
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or((0, 0)); // MPOL_DEFAULT
+
+    if flags & MPOL_F_MEMS_ALLOWED != 0 {
+        // Report the mask of nodes this task may use: every online node.
+        let n = numa_node_count().min(64);
+        let allowed: u64 = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if nodemask_ptr != 0 {
+            // SAFETY: copy_to_user validates the user pointer/length.
+            let _ = unsafe { copy_to_user(nodemask_ptr, &allowed.to_le_bytes()) };
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    let (mode, nodemask) = if flags & MPOL_F_ADDR != 0 {
+        resolve_policy(task, addr)
+    } else {
+        MEMPOLICY_TABLE
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&task).copied())
+            .unwrap_or((0, 0)) // MPOL_DEFAULT
+    };
+
     if mode_ptr != 0 {
-        // `mode` is written as an int.
+        let out_word: i32 = if flags & MPOL_F_NODE != 0 && flags & MPOL_F_ADDR != 0 {
+            // Report the node the page at `addr` would come from.
+            let pol = narf_memory::Mempolicy {
+                mode: mode & !MPOL_MODE_FLAGS,
+                nodemask,
+            };
+            mempolicy_resolved_node(pol) as i32
+        } else {
+            mode as i32
+        };
         // SAFETY: mode_ptr is the user int out-pointer; copy_to_user validates it.
-        if unsafe { copy_to_user(mode_ptr, &(mode as i32).to_le_bytes()) }.is_err() {
+        if unsafe { copy_to_user(mode_ptr, &out_word.to_le_bytes()) }.is_err() {
             ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
             return;
         }
@@ -5508,14 +5609,63 @@ fn sys_get_mempolicy(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// `mbind(addr, len, mode, nodemask, maxnode, flags)` — set a range
-/// policy. Validated and accepted; NARF applies no per-range NUMA
-/// binding yet.
+/// The node a fresh page under `pol` would be allocated from (used by
+/// get_mempolicy's MPOL_F_NODE|MPOL_F_ADDR query). Mirrors the
+/// allocator's preference resolution without actually allocating.
+fn mempolicy_resolved_node(pol: narf_memory::Mempolicy) -> u32 {
+    match pol.mode {
+        x if x == narf_memory::MPOL_BIND || x == narf_memory::MPOL_PREFERRED => {
+            if pol.nodemask != 0 {
+                pol.nodemask.trailing_zeros()
+            } else {
+                narf_memory::frame::local_node() as u32
+            }
+        }
+        x if x == narf_memory::MPOL_INTERLEAVE => {
+            if pol.nodemask != 0 {
+                pol.nodemask.trailing_zeros()
+            } else {
+                0
+            }
+        }
+        // DEFAULT / LOCAL
+        _ => narf_memory::frame::local_node() as u32,
+    }
+}
+
+/// `mbind(addr, len, mode, nodemask, maxnode, flags)` — bind a range to
+/// a NUMA policy. Stored per (task, range); the fault path consults it
+/// via `resolve_policy` so the binding is enforced on demand-fault.
 fn sys_mbind(ctx: &mut dyn TrapContext) {
-    let mode = ctx.args().arg2 as u32;
+    let a = *ctx.args();
+    let addr = a.arg0;
+    let len = a.arg1;
+    let mode = a.arg2 as u32;
     if !mpol_mode_valid(mode) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
+    }
+    let nodemask = if a.arg3 != 0 {
+        read_user_u64(a.arg3)
+    } else {
+        0
+    };
+    // Page-align the range like Linux (addr must be page-aligned;
+    // EINVAL otherwise).
+    if addr & 0xFFF != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let task = current_task_id();
+    let mut g = MBIND_TABLE.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    let ranges = map.entry(task).or_default();
+    // Drop any existing exact-overlap entry, then insert; a fresh mbind
+    // over the same start replaces the old policy.
+    ranges.retain(|&(s, _, _)| s != addr);
+    if (mode & !MPOL_MODE_FLAGS) != 0 {
+        // MPOL_DEFAULT removes the range binding (Linux semantics).
+        ranges.push((addr, len, (mode, nodemask)));
     }
     ctx.set_return(SyscallReturn::ok(0));
 }

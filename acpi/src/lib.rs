@@ -3523,6 +3523,54 @@ pub fn slit_locality_count() -> u32 {
     SLIT_DATA.lock().locality_count
 }
 
+/// Linux's `LOCAL_DISTANCE` — the ACPI-mandated distance from a node
+/// to itself (SLIT diagonal). See `include/linux/topology.h`.
+pub const LOCAL_DISTANCE: u8 = 10;
+
+/// Linux's `REMOTE_DISTANCE` — the conventional distance to a
+/// different node when no SLIT is present. See
+/// `include/linux/topology.h`.
+pub const REMOTE_DISTANCE: u8 = 20;
+
+/// NUMA distance from node `from` to node `to`, following the Linux
+/// `node_distance()` contract (`drivers/base/arch_numa.c` /
+/// `arch/x86/mm/numa.c`).
+///
+/// - When SLIT is parsed and both localities are in range, returns the
+///   parsed matrix entry.
+/// - Otherwise falls back to the Linux convention: `LOCAL_DISTANCE`
+///   (10) for a node to itself, `REMOTE_DISTANCE` (20) across nodes.
+///
+/// This is the single public distance accessor the allocator,
+/// scheduler, and sysfs all consume so the fallback is uniform.
+pub fn node_distance(from: u32, to: u32) -> u8 {
+    if is_slit_known() {
+        let t = SLIT_DATA.lock();
+        if from < t.locality_count && to < t.locality_count {
+            return t.matrix[from as usize][to as usize];
+        }
+    }
+    if from == to {
+        LOCAL_DISTANCE
+    } else {
+        REMOTE_DISTANCE
+    }
+}
+
+/// Number of NUMA nodes the distance machinery should iterate over.
+///
+/// Prefers the SLIT locality count (the authoritative distance-matrix
+/// dimension); falls back to the SRAT-derived proximity-domain count,
+/// and finally to 1 (single flat node) so callers always get a sane,
+/// non-zero bound.
+pub fn numa_node_count() -> u32 {
+    let slit = slit_locality_count();
+    if slit > 0 {
+        return slit;
+    }
+    node_count().max(1)
+}
+
 #[doc(hidden)]
 pub fn __test_parse_slit_body(body: &[u8]) -> u32 {
     let n = parse_slit_body(body);
