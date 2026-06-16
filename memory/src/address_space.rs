@@ -513,26 +513,39 @@ impl AddressSpace {
         let pages = (region.len + 0xFFF) >> 12;
         for i in 0..pages {
             let v = VirtAddr::new(region.base.as_u64() + (i << 12));
-            // SAFETY: same identity-mapping precondition as
-            // `materialize`; `v` lies inside `region` which was
-            // bookkept by `map_region`.
-            // An `Err` here means already-unmapped (double munmap, or the
-            // region was partially materialised), which is benign: the
-            // bookkeeping is gone now, the frames either never landed or are
-            // already back in the allocator.
+            // Tear down the leaf PTE. We deliberately IGNORE the phys it
+            // returns and free `region.phys[i]` instead — the region's
+            // own backing list is authoritative, the PTE can lag it.
+            // `cow_split_on_write` repoints `region.phys[i]` to the fresh
+            // private frame, but the PTE is only rewritten by the SEPARATE
+            // `remap_page` (the #PF handler calls both; any caller that
+            // splits without remapping leaves the PTE pointing at the OLD,
+            // already-freed frame). Freeing the PTE target there would
+            // double-free the old frame — the root of the "marginal-buddy"
+            // corruption. Freeing `region.phys[i]` frees exactly the frame
+            // this region owns, regardless of PTE drift.
+            // SAFETY: same identity-mapping precondition as `materialize`;
+            // `v` lies inside `region`. An `Err` (already unmapped) is
+            // benign — we still consult region.phys below.
             // SAFETY: Valid memory or trusted environment
-            if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
+            let _ = unsafe { unmap_4kb(self.root, v) };
+            {
                 // Borrowed (SHARED) frames belong to an external
                 // registry — unmap the PTE but never free the phys.
                 if region.perms.contains(RegionPerms::SHARED) {
                     continue;
                 }
-                // Skip phys that's registered as a page-table
-                // frame — `free_user_pml4_tree` will reclaim it
-                // on its own walk. Freeing here would double-free.
-                if crate::frame::__pagetable_is_registered(phys.raw()) {
-                    continue;
-                }
+                let phys = match region.phys.get(i as usize) {
+                    Some(p) if p.raw() != 0 => *p,
+                    // Demand-paged-but-untouched (phys 0) or a length
+                    // mismatch: nothing this region owns to free here.
+                    _ => continue,
+                };
+                // No `__pagetable_is_registered` guard here: a region's
+                // backing list only ever holds DATA frames (the loader,
+                // demand_alloc, and cow_split all populate it), never a
+                // page-table page — so the check could never fire, and at
+                // O(PT_REGISTRY_LEN) per page it was a real teardown cost.
                 free_frame(PhysFrame::new(phys));
             }
         }
@@ -548,15 +561,23 @@ impl AddressSpace {
         let pages = (region.len + 0xFFF) >> 12;
         for i in 0..pages {
             let v = VirtAddr::new(region.base.as_u64() + (i << 12));
+            // Tear down the PTE but free `region.phys[i]`, not the PTE
+            // target — the backing list is authoritative and the PTE can
+            // lag it (see the x86_64 variant for the full rationale).
             // SAFETY: see x86_64 variant.
-            if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
-                // Borrowed (SHARED) frames belong to an external registry
-                // — unmap the PTE but never free the phys.
-                if region.perms.contains(RegionPerms::SHARED) {
-                    continue;
-                }
-                free_frame(PhysFrame::new(phys));
+            let _ = unsafe { unmap_4kb(self.root, v) };
+            // Borrowed (SHARED) frames belong to an external registry
+            // — unmap the PTE but never free the phys.
+            if region.perms.contains(RegionPerms::SHARED) {
+                continue;
             }
+            let phys = match region.phys.get(i as usize) {
+                Some(p) if p.raw() != 0 => *p,
+                _ => continue,
+            };
+            // No is_registered guard — region.phys only holds data frames
+            // (see the x86_64 variant).
+            free_frame(PhysFrame::new(phys));
         }
     }
 
@@ -1253,6 +1274,20 @@ impl AddressSpace {
                 // LOCKED region — hint is honoured as a no-op so
                 // mlock'd pages stay resident.
                 if r.perms.contains(RegionPerms::LOCKED) {
+                    continue;
+                }
+                // SHARED region (vDSO / vvar / SysV shmem) — its frames
+                // are BORROWED from a global singleton / external
+                // registry, not allocated by this AS. Freeing them here
+                // (as the bookkeeping below would, then
+                // `madvise_release_pages`) returns a live, externally-
+                // owned frame to the buddy, which re-hands it out as
+                // another task's page table → the cross-AS double-free
+                // behind the "marginal-buddy" corruption. Every sibling
+                // teardown path (`unmap_region_pages`, `unmap_free_page`)
+                // skips SHARED for exactly this reason; MADV_DONTNEED must
+                // too — treat it as a no-op over a borrowed mapping.
+                if r.perms.contains(RegionPerms::SHARED) {
                     continue;
                 }
                 let start_v = lo.max(rb);
