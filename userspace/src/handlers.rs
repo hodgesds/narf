@@ -9776,14 +9776,6 @@ fn read_uidgid(task: u64) -> UidGid {
 /// for a real syscall MUST go through here. (Verified by grep: the
 /// open path is the sole call site; the only other `Accessor {…}`
 /// literals are in `tests.rs`.)
-/// Test-only window onto the DAC funnel so the security smoke can
-/// assert the exact host-id translation `sys_open` would use.
-#[cfg(feature = "container")]
-#[doc(hidden)]
-pub fn __test_current_accessor(task: u64) -> narf_filesystem::Accessor {
-    current_accessor(task)
-}
-
 fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     let acc = read_uidgid(task);
     #[cfg(feature = "container")]
@@ -9801,6 +9793,14 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
         uid: acc.fsuid,
         gid: acc.fsgid,
     }
+}
+
+/// Test-only window onto the DAC funnel so the security smoke can
+/// assert the exact host-id translation `sys_open` would use.
+#[cfg(feature = "container")]
+#[doc(hidden)]
+pub fn __test_current_accessor(task: u64) -> narf_filesystem::Accessor {
+    current_accessor(task)
 }
 
 /// Copy the parent's credential entry (uid/gid/euid/egid/fsuid/fsgid)
