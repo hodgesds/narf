@@ -541,12 +541,11 @@ impl AddressSpace {
                     // mismatch: nothing this region owns to free here.
                     _ => continue,
                 };
-                // Skip phys that's registered as a page-table frame —
-                // `free_user_pml4_tree` reclaims it on its own walk.
-                // (region.phys should never hold a table frame, but guard.)
-                if crate::frame::__pagetable_is_registered(phys.raw()) {
-                    continue;
-                }
+                // No `__pagetable_is_registered` guard here: a region's
+                // backing list only ever holds DATA frames (the loader,
+                // demand_alloc, and cow_split all populate it), never a
+                // page-table page — so the check could never fire, and at
+                // O(PT_REGISTRY_LEN) per page it was a real teardown cost.
                 free_frame(PhysFrame::new(phys));
             }
         }
@@ -576,9 +575,8 @@ impl AddressSpace {
                 Some(p) if p.raw() != 0 => *p,
                 _ => continue,
             };
-            if crate::frame::__pagetable_is_registered(phys.raw()) {
-                continue;
-            }
+            // No is_registered guard — region.phys only holds data frames
+            // (see the x86_64 variant).
             free_frame(PhysFrame::new(phys));
         }
     }
