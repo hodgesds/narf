@@ -1584,6 +1584,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("psched_smoke", "psched-ok"),
         // Linux-compat round 20: futex2 wait/wake/requeue/waitv.
         ("futex2_smoke", "futex2-ok"),
+        // Contended futex: N-thread mutex + join + condvar ping-pong.
+        ("futex_contend_smoke", "futex-contend-ok"),
         // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
         ("keyring_smoke", "keyring-ok"),
         // Linux-compat round 22: inotify real event delivery.

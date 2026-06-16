@@ -154,6 +154,21 @@ impl AddressSpace {
     /// mmap returning addresses in the same broad range.
     pub const MMAP_CURSOR_BASE: u64 = 0x0000_4080_0000_0000;
 
+    /// Ceiling of the no-hint mmap window. The user stack lives at the
+    /// TOP of the user half (`DEFAULT_USER_STACK_BASE` = 0x7FFF_FFFC_0000)
+    /// and grows down, so the mmap arena must stop well below it: this
+    /// leaves ~1 TiB of stack-growth headroom above the window while
+    /// still giving mmap a ~63 TiB arena. `bump_mmap_cursor_past`
+    /// ignores regions at/above this ceiling (the stack + its guard), so
+    /// registering the high-addressed stack region can't drag the cursor
+    /// up into the stack. Without that, the cursor climbed to the stack
+    /// top and subsequent no-hint mmaps (notably 2nd+ thread stacks)
+    /// were handed VAs that overlapped the stack and then straddled the
+    /// 0x0000_8000_0000_0000 canonical boundary — a non-canonical store
+    /// there #GP-kills the faulting thread, silently wedging every
+    /// multithreaded process that spawned a second thread.
+    pub const MMAP_WINDOW_TOP: u64 = 0x0000_7F00_0000_0000;
+
     /// Fresh address space with no regions. Stage-4 arch backend
     /// must assign `root` to a freshly-allocated page-table frame.
     pub const fn empty() -> Self {
@@ -179,12 +194,17 @@ impl AddressSpace {
     }
 
     /// Keep the mmap-allocation cursor past `region_end` when a region is
-    /// mapped into (or above) the mmap range, so the next
-    /// `reserve_mmap_va` can't hand back a colliding VA. No-op for
-    /// regions that live below the mmap window (program image, stack).
+    /// mapped into the mmap window, so the next `reserve_mmap_va` can't
+    /// hand back a colliding VA. No-op for regions that live outside the
+    /// window: below it (program image / interp / brk) OR at/above it
+    /// (the user stack + its guard, which sit at the very top of the
+    /// user half). The latter exclusion is load-bearing — without it,
+    /// registering the high-addressed stack region dragged the cursor up
+    /// to the stack top, so subsequent (e.g. thread-stack) mmaps climbed
+    /// into the stack and across the canonical boundary.
     fn bump_mmap_cursor_past(&self, region_base: u64, region_len: u64) {
         use core::sync::atomic::Ordering;
-        if region_base < Self::MMAP_CURSOR_BASE {
+        if !(Self::MMAP_CURSOR_BASE..Self::MMAP_WINDOW_TOP).contains(&region_base) {
             return;
         }
         let region_end = region_base.saturating_add(region_len);

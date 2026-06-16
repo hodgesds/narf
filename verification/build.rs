@@ -389,6 +389,7 @@ fn main() {
         "mem2_smoke",
         "psched_smoke",
         "futex2_smoke",
+        "futex_contend_smoke",
         "keyring_smoke",
         "inotify2_smoke",
         "fanotify_smoke",
