@@ -1,8 +1,8 @@
 // setitimer(2) / getitimer(2) / alarm(2) smoke. Arm ITIMER_REAL for a
-// 50 ms one-shot, confirm getitimer reports a non-zero remaining value,
-// then pause() until the kernel timer pump delivers SIGALRM. Finally
-// check alarm() returns the previous (unexpired) alarm's remaining
-// seconds. Success token "itimer-ok".
+// far-future one-shot and confirm getitimer reports a non-zero remaining
+// value, then re-arm a 50 ms one-shot and pause() until the kernel timer
+// pump delivers SIGALRM. Finally check alarm() returns the previous
+// (unexpired) alarm's remaining seconds. Success token "itimer-ok".
 //
 // The kernel raises SIGALRM from a sleep-pump while the task is parked
 // in pause(); the poll loop breaks the (infinite) park on the pending
@@ -27,8 +27,16 @@ int main(void) {
     if (sigaction(SIGALRM, &sa, 0) != 0) { w("itimer-fail: sigaction\n"); return 1; }
 
     struct itimerval it;
+
+    // (1) getitimer reports the remaining time of an armed one-shot.
+    // Arm a far-future value (1000 s): on a slow TCG / no-TSC-deadline
+    // QEMU the wall-clock gap between this setitimer and the getitimer
+    // below can be tens of ms, so a short (50 ms) one-shot could legally
+    // fire in between and read back zero — a false "getitimer-zero". A
+    // 1000 s timer cannot elapse in that window, so the only way to read
+    // zero here is a genuine getitimer bug.
     memset(&it, 0, sizeof it);
-    it.it_value.tv_usec = 50000; // 50 ms one-shot
+    it.it_value.tv_sec = 1000;
     if (setitimer(ITIMER_REAL, &it, 0) != 0) { w("itimer-fail: setitimer\n"); return 1; }
 
     struct itimerval cur;
@@ -37,6 +45,13 @@ int main(void) {
     if (cur.it_value.tv_sec == 0 && cur.it_value.tv_usec == 0) {
         w("itimer-fail: getitimer-zero\n"); return 1;
     }
+
+    // (2) signal delivery. Re-arm a short one-shot (this setitimer
+    // replaces the 1000 s timer above) and park until SIGALRM lands.
+    // Here a fast fire is exactly what we want, so 50 ms is fine.
+    memset(&it, 0, sizeof it);
+    it.it_value.tv_usec = 50000; // 50 ms one-shot
+    if (setitimer(ITIMER_REAL, &it, 0) != 0) { w("itimer-fail: setitimer2\n"); return 1; }
 
     // Park until SIGALRM is delivered. Each pause() either breaks on the
     // now-pending signal (and the next re-issue delivers it) or takes
