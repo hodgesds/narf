@@ -27,6 +27,7 @@ pub mod heap;
 pub mod heap_backend;
 pub mod hugepage;
 pub mod kaslr;
+pub mod mempolicy;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
@@ -77,6 +78,7 @@ pub const KERNEL_PHYS_OFFSET: u64 = 0;
 pub const KERNEL_PHYS_OFFSET: u64 = 0xFFFF_FF80_0000_0000;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const KERNEL_PHYS_OFFSET: u64 = 0;
+pub use frame::alloc_frame_on_strict;
 pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_on, current_frame_alloc_name,
     free_frame, init_from_map, install_frame_alloc, is_numa_aware, node_free,
@@ -89,6 +91,11 @@ pub use heap::BumpAllocator;
 pub use heap_backend::{
     current_heap_backend_name, install_heap_backend, BumpBackend, HeapAuthority, HeapBackend,
     HeapError, SlabBackend, BUMP_BACKEND, SLAB_BACKEND,
+};
+pub use mempolicy::{
+    active as mempolicy_active, alloc_frame_policied, clear_active as mempolicy_clear,
+    set_active as mempolicy_set, Mempolicy, MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL,
+    MPOL_PREFERRED,
 };
 pub use pager::{
     current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, SwapSlot,

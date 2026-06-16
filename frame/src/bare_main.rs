@@ -81,6 +81,24 @@ pub fn narf_phys_to_node(addr: u64) -> u32 {
 pub fn narf_cpu_to_node(cpu: u32) -> u32 {
     narf_acpi::cpu_node(cpu).unwrap_or(0)
 }
+#[unsafe(no_mangle)]
+pub fn narf_node_distance(from: u32, to: u32) -> u32 {
+    narf_acpi::node_distance(from, to) as u32
+}
+/// Online NUMA node count for sysfs/procfs/mempolicy consumers that
+/// reach it through a weak hook (keeping filesystem/userspace off a
+/// direct narf-acpi dep). Always >= 1.
+#[unsafe(no_mangle)]
+pub fn narf_numa_node_count() -> u32 {
+    narf_acpi::numa_node_count()
+}
+/// CPU → NUMA node, returning `u32::MAX` when the CPU has no SRAT
+/// proximity entry (so sysfs cpulist can distinguish "node 0" from
+/// "unknown"). The `narf_cpu_to_node` hook above collapses that to 0.
+#[unsafe(no_mangle)]
+pub fn narf_cpu_node_opt(cpu: u32) -> u32 {
+    narf_acpi::cpu_node(cpu).unwrap_or(u32::MAX)
+}
 
 /// Install the framebuffer console early (right after MMU init)
 /// so subsequent kernel logs and panics paint to the laptop
@@ -1160,6 +1178,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 // memory_node() is populated. Subsequent
                                 // alloc_frame() calls honour locality.
                                 narf_memory::rebalance_to_topology();
+                                // SLIT is the distance matrix; parse it
+                                // alongside SRAT so node_distance() reflects
+                                // the firmware-advertised locality costs.
+                                // Absence is normal (Linux falls back to
+                                // 10/20); only log on success.
+                                // SAFETY: same validated RSDP as parse_srat.
+                                match unsafe { narf_acpi::parse_slit(p) } {
+                                    Ok(loc) => {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  acpi: SLIT parsed, {} localities (d(0,1)={})",
+                                            loc,
+                                            narf_acpi::node_distance(0, 1)
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  acpi: SLIT parse skipped: {:?} (10/20 distance fallback)",
+                                            e
+                                        );
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = writeln!(
@@ -3608,6 +3649,8 @@ fn boot_userspace_init() {
                 ),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
+                // NUMA sysfs: /sys/devices/system/node/{online,nodeN/distance,meminfo}.
+                ("numa_smoke", narf_verification::NARF_NUMA_SMOKE_ELF),
                 // multi-DSO dynamic linking: main -> libb -> liba -> libc.
                 ("dso_smoke", narf_verification::NARF_DSO_SMOKE_ELF),
                 // per-DSO TLS: thread-locals in a shared library (libtls).

@@ -379,6 +379,39 @@ pub fn alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
     alloc_frame_on_inner(node)
 }
 
+/// Allocate one frame from `node`'s zone ONLY — no cross-node
+/// fallback. Returns `Exhausted` if `node` has no free frame.
+/// Used by `MPOL_BIND` enforcement, which must never spill outside
+/// the bound nodemask. Still applies the cgroup charge.
+pub fn alloc_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "cgroup")]
+    if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
+        return Err(FrameAllocError::Exhausted);
+    }
+    let r = buddy_alloc_frame_on_strict(node);
+    #[cfg(feature = "cgroup")]
+    if r.is_err() {
+        crate::cgroup_charge::uncharge(PAGE_SIZE);
+    }
+    r
+}
+
+/// Strict per-node buddy allocation: only `node`'s zone is consulted.
+fn buddy_alloc_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocError> {
+    let mut g = ALLOC.lock();
+    if !g.initialised {
+        return Err(FrameAllocError::Uninitialised);
+    }
+    let zone = if g.numa_aware {
+        node.min(MAX_NUMA_NODES - 1)
+    } else if node == 0 {
+        0
+    } else {
+        return Err(FrameAllocError::Exhausted);
+    };
+    alloc_below_ceiling(&mut g.zones[zone]).ok_or(FrameAllocError::Exhausted)
+}
+
 /// Core of `alloc_frame` / `alloc_frame_on` — does the cgroup charge +
 /// buddy dispatch. Kept separate (and NOT `#[track_caller]`) so the two
 /// public entry points each capture their OWN caller's source location
@@ -441,9 +474,13 @@ fn buddy_alloc_frame_on(node: usize) -> Result<PhysFrame, FrameAllocError> {
         return Ok(f);
     }
 
-    // Fallback: round-robin from the next-highest node, wrapping.
-    for offset in 1..MAX_NUMA_NODES {
-        let i = (preferred + offset) % MAX_NUMA_NODES;
+    // Fallback: try the remaining nodes nearest-first by NUMA distance
+    // (Linux's local-then-nearest policy) instead of a blind
+    // round-robin. On a single node (or no-topology stub) the order is
+    // still all other zones, just deterministically index-ordered.
+    let mut order = [0usize; MAX_NUMA_NODES];
+    let n = fallback_order(preferred, &mut order);
+    for &i in &order[..n] {
         if let Some(f) = alloc_below_ceiling(&mut g.zones[i]) {
             return Ok(f);
         }
@@ -509,8 +546,10 @@ fn alloc_pages_on_inner(node: usize, order: u8) -> Result<PhysFrame, FrameAllocE
     if !g.numa_aware {
         return Err(FrameAllocError::Exhausted);
     }
-    for offset in 1..MAX_NUMA_NODES {
-        let i = (preferred + offset) % MAX_NUMA_NODES;
+    // Nearest-first cross-node fallback (see buddy_alloc_frame_on).
+    let mut order = [0usize; MAX_NUMA_NODES];
+    let n = fallback_order(preferred, &mut order);
+    for &i in &order[..n] {
         if let Some(no) = try_alloc(&mut g.zones[i]) {
             return Ok(buddy::frame_from_no(no));
         }
@@ -904,6 +943,62 @@ extern "Rust" {
     /// Look up the NUMA node hosting a logical CPU. Returns `0`
     /// when topology is unknown.
     fn narf_cpu_to_node(cpu: u32) -> u32;
+    /// NUMA distance from node `from` to node `to` (Linux's
+    /// `node_distance`, scaled so local == 10). Returns the SLIT
+    /// matrix entry when available, else 10 (same node) / 20
+    /// (cross-node). Used to order the allocator's cross-node
+    /// fallback nearest-first.
+    fn narf_node_distance(from: u32, to: u32) -> u32;
+}
+
+/// Distance from node `from` to node `to`, via the weak ACPI hook.
+/// Clamps to a sane non-zero default (10 local / 20 remote) when the
+/// hook is the no-topology stub.
+#[inline]
+fn node_distance(from: usize, to: usize) -> u32 {
+    // SAFETY: narf-frame provides the `#[no_mangle]` definition.
+    let d = unsafe { narf_node_distance(from as u32, to as u32) };
+    if d == 0 {
+        if from == to {
+            10
+        } else {
+            20
+        }
+    } else {
+        d
+    }
+}
+
+/// Build the cross-node fallback search order for `preferred`: every
+/// *other* node, sorted nearest-first by NUMA distance, ties broken by
+/// ascending node index for determinism. Returns the count written into
+/// `out` (always `MAX_NUMA_NODES - 1`).
+fn fallback_order(preferred: usize, out: &mut [usize; MAX_NUMA_NODES]) -> usize {
+    let mut n = 0;
+    for i in 0..MAX_NUMA_NODES {
+        if i != preferred {
+            out[n] = i;
+            n += 1;
+        }
+    }
+    // Insertion sort by (distance, index); n <= 15 so this is cheap and
+    // avoids any alloc on the hot path.
+    for a in 1..n {
+        let mut b = a;
+        while b > 0 {
+            let cur = out[b];
+            let prev = out[b - 1];
+            let dc = node_distance(preferred, cur);
+            let dp = node_distance(preferred, prev);
+            if dc < dp || (dc == dp && cur < prev) {
+                out.swap(b, b - 1);
+                b -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+    n
 }
 
 #[inline]
@@ -927,6 +1022,14 @@ fn current_cpu_node() -> usize {
     } else {
         0
     }
+}
+
+/// The NUMA node hosting the current CPU (the "local" node for
+/// locality-first allocation). Public wrapper over `current_cpu_node`
+/// so the mempolicy + fault paths can resolve their `local` argument.
+#[inline]
+pub fn local_node() -> usize {
+    current_cpu_node()
 }
 
 // ── Pluggable FrameAlloc framework ─────────────────────────────────

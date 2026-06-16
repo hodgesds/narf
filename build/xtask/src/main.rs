@@ -435,6 +435,15 @@ impl Arch {
                     "-numa".into(),    "hmat-lb,initiator=0,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=0,hierarchy=memory,data-type=access-bandwidth,bandwidth=5G".into(),
                     "-numa".into(),    "hmat-lb,initiator=1,target=1,hierarchy=memory,data-type=access-bandwidth,bandwidth=10G".into(),
+                    // SLIT distance matrix (System Locality Information
+                    // Table). local=10, remote=20 — Linux's
+                    // LOCAL_DISTANCE / REMOTE_DISTANCE. Populates the
+                    // guest's SLIT so node_distance() is validatable
+                    // end-to-end (kernel-test numa_distance_smoke).
+                    "-numa".into(),    "dist,src=0,dst=0,val=10".into(),
+                    "-numa".into(),    "dist,src=0,dst=1,val=20".into(),
+                    "-numa".into(),    "dist,src=1,dst=0,val=20".into(),
+                    "-numa".into(),    "dist,src=1,dst=1,val=10".into(),
                     ]);
                 }
                 args.extend_from_slice(&[
@@ -1609,6 +1618,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("preemptsched_smoke", "preemptsched-ok"),
         // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
         ("procfs2_smoke", "procfs2-ok"),
+        // NUMA sysfs: node online range + per-node SLIT distance rows.
+        ("numa_smoke", "numa-ok"),
         // multi-DSO dynamic linking: main -> libb -> liba -> libc.
         ("dso_smoke", "dso-ok"),
         // per-DSO TLS: thread-locals in a shared library (libtls).

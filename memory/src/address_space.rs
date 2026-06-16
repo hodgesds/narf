@@ -636,8 +636,10 @@ impl AddressSpace {
                 // Already backed — spurious fault (TLB stale).
                 return Err(AddressSpaceError::AlignmentMismatch);
             }
-            // Allocate + zero the fresh frame.
-            let phys = crate::frame::alloc_frame()
+            // Allocate + zero the fresh frame, honoring the faulting
+            // task's NUMA mempolicy (set_mempolicy/mbind). DEFAULT
+            // resolves to the local node — today's behavior.
+            let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
                 .map_err(|_| AddressSpaceError::OutOfRange)?
                 .start_address();
             // SAFETY: identity-mapped DMA-equivalent; frame just
@@ -694,7 +696,7 @@ impl AddressSpace {
             if r.phys[i].raw() != 0 {
                 return Err(AddressSpaceError::AlignmentMismatch);
             }
-            let phys = crate::frame::alloc_frame()
+            let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
                 .map_err(|_| AddressSpaceError::OutOfRange)?
                 .start_address();
             // SAFETY: identity-mapped per allocator contract.

@@ -60,6 +60,55 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::uevent::{emit, UeventAction};
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
+// ── NUMA topology weak hooks ──────────────────────────────────────────
+//
+// `/sys/devices/system/node/` needs the SRAT/SLIT topology, but taking a
+// direct `narf-acpi` dependency here grows the kernel image just enough
+// to tip lld's orphan-section placement (the multi-MB DWARF `.debug_*`
+// sections then collide with `.boot`'s file range at link time). The
+// kernel binary (`narf-frame`) — which links narf-acpi anyway — provides
+// these `#[no_mangle]` shims; host unit-test builds that exercise sysfs
+// directly fall back to the single-node defaults below.
+extern "Rust" {
+    fn narf_numa_node_count() -> u32;
+    fn narf_node_distance(from: u32, to: u32) -> u32;
+    fn narf_cpu_node_opt(cpu: u32) -> u32;
+}
+
+#[inline]
+fn numa_node_count() -> u32 {
+    // SAFETY: narf-frame provides the definition; weak-linked elsewhere.
+    let n = unsafe { narf_numa_node_count() };
+    n.max(1)
+}
+
+#[inline]
+fn node_distance(from: u32, to: u32) -> u8 {
+    // SAFETY: narf-frame provides the definition.
+    let d = unsafe { narf_node_distance(from, to) };
+    if d == 0 {
+        if from == to {
+            10
+        } else {
+            20
+        }
+    } else {
+        d as u8
+    }
+}
+
+/// CPU's NUMA node, or `None` when it has no SRAT proximity entry.
+#[inline]
+fn cpu_node(cpu: u32) -> Option<u32> {
+    // SAFETY: narf-frame provides the definition.
+    let n = unsafe { narf_cpu_node_opt(cpu) };
+    if n == u32::MAX {
+        None
+    } else {
+        Some(n)
+    }
+}
+
 // ── Attr function types ───────────────────────────────────────────────
 
 /// Attribute show function: called on every read, returns a `String`.
@@ -465,11 +514,141 @@ pub fn populate_kernel_dir() {
     kobject_add_attr(&kernel, "uevent_seqnum", crate::uevent::gen_uevent_seqnum);
 }
 
+/// Build a Linux-style CPU bitmap string (comma-separated 32-bit
+/// hex words, high word first) for the CPUs whose SRAT proximity
+/// domain is `node`. Empty mask renders as a single "0".
+/// Linux ref: `node_read_cpumap` (drivers/base/node.c).
+fn node_cpumap_string(node: u32) -> String {
+    let mut mask: u128 = 0;
+    for cpu in 0..128u32 {
+        if cpu_node(cpu) == Some(node) {
+            mask |= 1u128 << cpu;
+        }
+    }
+    // 128 bits → four 32-bit words, high first, comma-joined.
+    let w3 = (mask >> 96) as u32;
+    let w2 = (mask >> 64) as u32;
+    let w1 = (mask >> 32) as u32;
+    let w0 = mask as u32;
+    format!("{:08x},{:08x},{:08x},{:08x}\n", w3, w2, w1, w0)
+}
+
+/// Build a Linux-style CPU list string ("0-7", "8-15", …) for the
+/// CPUs in proximity domain `node`.
+/// Linux ref: `node_read_cpulist` (drivers/base/node.c).
+fn node_cpulist_string(node: u32) -> String {
+    let mut cpus: Vec<u32> = Vec::new();
+    for cpu in 0..256u32 {
+        if cpu_node(cpu) == Some(node) {
+            cpus.push(cpu);
+        }
+    }
+    if cpus.is_empty() {
+        return "\n".to_string();
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < cpus.len() {
+        let start = cpus[i];
+        let mut end = start;
+        while i + 1 < cpus.len() && cpus[i + 1] == end + 1 {
+            end += 1;
+            i += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == end {
+            out.push_str(&format!("{}", start));
+        } else {
+            out.push_str(&format!("{}-{}", start, end));
+        }
+        i += 1;
+    }
+    out.push('\n');
+    out
+}
+
+/// Populate `/sys/devices/system/node/` with one `nodeN/` directory
+/// per NUMA node plus `online` / `possible` summaries.
+///
+/// Per-node attributes:
+/// - `distance`  — space-separated SLIT row (`node_distance(n, j)`).
+/// - `meminfo`   — `Node N MemTotal/MemFree:` lines from the per-node
+///   buddy free counts.
+/// - `cpulist` / `cpumap` — the CPUs in this proximity domain.
+///
+/// Linux ref: `drivers/base/node.c` (`register_node`,
+/// `node_read_distance`, `node_read_meminfo`).
+pub fn populate_numa_nodes() {
+    let root = get_root();
+    let devices = get_or_create_child(&root, "devices");
+    let system = get_or_create_child(&devices, "system");
+    let node_dir = get_or_create_child(&system, "node");
+
+    let n = numa_node_count().max(1);
+
+    // /sys/devices/system/node/online and /possible: "0" or "0-N".
+    let range = if n <= 1 {
+        "0\n".to_string()
+    } else {
+        format!("0-{}\n", n - 1)
+    };
+    let online = range.clone();
+    let possible = range.clone();
+    kobject_add_attr(&node_dir, "online", move || online.clone());
+    kobject_add_attr(&node_dir, "possible", move || possible.clone());
+    kobject_add_attr(&node_dir, "has_normal_memory", move || range.clone());
+
+    for node in 0..n {
+        let name = format!("node{}", node);
+        let kobj = get_or_create_child(&node_dir, &name);
+
+        // distance: SLIT row, space-separated, newline-terminated.
+        kobject_add_attr(&kobj, "distance", move || {
+            let cols = numa_node_count().max(1);
+            let mut s = String::new();
+            for to in 0..cols {
+                if to > 0 {
+                    s.push(' ');
+                }
+                s.push_str(&format!("{}", node_distance(node, to)));
+            }
+            s.push('\n');
+            s
+        });
+
+        // meminfo: per-node MemTotal / MemFree from the buddy.
+        let node_idx = node as usize;
+        kobject_add_attr(&kobj, "meminfo", move || {
+            let free_pages = if node_idx < narf_memory::FRAME_MAX_NUMA_NODES {
+                narf_memory::node_free(node_idx)
+            } else {
+                0
+            };
+            let free_kb = (free_pages as u64) * 4;
+            format!(
+                "Node {n} MemTotal:       {tot} kB\n\
+                 Node {n} MemFree:        {free} kB\n\
+                 Node {n} MemUsed:        {used} kB\n",
+                n = node_idx,
+                tot = free_kb,
+                free = free_kb,
+                used = 0u64,
+            )
+        });
+
+        kobject_add_attr(&kobj, "cpulist", move || node_cpulist_string(node));
+        kobject_add_attr(&kobj, "cpumap", move || node_cpumap_string(node));
+    }
+}
+
 /// Call all `populate_*` functions.  Invoked from the sysfs initcall.
 pub fn populate_all() {
     populate_block_class();
     populate_net_class();
     populate_kernel_dir();
+    populate_numa_nodes();
     // Stub class directories expected by userspace tooling.
     let root = get_root();
     let class_dir = get_or_create_child(&root, "class");
