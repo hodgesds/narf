@@ -307,11 +307,29 @@ pub unsafe fn enable() {
     //
     // We want SYSCALL to land at KCODE=0x08, SS=KDATA=0x10
     // (already CS+8 ✓), and SYSRET to land at UCODE=0x33,
-    // SS=UDATA=0x2B. Hardware ORs in RPL=3 for sysret, so
-    // STAR[63:48] = UCODE & ~3 - 16 = 0x30 - 16 = 0x20.
+    // SS=UDATA=0x2B.
+    //
+    // SYSRET derives the user selectors as CS = STAR[63:48]+16 and
+    // SS = STAR[63:48]+8. On Intel, SYSRET then ORs RPL=3 into BOTH
+    // selectors, so STAR[63:48]=0x20 would give CS=0x33, SS=0x2B.
+    // But on AMD (Zen4, e.g. under KVM `-cpu host`) SYSRET forces
+    // RPL=3 into CS but NOT into SS — it leaves SS = STAR[63:48]+8
+    // verbatim. With STAR[63:48]=0x20 that yields SS=0x28 (RPL=0),
+    // so the task runs at CPL3 with a CPL0-RPL stack selector; the
+    // next fault/IRQ then saves SS=0x28 and its return `iretq` #GPs
+    // (SS.RPL != CS.RPL). TCG emulates the Intel OR-RPL behaviour,
+    // which is why this only bit under KVM-on-AMD.
+    //
+    // Fix exactly as Linux does: set STAR[63:48] to a selector that
+    // already carries RPL=3 (Linux uses __USER32_CS = 0x23). Then
+    // CS = 0x23+16 = 0x33 and SS = 0x23+8 = 0x2B with the RPL bits
+    // present in the base value — correct whether or not the CPU
+    // re-ORs RPL=3. The +8/+16 only shift the GDT index (SS→idx5,
+    // CS→idx6); SYSRET synthesises the descriptors, so no GDT entry
+    // at index 4 (the 0x23 base) is required.
     let kernel_cs: u64 = 0x08;
-    let user_cs_minus_16: u64 = 0x20;
-    let star = (user_cs_minus_16 << 48) | (kernel_cs << 32);
+    let user_cs_base: u64 = 0x23;
+    let star = (user_cs_base << 48) | (kernel_cs << 32);
 
     let lstar = syscall_entry_x86_64 as usize as u64;
 
