@@ -699,7 +699,11 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // than the generic `invalid_op` shape.
     let fail = SyscallReturn::ok(!0u64);
     // Copy path from userspace into kernel buffer under SMAP bracket.
-    let path_owned = match copy_user_path(path_ptr, path_len) {
+    // Use the *raw* copy (no chroot) — `resolve_cwd_path` below is the
+    // single point that re-roots under the task's chroot. Using the
+    // chroot-applying `copy_user_path` here would compose the chroot
+    // prefix twice (e.g. `/init` → `/jail/jail/init`).
+    let path_owned = match copy_user_path_raw(path_ptr, path_len) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -2973,8 +2977,9 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
     // caller's cwd before chroot, so the stat family works from any
     // working directory — not just absolute paths.
-    let abs = resolve_cwd_path(current_task_id(), &raw);
-    let path_owned = apply_chroot(&abs);
+    // resolve_cwd_path already re-roots under the task's chroot — do
+    // not apply_chroot again or the prefix is composed twice.
+    let path_owned = resolve_cwd_path(current_task_id(), &raw);
     let _ = (); // silence unused-binding lint when both arms drop the value
     let path: &str = &path_owned;
     // `resolve_absolute` splits an absolute path into (mount, rel).
@@ -3152,9 +3157,9 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
-        // Resolve relative paths against the caller's cwd, then chroot.
-        let abs = resolve_cwd_path(current_task_id(), &raw);
-        let path_owned = apply_chroot(&abs);
+        // resolve_cwd_path resolves against the cwd AND re-roots under
+        // the task's chroot — applying apply_chroot again double-composes.
+        let path_owned = resolve_cwd_path(current_task_id(), &raw);
         stat_path_dir_aware(&path_owned)
     };
 
@@ -3785,7 +3790,9 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path = apply_chroot(&resolve_cwd_path(current_task_id(), &raw));
+    // resolve_cwd_path already re-roots under the task's chroot — do
+    // not apply_chroot again or the prefix is composed twice.
+    let path = resolve_cwd_path(current_task_id(), &raw);
     // resolve_parent_absolute returns Option<Option<Arc<dyn FileOps>>>:
     // outer None = no mount covers the path, inner None = parent walk
     // hit a missing component or the leaf is absent. Flatten both
@@ -13395,7 +13402,7 @@ pub fn __test_root_dir_reset() {
 /// through unchanged. Joining strips a leading `/` from `path` so
 /// the result has no double-slash.
 #[cfg(feature = "linux-compat")]
-fn apply_chroot(path: &str) -> alloc::string::String {
+pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     let task = current_task_id();
     let prefix = {
         let g = ROOT_DIR_TABLE.lock();
@@ -13419,7 +13426,7 @@ fn apply_chroot(path: &str) -> alloc::string::String {
 
 #[cfg(not(feature = "linux-compat"))]
 #[inline]
-fn apply_chroot(path: &str) -> alloc::string::String {
+pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     alloc::string::String::from(path)
 }
 

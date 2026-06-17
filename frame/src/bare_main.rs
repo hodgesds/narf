@@ -3627,6 +3627,10 @@ fn boot_userspace_init() {
                 // Filesystem navigation: chdir + getcwd + opendir/getdents64
                 // (directory fds) — what makes `cd` and `ls` work.
                 ("navfs_smoke", narf_verification::NARF_NAVFS_SMOKE_ELF),
+                // OCI container: minimal runtime that reads the /oci
+                // bundle, unshares namespaces, chroots into the bundle
+                // rootfs, and execs the contained entrypoint.
+                ("oci_smoke", narf_verification::NARF_OCI_SMOKE_ELF),
                 // Pipe blocking-read + EOF on writer exit (fd teardown on
                 // exit) — the mechanism behind shell `$(...)` substitution.
                 ("pipeof_smoke", narf_verification::NARF_PIPEOF_SMOKE_ELF),
@@ -3740,6 +3744,71 @@ fn boot_userspace_init() {
                 console::Writer,
                 "  boot-init: /lib mount skipped (no ld-musl at build time; \
                  dynamic-linked binaries will fail to exec)"
+            );
+        }
+
+        // ── OCI container bundle ────────────────────────────────────
+        // Seed a minimal OCI bundle at /oci so the `oci_smoke` runtime
+        // has a real bundle to launch: a `config.json` runtime-spec
+        // subset (hostname / root.path / namespaces / process), plus a
+        // `rootfs/` holding the static entrypoint at /oci/rootfs/init
+        // and the container's own /etc/os-release. Three nested MemFs
+        // mounts — the registry's longest-prefix resolver routes
+        // /oci/config.json, /oci/rootfs/init and /oci/rootfs/etc/os-release
+        // to the right mount, and after the runtime chroots to
+        // /oci/rootfs the entrypoint's "/init" + "/etc/os-release"
+        // resolve under it. Only seeded when the entrypoint was actually
+        // built (musl-gcc present); an empty placeholder would just fail
+        // to exec, so we skip it like the /lib mount above.
+        if !narf_verification::NARF_OCI_SMOKE_ELF.is_empty() {
+            const OCI_CONFIG_JSON: &[u8] = br#"{
+  "ociVersion": "1.0.2",
+  "hostname": "narfbox",
+  "root": { "path": "/oci/rootfs", "readonly": false },
+  "process": {
+    "cwd": "/",
+    "args": ["/init", "--contained"],
+    "env": ["PATH=/bin", "OCI_CONTAINER=1"]
+  },
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "uts" },
+      { "type": "ipc" },
+      { "type": "mount" },
+      { "type": "network" }
+    ]
+  }
+}
+"#;
+            const OCI_OS_RELEASE: &[u8] =
+                b"NAME=\"NARF-Container\"\nID=narf-container\nPRETTY_NAME=\"NARF OCI Container\"\n";
+            let oci_fs = MemFs::with_seeds("oci", &[("config.json", OCI_CONFIG_JSON)]);
+            let _ = registry().mount(&auth, "/oci", oci_fs);
+            let rootfs = MemFs::with_seeds(
+                "ocirootfs",
+                &[("init", narf_verification::NARF_OCI_SMOKE_ELF)],
+            );
+            let _ = registry().mount(&auth, "/oci/rootfs", rootfs);
+            let etc = MemFs::with_seeds("ocietc", &[("os-release", OCI_OS_RELEASE)]);
+            let _ = registry().mount(&auth, "/oci/rootfs/etc", etc);
+            // The entrypoint is a dynamic-PIE musl binary, so the bundle
+            // rootfs carries its own copy of the loader at
+            // /oci/rootfs/lib/ld-musl-x86_64.so.1. The execve loader
+            // resolves PT_INTERP under the container's chroot (see
+            // process.rs), so the contained process loads *this* loader,
+            // not the host's /lib — the container is self-contained.
+            if !narf_verification::NARF_LD_MUSL.is_empty() {
+                let lib = MemFs::with_seeds(
+                    "ocilib",
+                    &[("ld-musl-x86_64.so.1", narf_verification::NARF_LD_MUSL)],
+                );
+                let _ = registry().mount(&auth, "/oci/rootfs/lib", lib);
+            }
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: seeded OCI bundle at /oci ({} byte entrypoint)",
+                narf_verification::NARF_OCI_SMOKE_ELF.len(),
             );
         }
     }

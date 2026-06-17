@@ -1512,6 +1512,17 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
         ("signal_smoke", "signal-ok"),
+        // OCI container end-to-end: the `oci_smoke` runtime reads the
+        // /oci bundle, unshares namespaces, sets the container hostname,
+        // chroots into the bundle rootfs, and execs the contained
+        // entrypoint. The entrypoint proves rootfs isolation (reads the
+        // container's own /etc/os-release) + env propagation and prints
+        // `oci-container-ok`; the runtime then prints `oci-smoke-ok`.
+        // The nightly OCI job (.github/workflows/nightly-oci.yml) runs
+        // this same case as a dedicated scheduled signal. (A stronger
+        // `oci-uts-isolated` token lights up once the `container`
+        // feature boots cleanly — it currently hangs getty at boot.)
+        ("oci_smoke", "oci-smoke-ok"),
         ("fs_smoke", "fs-ok"),
         ("fork_pipe_smoke", "fork-ok"),
         ("pty_smoke", "pty-ok"),

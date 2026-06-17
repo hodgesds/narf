@@ -185,12 +185,22 @@ pub unsafe fn load_user_process_with(
     // `sys_listdir`). Bytes are owned for the duration of this
     // function; `load_elf_into_at` copies them into freshly-mapped
     // user pages so a borrowed slice is sufficient.
+    // PT_INTERP resolves under the execing task's chroot: a container
+    // execs a dynamic binary whose interpreter (/lib/ld-musl-...) must
+    // come from its *own* bundle rootfs, not the host's /lib. The
+    // execve already ran in this (the child) task's context, which set
+    // its chroot before exec, so `apply_chroot` keyed on the current
+    // task rewrites the interpreter path into the rootfs. Outside any
+    // chroot, `apply_chroot` returns the path unchanged.
     #[cfg(feature = "linux-compat")]
     let interp_fs_owned: Option<alloc::vec::Vec<u8>> = image
         .interp
         .as_deref()
         .filter(|name| interp::lookup_interpreter(name).is_none())
-        .and_then(read_path_from_vfs);
+        .and_then(|name| {
+            let resolved = crate::handlers::apply_chroot(name);
+            read_path_from_vfs(&resolved)
+        });
     #[cfg(not(feature = "linux-compat"))]
     let interp_fs_owned: Option<alloc::vec::Vec<u8>> = None;
 
