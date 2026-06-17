@@ -4252,6 +4252,13 @@ define_smoke_elf!(
     "NARF_OCI_SMOKE_ELF_X86_64",
     "NARF_OCI_SMOKE_ELF_AARCH64"
 );
+// Off-box network serving smoke: a TCP echo server bound to 0.0.0.0,
+// reached from the host via QEMU `hostfwd`.
+define_smoke_elf!(
+    NARF_NETSERVE_SMOKE_ELF,
+    "NARF_NETSERVE_SMOKE_ELF_X86_64",
+    "NARF_NETSERVE_SMOKE_ELF_AARCH64"
+);
 define_smoke_elf!(
     NARF_PIPEOF_SMOKE_ELF,
     "NARF_PIPEOF_SMOKE_ELF_X86_64",

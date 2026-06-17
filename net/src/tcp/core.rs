@@ -1453,7 +1453,11 @@ pub fn handle_segment(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
         m.values()
             .find(|t| {
                 let g = t.lock();
-                g.local_addr == dst && g.local_port == hdr.dst_port && g.state == TcpState::Listen
+                // A listener bound to 0.0.0.0 (INADDR_ANY) matches any
+                // local dst; a concrete-addr listener matches exactly.
+                (g.local_addr == dst || g.local_addr == [0, 0, 0, 0])
+                    && g.local_port == hdr.dst_port
+                    && g.state == TcpState::Listen
             })
             .cloned()
     };
@@ -1720,7 +1724,11 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     };
     if let Some(listen_arc) = m.values().find(|t| {
         let l = t.lock();
-        l.state == TcpState::Listen && l.local_addr == local_addr && l.local_port == local_port
+        // Match a concrete-addr listener exactly, or an INADDR_ANY
+        // (0.0.0.0) listener against the child's concrete local addr.
+        l.state == TcpState::Listen
+            && (l.local_addr == local_addr || l.local_addr == [0, 0, 0, 0])
+            && l.local_port == local_port
     }) {
         let mut l = listen_arc.lock();
         if l.accept_queue.len() < l.backlog {

@@ -1249,7 +1249,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     // installed itself there at boot. Cheap fn-pointer
                     // call when no handler is installed.
                     if idx == 0 {
-                        narf_net::iface::on_rx_frame(frame.payload());
+                        narf_net::iface::on_rx_frame_from("vnet0", frame.payload());
                     }
                     // try_send-then-yield loop. We can't hold the
                     // IrqSafeSpinLockGuard across an await (the guard
@@ -1362,7 +1362,7 @@ fn vnet0_drain_fn() -> bool {
         return true;
     }
     let end = (12 + payload_len as usize).min(buf.len());
-    narf_net::iface::on_rx_frame(&buf.as_slice()[12..end]);
+    narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
     true
 }
 

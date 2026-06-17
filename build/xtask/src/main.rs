@@ -46,6 +46,14 @@ enum Cmd {
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
+    /// Off-box network serving smoke. Boot with `qemu-net` (statically
+    /// configures vnet0 with the SLIRP lease) + a QEMU `hostfwd`, wait
+    /// for the auto-spawned `netserve` echo server to print
+    /// `netserve: listening`, then open a real TCP socket FROM THE HOST
+    /// to the forwarded port, round-trip a line, and assert the echo +
+    /// the guest's `netserve-ok`. Proves a guest server is reachable
+    /// from outside the VM over virtio-net.
+    NetSmoke(BuildArgs),
     /// Wave-78 — boot under QEMU and verify both linux-compat demo
     /// binaries (`/bin/hello` and `/bin/hello_musl`) print their
     /// expected output through the real shell + execve + ELF
@@ -517,9 +525,17 @@ impl Arch {
                         "-device".into(),
                         "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
                     ]);
+                    // Optional host→guest port forward for the off-box
+                    // network smoke: `XTASK_QEMU_HOSTFWD=tcp:127.0.0.1:H-:G`
+                    // makes QEMU's user-mode backend forward host port H to
+                    // guest port G so a host client can reach a guest server.
+                    let n0 = match std::env::var("XTASK_QEMU_HOSTFWD") {
+                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
+                        _ => "user,id=n0".into(),
+                    };
                     args.extend_from_slice(&[
                         "-netdev".into(),
-                        "user,id=n0".into(),
+                        n0,
                         "-device".into(),
                         "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     ]);
@@ -615,9 +631,17 @@ impl Arch {
                         "-device".into(),
                         "virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off".into(),
                     ]);
+                    // Optional host→guest port forward for the off-box
+                    // network smoke: `XTASK_QEMU_HOSTFWD=tcp:127.0.0.1:H-:G`
+                    // makes QEMU's user-mode backend forward host port H to
+                    // guest port G so a host client can reach a guest server.
+                    let n0 = match std::env::var("XTASK_QEMU_HOSTFWD") {
+                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
+                        _ => "user,id=n0".into(),
+                    };
                     args.extend_from_slice(&[
                         "-netdev".into(),
-                        "user,id=n0".into(),
+                        n0,
                         "-device".into(),
                         "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     ]);
@@ -2056,6 +2080,231 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         "\nxtask run-interactive: ok — typed `{}`, saw `{}`",
         args.cmd, args.expect,
     );
+    Ok(())
+}
+
+/// Off-box network serving smoke — see [`Cmd::NetSmoke`]. Boots with the
+/// `qemu-net` static config + a QEMU `hostfwd`, waits for the auto-
+/// spawned guest echo server to announce itself, then opens a real TCP
+/// socket from the host to the forwarded port and asserts the round-trip
+/// (plus the guest's `netserve-ok`).
+fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask net-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+    }
+
+    let host_port: u16 = 17777;
+    let guest_port: u16 = 7777;
+
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    ensure_feature(&mut build.features, "qemu-net");
+
+    let root = workspace_root()?;
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+
+    // Set in THIS process's env: `qemu_args` (called below, in-process)
+    // reads it to splice `hostfwd` into the user-mode netdev. Setting it
+    // on the child Command would be too late — the arg list is built here.
+    std::env::set_var(
+        "XTASK_QEMU_HOSTFWD",
+        format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
+    );
+
+    let qemu = build.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(
+        build
+            .arch
+            .qemu_args(&kernel, &build.display, build.hw_profile),
+    );
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    println!(
+        "xtask net-smoke: launching {} {} (hostfwd 127.0.0.1:{host_port} -> guest :{guest_port})",
+        qemu,
+        kernel.display()
+    );
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    let timeout_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(180);
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
+    let panic_flag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
+    let cap_r = captured.clone();
+    let panic_r = panic_flag.clone();
+    let reader = std::thread::spawn(move || {
+        let panic_markers: &[&[u8]] = &[
+            b"*** KERNEL PANIC ***",
+            b"panicked at",
+            b"double fault",
+            b"general protection",
+            b"kernel page fault",
+            b"unsafe precondition",
+        ];
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        let mut line: Vec<u8> = Vec::with_capacity(256);
+        let mut out = std::io::stdout();
+        loop {
+            let n = match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let _ = out.write_all(&buf[..n]);
+            let _ = out.flush();
+            if let Ok(mut g) = cap_r.lock() {
+                g.extend_from_slice(&buf[..n]);
+            }
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    for m in panic_markers {
+                        if line.windows(m.len()).any(|w| w == *m) {
+                            if let Ok(mut p) = panic_r.lock() {
+                                if p.is_none() {
+                                    *p = Some(String::from_utf8_lossy(&line).into_owned());
+                                }
+                            }
+                        }
+                    }
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+
+    let wait_for = |needle: &[u8], secs: u64| -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(secs) {
+            if panic_flag.lock().ok().map(|p| p.is_some()).unwrap_or(false) {
+                return false;
+            }
+            if let Ok(g) = captured.lock() {
+                if g.windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    };
+
+    // 1. Wait for the auto-spawned server to announce it is listening.
+    if !wait_for(b"netserve: listening", timeout_secs) {
+        let panic = panic_flag.lock().ok().and_then(|g| g.clone());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        if let Some(p) = panic {
+            bail!("xtask net-smoke: kernel panic before listen — '{p}'");
+        }
+        bail!(
+            "xtask net-smoke: guest server did not print `netserve: listening` within {timeout_secs}s"
+        );
+    }
+    println!(
+        "\nxtask net-smoke: guest is listening; connecting from host to 127.0.0.1:{host_port}..."
+    );
+
+    // 2. Connect from the host, retrying — SLIRP forwarding + the guest
+    //    accept loop may need a moment to be ready.
+    let mut stream: Option<TcpStream> = None;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
+        match TcpStream::connect(("127.0.0.1", host_port)) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let mut stream = match stream {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("xtask net-smoke: could not connect to 127.0.0.1:{host_port} within 20s");
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+
+    // 3. Round-trip a line and assert the echo.
+    let payload = b"hello-narf\n";
+    if stream.write_all(payload).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: host write failed");
+    }
+    let _ = stream.flush();
+    let mut got = Vec::new();
+    let mut rbuf = [0u8; 256];
+    loop {
+        match stream.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                got.extend_from_slice(&rbuf[..n]);
+                if got.len() >= payload.len() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !got.windows(payload.len()).any(|w| w == payload) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "xtask net-smoke: echo mismatch — sent {:?}, got {:?}",
+            String::from_utf8_lossy(payload),
+            String::from_utf8_lossy(&got)
+        );
+    }
+    println!(
+        "xtask net-smoke: host received the echo ({:?})",
+        String::from_utf8_lossy(&got)
+    );
+
+    // 4. Wait for the guest's clean-round-trip confirmation.
+    if !wait_for(b"netserve-ok", timeout_secs) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: guest did not print `netserve-ok` within {timeout_secs}s");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    println!("xtask net-smoke: ok — guest server echoed an off-box client over virtio-net");
     Ok(())
 }
 
@@ -4160,6 +4409,7 @@ fn main() -> Result<()> {
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
+        Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::MuslDemo(args) => musl_demo_cmd(&args),
         Cmd::Image(mut args) => {
             // Default-on boot-init for parity with `iso-boot`. An

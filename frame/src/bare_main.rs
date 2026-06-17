@@ -3631,6 +3631,9 @@ fn boot_userspace_init() {
                 // bundle, unshares namespaces, chroots into the bundle
                 // rootfs, and execs the contained entrypoint.
                 ("oci_smoke", narf_verification::NARF_OCI_SMOKE_ELF),
+                // Off-box network serving: TCP echo server bound to
+                // 0.0.0.0, reached from the host via QEMU hostfwd.
+                ("netserve_smoke", narf_verification::NARF_NETSERVE_SMOKE_ELF),
                 // Pipe blocking-read + EOF on writer exit (fd teardown on
                 // exit) — the mechanism behind shell `$(...)` substitution.
                 ("pipeof_smoke", narf_verification::NARF_PIPEOF_SMOKE_ELF),
@@ -3820,6 +3823,18 @@ fn boot_userspace_init() {
     // is seeded at `/bin/shell` (above) for getty's execve.
     let _ = baked_shell;
     spawn_one("getty", narf_verification::NARF_GETTY_ELF);
+
+    // Off-box network serving smoke (opt-in `qemu-net`): auto-spawn the
+    // TCP echo server alongside getty. The kernel statically configured
+    // vnet0 with the SLIRP lease (cross_crate_init), and QEMU forwards a
+    // host port to guest :7777, so the host-side `cargo xtask net-smoke`
+    // harness can connect and round-trip without driving the console.
+    #[cfg(feature = "qemu-net")]
+    {
+        if !narf_verification::NARF_NETSERVE_SMOKE_ELF.is_empty() {
+            spawn_one("netserve", narf_verification::NARF_NETSERVE_SMOKE_ELF);
+        }
+    }
 }
 
 /// aarch64 boot-init stub.

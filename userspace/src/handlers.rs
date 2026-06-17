@@ -16317,18 +16317,39 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             ctx.set_return(SyscallReturn::ok(new_fd as u64));
         }
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            // Yield like sys_futex / sys_sleep do: park ~1ms so
-            // other tasks (notably the connecter) make progress;
-            // user-side libc loops over us.
+            // No pending connection. A NON-blocking listen fd gets
+            // -EAGAIN immediately; a BLOCKING one must truly block until
+            // a peer connects — musl's `accept()` does NOT retry -EAGAIN
+            // on a blocking fd, so returning it here would make every
+            // real server fail its first accept (only a loopback client
+            // that races in before the syscall wins). Block the same way
+            // blocking console/pipe reads do: park ~1 ms and REWIND RIP
+            // so the `syscall` instruction re-executes on resume (no
+            // return value set), looping in-kernel until `Accepted`.
+            let task = current_task_id();
+            let listen_nonblock = fd::with_table(task, |t| {
+                t.get(fd)
+                    .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
+            })
+            .flatten()
+            .unwrap_or(false);
+            if listen_nonblock {
+                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+                return;
+            }
             if let (Some(uctx), Some(hook)) = (
                 crate::user_task::current_user_task(),
                 crate::user_task::yield_hook(),
             ) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                // Rewind past the 2-byte `syscall` instruction so the
+                // resumed task re-issues accept; do NOT set a return value.
+                let resume_rip = ctx.rip().wrapping_sub(2);
+                ctx.set_rip(resume_rip);
                 let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
                 // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-                // we hold the only reference while setting the deadline and saving CPU state
-                // into `uc.state` before the yield hook hands the task to the executor.
+                // we hold the only reference while setting the deadline and saving the
+                // RIP-rewound CPU state into `uc.state` before the yield hook hands the
+                // task to the executor.
                 // SAFETY: Valid memory or trusted environment
                 unsafe {
                     let uc = &*uctx;
@@ -16337,8 +16358,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     hook(uctx);
                 }
+                // unreachable — hook() longjmps to the executor
             }
-            ctx.set_return(fail);
+            // No executor (kernel-test context): surface EAGAIN.
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64));
         }
         _ => ctx.set_return(fail),
     }

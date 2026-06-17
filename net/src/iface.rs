@@ -147,6 +147,25 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
     })
 }
 
+/// Find the registered interface that OWNS the given IPv4 address (its
+/// primary `ipv4`). Used by the ARP responder so a request for a NIC's
+/// address is answered by THAT NIC's MAC — not always `primary()`,
+/// which is merely the first-registered iface and may carry no / a
+/// different address (e.g. when a second NIC registered ahead of the
+/// configured one).
+pub fn for_local_addr(ip: [u8; 4]) -> Option<NetIfaceSnapshot> {
+    let g = IFACES.lock();
+    let v = g.as_ref()?;
+    let e = v.iter().find(|e| e.ipv4 == ip)?;
+    Some(NetIfaceSnapshot {
+        name: e.name.clone(),
+        mac: e.mac,
+        send: e.send,
+        ipv4: e.ipv4,
+        gateway: e.gateway,
+    })
+}
+
 /// Send a complete Ethernet frame through the primary iface.
 /// Returns Err if no iface is registered or the driver failed.
 pub fn send(frame: &[u8]) -> Result<(), ()> {
@@ -271,7 +290,12 @@ pub fn set_gateway(iface_name: &str, gateway: [u8; 4]) {
 // fn-pointer slots so the dep direction stays one-way (drivers →
 // net → stack).
 
-type RxHandler = fn(&[u8]);
+// The RX handler carries the INGRESS iface name so the dispatch can
+// answer ARP / route replies out the NIC a frame actually arrived on —
+// essential with multiple NICs on overlapping subnets (e.g. two QEMU
+// user-mode NICs both at 10.0.2.0/24), where a global address lookup
+// would otherwise reply out the wrong NIC. `""` means "ingress unknown".
+type RxHandler = fn(&str, &[u8]);
 
 static RX_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
@@ -279,20 +303,25 @@ pub fn install_rx_handler(h: RxHandler) {
     RX_HANDLER.store(h as usize, Ordering::Release);
 }
 
-pub fn on_rx_frame(frame: &[u8]) {
+/// Dispatch a frame received on a known ingress interface.
+pub fn on_rx_frame_from(iface_name: &str, frame: &[u8]) {
     let v = RX_HANDLER.load(Ordering::Acquire);
     if v == 0 {
         return;
     }
     // SAFETY: `v` is non-zero (checked above) and was produced by
     // `install_rx_handler`, which stores exactly `h as usize` for a live
-    // `RxHandler` fn pointer. A `RxHandler` (a `fn(&[u8])`) is pointer-sized,
-    // so reconstituting it from that same `usize` yields the original valid,
-    // callable function pointer. The `Acquire`/`Release` pairing guarantees we
-    // observe the fully-written pointer value.
+    // `RxHandler` fn pointer (pointer-sized), so reconstituting it from that
+    // same `usize` yields the original valid, callable function pointer. The
+    // `Acquire`/`Release` pairing guarantees we observe the written pointer.
     // SAFETY: Valid memory or trusted environment
     let h: RxHandler = unsafe { core::mem::transmute::<usize, RxHandler>(v) };
-    h(frame);
+    h(iface_name, frame);
+}
+
+/// Dispatch a frame whose ingress iface is unknown (legacy callers).
+pub fn on_rx_frame(frame: &[u8]) {
+    on_rx_frame_from("", frame);
 }
 
 // ── RX drain hook ───────────────────────────────────────────────

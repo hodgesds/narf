@@ -1510,7 +1510,7 @@ pub fn rx_pump_step() -> bool {
     if n == 0 {
         return false;
     }
-    narf_net::iface::on_rx_frame(&buf[..n]);
+    narf_net::iface::on_rx_frame_from("eth0", &buf[..n]);
     true
 }
 

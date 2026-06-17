@@ -94,6 +94,11 @@ cargo xtask test --arch=x86_64
 # `nightly-oci` CI job runs this same demo on a schedule.
 cargo xtask run-interactive --arch=x86_64 --cmd "oci_smoke" --expect "oci-smoke-ok"
 
+# Serve off-box: boot a guest TCP echo server reachable from the host via
+# a QEMU port-forward, then connect a real host socket and round-trip a
+# line over virtio-net (kernel TCP server path + blocking accept).
+cargo xtask net-smoke --arch=x86_64
+
 # Boot via Limine ISO + OVMF UEFI (closer to real-hardware boot path)
 cargo xtask iso-boot --arch=x86_64 --release
 

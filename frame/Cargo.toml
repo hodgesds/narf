@@ -116,6 +116,12 @@ frame-alloc-audit    = ["narf-memory/frame-alloc-audit"]
 # Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
 container = ["narf-userspace/container"]
 
+# QEMU user-mode (SLIRP) static network config: assign the virtio-net
+# iface the well-known SLIRP guest lease (10.0.2.15/24, gw 10.0.2.2) at
+# boot so a guest server is reachable from the host via `hostfwd`. Opt-in
+# (dev / CI off-box network smoke); real hardware should run DHCP.
+qemu-net = []
+
 # cgroup-v2 unified hierarchy. Forwarded from narf-userspace; the
 # boot path also places init/shell into the root cgroup. Mounts
 # cgroupfs at /sys/fs/cgroup.
