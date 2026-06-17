@@ -560,8 +560,12 @@ impl FileOps for ConsoleFile {
                 // (`while tcgetpgrp(0) != getpgrp() { raise(SIGTTIN); }`)
                 // spins forever because tcgetpgrp returns 0 and
                 // getpgrp returns the shell's tid.
-                let pgrp = narf_filesystem::console_tty::fg_pgrp_or_install(
-                    crate::handlers::current_task_pgid(),
+                // fg_pgrp is kept in task-id space internally; report it
+                // to userspace in the visible-pid space getpid/getpgrp use.
+                let pgrp = crate::handlers::pgid_to_user(
+                    narf_filesystem::console_tty::fg_pgrp_or_install(
+                        crate::handlers::current_task_pgid(),
+                    ),
                 );
                 let bytes = (pgrp as i32).to_le_bytes();
                 // SAFETY: `copy_to_user` validates `arg` as a user address
@@ -586,7 +590,11 @@ impl FileOps for ConsoleFile {
                 if pgrp < 0 {
                     return Err(FsError::InvalidData);
                 }
-                narf_filesystem::console_tty::set_fg_pgrp(pgrp as u64);
+                // Userspace passes a visible pid; the tty stores fg_pgrp in
+                // task-id space (consistent with read_pgid / the SIGTTIN
+                // check), so translate before storing.
+                let pgrp = crate::handlers::pgid_from_user(pgrp as u64);
+                narf_filesystem::console_tty::set_fg_pgrp(pgrp);
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),

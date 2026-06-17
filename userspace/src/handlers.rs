@@ -9647,6 +9647,50 @@ fn read_pgid(target: u64) -> u64 {
         .unwrap_or(target) // default: pgid == pid
 }
 
+// ── pid-space translation at the pgid/sid/tty userspace boundary ───
+//
+// The kernel keeps pgid/sid/tty-foreground state in TASK-ID space
+// (PGID_TABLE, SID_TABLE, console_tty::fg_pgrp are all keyed by /
+// valued in TaskId). But `getpid()` reports the *visible* pid
+// (task→ProcessId, then PID-namespace translation) — see `sys_getpid`.
+// So when a process does `tcsetpgrp(getpid())` / `setpgid` / reads
+// `getpgrp()`, the userspace value is a visible pid while the kernel
+// table is a task id. Under the `container` feature those two spaces
+// diverge (e.g. getty task 14 ↔ visible pid 2), and the mismatch makes
+// `tty_background_access` see a foreground leader as "background" and
+// SIGTTIN-stop it — which hung getty at the login read.
+//
+// These two helpers translate at the syscall boundary so the internal
+// tables stay task-id-keyed while userspace consistently sees visible
+// pids. In the non-container build the two spaces coincide and both are
+// the identity (getpid returns the task id), so behaviour is unchanged.
+#[cfg(feature = "container")]
+pub(crate) fn pgid_to_user(task_space_id: u64) -> u64 {
+    if task_space_id == 0 {
+        return 0;
+    }
+    let outer = task_to_pid_raw(task_space_id).unwrap_or(task_space_id);
+    crate::pid_ns::self_inner_pid(task_space_id, outer)
+}
+#[cfg(not(feature = "container"))]
+#[inline]
+pub(crate) fn pgid_to_user(task_space_id: u64) -> u64 {
+    task_space_id
+}
+
+#[cfg(feature = "container")]
+pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
+    if user_pid == 0 {
+        return 0;
+    }
+    pid_to_task_raw(user_pid).unwrap_or(user_pid)
+}
+#[cfg(not(feature = "container"))]
+#[inline]
+pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
+    user_pid
+}
+
 /// Process-group id of the currently-polling task. Returns the
 /// task's own TaskId when no explicit `setpgid` mapping exists
 /// (Linux semantics: a process's pgid defaults to its pid until
@@ -9662,8 +9706,13 @@ pub fn current_task_pgid() -> u64 {
 
 fn sys_getpgid(ctx: &mut dyn TrapContext) {
     let pid = ctx.args().arg0;
-    let target = if pid == 0 { current_task_id() } else { pid };
-    ctx.set_return(SyscallReturn::ok(read_pgid(target)));
+    // arg0 is a *visible* pid (0 = self); the table is task-id-keyed.
+    let target = if pid == 0 {
+        current_task_id()
+    } else {
+        pgid_from_user(pid)
+    };
+    ctx.set_return(SyscallReturn::ok(pgid_to_user(read_pgid(target))));
 }
 
 fn sys_setpgid(ctx: &mut dyn TrapContext) {
@@ -9671,8 +9720,18 @@ fn sys_setpgid(ctx: &mut dyn TrapContext) {
     let pid = args.arg0;
     let pgid = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let target = if pid == 0 { current_task_id() } else { pid };
-    let value = if pgid == 0 { target } else { pgid };
+    // arg0/arg1 are *visible* pids (0 = self / pgid-of-self); the
+    // PGID_TABLE is keyed by and stores task ids, so translate in.
+    let target = if pid == 0 {
+        current_task_id()
+    } else {
+        pgid_from_user(pid)
+    };
+    let value = if pgid == 0 {
+        target
+    } else {
+        pgid_from_user(pgid)
+    };
     let mut g = PGID_TABLE.lock();
     let m = match g.as_mut() {
         Some(m) => m,
@@ -9766,7 +9825,9 @@ fn sys_setsid(ctx: &mut dyn TrapContext) {
             m.insert(task, CTTY_DETACHED);
         }
     }
-    ctx.set_return(SyscallReturn::ok(task));
+    // setsid(2) returns the new session id = the caller's pid, in the
+    // visible-pid space userspace sees.
+    ctx.set_return(SyscallReturn::ok(pgid_to_user(task)));
 }
 
 // ── Per-task controlling-tty table (Wave-76) ───────────────────────
@@ -10075,7 +10136,9 @@ fn sys_getegid(ctx: &mut dyn TrapContext) {
 /// `getpgrp()` — the calling process's process-group id (legacy; takes
 /// no argument, so it always targets self).
 fn sys_getpgrp(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok(read_pgid(current_task_id())));
+    ctx.set_return(SyscallReturn::ok(pgid_to_user(
+        read_pgid(current_task_id()),
+    )));
 }
 
 /// `setreuid(ruid, euid)` — set the real and/or effective uid; `-1`

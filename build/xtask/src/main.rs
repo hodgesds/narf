@@ -1518,10 +1518,12 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // entrypoint. The entrypoint proves rootfs isolation (reads the
         // container's own /etc/os-release) + env propagation and prints
         // `oci-container-ok`; the runtime then prints `oci-smoke-ok`.
-        // The nightly OCI job (.github/workflows/nightly-oci.yml) runs
-        // this same case as a dedicated scheduled signal. (A stronger
-        // `oci-uts-isolated` token lights up once the `container`
-        // feature boots cleanly — it currently hangs getty at boot.)
+        // This default build (no `container` feature) exercises the
+        // chroot-based rootfs isolation. The nightly OCI job
+        // (.github/workflows/nightly-oci.yml) runs the same smoke WITH
+        // `--features container`, where the runtime also prints the
+        // stronger `oci-uts-isolated` token (the contained sethostname
+        // did not leak to the host → a real UTS namespace).
         ("oci_smoke", "oci-smoke-ok"),
         ("fs_smoke", "fs-ok"),
         ("fork_pipe_smoke", "fork-ok"),
