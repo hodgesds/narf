@@ -3313,6 +3313,14 @@ fn boot_userspace_init() {
     // SAFETY: low-4-GiB identity map is live, frame allocator
     // initialised in `_start_rust`.
     fn spawn_one(name: &'static str, bytes: &[u8]) -> bool {
+        spawn_one_argv(name, bytes, &[name])
+    }
+
+    // Like `spawn_one` but with an explicit argv (argv[0] should be the
+    // program name). Lets a boot-spawned daemon receive flags — e.g.
+    // redis-server needs `--bind 0.0.0.0 --protected-mode no` to serve
+    // off-box.
+    fn spawn_one_argv(name: &'static str, bytes: &[u8], argv: &[&str]) -> bool {
         if bytes.is_empty() {
             let _ = writeln!(
                 console::Writer,
@@ -3321,7 +3329,7 @@ fn boot_userspace_init() {
             return false;
         }
         // SAFETY: Valid memory or trusted environment
-        let proc = match unsafe { load_user_process_with(bytes, &[name], &[], &[]) } {
+        let proc = match unsafe { load_user_process_with(bytes, argv, &[], &[]) } {
             Ok(p) => p,
             Err(e) => {
                 let _ = writeln!(
@@ -3364,7 +3372,7 @@ fn boot_userspace_init() {
         // /proc/[pid]/cmdline + comm seed for the boot-spawned
         // process. argv = ["init"] / ["shell"] is the convention
         // load_user_process_with uses above.
-        narf_userspace::handlers::set_proc_argv(tid.raw(), &[name]);
+        narf_userspace::handlers::set_proc_argv(tid.raw(), argv);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
         // Slot 24 = init spawned (lime), slot 23 = shell spawned
         // (cyan). Lets the user see at a glance which user task
@@ -3634,6 +3642,9 @@ fn boot_userspace_init() {
                 // Off-box network serving: TCP echo server bound to
                 // 0.0.0.0, reached from the host via QEMU hostfwd.
                 ("netserve_smoke", narf_verification::NARF_NETSERVE_SMOKE_ELF),
+                // Unmodified redis-server (7.2.x, musl) — a real server
+                // daemon, run off-box via the qemu-net + hostfwd harness.
+                ("redis-server", narf_verification::NARF_REDIS_SERVER_ELF),
                 // Pipe blocking-read + EOF on writer exit (fd teardown on
                 // exit) — the mechanism behind shell `$(...)` substitution.
                 ("pipeof_smoke", narf_verification::NARF_PIPEOF_SMOKE_ELF),
@@ -3833,6 +3844,27 @@ fn boot_userspace_init() {
     {
         if !narf_verification::NARF_NETSERVE_SMOKE_ELF.is_empty() {
             spawn_one("netserve", narf_verification::NARF_NETSERVE_SMOKE_ELF);
+        }
+        // Unmodified redis-server, bound off-box on 0.0.0.0:6379. Args
+        // skip IPv6 + RDB/AOF persistence so it serves from RAM only; the
+        // host-side `cargo xtask redis-smoke` harness then does SET/GET
+        // over the hostfwd port.
+        if !narf_verification::NARF_REDIS_SERVER_ELF.is_empty() {
+            spawn_one_argv(
+                "redis-server",
+                narf_verification::NARF_REDIS_SERVER_ELF,
+                &[
+                    "redis-server",
+                    "--bind",
+                    "0.0.0.0",
+                    "--protected-mode",
+                    "no",
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                ],
+            );
         }
     }
 }

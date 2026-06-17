@@ -769,8 +769,25 @@ impl FileOps for SocketFile {
         let state = self.state.lock();
         match &*state {
             SocketState::Fresh => 0,
+            // An AF_INET listener is accept-ready (POLL_IN) when its
+            // loopback `pending` queue OR — for a wired (off-box) listen
+            // — the kernel-stack accept-queue has a completed connection.
+            // Without the kernel-queue check, an epoll-driven server like
+            // redis never sees an incoming off-box connection.
+            SocketState::InetListener {
+                pending, listen_id, ..
+            } => {
+                let ready = !pending.is_empty()
+                    || listen_id
+                        .map(narf_net::tcp_stack::listen_has_pending)
+                        .unwrap_or(false);
+                if ready {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }
+            }
             SocketState::UnixListener { pending, .. }
-            | SocketState::InetListener { pending, .. }
             | SocketState::Inet6Listener { pending, .. } => {
                 if pending.is_empty() {
                     0
@@ -1174,7 +1191,12 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
-            _ => SocketOpResult::Err(SockError::NotSupported),
+            // Accept-and-ignore any option NARF doesn't model, rather
+            // than failing it. Linux returns success (or ENOPROTOOPT) for
+            // benign unknown options; returning an error makes real
+            // daemons abort — redis treats a failed setsockopt(IPV6_V6ONLY)
+            // on its listener as fatal. The value is simply not applied.
+            _ => SocketOpResult::Ok(0),
         }
     }
 

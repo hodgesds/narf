@@ -3864,6 +3864,18 @@ pub const NARF_HELLO_MUSL_DYN_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_MUSL_
 ))]
 pub const NARF_HELLO_MUSL_DYN_ELF: &[u8] = include_bytes!(env!("NARF_HELLO_MUSL_DYN_ELF_AARCH64"));
 
+/// Unmodified `redis-server` (7.2.x, musl, MALLOC=libc, no TLS, stripped).
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_REDIS_SERVER_ELF: &[u8] = include_bytes!(env!("NARF_REDIS_SERVER_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_REDIS_SERVER_ELF: &[u8] = include_bytes!(env!("NARF_REDIS_SERVER_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

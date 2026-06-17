@@ -38,10 +38,10 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, getsockopt_cong, getsockopt_int, listen, lookup_tcb, readable, recv,
-    remove_tcb, send, setsockopt_int, setsockopt_str, shutdown, tick_retransmit, Tcb,
-    TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG,
-    TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
+    accept, close, connect, getsockopt_cong, getsockopt_int, listen, listen_has_pending,
+    lookup_tcb, readable, recv, remove_tcb, send, setsockopt_int, setsockopt_str, shutdown,
+    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
+    TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 

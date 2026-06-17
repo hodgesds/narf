@@ -54,6 +54,20 @@ enum Cmd {
     /// the guest's `netserve-ok`. Proves a guest server is reachable
     /// from outside the VM over virtio-net.
     NetSmoke(BuildArgs),
+    /// Off-box redis smoke. Boot with `qemu-net` + a QEMU `hostfwd`,
+    /// wait for the auto-spawned unmodified `redis-server` to print
+    /// `Ready to accept connections`, then open a real host TCP socket to
+    /// the forwarded port and round-trip RESP `SET`/`GET`. Proves a real
+    /// third-party server daemon serves off-box over virtio-net.
+    RedisSmoke(BuildArgs),
+    /// Off-box redis PERFORMANCE benchmark with a Linux baseline.
+    /// Boots `qemu-net` + `hostfwd`, waits for the unmodified
+    /// `redis-server` to come up, then drives a pipelined SET/GET
+    /// throughput workload + a sequential-PING latency workload from a
+    /// real host TCP socket. Re-runs the IDENTICAL workload against the
+    /// SAME redis binary spawned natively on the Linux host and prints
+    /// a side-by-side NARF-guest-vs-Linux-host comparison.
+    RedisBench(BuildArgs),
     /// Wave-78 — boot under QEMU and verify both linux-compat demo
     /// binaries (`/bin/hello` and `/bin/hello_musl`) print their
     /// expected output through the real shell + execve + ELF
@@ -539,6 +553,16 @@ impl Arch {
                         "-device".into(),
                         "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     ]);
+                    // Optional wire capture for debugging: `XTASK_QEMU_NETDUMP=<path>`
+                    // pcaps every frame on netdev n0 (the hostfwd NIC).
+                    if let Ok(path) = std::env::var("XTASK_QEMU_NETDUMP") {
+                        if !path.is_empty() {
+                            args.extend_from_slice(&[
+                                "-object".into(),
+                                format!("filter-dump,id=netdump0,netdev=n0,file={path}"),
+                            ]);
+                        }
+                    }
                     args.extend_from_slice(&[
                         "-object".into(),
                         "rng-random,id=rng0,filename=/dev/urandom".into(),
@@ -645,6 +669,16 @@ impl Arch {
                         "-device".into(),
                         "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
                     ]);
+                    // Optional wire capture for debugging: `XTASK_QEMU_NETDUMP=<path>`
+                    // pcaps every frame on netdev n0 (the hostfwd NIC).
+                    if let Ok(path) = std::env::var("XTASK_QEMU_NETDUMP") {
+                        if !path.is_empty() {
+                            args.extend_from_slice(&[
+                                "-object".into(),
+                                format!("filter-dump,id=netdump0,netdev=n0,file={path}"),
+                            ]);
+                        }
+                    }
                     args.extend_from_slice(&[
                         "-object".into(),
                         "rng-random,id=rng0,filename=/dev/urandom".into(),
@@ -2305,6 +2339,1042 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let _ = child.wait();
     let _ = reader.join();
     println!("xtask net-smoke: ok — guest server echoed an off-box client over virtio-net");
+    Ok(())
+}
+
+/// Off-box redis smoke — see [`Cmd::RedisSmoke`]. Boots `qemu-net` + a
+/// QEMU `hostfwd`, waits for the auto-spawned unmodified `redis-server`
+/// to announce readiness, then drives RESP `SET`/`GET` from the host.
+fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask redis-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+    }
+
+    let host_port: u16 = 16379;
+    let guest_port: u16 = 6379;
+
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    ensure_feature(&mut build.features, "qemu-net");
+
+    let root = workspace_root()?;
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did the build succeed?",
+            kernel.display()
+        );
+    }
+
+    std::env::set_var(
+        "XTASK_QEMU_HOSTFWD",
+        format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
+    );
+
+    // redis spawns background (bio) threads at startup via clone(2). The
+    // SMP user-task *migration* path (task #87) is still being hardened —
+    // under the default 16-vCPU machine those threads intermittently
+    // fault when migrated/stolen across APs (a #PF with a corrupt resumed
+    // context; not a redis/TCP bug — the same crash never reproduces
+    // single-CPU). Until #87 lands, pin redis to one vCPU so the off-box
+    // serving + sustained-stress guarantees are deterministic. The full
+    // kernel SMP plumbing is otherwise unchanged; override with
+    // `NARF_QEMU_SMP=<n>` to reproduce the migration race on purpose.
+    if std::env::var_os("NARF_QEMU_SMP").is_none() {
+        std::env::set_var("NARF_QEMU_SMP", "1");
+    }
+
+    let qemu = build.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(
+        build
+            .arch
+            .qemu_args(&kernel, &build.display, build.hw_profile),
+    );
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    println!(
+        "xtask redis-smoke: launching {} {} (hostfwd 127.0.0.1:{host_port} -> guest :{guest_port})",
+        qemu,
+        kernel.display()
+    );
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    let timeout_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
+    let panic_flag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
+    let cap_r = captured.clone();
+    let panic_r = panic_flag.clone();
+    let reader = std::thread::spawn(move || {
+        let panic_markers: &[&[u8]] = &[
+            b"*** KERNEL PANIC ***",
+            b"panicked at",
+            b"double fault",
+            b"general protection",
+            b"kernel page fault",
+            b"unsafe precondition",
+        ];
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        let mut line: Vec<u8> = Vec::with_capacity(256);
+        let mut out = std::io::stdout();
+        loop {
+            let n = match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let _ = out.write_all(&buf[..n]);
+            let _ = out.flush();
+            if let Ok(mut g) = cap_r.lock() {
+                g.extend_from_slice(&buf[..n]);
+            }
+            for &b in &buf[..n] {
+                if b == b'\n' {
+                    for m in panic_markers {
+                        if line.windows(m.len()).any(|w| w == *m) {
+                            if let Ok(mut p) = panic_r.lock() {
+                                if p.is_none() {
+                                    *p = Some(String::from_utf8_lossy(&line).into_owned());
+                                }
+                            }
+                        }
+                    }
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+
+    let wait_for = |needle: &[u8], secs: u64| -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(secs) {
+            if panic_flag.lock().ok().map(|p| p.is_some()).unwrap_or(false) {
+                return false;
+            }
+            if let Ok(g) = captured.lock() {
+                if g.windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    };
+
+    // 1. Wait for redis to announce readiness.
+    if !wait_for(b"Ready to accept connections", timeout_secs) {
+        let panic = panic_flag.lock().ok().and_then(|g| g.clone());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        if let Some(p) = panic {
+            bail!("xtask redis-smoke: kernel panic before redis ready — '{p}'");
+        }
+        bail!(
+            "xtask redis-smoke: redis-server did not print `Ready to accept connections` within {timeout_secs}s"
+        );
+    }
+    println!(
+        "\nxtask redis-smoke: redis is ready; connecting from host to 127.0.0.1:{host_port}..."
+    );
+
+    // 2. Connect from the host.
+    let mut stream: Option<TcpStream> = None;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
+        match TcpStream::connect(("127.0.0.1", host_port)) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let mut stream = match stream {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("xtask redis-smoke: could not connect to 127.0.0.1:{host_port} within 20s");
+        }
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+
+    // RESP-encode an array of bulk strings.
+    let resp = |args: &[&str]| -> Vec<u8> {
+        let mut b = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            b.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            b.extend_from_slice(a.as_bytes());
+            b.extend_from_slice(b"\r\n");
+        }
+        b
+    };
+    // Read exactly ONE complete RESP reply (handles +simple, -error,
+    // :integer, $bulk, *array — recursively), returning the raw bytes.
+    fn read_one_resp<R: std::io::BufRead>(r: &mut R) -> std::io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        r.read_until(b'\n', &mut line)?;
+        if line.is_empty() {
+            return Ok(line);
+        }
+        let mut out = line.clone();
+        let num = |l: &[u8]| -> i64 {
+            std::str::from_utf8(&l[1..])
+                .ok()
+                .map(|s| s.trim())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(-1)
+        };
+        match line[0] {
+            b'$' => {
+                let len = num(&line);
+                if len >= 0 {
+                    let mut data = vec![0u8; len as usize + 2]; // payload + CRLF
+                    r.read_exact(&mut data)?;
+                    out.extend_from_slice(&data);
+                }
+            }
+            b'*' => {
+                let n = num(&line);
+                for _ in 0..n.max(0) {
+                    out.extend_from_slice(&read_one_resp(r)?);
+                }
+            }
+            _ => {} // +, -, : are single-line
+        }
+        Ok(out)
+    }
+
+    let fail = |child: &mut std::process::Child, msg: String| -> anyhow::Error {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow!(msg)
+    };
+
+    // A representative command battery across every redis data type +
+    // server/keyspace commands — proves the RESP protocol and command
+    // dispatch work broadly, not just SET/GET. Each entry is
+    // (args, check-on-raw-reply).
+    let sub = |s: &'static [u8]| -> Box<dyn Fn(&[u8]) -> bool> {
+        Box::new(move |r: &[u8]| r.windows(s.len()).any(|w| w == s))
+    };
+    let posint = || -> Box<dyn Fn(&[u8]) -> bool> {
+        Box::new(|r: &[u8]| r.first() == Some(&b':') && r.get(1).is_some_and(u8::is_ascii_digit))
+    };
+    let battery: Vec<(Vec<&str>, Box<dyn Fn(&[u8]) -> bool>)> = vec![
+        (vec!["PING"], sub(b"+PONG")),
+        // strings
+        (vec!["SET", "k:str", "hello-narf"], sub(b"+OK")),
+        (vec!["GET", "k:str"], sub(b"hello-narf")),
+        (vec!["APPEND", "k:str", "!"], sub(b":11")), // "hello-narf!" = 11
+        (vec!["STRLEN", "k:str"], sub(b":11")),
+        (vec!["EXISTS", "k:str"], sub(b":1")),
+        (vec!["GETRANGE", "k:str", "0", "4"], sub(b"hello")),
+        // integers
+        (vec!["SET", "k:num", "10"], sub(b"+OK")),
+        (vec!["INCR", "k:num"], sub(b":11")),
+        (vec!["INCRBY", "k:num", "5"], sub(b":16")),
+        (vec!["DECR", "k:num"], sub(b":15")),
+        (vec!["DEL", "k:num"], sub(b":1")),
+        (vec!["EXISTS", "k:num"], sub(b":0")),
+        // lists
+        (vec!["RPUSH", "k:list", "a", "b", "c"], sub(b":3")),
+        (vec!["LPUSH", "k:list", "z"], sub(b":4")),
+        (vec!["LLEN", "k:list"], sub(b":4")),
+        (vec!["LRANGE", "k:list", "0", "-1"], sub(b"a")),
+        (vec!["LPOP", "k:list"], sub(b"z")),
+        // hashes
+        (vec!["HSET", "k:hash", "f1", "v1", "f2", "v2"], sub(b":2")),
+        (vec!["HGET", "k:hash", "f1"], sub(b"v1")),
+        (vec!["HLEN", "k:hash"], sub(b":2")),
+        (vec!["HGETALL", "k:hash"], sub(b"v2")),
+        // sets
+        (vec!["SADD", "k:set", "x", "y", "z"], sub(b":3")),
+        (vec!["SCARD", "k:set"], sub(b":3")),
+        (vec!["SISMEMBER", "k:set", "y"], sub(b":1")),
+        // sorted sets
+        (vec!["ZADD", "k:zset", "1", "one", "2", "two"], sub(b":2")),
+        (vec!["ZCARD", "k:zset"], sub(b":2")),
+        (vec!["ZSCORE", "k:zset", "two"], sub(b"2")),
+        // expiry + introspection
+        (vec!["EXPIRE", "k:str", "1000"], sub(b":1")),
+        (vec!["TTL", "k:str"], posint()),
+        (vec!["PERSIST", "k:str"], sub(b":1")),
+        (vec!["TYPE", "k:list"], sub(b"+list")),
+        (vec!["DBSIZE"], posint()),
+        // server / config
+        (vec!["INFO", "server"], sub(b"redis_version:7.2.5")),
+        (vec!["CONFIG", "GET", "maxmemory"], sub(b"maxmemory")),
+        (vec!["COMMAND", "COUNT"], posint()),
+        (vec!["DBSIZE"], posint()),
+    ];
+
+    let mut reader_io = std::io::BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|e| fail(&mut child, format!("xtask redis-smoke: clone stream: {e}")))?,
+    );
+
+    let total = battery.len();
+    for (i, (args, check)) in battery.iter().enumerate() {
+        if stream.write_all(&resp(args)).is_err() {
+            return Err(fail(
+                &mut child,
+                format!("xtask redis-smoke: host write failed for {:?}", args),
+            ));
+        }
+        let _ = stream.flush();
+        let reply = read_one_resp(&mut reader_io)
+            .map_err(|e| anyhow!("xtask redis-smoke: read reply for {:?}: {e}", args))?;
+        if !check(&reply) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "xtask redis-smoke: command {:?} got unexpected reply: {:?}",
+                args,
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        println!(
+            "  redis [{:2}/{}] {:<28} -> {}",
+            i + 1,
+            total,
+            args.join(" "),
+            String::from_utf8_lossy(&reply).trim().replace("\r\n", " ")
+        );
+    }
+
+    // 3. Optional sustained stress phase. `XTASK_REDIS_STRESS_SECS=120`
+    //    hammers redis with mixed-type round-trips for ~2 minutes to
+    //    prove the TCP/epoll path stays healthy under sustained load:
+    //    no stall (the failure mode was a stuck read after ~34 RTs), no
+    //    leak, no crash. Keys are segregated per data type so a RESP
+    //    error reply (`-...`) is always a real failure (never a benign
+    //    WRONGTYPE from cross-type access). Default 0 = skip, keeping
+    //    the quick smoke fast.
+    let stress_secs: u64 = std::env::var("XTASK_REDIS_STRESS_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if stress_secs > 0 {
+        println!(
+            "\nxtask redis-smoke: starting {stress_secs}s sustained stress (mixed-type round-trips)..."
+        );
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        let start = Instant::now();
+        let deadline = Duration::from_secs(stress_secs);
+        // xorshift64 — deterministic host-side PRNG (no rand crate).
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut ops: u64 = 0;
+        let mut last_report = Instant::now();
+        while start.elapsed() < deadline {
+            let r = next();
+            let n = (r % 512).to_string(); // bounded keyspace → bounded memory
+            let v = format!("v{}", r & 0xffff_ffff);
+            // Command words. Each key prefix is touched by exactly one
+            // data type, so a `-...` error reply is always a real bug
+            // (never a benign cross-type WRONGTYPE).
+            let mk = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+            let words: Vec<String> = match (r >> 9) % 16 {
+                0 => mk(&["SET", &format!("ss:{n}"), &v]),
+                1 => mk(&["GET", &format!("ss:{n}")]),
+                2 => mk(&["APPEND", &format!("ss:{n}"), "x"]),
+                3 => mk(&["STRLEN", &format!("ss:{n}")]),
+                4 => mk(&["INCR", &format!("si:{n}")]),
+                5 => mk(&["INCRBY", &format!("si:{n}"), "3"]),
+                6 => mk(&["RPUSH", &format!("sl:{n}"), &v]),
+                7 => mk(&["LLEN", &format!("sl:{n}")]),
+                8 => mk(&["LPOP", &format!("sl:{n}")]),
+                9 => mk(&["HSET", &format!("sh:{n}"), "f", &v]),
+                10 => mk(&["HGET", &format!("sh:{n}"), "f"]),
+                11 => mk(&["SADD", &format!("sx:{n}"), &v]),
+                12 => mk(&["SCARD", &format!("sx:{n}")]),
+                13 => mk(&["ZADD", &format!("sz:{n}"), &(r % 100).to_string(), &v]),
+                14 => mk(&["EXPIRE", &format!("ss:{n}"), "300"]),
+                _ => mk(&["PING"]),
+            };
+            let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+            if stream.write_all(&resp(&refs)).is_err() {
+                return Err(fail(
+                    &mut child,
+                    format!(
+                        "xtask redis-smoke: stress write failed after {ops} ops ({:?})",
+                        refs
+                    ),
+                ));
+            }
+            let _ = stream.flush();
+            let reply = read_one_resp(&mut reader_io).map_err(|e| {
+                fail(
+                    &mut child,
+                    format!(
+                        "xtask redis-smoke: STALL/read failure after {ops} ops on {:?}: {e} \
+                         (sustained-load regression)",
+                        refs
+                    ),
+                )
+            })?;
+            if reply.is_empty() || reply[0] == b'-' {
+                return Err(fail(
+                    &mut child,
+                    format!(
+                        "xtask redis-smoke: stress error reply after {ops} ops on {:?}: {:?}",
+                        refs,
+                        String::from_utf8_lossy(&reply)
+                    ),
+                ));
+            }
+            ops += 1;
+            if last_report.elapsed() >= Duration::from_secs(10) {
+                let el = start.elapsed().as_secs_f64().max(0.001);
+                println!(
+                    "  redis stress: {ops} ops in {:.0}s ({:.0} ops/s), 0 errors",
+                    el,
+                    ops as f64 / el
+                );
+                last_report = Instant::now();
+            }
+        }
+        // Final liveness check: a clean PING after the stress proves the
+        // connection + server survived intact (not merely "didn't error
+        // mid-loop because we stopped looping").
+        let _ = stream.write_all(&resp(&["PING"]));
+        let _ = stream.flush();
+        let pong = read_one_resp(&mut reader_io).map_err(|e| {
+            fail(
+                &mut child,
+                format!("xtask redis-smoke: post-stress PING failed: {e}"),
+            )
+        })?;
+        if !pong.windows(5).any(|w| w == b"+PONG") {
+            return Err(fail(
+                &mut child,
+                format!(
+                    "xtask redis-smoke: post-stress PING unexpected: {:?}",
+                    String::from_utf8_lossy(&pong)
+                ),
+            ));
+        }
+        let el = start.elapsed().as_secs_f64().max(0.001);
+        println!(
+            "xtask redis-smoke: stress ok — {ops} sustained round-trips in {:.0}s \
+             ({:.0} ops/s), 0 errors, server live after",
+            el,
+            ops as f64 / el
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    println!(
+        "xtask redis-smoke: ok — unmodified redis-server served {total} commands \
+         (strings/lists/hashes/sets/zsets/expiry/server) to an off-box client over virtio-net"
+    );
+    Ok(())
+}
+
+// ── redis-bench shared helpers ──────────────────────────────────────
+
+/// RESP-encode a command as an array of bulk strings.
+fn resp_encode(parts: &[&str]) -> Vec<u8> {
+    let mut b = format!("*{}\r\n", parts.len()).into_bytes();
+    for p in parts {
+        b.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+        b.extend_from_slice(p.as_bytes());
+        b.extend_from_slice(b"\r\n");
+    }
+    b
+}
+
+/// Read exactly ONE complete RESP reply (handles +simple, -error,
+/// :integer, $bulk, *array — recursively), returning the raw bytes.
+fn read_one_resp_full<R: std::io::BufRead>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    r.read_until(b'\n', &mut line)?;
+    if line.is_empty() {
+        return Ok(line);
+    }
+    let mut out = line.clone();
+    let num = |l: &[u8]| -> i64 {
+        std::str::from_utf8(&l[1..])
+            .ok()
+            .map(|s| s.trim())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(-1)
+    };
+    match line[0] {
+        b'$' => {
+            let len = num(&line);
+            if len >= 0 {
+                let mut data = vec![0u8; len as usize + 2];
+                r.read_exact(&mut data)?;
+                out.extend_from_slice(&data);
+            }
+        }
+        b'*' => {
+            let n = num(&line);
+            for _ in 0..n.max(0) {
+                out.extend_from_slice(&read_one_resp_full(r)?);
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// One benchmark result for a single redis target.
+#[derive(Clone, Copy)]
+struct BenchMetrics {
+    set_ops_s: f64,
+    get_ops_s: f64,
+    lat_min_us: u64,
+    lat_avg_us: u64,
+    lat_p50_us: u64,
+    lat_p99_us: u64,
+}
+
+/// Drive an identical workload against a connected redis stream:
+///   • pipelined SET throughput, • pipelined GET throughput,
+///   • sequential single-command PING latency (p50/p99/avg/min).
+/// Any error reply (`-...`), short read, or stall fails the bench.
+fn redis_bench_workload(
+    stream: &mut std::net::TcpStream,
+    throughput_ops: usize,
+    pipeline_depth: usize,
+    latency_ops: usize,
+) -> Result<BenchMetrics> {
+    use std::io::{BufReader, Write};
+    use std::time::{Duration, Instant};
+
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    stream.set_nodelay(true).ok();
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|e| anyhow!("bench: clone stream: {e}"))?,
+    );
+
+    // Pipelined throughput for a given command builder.
+    let mut throughput = |verb: &str| -> Result<f64> {
+        let val = "v".repeat(16);
+        let start = Instant::now();
+        let mut done = 0usize;
+        while done < throughput_ops {
+            let batch = pipeline_depth.min(throughput_ops - done);
+            let mut out = Vec::with_capacity(batch * 48);
+            for i in 0..batch {
+                let key = format!("bench:{}", (done + i) % 4096);
+                let cmd = if verb == "SET" {
+                    resp_encode(&["SET", &key, &val])
+                } else {
+                    resp_encode(&["GET", &key])
+                };
+                out.extend_from_slice(&cmd);
+            }
+            stream
+                .write_all(&out)
+                .map_err(|e| anyhow!("bench {verb}: write after {done}: {e}"))?;
+            stream.flush().ok();
+            for _ in 0..batch {
+                let reply = read_one_resp_full(&mut reader)
+                    .map_err(|e| anyhow!("bench {verb}: read after {done}: {e}"))?;
+                if reply.is_empty() || reply[0] == b'-' {
+                    bail!(
+                        "bench {verb}: error reply after {done}: {:?}",
+                        String::from_utf8_lossy(&reply)
+                    );
+                }
+            }
+            done += batch;
+        }
+        Ok(throughput_ops as f64 / start.elapsed().as_secs_f64().max(1e-6))
+    };
+
+    let set_ops_s = throughput("SET")?;
+    let get_ops_s = throughput("GET")?;
+
+    // Sequential single-command latency.
+    let mut samples: Vec<u64> = Vec::with_capacity(latency_ops);
+    for _ in 0..latency_ops {
+        let t = Instant::now();
+        stream
+            .write_all(&resp_encode(&["PING"]))
+            .map_err(|e| anyhow!("bench PING: write: {e}"))?;
+        stream.flush().ok();
+        let reply =
+            read_one_resp_full(&mut reader).map_err(|e| anyhow!("bench PING: read: {e}"))?;
+        if !reply.windows(5).any(|w| w == b"+PONG") {
+            bail!(
+                "bench PING: unexpected {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        samples.push(t.elapsed().as_micros() as u64);
+    }
+    samples.sort_unstable();
+    let n = samples.len().max(1);
+    let sum: u64 = samples.iter().sum();
+    Ok(BenchMetrics {
+        set_ops_s,
+        get_ops_s,
+        lat_min_us: *samples.first().unwrap_or(&0),
+        lat_avg_us: sum / n as u64,
+        lat_p50_us: samples[n / 2],
+        lat_p99_us: samples[(n * 99 / 100).min(n - 1)],
+    })
+}
+
+/// Boot NARF's `redis-server` under QEMU (qemu-net + hostfwd, pinned to
+/// 1 vCPU per the migration caveat) and return the child, its serial
+/// reader thread, and a connected host `TcpStream`.
+fn boot_narf_redis(
+    args: &BuildArgs,
+    host_port: u16,
+    guest_port: u16,
+) -> Result<(
+    std::process::Child,
+    std::thread::JoinHandle<()>,
+    std::net::TcpStream,
+)> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    ensure_feature(&mut build.features, "qemu-net");
+
+    let root = workspace_root()?;
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!("expected kernel at {}", kernel.display());
+    }
+    std::env::set_var(
+        "XTASK_QEMU_HOSTFWD",
+        format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
+    );
+    if std::env::var_os("NARF_QEMU_SMP").is_none() {
+        std::env::set_var("NARF_QEMU_SMP", "1");
+    }
+
+    let qemu = build.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(
+        build
+            .arch
+            .qemu_args(&kernel, &build.display, build.hw_profile),
+    );
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().with_context(|| format!("spawn {qemu}"))?;
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
+    let panic_flag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let cap_r = captured.clone();
+    let panic_r = panic_flag.clone();
+    let reader = std::thread::spawn(move || {
+        let markers: &[&[u8]] = &[b"KERNEL PANIC", b"panicked at", b"double fault"];
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let nr = match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if let Ok(mut g) = cap_r.lock() {
+                g.extend_from_slice(&buf[..nr]);
+            }
+            for &b in &buf[..nr] {
+                if b == b'\n' {
+                    for m in markers {
+                        if line.windows(m.len()).any(|w| w == *m) {
+                            if let Ok(mut p) = panic_r.lock() {
+                                if p.is_none() {
+                                    *p = Some(String::from_utf8_lossy(&line).into_owned());
+                                }
+                            }
+                        }
+                    }
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+
+    let timeout_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    let start = Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(timeout_secs) {
+        if panic_flag.lock().ok().and_then(|p| p.clone()).is_some() {
+            break;
+        }
+        if let Ok(g) = captured.lock() {
+            if g.windows(27).any(|w| w == b"Ready to accept connections") {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ready {
+        let panic = panic_flag.lock().ok().and_then(|g| g.clone());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        if let Some(p) = panic {
+            bail!("NARF redis: kernel panic before ready — '{p}'");
+        }
+        bail!("NARF redis: not ready within {timeout_secs}s");
+    }
+
+    let mut stream = None;
+    let cstart = Instant::now();
+    while cstart.elapsed() < Duration::from_secs(20) {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", host_port)) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let stream = match stream {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            bail!("NARF redis: could not connect to 127.0.0.1:{host_port}");
+        }
+    };
+    let _ = writeln!(std::io::stdout(), "  [NARF] redis ready, connected.");
+    Ok((child, reader, stream))
+}
+
+/// Build a minimal initramfs (busybox + the SAME redis binary + musl
+/// loader + an `/init` that brings up virtio-net and execs redis) and
+/// boot a stock Linux kernel under QEMU with the same hostfwd. Returns
+/// the QEMU child and a connected host `TcpStream`. This is the
+/// apples-to-apples Linux baseline: same redis binary, same QEMU +
+/// virtio-net + SLIRP, just a Linux kernel in place of NARF.
+fn boot_linux_redis(
+    host_port: u16,
+    guest_port: u16,
+) -> Result<(std::process::Child, std::net::TcpStream)> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let root = workspace_root()?;
+    let redis = root.join("verification/data/musl-demo/redis_server_x86_64");
+    if !redis.exists() {
+        bail!(
+            "Linux baseline: redis binary missing at {}",
+            redis.display()
+        );
+    }
+    // busybox: prefer the committed static one, else the host's.
+    let busybox = {
+        let local = root.join("verification/data/musl-demo/busybox_static_x86_64");
+        if local.exists() {
+            local
+        } else {
+            PathBuf::from("/usr/bin/busybox")
+        }
+    };
+    if !busybox.exists() {
+        bail!("Linux baseline: need a static busybox (committed or /usr/bin/busybox)");
+    }
+    // musl loader the redis PIE asks for (/lib/ld-musl-x86_64.so.1).
+    let musl_loader = PathBuf::from("/lib/ld-musl-x86_64.so.1");
+    if !musl_loader.exists() {
+        bail!("Linux baseline: musl loader /lib/ld-musl-x86_64.so.1 absent on host");
+    }
+    // A Linux kernel image. Override with XTASK_LINUX_KERNEL; else pick
+    // the newest /boot/vmlinuz-*.
+    let kernel = if let Ok(k) = std::env::var("XTASK_LINUX_KERNEL") {
+        PathBuf::from(k)
+    } else {
+        let mut cands: Vec<PathBuf> = std::fs::read_dir("/boot")
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("vmlinuz-"))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        cands.sort();
+        cands
+            .pop()
+            .or_else(|| {
+                let v = PathBuf::from("/boot/vmlinuz");
+                v.exists().then_some(v)
+            })
+            .ok_or_else(|| anyhow!("Linux baseline: no /boot/vmlinuz* (set XTASK_LINUX_KERNEL)"))?
+    };
+
+    // Stage an initramfs tree.
+    let stage = std::env::temp_dir().join(format!("narf-linux-redis-{host_port}"));
+    let _ = std::fs::remove_dir_all(&stage);
+    for d in ["bin", "lib", "proc", "sys", "dev"] {
+        std::fs::create_dir_all(stage.join(d))?;
+    }
+    std::fs::copy(&busybox, stage.join("bin/busybox"))?;
+    std::fs::copy(&redis, stage.join("bin/redis-server"))?;
+    // Resolve the musl loader symlink to its real file.
+    let musl_real = std::fs::canonicalize(&musl_loader).unwrap_or(musl_loader.clone());
+    std::fs::copy(&musl_real, stage.join("lib/ld-musl-x86_64.so.1"))?;
+    let init = "#!/bin/busybox sh\n\
+         /bin/busybox mount -t proc proc /proc\n\
+         /bin/busybox mount -t sysfs sysfs /sys\n\
+         /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null\n\
+         /bin/busybox mknod /dev/null c 1 3 2>/dev/null\n\
+         /bin/busybox ifconfig lo 127.0.0.1 up\n\
+         /bin/busybox ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up\n\
+         /bin/busybox route add default gw 10.0.2.2\n\
+         echo NARF-LINUX-BASELINE-NET-UP\n\
+         exec /bin/redis-server --bind 0.0.0.0 --protected-mode no --save \"\" \
+         --appendonly no --loglevel notice\n";
+    std::fs::write(stage.join("init"), init)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in ["init", "bin/busybox", "bin/redis-server"] {
+            let p = stage.join(f);
+            let mut perm = std::fs::metadata(&p)?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm)?;
+        }
+    }
+    // Pack: `find . | cpio -o -H newc | gzip > initramfs`.
+    let initramfs = std::env::temp_dir().join(format!("narf-linux-redis-{host_port}.cpio.gz"));
+    let find = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "cd {} && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -1 > {}",
+            stage.display(),
+            initramfs.display()
+        ))
+        .status()
+        .with_context(|| "Linux baseline: building initramfs (need cpio + gzip)")?;
+    if !find.success() {
+        bail!("Linux baseline: initramfs pack failed");
+    }
+
+    let mem = std::env::var("NARF_QEMU_MEM_MB").unwrap_or_else(|_| "2048".into());
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args([
+        "-nographic",
+        "-no-reboot",
+        "-kernel",
+        &kernel.display().to_string(),
+        "-initrd",
+        &initramfs.display().to_string(),
+        "-append",
+        "console=ttyS0 panic=-1 quiet",
+        "-m",
+        mem.as_str(),
+        "-smp",
+        "1",
+        "-netdev",
+        &format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
+        "-device",
+        "virtio-net-pci,netdev=n0",
+    ]);
+    // KVM if available — fairer to Linux (and harmless: NARF runs the
+    // same accel). Fall back to TCG silently.
+    if std::path::Path::new("/dev/kvm").exists() {
+        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("Linux baseline: spawn qemu-system-x86_64")?;
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let cap_r = captured.clone();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut g) = cap_r.lock() {
+                        g.extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        }
+    });
+
+    let start = Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(120) {
+        if let Ok(g) = captured.lock() {
+            if g.windows(27).any(|w| w == b"Ready to accept connections") {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ready {
+        let tail = captured
+            .lock()
+            .ok()
+            .map(|g| String::from_utf8_lossy(&g[g.len().saturating_sub(800)..]).into_owned())
+            .unwrap_or_default();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        bail!("Linux baseline: redis not ready within 120s. Serial tail:\n{tail}");
+    }
+    drop(reader); // detach; QEMU keeps draining into the (now-dropped) pipe
+
+    let mut stream = None;
+    let cstart = Instant::now();
+    while cstart.elapsed() < Duration::from_secs(20) {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", host_port)) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let stream = match stream {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Linux baseline: could not connect to 127.0.0.1:{host_port}");
+        }
+    };
+    let _ = writeln!(
+        std::io::stdout(),
+        "  [Linux] kernel {} booted, redis ready, connected.",
+        kernel.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+    );
+    Ok((child, stream))
+}
+
+/// Off-box redis performance benchmark — see [`Cmd::RedisBench`].
+fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask redis-bench: only x86_64 is wired");
+    }
+    let ops: usize = std::env::var("XTASK_REDIS_BENCH_OPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    let pipeline: usize = std::env::var("XTASK_REDIS_BENCH_PIPELINE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let lat_ops: usize = std::env::var("XTASK_REDIS_BENCH_LAT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    println!(
+        "xtask redis-bench: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
+         {lat_ops} sequential PINGs for latency\n"
+    );
+
+    // 1. NARF under QEMU.
+    println!("── NARF (microkernel) under QEMU ──");
+    let (mut narf_child, narf_reader, mut narf_stream) = boot_narf_redis(args, 16379, 6379)?;
+    let narf = redis_bench_workload(&mut narf_stream, ops, pipeline, lat_ops);
+    let _ = narf_child.kill();
+    let _ = narf_child.wait();
+    let _ = narf_reader.join();
+    let narf = narf?;
+
+    // 2. Stock Linux kernel under the same QEMU + virtio-net.
+    println!("\n── Linux (stock kernel) under QEMU ──");
+    let linux = match boot_linux_redis(16380, 6379) {
+        Ok((mut lchild, mut lstream)) => {
+            let m = redis_bench_workload(&mut lstream, ops, pipeline, lat_ops);
+            let _ = lchild.kill();
+            let _ = lchild.wait();
+            Some(m?)
+        }
+        Err(e) => {
+            println!("  Linux baseline unavailable: {e:#}");
+            None
+        }
+    };
+
+    // 3. Report.
+    println!("\n┌─ redis off-box performance (same redis-server 7.2.5 binary) ─");
+    let row = |label: &str, m: &BenchMetrics| {
+        println!(
+            "│ {label:<22} SET {:>9.0} ops/s  GET {:>9.0} ops/s  \
+             PING lat min {:>6}µs avg {:>6}µs p50 {:>6}µs p99 {:>6}µs",
+            m.set_ops_s, m.get_ops_s, m.lat_min_us, m.lat_avg_us, m.lat_p50_us, m.lat_p99_us
+        );
+    };
+    row("NARF (QEMU guest)", &narf);
+    if let Some(l) = &linux {
+        row("Linux (QEMU guest)", l);
+        println!(
+            "│ ratio (NARF/Linux)    SET {:>9.2}x  GET {:>9.2}x  PING lat {:>6.2}x",
+            narf.set_ops_s / l.set_ops_s.max(1e-6),
+            narf.get_ops_s / l.get_ops_s.max(1e-6),
+            narf.lat_avg_us as f64 / (l.lat_avg_us.max(1) as f64),
+        );
+    }
+    println!("└────────────────────────────────────────────────────────────");
+    println!("\nxtask redis-bench: ok");
     Ok(())
 }
 
@@ -4410,6 +5480,8 @@ fn main() -> Result<()> {
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
+        Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
+        Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::MuslDemo(args) => musl_demo_cmd(&args),
         Cmd::Image(mut args) => {
             // Default-on boot-init for parity with `iso-boot`. An

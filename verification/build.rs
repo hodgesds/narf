@@ -247,6 +247,19 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_HELLO_MUSL_DYN_ELF_AARCH64=/dev/null");
 
+    // Unmodified redis-server (Alpine-style musl build: 7.2.x,
+    // `make MALLOC=libc BUILD_TLS=no`, stripped). A real third-party
+    // server daemon — dynamic-PIE musl, PT_INTERP=/lib/ld-musl, single
+    // DT_NEEDED libc.so. Committed prebuilt (the kernel build doesn't
+    // rebuild redis); see data/musl-demo/REGEN_redis.sh for the recipe.
+    println!("cargo:rerun-if-changed=data/musl-demo/redis_server_x86_64");
+    let redis_server = manifest_dir.join("data/musl-demo/redis_server_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_REDIS_SERVER_ELF_X86_64={}",
+        redis_server.display()
+    );
+    println!("cargo:rustc-env=NARF_REDIS_SERVER_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

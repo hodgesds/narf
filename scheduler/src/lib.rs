@@ -1804,6 +1804,41 @@ pub fn run_until_empty() {
             continue;
         }
 
+        // Drain any wakers that IRQ handlers stashed for deferred
+        // execution — EVERY round, not just when all tasks parked.
+        // The IRQ paths (dispatch::on_irq's vector-waker chain,
+        // timer_pump's pump_irq → wheel wakers) can't call
+        // `Waker::wake()` directly — the drop of the inner Arc can hit
+        // a Sleepable slab dealloc, which the allocator's IRQ-context
+        // check refuses. They push to the per-CPU deferred queue; we
+        // drain + wake here, in non-IRQ context. This is the
+        // load-bearing wake path for everything that depends on IRQ
+        // delivery (virtio-net RX completions, xHCI completions,
+        // keyboard IRQ1, HPET-driven wheel wakes).
+        //
+        // This MUST run every round, not only in the `ready==0`
+        // branch below: a perpetually self-waking task (the FB cursor
+        // pump, the diagnostic heartbeat, any `yield_now` busy-poll)
+        // keeps `ready_this_round > 0` forever, so gating the drain on
+        // the all-parked branch starves it. The deferred queue is a
+        // bounded 64-slot stash that silently drops on overflow; left
+        // undrained it fills over a few dozen IRQs and then drops
+        // load-bearing wakes permanently (the "next tick re-fires"
+        // recovery the queue assumes ALSO can't be queued once full).
+        // That manifested as an off-box TCP stream wedging mid-flight
+        // after ~25-34 round-trips: the parked virtio-net RX pump's
+        // completion wake was dropped and never re-delivered, so
+        // inbound frames piled up unprocessed while the host
+        // retransmitted into silence. Draining unconditionally is
+        // cheap when the queue is empty (one lock + scan) and bounds
+        // wake latency to a single poll-round.
+        if narf_lib::deferred_wake::drain_and_wake() > 0 {
+            // A drained wake may have flipped a parked slot's awake
+            // flag — re-evaluate from the top instead of falling into
+            // the halt/spin idle path with runnable work pending.
+            continue;
+        }
+
         if ready_this_round == 0 {
             // All tasks parked this round. Tick the sleep pumps so the work
             // that USED to ride the per-task 1ms sleep busy-wait still makes
@@ -1814,17 +1849,9 @@ pub fn run_until_empty() {
             // deferred queue / signal wakers and are picked up by the
             // drain + the next round.
             sleep_pumps::run();
-            // Drain any wakers that IRQ handlers stashed for
-            // deferred execution. The IRQ paths (dispatch::on_irq's
-            // vector-waker chain, timer_pump's pump_irq → wheel
-            // wakers) can't call `Waker::wake()` directly — the
-            // drop of the inner Arc can hit a Sleepable slab
-            // dealloc, which the allocator's IRQ-context check
-            // refuses. They push to the per-CPU deferred queue;
-            // we drain + wake here, in non-IRQ context. This is
-            // the load-bearing wake path for everything that
-            // depends on IRQ delivery (xHCI completions,
-            // keyboard IRQ1, HPET-driven wheel wakes).
+            // sleep_pumps may itself have stashed wakers (signal
+            // wakers, freshly-due wheel slots) — drain them before
+            // committing to a halt.
             let n_drained = narf_lib::deferred_wake::drain_and_wake();
             if n_drained > 0 {
                 // A drained wake may have flipped a slot's
