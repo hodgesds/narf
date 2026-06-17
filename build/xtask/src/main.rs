@@ -3209,6 +3209,12 @@ fn boot_linux_redis(
     }
 
     let mem = std::env::var("NARF_QEMU_MEM_MB").unwrap_or_else(|_| "2048".into());
+    // Mirror NARF's accelerator + CPU EXACTLY so the comparison is
+    // apples-to-apples. NARF's qemu_args defaults to TCG (no `-accel`)
+    // with `-cpu max`, and only adds `-accel <x>` when `XTASK_QEMU_ACCEL`
+    // is set; we do the same here. (Earlier this hard-forced `-enable-kvm
+    // -cpu host` for Linux while NARF ran TCG — a ~10-50x unfair tilt.)
+    let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-nographic",
@@ -3223,15 +3229,15 @@ fn boot_linux_redis(
         mem.as_str(),
         "-smp",
         "1",
+        "-cpu",
+        cpu.as_str(),
         "-netdev",
         &format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
         "-device",
         "virtio-net-pci,netdev=n0",
     ]);
-    // KVM if available — fairer to Linux (and harmless: NARF runs the
-    // same accel). Fall back to TCG silently.
-    if std::path::Path::new("/dev/kvm").exists() {
-        cmd.args(["-enable-kvm", "-cpu", "host"]);
+    if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+        cmd.args(["-accel", accel.as_str()]);
     }
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -3325,9 +3331,11 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
+    let accel = std::env::var("XTASK_QEMU_ACCEL").unwrap_or_else(|_| "tcg (default)".into());
     println!(
         "xtask redis-bench: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
-         {lat_ops} sequential PINGs for latency\n"
+         {lat_ops} sequential PINGs for latency\n\
+         both guests: 1 vCPU, accel={accel}, -cpu max, same virtio-net + hostfwd\n"
     );
 
     // 1. NARF under QEMU.
