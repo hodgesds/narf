@@ -401,6 +401,7 @@ fn main() {
         "jobctl_smoke",
         "jobctl2_smoke",
         "navfs_smoke",
+        "oci_smoke",
         "pipeof_smoke",
         "relpaths_smoke",
         "consoletty_smoke",

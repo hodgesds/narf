@@ -40,7 +40,12 @@ NARF is a research kernel built around four ideas:
 The Linux-compat surface (epoll, eventfd, timerfd, clone3, mmap,
 fcntl, statx, signalfd, memfd, mount/umount/chroot/pivot_root, POSIX
 timers, namespaces) lives behind Cargo features so you can build a
-NARF-native kernel without it. See [`docs/PERSONAS.md`](docs/PERSONAS.md).
+NARF-native kernel without it. It is complete enough to run unmodified
+musl binaries (BusyBox sh, dynamically linked) and an **OCI-style
+container** end-to-end — read a bundle (`config.json` + `rootfs/`),
+unshare namespaces, `chroot` into the rootfs, and `execve` the
+contained entrypoint, which then sees only the container's own
+filesystem. See [`docs/PERSONAS.md`](docs/PERSONAS.md).
 
 ---
 
@@ -81,6 +86,13 @@ cargo xtask run --arch=x86_64 --display=gtk
 
 # Run the full kernel-test suite (prints a pass/fail/skip summary)
 cargo xtask test --arch=x86_64
+
+# Run an OCI-style container end-to-end: the `oci_smoke` runtime reads a
+# kernel-seeded bundle at /oci, unshares namespaces, chroots into the
+# bundle rootfs, and execs the contained entrypoint, which proves it is
+# isolated (sees the container's own /etc/os-release). The nightly
+# `nightly-oci` CI job runs this same demo on a schedule.
+cargo xtask run-interactive --arch=x86_64 --cmd "oci_smoke" --expect "oci-smoke-ok"
 
 # Boot via Limine ISO + OVMF UEFI (closer to real-hardware boot path)
 cargo xtask iso-boot --arch=x86_64 --release

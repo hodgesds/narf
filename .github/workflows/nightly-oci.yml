@@ -1,0 +1,98 @@
+name: nightly-oci
+
+# Nightly end-to-end check that NARF can run an OCI-style container:
+# read an OCI bundle (config.json + rootfs), create namespaces, set the
+# container hostname, chroot into the bundle rootfs, exec the contained
+# entrypoint, and have that entrypoint prove it is isolated — it sees
+# only the container's own filesystem (its /etc/os-release) and the env
+# the runtime handed it. This is a focused, dedicated OCI signal that
+# runs on a schedule (and on demand) independent of per-PR pushes.
+#
+# It boots the DEFAULT kernel (the `container` feature's per-task
+# namespace divergence is still structural and not yet boot-stable, so
+# enabling it would hang getty — tracked separately). The chroot-based
+# rootfs isolation that defines an OCI container is fully exercised
+# here; the stronger UTS-namespace assertion (`oci-uts-isolated`) lights
+# up automatically once the container feature boots cleanly.
+on:
+  schedule:
+    # 07:00 UTC daily (after most pushes have settled).
+    - cron: "0 7 * * *"
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+  # GHA's packaged qemu-system-x86 SIGSEGVs during virtio-balloon
+  # bring-up; drop the balloon device (matches ci.yml).
+  XTASK_QEMU_NO_BALLOON: "1"
+  # Extra buddy headroom for the TCG QEMU boot (matches ci.yml).
+  NARF_QEMU_MEM_MB: "2048"
+
+jobs:
+  oci-container:
+    name: oci container (x86_64)
+    runs-on: ubuntu-latest
+    # Cold build of the kernel + verification crates (~10-15 min on
+    # GHA's free runners) plus a TCG QEMU boot.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview rustfmt
+
+      - name: Install host build deps
+        # Same set as the musl-demo job: the verification crate's
+        # build.rs compiles the OCI smoke (needs musl-tools +
+        # linux-libc-dev); QEMU + OVMF boot the image; ld-musl comes
+        # from musl-tools (staged into the bundle rootfs at boot).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            cpio \
+            mtools \
+            dosfstools \
+            e2fsprogs \
+            ovmf \
+            musl-tools \
+            clang \
+            lld \
+            linux-libc-dev
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-x86_64-oci-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-x86_64-
+
+      # Boot real init, type `oci_smoke` at the shell, and assert the
+      # runtime's `oci-smoke-ok` token (printed only after the contained
+      # entrypoint exits 0 — i.e. it chrooted into the bundle rootfs,
+      # exec'd, and read the container's own /etc/os-release). GHA's TCG
+      # QEMU is much slower than local KVM; bump the run-interactive
+      # prompt/echo deadlines so a slow cold boot under load can't
+      # false-fail.
+      - name: OCI container smoke
+        env:
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
+          XTASK_RI_ECHO_TIMEOUT_SECS: "900"
+        run: >
+          cargo xtask run-interactive
+          --arch=x86_64
+          --cmd "oci_smoke"
+          --expect "oci-smoke-ok"

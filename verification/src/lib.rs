@@ -4244,6 +4244,14 @@ define_smoke_elf!(
     "NARF_NAVFS_SMOKE_ELF_X86_64",
     "NARF_NAVFS_SMOKE_ELF_AARCH64"
 );
+// OCI-container runtime smoke (static): both container-manager and
+// contained-entrypoint in one binary. Seeded at /bin/oci_smoke (the
+// runtime) and at /oci/rootfs/init (the entrypoint, reached via chroot).
+define_smoke_elf!(
+    NARF_OCI_SMOKE_ELF,
+    "NARF_OCI_SMOKE_ELF_X86_64",
+    "NARF_OCI_SMOKE_ELF_AARCH64"
+);
 define_smoke_elf!(
     NARF_PIPEOF_SMOKE_ELF,
     "NARF_PIPEOF_SMOKE_ELF_X86_64",
