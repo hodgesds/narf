@@ -215,8 +215,9 @@ fn smoke_chroot_rewrites_paths() -> TestResult {
         return TestResult::Fail("preliminary mount /jail failed");
     }
 
-    // sys_chroot("/jail")
-    let path = b"/jail";
+    // sys_chroot("/jail"). chroot(2) takes a single NUL-terminated path
+    // (no length arg) — match the real Linux ABI the handler now reads.
+    let path = b"/jail\0";
     let mut cctx = StubCtx {
         args: path_args(path),
         ret: None,

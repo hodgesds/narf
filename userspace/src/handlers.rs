@@ -8157,6 +8157,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     if !share_fs {
         cwd_fork(parent_pid, child_tid.raw());
     }
+    // chroot: a child inherits the parent's root directory (Linux copies
+    // fs->root on fork). Without this, a process exec'd inside a chroot
+    // can't fork+exec further binaries from the chrooted rootfs — the
+    // child resolves the host root instead, breaking containers.
+    root_dir_fork(parent_pid, child_tid.raw());
     // Credentials (uid/gid/euid/...) are copied to the child so a parent
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
@@ -8591,6 +8596,9 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
+    // chroot inheritance (see do_clone3) — child inherits the parent's root.
+    #[cfg(feature = "linux-compat")]
+    root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
@@ -11826,7 +11834,7 @@ fn normalize_abs(p: &str) -> alloc::string::String {
 /// into a normalized absolute path. Relative paths are joined onto the
 /// task's current working directory; `.`/`..` are collapsed.
 fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
-    if path.starts_with('/') {
+    let normalized = if path.starts_with('/') {
         normalize_abs(path)
     } else {
         let mut joined = cwd_of(task);
@@ -11835,6 +11843,17 @@ fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
         }
         joined.push_str(path);
         normalize_abs(&joined)
+    };
+    // Re-root under the task's chroot (if any) so a chrooted process —
+    // e.g. a container — resolves paths against the chrooted rootfs, not
+    // the host root. No-op for tasks without a chroot.
+    #[cfg(feature = "linux-compat")]
+    {
+        apply_chroot(&normalized)
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        normalized
     }
 }
 
@@ -12165,8 +12184,11 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     // Step 3: resolve the path through the VFS and read the
     // ELF bytes into a kernel-owned buffer. The buffer survives
     // the AS swap below.
+    // Resolve the binary under the caller's chroot (containers exec
+    // `/bin/sh` expecting the chrooted rootfs, not the host's `/bin`).
+    let exec_path = apply_chroot(path);
     let ops = match narf_filesystem::registry()
-        .resolve_absolute(path, |fs, rel| {
+        .resolve_absolute(&exec_path, |fs, rel| {
             poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
         })
         .flatten()
@@ -13406,7 +13428,12 @@ fn apply_chroot(path: &str) -> alloc::string::String {
 fn sys_chroot(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let raw = match copy_user_path_raw(args.arg0, args.arg1 as usize) {
+    // Linux `chroot(const char *path)` passes a single NUL-terminated
+    // path in arg0 — there is no length argument. (The earlier
+    // `copy_user_path_raw(arg0, arg1)` form misread arg1 as a length,
+    // which is garbage for a real Linux binary, so every chroot from
+    // unmodified userspace failed with -1.)
+    let raw = match copy_user_cstr(args.arg0, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
