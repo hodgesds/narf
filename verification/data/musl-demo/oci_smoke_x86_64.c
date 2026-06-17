@@ -28,10 +28,10 @@
 // fork and re-checks it after the child exits. If the child's
 // sethostname() did NOT leak back to the parent, the UTS namespace
 // isolated it — the runtime prints `oci-uts-isolated`. That token only
-// appears when the kernel is built with the `container` feature (whose
-// per-task namespace divergence currently hangs getty at boot, so it
-// is not yet exercised in CI); the default build passes on the
-// chroot-based `oci-smoke-ok`, which is the OCI essence.
+// appears when the kernel is built with the `container` feature (the
+// nightly OCI job builds with it and asserts the stronger token); the
+// default per-PR build passes on the chroot-based `oci-smoke-ok`, which
+// is the OCI essence.
 //
 // Success token (runtime): "oci-smoke-ok". Stronger token, container
 // builds only: "oci-uts-isolated". Payload token: "oci-container-ok".
