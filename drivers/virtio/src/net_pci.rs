@@ -1097,7 +1097,18 @@ impl VirtioNetPci {
 /// one virtio-net controller (separate vlans, separate netdevs); the
 /// singleton-Option shape used to swallow the second probe — match
 /// the virtio-input fix and keep all bound devices.
-static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<VirtioNetPci>> =
+// Bound controllers held behind `Arc` so `with_at` / `with_controller` /
+// `with_each` can clone the handle out under the lock and then DROP the
+// lock before running the caller's closure. Holding this IrqSafeSpinLock
+// across the closure deadlocks: `vnet0_send_fn` → `with_controller` (lock
+// held) → `tx_dma` → `responsive_spin_until` runs `sleep_pumps`, which can
+// re-enter `with_at`/`with_controller` → re-locks CONTROLLERS → spins
+// forever with IRQs disabled on the single cooperative CPU (the lock
+// holder never resumes to release it). Cloning the Arc out first means the
+// closure — and any re-entrant net_pci call it makes via the sleep-pump
+// spin — runs with the lock released. Controllers are append-only after
+// probe, so a stale clone is never freed mid-use.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1139,7 +1150,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let idx = {
         let mut g = CONTROLLERS.lock();
         let i = g.len();
-        g.push(dev);
+        g.push(Arc::new(dev));
         i
     };
     let bound_name = alloc::format!("vnet{}", idx);
@@ -1414,13 +1425,19 @@ pub fn count() -> usize {
 /// `with_each` iterator instead when behaviour should fan out over
 /// every device.
 pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
-    CONTROLLERS.lock().first().map(f)
+    // Clone the Arc out, then DROP the lock before calling `f` (see the
+    // CONTROLLERS doc comment: `f` may re-enter net_pci via tx_dma's
+    // sleep-pump spin, which re-locks CONTROLLERS).
+    let ctrl = CONTROLLERS.lock().first().cloned();
+    ctrl.as_deref().map(f)
 }
 
 /// Run `f` against every bound controller in probe order.
 pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
-    let g = CONTROLLERS.lock();
-    for c in g.iter() {
+    // Snapshot the Arc handles, drop the lock, then run `f` (see the
+    // CONTROLLERS doc comment).
+    let ctrls: alloc::vec::Vec<Arc<VirtioNetPci>> = CONTROLLERS.lock().iter().cloned().collect();
+    for c in &ctrls {
         f(c);
     }
 }
@@ -1429,5 +1446,8 @@ pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
 /// forwarder tasks call this every tick to drain/post on their own
 /// queues without stepping on siblings.
 pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
-    CONTROLLERS.lock().get(idx).map(f)
+    // Clone the Arc out, then DROP the lock before calling `f` (see the
+    // CONTROLLERS doc comment).
+    let ctrl = CONTROLLERS.lock().get(idx).cloned();
+    ctrl.as_deref().map(f)
 }
