@@ -302,6 +302,16 @@ pub fn next_deadline_cycles() -> Option<u64> {
     WHEEL.lock().min_deadline()
 }
 
+/// Like `next_deadline_cycles` but uses `try_lock`. Safe to call from IRQ
+/// context (e.g. the timer ISR's re-arm), where a blocking `lock()` would
+/// deadlock against an interrupted `register()`/`fire_due` holding the wheel.
+/// Returns None if the wheel is empty OR currently contended (the caller
+/// then arms the periodic fallback; the contending path re-arms via the
+/// arm-callback right after).
+pub fn next_deadline_cycles_try() -> Option<u64> {
+    WHEEL.try_lock().and_then(|w| w.min_deadline())
+}
+
 /// Diagnostic: number of currently-occupied slots.
 pub fn occupied() -> usize {
     WHEEL.lock().slots.iter().filter(|s| s.is_some()).count()

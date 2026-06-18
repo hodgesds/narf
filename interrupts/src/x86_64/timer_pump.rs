@@ -129,6 +129,11 @@ fn deadline_cycles_to_hpet_target(deadline_cycles: u64) -> u64 {
 /// `deadline_cycles`. Called from inside `timer_wheel::register`
 /// and from our IRQ handler — both with IRQs already disabled.
 fn wheel_arm(deadline_cycles: u64) {
+    // Primary: LAPIC TSC-deadline one-shot (reliable under KVM, where the
+    // HPET one-shot IRQ isn't promptly delivered). Unconditional — must run
+    // even before the HPET pump's STATE.initialised is set.
+    crate::x86_64::apic::arm_tsc_deadline_if_earlier(deadline_cycles);
+    // Secondary: HPET one-shot (some bare-metal configs); skip if pump uninit.
     if !STATE.initialised.load(Ordering::Acquire) {
         return;
     }
