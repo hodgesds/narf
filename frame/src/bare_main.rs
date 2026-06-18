@@ -2936,63 +2936,44 @@ fn run_async_demo() -> ! {
     // boot-init user tasks alive, so a post-run_until_empty
     // spawn would never reach the executor).
     {
-        struct Heartbeat;
-        impl core::future::Future for Heartbeat {
-            type Output = ();
-            fn poll(
-                self: core::pin::Pin<&mut Self>,
-                cx: &mut core::task::Context<'_>,
-            ) -> core::task::Poll<()> {
-                use core::sync::atomic::{AtomicU64, Ordering};
-                static LAST_TSC: AtomicU64 = AtomicU64::new(0);
-                // Tick at ~10 Hz so the FB beacon slots animate
-                // promptly when keystrokes arrive (a 5s period would
-                // mean a typed char takes 5s to reflect). The serial
-                // line only prints every 5s; the beacon slots paint
-                // every tick.
-                const PERIOD_CYCLES: u64 = 100_000_000;
-                let now = narf_time::now_cycles();
-                let last = LAST_TSC.load(Ordering::Relaxed);
-                if now.saturating_sub(last) >= PERIOD_CYCLES {
-                    LAST_TSC.store(now, Ordering::Relaxed);
-                    let ascii_in = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
-                    let ascii_out = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
-                    let key_in = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
-                    // FB beacon visualization — six slots on row 0,
-                    // far right of the row. White label slots paint
-                    // once-and-stick; counter slots cycle colour as
-                    // the corresponding counter increments. If the
-                    // user presses a key and slot 37 changes colour,
-                    // the kbd is delivering KEY_PUSH events. Same
-                    // for slot 35 = serial RX pushes, slot 33 =
-                    // ascii pops drained by the shell.
-                    const PALETTE: [u32; 8] = [
-                        0x00FF_0000, // red
-                        0x00FF_8000, // orange
-                        0x00FF_FF00, // yellow
-                        0x0000_FF00, // green
-                        0x0000_FF80, // mint
-                        0x0000_FFFF, // cyan
-                        0x0000_80FF, // sky
-                        0x00FF_00FF, // magenta
-                    ];
-                    narf_memory::beacon::paint(40, 0x00FF_FFFF); // label "I"
-                    narf_memory::beacon::paint(41, PALETTE[(ascii_in as usize) & 7]);
-                    narf_memory::beacon::paint(42, 0x00FF_FFFF); // label "O"
-                    narf_memory::beacon::paint(43, PALETTE[(ascii_out as usize) & 7]);
-                    narf_memory::beacon::paint(44, 0x00FF_FFFF); // label "K"
-                    narf_memory::beacon::paint(45, PALETTE[(key_in as usize) & 7]);
-                    // Serial heartbeat removed — the FB beacon
-                    // visualization above already shows liveness
-                    // (slots 41/43/45 cycle colour on each event),
-                    // so the console line was pure noise on a
-                    // healthy boot.
-                }
-                cx.waker().wake_by_ref();
-                core::task::Poll::Pending
+        // FB beacon liveness heartbeat. Parks on the timer wheel between
+        // ~10 Hz repaints (via `sleep_cycles`) rather than self-waking
+        // every poll: a perpetual self-wake kept `ready_this_round > 0`
+        // forever, which is exactly what stops the cooperative executor
+        // from ever HLTing when otherwise idle (Linux idles iff
+        // nr_running==0). Timer-parked, it's off the runnable set between
+        // beats so the CPU can actually halt.
+        async fn heartbeat() {
+            // ~10 Hz so the beacon slots animate promptly on keystrokes.
+            const PERIOD_CYCLES: u64 = 100_000_000;
+            const PALETTE: [u32; 8] = [
+                0x00FF_0000, // red
+                0x00FF_8000, // orange
+                0x00FF_FF00, // yellow
+                0x0000_FF00, // green
+                0x0000_FF80, // mint
+                0x0000_FFFF, // cyan
+                0x0000_80FF, // sky
+                0x00FF_00FF, // magenta
+            ];
+            loop {
+                use core::sync::atomic::Ordering;
+                let ascii_in = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
+                let ascii_out = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
+                let key_in = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
+                // Slots 40..=45: white label + counter-coloured slot per
+                // input class (ascii in/out, key in). A slot cycling
+                // colour on a keypress means that pipeline is delivering.
+                narf_memory::beacon::paint(40, 0x00FF_FFFF); // label "I"
+                narf_memory::beacon::paint(41, PALETTE[(ascii_in as usize) & 7]);
+                narf_memory::beacon::paint(42, 0x00FF_FFFF); // label "O"
+                narf_memory::beacon::paint(43, PALETTE[(ascii_out as usize) & 7]);
+                narf_memory::beacon::paint(44, 0x00FF_FFFF); // label "K"
+                narf_memory::beacon::paint(45, PALETTE[(key_in as usize) & 7]);
+                narf_time::sleep_cycles(PERIOD_CYCLES).await;
             }
         }
-        let _ = narf_scheduler::spawn(Heartbeat);
+        let _ = narf_scheduler::spawn(heartbeat());
     }
 
     // Spawn the cursor pump *before* run_until_empty so it's in the
