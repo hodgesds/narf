@@ -1108,7 +1108,10 @@ impl VirtioNetPci {
 // closure — and any re-entrant net_pci call it makes via the sleep-pump
 // spin — runs with the lock released. Controllers are append-only after
 // probe, so a stale clone is never freed mid-use.
-static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
+//
+// `pub(crate)` so the e2e re-entrancy regression test can assert the lock
+// is released while a `with_*` closure runs (`smoke_e2e_net_with_at_*`).
+pub(crate) static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
