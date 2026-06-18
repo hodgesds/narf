@@ -1445,6 +1445,18 @@ pub fn run_until_empty() {
         0
     };
 
+    // Forced-pump fallback: when a runnable slot lets us skip the per-round
+    // sleep_pumps on the wake→repoll fast path (below), a *perpetual*
+    // self-waker would otherwise starve the pumps forever. Bound that by
+    // forcing a pump if one hasn't run in ~1 ms of wall time regardless of
+    // how busy the queue stays. Normal request/response idles between rounds,
+    // so the all-parked branch pumps every cycle and this never trips.
+    let pump_interval_cycles = {
+        let cpns = narf_time::cycles_per_ns().max(1) as u64;
+        1_000_000u64.saturating_mul(cpns) // ~1 ms
+    };
+    let mut last_pump_cycles = narf_time::now_cycles();
+
     loop {
         // Per-round drain of IRQ-deferred wakers. Must run every
         // round (not gated on ready_this_round == 0), because a
@@ -1788,14 +1800,6 @@ pub fn run_until_empty() {
         // infinite park stopped busy-spinning the pumps itself. Their wakes
         // land in the deferred queue / signal wakers and are picked up by
         // the drain immediately below.
-        sleep_pumps::run();
-        if narf_lib::deferred_wake::drain_and_wake() > 0 {
-            // A drained wake may have flipped a parked slot's awake
-            // flag — re-evaluate from the top instead of falling into
-            // the halt/spin idle path with runnable work pending.
-            continue;
-        }
-
         // Halt iff NO task is runnable — Linux idles a CPU exactly when
         // nr_running == 0. Scan the ready queue for any slot whose `awake`
         // flag is set: a wake that landed after the slot was polled this
@@ -1806,6 +1810,17 @@ pub fn run_until_empty() {
         // event-paced. A wake that lands AFTER this scan but before the HLT
         // is not lost: it pushes to the deferred-wake queue (drained next
         // round) and the HLT itself wakes on the delivering IRQ.
+        //
+        // This scan runs BEFORE sleep_pumps so a freshly-woken task is
+        // re-polled WITHOUT first paying a full sleep_pumps::run() (fb drain,
+        // smoltcp timer poll, serial drain, posix timers). When the FIFO
+        // order put the woken task (e.g. epoll-parked redis) ahead of its
+        // waker (the virtio-net forwarder) in this round, that per-round pump
+        // cost was injecting ~tens-of-µs into the wake→repoll hop on roughly
+        // half of off-box round-trips — a bimodal request latency. The pumps
+        // still run on the all-parked branch below (every idle cycle, i.e.
+        // once per request/response since the loop idles between them), plus
+        // a ~1 ms forced fallback so a perpetual self-waker can't starve them.
         let any_runnable = {
             let q = READY[cpu].lock();
             q.as_ref()
@@ -1813,8 +1828,15 @@ pub fn run_until_empty() {
                 .unwrap_or(false)
         };
         if any_runnable {
+            let now = narf_time::now_cycles();
+            if now.wrapping_sub(last_pump_cycles) >= pump_interval_cycles {
+                last_pump_cycles = now;
+                sleep_pumps::run();
+                let _ = narf_lib::deferred_wake::drain_and_wake();
+            }
             continue;
         }
+        last_pump_cycles = narf_time::now_cycles();
 
         {
             // All tasks parked this round. Tick the sleep pumps so the work
