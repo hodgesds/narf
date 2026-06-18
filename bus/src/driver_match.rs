@@ -239,26 +239,6 @@ pub fn probe_all(
         if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
             probe_log(_name, _vid, _did, /*pre=*/ true, None);
         }
-        // FB beacon: paint slot 32 with a colour derived from the
-        // driver name so the user can identify a hung probe even
-        // when serial / console output isn't reachable. The hash
-        // is a one-pass FNV-1a-ish reduction over the name bytes;
-        // collisions are OK because the post-probe paint (next
-        // iteration) overwrites this slot anyway. If boot stops
-        // and slot 32 stays the same colour, the previous probe
-        // log line names which driver wedged.
-        {
-            let mut h: u32 = 0x811C_9DC5;
-            for b in _name.as_bytes() {
-                h ^= *b as u32;
-                h = h.wrapping_mul(0x0100_0193);
-            }
-            // Mix the colour into the high-saturation range so it's
-            // visible against the FB background. Keep alpha high
-            // (bits 24..31) at 0 since the FB is BGR0.
-            let colour = (h & 0x00FF_FFFF) | 0x0040_4040;
-            narf_memory::beacon::paint(32, colour);
-        }
         let result = (m.probe)(*d, cap);
         if PROBE_LOG.load(core::sync::atomic::Ordering::Acquire) {
             // NotForThisDriver = class-backstop saw a device the

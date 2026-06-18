@@ -82,14 +82,7 @@ const DRAIN_PERIOD_CYCLES: u64 = 50_000_000;
 /// drain loop has its own kernel stack.
 pub async fn drain_loop(writer: FbWriter) {
     loop {
-        narf_memory::beacon::paint(22, 0x00FF_FFFF); // slot 22: poll entry
         drain_once(&writer);
-        #[cfg(not(feature = "kernel-test"))]
-        {
-            let n = DRAIN_TICKS.load(Ordering::Relaxed);
-            let colour = if n & 1 == 0 { 0x00FF_4040 } else { 0x0040_FF40 };
-            narf_memory::beacon::paint(27, colour);
-        }
         // NOTE: status::paint moved out to the fb-status-refresh
         // task. status::paint takes CONTROLLER + AML + I2C + GPIO +
         // power-source locks; on real silicon any of those can be

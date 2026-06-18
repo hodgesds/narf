@@ -1287,22 +1287,13 @@ impl core::future::Future for UserTaskFuture {
                     this.state = TaskState::Running;
                     let entry = this.process.entry.0.as_u64();
                     let rsp = this.process.stack_top.as_u64();
-                    // Bring-up beacons (real-HW hang diagnosis):
-                    //   slot 50 = about to iretq into a fresh user task
-                    //   slot 52 = re-poll after trap-return (set below)
-                    // If 50 lights but no 52 ever does, init is
-                    // running in CPL=3 without trapping (infinite
-                    // user-side loop, or stuck waiting for a kernel
-                    // IRQ the scheduler hasn't delivered).
-                    #[cfg(target_arch = "x86_64")]
-                    narf_memory::beacon::paint(50, 0x00FF_60FF); // magenta: pre-iretq
-                                                                 // SAFETY: the AS is activated and the user
-                                                                 // mappings cover entry + rsp by construction
-                                                                 // (load_user_process_with mapped them). Never
-                                                                 // returns — control reaches CPL=3. When the
-                                                                 // process carries an entry_arg (clone(2) for
-                                                                 // pthread start), deliver it as the first
-                                                                 // SysV integer arg (RDI).
+                    // SAFETY: the AS is activated and the user
+                    // mappings cover entry + rsp by construction
+                    // (load_user_process_with mapped them). Never
+                    // returns — control reaches CPL=3. When the
+                    // process carries an entry_arg (clone(2) for
+                    // pthread start), deliver it as the first
+                    // SysV integer arg (RDI).
                     if let Some(arg) = this.process.entry_arg {
                         // SAFETY: the AS is activated and the user
                         // mappings cover `entry` + `rsp` by construction
@@ -1321,23 +1312,6 @@ impl core::future::Future for UserTaskFuture {
                 }
                 TaskState::Running => {
                     // SAFETY: a prior poll's trap path populated
-                    // ctx.state via TrapContext::save_user_state.
-                    // The AS is re-activated and the kernel state
-                    // (TSS rsp0, GS) is still correct from the
-                    // first entry.
-                    #[cfg(target_arch = "x86_64")]
-                    narf_memory::beacon::paint(51, 0x0060_FFFF); // cyan: pre-iretq-resume
-                                                                 // SAFETY: `state.get()` is the `*mut UserState`
-                                                                 // this future owns; a prior poll's trap path filled
-                                                                 // it via `TrapContext::save_user_state`, so the
-                                                                 // shared `&*` read is of an initialised, aligned
-                                                                 // frame with no aliasing `&mut` live here.
-                    #[cfg(target_arch = "x86_64")]
-                    // SAFETY: Valid memory or trusted environment
-                    unsafe {
-                        let _us = &*(this.ctx.state.get() as *const narf_scheduler::UserState);
-                    }
-                    // SAFETY: a prior poll's trap path populated
                     // `ctx.state` via `TrapContext::save_user_state`;
                     // the AS is re-activated and kernel state (TSS rsp0,
                     // GS) is still correct from first entry. Never
@@ -1348,8 +1322,6 @@ impl core::future::Future for UserTaskFuture {
                 TaskState::Exited => unreachable!("guarded above"),
             }
         }
-        #[cfg(target_arch = "x86_64")]
-        narf_memory::beacon::paint(52, 0x0060_FF60); // pale green: post-trap, re-polled
 
         // Save this task's x87/SSE register file. The trap left the
         // user's live XMM/x87 in the hardware registers (the kernel is

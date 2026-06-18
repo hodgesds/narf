@@ -150,9 +150,7 @@ pub unsafe fn enable_pcide() {
     // on every x86_64 CPU.
     // SAFETY: Valid memory or trusted environment
     let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
-    crate::beacon_paint(28, 0x00C0FFC0); // post-CPUID
     if leaf1.ecx & (1u32 << 17) == 0 {
-        crate::beacon_paint(29, 0x00FF0000); // RED — CPU has no PCID
         return;
     }
 
@@ -167,12 +165,9 @@ pub unsafe fn enable_pcide() {
     // SAFETY: BSP boot path; caller verified PCID support.
     unsafe {
         let cr3 = cr::read_cr3();
-        crate::beacon_paint(29, 0x00C0FF80); // post-read_cr3
         cr::write_cr3(cr3 & !0xFFFu64);
-        crate::beacon_paint(30, 0x0080FF80); // post-write_cr3 (cleared)
         let cr4 = cr::read_cr4();
         cr::write_cr4(cr4 | cr::CR4_PCIDE);
-        crate::beacon_paint(31, 0x0040FF40); // post-write_cr4 (PCIDE on)
     }
 }
 

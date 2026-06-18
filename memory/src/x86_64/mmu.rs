@@ -119,7 +119,6 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
 ///   be covered by the identity map being built (currently the low
 ///   4 GiB + the high-half -2 GiB window).
 pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
-    use crate::beacon;
     // Use BSS-resident page tables (see `EarlyPageTables` doc) so
     // the four storage buffers are guaranteed to be in the
     // boot.S 4-GiB identity-mapped window. Asking the frame
@@ -150,7 +149,6 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     let pdpt_lo_addr = PhysAddr::new(pdpt_lo_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pdpt_hi_mmio_addr = PhysAddr::new(pdpt_hi_mmio_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pdpt_hi_addr = PhysAddr::new(pdpt_hi_virt.wrapping_sub(KERNEL_VIRT_BASE));
-    beacon::paint(10, 0x0080_FFFF); // dim cyan: page-table addresses fixed
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
@@ -159,7 +157,6 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     PageTable::zero_at(pdpt_lo_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_mmio_addr.as_mut_ptr::<PageTable>());
     PageTable::zero_at(pdpt_hi_addr.as_mut_ptr::<PageTable>());
-    beacon::paint(11, 0x0080_FF80); // dim lime: zero_at done
 
     // Step 2: populate.
     let flags_ptr = PtFlags::PRESENT | PtFlags::WRITABLE;
@@ -177,7 +174,6 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
             let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
-        beacon::paint(12, 0x00FF_FF80); // dim yellow: low identity done
 
         // High-MMIO identity (PML4[1]: virt 512 GiB ≤ V < 1 TiB →
         // phys 512 GiB ≤ P < 1 TiB). Covers UEFI-assigned 64-bit
@@ -206,7 +202,6 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
             let slot = PhysAddr::new(pdpt_hi_mmio_addr.raw() + gib * 8);
             write_identity::<PageTableEntry>(slot, entry);
         }
-        beacon::paint(13, 0x00FF_8080); // dim orange: hi-MMIO done
 
         // High-half PML4[511] + PDPT[510] → phys 0 (1 GiB huge page).
         // Virtual 0xFFFF_FFFF_8000_0000 + x maps to physical 0 + x.
@@ -218,7 +213,6 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
         let hh_slot = PhysAddr::new(pdpt_hi_addr.raw() + (HIGHER_HALF_PDPT_INDEX as u64) * 8);
         write_identity::<PageTableEntry>(hh_slot, hh_entry);
     }
-    beacon::paint(14, 0x00FF_80FF); // dim magenta: higher-half done, about to CR3
 
     // Step 3 from console/ §3.1: *caller* prints the handoff line
     // before calling us so a panic across the CR3 swap is visible.

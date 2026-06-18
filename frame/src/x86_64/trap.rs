@@ -74,23 +74,6 @@ const _: () = {
     );
 };
 
-/// Render a u64 as 16 ASCII hex digits, MS→LS, on the FB at
-/// pixel-row `px_y`. Each digit takes 18 px (16 px char at 2×
-/// scale + 2 px gap). Uses `narf_graphics::font8x8` via
-/// `beacon::paint_glyph_2x_at` so this works the same on real
-/// silicon as on QEMU — the trap-handler hex dump no longer
-/// requires the operator to count bar heights.
-fn paint_hex_u64_text(px_y: u32, value: u64, fg: u32, bg: u32) {
-    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-    for i in 0..16u32 {
-        let shift = 60 - (i * 4);
-        let nibble = ((value >> shift) & 0xF) as usize;
-        let glyph = narf_graphics::font8x8::lookup(HEX_DIGITS[nibble]);
-        let px_x = i * 18;
-        narf_memory::beacon::paint_glyph_2x_at(px_x, px_y, &glyph, fg, bg);
-    }
-}
-
 fn vector_name(v: u64) -> &'static str {
     match v {
         0 => "#DE  divide-by-zero",
@@ -493,85 +476,6 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         narf_memory::diag::note_pf(cr2, frame.rip);
     }
 
-    // Paint a HUGE diagnostic block to FB so real-HW boots
-    // without serial can see WHICH vector fired. Uses the
-    // beacon facility — slot index = vector number, color
-    // encodes vector range. Painted BEFORE writeln so even if
-    // console writes don't reach FB, the beacon block does.
-    {
-        // Color: distinct per common vector for easy ID.
-        let color: u32 = match frame.vector {
-            6 => 0x00FF0000,  // #UD red
-            13 => 0x00FF8000, // #GP orange
-            14 => 0x00FFFF00, // #PF yellow
-            8 => 0x00FF00FF,  // #DF magenta
-            18 => 0x000000FF, // #MC blue
-            _ => 0x00FFFFFF,  // anything else = white
-        };
-        // Paint slot = vector index in row 3 (y=60-76, well
-        // below earlier diagnostic rows so it's visible
-        // alongside any other beacons).
-        narf_memory::beacon::paint_at(frame.vector as u32, 3, color);
-        // Also paint a big bar across the whole top of row 4
-        // (y=80-96) for visibility — color matches the vector
-        // color so even if vector-slot is off-screen it's
-        // obvious a fault happened.
-        for slot in 0..16u32 {
-            narf_memory::beacon::paint_at(slot, 4, color);
-        }
-
-        // Hex diagnostics — font-free bar-height encoding so they're
-        // legible on any FB regardless of GTK scaling / panel font.
-        // Each row is 16 slots × 4-bit nibble = one u64 value MS→LS:
-        //   row 5: RIP                  (where it faulted)
-        //   row 6: CR2 (only if #PF)    (what addr it touched)
-        //   row 7: error_code           (selector / PF flags)
-        // Even bytes = bright fg colour, odd bytes = darker variant
-        // so you can group nibble-pairs into bytes visually.
-        let bg = 0x00_10_10_10; // near-black grid background
-        let (fg_e, fg_o) = match frame.vector {
-            6 => (0x00_FF_60_60, 0x00_A0_30_30),  // #UD reds
-            13 => (0x00_FF_C0_60, 0x00_A0_70_30), // #GP oranges
-            14 => (0x00_FF_FF_60, 0x00_A0_A0_30), // #PF yellows
-            8 => (0x00_FF_60_FF, 0x00_A0_30_A0),  // #DF magentas
-            18 => (0x00_60_60_FF, 0x00_30_30_A0), // #MC blues
-            _ => (0x00_FF_FF_FF, 0x00_80_80_80),  // generic
-        };
-        narf_memory::beacon::paint_u64_hex(0, 5, frame.rip, fg_e, fg_o, bg);
-        if frame.vector == 14 {
-            let cr2: u64;
-            // SAFETY: reading CR2 at CPL=0 is always defined.
-            unsafe {
-                core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
-                options(nostack, preserves_flags));
-            }
-            narf_memory::beacon::paint_u64_hex(0, 6, cr2, fg_e, fg_o, bg);
-        }
-        narf_memory::beacon::paint_u64_hex(0, 7, frame.error_code, fg_e, fg_o, bg);
-
-        // Hex-digit TEXT diagnostics — actual readable ASCII
-        // characters rendered from font8x8 at 2x scale (16x16
-        // per char). Bar-height encoding above is the visual
-        // backup; this lets the operator just READ the values
-        // off the panel.
-        //
-        // Layout: 16 chars per u64, 18 px per char (16 + 2 gap)
-        // = 288 px wide. Three rows stacked starting at y=180
-        // (well below the row-7 nibble band) with 20 px row gap.
-        paint_hex_u64_text(180, frame.rip, fg_e, bg);
-        if frame.vector == 14 {
-            // CR2 — re-read since the asm! above is in a
-            // different scope (and reading CR2 twice is cheap).
-            let cr2: u64;
-            // SAFETY: reading CR2 at CPL=0 is always defined.
-            unsafe {
-                core::arch::asm!("mov {v}, cr2", v = out(reg) cr2,
-                options(nostack, preserves_flags));
-            }
-            paint_hex_u64_text(200, cr2, fg_e, bg);
-        }
-        paint_hex_u64_text(220, frame.error_code, fg_e, bg);
-    }
     // Lock-free TrapWriter: the original faulting code may already
     // hold `CONSOLE.lock` (e.g. it faulted mid-`write_str`); a
     // blocking re-acquire from inside the trap handler would

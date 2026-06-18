@@ -259,16 +259,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // single atomic store — safe from very-early boot before any
     // allocator is alive.
     narf_memory::diag::set_phase(narf_memory::diag::BootPhase::StartRust);
-    // Boot beacons (left-to-right, top-left of FB). Each lit
-    // slot proves we passed that stage. See `boot_beacon` doc.
-    //   slot 0 RED    — _start_rust entered
-    //   slot 1 ORANGE — UART init done
-    //   slot 2 PURPLE — about to call parse_raw
-    //   slot 3 BLUE   — parse_raw returned (Ok or Err)
-    //   slot 4 YELLOW — parse_raw Ok branch
-    //   slot 5 WHITE  — parse_raw Err branch (sad path)
-    //   slot 6 GREEN  — frame allocator init done
-    //   slot 7 CYAN   — MMU init done
     #[cfg(target_arch = "x86_64")]
     let _early_fb: Option<narf_boot::info::FramebufferInfo> = {
         if raw.magic == narf_boot::x86_64::multiboot2::BOOT_MAGIC {
@@ -277,34 +267,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // bootloader contract guarantees `payload` points at the
             // multiboot2 info struct that `framebuffer` walks.
             // SAFETY: Valid memory or trusted environment
-            let fb = unsafe { narf_boot::x86_64::multiboot2::framebuffer(info_ptr) };
-            if let Some(ref fb_info) = fb {
-                // Register the FB for any code that wants to paint
-                // boot beacons (including init_mmu deep in the
-                // memory crate). Stride in pixels = pitch / bytes-
-                // per-pixel. Phys ceiling = 4 GiB to match boot.S
-                // identity map.
-                let stride_px = fb_info.pitch / ((fb_info.bpp as u32).max(8) / 8);
-                narf_memory::beacon::register(
-                    fb_info.addr.raw(),
-                    stride_px,
-                    fb_info.width,
-                    fb_info.height,
-                    4u64 << 30,
-                );
-                // BUILD MARKER v4: a SOLID 32-px-tall PURPLE bar
-                // across the entire top of the screen. Painted
-                // before any per-slot beacon. If you don't see
-                // purple covering the whole top edge, this build
-                // isn't running.
-                narf_memory::beacon::paint_build_stripe(0x00800080); // PURPLE
-                narf_memory::beacon::paint(0, 0x0000FFFF); // CYAN — _start_rust alive
-                                                           // Wire arch-side beacon hook to memory beacon
-                                                           // facility so arch code (pcid::enable_pcide etc.)
-                                                           // can paint without depending on memory.
-                narf_arch::set_beacon_hook(narf_memory::beacon::paint);
-            }
-            fb
+            unsafe { narf_boot::x86_64::multiboot2::framebuffer(info_ptr) }
         } else {
             None
         }
@@ -317,7 +280,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // 16550A COM1 at I/O port 0x3F8 — hard-coded default. Real detection
         // lands with the ACPI/FDT parse in Wave 2.
         console::early_init(PhysAddr::new(0x3F8), UartKind::Uart16550);
-        narf_memory::beacon::paint(1, 0x00FF_8000); // ORANGE
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -421,19 +383,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             cpuval.invariant_tsc,
         );
         match fatal {
-            None => {
-                // Slot 31 = baseline ok. Stays lit through the
-                // whole boot so a glance at the row confirms the
-                // gate passed.
-                narf_memory::beacon::paint(31, 0x0000FF80); // bright green
-            }
+            None => {}
             Some(why) => {
                 let _ = writeln!(console::Writer, "  cpu-validate: FATAL — {}", why);
-                // Slot 31 = baseline fail (bright red). Halt with
-                // CLI+HLT loop so the operator sees the message
-                // + beacon instead of crashing into a userspace
+                // Halt with CLI+HLT loop so the operator sees the
+                // message instead of crashing into a userspace
                 // fault five stages later.
-                narf_memory::beacon::paint(31, 0x00FF0000); // bright red
                 #[allow(clippy::empty_loop)]
                 loop {
                     // SAFETY: CLI + HLT at CPL=0 is the canonical
@@ -537,13 +492,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // in later stages rather than a boot panic).
     #[cfg(target_arch = "x86_64")]
     {
-        // Fine-grained early-boot beacons (slots 22+ are
-        // diagnostic, used to localize hangs between ORANGE and
-        // PURPLE on real HW).
-        narf_memory::beacon::paint(22, 0x00FFA500); // amber: post-orange / pre-features
-                                                    // SAFETY: CPUID is always legal at CPL=0.
+        // SAFETY: CPUID is always legal at CPL=0.
         let feats = unsafe { narf_arch::x86_64::Features::probe() };
-        narf_memory::beacon::paint(23, 0x00FFB347); // peach: CPUID done
         let _ = writeln!(
             console::Writer,
             "  features: nx={} tsc_inv={} pku={} pks={} uipi={} rdseed={} rdrand={} hybrid={}",
@@ -556,7 +506,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             feats.rdrand,
             feats.hybrid
         );
-        narf_memory::beacon::paint(24, 0x0000FF80); // mint: features-writeln OK
 
         // Record the BSP's hybrid CPU type. CPUID leaf 0x1A
         // EAX[31:24] is per-LP — APs populate their own slots
@@ -615,21 +564,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // automatically. Domain-private mappings (which require
             // a per-domain PDPT under one PML4 slot) are a follow-up.
             //
-            narf_memory::beacon::paint(25, 0x0000FFC0); // aqua: pre-PCID
-                                                        // SAFETY: PCID is a baseline x86_64 feature on all
-                                                        // long-mode CPUs, so `enable_pcide` (sets CR4.PCIDE) and
-                                                        // `init` are valid here; the bootloader-provided CR3's low
-                                                        // bits are zero as the PCID code requires.
-                                                        // SAFETY: Valid memory or trusted environment
+            // SAFETY: PCID is a baseline x86_64 feature on all
+            // long-mode CPUs, so `enable_pcide` (sets CR4.PCIDE) and
+            // `init` are valid here; the bootloader-provided CR3's low
+            // bits are zero as the PCID code requires.
+            // SAFETY: Valid memory or trusted environment
             unsafe {
                 narf_arch::x86_64::pcid::enable_pcide();
                 narf_arch::x86_64::pcid::init();
             }
-            narf_memory::beacon::paint(21, 0x0040FFC0); // pale-cyan: PCID init done
-                                                        // Allocate + register 16 per-domain PML4 clones, spread
-                                                        // across NUMA nodes. Domain D's PML4 lands on node
-                                                        // (D % num_nodes) so PML4 reads on a CPU local to that
-                                                        // node hit local memory.
+            // Allocate + register 16 per-domain PML4 clones, spread
+            // across NUMA nodes. Domain D's PML4 lands on node
+            // (D % num_nodes) so PML4 reads on a CPU local to that
+            // node hit local memory.
             let num_nodes = if narf_memory::is_numa_aware() {
                 // Count nodes with non-zero free pages.
                 let mut n = 0usize;
@@ -646,7 +593,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // ASID/PCID allocator before populating per-domain PML4s.
             narf_memory::asid_alloc::allocator_init();
             narf_memory::per_domain_root::init();
-            narf_memory::beacon::paint(27, 0x0080FFC0); // sea-green: pre-PML4 loop
             let mut registered = 0u8;
             for domain in 0u8..16 {
                 let node = (domain as usize) % num_nodes;
@@ -930,8 +876,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         );
     }
 
-    narf_memory::beacon::paint(2, 0x00FF_00FF); // PURPLE: pre-parse_raw
-
     // Step 2: parse the bootloader handoff into a validated BootInfo.
     // SAFETY: the raw struct came from the arch stub; bootloader contract.
     let boot_result = unsafe {
@@ -945,8 +889,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     };
 
-    narf_memory::beacon::paint(3, 0x0000_00FF); // BLUE: parse_raw returned
-
     match boot_result {
         Ok(info) => {
             // SAFETY: Single-threaded boot path.
@@ -954,7 +896,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 RAW_BOOT_INFO = Some(raw);
                 BOOT_INFO = Some(info.clone());
             }
-            narf_memory::beacon::paint(4, 0x00FF_FF00); // YELLOW: Ok branch
             let _ = writeln!(
                 console::Writer,
                 "  boot info: {} memory region(s), uart_phys={:?}",
@@ -1053,7 +994,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             unsafe {
                 narf_memory::init_from_map(&regions, &excludes);
             }
-            narf_memory::beacon::paint(6, 0x0000_FF00); // GREEN: frame alloc
 
             // Register the generic framebuffer if provided by the bootloader.
             if let Some(fb_info) = info.framebuffer {
@@ -1091,19 +1031,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             {
                 let _ = writeln!(console::Writer, "  mmu: handoff...");
-                // Pre-init_mmu beacon (slot 8: dim red).
-                narf_memory::beacon::paint(8, 0x00800000);
                 // SAFETY: BSP, interrupts disabled (boot.S CLI + IDT
                 // doesn't unmask), allocator populated above.
                 // SAFETY: Valid memory or trusted environment
                 match unsafe { narf_memory::mmu::init_mmu() } {
                     Ok(pml4) => {
-                        // Post-init_mmu beacon (slot 9: dim green —
-                        // init_mmu returned, but CR3 is now using the
-                        // new PML4. If we see this but not the next
-                        // remap_to_virtual print, something between
-                        // CR3 swap and serial output is wedged.
-                        narf_memory::beacon::paint(9, 0x00008000);
                         // The new PML4 identity-maps 0..=4 GiB, so the
                         // UART (I/O port on x86_64) is reachable and
                         // console::remap_to_virtual with an identity
@@ -1114,7 +1046,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
                         );
-                        narf_memory::beacon::paint(7, 0x0000_FFFF); // CYAN: MMU
 
                         // Real-HW bring-up aid: install the FB
                         // console NOW, not at Stage::Late. Without
@@ -1166,7 +1097,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // SAFETY: Valid memory or trusted environment
                         match unsafe { narf_acpi::parse_srat(p) } {
                             Ok(n) => {
-                                narf_memory::beacon::paint(15, 0x0080_FF40); // LIME: ACPI parsed
                                 let _ = writeln!(
                                     console::Writer,
                                     "  acpi: SRAT parsed, {} entries, {} NUMA node(s)",
@@ -1641,9 +1571,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         console::Writer,
                         "  smp: SKIPPED via nosmp cmdline (BSP only)"
                     );
-                    narf_memory::beacon::paint(16, 0x00808080); // GRAY: SMP skipped
-                                                                // BSP-only topology summary. Same as the SMP
-                                                                // path below but with no APs to count.
+                    // BSP-only topology summary. Same as the SMP
+                    // path below but with no APs to count.
                     let bsp_ty = narf_lib::percpu::cpu_type(0);
                     let n_p = narf_lib::percpu::count_cpu_type(narf_lib::percpu::CpuType::Core);
                     let n_e = narf_lib::percpu::count_cpu_type(narf_lib::percpu::CpuType::Atom);
@@ -1659,7 +1588,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     // above; identity map covers 0x8000.
                     // SAFETY: Valid memory or trusted environment
                     let started = unsafe { x86_64::smp::start_aps() };
-                    narf_memory::beacon::paint(16, 0x0040_FFFF); // TEAL: SMP up
                     let _ = writeln!(
                         console::Writer,
                         "  smp: started {} AP(s); {} CPU(s) online",
@@ -2270,22 +2198,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 };
                 narf_fb::rebase_generic(m.virt);
-                // Re-register beacon at the WC virt. Subsequent
-                // paint() calls (cursor liveness, slot 50/52
-                // bisection beacons, etc.) burst-write instead of
-                // uncached.
-                narf_memory::beacon::register(
-                    m.virt,
-                    info.stride,
-                    info.width,
-                    info.height,
-                    /* ceiling: WC virt is in kernel half, well
-                     * above the 4 GiB identity-map cap, but
-                     * beacon ignores ceiling=0 and treats
-                     * non-zero as the bound. Pass u64::MAX so
-                     * any beacon write succeeds. */
-                    u64::MAX,
-                );
                 // Rebase the installed FbConsole's internal
                 // Framebuffer to the WC virt. Without this the
                 // FbConsole keeps writing to the old uncached
@@ -2531,23 +2443,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     last_stage.name()
                 );
             }
-            // Run stages one at a time so each completion paints a
-            // beacon. Slot 17+ light up as we cross into Subsys, Fs,
-            // Device, Late — anyone watching the screen sees the
-            // initcall pipeline progress in real time.
+            // Run stages one at a time.
             for s in narf_init::Stage::ALL {
                 if (s as u8) > (last_stage as u8) {
                     break;
                 }
                 let _ = narf_init::run_stage(s);
-                let (slot, color) = match s {
-                    narf_init::Stage::Subsys => (17u32, 0x00FF_C0CB), // PINK
-                    narf_init::Stage::Fs => (18u32, 0x00FF_D700),     // GOLD
-                    narf_init::Stage::Device => (19u32, 0x0087_CEEB), // SKY
-                    narf_init::Stage::Late => (20u32, 0x00E6_E6FA),   // LAVENDER
-                    _ => continue,
-                };
-                narf_memory::beacon::paint(slot, color);
             }
             let _ = narf_init::print_summary(&mut console::Writer);
             // Status-panel diag: initcalls done; flip the phase to
@@ -2586,7 +2487,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             }
         }
         Err(e) => {
-            narf_memory::beacon::paint(5, 0x00FF_FFFF); // WHITE: Err branch
             let _ = writeln!(console::Writer, "  boot parse failed: {e:?}");
         }
     }
@@ -2915,66 +2815,8 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
-    // Slot 19: build-freshness sentinel. Painted before any
-    // executor work. If you re-burn the ISO and slot 19 is
-    // *missing* (only the original 28/29/30 show), the ISO is
-    // built from a stale binary — the source-tree changes never
-    // reached the kernel image. Verify with `cargo xtask image`
-    // (or whatever you use), make sure it rebuilds `narf-frame`,
-    // and confirm Limine is loading the freshly-built kernel.
-    narf_memory::beacon::paint(19, 0x00FF_00FF); // magenta
-
     #[cfg(feature = "boot-init")]
     boot_userspace_init();
-
-    // Periodic serial heartbeat — surfaces input-pipeline counters
-    // (ASCII_PUSH / ASCII_POP / KEY_PUSH) every ~2s so a headless
-    // serial capture shows whether keystrokes are reaching the
-    // shell. Spawned BEFORE run_until_empty so it lives in the
-    // queue regardless of the headless-vs-interactive branch
-    // below (run_until_empty doesn't return when there are
-    // boot-init user tasks alive, so a post-run_until_empty
-    // spawn would never reach the executor).
-    {
-        // FB beacon liveness heartbeat. Parks on the timer wheel between
-        // ~10 Hz repaints (via `sleep_cycles`) rather than self-waking
-        // every poll: a perpetual self-wake kept `ready_this_round > 0`
-        // forever, which is exactly what stops the cooperative executor
-        // from ever HLTing when otherwise idle (Linux idles iff
-        // nr_running==0). Timer-parked, it's off the runnable set between
-        // beats so the CPU can actually halt.
-        async fn heartbeat() {
-            // ~10 Hz so the beacon slots animate promptly on keystrokes.
-            const PERIOD_CYCLES: u64 = 100_000_000;
-            const PALETTE: [u32; 8] = [
-                0x00FF_0000, // red
-                0x00FF_8000, // orange
-                0x00FF_FF00, // yellow
-                0x0000_FF00, // green
-                0x0000_FF80, // mint
-                0x0000_FFFF, // cyan
-                0x0000_80FF, // sky
-                0x00FF_00FF, // magenta
-            ];
-            loop {
-                use core::sync::atomic::Ordering;
-                let ascii_in = narf_input::ASCII_PUSH_COUNT.load(Ordering::Relaxed);
-                let ascii_out = narf_input::ASCII_POP_COUNT.load(Ordering::Relaxed);
-                let key_in = narf_input::KEY_PUSH_COUNT.load(Ordering::Relaxed);
-                // Slots 40..=45: white label + counter-coloured slot per
-                // input class (ascii in/out, key in). A slot cycling
-                // colour on a keypress means that pipeline is delivering.
-                narf_memory::beacon::paint(40, 0x00FF_FFFF); // label "I"
-                narf_memory::beacon::paint(41, PALETTE[(ascii_in as usize) & 7]);
-                narf_memory::beacon::paint(42, 0x00FF_FFFF); // label "O"
-                narf_memory::beacon::paint(43, PALETTE[(ascii_out as usize) & 7]);
-                narf_memory::beacon::paint(44, 0x00FF_FFFF); // label "K"
-                narf_memory::beacon::paint(45, PALETTE[(key_in as usize) & 7]);
-                narf_time::sleep_cycles(PERIOD_CYCLES).await;
-            }
-        }
-        let _ = narf_scheduler::spawn(heartbeat());
-    }
 
     // Spawn the cursor pump *before* run_until_empty so it's in the
     // queue when the executor starts. With boot-init the user task
@@ -2984,18 +2826,10 @@ fn run_async_demo() -> ! {
     // Cursor pump + USB HID supervisor are spawned by their own
     // Stage::Late initcalls — no manual re-spawn needed now that
     // the redundant scheduler::init() above is gone.
-    // Beacon slot 28 (free): `narf_fb::info()` returned Some — i.e.
-    // a scanout was registered. If you see this beacon BUT no
-    // status panel + no shell, the panel-paint code path failed
-    // independently. If you DON'T see this beacon, no scanout was
-    // ever registered (Limine FB tag absent / select_active picked
-    // None).
     if narf_fb::info().is_some() {
-        narf_memory::beacon::paint(28, 0x00FF_8C00); // dark-orange: fb-info-some
         let cap = narf_fb::bootstrap_writer();
         if let Ok(panel_writer) = narf_fb::FbWriter::new(cap) {
             narf_fb::status::paint(&panel_writer);
-            narf_memory::beacon::paint(29, 0x00FF_FF40); // pale-yellow: panel-painted
         }
     }
     // FB up implies the cursor-pump task was spawned by the
@@ -3009,13 +2843,7 @@ fn run_async_demo() -> ! {
         console::Writer,
         "  scheduler: spawning 1 task, running to completion"
     );
-    // Beacon slot 30: about to enter run_until_empty. If you see
-    // 30 paint but never see 31, run_until_empty hung (busy-spin
-    // task or kernel-wide deadlock). If you see 31, the executor
-    // returned cleanly and the issue is later.
-    narf_memory::beacon::paint(30, 0x0000_FF80); // mint: pre-run_until_empty
     narf_scheduler::run_until_empty();
-    narf_memory::beacon::paint(31, 0x0080_FF00); // chartreuse: post-run_until_empty
 
     let _ = writeln!(
         console::Writer,
@@ -3355,16 +3183,6 @@ fn boot_userspace_init() {
         // load_user_process_with uses above.
         narf_userspace::handlers::set_proc_argv(tid.raw(), argv);
         narf_userspace::handlers::set_proc_comm(tid.raw(), name);
-        // Slot 24 = init spawned (lime), slot 23 = shell spawned
-        // (cyan). Lets the user see at a glance which user task
-        // got past load_user_process_with on real silicon. Both
-        // colours stick — no toggle — so a missing colour means
-        // that user task never reached spawn.
-        match name {
-            "init" => narf_memory::beacon::paint(24, 0x0080_FF00),
-            "shell" => narf_memory::beacon::paint(23, 0x0000_FFFF),
-            _ => {}
-        }
         true
     }
 

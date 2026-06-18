@@ -1452,20 +1452,6 @@ pub fn run_until_empty() {
         // YieldTimeout) keeps ready > 0 and would otherwise
         // starve deferred wakes forever.
         let _ = narf_lib::deferred_wake::drain_and_wake();
-        // Slot 21: run_until_empty round entry beacon. White → red
-        // toggles each round. If this stays a single colour, the
-        // executor never completes one round (wedged in first
-        // task's poll). If it toggles but slot 22 (DrainTask poll
-        // entry) doesn't, the task ahead of DrainTask never
-        // returns Pending and the round never reaches DrainTask.
-        narf_memory::beacon::paint(
-            21,
-            if (narf_time::now_cycles() >> 27) & 1 == 0 {
-                0x00FF_FFFF
-            } else {
-                0x00FF_0000
-            },
-        );
         // Snapshot queue length. We'll visit each task at most once per
         // round; spawns during the round land at the back and get
         // visited on the NEXT round.
@@ -1531,21 +1517,6 @@ pub fn run_until_empty() {
                 let mut q = READY[cpu].lock();
                 q.as_mut().unwrap().push_back(slot);
                 continue;
-            }
-
-            // Slot 17: user-task poll heartbeat — painted in
-            // KERNEL AS, before `activate()` swaps CR3 to the
-            // user's AS (which lacks the low-half identity map
-            // that the FB phys lives in; a beacon paint after
-            // activate would page-fault and the next kernel task
-            // polled with stale CR3 would page-fault too).
-            // Blue ↔ red toggle.
-            if slot.addr_space.is_some() {
-                use core::sync::atomic::{AtomicU64, Ordering as O};
-                static N: AtomicU64 = AtomicU64::new(0);
-                let v = N.fetch_add(1, O::Relaxed);
-                let colour = if v & 1 == 0 { 0x0000_00FF } else { 0x00FF_0000 };
-                narf_memory::beacon::paint(17, colour);
             }
 
             // Save the kernel per-AS register before activating
@@ -1641,35 +1612,6 @@ pub fn run_until_empty() {
                     // SAFETY: Valid memory or trusted environment
                     unsafe { narf_arch::x86_64::pks::restore(saved) };
                 }
-            }
-            // Per-poll identification beacon — slot 18 cycles
-            // through 8 palette colors keyed by a global counter.
-            // When run_until_empty wedges inside one task's poll
-            // (slot 21 stuck, slot 17 dark), this slot's color
-            // tells you WHICH poll-count was the last one
-            // attempted: red(0) → orange(1) → yellow(2) →
-            // green(3) → blue(4) → cyan(5) → magenta(6) →
-            // white(7) → wraps. Combined with knowing the rough
-            // boot-order of spawn() calls (TPM init tasks
-            // first, then power-monitor, then FB stuff, then
-            // measured-boot, then heartbeat, then init/shell
-            // last), pin the wedge.
-            #[cfg(target_arch = "x86_64")]
-            {
-                use core::sync::atomic::{AtomicU64, Ordering as O};
-                static POLL_N: AtomicU64 = AtomicU64::new(0);
-                const PALETTE: [u32; 8] = [
-                    0x00FF_0000, // red 0
-                    0x00FF_8000, // orange 1
-                    0x00FF_FF00, // yellow 2
-                    0x0000_FF00, // green 3
-                    0x0000_00FF, // blue 4
-                    0x0000_FFFF, // cyan 5
-                    0x00FF_00FF, // magenta 6
-                    0x00FF_FFFF, // white 7
-                ];
-                let n = POLL_N.fetch_add(1, O::Relaxed);
-                narf_memory::beacon::paint(18, PALETTE[(n as usize) & 7]);
             }
             let poll_result = slot.task.as_mut().poll(&mut ctx);
             current_task_slot().store(0, Ordering::Release);

@@ -14,7 +14,6 @@ pub mod addr;
 pub mod address_space;
 pub mod asid_alloc;
 pub mod atomic_pool;
-pub mod beacon;
 pub mod buddy;
 #[cfg(feature = "cgroup")]
 pub mod cgroup_charge;
