@@ -1349,10 +1349,20 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         // scheduling overhead, not this poll period. Fast mode
                         // only engages while frames are flowing; an idle NIC
                         // still parks at 100 ms.
+                        // Idle fallback is 2 ms, NOT 100 ms. The IRQ edge
+                        // resolves `w` immediately when caught; this deadline
+                        // only bounds the tail when an RX MSI-X is missed.
+                        // Once the executor actually HALTS when idle (init no
+                        // longer busy-spins), a 100 ms idle deadline became
+                        // the wake latency for the ~1% of requests whose
+                        // MSI-X is missed — a heavy avg tail (p50 227 µs but
+                        // avg >1 ms). The HLT already saves CPU while idle, so
+                        // the long backoff buys nothing; 2 ms caps the
+                        // missed-IRQ tail while keeping idle re-polls rare.
                         let dl = if fast {
                             narf_time::Deadline::after_us(200)
                         } else {
-                            narf_time::Deadline::after_ms(100)
+                            narf_time::Deadline::after_ms(2)
                         };
                         let _ = narf_time::timeout(dl, w).await;
                     }

@@ -2049,16 +2049,26 @@ pub fn getcwd(buf: &mut [u8]) -> i32 {
 
 // ── Sleep ──────────────────────────────────────────────────────────
 
-/// Sleep for at least `ns` nanoseconds. The kernel-side handler
-/// today spin-waits in trap context (see `sys_sleep` in
-/// `userspace/src/handlers.rs`); long sleeps therefore burn the
-/// calling CPU. This wrapper just plumbs the request through —
-/// the user-visible contract is "blocks for ≥ ns wall time".
-/// Returns 0 on success.
+/// Sleep for at least `ns` nanoseconds. Returns 0 on success.
+///
+/// `SYS_SLEEP` is wire number 35 — the Linux `nanosleep(2)` ABI, whose
+/// `arg0` is a `*const timespec` (`{ tv_sec: i64, tv_nsec: i64 }`), NOT a
+/// raw nanosecond scalar. Passing the scalar made the kernel read it as a
+/// user pointer (`copy_from_user` faulted → -1), so EVERY narf-libc
+/// `sleep`/`usleep`/`nanosleep` returned instantly and the caller
+/// busy-looped (e.g. `init`'s `loop { sleep(u32::MAX) }` pinned the CPU,
+/// preventing the cooperative executor from ever halting). Marshal a
+/// proper `timespec` on the stack and pass its address.
 #[inline]
 pub fn nanosleep(ns: u64) -> i32 {
-    // SAFETY: SYS_SLEEP signature: arg0 ns.
-    let r = unsafe { syscall1(SYS_SLEEP, ns) };
+    let ts: [i64; 2] = [
+        (ns / 1_000_000_000) as i64, // tv_sec
+        (ns % 1_000_000_000) as i64, // tv_nsec
+    ];
+    // SAFETY: `SYS_SLEEP`/nanosleep reads a 16-byte timespec from arg0;
+    // `ts` is a live 16-byte stack array valid for the duration of the
+    // syscall, and `arg1` (rem) is ignored by the handler.
+    let r = unsafe { syscall1(SYS_SLEEP, ts.as_ptr() as u64) };
     if r == 0 {
         0
     } else {

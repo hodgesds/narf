@@ -32,6 +32,12 @@ fn main() {
     println!("cargo:rerun-if-changed=../narf-libc/validate/src/main.rs");
     println!("cargo:rerun-if-changed=../narf-libc/validate/validate.ld");
     println!("cargo:rerun-if-changed=../narf-libc/validate/Cargo.toml");
+    // narf-libc (and thus every boot-init user binary) links narf_user_runtime;
+    // its sources must invalidate the embedded ELFs too, else a fix in the
+    // runtime's syscall wrappers (e.g. nanosleep's ABI) is served stale.
+    println!("cargo:rerun-if-changed=../user-runtime/src/lib.rs");
+    println!("cargo:rerun-if-changed=../user-runtime/src/graphics.rs");
+    println!("cargo:rerun-if-changed=../user-runtime/src/shmem.rs");
     // boot-init feature: init + shell binaries.
     println!("cargo:rerun-if-changed=../userspace/init/src/main.rs");
     println!("cargo:rerun-if-changed=../userspace/init/init.ld");
