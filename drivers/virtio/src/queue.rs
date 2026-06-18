@@ -223,19 +223,25 @@ impl Virtqueue {
                 // SAFETY: `curr` is a descriptor index just returned by
                 // alloc_desc (< capacity), so `table.add(curr)` is a valid,
                 // aligned slot in this queue's owned descriptor table.
+                // `write_volatile`: this is DMA memory the device reads, so
+                // the store must not be elided/cached by the compiler (it
+                // can't prove the device is a reader). Mirrors the
+                // `read_volatile` on the used-ring side. Matters under KVM,
+                // where the device runs on another host CPU asynchronously.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
-                    *table.add(curr as usize) = desc_val;
+                    core::ptr::write_volatile(table.add(curr as usize), desc_val);
                 }
                 curr = next;
             } else {
                 desc_val.flags &= !VIRTQ_DESC_F_NEXT;
                 // SAFETY: `curr` is a descriptor index from alloc_desc
                 // (< capacity); writing the final descriptor only touches this
-                // queue's owned table slot.
+                // queue's owned table slot. `write_volatile`: DMA memory the
+                // device reads (see the next-descriptor write above).
                 // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
-                    *table.add(curr as usize) = desc_val;
+                    core::ptr::write_volatile(table.add(curr as usize), desc_val);
                 }
             }
         }
@@ -252,11 +258,17 @@ impl Virtqueue {
         unsafe {
             let ring = self.avail_base().add(2);
             let slot = (self.avail_idx as usize) % (self.layout.capacity as usize);
-            *ring.add(slot) = head;
+            // `write_volatile` for both DMA-ring stores the device reads.
+            // A plain store lets the compiler elide/coalesce it (it can't
+            // prove the device is a reader), so under KVM — where the device
+            // polls these from another host CPU — a posted buffer could be
+            // invisible and the queue would stall. `virtio_fence` keeps the
+            // ring-entry store ordered before the idx publication.
+            core::ptr::write_volatile(ring.add(slot), head);
 
             virtio_fence();
             self.avail_idx = self.avail_idx.wrapping_add(1);
-            *(self.avail_base().add(1)) = self.avail_idx;
+            core::ptr::write_volatile(self.avail_base().add(1), self.avail_idx);
         }
 
         Some(head)
@@ -274,8 +286,14 @@ impl Virtqueue {
         // SAFETY: used_base+1 is the u16 `idx` field of this queue's used ring
         // (DMA memory sized within one page by VirtqueueLayout::new), valid and
         // aligned to read the device-published index.
+        // `read_volatile`: the device bumps this index from another host CPU
+        // under KVM. A plain read lets the compiler hoist/cache it (this is
+        // called in a tight drain loop), so a stale value would make
+        // `poll_used` report "no completion" forever — RX/TX wedges. Plain
+        // reads happen to work under TCG only because the device updates the
+        // ring synchronously inside the notify MMIO write.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let used_idx = unsafe { *(self.used_base().add(1)) };
+        let used_idx = unsafe { core::ptr::read_volatile(self.used_base().add(1)) };
         if self.last_used_idx == used_idx {
             return None;
         }
@@ -291,8 +309,9 @@ impl Virtqueue {
         // SAFETY: `slot` is taken modulo capacity, so ring.add(slot) is an
         // in-bounds, aligned VirtqUsedElem in this queue's used ring; the
         // device wrote it before bumping used_idx (ordered by virtio_fence).
+        // `read_volatile`: DMA memory written by the device (see used_idx).
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let elem = unsafe { *ring.add(slot) };
+        let elem = unsafe { core::ptr::read_volatile(ring.add(slot)) };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         Some((elem.id, elem.len))
