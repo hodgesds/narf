@@ -60,3 +60,10 @@ fhandle_smoke_x86_64
 mountapi_smoke_x86_64
 jobctl_smoke_x86_64
 procfs2_smoke_x86_64
+
+# Host-derived / downloaded binaries used by the busybox + off-box redis
+# smokes. Reproduced on demand by xtask (copied from the host busybox /
+# fetched musl libc); never committed.
+busybox_static_x86_64
+busybox_alpine_x86_64
+ld-musl-alpine-x86_64.so.1
