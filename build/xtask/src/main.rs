@@ -3022,6 +3022,11 @@ fn boot_narf_redis(
             if let Ok(mut g) = cap_r.lock() {
                 g.extend_from_slice(&buf[..nr]);
             }
+            if std::env::var_os("XTASK_REDIS_TEE_SERIAL").is_some() {
+                use std::io::Write as _;
+                let _ = std::io::stdout().write_all(&buf[..nr]);
+                let _ = std::io::stdout().flush();
+            }
             for &b in &buf[..nr] {
                 if b == b'\n' {
                     for m in markers {

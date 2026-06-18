@@ -1670,3 +1670,115 @@ kernel_test_in!(
     "interrupts/ipi",
     smoke_ipi_shootdown_handler_invpcid_path_taken
 );
+
+// --- one-shot multiplex: next_arm_target pure-logic smokes ------------
+//
+// Exercise the pure min+floor selection used by the LAPIC TSC-deadline
+// one-shot (`on_timer_tick` / `arm_tsc_deadline_if_earlier`). Pure
+// arithmetic — no hardware — so they run on every arch. `next_arm_target`
+// is x86_64-only (lives in apic.rs), so gate the real-call smokes on
+// x86_64 and provide aarch64 skips.
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_next_arm_target_wheel_earlier_than_periodic() -> TestResult {
+    use crate::x86_64::apic::next_arm_target;
+    let now = 1_000_000u64;
+    let min_delta = 10_000u64;
+    // Wheel deadline well above the floor but before the periodic tick.
+    let periodic = now + 1_000_000;
+    let wheel = now + 50_000;
+    if next_arm_target(now, periodic, Some(wheel), min_delta) == wheel {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("expected the earlier wheel deadline")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_next_arm_target_wheel_earlier_than_periodic
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_next_arm_target_wheel_later_than_periodic() -> TestResult {
+    use crate::x86_64::apic::next_arm_target;
+    let now = 1_000_000u64;
+    let min_delta = 10_000u64;
+    let periodic = now + 30_000;
+    let wheel = now + 500_000;
+    if next_arm_target(now, periodic, Some(wheel), min_delta) == periodic {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("expected the earlier periodic deadline")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_next_arm_target_wheel_later_than_periodic
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_next_arm_target_no_wheel() -> TestResult {
+    use crate::x86_64::apic::next_arm_target;
+    let now = 1_000_000u64;
+    let min_delta = 10_000u64;
+    let periodic = now + 30_000;
+    if next_arm_target(now, periodic, None, min_delta) == periodic {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("empty wheel must yield the periodic deadline")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/timer", smoke_next_arm_target_no_wheel);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_next_arm_target_both_in_past_floored() -> TestResult {
+    use crate::x86_64::apic::next_arm_target;
+    let now = 1_000_000u64;
+    let min_delta = 10_000u64;
+    // Both deadlines already behind `now`: must floor to now + min_delta.
+    let periodic = now - 100_000;
+    let wheel = now - 50_000;
+    if next_arm_target(now, periodic, Some(wheel), min_delta) == now + min_delta {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("past deadlines must floor to now + min_delta")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_next_arm_target_both_in_past_floored
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_next_arm_target_within_min_delta_floored() -> TestResult {
+    use crate::x86_64::apic::next_arm_target;
+    let now = 1_000_000u64;
+    let min_delta = 10_000u64;
+    // A wheel deadline between now and now + min_delta floors up.
+    let periodic = now + 1_000_000;
+    let wheel = now + 5_000; // < min_delta
+    if next_arm_target(now, periodic, Some(wheel), min_delta) == now + min_delta {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("sub-min_delta deadline must floor to now + min_delta")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_next_arm_target_within_min_delta_floored
+);
+
+#[cfg(not(target_arch = "x86_64"))]
+fn smoke_next_arm_target_wheel_earlier_than_periodic() -> TestResult {
+    TestResult::Skip("next_arm_target is x86_64-specific (LAPIC TSC-deadline)")
+}
+#[cfg(not(target_arch = "x86_64"))]
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_next_arm_target_wheel_earlier_than_periodic
+);

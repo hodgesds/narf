@@ -1108,7 +1108,10 @@ impl VirtioNetPci {
 // closure — and any re-entrant net_pci call it makes via the sleep-pump
 // spin — runs with the lock released. Controllers are append-only after
 // probe, so a stale clone is never freed mid-use.
-static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
+//
+// `pub(crate)` so the e2e re-entrancy regression test can assert the lock
+// is released while a `with_*` closure runs (`smoke_e2e_net_with_at_*`).
+pub(crate) static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1235,19 +1238,19 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
             const FAST_ROUNDS: u32 = 64;
             let mut idle_rounds: u32 = FAST_ROUNDS;
             loop {
-                let fast = idle_rounds < FAST_ROUNDS;
-                if let Some(v) = irq {
-                    let dl = if fast {
-                        narf_time::Deadline::after_ms(1)
-                    } else {
-                        narf_time::Deadline::after_ms(100)
-                    };
-                    let _ = narf_interrupts::wait_for_irq_until(v, dl).await;
-                } else if fast {
-                    narf_time::sleep_cycles(PUMP_CYCLES / 50).await;
-                } else {
-                    narf_time::sleep_cycles(PUMP_CYCLES).await;
-                }
+                // Snapshot the IRQ generation BEFORE draining (Linux NAPI
+                // re-check pattern). A frame that lands during or after the
+                // drain below bumps the vector's `fire_count` past this
+                // baseline, so the wait at the bottom of the loop resolves
+                // immediately instead of sleeping out the deadline. In the
+                // old wait-then-drain order, a frame arriving in the window
+                // between a drain and the next `wait_for_irq` snapshot was
+                // absorbed into the new baseline and waited the full 1 ms
+                // deadline — that dragged off-box request latency to ~0.7 ms
+                // avg (vs ~0.15 ms when the IRQ edge was caught). Building
+                // the future just snapshots the count; its waker isn't
+                // installed until the first poll (in `timeout` below).
+                let irq_waiter = irq.map(narf_interrupts::wait_for_irq);
                 let mut processed_any = false;
                 loop {
                     let taken = match with_at(idx, |c| c.rx_take_on(pair_idx)) {
@@ -1316,12 +1319,50 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         }
                     }
                 }
-                // Adapt the next wait: reset to fast-poll if this wake
-                // drained anything, else step toward the slow fallback.
+                // Adapt cadence: reset to fast-poll if this round drained
+                // anything, else step toward the slow fallback.
                 if processed_any {
                     idle_rounds = 0;
                 } else {
                     idle_rounds = idle_rounds.saturating_add(1);
+                }
+                // Wait for an IRQ newer than the pre-drain baseline (a frame
+                // that arrived during the drain resolves this immediately),
+                // or fall back to the adaptive deadline. Non-MSI-X pairs
+                // (`irq == None`) poll on the sleep cadence.
+                let fast = idle_rounds < FAST_ROUNDS;
+                match irq_waiter {
+                    Some(w) => {
+                        // Fast-mode fallback is 200 µs, not 1 ms. The IRQ
+                        // edge resolves `w` immediately when caught; this
+                        // deadline only bounds the tail when an RX MSI-X
+                        // completion is missed/late under KVM. virtio-net
+                        // negotiates neither EVENT_IDX nor sets avail.flags
+                        // NO_INTERRUPT, so the device fires on every used
+                        // buffer. 200 µs is an empirically-measured sweet
+                        // spot for off-box redis under KVM (PING avg ~0.5 ms
+                        // vs ~0.7 ms at 1 ms). Tightening further is NOT a
+                        // win: at 50 µs the wake-drain-empty-rearm churn adds
+                        // enough scheduler/timer jitter to RAISE both min and
+                        // avg latency (min 106→203 µs, avg 512→724 µs) — the
+                        // residual gap to Linux is per-hop executor
+                        // scheduling overhead, not this poll period. Fast mode
+                        // only engages while frames are flowing; an idle NIC
+                        // still parks at 100 ms.
+                        let dl = if fast {
+                            narf_time::Deadline::after_us(200)
+                        } else {
+                            narf_time::Deadline::after_ms(100)
+                        };
+                        let _ = narf_time::timeout(dl, w).await;
+                    }
+                    None => {
+                        if fast {
+                            narf_time::sleep_cycles(PUMP_CYCLES / 50).await;
+                        } else {
+                            narf_time::sleep_cycles(PUMP_CYCLES).await;
+                        }
+                    }
                 }
             }
         });

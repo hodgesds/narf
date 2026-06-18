@@ -2822,7 +2822,7 @@ fn run_async_demo() -> ! {
         }
 
         let selected = narf_time::clockevent::select_primary(
-            100, // 100 Hz tick — 10 ms period
+            1000, // 1000 Hz tick — 1 ms period (match Linux CONFIG_HZ_1000)
             narf_interrupts::VECTOR_TIMER,
         );
         match selected {

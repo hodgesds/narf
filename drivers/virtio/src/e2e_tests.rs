@@ -1145,3 +1145,43 @@ kernel_test_in!(
     "drivers/virtio/e2e",
     smoke_e2e_blk_live_block_device_registered
 );
+
+/// Smoke 19 — virtio-net `CONTROLLERS` lock is NOT held across the
+/// `with_at` / `with_controller` closure (re-entrancy deadlock regression).
+///
+/// Regression guard for the spinlock deadlock fixed by storing
+/// `Vec<Arc<VirtioNetPci>>` and cloning the Arc out before calling the
+/// closure. The bug: `with_*` held the `CONTROLLERS` `IrqSafeSpinLock`
+/// across the caller's closure, so the TX path
+/// (`vnet0_send_fn → with_controller → tx_dma → responsive_spin_until`
+/// runs `sleep_pumps`, which can re-enter net_pci) re-locked `CONTROLLERS`
+/// and spun forever with IRQs disabled on the single cooperative CPU,
+/// wedging the executor (observed as redis hanging off-box under KVM).
+///
+/// We assert the structural property of the fix directly: inside the
+/// closure the lock must be acquirable (`try_lock().is_some()`). With the
+/// pre-fix code the lock is held here and `try_lock` returns `None`. This
+/// is a clean assertion — it never deadlocks even on regression (unlike a
+/// nested `with_at`, which would hang).
+fn smoke_e2e_net_with_at_no_reentrant_deadlock() -> TestResult {
+    use crate::net_pci;
+    if !net_pci::is_probed() {
+        return TestResult::Skip("no virtio-net-pci device");
+    }
+    // `with_at` returns `None` only if there is no controller at index 0;
+    // `is_probed()` above guarantees there is one, so `Some(true)` is the
+    // pass case.
+    let lock_free_in_closure = net_pci::with_at(0, |_c| net_pci::CONTROLLERS.try_lock().is_some());
+    match lock_free_in_closure {
+        Some(true) => TestResult::Pass,
+        Some(false) => TestResult::Fail(
+            "CONTROLLERS lock held across with_at closure — re-entrant net_pci \
+             call (e.g. tx_dma's sleep-pump spin) would deadlock",
+        ),
+        None => TestResult::Fail("with_at(0) skipped its closure despite is_probed()"),
+    }
+}
+kernel_test_in!(
+    "drivers/virtio/e2e",
+    smoke_e2e_net_with_at_no_reentrant_deadlock
+);

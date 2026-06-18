@@ -551,18 +551,23 @@ fn spawn_supervisor_task() {
             // never gets suspended; an idle USB stick / hub does.
             attach::idle_suspend_pass(c).await;
             SUPERVISOR_PHASE.store(9, core::sync::atomic::Ordering::Relaxed);
-            // Wheel-bypass inter-cycle delay. yield_now self-wakes
-            // and the slot is re-polled on the next round; a TSC
-            // deadline check provides the ~100 ms cadence so we
-            // don't busy-loop pump_all at full preemption speed.
-            // (The xHCI IRQ wait path was wheel-based and not firing
-            // for this task; same workaround as elsewhere in the
-            // supervisor.)
-            let _ = irq_vector; // unused while wheel is suspected
-            let pause = narf_time::Deadline::after_ms(100);
-            while !pause.expired() {
-                narf_scheduler::yield_now().await;
-            }
+            // Inter-cycle delay: PARK on the timer wheel for ~100 ms
+            // instead of busy-yielding. The old `while !pause.expired()
+            // { yield_now().await }` form self-woke every executor round
+            // for the full 100 ms — a perpetual runnable task that kept
+            // the executor from ever halting (nr_running never hit 0),
+            // pinned the CPU at 100%, and paced every scheduler round at
+            // the cost of that spin. On an otherwise-idle single-flight
+            // workload (off-box redis) that turned a sub-round wake into
+            // a ~one-round (~230 µs) latency hit on EVERY request, since a
+            // freshly-woken peer (the epoll-parked server) waited out a
+            // full spinning round to be re-polled. The timer wheel now
+            // fires reliably (one-shot TSC-deadline), so a real parked
+            // sleep wakes this task on time AND lets the executor halt
+            // between USB pump cycles.
+            let _ = irq_vector;
+            let cyc = 100_000_000u64.saturating_mul(narf_time::cycles_per_ns().max(1) as u64);
+            narf_time::sleep_cycles(cyc).await;
         }
     });
 }

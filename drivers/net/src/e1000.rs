@@ -1466,17 +1466,42 @@ fn spawn_pumps(
 }
 
 async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+    // Adaptive RX poll. The old form `yield_now().await` every loop made
+    // this task self-wake on EVERY executor round — a perpetually-runnable
+    // task that kept the cooperative executor from ever halting
+    // (nr_running never hit 0), pinned the CPU at 100%, and paced every
+    // scheduler round at the spin rate. With a second idle NIC attached
+    // (e1000 alongside virtio-net, the standard off-box-redis QEMU
+    // config), that spin paced the WHOLE system: a freshly-woken peer
+    // (the epoll-parked server task on the *other* NIC) waited a full
+    // ~230 µs spinning round to be re-polled, turning a sub-100 µs wake
+    // into a ~0.5 ms request latency. Fix: after a run of empty polls,
+    // PARK on the timer wheel so the executor can halt; stay tight-poll
+    // while frames are actually flowing.
+    const IDLE_BACKOFF_ROUNDS: u32 = 64;
+    let idle_park_cycles = 1_000_000u64.saturating_mul(narf_time::cycles_per_ns().max(1) as u64);
     let mut buf = [0u8; 2048];
+    let mut idle_rounds: u32 = 0;
     loop {
         let n = device.rx_recv(&mut buf);
         if n > 0 {
+            idle_rounds = 0;
             // Push to network stack.
             let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, n as u32);
             frame.payload_mut().copy_from_slice(&buf[..n]);
             let _ = rx_prod.send(frame).await;
+            continue;
         }
-        narf_scheduler::yield_now().await;
+        idle_rounds = idle_rounds.saturating_add(1);
+        if idle_rounds < IDLE_BACKOFF_ROUNDS {
+            // Recently active: tight re-poll for low RX latency.
+            narf_scheduler::yield_now().await;
+        } else {
+            // Idle: park ~1 ms on the timer wheel so the executor can
+            // halt instead of spinning this empty poll every round.
+            narf_time::sleep_cycles(idle_park_cycles).await;
+        }
     }
 }
 
