@@ -147,13 +147,16 @@ struct QueuePair {
     tx_queue: IrqSafeSpinLock<Option<Virtqueue>>,
     /// RX descriptor → buffer table for this pair only.
     rx_buffers: IrqSafeSpinLock<Vec<Option<DmaBuffer>>>,
+    /// TX descriptor → in-flight buffer table for this pair only.
+    /// With fire-and-forget TX the payload `DmaBuffer` must stay
+    /// alive (the device DMAs from it) until its used-ring entry
+    /// appears. On submit we move the buffer into `tx_buffers[head]`;
+    /// on lazy reclaim (drained at the start of the next transmit)
+    /// we `take()` it out and drop it. Sized to the TX queue size.
+    tx_buffers: IrqSafeSpinLock<Vec<Option<DmaBuffer>>>,
     /// Holds DMA pages backing the desc/avail/used rings alive.
     _rx_q_buf: DmaBuffer,
     _tx_q_buf: DmaBuffer,
-    /// 12-byte virtio-net header scratch. Per-pair so concurrent
-    /// TX submissions on different pairs don't clobber each other's
-    /// header bytes mid-DMA.
-    tx_hdr_buf: DmaBuffer,
     rx_qsize: u16,
     tx_qsize: u16,
     rx_notify_off: u16,
@@ -522,11 +525,11 @@ impl VirtioNetPci {
                 notify.write16(rx_off, rx_qidx);
             }
 
-            // Per-pair TX header scratch. 4 KiB is overkill for 12
-            // bytes but matches the smallest DMA-coherent allocation
-            // granularity we have.
-            let tx_hdr_buf = alloc_coherent(4096, DomainId::DRIVER_0)
-                .map_err(|_| VirtioPciError::BarMapFailed)?;
+            // Per-descriptor in-flight TX buffer table, sized to the
+            // TX queue. A submitted frame's `DmaBuffer` parks here at
+            // its descriptor head until the device publishes the
+            // completion (lazily reclaimed before the next transmit).
+            let tx_buffers: Vec<Option<DmaBuffer>> = (0..tx_qsize).map(|_| None).collect();
 
             pairs.push(QueuePair {
                 rx_qidx,
@@ -534,9 +537,9 @@ impl VirtioNetPci {
                 rx_queue: IrqSafeSpinLock::new(Some(rx_q)),
                 tx_queue: IrqSafeSpinLock::new(Some(tx_q)),
                 rx_buffers: IrqSafeSpinLock::new(rx_buffers),
+                tx_buffers: IrqSafeSpinLock::new(tx_buffers),
                 _rx_q_buf: rx_q_buf,
                 _tx_q_buf: tx_q_buf,
-                tx_hdr_buf,
                 rx_qsize,
                 tx_qsize,
                 rx_notify_off,
@@ -706,118 +709,160 @@ impl VirtioNetPci {
         (n as usize) % self.pairs.len()
     }
 
-    /// Transmit a frame backed by a caller-owned `DmaBuffer`.
-    /// Zero-copy: the payload descriptor points at `buf` directly
-    /// — the driver never memcpys the frame body, only the 12-byte
-    /// virtio-net header stub at the front of the chain. `payload`
-    /// gives the slice of `buf` to send (offset + len within the
-    /// page); the caller must keep `buf` alive until this call
-    /// returns since the descriptor chain references its phys
-    /// address.
+    /// Transmit a frame backed by a caller-owned `DmaBuffer`,
+    /// fire-and-forget (Linux-style). Takes the buffer BY VALUE: the
+    /// device DMAs the frame body directly out of `buf`, so the
+    /// buffer must stay alive until the device has read it. We keep
+    /// it alive by parking it in the per-pair `tx_buffers` slot keyed
+    /// on its descriptor head; it's dropped lazily when a later
+    /// transmit observes its used-ring completion. This function
+    /// NEVER waits on the device — it submits, kicks the notify
+    /// register, and returns immediately.
+    ///
+    /// Buffer layout contract: the 12-byte virtio-net header lives at
+    /// offset 0 of `buf` (written here, all-zero), and the frame body
+    /// occupies `buf[12 .. 12 + frame_len]`. Callers must therefore
+    /// leave 12 bytes of headroom and place the frame at offset 12.
+    /// A SINGLE device-readable descriptor `[buf_phys, 12 + frame_len]`
+    /// is submitted — no shared per-pair header scratch, so any number
+    /// of transmits can be in flight concurrently without racing on a
+    /// shared header region.
     ///
     /// Picks a TX pair via the round-robin selector. With
     /// VIRTIO_NET_F_MQ negotiated and >1 pairs active, parallel
     /// callers fan out across the device's TX virtqueues; with a
     /// single pair the round-robin degenerates to "always pair 0".
-    ///
-    /// Polled completion via `responsive_spin_until` so sleep_pumps
-    /// keep advancing while the device drains.
-    pub fn tx_dma(
-        &self,
-        buf: &DmaBuffer,
-        payload_offset: u32,
-        payload_len: u32,
-    ) -> Result<(), VirtioPciError> {
+    pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
         let pair_idx = self.next_tx_pair();
-        self.tx_dma_on(pair_idx, buf, payload_offset, payload_len)
+        self.tx_dma_on(pair_idx, buf, frame_len)
     }
 
     /// Like `tx_dma` but submits on a specific pair. Used by the
     /// TX forwarder (already picks the pair, doesn't need to
     /// re-roll the round-robin) and by tests that want to exercise
     /// a particular queue.
+    ///
+    /// See [`Self::tx_dma`] for the buffer layout contract and the
+    /// fire-and-forget / lazy-reclaim ownership model.
     pub fn tx_dma_on(
         &self,
         pair_idx: usize,
-        buf: &DmaBuffer,
-        payload_offset: u32,
-        payload_len: u32,
+        mut buf: DmaBuffer,
+        frame_len: u32,
     ) -> Result<(), VirtioPciError> {
         let pair = self.pairs.get(pair_idx).ok_or(VirtioPciError::NoQueues)?;
-        let payload_offset = payload_offset as usize;
-        let payload_len = payload_len as usize;
-        if payload_len == 0 || payload_len > MAX_FRAME - 12 {
+        let frame_len = frame_len as usize;
+        if frame_len == 0 || frame_len > MAX_FRAME - 12 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        if payload_offset.saturating_add(payload_len) > buf.len() {
+        // Total device-readable region: 12-byte header + frame body.
+        let total_len = 12 + frame_len;
+        if total_len > buf.len() {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        // Per-pair header scratch keeps concurrent submissions on
-        // sibling pairs from racing on the same 12-byte region.
-        let hdr_phys = pair.tx_hdr_buf.phys_addr().raw();
-        // SAFETY: identity-mapped DMA buffer; offset 0..12 within
-        // the 4 KiB tx_hdr_buf page.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            for i in 0..12u64 {
-                core::ptr::write_volatile((hdr_phys + i) as *mut u8, 0);
+        // Prepend the 12-byte (all-zero) virtio-net header into the
+        // payload buffer itself. No shared scratch → no header race
+        // even with many in-flight transmits.
+        {
+            let slice = buf.as_mut_slice();
+            slice[..12].fill(0);
+        }
+        let buf_phys = buf.phys_addr().raw();
+
+        // Lazy completion reclaim: drain every TX the device has
+        // finished since the last transmit. For each completed head,
+        // return its descriptor to the free list and drop the buffer
+        // that was DMAed out of. This MUST run before we add the new
+        // descriptor: the descriptor allocator only hands out heads
+        // that have been freed, so freeing here guarantees the head
+        // we're about to allocate has an empty `tx_buffers` slot
+        // (no live buffer can be clobbered).
+        {
+            let mut q = pair.tx_queue.lock();
+            let q = q.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            let mut bufs = pair.tx_buffers.lock();
+            while let Some((done_head, _)) = q.poll_used() {
+                q.free_chain(done_head as u16);
+                if let Some(slot) = bufs.get_mut(done_head as usize) {
+                    // Drop the in-flight buffer (device is done with it).
+                    let _ = slot.take();
+                }
             }
         }
-        let payload_phys = buf.phys_addr().raw() + payload_offset as u64;
-        // Two descriptors: header + payload, both device-readable.
-        let descs = [
-            VirtqDesc {
-                addr: hdr_phys,
-                len: 12,
+
+        // Single device-readable descriptor over [hdr | frame].
+        let submit = |q: &mut Virtqueue| -> Option<u16> {
+            let descs = [VirtqDesc {
+                addr: buf_phys,
+                len: total_len as u32,
                 flags: 0,
                 next: 0,
-            },
-            VirtqDesc {
-                addr: payload_phys,
-                len: payload_len as u32,
-                flags: 0,
-                next: 0,
-            },
-        ];
-        let head = {
-            let mut g = pair.tx_queue.lock();
-            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+            }];
+            q.add_buffer(&descs)
         };
-        let off = (pair.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped.
-        unsafe {
-            self.notify.write16(off, pair.tx_qidx);
-        }
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay alive
-        // while waiting for the device to publish a used-ring entry.
-        let mut q_err = false;
-        let done = narf_scheduler::responsive_spin_until(
-            || {
-                let elem = {
-                    let mut g = pair.tx_queue.lock();
-                    match g.as_mut() {
-                        Some(q) => q.poll_used(),
-                        None => {
-                            q_err = true;
-                            return true;
+
+        // Submit. If the ring is full even after the reclaim pass
+        // above, do a bounded reclaim-retry; if still full, drop the
+        // frame (return Err) rather than ever busy-waiting on the
+        // device. TCP/upper layers retransmit.
+        let head = {
+            let mut q = pair.tx_queue.lock();
+            let q = q.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            match submit(q) {
+                Some(h) => h,
+                None => {
+                    // Ring full. Bounded retry: re-drain completions a
+                    // few times. Each pass can only free what the device
+                    // has already finished — no spinning on un-finished
+                    // work, no unbounded sync wait.
+                    let mut bufs = pair.tx_buffers.lock();
+                    let mut retried = None;
+                    for _ in 0..8 {
+                        let mut freed_any = false;
+                        while let Some((done_head, _)) = q.poll_used() {
+                            q.free_chain(done_head as u16);
+                            if let Some(slot) = bufs.get_mut(done_head as usize) {
+                                let _ = slot.take();
+                            }
+                            freed_any = true;
+                        }
+                        if !freed_any {
+                            break;
+                        }
+                        if let Some(h) = submit(q) {
+                            retried = Some(h);
+                            break;
                         }
                     }
-                };
-                matches!(elem, Some((id, _)) if id == head as u32)
-            },
-            narf_time::Deadline::after_ms(1_000),
-        );
-        if q_err {
-            return Err(VirtioPciError::NoQueues);
+                    // Still full after draining everything the device
+                    // finished → drop the frame (TCP retransmits).
+                    match retried {
+                        Some(h) => h,
+                        None => return Err(VirtioPciError::QueueTooSmall),
+                    }
+                }
+            }
+        };
+
+        // Park the buffer in its descriptor slot so it stays alive
+        // until the device completes the transmit. The slot was
+        // guaranteed empty by the reclaim pass (the head was on the
+        // free list, hence already reclaimed).
+        {
+            let mut bufs = pair.tx_buffers.lock();
+            if let Some(slot) = bufs.get_mut(head as usize) {
+                *slot = Some(buf);
+            }
+            // If the slot is out of range (can't happen: head < qsize),
+            // `buf` drops here — harmless, just no in-flight tracking.
         }
-        if !done {
-            return Err(VirtioPciError::QueueTooSmall);
-        }
-        let mut g = pair.tx_queue.lock();
-        if let Some(q) = g.as_mut() {
-            q.free_chain(head);
+
+        let off = (pair.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped. Fire-and-forget: kick the device
+        // and return — completion is reclaimed lazily on the next TX.
+        unsafe {
+            self.notify.write16(off, pair.tx_qidx);
         }
         Ok(())
     }
@@ -1381,14 +1426,37 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // Single TX forwarder per device. Drains the tx_consumer once
     // and round-robins each frame to one of the N TX virtqueues
     // via the controller's `tx_dma` (which calls `next_tx_pair`).
-    // Zero-copy: the payload descriptor points at the Frame's
-    // DmaBuffer directly.
+    //
+    // tx_dma is fire-and-forget and requires the frame body at
+    // offset 12 (12-byte header headroom at offset 0), taking the
+    // DmaBuffer BY VALUE. Channel-pushed Frames carry their payload
+    // at an arbitrary `offset` (0 for Frame::new), so we relocate
+    // into a fresh headroom buffer here — the channel path is the
+    // slow path; the production TCP stack uses the synchronous
+    // `vnet0_send_fn` tap which already places the frame at offset 12.
     // Stackful: TX forwarder.
     narf_scheduler::spawn_stackful(async move {
         while let Ok(frame) = tx_cons.recv().await {
-            let (buf, offset, len) = frame.into_parts_with_offset();
-            let _ = with_at(idx, |c| c.tx_dma(&buf, offset, len));
-            // `buf` drops here → DmaBuffer::drop frees the page.
+            let payload = frame.payload();
+            let plen = payload.len();
+            if plen == 0 || plen > MAX_FRAME - 12 {
+                continue; // bad frame; drop it
+            }
+            let mut buf = match alloc_coherent(4096, DomainId::DRIVER_0) {
+                Ok(b) => b,
+                Err(_) => continue, // out of DMA pages; drop (TCP retransmits)
+            };
+            {
+                let slice = buf.as_mut_slice();
+                if slice.len() < 12 + plen {
+                    continue;
+                }
+                slice[12..12 + plen].copy_from_slice(payload);
+            }
+            // tx_dma takes ownership of `buf` and keeps it alive until
+            // the device completes; never wait, never drop early.
+            let _ = with_at(idx, |c| c.tx_dma(buf, plen as u32));
+            // `frame` (and its DmaBuffer) drops at end of scope.
         }
     });
 
@@ -1406,11 +1474,11 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
 
 /// `iface::SendFn` for the primary virtio-net controller. The TCP
 /// stack invokes this with a full Ethernet frame; we allocate a
-/// fresh DmaBuffer, memcpy the bytes in, and submit through the
-/// existing zero-copy tx_dma path. The single memcpy is on the
-/// stack-side slow path (one alloc per outbound frame); zero-copy
-/// stays in effect when the producer pushes a pre-built Frame
-/// through `tx_prod` directly.
+/// fresh DmaBuffer, leave 12 bytes of virtio-net-header headroom at
+/// the front, memcpy the frame in at offset 12, and submit through
+/// the fire-and-forget tx_dma path. tx_dma takes the buffer BY VALUE
+/// and keeps it alive (in the per-pair in-flight table) until the
+/// device completes the transmit, so we must NOT drop it here.
 fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
         return Err(());
@@ -1418,17 +1486,22 @@ fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
     let mut buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| ())?;
     {
         let slice = buf.as_mut_slice();
-        if slice.len() < frame.len() {
+        if slice.len() < 12 + frame.len() {
             return Err(());
         }
-        slice[..frame.len()].copy_from_slice(frame);
+        // Frame body at offset 12; tx_dma writes the 12-byte header.
+        slice[12..12 + frame.len()].copy_from_slice(frame);
     }
-    let res = with_controller(|c| c.tx_dma(&buf, 0, frame.len() as u32));
+    // Move `buf` into tx_dma — it owns the buffer until the device
+    // finishes DMAing the frame out of it.
+    let res = with_controller(|c| c.tx_dma(buf, frame.len() as u32));
     match res {
         Some(Ok(())) => Ok(()),
+        // `tx_dma` consumed `buf` (the closure moved it in). On the
+        // None branch (no controller) the closure never ran and `buf`
+        // would have been dropped inside `with_controller`'s map.
         _ => Err(()),
     }
-    // `buf` drops at end of scope → DmaBuffer::drop frees the page.
 }
 
 /// `iface::DrainFn` — synchronous one-frame drain used by the TCP

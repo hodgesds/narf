@@ -537,17 +537,18 @@ fn smoke_virtio_net_pci_tx() -> TestResult {
         return TestResult::Fail("virtio-net-pci not probed");
     }
     // Build a synthetic 64-byte frame in a fresh DMA buffer and
-    // hand it to tx_dma — zero-copy: the device descriptor will
-    // point at this buffer directly.
+    // hand it to tx_dma. Fire-and-forget tx_dma takes the buffer BY
+    // VALUE and writes the 12-byte virtio-net header at offset 0, so
+    // the frame body lives at offset 12.
     let mut tx_buf =
         narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc tx scratch");
     {
         let slice = tx_buf.as_mut_slice();
-        for (i, b) in slice[14..64].iter_mut().enumerate() {
+        for (i, b) in slice[12 + 14..12 + 64].iter_mut().enumerate() {
             *b = ((i + 14) as u8).wrapping_mul(0x3D);
         }
     }
-    let tx_ok = net_pci::with_controller(|c| c.tx_dma(&tx_buf, 0, 64))
+    let tx_ok = net_pci::with_controller(|c| c.tx_dma(tx_buf, 64))
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !tx_ok {
@@ -587,39 +588,42 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
     let mut tx_dma =
         narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc arp scratch");
     {
+        // Frame body lives at offset H=12 (tx_dma writes the 12-byte
+        // virtio-net header at offset 0 and takes the buffer by value).
+        const H: usize = 12;
         let f = tx_dma.as_mut_slice();
-        for b in f.iter_mut().take(6) {
+        for b in f[H..H + 6].iter_mut() {
             *b = 0xFF;
         }
-        f[6] = 0x52;
-        f[7] = 0x54;
-        f[8] = 0x00;
-        f[9] = 0x12;
-        f[10] = 0x34;
-        f[11] = 0x57;
-        f[12] = 0x08;
-        f[13] = 0x06;
-        f[14] = 0x00;
-        f[15] = 0x01;
-        f[16] = 0x08;
-        f[17] = 0x00;
-        f[18] = 6;
-        f[19] = 4;
-        f[20] = 0x00;
-        f[21] = 0x01;
+        f[H + 6] = 0x52;
+        f[H + 7] = 0x54;
+        f[H + 8] = 0x00;
+        f[H + 9] = 0x12;
+        f[H + 10] = 0x34;
+        f[H + 11] = 0x57;
+        f[H + 12] = 0x08;
+        f[H + 13] = 0x06;
+        f[H + 14] = 0x00;
+        f[H + 15] = 0x01;
+        f[H + 16] = 0x08;
+        f[H + 17] = 0x00;
+        f[H + 18] = 6;
+        f[H + 19] = 4;
+        f[H + 20] = 0x00;
+        f[H + 21] = 0x01;
         for i in 0..6 {
-            f[22 + i] = f[6 + i];
+            f[H + 22 + i] = f[H + 6 + i];
         }
-        f[28] = 10;
-        f[29] = 0;
-        f[30] = 2;
-        f[31] = 15;
-        f[38] = 10;
-        f[39] = 0;
-        f[40] = 2;
-        f[41] = 2;
+        f[H + 28] = 10;
+        f[H + 29] = 0;
+        f[H + 30] = 2;
+        f[H + 31] = 15;
+        f[H + 38] = 10;
+        f[H + 39] = 0;
+        f[H + 40] = 2;
+        f[H + 41] = 2;
     }
-    if !net_pci::with_controller(|c| c.tx_dma(&tx_dma, 0, 42))
+    if !net_pci::with_controller(|c| c.tx_dma(tx_dma, 42))
         .map(|r| r.is_ok())
         .unwrap_or(false)
     {
@@ -913,15 +917,16 @@ fn smoke_virtio_net_pci_mq_pairs_consistent() -> TestResult {
         return TestResult::Fail("primary-pair queue sizes zero");
     }
     // tx_dma_on(0) should accept a small frame even with MQ active.
+    // Frame body at offset 12 (tx_dma_on writes the 12-byte header).
     let mut buf =
         narf_io::alloc_coherent(4096, narf_lib::id::DomainId::DRIVER_0).expect("alloc tx scratch");
     {
         let s = buf.as_mut_slice();
-        for (i, b) in s.iter_mut().enumerate().take(64) {
+        for (i, b) in s[12..12 + 64].iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(0x17);
         }
     }
-    let ok = net_pci::with_controller(|c| c.tx_dma_on(0, &buf, 0, 64))
+    let ok = net_pci::with_controller(|c| c.tx_dma_on(0, buf, 64))
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !ok {
