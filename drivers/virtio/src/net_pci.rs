@@ -1333,8 +1333,24 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 let fast = idle_rounds < FAST_ROUNDS;
                 match irq_waiter {
                     Some(w) => {
+                        // Fast-mode fallback is 200 µs, not 1 ms. The IRQ
+                        // edge resolves `w` immediately when caught; this
+                        // deadline only bounds the tail when an RX MSI-X
+                        // completion is missed/late under KVM. virtio-net
+                        // negotiates neither EVENT_IDX nor sets avail.flags
+                        // NO_INTERRUPT, so the device fires on every used
+                        // buffer. 200 µs is an empirically-measured sweet
+                        // spot for off-box redis under KVM (PING avg ~0.5 ms
+                        // vs ~0.7 ms at 1 ms). Tightening further is NOT a
+                        // win: at 50 µs the wake-drain-empty-rearm churn adds
+                        // enough scheduler/timer jitter to RAISE both min and
+                        // avg latency (min 106→203 µs, avg 512→724 µs) — the
+                        // residual gap to Linux is per-hop executor
+                        // scheduling overhead, not this poll period. Fast mode
+                        // only engages while frames are flowing; an idle NIC
+                        // still parks at 100 ms.
                         let dl = if fast {
-                            narf_time::Deadline::after_ms(1)
+                            narf_time::Deadline::after_us(200)
                         } else {
                             narf_time::Deadline::after_ms(100)
                         };
