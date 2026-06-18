@@ -81,6 +81,69 @@ pub fn drop_signal_waker(task_id: u64) {
     }
 }
 
+// ── Net I/O readiness wakers (epoll/poll) ───────────────────────────
+//
+// Tasks parked in `epoll_wait`/`poll` register their waker here while
+// blocked. When inbound TCP data lands, the net stack calls
+// `crate::readiness::notify` → `wake_io_waiters` (installed at boot),
+// which clears each waiter's sleep deadline and fires its waker so it
+// re-polls readiness immediately. Without this, a parked epoll task
+// only re-checks at its next wheel deadline — redis's ~100 ms
+// serverCron tick — turning a sub-ms round-trip into ~80 ms.
+
+static IO_WAKERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+pub fn io_waker_init() {
+    *IO_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+}
+
+/// Register `task_id`'s waker as parked on net I/O readiness. Called
+/// from the user-task poll routine while a task blocks in epoll/poll.
+pub fn register_io_waiter(task_id: u64, waker: core::task::Waker) {
+    let mut g = IO_WAKERS.lock();
+    if let Some(m) = g.as_mut() {
+        m.insert(task_id, waker);
+    }
+}
+
+/// Remove `task_id`'s I/O waker without firing it (the task woke for
+/// another reason / is returning from the syscall).
+pub fn drop_io_waiter(task_id: u64) {
+    let mut g = IO_WAKERS.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&task_id);
+    }
+}
+
+/// Wake every task parked on net I/O readiness. Installed as the
+/// `narf_net::readiness` hook at boot; invoked from the TCP receive
+/// path when a socket becomes readable. Clears each task's finite
+/// sleep deadline so its re-poll falls through to re-check readiness
+/// instead of re-parking on the stale deadline.
+pub fn wake_io_waiters() {
+    // Snapshot + clear the table under the lock, then wake outside it
+    // (wake() may re-enter scheduling / drop an Arc).
+    let wakers: alloc::vec::Vec<(u64, core::task::Waker)> = {
+        let mut g = IO_WAKERS.lock();
+        match g.as_mut() {
+            Some(m) => core::mem::take(m).into_iter().collect(),
+            None => return,
+        }
+    };
+    for (task_id, w) in wakers {
+        if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
+            // SAFETY: pointer from `lookup_user_task_ctx` for a live task;
+            // `sleep_deadline_ns` is an atomic field.
+            // SAFETY: Valid memory or trusted environment
+            let uctx = unsafe { &*uctx_ptr };
+            uctx.sleep_deadline_ns.store(0, Ordering::Release);
+        }
+        w.wake();
+    }
+}
+
 // ── Current-task lookup shim ───────────────────────────────────────
 //
 // Same shape as `AS_LOOKUP` — wired in by the kernel boot to
@@ -792,7 +855,12 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             }
         }
         None => {
-            ctx.set_return(fail);
+            // Missing file (no O_CREAT): report -ENOENT, not the generic
+            // -1 sentinel. musl maps the raw return to -errno, so a
+            // daemon that opens an optional file (e.g. redis probing for
+            // dump.rdb) sees ENOENT and continues instead of treating it
+            // as a fatal EPERM. Native callers detect the negative range.
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
             return;
         }
     };
@@ -8926,6 +8994,11 @@ pub fn wait_init() {
     crate::user_task::wait_child_waker_init();
     crate::user_task::user_task_ctx_init();
     signal_waker_init();
+    io_waker_init();
+    // Wake epoll/poll waiters the instant inbound TCP data lands,
+    // rather than at their next wheel deadline. Latency-only; safe to
+    // install unconditionally (no-op until a task parks on net I/O).
+    narf_net::readiness::set_hook(wake_io_waiters);
     crate::pidfd::init();
     // Wave-65: clone3 CLONE_CHILD_CLEARTID + set_tid_address(2)
     // bookkeeping. The table holds per-task user-pointer slots;
@@ -16317,18 +16390,39 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             ctx.set_return(SyscallReturn::ok(new_fd as u64));
         }
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            // Yield like sys_futex / sys_sleep do: park ~1ms so
-            // other tasks (notably the connecter) make progress;
-            // user-side libc loops over us.
+            // No pending connection. A NON-blocking listen fd gets
+            // -EAGAIN immediately; a BLOCKING one must truly block until
+            // a peer connects — musl's `accept()` does NOT retry -EAGAIN
+            // on a blocking fd, so returning it here would make every
+            // real server fail its first accept (only a loopback client
+            // that races in before the syscall wins). Block the same way
+            // blocking console/pipe reads do: park ~1 ms and REWIND RIP
+            // so the `syscall` instruction re-executes on resume (no
+            // return value set), looping in-kernel until `Accepted`.
+            let task = current_task_id();
+            let listen_nonblock = fd::with_table(task, |t| {
+                t.get(fd)
+                    .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
+            })
+            .flatten()
+            .unwrap_or(false);
+            if listen_nonblock {
+                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+                return;
+            }
             if let (Some(uctx), Some(hook)) = (
                 crate::user_task::current_user_task(),
                 crate::user_task::yield_hook(),
             ) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                // Rewind past the 2-byte `syscall` instruction so the
+                // resumed task re-issues accept; do NOT set a return value.
+                let resume_rip = ctx.rip().wrapping_sub(2);
+                ctx.set_rip(resume_rip);
                 let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
                 // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-                // we hold the only reference while setting the deadline and saving CPU state
-                // into `uc.state` before the yield hook hands the task to the executor.
+                // we hold the only reference while setting the deadline and saving the
+                // RIP-rewound CPU state into `uc.state` before the yield hook hands the
+                // task to the executor.
                 // SAFETY: Valid memory or trusted environment
                 unsafe {
                     let uc = &*uctx;
@@ -16337,8 +16431,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     hook(uctx);
                 }
+                // unreachable — hook() longjmps to the executor
             }
-            ctx.set_return(fail);
+            // No executor (kernel-test context): surface EAGAIN.
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64));
         }
         _ => ctx.set_return(fail),
     }

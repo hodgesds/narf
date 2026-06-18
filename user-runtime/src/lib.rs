@@ -2197,7 +2197,9 @@ pub fn open_flags(path: &str, mount: &str, flags: u64) -> Option<u32> {
             flags,
         )
     };
-    if r == !0u64 {
+    // Failure is any negative return: the legacy -1 sentinel OR a real
+    // -errno (e.g. -ENOENT for a missing file). A valid fd is small +ve.
+    if (r as i64) < 0 {
         None
     } else {
         Some(r as u32)
@@ -2903,7 +2905,9 @@ pub fn openat(dirfd: i32, path: &str, flags: u64, mode: u32) -> Option<u32> {
             mode as u64,
         )
     };
-    if r == !0u64 {
+    // Failure is any negative return (legacy -1 sentinel OR a real
+    // -errno such as -ENOENT). A valid fd is a small positive integer.
+    if (r as i64) < 0 {
         None
     } else {
         Some(r as u32)

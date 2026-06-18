@@ -112,6 +112,21 @@ fn install_net_stack() {
         "  net: tcp_stack init; iface count = {}",
         narf_net::iface::count()
     );
+    // QEMU SLIRP static config: the user-mode network backend always
+    // hands the guest 10.0.2.15/24 with the gateway + DNS at 10.0.2.2.
+    // Assign it statically to the virtio-net iface so a guest server is
+    // reachable from the host through `-netdev user,hostfwd=...` (the
+    // off-box serving smoke). Opt-in feature: real hardware should run
+    // the DHCP client instead of hardcoding the SLIRP lease.
+    #[cfg(feature = "qemu-net")]
+    {
+        narf_net::iface::add_addr("vnet0", [10, 0, 2, 15], 24);
+        narf_net::iface::set_iface_ipv4("vnet0", [10, 0, 2, 15], [10, 0, 2, 2]);
+        let _ = writeln!(
+            console::Writer,
+            "  net: qemu-net static config — vnet0 = 10.0.2.15/24 gw 10.0.2.2"
+        );
+    }
     // Stackful: the e1000 RX pump's inner `while rx_pump_step()`
     // could starve the executor on real silicon if the device's
     // RX descriptor ring stays "ready" indefinitely (e.g.

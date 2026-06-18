@@ -1097,7 +1097,18 @@ impl VirtioNetPci {
 /// one virtio-net controller (separate vlans, separate netdevs); the
 /// singleton-Option shape used to swallow the second probe — match
 /// the virtio-input fix and keep all bound devices.
-static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<VirtioNetPci>> =
+// Bound controllers held behind `Arc` so `with_at` / `with_controller` /
+// `with_each` can clone the handle out under the lock and then DROP the
+// lock before running the caller's closure. Holding this IrqSafeSpinLock
+// across the closure deadlocks: `vnet0_send_fn` → `with_controller` (lock
+// held) → `tx_dma` → `responsive_spin_until` runs `sleep_pumps`, which can
+// re-enter `with_at`/`with_controller` → re-locks CONTROLLERS → spins
+// forever with IRQs disabled on the single cooperative CPU (the lock
+// holder never resumes to release it). Cloning the Arc out first means the
+// closure — and any re-entrant net_pci call it makes via the sleep-pump
+// spin — runs with the lock released. Controllers are append-only after
+// probe, so a stale clone is never freed mid-use.
+static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
@@ -1139,7 +1150,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     let idx = {
         let mut g = CONTROLLERS.lock();
         let i = g.len();
-        g.push(dev);
+        g.push(Arc::new(dev));
         i
     };
     let bound_name = alloc::format!("vnet{}", idx);
@@ -1212,18 +1223,32 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
         // Stackful: virtio-net RX pump.
         narf_scheduler::spawn_stackful(async move {
             const PUMP_CYCLES: u64 = 53_000_000;
+            // Adaptive (NAPI-style) poll cadence. virtio-net MSI-X RX
+            // completions don't always wake us promptly under SLIRP/TCG
+            // (the device can leave the used-ring interrupt suppressed),
+            // so a fixed 100 ms fallback gated every off-box round-trip
+            // at ~tens of ms. Instead: while frames are flowing, re-poll
+            // on a 1 ms deadline so request/response latency is sub-ms;
+            // after a run of empty polls, back off to 100 ms so an idle
+            // NIC parks instead of spinning the CPU. `idle_rounds`
+            // counts consecutive empty wakes.
+            const FAST_ROUNDS: u32 = 64;
+            let mut idle_rounds: u32 = FAST_ROUNDS;
             loop {
+                let fast = idle_rounds < FAST_ROUNDS;
                 if let Some(v) = irq {
-                    // 100 ms deadline mirrors the sleep_cycles
-                    // fallback period — if the MSI-X path goes
-                    // silent we re-poll the rx queue at the same
-                    // cadence the no-IRQ branch uses.
-                    let _ =
-                        narf_interrupts::wait_for_irq_until(v, narf_time::Deadline::after_ms(100))
-                            .await;
+                    let dl = if fast {
+                        narf_time::Deadline::after_ms(1)
+                    } else {
+                        narf_time::Deadline::after_ms(100)
+                    };
+                    let _ = narf_interrupts::wait_for_irq_until(v, dl).await;
+                } else if fast {
+                    narf_time::sleep_cycles(PUMP_CYCLES / 50).await;
                 } else {
                     narf_time::sleep_cycles(PUMP_CYCLES).await;
                 }
+                let mut processed_any = false;
                 loop {
                     let taken = match with_at(idx, |c| c.rx_take_on(pair_idx)) {
                         Some(t) => t,
@@ -1233,6 +1258,9 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         Some(t) => t,
                         None => break,
                     };
+                    // Saw a used-ring entry → the NIC is active; stay in
+                    // fast-poll mode.
+                    processed_any = true;
                     // virtio-net always prepends a 12-byte header to
                     // every RX frame. Strip it via Frame::with_offset
                     // — the bytes stay where the device wrote them.
@@ -1244,49 +1272,56 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     }
                     let frame = Frame::with_offset(buf, 12, payload_len);
                     // Tap: synchronously dispatch the payload through
-                    // the legacy iface RX handler. Only meaningful for
-                    // the primary controller (idx 0) — the TCP stack
-                    // installed itself there at boot. Cheap fn-pointer
-                    // call when no handler is installed.
+                    // the iface RX handler. Only installed for the
+                    // primary controller (idx 0) — the TCP stack hooked
+                    // itself there at boot via `install_rx_drain` /
+                    // `on_rx_frame_from`. Cheap fn-pointer call when no
+                    // handler is installed.
                     if idx == 0 {
-                        narf_net::iface::on_rx_frame(frame.payload());
+                        narf_net::iface::on_rx_frame_from("vnet0", frame.payload());
+                        // The tap consumed the frame synchronously and
+                        // completely. The iface's rx_prod/rx_cons
+                        // channel is the *legacy* delivery path and is
+                        // NOT drained in production (only the net unit
+                        // tests pop its `rx_cons`). Pushing here would
+                        // fill the 64-slot ring after 64 frames and then
+                        // spin the pump forever in the try_send/yield
+                        // loop below — observed as an off-box TCP stream
+                        // wedging dead at the 65th received frame. So
+                        // drop the frame now (its DmaBuffer frees on
+                        // scope exit) and keep draining the device.
+                        continue;
                     }
-                    // try_send-then-yield loop. We can't hold the
-                    // IrqSafeSpinLockGuard across an await (the guard
-                    // is !Send because it disables IRQs on lock), so
-                    // we drop the lock between full-ring retries and
-                    // yield the task to let the iface consumer drain.
-                    let mut frame_opt = Some(frame);
-                    loop {
-                        let outcome = {
-                            let mut g = rx_prod.lock();
-                            let prod = match g.as_mut() {
-                                Some(p) => p,
-                                None => return,
-                            };
-                            // try_send takes the value by-move; on
-                            // Full it hands the value back so we can
-                            // retry. Closed = consumer dropped, bail
-                            // out of this forwarder.
-                            match prod.try_send(frame_opt.take().unwrap()) {
-                                Ok(()) => Ok(()),
-                                Err(narf_ipc::TrySendError::Closed(_)) => {
-                                    *g = None;
-                                    return;
-                                }
-                                Err(narf_ipc::TrySendError::Full(f)) => {
-                                    frame_opt = Some(f);
-                                    Err(())
-                                }
-                            }
+                    // Secondary controllers (idx != 0) have no
+                    // synchronous tap, so the channel IS their delivery
+                    // path. Push best-effort: on a full ring DROP the
+                    // frame (TCP will retransmit) rather than spin the
+                    // pump forever — an undrained/slow consumer must not
+                    // wedge RX. Closed ⇒ consumer gone, bail.
+                    {
+                        let mut g = rx_prod.lock();
+                        let prod = match g.as_mut() {
+                            Some(p) => p,
+                            None => return,
                         };
-                        if outcome.is_ok() {
-                            break;
+                        match prod.try_send(frame) {
+                            Ok(()) => {}
+                            Err(narf_ipc::TrySendError::Closed(_)) => {
+                                *g = None;
+                                return;
+                            }
+                            Err(narf_ipc::TrySendError::Full(_)) => {
+                                // Frame dropped on scope exit.
+                            }
                         }
-                        // Ring full — yield so the iface consumer
-                        // gets a chance to drain before we try again.
-                        narf_scheduler::yield_now().await;
                     }
+                }
+                // Adapt the next wait: reset to fast-poll if this wake
+                // drained anything, else step toward the slow fallback.
+                if processed_any {
+                    idle_rounds = 0;
+                } else {
+                    idle_rounds = idle_rounds.saturating_add(1);
                 }
             }
         });
@@ -1362,7 +1397,7 @@ fn vnet0_drain_fn() -> bool {
         return true;
     }
     let end = (12 + payload_len as usize).min(buf.len());
-    narf_net::iface::on_rx_frame(&buf.as_slice()[12..end]);
+    narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
     true
 }
 
@@ -1390,13 +1425,19 @@ pub fn count() -> usize {
 /// `with_each` iterator instead when behaviour should fan out over
 /// every device.
 pub fn with_controller<R>(f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
-    CONTROLLERS.lock().first().map(f)
+    // Clone the Arc out, then DROP the lock before calling `f` (see the
+    // CONTROLLERS doc comment: `f` may re-enter net_pci via tx_dma's
+    // sleep-pump spin, which re-locks CONTROLLERS).
+    let ctrl = CONTROLLERS.lock().first().cloned();
+    ctrl.as_deref().map(f)
 }
 
 /// Run `f` against every bound controller in probe order.
 pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
-    let g = CONTROLLERS.lock();
-    for c in g.iter() {
+    // Snapshot the Arc handles, drop the lock, then run `f` (see the
+    // CONTROLLERS doc comment).
+    let ctrls: alloc::vec::Vec<Arc<VirtioNetPci>> = CONTROLLERS.lock().iter().cloned().collect();
+    for c in &ctrls {
         f(c);
     }
 }
@@ -1405,5 +1446,8 @@ pub fn with_each(mut f: impl FnMut(&VirtioNetPci)) {
 /// forwarder tasks call this every tick to drain/post on their own
 /// queues without stepping on siblings.
 pub fn with_at<R>(idx: usize, f: impl FnOnce(&VirtioNetPci) -> R) -> Option<R> {
-    CONTROLLERS.lock().get(idx).map(f)
+    // Clone the Arc out, then DROP the lock before calling `f` (see the
+    // CONTROLLERS doc comment).
+    let ctrl = CONTROLLERS.lock().get(idx).cloned();
+    ctrl.as_deref().map(f)
 }

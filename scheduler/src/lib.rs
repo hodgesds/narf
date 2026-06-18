@@ -1183,6 +1183,20 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 /// vtable) from "wake fires but the executor doesn't re-poll."
 pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// The cooperative executor idles a CPU exactly when no task is RUNNABLE,
+// matching Linux (`schedule()` picks the idle task iff `nr_running == 0`).
+// "Runnable" is encoded by a task's `awake` flag: a `wake` (self-wake
+// heartbeat, or a cross-task / IRQ readiness wake) stores `true` into it.
+// `run_until_empty` polls every awake slot each round and, before
+// committing to `halt_until_irq`, SCANS the ready queue for any slot whose
+// flag is still set — i.e. a wake that landed after the slot was polled
+// this round (inbound TCP data waking the epoll-parked redis task, a
+// driver completion). Any such slot is runnable, so it re-polls instead of
+// halting. This is what keeps off-box request/response latency event-paced
+// rather than gated at the 10 ms tick. No separate external-wake flag is
+// needed: the awake bit IS the runnable bit, and the scan reads it
+// directly.
+
 unsafe fn wake_raw(data: *const ()) {
     WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     // wake-by-value: consume the Arc.
@@ -1462,8 +1476,6 @@ pub fn run_until_empty() {
                 .len()
         };
 
-        let mut ready_this_round: usize = 0;
-
         for _ in 0..round_len {
             // Wave D: the pluggable `Scheduler` policy decides which
             // slot to dispatch next. Default is `FifoScheduler` — its
@@ -1737,9 +1749,7 @@ pub fn run_until_empty() {
             narf_rcu::report_quiescent();
 
             match poll_result {
-                Poll::Ready(()) => {
-                    ready_this_round += 1; /* drop slot */
-                }
+                Poll::Ready(()) => { /* completed — drop slot */ }
                 Poll::Pending => {
                     // Stage-5 fair-share enforcement (§3.4): act on
                     // the `BudgetAccount::charge` outcome before
@@ -1768,20 +1778,12 @@ pub fn run_until_empty() {
                         }
                         ChargeOutcome::Continue => {}
                     }
-                    // Did the poll itself self-wake? `yield_now()` and
-                    // `SleepUntil`'s busy-poll fallback both call
-                    // `cx.waker().wake_by_ref()` which flips awake
-                    // back to true before Poll::Pending returns.
-                    // Counting that as forward progress for this
-                    // round is what keeps the executor alive on
-                    // hosts where timer IRQs misfire (real-HW
-                    // laptops where the LAPIC didn't enumerate
-                    // cleanly, etc.) — without it, halt_until_irq
-                    // sleeps forever and busy-polling futures stop
-                    // making progress despite their self-wakes.
-                    if slot.awake.load(Ordering::Acquire) {
-                        ready_this_round += 1;
-                    }
+                    // A self-wake during the poll (`yield_now`, the
+                    // SleepUntil busy-poll fallback) leaves `slot.awake`
+                    // set; the pre-halt runnable scan below sees it and
+                    // re-polls, so a self-waking future keeps making
+                    // progress (and an idle CPU still halts once nothing
+                    // is awake) without a separate progress counter.
                     let mut q = READY[cpu].lock();
                     q.as_mut().unwrap().push_back(slot);
                 }
@@ -1804,7 +1806,75 @@ pub fn run_until_empty() {
             continue;
         }
 
-        if ready_this_round == 0 {
+        // Drain any wakers that IRQ handlers stashed for deferred
+        // execution — EVERY round, not just when all tasks parked.
+        // The IRQ paths (dispatch::on_irq's vector-waker chain,
+        // timer_pump's pump_irq → wheel wakers) can't call
+        // `Waker::wake()` directly — the drop of the inner Arc can hit
+        // a Sleepable slab dealloc, which the allocator's IRQ-context
+        // check refuses. They push to the per-CPU deferred queue; we
+        // drain + wake here, in non-IRQ context. This is the
+        // load-bearing wake path for everything that depends on IRQ
+        // delivery (virtio-net RX completions, xHCI completions,
+        // keyboard IRQ1, HPET-driven wheel wakes).
+        //
+        // This MUST run every round, not only in the `ready==0`
+        // branch below: a perpetually self-waking task (the FB cursor
+        // pump, the diagnostic heartbeat, any `yield_now` busy-poll)
+        // keeps `ready_this_round > 0` forever, so gating the drain on
+        // the all-parked branch starves it. The deferred queue is a
+        // bounded 64-slot stash that silently drops on overflow; left
+        // undrained it fills over a few dozen IRQs and then drops
+        // load-bearing wakes permanently (the "next tick re-fires"
+        // recovery the queue assumes ALSO can't be queued once full).
+        // That manifested as an off-box TCP stream wedging mid-flight
+        // after ~25-34 round-trips: the parked virtio-net RX pump's
+        // completion wake was dropped and never re-delivered, so
+        // inbound frames piled up unprocessed while the host
+        // retransmitted into silence. Draining unconditionally is
+        // cheap when the queue is empty (one lock + scan) and bounds
+        // wake latency to a single poll-round.
+        //
+        // Tick the sleep pumps EVERY round for the same reason — NOT only
+        // in the `ready_this_round == 0` branch below. The pumps raise the
+        // POSIX interval-timer SIGALRM for a parked task, drain serial
+        // input to a blocked console reader, and step kernel async work.
+        // Gating them on the all-parked branch lets a perpetually
+        // self-waking peer (FB cursor pump, diagnostic heartbeat) keep
+        // `ready_this_round > 0` forever and starve them — which manifested
+        // as `itimer_smoke` hanging (the alarm never fires) once the
+        // infinite park stopped busy-spinning the pumps itself. Their wakes
+        // land in the deferred queue / signal wakers and are picked up by
+        // the drain immediately below.
+        sleep_pumps::run();
+        if narf_lib::deferred_wake::drain_and_wake() > 0 {
+            // A drained wake may have flipped a parked slot's awake
+            // flag — re-evaluate from the top instead of falling into
+            // the halt/spin idle path with runnable work pending.
+            continue;
+        }
+
+        // Halt iff NO task is runnable — Linux idles a CPU exactly when
+        // nr_running == 0. Scan the ready queue for any slot whose `awake`
+        // flag is set: a wake that landed after the slot was polled this
+        // round (the virtio-net RX pump making a socket readable and waking
+        // the epoll-parked redis task; a driver completion; a self-wake).
+        // Any such slot is runnable, so re-poll instead of sleeping out the
+        // next 10 ms tick — this is what keeps off-box round-trips
+        // event-paced. A wake that lands AFTER this scan but before the HLT
+        // is not lost: it pushes to the deferred-wake queue (drained next
+        // round) and the HLT itself wakes on the delivering IRQ.
+        let any_runnable = {
+            let q = READY[cpu].lock();
+            q.as_ref()
+                .map(|d| d.iter().any(|s| s.awake.load(Ordering::Acquire)))
+                .unwrap_or(false)
+        };
+        if any_runnable {
+            continue;
+        }
+
+        {
             // All tasks parked this round. Tick the sleep pumps so the work
             // that USED to ride the per-task 1ms sleep busy-wait still makes
             // progress now that finite sleeps truly park on the timer wheel:
@@ -1814,17 +1884,9 @@ pub fn run_until_empty() {
             // deferred queue / signal wakers and are picked up by the
             // drain + the next round.
             sleep_pumps::run();
-            // Drain any wakers that IRQ handlers stashed for
-            // deferred execution. The IRQ paths (dispatch::on_irq's
-            // vector-waker chain, timer_pump's pump_irq → wheel
-            // wakers) can't call `Waker::wake()` directly — the
-            // drop of the inner Arc can hit a Sleepable slab
-            // dealloc, which the allocator's IRQ-context check
-            // refuses. They push to the per-CPU deferred queue;
-            // we drain + wake here, in non-IRQ context. This is
-            // the load-bearing wake path for everything that
-            // depends on IRQ delivery (xHCI completions,
-            // keyboard IRQ1, HPET-driven wheel wakes).
+            // sleep_pumps may itself have stashed wakers (signal
+            // wakers, freshly-due wheel slots) — drain them before
+            // committing to a halt.
             let n_drained = narf_lib::deferred_wake::drain_and_wake();
             if n_drained > 0 {
                 // A drained wake may have flipped a slot's

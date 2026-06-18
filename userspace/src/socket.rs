@@ -319,15 +319,22 @@ enum SocketState {
         /// Bytes the local end RECEIVES (peer writes).
         rx: Arc<RingBuf>,
     },
-    /// AF_INET SOCK_STREAM bound listener at (addr, port). Stage-1
-    /// loopback only — connect to 127.0.0.1 finds the listener
-    /// in the INET_LISTENERS map; non-loopback addresses fail
-    /// with ConnectionRefused until the NIC TX path lands.
+    /// AF_INET SOCK_STREAM bound listener at (addr, port). The
+    /// `pending` queue + `INET_LISTENERS` map serve loopback
+    /// (127.0.0.1) connects in-process. When the bind address is NOT
+    /// loopback (0.0.0.0 / a wired iface IP), `listen()` ALSO opens a
+    /// listener in the kernel TCP-over-NIC stack and records its
+    /// `listen_id` here, so `accept()` pulls off-box connections (whose
+    /// SYNs arrive via `tcp_stack::rx_handler`) from the kernel
+    /// accept-queue and wraps each as an `InetWired` endpoint.
     InetListener {
         addr: u32,
         port: u16,
         backlog: u32,
         pending: VecDeque<Arc<SocketFile>>,
+        /// `Some(id)` once a kernel-stack listener is open (non-loopback
+        /// binds); `None` for loopback-only listeners.
+        listen_id: Option<u32>,
     },
     /// AF_INET connected endpoint — same ring shape as UnixConnected.
     InetConnected {
@@ -598,7 +605,20 @@ impl SocketFile {
             let state = self.state.lock();
             match &*state {
                 SocketState::UnixListener { path, .. } => Reg::Unix(path.clone()),
-                SocketState::InetListener { addr, port, .. } => Reg::Inet(*addr, *port),
+                SocketState::InetListener {
+                    addr,
+                    port,
+                    listen_id,
+                    ..
+                } => {
+                    // Tear down the kernel-stack listener TCB (if any);
+                    // accepted child TCBs are owned by their own InetWired
+                    // sockets and torn down separately.
+                    if let Some(id) = listen_id {
+                        narf_net::tcp_stack::remove_tcb(*id);
+                    }
+                    Reg::Inet(*addr, *port)
+                }
                 SocketState::Inet6Listener { addr, port, .. } => Reg::Inet6(*addr, *port),
                 SocketState::UnixDgram { path: Some(p), .. } => Reg::UnixDgram(p.clone()),
                 SocketState::InetDgram {
@@ -749,8 +769,25 @@ impl FileOps for SocketFile {
         let state = self.state.lock();
         match &*state {
             SocketState::Fresh => 0,
+            // An AF_INET listener is accept-ready (POLL_IN) when its
+            // loopback `pending` queue OR — for a wired (off-box) listen
+            // — the kernel-stack accept-queue has a completed connection.
+            // Without the kernel-queue check, an epoll-driven server like
+            // redis never sees an incoming off-box connection.
+            SocketState::InetListener {
+                pending, listen_id, ..
+            } => {
+                let ready = !pending.is_empty()
+                    || listen_id
+                        .map(narf_net::tcp_stack::listen_has_pending)
+                        .unwrap_or(false);
+                if ready {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }
+            }
             SocketState::UnixListener { pending, .. }
-            | SocketState::InetListener { pending, .. }
             | SocketState::Inet6Listener { pending, .. } => {
                 if pending.is_empty() {
                     0
@@ -1154,7 +1191,12 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
-            _ => SocketOpResult::Err(SockError::NotSupported),
+            // Accept-and-ignore any option NARF doesn't model, rather
+            // than failing it. Linux returns success (or ENOPROTOOPT) for
+            // benign unknown options; returning an error makes real
+            // daemons abort — redis treats a failed setsockopt(IPV6_V6ONLY)
+            // on its listener as fatal. The value is simply not applied.
+            _ => SocketOpResult::Ok(0),
         }
     }
 
@@ -1513,6 +1555,7 @@ impl SocketFile {
                             port,
                             backlog: 0,
                             pending: VecDeque::new(),
+                            listen_id: None,
                         };
                         SocketOpResult::Ok(0)
                     }
@@ -1526,10 +1569,24 @@ impl SocketFile {
                         addr,
                         port,
                         backlog: b,
+                        listen_id,
                         ..
                     } => {
                         *b = backlog;
-                        let key = (self.net_ns_id(), *addr, *port);
+                        let addr = *addr;
+                        let port = *port;
+                        // Non-loopback (0.0.0.0 / wired IP) binds also open a
+                        // kernel-stack listener so off-box clients reach us.
+                        // 127.x stays loopback-only (the INET_LISTENERS map).
+                        if (addr >> 24) != 127 && listen_id.is_none() {
+                            let a = addr.to_be_bytes();
+                            if let Ok(id) =
+                                narf_net::tcp_stack::listen(a, port, backlog.max(1) as usize)
+                            {
+                                *listen_id = Some(id);
+                            }
+                        }
+                        let key = (self.net_ns_id(), addr, port);
                         drop(state);
                         let mut listeners = INET_LISTENERS.lock();
                         let map = listeners.get_or_insert_with(BTreeMap::new);
@@ -1540,6 +1597,36 @@ impl SocketFile {
                 }
             }
             SocketOp::Accept => {
+                // Kernel-stack listener first: pop a completed off-box
+                // connection from the accept-queue (its SYN/handshake was
+                // driven by tcp_stack::rx_handler) and wrap the child TCB
+                // as an InetWired endpoint whose send/recv forward to the
+                // stack.
+                let kernel_listen_id = {
+                    let state = self.state.lock();
+                    match &*state {
+                        SocketState::InetListener { listen_id, .. } => *listen_id,
+                        _ => None,
+                    }
+                };
+                if let Some(lid) = kernel_listen_id {
+                    if let Ok(Some(child_id)) = narf_net::tcp_stack::accept(lid) {
+                        let child = SocketFile::new(AF_INET, SOCK_STREAM);
+                        {
+                            let mut cs = child.state.lock();
+                            *cs = SocketState::InetWired {
+                                tcb_id: child_id,
+                                peer_addr: 0,
+                                peer_port: 0,
+                            };
+                        }
+                        return SocketOpResult::Accepted {
+                            socket: child,
+                            peer: None,
+                        };
+                    }
+                }
+                // Loopback pending queue.
                 let mut state = self.state.lock();
                 match &mut *state {
                     SocketState::InetListener { pending, .. } => {

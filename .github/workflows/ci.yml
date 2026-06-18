@@ -236,6 +236,62 @@ jobs:
           XTASK_RI_ECHO_TIMEOUT_SECS: "900"
         run: cargo xtask musl-demo --arch=x86_64
 
+  net-smoke:
+    name: net-smoke (x86_64, off-box serving)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview rustfmt
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            cpio \
+            mtools \
+            dosfstools \
+            e2fsprogs \
+            ovmf \
+            musl-tools \
+            clang \
+            lld \
+            linux-libc-dev
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-x86_64-net-smoke-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-x86_64-
+
+      # Off-box network serving: boot with the `qemu-net` static config +
+      # a QEMU user-mode `hostfwd`, then connect a REAL host TCP socket to
+      # the forwarded port and assert the guest echo server round-trips
+      # the line back over virtio-net. Exercises the kernel TCP server
+      # path (wildcard listen → passive open → accept-queue), blocking
+      # accept(2), ingress-aware ARP, and the virtio-net RX/TX path
+      # end-to-end with an external client. GHA's TCG QEMU is slow under
+      # load; bump the prompt deadline.
+      - name: cargo xtask net-smoke
+        env:
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
+        run: cargo xtask net-smoke --arch=x86_64
+
   kernel-test:
     name: kernel-test (x86_64)
     runs-on: ubuntu-latest

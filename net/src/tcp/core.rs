@@ -470,6 +470,20 @@ pub fn accept(listen_id: u32) -> Result<Option<u32>, ()> {
     Ok(t.accept_queue.pop_front())
 }
 
+/// Non-destructive accept-readiness check: true iff the listener has at
+/// least one completed connection waiting in its accept-queue. Used by
+/// `poll`/`epoll` so an event-driven server (e.g. redis) wakes on an
+/// inbound off-box connection without consuming it.
+pub fn listen_has_pending(listen_id: u32) -> bool {
+    match lookup_tcb(listen_id) {
+        Some(arc) => {
+            let t = arc.lock();
+            t.state == TcpState::Listen && !t.accept_queue.is_empty()
+        }
+        None => false,
+    }
+}
+
 // ── Public API: connect ─────────────────────────────────────────────
 
 pub fn connect(remote_addr: [u8; 4], remote_port: u16) -> Result<u32, ()> {
@@ -1453,7 +1467,11 @@ pub fn handle_segment(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
         m.values()
             .find(|t| {
                 let g = t.lock();
-                g.local_addr == dst && g.local_port == hdr.dst_port && g.state == TcpState::Listen
+                // A listener bound to 0.0.0.0 (INADDR_ANY) matches any
+                // local dst; a concrete-addr listener matches exactly.
+                (g.local_addr == dst || g.local_addr == [0, 0, 0, 0])
+                    && g.local_port == hdr.dst_port
+                    && g.state == TcpState::Listen
             })
             .cloned()
     };
@@ -1720,7 +1738,11 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     };
     if let Some(listen_arc) = m.values().find(|t| {
         let l = t.lock();
-        l.state == TcpState::Listen && l.local_addr == local_addr && l.local_port == local_port
+        // Match a concrete-addr listener exactly, or an INADDR_ANY
+        // (0.0.0.0) listener against the child's concrete local addr.
+        l.state == TcpState::Listen
+            && (l.local_addr == local_addr || l.local_addr == [0, 0, 0, 0])
+            && l.local_port == local_port
     }) {
         let mut l = listen_arc.lock();
         if l.accept_queue.len() < l.backlog {
@@ -1744,6 +1766,13 @@ fn handle_in_established(
     }
     schedule_ack(arc, !payload.is_empty());
     pump_send(arc);
+    // Data (or a FIN → EOF) just became visible to the application —
+    // wake any task parked in epoll_wait/poll on this socket NOW instead
+    // of leaving it to its next wheel deadline. Done after all locks are
+    // released; best-effort (no correctness dependency).
+    if !payload.is_empty() || hdr.flags & FLAG_FIN != 0 {
+        crate::readiness::notify();
+    }
 }
 
 fn handle_in_fin_wait1(

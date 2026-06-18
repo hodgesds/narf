@@ -38,10 +38,10 @@ use crate::pkt::{
 };
 
 pub use crate::tcp::core::{
-    accept, close, connect, getsockopt_cong, getsockopt_int, listen, lookup_tcb, readable, recv,
-    remove_tcb, send, setsockopt_int, setsockopt_str, shutdown, tick_retransmit, Tcb,
-    TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG,
-    TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
+    accept, close, connect, getsockopt_cong, getsockopt_int, listen, listen_has_pending,
+    lookup_tcb, readable, recv, remove_tcb, send, setsockopt_int, setsockopt_str, shutdown,
+    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_KEEPALIVE, TCP_KEEPCNT, TCP_KEEPIDLE,
+    TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_QUICKACK, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 
@@ -100,10 +100,16 @@ pub fn arp_resolve(ip: [u8; 4], timeout_ms: u64) -> Result<[u8; 6], ()> {
 
 /// Top-level RX path called by the iface registry. Parses the
 /// L2 header and routes by ethertype.
-pub fn rx_handler(frame: &[u8]) {
+pub fn rx_handler(iface_name: &str, frame: &[u8]) {
     if frame.len() < ETH_HDR_LEN {
         return;
     }
+    // Ingress iface for ARP replies (empty = unknown).
+    let _iface_name = if iface_name.is_empty() {
+        None
+    } else {
+        Some(iface_name)
+    };
     // Kernel-bypass classifier. Runs before any L2 parse so a
     // whole-NIC daemon attach sees the raw frame; per-flow claims
     // get their 5-tuple from the frame's IPv4+L4 headers. On a
@@ -130,14 +136,10 @@ pub fn rx_handler(frame: &[u8]) {
         None => return,
     };
     match eth.ethertype {
-        ETHERTYPE_ARP => handle_arp(body),
+        ETHERTYPE_ARP => handle_arp_on(body, _iface_name),
         ETHERTYPE_IPV4 => handle_ipv4(body),
         _ => {}
     }
-}
-
-fn handle_arp(body: &[u8]) {
-    handle_arp_on(body, None);
 }
 
 /// ARP handler with optional ingress-iface context. When `iface_name`
@@ -156,7 +158,25 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
         arp_cache::insert(name, arp.spa, arp.sha);
     }
     if arp.op == ARP_OP_REQUEST {
-        let snap = iface_name.and_then(iface::lookup).or_else(iface::primary);
+        // Answer from whichever iface actually owns the requested
+        // address. ARP targets a specific IP, so the responder MUST be
+        // that IP's iface — falling back to `primary()` (first-
+        // registered) wrongly answers (or fails to answer) when the
+        // owning NIC isn't first, e.g. e1000 registers before virtio-net
+        // but only virtio-net carries 10.0.2.15. Without this, QEMU's
+        // user-mode (SLIRP) hostfwd can't ARP-resolve the guest and the
+        // forwarded SYN is never delivered.
+        // Prefer the INGRESS iface when it owns the requested address —
+        // the reply must go back out the NIC the request came in on, so a
+        // multi-NIC / overlapping-subnet setup (e.g. two QEMU user-mode
+        // NICs) answers on the correct link. Fall back to any iface that
+        // owns the address, then `primary`.
+        let snap = iface_name
+            .and_then(iface::lookup)
+            .filter(|s| s.ipv4 == arp.tpa)
+            .or_else(|| iface::for_local_addr(arp.tpa))
+            .or_else(|| iface_name.and_then(iface::lookup))
+            .or_else(iface::primary);
         let iface = match snap {
             Some(i) => i,
             None => return,

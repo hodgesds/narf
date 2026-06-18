@@ -446,6 +446,26 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     // Option; `None` forces the `timeout == 0` (non-blocking) path.
     let uctx_opt = crate::user_task::current_user_task();
 
+    // Reset the net-I/O-wait *flag* on every (re-)entry (the syscall
+    // re-executes via RIP-rewind each park cycle). We deliberately do
+    // NOT drop the io-waiter here: the readiness wake `take()`s the
+    // whole table, so a registered waker self-clears when it fires;
+    // dropping it on re-entry created a window where inbound data's
+    // `notify` found an empty table and fell back to the deadline.
+    if let Some(uctx_ptr) = uctx_opt {
+        // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`,
+        // live for this trap; both are atomic fields.
+        unsafe {
+            (*uctx_ptr).net_io_wait.store(false, Ordering::Release);
+            // Snapshot the net readiness generation BEFORE the
+            // readiness check below, so the poll routine can detect a
+            // notify that races our check→park window.
+            (*uctx_ptr)
+                .epoll_park_gen
+                .store(narf_net::readiness::generation(), Ordering::Release);
+        }
+    }
+
     let deadline_ns: Option<u64> = match uctx_opt {
         None => Some(0),
         Some(uctx_ptr) => {
@@ -540,6 +560,11 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                     // SAFETY: Valid memory or trusted environment
                     unsafe {
                         let uc = &*uctx_ptr;
+                        // Flag this park as a net-I/O wait so the poll
+                        // routine registers our waker for inbound-data
+                        // wakeups (immediate re-poll on TCP data instead
+                        // of waiting out the deadline).
+                        uc.net_io_wait.store(true, Ordering::Release);
                         // Rewind RIP so we re-execute epoll_wait on resume.
                         ctx.set_rip(ctx.rip().wrapping_sub(2));
                         ctx.save_user_state(uc.state.get() as *mut u8);

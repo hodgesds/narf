@@ -1261,7 +1261,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         window: 65535,
         payload: &[],
     });
-    crate::tcp_stack::rx_handler(&syn_full);
+    crate::tcp_stack::rx_handler("", &syn_full);
     let _ = drain_captured();
 
     // Conntrack snapshot should have a TCP entry for this flow.
@@ -1306,7 +1306,7 @@ fn smoke_e2e_netfilter_conntrack_tracks_flow() -> TestResult {
         window: 65535,
         payload: &[],
     });
-    crate::tcp_stack::rx_handler(&ack_full);
+    crate::tcp_stack::rx_handler("", &ack_full);
     let _ = drain_captured();
 
     // After ACK, conntrack sub-state should be ESTABLISHED.
