@@ -988,19 +988,41 @@ impl core::future::Future for UserTaskFuture {
                     }
                 }
                 if deadline == u64::MAX {
-                    // Infinite park (pause / blocking poll/epoll/futex wait):
-                    // a finite wake deadline doesn't apply, and we must keep
-                    // ticking the sleep pumps so an interval timer / kernel
-                    // async task can raise the signal that ends the wait.
-                    // Keep the bounded self-wake here (woken promptly by
-                    // wake_signal on a raise; this is rare and short-lived).
-                    const PARK_CHUNK_NS: u64 = 1_000_000;
-                    let chunk_end = now.saturating_add(PARK_CHUNK_NS);
-                    while narf_scheduler::narf_time::monotonic_ns() < chunk_end {
-                        crate::handlers::sleep_pumps::run();
-                        core::hint::spin_loop();
+                    // Infinite park (pause / blocking poll/epoll/futex wait).
+                    // Earlier this BUSY-SPUN for 1 ms per poll running the
+                    // sleep pumps, then self-woke. That had two bad effects
+                    // under a real HLT-ing executor (KVM): (1) the 1 ms spin
+                    // charged a full burst against the fair-share budget every
+                    // poll, so an I/O-bound task (epoll-parked redis) looked
+                    // like a CPU hog and got Throttled — after which only an
+                    // external wake, NOT the timer tick, could revive it, so a
+                    // single lost readiness wake wedged it permanently; and
+                    // (2) the self-wake tick-paced its re-poll, gating off-box
+                    // round-trips at ~16.7 ms. Instead, PARK on the timer wheel
+                    // with a one-tick fallback deadline: the real wake is the
+                    // io-waiter / futex / signal wake (now re-polled PROMPTLY
+                    // by the scheduler's EXTERNAL_WAKE fast-repoll), and the
+                    // wheel slot is just a lost-wake / pending-signal safety
+                    // net that bounds the worst case to ~one tick. sleep_pumps
+                    // still run in the executor's own idle path every round.
+                    const FALLBACK_NS: u64 = 10_000_000; // ~1 tick (100 Hz)
+                    let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+                    let fallback_cycles = now.saturating_add(FALLBACK_NS).saturating_mul(cpns);
+                    let refreshed = this.sleep_handle.is_some_and(|h| {
+                        narf_scheduler::narf_time::timer_wheel::refresh_waker(h, cx.waker().clone())
+                    });
+                    if !refreshed {
+                        this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
+                            fallback_cycles,
+                            cx.waker().clone(),
+                        )
+                        .ok();
+                        if this.sleep_handle.is_none() {
+                            // Wheel full / no arm callback: self-wake so the
+                            // task still makes progress (degraded, never wedged).
+                            cx.waker().wake_by_ref();
+                        }
                     }
-                    cx.waker().wake_by_ref();
                     return core::task::Poll::Pending;
                 }
                 // Finite sleep (sys_sleep / nanosleep): PARK on the timer

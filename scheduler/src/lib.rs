@@ -1183,12 +1183,77 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
 /// vtable) from "wake fires but the executor doesn't re-poll."
 pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ── External-wake fast-repoll ────────────────────────────────────────
+//
+// The executor halts (`halt_until_irq`) between rounds whenever no task
+// COMPLETED that round (`ready_this_round == 0`) — which is every round
+// for infinite service loops (the epoll-parked redis user task, the
+// virtio-net RX pump). Under KVM that's a real HLT (under TCG it busy-
+// spun), so a task woken AFTER it was already polled this round isn't
+// re-polled until the next 10 ms timer tick. For a self-wake (a task's
+// own `wake_by_ref`, e.g. the epoll park heartbeat or `yield_now`) that
+// tick-pacing is intentional — it stops a self-waking future from
+// spinning a core hot. But an EXTERNAL wake (a different task or an IRQ
+// handler waking this one — inbound TCP data, a completion) must re-poll
+// PROMPTLY, else off-box request/response latency is gated at a tick
+// (~16.7 ms redis round-trips under KVM vs ~0.06 ms on Linux).
+//
+// `CURRENT_AWAKE[cpu]` holds the awake-flag pointer of the task currently
+// being polled on that CPU (0 outside any poll). A `wake` whose target
+// pointer differs from `CURRENT_AWAKE[cpu]` (or that fires with no poll
+// in progress, i.e. from an IRQ) is EXTERNAL and sets `EXTERNAL_WAKE`;
+// `run_until_empty` then re-polls instead of halting.
+static CURRENT_AWAKE: [core::sync::atomic::AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
+static EXTERNAL_WAKE: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// Record the awake-flag pointer of the task about to be polled on `cpu`,
+/// returning the previous value so the caller can restore it after the
+/// poll (nested polls — a syscall body that runs `sleep_pumps` — must not
+/// clobber the outer task's identity).
+#[inline]
+fn enter_poll(cpu: usize, awake_ptr: usize) -> usize {
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        CURRENT_AWAKE[cpu].swap(awake_ptr, Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn leave_poll(cpu: usize, prev: usize) {
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        CURRENT_AWAKE[cpu].store(prev, Ordering::Relaxed);
+    }
+}
+
+/// True iff an external wake fired on `cpu` since the flag was last
+/// cleared. Consumed by `run_until_empty` to force a prompt re-poll.
+#[inline]
+fn take_external_wake(cpu: usize) -> bool {
+    cpu < narf_lib::percpu::MAX_CPUS && EXTERNAL_WAKE[cpu].swap(false, Ordering::Acquire)
+}
+
+/// Flag the wake of `data` as external (cross-task or IRQ) unless it is
+/// the currently-polling task waking itself.
+#[inline]
+fn note_wake(data: *const ()) {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < narf_lib::percpu::MAX_CPUS
+        && CURRENT_AWAKE[cpu].load(Ordering::Relaxed) != data as usize
+    {
+        EXTERNAL_WAKE[cpu].store(true, Ordering::Release);
+    }
+}
+
 unsafe fn wake_raw(data: *const ()) {
     WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<AtomicBool>::from_raw(data as *const AtomicBool) };
     arc.store(true, Ordering::Release);
+    note_wake(data);
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -1201,6 +1266,7 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     unsafe {
         (*ptr).store(true, Ordering::Release);
     }
+    note_wake(data);
 }
 
 unsafe fn drop_raw(data: *const ()) {
@@ -1339,7 +1405,10 @@ pub fn poll_one_round() -> usize {
                 unsafe { narf_arch::x86_64::pks::restore(saved) };
             }
         }
+        let awake_ptr = Arc::as_ptr(&slot.awake) as usize;
+        let prev_awake = enter_poll(cpu, awake_ptr);
         let poll_result = slot.task.as_mut().poll(&mut ctx);
+        leave_poll(cpu, prev_awake);
         current_task_slot().store(outer_task, Ordering::Release);
         *active_user_as_slot().lock() = outer_as;
         let elapsed = Instant::now().cycles_since(start);
@@ -1659,7 +1728,13 @@ pub fn run_until_empty() {
                 let n = POLL_N.fetch_add(1, O::Relaxed);
                 narf_memory::beacon::paint(18, PALETTE[(n as usize) & 7]);
             }
+            // Publish the task's awake-flag identity so a self-wake during
+            // this poll is distinguished from an external wake (see
+            // `note_wake`). Restored after the poll to survive nesting.
+            let awake_ptr = Arc::as_ptr(&slot.awake) as usize;
+            let prev_awake = enter_poll(cpu, awake_ptr);
             let poll_result = slot.task.as_mut().poll(&mut ctx);
+            leave_poll(cpu, prev_awake);
             current_task_slot().store(0, Ordering::Release);
             *active_user_as_slot().lock() = None;
             // Restore kernel per-AS register — see save comment
@@ -1832,10 +1907,35 @@ pub fn run_until_empty() {
         // retransmitted into silence. Draining unconditionally is
         // cheap when the queue is empty (one lock + scan) and bounds
         // wake latency to a single poll-round.
+        //
+        // Tick the sleep pumps EVERY round for the same reason — NOT only
+        // in the `ready_this_round == 0` branch below. The pumps raise the
+        // POSIX interval-timer SIGALRM for a parked task, drain serial
+        // input to a blocked console reader, and step kernel async work.
+        // Gating them on the all-parked branch lets a perpetually
+        // self-waking peer (FB cursor pump, diagnostic heartbeat) keep
+        // `ready_this_round > 0` forever and starve them — which manifested
+        // as `itimer_smoke` hanging (the alarm never fires) once the
+        // infinite park stopped busy-spinning the pumps itself. Their wakes
+        // land in the deferred queue / signal wakers and are picked up by
+        // the drain immediately below.
+        sleep_pumps::run();
         if narf_lib::deferred_wake::drain_and_wake() > 0 {
             // A drained wake may have flipped a parked slot's awake
             // flag — re-evaluate from the top instead of falling into
             // the halt/spin idle path with runnable work pending.
+            continue;
+        }
+
+        // External-wake fast-repoll: a cross-task or IRQ wake that fired
+        // AFTER its target was polled this round (e.g. the virtio-net RX
+        // pump making a socket readable and waking the epoll-parked redis
+        // task) only set the target's awake flag — which the
+        // `ready_this_round == 0` halt below ignores. Re-poll now instead
+        // of sleeping until the next 10 ms tick. Self-wakes (epoll
+        // heartbeat, yield_now) do NOT set this flag, so a self-waking
+        // future still tick-paces and a truly-idle CPU still halts.
+        if take_external_wake(cpu) {
             continue;
         }
 
