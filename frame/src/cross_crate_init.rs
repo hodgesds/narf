@@ -132,10 +132,28 @@ fn install_net_stack() {
     // RX descriptor ring stays "ready" indefinitely (e.g.
     // 0xFFFFFFFF reads on absent-device). Preemption caps it at
     // a 10 ms slice.
+    //
+    // Idle backoff: the old form `yield_now().await` after every empty
+    // drain self-woke on EVERY executor round, so this task was always
+    // runnable — the cooperative executor never halted (nr_running never
+    // hit 0), pinning the CPU and pacing every round at the spin rate.
+    // With an idle e1000 (off-box redis runs on virtio-net) it spun
+    // forever, adding ~one-round (~230 µs) of latency to every request on
+    // the OTHER NIC. PARK ~1 ms on the wheel after an empty drain so the
+    // executor can halt; tight-poll only while frames are flowing.
     narf_scheduler::spawn_stackful(async {
+        let idle_park_cycles =
+            1_000_000u64.saturating_mul(narf_time::cycles_per_ns().max(1) as u64);
         loop {
-            while narf_drivers_net::e1000::rx_pump_step() {}
-            narf_scheduler::yield_now().await;
+            let mut any = false;
+            while narf_drivers_net::e1000::rx_pump_step() {
+                any = true;
+            }
+            if any {
+                narf_scheduler::yield_now().await;
+            } else {
+                narf_time::sleep_cycles(idle_park_cycles).await;
+            }
         }
     });
 }
