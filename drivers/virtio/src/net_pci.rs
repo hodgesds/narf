@@ -1412,42 +1412,36 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 let fast = idle_rounds < FAST_ROUNDS;
                 match irq_waiter {
                     Some(w) => {
-                        // Fast-mode fallback is 200 µs, not 1 ms. The IRQ
-                        // edge resolves `w` immediately when caught; this
-                        // deadline only bounds the tail when an RX MSI-X
-                        // completion is missed/late under KVM. virtio-net
-                        // negotiates neither EVENT_IDX nor sets avail.flags
-                        // NO_INTERRUPT, so the device fires on every used
-                        // buffer. 200 µs is an empirically-measured sweet
-                        // spot for off-box redis under KVM (PING avg ~0.5 ms
-                        // vs ~0.7 ms at 1 ms). Tightening further is NOT a
-                        // win: at 50 µs the wake-drain-empty-rearm churn adds
-                        // enough scheduler/timer jitter to RAISE both min and
-                        // avg latency (min 106→203 µs, avg 512→724 µs) — the
-                        // residual gap to Linux is per-hop executor
-                        // scheduling overhead, not this poll period. Fast mode
-                        // only engages while frames are flowing; an idle NIC
-                        // still parks at 100 ms.
-                        // Idle fallback is 2 ms, NOT 100 ms. The IRQ edge
-                        // resolves `w` immediately when caught; this deadline
-                        // only bounds the tail when an RX MSI-X is missed.
-                        // Once the executor actually HALTS when idle (init no
-                        // longer busy-spins), a 100 ms idle deadline became
-                        // the wake latency for the ~1% of requests whose
-                        // MSI-X is missed — a heavy avg tail (p50 227 µs but
-                        // avg >1 ms). The HLT already saves CPU while idle, so
-                        // the long backoff buys nothing; 2 ms caps the
-                        // missed-IRQ tail while keeping idle re-polls rare.
-                        let dl = if fast {
-                            narf_time::Deadline::after_us(200)
+                        if fast {
+                            // NAPI sustained-poll: while frames are flowing
+                            // (recent non-empty drain), do NOT park waiting for
+                            // an RX IRQ. Under concurrent load the device
+                            // COALESCES interrupts — frames pile into the ring
+                            // faster than IRQs fire — so parking on the IRQ
+                            // leaves the vcpu HLT'd between batches (measured:
+                            // concurrent redis throughput ran ~96% vcpu-idle,
+                            // capped ~0.43x Linux despite IPC 2.08 and ~4.9M-
+                            // ops/s of CPU headroom). Instead re-queue and
+                            // re-poll the ring next round, keeping the executor
+                            // hot and the ring drained like Linux NAPI. `w` is
+                            // dropped (never polled → no waker installed);
+                            // `idle_rounds` climbs once the burst ends so we
+                            // fall to the IRQ-park below and an idle NIC still
+                            // HLTs and saves power.
+                            drop(w);
+                            narf_scheduler::yield_now().await;
                         } else {
-                            narf_time::Deadline::after_ms(2)
-                        };
-                        let _ = narf_time::timeout(dl, w).await;
+                            // Idle: park on the IRQ. The edge resolves `w`
+                            // immediately when caught; the 2 ms deadline only
+                            // backstops a missed/late RX MSI-X so the executor
+                            // can HLT and save power while no traffic flows.
+                            let dl = narf_time::Deadline::after_ms(2);
+                            let _ = narf_time::timeout(dl, w).await;
+                        }
                     }
                     None => {
                         if fast {
-                            narf_time::sleep_cycles(PUMP_CYCLES / 50).await;
+                            narf_scheduler::yield_now().await;
                         } else {
                             narf_time::sleep_cycles(PUMP_CYCLES).await;
                         }
@@ -1519,7 +1513,9 @@ fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
     }
     // Take a recycled TX buffer (or a fresh coherent alloc) from the pool,
     // keeping the page allocator off the per-frame TX hot path.
-    let mut buf = with_controller(|c| c.tx_buf_acquire()).flatten().ok_or(())?;
+    let mut buf = with_controller(|c| c.tx_buf_acquire())
+        .flatten()
+        .ok_or(())?;
     {
         let slice = buf.as_mut_slice();
         if slice.len() < 12 + frame.len() {
