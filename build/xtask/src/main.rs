@@ -3331,6 +3331,68 @@ fn boot_linux_redis(
 }
 
 /// Off-box redis performance benchmark — see [`Cmd::RedisBench`].
+/// Run the host's `redis-benchmark` against a guest's hostfwd port with
+/// real concurrency (`-c` clients). Unlike the single-connection xtask
+/// workload (which idles the guest between synchronous batches → RTT-
+/// bound), N concurrent clients keep the guest CPU-saturated, so this
+/// measures COMPUTE-bound throughput. Gated on `XTASK_REDIS_BENCHMARK`.
+fn run_redis_benchmark(host_port: u16, label: &str) {
+    let env_u = |k: &str, d: u32| -> u32 {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
+    let clients = env_u("XTASK_REDIS_BENCHMARK_C", 50);
+    let pipeline = env_u("XTASK_REDIS_BENCHMARK_P", 16);
+    let n = env_u("XTASK_REDIS_BENCHMARK_N", 100_000);
+    println!("  [{label}] redis-benchmark -c {clients} -P {pipeline} -n {n} -t set,get,ping");
+    let bin = ["/usr/bin/redis-benchmark", "/usr/local/bin/redis-benchmark"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or("redis-benchmark");
+    // The host redis-benchmark is a buckos build with a non-standard ELF
+    // interpreter path that doesn't exist here, so a direct exec fails with
+    // ENOENT. Invoke via the real loader explicitly (libs still resolve).
+    let loader = "/lib64/ld-linux-x86-64.so.2";
+    let bench_args = [
+        "-h",
+        "127.0.0.1",
+        "-p",
+        &host_port.to_string(),
+        "-c",
+        &clients.to_string(),
+        "-P",
+        &pipeline.to_string(),
+        "-n",
+        &n.to_string(),
+        "-t",
+        "set,get,ping_inline",
+        "-q",
+    ];
+    let out = if std::path::Path::new(loader).exists() {
+        std::process::Command::new(loader)
+            .arg(bin)
+            .args(bench_args)
+            .output()
+    } else {
+        std::process::Command::new(bin).args(bench_args).output()
+    };
+    match out {
+        Ok(o) => {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if !line.trim().is_empty() {
+                    println!("  [{label}] {line}");
+                }
+            }
+            if !o.status.success() {
+                println!("  [{label}] redis-benchmark exited {:?}", o.status.code());
+            }
+        }
+        Err(e) => println!("  [{label}] redis-benchmark spawn failed: {e}"),
+    }
+}
+
 fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
         bail!("xtask redis-bench: only x86_64 is wired");
@@ -3358,6 +3420,9 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     // 1. NARF under QEMU.
     println!("── NARF (microkernel) under QEMU ──");
     let (mut narf_child, narf_reader, mut narf_stream) = boot_narf_redis(args, 16379, 6379)?;
+    if std::env::var_os("XTASK_REDIS_BENCHMARK").is_some() {
+        run_redis_benchmark(16379, "NARF");
+    }
     let narf = redis_bench_workload(&mut narf_stream, ops, pipeline, lat_ops);
     let _ = narf_child.kill();
     let _ = narf_child.wait();
@@ -3368,6 +3433,9 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     println!("\n── Linux (stock kernel) under QEMU ──");
     let linux = match boot_linux_redis(16380, 6379) {
         Ok((mut lchild, mut lstream)) => {
+            if std::env::var_os("XTASK_REDIS_BENCHMARK").is_some() {
+                run_redis_benchmark(16380, "Linux");
+            }
             let m = redis_bench_workload(&mut lstream, ops, pipeline, lat_ops);
             let _ = lchild.kill();
             let _ = lchild.wait();
