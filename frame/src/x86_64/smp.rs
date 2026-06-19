@@ -165,6 +165,21 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::x86_64::cpu::set_current_cpu(id);
     }
 
+    // 1.5 Load the BSP-built IDT *before* any per-silicon errata. The errata
+    //     apply path writes AMD DE_CFG chicken bits via `wrmsr_or_gp`, a
+    //     recoverable write that arms a per-CPU #GP probe (keyed by
+    //     `current_cpu()` — hence after `set_current_cpu` above) and relies on
+    //     the #GP vectoring to the trap handler to recover. Under KVM the
+    //     DE_CFG write #GPs; without a live IDT that fault is uncatchable and
+    //     the AP triple-faults — and QEMU's `-no-reboot` then freezes the
+    //     entire VM (BSP included), wedging SMP bring-up. The BSP avoids this
+    //     by running `init_traps` long before errata; mirror that order here.
+    // SAFETY: BSP populated IDT during init_traps; per-CPU IDTR load is
+    // required even when entries are shared.
+    unsafe {
+        super::idt::load_idtr_ap();
+    }
+
     // 1a. Record this AP's hybrid CPU type. Order matters: must
     //     come after set_current_cpu (so the slot index is right
     //     even if a future revision changes how the slot is
@@ -190,13 +205,6 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         let _ = narf_arch::x86_64::errata::apply_for_current_cpu();
     }
 
-    // 2. Load the BSP-built IDT register on this CPU.
-    // SAFETY: BSP populated IDT during init_traps; per-CPU IDTR
-    // load is required even when entries are shared.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        super::idt::load_idtr_ap();
-    }
 
     // 2a. Per-CPU user-mode entry setup (only when user-task SMP is
     //     built — otherwise APs run kernel tasks only and need none of
