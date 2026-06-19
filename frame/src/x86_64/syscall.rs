@@ -244,15 +244,20 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         // RSP slot to move the user stack (e.g. onto a signal frame);
         // honouring the slot here makes those rewrites take effect on
         // `sysretq`. Must read [rsp+136] BEFORE dropping the scratch.
-        "mov rsp, [rsp + 136]",                // user RSP (from state)
-        // Clear IF before the swapgs/sysretq window. With IRQs left on
-        // (re-enabled at entry), an interrupt landing between `swapgs`
-        // (kernel→user GS) and `sysretq` would run a CPL=0 handler with
-        // the USER gs base — common_trap only swapgs'es for CPL=3, so
-        // it would read gs:[N] against user state. Masking here mirrors
-        // the user-entry path's "clear IF before swapgs/iretq"
-        // discipline; sysretq restores the user's RFLAGS (IF=1).
+        // Clear IF BEFORE restoring the user RSP — order matters. With IF
+        // left on (re-enabled at entry), the window between loading the
+        // user RSP and `sysretq` runs at CPL=0 on the USER stack; an IRQ
+        // landing there does NOT switch stacks (no CPL change, no IST), so
+        // a CPL=0 handler runs on the user stack and (with the wrong GS,
+        // since swapgs hasn't run) faults — fault-on-bad-stack → #DF. This
+        // window is sub-instruction but a high IRQ rate (NAPI RX poll at
+        // ~560k/s during heavy redis load) hits it deterministically.
+        // Masking first means the user RSP is only ever live with IRQs off;
+        // also covers the original swapgs→sysretq concern (a CPL=0 IRQ with
+        // user GS reading gs:[N] against user state). sysretq restores the
+        // user's RFLAGS (IF=1) atomically.
         syscall_irq_off!(),
+        "mov rsp, [rsp + 136]",                // user RSP (from state)
         "swapgs",
         "sysretq",
         dispatch = sym dispatch_syscall,
