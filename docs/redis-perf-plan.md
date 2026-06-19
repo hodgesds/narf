@@ -90,6 +90,48 @@ residual is diffuse per-request kernel cost amortized over the burst,
 intertwined with the SLIRP closed loop. Single-PING floor is already at
 parity, so there is no per-request *latency* bug — it's load behavior.
 
+## The remaining gap is structural: single-vCPU cooperative scheduling
+
+After closing the SLIRP question (above), the residual ~0.6× throughput
+factor has one consistent explanation left, and every cheap lever is
+falsified:
+- guest **90% idle** at 485k ops/s → not CPU-bound
+- single-PING p50 at **parity** (60 vs 57µs) → per-request path is fine
+- **~15 ops/frame, ~1 notify/frame** → redis batches per-wake as well as
+  Linux (per-wake fragmentation falsified)
+- iTLB/cache, ring depth, Nagle, delayed-ACK, O(N) TCB scan, release,
+  -c200 scaling → all falsified (table below)
+
+What's left is **cooperative single-vCPU scheduling**: NARF runs the virtio
+forwarder, the TCP stack, AND redis on ONE core, interleaved by one
+cooperative executor. Every per-batch RTT under 50-way load eats executor
+scheduling latency that Linux avoids by spreading softirq-RX and the redis
+thread across cores. That matches a constant per-batch wait factor on an
+otherwise-idle CPU.
+
+**SMP is the lever — but it's gated behind two substantial efforts, and its
+payoff is uncertain:**
+1. **AP bringup hangs under KVM.** `NARF_QEMU_SMP=2 + accel=kvm` (release,
+   redis image) **hangs at AP bringup** — serial stops right after
+   `smp(x86): trampoline installed at 0x8000`, never reaches "started N
+   AP(s)" (exit 124 / timeout). User-task SMP is on-by-default (gated on
+   APs-online + x2APIC), but the second vCPU never comes online here, so the
+   redis task can't migrate. Must be root-caused first. (Overlaps the
+   in-progress SMP arc, task #87.)
+2. **Global TCP-stack lock would contend.** Even with redis on an AP, the
+   TCP stack is behind a single global lock that the BSP forwarder also
+   takes per frame. redis-on-AP would contend that lock on every
+   read/write/epoll against the forwarder → the SMP win could be partly or
+   wholly negated without making the TCP stack lock-granular / per-CPU
+   first. So SMP-for-redis-throughput is **speculative**, not a sure win.
+
+**Conclusion:** the single-vCPU redis path is thoroughly optimized
+(SET 0.43→0.61×, GET 0.35→0.71×, p50 to parity) and the remaining gap is a
+well-characterized structural ceiling. Closing it to true parity is an
+*architectural* arc (SMP user-task migration that boots under KVM + a
+lock-granular TCP stack), not another point optimization — and the payoff
+is uncertain until the lock-contention question is answered.
+
 ## Plan — remaining gaps (ranked)
 
 The throughput constant factor (~0.6× across pipeline depths; guest ~90%
@@ -108,11 +150,22 @@ interleaving — it needs per-connection latency instrumentation. **Open
 question we can't yet answer here: is the residual NARF's in-guest
 per-batch queueing or SLIRP's per-connection serialization?**
 
-1. **Tap/bridge backend sanity check (DO THIS FIRST — diagnostic).** Run the
-   same concurrent bench over a non-SLIRP backend. If the gap shrinks, the
-   residual is the SLIRP harness, not NARF (stop). If it persists, it's
-   NARF's virtio RX/TX timing and worth pursuing. Without this we're guessing
-   whether there's anything left to fix in NARF at all.
+1. ~~**Tap/bridge backend sanity check.**~~ **DONE — redundant + blocked.**
+   Two findings: (a) **Redundant for throughput:** Linux hits 794k SET / 741k
+   GET over the *identical* SLIRP+hostfwd+virtio harness while NARF tops out
+   ~485k. Since Linux *exceeds* NARF's number on the **same SLIRP backend**,
+   SLIRP's throughput capacity is proven ≥794k → **SLIRP is NOT NARF's
+   throughput ceiling; the residual is NARF-side.** The tap test could only
+   have confirmed this. (b) **Blocked:** NARF networking has only ever run
+   over SLIRP's *emulated* L2. Over a real `tap` (offloads on or off), NARF
+   boots redis ("Ready to accept connections") but the host never ARP-resolves
+   10.0.2.15 — even with `csum/gso/tso=off`. NARF *has* an ARP-reply path
+   (`tcp_stack::handle_arp_on`) and `send_gratuitous_arp`, but GARP is **not
+   called on bringup** and the reply isn't reaching the host over real tap
+   (likely RX-side: the host's broadcast who-has isn't being delivered/parsed,
+   or the reply TX isn't valid on a real NIC). Bringing NARF up over a real
+   tap/NIC is a **separate networking project**, orthogonal to redis perf.
+   Harness scaffolding for it was prototyped (`XTASK_QEMU_TAP`) then reverted.
 2. **PING p99 (2.4×, ~180 vs 74µs).** p50 is parity; the tail is residual
    SLIRP/KVM delivery jitter + occasional in-guest variance. Smaller win.
    The one concrete in-guest contributor (fb-status paint) is already fixed.
