@@ -103,8 +103,14 @@ pub fn is_enabled() -> bool {
 #[inline(always)]
 pub unsafe fn stac() {
     // SAFETY: encoding documented above; clobbers no registers.
+    // NOT `nomem`/`preserves_flags`: STAC opens the EFLAGS.AC user-access
+    // window, and the whole point is to gate the user-memory accesses that
+    // follow. With `nomem` the optimizer treats this as side-effect-free and
+    // is free to HOIST those accesses out of the STAC…CLAC window — sound in
+    // a debug build (no reordering), a SMAP #PF in release. The bare asm acts
+    // as a compiler memory barrier so the bracketed copy stays inside.
     unsafe {
-        asm!("stac", options(nomem, nostack, preserves_flags));
+        asm!("stac", options(nostack));
     }
 }
 
@@ -115,8 +121,10 @@ pub unsafe fn stac() {
 #[inline(always)]
 pub unsafe fn clac() {
     // SAFETY: encoding documented above; clobbers no registers.
+    // See `stac`: NOT `nomem` — must act as a compiler barrier so the
+    // bracketed user-memory copy can't be sunk past CLAC (window close).
     unsafe {
-        asm!("clac", options(nomem, nostack, preserves_flags));
+        asm!("clac", options(nostack));
     }
 }
 
