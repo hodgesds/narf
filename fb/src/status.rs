@@ -46,6 +46,49 @@ const HEADER_LINES: u32 = 6;
 const PANEL_HEIGHT: u32 = 8 * (HEADER_LINES + KLOG_TAIL_LINES as u32 + 1); // header + klog tail + separator
 const PANEL_PAD: u32 = 4;
 
+/// Cheap fold of the panel's *meaningful* state — the things a viewer
+/// actually cares to see change: klog output, driver enumeration, boot
+/// phase, latched faults. Deliberately EXCLUDES free-running counters
+/// (irq totals, clock ticks, wake counts, heap churn) that tick on every
+/// pass and would otherwise force a full ~700µs repaint at the panel's
+/// ~5 Hz cadence — which blocked the cooperative executor and spiked
+/// tail latency for concurrent work (off-box redis p99).
+fn change_signature() -> u64 {
+    use core::sync::atomic::Ordering::Acquire;
+    #[inline]
+    fn mix(h: &mut u64, v: u64) {
+        *h ^= v;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    // klog tail (the bulk of the render) — `written` bumps on any output.
+    mix(&mut h, narf_console::klog::bytes_written());
+    mix(&mut h, narf_drivers_i2c::registered_bus_count() as u64);
+    mix(
+        &mut h,
+        narf_drivers_gpio::registered_controller_count() as u64,
+    );
+    mix(&mut h, narf_drivers_usb::xhci::is_probed() as u64);
+    mix(
+        &mut h,
+        narf_drivers_usb::hid::ATTACHED_KEYBOARD_COUNT.load(Acquire) as u64,
+    );
+    mix(
+        &mut h,
+        narf_drivers_usb::hid::mouse::ATTACHED_MOUSE_COUNT.load(Acquire) as u64,
+    );
+    let (aml_nodes, _) = narf_aml::boot_snapshot();
+    mix(&mut h, aml_nodes as u64);
+    mix(&mut h, (crate::cursor::moves() > 0) as u64);
+    let diag = narf_memory::diag::snapshot();
+    mix(&mut h, diag.panic_latched as u64);
+    mix(&mut h, diag.first_pf_seen as u64);
+    for b in diag.phase.as_str().bytes() {
+        mix(&mut h, b as u64);
+    }
+    h
+}
+
 /// Paint the status panel into the bottom of the active FB. Best-
 /// effort — clipping handles small framebuffers; FbWriter cap
 /// failures fall through silently.
@@ -72,6 +115,24 @@ pub fn paint(fb: &FbWriter) {
     let h = fb.height();
     if h < PANEL_HEIGHT + PANEL_PAD * 2 || w < 200 {
         return;
+    }
+
+    // Skip-when-unchanged: re-render only when meaningful state changed
+    // (see `change_signature`). A ~700µs full repaint at 5 Hz otherwise
+    // monopolises the cooperative executor and inflates concurrent tail
+    // latency. A slow heartbeat (~every 32nd call ≈ 6 s) still refreshes
+    // the free-running counters so a watched display doesn't look frozen;
+    // at that rate the repaint is far too rare to affect p99.
+    {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        static LAST_SIG: AtomicU64 = AtomicU64::new(0);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        const HEARTBEAT_EVERY: u32 = 32;
+        let sig = change_signature();
+        let force = CALLS.fetch_add(1, Ordering::Relaxed) % HEARTBEAT_EVERY == 0;
+        if LAST_SIG.swap(sig, Ordering::Relaxed) == sig && !force {
+            return;
+        }
     }
 
     // Pull a coherent snapshot of the diag state BEFORE the rest
