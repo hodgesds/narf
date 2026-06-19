@@ -63,6 +63,8 @@ feed/network constant factor, not a serialization/scaling failure.
 | **TCP Nagle** | ❌ not it | forcing `nagle_enabled=false` default: no change ⇒ redis's `TCP_NODELAY` already wired/honored |
 | **TCP delayed-ACK** | ❌ worse | forcing immediate ACK every segment: throughput DROPPED (more ACK segments/VM-exits); piggyback already works |
 | **O(N) inbound TCB scan** | ⚠️ real bug, NOT the lever | `handle_segment` linear-scans+locks all TCBs per segment under the global lock. Added a 4-tuple cache (O(log N)): single-PING unchanged, concurrent throughput unchanged. On 1 cooperative vCPU the lock is never contended, so it's pure serial CPU masked by the 90%-idle headroom. Reverted. **Worth fixing for high connection counts (1000s), but not the throughput lever here.** |
+| **release build (debug overhead)** | ❌ no throughput change | The kernel had been built DEBUG all along (un-inlined `irq_restore`, `precondition_check`, `is_null::runtime` dominated a tick-RIP profile). A `--release` build did NOT change throughput (GET ~558k vs debug ~524k; SET noise) or latency — re-confirming RTT/feed-bound, not CPU. **BUT building release exposed a real SMAP-soundness bug (`stac/clac` `nomem` let the optimizer hoist the user copy out of the AC window → #PF) — fixed in `c42b0d3f`.** Use `--release` for fair-vs-Linux comparisons regardless. |
+| **higher concurrency (-c 200)** | ❌ no scaling | NARF stays ~400–560k from -c 50 to -c 200 (release); Linux scales 790k→830k+. NARF has a structural throughput CEILING = concurrency / per-batch-RTT, and the per-batch RTT INFLATES under load (queueing), so more clients don't help. The ceiling is the wait/feed RTT, not CPU. |
 
 ## Root model (settled)
 
