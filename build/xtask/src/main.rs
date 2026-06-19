@@ -2886,6 +2886,14 @@ fn redis_bench_workload(
             .map_err(|e| anyhow!("bench: clone stream: {e}"))?,
     );
 
+    // Working-set size (distinct keys). Default 4096; XTASK_REDIS_BENCH_KEYS=1
+    // shrinks the working set to a single key (TLB/cache-hypothesis control).
+    let bench_keys: usize = std::env::var("XTASK_REDIS_BENCH_KEYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(4096);
+
     // Pipelined throughput for a given command builder.
     let mut throughput = |verb: &str| -> Result<f64> {
         let val = "v".repeat(16);
@@ -2895,7 +2903,7 @@ fn redis_bench_workload(
             let batch = pipeline_depth.min(throughput_ops - done);
             let mut out = Vec::with_capacity(batch * 48);
             for i in 0..batch {
-                let key = format!("bench:{}", (done + i) % 4096);
+                let key = format!("bench:{}", (done + i) % bench_keys);
                 let cmd = if verb == "SET" {
                     resp_encode(&["SET", &key, &val])
                 } else {
