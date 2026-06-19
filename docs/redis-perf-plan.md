@@ -58,6 +58,8 @@ feed/network constant factor, not a serialization/scaling failure.
 | **stackless forwarder** | ❌ no-op | removing stackful park machinery didn't move p50 |
 | **shorter forwarder fast-deadline (50µs)** | ❌ worse | wake-churn raised min+avg latency |
 | **event-driven one-shot timer (for p99)** | ❌ not the cause | RX IRQ is NOT missed; deadline-wakes are benign inter-ping-gap re-polls |
+| **RX→redis frame/notify amplification** (plan #1) | ❌ ruled out | counters under load: **~15 ops per frame** (frames/op ≈ 0.067), ~1 TX notify per frame. NARF coalesces pipelined requests as well as Linux. Not the per-request factor. |
+| **pipeline-depth scaling** | ❌ no extra win | SET P1 53k→P16 485k→P64 752k scales fine, but Linux ratio stays ~constant ~0.6× across depths ⇒ a per-request constant factor, not a serialization/scaling failure |
 
 ## Root model (settled)
 
@@ -69,21 +71,27 @@ harness for true throughput.
 
 ## Plan — remaining gaps (ranked)
 
-1. **Throughput constant factor (~0.6× across pipeline depths).** Guest
-   ~90% idle even at 485k ops/s → per-request feed/network cost is ~1.6×
-   Linux. Candidate lever: **RX→redis delivery batching** — confirm whether
-   NARF wakes redis once per drained batch (good) or per frame (serializes),
-   and whether the TCP stack hands redis all buffered pipelined bytes in one
-   `read()`. Measure syscalls-per-op and frames-per-op under load first.
-   *Status: hypothesis; needs the epoll/TCP-wake path traced. NOT compute.*
+The throughput constant factor (~0.6× across pipeline depths; guest ~90%
+idle even at 485k ops/s) is NOT compute, NOT frame/notify amplification,
+NOT ring depth (all ruled out by measurement above). It's in the fine
+SLIRP↔virtio round-trip TIMING under load — NARF's per-batch wall RTT is
+~1.6× Linux's despite batching the same. This is the hardest class and may
+be partly external (SLIRP's response to NARF's ring/notify cadence).
+
+1. **Tap/bridge backend sanity check (DO THIS FIRST — diagnostic).** Run the
+   same concurrent bench over a non-SLIRP backend. If the gap shrinks, the
+   residual is the SLIRP harness, not NARF (stop). If it persists, it's
+   NARF's virtio RX/TX timing and worth pursuing. Without this we're guessing
+   whether there's anything left to fix in NARF at all.
 2. **PING p99 (2.4×, ~180 vs 74µs).** p50 is parity; the tail is residual
    SLIRP/KVM delivery jitter + occasional in-guest variance. Smaller win.
    The one concrete in-guest contributor (fb-status paint) is already fixed.
-3. **virtio EVENT_IDX / notification suppression.** Not yet tried. Could cut
-   per-batch MMIO-notify VM-exits under load — plausibly part of the ~1.6×
-   per-request factor. Contained to the virtio driver.
-4. **Non-SLIRP backend (tap/bridge) sanity check.** Determines how much of
-   the residual is the SLIRP test harness vs NARF. Diagnostic, not a fix.
+3. **virtio EVENT_IDX / notification suppression.** ~2% at most — notifies
+   are already per-frame (~0.067/op), not per-request. Low priority.
+4. **RX→redis hop wall-time decomposition under load.** If #1 shows the gap
+   is in-guest, decompose the per-batch in-guest path (RX-dispatch → redis
+   read → process → TX) with one-shot timestamps under concurrent load, as
+   was done for single-PING latency. Only worthwhile if #1 says it's in NARF.
 
 ### Measurement discipline (lessons)
 - Measure throughput CONCURRENT (`-c 50`), never single-connection — the
