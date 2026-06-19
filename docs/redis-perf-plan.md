@@ -60,6 +60,9 @@ feed/network constant factor, not a serialization/scaling failure.
 | **event-driven one-shot timer (for p99)** | ❌ not the cause | RX IRQ is NOT missed; deadline-wakes are benign inter-ping-gap re-polls |
 | **RX→redis frame/notify amplification** (plan #1) | ❌ ruled out | counters under load: **~15 ops per frame** (frames/op ≈ 0.067), ~1 TX notify per frame. NARF coalesces pipelined requests as well as Linux. Not the per-request factor. |
 | **pipeline-depth scaling** | ❌ no extra win | SET P1 53k→P16 485k→P64 752k scales fine, but Linux ratio stays ~constant ~0.6× across depths ⇒ a per-request constant factor, not a serialization/scaling failure |
+| **TCP Nagle** | ❌ not it | forcing `nagle_enabled=false` default: no change ⇒ redis's `TCP_NODELAY` already wired/honored |
+| **TCP delayed-ACK** | ❌ worse | forcing immediate ACK every segment: throughput DROPPED (more ACK segments/VM-exits); piggyback already works |
+| **O(N) inbound TCB scan** | ⚠️ real bug, NOT the lever | `handle_segment` linear-scans+locks all TCBs per segment under the global lock. Added a 4-tuple cache (O(log N)): single-PING unchanged, concurrent throughput unchanged. On 1 cooperative vCPU the lock is never contended, so it's pure serial CPU masked by the 90%-idle headroom. Reverted. **Worth fixing for high connection counts (1000s), but not the throughput lever here.** |
 
 ## Root model (settled)
 
@@ -73,10 +76,19 @@ harness for true throughput.
 
 The throughput constant factor (~0.6× across pipeline depths; guest ~90%
 idle even at 485k ops/s) is NOT compute, NOT frame/notify amplification,
-NOT ring depth (all ruled out by measurement above). It's in the fine
-SLIRP↔virtio round-trip TIMING under load — NARF's per-batch wall RTT is
-~1.6× Linux's despite batching the same. This is the hardest class and may
-be partly external (SLIRP's response to NARF's ring/notify cadence).
+NOT ring depth, NOT Nagle/delayed-ACK, NOT the O(N) TCB scan — ALL ruled
+out by measurement above. The single-PING floor is at Linux parity (60 vs
+57µs), so the per-request path is fine; the gap is the per-batch wall RTT
+UNDER LOAD (~1.65ms vs Linux ~1.0ms = ~27× vs ~17× inflation over the
+single-request floor). That inflation is queueing/wait, NOT CPU (90% idle).
+Since NARF (485k) is BELOW SLIRP's proven capacity (Linux hits 794k on the
+same SLIRP), it's a NARF-side per-batch *latency-under-load* issue — but
+wall-time wait, not reducible CPU. In-guest RX→TX measured ~320µs under
+load vs ~94µs single (3.4× queueing). Localizing further is blocked: a
+single-slot hop/uexec probe gets ~0 paired samples under 50-way
+interleaving — it needs per-connection latency instrumentation. **Open
+question we can't yet answer here: is the residual NARF's in-guest
+per-batch queueing or SLIRP's per-connection serialization?**
 
 1. **Tap/bridge backend sanity check (DO THIS FIRST — diagnostic).** Run the
    same concurrent bench over a non-SLIRP backend. If the gap shrinks, the
