@@ -2985,6 +2985,10 @@ fn boot_narf_redis(
     ensure_feature(&mut build.features, "boot-init");
     ensure_feature(&mut build.features, "firmware-allow-unsigned");
     ensure_feature(&mut build.features, "qemu-net");
+    // XTASK_PERF_DUMP=1 enables the periodic per-CPU perf-stat dump.
+    if std::env::var_os("XTASK_PERF_DUMP").is_some() {
+        ensure_feature(&mut build.features, "perf-dump");
+    }
 
     let root = workspace_root()?;
     let out_dir = cargo_build(&build, &root)?;

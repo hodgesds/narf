@@ -16,6 +16,74 @@ use core::fmt::Write;
 
 use narf_console::TrapWriter;
 
+/// Feature-gated perf-stat dump: reads the per-CPU `narf_lib::perf` software
+/// counters (summed) + the hardware PMU and prints a `perf stat`-style line
+/// every ~3000 timer ticks. Off by default; build with `--features
+/// perf-dump` for a profiling run. The counters themselves are always on.
+#[cfg(feature = "perf-dump")]
+mod perf_dump {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_arch::x86_64::pmu;
+
+    static PMUC: narf_lib::sync::IrqSafeSpinLock<Option<[pmu::PmuCounter; 4]>> =
+        narf_lib::sync::IrqSafeSpinLock::new(None);
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    pub fn on_tick() {
+        // Attach the profiler (enables the per-CPU tracepoints). Cheap guard
+        // so we don't re-store the shared `enabled` flag every tick.
+        if !narf_lib::perf::enabled() {
+            narf_lib::perf::set_enabled(true);
+        }
+        let t = narf_lib::perf::total_ticks();
+        if t == 0 || t % 3000 != 0 || LAST.swap(t, Ordering::Relaxed) == t {
+            return;
+        }
+        let mut g = PMUC.lock();
+        if g.is_none() {
+            // SAFETY: tick handler runs at CPL=0; single-CPU init.
+            unsafe {
+                if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+                    pmu::alloc_counter(pmu::PmuEvent::Instructions),
+                    pmu::alloc_counter(pmu::PmuEvent::Cycles),
+                    pmu::alloc_counter(pmu::PmuEvent::LlcMisses),
+                    pmu::alloc_counter(pmu::PmuEvent::BranchMisses),
+                ) {
+                    *g = Some([a, b, c, d]);
+                }
+            }
+        }
+        let (i, c, l, b) = match g.as_ref() {
+            // SAFETY: live counters from alloc_counter; CPL=0.
+            Some(c) => unsafe {
+                (
+                    pmu::read(&c[0]),
+                    pmu::read(&c[1]),
+                    pmu::read(&c[2]),
+                    pmu::read(&c[3]),
+                )
+            },
+            None => (0, 0, 0, 0),
+        };
+        drop(g);
+        let s = narf_lib::perf::snapshot();
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::TrapWriter,
+            "PERF ctx={} sc={} pf={} | uTk={} kTk={} | instr={} cyc={} llc={} br={}",
+            s.ctx,
+            s.syscalls,
+            s.page_faults,
+            s.user_ticks,
+            s.kernel_ticks,
+            i,
+            c,
+            l,
+            b
+        );
+    }
+}
+
 /// The on-stack layout that `common_trap` builds before calling here.
 ///
 /// Order follows the asm's reverse pushes + CPU-pushed frame at the end.
@@ -194,6 +262,10 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             if tick_vector == 32 || (tick_vector == 0 && frame.vector == 32) {
                 narf_interrupts::x86_64::apic::on_timer_tick();
             }
+            // Per-CPU perf counters: tag this tick by interrupted CPL.
+            narf_lib::perf::tick((frame.cs & 3) != 3);
+            #[cfg(feature = "perf-dump")]
+            perf_dump::on_tick();
         }
         // Note: we don't call timer_wheel::fire_due from this trap
         // context. fire_due drops Wakers, which deallocate via the
@@ -312,6 +384,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // On any failure we fall through to the panic path so the
     // existing diagnostic still fires on genuine bugs.
     if frame.vector == 14 {
+        narf_lib::perf::page_fault();
         // PF error code (Intel SDM Vol. 3 §4.7):
         //   bit 0 (P): set if fault was a present-page violation
         //   bit 1 (W): set if write

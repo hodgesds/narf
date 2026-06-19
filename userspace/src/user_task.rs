@@ -1316,6 +1316,7 @@ impl core::future::Future for UserTaskFuture {
                     // the AS is re-activated and kernel state (TSS rsp0,
                     // GS) is still correct from first entry. Never
                     // returns — iretq resumes the saved user frame.
+                    narf_lib::perf::ctx_switch();
                     // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }
@@ -1702,6 +1703,7 @@ impl core::future::Future for UserTaskFuture {
                 TaskState::Running => {
                     // SAFETY: a prior poll's trap path populated
                     // ctx.state via TrapContext::save_user_state.
+                    narf_lib::perf::ctx_switch();
                     // SAFETY: Valid memory or trusted environment
                     unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
                 }

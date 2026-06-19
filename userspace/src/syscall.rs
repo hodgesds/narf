@@ -3648,6 +3648,7 @@ impl SyscallTable {
     }
 
     pub fn dispatch_ctx_versioned(&self, variant: Syscall, version: u8, ctx: &mut dyn TrapContext) {
+        narf_lib::perf::syscall();
         if version != 0 {
             if let Some((_, _, handler)) = self
                 .versioned_handlers

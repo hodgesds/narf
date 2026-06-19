@@ -95,6 +95,11 @@ narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
 [features]
+# Profiling: emit a `perf stat`-style line (per-CPU narf_lib::perf software
+# counters + hardware PMU) every ~3000 timer ticks. Counters are always on;
+# this just enables the periodic serial dump. Off by default.
+perf-dump = []
+
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from
 # narf-userspace.  Stub for Waves 63-67.
