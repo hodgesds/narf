@@ -163,6 +163,11 @@ struct QueuePair {
     tx_notify_off: u16,
 }
 
+/// Cap on the recycled TX DMA-buffer free-list (see `VirtioNetPci::tx_pool`).
+/// Comfortably covers a full TX ring's worth of in-flight + spare buffers;
+/// overflow drops (frees) rather than growing unbounded.
+const TX_POOL_CAP: usize = 64;
+
 pub struct VirtioNetPci {
     common: VirtioRegion,
     notify: VirtioRegion,
@@ -224,6 +229,12 @@ pub struct VirtioNetPci {
     /// driver-match registry + re-walk PCI) is idempotent — we
     /// recognise the device and don't push a duplicate controller.
     cfg_phys: u64,
+    /// Recycled TX DMA buffers (Linux `page_pool`-style). A completed
+    /// transmit returns its 4 KiB buffer here instead of freeing it, and
+    /// `tx_buf_acquire` pops from here instead of `alloc_coherent` — keeping
+    /// the coherent/buddy allocator off the per-frame TX hot path. Capped at
+    /// `TX_POOL_CAP`; overflow drops (frees) the buffer.
+    tx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
 }
 
 /// Control-queue runtime state. `ctrl_buf` holds back-to-back
@@ -613,6 +624,7 @@ impl VirtioNetPci {
             ctrl_qidx,
             ctrl,
             cfg_phys,
+            tx_pool: IrqSafeSpinLock::new(Vec::new()),
         };
 
         // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
@@ -732,6 +744,24 @@ impl VirtioNetPci {
     /// VIRTIO_NET_F_MQ negotiated and >1 pairs active, parallel
     /// callers fan out across the device's TX virtqueues; with a
     /// single pair the round-robin degenerates to "always pair 0".
+    /// Take a 4 KiB TX DMA buffer — recycled from `tx_pool` if available,
+    /// else a fresh coherent allocation. Pairs with `tx_buf_release`.
+    fn tx_buf_acquire(&self) -> Option<DmaBuffer> {
+        if let Some(b) = self.tx_pool.lock().pop() {
+            return Some(b);
+        }
+        alloc_coherent(4096, DomainId::DRIVER_0).ok()
+    }
+
+    /// Return a completed TX DMA buffer to `tx_pool` for reuse, or drop it
+    /// (freeing) when the pool is already at `TX_POOL_CAP`.
+    fn tx_buf_release(&self, buf: DmaBuffer) {
+        let mut pool = self.tx_pool.lock();
+        if pool.len() < TX_POOL_CAP {
+            pool.push(buf);
+        }
+    }
+
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
         let pair_idx = self.next_tx_pair();
         self.tx_dma_on(pair_idx, buf, frame_len)
@@ -784,8 +814,10 @@ impl VirtioNetPci {
             while let Some((done_head, _)) = q.poll_used() {
                 q.free_chain(done_head as u16);
                 if let Some(slot) = bufs.get_mut(done_head as usize) {
-                    // Drop the in-flight buffer (device is done with it).
-                    let _ = slot.take();
+                    // Device is done with it — recycle into the TX pool.
+                    if let Some(b) = slot.take() {
+                        self.tx_buf_release(b);
+                    }
                 }
             }
         }
@@ -822,7 +854,9 @@ impl VirtioNetPci {
                         while let Some((done_head, _)) = q.poll_used() {
                             q.free_chain(done_head as u16);
                             if let Some(slot) = bufs.get_mut(done_head as usize) {
-                                let _ = slot.take();
+                                if let Some(b) = slot.take() {
+                                    self.tx_buf_release(b);
+                                }
                             }
                             freed_any = true;
                         }
@@ -1483,7 +1517,9 @@ fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
         return Err(());
     }
-    let mut buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| ())?;
+    // Take a recycled TX buffer (or a fresh coherent alloc) from the pool,
+    // keeping the page allocator off the per-frame TX hot path.
+    let mut buf = with_controller(|c| c.tx_buf_acquire()).flatten().ok_or(())?;
     {
         let slice = buf.as_mut_slice();
         if slice.len() < 12 + frame.len() {
