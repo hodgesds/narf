@@ -3355,6 +3355,8 @@ fn run_redis_benchmark(host_port: u16, label: &str) {
     // interpreter path that doesn't exist here, so a direct exec fails with
     // ENOENT. Invoke via the real loader explicitly (libs still resolve).
     let loader = "/lib64/ld-linux-x86-64.so.2";
+    let tests =
+        std::env::var("XTASK_REDIS_BENCHMARK_T").unwrap_or_else(|_| "set,get,ping_inline".into());
     let bench_args = [
         "-h",
         "127.0.0.1",
@@ -3367,7 +3369,7 @@ fn run_redis_benchmark(host_port: u16, label: &str) {
         "-n",
         &n.to_string(),
         "-t",
-        "set,get,ping_inline",
+        &tests,
         "-q",
     ];
     let out = if std::path::Path::new(loader).exists() {

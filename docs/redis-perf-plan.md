@@ -72,6 +72,22 @@ built-in workload is single-connection synchronous batches → RTT-bound
 (guest 97% halted) → its "throughput" == latency; use the concurrent
 harness for true throughput.
 
+**Under-load in-guest decomposition** (clean: per-TCB cycle stamps,
+GET-only to avoid SET dict-rehash, dump fired AFTER the load so the print
+doesn't distort it). Per-connection in-guest request→response under 50
+clients ≈ **560µs**, and the *total* per-batch RTT ≈ 1.65–1.86ms, so
+in-guest is ~⅓, external (SLIRP closed loop) ~⅔. The in-guest splits:
+- **hop (data-arrived → redis reads it) ≈ 351µs (63%)** — scheduling +
+  waiting for redis's current burst + closed-loop wait for the next batch
+  (the wake itself is prompt: `readiness::notify()` per data segment).
+- **proc (read → response sent) ≈ 206µs (37%)** — redis event-loop batch
+  queueing (read N / process N / write N) + send/TX.
+Both are queueing intrinsic to single-threaded redis chewing a 50-way
+burst on one vCPU — Linux does the same. No single discrete lever; the
+residual is diffuse per-request kernel cost amortized over the burst,
+intertwined with the SLIRP closed loop. Single-PING floor is already at
+parity, so there is no per-request *latency* bug — it's load behavior.
+
 ## Plan — remaining gaps (ranked)
 
 The throughput constant factor (~0.6× across pipeline depths; guest ~90%
