@@ -765,7 +765,7 @@ fn build_frame(
     );
     pkt::set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
     let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
-    let mut hdr = TcpHeader {
+    let hdr = TcpHeader {
         src_port,
         dst_port,
         sequence: seq,
@@ -781,10 +781,14 @@ fn build_frame(
     frame[tcp_off..tcp_off + bytes.len()].copy_from_slice(&bytes);
     frame[tcp_off + bytes.len()..tcp_off + bytes.len() + payload.len()].copy_from_slice(payload);
     let segment = &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()];
+    // Patch the 2-byte TCP checksum in place (it lives at offset 16 of the
+    // TCP header, after src/dst port + seq + ack + dataoff/flags + window)
+    // rather than re-encoding the whole header into a fresh Vec and copying
+    // it back — saves one heap alloc + a full-header copy per outbound
+    // segment. The checksum was computed over the header with this field
+    // zeroed (as encoded above), which is the required pseudo-header form.
     let cs = ipv4_pseudo_checksum(src_ip, dst_ip, segment);
-    hdr.checksum = cs;
-    let final_bytes = hdr.encode();
-    frame[tcp_off..tcp_off + final_bytes.len()].copy_from_slice(&final_bytes);
+    frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&cs.to_be_bytes());
     frame
 }
 
