@@ -1456,6 +1456,13 @@ pub fn run_until_empty() {
         1_000_000u64.saturating_mul(cpns) // ~1 ms
     };
     let mut last_pump_cycles = narf_time::now_cycles();
+    // Adaptive halt-poll window (cycles), per the KVM `halt_poll_ns`
+    // model. Grows when an idle spin catches a quick wake (a busy
+    // request/response workload), shrinks toward 0 when spins miss (a
+    // genuinely idle CPU), so latency-sensitive load gets the spin win
+    // while a truly idle CPU still HLTs and preserves power. Persists
+    // across rounds as an executor-local — no static, no layout churn.
+    let mut halt_poll_cycles: u64 = 0;
 
     loop {
         // Per-round drain of IRQ-deferred wakers. Must run every
@@ -1896,6 +1903,64 @@ pub fn run_until_empty() {
                 // natural state; nothing here holds an IRQ-unsafe lock.
                 unsafe {
                     narf_arch::enable_interrupts();
+                }
+                // Adaptive halt-poll (KVM `halt_poll_ns` analogue). Before
+                // paying the HLT VM-exit + host-vcpu-deschedule wakeup cost,
+                // spin a short bounded window re-checking for a wake. A virtio
+                // RX IRQ that lands during the spin keeps the vcpu hot and is
+                // serviced here in µs instead of after the next 1 ms timer tick
+                // — measured to cut redis off-box PING p50 from ~300-400µs to
+                // ~200µs. Spins ONLY when otherwise fully idle and bails to the
+                // HLT below once the budget expires, so a truly idle system
+                // still halts (Phase A power behaviour preserved). Gated on a
+                // reliable tick (KVM / TSC-deadline); the InitialCount fallback
+                // already busy-spins inside `idle_wait`.
+                if narf_time::tick_reliable() {
+                    let cpns = narf_time::cycles_per_ns().max(1) as u64;
+                    // Window bounds: cap at 60µs (the measured PING-wake
+                    // sweet spot), seed a grown window at 8µs.
+                    let max_poll = 60_000u64.saturating_mul(cpns);
+                    let grow_start = 8_000u64.saturating_mul(cpns);
+                    let mut woke = false;
+                    if halt_poll_cycles > 0 {
+                        let spin_start = narf_time::now_cycles();
+                        while narf_time::now_cycles().wrapping_sub(spin_start) < halt_poll_cycles {
+                            // A wake arrives either as an IRQ-deferred waker or
+                            // as a directly-set awake flag on a ready slot.
+                            if narf_lib::deferred_wake::drain_and_wake() > 0 {
+                                woke = true;
+                                break;
+                            }
+                            let any = {
+                                let q = READY[cpu].lock();
+                                q.as_ref()
+                                    .map(|d| d.iter().any(|s| s.awake.load(Ordering::Acquire)))
+                                    .unwrap_or(false)
+                            };
+                            if any {
+                                woke = true;
+                                break;
+                            }
+                            core::hint::spin_loop();
+                        }
+                    } else {
+                        // Window collapsed (idle CPU): one cheap probe before
+                        // committing to the spin-grow cycle, so a lone wake
+                        // that already landed skips the HLT.
+                        woke = narf_lib::deferred_wake::drain_and_wake() > 0;
+                    }
+                    if woke {
+                        // Hit: grow the window (seed if collapsed, else ×2).
+                        halt_poll_cycles = if halt_poll_cycles == 0 {
+                            grow_start
+                        } else {
+                            halt_poll_cycles.saturating_mul(2).min(max_poll)
+                        };
+                        continue;
+                    }
+                    // Miss: shrink toward 0 so a genuinely idle CPU stops
+                    // spinning and just HLTs.
+                    halt_poll_cycles /= 2;
                 }
             }
             let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
