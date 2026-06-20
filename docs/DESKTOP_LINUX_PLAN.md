@@ -10,6 +10,21 @@ ladder of runnable milestones** that gets us there one rung at a time.
 Each rung ends in something that *boots and runs under `qemu`*, so we
 never accumulate unverifiable work.
 
+## Progress
+
+- **Rung 0 (keystone) — DONE.** `FileOps::mmap_frames` + `sys_mmap`
+  shared-device dispatch + scanout phys. On `main`.
+- **Rung 1 (`/dev/fb0`) — DONE & proven end-to-end.** Device + Linux
+  fbdev ioctls; `smoke_fbdev_*` kernel smokes pass; `/bin/fb_smoke`
+  (stock musl) opens `/dev/fb0`, `mmap`s it `MAP_SHARED`, draws + reads
+  back → `fb-ok` / `fb-geom 1280x800` via `xtask run-interactive`. Wired
+  into the `xtask musl-demo` CI case list. On `main`.
+- Next: **Rung 2** (`/dev/input/event*` evdev).
+
+Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
+end-to-end proofs run from the **boot-init shell** (`run-interactive` /
+`musl-demo`), not the testbin.
+
 ---
 
 ## Current state (2026-06-20)
