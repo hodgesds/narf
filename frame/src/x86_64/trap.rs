@@ -154,8 +154,18 @@ mod perf_dump {
     static PMUC: narf_lib::sync::IrqSafeSpinLock<Option<[pmu::PmuCounter; 4]>> =
         narf_lib::sync::IrqSafeSpinLock::new(None);
     static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    // Last interrupted RIP / CPL per CPU, recorded every tick — shows WHERE a
+    // busy core is spinning (addr2line the printed rip against narf-frame).
+    const MAXC: usize = 16;
+    static LAST_RIP: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static LAST_CPL: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
 
-    pub fn on_tick() {
+    pub fn on_tick(rip: u64, cs: u64) {
+        let cpu = narf_lib::percpu::current_cpu();
+        if cpu < MAXC {
+            LAST_RIP[cpu].store(rip, Ordering::Relaxed);
+            LAST_CPL[cpu].store(cs & 3, Ordering::Relaxed);
+        }
         // Attach the profiler (enables the per-CPU tracepoints). Cheap guard
         // so we don't re-store the shared `enabled` flag every tick.
         if !narf_lib::perf::enabled() {
@@ -219,10 +229,12 @@ mod perf_dump {
             if pc.user_ticks == 0 && pc.kernel_ticks == 0 && pc.syscalls == 0 {
                 continue;
             }
+            let rip = LAST_RIP[cpu].load(Ordering::Relaxed);
+            let cpl = LAST_CPL[cpu].load(Ordering::Relaxed);
             let _ = writeln!(
                 narf_console::TrapWriter,
-                "PCORE cpu={} uTk={} kTk={} sc={} ctx={} pf={}",
-                cpu, pc.user_ticks, pc.kernel_ticks, pc.syscalls, pc.ctx, pc.page_faults
+                "PCORE cpu={} uTk={} kTk={} sc={} ctx={} pf={} cpl={} rip={:#x}",
+                cpu, pc.user_ticks, pc.kernel_ticks, pc.syscalls, pc.ctx, pc.page_faults, cpl, rip
             );
         }
     }
@@ -413,7 +425,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             #[cfg(feature = "stall-watchdog")]
             stall_wd::tick(frame.cs, frame.rip);
             #[cfg(feature = "perf-dump")]
-            perf_dump::on_tick();
+            perf_dump::on_tick(frame.rip, frame.cs);
         }
         // Note: we don't call timer_wheel::fire_due from this trap
         // context. fire_due drops Wakers, which deallocate via the
