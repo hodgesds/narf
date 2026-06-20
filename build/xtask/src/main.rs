@@ -1705,6 +1705,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("fs_smoke", "fs-ok"),
         ("fork_pipe_smoke", "fork-ok"),
         ("pty_smoke", "pty-ok"),
+        // Framebuffer smoke — opens /dev/fb0, FBIOGET_VSCREENINFO,
+        // mmap MAP_SHARED, writes + reads back pixels through the
+        // mapping. End-to-end proof of the device-mmap keystone +
+        // the Linux fbdev ioctls from stock musl.
+        ("fb_smoke", "fb-ok"),
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),

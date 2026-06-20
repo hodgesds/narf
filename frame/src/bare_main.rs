@@ -3340,6 +3340,10 @@ fn boot_userspace_init() {
                 // /dev/pts/N, round-trip "ping" / "pong" across
                 // the master/slave pair. Success token "pty-ok".
                 ("pty_smoke", narf_verification::NARF_PTY_SMOKE_ELF),
+                // Framebuffer smoke — opens /dev/fb0, mmaps it
+                // MAP_SHARED, draws + reads back. Proves the
+                // device-mmap keystone end-to-end. Success: `fb-ok`.
+                ("fb_smoke", narf_verification::NARF_FB_SMOKE_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),

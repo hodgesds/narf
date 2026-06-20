@@ -3915,6 +3915,20 @@ pub const NARF_PTY_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_PTY_SMOKE_ELF_X8
 ))]
 pub const NARF_PTY_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_PTY_SMOKE_ELF_AARCH64"));
 
+/// `/bin/fb_smoke` — opens `/dev/fb0`, mmaps it MAP_SHARED, draws, and
+/// reads back through the mapping. Proves the device-mmap keystone +
+/// fbdev ioctls end-to-end from stock musl. Success token: `fb-ok`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_FB_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_FB_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_FB_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_FB_SMOKE_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

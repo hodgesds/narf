@@ -445,6 +445,7 @@ fn main() {
         "procfs2_smoke",
         "pty_smoke",
         "numa_smoke",
+        "fb_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());
