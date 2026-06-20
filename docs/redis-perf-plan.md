@@ -198,6 +198,32 @@ well-characterized structural ceiling. Closing it to true parity is an
 lock-granular TCP stack), not another point optimization — and the payoff
 is uncertain until the lock-contention question is answered.
 
+## #126 in-guest stage profile (settled: no NARF in-guest lever)
+
+Direct stage instrumentation (temporary per-TCB TSC stamps, accumulated to
+globals, one-shot dumped; reverted after) under `-c50 -P16` GET with the
+placement fix live:
+
+| stage | mean | what it is |
+|---|---|---|
+| HOP (data-arrival → redis `recv`) | **209µs** | request waits while redis services *other* connections |
+| PROC (redis `recv` → `send`) | **154µs** | redis read-all/process-all/write-all batch over 50 conns |
+| RXcpu (`rx_handler` dispatch) | **4.0µs** | NARF kernel RX per frame |
+| TXcpu (`send` submit) | **3.4µs** | NARF kernel TX per write |
+
+NARF's whole kernel RX+TX cost (**~7.4µs**) is *negligible* against the
+**~363µs** the request spends inside redis's single-threaded event loop
+(HOP+PROC) — and that 363µs is intrinsic redis behavior Linux's redis does
+identically. **So there is no NARF in-guest throughput lever.** The ~0.6×
+concurrent gap is intrinsic single-threaded-redis-under-load + the external
+SLIRP closed-loop turnaround. The only real throughput unblock is escaping
+SLIRP (tap, #127) for a faster external loop; for *scaling* it's
+multithreaded workloads + MQ/RSS (#125). Also TCP window ruled out as a
+lever: NARF uses a fixed 256 KiB rcv buffer, far larger than redis's tiny
+pipelined messages need. *Minor cleanup (not a lever, we're idle-bound):
+`rx_handler` clones the iface-name `String` per frame and `handle_segment`
+still O(N)-scans the TCB table — worth fixing for a future high-PPS NIC.*
+
 ## Plan — remaining gaps (ranked)
 
 The throughput constant factor (~0.6× across pipeline depths; guest ~90%
