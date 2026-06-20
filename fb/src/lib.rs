@@ -76,6 +76,15 @@ pub trait FbScanout: Send + Sync + core::fmt::Debug {
     /// No-op for direct-FB backends (bochs); on virtio-gpu it issues
     /// TRANSFER_TO_HOST_2D + RESOURCE_FLUSH.
     fn flush(&self, x: u32, y: u32, w: u32, h: u32);
+    /// Physical base address of the scanout pixel buffer, if it is a
+    /// plain physically-contiguous buffer that can be safely aliased
+    /// into a userspace `mmap` (the Linux `/dev/fb0` model). Returns
+    /// `None` for backends whose scanout is not directly mappable that
+    /// way (e.g. a rebased/ioremapped generic FB). Used by the fbdev
+    /// device node — see [`fbdev_info`].
+    fn phys_base(&self) -> Option<u64> {
+        None
+    }
     /// Borrow a `narf_graphics::Framebuffer` view for direct
     /// per-pixel writes. Caller is responsible for serialisation.
     ///
@@ -111,6 +120,18 @@ impl FbScanout for BochsScanout {
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // bochs is direct-MMIO — pixels appear as soon as they're
         // written. No host-side blit needed.
+    }
+    fn phys_base(&self) -> Option<u64> {
+        // BAR0 phys; `fb_reachable()` already proved it's <4 GiB and
+        // thus covered by the x86_64 identity map.
+        narf_graphics_driver::bochs::with_controller(|d| {
+            if d.fb_reachable() {
+                Some(d.fb_phys())
+            } else {
+                None
+            }
+        })
+        .flatten()
     }
     unsafe fn framebuffer(&self) -> Framebuffer {
         // SAFETY: caller-asserted exclusive write access via the cap.
@@ -234,6 +255,9 @@ impl FbScanout for VirtioGpuScanout {
     }
     fn name(&self) -> &'static str {
         "virtio-gpu"
+    }
+    fn phys_base(&self) -> Option<u64> {
+        narf_drivers_virtio::gpu_pci::with_controller(|d| d.scanout_phys())
     }
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
         // M0: flush always covers the full scanout. Per-rect flush
@@ -493,6 +517,65 @@ pub fn select_active() -> Option<&'static dyn FbScanout> {
         }
     }
     None
+}
+
+// ── fbdev (`/dev/fb0`) backing ──────────────────────────────────────
+
+/// Geometry + physical backing of the active scanout, for the Linux
+/// `/dev/fb0` framebuffer device. All fields describe the live
+/// scanout the picker selected; `phys` is the base of the pixel
+/// buffer to alias into a userspace `mmap`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FbdevInfo {
+    /// Physical base address of the scanout pixel buffer.
+    pub phys: u64,
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Bytes per scanline (`stride_pixels * 4` for XRGB8888).
+    pub stride_bytes: u32,
+    /// Bits per pixel (32 — XRGB8888).
+    pub bpp: u32,
+}
+
+impl FbdevInfo {
+    /// Total bytes of the scanout buffer (`stride_bytes * height`),
+    /// rounded up to a page — the size a `/dev/fb0` mmap covers.
+    pub fn map_len(&self) -> usize {
+        let raw = self.stride_bytes as usize * self.height as usize;
+        (raw + 0xFFF) & !0xFFF
+    }
+}
+
+/// Query the active scanout for `/dev/fb0`. Returns `None` when no
+/// scanout is selected yet, or the selected backend can't expose a
+/// directly-mappable physical buffer (`phys_base() == None`).
+pub fn fbdev_info() -> Option<FbdevInfo> {
+    let s = select_active()?;
+    let phys = s.phys_base()?;
+    let width = s.width();
+    let height = s.height();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(FbdevInfo {
+        phys,
+        width,
+        height,
+        stride_bytes: s.stride().checked_mul(4)?,
+        bpp: 32,
+    })
+}
+
+/// Flush the whole active scanout to the host display. No-op for
+/// direct-MMIO backends (bochs); on virtio-gpu this issues
+/// TRANSFER_TO_HOST_2D + RESOURCE_FLUSH so a `/dev/fb0` writer's
+/// pixels become visible.
+pub fn fbdev_flush() {
+    if let Some(s) = select_active() {
+        s.flush(0, 0, s.width(), s.height());
+    }
 }
 
 // ── cap typing ──────────────────────────────────────────────────────

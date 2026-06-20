@@ -4376,6 +4376,61 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    const MAP_SHARED: u32 = 0x01;
+    // Device-backed shared mapping — the keystone for graphics. A
+    // `/dev/fb0` framebuffer (or a DRM dumb buffer) returns the
+    // physical frames of its scanout buffer from `FileOps::mmap_frames`;
+    // we alias (borrow) those frames into the caller's AS so userspace
+    // gets a direct CPU-drawable pointer. RegionPerms::SHARED keeps the
+    // teardown paths from `free_frame`-ing device-owned frames on
+    // munmap/exit — same borrowed-frame contract as `sys_shmem_map` /
+    // `sys_fb_ring_map`. A device that doesn't support mmap returns
+    // Unsupported and we fall through to the regular file path.
+    if fd >= 0 && flags & MAP_SHARED != 0 {
+        let task = current_task_id();
+        let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
+        if let Some(ops) = ops {
+            match ops.mmap_frames(offset, len as usize) {
+                Ok(frames) => {
+                    if frames.len() != pages {
+                        const EINVAL: i64 = 22;
+                        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                        return;
+                    }
+                    let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames
+                        .iter()
+                        .map(|&p| narf_memory::PhysAddr::new(p))
+                        .collect();
+                    if as_ref
+                        .map_region(Region {
+                            base: VirtAddr::new(base),
+                            len,
+                            perms: perms | RegionPerms::SHARED,
+                            phys,
+                        })
+                        .is_err()
+                    {
+                        ctx.set_return(SyscallReturn::invalid_op());
+                        return;
+                    }
+                    // SAFETY: `as_ref` is the calling task's AddressSpace (valid
+                    // root); the region was just registered via map_region, so
+                    // materialize installs only its PTEs over borrowed frames.
+                    // SAFETY: Valid memory or trusted environment
+                    if unsafe { as_ref.materialize() }.is_err() {
+                        ctx.set_return(SyscallReturn::invalid_op());
+                        return;
+                    }
+                    ctx.set_return(SyscallReturn::ok(base));
+                    return;
+                }
+                // Unsupported (or any device error): fall through to the
+                // regular file-backed path below, unchanged from before.
+                Err(_) => {}
+            }
+        }
+    }
+
     let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
     let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
         // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros

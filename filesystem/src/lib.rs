@@ -420,6 +420,30 @@ pub trait FileOps: Send + Sync {
         Err(FsError::Unsupported)
     }
 
+    /// `mmap(2)` device backing. For a `MAP_SHARED` mapping of this
+    /// file, return the list of **physical page-frame addresses** that
+    /// back the byte range `[offset, offset + len)` — one entry per
+    /// 4 KiB page, in order. The syscall layer maps these frames
+    /// *shared* (borrowed) into the caller's address space: writes go
+    /// straight to the device's own memory, and the frames are never
+    /// freed on `munmap`/exit (the device owns them).
+    ///
+    /// Both `offset` and `len` are page-aligned by the syscall layer
+    /// before this is called. Returning a vec whose length isn't
+    /// `len / 4096` is a contract violation the caller rejects.
+    ///
+    /// This is the keystone for graphics: a `/dev/fb0` framebuffer or a
+    /// DRM dumb buffer returns the frames of its scanout/buffer here so
+    /// userspace gets a direct CPU-drawable mapping.
+    ///
+    /// The default returns [`FsError::Unsupported`]; the syscall layer
+    /// then falls back to its private-copy file-mapping path. Only
+    /// device nodes whose memory is safe to alias into userspace
+    /// override this.
+    fn mmap_frames(&self, _offset: u64, _len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Wave-76: if this file is a PTY master, return the slave index.
     /// Used by `sys_ioctl(TIOCGPTPEER)` to open a fresh slave fd
     /// without going through a downcast / Any dance. Default: `None`.

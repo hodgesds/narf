@@ -314,6 +314,15 @@ impl VirtioGpuPci {
         Ok(())
     }
 
+    /// Physical base address of the scanout DMA buffer. On x86_64
+    /// (`KERNEL_PHYS_OFFSET == 0`) this is also the kernel-virtual
+    /// address. Exposed so `/dev/fb0` can alias the scanout's frames
+    /// into a userspace `mmap`. Stable for the controller's lifetime
+    /// once `init_scanout` has run.
+    pub fn scanout_phys(&self) -> u64 {
+        self.scanout_buf.phys_addr().raw()
+    }
+
     /// Borrow a `Framebuffer` view over the scanout buffer.
     /// Caller-side updates land in DMA memory; call `flush` to push
     /// them to the host scanout via TRANSFER + FLUSH.
