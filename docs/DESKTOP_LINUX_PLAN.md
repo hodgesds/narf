@@ -24,8 +24,21 @@ never accumulate unverifiable work.
   unchanged) + `EVIOCG*` ioctls (version/id/name/bits/abs/grab);
   `virtio-tablet-pci` added to QEMU (keyboard + tablet both probe).
   `smoke_dev_input_*` kernel smokes pass. On `main`.
-- Next: **Rung 3** — run an unmodified SDL2 app (fbdev/kmsdrm) from the
-  boot-init shell to surface the real ABI gaps toward a compositor.
+- **Rung 3 (DRM/KMS dumb-buffer modeset) — DONE & proven end-to-end.**
+  `/dev/dri/card0` now answers the modeset path: `GET_CAP(DUMB_BUFFER)`,
+  `MODE_CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`, `ADDFB2`, `SETCRTC`/
+  `PAGE_FLIP`, `GEM_CLOSE`. `MAP_DUMB`+`mmap` reuse the Rung-0 keystone;
+  `SETCRTC` blits the dumb buffer into the active scanout (`fbdev_info`).
+  `/bin/drm_smoke` (stock musl) runs the whole open→CREATE_DUMB→mmap→draw
+  →ADDFB2→SETCRTC chain → `drm-ok` / `drm-geom 256x256` via
+  `xtask run-interactive`; wired into the `musl-demo` CI list. On `main`.
+  (Three boot-time bugs the agent's `cargo check` missed were fixed:
+  initcall stage ordering, missing SMAP brackets in the ioctl copy
+  helpers, and discarded GET_CAP/ADDFB2 results.)
+- Next: a real DRM client — `modetest` (libdrm), then a minimal
+  Wayland compositor (weston `--use-pixman` / wlroots-pixman) or
+  Xorg-on-fbdev. The kernel modeset primitives now exist; the remaining
+  work is porting the userspace stacks + filling their ABI gaps.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
