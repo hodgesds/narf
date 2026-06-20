@@ -148,9 +148,6 @@ pub struct Conntrack {
     by_tuple: IrqSafeSpinLock<BTreeMap<Tuple, u64>>,
     /// Entry storage.
     by_id: IrqSafeSpinLock<BTreeMap<u64, Arc<IrqSafeSpinLock<ConntrackEntry>>>>,
-    /// LRU order — pushed on insert / refresh, popped on eviction.
-    /// Approximation: a `Vec<u64>` with newest at tail.
-    lru: IrqSafeSpinLock<alloc::vec::Vec<u64>>,
     next_id: AtomicU64,
     /// Hard cap on simultaneous entries.
     max_entries: usize,
@@ -161,7 +158,6 @@ impl Conntrack {
         Self {
             by_tuple: IrqSafeSpinLock::new(BTreeMap::new()),
             by_id: IrqSafeSpinLock::new(BTreeMap::new()),
-            lru: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             next_id: AtomicU64::new(1),
             max_entries,
         }
@@ -184,21 +180,23 @@ impl Conntrack {
         self.by_id.lock().is_empty()
     }
 
-    /// Touch LRU (move id to tail).
-    fn touch_lru(&self, id: u64) {
-        let mut lru = self.lru.lock();
-        lru.retain(|&x| x != id);
-        lru.push(id);
-    }
-
-    /// Evict the LRU entry. Called when `len == max_entries`.
-    fn evict_lru(&self) {
+    /// Evict the least-recently-seen entry. Called only when at capacity
+    /// (`len == max_entries`), so the O(n) scan over `by_id` is off the
+    /// per-packet path. Picks the entry with the smallest `last_seen_ns`
+    /// (every packet refreshes its entry's `last_seen_ns` via
+    /// `refresh_expiry`, so this is a true LRU without a separate
+    /// per-packet-maintained list). Conntrack is best-effort, so evicting
+    /// an approximately-oldest flow is always safe (it re-tracks on its
+    /// next packet).
+    fn evict_oldest(&self) {
         let victim_id = {
-            let mut lru = self.lru.lock();
-            if lru.is_empty() {
-                return;
-            }
-            lru.remove(0)
+            let by = self.by_id.lock();
+            by.iter()
+                .min_by_key(|(_, e)| e.lock().last_seen_ns)
+                .map(|(id, _)| *id)
+        };
+        let Some(victim_id) = victim_id else {
+            return;
         };
         let entry = self.by_id.lock().remove(&victim_id);
         if let Some(e) = entry {
@@ -217,12 +215,11 @@ impl Conntrack {
     /// existing one (no double-insert).
     pub fn insert_new(&self, original: Tuple, now_ns: u64) -> Arc<IrqSafeSpinLock<ConntrackEntry>> {
         if let Some(e) = self.lookup(&original) {
-            self.touch_lru(e.lock().id);
             return e;
         }
-        // LRU eviction if at capacity.
+        // Evict the oldest entry if at capacity.
         if self.by_id.lock().len() >= self.max_entries {
-            self.evict_lru();
+            self.evict_oldest();
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(IrqSafeSpinLock::new(ConntrackEntry::new(
@@ -235,7 +232,6 @@ impl Conntrack {
             by.insert(reply, id);
         }
         self.by_id.lock().insert(id, entry.clone());
-        self.touch_lru(id);
         entry
     }
 
@@ -274,9 +270,6 @@ impl Conntrack {
                 let mut by = self.by_tuple.lock();
                 by.remove(&orig);
                 by.remove(&reply);
-                drop(by);
-                let mut lru = self.lru.lock();
-                lru.retain(|&x| x != id);
             }
         }
         n
@@ -287,7 +280,6 @@ impl Conntrack {
     pub fn __reset_for_test(&self) {
         self.by_tuple.lock().clear();
         self.by_id.lock().clear();
-        self.lru.lock().clear();
         self.next_id.store(1, Ordering::Relaxed);
     }
 }
@@ -461,7 +453,7 @@ fn next_tcp_state(cur: TcpCtState, flags: u8, is_reply: bool) -> TcpCtState {
 /// advances TCP state, refreshes UDP/ICMP expiry, and tags
 /// `ctx.conntrack_id` for downstream hooks.
 pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
-    let tuple = match parse_tuple_ipv4(ctx.packet) {
+    let tuple = match parse_tuple_ipv4(ctx.packet()) {
         Some(t) => t,
         None => return Verdict::Accept,
     };
@@ -471,7 +463,6 @@ pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
         .unwrap_or_else(|| CT.insert_new(tuple, now));
     let id = entry.lock().id;
     ctx.conntrack_id = Some(id);
-    CT.touch_lru(id);
 
     // Direction: matches original if `tuple == entry.original`.
     let original = entry.lock().original;
@@ -482,8 +473,8 @@ pub fn conntrack_hook(ctx: &mut PktCtx<'_>) -> Verdict {
         L4Proto::Tcp => {
             // TCP flags live at IPv4 + 13.
             let flags_off = super::IPV4_MIN_HDR_LEN + 13;
-            if ctx.packet.len() > flags_off {
-                let flags = ctx.packet[flags_off];
+            if ctx.packet().len() > flags_off {
+                let flags = ctx.packet()[flags_off];
                 tcp_advance(&entry, flags, is_reply, now);
             }
         }
