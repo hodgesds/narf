@@ -3876,6 +3876,20 @@ pub const NARF_REDIS_SERVER_ELF: &[u8] = include_bytes!(env!("NARF_REDIS_SERVER_
 ))]
 pub const NARF_REDIS_SERVER_ELF: &[u8] = include_bytes!(env!("NARF_REDIS_SERVER_ELF_AARCH64"));
 
+/// `mt-echo` — multithreaded SO_REUSEPORT TCP echo server (static musl).
+/// The multi-queue/RSS benchmark workload: N worker threads, one listener
+/// each on the same port, so distinct flows are served in parallel.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_MT_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_MT_ECHO_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_MT_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_MT_ECHO_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

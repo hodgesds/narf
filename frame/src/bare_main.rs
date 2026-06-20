@@ -3647,7 +3647,9 @@ fn boot_userspace_init() {
         // Unmodified redis-server, bound off-box on 0.0.0.0:6379. Args
         // skip IPv6 + RDB/AOF persistence so it serves from RAM only; the
         // host-side `cargo xtask redis-smoke` harness then does SET/GET
-        // over the hostfwd port.
+        // over the hostfwd port. Suppressed under `mt-echo`, which
+        // dedicates the box to the multithreaded benchmark workload.
+        #[cfg(not(feature = "mt-echo"))]
         if !narf_verification::NARF_REDIS_SERVER_ELF.is_empty() {
             spawn_one_argv(
                 "redis-server",
@@ -3663,6 +3665,28 @@ fn boot_userspace_init() {
                     "--appendonly",
                     "no",
                 ],
+            );
+        }
+        // mt-echo: multithreaded SO_REUSEPORT echo server — the
+        // multi-queue/RSS benchmark workload. One listener (== one kernel
+        // Listen TCB) per worker thread on 0.0.0.0:7000; the stack steers
+        // distinct flows to distinct workers (add_to_listener_accept_queue)
+        // so RX is consumed in parallel across cores. Thread count from
+        // the kernel cmdline `mt_echo_threads=N` (default = CPU count) so
+        // the harness can sweep it without rebuilding the kernel.
+        #[cfg(feature = "mt-echo")]
+        if !narf_verification::NARF_MT_ECHO_ELF.is_empty() {
+            let n = parse_cmdline_count(narf_boot::cmdline(), "mt_echo_threads");
+            let threads = if n == 0 {
+                (narf_lib::smp::cpu_count() as usize).max(1)
+            } else {
+                n
+            };
+            let threads_str = alloc::format!("{threads}");
+            spawn_one_argv(
+                "mt-echo",
+                narf_verification::NARF_MT_ECHO_ELF,
+                &["mt-echo", "7000", &threads_str],
             );
         }
     }

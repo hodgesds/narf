@@ -266,6 +266,20 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_REDIS_SERVER_ELF_AARCH64=/dev/null");
 
+    // mt-echo — multithreaded SO_REUSEPORT TCP echo server. N pthreads,
+    // each its own listener (one kernel Listen TCB per worker) on the
+    // same port; the stack steers distinct flows to distinct workers so
+    // RX is consumed in parallel across cores — the multi-queue/RSS
+    // benchmark workload redis (single-threaded) can't be. Committed
+    // prebuilt static-musl ELF; recipe in userspace/mt-echo/build.sh.
+    println!("cargo:rerun-if-changed=data/musl-demo/mt_echo_server_x86_64");
+    let mt_echo = manifest_dir.join("data/musl-demo/mt_echo_server_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_MT_ECHO_ELF_X86_64={}",
+        mt_echo.display()
+    );
+    println!("cargo:rustc-env=NARF_MT_ECHO_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

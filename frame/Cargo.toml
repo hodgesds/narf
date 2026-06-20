@@ -127,6 +127,13 @@ container = ["narf-userspace/container"]
 # (dev / CI off-box network smoke); real hardware should run DHCP.
 qemu-net = []
 
+# mt-echo benchmark workload: at boot, spawn the multithreaded
+# SO_REUSEPORT echo server (one Listen TCB per worker thread) instead of
+# redis, so a multi-queue/RSS NIC can be driven in parallel across cores.
+# Implies qemu-net (needs the off-box vnet0 config). Thread count comes
+# from the kernel cmdline `mt_echo_threads=N` (default = CPU count).
+mt-echo = ["qemu-net"]
+
 # cgroup-v2 unified hierarchy. Forwarded from narf-userspace; the
 # boot path also places init/shell into the root cgroup. Mounts
 # cgroupfs at /sys/fs/cgroup.

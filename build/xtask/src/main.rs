@@ -68,6 +68,16 @@ enum Cmd {
     /// SAME redis binary spawned natively on the Linux host and prints
     /// a side-by-side NARF-guest-vs-Linux-host comparison.
     RedisBench(BuildArgs),
+    /// Multi-queue / RSS throughput+latency benchmark. Boots NARF with
+    /// the `mt-echo` feature (a multithreaded SO_REUSEPORT echo server:
+    /// one Listen TCB per worker thread, distinct flows steered to
+    /// distinct workers/cores), then drives a host-side load generator
+    /// (N persistent connections, request→response) and reports
+    /// req/s + p50/p99/p99.9 latency. Sweeps the kernel cmdline
+    /// `mt_echo_threads=N` and the virtio-net queue count
+    /// (`XTASK_QEMU_QUEUES`, tap only) so the MQ scaling curve is
+    /// visible. The workload redis (single-threaded) cannot exercise.
+    MtEchoBench(BuildArgs),
     /// Wave-78 — boot under QEMU and verify both linux-compat demo
     /// binaries (`/bin/hello` and `/bin/hello_musl`) print their
     /// expected output through the real shell + execve + ELF
@@ -632,6 +642,16 @@ impl Arch {
                     ]);
                 }
 
+                // Optional kernel cmdline (multiboot2 `-append`). Used to
+                // pass runtime knobs the kernel parses from
+                // `narf_boot::cmdline()` — e.g. `mt_echo_threads=N` for the
+                // mt-echo benchmark — without rebuilding the kernel.
+                if let Ok(append) = std::env::var("XTASK_QEMU_APPEND") {
+                    if !append.is_empty() {
+                        args.push("-append".into());
+                        args.push(append);
+                    }
+                }
                 args.push("-kernel".into());
                 args.push(kernel);
                 args
@@ -785,6 +805,13 @@ impl Arch {
                     ),
                 ]);
 
+                // Optional kernel cmdline — see the x86_64 arm above.
+                if let Ok(append) = std::env::var("XTASK_QEMU_APPEND") {
+                    if !append.is_empty() {
+                        args.push("-append".into());
+                        args.push(append);
+                    }
+                }
                 args.push("-kernel".into());
                 args.push(kernel);
                 args
@@ -3491,6 +3518,331 @@ fn run_redis_benchmark(host_port: u16, label: &str) {
     }
 }
 
+// ── mt-echo multi-queue benchmark ──────────────────────────────────
+
+/// One `loadgen` run's parsed aggregate metrics (from its RESULT line).
+#[derive(Clone, Copy)]
+struct LoadgenResult {
+    requests: u64,
+    errors: u64,
+    rps: f64,
+    p50_us: u64,
+    p99_us: u64,
+    p999_us: u64,
+}
+
+/// Compile the host-side `loadgen` (userspace/mt-echo/loadgen.c) once and
+/// return its path. The server binary is the committed static ELF that
+/// boots inside the guest; `loadgen` runs on the host, so it's built here
+/// with the host cc rather than musl.
+fn build_loadgen(root: &Path) -> Result<PathBuf> {
+    let src = root.join("userspace/mt-echo/loadgen.c");
+    if !src.exists() {
+        bail!("loadgen source missing at {}", src.display());
+    }
+    let out = root.join("target").join("mt-echo-loadgen");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let status = Command::new(&cc)
+        .args(["-O2", "-pthread", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .with_context(|| format!("invoking {cc} to build loadgen"))?;
+    if !status.success() {
+        bail!("loadgen build failed (cc exit {status})");
+    }
+    Ok(out)
+}
+
+/// Run `loadgen <host> <port> <conns> <secs> <client_threads>` and parse
+/// its RESULT line.
+fn run_loadgen(
+    loadgen: &Path,
+    host: &str,
+    port: u16,
+    conns: usize,
+    secs: usize,
+    client_threads: usize,
+) -> Result<LoadgenResult> {
+    let out = Command::new(loadgen)
+        .args([
+            host.to_string(),
+            port.to_string(),
+            conns.to_string(),
+            secs.to_string(),
+            client_threads.to_string(),
+        ])
+        .output()
+        .with_context(|| "spawning loadgen")?;
+    // loadgen prints its progress to stderr; the RESULT key=val line is
+    // the only thing on stdout.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("RESULT "))
+        .ok_or_else(|| {
+            anyhow!(
+                "loadgen produced no RESULT line (stderr: {})",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+        })?;
+    let get = |key: &str| -> Option<&str> {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(key))
+    };
+    let num = |key: &str| -> u64 { get(key).and_then(|v| v.parse().ok()).unwrap_or(0) };
+    Ok(LoadgenResult {
+        requests: num("requests="),
+        errors: num("errors="),
+        rps: get("rps=").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+        p50_us: num("p50_us="),
+        p99_us: num("p99_us="),
+        p999_us: num("p999_us="),
+    })
+}
+
+/// Boot NARF's `mt-echo` server under QEMU and return the child + serial
+/// reader thread once the readiness marker is seen. Mirrors
+/// `boot_narf_redis` but with the `mt-echo` feature, the
+/// `mt_echo_threads=N` kernel cmdline, and the mt-echo readiness probe.
+fn boot_narf_mt_echo(
+    args: &BuildArgs,
+    server_threads: usize,
+    host_port: u16,
+    guest_port: u16,
+) -> Result<(std::process::Child, std::thread::JoinHandle<()>)> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let mut build = args.clone();
+    ensure_feature(&mut build.features, "boot-init");
+    ensure_feature(&mut build.features, "firmware-allow-unsigned");
+    ensure_feature(&mut build.features, "mt-echo");
+    if std::env::var_os("XTASK_PERF_DUMP").is_some() {
+        ensure_feature(&mut build.features, "perf-dump");
+    }
+
+    let root = workspace_root()?;
+    let out_dir = cargo_build(&build, &root)?;
+    let kernel = out_dir.join(&build.package);
+    if !kernel.exists() {
+        bail!("expected kernel at {}", kernel.display());
+    }
+
+    // Worker thread count → kernel cmdline (parsed by bare_main). Set
+    // before qemu_args runs (it reads XTASK_QEMU_APPEND).
+    std::env::set_var(
+        "XTASK_QEMU_APPEND",
+        format!("mt_echo_threads={server_threads}"),
+    );
+    // Default to enough vCPUs that the N workers can actually spread
+    // (one extra for the BSP forwarder/main). The caller can override.
+    if std::env::var_os("NARF_QEMU_SMP").is_none() {
+        std::env::set_var("NARF_QEMU_SMP", format!("{}", server_threads + 1));
+    }
+    let tap_mode = std::env::var_os("XTASK_QEMU_TAP").is_some();
+    if !tap_mode {
+        std::env::set_var(
+            "XTASK_QEMU_HOSTFWD",
+            format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
+        );
+    }
+
+    let qemu = build.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(
+        build
+            .arch
+            .qemu_args(&kernel, &build.display, build.hw_profile),
+    );
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().with_context(|| format!("spawn {qemu}"))?;
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::with_capacity(64 * 1024)));
+    let panic_flag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let cap_r = captured.clone();
+    let panic_r = panic_flag.clone();
+    let reader = std::thread::spawn(move || {
+        let markers: &[&[u8]] = &[b"KERNEL PANIC", b"panicked at", b"double fault"];
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let nr = match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if let Ok(mut g) = cap_r.lock() {
+                g.extend_from_slice(&buf[..nr]);
+            }
+            if std::env::var_os("XTASK_REDIS_TEE_SERIAL").is_some() {
+                let _ = std::io::stdout().write_all(&buf[..nr]);
+                let _ = std::io::stdout().flush();
+            }
+            for &b in &buf[..nr] {
+                if b == b'\n' {
+                    for m in markers {
+                        if line.windows(m.len()).any(|w| w == *m) {
+                            if let Ok(mut p) = panic_r.lock() {
+                                if p.is_none() {
+                                    *p = Some(String::from_utf8_lossy(&line).into_owned());
+                                }
+                            }
+                        }
+                    }
+                    line.clear();
+                } else {
+                    line.push(b);
+                }
+            }
+        }
+    });
+
+    let timeout_secs = std::env::var("XTASK_RI_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    let marker = b"mt-echo: listening";
+    let start = Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(timeout_secs) {
+        if panic_flag.lock().ok().and_then(|p| p.clone()).is_some() {
+            break;
+        }
+        if let Ok(g) = captured.lock() {
+            if g.windows(marker.len()).any(|w| w == marker) {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ready {
+        let panic = panic_flag.lock().ok().and_then(|g| g.clone());
+        if let Ok(h) = std::env::var("XTASK_TAP_HOLD") {
+            if let Ok(secs) = h.parse::<u64>() {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "  [NARF] mt-echo not ready; holding guest {secs}s for debug (pid {})",
+                    child.id()
+                );
+                std::thread::sleep(Duration::from_secs(secs));
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        if let Some(p) = panic {
+            bail!("NARF mt-echo: kernel panic before ready — '{p}'");
+        }
+        bail!("NARF mt-echo: not ready within {timeout_secs}s");
+    }
+    let _ = writeln!(
+        std::io::stdout(),
+        "  [NARF] mt-echo ready ({server_threads} worker thread(s))."
+    );
+    Ok((child, reader))
+}
+
+fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask mt-echo-bench: only x86_64 is wired");
+    }
+    let guest_port = 7000u16;
+    let host_port = 17000u16;
+    let conns: usize = std::env::var("XTASK_MT_ECHO_CONNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let secs: usize = std::env::var("XTASK_MT_ECHO_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let client_threads: usize = std::env::var("XTASK_MT_ECHO_CLIENT_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(conns.min(16));
+    // Server worker-thread sweep, e.g. "1,2,4,8". Each value boots a
+    // fresh kernel with mt_echo_threads=N.
+    let sweep: Vec<usize> = std::env::var("XTASK_MT_ECHO_THREADS")
+        .unwrap_or_else(|_| "4".into())
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    let sweep = if sweep.is_empty() { vec![4] } else { sweep };
+
+    let tap_mode = std::env::var_os("XTASK_QEMU_TAP").is_some();
+    let queues = std::env::var("XTASK_QEMU_QUEUES").unwrap_or_else(|_| "1".into());
+    let accel = std::env::var("XTASK_QEMU_ACCEL").unwrap_or_else(|_| "tcg (default)".into());
+    let backend = if tap_mode { "tap (real NIC)" } else { "SLIRP+hostfwd" };
+
+    println!(
+        "xtask mt-echo-bench: {conns} conns / {client_threads} client thread(s), \
+         {secs}s measured, backend={backend}, queues={queues}, accel={accel}\n\
+         server thread sweep: {sweep:?}\n\
+         NOTE: real multi-queue/RSS scaling needs tap (XTASK_QEMU_TAP=<if>) + \
+         XTASK_QEMU_QUEUES=N; SLIRP is single-queue.\n"
+    );
+
+    let root = workspace_root()?;
+    let loadgen = build_loadgen(&root)?;
+
+    let mut rows: Vec<(usize, LoadgenResult)> = Vec::new();
+    for &threads in &sweep {
+        println!("── NARF mt-echo: {threads} worker thread(s) ──");
+        let (mut child, reader) = boot_narf_mt_echo(args, threads, host_port, guest_port)?;
+        let (lg_host, lg_port) = if tap_mode {
+            ("10.0.2.15".to_string(), guest_port)
+        } else {
+            ("127.0.0.1".to_string(), host_port)
+        };
+        // Brief settle so all N listeners + the accept path are live.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let res = run_loadgen(&loadgen, &lg_host, lg_port, conns, secs, client_threads);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        match res {
+            Ok(r) => {
+                println!(
+                    "  [NARF t={threads}] rps={:.0}  p50={}µs  p99={}µs  p99.9={}µs  \
+                     (reqs={} errs={})",
+                    r.rps, r.p50_us, r.p99_us, r.p999_us, r.requests, r.errors
+                );
+                rows.push((threads, r));
+            }
+            Err(e) => println!("  [NARF t={threads}] loadgen failed: {e:#}"),
+        }
+    }
+
+    println!("\n┌─ mt-echo scaling (NARF, backend={backend}, queues={queues}) ─");
+    println!(
+        "│ {:>8}  {:>12}  {:>8}  {:>8}  {:>8}",
+        "threads", "rps", "p50µs", "p99µs", "p99.9µs"
+    );
+    for (t, r) in &rows {
+        println!(
+            "│ {t:>8}  {:>12.0}  {:>8}  {:>8}  {:>8}",
+            r.rps, r.p50_us, r.p99_us, r.p999_us
+        );
+    }
+    if let (Some((_, first)), Some((_, last))) = (rows.first(), rows.last()) {
+        if first.rps > 0.0 && rows.len() > 1 {
+            println!(
+                "└─ throughput scaled {:.2}× from {} to {} threads",
+                last.rps / first.rps,
+                rows.first().unwrap().0,
+                rows.last().unwrap().0
+            );
+        }
+    }
+    Ok(())
+}
+
 fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
         bail!("xtask redis-bench: only x86_64 is wired");
@@ -5673,6 +6025,7 @@ fn main() -> Result<()> {
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
+        Cmd::MtEchoBench(args) => mt_echo_bench_cmd(&args),
         Cmd::MuslDemo(args) => musl_demo_cmd(&args),
         Cmd::Image(mut args) => {
             // Default-on boot-init for parity with `iso-boot`. An

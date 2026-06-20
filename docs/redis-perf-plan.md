@@ -318,3 +318,55 @@ per-batch queueing or SLIRP's per-connection serialization?**
 
 Cross-ref agent memory: `narf-redis-ping-wake-bound-haltpoll`,
 `narf-sysret-irq-user-stack-df`, `narf-ping-overhead-inventory`.
+
+---
+
+## #125 — Multi-queue / RSS via the `mt-echo` workload
+
+redis is single-threaded → one core, one effective RX queue → it can never
+demonstrate MQ. `mt-echo` is the workload that can: N worker threads, each
+its OWN listener on the same port via `SO_REUSEPORT`, so distinct flows are
+served by distinct workers on distinct cores in parallel.
+
+### Foundation landed (validated)
+- **SO_REUSEPORT flow distribution** (`net/src/tcp/core.rs`). NARF already
+  allowed N listeners per port (mt-echo sets `SO_REUSEADDR` too, and each
+  `listen()` mints its own kernel Listen TCB). The only gap was selection:
+  `add_to_listener_accept_queue` used `.find()` (first match), so every
+  connection piled into listener #0 and workers 1..N starved. Fixed to
+  collect all matching Listen TCBs and steer by a 4-tuple FNV hash
+  (`reuseport_flow_hash`) — `group.len()==1` is a no-op, so redis/netserve
+  are unchanged (net-smoke green). Added the missing `readiness::notify()`
+  on accept-enqueue so the steered worker's epoll wakes promptly.
+- **mt-echo embedded + boot-spawned** behind a new `mt-echo` cargo feature
+  (= `qemu-net`, suppresses redis). Worker count from kernel cmdline
+  `mt_echo_threads=N` (default = CPU count) → sweep with no kernel rebuild.
+  pthread workers get `user_task()` spec → migrate to APs.
+- **NARF cmdline plumbing**: added `-append` from `XTASK_QEMU_APPEND` at the
+  `-kernel` sites (NARF boots multiboot2 with no `-append` before this).
+- **Harness**: `cargo run -p xtask -- mt-echo-bench --arch=x86_64` (builds
+  host `loadgen`, sweeps `XTASK_MT_ECHO_THREADS`, prints rps + p50/p99/p99.9
+  table). Reuses `XTASK_QEMU_TAP`/`_QUEUES`/`_ACCEL`.
+
+### First measurements (debug, KVM, 50 conns / 4s, threads 1→4)
+| backend | queues | scaling | rps (t=1→4) | p99 |
+|---|---|---|---|---|
+| SLIRP | 1 | 1.08× (flat) | ~16k | ~1.3ms |
+| tap0 (multi_queue) | 4 | **1.51×** | 2.6k→4.6k | **~22ms** |
+
+tap shows a real MQ thread-scaling signal (1.51× vs SLIRP's flat 1.08×) but
+absolute throughput is LOWER and there's a uniform **~22ms p99 tail** (p50
+fine ~450µs, 0 errors). The ~22ms ≈ NARF RTO retransmitting packets DROPPED
+under load: all N queue forwarders are BSP-pinned and funnel into one
+global-locked TCP stack → the RX ring / tap queue overflows.
+
+### Next steps (the actual scaling enablers)
+1. **Forwarder CPU placement** — spread per-queue RX forwarders across cores
+   (today all BSP-pinned; `StackfulOptions` has no affinity field).
+2. **Sharded / lock-granular TCP stack** — so N forwarders don't serialize
+   on the global `TCB_TABLE` lock.
+3. High-PPS RX cleanup (#126): `rx_handler` per-frame String clone;
+   `handle_segment` O(N) TCB scan.
+4. Wire the Linux `mt-echo` baseline into the harness.
+
+Cross-ref agent memory: `narf-mt-echo-mq-workload`.

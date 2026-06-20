@@ -1728,6 +1728,12 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     }
     // Look for a parent LISTEN TCB to push this onto.
     add_to_listener_accept_queue(arc);
+    // A connection just became accept-ready — wake any worker parked in
+    // epoll_wait/poll on its listener NOW (mirrors the data-arrival wake
+    // below) instead of waiting for the next wheel deadline or the first
+    // data segment. Global best-effort: each parked listener re-checks
+    // its own accept-queue, so only the steered worker finds POLL_IN.
+    crate::readiness::notify();
     if !payload.is_empty() {
         enqueue_recv(arc, hdr.sequence, payload);
     }
@@ -1736,28 +1742,68 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
     }
 }
 
+/// Hash the connection's remote endpoint (+ local port) to a stable
+/// 32-bit value. Used to steer a completed passive-open to one listener
+/// of a `SO_REUSEPORT` group: the same flow always maps to the same
+/// listener, and distinct flows spread across the group. FNV-1a over the
+/// 4-tuple-ish key. Mirrors Linux `reuseport_select_sock`'s flow hash.
+#[inline]
+fn reuseport_flow_hash(remote_addr: [u8; 4], remote_port: u16, local_port: u16) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in remote_addr {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    for b in remote_port.to_be_bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    for b in local_port.to_be_bytes() {
+        h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
 fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
-    let (local_addr, local_port, id) = {
+    let (local_addr, local_port, remote_addr, remote_port, id) = {
         let t = arc.lock();
-        (t.local_addr, t.local_port, t.id)
+        (t.local_addr, t.local_port, t.remote_addr, t.remote_port, t.id)
     };
     let g = TCB_TABLE.lock();
     let m = match g.as_ref() {
         Some(m) => m,
         None => return,
     };
-    if let Some(listen_arc) = m.values().find(|t| {
-        let l = t.lock();
-        // Match a concrete-addr listener exactly, or an INADDR_ANY
-        // (0.0.0.0) listener against the child's concrete local addr.
-        l.state == TcpState::Listen
-            && (l.local_addr == local_addr || l.local_addr == [0, 0, 0, 0])
-            && l.local_port == local_port
-    }) {
-        let mut l = listen_arc.lock();
-        if l.accept_queue.len() < l.backlog {
-            l.accept_queue.push_back(id);
+    // Collect EVERY LISTEN TCB on this (addr, port). Normally there is
+    // exactly one, but a `SO_REUSEPORT`/`SO_REUSEADDR` server (e.g. a
+    // multithreaded daemon with one listener per worker thread, each its
+    // own kernel TCB) installs several distinct Listen TCBs on the same
+    // port. `BTreeMap::values()` yields in ascending-TCB-id order, so the
+    // group ordering is deterministic for a stable listener set.
+    let group: alloc::vec::Vec<&Arc<IrqSafeSpinLock<Tcb>>> = m
+        .values()
+        .filter(|t| {
+            let l = t.lock();
+            // Match a concrete-addr listener exactly, or an INADDR_ANY
+            // (0.0.0.0) listener against the child's concrete local addr.
+            l.state == TcpState::Listen
+                && (l.local_addr == local_addr || l.local_addr == [0, 0, 0, 0])
+                && l.local_port == local_port
+        })
+        .collect();
+    let listen_arc = match group.len() {
+        0 => return,
+        // Single listener: the common, non-REUSEPORT case — no steering.
+        1 => group[0],
+        // Multiple listeners (REUSEPORT group): steer this flow to one of
+        // them by hashing its remote endpoint, so distinct flows land on
+        // distinct listeners/workers/cores in parallel.
+        n => {
+            let h = reuseport_flow_hash(remote_addr, remote_port, local_port);
+            group[(h as usize) % n]
         }
+    };
+    let mut l = listen_arc.lock();
+    if l.accept_queue.len() < l.backlog {
+        l.accept_queue.push_back(id);
     }
 }
 
