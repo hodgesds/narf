@@ -550,21 +550,39 @@ impl Arch {
                     // `ip addr add 10.0.2.2/24 dev tap0`, `ip link set tap0 up`).
                     // For NARF-over-real-NIC bring-up + perf free of the
                     // single-threaded-SLIRP confound (task #127).
+                    // XTASK_QEMU_QUEUES=N (tap only) requests N virtio-net queue
+                    // pairs (multi-queue / RSS). The tap must be created with
+                    // the multi_queue flag (`ip tuntap add ... multi_queue`);
+                    // the netdev gets `queues=N` and the device `mq=on` plus
+                    // 2N+2 MSI-X vectors (2/pair + control + config).
+                    let queues: usize = std::env::var("XTASK_QEMU_QUEUES")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|&n| n > 1)
+                        .unwrap_or(1);
                     let n0 = match std::env::var("XTASK_QEMU_TAP") {
                         Ok(tap) if !tap.is_empty() => {
-                            format!("tap,id=n0,ifname={tap},script=no,downscript=no")
+                            let q = if queues > 1 {
+                                format!(",queues={queues}")
+                            } else {
+                                String::new()
+                            };
+                            format!("tap,id=n0,ifname={tap},script=no,downscript=no{q}")
                         }
                         _ => match std::env::var("XTASK_QEMU_HOSTFWD") {
                             Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
                             _ => "user,id=n0".into(),
                         },
                     };
-                    args.extend_from_slice(&[
-                        "-netdev".into(),
-                        n0,
-                        "-device".into(),
-                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    let dev = if queues > 1 {
+                        format!(
+                            "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mq=on,vectors={}",
+                            2 * queues + 2
+                        )
+                    } else {
+                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into()
+                    };
+                    args.extend_from_slice(&["-netdev".into(), n0, "-device".into(), dev]);
                     // Optional wire capture for debugging: `XTASK_QEMU_NETDUMP=<path>`
                     // pcaps every frame on netdev n0 (the hostfwd NIC).
                     if let Ok(path) = std::env::var("XTASK_QEMU_NETDUMP") {
@@ -678,21 +696,39 @@ impl Arch {
                     // `ip addr add 10.0.2.2/24 dev tap0`, `ip link set tap0 up`).
                     // For NARF-over-real-NIC bring-up + perf free of the
                     // single-threaded-SLIRP confound (task #127).
+                    // XTASK_QEMU_QUEUES=N (tap only) requests N virtio-net queue
+                    // pairs (multi-queue / RSS). The tap must be created with
+                    // the multi_queue flag (`ip tuntap add ... multi_queue`);
+                    // the netdev gets `queues=N` and the device `mq=on` plus
+                    // 2N+2 MSI-X vectors (2/pair + control + config).
+                    let queues: usize = std::env::var("XTASK_QEMU_QUEUES")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|&n| n > 1)
+                        .unwrap_or(1);
                     let n0 = match std::env::var("XTASK_QEMU_TAP") {
                         Ok(tap) if !tap.is_empty() => {
-                            format!("tap,id=n0,ifname={tap},script=no,downscript=no")
+                            let q = if queues > 1 {
+                                format!(",queues={queues}")
+                            } else {
+                                String::new()
+                            };
+                            format!("tap,id=n0,ifname={tap},script=no,downscript=no{q}")
                         }
                         _ => match std::env::var("XTASK_QEMU_HOSTFWD") {
                             Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
                             _ => "user,id=n0".into(),
                         },
                     };
-                    args.extend_from_slice(&[
-                        "-netdev".into(),
-                        n0,
-                        "-device".into(),
-                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    let dev = if queues > 1 {
+                        format!(
+                            "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mq=on,vectors={}",
+                            2 * queues + 2
+                        )
+                    } else {
+                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into()
+                    };
+                    args.extend_from_slice(&["-netdev".into(), n0, "-device".into(), dev]);
                     // Optional wire capture for debugging: `XTASK_QEMU_NETDUMP=<path>`
                     // pcaps every frame on netdev n0 (the hostfwd NIC).
                     if let Ok(path) = std::env::var("XTASK_QEMU_NETDUMP") {

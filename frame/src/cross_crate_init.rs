@@ -124,7 +124,8 @@ fn install_net_stack() {
         narf_net::iface::set_iface_ipv4("vnet0", [10, 0, 2, 15], [10, 0, 2, 2]);
         let _ = writeln!(
             console::Writer,
-            "  net: qemu-net static config — vnet0 = 10.0.2.15/24 gw 10.0.2.2"
+            "  net: qemu-net static config — vnet0 = 10.0.2.15/24 gw 10.0.2.2 ({} virtio-net queue pair(s))",
+            narf_drivers_virtio::net_pci::primary_num_pairs()
         );
     }
     // Stackful: the e1000 RX pump's inner `while rx_pump_step()`

@@ -1577,6 +1577,12 @@ pub fn count() -> usize {
     CONTROLLERS.lock().len()
 }
 
+/// Active virtio-net queue-pair count on the primary device (1 unless
+/// VIRTIO_NET_F_MQ was negotiated and `VQ_PAIRS_SET` accepted N>1).
+pub fn primary_num_pairs() -> usize {
+    CONTROLLERS.lock().first().map(|c| c.num_pairs()).unwrap_or(0)
+}
+
 /// Run `f` against the first bound controller, if any. Use the
 /// `with_each` iterator instead when behaviour should fan out over
 /// every device.
