@@ -632,6 +632,24 @@ fn target_cpu(spec: &TaskSpec) -> usize {
 /// processors (see [`user_ap_affinity`]).
 static NEXT_USER_AP: AtomicU32 = AtomicU32::new(0);
 
+/// Count of low CPUs (0..N) reserved for kernel RX-forwarder tasks, so
+/// `user_ap_affinity` steers user tasks (the server workers) to the
+/// REMAINING cores. Set by the virtio-net driver when it places one
+/// per-queue RX forwarder per core under multi-queue. 0 = no
+/// reservation (default; single-queue / nosmp), which keeps the prior
+/// "workers on any AP" behaviour. Partitioning forwarders and workers
+/// onto disjoint cores keeps multi-queue RX dispatch from contending the
+/// workers; it's throughput-neutral until the binding bottleneck (the
+/// workers don't yet scale — see `docs/redis-perf-plan.md`) is lifted,
+/// but is the correct MQ core layout, so it's kept.
+static RX_FORWARDER_CORES: AtomicU32 = AtomicU32::new(0);
+
+/// Reserve CPUs `0..n` for RX forwarders (see [`RX_FORWARDER_CORES`]).
+/// Idempotent; the driver calls this once it knows the queue count.
+pub fn reserve_rx_forwarder_cores(n: u32) {
+    RX_FORWARDER_CORES.store(n, Ordering::Relaxed);
+}
+
 /// Affinity for a user task when user-task SMP is live: **`preferred`
 /// biased to a round-robin online application processor, `allowed`
 /// left wide open** (every CPU). A soft initial-placement hint, not a
@@ -670,12 +688,25 @@ fn user_ap_affinity() -> Affinity {
     // forwarder(BSP)↔app(AP) pipeline for a hot server (it spawns on an
     // AP, is woken there, and re-enqueues there) without the starvation.
     let cap = narf_lib::percpu::MAX_CPUS.min(64) as u32;
+    // Skip CPUs reserved for RX forwarders so workers land on disjoint
+    // cores (start at least at 1 — the BSP is never a worker target).
+    let base = RX_FORWARDER_CORES.load(Ordering::Relaxed).max(1);
     let mut aps = [0u32; 64];
     let mut n = 0usize;
-    for cpu in 1..cap {
+    for cpu in base..cap {
         if narf_lib::smp::is_online(cpu) {
             aps[n] = cpu;
             n += 1;
+        }
+    }
+    // If the reservation left no worker cores (too few vCPUs), fall back
+    // to every AP so workers are never starved of a runnable CPU.
+    if n == 0 {
+        for cpu in 1..cap {
+            if narf_lib::smp::is_online(cpu) {
+                aps[n] = cpu;
+                n += 1;
+            }
         }
     }
     if n == 0 {
@@ -793,6 +824,25 @@ where
     let mut adapter = stackful::StackfulAdapter::with_options(f, opts);
     adapter.apply_options();
     spawn(adapter)
+}
+
+/// Spawn a stackful task HARD-pinned to `cpu` (otherwise default
+/// preemption options). Used by the virtio-net per-queue RX forwarders
+/// to spread RX dispatch across cores instead of funneling every queue
+/// through the boot CPU. The task MUST be SMP-safe — touch only
+/// `IrqSafeSpinLock`-guarded state — since it runs off the BSP (see
+/// `TaskSpec::unthrottled`'s note on why spawn-and-forget tasks are
+/// BSP-pinned by default). `cpu == 0` pins to the BSP, i.e. identical to
+/// `spawn_stackful`.
+pub fn spawn_stackful_pinned<F>(f: F, cpu: u32) -> TaskId
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let spec = TaskSpec {
+        affinity: Affinity::pinned(crate::affinity::CpuId(cpu)),
+        ..TaskSpec::unthrottled()
+    };
+    spawn_with_spec(stackful::StackfulAdapter::new(f), spec)
 }
 
 /// Shorthand: spawn a task with a budget cap + the default everywhere-

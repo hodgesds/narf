@@ -1322,6 +1322,22 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // Keep fast-polling for ~5 ms after the last NIC-wide RX activity.
     let active_window_cycles = (narf_time::cycles_per_ns().max(1) as u64) * 5_000_000;
 
+    // Core-partitioned RX placement. Under multi-queue with enough cores,
+    // give each per-queue forwarder its OWN low CPU (pair K → CPU K, pair
+    // 0 on the BSP where its MSI-X lands) and reserve those cores so the
+    // scheduler steers user-task workers to the REMAINING cores
+    // (`reserve_rx_forwarder_cores`). This spreads RX dispatch across
+    // cores WITHOUT the forwarders contending the AP-biased workers — the
+    // failure mode of naive AP-pinning. The per-segment TCB lookup is off
+    // the global lock (sharded CONN_INDEX), so the forwarders run truly
+    // concurrently. Falls back to all-on-BSP (the prior behaviour) for
+    // single-queue / nosmp / too-few-vCPUs, where partitioning can't help.
+    let online = narf_lib::smp::online_count() as usize;
+    let partition = num_pairs >= 2 && online > num_pairs;
+    if partition {
+        narf_scheduler::reserve_rx_forwarder_cores(num_pairs as u32);
+    }
+
     // Spawn one RX forwarder per active pair.
     for pair_idx in 0..num_pairs {
         let rx_prod = Arc::clone(&rx_prod);
@@ -1330,8 +1346,10 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
         // function-level comment for why we don't allocate per-queue
         // MSI-X vectors yet.
         let irq = if pair_idx == 0 { irq_vector } else { None };
+        // Forwarder's home core (see the partition comment above).
+        let target_cpu = if partition { pair_idx as u32 } else { 0 };
         // Stackful: virtio-net RX pump.
-        narf_scheduler::spawn_stackful(async move {
+        narf_scheduler::spawn_stackful_pinned(async move {
             const PUMP_CYCLES: u64 = 53_000_000;
             // Adaptive (NAPI-style) poll cadence. virtio-net MSI-X RX
             // completions don't always wake us promptly under SLIRP/TCG
@@ -1489,7 +1507,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     }
                 }
             }
-        });
+        }, target_cpu);
     }
 
     // Single TX forwarder per device. Drains the tx_consumer once
