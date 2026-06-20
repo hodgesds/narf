@@ -59,13 +59,10 @@ unsafe fn copy_in(uptr: usize, len: usize) -> Result<Vec<u8>, FsError> {
         return Err(FsError::InvalidData);
     }
     let mut out = vec![0u8; len];
-    // SAFETY: pointer is opaque to this layer — the SMAP bracket
-    // belongs in the syscall layer that called us. On test paths the
-    // pointer is kernel-owned and the unsafe read is a plain memcpy.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
+    // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
+    // SMAP-brackets the read so a real user pointer doesn't #PF under SMAP.
     unsafe {
-        let src = uptr as *const u8;
-        core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), len);
+        user_memcpy(out.as_mut_ptr(), uptr as *const u8, len);
     }
     Ok(out)
 }
@@ -75,12 +72,37 @@ unsafe fn copy_out(uptr: usize, bytes: &[u8]) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
-    // SAFETY: pointer is opaque to this layer — caller invariants.
+    // SAFETY: `uptr` is the user (or test-kernel) ioctl arg; `user_memcpy`
+    // SMAP-brackets the write.
     unsafe {
-        let dst = uptr as *mut u8;
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        user_memcpy(uptr as *mut u8, bytes.as_ptr(), bytes.len());
     }
     Ok(())
+}
+
+/// `copy_nonoverlapping` bracketed by a SMAP user-access window so the
+/// kernel may touch user memory through the raw ioctl pointer. The DRM
+/// ioctl path reaches here from `sys_ioctl`, which passes the user `arg`
+/// straight through without clearing SMAP. Harmless on kernel pointers
+/// (the test smokes): `stac` only relaxes the U/S check, it never breaks
+/// a supervisor access.
+///
+/// # Safety
+/// `dst`/`src` must be valid for `len` bytes; one side may be user memory.
+#[cfg(target_arch = "x86_64")]
+unsafe fn user_memcpy(dst: *mut u8, src: *const u8, len: usize) {
+    // SAFETY: caller guarantees the ranges; with_user_access toggles AC.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(src, dst, len);
+        });
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn user_memcpy(dst: *mut u8, src: *const u8, len: usize) {
+    // SAFETY: caller guarantees the ranges.
+    unsafe { core::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
 // ── Error translation ────────────────────────────────────────────────
@@ -742,13 +764,28 @@ fn handle_generic(
     } else {
         Vec::new()
     };
-    let mut card = mode_state.lock();
-    let result = dispatch(&mut card, nr, &in_bytes, ctx).map_err(map_err)?;
-    // GEM_CLOSE / RMFB / SyncObj have no meaningful out-payload — return 0.
-    // GETCAP, ADDFB2 results would need per-cmd serialisation back to
-    // the user buffer; left to a follow-on pass once Mesa exercises
-    // those code paths.
-    let _ = result;
+    let result = {
+        let mut card = mode_state.lock();
+        dispatch(&mut card, nr, &in_bytes, ctx).map_err(map_err)?
+    };
+    // Serialise the out-payload back to the user buffer for the ioctls
+    // that carry one. GEM_CLOSE / RMFB / SyncObj have none → return 0.
+    match result {
+        // drm_get_cap = { __u64 capability; __u64 value; } — write `value`.
+        crate::drm::ioctl::DrmIoctlResult::GetCap(cap) if arg != 0 => {
+            let mut out = [0u8; 16];
+            out[0..8].copy_from_slice(&cap.capability.to_le_bytes());
+            out[8..16].copy_from_slice(&cap.value.to_le_bytes());
+            // SAFETY: `arg` is the validated user drm_get_cap pointer (16 bytes).
+            unsafe { copy_out(arg, &out)? };
+        }
+        // fb_id is the first __u32 of struct drm_mode_fb_cmd2.
+        crate::drm::ioctl::DrmIoctlResult::AddFb2(fb_id) if arg != 0 => {
+            // SAFETY: `arg` is the validated user drm_mode_fb_cmd2 pointer.
+            unsafe { copy_out(arg, &fb_id.to_le_bytes())? };
+        }
+        _ => {}
+    }
     Ok(0)
 }
 

@@ -246,11 +246,14 @@ pub fn register_initcalls() {
         backlight::init_backlight_initcall();
         InitResult::Ok
     });
-    // bochs DRM card registration: runs at Device stage (after Subsys
-    // where bochs probe runs). Registers a BochsCard with the DRM
-    // registry so /sys/class/drm/card<N>/ and /dev/dri/card<N> appear.
+    // bochs DRM card registration. Must run at Late stage: the bochs
+    // PCI device isn't probed until the post-Device probe phase, so
+    // `is_probed()` is still false at Device stage (the card would
+    // silently never register and /dev/dri/card0 would be absent).
+    // Registers a BochsCard with the DRM registry so
+    // /sys/class/drm/card<N>/ and /dev/dri/card<N> appear.
     // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
-    narf_init::register(Stage::Device, "bochs-drm-card", || {
+    narf_init::register(Stage::Late, "bochs-drm-card", || {
         if narf_graphics_driver::bochs::is_probed() {
             use drm::card::{Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType};
             let count = drm_registry::count() as u32;
