@@ -420,14 +420,29 @@ can't pull more than the BSP forwarder feeds. NARF p99 also runs ~1.8×
 Linux's. This is the real residual: **off-load RX dispatch from the single
 BSP core.**
 
-### Open levers (to lift NARF past its ~72k single-cored-RX ceiling)
-1. **Spread RX forwarders across cores — done right.** The naive version
-   (pin forwarders to APs) lost because forwarders then contended the
-   AP-biased workers; partition cores (forwarders on a dedicated set,
-   workers on the rest) instead. This is THE lever — NARF is flat across
-   threads precisely because RX is single-cored.
-2. Shard the **by-id** `TCB_TABLE` (workers' `lookup_tcb` on every
-   send/recv still take one global lock).
-3. NARF's ~1.8× p99 tail vs Linux.
+### RX-core-spread is NOT the lever — FALSIFIED (placement tried twice)
+Two forwarder-placement strategies were implemented + measured + reverted:
+(1) pin forwarders to APs → 74k→69k (forwarders contended the AP-biased
+workers); (2) **core-partitioned** (reserve CPUs `0..Q` for forwarders via
+`reserve_rx_forwarder_cores`, steer workers to `Q..N`, forwarder pair K→CPU
+K) → SMP=8/q=4 t=2 71k, t=4 67k — flat-to-worse. **Putting RX dispatch on 4
+dedicated cores does not move ~72k**, so RX core-count isn't the limit.
+
+### Refined diagnosis: the WORKERS don't scale
+t=1 (one worker, no wake-herd) ≈ t=4 ≈ 72k — 4 workers behave like 1. So
+something serializes the workers, independent of RX cores *and* worker
+count. Candidates, not yet discriminated:
+1. **Single-queue RX in practice** — if the host tap delivers all flows to
+   virtio RX queue 0 (`tun_select_queue` not spreading), only forwarder 0
+   is active and feeds every worker at one core's rate. Then MQ is a no-op
+   on RX and placement *can't* help. **Check first** with per-pair RX
+   frame counters in `net_pci`.
+2. **Global epoll wake herd** — `wake_io_waiters` wakes EVERY parked epoll
+   task on EVERY readiness event (no per-fd wait queue, unlike Linux);
+   O(events×waiters) through one lock.
+3. **by-id `TCB_TABLE` lock** — workers' `lookup_tcb` per send/recv.
+
+Next: instrument per-pair RX to settle (1) before any more placement/lock
+work. Also NARF's ~1.8× p99 tail vs Linux.
 
 Cross-ref agent memory: `narf-mt-echo-mq-workload`.
