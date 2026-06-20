@@ -2582,7 +2582,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallTable,
+        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
+        SyscallTable,
         TrapContext,
     };
 
@@ -2613,8 +2614,8 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     }
 
     struct UnwindHandler;
-    impl RawSyscallHandler for UnwindHandler {
-        fn invoke(&self, ctx: &mut dyn TrapContext) {
+    impl SyscallHandler for UnwindHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
             // Any RSP is OK — the trampoline overwrites RSP before
             // any stack use.
@@ -2765,7 +2766,8 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallTable,
+        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
+        SyscallTable,
         TrapContext,
     };
 
@@ -2814,8 +2816,8 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     // with a pointer to SAVED_USER, which iretq's back to user at
     // the saved RIP.
     struct YieldHandler;
-    impl RawSyscallHandler for YieldHandler {
-        fn invoke(&self, ctx: &mut dyn TrapContext) {
+    impl SyscallHandler for YieldHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
             // SAFETY: SAVED_USER is a sized slot for this trap path.
             unsafe {
                 ctx.save_user_state(core::ptr::addr_of_mut!(SAVED_USER) as *mut u8);
@@ -2835,8 +2837,8 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     // Sleep handler: captures the second magic, longjmps back to
     // the test's setjmp.
     struct UnwindHandler;
-    impl RawSyscallHandler for UnwindHandler {
-        fn invoke(&self, ctx: &mut dyn TrapContext) {
+    impl SyscallHandler for UnwindHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_MAGIC.store(ctx.args().arg0, Ordering::Release);
             let _ =
                 ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
@@ -3380,7 +3382,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     use core::arch::naked_asm;
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
-        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallTable,
+        install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
+        SyscallTable,
         TrapContext,
     };
 
@@ -3435,8 +3438,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     // intact (no `swapgs`-like demote on the FS hidden base), so we
     // don't need to re-program it on the resume.
     struct CaptureTpHandler;
-    impl RawSyscallHandler for CaptureTpHandler {
-        fn invoke(&self, ctx: &mut dyn TrapContext) {
+    impl SyscallHandler for CaptureTpHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_TP.store(ctx.args().arg0, Ordering::Release);
             // SAFETY: SAVED_USER is a sized slot for this trap path.
             unsafe {
@@ -3454,8 +3457,8 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     // Sleep handler: capture rdi as the file-image read, longjmp
     // back to the test's setjmp.
     struct CaptureFileHandler;
-    impl RawSyscallHandler for CaptureFileHandler {
-        fn invoke(&self, ctx: &mut dyn TrapContext) {
+    impl SyscallHandler for CaptureFileHandler {
+        fn handle(&self, ctx: &mut dyn TrapContext) {
             SEEN_FILEIMAGE.store(ctx.args().arg0, Ordering::Release);
             let _ =
                 ctx.redirect_to_kernel(resume_trampoline as usize as u64, 0xFFFF_FFFF_FFFF_FFF0);
@@ -5244,7 +5247,7 @@ fn smoke_firmware_install_syscall_round_trip() -> TestResult {
         },
         ret: None,
     };
-    table.dispatch_ctx(Syscall::FirmwareInstall, &mut ctx);
+    table.dispatch(Syscall::FirmwareInstall, &mut ctx);
 
     let r = match ctx.ret {
         Some(r) => r,
