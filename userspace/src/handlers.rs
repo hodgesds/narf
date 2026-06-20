@@ -91,12 +91,33 @@ pub fn drop_signal_waker(task_id: u64) {
 // only re-checks at its next wheel deadline — redis's ~100 ms
 // serverCron tick — turning a sub-ms round-trip into ~80 ms.
 
-static IO_WAKERS: narf_lib::sync::IrqSafeSpinLock<
+/// Number of wake-path shards (power of two). `IO_WAKERS` is touched on the
+/// RX forwarder per inbound segment (targeted wake of the owning task) AND
+/// by every worker that parks/unparks in epoll — a single global lock there
+/// serialized the forwarder against all workers. `TCB_OWNER` likewise. Both
+/// are keyed by id (task id / tcb id), so sharding decouples the forwarder's
+/// per-segment touch (the owner's shard) from unrelated workers' park shards.
+const WAKE_SHARDS: usize = 32;
+
+#[inline]
+fn io_waker_shard(task_id: u64) -> usize {
+    (task_id as usize) & (WAKE_SHARDS - 1)
+}
+
+#[inline]
+fn tcb_owner_shard(tcb_id: u32) -> usize {
+    (tcb_id as usize) & (WAKE_SHARDS - 1)
+}
+
+#[allow(clippy::type_complexity)]
+static IO_WAKERS: [narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+>; WAKE_SHARDS] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
 
 pub fn io_waker_init() {
-    *IO_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
+    for shard in IO_WAKERS.iter() {
+        *shard.lock() = Some(alloc::collections::BTreeMap::new());
+    }
 }
 
 // ── Targeted-wake ownership: TCB id → owning task ───────────────────
@@ -111,34 +132,35 @@ pub fn io_waker_init() {
 // key falls back to wake-all; the lost-wakeup gen guard
 // (`epoll_park_gen`) covers the check→park race, so targeting can't
 // strand a parked task.
-static TCB_OWNER: narf_lib::sync::IrqSafeSpinLock<
+#[allow(clippy::type_complexity)]
+static TCB_OWNER: [narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u32, u64>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+>; WAKE_SHARDS] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
 
 /// Record that `task_id` owns the socket backed by kernel `tcb_id`.
 pub fn set_tcb_owner(tcb_id: u32, task_id: u64) {
-    let mut g = TCB_OWNER.lock();
+    let mut g = TCB_OWNER[tcb_owner_shard(tcb_id)].lock();
     g.get_or_insert_with(alloc::collections::BTreeMap::new)
         .insert(tcb_id, task_id);
 }
 
 /// Drop the ownership record for `tcb_id` (socket closed / TCB gone).
 pub fn clear_tcb_owner(tcb_id: u32) {
-    let mut g = TCB_OWNER.lock();
+    let mut g = TCB_OWNER[tcb_owner_shard(tcb_id)].lock();
     if let Some(m) = g.as_mut() {
         m.remove(&tcb_id);
     }
 }
 
 fn tcb_owner(tcb_id: u32) -> Option<u64> {
-    let g = TCB_OWNER.lock();
+    let g = TCB_OWNER[tcb_owner_shard(tcb_id)].lock();
     g.as_ref().and_then(|m| m.get(&tcb_id).copied())
 }
 
 /// Register `task_id`'s waker as parked on net I/O readiness. Called
 /// from the user-task poll routine while a task blocks in epoll/poll.
 pub fn register_io_waiter(task_id: u64, waker: core::task::Waker) {
-    let mut g = IO_WAKERS.lock();
+    let mut g = IO_WAKERS[io_waker_shard(task_id)].lock();
     if let Some(m) = g.as_mut() {
         m.insert(task_id, waker);
     }
@@ -147,7 +169,7 @@ pub fn register_io_waiter(task_id: u64, waker: core::task::Waker) {
 /// Remove `task_id`'s I/O waker without firing it (the task woke for
 /// another reason / is returning from the syscall).
 pub fn drop_io_waiter(task_id: u64) {
-    let mut g = IO_WAKERS.lock();
+    let mut g = IO_WAKERS[io_waker_shard(task_id)].lock();
     if let Some(m) = g.as_mut() {
         m.remove(&task_id);
     }
@@ -181,9 +203,10 @@ fn wake_one(task_id: u64, w: core::task::Waker) {
 pub fn wake_io_waiters(key: u64) {
     if key != 0 {
         if let Some(owner) = tcb_owner(key as u32) {
-            // Owner known: targeted wake iff it's parked.
+            // Owner known: targeted wake iff it's parked. Its waker lives in
+            // the owner's shard (keyed by task id).
             let waker = {
-                let mut g = IO_WAKERS.lock();
+                let mut g = IO_WAKERS[io_waker_shard(owner)].lock();
                 g.as_mut().and_then(|m| m.remove(&owner))
             };
             if let Some(w) = waker {
@@ -199,15 +222,15 @@ pub fn wake_io_waiters(key: u64) {
 /// Wake every task parked on net I/O readiness (the conservative
 /// fallback for untracked keys — loopback / unix / not-yet-owned).
 fn wake_all_io_waiters() {
-    // Snapshot + clear the table under the lock, then wake outside it
-    // (wake() may re-enter scheduling / drop an Arc).
-    let wakers: alloc::vec::Vec<(u64, core::task::Waker)> = {
-        let mut g = IO_WAKERS.lock();
-        match g.as_mut() {
-            Some(m) => core::mem::take(m).into_iter().collect(),
-            None => return,
+    // Snapshot + clear EVERY shard under its own lock, then wake outside the
+    // locks (wake() may re-enter scheduling / drop an Arc).
+    let mut wakers: alloc::vec::Vec<(u64, core::task::Waker)> = alloc::vec::Vec::new();
+    for shard in IO_WAKERS.iter() {
+        let mut g = shard.lock();
+        if let Some(m) = g.as_mut() {
+            wakers.extend(core::mem::take(m));
         }
-    };
+    }
     for (task_id, w) in wakers {
         wake_one(task_id, w);
     }

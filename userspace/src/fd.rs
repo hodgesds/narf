@@ -180,24 +180,41 @@ impl FdTable {
     }
 }
 
-// ── Global per-task table ──────────────────────────────────────────
+// ── Sharded per-task table ─────────────────────────────────────────
 
 /// `TaskId.raw()` keys.
 type Tables = BTreeMap<u64, FdTable>;
 
-static TABLES: IrqSafeSpinLock<Option<Tables>> = IrqSafeSpinLock::new(None);
+/// Number of fd-table shards (power of two). The fd table is consulted on
+/// EVERY fd syscall (read/write/epoll resolve fd→FileOps via `with_table`),
+/// keyed by task id. A single global lock there serialized all tasks — under
+/// an 8-worker server every read/write/poll contended one lock (a hot
+/// contributor to the 8-thread mt-echo lock-spin wedge). Sharding by task id
+/// means distinct tasks almost never share a shard lock. Same idea as the
+/// TCP `TCB_TABLE` / `CONN_INDEX` shards.
+const TABLE_SHARDS: usize = 32;
+
+#[inline]
+fn table_shard(task_id: u64) -> usize {
+    (task_id as usize) & (TABLE_SHARDS - 1)
+}
+
+static TABLES: [IrqSafeSpinLock<Option<Tables>>; TABLE_SHARDS] =
+    [const { IrqSafeSpinLock::new(None) }; TABLE_SHARDS];
 
 /// Initialise the per-task fd table store. Called once at boot
 /// before any task can install fds.
 pub fn init() {
-    *TABLES.lock() = Some(BTreeMap::new());
+    for shard in TABLES.iter() {
+        *shard.lock() = Some(BTreeMap::new());
+    }
 }
 
 /// Look up + run `op` against the table for `task_id`. Creates a
 /// fresh table — pre-populated with stdio at fds 0/1/2 — on first
 /// reference. Returns the closure's value.
 pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
-    let mut g = TABLES.lock();
+    let mut g = TABLES[table_shard(task_id)].lock();
     let map = g.as_mut()?;
     let table = map.entry(task_id).or_insert_with(|| {
         let mut t = FdTable::new();
@@ -616,26 +633,34 @@ impl FileOps for ConsoleFile {
 ///
 /// Returns the number of fds copied.
 pub fn fork(parent: u64, child: u64) -> usize {
-    let mut g = TABLES.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => return 0,
+    // Parent and child may live in different shards, so snapshot the
+    // parent's slots under its shard lock, DROP it, then insert into the
+    // child's shard. (fork is not on the hot path, so two acquisitions are
+    // fine; never hold two shard locks at once → no lock-ordering hazard.)
+    let parent_slots: Vec<Option<FdEntry>> = {
+        let g = TABLES[table_shard(parent)].lock();
+        match g.as_ref() {
+            Some(m) => m.get(&parent).map(|t| t.slots.clone()).unwrap_or_default(),
+            None => return 0,
+        }
     };
-    let parent_slots: Vec<Option<FdEntry>> = map
-        .get(&parent)
-        .map(|t| t.slots.clone())
-        .unwrap_or_default();
     let copied = parent_slots.iter().filter(|s| s.is_some()).count();
     let mut child_table = FdTable::new();
     child_table.slots = parent_slots;
-    map.insert(child, child_table);
-    copied
+    let mut g = TABLES[table_shard(child)].lock();
+    match g.as_mut() {
+        Some(m) => {
+            m.insert(child, child_table);
+            copied
+        }
+        None => 0,
+    }
 }
 
 /// Drop the entire fd table for `task_id`. Call on task exit so
 /// the FileOps `Arc`s can release.
 pub fn detach(task_id: u64) {
-    if let Some(map) = TABLES.lock().as_mut() {
+    if let Some(map) = TABLES[table_shard(task_id)].lock().as_mut() {
         map.remove(&task_id);
     }
     // Drop any advisory POSIX locks the task held so its peers can
@@ -648,12 +673,17 @@ pub fn detach(task_id: u64) {
 /// kernel_test cases share state cleanly.
 #[doc(hidden)]
 pub fn __test_reset() {
-    *TABLES.lock() = Some(BTreeMap::new());
+    for shard in TABLES.iter() {
+        *shard.lock() = Some(BTreeMap::new());
+    }
 }
 
 /// Number of tasks with at least one fd installed. Diagnostic.
 pub fn live_task_count() -> usize {
-    TABLES.lock().as_ref().map(|m| m.len()).unwrap_or(0)
+    TABLES
+        .iter()
+        .map(|s| s.lock().as_ref().map(|m| m.len()).unwrap_or(0))
+        .sum()
 }
 
 // ── Advisory POSIX file locks (Wave-68, linux-compat) ──────────────

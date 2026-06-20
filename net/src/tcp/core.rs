@@ -220,6 +220,25 @@ pub struct Tcb {
     pub drop_cause: Option<DropCause>,
     /// Last error from a setsockopt / get path.
     pub last_error: i32,
+
+    /// Memoized egress interface (NIC source MAC + frame-emit fn) for this
+    /// connection. The egress is a pure function of the immutable
+    /// `remote_addr` (route → iface), so we resolve `iface::for_dst` ONCE on
+    /// the first `send_data` and cache it here. Without this, every TX
+    /// segment took the global `ROUTE_TABLE` + `IFACES` locks (a per-segment
+    /// hot-path serialization across all workers + the RX forwarder's ACKs).
+    /// `None` until first resolved (and for LISTEN TCBs, which never send).
+    pub egress: Option<CachedEgress>,
+}
+
+/// Cached per-connection egress: the chosen NIC's source MAC and its
+/// frame-emit function. Both are immutable for the life of the connection
+/// (the route to a fixed peer doesn't change), so they're resolved once and
+/// reused — keeping `ROUTE_TABLE`/`IFACES` off the per-segment TX path.
+#[derive(Copy, Clone, Debug)]
+pub struct CachedEgress {
+    pub mac: [u8; 6],
+    pub send: iface::SendFn,
 }
 
 impl core::fmt::Debug for Tcb {
@@ -299,6 +318,7 @@ impl Tcb {
             backlog: 0,
             drop_cause: None,
             last_error: 0,
+            egress: None,
         }
     }
 
@@ -339,8 +359,26 @@ impl Tcb {
 
 // ── TCB table ───────────────────────────────────────────────────────
 
-static TCB_TABLE: IrqSafeSpinLock<Option<BTreeMap<u32, Arc<IrqSafeSpinLock<Tcb>>>>> =
-    IrqSafeSpinLock::new(None);
+/// Number of by-id TCB-table shards (power of two). The by-id table is the
+/// authoritative registry (lifecycle, timer sweep, /proc, and the syscall
+/// `send`/`recv`/`readable` handle-resolution path). Under an 8-worker
+/// server each worker resolves its own connections' ids via `lookup_tcb`
+/// on EVERY read/write/poll — a single global lock there serialized all
+/// workers (the 8-thread mt-echo wedge: a CPU spinning in
+/// `run_lock_spin_hook`). Sharding by id (ids are sequential, so `id & MASK`
+/// round-robins them) means distinct connections almost never share a shard
+/// lock. Mirrors the already-sharded `CONN_INDEX`.
+const TCB_SHARDS: usize = 32;
+
+#[allow(clippy::type_complexity)]
+static TCB_TABLE: [IrqSafeSpinLock<Option<BTreeMap<u32, Arc<IrqSafeSpinLock<Tcb>>>>>; TCB_SHARDS] =
+    [const { IrqSafeSpinLock::new(None) }; TCB_SHARDS];
+
+#[inline]
+fn tcb_shard(id: u32) -> usize {
+    (id as usize) & (TCB_SHARDS - 1)
+}
+
 static NEXT_TCB_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_LOCAL_PORT: AtomicU32 = AtomicU32::new(49152);
 
@@ -486,7 +524,7 @@ fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
     let listen_k = is_listen.then_some((tcb.local_addr, tcb.local_port));
     let arc = Arc::new(IrqSafeSpinLock::new(tcb));
     {
-        let mut g = TCB_TABLE.lock();
+        let mut g = TCB_TABLE[tcb_shard(id)].lock();
         let m = g.get_or_insert_with(BTreeMap::new);
         m.insert(id, arc.clone());
     }
@@ -510,7 +548,7 @@ fn fresh_local_port() -> u16 {
 
 /// Look up a TCB by id.
 pub fn lookup_tcb(id: u32) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
-    let g = TCB_TABLE.lock();
+    let g = TCB_TABLE[tcb_shard(id)].lock();
     g.as_ref().and_then(|m| m.get(&id).cloned())
 }
 
@@ -536,7 +574,7 @@ pub fn remove_tcb(id: u32) {
             conn_index_remove(conn_key(ra, rp, la, lp));
         }
     }
-    let mut g = TCB_TABLE.lock();
+    let mut g = TCB_TABLE[tcb_shard(id)].lock();
     if let Some(m) = g.as_mut() {
         m.remove(&id);
     }
@@ -545,8 +583,8 @@ pub fn remove_tcb(id: u32) {
 /// Test-only: drop every TCB.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    {
-        let mut g = TCB_TABLE.lock();
+    for shard in TCB_TABLE.iter() {
+        let mut g = shard.lock();
         if let Some(m) = g.as_mut() {
             m.clear();
         }
@@ -587,26 +625,28 @@ pub struct TcbSnapshot {
 /// Snapshot every TCB in the table. Cheap: a few cycles per entry
 /// to copy 16 bytes plus the state byte.
 pub fn snapshot() -> alloc::vec::Vec<TcbSnapshot> {
-    let g = TCB_TABLE.lock();
-    let m = match g.as_ref() {
-        Some(m) => m,
-        None => return alloc::vec::Vec::new(),
-    };
-    let mut out = alloc::vec::Vec::with_capacity(m.len());
-    for arc in m.values() {
-        let t = arc.lock();
-        out.push(TcbSnapshot {
-            local_addr: t.local_addr,
-            local_port: t.local_port,
-            remote_addr: t.remote_addr,
-            remote_port: t.remote_port,
-            state_code: tcp_state_code(t.state),
-            tx_queue: t.send_buf.len() as u32,
-            // RecvBuf exposes free_window; rx_queue is the in-order
-            // bytes waiting for the user, i.e. limit - free_window.
-            rx_queue: (t.recv_buf.limit as u32).saturating_sub(t.recv_buf.free_window()),
-            retrnsmt: t.rto_count,
-        });
+    let mut out = alloc::vec::Vec::new();
+    for shard in TCB_TABLE.iter() {
+        let g = shard.lock();
+        let m = match g.as_ref() {
+            Some(m) => m,
+            None => continue,
+        };
+        for arc in m.values() {
+            let t = arc.lock();
+            out.push(TcbSnapshot {
+                local_addr: t.local_addr,
+                local_port: t.local_port,
+                remote_addr: t.remote_addr,
+                remote_port: t.remote_port,
+                state_code: tcp_state_code(t.state),
+                tx_queue: t.send_buf.len() as u32,
+                // RecvBuf exposes free_window; rx_queue is the in-order
+                // bytes waiting for the user, i.e. limit - free_window.
+                rx_queue: (t.recv_buf.limit as u32).saturating_sub(t.recv_buf.free_window()),
+                retrnsmt: t.rto_count,
+            });
+        }
     }
     out
 }
@@ -1121,10 +1161,27 @@ fn send_data(
     extra_flags: u8,
     record_retx: bool,
 ) {
-    let dst_for_iface = arc.lock().remote_addr;
-    let iface = match iface::for_dst(dst_for_iface) {
-        Some(i) => i,
-        None => return,
+    // Egress (NIC src MAC + emit fn): use the per-connection memoized cache;
+    // resolve `iface::for_dst` (global ROUTE_TABLE + IFACES locks) only on
+    // the first segment, then reuse — keeping those locks off the hot path.
+    let egress = {
+        let cached = arc.lock().egress;
+        match cached {
+            Some(e) => e,
+            None => {
+                let dst_for_iface = arc.lock().remote_addr;
+                let snap = match iface::for_dst(dst_for_iface) {
+                    Some(i) => i,
+                    None => return,
+                };
+                let e = CachedEgress {
+                    mac: snap.mac,
+                    send: snap.send,
+                };
+                arc.lock().egress = Some(e);
+                e
+            }
+        }
     };
     let (src_ip, dst_ip, src_port, dst_port, ack, peer_mac, window, opt_bytes) = {
         let mut t = arc.lock();
@@ -1145,7 +1202,7 @@ fn send_data(
         )
     };
     let frame = build_frame(
-        iface.mac,
+        egress.mac,
         peer_mac,
         src_ip,
         dst_ip,
@@ -1158,7 +1215,7 @@ fn send_data(
         opt_bytes,
         payload,
     );
-    let _ = (iface.send)(&frame);
+    let _ = (egress.send)(&frame);
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -2385,11 +2442,13 @@ pub fn __with_tcb_mut<R>(id: u32, f: impl FnOnce(&mut Tcb) -> R) -> Option<R> {
 /// pump iteration; cheap (lock + short walk).
 pub fn tick_all() {
     let ids: Vec<u32> = {
-        let g = TCB_TABLE.lock();
-        match g.as_ref() {
-            Some(m) => m.keys().copied().collect(),
-            None => return,
+        let mut ids = Vec::new();
+        for shard in TCB_TABLE.iter() {
+            if let Some(m) = shard.lock().as_ref() {
+                ids.extend(m.keys().copied());
+            }
         }
+        ids
     };
     for id in ids {
         if let Some(arc) = lookup_tcb(id) {
