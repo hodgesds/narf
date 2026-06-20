@@ -834,7 +834,8 @@ pub unsafe fn init_ap() {
 /// wheel's earliest, floored to `now + MIN_DELTA_CYCLES`.
 #[inline]
 pub fn on_timer_tick() {
-    let period = TSC_DEADLINE_PERIOD_CYCLES.load(Ordering::Relaxed);
+    let cpu = tsc_cpu();
+    let period = TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed);
     if period == 0 {
         // InitialCount periodic mode: hardware auto-reloads; just count.
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -842,7 +843,7 @@ pub fn on_timer_tick() {
     }
     // SAFETY: _rdtsc compiles to RDTSC, unconditionally legal at CPL=0.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
-    let mut periodic_next = TSC_DEADLINE_NEXT.load(Ordering::Relaxed);
+    let mut periodic_next = TSC_DEADLINE_NEXT[cpu].load(Ordering::Relaxed);
     if now >= periodic_next {
         // Genuine periodic expiry (not an early wheel-deadline fire).
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -853,7 +854,7 @@ pub fn on_timer_tick() {
         } else {
             now.wrapping_add(period)
         };
-        TSC_DEADLINE_NEXT.store(periodic_next, Ordering::Relaxed);
+        TSC_DEADLINE_NEXT[cpu].store(periodic_next, Ordering::Relaxed);
     }
     let target = next_arm_target(
         now,
@@ -861,7 +862,7 @@ pub fn on_timer_tick() {
         narf_time::timer_wheel::next_deadline_cycles_try(),
         MIN_DELTA_CYCLES,
     );
-    TSC_ARMED.store(target, Ordering::Relaxed);
+    TSC_ARMED[cpu].store(target, Ordering::Relaxed);
     // SAFETY: TSC-deadline MSR is unconditionally writable when the
     // LVT_TIMER is configured for deadline mode, which is the gate that
     // set TSC_DEADLINE_PERIOD_CYCLES non-zero.
@@ -895,27 +896,59 @@ pub fn on_timer_tick() {
     // serves the wheel on the next round.
 }
 
-/// Period (TSC cycles) between consecutive TSC-deadline IRQs.
+/// Per-CPU TSC-deadline timer state. The LAPIC TSC-deadline MSR is
+/// inherently per-CPU (each core has its own LVT_TIMER + IA32_TSC_DEADLINE),
+/// so the *software* state that mirrors it — the period, the next periodic
+/// deadline, and the currently-armed value — MUST be per-CPU too. Indexed
+/// by `narf_lib::percpu::current_cpu()` (via `tsc_cpu()`).
+///
+/// ── BUG FIX (intermittent permanent SMP wedge) ──
+/// These were single globals (the original code only ran the TSC-deadline
+/// tick on the BSP). Under user-task SMP every AP also runs its own
+/// TSC-deadline tick (`start_timer_tsc_deadline` in `smp.rs`) and arms its
+/// own LAPIC for wheel sleeps via `arm_tsc_deadline_if_earlier`. With ONE
+/// shared `TSC_ARMED`, a CPU's "is my new deadline earlier than what *I*
+/// have armed?" guard actually read whatever *another* CPU last armed.
+/// Concretely: cpu0's periodic tick stores its near deadline into the
+/// global `TSC_ARMED`; cpu6 then registers a wheel sleeper, but its
+/// `target < TSC_ARMED` test reads cpu0's value, sees "not earlier", and
+/// SKIPS programming cpu6's own LAPIC. cpu6 halts with its LAPIC armed only
+/// to a far/stale deadline, so the sleeper's wake fires only via the 2 ms
+/// idle backstop (or never) — the task strands on the halted AP and any
+/// connection it serves stalls. That is the ~50%-of-200-conn livelock,
+/// masked into a ~950-rps degraded state by the backstop. Making the state
+/// per-CPU means each core's guard reflects only its own armed MSR.
+const MAXC: usize = narf_lib::percpu::MAX_CPUS;
+
+/// This CPU's index, clamped into the per-CPU arrays below.
+#[inline]
+fn tsc_cpu() -> usize {
+    let c = narf_lib::percpu::current_cpu();
+    if c < MAXC {
+        c
+    } else {
+        0
+    }
+}
+
+/// Period (TSC cycles) between consecutive TSC-deadline IRQs, per CPU.
 /// Non-zero gates the ISR's auto-rearm path; 0 means the timer
 /// is in classic periodic-InitialCount mode and the ISR does
 /// nothing extra (hardware re-loads from InitialCount).
-static TSC_DEADLINE_PERIOD_CYCLES: AtomicU64 = AtomicU64::new(0);
+static TSC_DEADLINE_PERIOD_CYCLES: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
 
-/// Last deadline written to IA32_TSC_DEADLINE. ISR computes the
+/// Last deadline written to this CPU's IA32_TSC_DEADLINE. ISR computes the
 /// next deadline as `max(prev + period, now + period)` to
 /// preserve drift-free periodicity while never slipping behind
 /// the current TSC if a long handler delayed us.
-///
-/// Single value (BSP only) — when per-CPU TSC-deadline is needed,
-/// move this into a per-CPU array indexed by current_cpu().
-static TSC_DEADLINE_NEXT: AtomicU64 = AtomicU64::new(0);
+static TSC_DEADLINE_NEXT: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
 
-/// Absolute TSC value currently programmed into IA32_TSC_DEADLINE (the
-/// earliest of the periodic tick and any wheel deadline). Lets
+/// Absolute TSC value currently programmed into this CPU's IA32_TSC_DEADLINE
+/// (the earliest of its periodic tick and any wheel deadline). Lets
 /// `arm_tsc_deadline_if_earlier` reprogram only when a strictly-earlier
 /// deadline appears (mirrors Linux hrtimer_reprogram's `expires >=
-/// expires_next` guard).
-static TSC_ARMED: AtomicU64 = AtomicU64::new(u64::MAX);
+/// expires_next` guard) — now against THIS CPU's armed value, not a global.
+static TSC_ARMED: [AtomicU64; MAXC] = [const { AtomicU64::new(u64::MAX) }; MAXC];
 /// Minimum delta (TSC cycles) to program — a deadline already in the past
 /// is armed `now + MIN_DELTA_CYCLES` so it fires ASAP without a re-fire
 /// storm. ~a few µs at multi-GHz; mirrors Linux clockevents min_delta_ns.
@@ -951,9 +984,10 @@ pub(crate) fn next_arm_target(
 /// tick. No-op in InitialCount mode. Brief IRQ-off RCW so on_timer_tick
 /// (which also writes TSC_ARMED + the MSR) can't interleave.
 pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
-    if TSC_DEADLINE_PERIOD_CYCLES.load(Ordering::Relaxed) == 0 {
-        return;
-    }
+    // IRQs are masked across the whole RCW below (see the disable/enable
+    // pair), so `tsc_cpu()` is stable — we can't migrate mid-function — and
+    // the per-CPU `TSC_ARMED`/MSR we read, compare, and write all belong to
+    // the same core.
     // Read RFLAGS.IF so we only re-enable IRQs if they were on coming in
     // (don't blindly STI inside an already-IRQ-disabled caller, e.g. the
     // wheel's `register()` under lock).
@@ -964,6 +998,16 @@ pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
             narf_arch::current::disable_interrupts();
         }
     }
+    let cpu = tsc_cpu();
+    if TSC_DEADLINE_PERIOD_CYCLES[cpu].load(Ordering::Relaxed) == 0 {
+        if irqs_were_on {
+            // SAFETY: restore caller IRQ state before the early return.
+            unsafe {
+                narf_arch::current::enable_interrupts();
+            }
+        }
+        return;
+    }
     // SAFETY: RDTSC is unconditionally legal at CPL=0.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
     let floor = now.wrapping_add(MIN_DELTA_CYCLES);
@@ -972,8 +1016,8 @@ pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
     } else {
         deadline_cycles
     };
-    if target < TSC_ARMED.load(Ordering::Relaxed) {
-        TSC_ARMED.store(target, Ordering::Relaxed);
+    if target < TSC_ARMED[cpu].load(Ordering::Relaxed) {
+        TSC_ARMED[cpu].store(target, Ordering::Relaxed);
         // SAFETY: TSC-deadline MSR writable (period != 0 gate above);
         // MFENCE mirrors Linux weak_wrmsr_fence (see on_timer_tick).
         unsafe {
@@ -1004,12 +1048,15 @@ pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
 /// - Caller still owns IRQ masking (LVT_TIMER write is racy with
 ///   in-flight IRQs of the same vector).
 pub unsafe fn start_timer_tsc_deadline(timer_vector: u8, period_cycles: u64) {
-    TSC_DEADLINE_PERIOD_CYCLES.store(period_cycles, Ordering::Release);
+    // Caller owns IRQ masking (doc contract), so `tsc_cpu()` is stable and
+    // this initialises THIS CPU's slot — each AP calls this on itself.
+    let cpu = tsc_cpu();
+    TSC_DEADLINE_PERIOD_CYCLES[cpu].store(period_cycles, Ordering::Release);
     // SAFETY: caller upholds CPL=0 + LAPIC live.
     let now = unsafe { core::arch::x86_64::_rdtsc() };
     let first = now.wrapping_add(period_cycles);
-    TSC_DEADLINE_NEXT.store(first, Ordering::Release);
-    TSC_ARMED.store(first, Ordering::Release);
+    TSC_DEADLINE_NEXT[cpu].store(first, Ordering::Release);
+    TSC_ARMED[cpu].store(first, Ordering::Release);
     let lvt = LVT_TIMER_TSC_DEADLINE | (timer_vector as u64);
     // SAFETY: APIC live; TSC-deadline support implied by caller.
     unsafe {
