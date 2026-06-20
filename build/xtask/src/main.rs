@@ -543,9 +543,21 @@ impl Arch {
                     // network smoke: `XTASK_QEMU_HOSTFWD=tcp:127.0.0.1:H-:G`
                     // makes QEMU's user-mode backend forward host port H to
                     // guest port G so a host client can reach a guest server.
-                    let n0 = match std::env::var("XTASK_QEMU_HOSTFWD") {
-                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
-                        _ => "user,id=n0".into(),
+                    // `XTASK_QEMU_TAP=<ifname>` uses a real host tap backend
+                    // instead of SLIRP — the host reaches the guest directly at
+                    // its static IP (10.0.2.15), no hostfwd. Needs the tap
+                    // pre-created + up (e.g. `ip tuntap add tap0 mode tap`,
+                    // `ip addr add 10.0.2.2/24 dev tap0`, `ip link set tap0 up`).
+                    // For NARF-over-real-NIC bring-up + perf free of the
+                    // single-threaded-SLIRP confound (task #127).
+                    let n0 = match std::env::var("XTASK_QEMU_TAP") {
+                        Ok(tap) if !tap.is_empty() => {
+                            format!("tap,id=n0,ifname={tap},script=no,downscript=no")
+                        }
+                        _ => match std::env::var("XTASK_QEMU_HOSTFWD") {
+                            Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
+                            _ => "user,id=n0".into(),
+                        },
                     };
                     args.extend_from_slice(&[
                         "-netdev".into(),
@@ -659,9 +671,21 @@ impl Arch {
                     // network smoke: `XTASK_QEMU_HOSTFWD=tcp:127.0.0.1:H-:G`
                     // makes QEMU's user-mode backend forward host port H to
                     // guest port G so a host client can reach a guest server.
-                    let n0 = match std::env::var("XTASK_QEMU_HOSTFWD") {
-                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
-                        _ => "user,id=n0".into(),
+                    // `XTASK_QEMU_TAP=<ifname>` uses a real host tap backend
+                    // instead of SLIRP — the host reaches the guest directly at
+                    // its static IP (10.0.2.15), no hostfwd. Needs the tap
+                    // pre-created + up (e.g. `ip tuntap add tap0 mode tap`,
+                    // `ip addr add 10.0.2.2/24 dev tap0`, `ip link set tap0 up`).
+                    // For NARF-over-real-NIC bring-up + perf free of the
+                    // single-threaded-SLIRP confound (task #127).
+                    let n0 = match std::env::var("XTASK_QEMU_TAP") {
+                        Ok(tap) if !tap.is_empty() => {
+                            format!("tap,id=n0,ifname={tap},script=no,downscript=no")
+                        }
+                        _ => match std::env::var("XTASK_QEMU_HOSTFWD") {
+                            Ok(fwd) if !fwd.is_empty() => format!("user,id=n0,hostfwd={fwd}"),
+                            _ => "user,id=n0".into(),
+                        },
                     };
                     args.extend_from_slice(&[
                         "-netdev".into(),
@@ -2996,10 +3020,16 @@ fn boot_narf_redis(
     if !kernel.exists() {
         bail!("expected kernel at {}", kernel.display());
     }
-    std::env::set_var(
-        "XTASK_QEMU_HOSTFWD",
-        format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
-    );
+    // Tap mode (XTASK_QEMU_TAP): the host reaches the guest directly at its
+    // static IP — no hostfwd, and the readiness check connects to the guest
+    // IP:guest_port instead of 127.0.0.1:host_port (task #127).
+    let tap_mode = std::env::var_os("XTASK_QEMU_TAP").is_some();
+    if !tap_mode {
+        std::env::set_var(
+            "XTASK_QEMU_HOSTFWD",
+            format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
+        );
+    }
     if std::env::var_os("NARF_QEMU_SMP").is_none() {
         std::env::set_var("NARF_QEMU_SMP", "1");
     }
@@ -3087,10 +3117,15 @@ fn boot_narf_redis(
         bail!("NARF redis: not ready within {timeout_secs}s");
     }
 
+    let (conn_host, conn_port) = if tap_mode {
+        ("10.0.2.15", guest_port)
+    } else {
+        ("127.0.0.1", host_port)
+    };
     let mut stream = None;
     let cstart = Instant::now();
     while cstart.elapsed() < Duration::from_secs(20) {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", host_port)) {
+        if let Ok(s) = TcpStream::connect((conn_host, conn_port)) {
             stream = Some(s);
             break;
         }
@@ -3102,7 +3137,7 @@ fn boot_narf_redis(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
-            bail!("NARF redis: could not connect to 127.0.0.1:{host_port}");
+            bail!("NARF redis: could not connect to {conn_host}:{conn_port}");
         }
     };
     let _ = writeln!(std::io::stdout(), "  [NARF] redis ready, connected.");
