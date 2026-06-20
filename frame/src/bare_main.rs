@@ -738,6 +738,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // call shoot_va once they come up, and the handler must
             // be live before the first IPI lands.
             narf_interrupts::x86_64::ipi::install();
+            // Reschedule IPI: handler (a no-op — being interrupted is the
+            // point) + the scheduler's sender hook. A cross-core waker uses
+            // this to un-halt an idle owner CPU immediately instead of
+            // waiting out its next timer tick (the cross-core wake tail).
+            narf_interrupts::install_resched_ipi();
+            narf_scheduler::set_resched_ipi_hook(|cpu| {
+                narf_interrupts::x86_64::apic::send_fixed_ipi(
+                    1u64 << cpu,
+                    narf_interrupts::VECTOR_RESCHED,
+                );
+            });
             // Wire the memory subsystem's `invlpg_global` to
             // broadcast through this IPI surface. After this call,
             // every unmap_4kb fans out to peer CPUs.

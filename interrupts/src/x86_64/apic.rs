@@ -518,6 +518,17 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
     }
 }
 
+/// Send a fixed-vector IPI to every CPU in `cpu_mask`. Thin public
+/// wrapper over the x2APIC ICR write — used by the scheduler's
+/// reschedule IPI to kick an idle remote CPU off its HLT so a
+/// cross-core wake takes effect immediately instead of at that CPU's
+/// next timer tick. Fire-and-forget (no ack), edge-triggered fixed
+/// delivery. No-op under xAPIC fallback (same caveat as the broadcast).
+#[inline]
+pub fn send_fixed_ipi(cpu_mask: u64, vector: u8) {
+    x2apic_broadcast(cpu_mask, vector);
+}
+
 /// Global singleton for registration with the clockevent registry.
 pub static LAPIC_CLOCKEVENT: LapicClockEvent = LapicClockEvent;
 

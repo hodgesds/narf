@@ -143,7 +143,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use core::sync::atomic::AtomicU64;
@@ -335,15 +335,65 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     active_user_as_slot().lock().clone()
 }
 
+/// A task's wake state, shared between its ready-queue slot and every
+/// `Waker` it has handed out. `flag` is the "needs-repoll" bit; `cpu` is
+/// the CPU whose ready queue currently holds the slot — the reschedule-
+/// IPI target so a cross-core wake un-halts an idle owner immediately
+/// instead of leaving it to wake at its next timer tick.
+pub(crate) struct WakeCell {
+    flag: AtomicBool,
+    cpu: AtomicU32,
+}
+
+/// Per-CPU "about to halt / halted" flag, used to gate the reschedule
+/// IPI: only kick a CPU that is actually idle (a running CPU sees the
+/// awake flag on its next round, no IPI needed). The wake side and the
+/// idle side fence around this (Dekker) so a wake racing a halt is never
+/// both un-IPI'd AND unobserved.
+static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// Installed at boot: sends a fixed reschedule IPI to `cpu`. A hook (not
+/// a direct call) keeps `narf-scheduler` free of an `narf-interrupts`
+/// dependency. `0` = not installed (single-CPU / pre-boot) → no IPI.
+static RESCHED_IPI_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the reschedule-IPI sender (boot installs the x2APIC ICR write).
+pub fn set_resched_ipi_hook(f: fn(u32)) {
+    RESCHED_IPI_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Reschedule the owner of a just-woken task: if it lives on a DIFFERENT
+/// CPU that is currently halted, IPI that CPU so it re-runs its round
+/// now. Same-CPU or running-CPU wakes need nothing (the run loop's
+/// pre-halt scan catches them). Dekker fence pairs with the idle side.
+#[inline]
+fn resched_remote(target_cpu: u32) {
+    let me = narf_lib::percpu::current_cpu() as u32;
+    if target_cpu == me || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
+        return;
+    }
+    // Pair with the idle side's `mark_halted(true); fence; final-scan`.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
+        return;
+    }
+    let p = RESCHED_IPI_HOOK.load(Ordering::Acquire);
+    if p != 0 {
+        // SAFETY: `p` was set by `set_resched_ipi_hook` from a `fn(u32)`.
+        let f: fn(u32) = unsafe { core::mem::transmute::<usize, fn(u32)>(p) };
+        f(target_cpu);
+    }
+}
+
 pub(crate) struct TaskSlot {
     task: BoxedTask,
-    // Per-task "needs-repoll" flag set by the waker. The slot owns one
-    // `Arc<AtomicBool>`; each handed-out `Waker` owns another clone, so
-    // the flag outlives the slot if the future has stashed its waker.
-    // The scheduler swaps this to `false` before polling; if the poll
-    // returns `Pending` and nothing has re-set it, the slot is skipped
-    // on subsequent rounds until a waker flips it back to `true`.
-    awake: Arc<AtomicBool>,
+    // Per-task wake state. The slot owns one `Arc<WakeCell>`; each
+    // handed-out `Waker` owns another clone, so it outlives the slot if
+    // the future stashed its waker. The scheduler swaps `flag` to
+    // `false` before polling; if the poll returns `Pending` and nothing
+    // re-set it, the slot is skipped until a waker flips it back.
+    awake: Arc<WakeCell>,
     /// Monotonic identifier stamped at spawn time so `donate_to` has
     /// a stable handle into the ready queue. `pub(crate)` so the
     /// `policy` module's `RunQueue` projection can read it.
@@ -408,7 +458,7 @@ impl core::fmt::Debug for TaskSlot {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TaskSlot")
             .field("id", &self.id)
-            .field("awake", &self.awake.load(Ordering::Relaxed))
+            .field("awake", &self.awake.flag.load(Ordering::Relaxed))
             .field("spec", &self.spec)
             .field("account", &self.account)
             .finish_non_exhaustive()
@@ -721,6 +771,10 @@ fn user_ap_affinity() -> Affinity {
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
 fn enqueue_on(cpu: usize, slot: TaskSlot) {
+    // Record the slot's home CPU so a cross-core waker knows where to
+    // send the reschedule IPI. Updated again each time the slot is
+    // polled (it may have been work-stolen onto a different CPU).
+    slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
     let mut q = READY[cpu].lock();
     q.as_mut()
         .expect("scheduler: spawn before init")
@@ -746,7 +800,10 @@ where
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
         task: Box::pin(f),
-        awake: Arc::new(AtomicBool::new(true)),
+        awake: Arc::new(WakeCell {
+            flag: AtomicBool::new(true),
+            cpu: AtomicU32::new(0),
+        }),
         id,
         spec,
         addr_space: None,
@@ -868,7 +925,10 @@ where
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let slot = TaskSlot {
         task: Box::pin(f),
-        awake: Arc::new(AtomicBool::new(true)),
+        awake: Arc::new(WakeCell {
+            flag: AtomicBool::new(true),
+            cpu: AtomicU32::new(0),
+        }),
         id,
         spec,
         addr_space: Some(addr_space),
@@ -1230,7 +1290,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                     stage_donor_debit(donor_id, donor_remaining);
                 }
             }
-            slot.awake.store(true, Ordering::Release);
+            slot.awake.flag.store(true, Ordering::Release);
             match placement {
                 crate::donation::EnqueueDonee::HeadOfQueue => ready.push_front(slot),
                 crate::donation::EnqueueDonee::BackOfQueue => ready.push_back(slot),
@@ -1285,7 +1345,7 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
     // SAFETY: `data` was produced by `Arc::into_raw` in `make_waker`
     // or a prior `clone_raw`, and the Arc is still live.
     // SAFETY: Valid memory or trusted environment
-    let arc = unsafe { Arc::<AtomicBool>::from_raw(data as *const AtomicBool) };
+    let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
     let cloned = arc.clone();
     let _ = Arc::into_raw(arc);
     RawWaker::new(Arc::into_raw(cloned) as *const (), &TASK_VTABLE)
@@ -1315,32 +1375,37 @@ unsafe fn wake_raw(data: *const ()) {
     WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
-    let arc = unsafe { Arc::<AtomicBool>::from_raw(data as *const AtomicBool) };
-    arc.store(true, Ordering::Release);
+    let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
+    arc.flag.store(true, Ordering::Release);
+    // Kick the owner's CPU if it's idle on another core (else the awake
+    // bit waits until that CPU's next timer tick — the cross-core wake
+    // tail). `resched_remote` no-ops for same-CPU / running targets.
+    resched_remote(arc.cpu.load(Ordering::Acquire));
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
     WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
-    let ptr = data as *const AtomicBool;
+    let ptr = data as *const WakeCell;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
-    // the AtomicBool behind `data` is valid for the duration of this
-    // call.
+    // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    unsafe {
-        (*ptr).store(true, Ordering::Release);
-    }
+    let cpu = unsafe {
+        (*ptr).flag.store(true, Ordering::Release);
+        (*ptr).cpu.load(Ordering::Acquire)
+    };
+    resched_remote(cpu);
 }
 
 unsafe fn drop_raw(data: *const ()) {
     // SAFETY: reconstructing consumes the refcount owned by this waker.
     unsafe {
-        drop(Arc::<AtomicBool>::from_raw(data as *const AtomicBool));
+        drop(Arc::<WakeCell>::from_raw(data as *const WakeCell));
     }
 }
 
-fn make_waker(flag: Arc<AtomicBool>) -> Waker {
-    let raw = Arc::into_raw(flag) as *const ();
-    // SAFETY: vtable functions are matched to the `Arc<AtomicBool>`
+fn make_waker(cell: Arc<WakeCell>) -> Waker {
+    let raw = Arc::into_raw(cell) as *const ();
+    // SAFETY: vtable functions are matched to the `Arc<WakeCell>`
     // representation encoded in `raw`.
     // SAFETY: Valid memory or trusted environment
     unsafe { Waker::from_raw(RawWaker::new(raw, &TASK_VTABLE)) }
@@ -1431,11 +1496,14 @@ pub fn poll_one_round() -> usize {
                 continue;
             }
         }
-        if !slot.awake.swap(false, Ordering::Acquire) {
+        if !slot.awake.flag.swap(false, Ordering::Acquire) {
             let mut q = READY[cpu].lock();
             q.as_mut().unwrap().push_back(slot);
             continue;
         }
+        // Running on this CPU now — aim future wakes' reschedule IPI here
+        // (the slot may have been work-stolen since it was enqueued).
+        slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
         let waker = make_waker(slot.awake.clone());
         let mut ctx = Context::from_waker(&waker);
         let start = Instant::now();
@@ -1495,7 +1563,7 @@ pub fn poll_one_round() -> usize {
                     ChargeOutcome::Kill => continue,
                     ChargeOutcome::Demote => slot.spec.class = SchedClass::Idle,
                     ChargeOutcome::Throttle => {
-                        slot.awake.store(false, Ordering::Release);
+                        slot.awake.flag.store(false, Ordering::Release);
                     }
                     ChargeOutcome::Continue => {}
                 }
@@ -1646,11 +1714,14 @@ pub fn run_until_empty() {
 
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
-            if !slot.awake.swap(false, Ordering::Acquire) {
+            if !slot.awake.flag.swap(false, Ordering::Acquire) {
                 let mut q = READY[cpu].lock();
                 q.as_mut().unwrap().push_back(slot);
                 continue;
             }
+            // Running on this CPU now — aim future wakes' reschedule IPI
+            // here (the slot may have been work-stolen since enqueue).
+            slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
 
             // Save the kernel per-AS register before activating
             // the user AS so we can swap back after `poll()`
@@ -1846,7 +1917,7 @@ pub fn run_until_empty() {
                             // Clear awake so the next round skips
                             // this slot; only an external wake
                             // (timer, IRQ, peer-wake) revives it.
-                            slot.awake.store(false, Ordering::Release);
+                            slot.awake.flag.store(false, Ordering::Release);
                             let mut q = READY[cpu].lock();
                             q.as_mut().unwrap().push_back(slot);
                             continue;
@@ -1945,7 +2016,7 @@ pub fn run_until_empty() {
         let any_runnable = {
             let q = READY[cpu].lock();
             q.as_ref()
-                .map(|d| d.iter().any(|s| s.awake.load(Ordering::Acquire)))
+                .map(|d| d.iter().any(|s| s.awake.flag.load(Ordering::Acquire)))
                 .unwrap_or(false)
         };
         if any_runnable {
@@ -2048,7 +2119,7 @@ pub fn run_until_empty() {
                             let any = {
                                 let q = READY[cpu].lock();
                                 q.as_ref()
-                                    .map(|d| d.iter().any(|s| s.awake.load(Ordering::Acquire)))
+                                    .map(|d| d.iter().any(|s| s.awake.flag.load(Ordering::Acquire)))
                                     .unwrap_or(false)
                             };
                             if any {
@@ -2078,12 +2149,34 @@ pub fn run_until_empty() {
                 }
             }
             let next_deadline = narf_time::timer_wheel::next_deadline_cycles();
+            // Publish "this CPU is about to halt" so a concurrent cross-core
+            // waker sends us a reschedule IPI instead of leaving the awake
+            // bit to wake us at the next timer tick. Dekker ordering: store
+            // HALTED=true, full fence, then RE-SCAN the ready queue. The
+            // waker does the mirror: set the awake flag, full fence, load
+            // HALTED. If the waker's flag-set precedes our scan we see it
+            // (and skip the halt); otherwise our HALTED store precedes the
+            // waker's load and it IPIs us. Either way the wake is never both
+            // un-IPI'd AND unobserved.
+            CPU_HALTED[cpu].store(true, Ordering::SeqCst);
+            core::sync::atomic::fence(Ordering::SeqCst);
+            let woke_late = {
+                let q = READY[cpu].lock();
+                q.as_ref()
+                    .map(|d| d.iter().any(|s| s.awake.flag.load(Ordering::Acquire)))
+                    .unwrap_or(false)
+            };
+            if woke_late {
+                CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                continue;
+            }
             // Idle until a wake is plausible. On a reliable tick this HLTs
-            // (woken by the periodic tick, a peer's shootdown IPI, or any
+            // (woken by the periodic tick, a reschedule/shootdown IPI, or any
             // device IRQ); on the InitialCount fallback it bounded-spins so a
             // dropped tick can't strand a parked sleeper or stall the
             // sleep-pumps. See `idle_wait`.
             idle_wait(next_deadline);
+            CPU_HALTED[cpu].store(false, Ordering::SeqCst);
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
                 // fire any due wakers in this non-IRQ context.
@@ -2485,13 +2578,16 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     // again until the future completes.
     // SAFETY: Valid memory or trusted environment
     let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
-    let awake = Arc::new(AtomicBool::new(true));
+    let awake = Arc::new(WakeCell {
+        flag: AtomicBool::new(true),
+        cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
+    });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);
     loop {
         // Reset awake before polling so a wake landing during
         // the poll body is observable on the next iteration.
-        awake.store(false, Ordering::Release);
+        awake.flag.store(false, Ordering::Release);
         match fut.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return v,
             Poll::Pending => {
@@ -2499,7 +2595,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
                 // alive while we wait for an IRQ wake or self-
                 // wake from the future's busy-poll.
                 sleep_pumps::run();
-                if allow_halt && !awake.load(Ordering::Acquire) {
+                if allow_halt && !awake.flag.load(Ordering::Acquire) {
                     // Cooperative path: idle until something
                     // fires an IRQ. IRQ handler (or the future's
                     // own wake_by_ref) flips awake, then we return.

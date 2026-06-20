@@ -52,6 +52,12 @@ pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF0;
 /// IA32_X2APIC_ESR after writing 0 to it (Intel SDM Vol 3
 /// §11.5.3) reports which error bits latched. Diagnostic
 /// only — the kernel doesn't recover from APIC errors.
+/// Cross-CPU reschedule IPI. Fire-and-forget: the sender just needs the
+/// target CPU to take an interrupt so it exits `hlt` and re-runs its
+/// scheduler round (which then observes the awake flag the waker set).
+/// The handler does nothing — the act of being interrupted is the whole
+/// point; the dispatch framework EOIs afterward.
+pub const VECTOR_RESCHED: u8 = 0xF1;
 pub const VECTOR_APIC_ERROR: u8 = 0xFE;
 pub const VECTOR_SPURIOUS: u8 = 0xFF;
 
@@ -86,6 +92,16 @@ pub unsafe fn eoi() {}
 /// one CPU is online).
 pub fn install_tlb_shootdown_bridge() {
     narf_memory::tlb_shootdown::set_ipi_fanout(ipi_fanout_bridge);
+}
+
+/// Install the reschedule-IPI handler (a no-op) for [`VECTOR_RESCHED`].
+/// `dispatch::install` registers into a global per-vector table, so one
+/// call from the BSP at boot covers every CPU. The IDT already routes
+/// 32..=254 to the common trap → dispatch path, so no gate work is
+/// needed. Receiving the IPI un-halts an idle CPU; nothing else to do.
+#[cfg(target_arch = "x86_64")]
+pub fn install_resched_ipi() {
+    dispatch::install(VECTOR_RESCHED, || {});
 }
 
 #[cfg(target_arch = "x86_64")]
