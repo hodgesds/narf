@@ -19,7 +19,13 @@ never accumulate unverifiable work.
   (stock musl) opens `/dev/fb0`, `mmap`s it `MAP_SHARED`, draws + reads
   back → `fb-ok` / `fb-geom 1280x800` via `xtask run-interactive`. Wired
   into the `xtask musl-demo` CI case list. On `main`.
-- Next: **Rung 2** (`/dev/input/event*` evdev).
+- **Rung 2 (`/dev/input/event*`) — DONE.** Real 24-byte Linux
+  `input_event` wire format at the node (16-byte internal `EvdevEvent`
+  unchanged) + `EVIOCG*` ioctls (version/id/name/bits/abs/grab);
+  `virtio-tablet-pci` added to QEMU (keyboard + tablet both probe).
+  `smoke_dev_input_*` kernel smokes pass. On `main`.
+- Next: **Rung 3** — run an unmodified SDL2 app (fbdev/kmsdrm) from the
+  boot-init shell to surface the real ABI gaps toward a compositor.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
