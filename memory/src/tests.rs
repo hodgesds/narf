@@ -5516,10 +5516,15 @@ kernel_test_in!("memory", smoke_diag_phase_round_trip);
 fn smoke_diag_bump_irq_counts_total_and_last() -> TestResult {
     use crate::diag;
     // `bump_irq` is also called by the live IRQ handler (interrupts::on_irq),
-    // and vector 32 is the timer tick — a real IRQ landing between the reset
-    // and the snapshot would push irq_total past 3 and flake this test. Mask
-    // IRQs across the reset → bump → snapshot window so the count reflects
-    // exactly our three bumps. (Restored to the caller's prior state after.)
+    // and vector 32 is the timer tick. Masking LOCAL IRQs across the
+    // reset → bump → snapshot window keeps THIS CPU from perturbing the
+    // global counter — but under SMP another core's timer IRQ can bump the
+    // same global `IRQ_TOTAL` / clobber `LAST_IRQ_VECTOR` in that window
+    // (the diag counters are a single global operator facility, not
+    // per-CPU). So the exact-count assertion only holds on a uniprocessor
+    // boot; under SMP we assert the sound monotonic invariant instead
+    // (our three bumps definitely landed; peers can only add more).
+    let smp = narf_lib::smp::cpu_count() > 1;
     let was_enabled = narf_arch::interrupts_enabled();
     // SAFETY: a brief local IRQ mask in a synchronous test; restored below.
     unsafe {
@@ -5537,11 +5542,20 @@ fn smoke_diag_bump_irq_counts_total_and_last() -> TestResult {
             narf_arch::enable_interrupts();
         }
     }
-    if s.irq_total != 3 {
-        return TestResult::Fail("irq_total not 3 after 3 bumps");
-    }
-    if s.last_irq_vector != 32 {
-        return TestResult::Fail("last_irq_vector not the latest bump");
+    if smp {
+        // Peers can only ADD to the global counter, never remove our bumps.
+        if s.irq_total < 3 {
+            return TestResult::Fail("irq_total under 3 after 3 bumps");
+        }
+        // LAST_IRQ_VECTOR may have been clobbered by a concurrent peer IRQ;
+        // not assertable under SMP.
+    } else {
+        if s.irq_total != 3 {
+            return TestResult::Fail("irq_total not 3 after 3 bumps");
+        }
+        if s.last_irq_vector != 32 {
+            return TestResult::Fail("last_irq_vector not the latest bump");
+        }
     }
     TestResult::Pass
 }
