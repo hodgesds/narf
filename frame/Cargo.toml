@@ -99,6 +99,10 @@ narf-verification    = { path = "../verification", optional = true }
 # counters + hardware PMU) every ~3000 timer ticks. Counters are always on;
 # this just enables the periodic serial dump. Off by default.
 perf-dump = []
+# stall-watchdog: arm the scheduler-stall watchdog (frame/x86_64/trap.rs).
+# Detects a global forward-progress stall (the intermittent SMP wedge) and
+# dumps per-CPU scheduler state once for classification. Off by default.
+stall-watchdog = []
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from

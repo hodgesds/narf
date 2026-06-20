@@ -16,6 +16,127 @@ use core::fmt::Write;
 
 use narf_console::TrapWriter;
 
+/// Scheduler-stall watchdog. Detects a *global forward-progress stall*
+/// (the kernel keeps taking timer ticks but USER SYSCALLS stop advancing —
+/// the signature of the intermittent SMP wedge: workers parked/stuck while
+/// the benchmark gets no responses) and dumps per-CPU scheduler state ONCE
+/// so the wedge can be classified without a debugger:
+///   - per CPU: ready-queue depth, # of awake (runnable) slots, the
+///     published HALTED flag, whether the queue lock was held, and the
+///     last-tick CPL/RIP (kernel RIP → addr2line offline).
+/// Decision: `halted && awake>0` ⇒ lost wakeup; `!halted && awake>0` ⇒
+/// spinning-not-polling (data-path/lock); `locked` ⇒ stuck in the queue
+/// lock. Self-latches after one dump. Cheap (a few atomics per tick); the
+/// dump only ever runs once, from IRQ context, via the same TrapWriter the
+/// perf dump uses.
+///
+/// Off by default — build with `--features stall-watchdog` to arm it for
+/// an SMP-wedge investigation (a few atomics per tick; dumps once).
+#[cfg(feature = "stall-watchdog")]
+mod stall_wd {
+    use core::fmt::Write as _;
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use narf_console::TrapWriter;
+
+    const MAXC: usize = 16;
+    // Last interrupted RIP / CPL per CPU, recorded every tick.
+    static LAST_RIP: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC];
+    static LAST_CPL: [AtomicU8; MAXC] = [const { AtomicU8::new(0) }; MAXC];
+    // Stall detector state (checked on whichever CPU happens to tick).
+    static LAST_CHECK_CYCLES: AtomicU64 = AtomicU64::new(0);
+    static LAST_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+    static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+    static FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+
+    /// Called from the timer-tick path with the interrupted CPL3-or-not
+    /// `cs` and `rip`. Records this CPU's last RIP/CPL, then (rate-limited
+    /// to ~once/second, on whatever CPU ticks) checks for a syscall-count
+    /// stall and dumps once.
+    pub fn tick(cs: u64, rip: u64) {
+        let cpu = narf_lib::percpu::current_cpu();
+        if cpu < MAXC {
+            LAST_RIP[cpu].store(rip, Ordering::Relaxed);
+            LAST_CPL[cpu].store((cs & 3) as u8, Ordering::Relaxed);
+        }
+        if DUMPED.load(Ordering::Relaxed) {
+            return;
+        }
+        // The per-CPU `narf_lib::perf` software counters (incl. `syscalls`,
+        // our forward-progress signal) only increment while perf is
+        // ENABLED — otherwise the bump is a no-op and the count stays 0.
+        // The perf-dump tick enables it, but that's a separate feature; the
+        // watchdog must enable it itself or its syscall signal is always 0.
+        if !narf_lib::perf::enabled() {
+            narf_lib::perf::set_enabled(true);
+        }
+        let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+        let now = narf_scheduler::narf_time::now_cycles();
+        // ~1 s cadence.
+        let window = cpns.saturating_mul(1_000_000_000);
+        let last = LAST_CHECK_CYCLES.load(Ordering::Relaxed);
+        if now.wrapping_sub(last) < window {
+            return;
+        }
+        // Only one CPU advances the check per window (CAS the timestamp).
+        if LAST_CHECK_CYCLES
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let sc = narf_lib::perf::snapshot().syscalls;
+        let prev = LAST_SYSCALLS.swap(sc, Ordering::Relaxed);
+        // `HIGH_WATER` reused as a monotonic WINDOW COUNTER here.
+        let wc = HIGH_WATER.fetch_add(1, Ordering::Relaxed) + 1;
+        let delta = sc.wrapping_sub(prev);
+        // Wedge signature: past boot (window 20 ≈ 20 s uptime) and the
+        // syscall RATE collapses far below healthy. A healthy 200-conn run
+        // does ~150-200k syscalls/window; the partial wedge limps at ~2k
+        // (most workers stuck, a few connections trickling). Trigger on
+        // delta < 10k for 4 consecutive windows — catches both the full
+        // stall (delta 0) and the degraded "limping" wedge.
+        if wc > 20 && delta < 10_000 {
+            let flats = FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
+            if flats >= 4 && !DUMPED.swap(true, Ordering::Relaxed) {
+                dump(sc);
+            }
+        } else {
+            FLAT_WINDOWS.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn dump(sc: u64) {
+        let _ = writeln!(
+            TrapWriter,
+            "STALL-WD: scheduler stalled (syscalls flat at {sc}); per-CPU state:"
+        );
+        for cpu in 0..MAXC {
+            if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+                continue;
+            }
+            let (depth, awake, halted, locked) = narf_scheduler::dbg_cpu_stall(cpu);
+            let rip = LAST_RIP[cpu].load(Ordering::Relaxed);
+            let cpl = LAST_CPL[cpu].load(Ordering::Relaxed);
+            let verdict = if locked {
+                "LOCK-HELD"
+            } else if halted && awake > 0 {
+                "LOST-WAKEUP"
+            } else if !halted && awake > 0 {
+                "SPIN-NOT-POLLING"
+            } else if halted {
+                "idle-halted"
+            } else {
+                "running"
+            };
+            let _ = writeln!(
+                TrapWriter,
+                "STALL-WD cpu={cpu} depth={depth} awake={awake} halted={halted} locked={locked} cpl={cpl} rip={rip:#x} -> {verdict}"
+            );
+        }
+    }
+}
+
 /// Feature-gated perf-stat dump: reads the per-CPU `narf_lib::perf` software
 /// counters (summed) + the hardware PMU and prints a `perf stat`-style line
 /// every ~3000 timer ticks. Off by default; build with `--features
@@ -282,6 +403,10 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             }
             // Per-CPU perf counters: tag this tick by interrupted CPL.
             narf_lib::perf::tick((frame.cs & 3) != 3);
+            // Scheduler-stall watchdog: record this CPU's RIP/CPL and, on a
+            // global syscall-progress stall, dump per-CPU state once.
+            #[cfg(feature = "stall-watchdog")]
+            stall_wd::tick(frame.cs, frame.rip);
             #[cfg(feature = "perf-dump")]
             perf_dump::on_tick();
         }
