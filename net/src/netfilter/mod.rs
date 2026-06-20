@@ -119,6 +119,51 @@ impl L4Proto {
 /// mutably so NAT can rewrite source/dest addresses and ports in
 /// place. `iface_in` / `iface_out` are short strings (interface names
 /// like `"eth0"`); either may be empty depending on the hook point.
+/// Copy-on-write packet backing for a [`PktCtx`].
+///
+/// Most packets pass through the hook chain unmodified — conntrack and
+/// filter only READ the bytes (parse the 5-tuple, peek the TCP flags);
+/// only NAT/mangle rewrite in place. The RX dispatch (`handle_ipv4`) is
+/// per-frame on the single forwarder core, so the old unconditional
+/// `body.to_vec()` (one heap alloc + memcpy of every frame, just to hand
+/// hooks a `&mut`) was pure overhead on the hot path whenever no rule
+/// mutated. `PktBuf` defers that copy: a `Ref` borrow stays zero-copy
+/// through a read-only chain and only clones to `Owned` the first time a
+/// hook calls `packet_mut()`.
+#[derive(Debug)]
+enum PktBuf<'a> {
+    /// Read-only borrow; clones to `Owned` on first `packet_mut()`.
+    Ref(&'a [u8]),
+    /// Caller-provided mutable borrow; mutated in place, never copied.
+    Mut(&'a mut [u8]),
+    /// Owned copy produced by the COW path.
+    Owned(alloc::vec::Vec<u8>),
+}
+
+impl PktBuf<'_> {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            PktBuf::Ref(s) => s,
+            PktBuf::Mut(s) => s,
+            PktBuf::Owned(v) => v,
+        }
+    }
+
+    #[inline]
+    fn to_mut(&mut self) -> &mut [u8] {
+        if let PktBuf::Ref(s) = self {
+            *self = PktBuf::Owned(s.to_vec());
+        }
+        match self {
+            PktBuf::Mut(s) => s,
+            PktBuf::Owned(v) => v.as_mut_slice(),
+            // SAFETY-of-logic: a `Ref` was just rewritten to `Owned` above.
+            PktBuf::Ref(_) => unreachable!("Ref was converted to Owned"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PktCtx<'a> {
     pub l3_proto: L3Proto,
@@ -127,17 +172,19 @@ pub struct PktCtx<'a> {
     pub iface_in: &'a str,
     /// Outbound interface name (LOCAL_OUT / FORWARD / POST_ROUTING).
     pub iface_out: &'a str,
-    /// The L3 packet (IP header onwards). Hooks may rewrite in-place
-    /// (NAT mangles src/dst). The slice's length doesn't change at
-    /// this layer — packet length adjustment is a future concern.
-    pub packet: &'a mut [u8],
+    /// The L3 packet (IP header onwards), copy-on-write. Read via
+    /// [`PktCtx::packet`]; a hook that rewrites it (NAT) calls
+    /// [`PktCtx::packet_mut`], which clones a borrowed packet once.
+    packet: PktBuf<'a>,
     /// Optional conntrack entry id assigned by the conntrack hook.
     /// Downstream hooks (NAT) read this to find the mapping.
     pub conntrack_id: Option<u64>,
 }
 
 impl<'a> PktCtx<'a> {
-    /// Construct a fresh IPv4 packet context for a given hook.
+    /// Construct a fresh IPv4 packet context over a MUTABLE buffer (the
+    /// caller already owns a writable copy — no COW needed; NAT rewrites
+    /// it in place).
     pub fn new_ipv4(
         hook: HookPoint,
         iface_in: &'a str,
@@ -149,9 +196,44 @@ impl<'a> PktCtx<'a> {
             hook,
             iface_in,
             iface_out,
-            packet,
+            packet: PktBuf::Mut(packet),
             conntrack_id: None,
         }
+    }
+
+    /// Construct a fresh IPv4 packet context over a READ-ONLY borrow. The
+    /// packet stays zero-copy through a read-only hook chain (conntrack +
+    /// filter); only a mutating hook (NAT) triggers a single clone via
+    /// [`PktCtx::packet_mut`]. The hot RX path uses this to avoid copying
+    /// every frame.
+    pub fn new_ipv4_ref(
+        hook: HookPoint,
+        iface_in: &'a str,
+        iface_out: &'a str,
+        packet: &'a [u8],
+    ) -> Self {
+        Self {
+            l3_proto: L3Proto::Ipv4,
+            hook,
+            iface_in,
+            iface_out,
+            packet: PktBuf::Ref(packet),
+            conntrack_id: None,
+        }
+    }
+
+    /// Borrow the packet bytes (read-only). Zero-copy.
+    #[inline]
+    pub fn packet(&self) -> &[u8] {
+        self.packet.as_slice()
+    }
+
+    /// Borrow the packet bytes mutably. Clones a borrowed (`Ref`) packet
+    /// to an owned copy on first call (COW); a `Mut`/`Owned` packet is
+    /// returned directly.
+    #[inline]
+    pub fn packet_mut(&mut self) -> &mut [u8] {
+        self.packet.to_mut()
     }
 }
 

@@ -122,7 +122,7 @@ pub fn nf_table_set_policy(table: &str, chain: &str, v: Verdict) {
 // ── Hooks ───────────────────────────────────────────────────────────
 
 fn filter_for(hook: HookPoint, ctx: &mut PktCtx<'_>) -> Verdict {
-    let tuple = match parse_tuple_ipv4(ctx.packet) {
+    let tuple = match parse_tuple_ipv4(ctx.packet()) {
         Some(t) => t,
         None => return Verdict::Accept,
     };

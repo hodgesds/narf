@@ -381,7 +381,7 @@ fn rewrite_dst_port(packet: &mut [u8], new_port: u16) {
 /// conntrack reply tuple so PRE_ROUTING can find the flow on the way
 /// back.
 pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
-    let tuple = match parse_tuple_ipv4(ctx.packet) {
+    let tuple = match parse_tuple_ipv4(ctx.packet()) {
         Some(t) => t,
         None => return Verdict::Accept,
     };
@@ -400,8 +400,8 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
 
     // Already NAT'd? Reuse mapping.
     if let Some((nat_ip, nat_port)) = NAT.lookup_ct(id) {
-        rewrite_src_ip(ctx.packet, nat_ip);
-        rewrite_src_port(ctx.packet, nat_port);
+        rewrite_src_ip(ctx.packet_mut(), nat_ip);
+        rewrite_src_port(ctx.packet_mut(), nat_port);
         return Verdict::Accept;
     }
 
@@ -434,8 +434,8 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
     }
 
     // Rewrite the packet in place.
-    rewrite_src_ip(ctx.packet, rule.iface_ip);
-    rewrite_src_port(ctx.packet, nat_port);
+    rewrite_src_ip(ctx.packet_mut(), rule.iface_ip);
+    rewrite_src_port(ctx.packet_mut(), nat_port);
     Verdict::Accept
 }
 
@@ -443,15 +443,15 @@ pub fn snat_postrouting(ctx: &mut PktCtx<'_>) -> Verdict {
 /// recorded egress mapping. Rewrites
 /// `(dst_ip, dst_port) → (orig_src_ip, orig_src_port)`.
 pub fn dnat_prerouting(ctx: &mut PktCtx<'_>) -> Verdict {
-    let tuple = match parse_tuple_ipv4(ctx.packet) {
+    let tuple = match parse_tuple_ipv4(ctx.packet()) {
         Some(t) => t,
         None => return Verdict::Accept,
     };
     if let Some((orig_ip, orig_port)) =
         NAT.lookup_ingress(tuple.dst_ip, tuple.dst_port, tuple.proto)
     {
-        rewrite_dst_ip(ctx.packet, orig_ip);
-        rewrite_dst_port(ctx.packet, orig_port);
+        rewrite_dst_ip(ctx.packet_mut(), orig_ip);
+        rewrite_dst_port(ctx.packet_mut(), orig_port);
     }
     Verdict::Accept
 }

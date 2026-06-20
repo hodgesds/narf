@@ -194,42 +194,35 @@ pub fn handle_arp_on(body: &[u8], iface_name: Option<&str>) {
 fn handle_ipv4(body: &[u8]) {
     // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
     //
-    // Copy the L3 packet into a mutable scratch buffer so hooks
-    // (conntrack, NAT, filter) can rewrite addresses / ports in
-    // place. If PRE_ROUTING returns Drop the packet is dropped here;
-    // otherwise we continue with the (possibly mutated) packet. For
-    // a locally-destined packet we then dispatch LOCAL_IN before
-    // handing to the L4 receiver.
+    // The hooks only READ the packet (conntrack parses the tuple, filter
+    // matches rules) unless a NAT/mangle rule actually rewrites it, so we
+    // hand them a copy-on-write borrow (`new_ipv4_ref`) instead of
+    // eagerly copying every frame into a scratch buffer. With no mutating
+    // rule (the common server case) this is zero-copy on the per-frame
+    // forwarder hot path; only a NAT rewrite triggers a single clone. One
+    // `PktCtx` carries the packet across both hook points so a PRE_ROUTING
+    // mutation is visible at LOCAL_IN. If either returns Drop, drop here.
     //
     // Matches Linux's NF_HOOK call from `ip_rcv_core()` →
     // `ip_rcv_finish()` in `net/ipv4/ip_input.c`.
     if body.len() < crate::netfilter::IPV4_MIN_HDR_LEN {
         return;
     }
-    let mut scratch: alloc::vec::Vec<u8> = body.to_vec();
-    {
-        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
-            crate::netfilter::HookPoint::PreRouting,
-            "",
-            "",
-            &mut scratch,
-        );
-        if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
-            return;
-        }
+    let mut ctx = crate::netfilter::PktCtx::new_ipv4_ref(
+        crate::netfilter::HookPoint::PreRouting,
+        "",
+        "",
+        body,
+    );
+    if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
+        return;
     }
-    {
-        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
-            crate::netfilter::HookPoint::LocalIn,
-            "",
-            "",
-            &mut scratch,
-        );
-        if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
-            return;
-        }
+    ctx.hook = crate::netfilter::HookPoint::LocalIn;
+    ctx.conntrack_id = None;
+    if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
+        return;
     }
-    let body = &scratch[..];
+    let body = ctx.packet();
     let (ip, payload) = match parse_ipv4(body) {
         Some(t) => t,
         None => return,
