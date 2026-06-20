@@ -128,15 +128,28 @@ WORSE** — the classic signature of cross-CPU contention. redis DOES migrate
    write; the recoverable-probe fixup needs a live IDT, so with none loaded
    the AP triple-faulted and `-no-reboot` froze the whole VM. Now boots to
    "2 CPU(s) online" + redis serves.
-2. ⏳ **Global TCP-stack lock contends (task #122 — the scaling blocker).**
-   `TCB_TABLE` is one `IrqSafeSpinLock<BTreeMap<…>>`. The BSP forwarder's
-   `handle_segment` holds it while `m.values().find()` **locks every TCB**
-   to 4-tuple-match — O(N) per inbound segment. redis-on-AP's
-   read/write/epoll need the same lock → the two CPUs serialize, negating
-   the 2nd vCPU. Fix: an **O(1) 4-tuple index** so the forwarder touches
-   only the target TCB (briefly), not all of them. (The 4-tuple cache tried
-   earlier and dismissed as a single-vCPU dead-end is the RIGHT move *under
-   SMP*, where the lock is now contended.)
+2. ❌ **TCB-lock contention RULED OUT as the SMP scaling blocker.** Built the
+   O(1) 4-tuple index (`TCB_BY_TUPLE`, fast-path + O(N) scan fallback for
+   correctness) so the BSP forwarder's `handle_segment` no longer holds
+   `TCB_TABLE` across a `values().find()` that locks every TCB. redis stayed
+   correct (50-conn/500k-op bench passed) but **GET throughput was unchanged**
+   (532k vs 543k — noise). Reverted (measure-or-revert; not on the critical
+   path). The decisive tell: SMP=2 makes redis latency *WORSE* (p50 60→71µs,
+   p99 180→315µs). Pure lock contention would only fail to *improve* latency,
+   not worsen it — worse latency = added **migration/TLB-shootdown/cache
+   cost**. So the blocker is **migration cost**, not a TCP lock.
+3. ⏳ **Migration cost / no affinity hysteresis (the real scaling blocker).**
+   redis gets `Affinity::any()` and work-stealing bounces it BSP↔AP. Each
+   bounce pays CR3 reload + cross-CPU TLB shootdown (shared user AS) + FPU
+   save/restore + cache-line refill — and because redis↔forwarder is a
+   tight closed-loop producer/consumer, there's limited true parallelism to
+   amortize that cost against. Linux scales because its load balancer keeps
+   the redis thread *sticky* on one CPU while RX-softirq runs on the other.
+   NARF needs the same: **affinity hysteresis** (once redis runs on a CPU,
+   prefer to keep it there; only migrate on a real imbalance) so the 2nd
+   vCPU adds parallelism without per-poll bounce cost. This is a *scheduler*
+   change, not a TCP-stack one. (Open: confirm the bounce rate with a
+   per-CPU user-task-poll counter before building the fix.)
 
 **Conclusion:** the single-vCPU redis path is thoroughly optimized
 (SET 0.43→0.61×, GET 0.35→0.71×, p50 to parity) and the remaining gap is a
