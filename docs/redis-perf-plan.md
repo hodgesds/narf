@@ -138,18 +138,38 @@ WORSE** — the classic signature of cross-CPU contention. redis DOES migrate
    p99 180→315µs). Pure lock contention would only fail to *improve* latency,
    not worsen it — worse latency = added **migration/TLB-shootdown/cache
    cost**. So the blocker is **migration cost**, not a TCP lock.
-3. ⏳ **Migration cost / no affinity hysteresis (the real scaling blocker).**
-   redis gets `Affinity::any()` and work-stealing bounces it BSP↔AP. Each
-   bounce pays CR3 reload + cross-CPU TLB shootdown (shared user AS) + FPU
-   save/restore + cache-line refill — and because redis↔forwarder is a
-   tight closed-loop producer/consumer, there's limited true parallelism to
-   amortize that cost against. Linux scales because its load balancer keeps
-   the redis thread *sticky* on one CPU while RX-softirq runs on the other.
-   NARF needs the same: **affinity hysteresis** (once redis runs on a CPU,
-   prefer to keep it there; only migrate on a real imbalance) so the 2nd
-   vCPU adds parallelism without per-poll bounce cost. This is a *scheduler*
-   change, not a TCP-stack one. (Open: confirm the bounce rate with a
-   per-CPU user-task-poll counter before building the fix.)
+3. ✅ **ROOT-CAUSED — it's user-task PLACEMENT, not hysteresis (confirmed by
+   experiment).** Tried migration hysteresis (per-task steal cooldown):
+   **no throughput change**. Then force-pinned user tasks to AP CPU 1
+   (`Affinity::pinned(CpuId(1))`, forwarder stays BSP-pinned) — that DID help:
+
+   | metric | 1vCPU | 2vCPU any() | **2vCPU redis→AP** | Linux 2vCPU |
+   |---|---|---|---|---|
+   | built-in GET ratio | — | 0.66× | **0.76×** | 1.0 |
+   | built-in SET ratio | — | 0.68× | **0.83×** | 1.0 |
+   | PING p50 | 60µs | 80µs | **67µs** | 58µs |
+   | PING p99 | 180µs | 264µs | **160µs** | 116µs |
+   | concurrent GET | 526k | 533k | **555k** | 873k |
+
+   **Why:** under `Affinity::any()` + work-stealing, redis blocks on epoll
+   and is woken (by the BSP forwarder) into `READY[bsp]`; the **BSP polls it
+   before the idle AP can steal it**, so redis effectively stays on the BSP
+   and the AP starves — the forwarder(BSP)↔redis(AP) pipeline never forms.
+   Hysteresis can't help because redis never *reaches* the AP. Force-placing
+   redis on the AP forms the pipeline → latency recovers (p99 264→160µs) and
+   the built-in workload jumps. Proper fix: a **placement policy** that gives
+   a hot user task a dedicated non-BSP core (reserve BSP for kernel/forwarder
+   /IRQ), instead of relying on steal to win the placement race. Blunt
+   pin-all-to-CPU1 confirmed the mechanism but is too broad to ship (changes
+   the 16-CPU boot path; needs full kernel-test validation). *Scheduler* work.
+4. ⏳ **Concurrent-throughput ceiling = single virtio RX queue / single
+   forwarder.** Even with redis perfectly placed on the AP, concurrent GET is
+   only 0.64× (555k vs 873k). All 50 connections' RX funnels through ONE
+   virtio RX queue drained by ONE BSP-pinned forwarder — a serial feed a 2nd
+   vCPU can't parallelize. Linux uses multi-queue + RSS + per-core softirq.
+   The concurrent-throughput lever is **multi-queue virtio-net (RSS)**: N RX
+   queues, a forwarder per queue on distinct CPUs. Substantial networking
+   work; the real ceiling-lifter for many-connection throughput.
 
 **Conclusion:** the single-vCPU redis path is thoroughly optimized
 (SET 0.43→0.61×, GET 0.35→0.71×, p50 to parity) and the remaining gap is a
