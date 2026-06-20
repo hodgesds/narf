@@ -138,35 +138,30 @@ kernel_test_in!("initramfs", smoke_initramfs_pvh_module_parser);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_initramfs_pvh_module_parser_no_match() -> TestResult {
-    // Same shape as the prior smoke but with a non-matching
-    // cmdline ("vmlinux"). The parser must return `None`.
+    // Same shape as the prior smoke but with ZERO modules
+    // (`nr_modules = 0`) — the parser must return `None` when there is
+    // nothing to hand back. (The parser returns the FIRST module present
+    // regardless of its cmdline — the bootloader only ever passes the
+    // initramfs — so the meaningful no-match case is "no module at all",
+    // not "a module with a non-`initramfs` cmdline".)
     use narf_boot::x86_64::pvh::initramfs_module;
-    let cmdline: &'static [u8] = alloc::boxed::Box::leak(b"vmlinux\0".to_vec().into_boxed_slice());
-    let modlist_bytes = {
-        let mut v = alloc::vec::Vec::with_capacity(32);
-        v.extend_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
-        v.extend_from_slice(&0x1u64.to_le_bytes());
-        v.extend_from_slice(&(cmdline.as_ptr() as u64).to_le_bytes());
-        v.extend_from_slice(&0u64.to_le_bytes());
-        v.into_boxed_slice()
-    };
-    let modlist: &'static [u8] = alloc::boxed::Box::leak(modlist_bytes);
     let mut hdr_bytes = alloc::vec::Vec::with_capacity(56);
-    hdr_bytes.extend_from_slice(&0x336e_c578u32.to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());
-    hdr_bytes.extend_from_slice(&1u32.to_le_bytes());
-    hdr_bytes.extend_from_slice(&(modlist.as_ptr() as u64).to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u64.to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u64.to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u64.to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());
-    hdr_bytes.extend_from_slice(&0u32.to_le_bytes());
+    hdr_bytes.extend_from_slice(&0x336e_c578u32.to_le_bytes()); // magic
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // version
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // nr_modules = 0
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // modlist (none)
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // cmdline
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // rsdp
+    hdr_bytes.extend_from_slice(&0u64.to_le_bytes()); // memmap_paddr
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // memmap_entries
+    hdr_bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
     let hdr: &'static [u8] = alloc::boxed::Box::leak(hdr_bytes.into_boxed_slice());
-    // SAFETY: same.
+    // SAFETY: hdr points at a fully-initialized PVH start_info with no
+    // modules; the parser walks an empty modlist and returns None.
     let result = unsafe { initramfs_module(hdr.as_ptr() as usize) };
     if result.is_some() {
-        TestResult::Fail("parser matched a non-initramfs cmdline")
+        TestResult::Fail("parser returned a module when nr_modules == 0")
     } else {
         TestResult::Pass
     }
