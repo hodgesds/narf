@@ -109,21 +109,34 @@ scheduling latency that Linux avoids by spreading softirq-RX and the redis
 thread across cores. That matches a constant per-batch wait factor on an
 otherwise-idle CPU.
 
-**SMP is the lever — but it's gated behind two substantial efforts, and its
-payoff is uncertain:**
-1. **AP bringup hangs under KVM.** `NARF_QEMU_SMP=2 + accel=kvm` (release,
-   redis image) **hangs at AP bringup** — serial stops right after
-   `smp(x86): trampoline installed at 0x8000`, never reaches "started N
-   AP(s)" (exit 124 / timeout). User-task SMP is on-by-default (gated on
-   APs-online + x2APIC), but the second vCPU never comes online here, so the
-   redis task can't migrate. Must be root-caused first. (Overlaps the
-   in-progress SMP arc, task #87.)
-2. **Global TCP-stack lock would contend.** Even with redis on an AP, the
-   TCP stack is behind a single global lock that the BSP forwarder also
-   takes per frame. redis-on-AP would contend that lock on every
-   read/write/epoll against the forwarder → the SMP win could be partly or
-   wholly negated without making the TCP stack lock-granular / per-CPU
-   first. So SMP-for-redis-throughput is **speculative**, not a sure win.
+**SMP is the lever. Measured 2026-06 (NARF_QEMU_SMP=2, KVM, release, GET
+-c50 -P16):**
+
+| metric | NARF 1vCPU | **NARF 2vCPU** | Linux 1vCPU | **Linux 2vCPU** |
+|---|---|---|---|---|
+| GET rps | ~526k | **543k (+3%)** | ~741k | **868k (+17%)** |
+| PING p50 | 60µs | **70µs (worse)** | 57µs | 58µs |
+| PING p99 | ~180µs | **234µs (worse)** | 74µs | 79µs |
+
+**Linux scales +17% with the 2nd vCPU; NARF only +3%, and latency gets
+WORSE** — the classic signature of cross-CPU contention. redis DOES migrate
+(user tasks get `Affinity::any()` when user-task-SMP is on), but then:
+
+1. ✅ **FIXED — AP bringup hung under KVM** (commit: load AP IDT before
+   errata). `_ap_start_rust` applied AMD Zen4 erratum 1485
+   (`wrmsr_or_gp(DE_CFG[14])`) *before* `load_idtr_ap`. KVM #GPs the DE_CFG
+   write; the recoverable-probe fixup needs a live IDT, so with none loaded
+   the AP triple-faulted and `-no-reboot` froze the whole VM. Now boots to
+   "2 CPU(s) online" + redis serves.
+2. ⏳ **Global TCP-stack lock contends (task #122 — the scaling blocker).**
+   `TCB_TABLE` is one `IrqSafeSpinLock<BTreeMap<…>>`. The BSP forwarder's
+   `handle_segment` holds it while `m.values().find()` **locks every TCB**
+   to 4-tuple-match — O(N) per inbound segment. redis-on-AP's
+   read/write/epoll need the same lock → the two CPUs serialize, negating
+   the 2nd vCPU. Fix: an **O(1) 4-tuple index** so the forwarder touches
+   only the target TCB (briefly), not all of them. (The 4-tuple cache tried
+   earlier and dismissed as a single-vCPU dead-end is the RIGHT move *under
+   SMP*, where the lock is now contended.)
 
 **Conclusion:** the single-vCPU redis path is thoroughly optimized
 (SET 0.43→0.61×, GET 0.35→0.71×, p50 to parity) and the remaining gap is a
