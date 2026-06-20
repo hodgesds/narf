@@ -1318,9 +1318,6 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // queue ate the whole deadline, a fixed ~22 ms p99 tail under load.
     // Staying hot while ANY queue is active keeps the tail sub-ms; the
     // device still parks (all pairs back off) once the whole NIC quiets.
-    let last_rx_cycles = Arc::new(AtomicU64::new(0));
-    // Keep fast-polling for ~5 ms after the last NIC-wide RX activity.
-    let active_window_cycles = (narf_time::cycles_per_ns().max(1) as u64) * 5_000_000;
     // Slow-poll cadence for the poll-only pairs (no MSI-X) once idle: 2 ms,
     // matching the MSI-X pair's IRQ-park backstop. The old fixed 53M-cycle
     // sleep was ~22 ms at the KVM TSC, so a packet landing on a backed-off
@@ -1348,7 +1345,6 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // Spawn one RX forwarder per active pair.
     for pair_idx in 0..num_pairs {
         let rx_prod = Arc::clone(&rx_prod);
-        let last_rx_cycles = Arc::clone(&last_rx_cycles);
         // Only pair 0 gets the MSI-X wakeup; pairs 1..N poll. See
         // function-level comment for why we don't allocate per-queue
         // MSI-X vectors yet.
@@ -1451,13 +1447,9 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     }
                 }
                 // Adapt cadence: reset to fast-poll if this round drained
-                // anything, else step toward the slow fallback.
+                // anything (per-queue), else step toward the slow fallback.
                 if processed_any {
                     idle_rounds = 0;
-                    // Publish NIC-wide activity so the other pairs' poll-only
-                    // forwarders keep fast-polling instead of sleeping out the
-                    // coarse PUMP_CYCLES deadline.
-                    last_rx_cycles.store(narf_time::now_cycles(), Ordering::Relaxed);
                 } else {
                     idle_rounds = idle_rounds.saturating_add(1);
                 }
@@ -1465,16 +1457,21 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 // that arrived during the drain resolves this immediately),
                 // or fall back to the adaptive deadline. Non-MSI-X pairs
                 // (`irq == None`) poll on the sleep cadence.
-                // Stay in fast-poll while THIS queue is bursting (idle_rounds)
-                // OR the NIC saw traffic on ANY queue within the recent
-                // window — the latter is what keeps an RSS-fed but briefly-
-                // idle queue off the coarse slow-poll deadline.
-                let nic_active = {
-                    let last = last_rx_cycles.load(Ordering::Relaxed);
-                    last != 0
-                        && narf_time::now_cycles().wrapping_sub(last) < active_window_cycles
-                };
-                let fast = idle_rounds < FAST_ROUNDS || nic_active;
+                //
+                // PER-QUEUE activity gating: fast-poll only while THIS queue
+                // is bursting (`idle_rounds` resets to 0 on every non-empty
+                // drain). The earlier NIC-WIDE `nic_active` gate kept EVERY
+                // poll-only pair hot whenever ANY queue saw traffic — but the
+                // host tap delivers all flows to RX queue 0 (no RSS spread),
+                // so the secondary queues NEVER receive yet busy-spun a whole
+                // core each forever (perf-dump: a poll-only forwarder core at
+                // ~100% kTk, 0 syscalls). Gating on this queue's own idleness
+                // lets a dead queue's forwarder park (IRQ-park / slow-poll)
+                // while the busy queue 0 stays hot (its `idle_rounds` stays
+                // low under load). If real RSS spreads later, an MSI-X pair
+                // re-wakes on its own RX IRQ; a poll-only pair re-checks on
+                // the 2 ms slow-poll — both per-queue, not NIC-wide.
+                let fast = idle_rounds < FAST_ROUNDS;
                 match irq_waiter {
                     Some(w) => {
                         if fast {
