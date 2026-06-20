@@ -145,6 +145,22 @@ pub fn snapshot() -> Snapshot {
     s
 }
 
+/// One CPU's counters, WITHOUT the cross-CPU sum — for per-core
+/// profiling (where is the work landing, and in what mode). A
+/// concentrated `syscalls`/`user_ticks` on one core with the rest idle
+/// is the signature of a serialization bottleneck the aggregate
+/// [`snapshot`] hides.
+pub fn snapshot_cpu(cpu: usize) -> Snapshot {
+    let p = &COUNTERS[if cpu < MAX_CPUS { cpu } else { 0 }];
+    Snapshot {
+        ctx: p.ctx.load(Ordering::Relaxed),
+        syscalls: p.syscalls.load(Ordering::Relaxed),
+        page_faults: p.page_faults.load(Ordering::Relaxed),
+        user_ticks: p.user_ticks.load(Ordering::Relaxed),
+        kernel_ticks: p.kernel_ticks.load(Ordering::Relaxed),
+    }
+}
+
 /// Total timer ticks across all CPUs — handy as a periodic-dump cadence.
 pub fn total_ticks() -> u64 {
     let mut t = 0u64;

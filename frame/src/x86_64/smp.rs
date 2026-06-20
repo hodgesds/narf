@@ -257,6 +257,16 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
             narf_arch::x86_64::smap::enable();
         }
         narf_arch::x86_64::sse::enable();
+        // CR4.OSXSAVE (bit 18) MUST be set before `xsave::enable_default`
+        // issues `xsetbv`, exactly as the BSP does in bare_main. CR4 is
+        // per-logical-processor, so the BSP's write doesn't cover APs. The
+        // AP path previously called enable_default() without it, so the
+        // `xsetbv` #GP'd on every AP — and there's no IDT-recoverable
+        // fixup armed for it — so every AP crashed right after the
+        // trampoline. THAT is the "KVM AP bring-up hangs" symptom.
+        let mut cr4 = narf_arch::x86_64::cr::read_cr4();
+        cr4 |= narf_arch::x86_64::cr::CR4_OSXSAVE;
+        narf_arch::x86_64::cr::write_cr4(cr4);
         // TODO: MTE and other domains.
         narf_arch::x86_64::xsave::enable_default();
     }
@@ -355,9 +365,6 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
 /// - The BSP's CR3 / GDT / IDT are valid + reachable identity-mapped.
 /// - LAPIC is up (x2APIC mode, BSP-side init_bsp ran).
 pub unsafe fn start_aps() -> u32 {
-    // KVM AP bring-up hangs on the host, returning early to test perf.
-    return 0;
-
     let total = narf_lib::smp::cpu_count();
     if total <= 1 {
         return 0;

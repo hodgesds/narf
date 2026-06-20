@@ -81,6 +81,24 @@ mod perf_dump {
             l,
             b
         );
+        // Per-core breakdown: where is the work landing, and in what mode?
+        // A serialization bottleneck shows as ticks/syscalls concentrated
+        // on one or two cores with the rest idle. Cheap (a few reads +
+        // one writeln per online CPU, only every 3000 ticks).
+        for cpu in 0..narf_lib::percpu::MAX_CPUS.min(16) {
+            if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
+                continue;
+            }
+            let pc = narf_lib::perf::snapshot_cpu(cpu);
+            if pc.user_ticks == 0 && pc.kernel_ticks == 0 && pc.syscalls == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                narf_console::TrapWriter,
+                "PCORE cpu={} uTk={} kTk={} sc={} ctx={} pf={}",
+                cpu, pc.user_ticks, pc.kernel_ticks, pc.syscalls, pc.ctx, pc.page_faults
+            );
+        }
     }
 }
 
