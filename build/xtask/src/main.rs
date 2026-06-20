@@ -565,11 +565,9 @@ impl Arch {
                     // the multi_queue flag (`ip tuntap add ... multi_queue`);
                     // the netdev gets `queues=N` and the device `mq=on` plus
                     // 2N+2 MSI-X vectors (2/pair + control + config).
-                    let queues: usize = std::env::var("XTASK_QEMU_QUEUES")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .filter(|&n| n > 1)
-                        .unwrap_or(1);
+                    // Bumped to ≥2 for a multi_queue tap (QEMU can't open
+                    // it single-queue → silent no-serial boot failure).
+                    let queues: usize = effective_qemu_queues();
                     let n0 = match std::env::var("XTASK_QEMU_TAP") {
                         Ok(tap) if !tap.is_empty() => {
                             let q = if queues > 1 {
@@ -721,11 +719,9 @@ impl Arch {
                     // the multi_queue flag (`ip tuntap add ... multi_queue`);
                     // the netdev gets `queues=N` and the device `mq=on` plus
                     // 2N+2 MSI-X vectors (2/pair + control + config).
-                    let queues: usize = std::env::var("XTASK_QEMU_QUEUES")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .filter(|&n| n > 1)
-                        .unwrap_or(1);
+                    // Bumped to ≥2 for a multi_queue tap (QEMU can't open
+                    // it single-queue → silent no-serial boot failure).
+                    let queues: usize = effective_qemu_queues();
                     let n0 = match std::env::var("XTASK_QEMU_TAP") {
                         Ok(tap) if !tap.is_empty() => {
                             let q = if queues > 1 {
@@ -1316,6 +1312,42 @@ fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
     } else {
         fat[off] = (fat[off] & 0x0F) | (((v << 4) & 0xF0) as u8);
         fat[off + 1] = ((v >> 4) & 0xFF) as u8;
+    }
+}
+
+/// True if the tap netdev `tap` was created with `IFF_MULTI_QUEUE`
+/// (flag 0x0100 in `/sys/class/net/<tap>/tun_flags`). QEMU rejects a
+/// single-queue open of such a tap ("could not configure /dev/net/tun:
+/// Invalid argument") — which surfaces as a guest that never boots (no
+/// serial). The harness can't open a multi_queue tap with one queue, so
+/// it must request ≥2.
+fn tap_is_multi_queue(tap: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{tap}/tun_flags"))
+        .ok()
+        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .map(|flags| flags & 0x0100 != 0)
+        .unwrap_or(false)
+}
+
+/// Effective virtio-net queue-pair count for the current netdev config.
+/// Honors `XTASK_QEMU_QUEUES` (>1), but forces a minimum of 2 when
+/// `XTASK_QEMU_TAP` names a `multi_queue` tap (see [`tap_is_multi_queue`]).
+/// A single-queue tap or SLIRP stays at 1.
+fn effective_qemu_queues() -> usize {
+    let requested = std::env::var("XTASK_QEMU_QUEUES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 1)
+        .unwrap_or(1);
+    let multi_queue_tap = std::env::var("XTASK_QEMU_TAP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|tap| tap_is_multi_queue(&tap))
+        .unwrap_or(false);
+    if multi_queue_tap {
+        requested.max(2)
+    } else {
+        requested
     }
 }
 
@@ -3380,11 +3412,24 @@ fn boot_linux_redis(
     // apples-to-apples over a real backend (the guest self-assigns
     // 10.0.2.15 in its init). Else SLIRP + hostfwd.
     let linux_tap = std::env::var("XTASK_QEMU_TAP").ok().filter(|s| !s.is_empty());
-    let linux_netdev = match &linux_tap {
-        Some(tap) => format!("tap,id=n0,ifname={tap},script=no,downscript=no"),
-        None => format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
+    // Match a multi_queue tap (≥2 queues) just like the NARF side, else
+    // QEMU can't open it and the Linux baseline silently fails to boot.
+    let lq = effective_qemu_queues();
+    let (linux_netdev, linux_dev) = match &linux_tap {
+        Some(tap) if lq > 1 => (
+            format!("tap,id=n0,ifname={tap},script=no,downscript=no,queues={lq}"),
+            format!("virtio-net-pci,netdev=n0,mq=on,vectors={}", 2 * lq + 2),
+        ),
+        Some(tap) => (
+            format!("tap,id=n0,ifname={tap},script=no,downscript=no"),
+            "virtio-net-pci,netdev=n0".to_string(),
+        ),
+        None => (
+            format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
+            "virtio-net-pci,netdev=n0".to_string(),
+        ),
     };
-    cmd.args(["-netdev", &linux_netdev, "-device", "virtio-net-pci,netdev=n0"]);
+    cmd.args(["-netdev", &linux_netdev, "-device", &linux_dev]);
     if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
         cmd.args(["-accel", accel.as_str()]);
     }
@@ -3594,10 +3639,8 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
     // Match NARF's vCPU count (mt-echo-bench defaults NARF_QEMU_SMP to
     // server_threads+1 too) so the comparison is on equal cores.
     let smp = std::env::var("NARF_QEMU_SMP").unwrap_or_else(|_| format!("{}", server_threads + 1));
-    let queues: usize = std::env::var("XTASK_QEMU_QUEUES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    // ≥2 for a multi_queue tap (else QEMU can't open it single-queue).
+    let queues: usize = effective_qemu_queues();
     let (netdev, device) = if queues > 1 {
         (
             format!("tap,id=n0,ifname={tap},script=no,downscript=no,queues={queues}"),
