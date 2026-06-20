@@ -46,6 +46,29 @@ SMP throughput is still ~0.62× — placement fixed redis's *core assignment*
 RX queue + ONE BSP forwarder, a serial feed a 2nd vCPU can't parallelize.
 That's the remaining lever (multi-queue/RSS, task #125).
 
+### #127: NARF serves off-box over a REAL tap NIC (no SLIRP) — and a TCP fix
+
+NARF had only ever run off-box over SLIRP (emulated, single-threaded). Booted
+it over a real host `tap` (`XTASK_QEMU_TAP=tap0`) and found ARP + ICMP worked
+but every TCP connect went **SYN → SYN-ACK → RST**. Root cause (caught with an
+AF_PACKET sniffer): the passive-open **SYN-ACK echoed `rcv_nxt` (the ACK
+number) as the TCP-timestamp TSecr instead of the peer's TSval** — an RFC 7323
+violation. SLIRP regenerates TCP timestamps so it masked the bug for years; a
+real Linux host rejects the bad echo and resets. Fixed in `send_syn` (echo
+`opts.ts_recent`). redis now serves off-box over a real tap: 0 RSTs, clean
+handshake + data. **Clean 20k-PING latency over tap — NARF beats Linux on the
+common case:**
+
+| metric | NARF/tap | Linux/tap |
+|---|---|---|
+| PING min | **40µs** | 50µs |
+| PING p50 | **50µs** | 58µs |
+| PING avg | **58µs** | 60µs |
+| PING p99 | 168µs | 79µs |
+
+This unblocks real off-box throughput numbers free of the single-threaded-SLIRP
+confound, and makes multi-queue/RSS (#125) testable.
+
 Throughput scales with pipeline depth (SET: P1 ~53k → P16 485k → P64 752k)
 but the **ratio to Linux is ~constant ~0.6× across depths** → a per-request
 feed/network constant factor, not a serialization/scaling failure.
