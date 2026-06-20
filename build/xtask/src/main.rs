@@ -3291,11 +3291,16 @@ fn boot_linux_redis(
         "1",
         "-cpu",
         cpu.as_str(),
-        "-netdev",
-        &format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
-        "-device",
-        "virtio-net-pci,netdev=n0",
     ]);
+    // Tap mode: same real NIC NARF uses, so the Linux baseline is
+    // apples-to-apples over a real backend (the guest self-assigns
+    // 10.0.2.15 in its init). Else SLIRP + hostfwd.
+    let linux_tap = std::env::var("XTASK_QEMU_TAP").ok().filter(|s| !s.is_empty());
+    let linux_netdev = match &linux_tap {
+        Some(tap) => format!("tap,id=n0,ifname={tap},script=no,downscript=no"),
+        None => format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
+    };
+    cmd.args(["-netdev", &linux_netdev, "-device", "virtio-net-pci,netdev=n0"]);
     if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
         cmd.args(["-accel", accel.as_str()]);
     }
@@ -3348,10 +3353,14 @@ fn boot_linux_redis(
     }
     drop(reader); // detach; QEMU keeps draining into the (now-dropped) pipe
 
+    let (lconn_host, lconn_port) = match &linux_tap {
+        Some(_) => ("10.0.2.15", guest_port),
+        None => ("127.0.0.1", host_port),
+    };
     let mut stream = None;
     let cstart = Instant::now();
     while cstart.elapsed() < Duration::from_secs(20) {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", host_port)) {
+        if let Ok(s) = TcpStream::connect((lconn_host, lconn_port)) {
             stream = Some(s);
             break;
         }
@@ -3362,7 +3371,7 @@ fn boot_linux_redis(
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("Linux baseline: could not connect to 127.0.0.1:{host_port}");
+            bail!("Linux baseline: could not connect to {lconn_host}:{lconn_port}");
         }
     };
     let _ = writeln!(
@@ -3400,11 +3409,19 @@ fn run_redis_benchmark(host_port: u16, label: &str) {
     let loader = "/lib64/ld-linux-x86-64.so.2";
     let tests =
         std::env::var("XTASK_REDIS_BENCHMARK_T").unwrap_or_else(|_| "set,get,ping_inline".into());
+    // Tap mode: both guests are reached directly at the static IP 10.0.2.15
+    // (they boot sequentially on the same tap), not via a 127.0.0.1 hostfwd.
+    let _ = label;
+    let (bench_host, bench_port) = if std::env::var_os("XTASK_QEMU_TAP").is_some() {
+        ("10.0.2.15".to_string(), "6379".to_string())
+    } else {
+        ("127.0.0.1".to_string(), host_port.to_string())
+    };
     let bench_args = [
         "-h",
-        "127.0.0.1",
+        &bench_host,
         "-p",
-        &host_port.to_string(),
+        &bench_port,
         "-c",
         &clients.to_string(),
         "-P",
