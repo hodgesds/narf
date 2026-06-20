@@ -7391,6 +7391,9 @@ fn sys_madvise(ctx: &mut dyn TrapContext) {
 //     return as Ok(0); test harnesses fire `notify_task_exited`
 //     manually.
 fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, core_dumped: bool) {
+    let pid = task_to_pid_raw(task).unwrap_or(task);
+    use core::fmt::Write;
+    let _ = writeln!(narf_console::Writer, "terminate_current_task: pid={} signum={} core_dumped={} ip={:x}", pid, signum, core_dumped, ctx.rip());
     stage_pending_termination(task, encode_signaled_status(signum, core_dumped));
 
     if let (Some(uctx), Some(hook)) = (

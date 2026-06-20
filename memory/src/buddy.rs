@@ -35,9 +35,9 @@ use crate::PhysAddr;
 /// Smallest block order. Order 0 = 4 KiB.
 pub const MIN_ORDER: u8 = 0;
 
-/// Largest block order in the buddy. Order 10 = 4 MiB.
+/// Largest block order in the buddy. Order 13 = 32 MiB.
 /// Hugepages (2 MiB / 1 GiB) live in a separate pool — see §3.1.2.
-pub const MAX_ORDER: u8 = 10;
+pub const MAX_ORDER: u8 = 13;
 
 /// Number of orders inclusive (0..=MAX_ORDER).
 pub const NUM_ORDERS: usize = (MAX_ORDER as usize) + 1;

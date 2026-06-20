@@ -446,6 +446,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // SAFETY: CPL=0; SSE2 is architectural.
         unsafe {
             narf_arch::x86_64::sse::enable();
+            let mut cr4 = narf_arch::x86_64::cr::read_cr4();
+            cr4 |= narf_arch::x86_64::cr::CR4_OSXSAVE;
+            narf_arch::x86_64::cr::write_cr4(cr4);
+            narf_arch::x86_64::xsave::enable_default();
+            
+            let c = narf_arch::x86_64::xsave::caps();
+            let _ = core::fmt::Write::write_fmt(
+                &mut console::Writer,
+                core::format_args!("  xsave: xcr0_supp={:x} avx={} avx512={}\n", c.xcr0_supported, c.avx, c.avx512)
+            );
         }
         // KPTI detect — Renoir + Phoenix come back Posture::Native and
         // we skip the dual-CR3 dance entirely. Log the decision once.
@@ -3365,6 +3375,7 @@ fn boot_userspace_init() {
                 ("cap_smoke", narf_verification::NARF_CAP_SMOKE_ELF),
                 ("itimer_smoke", narf_verification::NARF_ITIMER_SMOKE_ELF),
                 ("xattr_smoke", narf_verification::NARF_XATTR_SMOKE_ELF),
+                ("perf_smoke", narf_verification::NARF_PERF_SMOKE_ELF),
                 ("fhint_smoke", narf_verification::NARF_FHINT_SMOKE_ELF),
                 // Linux-compat round 8: mq_* / inotify / pkey_* / process_vm_*.
                 ("mq_smoke", narf_verification::NARF_MQ_SMOKE_ELF),

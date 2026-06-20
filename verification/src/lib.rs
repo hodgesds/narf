@@ -4116,6 +4116,11 @@ define_smoke_elf!(
     "NARF_XATTR_SMOKE_ELF_AARCH64"
 );
 define_smoke_elf!(
+    NARF_PERF_SMOKE_ELF,
+    "NARF_PERF_SMOKE_ELF_X86_64",
+    "NARF_PERF_SMOKE_ELF_AARCH64"
+);
+define_smoke_elf!(
     NARF_FHINT_SMOKE_ELF,
     "NARF_FHINT_SMOKE_ELF_X86_64",
     "NARF_FHINT_SMOKE_ELF_AARCH64"

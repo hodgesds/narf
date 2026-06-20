@@ -4135,6 +4135,8 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
+    let image = crate::parse_elf(&bytes).unwrap();
+    unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0).unwrap() };
 
     // Read back the slot through the AS — same translate-and-cast
     // pattern the other smokes use.
@@ -4283,6 +4285,8 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
+    let image = crate::parse_elf(&bytes).unwrap();
+    unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0).unwrap() };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
         let p =
@@ -4402,8 +4406,13 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
     // SAFETY: Valid memory or trusted environment
-    match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
-        Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
+    let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+    let image = crate::parse_elf(&bytes).unwrap();
+    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
+        Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // No DT_STRTAB + st_name=0 → name buffer must be empty.
             if name == [0u8; 32] {
                 TestResult::Pass
@@ -4411,7 +4420,7 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
                 TestResult::Fail("UnresolvedSymbol.name should be empty without DT_STRTAB")
             }
         }
-        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error"),
+        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations"),
         Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
@@ -4431,8 +4440,13 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
     // SAFETY: Valid memory or trusted environment
-    match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
-        Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
+    let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+    let image = crate::parse_elf(&bytes).unwrap();
+    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
+        Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             if &name[..6] != b"printf" {
                 return TestResult::Fail("name buffer doesn't start with \"printf\"");
             }
@@ -4441,7 +4455,7 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
             }
             TestResult::Pass
         }
-        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error"),
+        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations"),
         Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
@@ -4469,8 +4483,13 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
     // frame allocator initialised, satisfying the loader's `# Safety` contract;
     // `bytes` lives for the whole call.
     // SAFETY: Valid memory or trusted environment
-    match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
-        Err(ProcessLoadError::Load(LoadBytesError::UnresolvedSymbol { idx: 1, name })) => {
+    let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+    let image = crate::parse_elf(&bytes).unwrap();
+    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
+        Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // First 32 bytes must equal the source's first 32 bytes,
             // and *all* 32 must be non-zero (we truncated mid-name,
             // so no terminator was reached inside the buffer).
@@ -4482,7 +4501,7 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
             }
             TestResult::Pass
         }
-        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error"),
+        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations"),
         Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }

@@ -1579,7 +1579,9 @@ impl AddressSpace {
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {} // idempotent
-                    Err(_) => return Err(AddressSpaceError::NotImplemented),
+                    Err(e) => {
+                        panic!("materialize map_4kb failed at virt {:x} phys {:x} with {:?}", v.raw(), p.raw(), e);
+                    }
                 }
             }
         }
@@ -1627,7 +1629,9 @@ impl AddressSpace {
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}
-                    Err(_) => return Err(AddressSpaceError::NotImplemented),
+                    Err(e) => {
+                        panic!("materialize map_4kb failed at virt {:x} phys {:x} with {:?}", v.raw(), p.raw(), e);
+                    }
                 }
             }
         }

@@ -2111,6 +2111,10 @@ pub enum Syscall {
     /// calling task (irreversible). Linux (x86_64=446, aarch64=446).
     LandlockRestrictSelf,
 
+    /// `perf_event_open(attr, pid, cpu, group_fd, flags)` — set up performance monitoring.
+    /// Linux (x86_64=298, aarch64=241).
+    PerfEventOpen,
+
     /// `lsm_get_self_attr(attr, ctx, size, flags)` — read a task security
     /// attribute. Linux (x86_64=459, aarch64=459).
     LsmGetSelfAttr,
@@ -2452,6 +2456,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // the legacy eventfd (284). glibc/musl's `eventfd()` wrapper always
     // issues eventfd2, so map 290 to the same (eventfd2-shaped) handler.
     (Syscall::Eventfd, 290),
+    (Syscall::PerfEventOpen, 298),
     (Syscall::Fallocate, 285),
     (Syscall::TimerfdSettime, 286),
     (Syscall::TimerfdGettime, 287),
@@ -2642,6 +2647,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SocketSendMsg, 211),
     (Syscall::SocketRecvMsg, 212),
     (Syscall::SocketPair, 199),
+    (Syscall::PerfEventOpen, 241),
     (Syscall::SocketAccept4, 242),
     (Syscall::Sendfile, 71),
     (Syscall::Mremap, 216),

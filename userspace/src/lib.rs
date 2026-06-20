@@ -68,6 +68,8 @@ pub mod namespaces;
 pub mod pid_ns;
 pub mod pidfd;
 pub mod pipe;
+#[cfg(feature = "linux-compat")]
+pub mod perf_event;
 pub mod poll;
 #[cfg(feature = "linux-compat")]
 pub mod posix_timer;

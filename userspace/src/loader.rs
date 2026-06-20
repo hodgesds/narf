@@ -403,6 +403,7 @@ const SHN_UNDEF: u16 = 0;
 
 // x86_64 relocation type codes (low 32 bits of `r_info`).
 // AMD64 SysV ABI psABI v1.0 §4.4.1 "Relocation Types".
+const R_X86_64_NONE: u32 = 0;
 const R_X86_64_64: u32 = 1;
 const R_X86_64_GLOB_DAT: u32 = 6;
 const R_X86_64_JUMP_SLOT: u32 = 7;
@@ -421,6 +422,7 @@ const R_X86_64_RELATIVE: u32 = 8;
 const R_X86_64_DTPMOD64: u32 = 16;
 const R_X86_64_DTPOFF64: u32 = 17;
 const R_X86_64_TPOFF64: u32 = 18;
+const R_X86_64_IRELATIV: u32 = 37;
 
 /// Lookup helper — return the value paired with the *first*
 /// occurrence of `tag` in `dynamic`. PT_DYNAMIC duplicates would
@@ -855,7 +857,18 @@ unsafe fn process_rela_array(
                     .wrapping_sub(tls_size as i64)
                     .wrapping_add(r_addend) as u64
             }
-            _ => return Err(LoadBytesError::UnsupportedRelocation),
+            R_X86_64_IRELATIV | R_X86_64_NONE => {
+                // Cannot resolve IRELATIV in kernel space. Skip it.
+                // Musl static-pie binaries have an internal __reloc_self
+                // routine that runs in userspace before main() and will
+                // resolve this.
+                continue;
+            }
+            _ => {
+                use core::fmt::Write;
+                let _ = writeln!(narf_console::Writer, "Unsupported relocation type: {}", rtype);
+                return Err(LoadBytesError::UnsupportedRelocation);
+            }
         };
 
         // Patch site. r_offset is the link-time vaddr of the slot;

@@ -1711,6 +1711,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("cap_smoke", "cap-ok"),
         ("itimer_smoke", "itimer-ok"),
         ("xattr_smoke", "xattr-ok"),
+        ("perf_smoke", "perf_smoke: OK"),
         ("fhint_smoke", "fhint-ok"),
         // Linux-compat round 8: mq_*, inotify, pkey_*, process_vm_*.
         ("mq_smoke", "mq-ok"),
@@ -1827,13 +1828,29 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         );
     }
 
+    let fw_dir = root.join("target").join("firmware");
+    let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &args.build.initramfs_firmware)?;
+    let mut cpio_path = None;
+    if !fw_initramfs.is_empty() {
+        let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
+        for (path, bytes) in &fw_initramfs {
+            cpio_entries.push((path.as_str(), bytes.as_slice()));
+        }
+        let cpio = encode_cpio_newc(&cpio_entries);
+        let p = out_dir.join("initramfs.cpio");
+        std::fs::write(&p, &cpio)
+            .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;
+        cpio_path = Some(p);
+    }
+
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile),
-    );
+    let mut qemu_args = build.arch.qemu_args(&kernel, &build.display, build.hw_profile);
+    if let Some(cpio) = cpio_path {
+        qemu_args.push("-initrd".into());
+        qemu_args.push(cpio.display().to_string());
+    }
+    cmd.args(qemu_args);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -2115,10 +2132,14 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         // loop instead of waiting out the full timeout.
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Ev::Panic(p)) => {
+                std::thread::sleep(Duration::from_millis(1500));
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader_handle.join();
-                bail!("xtask run-interactive: panic after typing — '{}'", p);
+                let g = captured.lock().unwrap();
+                let cap_str = String::from_utf8_lossy(&g);
+                let tail = if cap_str.len() > 4096 { &cap_str[cap_str.len() - 4096..] } else { &cap_str };
+                bail!("xtask run-interactive: panic after typing — '{}'\nCapture Tail:\n{}", p, tail);
             }
             Ok(Ev::Prompt) => {}
             Ok(Ev::Eof) => {

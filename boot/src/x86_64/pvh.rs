@@ -126,17 +126,8 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
         // entries at `modlist_paddr`.
         // SAFETY: Valid memory or trusted environment
         let e = unsafe { (entry_ptr as *const HvmModlistEntry).read_unaligned() };
-        if e.cmdline_paddr == 0 {
-            continue;
-        }
-        // SAFETY: cmdline is a NUL-terminated ASCII string at
-        // `cmdline_paddr` per the PVH spec. We bound the scan at
-        // 256 bytes; "initramfs" fits in 9 + NUL.
-        // SAFETY: Valid memory or trusted environment
-        let cmd = unsafe { read_cstr(e.cmdline_paddr as usize, 256) };
-        if cmd.eq_ignore_ascii_case(b"initramfs") {
-            return Some((e.paddr, e.size));
-        }
+        // Just return the first module since we only ever pass the initramfs.
+        return Some((e.paddr, e.size));
     }
     None
 }

@@ -403,6 +403,7 @@ fn main() {
         "cap_smoke",
         "itimer_smoke",
         "xattr_smoke",
+        "perf_smoke",
         "fhint_smoke",
         "mq_smoke",
         "inotify_smoke",

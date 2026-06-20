@@ -228,13 +228,9 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
         // SAFETY: Valid memory or trusted environment
         let mod_end = unsafe { ((payload + 4) as *const u32).read_unaligned() } as u64;
         let str_start = payload + 8;
-        let str_max = (size as usize).saturating_sub(16);
-        // SAFETY: string lives within the tag.
-        let cmd = unsafe { read_cstr(str_start, str_max) };
-        if cmd.eq_ignore_ascii_case(b"initramfs") {
-            let len = mod_end.saturating_sub(mod_start);
-            return Some((mod_start, len));
-        }
+        // Just return the first module since we only ever pass the initramfs.
+        let len = mod_end.saturating_sub(mod_start);
+        return Some((mod_start, len));
     }
     None
 }

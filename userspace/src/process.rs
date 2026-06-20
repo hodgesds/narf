@@ -168,14 +168,10 @@ pub unsafe fn load_user_process_with(
         crate::ExecKind::Elf64Dyn => PROGRAM_DYN_BASE,
         _ => 0,
     };
-    if !image.dynamic.is_empty() && image.interp.is_none() {
-        // SAFETY: `address_space` was just materialized by `load_elf_bytes`,
-        // so every PT_DYNAMIC relocation site is walkable via `paging::
-        // translate`; `program_bias` is the same load offset that fn chose.
-        // SAFETY: Valid memory or trusted environment
-        unsafe { apply_relocations(bytes, &image, &address_space, program_bias) }?;
-    }
-
+    // Static-PIE binaries (no interpreter, but PT_DYNAMIC is present)
+    // use rcrt1.o from musl to self-relocate using AT_PHDR. The kernel
+    // must NOT apply relocations itself, otherwise R_X86_64_RELATIVE
+    // biases will be applied twice and crash the process!
     // FS-backed PT_INTERP fallback: when the in-memory `interp::`
     // registry misses, read the path through the VFS. The mount the
     // path lives under is whatever `registry().resolve_absolute`
@@ -328,9 +324,10 @@ pub unsafe fn load_user_process_with(
     //
     // Only emitted when an interpreter was actually loaded — the
     // NARF-native (no-interpreter) path keeps the all-zero top-of-
-    // stack contract that the smoke tests assert against.
+    // stack contract that the smoke tests assert against. We determine
+    // this by checking if args/envp/auxv are completely empty.
     #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-    let (stack_top_v, at_random_vaddr) = if interp_loaded {
+    let (stack_top_v, at_random_vaddr) = if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
         let entropy_va = stack_top_v - 16;
         let mut key = [0u8; 32];
         let _src = narf_arch::x86_64::hwrng::fill_key_32(&mut key);
@@ -357,59 +354,57 @@ pub unsafe fn load_user_process_with(
     // AT_BASE, AT_PAGESZ) only when the caller didn't already set
     // them. This is what relibc / a Shiva-style ld-narf needs to
     // find the program after the interpreter starts.
-    let final_aux: alloc::vec::Vec<AuxEntry> = if interp_loaded {
-        let mut v: alloc::vec::Vec<AuxEntry> = aux.to_vec();
-        // AT_PHDR / AT_PHENT / AT_PHNUM let the dynamic linker walk
-        // the program's program-header table at runtime. ld-musl
-        // needs these to find PT_DYNAMIC (and from there the
-        // .dynsym / .dynstr / .rela.* tables) so it can patch the
-        // program's relocations. Without them ld-musl loads an
-        // uninitialised pointer from the auxv block, dereferences
-        // it, and SIGSEGVs at vaddr 0 before reaching its symbol
-        // resolver. Computed from the ELF header + the first
-        // PT_LOAD segment: the phdr table sits at file-offset
-        // e_phoff, which the first PT_LOAD maps into memory at
-        // (first_load.vaddr - first_load.file_off + e_phoff).
-        let e_phoff = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap_or([0; 8]));
-        let e_phentsize = u16::from_le_bytes(bytes[0x36..0x38].try_into().unwrap_or([0; 2]));
-        let e_phnum = u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap_or([0; 2]));
-        let first_load = image.segments.first();
-        // ET_DYN binaries' PT_LOAD vaddrs are 0-relative; bias them
-        // by `program_bias` so AT_PHDR points at the actual
-        // runtime mapping. ET_EXEC stays at the declared vaddr.
-        let at_phdr = first_load
-            .map(|s| {
-                s.vaddr
-                    .wrapping_sub(s.file_off)
-                    .wrapping_add(e_phoff)
-                    .wrapping_add(program_bias)
-            })
-            .unwrap_or(0);
+    // AT_PHDR / AT_PHENT / AT_PHNUM let the dynamic linker walk
+    // the program's program-header table at runtime. ld-musl
+    // needs these to find PT_DYNAMIC (and from there the
+    // .dynsym / .dynstr / .rela.* tables) so it can patch the
+    // program's relocations. Without them ld-musl loads an
+    // uninitialised pointer from the auxv block, dereferences
+    // it, and SIGSEGVs at vaddr 0 before reaching its symbol
+    // resolver. Computed from the ELF header + the first
+    // PT_LOAD segment: the phdr table sits at file-offset
+    // e_phoff, which the first PT_LOAD maps into memory at
+    // (first_load.vaddr - first_load.file_off + e_phoff).
+    let e_phoff = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap_or([0; 8]));
+    let e_phentsize = u16::from_le_bytes(bytes[0x36..0x38].try_into().unwrap_or([0; 2]));
+    let e_phnum = u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap_or([0; 2]));
+    let first_load = image.segments.first();
+    // ET_DYN binaries' PT_LOAD vaddrs are 0-relative; bias them
+    // by `program_bias` so AT_PHDR points at the actual
+    // runtime mapping. ET_EXEC stays at the declared vaddr.
+    let at_phdr = first_load
+        .map(|s| {
+            s.vaddr
+                .wrapping_sub(s.file_off)
+                .wrapping_add(e_phoff)
+                .wrapping_add(program_bias)
+        })
+        .unwrap_or(0);
+
+    let mut final_aux = aux.to_vec();
+    if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
         for default in [
             AuxEntry::Pagesz(4096),
             AuxEntry::Entry(program_entry.0.as_u64()),
-            AuxEntry::Base(INTERP_BIAS),
+            AuxEntry::Base(if interp_loaded { INTERP_BIAS } else { 0 }),
             AuxEntry::Phdr(at_phdr),
             AuxEntry::PhEnt(e_phentsize as u32),
             AuxEntry::PhNum(e_phnum as u32),
         ] {
             let tag = default.tag();
-            if !v.iter().any(|e| e.tag() == tag) {
-                v.push(default);
+            if !final_aux.iter().any(|e| e.tag() == tag) {
+                final_aux.push(default);
             }
         }
         // Linux-compat AT_RANDOM stamp. Only emitted when the entropy
         // block was actually written (x86_64 + linux-compat feature).
         if let Some(va) = at_random_vaddr {
             let tag = AuxEntry::Random(0).tag();
-            if !v.iter().any(|e| e.tag() == tag) {
-                v.push(AuxEntry::Random(va));
+            if !final_aux.iter().any(|e| e.tag() == tag) {
+                final_aux.push(AuxEntry::Random(va));
             }
         }
-        v
-    } else {
-        aux.to_vec()
-    };
+    }
 
     // AT_SYSINFO_EHDR: hand libc the vDSO base so it can resolve the
     // __vdso_* / __kernel_* symbols (added regardless of interpreter; a
