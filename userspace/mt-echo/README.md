@@ -105,62 +105,74 @@ Runs the server at 1/2/4/8 threads on `127.0.0.1` and shows req/s
 rising with server thread count on this multicore host. See the bottom
 of this file for a sample result.
 
-## Intended NARF-vs-Linux-over-tap wiring (for xtask)
+## Running under NARF (implemented)
 
-This mirrors the existing `redis-bench` flow
-(`build/xtask/src/main.rs`: `boot_narf_redis` / `boot_linux_redis` /
-`run_redis_benchmark`). **Do not** hand-edit those here — this section
-is the spec for whoever wires it in.
+The server is embedded in the kernel image and boot-spawned, and an
+xtask subcommand drives `loadgen` against it. (This mirrors the
+`redis-bench` flow: `build/xtask/src/main.rs`
+`boot_narf_redis`/`redis_bench_cmd`.)
 
-1. **Embed the server in NARF** (same path redis takes):
-   - Drop `mt_echo_server_x86_64` next to the other guest binaries in
-     `verification/data/musl-demo/` (or a sibling), add a
-     `cargo:rerun-if-changed` + `include_bytes!` entry in
-     `verification/build.rs` + `verification/src/lib.rs` (e.g.
-     `NARF_MT_ECHO_ELF`), and have `frame/src/bare_main.rs` spawn it —
-     exactly like `netserve` / `redis-server` are spawned today
-     (search `NARF_NETSERVE_SMOKE_ELF`, the redis spawn near line
-     3647). Spawn it bound on `0.0.0.0:<guest_port>` with a thread
-     count matching the guest vCPU count (`MT_ECHO_THREADS` or argv[2]).
+**How it's wired:**
+- `mt_echo_server_x86_64` is committed at
+  `verification/data/musl-demo/`, embedded via `NARF_MT_ECHO_ELF`
+  (`verification/build.rs` + `verification/src/lib.rs`).
+- A `mt-echo` cargo feature (`frame/Cargo.toml`, implies `qemu-net`)
+  makes `frame/src/bare_main.rs` spawn the server on `0.0.0.0:7000`
+  **instead of** redis. Worker count comes from the kernel cmdline
+  `mt_echo_threads=N` (default = CPU count) — passed via QEMU `-append`
+  (`XTASK_QEMU_APPEND`), so a thread sweep needs **no kernel rebuild**.
+- `cargo run -p xtask -- mt-echo-bench --arch=x86_64` builds the host
+  `loadgen`, boots NARF per `XTASK_MT_ECHO_THREADS` (CSV sweep), waits
+  for the `mt-echo: listening` marker, runs `loadgen`, and prints an
+  rps + p50/p99/p99.9 table.
 
-2. **Boot NARF over the tap** (the MQ scenario):
-   - Reuse `boot_narf_redis`'s structure but:
-     - wait for `mt-echo: listening` instead of
-       `Ready to accept connections`;
-     - set `NARF_QEMU_SMP=<n>` (MQ needs multiple vCPUs to land flows
-       on multiple cores) instead of forcing `=1`;
-     - use **tap mode** (`XTASK_QEMU_TAP=1`), guest `10.0.2.15`, host
-       `tap0` `10.0.2.2`. Host tap setup:
-       ```sh
-       ip tuntap add tap0 mode tap
-       ip addr add 10.0.2.2/24 dev tap0
-       ip link set tap0 up
-       ```
-     - enable multi-queue virtio-net on the QEMU device
-       (`-device virtio-net-pci,...,mq=on,vectors=<2N+2>` + a
-       multi-queue `-netdev tap,...,queues=<N>`), so RSS actually has
-       multiple queues to steer into. (Single-queue = the redis
-       situation; the point of this workload is `queues>1`.)
+**Reproduction (real multi-queue tap):**
+```sh
+# one-time host tap (persistent), gateway IP NARF expects:
+ip tuntap add tap0 mode tap multi_queue        # if not already present
+ip addr add 10.0.2.2/24 dev tap0; ip link set tap0 up
 
-3. **Drive the load from the host**:
-   ```sh
-   loadgen 10.0.2.15 <guest_port> <connections> <duration> <client_threads>
-   ```
-   Parse the `RESULT ... rps= p50_us= p99_us= p999_us=` line.
+NARF_QEMU_SMP=8 \
+XTASK_QEMU_ACCEL=kvm XTASK_QEMU_TAP=tap0 XTASK_QEMU_QUEUES=4 \
+XTASK_MT_ECHO_THREADS=4 XTASK_MT_ECHO_CONNS=50 XTASK_MT_ECHO_SECS=5 \
+  cargo run -p xtask -- mt-echo-bench --arch=x86_64
+```
+Knobs: `XTASK_MT_ECHO_THREADS` (server-worker CSV sweep, default 4),
+`XTASK_MT_ECHO_CONNS` (50), `XTASK_MT_ECHO_SECS` (5),
+`XTASK_MT_ECHO_CLIENT_THREADS` (default `min(conns,64)` — fewer caps
+offered concurrency and under-measures the server), `XTASK_QEMU_QUEUES`
+(virtio-net queue pairs, tap only), `NARF_QEMU_SMP`.
 
-4. **Linux baseline**: mirror `boot_linux_redis` — same
-   `mt_echo_server_x86_64` binary, busybox `init` that brings up
-   `eth0 10.0.2.15` and `exec`s the server, same QEMU + multi-queue
-   virtio-net + tap, just a stock Linux kernel. Run the IDENTICAL
-   `loadgen` invocation and print NARF-guest-vs-Linux-host side by
-   side.
+## Measured under NARF (debug kernel, KVM, tap0 multi_queue, 50 conns/5s)
 
-5. **The MQ scaling sweep** (what proves MQ's value): for
-   `queues ∈ {1,2,4,8}` (with `server_threads == queues` and
-   `vCPUs >= queues`), run the same `loadgen` and chart rps + p99 vs
-   queue count. Single-queue is the redis-equivalent floor; throughput
-   and p99 should improve as queues rise — the result redis cannot
-   show.
+Off-box over a **real multi-queue NIC** (not SLIRP). 0 errors throughout.
+
+| config | rps | p50 | p99 |
+|---|---|---|---|
+| SLIRP (single-queue, q=1) | ~16k | ~470µs | ~1.3ms |
+| tap q=4, before RX poll-backoff fix | ~4k | ~450µs | **~22.7ms** |
+| tap q=4, after fix, SMP=5 | ~57–65k | ~800µs | ~1.8ms |
+| tap q=4, **SMP=8** | **~74k** | ~650µs | ~1.3ms |
+
+Findings (all in `docs/redis-perf-plan.md`):
+1. **RX poll-backoff was the tap killer**: poll-only queue forwarders
+   slept `PUMP_CYCLES` (~22ms at the KVM TSC) when an RSS-fed queue
+   briefly idled → 9× throughput / 25× tail once gated on NIC-wide
+   activity.
+2. **The loadgen's client-thread count caps it**: 16 threads × ~410µs
+   RTT ≈ 39k looked like a NARF ceiling but wasn't; one thread per
+   connection lifted it to ~60–74k.
+3. **Removing the global TCB_TABLE RX lock** (sharded 4-tuple index):
+   correct (5138 kernel-tests) but throughput-neutral at 50 conns.
+4. **Forwarder CPU placement**: tried, **reverted** — at SMP=8 it
+   measured slightly *worse* (69k vs 74k index-only). The BSP forwarder
+   isn't the bottleneck at this scale.
+5. **The real lever is worker cores**: SMP 5→8 took q=4/t=4 from 59k to
+   74k. Earlier "flat thread scaling" was core starvation, not RX.
+
+**TODO:** Linux-over-tap baseline (`boot_linux_redis`-style initramfs
+with this same binary) is not yet wired into `mt-echo-bench` — the hook
+is there; it currently reports NARF only.
 
 ## Sample LOCAL result
 
