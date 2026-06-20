@@ -3466,6 +3466,230 @@ fn boot_linux_redis(
     Ok((child, stream))
 }
 
+/// Linux baseline for the mt-echo workload: the SAME static
+/// `mt_echo_server` binary under a stock Linux kernel, with the SAME
+/// multi-queue virtio-net + tap + vCPU count NARF uses, so the
+/// comparison is apples-to-apples on the real-NIC MQ path. busybox init
+/// brings up `eth0 10.0.2.15`, best-effort activates all N virtio-net
+/// queue pairs via `ethtool -L eth0 combined N` (so Linux gets the same
+/// RX spread NARF does), then execs the server. Returns the QEMU child
+/// once the readiness marker appears; the caller drives `loadgen`
+/// against `10.0.2.15:<guest_port>` itself. Tap-only (MQ is moot over
+/// SLIRP).
+fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::process::Child> {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let tap = std::env::var("XTASK_QEMU_TAP")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("Linux mt-echo baseline is tap-only (set XTASK_QEMU_TAP)"))?;
+
+    let root = workspace_root()?;
+    let server = root.join("verification/data/musl-demo/mt_echo_server_x86_64");
+    if !server.exists() {
+        bail!("Linux baseline: mt-echo binary missing at {}", server.display());
+    }
+    let busybox = {
+        let local = root.join("verification/data/musl-demo/busybox_static_x86_64");
+        if local.exists() {
+            local
+        } else {
+            PathBuf::from("/usr/bin/busybox")
+        }
+    };
+    if !busybox.exists() {
+        bail!("Linux baseline: need a static busybox");
+    }
+    // ethtool (optional): activates all N virtio-net queue pairs so the
+    // Linux side gets the same multi-queue RX spread NARF does. Without
+    // it, Linux defaults to a single combined queue.
+    let ethtool = ["/sbin/ethtool", "/usr/sbin/ethtool"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists());
+
+    let kernel = if let Ok(k) = std::env::var("XTASK_LINUX_KERNEL") {
+        PathBuf::from(k)
+    } else {
+        let mut cands: Vec<PathBuf> = std::fs::read_dir("/boot")
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("vmlinuz-"))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        cands.sort();
+        cands
+            .pop()
+            .or_else(|| {
+                let v = PathBuf::from("/boot/vmlinuz");
+                v.exists().then_some(v)
+            })
+            .ok_or_else(|| anyhow!("Linux baseline: no /boot/vmlinuz* (set XTASK_LINUX_KERNEL)"))?
+    };
+
+    let stage = std::env::temp_dir().join(format!("narf-linux-mtecho-{guest_port}"));
+    let _ = std::fs::remove_dir_all(&stage);
+    for d in ["bin", "proc", "sys", "dev"] {
+        std::fs::create_dir_all(stage.join(d))?;
+    }
+    std::fs::copy(&busybox, stage.join("bin/busybox"))?;
+    std::fs::copy(&server, stage.join("bin/mt-echo"))?;
+    let mut exec_files: Vec<&str> = vec!["init", "bin/busybox", "bin/mt-echo"];
+    let ethtool_line = if let Some(et) = &ethtool {
+        std::fs::copy(et, stage.join("bin/ethtool"))?;
+        exec_files.push("bin/ethtool");
+        format!("/bin/ethtool -L eth0 combined {server_threads} 2>/dev/null\n")
+    } else {
+        String::new()
+    };
+    let init = format!(
+        "#!/bin/busybox sh\n\
+         /bin/busybox mount -t proc proc /proc\n\
+         /bin/busybox mount -t sysfs sysfs /sys\n\
+         /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null\n\
+         /bin/busybox mknod /dev/null c 1 3 2>/dev/null\n\
+         /bin/busybox ifconfig lo 127.0.0.1 up\n\
+         /bin/busybox ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up\n\
+         /bin/busybox route add default gw 10.0.2.2\n\
+         {ethtool_line}\
+         echo NARF-LINUX-BASELINE-NET-UP\n\
+         exec /bin/mt-echo {guest_port} {server_threads}\n",
+    );
+    std::fs::write(stage.join("init"), init)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in &exec_files {
+            let p = stage.join(f);
+            let mut perm = std::fs::metadata(&p)?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm)?;
+        }
+    }
+    let initramfs = std::env::temp_dir().join(format!("narf-linux-mtecho-{guest_port}.cpio.gz"));
+    let pack = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "cd {} && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -1 > {}",
+            stage.display(),
+            initramfs.display()
+        ))
+        .status()
+        .with_context(|| "Linux baseline: building initramfs (need cpio + gzip)")?;
+    if !pack.success() {
+        bail!("Linux baseline: initramfs pack failed");
+    }
+
+    let mem = std::env::var("NARF_QEMU_MEM_MB").unwrap_or_else(|_| "2048".into());
+    let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
+    // Match NARF's vCPU count (mt-echo-bench defaults NARF_QEMU_SMP to
+    // server_threads+1 too) so the comparison is on equal cores.
+    let smp = std::env::var("NARF_QEMU_SMP").unwrap_or_else(|_| format!("{}", server_threads + 1));
+    let queues: usize = std::env::var("XTASK_QEMU_QUEUES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let (netdev, device) = if queues > 1 {
+        (
+            format!("tap,id=n0,ifname={tap},script=no,downscript=no,queues={queues}"),
+            format!("virtio-net-pci,netdev=n0,mq=on,vectors={}", 2 * queues + 2),
+        )
+    } else {
+        (
+            format!("tap,id=n0,ifname={tap},script=no,downscript=no"),
+            "virtio-net-pci,netdev=n0".to_string(),
+        )
+    };
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args([
+        "-nographic",
+        "-no-reboot",
+        "-kernel",
+        &kernel.display().to_string(),
+        "-initrd",
+        &initramfs.display().to_string(),
+        "-append",
+        "console=ttyS0 panic=-1 quiet",
+        "-m",
+        mem.as_str(),
+        "-smp",
+        smp.as_str(),
+        "-cpu",
+        cpu.as_str(),
+        "-netdev",
+        &netdev,
+        "-device",
+        &device,
+    ]);
+    if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+        cmd.args(["-accel", accel.as_str()]);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("Linux baseline: spawn qemu-system-x86_64")?;
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let cap_r = captured.clone();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 256];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut g) = cap_r.lock() {
+                        g.extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        }
+    });
+
+    let marker = b"mt-echo: listening";
+    let start = Instant::now();
+    let mut ready = false;
+    while start.elapsed() < Duration::from_secs(120) {
+        if let Ok(g) = captured.lock() {
+            if g.windows(marker.len()).any(|w| w == marker) {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !ready {
+        let tail = captured
+            .lock()
+            .ok()
+            .map(|g| String::from_utf8_lossy(&g[g.len().saturating_sub(800)..]).into_owned())
+            .unwrap_or_default();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        bail!("Linux baseline: mt-echo not ready within 120s. Serial tail:\n{tail}");
+    }
+    drop(reader);
+    let _ = writeln!(
+        std::io::stdout(),
+        "  [Linux] kernel {} booted, mt-echo ready ({server_threads} thread(s)).",
+        kernel.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+    );
+    Ok(child)
+}
+
 /// Off-box redis performance benchmark — see [`Cmd::RedisBench`].
 /// Run the host's `redis-benchmark` against a guest's hostfwd port with
 /// real concurrency (`-c` clients). Unlike the single-connection xtask
@@ -3817,8 +4041,14 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
     let root = workspace_root()?;
     let loadgen = build_loadgen(&root)?;
 
-    let mut rows: Vec<(usize, LoadgenResult)> = Vec::new();
+    // Linux baseline runs over the same tap (so MQ is real); it shares
+    // 10.0.2.15, so it boots only AFTER NARF's QEMU is killed. Off over
+    // SLIRP (MQ is moot) or when opted out via XTASK_MT_ECHO_NO_LINUX.
+    let run_linux = tap_mode && std::env::var_os("XTASK_MT_ECHO_NO_LINUX").is_none();
+
+    let mut rows: Vec<(usize, LoadgenResult, Option<LoadgenResult>)> = Vec::new();
     for &threads in &sweep {
+        // ── NARF ──
         println!("── NARF mt-echo: {threads} worker thread(s) ──");
         let (mut child, reader) = boot_narf_mt_echo(args, threads, host_port, guest_port)?;
         let (lg_host, lg_port) = if tap_mode {
@@ -3826,46 +4056,86 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
         } else {
             ("127.0.0.1".to_string(), host_port)
         };
-        // Brief settle so all N listeners + the accept path are live.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let res = run_loadgen(&loadgen, &lg_host, lg_port, conns, secs, client_threads);
+        let narf_res = run_loadgen(&loadgen, &lg_host, lg_port, conns, secs, client_threads);
         let _ = child.kill();
         let _ = child.wait();
         let _ = reader.join();
-        match res {
+        let narf_r = match narf_res {
             Ok(r) => {
                 println!(
-                    "  [NARF t={threads}] rps={:.0}  p50={}µs  p99={}µs  p99.9={}µs  \
-                     (reqs={} errs={})",
+                    "  [NARF  t={threads}] rps={:.0}  p50={}µs  p99={}µs  p99.9={}µs  (reqs={} errs={})",
                     r.rps, r.p50_us, r.p99_us, r.p999_us, r.requests, r.errors
                 );
-                rows.push((threads, r));
+                Some(r)
             }
-            Err(e) => println!("  [NARF t={threads}] loadgen failed: {e:#}"),
+            Err(e) => {
+                println!("  [NARF  t={threads}] loadgen failed: {e:#}");
+                None
+            }
+        };
+
+        // ── Linux baseline (same binary, stock kernel) ──
+        let linux_r = if run_linux {
+            // Let the tap link settle after NARF's QEMU exits.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match boot_linux_mt_echo(guest_port, threads) {
+                Ok(mut lchild) => {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let r =
+                        run_loadgen(&loadgen, "10.0.2.15", guest_port, conns, secs, client_threads);
+                    let _ = lchild.kill();
+                    let _ = lchild.wait();
+                    match r {
+                        Ok(r) => {
+                            println!(
+                                "  [Linux t={threads}] rps={:.0}  p50={}µs  p99={}µs  p99.9={}µs  (reqs={} errs={})",
+                                r.rps, r.p50_us, r.p99_us, r.p999_us, r.requests, r.errors
+                            );
+                            Some(r)
+                        }
+                        Err(e) => {
+                            println!("  [Linux t={threads}] loadgen failed: {e:#}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  [Linux t={threads}] baseline unavailable: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(n) = narf_r {
+            rows.push((threads, n, linux_r));
         }
     }
 
-    println!("\n┌─ mt-echo scaling (NARF, backend={backend}, queues={queues}) ─");
+    println!("\n┌─ mt-echo: NARF vs Linux — same binary, backend={backend}, queues={queues} ─");
     println!(
-        "│ {:>8}  {:>12}  {:>8}  {:>8}  {:>8}",
-        "threads", "rps", "p50µs", "p99µs", "p99.9µs"
+        "│ {:>7}  {:>10} {:>10} {:>6}   {:>9} {:>9}",
+        "threads", "NARF rps", "Linux rps", "N/L", "NARF p99", "Linux p99"
     );
-    for (t, r) in &rows {
-        println!(
-            "│ {t:>8}  {:>12.0}  {:>8}  {:>8}  {:>8}",
-            r.rps, r.p50_us, r.p99_us, r.p999_us
-        );
-    }
-    if let (Some((_, first)), Some((_, last))) = (rows.first(), rows.last()) {
-        if first.rps > 0.0 && rows.len() > 1 {
-            println!(
-                "└─ throughput scaled {:.2}× from {} to {} threads",
-                last.rps / first.rps,
-                rows.first().unwrap().0,
-                rows.last().unwrap().0
-            );
+    for (t, n, lx) in &rows {
+        match lx {
+            Some(l) => println!(
+                "│ {t:>7}  {:>10.0} {:>10.0} {:>5.2}×   {:>7}µs {:>7}µs",
+                n.rps,
+                l.rps,
+                if l.rps > 0.0 { n.rps / l.rps } else { 0.0 },
+                n.p99_us,
+                l.p99_us
+            ),
+            None => println!(
+                "│ {t:>7}  {:>10.0} {:>10} {:>6}   {:>7}µs {:>9}",
+                n.rps, "—", "—", n.p99_us, "—"
+            ),
         }
     }
+    println!("└─");
     Ok(())
 }
 
