@@ -401,10 +401,33 @@ core starvation (4 workers + forwarder over 4 APs), not an RX-dispatch
 ceiling. NARF serves **~74k rps** off-box over real multi-queue tap, p99
 ~1.3ms, 0 errors.
 
-### Open levers
-1. Shard the **by-id** `TCB_TABLE` too — workers' `lookup_tcb` on every
-   send/recv still take one global lock (~74k+ ops/s).
-2. Worker-side per-connection serialization (why p50 climbs with load).
-3. Wire the Linux `mt-echo` baseline into the harness.
+### NARF vs Linux — multithreaded MQ (same binary, q=4, SMP=8, KVM, 50 conns/5s)
+`boot_linux_mt_echo` runs the SAME static `mt_echo_server` under a stock
+Linux kernel with the SAME multi-queue tap + vCPUs (`ethtool -L eth0
+combined N` to activate Linux's queues).
+
+| threads | NARF rps | Linux rps | N/L | NARF p99 | Linux p99 |
+|---|---|---|---|---|---|
+| 1 | 71.8k | 77.8k | **0.92×** | 1279µs | 841µs |
+| 2 | 72.7k | 110.5k | 0.66× | 1307µs | 734µs |
+| 4 | 72.0k | 110.4k | 0.65× | 1320µs | 685µs |
+
+**The gap is scaling, not single-thread speed.** Single-threaded NARF is
+at near-parity (0.92×). But **Linux scales 1→2 threads (78k→110k) and NARF
+is FLAT at ~72k for any thread count** — its RX dispatch is single-cored
+(the N per-queue forwarders all time-share the BSP), so worker threads
+can't pull more than the BSP forwarder feeds. NARF p99 also runs ~1.8×
+Linux's. This is the real residual: **off-load RX dispatch from the single
+BSP core.**
+
+### Open levers (to lift NARF past its ~72k single-cored-RX ceiling)
+1. **Spread RX forwarders across cores — done right.** The naive version
+   (pin forwarders to APs) lost because forwarders then contended the
+   AP-biased workers; partition cores (forwarders on a dedicated set,
+   workers on the rest) instead. This is THE lever — NARF is flat across
+   threads precisely because RX is single-cored.
+2. Shard the **by-id** `TCB_TABLE` (workers' `lookup_tcb` on every
+   send/recv still take one global lock).
+3. NARF's ~1.8× p99 tail vs Linux.
 
 Cross-ref agent memory: `narf-mt-echo-mq-workload`.

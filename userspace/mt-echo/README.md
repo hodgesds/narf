@@ -170,9 +170,30 @@ Findings (all in `docs/redis-perf-plan.md`):
 5. **The real lever is worker cores**: SMP 5→8 took q=4/t=4 from 59k to
    74k. Earlier "flat thread scaling" was core starvation, not RX.
 
-**TODO:** Linux-over-tap baseline (`boot_linux_redis`-style initramfs
-with this same binary) is not yet wired into `mt-echo-bench` — the hook
-is there; it currently reports NARF only.
+## NARF vs Linux (same binary, stock Linux kernel, same MQ tap)
+
+`mt-echo-bench` now boots a Linux baseline too (`boot_linux_mt_echo`:
+the SAME static binary under a stock kernel, SAME multi-queue tap +
+vCPUs, `ethtool -L eth0 combined N` to activate Linux's queues). It runs
+NARF then Linux per config (sequentially — they share `10.0.2.15`) and
+prints a side-by-side table. (Tap-only; opt out with
+`XTASK_MT_ECHO_NO_LINUX`.)
+
+q=4, SMP=8, KVM, 50 conns / 5s, 0 errors both:
+
+| threads | NARF rps | Linux rps | N/L | NARF p99 | Linux p99 |
+|---|---|---|---|---|---|
+| 1 | 71.8k | 77.8k | **0.92×** | 1279µs | 841µs |
+| 2 | 72.7k | 110.5k | 0.66× | 1307µs | 734µs |
+| 4 | 72.0k | 110.4k | 0.65× | 1320µs | 685µs |
+
+**The gap is scaling, not single-thread speed.** NARF is near-parity at
+1 thread (0.92×), but **Linux scales 1→2 threads (78k→110k) while NARF
+stays flat at ~72k for any thread count** — NARF's RX dispatch is
+single-cored (the N per-queue forwarders time-share the BSP), so worker
+threads can't outrun what the one BSP forwarder feeds. Lifting this needs
+RX dispatch spread across cores with forwarders and workers on disjoint
+core sets (see `docs/redis-perf-plan.md`).
 
 ## Sample LOCAL result
 
