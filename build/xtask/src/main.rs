@@ -626,6 +626,12 @@ impl Arch {
                         "-device".into(),
                         "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
                     ]);
+                    // Absolute-pointing tablet so /dev/input/event* covers
+                    // EV_ABS (ABS_X/ABS_Y) alongside the keyboard's EV_KEY.
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
@@ -779,6 +785,12 @@ impl Arch {
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                    ]);
+                    // Absolute-pointing tablet so /dev/input/event* covers
+                    // EV_ABS (ABS_X/ABS_Y) alongside the keyboard's EV_KEY.
+                    args.extend_from_slice(&[
+                        "-device".into(),
+                        "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
                     ]);
                     args.extend_from_slice(&[
                         "-device".into(),

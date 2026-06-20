@@ -196,6 +196,22 @@ impl CapBitmap {
             false
         }
     }
+
+    /// View the bitmap as a little-endian byte slice, suitable for
+    /// copying into an `EVIOCGBIT` user buffer.  Linux returns the
+    /// bitmap in this exact layout (`unsigned long` array, LE on x86).
+    /// Ref: `evdev.c::bits_to_user` / `evdev.c::handle_eviocgbit`.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `[u64; N]` is `repr(Rust)` but a plain POD array with
+        // no padding; reinterpreting it as a byte slice of the same total
+        // length is sound for read-only access on a little-endian target.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.words.as_ptr() as *const u8,
+                core::mem::size_of_val(&self.words),
+            )
+        }
+    }
 }
 
 /// Per-type capability bitmaps for a device.
@@ -593,6 +609,19 @@ impl Router {
             .filter(|n| n.is_alive())
             .map(|n| n.id)
             .collect()
+    }
+
+    /// Clone the capability set of a registered device, or `None` if the
+    /// id is unknown or already removed.  Used by `InputEventFile`'s
+    /// `EVIOCG*` ioctl handlers, which need the device's keybit/relbit/
+    /// absbit/evbit to answer capability queries.
+    pub fn caps(&self, id: DeviceId) -> Option<DeviceCaps> {
+        self.inner
+            .lock()
+            .devices
+            .iter()
+            .find(|n| n.id == id && n.is_alive())
+            .map(|n| n.caps.clone())
     }
 }
 

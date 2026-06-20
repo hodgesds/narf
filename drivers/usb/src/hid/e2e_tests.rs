@@ -46,7 +46,6 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::mem;
 
 use narf_filesystem::devfs_input::{DeviceKind, InputEventFile};
 use narf_input::evdev::{syn, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, ROUTER};
@@ -59,9 +58,12 @@ use crate::hid::mouse::{boot_mouse_evdev_caps, BootMouse, MouseReport};
 
 // ── Wire constants ────────────────────────────────────────────────────────────
 
-/// Size of one evdev event on the wire (matches `EvdevEvent`).
-/// Ref: `include/uapi/linux/input.h struct input_event` (64-bit kernel).
-const EV_SZ: usize = mem::size_of::<EvdevEvent>();
+/// Size of one Linux `struct input_event` on the wire (64-bit kernel):
+/// timeval (16) + type (2) + code (2) + value (4) = 24 bytes. This is what
+/// `/dev/input/event*` reads/writes exchange (the internal `EvdevEvent`
+/// stays 16 bytes; the file layer packs/unpacks).
+/// Ref: `include/uapi/linux/input.h struct input_event`.
+const LINUX_EV_SZ: usize = 24;
 
 /// KEY_A in evdev (Linux `input-event-codes.h`).
 const KEY_A_CODE: u16 = 30;
@@ -650,22 +652,12 @@ fn smoke_e2e_uinput_write_injection() -> TestResult {
         }
     };
 
-    // Build an EvdevEvent for KEY_F1 press and serialise it.
-    let ev = EvdevEvent {
-        time: narf_time::now_cycles(),
-        type_: EventType::Key,
-        code: KEY_F1_CODE,
-        value: 1,
-    };
-    let mut buf = [0u8; EV_SZ];
-    // SAFETY: EvdevEvent is repr(C), EV_SZ bytes.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            &ev as *const EvdevEvent as *const u8,
-            buf.as_mut_ptr(),
-            EV_SZ,
-        );
-    }
+    // Build a 24-byte Linux `input_event` for a KEY_F1 press (the wire
+    // format the uinput write path now expects). tv_sec/tv_usec zero.
+    let mut buf = [0u8; LINUX_EV_SZ];
+    buf[16..18].copy_from_slice(&(EventType::Key as u16).to_le_bytes());
+    buf[18..20].copy_from_slice(&KEY_F1_CODE.to_le_bytes());
+    buf[20..24].copy_from_slice(&1i32.to_le_bytes());
 
     // Write via FileOps (the uinput injection path).
     // We run the async future synchronously using a no-op executor
@@ -691,7 +683,7 @@ fn smoke_e2e_uinput_write_injection() -> TestResult {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let pinned = unsafe { core::pin::Pin::new_unchecked(&mut write_fut) };
         match pinned.poll(&mut cx) {
-            Poll::Ready(Ok(n)) if n == EV_SZ => {}
+            Poll::Ready(Ok(n)) if n == LINUX_EV_SZ => {}
             Poll::Ready(Ok(_)) => {
                 drop(dev);
                 return TestResult::Fail("write returned wrong byte count");
@@ -744,22 +736,13 @@ fn smoke_e2e_hw_device_write_rejected() -> TestResult {
         }
     };
 
-    // Build a dummy EvdevEvent payload.
-    let ev = EvdevEvent {
-        time: 0,
-        type_: EventType::Key,
-        code: KEY_A_CODE,
-        value: 1,
-    };
-    let mut buf = [0u8; EV_SZ];
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            &ev as *const EvdevEvent as *const u8,
-            buf.as_mut_ptr(),
-            EV_SZ,
-        );
-    }
+    // Build a dummy 24-byte Linux `input_event` payload (KEY_A press).
+    // The hardware-write permission check fires before any size check,
+    // but we use the real wire size to keep the test honest.
+    let mut buf = [0u8; LINUX_EV_SZ];
+    buf[16..18].copy_from_slice(&(EventType::Key as u16).to_le_bytes());
+    buf[18..20].copy_from_slice(&KEY_A_CODE.to_le_bytes());
+    buf[20..24].copy_from_slice(&1i32.to_le_bytes());
 
     // Write must be rejected with PermissionDenied.
     {

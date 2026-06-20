@@ -1386,12 +1386,12 @@ kernel_test_in!(
     smoke_dev_input_read_zero_buf_non_blocking
 );
 
-/// 3. InputEventFile read with 1 event available → exactly EVDEV_EVENT_SIZE bytes,
-///    layout matches the event that was dispatched.
+/// 3. InputEventFile read with 1 event available → exactly one 24-byte
+///    Linux `input_event`, with tv_sec/tv_usec present and type/code/value
+///    unpacking to the event that was dispatched.
 fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
-    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::devfs_input::{DeviceKind, InputEventFile, LINUX_INPUT_EVENT_SIZE};
     use crate::FileOps;
-    use core::mem;
     use narf_input::evdev::key::KEY_A;
     use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
 
@@ -1399,7 +1399,9 @@ fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
     caps.add_key(KEY_A);
     let (id, node) = ROUTER.register_device(caps);
 
-    let now = narf_time::now_cycles();
+    // Pick a time that yields non-zero tv_sec AND tv_usec when split as
+    // microseconds (sec = time / 1e6, usec = time % 1e6).
+    let now = 2_000_500u64;
     let sent = EvdevEvent {
         time: now,
         type_: EventType::Key,
@@ -1416,35 +1418,36 @@ fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
         }
     };
 
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; LINUX_INPUT_EVENT_SIZE];
     let result = poll_once_devfs_input(file.read(0, &mut buf));
     ROUTER.unregister_device(id);
 
     match result {
-        Some(Ok(n)) if n == mem::size_of::<EvdevEvent>() => {}
-        Some(Ok(n)) => {
-            let _ = n;
-            return TestResult::Fail("read did not return exactly EVDEV_EVENT_SIZE bytes");
+        Some(Ok(n)) if n == LINUX_INPUT_EVENT_SIZE => {}
+        Some(Ok(_)) => {
+            return TestResult::Fail("read did not return exactly one 24-byte record");
         }
         _ => return TestResult::Fail("read failed or returned Pending"),
     }
 
-    // Verify layout: reconstruct EvdevEvent from the raw bytes.
-    // SAFETY: buf holds exactly 16 bytes written by a prior copy from a valid EvdevEvent;
-    // EvdevEvent is a repr(C) POD type with no padding traps at this size.
-    // SAFETY: Valid memory or trusted environment
-    let got: EvdevEvent = unsafe {
-        let mut v = core::mem::MaybeUninit::<EvdevEvent>::uninit();
-        core::ptr::copy_nonoverlapping(buf.as_ptr(), v.as_mut_ptr() as *mut u8, 16);
-        v.assume_init()
-    };
-    if got.type_ != EventType::Key {
+    // Decode the 24-byte Linux input_event: tv_sec(8) tv_usec(8) type(2)
+    // code(2) value(4), all little-endian.
+    let tv_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let tv_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let raw_type = u16::from_le_bytes(buf[16..18].try_into().unwrap());
+    let code = u16::from_le_bytes(buf[18..20].try_into().unwrap());
+    let value = i32::from_le_bytes(buf[20..24].try_into().unwrap());
+
+    if tv_sec != 2 || tv_usec != 500 {
+        return TestResult::Fail("tv_sec/tv_usec did not split the timestamp correctly");
+    }
+    if raw_type != EventType::Key as u16 {
         return TestResult::Fail("event type mismatch in serialised bytes");
     }
-    if got.code != KEY_A {
+    if code != KEY_A {
         return TestResult::Fail("event code mismatch");
     }
-    if got.value != 1 {
+    if value != 1 {
         return TestResult::Fail("event value mismatch");
     }
     TestResult::Pass
@@ -1457,9 +1460,8 @@ kernel_test_in!(
 /// 4. InputEventFile read with 5 events available and a 10-event buffer →
 ///    exactly 5 events returned in one call.
 fn smoke_dev_input_read_five_events_in_one_call() -> TestResult {
-    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::devfs_input::{DeviceKind, InputEventFile, LINUX_INPUT_EVENT_SIZE};
     use crate::FileOps;
-    use core::mem;
     use narf_input::evdev::key::KEY_A;
     use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
 
@@ -1485,17 +1487,13 @@ fn smoke_dev_input_read_five_events_in_one_call() -> TestResult {
         }
     };
 
-    const EVENT_SIZE: usize = mem::size_of::<EvdevEvent>();
-    let mut buf = [0u8; EVENT_SIZE * 10];
+    let mut buf = [0u8; LINUX_INPUT_EVENT_SIZE * 10];
     let result = poll_once_devfs_input(file.read(0, &mut buf));
     ROUTER.unregister_device(id);
 
     match result {
-        Some(Ok(n)) if n == EVENT_SIZE * 5 => TestResult::Pass,
-        Some(Ok(n)) => {
-            let _ = n;
-            TestResult::Fail("read returned wrong byte count for 5 events")
-        }
+        Some(Ok(n)) if n == LINUX_INPUT_EVENT_SIZE * 5 => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("read returned wrong byte count for 5 events"),
         _ => TestResult::Fail("read failed or returned Pending"),
     }
 }
@@ -1519,8 +1517,8 @@ fn smoke_dev_input_write_hardware_denied() -> TestResult {
         }
     };
 
-    // Attempt to write 16 zero bytes (one null EvdevEvent).
-    let payload = [0u8; 16];
+    // Attempt to write one 24-byte Linux input_event of zeros.
+    let payload = [0u8; crate::devfs_input::LINUX_INPUT_EVENT_SIZE];
     let result = poll_once_devfs_input(file.write(0, &payload));
     ROUTER.unregister_device(id);
 
@@ -1538,11 +1536,10 @@ kernel_test_in!(
 
 /// 6. Write to UserDevice → event injected; reader sees it round-trip.
 fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
-    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::devfs_input::{DeviceKind, InputEventFile, LINUX_INPUT_EVENT_SIZE};
     use crate::FileOps;
-    use core::mem;
     use narf_input::evdev::key::KEY_A;
-    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+    use narf_input::evdev::{DeviceCaps, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_key(KEY_A);
@@ -1556,29 +1553,16 @@ fn smoke_dev_input_write_uinput_injects_event() -> TestResult {
         }
     };
 
-    // Build a valid EvdevEvent into raw bytes.
-    let ev = EvdevEvent {
-        time: 0,
-        type_: EventType::Key,
-        code: KEY_A,
-        value: 1,
-    };
-    let mut payload = [0u8; 16];
-    // SAFETY: `ev` is a valid EvdevEvent on the stack; payload is 16 bytes matching
-    // size_of::<EvdevEvent>(); the two regions do not overlap.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            &ev as *const EvdevEvent as *const u8,
-            payload.as_mut_ptr(),
-            mem::size_of::<EvdevEvent>(),
-        );
-    }
+    // Build a 24-byte Linux input_event (tv_sec/tv_usec zero, EV_KEY KEY_A press).
+    let mut payload = [0u8; LINUX_INPUT_EVENT_SIZE];
+    payload[16..18].copy_from_slice(&(EventType::Key as u16).to_le_bytes());
+    payload[18..20].copy_from_slice(&KEY_A.to_le_bytes());
+    payload[20..24].copy_from_slice(&1i32.to_le_bytes());
 
     // Write the event via the uinput path.
     let write_result = poll_once_devfs_input(file.write(0, &payload));
     match write_result {
-        Some(Ok(16)) => {}
+        Some(Ok(n)) if n == LINUX_INPUT_EVENT_SIZE => {}
         _ => {
             ROUTER.unregister_device(id);
             return TestResult::Fail("uinput write failed or returned wrong count");
@@ -1639,3 +1623,84 @@ fn smoke_dev_input_open_by_path() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/devfs_input", smoke_dev_input_open_by_path);
+
+/// 8. EVIOCGVERSION / EVIOCGBIT(EV_KEY) / EVIOCGNAME — the capability
+///    ioctls evdev readers issue at startup.
+///
+/// The handlers copy into `arg` via `copy_to_user_bytes`, whose only
+/// effect in kernel-test context is the SMAP STAC/CLAC bracket; a kernel
+/// stack buffer address is a valid destination inside that window.
+fn smoke_dev_input_eviocg_ioctls() -> TestResult {
+    use crate::devfs_input::{DeviceKind, InputEventFile};
+    use crate::FileOps;
+    use narf_input::evdev::key::KEY_A;
+    use narf_input::evdev::{DeviceCaps, EventType, ROUTER};
+
+    // _IOC(dir, type, nr, size) helper mirroring the kernel macro.
+    fn ioc(dir: u32, nr: u32, size: u32) -> u32 {
+        (dir << 30) | (size << 16) | ((b'E' as u32) << 8) | nr
+    }
+    const READ: u32 = 2;
+
+    let mut caps = DeviceCaps::new();
+    caps.add_key(KEY_A);
+    let (id, _node) = ROUTER.register_device(caps);
+
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(f) => f,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("open returned None");
+        }
+    };
+
+    // EVIOCGVERSION → i32 0x010001.
+    let mut ver = 0i32;
+    let cmd = ioc(READ, 0x01, 4);
+    match file.ioctl(cmd, &mut ver as *mut i32 as usize) {
+        Ok(4) => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("EVIOCGVERSION returned wrong count");
+        }
+    }
+    if ver != 0x01_0001 {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("EVIOCGVERSION value mismatch");
+    }
+
+    // EVIOCGBIT(EV_KEY, 96) → keybit; bit KEY_A must be set.
+    let mut keybit = [0u8; 96];
+    let cmd = ioc(READ, 0x20 + EventType::Key as u32, keybit.len() as u32);
+    match file.ioctl(cmd, keybit.as_mut_ptr() as usize) {
+        Ok(n) if n as usize == keybit.len() => {}
+        _ => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("EVIOCGBIT(EV_KEY) returned wrong count");
+        }
+    }
+    let byte = (KEY_A / 8) as usize;
+    let bit = KEY_A % 8;
+    if keybit[byte] & (1u8 << bit) == 0 {
+        ROUTER.unregister_device(id);
+        return TestResult::Fail("EVIOCGBIT(EV_KEY) did not reflect KEY_A");
+    }
+
+    // EVIOCGNAME(32) → non-empty NUL-terminated string.
+    let mut name = [0u8; 32];
+    let cmd = ioc(READ, 0x06, name.len() as u32);
+    let nlen = match file.ioctl(cmd, name.as_mut_ptr() as usize) {
+        Ok(n) => n as usize,
+        _ => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("EVIOCGNAME failed");
+        }
+    };
+    ROUTER.unregister_device(id);
+
+    if nlen < 2 || name[0] == 0 || name[nlen - 1] != 0 {
+        return TestResult::Fail("EVIOCGNAME did not return a NUL-terminated name");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs_input", smoke_dev_input_eviocg_ioctls);

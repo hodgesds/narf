@@ -12,7 +12,19 @@
 //!
 //! # ABI
 //!
-//! Each read returns a multiple of `size_of::<EvdevEvent>()` (16 bytes).
+//! On the wire each read/write returns a multiple of the **24-byte**
+//! Linux `struct input_event` (64-bit kernel layout) so unmodified
+//! evdev programs (evtest, libinput) work unchanged.  The internal
+//! `EvdevEvent` stays 16 bytes; `read` packs each into a 24-byte Linux
+//! record and `write` unpacks the 24-byte records back.
+//!
+//! ```c
+//! struct input_event {
+//!     struct timeval time;  // { long tv_sec; long tv_usec; } = 16 bytes
+//!     __u16 type; __u16 code; __s32 value;   // 8 bytes
+//! };                                          // 24 bytes total
+//! ```
+//!
 //! If the ring is empty and `buf` is non-zero, the read awaits one
 //! `WaitEventFuture` and then drains whatever arrived — matching Linux
 //! blocking-fd semantics (O_RDONLY with no O_NONBLOCK).  A non-blocking
@@ -27,8 +39,9 @@
 //!   ...
 //! ```
 //!
-//! `/dev/input/mice` (multiplexed mouse) and EVIOCG* ioctls are
-//! deferred to a later wave.
+//! `/dev/input/mice` (multiplexed mouse) is deferred to a later wave.
+//! The `EVIOCG*` capability ioctls evdev readers issue at startup are
+//! implemented here (`ioctl`).
 
 extern crate alloc;
 
@@ -38,17 +51,159 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
 
-use narf_input::evdev::{DeviceId, EvdevEvent, ROUTER};
+use narf_input::evdev::{DeviceId, EventType, EvdevEvent, ROUTER};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
 
-// ── EvdevEvent size constant ──────────────────────────────────────────────────
+// ── Event-record sizes ────────────────────────────────────────────────────────
 
-/// Wire size of one evdev event on the userspace ABI (16 bytes).
+/// In-memory size of one internal `EvdevEvent` (16 bytes).
 /// `size_of::<EvdevEvent>()` = 8 (time) + 2 (type) + 2 (code) + 4 (value).
-/// Ref: `include/uapi/linux/input.h` `struct input_event` (64-bit kernel).
 const EVDEV_EVENT_SIZE: usize = mem::size_of::<EvdevEvent>();
+
+// The internal event must stay 16 bytes; the wire format is the 24-byte
+// Linux record built by `pack_linux_event`.  This const assertion fails
+// the build if the internal layout ever drifts.
+const _: () = assert!(EVDEV_EVENT_SIZE == 16);
+
+/// Wire size of one Linux `struct input_event` on a 64-bit kernel (24 bytes):
+/// `timeval` (2 × 8-byte long = 16) + type (2) + code (2) + value (4).
+/// Ref: `include/uapi/linux/input.h` `struct input_event`.
+pub(crate) const LINUX_INPUT_EVENT_SIZE: usize = 24;
+
+// ── Linux input_event packing ─────────────────────────────────────────────────
+
+/// Pack one internal `EvdevEvent` into a 24-byte Linux `input_event`.
+///
+/// The internal `time` is a TSC-monotonic u64; we split it into the
+/// `timeval` seconds/microseconds fields by treating it as a microsecond
+/// count (`tv_sec = time / 1_000_000`, `tv_usec = time % 1_000_000`).
+/// evdev consumers only ever subtract timestamps for relative timing, so
+/// the absolute epoch is irrelevant — only monotonicity matters, which
+/// the TSC source guarantees.
+fn pack_linux_event(ev: &EvdevEvent) -> [u8; LINUX_INPUT_EVENT_SIZE] {
+    let mut out = [0u8; LINUX_INPUT_EVENT_SIZE];
+    let tv_sec = (ev.time / 1_000_000) as i64;
+    let tv_usec = (ev.time % 1_000_000) as i64;
+    out[0..8].copy_from_slice(&tv_sec.to_le_bytes());
+    out[8..16].copy_from_slice(&tv_usec.to_le_bytes());
+    out[16..18].copy_from_slice(&(ev.type_ as u16).to_le_bytes());
+    out[18..20].copy_from_slice(&ev.code.to_le_bytes());
+    out[20..24].copy_from_slice(&ev.value.to_le_bytes());
+    out
+}
+
+/// Unpack a 24-byte Linux `input_event` into an internal `EvdevEvent`.
+///
+/// Returns `None` if the `type` field is not a recognised `EV_*` code.
+/// The `timeval` is collapsed back to a TSC-style u64 microsecond count
+/// (`tv_sec * 1_000_000 + tv_usec`); uinput callers normally zero it and
+/// let the kernel timestamp, but we preserve whatever they sent.
+fn unpack_linux_event(buf: &[u8]) -> Option<EvdevEvent> {
+    if buf.len() < LINUX_INPUT_EVENT_SIZE {
+        return None;
+    }
+    let tv_sec = i64::from_le_bytes(buf[0..8].try_into().ok()?);
+    let tv_usec = i64::from_le_bytes(buf[8..16].try_into().ok()?);
+    let raw_type = u16::from_le_bytes(buf[16..18].try_into().ok()?);
+    let code = u16::from_le_bytes(buf[18..20].try_into().ok()?);
+    let value = i32::from_le_bytes(buf[20..24].try_into().ok()?);
+    let type_ = EventType::from_raw(raw_type)?;
+    let time = (tv_sec as u64)
+        .wrapping_mul(1_000_000)
+        .wrapping_add(tv_usec as u64);
+    Some(EvdevEvent {
+        time,
+        type_,
+        code,
+        value,
+    })
+}
+
+// ── User-pointer copy (ioctl out) ─────────────────────────────────────────────
+//
+// Mirrors the pattern in `devfs_pty.rs`: the SMAP/STAC bracket is opened
+// per access so a CPL=0 store into a user-only PTE doesn't fault once
+// CR4.SMAP=1.  See `[[project_user_cstr_page_safety]]`.
+
+/// Copy `src` into the user buffer at `uptr`.  Returns the number of
+/// bytes written.  `src.len()` is the caller's responsibility to bound
+/// (the ioctl handlers truncate to the request's `size` field).
+///
+/// # Safety
+/// `uptr` must be a valid user-space pointer with at least `src.len()`
+/// bytes writable, or null (rejected).
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_to_user_bytes(uptr: usize, src: &[u8]) -> Result<usize, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees `uptr` is a valid writable user pointer of
+    // at least `src.len()` bytes; `with_user_access` opens the SMAP window
+    // and the byte copy stays within that range.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), uptr as *mut u8, src.len());
+        });
+    }
+    Ok(src.len())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn copy_to_user_bytes(uptr: usize, src: &[u8]) -> Result<usize, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees `uptr` is a valid writable user pointer of
+    // at least `src.len()` bytes (no SMAP outside x86_64).
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), uptr as *mut u8, src.len());
+    }
+    Ok(src.len())
+}
+
+// ── EVIOC* ioctl decoding ─────────────────────────────────────────────────────
+
+/// Linux `_IOC` field accessors.  An ioctl `cmd` packs
+/// `dir(2) | size(14) | type(8) | nr(8)`.
+/// Ref: `include/uapi/asm-generic/ioctl.h`.
+mod ioc {
+    pub const fn dir(cmd: u32) -> u32 {
+        (cmd >> 30) & 0x3
+    }
+    pub const fn size(cmd: u32) -> u32 {
+        (cmd >> 16) & 0x3FFF
+    }
+    pub const fn typ(cmd: u32) -> u32 {
+        (cmd >> 8) & 0xFF
+    }
+    pub const fn nr(cmd: u32) -> u32 {
+        cmd & 0xFF
+    }
+}
+
+/// evdev ioctl type byte (`'E'`).  Ref: `include/uapi/linux/input.h`.
+const EVIOC_TYPE: u32 = b'E' as u32;
+
+/// `EV_VERSION` reported by `EVIOCGVERSION`.
+/// Ref: `include/uapi/linux/input.h:53`.
+const EV_VERSION: i32 = 0x01_0001;
+
+/// `BUS_VIRTUAL` bustype for the synthesised `input_id`.
+/// Ref: `include/uapi/linux/input.h:259`.
+const BUS_VIRTUAL: u16 = 0x06;
+
+/// Fixed `nr` values for the non-parametric evdev ioctls.
+const EVIOC_NR_GVERSION: u32 = 0x01; // EVIOCGVERSION
+const EVIOC_NR_GID: u32 = 0x02; // EVIOCGID
+const EVIOC_NR_GNAME: u32 = 0x06; // EVIOCGNAME(len)
+const EVIOC_NR_GBIT_BASE: u32 = 0x20; // EVIOCGBIT(ev, len) → 0x20 + ev
+const EVIOC_NR_GABS_BASE: u32 = 0x40; // EVIOCGABS(abs) → 0x40 + abs
+const EVIOC_NR_GRAB: u32 = 0x90; // EVIOCGRAB
+
+/// Synthetic device name reported by `EVIOCGNAME`.
+const DEVICE_NAME: &[u8] = b"narf-input";
 
 // ── InputEventFile ────────────────────────────────────────────────────────────
 
@@ -108,9 +263,10 @@ impl InputEventFile {
     }
 
     /// Non-blocking drain: pop up to `n` events from the reader into
-    /// the raw byte slice.  Returns the number of *bytes* written.
+    /// the raw byte slice, packing each into a 24-byte Linux
+    /// `input_event`.  Returns the number of *bytes* written.
     fn drain_into(&self, buf: &mut [u8]) -> usize {
-        let max_events = buf.len() / EVDEV_EVENT_SIZE;
+        let max_events = buf.len() / LINUX_INPUT_EVENT_SIZE;
         if max_events == 0 {
             return 0;
         }
@@ -123,18 +279,11 @@ impl InputEventFile {
         for i in 0..max_events {
             match reader.poll_event() {
                 Some(ev) => {
-                    let dst = &mut buf[i * EVDEV_EVENT_SIZE..(i + 1) * EVDEV_EVENT_SIZE];
-                    // SAFETY: EvdevEvent is repr(C), size_of matches EVDEV_EVENT_SIZE,
-                    // and we're copying exactly that many bytes into a properly sized slice.
-                    // SAFETY: Valid memory or trusted environment
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            &ev as *const EvdevEvent as *const u8,
-                            dst.as_mut_ptr(),
-                            EVDEV_EVENT_SIZE,
-                        );
-                    }
-                    written += EVDEV_EVENT_SIZE;
+                    let packed = pack_linux_event(&ev);
+                    let dst =
+                        &mut buf[i * LINUX_INPUT_EVENT_SIZE..(i + 1) * LINUX_INPUT_EVENT_SIZE];
+                    dst.copy_from_slice(&packed);
+                    written += LINUX_INPUT_EVENT_SIZE;
                 }
                 None => break,
             }
@@ -146,19 +295,21 @@ impl InputEventFile {
 impl FileOps for InputEventFile {
     /// Read events from the device ring into `buf`.
     ///
-    /// - `buf` must hold at least `EVDEV_EVENT_SIZE` (16) bytes; smaller
-    ///   buffers return `Ok(0)` immediately (non-blocking semantics).
+    /// - `buf` must hold at least `LINUX_INPUT_EVENT_SIZE` (24) bytes;
+    ///   smaller buffers return `Ok(0)` immediately (non-blocking).
     /// - Fast path: drain whatever is already queued (non-blocking).
     /// - Slow path: if the ring is empty, open a temporary reader and
     ///   await `WaitEventFuture` for one event, then return that event.
     ///   Any further events that arrived are left in the ring for the
     ///   next read call.
+    /// - Every returned event is packed into the 24-byte Linux
+    ///   `input_event` wire format.
     /// - `offset` is ignored (event stream, not seekable).
     ///
     /// Ref: `evdev.c::evdev_read` lines ~441-490.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            if buf.len() < EVDEV_EVENT_SIZE {
+            if buf.len() < LINUX_INPUT_EVENT_SIZE {
                 // Non-blocking or zero-size: return immediately.
                 return Ok(0);
             }
@@ -183,19 +334,10 @@ impl FileOps for InputEventFile {
                 // Block until one event or device-removal.
                 if let Some(ev) = wr.wait_event_async().await {
                     // `wait_event_async` consumed the event from the ring.
-                    // Serialize it into `buf[0..EVDEV_EVENT_SIZE]`.
-                    let dst = &mut buf[..EVDEV_EVENT_SIZE];
-                    // SAFETY: `EvdevEvent` is `repr(C)` and exactly
-                    // `EVDEV_EVENT_SIZE` bytes; `dst` is that size.
-                    // SAFETY: Valid memory or trusted environment
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            &ev as *const EvdevEvent as *const u8,
-                            dst.as_mut_ptr(),
-                            EVDEV_EVENT_SIZE,
-                        );
-                    }
-                    return Ok(EVDEV_EVENT_SIZE);
+                    // Pack it into the 24-byte Linux record at buf[0..24].
+                    let packed = pack_linux_event(&ev);
+                    buf[..LINUX_INPUT_EVENT_SIZE].copy_from_slice(&packed);
+                    return Ok(LINUX_INPUT_EVENT_SIZE);
                 }
             }
 
@@ -207,8 +349,11 @@ impl FileOps for InputEventFile {
     /// Write events into the device (uinput path).
     ///
     /// Hardware devices return `FsError::PermissionDenied`.
-    /// UserDevice files accept a buffer of packed `EvdevEvent` structs
-    /// and inject them via `DeviceNode::dispatch`.
+    /// UserDevice files accept a buffer of 24-byte Linux `input_event`
+    /// records, unpack each into an internal `EvdevEvent`, and inject
+    /// them via `ROUTER.dispatch`.  Records with an unrecognised `EV_*`
+    /// type are skipped but still counted as consumed (Linux uinput is
+    /// equally lenient).
     ///
     /// Ref: `uinput.c::uinput_write` (line ~502).
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -216,27 +361,20 @@ impl FileOps for InputEventFile {
             if self.kind == DeviceKind::Hardware {
                 return Err(FsError::PermissionDenied);
             }
-            if buf.len() % EVDEV_EVENT_SIZE != 0 {
+            if buf.len() % LINUX_INPUT_EVENT_SIZE != 0 {
                 return Err(FsError::InvalidPath);
             }
-            let mut injected = 0usize;
-            let count = buf.len() / EVDEV_EVENT_SIZE;
+            let mut consumed = 0usize;
+            let count = buf.len() / LINUX_INPUT_EVENT_SIZE;
             for i in 0..count {
-                let src = &buf[i * EVDEV_EVENT_SIZE..(i + 1) * EVDEV_EVENT_SIZE];
-                // SAFETY: EvdevEvent is repr(C), src is exactly EVDEV_EVENT_SIZE bytes.
-                let ev: EvdevEvent = unsafe {
-                    let mut v = core::mem::MaybeUninit::<EvdevEvent>::uninit();
-                    core::ptr::copy_nonoverlapping(
-                        src.as_ptr(),
-                        v.as_mut_ptr() as *mut u8,
-                        EVDEV_EVENT_SIZE,
-                    );
-                    v.assume_init()
-                };
-                ROUTER.dispatch(self.device_id, ev);
-                injected += EVDEV_EVENT_SIZE;
+                let src =
+                    &buf[i * LINUX_INPUT_EVENT_SIZE..(i + 1) * LINUX_INPUT_EVENT_SIZE];
+                if let Some(ev) = unpack_linux_event(src) {
+                    ROUTER.dispatch(self.device_id, ev);
+                }
+                consumed += LINUX_INPUT_EVENT_SIZE;
             }
-            Ok(injected)
+            Ok(consumed)
         })
     }
 
@@ -275,6 +413,98 @@ impl FileOps for InputEventFile {
             }
         }
         0
+    }
+
+    /// `EVIOCG*` capability ioctls — what evdev readers (evtest,
+    /// libinput) issue right after `open()` to learn the device's
+    /// version, id, name, and supported event/key/axis bits.
+    ///
+    /// All handlers decode the `_IOC` `cmd` word into `dir/size/type/nr`
+    /// (see `ioc`), answer from the device's `DeviceCaps` pulled out of
+    /// `ROUTER`, and copy the result into the user pointer `arg`.  The
+    /// requested length (`_IOC` size, or the EVIOCGABS struct length) is
+    /// the upper bound on bytes written; we return the actual count.
+    ///
+    /// Unknown requests return `Unsupported` → `-ENOTTY`, matching Linux.
+    ///
+    /// Ref: `drivers/input/evdev.c::evdev_do_ioctl`.
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        // Only the evdev ('E') type is handled here.
+        if ioc::typ(cmd) != EVIOC_TYPE {
+            return Err(FsError::Unsupported);
+        }
+        let nr = ioc::nr(cmd);
+        let size = ioc::size(cmd) as usize;
+
+        match nr {
+            EVIOC_NR_GVERSION => {
+                // EVIOCGVERSION → i32 EV_VERSION.
+                // SAFETY: `arg` is the user `int *` validated by the
+                // syscall layer before dispatch.
+                let n = unsafe { copy_to_user_bytes(arg, &EV_VERSION.to_le_bytes())? };
+                Ok(n as u64)
+            }
+            EVIOC_NR_GID => {
+                // EVIOCGID → struct input_id { bustype, vendor, product, version }.
+                let mut id = [0u8; 8];
+                id[0..2].copy_from_slice(&BUS_VIRTUAL.to_le_bytes());
+                // vendor/product/version left zero (synthetic device).
+                // SAFETY: `arg` is the user `struct input_id *`.
+                let n = unsafe { copy_to_user_bytes(arg, &id)? };
+                Ok(n as u64)
+            }
+            EVIOC_NR_GNAME => {
+                // EVIOCGNAME(len) → NUL-terminated device name, truncated
+                // to the requested length.  Returns the byte count copied.
+                let mut name = Vec::with_capacity(DEVICE_NAME.len() + 1);
+                name.extend_from_slice(DEVICE_NAME);
+                name.push(0);
+                let take = name.len().min(size.max(1));
+                // SAFETY: `arg` is the user name buffer of `size` bytes.
+                let n = unsafe { copy_to_user_bytes(arg, &name[..take])? };
+                Ok(n as u64)
+            }
+            EVIOC_NR_GRAB => {
+                // EVIOCGRAB — accept and no-op (single-reader anyway).
+                Ok(0)
+            }
+            nr if (EVIOC_NR_GBIT_BASE..EVIOC_NR_GABS_BASE).contains(&nr) => {
+                // EVIOCGBIT(ev, len): nr = 0x20 + ev.  ev == 0 asks for
+                // the EV_* type bitmask; otherwise the per-type code bits.
+                let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
+                let ev = (nr - EVIOC_NR_GBIT_BASE) as u16;
+                if ev == 0 {
+                    // EV_* type bitmask: evbit is a u32 little-endian word.
+                    let bytes = caps.evbit.to_le_bytes();
+                    let take = bytes.len().min(size);
+                    // SAFETY: `arg` is the user bitmask buffer of `size` bytes.
+                    let n = unsafe { copy_to_user_bytes(arg, &bytes[..take])? };
+                    Ok(n as u64)
+                } else {
+                    let src: &[u8] = match EventType::from_raw(ev) {
+                        Some(EventType::Key) => caps.keybit.as_bytes(),
+                        Some(EventType::Rel) => caps.relbit.as_bytes(),
+                        Some(EventType::Abs) => caps.absbit.as_bytes(),
+                        // No bitmap tracked for other types — report none.
+                        _ => &[],
+                    };
+                    let take = src.len().min(size);
+                    // SAFETY: `arg` is the user bitmask buffer of `size` bytes.
+                    let n = unsafe { copy_to_user_bytes(arg, &src[..take])? };
+                    Ok(n as u64)
+                }
+            }
+            nr if nr >= EVIOC_NR_GABS_BASE && nr < EVIOC_NR_GABS_BASE + 0x40 => {
+                // EVIOCGABS(abs): nr = 0x40 + abs.  struct input_absinfo
+                // is six i32s; we report all-zero limits (no calibration
+                // data synthesised for the virtual pointer).
+                let absinfo = [0u8; 24];
+                // SAFETY: `arg` is the user `struct input_absinfo *`.
+                let n = unsafe { copy_to_user_bytes(arg, &absinfo)? };
+                Ok(n as u64)
+            }
+            _ => Err(FsError::Unsupported),
+        }
     }
 }
 
