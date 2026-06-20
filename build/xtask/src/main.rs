@@ -3762,10 +3762,15 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    // One client thread per connection by default (capped): the loadgen
+    // services a thread's connections sequentially, so too few client
+    // threads caps offered concurrency below `conns` and under-measures
+    // the server (16 threads × ~410µs RTT ≈ 39k was a loadgen cap, not a
+    // NARF ceiling — one-thread-per-conn lifted it to ~60k).
     let client_threads: usize = std::env::var("XTASK_MT_ECHO_CLIENT_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(conns.min(16));
+        .unwrap_or(conns.min(64));
     // Server worker-thread sweep, e.g. "1,2,4,8". Each value boots a
     // fresh kernel with mt_echo_threads=N.
     let sweep: Vec<usize> = std::env::var("XTASK_MT_ECHO_THREADS")

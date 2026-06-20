@@ -348,25 +348,45 @@ served by distinct workers on distinct cores in parallel.
   host `loadgen`, sweeps `XTASK_MT_ECHO_THREADS`, prints rps + p50/p99/p99.9
   table). Reuses `XTASK_QEMU_TAP`/`_QUEUES`/`_ACCEL`.
 
-### First measurements (debug, KVM, 50 conns / 4s, threads 1→4)
-| backend | queues | scaling | rps (t=1→4) | p99 |
-|---|---|---|---|---|
-| SLIRP | 1 | 1.08× (flat) | ~16k | ~1.3ms |
-| tap0 (multi_queue) | 4 | **1.51×** | 2.6k→4.6k | **~22ms** |
+### The ~22ms tap tail — root-caused + FIXED (commit ce51022e)
+First tap numbers were bad: ~4k rps, a uniform **~22ms p99 tail**. First
+hypothesis (RTO on dropped packets) was WRONG — RTO_MIN is 200ms, and
+deepening the RX ring (post the full ~128-desc ring vs a fixed 8) did NOT
+move the tail. Real cause: the **poll-only RX forwarders** (queue pairs
+1..N have no MSI-X) back off to `sleep_cycles(PUMP_CYCLES)` when a queue
+briefly idles, and PUMP_CYCLES (53M) ≈ **22ms at the KVM TSC**. The host
+RSS-spreads flows across all queues, so any single queue idles for short
+windows even while the NIC is busy → a forwarder slept 22ms and the next
+request steered there ate the deadline. Fix: a shared per-NIC
+"saw-RX-recently" timestamp; poll-only pairs keep fast-polling while ANY
+queue was active within ~5ms, backing off only when the whole NIC quiets.
 
-tap shows a real MQ thread-scaling signal (1.51× vs SLIRP's flat 1.08×) but
-absolute throughput is LOWER and there's a uniform **~22ms p99 tail** (p50
-fine ~450µs, 0 errors). The ~22ms ≈ NARF RTO retransmitting packets DROPPED
-under load: all N queue forwarders are BSP-pinned and funnel into one
-global-locked TCP stack → the RX ring / tap queue overflows.
+### Measurements (debug, KVM, tap0 multi_queue, queues=4, 50 conns / 4s)
+| config | rps | p50 | p99 |
+|---|---|---|---|
+| before tail fix | ~4k | ~450µs | **~22.7ms** |
+| after tail fix (16 client thr) | ~37k | ~410µs | ~0.9ms |
+| after, 1 client thr/conn | **~60–65k** | ~0.8ms | **~1.8ms** |
 
-### Next steps (the actual scaling enablers)
+Two findings: (1) the tail fix alone was **9× throughput / 25× tail**.
+(2) the 16-client-thread default was a LOADGEN cap (16 × ~410µs RTT ≈ 39k);
+one client thread per connection lifts NARF to **~60–65k rps** off-box over
+a real multi-queue NIC at sub-2ms p99, 0 errors. net-smoke green.
+
+**Worker-thread scaling is now flat-to-declining** (t=1 65k, t=2 67k, t=4
+57k) even at full client load → the ceiling is NOT the workers but the
+**RX-dispatch path**: a single BSP forwarder drains all N queues and every
+frame does an O(N) `TCB_TABLE` scan under one global lock.
+
+### Next steps (the RX-dispatch ceiling — the real scaling enablers)
 1. **Forwarder CPU placement** — spread per-queue RX forwarders across cores
-   (today all BSP-pinned; `StackfulOptions` has no affinity field).
+   (today all BSP-pinned; needs an affinity field on the stackful spawn AND
+   an SMP-safety audit of the forwarder's touched state — the scheduler
+   explicitly keeps `unthrottled()` BSP-pinned for un-audited tasks).
 2. **Sharded / lock-granular TCP stack** — so N forwarders don't serialize
-   on the global `TCB_TABLE` lock.
-3. High-PPS RX cleanup (#126): `rx_handler` per-frame String clone;
-   `handle_segment` O(N) TCB scan.
-4. Wire the Linux `mt-echo` baseline into the harness.
+   on the global `TCB_TABLE` lock; also kills the per-frame O(N) lookup scan
+   (the #122 O(1) tuple index, reverted as no-help for single-queue redis,
+   should matter here).
+3. Wire the Linux `mt-echo` baseline into the harness.
 
 Cross-ref agent memory: `narf-mt-echo-mq-workload`.
