@@ -593,7 +593,11 @@ fn handle_setcrtc(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    let _ = ctx;
+    // Modeset is primary-node only — render nodes (Mesa/Vulkan) carry no
+    // DRM master and must be rejected with EACCES (DRM_MASTER in Linux).
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
 
     // SAFETY: arg is the ioctl argument pointer.
     // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -644,7 +648,10 @@ fn handle_page_flip(
     arg: usize,
     ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    let _ = ctx;
+    // Page flip is a modeset op — primary-node only (see handle_setcrtc).
+    if ctx.is_render_client() {
+        return Err(FsError::PermissionDenied);
+    }
 
     // SAFETY: arg is the ioctl argument pointer.
     // SAFETY: Valid MMIO bounds or trusted driver environment
