@@ -147,6 +147,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use core::sync::atomic::AtomicU64;
+use core::sync::atomic::AtomicU32;
 
 use narf_capabilities::{Cap, CapKind, CapType, Spend};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -492,7 +493,10 @@ impl TaskSpec {
     /// Not `const`: the affinity depends on the runtime enable flag.
     pub fn user_task() -> Self {
         let affinity = if user_task_smp_enabled() {
-            Affinity::any()
+            // Reserve the BSP for kernel/IRQ/forwarder work; run user
+            // tasks on the APs so the RX forwarder (BSP) and request
+            // processing (AP) pipeline across cores. See `user_ap_affinity`.
+            user_ap_affinity()
         } else {
             Affinity::pinned(crate::affinity::CpuId::BOOT)
         };
@@ -621,6 +625,66 @@ fn target_cpu(spec: &TaskSpec) -> usize {
         here
     } else {
         0
+    }
+}
+
+/// Round-robin cursor for spreading user tasks across application
+/// processors (see [`user_ap_affinity`]).
+static NEXT_USER_AP: AtomicU32 = AtomicU32::new(0);
+
+/// Affinity for a user task when user-task SMP is live: **`preferred`
+/// biased to a round-robin online application processor, `allowed`
+/// left wide open** (every CPU). A soft initial-placement hint, not a
+/// pin.
+///
+/// Rationale (redis SMP scaling — see `docs/redis-perf-plan.md`): the
+/// virtio RX forwarder and the other kernel housekeeping tasks are
+/// BSP-pinned. A user task spawned with `Affinity::any()` lands on the
+/// spawning CPU (the BSP) and, because the forwarder wakes it into
+/// `READY[bsp]` and the BSP re-polls it before an idle AP can steal it,
+/// effectively stays there — so the forwarder(BSP)↔app(AP) pipeline
+/// never forms across cores and the 2nd vCPU adds almost nothing.
+/// Steering the *initial* placement to an AP spawns the task off the
+/// BSP, where it is woken and re-enqueued, forming the pipeline —
+/// measured: SMP PING p99 254→222µs, p50 69→65µs (20k samples).
+///
+/// `allowed` stays `CpuSet::ALL` deliberately: an earlier hard "APs
+/// only" mask exiled *every* user task to the lone AP on a 2-vCPU box
+/// and starved co-resident user tasks (net-smoke's `netserve` never
+/// reached `listen`) while the BSP sat kernel-idle. Leaving the BSP in
+/// `allowed` lets work-stealing rebalance under load while keeping the
+/// AP bias for the common case.
+///
+/// Falls back to `Affinity::any()` if — against the
+/// `user_task_smp_enabled()` precondition — no AP is online, so a task
+/// is never left unrunnable. CPUs ≥ 64 aren't scanned (the round-robin
+/// list is a fixed 64-wide buffer); NARF tops out well below that.
+fn user_ap_affinity() -> Affinity {
+    // SOFT bias, not a hard pin: `allowed` stays ALL so a user task can
+    // still fall back to the BSP under load — only `preferred` (the
+    // initial-placement / target_cpu hint) is steered to a round-robin
+    // online AP. A hard "APs only" mask exiled *every* user task to the
+    // single AP on a 2-vCPU box, starving co-resident user tasks
+    // (observed: net-smoke's netserve never reached `listen`) while the
+    // BSP sat kernel-idle. Biasing only the initial CPU still forms the
+    // forwarder(BSP)↔app(AP) pipeline for a hot server (it spawns on an
+    // AP, is woken there, and re-enqueues there) without the starvation.
+    let cap = narf_lib::percpu::MAX_CPUS.min(64) as u32;
+    let mut aps = [0u32; 64];
+    let mut n = 0usize;
+    for cpu in 1..cap {
+        if narf_lib::smp::is_online(cpu) {
+            aps[n] = cpu;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Affinity::any();
+    }
+    let idx = (NEXT_USER_AP.fetch_add(1, Ordering::Relaxed) as usize) % n;
+    Affinity {
+        allowed: crate::affinity::CpuSet::ALL,
+        preferred: Some(crate::affinity::CpuId(aps[idx])),
     }
 }
 
