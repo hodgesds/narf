@@ -1321,6 +1321,13 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     let last_rx_cycles = Arc::new(AtomicU64::new(0));
     // Keep fast-polling for ~5 ms after the last NIC-wide RX activity.
     let active_window_cycles = (narf_time::cycles_per_ns().max(1) as u64) * 5_000_000;
+    // Slow-poll cadence for the poll-only pairs (no MSI-X) once idle: 2 ms,
+    // matching the MSI-X pair's IRQ-park backstop. The old fixed 53M-cycle
+    // sleep was ~22 ms at the KVM TSC, so a packet landing on a backed-off
+    // poll-only queue stalled up to ~22 ms — the p99.9 tail. 2 ms caps that
+    // at the same bound as the IRQ pair; a truly idle NIC still parks (it
+    // just wakes to poll every 2 ms — negligible CPU).
+    let slow_poll_cycles = (narf_time::cycles_per_ns().max(1) as u64) * 2_000_000;
 
     // Core-partitioned RX placement. Under multi-queue with enough cores,
     // give each per-queue forwarder its OWN low CPU (pair K → CPU K, pair
@@ -1350,7 +1357,6 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
         let target_cpu = if partition { pair_idx as u32 } else { 0 };
         // Stackful: virtio-net RX pump.
         narf_scheduler::spawn_stackful_pinned(async move {
-            const PUMP_CYCLES: u64 = 53_000_000;
             // Adaptive (NAPI-style) poll cadence. virtio-net MSI-X RX
             // completions don't always wake us promptly under SLIRP/TCG
             // (the device can leave the used-ring interrupt suppressed),
@@ -1502,7 +1508,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         if fast {
                             narf_scheduler::yield_now().await;
                         } else {
-                            narf_time::sleep_cycles(PUMP_CYCLES).await;
+                            narf_time::sleep_cycles(slow_poll_cycles).await;
                         }
                     }
                 }
