@@ -35,12 +35,18 @@ use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 #[repr(u32)]
 pub enum IoctlCmd {
     Version = 0x00,
+    GemClose = 0x09,
     GetCap = 0x0C,
     PrimeHandleToFd = 0x2D,
     PrimeFdToHandle = 0x2E,
     ModeGetResources = 0xA0,
+    ModeSetCrtc = 0xA2,
     ModeGetConnector = 0xA7,
     ModeRmFb = 0xA8,
+    ModePageFlip = 0xB0,
+    ModeCreateDumb = 0xB2,
+    ModeMapDumb = 0xB3,
+    ModeDestroyDumb = 0xB4,
     ModeAddFb2 = 0xB8,
     ModeGetPlaneRes = 0xB5,
     ModeAtomic = 0xBC,
@@ -57,12 +63,18 @@ impl IoctlCmd {
     pub fn from_raw(raw: u32) -> Self {
         match raw & 0xFF {
             0x00 => IoctlCmd::Version,
+            0x09 => IoctlCmd::GemClose,
             0x0C => IoctlCmd::GetCap,
             0x2D => IoctlCmd::PrimeHandleToFd,
             0x2E => IoctlCmd::PrimeFdToHandle,
             0xA0 => IoctlCmd::ModeGetResources,
+            0xA2 => IoctlCmd::ModeSetCrtc,
             0xA7 => IoctlCmd::ModeGetConnector,
             0xA8 => IoctlCmd::ModeRmFb,
+            0xB0 => IoctlCmd::ModePageFlip,
+            0xB2 => IoctlCmd::ModeCreateDumb,
+            0xB3 => IoctlCmd::ModeMapDumb,
+            0xB4 => IoctlCmd::ModeDestroyDumb,
             0xB8 => IoctlCmd::ModeAddFb2,
             0xB5 => IoctlCmd::ModeGetPlaneRes,
             0xBC => IoctlCmd::ModeAtomic,
@@ -265,6 +277,12 @@ pub enum DrmIoctlResult {
     AddFb2(u32),
     RmFb,
     GetPlaneRes { count_planes: u32 },
+    /// CREATE_DUMB result: (handle, pitch, size).
+    CreateDumb { handle: u32, pitch: u32, size: u64 },
+    /// MAP_DUMB result: fake mmap offset.
+    MapDumb { offset: u64 },
+    /// Generic success with no output payload.
+    Ok,
 }
 
 /// Dispatch a DRM ioctl against `card` for the calling `ctx`.
@@ -298,6 +316,9 @@ pub fn dispatch(
         IoctlCmd::ModeAddFb2 => handle_addfb2(card, arg),
         IoctlCmd::ModeRmFb => handle_rmfb(card, arg),
         IoctlCmd::ModeGetPlaneRes => handle_getplane_res(card),
+        // GemClose: handled in the bridge where we can free the backing.
+        // Return Ok here so the permission gate fires correctly.
+        IoctlCmd::GemClose => handle_gem_close(card, arg),
         // Atomic / syncobj / prime ioctls are dispatched via the
         // higher-level entry points in their own modules (the per-fd
         // tables don't live on `Card`); the dispatcher just returns
@@ -309,6 +330,13 @@ pub fn dispatch(
         | IoctlCmd::SyncobjSignal
         | IoctlCmd::PrimeHandleToFd
         | IoctlCmd::PrimeFdToHandle => Err(DrmIoctlError::UnknownCmd),
+        // Dumb-buffer / modeset ioctls — handled in the bridge with
+        // full serialisation of the in/out structs.
+        IoctlCmd::ModeSetCrtc
+        | IoctlCmd::ModePageFlip
+        | IoctlCmd::ModeCreateDumb
+        | IoctlCmd::ModeMapDumb
+        | IoctlCmd::ModeDestroyDumb => Err(DrmIoctlError::UnknownCmd),
         IoctlCmd::Unknown => Err(DrmIoctlError::UnknownCmd),
     }
 }
@@ -333,7 +361,7 @@ fn handle_get_cap(arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
     }
     let capability = u64::from_le_bytes(arg[0..8].try_into().unwrap());
     let value = match capability {
-        drm_cap::DUMB_BUFFER => 0u64, // no dumb-buffer alloc yet
+        drm_cap::DUMB_BUFFER => 1u64, // dumb-buffer alloc supported
         // DRM_PRIME_CAP_EXPORT (1) | DRM_PRIME_CAP_IMPORT (2): both
         // supported via drm/prime.rs PrimeTable.
         drm_cap::PRIME => 3,
@@ -421,6 +449,19 @@ fn handle_rmfb(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlEr
     let fb_id = u32::from_le_bytes(arg[0..4].try_into().unwrap());
     card.rmfb(fb_id)?;
     Ok(DrmIoctlResult::RmFb)
+}
+
+fn handle_gem_close(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
+    if arg.len() < 4 {
+        return Err(DrmIoctlError::BadSize);
+    }
+    let handle = u32::from_le_bytes(arg[0..4].try_into().unwrap());
+    // Remove dumb backing if one exists (frees the physical pages).
+    // Physical memory freeing is deferred to the bridge layer that has
+    // access to narf_memory (this ioctl layer is pure logic).
+    // We just remove from the GEM table here; bridge calls the physical free.
+    let _ = card.gem.free(handle);
+    Ok(DrmIoctlResult::Ok)
 }
 
 fn handle_getplane_res(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {

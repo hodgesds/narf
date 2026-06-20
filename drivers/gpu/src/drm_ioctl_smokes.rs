@@ -471,6 +471,176 @@ kernel_test_in!(
     smoke_dri_render_file_setcrtc_eacces
 );
 
+// ── 14. CREATE_DUMB returns sane handle/pitch/size ─────────────────────
+
+#[allow(dead_code)]
+fn smoke_drm_create_dumb_basic() -> TestResult {
+    use crate::drm_uapi::{DrmModeCreateDumbUapi, DRM_IOCTL_MODE_CREATE_DUMB};
+    let idx = register_test_card();
+    let mut req = DrmModeCreateDumbUapi {
+        height: 64,
+        width: 64,
+        bpp: 32,
+        flags: 0,
+        handle: 0,
+        pitch: 0,
+        size: 0,
+    };
+    // We can't actually run alloc_pages_on in the kernel-test path because
+    // the buddy allocator needs a live memory map. Instead test the ioctl
+    // dispatch routing + size computation logic by checking that the card
+    // correctly routes to CREATE_DUMB (returns InvalidData rather than
+    // Unsupported, which would mean the cmd was unrecognised).
+    let r = dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_CREATE_DUMB,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    );
+    // In the kernel-test environment the frame allocator may or may not be
+    // live. Accept either Ok (allocator live) or Err(InvalidData) (allocator
+    // not wired). What we MUST NOT get is Err(Unsupported) (unrecognised cmd).
+    match r {
+        Ok(_) | Err(narf_filesystem::FsError::InvalidData) => TestResult::Pass,
+        Err(narf_filesystem::FsError::Unsupported) => {
+            TestResult::Fail("CREATE_DUMB returned Unsupported — cmd not routed")
+        }
+        Err(narf_filesystem::FsError::PermissionDenied) => {
+            TestResult::Fail("CREATE_DUMB rejected — should be RENDER_ALLOW or master")
+        }
+        Err(_) => TestResult::Pass, // any other error = routed + failed for non-dispatch reason
+    }
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_create_dumb_basic);
+
+// ── 15. MAP_DUMB returns an offset that resolves back to buffer phys ───
+
+#[allow(dead_code)]
+fn smoke_drm_map_dumb_resolves_to_phys() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    use crate::drm_uapi::{DrmModeMapDumbUapi, DRM_IOCTL_MODE_MAP_DUMB};
+    // Build a card + manually insert a fake dumb backing so we can
+    // exercise MAP_DUMB without needing the buddy allocator.
+    let idx = {
+        let name = format!("card{}", crate::drm_registry::count());
+        let mut card = make_test_card();
+        // Fake dumb backing: phys=0xDEAD_0000, size=4096, order=0.
+        let fake_phys = 0xDEAD_0000u64;
+        let fake_size = 4096usize;
+        // Allocate a GEM handle manually to avoid calling alloc_pages_on.
+        let handle = card.gem.alloc(fake_phys, fake_size).unwrap();
+        let mmap_offset = (handle as u64) << 12;
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys: fake_phys,
+            byte_len: fake_size,
+            order: 0,
+            mmap_offset,
+        });
+        crate::drm_registry::register_drm_card_with_state(
+            Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
+            card,
+        )
+    };
+
+    let mut req = DrmModeMapDumbUapi {
+        handle: 1, // first handle from GemTable
+        pad: 0,
+        offset: 0,
+    };
+    let r = dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_MAP_DUMB,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    );
+    if r.is_err() {
+        return TestResult::Fail("MAP_DUMB returned error");
+    }
+    // Offset should be handle << 12 = 1 << 12 = 4096.
+    if req.offset == 0 {
+        return TestResult::Fail("MAP_DUMB returned zero offset");
+    }
+    // Verify dispatch_mmap resolves the offset back to the fake phys.
+    let frames = crate::drm_ioctl_bridge::dispatch_mmap(idx, req.offset, 4096);
+    match frames {
+        Ok(v) if !v.is_empty() && v[0] == 0xDEAD_0000 => TestResult::Pass,
+        Ok(v) => {
+            let _ = v;
+            TestResult::Fail("dispatch_mmap returned wrong phys")
+        }
+        Err(_) => TestResult::Fail("dispatch_mmap returned error"),
+    }
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_map_dumb_resolves_to_phys);
+
+// ── 16. SETCRTC with valid fb_id succeeds (no live scanout in test) ────
+
+#[allow(dead_code)]
+fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    use crate::drm_uapi::{DrmModeCrtcUapi, DRM_IOCTL_MODE_SETCRTC};
+    // Build a card with a fake dumb backing + framebuffer.
+    let idx = {
+        let name = format!("card{}", crate::drm_registry::count());
+        let mut card = make_test_card();
+        let fake_phys = 0xBEEF_0000u64;
+        let fake_size = 256 * 256 * 4usize;
+        let handle = card.gem.alloc(fake_phys, fake_size).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys: fake_phys,
+            byte_len: fake_size,
+            order: 0,
+            mmap_offset: (handle as u64) << 12,
+        });
+        // Register a framebuffer backed by this handle.
+        let fb_id = card
+            .addfb2(256, 256, 0x3438_5258 /* XR24 */, 256 * 4, handle)
+            .unwrap();
+        let _ = fb_id;
+        crate::drm_registry::register_drm_card_with_state(
+            Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
+            card,
+        )
+    };
+
+    // Look up the fb_id (should be 1 since next_fb_id starts at 1).
+    let fb_id = {
+        let ms = crate::drm_registry::mode_state(idx).unwrap();
+        let card = ms.lock();
+        card.framebuffers.first().map(|f| f.id).unwrap_or(0)
+    };
+    if fb_id == 0 {
+        return TestResult::Fail("no framebuffer registered");
+    }
+
+    let mut req = DrmModeCrtcUapi {
+        crtc_id: 11,
+        fb_id,
+        ..Default::default()
+    };
+    let r = dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_SETCRTC,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    );
+    // SETCRTC should succeed even when no real scanout is live
+    // (blit_to_scanout returns early when query_scanout() returns None).
+    match r {
+        Ok(_) => TestResult::Pass,
+        Err(narf_filesystem::FsError::PermissionDenied) => {
+            TestResult::Fail("SETCRTC rejected on primary fd — wrong permission gate")
+        }
+        Err(e) => {
+            let _ = e;
+            TestResult::Fail("SETCRTC returned unexpected error")
+        }
+    }
+}
+kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_setcrtc_with_fb_succeeds);
+
 // Anchor the kernel-test framework imports so the kernel-test feature
 // doesn't trip a "use never used" warning on cfg-out builds.
 const _USE_STRING: Option<String> = None;

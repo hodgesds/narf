@@ -196,6 +196,28 @@ pub enum CardError {
     TooManyFbs,
 }
 
+/// Dumb-buffer allocation: physical frames + size kept alive on the Card
+/// so the memory is freed when the GEM handle is closed.
+///
+/// Stored as `(gem_handle, base_phys_addr, num_pages)`.
+/// The physical memory is contiguous; `num_pages` is the buddy-allocator
+/// order (number of pages = 2^order would be cleaner but we store raw
+/// page count since alloc_pages_anywhere isn't yet wired; instead we
+/// store the base phys + byte_len and free on GEM close).
+#[derive(Debug)]
+pub struct DumbBacking {
+    /// GEM handle that owns this allocation.
+    pub gem_handle: u32,
+    /// Physical base address (page-aligned).
+    pub phys: u64,
+    /// Allocation size in bytes (page-rounded).
+    pub byte_len: usize,
+    /// Buddy order used for the allocation.
+    pub order: u8,
+    /// Fake mmap offset returned by MAP_DUMB (gem_handle << 12).
+    pub mmap_offset: u64,
+}
+
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
 ///
 /// Linux analogue: `struct drm_device` + `drm_mode_config`.
@@ -223,6 +245,9 @@ pub struct Card {
     pub(crate) next_fb_id: u32,
     /// GEM object table for this card.
     pub gem: GemTable,
+    /// Dumb-buffer physical backings. Kept alive here so the memory
+    /// is freed when the GEM handle is destroyed (DESTROY_DUMB / GEM_CLOSE).
+    pub dumb_backings: Vec<DumbBacking>,
 }
 
 impl Card {
@@ -242,6 +267,7 @@ impl Card {
             framebuffers: Vec::new(),
             next_fb_id: 1,
             gem: GemTable::new(),
+            dumb_backings: Vec::new(),
         }
     }
 
@@ -276,6 +302,47 @@ impl Card {
             .iter()
             .find(|c| c.id == id)
             .ok_or(CardError::UnknownCrtc)
+    }
+
+    /// Look up a CRTC mutably by id.
+    pub fn crtc_mut(&mut self, id: u32) -> Result<&mut Crtc, CardError> {
+        self.crtcs
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(CardError::UnknownCrtc)
+    }
+
+    /// Look up a dumb backing by GEM handle.
+    pub fn dumb_backing(&self, gem_handle: u32) -> Option<&DumbBacking> {
+        self.dumb_backings.iter().find(|b| b.gem_handle == gem_handle)
+    }
+
+    /// Look up a dumb backing by mmap offset.
+    pub fn dumb_backing_by_offset(&self, mmap_offset: u64) -> Option<&DumbBacking> {
+        self.dumb_backings.iter().find(|b| b.mmap_offset == mmap_offset)
+    }
+
+    /// Register a new dumb backing. Returns the gem handle.
+    pub fn register_dumb_backing(&mut self, phys: u64, byte_len: usize, order: u8) -> Result<u32, CardError> {
+        let handle = self.gem.alloc(phys, byte_len).map_err(|_| CardError::TooManyFbs)?;
+        // Fake mmap offset = handle << 12. Must not alias a real file offset.
+        let mmap_offset = (handle as u64) << 12;
+        self.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys,
+            byte_len,
+            order,
+            mmap_offset,
+        });
+        Ok(handle)
+    }
+
+    /// Remove a dumb backing by GEM handle. Returns (phys, order) for the caller to free.
+    pub fn remove_dumb_backing(&mut self, gem_handle: u32) -> Option<(u64, u8)> {
+        let pos = self.dumb_backings.iter().position(|b| b.gem_handle == gem_handle)?;
+        let b = self.dumb_backings.swap_remove(pos);
+        let _ = self.gem.free(gem_handle);
+        Some((b.phys, b.order))
     }
 
     // ── ADDFB2 / RMFB ────────────────────────────────────────────────

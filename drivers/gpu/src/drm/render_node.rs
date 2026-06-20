@@ -254,6 +254,9 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         // VERSION + GET_CAP are RENDER_ALLOW per Linux.
         0x00 => Some(IoctlFlags::render_allow()),
         0x0C => Some(IoctlFlags::render_allow()),
+        // GEM_CLOSE — RENDER_ALLOW (no display authority needed).
+        // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
+        0x09 => Some(IoctlFlags::render_allow()),
         // GETRESOURCES, GETCONNECTOR, GETPLANE_RES — display-side, NOT
         // RENDER_ALLOW in upstream.  Linux marks them DRM_AUTH (a
         // legacy auth gate); we keep the auth flag so render clients
@@ -262,8 +265,13 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         0xA0 | 0xA7 | 0xB5 => Some(IoctlFlags::auth_only()),
         // SETCRTC / ADDFB2 / RMFB — DRM_MASTER (display authority).
         0xA2 | 0xB8 | 0xA8 => Some(IoctlFlags::master_only()),
+        // PAGE_FLIP — DRM_MASTER.
+        0xB0 => Some(IoctlFlags::master_only()),
         // ATOMIC commit — DRM_MASTER.
         0xBC => Some(IoctlFlags::master_only()),
+        // CREATE_DUMB, MAP_DUMB, DESTROY_DUMB — RENDER_ALLOW per Linux.
+        // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
+        0xB2 | 0xB3 | 0xB4 => Some(IoctlFlags::render_allow()),
         // PRIME handle ↔ fd — RENDER_ALLOW (no display authority needed).
         0x2D | 0x2E => Some(IoctlFlags::render_allow()),
         // SYNCOBJ create/destroy/wait/signal — RENDER_ALLOW.

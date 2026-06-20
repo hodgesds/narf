@@ -73,6 +73,16 @@ impl FileOps for DriCardFile {
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         crate::drm_ioctl_bridge::dispatch_card(self.index, cmd, arg, /*render*/ false)
     }
+
+    /// DRM dumb-buffer mmap: resolve a MAP_DUMB fake offset to the
+    /// physical frames of the dumb buffer. Called by `sys_mmap` for
+    /// MAP_SHARED on this fd.
+    ///
+    /// `offset` is the value returned by DRM_IOCTL_MODE_MAP_DUMB
+    /// (`gem_handle << 12`). `len` must be ≤ the buffer's allocation.
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        crate::drm_ioctl_bridge::dispatch_mmap(self.index, offset, len)
+    }
 }
 
 // ── DriRenderFile ──────────────────────────────────────────────────────────

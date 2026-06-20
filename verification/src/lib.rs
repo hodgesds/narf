@@ -3929,6 +3929,21 @@ pub const NARF_FB_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_FB_SMOKE_ELF_X86_
 ))]
 pub const NARF_FB_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_FB_SMOKE_ELF_AARCH64"));
 
+/// `/bin/drm_smoke` — opens `/dev/dri/card0`, GET_CAP(DUMB_BUFFER),
+/// CREATE_DUMB, MAP_DUMB, mmap MAP_SHARED, draws a pattern, ADDFB2,
+/// SETCRTC (blits to scanout). Proves DRM/KMS dumb-buffer path end-to-end
+/// from stock musl. Success token: `drm-ok`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_DRM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_DRM_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_DRM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_DRM_SMOKE_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

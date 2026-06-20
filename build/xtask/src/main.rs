@@ -1722,6 +1722,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // mapping. End-to-end proof of the device-mmap keystone +
         // the Linux fbdev ioctls from stock musl.
         ("fb_smoke", "fb-ok"),
+        // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
+        // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
+        // path end-to-end from stock musl.
+        ("drm_smoke", "drm-ok"),
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),

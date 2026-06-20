@@ -148,6 +148,13 @@ pub const SZ_DRM_SYNCOBJ_DESTROY: u32 = 8; // drm_syncobj_destroy
 pub const SZ_DRM_SYNCOBJ_WAIT: u32 = 32; // drm_syncobj_wait
 pub const SZ_DRM_SYNCOBJ_HANDLE: u32 = 24; // drm_syncobj_handle
 
+// ── Dumb-buffer / modesetting struct sizes ─────────────────────────────
+
+pub const SZ_DRM_MODE_CREATE_DUMB: u32 = 32; // drm_mode_create_dumb
+pub const SZ_DRM_MODE_MAP_DUMB: u32 = 16; // drm_mode_map_dumb
+pub const SZ_DRM_MODE_DESTROY_DUMB: u32 = 4; // drm_mode_destroy_dumb
+pub const SZ_DRM_MODE_CRTC_PAGE_FLIP: u32 = 24; // drm_mode_crtc_page_flip
+
 // ── DRM_IOCTL_* numbers ────────────────────────────────────────────────
 //
 // Each constant matches `include/uapi/drm/drm.h` 1:1 — the numeric
@@ -174,6 +181,18 @@ pub const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = iowr(DRM_IOCTL_BASE, 0x2E, SZ_DRM_
 
 /// DRM_IOCTL_MODE_GETRESOURCES = _IOWR('d', 0xa0, struct drm_mode_card_res).
 pub const DRM_IOCTL_MODE_GETRESOURCES: u32 = iowr(DRM_IOCTL_BASE, 0xA0, SZ_DRM_MODE_CARD_RES);
+
+/// DRM_IOCTL_MODE_GETCONNECTOR = _IOWR('d', 0xb0, struct drm_mode_crtc_page_flip).
+pub const DRM_IOCTL_MODE_PAGE_FLIP: u32 = iowr(DRM_IOCTL_BASE, 0xB0, SZ_DRM_MODE_CRTC_PAGE_FLIP);
+
+/// DRM_IOCTL_MODE_CREATE_DUMB = _IOWR('d', 0xb2, struct drm_mode_create_dumb).
+pub const DRM_IOCTL_MODE_CREATE_DUMB: u32 = iowr(DRM_IOCTL_BASE, 0xB2, SZ_DRM_MODE_CREATE_DUMB);
+
+/// DRM_IOCTL_MODE_MAP_DUMB = _IOWR('d', 0xb3, struct drm_mode_map_dumb).
+pub const DRM_IOCTL_MODE_MAP_DUMB: u32 = iowr(DRM_IOCTL_BASE, 0xB3, SZ_DRM_MODE_MAP_DUMB);
+
+/// DRM_IOCTL_MODE_DESTROY_DUMB = _IOWR('d', 0xb4, struct drm_mode_destroy_dumb).
+pub const DRM_IOCTL_MODE_DESTROY_DUMB: u32 = iowr(DRM_IOCTL_BASE, 0xB4, SZ_DRM_MODE_DESTROY_DUMB);
 
 /// DRM_IOCTL_MODE_GETCRTC = _IOWR('d', 0xa1, struct drm_mode_crtc).
 pub const DRM_IOCTL_MODE_GETCRTC: u32 = iowr(DRM_IOCTL_BASE, 0xA1, SZ_DRM_MODE_CRTC);
@@ -304,3 +323,111 @@ pub struct DrmSyncobjCreateUapi {
     pub handle: u32,
     pub flags: u32,
 }
+
+// ── Dumb-buffer + modesetting UAPI structs ─────────────────────────────
+//
+// From `include/uapi/drm/drm_mode.h` + `drm.h` (Linux).
+
+/// `struct drm_mode_modeinfo` — one display mode entry.
+/// Linux: `include/uapi/drm/drm_mode.h`.
+/// Size: 68 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmModeModeInfoUapi {
+    pub clock: u32,
+    pub hdisplay: u16,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub hskew: u16,
+    pub vdisplay: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    pub vscan: u16,
+    pub vrefresh: u32,
+    pub flags: u32,
+    pub r#type: u32,
+    pub name: [u8; 32],
+}
+
+const _: () = assert!(core::mem::size_of::<DrmModeModeInfoUapi>() == 68);
+
+/// `struct drm_mode_crtc` — DRM_IOCTL_MODE_SETCRTC / GETCRTC.
+/// Linux: `include/uapi/drm/drm_mode.h`.
+/// Size: 104 bytes (8 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 68 = 104).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmModeCrtcUapi {
+    pub set_connectors_ptr: u64,
+    pub count_connectors: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub gamma_size: u32,
+    pub mode_valid: u32,
+    pub mode: DrmModeModeInfoUapi,
+}
+
+const _: () = assert!(core::mem::size_of::<DrmModeCrtcUapi>() == SZ_DRM_MODE_CRTC as usize);
+
+/// `struct drm_mode_create_dumb` — DRM_IOCTL_MODE_CREATE_DUMB.
+/// Linux: `include/uapi/drm/drm_mode.h`.
+/// Size: 32 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmModeCreateDumbUapi {
+    pub height: u32,
+    pub width: u32,
+    pub bpp: u32,
+    pub flags: u32,
+    pub handle: u32,
+    pub pitch: u32,
+    pub size: u64,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<DrmModeCreateDumbUapi>() == SZ_DRM_MODE_CREATE_DUMB as usize);
+
+/// `struct drm_mode_map_dumb` — DRM_IOCTL_MODE_MAP_DUMB.
+/// Linux: `include/uapi/drm/drm_mode.h`.
+/// Size: 16 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmModeMapDumbUapi {
+    pub handle: u32,
+    pub pad: u32,
+    pub offset: u64,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<DrmModeMapDumbUapi>() == SZ_DRM_MODE_MAP_DUMB as usize);
+
+/// `struct drm_mode_destroy_dumb` — DRM_IOCTL_MODE_DESTROY_DUMB.
+/// Linux: `include/uapi/drm/drm_mode.h`.
+/// Size: 4 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmModeDestroyDumbUapi {
+    pub handle: u32,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<DrmModeDestroyDumbUapi>() == SZ_DRM_MODE_DESTROY_DUMB as usize);
+
+/// `struct drm_mode_crtc_page_flip` — DRM_IOCTL_MODE_PAGE_FLIP.
+/// Linux: `include/uapi/drm/drm_mode.h`.
+/// Size: 24 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmModePageFlipUapi {
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub flags: u32,
+    pub reserved: u32,
+    pub user_data: u64,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<DrmModePageFlipUapi>() == SZ_DRM_MODE_CRTC_PAGE_FLIP as usize);

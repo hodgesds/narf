@@ -28,7 +28,10 @@ use narf_filesystem::FsError;
 
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
 use crate::drm::render_node::DrmFileCtx;
-use crate::drm_uapi::{self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmVersionUapi};
+use crate::drm_uapi::{
+    self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmModeCrtcUapi, DrmModeCreateDumbUapi,
+    DrmModeDestroyDumbUapi, DrmModeMapDumbUapi, DrmModePageFlipUapi, DrmVersionUapi,
+};
 
 // ── Copy helpers ──────────────────────────────────────────────────────
 //
@@ -131,6 +134,15 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // GETRESOURCES is special because the response has pointer
         // arrays the user supplied; we must write IDs into those.
         IoctlCmd::ModeGetResources => handle_getresources(&mode_state, arg, &ctx),
+        // Dumb-buffer ioctls — new in Rung 3.
+        IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
+        IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),
+        IoctlCmd::ModeDestroyDumb => handle_destroy_dumb(&mode_state, arg, &ctx),
+        // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
+        IoctlCmd::ModeSetCrtc => handle_setcrtc(&mode_state, arg, &ctx),
+        IoctlCmd::ModePageFlip => handle_page_flip(&mode_state, arg, &ctx),
+        // GEM_CLOSE — free dumb backing if present.
+        IoctlCmd::GemClose => handle_gem_close(&mode_state, arg, &ctx),
         // Everything else: copy a generic buffer in, hand to the
         // generic dispatcher, copy results back. A few ioctls have
         // pure-output (no input bytes); those still funnel through the
@@ -375,6 +387,332 @@ fn handle_atomic(
         Ok(()) => Ok(0),
         Err(_) => Err(FsError::InvalidData),
     }
+}
+
+/// DRM_IOCTL_MODE_CREATE_DUMB — allocate a dumb buffer (physically
+/// contiguous pages) for a scanout-capable surface.
+///
+/// Linux ref: `drivers/gpu/drm/drm_dumb_buffers.c::drm_mode_create_dumb`.
+fn handle_create_dumb(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // Permission: CREATE_DUMB is RENDER_ALLOW in Linux; the ioctl_flags
+    // table already gates render-node access, so this just needs primary.
+    let _ = ctx;
+
+    // SAFETY: arg is the ioctl arg pointer; copy_in bounds-checks.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCreateDumbUapi>())? };
+    let mut req: DrmModeCreateDumbUapi =
+        // SAFETY: bytes is freshly allocated of exactly the right size.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCreateDumbUapi) };
+
+    if req.width == 0 || req.height == 0 || req.bpp == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // Compute pitch (round up to 64-byte stride for alignment).
+    let bpp_bytes = (req.bpp + 7) / 8;
+    let pitch = req.width * bpp_bytes;
+    let raw_size = pitch as u64 * req.height as u64;
+    // Round up to page size.
+    let page_size: u64 = 4096;
+    let size = (raw_size + page_size - 1) & !(page_size - 1);
+
+    // Compute buddy order (smallest power-of-two page count >= pages_needed).
+    let pages_needed = size / page_size;
+    let order = {
+        let mut o = 0u8;
+        while (1u64 << o) < pages_needed {
+            o += 1;
+        }
+        o
+    };
+
+    // Allocate contiguous physical pages via the buddy allocator.
+    let frame = narf_memory::frame::alloc_pages_on(0, order)
+        .map_err(|_| FsError::InvalidData)?;
+    let phys = frame.start_address().raw();
+
+    // Zero the buffer so userspace doesn't see stale kernel data.
+    // SAFETY: phys is identity-mapped (KERNEL_PHYS_OFFSET==0 on x86_64);
+    // the allocation covers `size` bytes at `phys`.
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        core::ptr::write_bytes(phys as *mut u8, 0, size as usize);
+    }
+
+    // Register in the card's dumb_backings table.
+    let handle = {
+        let mut card = mode_state.lock();
+        card.register_dumb_backing(phys, size as usize, order)
+            .map_err(|_| FsError::InvalidData)?
+    };
+
+    // Write back the result.
+    req.handle = handle;
+    req.pitch = pitch;
+    req.size = size;
+
+    let out_bytes: [u8; core::mem::size_of::<DrmModeCreateDumbUapi>()] =
+        // SAFETY: DrmModeCreateDumbUapi is #[repr(C)] POD.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::mem::transmute(req) };
+    // SAFETY: arg is the validated user/kernel pointer.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        copy_out(arg, &out_bytes)?;
+    }
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_MAP_DUMB — return a fake mmap offset encoding the
+/// GEM handle so `sys_mmap` can later resolve it back to the buffer.
+///
+/// Linux ref: `drivers/gpu/drm/drm_dumb_buffers.c::drm_mode_mmap_dumb`.
+fn handle_map_dumb(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    let _ = ctx;
+
+    // SAFETY: as above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeMapDumbUapi>())? };
+    let mut req: DrmModeMapDumbUapi =
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeMapDumbUapi) };
+
+    let mmap_offset = {
+        let card = mode_state.lock();
+        card.dumb_backing(req.handle)
+            .map(|b| b.mmap_offset)
+            .ok_or(FsError::InvalidData)?
+    };
+
+    req.offset = mmap_offset;
+
+    let out_bytes: [u8; core::mem::size_of::<DrmModeMapDumbUapi>()] =
+        // SAFETY: #[repr(C)] POD.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::mem::transmute(req) };
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    unsafe {
+        copy_out(arg, &out_bytes)?;
+    }
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_DESTROY_DUMB — free a dumb buffer's physical pages.
+///
+/// Linux ref: `drivers/gpu/drm/drm_dumb_buffers.c::drm_mode_destroy_dumb`.
+fn handle_destroy_dumb(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    let _ = ctx;
+
+    // SAFETY: as above.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeDestroyDumbUapi>())? };
+    let req: DrmModeDestroyDumbUapi =
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeDestroyDumbUapi) };
+
+    free_dumb_backing(mode_state, req.handle);
+    Ok(0)
+}
+
+/// GEM_CLOSE — close a GEM handle and free its backing if it's a dumb buffer.
+fn handle_gem_close(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    let _ = ctx;
+    if arg == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // GEM_CLOSE struct: u32 handle + u32 pad.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let bytes = unsafe { copy_in(arg, 8)? };
+    let handle = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    free_dumb_backing(mode_state, handle);
+    Ok(0)
+}
+
+/// Free a dumb buffer's physical backing pages (helper shared by DESTROY_DUMB + GEM_CLOSE).
+fn free_dumb_backing(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    gem_handle: u32,
+) {
+    let phys_order = {
+        let mut card = mode_state.lock();
+        card.remove_dumb_backing(gem_handle)
+    };
+    if let Some((phys, order)) = phys_order {
+        let frame = narf_memory::frame::PhysFrame::new(
+            narf_memory::addr::PhysAddr::new(phys),
+        );
+        narf_memory::frame::free_pages(frame, order);
+    }
+}
+
+/// DRM_IOCTL_MODE_SETCRTC — blit the named framebuffer's dumb buffer
+/// into the active scanout via `narf_fb::fbdev_info` + memcpy.
+///
+/// Linux ref: `drivers/gpu/drm/drm_crtc.c::drm_mode_setcrtc`.
+fn handle_setcrtc(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    let _ = ctx;
+
+    // SAFETY: arg is the ioctl argument pointer.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModeCrtcUapi>())? };
+    let req: DrmModeCrtcUapi =
+        // SAFETY: #[repr(C)] POD of right size.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModeCrtcUapi) };
+
+    // Look up the framebuffer → GEM handle → dumb backing phys.
+    let src_phys: Option<u64>;
+    let src_pitch: u32;
+    let src_w: u32;
+    let src_h: u32;
+    {
+        let mut card = mode_state.lock();
+
+        // Record the mode and active fb on the crtc.
+        if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
+            crtc.primary_fb = if req.fb_id != 0 { Some(req.fb_id) } else { None };
+            crtc.enabled = req.fb_id != 0;
+        }
+
+        if req.fb_id == 0 {
+            return Ok(0);
+        }
+
+        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::InvalidData)?;
+        src_pitch = fb.pitch;
+        src_w = fb.width;
+        src_h = fb.height;
+        let gem_handle = fb.gem_handle;
+        src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+    }
+
+    // Perform the blit if we have a valid source and a live scanout.
+    if let Some(src) = src_phys {
+        blit_to_scanout(src, src_pitch, src_w, src_h);
+    }
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_PAGE_FLIP — same blit as SETCRTC, no vblank event.
+///
+/// Linux ref: `drivers/gpu/drm/drm_crtc.c::drm_mode_page_flip_ioctl`.
+fn handle_page_flip(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    let _ = ctx;
+
+    // SAFETY: arg is the ioctl argument pointer.
+    // SAFETY: Valid MMIO bounds or trusted driver environment
+    let bytes = unsafe { copy_in(arg, core::mem::size_of::<DrmModePageFlipUapi>())? };
+    let req: DrmModePageFlipUapi =
+        // SAFETY: #[repr(C)] POD of right size.
+        // SAFETY: Valid MMIO bounds or trusted driver environment
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModePageFlipUapi) };
+
+    let src_phys: Option<u64>;
+    let src_pitch: u32;
+    let src_w: u32;
+    let src_h: u32;
+    {
+        let mut card = mode_state.lock();
+
+        // Update the crtc's active fb.
+        if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
+            crtc.primary_fb = if req.fb_id != 0 { Some(req.fb_id) } else { None };
+        }
+
+        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::InvalidData)?;
+        src_pitch = fb.pitch;
+        src_w = fb.width;
+        src_h = fb.height;
+        let gem_handle = fb.gem_handle;
+        src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+    }
+
+    if let Some(src) = src_phys {
+        blit_to_scanout(src, src_pitch, src_w, src_h);
+    }
+    Ok(0)
+}
+
+/// Blit pixels from a dumb buffer at `src_phys` into the active scanout.
+///
+/// Both source and destination are XRGB8888 linear; we copy row-by-row
+/// up to `min(src_w, scanout_w)` × `min(src_h, scanout_h)`. After the
+/// blit, `flush_scanout()` pushes the pixels to the host display on
+/// virtio-gpu; it is a no-op on bochs (direct MMIO).
+///
+/// The scanout geometry is fetched through the DRM fbdev hook installed
+/// by `narf_fb` at `Stage::Late` — avoids a circular crate dependency.
+fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
+    let info = match crate::drm_fb_hook::query_scanout() {
+        Some(i) => i,
+        None => return,
+    };
+    let dst_w = info.width.min(src_w);
+    let dst_h = info.height.min(src_h);
+    let row_bytes = (dst_w as usize) * 4;
+    for row in 0..dst_h as usize {
+        let src_row = src_phys + (row * src_pitch as usize) as u64;
+        let dst_row = info.phys + (row * info.stride_bytes as usize) as u64;
+        // SAFETY: Both src and dst are identity-mapped physical addresses
+        // validated by their respective allocators; `row_bytes` is within
+        // the allocation bounds (row < dst_h <= src_h, dst_w <= src_w).
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src_row as *const u8,
+                dst_row as *mut u8,
+                row_bytes,
+            );
+        }
+    }
+    crate::drm_fb_hook::flush_scanout();
+}
+
+/// Return the physical frames backing a dumb buffer for `sys_mmap`.
+///
+/// Called from `DriCardFile::mmap_frames`. `offset` is the fake mmap
+/// offset returned by MAP_DUMB (= gem_handle << 12); `len` is the
+/// requested mapping length.
+pub fn dispatch_mmap(card_index: u32, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+    let mode_state = crate::drm_registry::mode_state(card_index).ok_or(FsError::Unsupported)?;
+    let card = mode_state.lock();
+    let backing = card
+        .dumb_backing_by_offset(offset)
+        .ok_or(FsError::InvalidData)?;
+    if len > backing.byte_len {
+        return Err(FsError::InvalidData);
+    }
+    let pages = len / 4096;
+    let mut frames = Vec::with_capacity(pages);
+    for i in 0..pages {
+        frames.push(backing.phys + (i as u64) * 4096);
+    }
+    Ok(frames)
 }
 
 /// Fallback: hand any other DRM_IOCTL_* number to the generic

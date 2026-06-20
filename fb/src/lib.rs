@@ -966,6 +966,30 @@ pub fn register_initcalls() {
             InitResult::NotPresent
         }
     });
+    // Install the DRM fbdev hook so the GPU driver's dumb-buffer SETCRTC
+    // can blit into the live scanout without a circular crate dependency.
+    // The hook is a function pointer; installing it once during Stage::Late
+    // (single-CPU, non-IRQ) is safe.
+    narf_init::register(Stage::Late, "drm-fb-hook", || {
+        fn query() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
+            let info = fbdev_info()?;
+            Some(narf_drivers_gpu::drm_fb_hook::ScanoutGeom {
+                phys: info.phys,
+                width: info.width,
+                height: info.height,
+                stride_bytes: info.stride_bytes,
+            })
+        }
+        fn flush() {
+            fbdev_flush();
+        }
+        // SAFETY: single-CPU Stage::Late initcall; no concurrent reader.
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            narf_drivers_gpu::drm_fb_hook::install_drm_fb_hook(query, flush);
+        }
+        InitResult::Ok
+    });
     narf_init::register(Stage::Late, "fb-drain-task", || {
         if select_active().is_none() {
             return InitResult::NotPresent;
