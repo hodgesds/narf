@@ -798,7 +798,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         Some(i) => i,
         None => return,
     };
-    let (src_ip, dst_ip, src_port, dst_port, our_iss, ack, peer_dst_mac, mss, our_wscale, our_ts) = {
+    let (src_ip, dst_ip, src_port, dst_port, our_iss, ack, peer_dst_mac, mss, our_wscale, our_ts, peer_tsval) = {
         let t = arc.lock();
         let our_ts = tsval_now();
         (
@@ -812,9 +812,15 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
             t.opts.our_mss,
             DEFAULT_WSCALE,
             our_ts,
+            t.opts.ts_recent,
         )
     };
-    let opts = encode_syn_options(mss, our_wscale, our_ts, if ack_too { ack } else { 0 });
+    // For a SYN-ACK the TSecr must echo the peer's most recent TSval
+    // (captured into `ts_recent` from the incoming SYN), NOT the ACK
+    // sequence number. A wrong TSecr makes a strict peer (a real Linux
+    // host over tap; SLIRP regenerates timestamps so it masked this)
+    // reject the SYN-ACK and RST the handshake.
+    let opts = encode_syn_options(mss, our_wscale, our_ts, if ack_too { peer_tsval } else { 0 });
     let flags = if ack_too {
         FLAG_SYN | FLAG_ACK
     } else {

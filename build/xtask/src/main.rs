@@ -3134,6 +3134,14 @@ fn boot_narf_redis(
     let stream = match stream {
         Some(s) => s,
         None => {
+            // Debug aid (#127): keep the guest alive for off-box probing
+            // when the host connect fails. `XTASK_TAP_HOLD=<secs>`.
+            if let Ok(h) = std::env::var("XTASK_TAP_HOLD") {
+                if let Ok(secs) = h.parse::<u64>() {
+                    let _ = writeln!(std::io::stdout(), "  [NARF] connect failed; holding guest {secs}s for debug (pid {})", child.id());
+                    std::thread::sleep(Duration::from_secs(secs));
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
