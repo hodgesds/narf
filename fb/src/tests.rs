@@ -1206,3 +1206,67 @@ fn smoke_cursor_renderer_clamps_to_fb_bounds() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb/cursor", smoke_cursor_renderer_clamps_to_fb_bounds);
+
+fn smoke_fbdev_info_geometry() -> TestResult {
+    if crate::select_active().is_none() {
+        return TestResult::Skip("no scanout");
+    }
+    let info = match crate::fbdev_info() {
+        Some(i) => i,
+        None => return TestResult::Skip("no scanout phys (test backend or virtio-gpu)"),
+    };
+    if info.width == 0 || info.height == 0 {
+        return TestResult::Fail("zero dimensions");
+    }
+    if info.bpp != 32 {
+        return TestResult::Fail("bpp != 32");
+    }
+    if info.stride_bytes < info.width * 4 {
+        return TestResult::Fail("stride_bytes < width*4");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fbdev_info_geometry);
+
+fn smoke_fbdev_mmap_frames() -> TestResult {
+    use crate::fbdev::DevFb0;
+    use narf_filesystem::FileOps;
+
+    crate::install_test_scanout(64, 64);
+    let info = match crate::fbdev_info() {
+        Some(i) => i,
+        None => {
+            crate::clear_test_scanout();
+            return TestResult::Skip("no scanout phys for test backend");
+        }
+    };
+    let map_len = info.map_len();
+    let node = DevFb0;
+
+    let frames = match node.mmap_frames(0, map_len) {
+        Ok(f) => f,
+        Err(_) => {
+            crate::clear_test_scanout();
+            return TestResult::Fail("mmap_frames(0, map_len) failed");
+        }
+    };
+    let expected_pages = map_len / 4096;
+    if frames.len() != expected_pages {
+        crate::clear_test_scanout();
+        return TestResult::Fail("wrong frame count");
+    }
+    for &f in &frames {
+        if f == 0 {
+            crate::clear_test_scanout();
+            return TestResult::Fail("zero frame address");
+        }
+    }
+    // Over-size must fail.
+    if node.mmap_frames(0, map_len + 4096).is_ok() {
+        crate::clear_test_scanout();
+        return TestResult::Fail("over-size mmap_frames should fail");
+    }
+    crate::clear_test_scanout();
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fbdev_mmap_frames);

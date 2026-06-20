@@ -1423,6 +1423,7 @@ name = "narf-fb"
 version = "0.0.0"
 dependencies = [
  "narf-aml",
+ "narf-arch",
  "narf-capabilities",
  "narf-console",
  "narf-drivers-gpio",
@@ -1430,6 +1431,7 @@ dependencies = [
  "narf-drivers-i2c",
  "narf-drivers-usb",
  "narf-drivers-virtio",
+ "narf-filesystem",
  "narf-graphics",
  "narf-graphics-driver",
  "narf-init",

@@ -89,6 +89,197 @@ fn tri_wave(frame: u32, period: u32, span: u32) -> u32 {
     ((progress as u64 * span as u64) / half.max(1) as u64) as u32
 }
 
+/// Format `n` as decimal into `buf` (must be ≥10 bytes). Returns the
+/// subslice containing the digits (no leading zeros except "0" itself).
+#[cfg(target_arch = "x86_64")]
+fn fmt_u32(buf: &mut [u8; 10], n: u32) -> &[u8] {
+    if n == 0 {
+        buf[9] = b'0';
+        return &buf[9..];
+    }
+    let mut i = 10usize;
+    let mut v = n;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    &buf[i..]
+}
+
+/// `struct fb_var_screeninfo` wire layout (160 bytes, x86_64 ABI).
+/// Only the fields we read are named; the rest is `_rest`.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct WireVarScreenInfo {
+    xres: u32,
+    yres: u32,
+    xres_virtual: u32,
+    yres_virtual: u32,
+    xoffset: u32,
+    yoffset: u32,
+    bits_per_pixel: u32,
+    grayscale: u32,
+    // bitfields, flags … (160 bytes total, we only inspect first 8 u32s)
+    _rest: [u8; 128],
+}
+
+/// `struct fb_fix_screeninfo` wire layout (x86_64: 80 bytes).
+/// unsigned long → u64 on x86_64.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct WireFixScreenInfo {
+    id: [u8; 16],       // 0..16
+    smem_start: u64,    // 16..24
+    smem_len: u32,      // 24..28
+    fb_type: u32,       // 28..32
+    type_aux: u32,      // 32..36
+    visual: u32,        // 36..40
+    xpanstep: u16,      // 40..42
+    ypanstep: u16,      // 42..44
+    ywrapstep: u16,     // 44..46
+    _pad: u16,          // 46..48 (implicit alignment pad before line_length)
+    line_length: u32,   // 48..52
+    mmio_start: u64,    // 52..60
+    mmio_len: u32,      // 60..64
+    accel: u32,         // 64..68
+    capabilities: u16,  // 68..70
+    reserved: [u16; 2], // 70..74  + 6 bytes padding to align to 80
+    _tail: [u8; 6],     // 74..80
+}
+
+/// Probe `/dev/fb0`:
+///  1. open, FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO
+///  2. mmap MAP_SHARED
+///  3. draw a horizontal gradient across the first scanline
+///  4. print "fb0: ok <W>x<H>\n" on success, "fb0: bad ...\n" on failure
+#[cfg(target_arch = "x86_64")]
+fn probe_dev_fb0() {
+    const FBIOGET_VSCREENINFO: u32 = 0x4600;
+    const FBIOGET_FSCREENINFO: u32 = 0x4602;
+    const SYS_IOCTL: u64 = 16;
+    const SYS_MMAP: u64 = 9;
+    const PROT_READ: u64 = 0x1;
+    const PROT_WRITE: u64 = 0x2;
+    const MAP_SHARED: u64 = 0x01;
+
+    let fd = match rt::open_abs("/dev/fb0") {
+        Some(f) => f,
+        None => {
+            rt::print_str("fb0: bad (open)\n");
+            return;
+        }
+    };
+
+    // ── FBIOGET_VSCREENINFO ──────────────────────────────────────
+    // SAFETY: WireVarScreenInfo is repr(C), zeroed is a valid bit pattern,
+    // and we pass its address to the ioctl which writes exactly sizeof bytes.
+    let mut vsi: WireVarScreenInfo = unsafe { core::mem::zeroed() };
+    let r = unsafe {
+        rt::syscall3_raw(
+            SYS_IOCTL,
+            fd as u64,
+            FBIOGET_VSCREENINFO as u64,
+            &mut vsi as *mut WireVarScreenInfo as u64,
+        )
+    };
+    if r != 0 {
+        let _ = rt::close(fd);
+        rt::print_str("fb0: bad (vscreeninfo)\n");
+        return;
+    }
+    let w = vsi.xres;
+    let h = vsi.yres;
+    if w == 0 || h == 0 || vsi.bits_per_pixel != 32 {
+        let _ = rt::close(fd);
+        rt::print_str("fb0: bad (geom)\n");
+        return;
+    }
+
+    // ── FBIOGET_FSCREENINFO ──────────────────────────────────────
+    // SAFETY: same justification as above.
+    let mut fsi: WireFixScreenInfo = unsafe { core::mem::zeroed() };
+    let r = unsafe {
+        rt::syscall3_raw(
+            SYS_IOCTL,
+            fd as u64,
+            FBIOGET_FSCREENINFO as u64,
+            &mut fsi as *mut WireFixScreenInfo as u64,
+        )
+    };
+    if r != 0 {
+        let _ = rt::close(fd);
+        rt::print_str("fb0: bad (fscreeninfo)\n");
+        return;
+    }
+    let map_len = fsi.smem_len as usize;
+    let map_len_rounded = (map_len + 0xFFF) & !0xFFF;
+    if map_len_rounded == 0 {
+        let _ = rt::close(fd);
+        rt::print_str("fb0: bad (map_len=0)\n");
+        return;
+    }
+
+    // ── mmap MAP_SHARED ──────────────────────────────────────────
+    // Call mmap(0, map_len_rounded, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+    // using inline asm since rt::mmap hardcodes fd=-1 (anonymous).
+    // SAFETY: We hold `fd`, which was opened above and is valid for the
+    // duration of the mapping; MAP_SHARED aliases the device's physical
+    // frames directly; we pass hint=0 so the kernel picks the address.
+    let fb_ptr: *mut u32 = {
+        let r = unsafe {
+            // x86_64 syscall ABI: rax=num, rdi=a0, rsi=a1, rdx=a2,
+            // r10=a3 (not rcx!), r8=a4, r9=a5.
+            let ret: u64;
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") SYS_MMAP => ret,
+                in("rdi") 0u64,
+                in("rsi") map_len_rounded as u64,
+                in("rdx") PROT_READ | PROT_WRITE,
+                in("r10") MAP_SHARED,
+                in("r8")  fd as u64,
+                in("r9")  0u64,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+            ret
+        };
+        if r == 0 || r > u64::MAX - 4096 {
+            let _ = rt::close(fd);
+            rt::print_str("fb0: bad (mmap)\n");
+            return;
+        }
+        r as *mut u32
+    };
+
+    // ── draw a horizontal gradient across the first scanline ─────
+    let stride_px = (fsi.line_length / 4) as usize; // pixels per scanline
+    let grad_w = w.min(256) as usize;
+    for x in 0..grad_w {
+        let r8 = (x * 255 / grad_w.max(1)) as u32;
+        let g8 = ((grad_w - x) * 255 / grad_w.max(1)) as u32;
+        let pixel = (r8 << 16) | (g8 << 8) | 0x80; // XRGB8888
+        // SAFETY: fb_ptr + x is within the mmap'd region (stride_px ≥ w).
+        unsafe { core::ptr::write_volatile(fb_ptr.add(x.min(stride_px - 1)), pixel); }
+    }
+
+    let _ = rt::close(fd);
+
+    // ── print "fb0: ok <W>x<H>" ───────────────────────────────────
+    let mut wb = [0u8; 10];
+    let mut hb = [0u8; 10];
+    let ws = fmt_u32(&mut wb, w);
+    let hs = fmt_u32(&mut hb, h);
+    rt::print_str("fb0: ok ");
+    // SAFETY: fmt_u32 produces valid ASCII digits only.
+    rt::print_str(unsafe { core::str::from_utf8_unchecked(ws) });
+    rt::print_str("x");
+    rt::print_str(unsafe { core::str::from_utf8_unchecked(hs) });
+    rt::print_str("\n");
+}
+
 #[cfg(target_arch = "x86_64")]
 fn run_probes_x86_64(rsp_at_entry: u64) {
     const EXPECT_ARGV0: &[u8] = b"narf-testbin";
@@ -372,6 +563,10 @@ fn run_probes_x86_64(rsp_at_entry: u64) {
         Err(_) => false,
     };
     rt::print_str(if fb_ok { "fb: ok\n" } else { "fb: bad\n" });
+
+    // ── /dev/fb0 probe ──────────────────────────────────────────────
+    // Prints "fb0: ok <W>x<H>" on success, "fb0: bad ..." on failure.
+    probe_dev_fb0();
 }
 
 #[panic_handler]

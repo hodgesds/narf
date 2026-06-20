@@ -36,6 +36,7 @@ pub mod client;
 pub mod cmd_ring;
 pub mod cursor;
 pub mod drain_task;
+pub mod fbdev;
 pub mod gop;
 pub mod registry;
 pub mod status;
@@ -188,6 +189,13 @@ impl FbScanout for TestScanout {
     }
     fn name(&self) -> &'static str {
         "test"
+    }
+    fn phys_base(&self) -> Option<u64> {
+        // Heap pixel buffer; on the low-4-GiB identity map (x86_64
+        // KERNEL_PHYS_OFFSET == 0) its kernel-virtual pointer doubles
+        // as the physical base, so the fbdev smokes can exercise
+        // mmap_frames without a real display backend.
+        Some(self.0.lock().buf.as_ptr() as u64)
     }
     fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
     unsafe fn framebuffer(&self) -> Framebuffer {
@@ -1053,6 +1061,15 @@ pub fn register_initcalls() {
         } else {
             InitResult::Error("drain stalled")
         }
+    });
+    // Register /dev/fb0 once a mappable scanout exists. NotPresent on
+    // headless CI (no backend exposes a physical buffer).
+    narf_init::register(Stage::Late, "fb-devfs", || {
+        if fbdev_info().is_none() {
+            return InitResult::NotPresent;
+        }
+        narf_filesystem::devfs::register_fb0(alloc::sync::Arc::new(crate::fbdev::DevFb0));
+        InitResult::Ok
     });
 }
 

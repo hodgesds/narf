@@ -203,6 +203,19 @@ pub fn unregister_fp() {
     *FP_NODE.lock() = None;
 }
 
+// ── /dev/fb0 ─────────────────────────────────────────────────────────
+
+/// Optional `FileOps` delegate for `/dev/fb0`. Installed by the FB
+/// initcall when a scanout is active. Exposes the active framebuffer
+/// as a Linux-compatible character device.
+static FB0_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
+
+/// Register the `/dev/fb0` file node. Called from the `fb-devfs`
+/// initcall after the scanout-picker confirms a backend is active.
+pub fn register_fb0(node: Arc<dyn FileOps>) {
+    *FB0_NODE.lock() = Some(node);
+}
+
 // ── /dev/rfcomm<N> hook ───────────────────────────────────────────────────
 // Linux ref: `net/bluetooth/rfcomm/tty.c:318` — rfcomm_dev_add.
 
@@ -406,6 +419,50 @@ impl FileOps for DevFp {
                 perms: 0o660,
             },
             mtime_cycles: 0,
+        }
+    }
+}
+
+/// `/dev/fb0` — proxy to the installed FB FileOps.
+struct DevFb0Proxy;
+
+impl FileOps for DevFb0Proxy {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let node = FB0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.read(offset, buf).await,
+                None => Ok(0),
+            }
+        })
+    }
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let node = FB0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.write(offset, buf).await,
+                None => Ok(0),
+            }
+        })
+    }
+    fn stat(&self) -> Stat {
+        FB0_NODE.lock().as_ref().map(|n| n.stat()).unwrap_or_else(|| Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode { file_type: FileType::Special, perms: 0o660 },
+            mtime_cycles: 0,
+        })
+    }
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
+        match FB0_NODE.lock().clone() {
+            Some(n) => n.mmap_frames(offset, len),
+            None => Err(FsError::Unsupported),
+        }
+    }
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        match FB0_NODE.lock().clone() {
+            Some(n) => n.ioctl(cmd, arg),
+            None => Err(FsError::Unsupported),
         }
     }
 }
@@ -776,6 +833,7 @@ impl DirOps for DevDir {
             "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
             "console" | "tty" | "tty0" => Some(Arc::new(DevConsole) as Arc<dyn FileOps>),
             "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
+            "fb0" => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
             "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
             "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
@@ -872,6 +930,10 @@ impl DirOps for DevDir {
                 file_type: FileType::Special,
             },
             DirEntry {
+                name: "fb0",
+                file_type: FileType::Special,
+            },
+            DirEntry {
                 name: "fp0",
                 file_type: FileType::Special,
             },
@@ -921,6 +983,7 @@ impl DirOps for DevDir {
             ("tty", FileType::Special),
             ("tty0", FileType::Special),
             ("ptmx", FileType::Special),
+            ("fb0", FileType::Special),
             ("fp0", FileType::Special),
             ("tpm0", FileType::Special),
             ("tpmrm0", FileType::Special),

@@ -34,6 +34,8 @@ narf-console      = { path = "../console" }
 narf-aml          = { path = "../aml" }
 narf-power        = { path = "../power" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
+narf-filesystem   = { path = "../filesystem" }
+narf-arch         = { path = "../arch" }
 
 [features]
 # Marker the frame-level `kernel-test` feature switches on so this
