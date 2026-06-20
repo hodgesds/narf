@@ -257,7 +257,15 @@ struct CtrlQueue {
     _layout_buf: DmaBuffer,
 }
 
-const RX_POOL_LEN: usize = 8;
+// Target depth of the RX buffer ring. Posted up front and kept full by
+// the one-for-one refill in `rx_take_on`. Capped by the actual queue
+// size (`rx_qsize`), so on a typical 128-descriptor virtio-net RX queue
+// the whole ring is posted. A shallow ring (the old value was 8) is the
+// burst-absorption limit: under concurrent off-box load, if the single
+// forwarder falls briefly behind, an 8-deep ring empties and the host
+// tap silently drops frames → TCP retransmit (a ~tens-of-ms p99 tail).
+// Post the full ring so a momentary scheduling stall doesn't drop.
+const RX_POOL_LEN: usize = 256;
 
 impl core::fmt::Debug for VirtioNetPci {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -385,7 +393,11 @@ impl VirtioNetPci {
             if qmax == 0 {
                 return Err(VirtioPciError::QueueTooSmall);
             }
-            let qsize = qmax.min(64).next_power_of_two() / 2;
+            // Deepen the ring (was capped at 32) so the RX path has more
+            // burst headroom under concurrent off-box load — see
+            // RX_POOL_LEN. Still halved from the device max for descriptor
+            // headroom, and bounded by what the device actually supports.
+            let qsize = qmax.min(256).next_power_of_two() / 2;
             let qsize = if qsize == 0 { 4 } else { qsize.min(qmax) };
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
@@ -1295,9 +1307,25 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // producer feeding the iface's RX ring.
     let rx_prod = Arc::new(IrqSafeSpinLock::new(Some(rx_prod)));
 
+    // Shared "the NIC saw RX traffic recently" timestamp (TSC cycles),
+    // updated by EVERY per-pair forwarder when it drains a frame. The
+    // poll-only pairs (1..N, no MSI-X) read it to decide whether to keep
+    // fast-polling. Under concurrent off-box load the host RSS-spreads
+    // flows across all queues, so any single queue idles for short
+    // windows even while the NIC is busy. Without this, a poll-only pair
+    // exhausted its fast rounds and backed off to the PUMP_CYCLES sleep
+    // (~22 ms at a 2.3 GHz TSC) — and the next request steered to that
+    // queue ate the whole deadline, a fixed ~22 ms p99 tail under load.
+    // Staying hot while ANY queue is active keeps the tail sub-ms; the
+    // device still parks (all pairs back off) once the whole NIC quiets.
+    let last_rx_cycles = Arc::new(AtomicU64::new(0));
+    // Keep fast-polling for ~5 ms after the last NIC-wide RX activity.
+    let active_window_cycles = (narf_time::cycles_per_ns().max(1) as u64) * 5_000_000;
+
     // Spawn one RX forwarder per active pair.
     for pair_idx in 0..num_pairs {
         let rx_prod = Arc::clone(&rx_prod);
+        let last_rx_cycles = Arc::clone(&last_rx_cycles);
         // Only pair 0 gets the MSI-X wakeup; pairs 1..N poll. See
         // function-level comment for why we don't allocate per-queue
         // MSI-X vectors yet.
@@ -1402,6 +1430,10 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 // anything, else step toward the slow fallback.
                 if processed_any {
                     idle_rounds = 0;
+                    // Publish NIC-wide activity so the other pairs' poll-only
+                    // forwarders keep fast-polling instead of sleeping out the
+                    // coarse PUMP_CYCLES deadline.
+                    last_rx_cycles.store(narf_time::now_cycles(), Ordering::Relaxed);
                 } else {
                     idle_rounds = idle_rounds.saturating_add(1);
                 }
@@ -1409,7 +1441,16 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 // that arrived during the drain resolves this immediately),
                 // or fall back to the adaptive deadline. Non-MSI-X pairs
                 // (`irq == None`) poll on the sleep cadence.
-                let fast = idle_rounds < FAST_ROUNDS;
+                // Stay in fast-poll while THIS queue is bursting (idle_rounds)
+                // OR the NIC saw traffic on ANY queue within the recent
+                // window — the latter is what keeps an RSS-fed but briefly-
+                // idle queue off the coarse slow-poll deadline.
+                let nic_active = {
+                    let last = last_rx_cycles.load(Ordering::Relaxed);
+                    last != 0
+                        && narf_time::now_cycles().wrapping_sub(last) < active_window_cycles
+                };
+                let fast = idle_rounds < FAST_ROUNDS || nic_active;
                 match irq_waiter {
                     Some(w) => {
                         if fast {
