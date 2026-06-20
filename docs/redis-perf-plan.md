@@ -378,15 +378,33 @@ a real multi-queue NIC at sub-2ms p99, 0 errors. net-smoke green.
 **RX-dispatch path**: a single BSP forwarder drains all N queues and every
 frame does an O(N) `TCB_TABLE` scan under one global lock.
 
-### Next steps (the RX-dispatch ceiling — the real scaling enablers)
-1. **Forwarder CPU placement** — spread per-queue RX forwarders across cores
-   (today all BSP-pinned; needs an affinity field on the stackful spawn AND
-   an SMP-safety audit of the forwarder's touched state — the scheduler
-   explicitly keeps `unthrottled()` BSP-pinned for un-audited tasks).
-2. **Sharded / lock-granular TCP stack** — so N forwarders don't serialize
-   on the global `TCB_TABLE` lock; also kills the per-frame O(N) lookup scan
-   (the #122 O(1) tuple index, reverted as no-help for single-queue redis,
-   should matter here).
+### RX global lock — REMOVED (commit `net/tcp: remove the global TCB_TABLE lock`)
+`handle_segment` walked `TCB_TABLE` under one global lock in an O(N)
+`values().find()` (locking every TCB), twice per segment — serializing the
+BSP forwarder against every AP worker's by-id `send`/`recv` lookup. Replaced
+with a 32-way sharded **CONN_INDEX** (O(1) 4-tuple lookup, no shared lock) +
+a **LISTEN_INDEX** ((addr,port)→SO_REUSEPORT group), maintained in
+`install_tcb`/`remove_tcb`. `TCB_TABLE` stays the by-id registry, off the
+per-segment path. Validated 5138/5138 kernel-tests (TCG). Throughput-neutral
+standalone (50 conns → the O(N) scan wasn't the limiter), as expected.
+
+### Forwarder CPU placement — TRIED, REVERTED (measure-or-revert)
+Pinned poll-only RX pairs 1..N to round-robin APs. Clean A/B at SMP=8/q=4/
+t=4: index-only **73.9k** rps vs placement **69.4k** (+ a 13ms p99.9
+outlier). Placement is slightly *worse* — the BSP forwarder isn't the
+bottleneck at this scale, and pinning forwarders onto APs makes them contend
+the (AP-biased) workers. Reverted.
+
+### The real lever: WORKER cores, not RX parallelism
+SMP 5→8 (q=4/t=4): **59k → 74k rps**. The earlier "flat thread scaling" was
+core starvation (4 workers + forwarder over 4 APs), not an RX-dispatch
+ceiling. NARF serves **~74k rps** off-box over real multi-queue tap, p99
+~1.3ms, 0 errors.
+
+### Open levers
+1. Shard the **by-id** `TCB_TABLE` too — workers' `lookup_tcb` on every
+   send/recv still take one global lock (~74k+ ops/s).
+2. Worker-side per-connection serialization (why p50 climbs with load).
 3. Wire the Linux `mt-echo` baseline into the harness.
 
 Cross-ref agent memory: `narf-mt-echo-mq-workload`.
