@@ -344,13 +344,159 @@ static TCB_TABLE: IrqSafeSpinLock<Option<BTreeMap<u32, Arc<IrqSafeSpinLock<Tcb>>
 static NEXT_TCB_ID: AtomicU32 = AtomicU32::new(1);
 static NEXT_LOCAL_PORT: AtomicU32 = AtomicU32::new(49152);
 
+// ── Fast TCB lookup indexes (off the global by-id TCB_TABLE lock) ────
+//
+// `handle_segment` (the RX hot path) and the accept-enqueue path must
+// find a TCB by its 4-tuple / listen (addr,port) WITHOUT holding
+// `TCB_TABLE` across an O(N) `values().find()` scan. That scan locked
+// every TCB while the BSP RX forwarder held the one global lock —
+// serializing it against every AP worker's by-id `send`/`recv` lookup
+// (which also takes `TCB_TABLE`). These indexes give O(1) lookups: the
+// connected index is sharded so RX dispatch for different connections
+// never shares a lock, and the by-id `TCB_TABLE` is no longer on the
+// per-segment path at all (it stays the authoritative registry for
+// lifecycle, the timer sweep, and syscall handle resolution).
+//
+// Maintained centrally by `install_tcb`/`remove_tcb`, keyed off
+// immutable TCB fields (a TCB's 4-tuple and LISTEN role never change
+// after construction), so the indexes cannot drift from the by-id table.
+
+/// Number of connected-index shards (power of two).
+const CONN_SHARDS: usize = 32;
+
+/// Connected-TCB key: (remote_ip, remote_port, local_ip, local_port),
+/// IPs packed big-endian. Uniquely identifies a non-LISTEN TCB.
+type ConnKey = (u32, u16, u32, u16);
+
+#[inline]
+fn conn_key(remote: [u8; 4], remote_port: u16, local: [u8; 4], local_port: u16) -> ConnKey {
+    (
+        u32::from_be_bytes(remote),
+        remote_port,
+        u32::from_be_bytes(local),
+        local_port,
+    )
+}
+
+#[inline]
+fn conn_shard(k: &ConnKey) -> usize {
+    // FNV-1a over the tuple, masked to the shard count.
+    let mut h: u32 = 0x811c_9dc5;
+    let mut mix = |v: u32| {
+        for b in v.to_le_bytes() {
+            h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+        }
+    };
+    mix(k.0);
+    mix(k.1 as u32);
+    mix(k.2);
+    mix(k.3 as u32);
+    (h as usize) & (CONN_SHARDS - 1)
+}
+
+#[allow(clippy::type_complexity)]
+static CONN_INDEX: [IrqSafeSpinLock<Option<BTreeMap<ConnKey, Arc<IrqSafeSpinLock<Tcb>>>>>;
+    CONN_SHARDS] = [const { IrqSafeSpinLock::new(None) }; CONN_SHARDS];
+
+/// Listener index: (local_ip, local_port) → SO_REUSEPORT group. Far
+/// lower frequency than the connected path (per-SYN, not per-segment),
+/// so a single lock is fine.
+#[allow(clippy::type_complexity)]
+static LISTEN_INDEX: IrqSafeSpinLock<
+    Option<BTreeMap<(u32, u16), alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>>>>,
+> = IrqSafeSpinLock::new(None);
+
+fn conn_index_insert(key: ConnKey, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let mut g = CONN_INDEX[conn_shard(&key)].lock();
+    g.get_or_insert_with(BTreeMap::new).insert(key, arc.clone());
+}
+
+fn conn_index_remove(key: ConnKey) {
+    let mut g = CONN_INDEX[conn_shard(&key)].lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&key);
+    }
+}
+
+fn conn_index_lookup(key: ConnKey) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
+    let g = CONN_INDEX[conn_shard(&key)].lock();
+    g.as_ref().and_then(|m| m.get(&key).cloned())
+}
+
+fn listen_index_insert(local: [u8; 4], local_port: u16, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let key = (u32::from_be_bytes(local), local_port);
+    let mut g = LISTEN_INDEX.lock();
+    g.get_or_insert_with(BTreeMap::new)
+        .entry(key)
+        .or_default()
+        .push(arc.clone());
+}
+
+fn listen_index_remove(local: [u8; 4], local_port: u16, arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let key = (u32::from_be_bytes(local), local_port);
+    let mut g = LISTEN_INDEX.lock();
+    if let Some(m) = g.as_mut() {
+        if let Some(v) = m.get_mut(&key) {
+            // Identity compare by Arc pointer — no TCB lock taken under
+            // the LISTEN_INDEX lock (avoids a lock-ordering hazard).
+            v.retain(|a| !Arc::ptr_eq(a, arc));
+            if v.is_empty() {
+                m.remove(&key);
+            }
+        }
+    }
+}
+
+/// All LISTEN TCBs that match an inbound packet to (dst, port): a
+/// concrete-addr listener bound to `dst` plus an INADDR_ANY (0.0.0.0)
+/// listener on the same port. Order is deterministic (concrete then
+/// wildcard, install order within each) so the SO_REUSEPORT flow-hash
+/// selection is stable across the SYN and accept-enqueue call sites.
+fn listen_index_group(dst: [u8; 4], port: u16) -> alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>> {
+    let mut out: alloc::vec::Vec<Arc<IrqSafeSpinLock<Tcb>>> = alloc::vec::Vec::new();
+    let g = LISTEN_INDEX.lock();
+    let m = match g.as_ref() {
+        Some(m) => m,
+        None => return out,
+    };
+    if let Some(v) = m.get(&(u32::from_be_bytes(dst), port)) {
+        out.extend(v.iter().cloned());
+    }
+    if dst != [0, 0, 0, 0] {
+        if let Some(v) = m.get(&(0u32, port)) {
+            out.extend(v.iter().cloned());
+        }
+    }
+    out
+}
+
 /// Internal: register a TCB and return its id.
 fn install_tcb(tcb: Tcb) -> (u32, Arc<IrqSafeSpinLock<Tcb>>) {
     let id = tcb.id;
+    // Compute the index key from immutable fields BEFORE moving `tcb`.
+    let is_listen = tcb.state == TcpState::Listen;
+    let conn_k = (!is_listen).then(|| {
+        conn_key(
+            tcb.remote_addr,
+            tcb.remote_port,
+            tcb.local_addr,
+            tcb.local_port,
+        )
+    });
+    let listen_k = is_listen.then_some((tcb.local_addr, tcb.local_port));
     let arc = Arc::new(IrqSafeSpinLock::new(tcb));
-    let mut g = TCB_TABLE.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
-    m.insert(id, arc.clone());
+    {
+        let mut g = TCB_TABLE.lock();
+        let m = g.get_or_insert_with(BTreeMap::new);
+        m.insert(id, arc.clone());
+    }
+    // Maintain the fast lookup index (outside the TCB_TABLE lock).
+    if let Some(k) = conn_k {
+        conn_index_insert(k, &arc);
+    }
+    if let Some((la, lp)) = listen_k {
+        listen_index_insert(la, lp, &arc);
+    }
     (id, arc)
 }
 
@@ -368,8 +514,28 @@ pub fn lookup_tcb(id: u32) -> Option<Arc<IrqSafeSpinLock<Tcb>>> {
     g.as_ref().and_then(|m| m.get(&id).cloned())
 }
 
-/// Remove a TCB from the table.
+/// Remove a TCB from the table (and its fast-lookup index entry).
 pub fn remove_tcb(id: u32) {
+    // Resolve the TCB first so we can drop its index entry by its
+    // (immutable) key. Read fields under the per-TCB lock, then DROP
+    // that lock before touching the indexes (no nested locking).
+    if let Some(arc) = lookup_tcb(id) {
+        let (is_listen, la, lp, ra, rp) = {
+            let t = arc.lock();
+            (
+                t.state == TcpState::Listen,
+                t.local_addr,
+                t.local_port,
+                t.remote_addr,
+                t.remote_port,
+            )
+        };
+        if is_listen {
+            listen_index_remove(la, lp, &arc);
+        } else {
+            conn_index_remove(conn_key(ra, rp, la, lp));
+        }
+    }
     let mut g = TCB_TABLE.lock();
     if let Some(m) = g.as_mut() {
         m.remove(&id);
@@ -379,9 +545,23 @@ pub fn remove_tcb(id: u32) {
 /// Test-only: drop every TCB.
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    let mut g = TCB_TABLE.lock();
-    if let Some(m) = g.as_mut() {
-        m.clear();
+    {
+        let mut g = TCB_TABLE.lock();
+        if let Some(m) = g.as_mut() {
+            m.clear();
+        }
+    }
+    for shard in CONN_INDEX.iter() {
+        let mut g = shard.lock();
+        if let Some(m) = g.as_mut() {
+            m.clear();
+        }
+    }
+    {
+        let mut g = LISTEN_INDEX.lock();
+        if let Some(m) = g.as_mut() {
+            m.clear();
+        }
     }
     NEXT_TCB_ID.store(1, Ordering::Relaxed);
     NEXT_LOCAL_PORT.store(49152, Ordering::Relaxed);
@@ -1444,48 +1624,16 @@ pub fn handle_segment(src: [u8; 4], dst: [u8; 4], segment: &[u8]) {
         Ok(t) => t,
         Err(_) => return,
     };
-    // Find a connected-TCB match first; on miss, fall back to a
-    // matching LISTEN TCB.
-    let arc = {
-        let g = TCB_TABLE.lock();
-        let m = match g.as_ref() {
-            Some(m) => m,
-            None => return,
-        };
-        m.values()
-            .find(|t| {
-                let g = t.lock();
-                g.local_addr == dst
-                    && g.local_port == hdr.dst_port
-                    && g.remote_addr == src
-                    && g.remote_port == hdr.src_port
-                    && g.state != TcpState::Listen
-            })
-            .cloned()
-    };
-    if let Some(arc) = arc {
+    // Find a connected-TCB match first (O(1) sharded 4-tuple index, no
+    // global lock); on miss, fall back to a matching LISTEN TCB.
+    if let Some(arc) = conn_index_lookup(conn_key(src, hdr.src_port, dst, hdr.dst_port)) {
         process_in_state(&arc, src, dst, &hdr, segment);
         return;
     }
-    // LISTEN bucket.
-    let listen = {
-        let g = TCB_TABLE.lock();
-        let m = match g.as_ref() {
-            Some(m) => m,
-            None => return,
-        };
-        m.values()
-            .find(|t| {
-                let g = t.lock();
-                // A listener bound to 0.0.0.0 (INADDR_ANY) matches any
-                // local dst; a concrete-addr listener matches exactly.
-                (g.local_addr == dst || g.local_addr == [0, 0, 0, 0])
-                    && g.local_port == hdr.dst_port
-                    && g.state == TcpState::Listen
-            })
-            .cloned()
-    };
-    if let Some(listen_arc) = listen {
+    // LISTEN bucket: any listener on (dst | 0.0.0.0, dst_port) drives the
+    // passive open. The accept-enqueue (add_to_listener_accept_queue)
+    // re-selects within the SO_REUSEPORT group by flow hash.
+    if let Some(listen_arc) = listen_index_group(dst, hdr.dst_port).into_iter().next() {
         accept_into_listen(&listen_arc, src, dst, &hdr, segment);
     }
 }
@@ -1767,38 +1915,22 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         let t = arc.lock();
         (t.local_addr, t.local_port, t.remote_addr, t.remote_port, t.id)
     };
-    let g = TCB_TABLE.lock();
-    let m = match g.as_ref() {
-        Some(m) => m,
-        None => return,
-    };
-    // Collect EVERY LISTEN TCB on this (addr, port). Normally there is
-    // exactly one, but a `SO_REUSEPORT`/`SO_REUSEADDR` server (e.g. a
-    // multithreaded daemon with one listener per worker thread, each its
-    // own kernel TCB) installs several distinct Listen TCBs on the same
-    // port. `BTreeMap::values()` yields in ascending-TCB-id order, so the
-    // group ordering is deterministic for a stable listener set.
-    let group: alloc::vec::Vec<&Arc<IrqSafeSpinLock<Tcb>>> = m
-        .values()
-        .filter(|t| {
-            let l = t.lock();
-            // Match a concrete-addr listener exactly, or an INADDR_ANY
-            // (0.0.0.0) listener against the child's concrete local addr.
-            l.state == TcpState::Listen
-                && (l.local_addr == local_addr || l.local_addr == [0, 0, 0, 0])
-                && l.local_port == local_port
-        })
-        .collect();
+    // EVERY LISTEN TCB on this (addr, port). Normally exactly one, but a
+    // `SO_REUSEPORT`/`SO_REUSEADDR` server (e.g. a multithreaded daemon
+    // with one listener per worker thread, each its own kernel TCB)
+    // installs several distinct Listen TCBs on the same port. The index
+    // returns them in a deterministic order for a stable listener set.
+    let group = listen_index_group(local_addr, local_port);
     let listen_arc = match group.len() {
         0 => return,
         // Single listener: the common, non-REUSEPORT case — no steering.
-        1 => group[0],
+        1 => group[0].clone(),
         // Multiple listeners (REUSEPORT group): steer this flow to one of
         // them by hashing its remote endpoint, so distinct flows land on
         // distinct listeners/workers/cores in parallel.
         n => {
             let h = reuseport_flow_hash(remote_addr, remote_port, local_port);
-            group[(h as usize) % n]
+            group[(h as usize) % n].clone()
         }
     };
     let mut l = listen_arc.lock();
@@ -2265,22 +2397,7 @@ pub fn tick_all() {
 /// Mirrors `tcp_v4_err` (`net/ipv4/tcp_ipv4.c`); we don't currently
 /// distinguish hard vs. soft errors and just close the TCB.
 pub fn signal_icmp_error(remote_ip: [u8; 4], remote_port: u16, local_ip: [u8; 4], local_port: u16) {
-    let arc = {
-        let g = TCB_TABLE.lock();
-        let m = match g.as_ref() {
-            Some(m) => m,
-            None => return,
-        };
-        m.values()
-            .find(|t| {
-                let g = t.lock();
-                g.local_addr == local_ip
-                    && g.local_port == local_port
-                    && g.remote_addr == remote_ip
-                    && g.remote_port == remote_port
-            })
-            .cloned()
-    };
+    let arc = conn_index_lookup(conn_key(remote_ip, remote_port, local_ip, local_port));
     if let Some(arc) = arc {
         let mut t = arc.lock();
         t.drop_cause = Some(DropCause::PeerReset);
