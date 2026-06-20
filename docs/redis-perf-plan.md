@@ -21,6 +21,8 @@ Compare in-guest-vs-total **within one run**.
 
 ## Scoreboard (vs Linux, KVM)
 
+1 vCPU (the default redis config):
+
 | metric | session start | **now** | Linux | ratio |
 |---|---|---|---|---|
 | PING p50 | ~350µs | **60µs** | 57µs | **1.05×** (parity) |
@@ -30,6 +32,19 @@ Compare in-guest-vs-total **within one run**.
 | GET tput (c50 P16) | 0.35× | **0.71×** | 741k | — |
 | SET tput (c50 P64) | — | 752k | 1316k | 0.57× |
 | GET tput (c50 P64) | — | 841k | 1250k | 0.67× |
+
+2 vCPU (SMP — boot fix + AP-placement bias landed this round):
+
+| metric | SMP `any()` | **SMP +placement** | Linux 2vCPU | ratio |
+|---|---|---|---|---|
+| PING p50 (20k) | 69µs | **65µs** | 58µs | 1.12× |
+| PING p99 (20k) | 254µs | **222µs** | ~72µs | ~3.1× |
+| GET tput (c50 P16) | 533k | **537k** | 868k | 0.62× |
+
+SMP throughput is still ~0.62× — placement fixed redis's *core assignment*
+(PING p99 254→222µs) but all 50 connections still funnel through ONE virtio
+RX queue + ONE BSP forwarder, a serial feed a 2nd vCPU can't parallelize.
+That's the remaining lever (multi-queue/RSS, task #125).
 
 Throughput scales with pipeline depth (SET: P1 ~53k → P16 485k → P64 752k)
 but the **ratio to Linux is ~constant ~0.6× across depths** → a per-request
@@ -156,12 +171,17 @@ WORSE** — the classic signature of cross-CPU contention. redis DOES migrate
    before the idle AP can steal it**, so redis effectively stays on the BSP
    and the AP starves — the forwarder(BSP)↔redis(AP) pipeline never forms.
    Hysteresis can't help because redis never *reaches* the AP. Force-placing
-   redis on the AP forms the pipeline → latency recovers (p99 264→160µs) and
-   the built-in workload jumps. Proper fix: a **placement policy** that gives
-   a hot user task a dedicated non-BSP core (reserve BSP for kernel/forwarder
-   /IRQ), instead of relying on steal to win the placement race. Blunt
-   pin-all-to-CPU1 confirmed the mechanism but is too broad to ship (changes
-   the 16-CPU boot path; needs full kernel-test validation). *Scheduler* work.
+   redis on the AP forms the pipeline → latency recovers.
+   **✅ SHIPPED** (`80b95f14`): `TaskSpec::user_task()` now biases a user
+   task's *initial placement* (`preferred`) to a round-robin online AP while
+   leaving `allowed = ALL` so work-stealing can still rebalance onto the BSP
+   under load. First tried a hard "APs only" mask — it exiled every user task
+   to the lone AP on a 2-vCPU box and starved co-resident tasks (net-smoke's
+   `netserve` never reached `listen`); softening to a `preferred`-only bias
+   fixed that while keeping the win. Measured (SMP=2, 20k-PING): redis PING
+   p99 254→**222µs**, p50 69→**65µs**, avg 90→**83µs**. Validated: kernel-test
+   **5138 pass / 0 fail**, boot-smoke clean, musl-demo **85/85**, net-smoke +
+   redis green (all KVM, default 16-CPU and -smp 2).
 4. ⏳ **Concurrent-throughput ceiling = single virtio RX queue / single
    forwarder.** Even with redis perfectly placed on the AP, concurrent GET is
    only 0.64× (555k vs 873k). All 50 connections' RX funnels through ONE
