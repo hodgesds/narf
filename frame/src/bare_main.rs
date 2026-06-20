@@ -749,6 +749,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_interrupts::VECTOR_RESCHED,
                 );
             });
+            // Idle-halt LOST-WAKEUP backstop: let the executor arm a short
+            // fallback LAPIC deadline before HLT so a halted AP always
+            // re-scans within a bounded time even if a cross-core wake is
+            // lost. `arm_tsc_deadline_if_earlier` only pulls the deadline
+            // IN, never pushes it out, so it can't delay a sooner real wake.
+            narf_scheduler::set_idle_backstop_hook(|deadline| {
+                narf_interrupts::x86_64::apic::arm_tsc_deadline_if_earlier(deadline);
+            });
             // Wire the memory subsystem's `invlpg_global` to
             // broadcast through this IPI surface. After this call,
             // every unmap_4kb fans out to peer CPUs.

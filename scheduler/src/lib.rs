@@ -363,6 +363,37 @@ pub fn set_resched_ipi_hook(f: fn(u32)) {
     RESCHED_IPI_HOOK.store(f as usize, Ordering::Release);
 }
 
+/// Hook to arm a one-shot LAPIC TSC-deadline at the given TSC value (boot
+/// wires `apic::arm_tsc_deadline_if_earlier`). Used by the idle path as a
+/// LOST-WAKEUP BACKSTOP: an AP that HLTs with no wheel deadline otherwise
+/// relies entirely on an external wake (cross-core IPI / device IRQ) plus
+/// the periodic tick. The stall watchdog caught a runnable task stranded
+/// on a HALTED AP — a wake that was neither observed nor IPI-delivered.
+/// Arming a short fallback before every idle HLT guarantees the AP
+/// re-scans within a bounded time, so a lost/late wake self-heals (a
+/// permanent wedge becomes a sub-tick latency blip) regardless of any
+/// subtle wake-delivery race. `0` = not installed (single-CPU / pre-boot).
+static IDLE_BACKSTOP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the idle-halt fallback-deadline arm (boot installs the LAPIC
+/// TSC-deadline write).
+pub fn set_idle_backstop_hook(f: fn(u64)) {
+    IDLE_BACKSTOP_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Arm the idle backstop ~`ms` milliseconds out, if a hook is installed.
+fn arm_idle_backstop_ms(ms: u64) {
+    let p = IDLE_BACKSTOP_HOOK.load(Ordering::Acquire);
+    if p == 0 {
+        return;
+    }
+    let cpns = narf_time::cycles_per_ns().max(1) as u64;
+    let deadline = narf_time::now_cycles().wrapping_add(cpns.saturating_mul(ms * 1_000_000));
+    // SAFETY: `p` was set by `set_idle_backstop_hook` from a `fn(u64)`.
+    let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
+    f(deadline);
+}
+
 /// Reschedule the owner of a just-woken task: if it lives on a DIFFERENT
 /// CPU that is currently halted, IPI that CPU so it re-runs its round
 /// now. Same-CPU or running-CPU wakes need nothing (the run loop's
@@ -2158,6 +2189,38 @@ pub fn run_until_empty() {
             // (and skip the halt); otherwise our HALTED store precedes the
             // waker's load and it IPIs us. Either way the wake is never both
             // un-IPI'd AND unobserved.
+            //
+            // ── BUG FIX (intermittent permanent SMP wedge) ──
+            // The Dekker handshake only guarantees the waker SENDS the IPI;
+            // it does NOT by itself guarantee we don't HALT through it. With
+            // IRQs ENABLED (the user-task-SMP idle state — see the
+            // enable_interrupts() above the halt-poll), a reschedule IPI that
+            // arrives in the window AFTER the re-scan but BEFORE the HLT is
+            // serviced immediately by the (no-op) resched handler and thereby
+            // CONSUMED — then the HLT waits for the *next* IRQ. There is NO
+            // periodic timer on an idle AP whose timer-wheel has no armed
+            // deadline (`next_deadline == None`), so that "next IRQ" may never
+            // come: the AP HLTs forever while the woken task strands in
+            // READY[cpu] with awake=true, and any connection that task serves
+            // stalls — the ~50%-of-200-conn-runs permanent livelock.
+            //
+            // Fix: run the re-scan AND the HLT with IRQs MASKED, and halt via
+            // the atomic `sti;hlt;cli` (`idle_halt_then_disable`, Linux
+            // `safe_halt`). A resched IPI sent during the commit-to-halt
+            // window now stays PENDING in the LAPIC IRR (IF=0) and is taken
+            // by the `sti;hlt` pair, which wakes the HLT — no lost wakeup.
+            // Only applies on a reliable tick with IRQs currently enabled
+            // (i.e. the KVM / user-task-SMP path where the race exists); the
+            // InitialCount-fallback / IF=0-spin cases keep the old `idle_wait`.
+            let race_free_halt = narf_time::tick_reliable() && narf_arch::interrupts_enabled();
+            if race_free_halt {
+                // SAFETY: re-enabled below (or by the sti;hlt;cli halt).
+                // Masking IRQs across the Dekker re-scan + HLT is what closes
+                // the IPI-before-HLT race described above.
+                unsafe {
+                    narf_arch::disable_interrupts();
+                }
+            }
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
             let woke_late = {
@@ -2168,15 +2231,53 @@ pub fn run_until_empty() {
             };
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                if race_free_halt {
+                    // SAFETY: restore the IRQ state we masked above; a wake is
+                    // already pending so we loop straight back to polling.
+                    unsafe {
+                        narf_arch::enable_interrupts();
+                    }
+                }
                 continue;
             }
-            // Idle until a wake is plausible. On a reliable tick this HLTs
-            // (woken by the periodic tick, a reschedule/shootdown IPI, or any
-            // device IRQ); on the InitialCount fallback it bounded-spins so a
-            // dropped tick can't strand a parked sleeper or stall the
-            // sleep-pumps. See `idle_wait`.
-            idle_wait(next_deadline);
-            CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            // Idle until a wake is plausible.
+            if race_free_halt {
+                // IRQs are masked here. Skip the HLT if the deadline already
+                // passed; otherwise sti;hlt;cli — atomic enable+halt so a
+                // resched/shootdown IPI (or the armed TSC-deadline timer, or
+                // any device IRQ) wakes us, INCLUDING one that raced into the
+                // commit-to-halt window above. Returns with IRQs masked.
+                let deadline_passed = next_deadline
+                    .map(|d| narf_time::now_cycles() >= d)
+                    .unwrap_or(false);
+                if !deadline_passed {
+                    // LOST-WAKEUP BACKSTOP: arm a ~2 ms fallback so this AP
+                    // re-scans soon even if a cross-core wake is lost and
+                    // the periodic tick stalls (see `IDLE_BACKSTOP_HOOK`).
+                    // The watchdog observed a runnable task stranded on a
+                    // halted AP; this bounds the strand to ~2 ms. Armed with
+                    // IRQs masked so it can't fire-and-be-consumed before
+                    // the sti;hlt below.
+                    arm_idle_backstop_ms(2);
+                    // SAFETY: CPL=0, IF=0 on entry (we masked above); the
+                    // arch primitive is the Linux safe_halt sti;hlt;cli.
+                    unsafe {
+                        narf_arch::idle_halt_then_disable();
+                    }
+                }
+                CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+                // SAFETY: restore the IRQ state to the idle path's natural
+                // enabled state (it was enabled before we masked it).
+                unsafe {
+                    narf_arch::enable_interrupts();
+                }
+            } else {
+                // Unreliable-tick (InitialCount) bounded-spin or the
+                // IF=0 (no user-task-SMP) spin — both handled by `idle_wait`,
+                // which doesn't HLT-through-an-IPI, so the race doesn't apply.
+                idle_wait(next_deadline);
+                CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            }
             if next_deadline.is_some() {
                 // After the wake (or if the deadline already passed),
                 // fire any due wakers in this non-IRQ context.
@@ -2201,6 +2302,40 @@ pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
         out.push((cpu as u32, len));
     }
     out
+}
+
+/// Stall-watchdog diagnostic for one CPU: `(ready_depth, awake_count,
+/// halted, locked)`.
+///
+/// `halted` is the CPU's published `CPU_HALTED` flag (true ⇒ the CPU has
+/// committed to / is in HLT). `locked` is true when `try_lock` on the
+/// CPU's ready queue FAILED — i.e. some context holds the per-CPU queue
+/// lock right now (mid-mutation, or wedged holding it). Uses `try_lock`
+/// throughout so the watchdog can never itself deadlock on a wedged queue.
+///
+/// Decision table for a confirmed scheduler stall:
+/// - `halted && awake > 0`  ⇒ LOST WAKEUP (a runnable task on a halted CPU).
+/// - `!halted && awake > 0` ⇒ the CPU is spinning but not polling — a
+///   data-path/lock issue keeping it off the poll, OR a busy-loop bug.
+/// - `locked`               ⇒ a holder is stuck inside the queue lock.
+pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return (0, 0, false, false);
+    }
+    let halted = CPU_HALTED[cpu].load(Ordering::SeqCst);
+    match READY[cpu].try_lock() {
+        Some(g) => match g.as_ref() {
+            Some(d) => {
+                let awake = d
+                    .iter()
+                    .filter(|s| s.awake.flag.load(Ordering::Acquire))
+                    .count();
+                (d.len(), awake, halted, false)
+            }
+            None => (0, 0, halted, false),
+        },
+        None => (0, 0, halted, true),
+    }
 }
 
 /// NUMA node ID of the executing CPU, or `None` when SRAT
@@ -2316,6 +2451,23 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         }
     };
     if let Some(slot) = stolen {
+        // ── BUG FIX (intermittent permanent SMP wedge) ──
+        // Re-home the stolen slot to the THIEF before it lands on the
+        // thief's queue. `awake.cpu` is the CPU a cross-core waker will
+        // resched-IPI (see `resched_remote` / `enqueue_on`'s comment),
+        // and it is otherwise only refreshed when the slot is POLLED. The
+        // steal moved the slot from `victim`'s queue to `cpu`'s queue but
+        // left `awake.cpu == victim` (stale). A waker that fires before the
+        // thief first polls the slot would then read the stale victim id,
+        // check `CPU_HALTED[victim]`, and IPI VICTIM — while the slot
+        // actually sits in `READY[thief]` and the thief is the CPU that
+        // needs waking. If the thief has halted, that wake is lost and the
+        // task strands with awake=true → the connection it serves stalls
+        // (the intermittent 200-conn livelock; worse under affinity
+        // restriction, which forces more cross-core placement/stealing).
+        // `enqueue_on` already does this store for the normal enqueue path;
+        // the steal path bypassed it.
+        slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
         let mut g = READY[cpu].lock();
         g.as_mut()
             .expect("scheduler: steal before init")
