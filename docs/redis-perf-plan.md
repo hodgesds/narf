@@ -56,18 +56,34 @@ number) as the TCP-timestamp TSecr instead of the peer's TSval** — an RFC 7323
 violation. SLIRP regenerates TCP timestamps so it masked the bug for years; a
 real Linux host rejects the bad echo and resets. Fixed in `send_syn` (echo
 `opts.ts_recent`). redis now serves off-box over a real tap: 0 RSTs, clean
-handshake + data. **Clean 20k-PING latency over tap — NARF beats Linux on the
-common case:**
+handshake + data.
 
-| metric | NARF/tap | Linux/tap |
-|---|---|---|
-| PING min | **40µs** | 50µs |
-| PING p50 | **50µs** | 58µs |
-| PING avg | **58µs** | 60µs |
-| PING p99 | 168µs | 79µs |
+### FULL BASELINE before multi-queue (#125) — 1 vCPU, KVM, -c50 -P16
 
-This unblocks real off-box throughput numbers free of the single-threaded-SLIRP
-confound, and makes multi-queue/RSS (#125) testable.
+The Linux baseline boots on the same real tap too (`XTASK_QEMU_TAP`, it
+self-assigns 10.0.2.15), so this is apples-to-apples over a real backend:
+
+| metric | NARF SLIRP | Linux SLIRP | **NARF tap** | **Linux tap** |
+|---|---|---|---|---|
+| PING min | 41µs | 50µs | **40µs** | 46µs |
+| PING p50 | 57µs | 58µs | **49µs** | 51µs |
+| PING p99 | 178µs | 77µs | 159µs | 67µs |
+| SET tput | 551k | 751k | **654k** | 818k |
+| GET tput | 541k | 836k | **714k** | 858k |
+| SET ratio | 0.73× | — | **0.80×** | — |
+| GET ratio | 0.65× | — | **0.83×** | — |
+
+**Key takeaways:**
+1. **SLIRP was a major confound** (validates #126): moving NARF off SLIRP onto
+   a real tap lifts GET throughput 541k→714k (**+32%**), SET 551k→654k
+   (**+24%**), and the ratio-to-Linux jumps GET 0.65×→**0.83×**, SET
+   0.73×→**0.80×**.
+2. **Latency: NARF beats Linux on min + p50 over the real NIC** (p50 49 vs
+   51µs, min 40 vs 46µs). Only the **p99 tail** lags (159 vs 67µs) — the one
+   remaining latency gap.
+3. Throughput residual (~0.80–0.83×) is now small and, per #126, intrinsic
+   single-threaded-redis (MQ won't help *redis*; it's for multithreaded
+   servers, #125). The p99 tail is the more actionable latency item.
 
 Throughput scales with pipeline depth (SET: P1 ~53k → P16 485k → P64 752k)
 but the **ratio to Linux is ~constant ~0.6× across depths** → a per-request
