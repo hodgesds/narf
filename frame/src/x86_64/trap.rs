@@ -93,12 +93,16 @@ mod stall_wd {
         // Wedge signature: past boot (window 20 ≈ 20 s uptime) and the
         // syscall RATE collapses far below healthy. A healthy 200-conn run
         // does ~150-200k syscalls/window; the partial wedge limps at ~2k
-        // (most workers stuck, a few connections trickling). Trigger on
-        // delta < 10k for 4 consecutive windows — catches both the full
-        // stall (delta 0) and the degraded "limping" wedge.
-        if wc > 20 && delta < 10_000 {
+        // (most workers stuck, a few connections trickling). A healthy
+        // 200-conn run does >100k syscalls/window; a wedged/degraded run
+        // limps far below. Trigger on delta < 50k for 3 consecutive windows
+        // — catches the full stall (delta 0) AND the degraded "limping"
+        // wedge whose exact rate varies (2k-30k). A healthy run completes
+        // (and qemu exits) well before the window count matters, so this
+        // only ever fires on a genuine wedge.
+        if wc > 20 && delta < 50_000 {
             let flats = FLAT_WINDOWS.fetch_add(1, Ordering::Relaxed) + 1;
-            if flats >= 4 && !DUMPED.swap(true, Ordering::Relaxed) {
+            if flats >= 3 && !DUMPED.swap(true, Ordering::Relaxed) {
                 dump(sc);
             }
         } else {
@@ -107,9 +111,10 @@ mod stall_wd {
     }
 
     fn dump(sc: u64) {
+        let (ipi_sent, ipi_skip) = narf_scheduler::dbg_resched_counts();
         let _ = writeln!(
             TrapWriter,
-            "STALL-WD: scheduler stalled (syscalls flat at {sc}); per-CPU state:"
+            "STALL-WD: scheduler stalled (syscalls flat at {sc}); resched_ipi_sent={ipi_sent} resched_skip_not_halted={ipi_skip}; per-CPU state:"
         );
         for cpu in 0..MAXC {
             if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {

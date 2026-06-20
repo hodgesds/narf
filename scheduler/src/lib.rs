@@ -398,6 +398,23 @@ fn arm_idle_backstop_ms(ms: u64) {
 /// CPU that is currently halted, IPI that CPU so it re-runs its round
 /// now. Same-CPU or running-CPU wakes need nothing (the run loop's
 /// pre-halt scan catches them). Dekker fence pairs with the idle side.
+/// Diagnostic counters for the cross-core wake path (read by the stall
+/// watchdog). `SENT` = resched IPIs actually fired (target was halted);
+/// `SKIP` = cross-core wakes where the target was NOT halted so no IPI was
+/// sent (relied on the target's pre-halt re-scan). A wedge with SENT≈0 ⇒
+/// wakes race the halt (Dekker miss); SENT≫0 but the AP stays halted ⇒ the
+/// IPI is sent but doesn't wake it (delivery/handler issue).
+static RESCHED_SENT: AtomicU64 = AtomicU64::new(0);
+static RESCHED_SKIP: AtomicU64 = AtomicU64::new(0);
+
+/// `(resched_ipis_sent, cross_core_wakes_skipped_not_halted)`.
+pub fn dbg_resched_counts() -> (u64, u64) {
+    (
+        RESCHED_SENT.load(Ordering::Relaxed),
+        RESCHED_SKIP.load(Ordering::Relaxed),
+    )
+}
+
 #[inline]
 fn resched_remote(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
@@ -407,8 +424,10 @@ fn resched_remote(target_cpu: u32) {
     // Pair with the idle side's `mark_halted(true); fence; final-scan`.
     core::sync::atomic::fence(Ordering::SeqCst);
     if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
+        RESCHED_SKIP.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    RESCHED_SENT.fetch_add(1, Ordering::Relaxed);
     let p = RESCHED_IPI_HOOK.load(Ordering::Acquire);
     if p != 0 {
         // SAFETY: `p` was set by `set_resched_ipi_hook` from a `fn(u32)`.
