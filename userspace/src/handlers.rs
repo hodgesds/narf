@@ -8002,7 +8002,11 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // we got here, or the smoke ran with a synthetic uaddr that
     // isn't mapped through the user AS), the futex counter still
     // bumps so any waiter using the same uaddr observes the wake.
+    // Bump the counter (lost-wakeup gen guard) AND fire every parked
+    // waiter on the real wait queue (a joiner blocked in FUTEX_WAIT must
+    // wake promptly, not at the wheel fallback).
     futex_bump_counter(uaddr);
+    futex_wake_waiters(uaddr, u32::MAX);
 
     // Write zero into *uaddr via the page tables of the AS the
     // task ran in. We stashed the PML4 phys at clone time, so this
@@ -15040,6 +15044,85 @@ fn futex_bump_counter(uaddr: u64) {
     }
 }
 
+/// Live per-uaddr `FUTEX_WAKE` generation. The user-task poll routine
+/// snapshots this (`futex_park_gen`) before parking and re-reads it after
+/// registering the waker — a change means a wake raced the registration
+/// (lost-wakeup guard). Public mirror of `futex_wake_counter`.
+pub fn futex_gen(uaddr: u64) -> u64 {
+    futex_wake_counter(uaddr)
+}
+
+/// Per-uaddr blocking-futex wait queue: futex word → (task id → Waker).
+/// `FUTEX_WAIT` registers the caller's waker here (via the user-task poll
+/// routine) and truly parks; `FUTEX_WAKE` pops up to `val` wakers and fires
+/// them. This is what makes the futex a REAL blocking primitive instead of
+/// the old fixed-1ms nanosleep park: under contention musl's `__wait` spin
+/// loop otherwise re-parks every ~1ms (no early wake), so a contended pthread
+/// lock handoff cost ~1ms. Keyed by task id so a re-registering waiter
+/// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
+#[allow(clippy::type_complexity)]
+static FUTEX_WAITERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, alloc::collections::BTreeMap<u64, core::task::Waker>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Register `task_id`'s waker as parked on futex word `uaddr`. Called from
+/// the user-task poll routine while a task blocks in `FUTEX_WAIT`.
+pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker) {
+    let mut g = FUTEX_WAITERS.lock();
+    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    m.entry(uaddr)
+        .or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(task_id, waker);
+}
+
+/// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
+/// woke for another reason — lost-wakeup re-poll, timeout, or exit).
+pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
+    let mut g = FUTEX_WAITERS.lock();
+    if let Some(m) = g.as_mut() {
+        if let Some(set) = m.get_mut(&uaddr) {
+            set.remove(&task_id);
+            if set.is_empty() {
+                m.remove(&uaddr);
+            }
+        }
+    }
+}
+
+/// Wake up to `n` tasks parked on futex word `uaddr`. Returns the count
+/// woken. Drains the wakers under the table lock, then fires them after
+/// dropping it (wake() may re-enter the scheduler). Mirrors `wake_one`:
+/// clears each woken task's finite sleep deadline so its re-poll falls
+/// through to re-enter user mode (where musl re-checks the futex word).
+fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
+    let drained: alloc::vec::Vec<(u64, core::task::Waker)> = {
+        let mut g = FUTEX_WAITERS.lock();
+        let Some(m) = g.as_mut() else {
+            return 0;
+        };
+        let Some(set) = m.get_mut(&uaddr) else {
+            return 0;
+        };
+        // BTreeMap has no pop; collect the first `n` keys then remove them.
+        let take: alloc::vec::Vec<u64> = set.keys().take(n as usize).copied().collect();
+        let mut out = alloc::vec::Vec::with_capacity(take.len());
+        for tid in take {
+            if let Some(w) = set.remove(&tid) {
+                out.push((tid, w));
+            }
+        }
+        if set.is_empty() {
+            m.remove(&uaddr);
+        }
+        out
+    };
+    let count = drained.len();
+    for (tid, w) in drained {
+        wake_one(tid, w);
+    }
+    count
+}
+
 /// Test-only accessor for the futex wake counter — Wave-65 smokes
 /// observe CLONE_CHILD_CLEARTID's exit-side futex wake by reading
 /// this counter before/after the exit notification.
@@ -15055,35 +15138,30 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
     let val = args.arg2 as u32;
     let timeout_ns = args.arg3; // 0 = no timeout
     let fail = SyscallReturn::ok((-1i64) as u64);
+    // Start each futex op from clean park state so a stale `futex_uaddr` left
+    // by a prior wait (e.g. a wake that cleared only the deadline) can't make
+    // the poll routine re-register on the old word.
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: uctx is live for this trap; atomic field.
+        unsafe {
+            (*uctx).futex_uaddr.store(0, Ordering::Release);
+        }
+    }
     match op {
         FUTEX_WAIT => {
-            // Single-shot sleep variant. The full Linux semantics
-            // (block until wake or timeout) require yielding back
-            // to the scheduler so other tasks (notably the very
-            // thread we're waiting on) can make progress; the
-            // kernel-side parking would otherwise hog the CPU and
-            // deadlock the join.
+            // REAL blocking futex. Sample *uaddr; if it already differs from
+            // `val`, the wait condition no longer holds — return 0 (caller's
+            // fast path observes the change). Else register on the per-uaddr
+            // wait queue and PARK until a `FUTEX_WAKE` on this word fires our
+            // waker (or, with a timeout, until it expires) — NOT a fixed
+            // nanosleep. The poll routine (`UserTaskFuture::poll`) does the
+            // actual waker registration (it owns `cx.waker()`); here we just
+            // publish the uaddr + a wake-counter snapshot for its lost-wakeup
+            // guard and hand control back via the yield hook. On resume the
+            // user reads RAX=0 and musl's recheck loop re-evaluates the word.
             //
-            // The shape: sample *uaddr; if it already changed,
-            // return success right away (caller's fast path
-            // observes the value change). Otherwise schedule a
-            // short sleep deadline on the calling task and return
-            // 0. The user-side libc futex_wait wraps this in a
-            // recheck loop; each iteration parks the task in the
-            // executor (via user_task::poll's deadline branch),
-            // which lets other tasks (including the wake source)
-            // run. When *uaddr changes, the user loop exits.
-            //
-            // This is functionally a "futex-flavoured nanosleep"
-            // — the kernel holds no per-uaddr wait queue, just
-            // gives the caller back to the scheduler with a
-            // bounded park. POSIX permits spurious wakeups; the
-            // user-side recheck handles them.
-            //
-            // Null uaddr: no possible wait queue, treat as immediate
-            // success (POSIX-permitted spurious wake). Lets smoke
-            // tests exercise the wait/wake fast path without a
-            // backing user mapping.
+            // Null uaddr: no wait queue — immediate (POSIX-permitted) spurious
+            // wake so wake-path smokes run without a backing mapping.
             if uaddr == 0 {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
@@ -15102,32 +15180,30 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
-            // Park ~1ms (or the user-supplied timeout, capped).
-            // Long enough for the scheduler to round-robin every
-            // ready task at least once on a 1-CPU build; short
-            // enough to keep the recheck latency tight.
-            const DEFAULT_PARK_NS: u64 = 1_000_000; // 1 ms
-            let park_ns = if timeout_ns == 0 {
-                DEFAULT_PARK_NS
+            // Deadline: a real timeout when one was supplied (wakes at the
+            // timeout OR on a FUTEX_WAKE, whichever first), else infinite
+            // (`u64::MAX`) — the poll routine parks on the timer wheel with a
+            // one-tick fallback as a lost-wake safety net, but the primary
+            // wake is the registered futex waker.
+            let deadline = if timeout_ns == 0 {
+                u64::MAX
             } else {
-                core::cmp::min(timeout_ns, DEFAULT_PARK_NS)
+                narf_scheduler::narf_time::monotonic_ns().saturating_add(timeout_ns)
             };
-            // Yield to the executor: stash the deadline on the
-            // current UserTaskCtx, save the user state, then
-            // longjmp back via the yield hook. The next
-            // UserTaskFuture::poll consults the deadline and
-            // parks the task without re-entering user mode until
-            // it expires; on resume the user reads RAX=0 (we set
-            // it before the longjmp). Mirrors sys_sleep exactly.
+            // Snapshot the per-uaddr wake counter BEFORE publishing the wait
+            // so the poll routine can detect a FUTEX_WAKE that races in
+            // between (lost-wakeup guard).
+            let gen = futex_wake_counter(uaddr);
             if let (Some(uctx), Some(hook)) = (
                 crate::user_task::current_user_task(),
                 crate::user_task::yield_hook(),
             ) {
                 ctx.set_return(SyscallReturn::ok(0));
-                let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(park_ns);
                 // SAFETY: uctx is live for the trap round-trip.
                 unsafe {
                     let uc = &*uctx;
+                    uc.futex_park_gen.store(gen, Ordering::Release);
+                    uc.futex_uaddr.store(uaddr, Ordering::Release);
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -15135,20 +15211,18 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                 }
                 // unreachable
             }
-            // Test/no-future fallback: synchronous park.
-            let _ = futex_wake_counter(uaddr);
+            // Test/no-future fallback: synchronous success.
             ctx.set_return(SyscallReturn::ok(0));
         }
         FUTEX_WAKE => {
-            // Wake up to `val` waiters. Today we just bump the
-            // counter — every waiter on this uaddr re-checks on
-            // its next poll iteration. Linux distinguishes
-            // "wake one" vs "wake all" via val; the spin model
-            // wakes everyone regardless because the counter is
-            // shared. Returns the number woken (cap at val so
-            // callers expecting "≤ val" see consistent values).
+            // Bump the per-uaddr generation FIRST (the poll routine's
+            // lost-wakeup guard reads it), THEN fire up to `val` parked
+            // waiters' wakers. Returns the number actually woken (Linux
+            // contract). A waiter not yet registered when we fire is caught
+            // by the gen guard on its next poll.
             futex_bump_counter(uaddr);
-            ctx.set_return(SyscallReturn::ok(val as u64));
+            let woken = futex_wake_waiters(uaddr, val);
+            ctx.set_return(SyscallReturn::ok(woken as u64));
         }
         _ => ctx.set_return(fail),
     }
@@ -15190,23 +15264,27 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
         ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
         return;
     }
-    // Sample the wake counter so the executor's deadline park can observe a
-    // landing wake, then bounded-park (mirrors sys_futex's FUTEX_WAIT).
-    const DEFAULT_PARK_NS: u64 = 1_000_000; // 1 ms
-    let park_ns = if park_cap_ns == 0 {
-        DEFAULT_PARK_NS
+    // REAL blocking park, same wait queue + per-uaddr wake counter as the
+    // classic `sys_futex` FUTEX_WAIT (Linux futex2 and classic futex operate
+    // on the SAME words — a FUTEX_WAKE must wake either). Register happens in
+    // the poll routine; here we publish the uaddr + counter snapshot + an
+    // infinite (or timeout-bounded) deadline and yield.
+    let deadline = if park_cap_ns == 0 {
+        u64::MAX
     } else {
-        core::cmp::min(park_cap_ns, DEFAULT_PARK_NS)
+        narf_scheduler::narf_time::monotonic_ns().saturating_add(park_cap_ns)
     };
+    let gen = futex_wake_counter(uaddr);
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
     ) {
         ctx.set_return(SyscallReturn::ok(0));
-        let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(park_ns);
         // SAFETY: uctx is live for the trap round-trip.
         unsafe {
             let uc = &*uctx;
+            uc.futex_park_gen.store(gen, Ordering::Release);
+            uc.futex_uaddr.store(uaddr, Ordering::Release);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -15214,8 +15292,7 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
         }
         // unreachable
     }
-    // Test/no-future fallback: synchronous park.
-    let _ = futex_wake_counter(uaddr);
+    // Test/no-future fallback: synchronous success.
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -15245,8 +15322,11 @@ fn sys_futex_wake(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+    // Bump the gen counter AND fire up to `nr` parked waiters on the real
+    // queue (futex2 and classic futex share the same words / queue).
     futex_bump_counter(uaddr);
-    ctx.set_return(SyscallReturn::ok(nr));
+    let _ = futex_wake_waiters(uaddr, nr as u32);
+    ctx.set_return(SyscallReturn::ok(nr))
 }
 
 /// Linux futex2 `futex_requeue(waiters, flags, nr_wake, nr_requeue)`
@@ -15268,6 +15348,7 @@ fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
             let src = u64::from_ne_bytes(entry[8..16].try_into().unwrap());
             if src != 0 {
                 futex_bump_counter(src);
+                let _ = futex_wake_waiters(src, nr_wake as u32);
             }
         }
     }

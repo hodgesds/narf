@@ -111,6 +111,18 @@ pub struct UserTaskCtx {
     /// race) and the task self-wakes to re-poll instead of sleeping
     /// out its deadline.
     pub epoll_park_gen: AtomicU64,
+    /// Futex word address this task is blocked on (`FUTEX_WAIT`), or 0 when
+    /// not futex-waiting. Set by `sys_futex` before it yields; the poll
+    /// routine registers `cx.waker()` in the per-uaddr futex wait queue so a
+    /// `FUTEX_WAKE` on that word wakes this task PROMPTLY (a real blocking
+    /// futex, not the old fixed ~1ms nanosleep park). Mirrors `net_io_wait`.
+    pub futex_uaddr: AtomicU64,
+    /// Snapshot of the per-uaddr `FUTEX_WAKE` counter taken by `sys_futex`
+    /// just before it parks. The poll routine re-reads the live counter after
+    /// registering the waker; if it advanced, a wake landed in the
+    /// check→register window (lost-wakeup race) and the task self-wakes to
+    /// re-enter user mode instead of sleeping. Mirrors `epoll_park_gen`.
+    pub futex_park_gen: AtomicU64,
     /// Set non-null by `sys_execve` to hand a freshly-built
     /// `ExecRequest` to the polling routine. The routine takes
     /// ownership via `Box::from_raw` after the EXECVE longjmp
@@ -209,6 +221,8 @@ impl UserTaskCtx {
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
+            futex_uaddr: AtomicU64::new(0),
+            futex_park_gen: AtomicU64::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
@@ -987,6 +1001,30 @@ impl core::future::Future for UserTaskFuture {
                         return core::task::Poll::Pending;
                     }
                 }
+                // FUTEX_WAIT: `sys_futex` published the futex word here.
+                // Register our waker on the per-uaddr wait queue so a
+                // `FUTEX_WAKE` on that word wakes us promptly (a real blocking
+                // futex). Same lost-wakeup guard as net I/O: if the per-uaddr
+                // wake counter advanced since the syscall's snapshot, a wake
+                // raced us — clear the park and self-wake to re-enter user
+                // mode (musl re-checks the word) instead of sleeping it out.
+                let fu = this.ctx.futex_uaddr.load(Ordering::Acquire);
+                if fu != 0 {
+                    crate::handlers::futex_register_waiter(
+                        fu,
+                        crate::handlers::current_task_id(),
+                        cx.waker().clone(),
+                    );
+                    if crate::handlers::futex_gen(fu)
+                        != this.ctx.futex_park_gen.load(Ordering::Acquire)
+                    {
+                        crate::handlers::futex_drop_waiter(fu, crate::handlers::current_task_id());
+                        this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        this.ctx.futex_uaddr.store(0, Ordering::Release);
+                        cx.waker().wake_by_ref();
+                        return core::task::Poll::Pending;
+                    }
+                }
                 if deadline == u64::MAX {
                     // Infinite park (pause / blocking poll/epoll/futex wait).
                     // Earlier this BUSY-SPUN for 1 ms per poll running the
@@ -1058,6 +1096,7 @@ impl core::future::Future for UserTaskFuture {
             // user mode; a pending signal is delivered on the next return).
             this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.ctx.net_io_wait.store(false, Ordering::Release);
+            this.ctx.futex_uaddr.store(0, Ordering::Release);
             if let Some(h) = this.sleep_handle.take() {
                 narf_scheduler::narf_time::timer_wheel::cancel(h);
             }
