@@ -1874,14 +1874,13 @@ fn handle_in_syn_received(arc: &Arc<IrqSafeSpinLock<Tcb>>, hdr: &TcpHeader, payl
         t.retx_deadline_cycles = 0;
         t.last_progress_cycles = narf_scheduler::narf_time::now_cycles();
     }
-    // Look for a parent LISTEN TCB to push this onto.
-    add_to_listener_accept_queue(arc);
-    // A connection just became accept-ready — wake any worker parked in
-    // epoll_wait/poll on its listener NOW (mirrors the data-arrival wake
-    // below) instead of waiting for the next wheel deadline or the first
-    // data segment. Global best-effort: each parked listener re-checks
-    // its own accept-queue, so only the steered worker finds POLL_IN.
-    crate::readiness::notify();
+    // Look for a parent LISTEN TCB to push this onto; it returns the
+    // listener it steered the connection to.
+    let listener_id = add_to_listener_accept_queue(arc);
+    // A connection just became accept-ready — wake the worker parked in
+    // epoll_wait/poll on THAT listener (keyed by the listener's TCB id so
+    // only the steered worker wakes, not the whole REUSEPORT group).
+    crate::readiness::notify(listener_id.map(|i| i as u64).unwrap_or(0));
     if !payload.is_empty() {
         enqueue_recv(arc, hdr.sequence, payload);
     }
@@ -1910,7 +1909,9 @@ fn reuseport_flow_hash(remote_addr: [u8; 4], remote_port: u16, local_port: u16) 
     h
 }
 
-fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+/// Steer a completed passive-open onto a listener's accept queue and
+/// return that listener's TCB id (for the targeted accept-ready wake).
+fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<u32> {
     let (local_addr, local_port, remote_addr, remote_port, id) = {
         let t = arc.lock();
         (t.local_addr, t.local_port, t.remote_addr, t.remote_port, t.id)
@@ -1922,7 +1923,7 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // returns them in a deterministic order for a stable listener set.
     let group = listen_index_group(local_addr, local_port);
     let listen_arc = match group.len() {
-        0 => return,
+        0 => return None,
         // Single listener: the common, non-REUSEPORT case — no steering.
         1 => group[0].clone(),
         // Multiple listeners (REUSEPORT group): steer this flow to one of
@@ -1937,6 +1938,7 @@ fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     if l.accept_queue.len() < l.backlog {
         l.accept_queue.push_back(id);
     }
+    Some(l.id)
 }
 
 fn handle_in_established(
@@ -1959,7 +1961,10 @@ fn handle_in_established(
     // of leaving it to its next wheel deadline. Done after all locks are
     // released; best-effort (no correctness dependency).
     if !payload.is_empty() || hdr.flags & FLAG_FIN != 0 {
-        crate::readiness::notify();
+        // Key the wake by THIS connection's TCB id so only its owning
+        // task wakes (no thundering herd).
+        let id = arc.lock().id as u64;
+        crate::readiness::notify(id);
     }
 }
 

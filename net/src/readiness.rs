@@ -32,21 +32,25 @@ pub fn generation() -> u64 {
 }
 
 /// Install the readiness hook. Called once from `narf-userspace` boot.
-pub fn set_hook(f: fn()) {
+pub fn set_hook(f: fn(u64)) {
     HOOK.store(f as usize, Ordering::Release);
 }
 
 /// Signal that a socket became readable (or a listener gained a pending
-/// connection). Wakes parked epoll/poll waiters via the installed hook.
+/// connection). `key` identifies WHICH socket — the kernel TCB id (a
+/// connection's id for data, the listener's id for an accept) — so the
+/// hook can wake ONLY the task that owns that socket instead of every
+/// parked waiter (the thundering-herd / cross-core-IPI storm under SMP).
+/// `key == 0` means "unknown" → the hook falls back to waking everyone.
 /// No-op until a hook is set.
 #[inline]
-pub fn notify() {
+pub fn notify(key: u64) {
     GEN.fetch_add(1, Ordering::AcqRel);
     let p = HOOK.load(Ordering::Acquire);
     if p != 0 {
-        // SAFETY: `p` is only ever set by `set_hook` from a `fn()`
-        // pointer; transmuting it back to `fn()` is sound.
-        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
-        f();
+        // SAFETY: `p` is only ever set by `set_hook` from a `fn(u64)`
+        // pointer; transmuting it back is sound.
+        let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
+        f(key);
     }
 }

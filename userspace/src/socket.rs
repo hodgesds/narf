@@ -616,6 +616,7 @@ impl SocketFile {
                     // sockets and torn down separately.
                     if let Some(id) = listen_id {
                         narf_net::tcp_stack::remove_tcb(*id);
+                        crate::handlers::clear_tcb_owner(*id);
                     }
                     Reg::Inet(*addr, *port)
                 }
@@ -677,6 +678,7 @@ impl SocketFile {
             }
             Reg::Tcb(id) => {
                 let _ = narf_net::tcp_stack::close(id);
+                crate::handlers::clear_tcb_owner(id);
             }
             Reg::None => {}
         }
@@ -1584,6 +1586,12 @@ impl SocketFile {
                                 narf_net::tcp_stack::listen(a, port, backlog.max(1) as usize)
                             {
                                 *listen_id = Some(id);
+                                // This task owns the listener — targeted
+                                // accept-ready wakes go only to it.
+                                crate::handlers::set_tcb_owner(
+                                    id,
+                                    crate::handlers::current_task_id(),
+                                );
                             }
                         }
                         let key = (self.net_ns_id(), addr, port);
@@ -1620,6 +1628,12 @@ impl SocketFile {
                                 peer_port: 0,
                             };
                         }
+                        // The accepting task owns this connection — targeted
+                        // data-ready wakes go only to it.
+                        crate::handlers::set_tcb_owner(
+                            child_id,
+                            crate::handlers::current_task_id(),
+                        );
                         return SocketOpResult::Accepted {
                             socket: child,
                             peer: None,

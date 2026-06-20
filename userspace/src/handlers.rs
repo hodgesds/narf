@@ -99,6 +99,42 @@ pub fn io_waker_init() {
     *IO_WAKERS.lock() = Some(alloc::collections::BTreeMap::new());
 }
 
+// ── Targeted-wake ownership: TCB id → owning task ───────────────────
+//
+// Each kernel TCP socket (a listener, set at `listen`; a connection, set
+// at `accept`) is owned by the task that created it — which, for the
+// servers we run (SO_REUSEPORT workers, redis, netserve), is also the
+// task that `epoll_wait`s on it. The net stack notifies readiness keyed
+// by TCB id, so `wake_io_waiters` can wake ONLY that owner instead of
+// every parked waiter — killing the thundering herd (and, under SMP, the
+// cross-core IPI storm of waking workers on other cores). An untracked
+// key falls back to wake-all; the lost-wakeup gen guard
+// (`epoll_park_gen`) covers the check→park race, so targeting can't
+// strand a parked task.
+static TCB_OWNER: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u32, u64>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Record that `task_id` owns the socket backed by kernel `tcb_id`.
+pub fn set_tcb_owner(tcb_id: u32, task_id: u64) {
+    let mut g = TCB_OWNER.lock();
+    g.get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(tcb_id, task_id);
+}
+
+/// Drop the ownership record for `tcb_id` (socket closed / TCB gone).
+pub fn clear_tcb_owner(tcb_id: u32) {
+    let mut g = TCB_OWNER.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&tcb_id);
+    }
+}
+
+fn tcb_owner(tcb_id: u32) -> Option<u64> {
+    let g = TCB_OWNER.lock();
+    g.as_ref().and_then(|m| m.get(&tcb_id).copied())
+}
+
 /// Register `task_id`'s waker as parked on net I/O readiness. Called
 /// from the user-task poll routine while a task blocks in epoll/poll.
 pub fn register_io_waiter(task_id: u64, waker: core::task::Waker) {
@@ -122,7 +158,47 @@ pub fn drop_io_waiter(task_id: u64) {
 /// path when a socket becomes readable. Clears each task's finite
 /// sleep deadline so its re-poll falls through to re-check readiness
 /// instead of re-parking on the stale deadline.
-pub fn wake_io_waiters() {
+/// Clear a task's finite sleep deadline (so its re-poll re-checks
+/// readiness) and fire its waker.
+fn wake_one(task_id: u64, w: core::task::Waker) {
+    if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
+        // SAFETY: pointer from `lookup_user_task_ctx` for a live task;
+        // `sleep_deadline_ns` is an atomic field.
+        // SAFETY: Valid memory or trusted environment
+        let uctx = unsafe { &*uctx_ptr };
+        uctx.sleep_deadline_ns.store(0, Ordering::Release);
+    }
+    w.wake();
+}
+
+/// The net readiness hook. `key` is the kernel TCB id of the socket that
+/// became ready (a connection's id for data, the listener's id for an
+/// accept), or 0 for "unknown". When the key has a known owner task that
+/// is currently parked, wake ONLY it (no thundering herd / cross-core
+/// wake storm). If the owner is known but not parked it needs no wake —
+/// it will re-scan readiness on its next `epoll_wait` (the gen guard
+/// covers the race). Untracked keys fall back to waking everyone.
+pub fn wake_io_waiters(key: u64) {
+    if key != 0 {
+        if let Some(owner) = tcb_owner(key as u32) {
+            // Owner known: targeted wake iff it's parked.
+            let waker = {
+                let mut g = IO_WAKERS.lock();
+                g.as_mut().and_then(|m| m.remove(&owner))
+            };
+            if let Some(w) = waker {
+                wake_one(owner, w);
+            }
+            return;
+        }
+        // Untracked key → fall through to wake-all (safety net).
+    }
+    wake_all_io_waiters();
+}
+
+/// Wake every task parked on net I/O readiness (the conservative
+/// fallback for untracked keys — loopback / unix / not-yet-owned).
+fn wake_all_io_waiters() {
     // Snapshot + clear the table under the lock, then wake outside it
     // (wake() may re-enter scheduling / drop an Arc).
     let wakers: alloc::vec::Vec<(u64, core::task::Waker)> = {
@@ -133,14 +209,7 @@ pub fn wake_io_waiters() {
         }
     };
     for (task_id, w) in wakers {
-        if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
-            // SAFETY: pointer from `lookup_user_task_ctx` for a live task;
-            // `sleep_deadline_ns` is an atomic field.
-            // SAFETY: Valid memory or trusted environment
-            let uctx = unsafe { &*uctx_ptr };
-            uctx.sleep_deadline_ns.store(0, Ordering::Release);
-        }
-        w.wake();
+        wake_one(task_id, w);
     }
 }
 
