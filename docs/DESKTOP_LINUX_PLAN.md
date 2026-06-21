@@ -89,10 +89,19 @@ never accumulate unverifiable work.
   ladder. Final gap fixed: **frame-backed memfd** — MAP_SHARED of a memfd now
   aliases the same physical frames (was an eager private copy), so client +
   compositor share the wl_shm pool. musl-demo CI case. On `main`.
-  Remaining toward a usable desktop: present via DRM page-flip instead of the
-  fbdev blit (Rung 6); libinput over evdev (Rung 2) for input; multiple
-  surfaces / xdg-shell windows; then a real off-the-shelf compositor
-  (weston --use-pixman) + client.
+  Sub-step 5 done: **two-process Wayland — the real desktop architecture.**
+  /bin/wl_2proc forks a compositor process (named wl socket + event loop,
+  blits to /dev/fb0) and a SEPARATE client process; the client's pixel lands
+  on the framebuffer across process boundaries: `2proc-ok 1280x800
+  px=00c0ffee`. Proves named AF_UNIX connect-by-path, TRUE cross-process
+  SCM_RIGHTS fd-passing (the memfd kernel object moves between fd tables),
+  cross-process shared memory, and a compositor serving an external client.
+  Gaps fixed: stat() of a missing file → ENOENT (was EPERM); socket() masks
+  SOCK_CLOEXEC/SOCK_NONBLOCK from the type (libwayland's SOCK_STREAM|
+  SOCK_CLOEXEC was read as unknown → bind failed). musl-demo CI case. On main.
+  Remaining toward a usable desktop: present via DRM page-flip not the fbdev
+  blit (Rung 6); libinput over evdev (Rung 2) for input; xdg-shell windows;
+  then a real off-the-shelf compositor (weston --use-pixman) + client.
 - The actual compositor. The DRM/KMS present loop + evdev input + the
   Wayland fd-transport are now in place, so the remaining work is the big
   userspace build —
