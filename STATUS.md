@@ -1266,3 +1266,27 @@ dependency-ordered ladder (full plan + per-rung proofs in
   `-EAGAIN` on empty non-blocking read; `stat`/`statx` `-ENOENT` for missing
   files; `socket()` masks `SOCK_CLOEXEC`/`SOCK_NONBLOCK`;
   `getsockopt(SO_PEERCRED)`; `sys_select` SMAP bracket.
+
+### Booting a real Linux distro (Alpine) — June 2026
+
+NARF mounts a real **Alpine Linux 3.21** rootfs (ext2 on the QEMU virtio-blk
+disk) at `/mnt` and runs its unmodified userland — the container model:
+
+- **`/bin/distro_init`** `chroot`s into `/mnt` and execs Alpine's OWN busybox,
+  dynamically linked against Alpine's OWN musl resolved under the chroot.
+  busybox `sh` runs a session: `cat /etc/os-release` prints the Alpine release,
+  `uname -sm` prints `NARF x86_64`.
+- **`/bin/distro_desktop`** runs the Wayland desktop *inside* the distro: the
+  kernel bind-mounts `/dev` into `/mnt/dev` and mounts a writable MemFs `/tmp`,
+  then the launcher chroots and runs our compositor + the unmodified
+  weston-simple-shm (placed in the Alpine image) against Alpine's musl —
+  `app-ok 1280x800 win=250x250`.
+- **Two FS correctness fixes made the on-disk rootfs usable**: `stat`/`statx`
+  now drive the async VFS resolver (the sync one stubs on block FSes, so every
+  on-disk file was invisible to `stat` while `open`/`execve` saw it —
+  busybox PATH-probes with `stat`); and ext2 `read` serves fast-symlink
+  targets (≤60-byte inline targets read back empty, so every applet symlink
+  like `/bin/cat`→`/bin/busybox` was unresolvable).
+- The 28 MiB rootfs is built by `verification/data/musl-demo/REGEN_alpine_rootfs.sh`
+  (fetch Alpine + `mke2fs -d`); not committed, not an auto CI case (it
+  displaces the virtio-blk content smoke's expected image).

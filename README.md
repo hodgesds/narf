@@ -59,6 +59,7 @@ filesystem. See [`docs/PERSONAS.md`](docs/PERSONAS.md).
 | 4 — Compatibility | relibc / Linux-compat surface | **closed for in-tree shell + coreutils** |
 | 5 — Silicon | Boot on AMD Zen2 Renoir + Phoenix HawkPoint1 laptops | **in progress** |
 | G — Desktop Linux | `/dev/fb0` + evdev + DRM/KMS + `/dev/uinput`; unmodified libdrm & libwayland | **runs an off-the-shelf Wayland GUI app (weston-simple-shm)** |
+| D — Distro | Mounts a real Alpine Linux rootfs (ext2); chroot + exec its busybox/musl | **boots Alpine userland + runs the Wayland desktop inside it** |
 
 Today, both arches boot under QEMU and run the full async demo. The
 interactive end-to-end loop (`echo hello world` over `-serial stdio`)
@@ -74,7 +75,13 @@ presents client buffers via DRM/KMS **page-flip**, and delivers **real
 evdev input** (injected through `/dev/uinput`) over `wl_seat`. The
 headline: an **unmodified off-the-shelf GUI client** — weston's
 `simple-shm`, vendored verbatim — maps a window and renders a frame on
-NARF with zero awareness it isn't Linux. See
+NARF with zero awareness it isn't Linux.
+
+Beyond individual binaries, NARF mounts a real **Alpine Linux 3.21** rootfs
+(ext2 on virtio-blk) and `chroot`s into it to run Alpine's *own* busybox +
+musl — `uname` inside the distro prints `NARF x86_64` — and even runs the
+**Wayland desktop from inside the distro** (compositor + weston-simple-shm
+against Alpine's musl, with `/dev` bind-mounted into the chroot). See
 [`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md).
 
 For the full per-feature landing log and live driver portfolio see

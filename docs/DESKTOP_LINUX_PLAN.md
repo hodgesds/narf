@@ -164,8 +164,36 @@ never accumulate unverifiable work.
   and composites its first real frame: `app-ok 1280x800 win=250x250` (250×250
   = simple-shm's actual surface). A real toolkit client maps + renders on NARF
   with zero awareness it isn't Linux. musl-demo CI case. On `main`.
+- **Boot a real Linux distro — and the desktop inside it — DONE.** NARF mounts
+  a real **Alpine Linux 3.21** rootfs (ext2 on the QEMU virtio-blk disk) at
+  `/mnt`. `/bin/distro_init` `chroot`s into it and execs Alpine's OWN busybox
+  (unmodified, dynamically linked against Alpine's OWN musl resolved under the
+  chroot — the container model): `cat /etc/os-release` prints the Alpine
+  release and `uname -sm` prints `NARF x86_64`. `/bin/distro_desktop` goes
+  further and runs the **Wayland desktop from inside the distro** — the kernel
+  bind-mounts `/dev` into `/mnt/dev` and mounts a writable `/tmp`, then the
+  launcher chroots and runs our compositor + the unmodified weston-simple-shm
+  (placed in the Alpine image) against Alpine's musl: `app-ok 1280x800
+  win=250x250`. Two FS fixes made the distro usable (see below). The 28 MiB
+  rootfs is built by `REGEN_alpine_rootfs.sh` (not committed / not an auto CI
+  case — it displaces the virtio-blk content smoke). On `main`.
 
 ### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
+
+- **`stat` works on a mounted on-disk rootfs**: `stat`/`lstat`/`statx` drove
+  the *sync* VFS resolver, but ext2 (any block FS) stubs sync `lookup`, so
+  `stat` missed every on-disk file while `open`/`execve` (async resolver)
+  found it — busybox `PATH`-probes applets with `stat`, so every applet looked
+  "not found". `stat` now drives the async resolver like the open path.
+- **ext2 fast-symlink read**: a fast symlink (≤60-byte target inline in the
+  inode, e.g. Alpine's `/bin/cat`→`/bin/busybox`) read back empty because
+  `FileOps::read` walked data blocks; the VFS reads symlink targets via
+  `read`, so every applet symlink was unresolvable. ext2 `read` now serves
+  symlink inodes from the inline/data target.
+- **`fork` keeps `MAP_SHARED` regions shared** (was COWing them): a process
+  that mmaps a device (framebuffer, DRM dumb buffer) or POSIX shm then forks
+  now keeps writing the real frames in both parent and child — essential for
+  the compositor-forks-client architecture. Caught by Rung 10's KMS readback.
 
 - **`fork` keeps `MAP_SHARED` regions shared** (was COWing them): a process
   that mmaps a device (framebuffer, DRM dumb buffer) or POSIX shm then forks
