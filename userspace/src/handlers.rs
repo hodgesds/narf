@@ -15088,9 +15088,7 @@ static FUTEX_WAITERS: narf_lib::sync::IrqSafeSpinLock<
 pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker) {
     let mut g = FUTEX_WAITERS.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    m.entry(uaddr)
-        .or_default()
-        .insert(task_id, waker);
+    m.entry(uaddr).or_default().insert(task_id, waker);
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
