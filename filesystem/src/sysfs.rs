@@ -519,13 +519,51 @@ pub fn populate_net_class() {
 /// virtio keyboard, event1 = the virtio tablet, …), keyed off
 /// `ROUTER.device_ids()` so sysfs matches the real `/dev/input/` nodes.
 /// Major 13 / minor 64+N is the Linux evdev `dev_t` convention.
+/// Format an evdev capability bitmap as Linux's uevent/`input_print_bitmap`
+/// string: space-separated `unsigned long` hex words, most-significant word
+/// first, word 0 always printed. libudev's `make_bit` parses it from the end.
+fn fmt_cap_bitmap(words: &[u64]) -> alloc::string::String {
+    let hi = words.iter().rposition(|&w| w != 0).unwrap_or(0);
+    let mut s = alloc::string::String::new();
+    for i in (0..=hi).rev() {
+        if i != hi {
+            s.push(' ');
+        }
+        s.push_str(&format!("{:x}", words[i]));
+    }
+    s
+}
+
+/// Build the `EV=`/`KEY=`/`REL=`/`ABS=` uevent lines a device's capability
+/// set contributes. udev (libudev/libudev-zero, replacing the kernel's
+/// `60-input-id` builtin) reads these to set `ID_INPUT*` — without them
+/// libinput skips the device entirely. Linux ref: `input_add_uevent_bm_var`
+/// (drivers/input/input.c).
+fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::string::String {
+    use narf_input::evdev::EventType;
+    let mut s = format!("EV={:x}\n", caps.evbit);
+    if caps.evbit & (1 << (EventType::Key as u16)) != 0 {
+        s.push_str(&format!("KEY={}\n", fmt_cap_bitmap(&caps.keybit.words)));
+    }
+    if caps.evbit & (1 << (EventType::Rel as u16)) != 0 {
+        s.push_str(&format!("REL={}\n", fmt_cap_bitmap(&caps.relbit.words)));
+    }
+    if caps.evbit & (1 << (EventType::Abs as u16)) != 0 {
+        s.push_str(&format!("ABS={}\n", fmt_cap_bitmap(&caps.absbit.words)));
+    }
+    s
+}
+
 pub fn populate_input_class() {
     let root = get_root();
     let class_input = class_register("input");
     // /sys/dev/char/<maj>:<min> — udev (libudev/libudev-zero) enumerates from
-    // HERE, not /sys/class. Each entry is a directory carrying `uevent` plus a
-    // `subsystem` symlink whose basename is the subsystem name (libudev only
-    // basenames the readlink result), so the device is recognised as "input".
+    // HERE, not /sys/class. On real Linux each entry is a SYMLINK into
+    // /sys/devices/.../input/eventN; udev realpath()s it and libinput insists
+    // the resolved sysname start with "event" (drivers reject anything else).
+    // We mirror that: the canonical node is /sys/class/input/eventN (carrying
+    // uevent + caps + subsystem), and /sys/dev/char/13:<minor> is a symlink to
+    // it, so realpath lands on .../eventN.
     let dev_dir = get_or_create_child(&root, "dev");
     let dev_char = get_or_create_child(&dev_dir, "char");
     // udev scans BOTH /sys/dev/block and /sys/dev/char and fails the whole
@@ -539,18 +577,27 @@ pub fn populate_input_class() {
         kobject_add_attr(&kobj, "name", move || format!("input{}\n", n));
         let dev = format!("13:{}\n", minor);
         kobject_add_attr(&kobj, "dev", move || dev.clone());
-        let uevent = format!("MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\n", minor, n);
-        kobject_add_attr(&kobj, "uevent", {
-            let u = uevent.clone();
-            move || u.clone()
-        });
-        // Mark the class node's subsystem too (real Linux has this link).
+        // Capability bitmaps (EV/KEY/REL/ABS) so udev tags ID_INPUT* and
+        // libinput classifies + opens the device. Sourced from the live
+        // router so they match what EVIOCGBIT reports on /dev/input/eventN.
+        let caps_lines = narf_input::evdev::ROUTER
+            .caps(id)
+            .map(|c| evdev_caps_uevent(&c))
+            .unwrap_or_default();
+        let uevent = format!(
+            "MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\n{}",
+            minor, n, caps_lines
+        );
+        kobject_add_attr(&kobj, "uevent", move || uevent.clone());
+        // Mark the class node's subsystem (real Linux has this link).
         kobj.add_symlink("subsystem", "../../../class/input");
 
-        // The /sys/dev/char/13:<minor> node udev actually scans.
-        let cdev = class_device_register(dev_char.clone(), &format!("13:{}", minor));
-        kobject_add_attr(&cdev, "uevent", move || uevent.clone());
-        cdev.add_symlink("subsystem", "../../../class/input");
+        // /sys/dev/char/13:<minor> -> the canonical class dir. realpath()
+        // resolves it to .../event<N>, giving udev/libinput sysname "event<N>".
+        dev_char.add_symlink(
+            &format!("13:{}", minor),
+            &format!("../../class/input/event{}", n),
+        );
     }
 }
 
