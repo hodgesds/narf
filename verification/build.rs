@@ -350,6 +350,28 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_KMS_ELF_X86_64={}", wlk.display());
     println!("cargo:rustc-env=NARF_WL_KMS_ELF_AARCH64=/dev/null");
 
+    // wl_evdev — real evdev->wl_seat input bridge: compositor creates a
+    // /dev/uinput keyboard, reads the resulting /dev/input/eventN, and
+    // forwards the keypress over wl_keyboard. Rung 11.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_evdev_x86_64");
+    let wle = manifest_dir.join("data/musl-demo/wl_evdev_x86_64");
+    println!("cargo:rustc-env=NARF_WL_EVDEV_ELF_X86_64={}", wle.display());
+    println!("cargo:rustc-env=NARF_WL_EVDEV_ELF_AARCH64=/dev/null");
+
+    // simple_shm — UNMODIFIED weston 9.0 clients/simple-shm.c, launched by
+    // /bin/wl_app. The first real off-the-shelf GUI client. Rung 12.
+    println!("cargo:rerun-if-changed=data/musl-demo/simple_shm_x86_64");
+    let ssh = manifest_dir.join("data/musl-demo/simple_shm_x86_64");
+    println!("cargo:rustc-env=NARF_SIMPLE_SHM_ELF_X86_64={}", ssh.display());
+    println!("cargo:rustc-env=NARF_SIMPLE_SHM_ELF_AARCH64=/dev/null");
+
+    // wl_app — compositor that fork+execve's /bin/simple_shm and composites
+    // its first real frame. Rung 12.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_app_x86_64");
+    let wla = manifest_dir.join("data/musl-demo/wl_app_x86_64");
+    println!("cargo:rustc-env=NARF_WL_APP_ELF_X86_64={}", wla.display());
+    println!("cargo:rustc-env=NARF_WL_APP_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

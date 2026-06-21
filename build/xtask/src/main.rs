@@ -1740,6 +1740,12 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // KMS page-flip presentation — compositor scans out client buffers via
         // a DRM dumb buffer + PAGE_FLIP (not a direct fbdev blit).
         ("wl_kms", "kms-ok 1280x800"),
+        // Real evdev->wl_seat bridge: compositor injects via /dev/uinput, reads
+        // the resulting /dev/input/eventN, forwards the key over wl_keyboard.
+        ("wl_evdev", "evdev-ok 1280x800 key=30"),
+        // First unmodified off-the-shelf GUI client: weston-simple-shm maps an
+        // xdg_toplevel + renders a wl_shm frame our compositor composites.
+        ("wl_app", "app-ok 1280x800 win=250x250"),
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
