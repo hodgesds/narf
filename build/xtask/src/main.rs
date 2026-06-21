@@ -1734,6 +1734,9 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // xdg-shell window mapping (xdg_wm_base/xdg_surface/xdg_toplevel) —
         // the protocol every real GUI toolkit uses to map a top-level window.
         ("wl_xdg", "xdg-ok 1280x800"),
+        // wl_seat input delivery — compositor sends a synthetic keypress over
+        // wl_keyboard to the focused window; keymap fd is reverse SCM_RIGHTS.
+        ("wl_input", "input-ok 1280x800 key=30"),
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.

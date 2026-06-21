@@ -336,6 +336,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_XDG_ELF_X86_64={}", wlx.display());
     println!("cargo:rustc-env=NARF_WL_XDG_ELF_AARCH64=/dev/null");
 
+    // wl_input — wl_seat/wl_keyboard/wl_pointer input delivery to a mapped
+    // window; keymap fd travels compositor->client (reverse SCM_RIGHTS). Rung 9.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_input_x86_64");
+    let wli = manifest_dir.join("data/musl-demo/wl_input_x86_64");
+    println!("cargo:rustc-env=NARF_WL_INPUT_ELF_X86_64={}", wli.display());
+    println!("cargo:rustc-env=NARF_WL_INPUT_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

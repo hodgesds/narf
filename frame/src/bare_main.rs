@@ -3357,6 +3357,7 @@ fn boot_userspace_init() {
                 ("wl_2proc", narf_verification::NARF_WL_2PROC_ELF),
                 ("wl_multi", narf_verification::NARF_WL_MULTI_ELF),
                 ("wl_xdg", narf_verification::NARF_WL_XDG_ELF),
+                ("wl_input", narf_verification::NARF_WL_INPUT_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),

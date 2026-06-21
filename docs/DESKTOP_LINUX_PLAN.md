@@ -120,6 +120,19 @@ never accumulate unverifiable work.
   apps. Built on the libwayland pattern + xdg-shell protocol codegen
   (`REGEN_wl_xdg.sh`); no new kernel gaps (prior transport work covered it).
   musl-demo CI case. On `main`.
+- **Rung 9 (wl_seat input delivery) — DONE.** A drawn window is useless if it
+  can't receive input. `/bin/wl_input`'s compositor advertises **wl_seat**
+  (keyboard+pointer); the client maps an `xdg_toplevel`, binds
+  `wl_keyboard`/`wl_pointer`, and once the window is composited the compositor
+  synthesises a focus + keypress + click: `keyboard.keymap(fd)` →
+  `keyboard.enter` → `key(KEY_A, pressed/released)` → `pointer.enter` →
+  `motion` → `button(BTN_LEFT)` → `frame`. The client confirms it received
+  `KEY_A`: `input-ok 1280x800 key=30`. This also exercises **`SCM_RIGHTS` in
+  the reverse direction** — the keymap fd travels compositor→client (wl_shm's
+  buffer fd went client→compositor) — and it worked with no new kernel gaps.
+  musl-demo CI case (`REGEN_wl_input.sh`). On `main`. (Wiring the *real*
+  evdev `/dev/input/event*` stream into `wl_seat` is the follow-on; it needs
+  an input-injection harness, since CI can't generate hardware key events.)
 
 ### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
 
@@ -136,14 +149,17 @@ never accumulate unverifiable work.
 
 ### Remaining toward a *usable* desktop (not yet done)
 
-- **Input**: a `wl_seat`/`wl_keyboard`/`wl_pointer` path so a mapped window
-  receives input — the compositor reads the Rung-2 evdev nodes and forwards
-  events to the focused client. (Real apps then need libinput, which wants a
-  udev shim.) This is the next rung: a window that *responds*.
+- **Real evdev → wl_seat bridge**: the compositor reads the Rung-2
+  `/dev/input/event*` nodes and forwards real hardware events to the focused
+  client (the Wayland-side delivery is proven by Rung 9; this wires the
+  hardware source). Needs an input-injection harness for CI, since QEMU
+  hardware key events can't be generated from the sandbox. Real apps then
+  want libinput, which needs a udev shim.
 - Present via DRM/KMS page-flip instead of the direct fbdev blit (the Rung-6
   present path) — architecturally-correct presentation.
 - An unmodified toolkit app (an SDL2 or GTK program) mapping a real
-  `xdg_toplevel` against our compositor — now unblocked by Rung 8.
+  `xdg_toplevel` and taking input against our compositor — now unblocked by
+  Rungs 8–9.
 - A real off-the-shelf compositor (weston `--use-pixman`) + clients, or Xorg +
   `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/dma-buf,
   more `epoll`/`signalfd`/`timerfd` edges, udev enumeration.
