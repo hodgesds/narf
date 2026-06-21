@@ -34,6 +34,19 @@ curl -fsSL -o "$WORK/mini.tar.gz" "$URL"
 mkdir -p "$WORK/root"
 tar xzf "$WORK/mini.tar.gz" -C "$WORK/root"
 
+# Place the Wayland desktop stack into the distro so /bin/distro_desktop can
+# run it from inside the chroot: the compositor (wl_app) and the unmodified
+# weston-simple-shm client it launches. Both are musl-PIE and run against
+# Alpine's own /lib/ld-musl. (Skipped if not yet built — distro_init alone
+# only needs the stock rootfs.)
+HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
+if [ -f "$HERE/wl_app_x86_64" ] && [ -f "$HERE/simple_shm_x86_64" ]; then
+    cp "$HERE/wl_app_x86_64" "$WORK/root/bin/wl_app"
+    cp "$HERE/simple_shm_x86_64" "$WORK/root/bin/simple_shm"
+    chmod +x "$WORK/root/bin/wl_app" "$WORK/root/bin/simple_shm"
+    echo "placed wl_app + simple_shm in the Alpine /bin (for distro_desktop)"
+fi
+
 mkdir -p "$ROOT/target"
 rm -f "$OUT"
 # Plain ext2 (no journal/extents/64bit/csum) so the well-tested

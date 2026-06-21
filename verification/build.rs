@@ -379,6 +379,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_DISTRO_INIT_ELF_X86_64={}", dist.display());
     println!("cargo:rustc-env=NARF_DISTRO_INIT_ELF_AARCH64=/dev/null");
 
+    // distro_desktop — chroot into the Alpine rootfs and run the Wayland
+    // compositor (+ weston-simple-shm) from inside the distro. Desktop in distro.
+    println!("cargo:rerun-if-changed=data/musl-demo/distro_desktop_x86_64");
+    let dd = manifest_dir.join("data/musl-demo/distro_desktop_x86_64");
+    println!("cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_X86_64={}", dd.display());
+    println!("cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

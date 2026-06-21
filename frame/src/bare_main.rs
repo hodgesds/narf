@@ -2410,6 +2410,53 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
             });
 
+            // Make NARF's /dev reachable inside a chrooted /mnt rootfs, so a
+            // real distro booted from the virtio-blk image (see distro_init /
+            // distro_desktop) can open device files — /dev/fb0, /dev/dri,
+            // /dev/uinput — from within chroot("/mnt"). Best-effort: only acts
+            // when both /dev and /mnt are mounted and /mnt/dev isn't already
+            // bound. Mirrors a container runtime bind-mounting /dev.
+            narf_init::register(narf_init::Stage::Late, "mnt-dev-bind", || {
+                let mounts = narf_filesystem::registry().list();
+                let have_dev = mounts.iter().any(|m| m == "/dev");
+                let have_mnt = mounts.iter().any(|m| m == "/mnt");
+                let already = mounts.iter().any(|m| m == "/mnt/dev");
+                if have_dev && have_mnt && !already {
+                    let auth = narf_filesystem::bootstrap_mount_authority();
+                    match narf_filesystem::registry().bind_mount(&auth, "/dev", "/mnt/dev") {
+                        Ok(_) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-dev-bind: /dev bound at /mnt/dev (distro device access)"
+                            );
+                            // Also give the chroot a writable /tmp (a fresh
+                            // in-memory FS) — a distro's runtime dir for
+                            // sockets/lock files (e.g. the Wayland display
+                            // socket) since the on-disk rootfs may be read-only.
+                            if !mounts.iter().any(|m| m == "/mnt/tmp") {
+                                let tmp = narf_filesystem::MemFs::new("tmpfs");
+                                let _ = narf_filesystem::registry().mount(&auth, "/mnt/tmp", tmp);
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  mnt-dev-bind: writable /tmp mounted at /mnt/tmp"
+                                );
+                            }
+                            narf_init::InitResult::Ok
+                        }
+                        Err(e) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-dev-bind: bind /dev -> /mnt/dev failed: {:?}",
+                                e
+                            );
+                            narf_init::InitResult::NotPresent
+                        }
+                    }
+                } else {
+                    narf_init::InitResult::NotPresent
+                }
+            });
+
             narf_init::register(narf_init::Stage::Late, "virtio-gpu-splash", || {
                 use narf_graphics::Pixel32;
                 let painted = narf_drivers_virtio::gpu_pci::with_controller_mut(|d| {
@@ -3363,6 +3410,7 @@ fn boot_userspace_init() {
                 ("simple_shm", narf_verification::NARF_SIMPLE_SHM_ELF),
                 ("wl_app", narf_verification::NARF_WL_APP_ELF),
                 ("distro_init", narf_verification::NARF_DISTRO_INIT_ELF),
+                ("distro_desktop", narf_verification::NARF_DISTRO_DESKTOP_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),
