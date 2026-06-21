@@ -75,10 +75,14 @@ never accumulate unverifiable work.
   + fixed `getsockopt(SO_PEERCRED)` (wl_client_create) and `recvmsg`
   returning `-EAGAIN` for WouldBlock (not the EPERM-mapped `-1`).
   musl-demo CI case. On `main`.
-  Remaining sub-steps: wl_shm buffers (uses the fd-passing); composite
-  client buffers to a DRM dumb buffer + page-flip (Rungs 3/6); libinput
-  over evdev (Rung 2); then a real compositor + client (weston-pixman or a
-  minimal custom one) actually painting a window.
+  Sub-step 3 done: **wl_shm buffer sharing.** A client memfd_create()s a
+  pool, draws, and hands the fd to the server via wl_shm.create_pool
+  (marshalled over the socket with SCM_RIGHTS); the server mmaps it — the
+  compositor can now see a client's pixel buffer. Proven by `/bin/wl_shm`
+  -> `shm-ok` (no new kernel gaps — the SCM_RIGHTS work paid off). On main.
+  Remaining sub-steps: composite the client buffer into a DRM dumb buffer +
+  page-flip (Rungs 3/6); libinput over evdev (Rung 2); a real compositor +
+  client (weston-pixman or a minimal custom one) actually painting a window.
 - The actual compositor. The DRM/KMS present loop + evdev input + the
   Wayland fd-transport are now in place, so the remaining work is the big
   userspace build —
