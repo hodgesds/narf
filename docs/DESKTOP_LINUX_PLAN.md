@@ -54,11 +54,21 @@ never accumulate unverifiable work.
   no-op. `modetest -s` is a musl-demo CI case (anchors on `crtc 1`). On
   `main`. (Pixel-level screendump verification blocked by the sandbox
   killing backgrounded QEMU; serial proof + suite stand.)
-- Next: a program that *composites* — a minimal Wayland compositor (weston
-  `--use-pixman` / wlroots-pixman) or Xorg-on-fbdev. A much larger build
-  (libwayland + libffi + pixman + libinput + xkbcommon …); likely needs
-  SET_MASTER/DROP_MASTER, page-flip event delivery, PRIME/dma-buf, and a
-  Wayland socket; libinput will exercise the Rung-2 evdev surface.
+- **Rung 6 (compositor render loop) — DONE & proven.** DRM page-flip
+  event delivery: `PAGE_FLIP` with `DRM_MODE_PAGE_FLIP_EVENT` queues a
+  `drm_event_vblank` (FLIP_COMPLETE); the DRM fd is pollable (`POLL_IN`)
+  and `read()` drains the event — the exact present loop weston/Xorg use.
+  Plus `SET_MASTER`/`DROP_MASTER` no-ops, and a real `sys_select` #PF fix
+  (user `timeval` read without SMAP bracket). Proven: `modetest -v` runs a
+  continuous page-flip loop at ~44 Hz (`freq: 44.07Hz` …). Bounded
+  `smoke_drm_flip_event_format` in CI. On `main`.
+- Next: the actual compositor. The DRM/KMS present loop + evdev input are
+  now in place, so the remaining work is the big userspace build —
+  libwayland (+libffi) + a pixman-software compositor (weston `--use-pixman`
+  or a minimal wlroots/custom compositor) + a Wayland client, OR Xorg +
+  `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/
+  dma-buf for client buffer sharing, more `epoll`/`signalfd`/`timerfd`
+  edge cases, and the Wayland Unix-socket fast paths.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
