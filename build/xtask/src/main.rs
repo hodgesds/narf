@@ -1731,6 +1731,9 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("mini_compositor", "px=00c0ffee"),
         ("wl_2proc", "2proc-ok 1280x800"),
         ("wl_multi", "b=00bada55"),
+        // xdg-shell window mapping (xdg_wm_base/xdg_surface/xdg_toplevel) —
+        // the protocol every real GUI toolkit uses to map a top-level window.
+        ("wl_xdg", "xdg-ok 1280x800"),
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.

@@ -329,6 +329,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_MULTI_ELF_X86_64={}", wlm.display());
     println!("cargo:rustc-env=NARF_WL_MULTI_ELF_AARCH64=/dev/null");
 
+    // wl_xdg — xdg-shell window mapping (xdg_wm_base/xdg_surface/xdg_toplevel),
+    // the protocol every real GUI toolkit uses to map a window. Rung 8.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_xdg_x86_64");
+    let wlx = manifest_dir.join("data/musl-demo/wl_xdg_x86_64");
+    println!("cargo:rustc-env=NARF_WL_XDG_ELF_X86_64={}", wlx.display());
+    println!("cargo:rustc-env=NARF_WL_XDG_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).
