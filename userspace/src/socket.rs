@@ -41,6 +41,12 @@ pub const AF_INET6: u16 = 10;
 /// Picks 45 because Linux's number is taken; carries our four-ring
 /// model rather than mmap'd shared pages.
 pub const AF_BYPASS: u16 = 45;
+/// Linux `AF_NETLINK`. We implement exactly one protocol below.
+pub const AF_NETLINK: u16 = 16;
+/// `NETLINK_KOBJECT_UEVENT` — the udev hotplug-monitor netlink protocol.
+/// libudev opens `socket(AF_NETLINK, SOCK_DGRAM|SOCK_RAW, 15)` and reads
+/// device-uevent messages off it; we bridge it to the kernel uevent ring.
+pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -402,6 +408,13 @@ enum SocketState {
     Bypass {
         state: Arc<crate::xdp_socket::XdpSocketState>,
     },
+    /// `AF_NETLINK` / `NETLINK_KOBJECT_UEVENT` monitor. Each socket carries
+    /// its own cursor into the kernel uevent ring; `recv` drains one
+    /// device-uevent message at a time (Linux netlink wire text), `poll`
+    /// reports readable when the ring has events past the cursor.
+    NetlinkUevent {
+        reader: narf_filesystem::uevent::UeventReader,
+    },
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -438,6 +451,13 @@ impl SocketFile {
             // stamp a fresh per-socket state record.
             SocketState::Bypass {
                 state: Arc::new(crate::xdp_socket::XdpSocketState::new()),
+            }
+        } else if domain == AF_NETLINK {
+            // Start at the ring's oldest buffered event so a freshly-opened
+            // monitor still observes the boot-time device-add uevents (libudev
+            // de-dups these against its sysfs enumerate).
+            SocketState::NetlinkUevent {
+                reader: narf_filesystem::uevent::UeventReader::from_start(),
             }
         } else {
             SocketState::Fresh
@@ -845,6 +865,15 @@ impl FileOps for SocketFile {
                 // always proceed and let the XDP ring buffer throttle.
                 narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
             }
+            SocketState::NetlinkUevent { reader } => {
+                // Readable when an unread uevent is waiting; always writable
+                // (the udev monitor is read-only but POLL_OUT is harmless).
+                let mut bits = narf_filesystem::POLL_OUT;
+                if reader.has_pending() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
         }
     }
 }
@@ -886,6 +915,42 @@ impl SocketFile {
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
+            (AF_NETLINK, _) => self.dispatch_netlink(op),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// `AF_NETLINK` / `NETLINK_KOBJECT_UEVENT` dispatcher. The monitor only
+    /// ever binds (to a group mask we ignore) and receives; `recv` drains one
+    /// uevent message from the ring per call (libudev reads one message per
+    /// recv/recvmsg). Empty ring → WouldBlock so the caller blocks or gets
+    /// EAGAIN, exactly like a quiet hardware monitor.
+    fn dispatch_netlink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            // bind(sockaddr_nl{family=16, pid, groups}) — accept any.
+            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            // udev clients never send on the monitor; accept + discard.
+            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Recv { buf, flags: _ } => {
+                let ev = {
+                    let mut g = self.state.lock();
+                    match &mut *g {
+                        SocketState::NetlinkUevent { reader } => reader.drain(1).into_iter().next(),
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                match ev {
+                    Some(env) => {
+                        let text = env.to_text();
+                        let bytes = text.as_bytes();
+                        let n = core::cmp::min(buf.len(), bytes.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        SocketOpResult::Received { n, peer: None }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }

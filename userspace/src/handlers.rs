@@ -16442,6 +16442,7 @@ fn sys_socket(ctx: &mut dyn TrapContext) {
             | crate::socket::AF_INET
             | crate::socket::AF_INET6
             | crate::socket::AF_BYPASS
+            | crate::socket::AF_NETLINK
     ) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64));
         return;
