@@ -194,6 +194,23 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
+            // The VFS path walker (`resolve_async`) reads a symlink's target
+            // via `FileOps::read`. A *fast* symlink (target ≤ 60 bytes, e.g.
+            // Alpine's `/bin/cat` → `/bin/busybox`) stores the target inline in
+            // the inode's `i_block[]` with no data blocks, so the generic
+            // block-pointer walk below returns nothing — making every symlink
+            // unresolvable (and every busybox applet "not found" in a mounted
+            // distro rootfs). Serve the link target from the symlink-aware path.
+            if inode.is_symlink() {
+                let target = self.volume.read_symlink_target(&inode).await?;
+                let start = offset as usize;
+                if start >= target.len() {
+                    return Ok(0);
+                }
+                let n = (target.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&target[start..start + n]);
+                return Ok(n);
+            }
             self.read_inode_at(&inode, offset, buf).await
         })
     }

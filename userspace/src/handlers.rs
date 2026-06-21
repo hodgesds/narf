@@ -12192,8 +12192,16 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
             if rel.is_empty() {
                 None // mount root → treated as a directory below
             } else {
-                narf_filesystem::resolve(fs.root(), rel)
-                    .ok()
+                // Drive the ASYNC resolver (same as the open/execve path):
+                // on-disk filesystems like ext2 implement `lookup_async` but
+                // stub the sync `lookup` (block reads can't run synchronously),
+                // so the old `narf_filesystem::resolve` always missed real
+                // files — `stat("/mnt/bin/busybox")` failed while
+                // `open`/`execve` of the same path succeeded. That made every
+                // PATH probe (busybox/ash search applets via stat) report
+                // "not found" inside a mounted distro rootfs.
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+                    .and_then(|r| r.ok())
                     .map(|ops| ops.stat())
             }
         })
