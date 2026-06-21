@@ -184,6 +184,10 @@ pub struct Kobject {
     store_attrs: IrqSafeSpinLock<BTreeMap<&'static str, AttrStore>>,
     /// Binary attribute files.
     bin_attrs: IrqSafeSpinLock<BTreeMap<&'static str, BinAttrRead>>,
+    /// Symlink children: name → target path (verbatim, as `readlink`
+    /// returns it). udev relies on `subsystem`/`device`/`driver` links and
+    /// the `/sys/dev/char/<maj>:<min>` layout.
+    symlinks: IrqSafeSpinLock<BTreeMap<String, String>>,
 }
 
 impl fmt::Debug for Kobject {
@@ -204,6 +208,7 @@ impl Kobject {
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 
@@ -217,6 +222,7 @@ impl Kobject {
             attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             store_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
             bin_attrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            symlinks: IrqSafeSpinLock::new(BTreeMap::new()),
         });
         parent.children.lock().push(child.clone());
         child
@@ -263,6 +269,23 @@ impl Kobject {
             .iter()
             .find(|c| c.name == name)
             .cloned()
+    }
+
+    /// Add (or replace) a symlink child `name` pointing at `target`.
+    /// `target` is stored verbatim (relative or absolute); `readlink`
+    /// returns it as-is, which is all udev needs (it basenames the result).
+    pub fn add_symlink(&self, name: impl Into<String>, target: impl Into<String>) {
+        self.symlinks.lock().insert(name.into(), target.into());
+    }
+
+    /// Symlink target for `name`, if any.
+    pub fn get_symlink(&self, name: &str) -> Option<String> {
+        self.symlinks.lock().get(name).cloned()
+    }
+
+    /// List symlink child names.
+    pub fn symlink_names(&self) -> Vec<String> {
+        self.symlinks.lock().keys().cloned().collect()
     }
 
     /// List text attribute names.
@@ -497,7 +520,18 @@ pub fn populate_net_class() {
 /// `ROUTER.device_ids()` so sysfs matches the real `/dev/input/` nodes.
 /// Major 13 / minor 64+N is the Linux evdev `dev_t` convention.
 pub fn populate_input_class() {
+    let root = get_root();
     let class_input = class_register("input");
+    // /sys/dev/char/<maj>:<min> — udev (libudev/libudev-zero) enumerates from
+    // HERE, not /sys/class. Each entry is a directory carrying `uevent` plus a
+    // `subsystem` symlink whose basename is the subsystem name (libudev only
+    // basenames the readlink result), so the device is recognised as "input".
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_char = get_or_create_child(&dev_dir, "char");
+    // udev scans BOTH /sys/dev/block and /sys/dev/char and fails the whole
+    // enumerate if either directory is missing (scandir -1). Ensure block
+    // exists even when empty.
+    let _dev_block = get_or_create_child(&dev_dir, "block");
     for id in narf_input::evdev::ROUTER.device_ids() {
         let n = id.0.saturating_sub(1);
         let minor = 64 + n;
@@ -506,7 +540,17 @@ pub fn populate_input_class() {
         let dev = format!("13:{}\n", minor);
         kobject_add_attr(&kobj, "dev", move || dev.clone());
         let uevent = format!("MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\n", minor, n);
-        kobject_add_attr(&kobj, "uevent", move || uevent.clone());
+        kobject_add_attr(&kobj, "uevent", {
+            let u = uevent.clone();
+            move || u.clone()
+        });
+        // Mark the class node's subsystem too (real Linux has this link).
+        kobj.add_symlink("subsystem", "../../../class/input");
+
+        // The /sys/dev/char/13:<minor> node udev actually scans.
+        let cdev = class_device_register(dev_char.clone(), &format!("13:{}", minor));
+        kobject_add_attr(&cdev, "uevent", move || uevent.clone());
+        cdev.add_symlink("subsystem", "../../../class/input");
     }
 }
 
@@ -776,6 +820,10 @@ impl DirOps for SysKobjDir {
                 attr_name: attr_s,
             }));
         }
+        // Symlinks (subsystem/device/driver, …) — readlink reads the target.
+        if let Some(target) = self.kobj.get_symlink(name) {
+            return Some(Arc::new(SysSymlinkFile { target }));
+        }
         // Child dirs look like files so resolve() can stat them
         if let Some(child) = self.kobj.get_child(name) {
             return Some(Arc::new(SysDirMarker { kobj: child }));
@@ -792,6 +840,7 @@ impl DirOps for SysKobjDir {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         let child_names = self.kobj.child_names();
         let attr_names = self.kobj.attr_names();
+        let symlink_names = self.kobj.symlink_names();
         let mut entries: Vec<DirEntry> = Vec::new();
         for n in child_names {
             let leaked: &'static str = Box::leak(n.into_boxed_str());
@@ -806,18 +855,29 @@ impl DirOps for SysKobjDir {
                 file_type: FileType::File,
             });
         }
+        for n in symlink_names {
+            let leaked: &'static str = Box::leak(n.into_boxed_str());
+            entries.push(DirEntry {
+                name: leaked,
+                file_type: FileType::Symlink,
+            });
+        }
         Box::new(entries.into_iter())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
         let child_names = self.kobj.child_names();
         let attr_names = self.kobj.attr_names();
+        let symlink_names = self.kobj.symlink_names();
         let mut all: Vec<(String, FileType)> = Vec::new();
         for n in child_names {
             all.push((n, FileType::Dir));
         }
         for n in attr_names {
             all.push((n.to_string(), FileType::File));
+        }
+        for n in symlink_names {
+            all.push((n, FileType::Symlink));
         }
         all.into_iter().skip(cursor).take(max).collect()
     }
@@ -864,6 +924,43 @@ impl FileOps for SysDirMarker {
         Some(Arc::new(SysKobjDir {
             kobj: self.kobj.clone(),
         }))
+    }
+}
+
+/// A sysfs symlink. `stat()` reports `Symlink` (so `readlink`/`lstat` treat
+/// it as one) and `read()` returns the target verbatim — the same shape the
+/// VFS path walker and `sys_readlink` use for symlinks elsewhere.
+#[derive(Debug)]
+struct SysSymlinkFile {
+    target: String,
+}
+
+impl FileOps for SysSymlinkFile {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let bytes = self.target.as_bytes();
+            let start = offset as usize;
+            if start >= bytes.len() {
+                return Ok(0);
+            }
+            let n = (bytes.len() - start).min(buf.len());
+            buf[..n].copy_from_slice(&bytes[start..start + n]);
+            Ok(n)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: self.target.len() as u64,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
+            mtime_cycles: 0,
+        }
     }
 }
 
