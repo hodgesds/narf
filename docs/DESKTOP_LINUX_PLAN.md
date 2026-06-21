@@ -44,11 +44,21 @@ never accumulate unverifiable work.
   gaps (connector_id offset, missing GETCRTC/GETENCODER, NULL-property
   cleanup crash). `modetest -M narf-drm` is a `musl-demo` CI case
   (anchors on `(1280x800)`). On `main`.
-- Next: a minimal Wayland compositor (weston `--use-pixman` /
-  wlroots-pixman) or Xorg-on-fbdev — the first program that *composites*
-  rather than just enumerates. Likely needs SET_MASTER/DROP_MASTER,
-  PRIME/dma-buf, and a Wayland socket; libinput will exercise the evdev
-  surface from Rung 2.
+- **Rung 5 (first real display output) — DONE & proven.** `modetest -s
+  3@1:1280x800` (real libdrm) sets a video mode and presents an SMPTE test
+  pattern through the full present path: CREATE_DUMB → draw → ADDFB2 →
+  SETCRTC (blit to scanout). Serial: `setting mode 1280x800-60.00Hz on
+  connectors 3, crtc 1`, no errors. Gaps fixed: empty mode `name`, three
+  typo'd DRM fourcc constants (XR84→XR24 etc. — drm_smoke + smokes shared
+  the same wrong value so they passed; real libdrm exposed it), SETGAMMA
+  no-op. `modetest -s` is a musl-demo CI case (anchors on `crtc 1`). On
+  `main`. (Pixel-level screendump verification blocked by the sandbox
+  killing backgrounded QEMU; serial proof + suite stand.)
+- Next: a program that *composites* — a minimal Wayland compositor (weston
+  `--use-pixman` / wlroots-pixman) or Xorg-on-fbdev. A much larger build
+  (libwayland + libffi + pixman + libinput + xkbcommon …); likely needs
+  SET_MASTER/DROP_MASTER, page-flip event delivery, PRIME/dma-buf, and a
+  Wayland socket; libinput will exercise the Rung-2 evdev surface.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
