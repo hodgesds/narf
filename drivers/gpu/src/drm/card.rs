@@ -304,6 +304,14 @@ impl Card {
             .ok_or(CardError::UnknownCrtc)
     }
 
+    /// Look up an encoder by id.
+    pub fn encoder(&self, id: u32) -> Result<&Encoder, CardError> {
+        self.encoders
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or(CardError::UnknownCrtc)
+    }
+
     /// Look up a CRTC mutably by id.
     pub fn crtc_mut(&mut self, id: u32) -> Result<&mut Crtc, CardError> {
         self.crtcs

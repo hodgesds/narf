@@ -40,7 +40,9 @@ pub enum IoctlCmd {
     PrimeHandleToFd = 0x2D,
     PrimeFdToHandle = 0x2E,
     ModeGetResources = 0xA0,
+    ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
+    ModeGetEncoder = 0xA6,
     ModeGetConnector = 0xA7,
     ModeRmFb = 0xA8,
     ModePageFlip = 0xB0,
@@ -48,6 +50,7 @@ pub enum IoctlCmd {
     ModeMapDumb = 0xB3,
     ModeDestroyDumb = 0xB4,
     ModeAddFb2 = 0xB8,
+    ModeObjGetProperties = 0xB9,
     ModeGetPlaneRes = 0xB5,
     ModeAtomic = 0xBC,
     SyncobjCreate = 0xBF,
@@ -68,9 +71,12 @@ impl IoctlCmd {
             0x2D => IoctlCmd::PrimeHandleToFd,
             0x2E => IoctlCmd::PrimeFdToHandle,
             0xA0 => IoctlCmd::ModeGetResources,
+            0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
+            0xA6 => IoctlCmd::ModeGetEncoder,
             0xA7 => IoctlCmd::ModeGetConnector,
             0xA8 => IoctlCmd::ModeRmFb,
+            0xB9 => IoctlCmd::ModeObjGetProperties,
             0xB0 => IoctlCmd::ModePageFlip,
             0xB2 => IoctlCmd::ModeCreateDumb,
             0xB3 => IoctlCmd::ModeMapDumb,
@@ -333,6 +339,9 @@ pub fn dispatch(
         // Dumb-buffer / modeset ioctls — handled in the bridge with
         // full serialisation of the in/out structs.
         IoctlCmd::ModeSetCrtc
+        | IoctlCmd::ModeGetCrtc
+        | IoctlCmd::ModeGetEncoder
+        | IoctlCmd::ModeObjGetProperties
         | IoctlCmd::ModePageFlip
         | IoctlCmd::ModeCreateDumb
         | IoctlCmd::ModeMapDumb
@@ -396,10 +405,15 @@ fn handle_getresources(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {
 }
 
 fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlError> {
-    if arg.len() < 4 {
+    // `connector_id` is at offset 48 of struct drm_mode_get_connector
+    // (after encoders_ptr/modes_ptr/props_ptr/prop_values_ptr = 4×u64 and
+    // count_modes/count_props/count_encoders/encoder_id = 4×u32). On a
+    // libdrm count-probe pass the four out-pointers are zero, so reading
+    // the id from offset 0 looked up connector 0 → UnknownConnector → EINVAL.
+    if arg.len() < 52 {
         return Err(DrmIoctlError::BadSize);
     }
-    let connector_id = u32::from_le_bytes(arg[0..4].try_into().unwrap());
+    let connector_id = u32::from_le_bytes(arg[48..52].try_into().unwrap());
     let conn = card
         .connector(connector_id)
         .map_err(|_| DrmIoctlError::UnknownConnector)?;
@@ -483,7 +497,7 @@ fn copy_str_to_buf(buf: &mut [u8], s: &str) {
     }
 }
 
-fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
+pub(crate) fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
     let mut info = DrmModeModeInfo {
         hdisplay: m.width as u16,
         vdisplay: m.height as u16,

@@ -156,6 +156,12 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // GETRESOURCES is special because the response has pointer
         // arrays the user supplied; we must write IDs into those.
         IoctlCmd::ModeGetResources => handle_getresources(&mode_state, arg, &ctx),
+        // GETCONNECTOR fills user mode/encoder arrays + the two-pass
+        // count protocol; the generic path would discard the result.
+        IoctlCmd::ModeGetConnector => handle_getconnector(&mode_state, arg, &ctx),
+        IoctlCmd::ModeGetEncoder => handle_getencoder(&mode_state, arg, &ctx),
+        IoctlCmd::ModeGetCrtc => handle_getcrtc(&mode_state, arg, &ctx),
+        IoctlCmd::ModeObjGetProperties => handle_obj_getproperties(&mode_state, arg, &ctx),
         // Dumb-buffer ioctls — new in Rung 3.
         IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
         IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),
@@ -366,6 +372,176 @@ fn handle_getresources(
     unsafe {
         copy_out(arg, &out_bytes)?;
     }
+    Ok(0)
+}
+
+/// Serialise one `drm_mode_modeinfo` (68 bytes) into `out`.
+/// Layout: clock u32, {h,v}* u16×10, vrefresh u32, flags u32, type u32,
+/// name[32]. `DrmModeModeInfo` isn't repr(C), so we lay it out by hand.
+fn mode_to_bytes(m: &crate::drm::ioctl::DrmModeModeInfo) -> [u8; 68] {
+    let mut b = [0u8; 68];
+    b[0..4].copy_from_slice(&m.clock.to_le_bytes());
+    let u16s = [
+        m.hdisplay, m.hsync_start, m.hsync_end, m.htotal, m.hskew, m.vdisplay, m.vsync_start,
+        m.vsync_end, m.vtotal, m.vscan,
+    ];
+    for (i, v) in u16s.iter().enumerate() {
+        b[4 + i * 2..6 + i * 2].copy_from_slice(&v.to_le_bytes());
+    }
+    b[24..28].copy_from_slice(&m.vrefresh.to_le_bytes());
+    b[28..32].copy_from_slice(&m.flags.to_le_bytes());
+    b[32..36].copy_from_slice(&m.r#type.to_le_bytes());
+    b[36..68].copy_from_slice(&m.name);
+    b
+}
+
+/// DRM_IOCTL_MODE_GETCONNECTOR — connector info + the libdrm two-pass
+/// count protocol: pass 1 (zero out-ptrs) returns counts; pass 2 (ptrs +
+/// matching counts) fills the modes/encoders arrays. handle_generic can't
+/// do this (it discards the result), so it's a dedicated handler.
+///
+/// Linux ref: `drivers/gpu/drm/drm_connector.c::drm_mode_getconnector`.
+fn handle_getconnector(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // struct drm_mode_get_connector is 80 bytes. Read the user's
+    // out-pointers + advertised counts before dispatch.
+    // SAFETY: `arg` is the validated user/kernel ioctl pointer.
+    let in_bytes = unsafe { copy_in(arg, 80)? };
+    let rd = |o: usize| u64::from_le_bytes(in_bytes[o..o + 8].try_into().unwrap());
+    let rd32 = |o: usize| u32::from_le_bytes(in_bytes[o..o + 4].try_into().unwrap());
+    let encoders_ptr = rd(0);
+    let modes_ptr = rd(8);
+    let user_count_modes = rd32(32);
+    let user_count_encoders = rd32(40);
+
+    let result = {
+        let mut card = mode_state.lock();
+        dispatch(&mut card, 0xA7, &in_bytes, ctx).map_err(map_err)?
+    };
+    let (info, modes) = match result {
+        DrmIoctlResult::GetConnector(i, m) => (i, m),
+        _ => return Err(FsError::Unsupported),
+    };
+
+    // Pass 2: fill the modes array when the user gave a buffer big enough.
+    if modes_ptr != 0 && (user_count_modes as usize) >= modes.len() && !modes.is_empty() {
+        let mut buf: Vec<u8> = Vec::with_capacity(modes.len() * 68);
+        for m in &modes {
+            buf.extend_from_slice(&mode_to_bytes(m));
+        }
+        // SAFETY: user-supplied modes_ptr, sized for >= modes.len() entries.
+        unsafe { copy_out(modes_ptr as usize, &buf)? };
+    }
+    // Single encoder id into the encoders array.
+    if encoders_ptr != 0 && user_count_encoders >= 1 && info.encoder_id != 0 {
+        // SAFETY: user-supplied encoders_ptr with >= 1 slot.
+        unsafe { copy_out(encoders_ptr as usize, &info.encoder_id.to_le_bytes())? };
+    }
+
+    // Write the struct back, preserving the user's out-pointers (first 32
+    // bytes) and updating counts + connector fields (offsets 32..76).
+    let mut out = in_bytes;
+    out[32..36].copy_from_slice(&info.count_modes.to_le_bytes());
+    out[36..40].copy_from_slice(&0u32.to_le_bytes()); // count_props
+    out[40..44].copy_from_slice(&info.count_encoders.to_le_bytes());
+    out[44..48].copy_from_slice(&info.encoder_id.to_le_bytes());
+    out[48..52].copy_from_slice(&info.connector_id.to_le_bytes());
+    out[52..56].copy_from_slice(&info.connector_type.to_le_bytes());
+    out[56..60].copy_from_slice(&info.connector_type_id.to_le_bytes());
+    out[60..64].copy_from_slice(&info.connection.to_le_bytes());
+    out[64..68].copy_from_slice(&info.mm_width.to_le_bytes());
+    out[68..72].copy_from_slice(&info.mm_height.to_le_bytes());
+    out[72..76].copy_from_slice(&info.subpixel.to_le_bytes());
+    // SAFETY: `arg` is the validated user/kernel out-pointer (80 bytes).
+    unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_GETENCODER — struct drm_mode_get_encoder (20 bytes):
+/// encoder_id, encoder_type, crtc_id, possible_crtcs, possible_clones.
+///
+/// Linux ref: `drivers/gpu/drm/drm_encoder.c::drm_mode_getencoder`.
+fn handle_getencoder(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    _ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated user/kernel ioctl pointer (20 bytes).
+    let in_bytes = unsafe { copy_in(arg, 20)? };
+    let encoder_id = u32::from_le_bytes(in_bytes[0..4].try_into().unwrap());
+    let mut out = [0u8; 20];
+    {
+        let card = mode_state.lock();
+        let enc = card.encoder(encoder_id).map_err(|_| FsError::InvalidData)?;
+        out[0..4].copy_from_slice(&enc.id.to_le_bytes());
+        out[4..8].copy_from_slice(&(enc.encoder_type as u32).to_le_bytes());
+        out[8..12].copy_from_slice(&enc.crtc_id.unwrap_or(0).to_le_bytes());
+        out[12..16].copy_from_slice(&enc.possible_crtcs.to_le_bytes());
+        out[16..20].copy_from_slice(&enc.possible_clones.to_le_bytes());
+    }
+    // SAFETY: `arg` is the validated user/kernel out-pointer (20 bytes).
+    unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_GETCRTC — struct drm_mode_crtc (104 bytes). Reports the
+/// crtc's current fb/x/y/mode; `set_connectors_ptr`/`count_connectors` are
+/// input-only (zero on a get) and preserved.
+///
+/// Linux ref: `drivers/gpu/drm/drm_crtc.c::drm_mode_getcrtc`.
+fn handle_getcrtc(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    _ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated user/kernel ioctl pointer (104 bytes).
+    let in_bytes = unsafe { copy_in(arg, 104)? };
+    let crtc_id = u32::from_le_bytes(in_bytes[12..16].try_into().unwrap());
+    let mut out = in_bytes;
+    {
+        let card = mode_state.lock();
+        let crtc = card.crtc(crtc_id).map_err(|_| FsError::InvalidData)?;
+        out[12..16].copy_from_slice(&crtc.id.to_le_bytes());
+        out[16..20].copy_from_slice(&crtc.primary_fb.unwrap_or(0).to_le_bytes()); // fb_id
+        out[20..24].copy_from_slice(&crtc.x.to_le_bytes());
+        out[24..28].copy_from_slice(&crtc.y.to_le_bytes());
+        out[28..32].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
+        let mode_valid: u32 = crtc.mode.is_some() as u32;
+        out[32..36].copy_from_slice(&mode_valid.to_le_bytes());
+        match &crtc.mode {
+            Some(m) => {
+                let wire = crate::drm::ioctl::mode_to_wire(m);
+                out[36..104].copy_from_slice(&mode_to_bytes(&wire));
+            }
+            None => out[36..104].fill(0),
+        }
+    }
+    // SAFETY: `arg` is the validated user/kernel out-pointer (104 bytes).
+    unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_OBJ_GETPROPERTIES — struct drm_mode_obj_get_properties
+/// (24 bytes): props_ptr, prop_values_ptr, count_props, obj_id, obj_type.
+/// We expose no object properties yet, so report `count_props = 0` and
+/// succeed — returning ENOTTY made libdrm hand modetest a NULL property
+/// set that it dereferenced on cleanup (SIGSEGV).
+///
+/// Linux ref: `drivers/gpu/drm/drm_mode_object.c::drm_mode_obj_get_properties_ioctl`.
+fn handle_obj_getproperties(
+    _mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    _ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated user/kernel ioctl pointer (24 bytes).
+    let mut bytes = unsafe { copy_in(arg, 24)? };
+    // count_props is at offset 16 (after props_ptr + prop_values_ptr).
+    bytes[16..20].copy_from_slice(&0u32.to_le_bytes());
+    // SAFETY: `arg` is the validated 24-byte out-pointer.
+    unsafe { copy_out(arg, &bytes)? };
     Ok(0)
 }
 
