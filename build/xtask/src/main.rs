@@ -1727,6 +1727,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // libwayland (1.23 + libffi) client+server registry handshake over a
         // socketpair — proves the Wayland wire protocol + transport on NARF.
         ("wl_handshake", "wl-ok"),
+        ("wl_shm", "shm-ok"),
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.

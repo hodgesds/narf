@@ -3352,6 +3352,7 @@ fn boot_userspace_init() {
                 // modetest — real libdrm KMS client (Rung 4 DRM probe).
                 ("modetest", narf_verification::NARF_MODETEST_ELF),
                 ("wl_handshake", narf_verification::NARF_WL_HANDSHAKE_ELF),
+                ("wl_shm", narf_verification::NARF_WL_SHM_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),

@@ -3910,6 +3910,10 @@ pub const NARF_MODETEST_ELF: &[u8] = include_bytes!(env!("NARF_MODETEST_ELF_AARC
 pub const NARF_WL_HANDSHAKE_ELF: &[u8] = include_bytes!(env!("NARF_WL_HANDSHAKE_ELF_X86_64"));
 #[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
 pub const NARF_WL_HANDSHAKE_ELF: &[u8] = include_bytes!(env!("NARF_WL_HANDSHAKE_ELF_AARCH64"));
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_WL_SHM_ELF: &[u8] = include_bytes!(env!("NARF_WL_SHM_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_WL_SHM_ELF: &[u8] = include_bytes!(env!("NARF_WL_SHM_ELF_AARCH64"));
 
 #[cfg(all(
     target_arch = "x86_64",

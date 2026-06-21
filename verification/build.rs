@@ -301,6 +301,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_X86_64={}", wl.display());
     println!("cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_AARCH64=/dev/null");
 
+    // wl_shm — libwayland wl_shm pool over the Wayland fd-passing path
+    // (memfd marshalled via SCM_RIGHTS, server mmaps it). Rung 7.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_shm_x86_64");
+    let wlshm = manifest_dir.join("data/musl-demo/wl_shm_x86_64");
+    println!("cargo:rustc-env=NARF_WL_SHM_ELF_X86_64={}", wlshm.display());
+    println!("cargo:rustc-env=NARF_WL_SHM_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).
