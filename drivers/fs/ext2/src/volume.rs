@@ -70,6 +70,16 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// only and never across an `await` (the lock would otherwise
     /// deadlock under cooperative async).
     io: IrqSafeSpinLock<VolumeIo>,
+    /// Serialises use of the single shared scratch DMA buffer across
+    /// the WHOLE submit→await→copy span. The `io` spinlock above only
+    /// guards the byte-copy, NOT the device DMA — so two concurrent
+    /// reads (e.g. two simultaneous execve loads on different CPUs)
+    /// would both DMA into the one scratch buffer and clobber each
+    /// other's data, corrupting whichever read copied out second. An
+    /// async mutex (held across the `await`, unlike the IRQ-safe
+    /// spinlock) gives the scratch buffer single-owner semantics
+    /// without masking IRQs or deadlocking the cooperative executor.
+    scratch_lock: narf_lib::mutex::Mutex<()>,
     /// JBD2 read-side replay overrides — FS-block → post-replay
     /// bytes. Populated by `Ext2Volume::mount` when an unclean
     /// ext3+ volume is seen; consulted by `read_block` before
@@ -246,6 +256,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
+            scratch_lock: narf_lib::mutex::Mutex::new(()),
             journal_overrides,
         }))
     }
@@ -485,8 +496,16 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 let g = self.io.lock();
                 (g.cap, g.lbs)
             };
-            return Self::read_byte_range_with(&*self.device, cap, lbs, &self.io, byte_off, dst)
-                .await;
+            return Self::read_byte_range_with(
+                &*self.device,
+                cap,
+                lbs,
+                &self.io,
+                &self.scratch_lock,
+                byte_off,
+                dst,
+            )
+            .await;
         }
         // Walk one FS-block at a time, consulting the override map.
         let bs = self.block_size() as u64;
@@ -512,6 +531,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 cap,
                 lbs,
                 &self.io,
+                &self.scratch_lock,
                 abs,
                 &mut dst[cursor..cursor + want],
             )
@@ -537,7 +557,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let in_lba = (abs % lbs as u64) as usize;
             let want = core::cmp::min(src.len() - cursor, lbs - in_lba);
 
-            // If we're not writing a full sector, do a RMW.
+            // If we're not writing a full sector, do a RMW. The read takes the
+            // scratch lock internally; it is released before the write below.
             let mut sector = alloc::vec![0u8; lbs];
             if !(in_lba == 0 && want == lbs) {
                 Self::read_byte_range_with(
@@ -545,6 +566,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     cap,
                     lbs,
                     &self.io,
+                    &self.scratch_lock,
                     lba * lbs as u64,
                     &mut sector,
                 )
@@ -552,32 +574,36 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             sector[in_lba..in_lba + want].copy_from_slice(&src[cursor..cursor + want]);
 
-            // Stage into the DMA buffer, then issue the write.
+            // Stage into the DMA buffer, then issue the write — hold the scratch
+            // lock across the whole stage→submit→await span so a concurrent
+            // device op can't clobber the buffer mid-write.
             {
-                let buf = self
-                    .io
-                    .lock()
-                    .buffer()
-                    .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-                // SAFETY: see read_byte_range_with. Single-CPU
-                // cooperative async means the spinlock guards the
-                // buffer bytes for the duration of the copy.
-                // SAFETY: Valid MMIO bounds or trusted driver environment
-                let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
-                dst.copy_from_slice(&sector);
+                let _scratch_guard = self.scratch_lock.lock().await;
+                {
+                    let buf = self
+                        .io
+                        .lock()
+                        .buffer()
+                        .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+                    // SAFETY: see read_byte_range_with. The scratch lock gives us
+                    // sole ownership of the buffer for the duration of the copy.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
+                    let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
+                    dst.copy_from_slice(&sector);
+                }
+                let req = BlockRequest {
+                    op: BlockOp::Write { fua: false },
+                    lba,
+                    blocks: 1,
+                    buffer: cap
+                        .derive::<Read>()
+                        .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
+                    qos: QosHint::Latency,
+                    user_tag: 0,
+                };
+                let completion = self.device.submit(req).await;
+                completion.result.map_err(FsError::Io)?;
             }
-            let req = BlockRequest {
-                op: BlockOp::Write { fua: false },
-                lba,
-                blocks: 1,
-                buffer: cap
-                    .derive::<Read>()
-                    .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
-                qos: QosHint::Latency,
-                user_tag: 0,
-            };
-            let completion = self.device.submit(req).await;
-            completion.result.map_err(FsError::Io)?;
 
             cursor += want;
         }
@@ -651,9 +677,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         cap: Cap<DmaBuffer, Write>,
         lbs: usize,
         io_lock: &IrqSafeSpinLock<VolumeIo>,
+        scratch: &narf_lib::mutex::Mutex<()>,
         byte_off: u64,
         dst: &mut [u8],
     ) -> Result<(), FsError> {
+        // Hold the scratch buffer exclusively for the whole submit→await→copy
+        // span: the shared DMA buffer must not be reused by another concurrent
+        // device op (read or write) until we have copied our bytes out.
+        let _scratch_guard = scratch.lock().await;
         let mut cursor = 0usize;
         while cursor < dst.len() {
             let abs = byte_off + cursor as u64;
