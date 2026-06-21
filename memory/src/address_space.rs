@@ -1717,12 +1717,24 @@ impl AddressSpace {
         let parent_regions: Vec<Region> = {
             let mut g = self.regions.lock();
             for r in g.iter_mut() {
-                // Bump the refcount on every backing frame.
+                // MAP_SHARED regions (POSIX shm AND borrowed device
+                // frames — framebuffers, DRM dumb buffers) are genuinely
+                // shared across fork: parent and child map the SAME
+                // physical frames, both writable, each seeing the other's
+                // writes (Linux MAP_SHARED). They must NOT be COW'd —
+                // the frames are registry-owned / borrowed, not
+                // COW-refcounted (the drop path likewise skips SHARED),
+                // and stripping WRITE would silently fault the writer
+                // into a private copy that never reaches the device.
+                if r.perms.contains(RegionPerms::SHARED) {
+                    continue;
+                }
+                // Private region: bump the COW refcount on every backing
+                // frame, then strip WRITE so both ASes start the post-fork
+                // window read-only and split on first write.
                 for &p in r.phys.iter() {
                     let _ = crate::frame::cow::inc_ref(p);
                 }
-                // Strip WRITE — both ASes start the post-fork
-                // window read-only and split on first write.
                 r.perms = RegionPerms(r.perms.0 & !RegionPerms::WRITE.0);
             }
             g.clone()
