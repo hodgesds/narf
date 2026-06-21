@@ -119,17 +119,13 @@ pub unsafe fn initramfs_module(info_ptr: usize) -> Option<(u64, u64)> {
     if hdr.magic != MAGIC || hdr._nr_modules == 0 || hdr._modlist == 0 {
         return None;
     }
-    let n = hdr._nr_modules as usize;
-    for i in 0..n {
-        let entry_ptr = hdr._modlist as usize + i * core::mem::size_of::<HvmModlistEntry>();
-        // SAFETY: bootloader contract guarantees `n` valid
-        // entries at `modlist_paddr`.
-        // SAFETY: Valid memory or trusted environment
-        let e = unsafe { (entry_ptr as *const HvmModlistEntry).read_unaligned() };
-        // Just return the first module since we only ever pass the initramfs.
-        return Some((e.paddr, e.size));
-    }
-    None
+    // We only ever pass a single module (the initramfs); read the first
+    // modlist entry. `_nr_modules != 0` is guaranteed by the check above.
+    let entry_ptr = hdr._modlist as usize;
+    // SAFETY: bootloader contract guarantees a valid entry at `modlist_paddr`.
+    // SAFETY: Valid memory or trusted environment
+    let e = unsafe { (entry_ptr as *const HvmModlistEntry).read_unaligned() };
+    Some((e.paddr, e.size))
 }
 
 /// Read the kernel command-line that the PVH loader stashed at

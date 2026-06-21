@@ -169,6 +169,9 @@ unsafe fn copy_to_user_bytes(uptr: usize, src: &[u8]) -> Result<usize, FsError> 
 /// `dir(2) | size(14) | type(8) | nr(8)`.
 /// Ref: `include/uapi/asm-generic/ioctl.h`.
 mod ioc {
+    // Completes the `_IOC` field set for reference/symmetry with the
+    // size/typ/nr accessors below; not all callers decode the direction.
+    #[allow(dead_code)]
     pub const fn dir(cmd: u32) -> u32 {
         (cmd >> 30) & 0x3
     }
@@ -493,7 +496,7 @@ impl FileOps for InputEventFile {
                     Ok(n as u64)
                 }
             }
-            nr if nr >= EVIOC_NR_GABS_BASE && nr < EVIOC_NR_GABS_BASE + 0x40 => {
+            nr if (EVIOC_NR_GABS_BASE..EVIOC_NR_GABS_BASE + 0x40).contains(&nr) => {
                 // EVIOCGABS(abs): nr = 0x40 + abs.  struct input_absinfo
                 // is six i32s; we report all-zero limits (no calibration
                 // data synthesised for the virtual pointer).
