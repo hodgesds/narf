@@ -168,6 +168,14 @@ struct QueuePair {
 /// overflow drops (frees) rather than growing unbounded.
 const TX_POOL_CAP: usize = 64;
 
+/// Cap on the recycled RX DMA-buffer free-list (the RX `skb`/frame pool).
+/// Sized to a full RX ring so steady-state RX never falls back to the global
+/// buddy allocator + per-frame 4 KiB zero-fill (`alloc_coherent`): the device
+/// overwrites every RX buffer, so recycled buffers need no re-zeroing. This
+/// killed an ~880-in-200k (>128µs) `alloc_frame` lock-contention tail.
+/// Overflow drops (frees) the buffer.
+const RX_POOL_CAP: usize = 256;
+
 pub struct VirtioNetPci {
     common: VirtioRegion,
     notify: VirtioRegion,
@@ -191,6 +199,13 @@ pub struct VirtioNetPci {
     /// enabled. `None` means polled-only completion. Consumers wait
     /// via `narf_interrupts::wait_for_irq(v).await`.
     pub irq_vector: Option<u8>,
+    /// Per-RX-pair MSI-X IDT vectors, indexed by pair (queue `2*K`).
+    /// `rx_irq_vectors[K] == Some(v)` means pair K's forwarder parks on
+    /// IRQ `v` (routed to pair K's CPU); `None` means it polls. Empty
+    /// until `enable_rx_msix_all` runs; `rx_irq_vectors[0]` mirrors
+    /// `irq_vector`. This is what makes a multi-queue NIC wake every
+    /// forwarder on its own interrupt instead of pairs 1..N blind-sleeping.
+    pub rx_irq_vectors: alloc::vec::Vec<Option<u8>>,
     /// Per-queue MSI-X vector for TX completions on pair 0. `None`
     /// = caller hasn't called `enable_tx_msix` yet, TX uses polled
     /// used-ring drain.
@@ -235,6 +250,12 @@ pub struct VirtioNetPci {
     /// the coherent/buddy allocator off the per-frame TX hot path. Capped at
     /// `TX_POOL_CAP`; overflow drops (frees) the buffer.
     tx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
+    /// Recycled RX DMA buffers (the RX frame/`skb` pool). The forwarder returns
+    /// each fully-consumed RX buffer here instead of freeing it, and
+    /// `rx_take_on` pops from here for the replacement it posts back to the
+    /// device — keeping the buddy allocator off the per-frame RX hot path.
+    /// Capped at `RX_POOL_CAP`.
+    rx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
 }
 
 /// Control-queue runtime state. `ctrl_buf` holds back-to-back
@@ -626,6 +647,7 @@ impl VirtioNetPci {
             pairs,
             tx_rr: AtomicU64::new(0),
             irq_vector: None,
+            rx_irq_vectors: alloc::vec::Vec::new(),
             tx_irq_vector: None,
             msix: None,
             ready: true,
@@ -637,6 +659,7 @@ impl VirtioNetPci {
             ctrl,
             cfg_phys,
             tx_pool: IrqSafeSpinLock::new(Vec::new()),
+            rx_pool: IrqSafeSpinLock::new(Vec::new()),
         };
 
         // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
@@ -692,6 +715,53 @@ impl VirtioNetPci {
         Ok(v)
     }
 
+    /// Bind EVERY active RX queue pair to its own MSI-X vector, each routed
+    /// to the CPU its forwarder will run on, so no forwarder has to fall
+    /// back to a blind 2ms poll sleep between sparse frames. This is the
+    /// multi-queue completion of [`Self::enable_msix`] (which wired only
+    /// pair 0). The per-pair routing CPU mirrors the forwarder placement in
+    /// the RX-forwarder spawn (`partition` ⇒ pair K → CPU K, else CPU 0) so
+    /// the RX IRQ lands locally on the core that services the queue.
+    ///
+    /// Best-effort per pair: a pair that can't get a vector (MSI-X table
+    /// full, IDT exhausted) keeps `None` and its forwarder polls — correct,
+    /// just without the IRQ fast-path on that queue. `irq_vector` is kept
+    /// pointing at pair 0 for back-compat.
+    ///
+    /// # Safety
+    /// Caller owns the device's BAR + cfg-space exclusively (probe, before
+    /// the controller is shared into `CONTROLLERS`).
+    pub unsafe fn enable_rx_msix_all(
+        &mut self,
+        cap: &Cap<BusDeviceCap, Write>,
+        device: &BusDevice,
+    ) -> Result<(), VirtioPciError> {
+        let num_pairs = self.pairs.len();
+        // Mirror the forwarder placement decision (see the RX-forwarder
+        // spawn): with enough cores, pair K's forwarder is pinned to CPU K;
+        // otherwise all forwarders share the BSP. Route each queue's IRQ to
+        // the same CPU so the wake is local.
+        let online = narf_lib::smp::online_count() as usize;
+        let partition = num_pairs >= 2 && online > num_pairs;
+        let mut targets: alloc::vec::Vec<(u16, u32)> = alloc::vec::Vec::with_capacity(num_pairs);
+        for k in 0..num_pairs {
+            let cpu = if partition { k } else { 0 };
+            // Fall back to the BSP's APIC id (cpu 0) if the topology lookup
+            // fails — delivery still works, just not core-local.
+            let apic = narf_interrupts::apic_id_at(cpu)
+                .or_else(|| narf_interrupts::apic_id_at(0))
+                .unwrap_or(0);
+            targets.push((2 * k as u16, apic));
+        }
+        // SAFETY: caller owns the device exclusively.
+        let (table, vectors) =
+            unsafe { crate::pci::enable_msix_rx_queues(&self.common, cap, device, &targets) }?;
+        self.irq_vector = vectors.first().copied().flatten();
+        self.rx_irq_vectors = vectors;
+        self.msix = Some(table);
+        Ok(())
+    }
+
     /// TX-queue MSI-X for pair 0 (queue index 1). Reuses the
     /// existing `MsixTable` if RX MSI-X is already enabled — both
     /// vectors land on the same MSI-X table.
@@ -731,6 +801,31 @@ impl VirtioNetPci {
         // real synchroniser.
         let n = self.tx_rr.fetch_add(1, Ordering::Relaxed);
         (n as usize) % self.pairs.len()
+    }
+
+    /// Pick the TX pair for a frame by hashing its flow 4-tuple, so every
+    /// segment of a connection leaves on the SAME virtio TX queue.
+    ///
+    /// Why this matters: the host tun driver (multi-queue tap) records a
+    /// flow→queue map from the guest's TX (`tun_flow_update`) and replays it
+    /// to steer that flow's RX (`tun_select_queue`). So the guest's TX queue
+    /// choice *determines* RX stickiness. The old [`Self::next_tx_pair`]
+    /// round-robin bumped a single global counter per TX, so a connection's
+    /// segments fanned across queues 0,1,0,1… — the host re-steered its RX
+    /// every round and the flow never settled on one forwarder/CPU. Hashing
+    /// the 4-tuple keeps a flow pinned to one TX queue → one RX queue → one
+    /// forwarder (pair K → CPU K), i.e. the connection becomes sticky to a
+    /// core (Linux RSS+RFS). Falls back to round-robin for ARP / IPv6 /
+    /// non-TCP-UDP, which are low-volume and don't need affinity.
+    ///
+    /// `frame` is the Ethernet frame (no virtio header). The hash is
+    /// symmetric in (src,dst) so it composes with later worker co-location.
+    fn tx_pair_for_frame(&self, frame: &[u8]) -> usize {
+        let npairs = self.pairs.len();
+        if npairs <= 1 {
+            return 0;
+        }
+        flow_tx_pair(frame, npairs).unwrap_or_else(|| self.next_tx_pair())
     }
 
     /// Transmit a frame backed by a caller-owned `DmaBuffer`,
@@ -774,8 +869,38 @@ impl VirtioNetPci {
         }
     }
 
+    /// Take a 4 KiB RX DMA buffer — recycled from the RX frame pool if
+    /// available, else a fresh coherent allocation. The device overwrites the
+    /// whole buffer on receive, so a recycled (un-zeroed) buffer is fine.
+    /// Pairs with [`Self::rx_buf_release`].
+    pub fn rx_buf_acquire(&self) -> Option<DmaBuffer> {
+        if let Some(b) = self.rx_pool.lock().pop() {
+            return Some(b);
+        }
+        alloc_coherent(4096, DomainId::DRIVER_0).ok()
+    }
+
+    /// Return a fully-consumed RX DMA buffer to the RX frame pool for reuse,
+    /// or drop it (freeing) when the pool is already at `RX_POOL_CAP`.
+    pub fn rx_buf_release(&self, buf: DmaBuffer) {
+        let mut pool = self.rx_pool.lock();
+        if pool.len() < RX_POOL_CAP {
+            pool.push(buf);
+        }
+    }
+
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
-        let pair_idx = self.next_tx_pair();
+        // Flow-affine TX queue: hash the 4-tuple so the connection stays
+        // sticky to one queue/forwarder/CPU (see `tx_pair_for_frame`). The
+        // frame body sits at buf[12..12+frame_len] (after the virtio header).
+        // Validated +19% over round-robin at Q=4 CONNS=64 (both with per-queue
+        // MSI-X): round-robin flaps a conn across queues → cache + cross-core
+        // wake thrash; stickiness fixes it. Neutral at Q=2.
+        let pair_idx = {
+            let end = (12 + frame_len as usize).min(buf.len());
+            let frame = buf.as_slice().get(12..end).unwrap_or(&[]);
+            self.tx_pair_for_frame(frame)
+        };
         self.tx_dma_on(pair_idx, buf, frame_len)
     }
 
@@ -1124,7 +1249,7 @@ impl VirtioNetPci {
         // the device-filled buffer parked in its slot and return
         // None — better than handing the stack a frame and losing
         // the refill slot.
-        let replacement = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        let replacement = self.rx_buf_acquire()?;
         let rep_phys = replacement.phys_addr().raw();
         // Now swap: take the original out of its slot, free the
         // descriptor chain, post the replacement, stash it under
@@ -1205,6 +1330,56 @@ impl VirtioNetPci {
 pub(crate) static CONTROLLERS: IrqSafeSpinLock<alloc::vec::Vec<Arc<VirtioNetPci>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
+/// Symmetric per-flow hash of an Ethernet frame → TX pair index in
+/// `0..npairs`. Returns `None` for frames that aren't IPv4/TCP-UDP (ARP,
+/// IPv6, IP options we don't parse) so the caller can fall back to
+/// round-robin. See [`VirtioNetPci::tx_pair_for_frame`] for why a flow must
+/// stay pinned to one queue.
+///
+/// Parses Ethernet (14-byte header) → IPv4 → TCP/UDP ports. The hash folds
+/// (src⊕dst, sport⊕dport) so it's identical for both directions of a flow
+/// (matching the host tun's `__skb_get_hash_symmetric`), then runs an
+/// xorshift-multiply finaliser so the low bits (which `% npairs` selects)
+/// depend on the whole tuple rather than just the port LSBs.
+fn flow_tx_pair(frame: &[u8], npairs: usize) -> Option<usize> {
+    if npairs <= 1 {
+        return Some(0);
+    }
+    // Ethernet: 12 bytes of addresses, then a 2-byte ethertype.
+    if frame.len() < 14 {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype != 0x0800 {
+        return None; // not IPv4 (ARP 0x0806, IPv6 0x86dd, …)
+    }
+    let ip = frame.get(14..)?;
+    if ip.len() < 20 || (ip[0] >> 4) != 4 {
+        return None;
+    }
+    let ihl = ((ip[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || ip.len() < ihl {
+        return None;
+    }
+    let src = u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]]);
+    let dst = u32::from_be_bytes([ip[16], ip[17], ip[18], ip[19]]);
+    let mut h = src ^ dst;
+    let proto = ip[9];
+    if proto == 6 || proto == 17 {
+        if let Some(l4) = ip.get(ihl..ihl + 4) {
+            let sport = u16::from_be_bytes([l4[0], l4[1]]);
+            let dport = u16::from_be_bytes([l4[2], l4[3]]);
+            h ^= ((sport ^ dport) as u32).wrapping_mul(0x0001_0001);
+        }
+    }
+    // xorshift-multiply finaliser (Murmur3 fmix-style) so `% npairs` sees
+    // entropy from the whole tuple, not just the port low bits.
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb_352d);
+    h ^= h >> 15;
+    Some((h as usize) % npairs)
+}
+
 pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), narf_bus::ProbeError> {
     // Dedupe: tests that reset the bus driver-match registry and
     // re-walk PCI would otherwise push a second controller for
@@ -1238,9 +1413,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     };
     // SAFETY: probe-time caller owns the device. Best-effort —
     // failure leaves the polled fallback in place inside the
-    // forwarder.
+    // forwarder. Bind a per-queue MSI-X vector to EVERY RX pair (routed
+    // to each pair's forwarder CPU) so no forwarder blind-sleeps between
+    // sparse frames; single-queue NICs just get pair 0 as before.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let _ = unsafe { dev.enable_msix(&cap, &device) };
+    let _ = unsafe { dev.enable_rx_msix_all(&cap, &device) };
     let idx = {
         let mut g = CONTROLLERS.lock();
         let i = g.len();
@@ -1283,8 +1460,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 fn register_net_interface(idx: usize, name: alloc::string::String) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
-    let (mac, mtu, link_up, irq_vector, num_pairs) = match with_at(idx, |c| {
-        (c.mac(), c.mtu(), c.link_up(), c.irq_vector, c.num_pairs())
+    let (mac, mtu, link_up, rx_irq_vectors, num_pairs) = match with_at(idx, |c| {
+        (
+            c.mac(),
+            c.mtu(),
+            c.link_up(),
+            c.rx_irq_vectors.clone(),
+            c.num_pairs(),
+        )
     }) {
         Some(t) => t,
         None => return,
@@ -1345,10 +1528,11 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     // Spawn one RX forwarder per active pair.
     for pair_idx in 0..num_pairs {
         let rx_prod = Arc::clone(&rx_prod);
-        // Only pair 0 gets the MSI-X wakeup; pairs 1..N poll. See
-        // function-level comment for why we don't allocate per-queue
-        // MSI-X vectors yet.
-        let irq = if pair_idx == 0 { irq_vector } else { None };
+        // Each pair parks on its OWN MSI-X vector (`enable_rx_msix_all`
+        // routed pair K's IRQ to CPU K). A `None` entry (MSI-X table/IDT
+        // exhausted, or single-queue) falls back to the polled cadence
+        // below — correct, just without the per-queue IRQ fast-path.
+        let irq = rx_irq_vectors.get(pair_idx).copied().flatten();
         // Forwarder's home core (see the partition comment above).
         let target_cpu = if partition { pair_idx as u32 } else { 0 };
         // Stackful: virtio-net RX pump.
@@ -1380,8 +1564,17 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     // installed until the first poll (in `timeout` below).
                     let irq_waiter = irq.map(narf_interrupts::wait_for_irq);
                     let mut processed_any = false;
+                    // Buffer pending recycle into the RX frame pool, released on the
+                    // NEXT take's `with_at` so recycling adds no extra CONTROLLERS
+                    // lock on the per-frame hot path (flushed after the drain loop).
+                    let mut to_recycle: Option<DmaBuffer> = None;
                     loop {
-                        let taken = match with_at(idx, |c| c.rx_take_on(pair_idx)) {
+                        let taken = match with_at(idx, |c| {
+                            if let Some(b) = to_recycle.take() {
+                                c.rx_buf_release(b);
+                            }
+                            c.rx_take_on(pair_idx)
+                        }) {
                             Some(t) => t,
                             None => return, // controller vanished
                         };
@@ -1397,32 +1590,31 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                         // — the bytes stay where the device wrote them.
                         let payload_len = total_len.saturating_sub(12);
                         if payload_len == 0 {
-                            // Empty frame (just header); drop it and keep
-                            // draining. `buf` frees on scope exit.
+                            // Empty frame (just header): recycle the buffer (on the
+                            // next take's with_at) and keep draining.
+                            to_recycle = Some(buf);
+                            continue;
+                        }
+                        // Tap: synchronously dispatch the payload through the iface
+                        // RX handler. Only installed for the primary controller
+                        // (idx 0) — the TCP stack hooked itself there at boot via
+                        // `install_rx_drain` / `on_rx_frame_from`. virtio-net
+                        // prepends a 12-byte header; dispatch the payload slice
+                        // directly (no `Frame`) so the consumed DmaBuffer can be
+                        // RECYCLED into the RX frame pool instead of freed — keeping
+                        // the buddy allocator + per-frame 4 KiB zero-fill off the
+                        // hot path.
+                        if idx == 0 {
+                            let end = (12 + payload_len as usize).min(buf.len());
+                            narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
+                            // The tap consumed the frame synchronously + completely.
+                            // (The legacy rx_prod/rx_cons channel is NOT drained in
+                            // production, so pushing there would wedge after 64
+                            // frames.) Recycle the buffer on the next take's with_at.
+                            to_recycle = Some(buf);
                             continue;
                         }
                         let frame = Frame::with_offset(buf, 12, payload_len);
-                        // Tap: synchronously dispatch the payload through
-                        // the iface RX handler. Only installed for the
-                        // primary controller (idx 0) — the TCP stack hooked
-                        // itself there at boot via `install_rx_drain` /
-                        // `on_rx_frame_from`. Cheap fn-pointer call when no
-                        // handler is installed.
-                        if idx == 0 {
-                            narf_net::iface::on_rx_frame_from("vnet0", frame.payload());
-                            // The tap consumed the frame synchronously and
-                            // completely. The iface's rx_prod/rx_cons
-                            // channel is the *legacy* delivery path and is
-                            // NOT drained in production (only the net unit
-                            // tests pop its `rx_cons`). Pushing here would
-                            // fill the 64-slot ring after 64 frames and then
-                            // spin the pump forever in the try_send/yield
-                            // loop below — observed as an off-box TCP stream
-                            // wedging dead at the 65th received frame. So
-                            // drop the frame now (its DmaBuffer frees on
-                            // scope exit) and keep draining the device.
-                            continue;
-                        }
                         // Secondary controllers (idx != 0) have no
                         // synchronous tap, so the channel IS their delivery
                         // path. Push best-effort: on a full ring DROP the
@@ -1446,6 +1638,12 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                                 }
                             }
                         }
+                    }
+                    // Flush the last drained buffer's recycle: the per-frame recycle
+                    // rides the next take's `with_at`, but the final frame of the
+                    // round has no next take — release it here (≤1 with_at/round).
+                    if let Some(b) = to_recycle.take() {
+                        with_at(idx, |c| c.rx_buf_release(b));
                     }
                     // Adapt cadence: reset to fast-poll if this round drained
                     // anything (per-queue), else step toward the slow fallback.
@@ -1614,11 +1812,12 @@ fn vnet0_drain_fn() -> bool {
         None => return false,
     };
     let payload_len = total_len.saturating_sub(12);
-    if payload_len == 0 {
-        return true;
-    }
     let end = (12 + payload_len as usize).min(buf.len());
-    narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
+    if payload_len != 0 {
+        narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
+    }
+    // Recycle the consumed buffer into the RX frame pool instead of freeing.
+    with_controller(|c| c.rx_buf_release(buf));
     true
 }
 

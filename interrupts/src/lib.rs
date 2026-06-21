@@ -200,3 +200,24 @@ pub unsafe fn current_cpu_target_id() -> u32 {
 pub unsafe fn current_cpu_target_id() -> u32 {
     0
 }
+
+/// APIC ID of logical CPU `cpu` (its index in the ACPI MADT enumeration),
+/// or `None` if the topology is unknown / `cpu` is out of range. Thin
+/// passthrough to [`narf_acpi::apic_id_at`] so drivers (which dep
+/// `narf-interrupts` but not `narf-acpi`) can route a per-queue MSI-X
+/// vector to a specific CPU's LAPIC — the IRQ then lands on the core whose
+/// forwarder services that queue, instead of always the BSP.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn apic_id_at(cpu: usize) -> Option<u32> {
+    narf_acpi::apic_id_at(cpu)
+}
+
+/// aarch64 stub: GIC affinity routing isn't wired to logical CPU indices
+/// yet, so per-CPU MSI steering is unavailable (callers fall back to a
+/// single target).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn apic_id_at(_cpu: usize) -> Option<u32> {
+    None
+}

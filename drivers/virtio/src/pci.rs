@@ -419,6 +419,70 @@ pub unsafe fn enable_msix_queue(
     Ok((v, table))
 }
 
+/// Enable MSI-X and bind *each* RX queue in `targets` to its own MSI-X
+/// vector, routed to the named CPU's LAPIC. Unlike [`enable_msix_queue`]
+/// (which hardcodes table slot 0 for a single queue), this reserves one
+/// table slot + one IDT vector per entry, so every queue can park on its
+/// own interrupt instead of polling. `targets` is `(queue_index,
+/// target_apic_id)` per RX queue (queue `2*K` for pair `K`).
+///
+/// Returns the shared [`MsixTable`] plus a per-entry `Vec<Option<u8>>` of
+/// IDT vectors — `None` for any queue that couldn't get a slot/vector
+/// (table full, IDT exhausted, or the device rejected the binding). A
+/// `None` entry is not an error: the caller's forwarder falls back to its
+/// polled cadence for that queue, so the device still works, just without
+/// the IRQ fast-path on that queue.
+///
+/// # Safety
+/// Caller owns the device's BAR + cfg-space exclusively (single-threaded
+/// probe, before the controller is shared).
+pub unsafe fn enable_msix_rx_queues(
+    common: &VirtioRegion,
+    cap: &narf_capabilities::Cap<narf_bus::BusDeviceCap, narf_capabilities::Write>,
+    device: &narf_bus::BusDevice,
+    targets: &[(u16, u32)],
+) -> Result<(narf_bus::MsixTable, alloc::vec::Vec<Option<u8>>), VirtioPciError> {
+    let mut table =
+        narf_bus::msix::enable_msix(cap, device).map_err(|_| VirtioPciError::BarMapFailed)?;
+    let mut vectors: alloc::vec::Vec<Option<u8>> = alloc::vec::Vec::with_capacity(targets.len());
+    // Program each entry while MSI-X delivery is still gated off (PCIe
+    // §6.1.4 recommended order): reserve a slot, point it at the CPU's
+    // LAPIC, then bind the virtio queue to that slot. Enable once at the end.
+    for &(q_idx, target_apic) in targets {
+        let slot = match table.alloc_vector() {
+            Some(mv) => mv.vector,
+            None => {
+                vectors.push(None);
+                continue;
+            }
+        };
+        let v = match narf_interrupts::vector::alloc() {
+            Ok(v) => v,
+            Err(_) => {
+                vectors.push(None);
+                continue;
+            }
+        };
+        // SAFETY: caller owns the device's BAR exclusively.
+        if unsafe { table.program_vector(slot, target_apic, v) }.is_err() {
+            vectors.push(None);
+            continue;
+        }
+        // Bind virtio queue `q_idx` to MSI-X table slot `slot`.
+        // SAFETY: identity-mapped MMIO common-cfg region.
+        unsafe {
+            common.write16(CC_QUEUE_SELECT, q_idx);
+            common.write16(CC_QUEUE_MSIX_VECTOR, slot);
+        }
+        // SAFETY: same. Readback confirms the device accepted the binding.
+        let actual = unsafe { common.read16(CC_QUEUE_MSIX_VECTOR) };
+        vectors.push(if actual == slot { Some(v) } else { None });
+    }
+    // SAFETY: caller owns the device; flip the global MSI-X enable gate.
+    unsafe { table.enable() }.map_err(|_| VirtioPciError::BarMapFailed)?;
+    Ok((table, vectors))
+}
+
 // ── helpers ─────────────────────────────────────────────────────────
 
 #[inline]
