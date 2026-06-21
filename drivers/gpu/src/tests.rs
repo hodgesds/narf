@@ -4781,6 +4781,43 @@ fn smoke_drm_ioctl_getconnector_decode() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_ioctl_getconnector_decode);
 
+/// PAGE_FLIP event: `queue_flip_event` produces a well-formed 32-byte
+/// `drm_event_vblank` (FLIP_COMPLETE) carrying user_data + crtc_id, which
+/// `read(/dev/dri/cardN)` then drains for the compositor render loop.
+fn smoke_drm_flip_event_format() -> TestResult {
+    let mut card = make_test_card_for_ioctl();
+    if !card.events.is_empty() {
+        return TestResult::Fail("fresh card has queued events");
+    }
+    card.queue_flip_event(0xCAFE_F00D_1234_5678, 7);
+    let ev = match card.events.pop_front() {
+        Some(e) => e,
+        None => return TestResult::Fail("flip event not queued"),
+    };
+    if ev.len() != 32 {
+        return TestResult::Fail("event length != 32");
+    }
+    let rd32 = |o: usize| u32::from_le_bytes(ev[o..o + 4].try_into().unwrap());
+    let rd64 = |o: usize| u64::from_le_bytes(ev[o..o + 8].try_into().unwrap());
+    if rd32(0) != 2 {
+        return TestResult::Fail("type != DRM_EVENT_FLIP_COMPLETE(2)");
+    }
+    if rd32(4) != 32 {
+        return TestResult::Fail("base.length != 32");
+    }
+    if rd64(8) != 0xCAFE_F00D_1234_5678 {
+        return TestResult::Fail("user_data not echoed");
+    }
+    if rd32(24) != 1 {
+        return TestResult::Fail("sequence != 1");
+    }
+    if rd32(28) != 7 {
+        return TestResult::Fail("crtc_id != 7");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_format);
+
 fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
     use crate::drm::ioctl::{dispatch, DrmIoctlResult};
     use crate::drm::render_node::DrmFileCtx;
