@@ -918,7 +918,13 @@ fn sys_open(ctx: &mut dyn TrapContext) {
                 })
             });
             match new_fd {
-                Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                Some(n) => {
+                    // Record the backing path so /proc/<pid>/fd/<n> readlinks
+                    // to it (musl realpath, lsof, opendir-on-fd). See fd_path_of.
+                    #[cfg(feature = "linux-compat")]
+                    crate::mqueue::register_fd_path(task, n, path);
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                }
                 None => ctx.set_return(fail),
             }
             return;
@@ -3967,17 +3973,31 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     let file = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| parent.lookup(leaf))
         .flatten();
+    // POSIX errno discipline matters here: musl's realpath() walks a path by
+    // readlink()-ing each prefix and treats any failure other than EINVAL as
+    // fatal (`if (errno != EINVAL) return 0;`). A non-symlink that exists must
+    // therefore report EINVAL (not the generic -1 → EPERM, which aborted
+    // realpath at the first directory component); a path that names nothing
+    // reports ENOENT.
+    let einval = SyscallReturn::ok((-22i64) as u64); // -EINVAL: exists, not a symlink
+    let enoent = SyscallReturn::ok((-2i64) as u64); // -ENOENT: nothing here
     let file = match file {
         Some(f) => f,
         None => {
-            ctx.set_return(fail);
+            // Not a file. Directories and mount roots exist but aren't
+            // symlinks → EINVAL; a truly absent path → ENOENT.
+            if stat_path_dir_aware(&path).is_some() {
+                ctx.set_return(einval);
+            } else {
+                ctx.set_return(enoent);
+            }
             return;
         }
     };
     // Refuse non-symlinks — POSIX readlink returns EINVAL for those.
     let st = file.stat();
     if st.mode.file_type != narf_filesystem::FileType::Symlink {
-        ctx.set_return(fail);
+        ctx.set_return(einval);
         return;
     }
     // Allocate staging buffer at min(buf_len, target_len). MemSymlink
@@ -14698,16 +14718,47 @@ pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
 /// a Linux `/proc/[pid]/fd/<n>` symlink target.  Returns `None` when
 /// the fd or task doesn't exist.
 pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
+    // Preferred: the real backing path recorded at open() time (the same
+    // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>
+    // readlinks to — musl's realpath() opens O_PATH then readlinks here.
+    // Report it chroot-relative so a chrooted process (e.g. udev in a
+    // distro chroot) can re-open the link target in its own namespace.
+    #[cfg(feature = "linux-compat")]
+    if let Some(p) = crate::mqueue::fd_path(pid, n) {
+        return Some(strip_chroot_prefix(pid, &p));
+    }
     crate::fd::with_table(pid, |t| {
         let entry = t.get(n)?;
-        // Use the type_name as a fallback until FileOps grows a path()
-        // method with the VFS pathname cache.
+        // Use the type_name as a fallback for fds with no path (pipes,
+        // sockets, eventfd, …) until FileOps grows a path() method.
         let name = core::any::type_name_of_val(&*entry.ops);
         // Extract the last component (e.g. "PipeRead" from "crate::pipe::PipeRead").
         let short = name.rsplit("::").next().unwrap_or(name);
         Some(alloc::format!("anon_inode:[{}]", short))
     })
     .flatten()
+}
+
+/// Strip the task's chroot prefix from a host-absolute path, yielding the
+/// path as the (possibly chrooted) task sees it. No-op for un-chrooted
+/// tasks. Used so `/proc/<pid>/fd/<n>` and similar surfaces report paths a
+/// chrooted process can actually re-open.
+#[cfg(feature = "linux-compat")]
+fn strip_chroot_prefix(task: u64, path: &str) -> alloc::string::String {
+    let g = ROOT_DIR_TABLE.lock();
+    if let Some(prefix) = g.as_ref().and_then(|m| m.get(&task)) {
+        if prefix != "/" {
+            if let Some(rest) = path.strip_prefix(prefix.as_str()) {
+                if rest.is_empty() {
+                    return alloc::string::String::from("/");
+                }
+                if rest.starts_with('/') {
+                    return alloc::string::String::from(rest);
+                }
+            }
+        }
+    }
+    alloc::string::String::from(path)
 }
 
 // Per-task environ and auxv byte stores.

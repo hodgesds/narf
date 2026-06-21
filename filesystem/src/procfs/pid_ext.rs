@@ -475,10 +475,21 @@ impl FileOps for ProcFdFile {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
+        // Linux models /proc/<pid>/fd/<n> as a symlink to the backing path;
+        // readlink() (used by musl realpath, lsof, …) requires the node to
+        // report S_IFLNK or it returns EINVAL/EPERM. read() yields the target.
+        // size MUST equal the target length: sys_readlink sizes its staging
+        // buffer from st.size, so size:0 makes readlink return an empty link.
+        let size = hook_fd_path(self.pid, self.fd)
+            .map(|p| p.len())
+            .unwrap_or_else(|| "anon_inode:[unknown]".len()) as u64;
         Stat {
-            size: 0,
+            size,
             blocks: 0,
-            mode: Mode::FILE_RO,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
             mtime_cycles: 0,
         }
     }
@@ -507,7 +518,7 @@ impl DirOps for ProcFdDir {
             let leaked: &'static str = Box::leak(s.into_boxed_str());
             entries.push(DirEntry {
                 name: leaked,
-                file_type: FileType::File,
+                file_type: FileType::Symlink,
             });
         }
         Box::new(entries.into_iter())
