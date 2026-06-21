@@ -4752,7 +4752,10 @@ fn smoke_drm_ioctl_getconnector_decode() -> TestResult {
     use crate::drm::render_node::DrmFileCtx;
     let mut card = make_test_card_for_ioctl();
     let ctx = DrmFileCtx::primary_master();
-    let arg = 1u32.to_le_bytes();
+    // Full struct drm_mode_get_connector (80 bytes); connector_id is at
+    // offset 48 (after the four out-pointers + four counts).
+    let mut arg = [0u8; 80];
+    arg[48..52].copy_from_slice(&1u32.to_le_bytes());
     match dispatch(&mut card, 0xA7, &arg, &ctx) {
         Ok(DrmIoctlResult::GetConnector(info, modes)) => {
             if info.connector_id != 1 {
