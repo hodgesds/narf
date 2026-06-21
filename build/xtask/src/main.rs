@@ -3081,6 +3081,8 @@ struct BenchMetrics {
     lat_avg_us: u64,
     lat_p50_us: u64,
     lat_p99_us: u64,
+    lat_p999_us: u64,
+    lat_max_us: u64,
 }
 
 /// Drive an identical workload against a connected redis stream:
@@ -3179,6 +3181,8 @@ fn redis_bench_workload(
         lat_avg_us: sum / n as u64,
         lat_p50_us: samples[n / 2],
         lat_p99_us: samples[(n * 99 / 100).min(n - 1)],
+        lat_p999_us: samples[(n * 999 / 1000).min(n - 1)],
+        lat_max_us: *samples.last().unwrap_or(&0),
     })
 }
 
@@ -4338,8 +4342,15 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
     let row = |label: &str, m: &BenchMetrics| {
         println!(
             "│ {label:<22} SET {:>9.0} ops/s  GET {:>9.0} ops/s  \
-             PING lat min {:>6}µs avg {:>6}µs p50 {:>6}µs p99 {:>6}µs",
-            m.set_ops_s, m.get_ops_s, m.lat_min_us, m.lat_avg_us, m.lat_p50_us, m.lat_p99_us
+             PING lat min {:>6}µs avg {:>6}µs p50 {:>6}µs p99 {:>6}µs p99.9 {:>6}µs max {:>6}µs",
+            m.set_ops_s,
+            m.get_ops_s,
+            m.lat_min_us,
+            m.lat_avg_us,
+            m.lat_p50_us,
+            m.lat_p99_us,
+            m.lat_p999_us,
+            m.lat_max_us
         );
     };
     row("NARF (QEMU guest)", &narf);
