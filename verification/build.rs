@@ -315,6 +315,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_X86_64={}", mc.display());
     println!("cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_AARCH64=/dev/null");
 
+    // wl_2proc — two-process Wayland: fork() a compositor (named socket) +
+    // an independent client. Cross-process named-socket + SCM_RIGHTS. Rung 7.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_2proc_x86_64");
+    let wl2 = manifest_dir.join("data/musl-demo/wl_2proc_x86_64");
+    println!("cargo:rustc-env=NARF_WL_2PROC_ELF_X86_64={}", wl2.display());
+    println!("cargo:rustc-env=NARF_WL_2PROC_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

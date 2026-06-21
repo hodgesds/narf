@@ -3150,7 +3150,9 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     let s = match stat_path_dir_aware(path) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
+            // like libwayland's wl_socket_lock require the real errno.
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
             return;
         }
     };
@@ -3326,7 +3328,12 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
     let s = match fs_stat {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            // File doesn't exist — report ENOENT, not the bare -1 sentinel
+            // (which musl maps to EPERM). Callers that probe for a path's
+            // existence (e.g. libwayland's wl_socket_lock, which only
+            // proceeds when stat() of the socket path returns ENOENT) need
+            // the real errno.
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
             return;
         }
     };
@@ -16402,7 +16409,16 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
 fn sys_socket(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let domain = args.arg0 as u16;
-    let kind = args.arg1 as u32;
+    // The type argument carries optional SOCK_CLOEXEC / SOCK_NONBLOCK flags
+    // ORed onto the base type; strip them before categorising the socket
+    // (libwayland creates sockets as SOCK_STREAM|SOCK_CLOEXEC, which an
+    // unmasked compare reads as an unknown type → bind() fails).
+    const SOCK_CLOEXEC: u32 = 0x8_0000;
+    const SOCK_NONBLOCK: u32 = 0x800;
+    let raw_kind = args.arg1 as u32;
+    let sock_cloexec = (raw_kind & SOCK_CLOEXEC) != 0;
+    let sock_nonblock = (raw_kind & SOCK_NONBLOCK) != 0;
+    let kind = raw_kind & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
     let proto = args.arg2 as u32;
     // Reject unknown families up front (EAFNOSUPPORT shape).
     if !matches!(
@@ -16432,8 +16448,8 @@ fn sys_socket(ctx: &mut dyn TrapContext) {
         t.open(crate::fd::FdEntry {
             ops: sock.clone(),
             offset: 0,
-            flags: 0,
-            status_flags: 0,
+            flags: if sock_cloexec { crate::fd::FD_CLOEXEC } else { 0 },
+            status_flags: if sock_nonblock { 0x800 } else { 0 }, // O_NONBLOCK
         })
     }) {
         Some(n) => n,
