@@ -169,7 +169,7 @@ fn make_fb(card: &mut Card, width: u32, height: u32) -> (u32, u32) {
         .addfb2(
             width,
             height,
-            0x3438_5258, /* XRGB8888 */
+            0x3432_5258, /* XRGB8888 */
             width * 4,
             gem,
         )

@@ -162,6 +162,10 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         IoctlCmd::ModeGetEncoder => handle_getencoder(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetCrtc => handle_getcrtc(&mode_state, arg, &ctx),
         IoctlCmd::ModeObjGetProperties => handle_obj_getproperties(&mode_state, arg, &ctx),
+        // SETGAMMA — accept + no-op. We scan out the framebuffer verbatim
+        // (no hardware gamma LUT), so modetest's post-modeset gamma reset
+        // succeeds silently instead of warning `failed to set gamma`.
+        IoctlCmd::ModeSetGamma => Ok(0),
         // Dumb-buffer ioctls — new in Rung 3.
         IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
         IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),

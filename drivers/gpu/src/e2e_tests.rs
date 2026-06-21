@@ -492,13 +492,13 @@ fn smoke_drm_card_invalid_mode_rejected() -> TestResult {
     };
 
     // Zero width must be rejected.
-    let r = card.addfb2(0, 480, 0x3438_5258, 640 * 4, handle);
+    let r = card.addfb2(0, 480, 0x3432_5258, 640 * 4, handle);
     if !matches!(r, Err(CardError::InvalidDimensions)) {
         return TestResult::Fail("zero width was not rejected");
     }
 
     // Zero height must be rejected.
-    let r = card.addfb2(640, 0, 0x3438_5258, 640 * 4, handle);
+    let r = card.addfb2(640, 0, 0x3432_5258, 640 * 4, handle);
     if !matches!(r, Err(CardError::InvalidDimensions)) {
         return TestResult::Fail("zero height was not rejected");
     }
@@ -510,7 +510,7 @@ fn smoke_drm_card_invalid_mode_rejected() -> TestResult {
     }
 
     // Valid dimensions and format must succeed.
-    let r = card.addfb2(640, 480, 0x3438_5258, 640 * 4, handle);
+    let r = card.addfb2(640, 480, 0x3432_5258, 640 * 4, handle);
     if r.is_err() {
         return TestResult::Fail("valid addfb2 call rejected");
     }

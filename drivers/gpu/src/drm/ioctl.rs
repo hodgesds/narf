@@ -42,6 +42,7 @@ pub enum IoctlCmd {
     ModeGetResources = 0xA0,
     ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
+    ModeSetGamma = 0xA5,
     ModeGetEncoder = 0xA6,
     ModeGetConnector = 0xA7,
     ModeRmFb = 0xA8,
@@ -73,6 +74,7 @@ impl IoctlCmd {
             0xA0 => IoctlCmd::ModeGetResources,
             0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
+            0xA5 => IoctlCmd::ModeSetGamma,
             0xA6 => IoctlCmd::ModeGetEncoder,
             0xA7 => IoctlCmd::ModeGetConnector,
             0xA8 => IoctlCmd::ModeRmFb,
@@ -341,6 +343,7 @@ pub fn dispatch(
         IoctlCmd::ModeSetCrtc
         | IoctlCmd::ModeGetCrtc
         | IoctlCmd::ModeGetEncoder
+        | IoctlCmd::ModeSetGamma
         | IoctlCmd::ModeObjGetProperties
         | IoctlCmd::ModePageFlip
         | IoctlCmd::ModeCreateDumb
@@ -514,6 +517,11 @@ pub(crate) fn mode_to_wire(m: &crate::Mode) -> DrmModeModeInfo {
     // Approximate pixel clock: h × v × refresh / 1000 = kHz.
     let dot_clk_khz = (info.htotal as u32) * (info.vtotal as u32) * m.refresh_hz as u32;
     info.clock = dot_clk_khz / 1000;
+    // Mode name — libdrm/modetest match a requested mode by this string
+    // (e.g. `1280x800`). An empty name means `modetest -s 3@1:1280x800`
+    // can't find the mode and falls through to a 0×0 dumb buffer (EINVAL).
+    let name = alloc::format!("{}x{}", m.width, m.height);
+    copy_str_to_buf(&mut info.name, &name);
     info
 }
 

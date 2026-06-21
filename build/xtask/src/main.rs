@@ -1730,6 +1730,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
         // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.
         ("modetest -M narf-drm", "(1280x800)"),
+        // modetest -s actually sets a video mode + presents an SMPTE test
+        // pattern: CREATE_DUMB → draw → ADDFB2 → SETCRTC (blit to scanout).
+        // First real visual output from a third-party graphics program.
+        ("modetest -M narf-drm -s 3@1:1280x800", "crtc 1"),
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),

@@ -596,7 +596,7 @@ fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
         });
         // Register a framebuffer backed by this handle.
         let fb_id = card
-            .addfb2(256, 256, 0x3438_5258 /* XR24 */, 256 * 4, handle)
+            .addfb2(256, 256, 0x3432_5258 /* XR24 */, 256 * 4, handle)
             .unwrap();
         let _ = fb_id;
         crate::drm_registry::register_drm_card_with_state(

@@ -4793,7 +4793,7 @@ fn smoke_drm_addfb2_rmfb_roundtrip() -> TestResult {
     let mut arg = [0u8; 68];
     arg[4..8].copy_from_slice(&1920u32.to_le_bytes());
     arg[8..12].copy_from_slice(&1080u32.to_le_bytes());
-    arg[12..16].copy_from_slice(&0x3438_5258u32.to_le_bytes()); // XRGB8888
+    arg[12..16].copy_from_slice(&0x3432_5258u32.to_le_bytes()); // XRGB8888
     arg[20..24].copy_from_slice(&gem_handle.to_le_bytes());
     arg[36..40].copy_from_slice(&(1920u32 * 4).to_le_bytes());
     let fb_id = match dispatch(&mut card, 0xB8, &arg, &ctx) {
@@ -5153,7 +5153,7 @@ fn make_test_card_for_atomic() -> crate::drm::card::Card {
         y: 0,
     });
     let gh = card.gem.alloc(0x4000_0000, 1920 * 1080 * 4).unwrap();
-    card.addfb2(1920, 1080, 0x3438_5258, 1920 * 4, gh).unwrap();
+    card.addfb2(1920, 1080, 0x3432_5258, 1920 * 4, gh).unwrap();
     card
 }
 

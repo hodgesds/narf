@@ -231,7 +231,7 @@ int main(void) {
     memset(&fb, 0, sizeof fb);
     fb.width        = W;
     fb.height       = H;
-    fb.pixel_format = 0x34385258U; /* XR24 = XRGB8888 */
+    fb.pixel_format = 0x34325258U; /* XR24 = XRGB8888 */
     fb.handles[0]   = gem_handle;
     fb.pitches[0]   = pitch;
     if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fb) != 0 || fb.fb_id == 0) {

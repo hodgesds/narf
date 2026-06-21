@@ -147,9 +147,9 @@ pub struct Crtc {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PixelFormat {
-    Xrgb8888 = 0x3438_5258, // "XR24" little-endian
-    Argb8888 = 0x3438_3241, // "AR24"
-    Rgb565 = 0x3631_5247,   // "RG16"
+    Xrgb8888 = 0x3432_5258, // "XR24" little-endian
+    Argb8888 = 0x3432_5241, // "AR24"
+    Rgb565 = 0x3631_4752,   // "RG16"
 }
 
 /// Kernel-side framebuffer descriptor (result of ADDFB2).
@@ -378,9 +378,9 @@ impl Card {
         }
         // Validate pixel format.
         let format = match format {
-            0x3438_5258 => PixelFormat::Xrgb8888,
-            0x3438_3241 => PixelFormat::Argb8888,
-            0x3631_5247 => PixelFormat::Rgb565,
+            0x3432_5258 => PixelFormat::Xrgb8888,
+            0x3432_5241 => PixelFormat::Argb8888,
+            0x3631_4752 => PixelFormat::Rgb565,
             _ => return Err(CardError::UnknownFormat),
         };
         if self.framebuffers.len() >= 4096 {
