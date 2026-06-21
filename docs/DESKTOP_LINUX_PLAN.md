@@ -62,8 +62,19 @@ never accumulate unverifiable work.
   (user `timeval` read without SMAP bracket). Proven: `modetest -v` runs a
   continuous page-flip loop at ~44 Hz (`freq: 44.07Hz` …). Bounded
   `smoke_drm_flip_event_format` in CI. On `main`.
-- Next: the actual compositor. The DRM/KMS present loop + evdev input are
-  now in place, so the remaining work is the big userspace build —
+- **Rung 7 (compositor) — STARTED.** Sub-step 1 done: **AF_UNIX
+  `SCM_RIGHTS` fd-passing** — the Wayland transport primitive (clients
+  pass shm/dma-buf fds over the socket). `sendmsg`/`recvmsg` now parse
+  `msg_control`, resolve/install fds across the fd table, and write the
+  cmsg back. Proven by `/bin/scm_smoke` (passes stdout over a socketpair,
+  writes `scm-ok` THROUGH the received fd). musl-demo CI case. On `main`.
+  Remaining sub-steps: build libwayland (+libffi) + a minimal
+  compositor/client handshake; wl_shm buffers (uses the fd-passing);
+  composite client buffers to a DRM dumb buffer + page-flip (Rungs 3/6);
+  libinput over evdev (Rung 2).
+- The actual compositor. The DRM/KMS present loop + evdev input + the
+  Wayland fd-transport are now in place, so the remaining work is the big
+  userspace build —
   libwayland (+libffi) + a pixman-software compositor (weston `--use-pixman`
   or a minimal wlroots/custom compositor) + a Wayland client, OR Xorg +
   `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/
