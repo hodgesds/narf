@@ -206,6 +206,15 @@ pub struct VirtioNetPci {
     /// `irq_vector`. This is what makes a multi-queue NIC wake every
     /// forwarder on its own interrupt instead of pairs 1..N blind-sleeping.
     pub rx_irq_vectors: alloc::vec::Vec<Option<u8>>,
+    /// Whether to use flow-affine (4-tuple-hashed) TX queue selection vs
+    /// round-robin. Set true only when forwarders own dedicated cores
+    /// (`partition`, set in `enable_rx_msix_all`): flow affinity makes a
+    /// connection sticky to one queue → one forwarder CPU, which only helps
+    /// when those CPUs are distinct from the workers. When forwarders share a
+    /// core (single-vCPU / single-threaded server), the per-TX hash is pure
+    /// overhead and round-robin's even packet spread is better — so we fall
+    /// back to round-robin, matching pre-RSS behaviour exactly (zero cost).
+    flow_affine: bool,
     /// Per-queue MSI-X vector for TX completions on pair 0. `None`
     /// = caller hasn't called `enable_tx_msix` yet, TX uses polled
     /// used-ring drain.
@@ -370,7 +379,16 @@ impl VirtioNetPci {
         // enable a pair count through the control queue). Reject MQ
         // when the device skipped F_CTRL_VQ — keeps the pair vector
         // single-entry and avoids a control-queue-less code path.
-        let want_mq = (feats & (1u64 << VIRTIO_NET_F_MQ) != 0) && want_ctrl_vq;
+        // Multi-queue only earns its keep with more than one CPU to drain the
+        // queues IN PARALLEL. On a single vCPU one core polls every queue, so a
+        // 2nd RX queue just adds a 2nd forwarder task spinning on that same core
+        // — pure overhead (measurably slower for a single-threaded server like
+        // redis). Stay single-queue at smp=1: one forwarder, no flow-affine
+        // hash, no per-queue MSI-X. `online_count()` is accurate here (probe
+        // runs after AP bring-up — the `partition` logic below relies on it).
+        let want_mq = (feats & (1u64 << VIRTIO_NET_F_MQ) != 0)
+            && want_ctrl_vq
+            && narf_lib::smp::online_count() > 1;
         // F_CTRL_MAC_ADDR gates MAC_ADDR_SET via the control queue.
         // Same dependency as F_MQ: needs F_CTRL_VQ first.
         let want_ctrl_mac_addr =
@@ -648,6 +666,7 @@ impl VirtioNetPci {
             tx_rr: AtomicU64::new(0),
             irq_vector: None,
             rx_irq_vectors: alloc::vec::Vec::new(),
+            flow_affine: false,
             tx_irq_vector: None,
             msix: None,
             ready: true,
@@ -743,8 +762,21 @@ impl VirtioNetPci {
         // the same CPU so the wake is local.
         let online = narf_lib::smp::online_count() as usize;
         let partition = num_pairs >= 2 && online > num_pairs;
-        let mut targets: alloc::vec::Vec<(u16, u32)> = alloc::vec::Vec::with_capacity(num_pairs);
-        for k in 0..num_pairs {
+        // Gate flow-affine TX on the same condition (see the `flow_affine`
+        // field): sticky-queue TX only helps when forwarders own distinct CPUs.
+        self.flow_affine = partition;
+        // Per-queue MSI-X only PAYS OFF when each forwarder owns a core
+        // (`partition`): then pair K's RX IRQ lands on CPU K, a dedicated
+        // forwarder core, waking it without disturbing any worker. When
+        // forwarders SHARE a core with workers (`!partition` — a single-vCPU
+        // guest, or a single-threaded server like redis), an extra queue's IRQ
+        // instead INTERRUPTS the busy worker core on every burst (~5% redis
+        // throughput at smp=1). So bind a vector for pairs 1..N only under
+        // `partition`; pair 0 always keeps its (BSP) MSI-X. Ungated pairs fall
+        // back to the polled cadence — exactly the pre-per-queue behaviour.
+        let msix_pairs = if partition { num_pairs } else { 1 };
+        let mut targets: alloc::vec::Vec<(u16, u32)> = alloc::vec::Vec::with_capacity(msix_pairs);
+        for k in 0..msix_pairs {
             let cpu = if partition { k } else { 0 };
             // Fall back to the BSP's APIC id (cpu 0) if the topology lookup
             // fails — delivery still works, just not core-local.
@@ -890,16 +922,19 @@ impl VirtioNetPci {
     }
 
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
-        // Flow-affine TX queue: hash the 4-tuple so the connection stays
-        // sticky to one queue/forwarder/CPU (see `tx_pair_for_frame`). The
-        // frame body sits at buf[12..12+frame_len] (after the virtio header).
-        // Validated +19% over round-robin at Q=4 CONNS=64 (both with per-queue
-        // MSI-X): round-robin flaps a conn across queues → cache + cross-core
-        // wake thrash; stickiness fixes it. Neutral at Q=2.
-        let pair_idx = {
+        // Flow-affine TX (hash the 4-tuple → sticky queue/forwarder/CPU, see
+        // `tx_pair_for_frame`) ONLY when `flow_affine` (forwarders own
+        // dedicated cores). Validated +19% over round-robin at Q=4 CONNS=64
+        // with per-queue MSI-X. Otherwise round-robin: cheaper (no per-TX hash)
+        // and better-balanced for shared-core / single-threaded servers —
+        // exactly pre-RSS behaviour, zero added cost. Frame body at
+        // buf[12..12+frame_len] (after the virtio header).
+        let pair_idx = if self.flow_affine {
             let end = (12 + frame_len as usize).min(buf.len());
             let frame = buf.as_slice().get(12..end).unwrap_or(&[]);
             self.tx_pair_for_frame(frame)
+        } else {
+            self.next_tx_pair()
         };
         self.tx_dma_on(pair_idx, buf, frame_len)
     }
@@ -1345,35 +1380,28 @@ fn flow_tx_pair(frame: &[u8], npairs: usize) -> Option<usize> {
     if npairs <= 1 {
         return Some(0);
     }
-    // Ethernet: 12 bytes of addresses, then a 2-byte ethertype.
-    if frame.len() < 14 {
+    // TX HOT PATH — one call per transmitted frame, so it must be cheap. The
+    // queue is a pure function of the 4-tuple (constant per connection), so we
+    // only need a fast, consistent hash, not a parser. Fast path for the
+    // overwhelming common case: IPv4 with a 20-byte header (no options).
+    // ethertype 0x0800 at [12..14]; IPv4 version+IHL 0x45 at [14]. With
+    // eth(14) + ip(20): src_ip [26..30], dst_ip [30..34], L4 ports [34..38].
+    // After the single `len() < 38` check the compiler proves every fixed
+    // index in-bounds and elides the per-field bounds checks. Anything else
+    // (IPv6, IP options, runt, non-0x45) → None → caller round-robins (those
+    // are low-volume; flow affinity doesn't matter for them).
+    if frame.len() < 38 || frame[12] != 0x08 || frame[13] != 0x00 || frame[14] != 0x45 {
         return None;
     }
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype != 0x0800 {
-        return None; // not IPv4 (ARP 0x0806, IPv6 0x86dd, …)
-    }
-    let ip = frame.get(14..)?;
-    if ip.len() < 20 || (ip[0] >> 4) != 4 {
-        return None;
-    }
-    let ihl = ((ip[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || ip.len() < ihl {
-        return None;
-    }
-    let src = u32::from_be_bytes([ip[12], ip[13], ip[14], ip[15]]);
-    let dst = u32::from_be_bytes([ip[16], ip[17], ip[18], ip[19]]);
-    let mut h = src ^ dst;
-    let proto = ip[9];
-    if proto == 6 || proto == 17 {
-        if let Some(l4) = ip.get(ihl..ihl + 4) {
-            let sport = u16::from_be_bytes([l4[0], l4[1]]);
-            let dport = u16::from_be_bytes([l4[2], l4[3]]);
-            h ^= ((sport ^ dport) as u32).wrapping_mul(0x0001_0001);
-        }
-    }
-    // xorshift-multiply finaliser (Murmur3 fmix-style) so `% npairs` sees
-    // entropy from the whole tuple, not just the port low bits.
+    // Endianness is irrelevant for a hash — only per-flow consistency matters.
+    // `ports.rotate_left(16) ^ ports` and `src ^ dst` are symmetric in
+    // (src,dst)/(sport,dport), so the hash is identical for either flow
+    // direction (matches the host tun's symmetric steering). One
+    // xorshift-multiply finaliser scatters the low bits `% npairs` selects.
+    let src = u32::from_ne_bytes([frame[26], frame[27], frame[28], frame[29]]);
+    let dst = u32::from_ne_bytes([frame[30], frame[31], frame[32], frame[33]]);
+    let ports = u32::from_ne_bytes([frame[34], frame[35], frame[36], frame[37]]);
+    let mut h = src ^ dst ^ ports.rotate_left(16) ^ ports;
     h ^= h >> 16;
     h = h.wrapping_mul(0x7feb_352d);
     h ^= h >> 15;
