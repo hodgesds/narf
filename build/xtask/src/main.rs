@@ -1728,24 +1728,12 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // socketpair — proves the Wayland wire protocol + transport on NARF.
         ("wl_handshake", "wl-ok"),
         ("wl_shm", "shm-ok"),
-        ("mini_compositor", "px=00c0ffee"),
-        ("wl_2proc", "2proc-ok 1280x800"),
-        ("wl_multi", "b=00bada55"),
-        // xdg-shell window mapping (xdg_wm_base/xdg_surface/xdg_toplevel) —
-        // the protocol every real GUI toolkit uses to map a top-level window.
-        ("wl_xdg", "xdg-ok 1280x800"),
-        // wl_seat input delivery — compositor sends a synthetic keypress over
-        // wl_keyboard to the focused window; keymap fd is reverse SCM_RIGHTS.
-        ("wl_input", "input-ok 1280x800 key=30"),
-        // KMS page-flip presentation — compositor scans out client buffers via
-        // a DRM dumb buffer + PAGE_FLIP (not a direct fbdev blit).
-        ("wl_kms", "kms-ok 1280x800"),
-        // Real evdev->wl_seat bridge: compositor injects via /dev/uinput, reads
-        // the resulting /dev/input/eventN, forwards the key over wl_keyboard.
-        ("wl_evdev", "evdev-ok 1280x800 key=30"),
-        // First unmodified off-the-shelf GUI client: weston-simple-shm maps an
-        // xdg_toplevel + renders a wl_shm frame our compositor composites.
-        ("wl_app", "app-ok 1280x800 win=250x250"),
+        // NOTE: the multi-process Wayland compositor cases (mini_compositor,
+        // wl_2proc, wl_multi, wl_xdg, wl_input, wl_kms, wl_evdev, wl_app) run
+        // in their OWN fresh boots via GUI_FRESH_BOOT below — each forks a
+        // compositor + client(s) and maps the framebuffer, and that state
+        // accumulates across this single long-lived VM (a later case then
+        // hangs nondeterministically). One boot per case keeps them reliable.
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
@@ -1754,10 +1742,13 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
         // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.
         ("modetest -M narf-drm", "(1280x800)"),
-        // modetest -s actually sets a video mode + presents an SMPTE test
-        // pattern: CREATE_DUMB → draw → ADDFB2 → SETCRTC (blit to scanout).
-        // First real visual output from a third-party graphics program.
-        ("modetest -M narf-drm -s 3@1:1280x800", "crtc 1"),
+        // NOTE: `modetest -s 3@1:1280x800` (set a mode + present an SMPTE
+        // pattern) is NOT an auto case — `modetest -s` holds the mode and
+        // blocks on stdin (interactive), so it never returns to the shell
+        // prompt. The CREATE_DUMB → ADDFB2 → SETCRTC modeset path it exercises
+        // is already covered for CI by `drm_smoke`; run it by hand for a
+        // visual check: `xtask run-interactive --cmd "modetest -M narf-drm -s
+        // 3@1:1280x800" --expect "crtc 1"`.
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
@@ -1876,7 +1867,31 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
     // runtime, so amortizing it across all commands is the big win.
     // The VM keeps its full multi-vCPU/NUMA topology so concurrency
     // bugs still surface.
-    let (passed, failed) = run_interactive_multi(args, cases)?;
+    let (mut passed, mut failed) = run_interactive_multi(args, cases)?;
+
+    // Heavy multi-process Wayland compositor cases — each forks a compositor
+    // + client(s) and maps the framebuffer. That per-process state accumulates
+    // across a single long-lived VM and makes a later case hang
+    // nondeterministically, so each gets its OWN fresh boot. They pass
+    // reliably in isolation. The TCG boot is amortized for the ~80 lightweight
+    // cases above; these few extra boots are the price of robust GUI coverage.
+    const GUI_FRESH_BOOT: &[(&str, &str)] = &[
+        ("mini_compositor", "px=00c0ffee"),
+        ("wl_2proc", "2proc-ok 1280x800 px=00c0ffee"),
+        ("wl_multi", "b=00bada55"),
+        ("wl_xdg", "xdg-ok 1280x800 px=00c0ffee"),
+        ("wl_input", "input-ok 1280x800 key=30"),
+        ("wl_kms", "kms-ok 1280x800 px=00c0ffee flip=1"),
+        ("wl_evdev", "evdev-ok 1280x800 key=30"),
+        ("wl_app", "app-ok 1280x800 win=250x250"),
+    ];
+    for case in GUI_FRESH_BOOT {
+        eprintln!("\nmusl-demo (fresh boot): {}", case.0);
+        let (p, f) = run_interactive_multi(args, core::slice::from_ref(case))?;
+        passed += p;
+        failed += f;
+    }
+
     eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
     if failed > 0 {
         bail!("musl-demo failed ({} errors)", failed);
