@@ -3078,7 +3078,7 @@ pub mod linux_compat {
 // Build a Linux-shaped struct stat from a `narf_filesystem::Stat`.
 // Same conventions as sys_statx (uid/gid/atime not tracked).
 #[cfg(feature = "linux-compat")]
-fn linux_stat_from_fs(s: narf_filesystem::Stat) -> linux_compat::Stat {
+fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64) -> linux_compat::Stat {
     let ftype_bits: u32 = match s.mode.file_type {
         narf_filesystem::FileType::File => 0o100000,
         narf_filesystem::FileType::Dir => 0o040000,
@@ -3100,7 +3100,7 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat) -> linux_compat::Stat {
         st_uid: 0,
         st_gid: 0,
         __pad0: 0,
-        st_rdev: 0,
+        st_rdev: rdev,
         st_size: s.size as i64,
         st_blksize: 4096,
         st_blocks: s.blocks as i64,
@@ -3162,7 +3162,9 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let out = linux_stat_from_fs(s);
+    // Path-based stat doesn't carry the FileOps, so rdev isn't available here
+    // (device nodes report it via fstat on the opened fd — what libinput uses).
+    let out = linux_stat_from_fs(s, 0);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment
@@ -3193,15 +3195,15 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
-    let stat = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.stat()));
-    let s = match stat {
-        Some(Some(s)) => s,
+    let stat = fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.stat(), e.ops.rdev())));
+    let (s, rdev) = match stat {
+        Some(Some(pair)) => pair,
         _ => {
             ctx.set_return(fail);
             return;
         }
     };
-    let out = linux_stat_from_fs(s);
+    let out = linux_stat_from_fs(s, rdev);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment

@@ -482,6 +482,15 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// Device number reported in `stat.st_rdev` for a device node
+    /// (`FileType::Special`). Linux dev_t encoding: `(major << 8) | minor`
+    /// for the common small-number range. Default 0 (not a device); device
+    /// nodes (evdev, framebuffer, …) override it. libinput matches an
+    /// opened evdev fd's `st_rdev` against udev's MAJOR:MINOR.
+    fn rdev(&self) -> u64 {
+        0
+    }
+
     /// True when a blocking read on this fd (a pipe with an open writer
     /// and empty buffer) should park rather than return a spurious 0.
     fn read_should_block(&self) -> bool {

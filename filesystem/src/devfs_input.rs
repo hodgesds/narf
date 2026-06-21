@@ -409,6 +409,15 @@ impl FileOps for InputEventFile {
         }
     }
 
+    fn rdev(&self) -> u64 {
+        // Linux INPUT_MAJOR = 13; evdev minors start at 64 (event<N> = 64+N).
+        // dev_t = (major << 8) | minor for this small-number range. libinput
+        // matches this against udev's MAJOR:MINOR for the opened fd.
+        let major = 13u64;
+        let minor = 64 + self.event_num as u64;
+        (major << 8) | minor
+    }
+
     /// Poll readiness: `POLL_IN` if the ring has any events queued.
     ///
     /// Uses `has_pending()` (non-destructive) so the check does not
