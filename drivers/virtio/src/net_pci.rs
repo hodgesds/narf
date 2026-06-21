@@ -379,16 +379,7 @@ impl VirtioNetPci {
         // enable a pair count through the control queue). Reject MQ
         // when the device skipped F_CTRL_VQ — keeps the pair vector
         // single-entry and avoids a control-queue-less code path.
-        // Multi-queue only earns its keep with more than one CPU to drain the
-        // queues IN PARALLEL. On a single vCPU one core polls every queue, so a
-        // 2nd RX queue just adds a 2nd forwarder task spinning on that same core
-        // — pure overhead (measurably slower for a single-threaded server like
-        // redis). Stay single-queue at smp=1: one forwarder, no flow-affine
-        // hash, no per-queue MSI-X. `online_count()` is accurate here (probe
-        // runs after AP bring-up — the `partition` logic below relies on it).
-        let want_mq = (feats & (1u64 << VIRTIO_NET_F_MQ) != 0)
-            && want_ctrl_vq
-            && narf_lib::smp::online_count() > 1;
+        let want_mq = (feats & (1u64 << VIRTIO_NET_F_MQ) != 0) && want_ctrl_vq;
         // F_CTRL_MAC_ADDR gates MAC_ADDR_SET via the control queue.
         // Same dependency as F_MQ: needs F_CTRL_VQ first.
         let want_ctrl_mac_addr =
