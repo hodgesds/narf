@@ -1728,6 +1728,7 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // socketpair — proves the Wayland wire protocol + transport on NARF.
         ("wl_handshake", "wl-ok"),
         ("wl_shm", "shm-ok"),
+        ("mini_compositor", "px=00c0ffee"),
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.

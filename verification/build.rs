@@ -308,6 +308,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_SHM_ELF_X86_64={}", wlshm.display());
     println!("cargo:rustc-env=NARF_WL_SHM_ELF_AARCH64=/dev/null");
 
+    // mini_compositor — a minimal Wayland compositor that blits a client's
+    // wl_shm buffer onto /dev/fb0. The convergence of the desktop rungs.
+    println!("cargo:rerun-if-changed=data/musl-demo/mini_compositor_x86_64");
+    let mc = manifest_dir.join("data/musl-demo/mini_compositor_x86_64");
+    println!("cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_X86_64={}", mc.display());
+    println!("cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

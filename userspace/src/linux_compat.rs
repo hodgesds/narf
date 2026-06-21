@@ -151,9 +151,59 @@ pub const F_SEAL_WRITE: u32 = 0x0008;
 pub const F_SEAL_ALL: u32 = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
 
 /// Wave-70 memfd_create backing. Anonymous growable byte buffer +
+/// Page-frame-backed store for a memfd. The content lives in dedicated
+/// physical frames (page-aligned, never relocated) rather than a heap
+/// `Vec<u8>`, so two `MAP_SHARED` mappings of the same memfd — e.g. a
+/// Wayland client and the compositor sharing a wl_shm pool — alias the
+/// same memory. `mmap_frames` hands these frames to `sys_mmap`.
+struct MemfdStore {
+    /// Backing page frames (zeroed on allocation). `frames[i]` covers
+    /// bytes `[i*4096, (i+1)*4096)`.
+    frames: Vec<narf_memory::PhysFrame>,
+    /// Logical file length (may be < frames.len()*4096).
+    len: usize,
+}
+
+impl MemfdStore {
+    /// Grow the frame list to cover `pages` pages, zeroing new frames.
+    /// Returns false on allocation failure.
+    fn ensure_pages(&mut self, pages: usize) -> bool {
+        while self.frames.len() < pages {
+            match narf_memory::alloc_frame() {
+                Ok(f) => {
+                    // SAFETY: a freshly-allocated frame is identity-mapped
+                    // (x86_64 KERNEL_PHYS_OFFSET == 0) and owned by us.
+                    unsafe {
+                        core::ptr::write_bytes(f.start_address().raw() as *mut u8, 0, 4096);
+                    }
+                    self.frames.push(f);
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Identity-mapped pointer to backing page `page`.
+    fn page_ptr(&self, page: usize) -> *mut u8 {
+        self.frames[page].start_address().raw() as *mut u8
+    }
+}
+
+impl Drop for MemfdStore {
+    fn drop(&mut self) {
+        // NOTE: a mapping that outlives the memfd fd (close-then-use, which
+        // Linux permits) would dangle. The shm pattern keeps the fd open for
+        // the mapping's lifetime, so this is sound in practice.
+        for f in self.frames.drain(..) {
+            narf_memory::free_frame(f);
+        }
+    }
+}
+
 /// a Linux-shaped seal word. Read/write/truncate respect seals.
 pub struct MemFdFile {
-    bytes: IrqSafeSpinLock<Vec<u8>>,
+    store: IrqSafeSpinLock<MemfdStore>,
     seals: AtomicU32,
     /// Whether sealing is allowed (MFD_ALLOW_SEALING). When false,
     /// every F_ADD_SEALS returns -EPERM and F_GET_SEALS returns
@@ -164,7 +214,7 @@ pub struct MemFdFile {
 impl core::fmt::Debug for MemFdFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MemFdFile")
-            .field("len", &self.bytes.lock().len())
+            .field("len", &self.store.lock().len)
             .field("seals", &self.seals.load(Ordering::Relaxed))
             .field("allow_sealing", &self.allow_sealing)
             .finish()
@@ -178,7 +228,10 @@ impl MemFdFile {
         // must return F_SEAL_SEAL per Linux man-page semantics.
         let initial_seals = if allow { 0 } else { F_SEAL_SEAL };
         Arc::new(Self {
-            bytes: IrqSafeSpinLock::new(Vec::new()),
+            store: IrqSafeSpinLock::new(MemfdStore {
+                frames: Vec::new(),
+                len: 0,
+            }),
             seals: AtomicU32::new(initial_seals),
             allow_sealing: allow,
         })
@@ -207,16 +260,40 @@ impl MemFdFile {
     }
 }
 
+/// Copy `buf.len()` bytes between a byte slice and the frame store at byte
+/// `off`. `to_store=true` writes buf→store, false reads store→buf. The
+/// caller guarantees the store covers `[off, off+buf.len())`.
+fn store_copy(store: &MemfdStore, off: usize, buf: &mut [u8], to_store: bool) {
+    let mut done = 0;
+    while done < buf.len() {
+        let abs = off + done;
+        let page = abs / 4096;
+        let in_page = abs % 4096;
+        let n = core::cmp::min(buf.len() - done, 4096 - in_page);
+        // SAFETY: `page` is within the store's frames (caller-ensured), each
+        // frame is 4096 identity-mapped bytes; `in_page + n <= 4096`.
+        unsafe {
+            let p = store.page_ptr(page).add(in_page);
+            if to_store {
+                core::ptr::copy_nonoverlapping(buf[done..].as_ptr(), p, n);
+            } else {
+                core::ptr::copy_nonoverlapping(p, buf[done..].as_mut_ptr(), n);
+            }
+        }
+        done += n;
+    }
+}
+
 impl FileOps for MemFdFile {
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let g = self.bytes.lock();
+            let g = self.store.lock();
             let off = offset as usize;
-            if off >= g.len() {
+            if off >= g.len {
                 return Ok(0);
             }
-            let n = core::cmp::min(buf.len(), g.len() - off);
-            buf[..n].copy_from_slice(&g[off..off + n]);
+            let n = core::cmp::min(buf.len(), g.len - off);
+            store_copy(&g, off, &mut buf[..n], false);
             Ok(n)
         })
     }
@@ -227,31 +304,37 @@ impl FileOps for MemFdFile {
             if (seals & F_SEAL_WRITE) != 0 {
                 return Err(FsError::ReadOnly);
             }
-            let mut g = self.bytes.lock();
+            let mut g = self.store.lock();
             let off = offset as usize;
             let new_end = off + buf.len();
-            if new_end > g.len() {
-                if (seals & F_SEAL_GROW) != 0 {
-                    // Allow filling existing space only.
-                    if off >= g.len() {
-                        return Err(FsError::ReadOnly);
-                    }
-                    let n = g.len() - off;
-                    g[off..off + n].copy_from_slice(&buf[..n]);
-                    return Ok(n);
+            // F_SEAL_GROW: only fill existing space.
+            if new_end > g.len && (seals & F_SEAL_GROW) != 0 {
+                if off >= g.len {
+                    return Err(FsError::ReadOnly);
                 }
-                g.resize(new_end, 0);
+                let n = g.len - off;
+                let mut tmp = buf[..n].to_vec();
+                store_copy(&g, off, &mut tmp, true);
+                return Ok(n);
             }
-            g[off..off + buf.len()].copy_from_slice(buf);
+            let pages = new_end.div_ceil(4096);
+            if !g.ensure_pages(pages) {
+                return Err(FsError::Unsupported);
+            }
+            if new_end > g.len {
+                g.len = new_end;
+            }
+            let mut tmp = buf.to_vec();
+            store_copy(&g, off, &mut tmp, true);
             Ok(buf.len())
         })
     }
 
     fn stat(&self) -> Stat {
-        let g = self.bytes.lock();
+        let g = self.store.lock();
         Stat {
-            size: g.len() as u64,
-            blocks: (g.len() as u64).div_ceil(512),
+            size: g.len as u64,
+            blocks: (g.len as u64).div_ceil(512),
             mode: Mode::FILE_RW,
             mtime_cycles: 0,
         }
@@ -260,16 +343,41 @@ impl FileOps for MemFdFile {
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let seals = self.seals.load(Ordering::Acquire);
-            let mut g = self.bytes.lock();
-            let cur = g.len() as u64;
+            let mut g = self.store.lock();
+            let cur = g.len as u64;
             if len < cur && (seals & F_SEAL_SHRINK) != 0 {
                 return Err(FsError::ReadOnly);
             }
             if len > cur && (seals & F_SEAL_GROW) != 0 {
                 return Err(FsError::ReadOnly);
             }
-            g.resize(len as usize, 0);
+            // Allocate frames up-front (the shm pattern truncates to the pool
+            // size before mmap). Shrinking keeps frames to avoid dangling an
+            // active mapping; only `len` changes.
+            let pages = (len as usize).div_ceil(4096);
+            if !g.ensure_pages(pages) {
+                return Err(FsError::Unsupported);
+            }
+            g.len = len as usize;
             Ok(())
         })
+    }
+
+    /// `MAP_SHARED` backing — return the physical frames for the byte range
+    /// `[offset, offset+len)` so both mappers alias the same memory. This is
+    /// what makes wl_shm work: the compositor sees the client's pixels.
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
+        if offset & 0xFFF != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let mut g = self.store.lock();
+        let start = (offset as usize) / 4096;
+        let pages = len.div_ceil(4096);
+        if !g.ensure_pages(start + pages) {
+            return Err(FsError::Unsupported);
+        }
+        Ok((start..start + pages)
+            .map(|p| g.frames[p].start_address().raw())
+            .collect())
     }
 }
