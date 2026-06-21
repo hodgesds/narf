@@ -293,6 +293,14 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_MODETEST_ELF_AARCH64=/dev/null");
 
+    // wl_handshake — a libwayland client+server registry handshake over a
+    // socketpair (libwayland 1.23 + libffi, static-musl). Rung 7: proves the
+    // Wayland wire protocol + transport work on NARF. Recipe: REGEN_wl_handshake.sh.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_handshake_x86_64");
+    let wl = manifest_dir.join("data/musl-demo/wl_handshake_x86_64");
+    println!("cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_X86_64={}", wl.display());
+    println!("cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

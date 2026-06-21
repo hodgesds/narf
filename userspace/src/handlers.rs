@@ -17228,6 +17228,13 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
 
             ctx.set_return(SyscallReturn::ok(n as u64));
         }
+        // A non-blocking recv with no data must report EAGAIN, not the bare
+        // -1 sentinel (which musl maps to EPERM). libwayland's connection
+        // reader treats anything but EAGAIN as a fatal "failed to read
+        // client connection".
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        }
         _ => ctx.set_return(fail),
     }
 }

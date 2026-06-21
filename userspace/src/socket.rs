@@ -70,6 +70,7 @@ pub const SO_RCVBUF: u32 = 8;
 pub const SO_KEEPALIVE: u32 = 9;
 pub const SO_LINGER: u32 = 13;
 pub const SO_REUSEPORT: u32 = 15;
+pub const SO_PEERCRED: u32 = 17;
 pub const SO_BINDTODEVICE: u32 = 25;
 pub const SO_PROTOCOL: u32 = 38;
 pub const SO_DOMAIN: u32 = 39;
@@ -1243,6 +1244,20 @@ impl SocketFile {
                 SocketOpResult::OptValue { n }
             }
             (SOL_SOCKET, SO_TYPE) => write_u32(buf, self.kind),
+            // SO_PEERCRED → struct ucred { pid_t pid; uid_t uid; gid_t gid; }
+            // (12 bytes). NARF has no real user model and doesn't track per-
+            // socket peer credentials yet, so report a synthetic root ucred.
+            // libwayland's wl_client_create queries this for client identity
+            // and only stores it (no validation) — enough for the handshake.
+            (SOL_SOCKET, SO_PEERCRED) => {
+                if buf.len() < 12 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                buf[0..4].copy_from_slice(&1u32.to_ne_bytes()); // pid
+                buf[4..8].copy_from_slice(&0u32.to_ne_bytes()); // uid (root)
+                buf[8..12].copy_from_slice(&0u32.to_ne_bytes()); // gid (root)
+                SocketOpResult::OptValue { n: 12 }
+            }
             (SOL_SOCKET, SO_DOMAIN) => write_u32(buf, self.domain as u32),
             (SOL_SOCKET, SO_PROTOCOL) => write_u32(buf, self.protocol),
             (IPPROTO_TCP, TCP_NODELAY) => write_bool(buf, opts.tcp_nodelay),
