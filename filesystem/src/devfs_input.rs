@@ -200,10 +200,19 @@ const BUS_VIRTUAL: u16 = 0x06;
 /// Fixed `nr` values for the non-parametric evdev ioctls.
 const EVIOC_NR_GVERSION: u32 = 0x01; // EVIOCGVERSION
 const EVIOC_NR_GID: u32 = 0x02; // EVIOCGID
+const EVIOC_NR_GPHYS: u32 = 0x07; // EVIOCGPHYS(len) — physical location string
+const EVIOC_NR_GUNIQ: u32 = 0x08; // EVIOCGUNIQ(len) — unique id string
+const EVIOC_NR_GPROP: u32 = 0x09; // EVIOCGPROP(len) — INPUT_PROP_* bitmap
+const EVIOC_NR_GMTSLOTS: u32 = 0x0a; // EVIOCGMTSLOTS(len) — MT slot state
 const EVIOC_NR_GNAME: u32 = 0x06; // EVIOCGNAME(len)
+const EVIOC_NR_GKEY: u32 = 0x18; // EVIOCGKEY(len) — current key state
+const EVIOC_NR_GLED: u32 = 0x19; // EVIOCGLED(len) — current LED state
+const EVIOC_NR_GSND: u32 = 0x1a; // EVIOCGSND(len) — current sound state
+const EVIOC_NR_GSW: u32 = 0x1b; // EVIOCGSW(len) — current switch state
 const EVIOC_NR_GBIT_BASE: u32 = 0x20; // EVIOCGBIT(ev, len) → 0x20 + ev
 const EVIOC_NR_GABS_BASE: u32 = 0x40; // EVIOCGABS(abs) → 0x40 + abs
 const EVIOC_NR_GRAB: u32 = 0x90; // EVIOCGRAB
+const EVIOC_NR_SCLOCKID: u32 = 0xa0; // EVIOCSCLOCKID — set the event clock
 
 /// Synthetic device name reported by `EVIOCGNAME`.
 const DEVICE_NAME: &[u8] = b"narf-input";
@@ -469,6 +478,32 @@ impl FileOps for InputEventFile {
             EVIOC_NR_GRAB => {
                 // EVIOCGRAB — accept and no-op (single-reader anyway).
                 Ok(0)
+            }
+            EVIOC_NR_SCLOCKID => {
+                // EVIOCSCLOCKID — libinput selects CLOCK_MONOTONIC at startup.
+                // Our event timestamps are already monotonic; accept + no-op.
+                Ok(0)
+            }
+            EVIOC_NR_GPROP
+            | EVIOC_NR_GMTSLOTS
+            | EVIOC_NR_GKEY
+            | EVIOC_NR_GLED
+            | EVIOC_NR_GSND
+            | EVIOC_NR_GSW
+            | EVIOC_NR_GPHYS
+            | EVIOC_NR_GUNIQ => {
+                // Property bitmap, multitouch-slot state, current key/LED/sound/
+                // switch state, and the phys/uniq strings. We synthesise none of
+                // these, but libevdev (libinput's backend) issues them at device
+                // init and treats a FAILURE — notably EVIOCGPROP — as fatal,
+                // rejecting the device. Report an all-zero buffer of the
+                // requested length: no properties set, no keys/LEDs/switches
+                // active, empty strings. Linux ref: `libevdev_set_fd`.
+                let zeros = alloc::vec![0u8; size];
+                // SAFETY: `arg` is the user buffer of `size` bytes, validated
+                // by the syscall layer before dispatch.
+                let n = unsafe { copy_to_user_bytes(arg, &zeros)? };
+                Ok(n as u64)
             }
             nr if (EVIOC_NR_GBIT_BASE..EVIOC_NR_GABS_BASE).contains(&nr) => {
                 // EVIOCGBIT(ev, len): nr = 0x20 + ev.  ev == 0 asks for
