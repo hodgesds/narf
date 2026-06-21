@@ -1726,6 +1726,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
         ("drm_smoke", "drm-ok"),
+        // modetest (real libdrm) enumerates /dev/dri/card0 end-to-end —
+        // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
+        // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.
+        ("modetest -M narf-drm", "(1280x800)"),
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
