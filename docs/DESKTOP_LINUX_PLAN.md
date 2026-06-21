@@ -107,6 +107,19 @@ never accumulate unverifiable work.
   multi-client serving (multiple connections / memfds / fd-passing in flight)
   — the hallmark of a desktop running >1 app. Worked first try, no new gaps.
   On main.
+- **Rung 8 (xdg-shell window mapping) — DONE.** Core Wayland only moves
+  pixels; every real GUI toolkit (GTK/Qt/SDL) maps its top-level window
+  through **xdg-shell** (`xdg_wm_base` → `xdg_surface` → `xdg_toplevel`) and
+  aborts at startup if the compositor doesn't advertise it. `/bin/wl_xdg`
+  forks a compositor advertising `xdg_wm_base` + an independent client that
+  drives the full map sequence: create `xdg_toplevel` → initial
+  `wl_surface.commit` (no buffer) → server sends `xdg_toplevel.configure` +
+  `xdg_surface.configure` → client `ack_configure` → attach a wl_shm buffer +
+  commit → the compositor composites the now-mapped window to `/dev/fb0`:
+  `xdg-ok 1280x800 px=00c0ffee`. The gateway to running unmodified toolkit
+  apps. Built on the libwayland pattern + xdg-shell protocol codegen
+  (`REGEN_wl_xdg.sh`); no new kernel gaps (prior transport work covered it).
+  musl-demo CI case. On `main`.
 
 ### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
 
@@ -123,10 +136,14 @@ never accumulate unverifiable work.
 
 ### Remaining toward a *usable* desktop (not yet done)
 
+- **Input**: a `wl_seat`/`wl_keyboard`/`wl_pointer` path so a mapped window
+  receives input — the compositor reads the Rung-2 evdev nodes and forwards
+  events to the focused client. (Real apps then need libinput, which wants a
+  udev shim.) This is the next rung: a window that *responds*.
 - Present via DRM/KMS page-flip instead of the direct fbdev blit (the Rung-6
   present path) — architecturally-correct presentation.
-- **Input**: libinput over the Rung-2 evdev nodes (libinput needs a udev shim).
-- **xdg-shell** windows so unmodified toolkit apps (GTK/Qt/SDL) can target it.
+- An unmodified toolkit app (an SDL2 or GTK program) mapping a real
+  `xdg_toplevel` against our compositor — now unblocked by Rung 8.
 - A real off-the-shelf compositor (weston `--use-pixman`) + clients, or Xorg +
   `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/dma-buf,
   more `epoll`/`signalfd`/`timerfd` edges, udev enumeration.
