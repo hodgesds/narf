@@ -68,10 +68,17 @@ never accumulate unverifiable work.
   `msg_control`, resolve/install fds across the fd table, and write the
   cmsg back. Proven by `/bin/scm_smoke` (passes stdout over a socketpair,
   writes `scm-ok` THROUGH the received fd). musl-demo CI case. On `main`.
-  Remaining sub-steps: build libwayland (+libffi) + a minimal
-  compositor/client handshake; wl_shm buffers (uses the fd-passing);
-  composite client buffers to a DRM dumb buffer + page-flip (Rungs 3/6);
-  libinput over evdev (Rung 2).
+  Sub-step 2 done: **libwayland runs on NARF.** libwayland 1.23 + libffi
+  (static-musl) — a client connects to a server over a socketpair and
+  completes the wl_display/wl_registry handshake, receiving the
+  wl_compositor global. Proven by `/bin/wl_handshake` → `wl-ok`. Surfaced
+  + fixed `getsockopt(SO_PEERCRED)` (wl_client_create) and `recvmsg`
+  returning `-EAGAIN` for WouldBlock (not the EPERM-mapped `-1`).
+  musl-demo CI case. On `main`.
+  Remaining sub-steps: wl_shm buffers (uses the fd-passing); composite
+  client buffers to a DRM dumb buffer + page-flip (Rungs 3/6); libinput
+  over evdev (Rung 2); then a real compositor + client (weston-pixman or a
+  minimal custom one) actually painting a window.
 - The actual compositor. The DRM/KMS present loop + evdev input + the
   Wayland fd-transport are now in place, so the remaining work is the big
   userspace build —
