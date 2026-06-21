@@ -99,7 +99,7 @@ pub use devfs::{
     mount_default as mount_devfs_default, register_dri_dir, register_snd_dir, register_tpm,
     unregister_tpm, DevFs,
 };
-pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile};
+pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,

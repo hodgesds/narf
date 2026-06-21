@@ -508,6 +508,215 @@ impl FileOps for InputEventFile {
     }
 }
 
+// ── UinputControlFile (/dev/uinput) ────────────────────────────────────────────
+//
+// The userspace input-injection control device.  Tools like ydotool/wtype
+// open `/dev/uinput`, declare the device's capabilities via a sequence of
+// `UI_SET_*BIT` ioctls, then `UI_DEV_CREATE` to register a virtual device.
+// Afterwards they `write()` packed 24-byte Linux `input_event` records,
+// which are routed through `ROUTER.dispatch()` to whichever reader opened
+// the newly-created `/dev/input/eventN` node.
+//
+// Linux ref: `drivers/input/misc/uinput.c`, `include/uapi/linux/uinput.h`.
+
+use narf_input::evdev::{DeviceCaps, DeviceNode};
+
+/// uinput ioctl type byte (`'U'` = 0x55). `UINPUT_IOCTL_BASE` in
+/// `include/uapi/linux/uinput.h`.
+const UINPUT_TYPE: u32 = b'U' as u32; // 0x55
+
+/// uinput ioctl `nr` values. Ref: `include/uapi/linux/uinput.h`.
+const UI_DEV_CREATE: u32 = 1; // _IO('U', 1)
+const UI_DEV_DESTROY: u32 = 2; // _IO('U', 2)
+const UI_DEV_SETUP: u32 = 3; // _IOW('U', 3, struct uinput_setup)
+const UI_SET_EVBIT: u32 = 100; // _IOW('U', 100, int)
+const UI_SET_KEYBIT: u32 = 101; // _IOW('U', 101, int)
+const UI_SET_RELBIT: u32 = 102; // _IOW('U', 102, int)
+const UI_SET_ABSBIT: u32 = 103; // _IOW('U', 103, int)
+const UI_SET_MSCBIT: u32 = 104; // _IOW('U', 104, int)
+const UI_SET_PHYS: u32 = 108; // _IOW('U', 108, char*)
+
+/// Mutable state behind the control file's lock.
+struct UinputInner {
+    /// Capabilities accumulated via `UI_SET_*BIT` before `UI_DEV_CREATE`.
+    caps: DeviceCaps,
+    /// `Some` once `UI_DEV_CREATE` has registered the virtual device with
+    /// `ROUTER`; `None` before creation or after `UI_DEV_DESTROY`.
+    created: Option<(DeviceId, Arc<DeviceNode>)>,
+}
+
+/// `/dev/uinput` — the userspace input-injection control device.
+///
+/// A single top-level character node (not a directory).  One open file
+/// owns one virtual input device for its lifetime: capability ioctls
+/// build up `DeviceCaps`, `UI_DEV_CREATE` registers it with `ROUTER`
+/// (so it appears as `/dev/input/eventN`), `write()` injects events, and
+/// `UI_DEV_DESTROY` tears it down.
+///
+/// State is held behind an `IrqSafeSpinLock`; the lock scope is kept tight
+/// and is never held across an `.await` (the ioctl path is synchronous and
+/// `write` only takes the lock to read the stored id, never across dispatch
+/// suspension — `dispatch` itself is synchronous).
+///
+/// Ref: `drivers/input/misc/uinput.c`.
+pub struct UinputControlFile {
+    inner: IrqSafeSpinLock<UinputInner>,
+}
+
+impl core::fmt::Debug for UinputControlFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let g = self.inner.lock();
+        f.debug_struct("UinputControlFile")
+            .field("created", &g.created.as_ref().map(|(id, _)| *id))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for UinputControlFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UinputControlFile {
+    /// Create a fresh, un-set-up control file (no device registered yet).
+    /// Each `open("/dev/uinput")` produces one of these.
+    pub fn new() -> Self {
+        Self {
+            inner: IrqSafeSpinLock::new(UinputInner {
+                caps: DeviceCaps::new(),
+                created: None,
+            }),
+        }
+    }
+}
+
+impl FileOps for UinputControlFile {
+    /// Inject events into the created virtual device.
+    ///
+    /// Mirrors `InputEventFile::write` for `UserDevice`: requires a device
+    /// to have been created (else `PermissionDenied`, as Linux returns
+    /// `-ENODEV` before `UI_DEV_CREATE`), requires `buf.len()` to be a
+    /// multiple of 24, and routes each unpacked record via `ROUTER.dispatch`.
+    ///
+    /// The stored `DeviceId` is read under the lock and the lock is dropped
+    /// before any dispatch loop — the lock is never held across `.await`.
+    ///
+    /// Ref: `uinput.c::uinput_write` → `uinput_inject_events`.
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            // Snapshot the created device id under a tight lock, then release.
+            let id = {
+                let g = self.inner.lock();
+                match g.created.as_ref() {
+                    Some((id, _)) => *id,
+                    None => return Err(FsError::PermissionDenied),
+                }
+            };
+            if buf.len() % LINUX_INPUT_EVENT_SIZE != 0 {
+                return Err(FsError::InvalidPath);
+            }
+            let mut consumed = 0usize;
+            let count = buf.len() / LINUX_INPUT_EVENT_SIZE;
+            for i in 0..count {
+                let src = &buf[i * LINUX_INPUT_EVENT_SIZE..(i + 1) * LINUX_INPUT_EVENT_SIZE];
+                if let Some(ev) = unpack_linux_event(src) {
+                    ROUTER.dispatch(id, ev);
+                }
+                consumed += LINUX_INPUT_EVENT_SIZE;
+            }
+            Ok(consumed)
+        })
+    }
+
+    /// The control file is write-only from userspace's perspective; reads
+    /// return 0 (Linux uinput supports reading FF requests, which NARF does
+    /// not synthesise, so EOF is the safe answer).
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+
+    /// Stat: character device, mode 0660 (matches `/dev/uinput` on Linux,
+    /// owned by root:input, crw-rw----).  Major 10, minor 223 on Linux;
+    /// we report a generic Special node.
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o660,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    /// uinput control ioctls.
+    ///
+    /// Decodes the `_IOC` word; only the `'U'` (0x55) type is handled.
+    /// `UI_SET_*BIT` arguments are passed by *value* (the keycode/axis
+    /// itself), not as a user pointer — so no user memory is dereferenced
+    /// for those.  Unknown `'U'` requests are accepted (return 0) to match
+    /// uinput's lenient setup contract; non-`'U'` types return `Unsupported`.
+    ///
+    /// Ref: `uinput.c::uinput_ioctl_handler`.
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        if ioc::typ(cmd) != UINPUT_TYPE {
+            return Err(FsError::Unsupported);
+        }
+        let nr = ioc::nr(cmd);
+        let mut g = self.inner.lock();
+        match nr {
+            UI_DEV_CREATE => {
+                // Register the accumulated caps with ROUTER. Idempotent: if a
+                // device is already created, leave it in place (Linux returns
+                // -EINVAL on double-create, but accepting is harmless here).
+                if g.created.is_none() {
+                    let caps = g.caps.clone();
+                    let (id, node) = ROUTER.register_device(caps);
+                    g.created = Some((id, node));
+                }
+                Ok(0)
+            }
+            UI_DEV_DESTROY => {
+                if let Some((id, _node)) = g.created.take() {
+                    ROUTER.unregister_device(id);
+                }
+                // Reset caps so the same fd can build a fresh device.
+                g.caps = DeviceCaps::new();
+                Ok(0)
+            }
+            UI_SET_EVBIT => {
+                // EV_* type bit: the evbit is derived implicitly from the
+                // per-type SET_*BIT calls, so accept and no-op here.
+                let _ = arg;
+                Ok(0)
+            }
+            UI_SET_KEYBIT => {
+                // arg IS the keycode (passed by value, not a pointer).
+                g.caps.add_key(arg as u16);
+                Ok(0)
+            }
+            UI_SET_RELBIT => {
+                g.caps.add_rel(arg as u16);
+                Ok(0)
+            }
+            UI_SET_ABSBIT => {
+                g.caps.add_abs(arg as u16);
+                Ok(0)
+            }
+            UI_SET_MSCBIT | UI_SET_PHYS | UI_DEV_SETUP => {
+                // Accept; we don't model misc bits, phys strings, or the
+                // uinput_setup name/id struct (the synthetic device name is
+                // reported by InputEventFile's EVIOCGNAME handler).
+                Ok(0)
+            }
+            // uinput is lenient about unknown setup-style requests.
+            _ => Ok(0),
+        }
+    }
+}
+
 // ── DevInputDir ───────────────────────────────────────────────────────────────
 
 /// `/dev/input/` directory node.

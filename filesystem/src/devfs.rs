@@ -834,6 +834,11 @@ impl DirOps for DevDir {
             "console" | "tty" | "tty0" => Some(Arc::new(DevConsole) as Arc<dyn FileOps>),
             "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
             "fb0" => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
+            // Userspace input-injection control device.
+            // Linux ref: `drivers/input/misc/uinput.c`.
+            "uinput" => {
+                Some(Arc::new(crate::devfs_input::UinputControlFile::new()) as Arc<dyn FileOps>)
+            }
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
             "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
             "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
@@ -934,6 +939,10 @@ impl DirOps for DevDir {
                 file_type: FileType::Special,
             },
             DirEntry {
+                name: "uinput",
+                file_type: FileType::Special,
+            },
+            DirEntry {
                 name: "fp0",
                 file_type: FileType::Special,
             },
@@ -984,6 +993,7 @@ impl DirOps for DevDir {
             ("tty0", FileType::Special),
             ("ptmx", FileType::Special),
             ("fb0", FileType::Special),
+            ("uinput", FileType::Special),
             ("fp0", FileType::Special),
             ("tpm0", FileType::Special),
             ("tpmrm0", FileType::Special),

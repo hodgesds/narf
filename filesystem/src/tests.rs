@@ -1704,3 +1704,112 @@ fn smoke_dev_input_eviocg_ioctls() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs_input", smoke_dev_input_eviocg_ioctls);
+
+/// 9. `/dev/uinput` end-to-end loopback: declare caps + create a virtual
+///    device via the control ioctls, inject an EV_KEY/KEY_A press through
+///    the control file's `write`, read it back from the new `eventN`
+///    reader, then destroy the device and confirm it disappears.
+///
+/// This is the userspace input-injection path (ydotool/wtype) exercised
+/// entirely in-kernel, with no musl and no hardware key events.
+fn smoke_uinput_loopback() -> TestResult {
+    use crate::devfs_input::{UinputControlFile, LINUX_INPUT_EVENT_SIZE};
+    use crate::FileOps;
+    use narf_input::evdev::key::KEY_A;
+    use narf_input::evdev::{EventType, ROUTER};
+
+    // _IOC(dir, 'U', nr, size) — uinput type byte is 'U' = 0x55.
+    fn ioc(dir: u32, nr: u32, size: u32) -> u32 {
+        (dir << 30) | (size << 16) | ((b'U' as u32) << 8) | nr
+    }
+    const NONE: u32 = 0;
+    const WRITE: u32 = 1;
+    const EV_KEY: u32 = 1;
+
+    // uinput ioctl nr values (linux/uinput.h).
+    const UI_DEV_CREATE: u32 = 1;
+    const UI_DEV_DESTROY: u32 = 2;
+    const UI_DEV_SETUP: u32 = 3;
+    const UI_SET_EVBIT: u32 = 100;
+    const UI_SET_KEYBIT: u32 = 101;
+
+    let before: alloc::vec::Vec<_> = ROUTER.device_ids();
+
+    let ctrl = UinputControlFile::new();
+
+    // Declare capabilities: EV_KEY support + KEY_A. For SET_*BIT the arg is
+    // the code VALUE itself, not a user pointer.
+    if ctrl.ioctl(ioc(WRITE, UI_SET_EVBIT, 4), EV_KEY as usize).is_err() {
+        return TestResult::Fail("UI_SET_EVBIT failed");
+    }
+    if ctrl
+        .ioctl(ioc(WRITE, UI_SET_KEYBIT, 4), KEY_A as usize)
+        .is_err()
+    {
+        return TestResult::Fail("UI_SET_KEYBIT failed");
+    }
+    // UI_DEV_SETUP: accepted no-op (we pass a null arg; handler must not deref).
+    if ctrl.ioctl(ioc(WRITE, UI_DEV_SETUP, 92), 0).is_err() {
+        return TestResult::Fail("UI_DEV_SETUP failed");
+    }
+    // Create the virtual device.
+    if ctrl.ioctl(ioc(NONE, UI_DEV_CREATE, 0), 0).is_err() {
+        return TestResult::Fail("UI_DEV_CREATE failed");
+    }
+
+    // A new device id must have appeared in the router.
+    let after: alloc::vec::Vec<_> = ROUTER.device_ids();
+    let new_id = match after.iter().find(|id| !before.contains(id)) {
+        Some(id) => *id,
+        None => return TestResult::Fail("UI_DEV_CREATE did not register a new device"),
+    };
+
+    // Open a reader on the freshly-created device (the eventN node).
+    let reader = match ROUTER.open_reader(new_id) {
+        Some(r) => r,
+        None => {
+            ctrl.ioctl(ioc(NONE, UI_DEV_DESTROY, 0), 0).ok();
+            return TestResult::Fail("open_reader returned None for created device");
+        }
+    };
+
+    // Build EV_KEY/KEY_A press + EV_SYN report, two 24-byte records.
+    let mut payload = [0u8; LINUX_INPUT_EVENT_SIZE * 2];
+    // Record 0: EV_KEY, KEY_A, value=1 (press).
+    payload[16..18].copy_from_slice(&(EventType::Key as u16).to_le_bytes());
+    payload[18..20].copy_from_slice(&KEY_A.to_le_bytes());
+    payload[20..24].copy_from_slice(&1i32.to_le_bytes());
+    // Record 1: EV_SYN, SYN_REPORT(0), value=0 — type/code/value all zero,
+    // which decodes to EventType::Syn so it is left as-is.
+
+    let write_result = poll_once_devfs_input(ctrl.write(0, &payload));
+    match write_result {
+        Some(Ok(n)) if n == LINUX_INPUT_EVENT_SIZE * 2 => {}
+        _ => {
+            ctrl.ioctl(ioc(NONE, UI_DEV_DESTROY, 0), 0).ok();
+            return TestResult::Fail("uinput write failed or wrong count");
+        }
+    }
+
+    // Read back the injected press from the reader.
+    let press = reader.poll_event();
+    let got_press = matches!(
+        press,
+        Some(e) if e.type_ == EventType::Key && e.code == KEY_A && e.value == 1
+    );
+    if !got_press {
+        ctrl.ioctl(ioc(NONE, UI_DEV_DESTROY, 0), 0).ok();
+        return TestResult::Fail("reader did not see injected EV_KEY/KEY_A press");
+    }
+
+    // Destroy the device; it must vanish from the router.
+    if ctrl.ioctl(ioc(NONE, UI_DEV_DESTROY, 0), 0).is_err() {
+        return TestResult::Fail("UI_DEV_DESTROY failed");
+    }
+    if ROUTER.device_ids().contains(&new_id) {
+        return TestResult::Fail("device still present after UI_DEV_DESTROY");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs_input", smoke_uinput_loopback);
