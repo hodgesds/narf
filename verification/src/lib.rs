@@ -3893,6 +3893,20 @@ pub const NARF_MT_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_MT_ECHO_ELF_X86_64
 ))]
 pub const NARF_MT_ECHO_ELF: &[u8] = include_bytes!(env!("NARF_MT_ECHO_ELF_AARCH64"));
 
+/// `/bin/modetest` — libdrm's KMS test tool (static-musl). A real
+/// third-party DRM client used to validate `/dev/dri/card0` against
+/// the actual libdrm ioctl encodings (Rung 4).
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_MODETEST_ELF: &[u8] = include_bytes!(env!("NARF_MODETEST_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_MODETEST_ELF: &[u8] = include_bytes!(env!("NARF_MODETEST_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

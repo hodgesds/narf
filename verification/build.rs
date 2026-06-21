@@ -280,6 +280,19 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_MT_ECHO_ELF_AARCH64=/dev/null");
 
+    // modetest — libdrm's standard KMS test tool, a real third-party DRM
+    // client. Static-musl build of libdrm 2.4.134 + tests/modetest
+    // (xf86drm*.c + tests/util + tests/modetest, musl-gcc -static); see
+    // data/musl-demo/REGEN_modetest.sh. Exercises /dev/dri/card0 through
+    // the actual libdrm ioctl encodings — the Rung 4 desktop-Linux probe.
+    println!("cargo:rerun-if-changed=data/musl-demo/modetest_x86_64");
+    let modetest = manifest_dir.join("data/musl-demo/modetest_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_MODETEST_ELF_X86_64={}",
+        modetest.display()
+    );
+    println!("cargo:rustc-env=NARF_MODETEST_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).
