@@ -99,6 +99,12 @@ never accumulate unverifiable work.
   Gaps fixed: stat() of a missing file → ENOENT (was EPERM); socket() masks
   SOCK_CLOEXEC/SOCK_NONBLOCK from the type (libwayland's SOCK_STREAM|
   SOCK_CLOEXEC was read as unknown → bind failed). musl-demo CI case. On main.
+  Sub-step 6 done: **multi-window — two apps at once.** /bin/wl_multi forks
+  TWO independent client processes; the compositor composites both side by
+  side on /dev/fb0: `multi-ok 1280x800 a=00c0ffee b=00bada55`. Concurrent
+  multi-client serving (multiple connections / memfds / fd-passing in flight)
+  — the hallmark of a desktop running >1 app. Worked first try, no new gaps.
+  On main.
   Remaining toward a usable desktop: present via DRM page-flip not the fbdev
   blit (Rung 6); libinput over evdev (Rung 2) for input; xdg-shell windows;
   then a real off-the-shelf compositor (weston --use-pixman) + client.
