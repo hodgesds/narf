@@ -62,7 +62,9 @@ never accumulate unverifiable work.
   (user `timeval` read without SMAP bracket). Proven: `modetest -v` runs a
   continuous page-flip loop at ~44 Hz (`freq: 44.07Hz` …). Bounded
   `smoke_drm_flip_event_format` in CI. On `main`.
-- **Rung 7 (compositor) — STARTED.** Sub-step 1 done: **AF_UNIX
+- **Rung 7 (Wayland compositor) — DONE (6 sub-steps).** A real Wayland
+  compositor runs multiple unmodified-libwayland GUI client processes on
+  NARF, drawing to the screen across process boundaries. Sub-step 1: **AF_UNIX
   `SCM_RIGHTS` fd-passing** — the Wayland transport primitive (clients
   pass shm/dma-buf fds over the socket). `sendmsg`/`recvmsg` now parse
   `msg_control`, resolve/install fds across the fd table, and write the
@@ -105,17 +107,29 @@ never accumulate unverifiable work.
   multi-client serving (multiple connections / memfds / fd-passing in flight)
   — the hallmark of a desktop running >1 app. Worked first try, no new gaps.
   On main.
-  Remaining toward a usable desktop: present via DRM page-flip not the fbdev
-  blit (Rung 6); libinput over evdev (Rung 2) for input; xdg-shell windows;
-  then a real off-the-shelf compositor (weston --use-pixman) + client.
-- The actual compositor. The DRM/KMS present loop + evdev input + the
-  Wayland fd-transport are now in place, so the remaining work is the big
-  userspace build —
-  libwayland (+libffi) + a pixman-software compositor (weston `--use-pixman`
-  or a minimal wlroots/custom compositor) + a Wayland client, OR Xorg +
-  `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/
-  dma-buf for client buffer sharing, more `epoll`/`signalfd`/`timerfd`
-  edge cases, and the Wayland Unix-socket fast paths.
+
+### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
+
+- `sendmsg`/`recvmsg` **`SCM_RIGHTS`** fd-passing over AF_UNIX (was ignored).
+- **Frame-backed memfd** so `MAP_SHARED` aliases the same physical frames
+  across mappings/processes (was an eager private copy) — the bedrock of all
+  shared-memory IPC (wl_shm, POSIX shm).
+- `recvmsg` returns **`-EAGAIN`** (not `-1`→EPERM) on a non-blocking empty read.
+- `stat`/`statx`/`newfstatat` of a missing file returns **`-ENOENT`** (not EPERM).
+- `socket()` masks **`SOCK_CLOEXEC`/`SOCK_NONBLOCK`** from the type before
+  categorising + applies them to the fd.
+- `getsockopt(SO_PEERCRED)` returns a (synthetic) ucred.
+- `sys_select` reads the user `timeval` through `copy_from_user` (SMAP #PF fix).
+
+### Remaining toward a *usable* desktop (not yet done)
+
+- Present via DRM/KMS page-flip instead of the direct fbdev blit (the Rung-6
+  present path) — architecturally-correct presentation.
+- **Input**: libinput over the Rung-2 evdev nodes (libinput needs a udev shim).
+- **xdg-shell** windows so unmodified toolkit apps (GTK/Qt/SDL) can target it.
+- A real off-the-shelf compositor (weston `--use-pixman`) + clients, or Xorg +
+  `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/dma-buf,
+  more `epoll`/`signalfd`/`timerfd` edges, udev enumeration.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
@@ -123,36 +137,35 @@ end-to-end proofs run from the **boot-init shell** (`run-interactive` /
 
 ---
 
-## Current state (2026-06-20)
+## Current state (updated 2026-06-20)
 
-What already exists:
+All of Rungs 0–7 below have **landed on `main`** — see the Progress section
+above for what each delivered and how it's CI-proven. In short, NARF now:
 
-- **virtio-gpu 2D driver** (`drivers/virtio/src/gpu_pci.rs`) — real
-  `GET_DISPLAY_INFO` → `RESOURCE_CREATE_2D` → `SET_SCANOUT` →
-  `TRANSFER_TO_HOST_2D`/`FLUSH`; hands back a `narf_graphics::Framebuffer`.
-- **virtio-keyboard** + `narf_input` evdev layer; `/dev/input` devfs bridge.
-- **font-rendering framebuffer console** (`graphics/`, `fb/`).
-- **DRM/KMS scaffold** (`drivers/gpu/src/drm/`): `/dev/dri/card0` +
-  `renderD128` nodes; enumeration ioctls (`VERSION`, `GET_CAP`,
-  `MODE_GETRESOURCES`, `MODE_GETCONNECTOR`, `MODE_ADDFB2`, `MODE_RMFB`,
-  `MODE_GETPLANE_RES`) implemented at struct level.
-- `xtask demo` boots a graphical (GTK) QEMU window — but only shows the
-  text console today.
+- maps device memory into userspace (the Rung-0 `FileOps::mmap_frames` +
+  `sys_mmap MAP_SHARED` keystone);
+- exposes `/dev/fb0` (Linux fbdev), `/dev/input/event*` (evdev), and
+  `/dev/dri/card0` (DRM/KMS dumb-buffer modeset) — each driven by a real
+  musl C smoke;
+- runs unmodified **libdrm** (`modetest` enumerates + sets a mode +
+  presents + page-flips);
+- runs unmodified **libwayland** (libffi + libwayland 1.23 static-musl): a
+  Wayland compositor serves **multiple independent GUI client processes**,
+  each passing a frame-backed shared buffer over the socket (`SCM_RIGHTS`)
+  that the compositor blits to the screen.
 
-The blocking gaps:
+The original pre-Rung-0 gaps once recorded here — "no device mmap",
+"DUMB_BUFFER returns 0", "card wired to amdgpu" — are all **resolved**. The
+card is the bochs/virtio-gpu DRM card; dumb buffers alloc/map/scanout;
+`SETCRTC` blits.
 
-- **No device `mmap`.** `FileOps` (`filesystem/src/lib.rs:346`) has
-  `read/write/ioctl/poll` but **no `mmap` hook**. `sys_mmap`
-  (`userspace/src/handlers.rs:4327`) handles only anonymous (lazy) and
-  `MAP_PRIVATE` file (eager copy) — there is **no shared device-memory
-  mapping** that maps existing physical/DMA frames into a user AS.
-- DRM `DUMB_BUFFER` cap returns 0 — no buffer alloc, no `MAP_DUMB`, no
-  `SETCRTC` (nothing actually scans out), no PRIME/dma-buf. Card is
-  wired to amdgpu, not virtio-gpu.
+The sections below are the **original rung specifications** (kept for
+reference / rationale). They describe the work as future TODO; it is all
+DONE — read the Progress section for the as-built outcome of each.
 
 ---
 
-## Rung 0 — KEYSTONE: shared device mmap  ⚠️ hard, do first, do carefully
+## Rung 0 — KEYSTONE: shared device mmap  ✅ DONE (original spec below)
 
 Everything graphical depends on userspace getting a CPU pointer to the
 scanout buffer whose writes reach the display. This is one focused piece
@@ -173,7 +186,7 @@ kernel-side check confirms its writes land in the backing frames.
 
 ---
 
-## Rung 1 — `/dev/fb0` (Linux fbdev) over virtio-gpu
+## Rung 1 — `/dev/fb0` (Linux fbdev) over virtio-gpu  ✅ DONE (original spec below)
 
 Simplest standard Linux graphics ABI; proves the keystone end-to-end.
 
@@ -191,7 +204,7 @@ asserts a known pixel.
 
 ---
 
-## Rung 2 — `/dev/input/event*` (evdev) keyboard + mouse
+## Rung 2 — `/dev/input/event*` (evdev) keyboard + mouse  ✅ DONE (original spec below)
 
 - Ensure virtio-keyboard + a virtio-mouse/tablet feed `/dev/input/eventN`
   with proper `struct input_event` records (the devfs_input bridge
@@ -203,7 +216,7 @@ driven by `xtask run-interactive` keystrokes.
 
 ---
 
-## Rung 3 — DRM dumb-buffer path on `/dev/dri/card0` over virtio-gpu  ⚠️ hard
+## Rung 3 — DRM dumb-buffer path on `/dev/dri/card0`  ✅ DONE (original spec below)
 
 The modern path (what Wayland/X/Mesa use). Reuses Rung-0 mmap.
 
@@ -219,7 +232,7 @@ pattern; `xtask drm-smoke` screendumps + asserts.
 
 ---
 
-## Rung 4 — first real unmodified Linux GUI program
+## Rung 4 — first real unmodified Linux GUI program  ✅ DONE (modetest; original spec below)
 
 Pick the lightest real client that exercises 1–3 end-to-end. Candidates,
 easiest first: `modetest`, a DirectFB/fbdev demo, `fbterm`, or a small
@@ -229,7 +242,7 @@ Verify: the program runs unmodified from the initramfs/rootfs and draws.
 
 ---
 
-## Rung 5+ — the long tail (each a major effort, scoped later)
+## Rung 5+ — the long tail (Rungs 5–7 DONE; the rest scoped later)
 
 - **dma-buf / PRIME** export+import (compositor ↔ client buffer sharing).
 - **Mesa software** (swrast/llvmpipe) on the render node → GL without HW.

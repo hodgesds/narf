@@ -1225,3 +1225,34 @@ What's landed since the Stage-4 close (post-deadline memory work):
 - **virtio-net multi-NIC**: prior `drain_pump` only walked one
   interface; mixed-NIC topologies dropped RX on every NIC past
   the first.
+
+### Desktop-Linux graphics track (June 2026)
+
+Goal: run **unmodified** Linux graphical software under QEMU, built as a
+dependency-ordered ladder (full plan + per-rung proofs in
+[`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md)). All landed on
+`main`, each rung CI-proven by a real musl binary via `xtask musl-demo`:
+
+- **Device mmap keystone** — `FileOps::mmap_frames(offset,len)` +
+  `sys_mmap` dispatch for `fd>=0 && MAP_SHARED` that aliases existing
+  device/DMA frames into the user AS as a borrowed `RegionPerms::SHARED`
+  region. Everything graphical hangs off userspace getting a CPU pointer
+  to scanout/shared memory.
+- **`/dev/fb0`** (Linux fbdev): read/write/mmap + `FBIOGET_VSCREENINFO`/
+  `FSCREENINFO`. `/bin/fb_smoke` draws + reads back → `fb-ok`.
+- **`/dev/input/event*`** (evdev): 24-byte Linux `input_event` wire +
+  `EVIOCG*`; virtio-tablet added to QEMU.
+- **`/dev/dri/card0`** (DRM/KMS): dumb-buffer modeset — CREATE/MAP/DESTROY
+  _DUMB, ADDFB2, SETCRTC (blits into scanout), PAGE_FLIP event delivery,
+  GEM_CLOSE. Runs unmodified **libdrm** (`modetest`: enumerate → modeset →
+  present SMPTE → ~44 Hz page-flip loop).
+- **Wayland** — libffi + libwayland 1.23 (static-musl). A Wayland
+  compositor serves **multiple independent GUI client processes**; each
+  passes a frame-backed shared buffer over the socket (`SCM_RIGHTS`) that
+  the compositor blits to `/dev/fb0`. `/bin/wl_multi` → `multi-ok`.
+- **Kernel-ABI fixes surfaced (help all Linux software)**: `SCM_RIGHTS`
+  fd-passing; frame-backed memfd so `MAP_SHARED` truly aliases physical
+  frames across processes; `recvmsg` `-EAGAIN` on empty non-blocking read;
+  `stat`/`statx` `-ENOENT` for missing files; `socket()` masks
+  `SOCK_CLOEXEC`/`SOCK_NONBLOCK`; `getsockopt(SO_PEERCRED)`; `sys_select`
+  SMAP bracket.

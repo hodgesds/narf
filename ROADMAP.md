@@ -106,7 +106,11 @@ see [`docs/PERSONAS.md`](docs/PERSONAS.md).
   ld-musl), `/dev/pts` PTY plumbing.
 - `drivers/nvme/` — block storage.
 - `drivers/net/` — network.
-- `drivers/gpu/` — graphics (may land partial in Stage 4, full later).
+- `drivers/gpu/` — graphics. DRM/KMS dumb-buffer modeset on `/dev/dri/card0`
+  (+ `/dev/fb0`, evdev) runs unmodified libdrm + libwayland under QEMU; a
+  Wayland compositor serves multiple GUI client processes. See
+  [`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md). Native AMDGPU
+  modeset on real silicon is later.
 - `drivers/hwmon/` — hardware monitoring: thermal/fan management (k10temp, coretemp, nct6775, dell_smm).
 - `drivers/usb/` — xHCI host controller + HID keyboard/mouse class
   + USB hub class; first USB device flows IRQ → BYTE_RING → fd 0.
