@@ -343,6 +343,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_INPUT_ELF_X86_64={}", wli.display());
     println!("cargo:rustc-env=NARF_WL_INPUT_ELF_AARCH64=/dev/null");
 
+    // wl_kms — present client buffers via DRM/KMS page-flip (dumb buffer +
+    // ADDFB2 + PAGE_FLIP) instead of a direct fbdev blit. Rung 10.
+    println!("cargo:rerun-if-changed=data/musl-demo/wl_kms_x86_64");
+    let wlk = manifest_dir.join("data/musl-demo/wl_kms_x86_64");
+    println!("cargo:rustc-env=NARF_WL_KMS_ELF_X86_64={}", wlk.display());
+    println!("cargo:rustc-env=NARF_WL_KMS_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

@@ -3934,6 +3934,10 @@ pub const NARF_WL_XDG_ELF: &[u8] = include_bytes!(env!("NARF_WL_XDG_ELF_AARCH64"
 pub const NARF_WL_INPUT_ELF: &[u8] = include_bytes!(env!("NARF_WL_INPUT_ELF_X86_64"));
 #[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
 pub const NARF_WL_INPUT_ELF: &[u8] = include_bytes!(env!("NARF_WL_INPUT_ELF_AARCH64"));
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_WL_KMS_ELF: &[u8] = include_bytes!(env!("NARF_WL_KMS_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_WL_KMS_ELF: &[u8] = include_bytes!(env!("NARF_WL_KMS_ELF_AARCH64"));
 
 #[cfg(all(
     target_arch = "x86_64",

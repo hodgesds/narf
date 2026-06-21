@@ -1737,6 +1737,9 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // wl_seat input delivery — compositor sends a synthetic keypress over
         // wl_keyboard to the focused window; keymap fd is reverse SCM_RIGHTS.
         ("wl_input", "input-ok 1280x800 key=30"),
+        // KMS page-flip presentation — compositor scans out client buffers via
+        // a DRM dumb buffer + PAGE_FLIP (not a direct fbdev blit).
+        ("wl_kms", "kms-ok 1280x800"),
         // DRM/KMS dumb-buffer smoke — GET_CAP, CREATE_DUMB, MAP_DUMB,
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
