@@ -12493,51 +12493,94 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let argv_refs: alloc::vec::Vec<&str> = argv_strs.iter().map(|s| s.as_str()).collect();
     let envp_refs: alloc::vec::Vec<&str> = envp_strs.iter().map(|s| s.as_str()).collect();
 
-    // Step 3: resolve the path through the VFS and read the
-    // ELF bytes into a kernel-owned buffer. The buffer survives
-    // the AS swap below.
-    // Resolve the binary under the caller's chroot (containers exec
-    // `/bin/sh` expecting the chrooted rootfs, not the host's `/bin`).
-    let exec_path = apply_chroot(path);
-    let ops = match narf_filesystem::registry()
-        .resolve_absolute(&exec_path, |fs, rel| {
-            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-        })
-        .flatten()
-    {
-        Some(o) => o,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
+    // Resolve a path under the caller's chroot (containers/distros exec
+    // `/bin/sh` expecting the chrooted rootfs) and slurp its bytes, capped at
+    // 64 MiB. Returns None on any failure.
+    let read_exec = |p: &str| -> Option<alloc::vec::Vec<u8>> {
+        let ep = apply_chroot(p);
+        let ops = narf_filesystem::registry()
+            .resolve_absolute(&ep, |fs, rel| {
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
+            })
+            .flatten()?;
+        let file_size = ops.stat().size as usize;
+        if file_size == 0 || file_size > 64 * 1024 * 1024 {
+            return None;
         }
+        let mut buf = alloc::vec![0u8; file_size];
+        let mut off = 0usize;
+        while off < file_size {
+            match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
+                Some(Ok(0)) => break, // short read at EOF
+                Some(Ok(n)) => off += n,
+                _ => return None,
+            }
+        }
+        buf.truncate(off);
+        Some(buf)
     };
-    // Stat for file size, then read everything.
-    let stat = ops.stat();
-    let file_size = stat.size as usize;
-    if !(64..=64 * 1024 * 1024).contains(&file_size) {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    let mut elf_buf = alloc::vec![0u8; file_size];
-    let mut off = 0usize;
-    while off < file_size {
-        match poll_blocking(ops.read(off as u64, &mut elf_buf[off..])) {
-            Some(Ok(0)) => break, // short read at EOF
-            Some(Ok(n)) => off += n,
-            _ => {
+
+    // Step 3: read the image. A leading `#!` is an interpreter directive
+    // (Linux fs/binfmt_script.c): re-target exec at the named interpreter
+    // with the script path spliced into argv as
+    //   [interp, optional-arg, scriptpath, original-argv[1..]]
+    // Follow nested shebangs up to a small depth so a script interpreting a
+    // script still terminates. Without this, every `#!`-script execve EINVALs.
+    let mut cur_path = alloc::string::String::from(path);
+    let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
+    let elf_buf;
+    let mut depth = 0u32;
+    loop {
+        let buf = match read_exec(&cur_path) {
+            Some(b) => b,
+            None => {
                 ctx.set_return(SyscallReturn::invalid_op());
                 return;
             }
+        };
+        if buf.len() >= 2 && &buf[..2] == b"#!" {
+            if depth >= 4 {
+                ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+                return;
+            }
+            depth += 1;
+            let line_end = buf.iter().position(|&c| c == b'\n').unwrap_or(buf.len());
+            let line = core::str::from_utf8(&buf[2..line_end]).unwrap_or("").trim();
+            // interpreter = first whitespace-delimited token; the remainder
+            // (trimmed) is a SINGLE optional argument (Linux semantics).
+            let (interp, optarg) = match line.find([' ', '\t']) {
+                Some(i) => {
+                    let rest = line[i..].trim();
+                    (&line[..i], if rest.is_empty() { None } else { Some(rest) })
+                }
+                None => (line, None),
+            };
+            if interp.is_empty() {
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+            let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+            new_argv.push(interp.into());
+            if let Some(a) = optarg {
+                new_argv.push(a.into());
+            }
+            new_argv.push(cur_path.clone());
+            new_argv.extend(cur_argv.iter().skip(1).cloned());
+            cur_path = interp.into();
+            cur_argv = new_argv;
+            continue;
         }
+        if buf.len() < 64 {
+            // Too small for a valid ELF and not a shebang.
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+        elf_buf = buf;
+        break;
     }
-    if off < 64 {
-        ctx.set_return(SyscallReturn::invalid_op());
-        return;
-    }
-    elf_buf.truncate(off);
+    let argv_refs: alloc::vec::Vec<&str> = cur_argv.iter().map(|s| s.as_str()).collect();
 
     // Step 4: load the new image. SAFETY: load_user_process_with's
     // contract — identity-mapped low 4 GiB, frame allocator
