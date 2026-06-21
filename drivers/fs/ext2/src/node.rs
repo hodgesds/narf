@@ -272,6 +272,21 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             Ok(())
         })
     }
+
+    /// Bridge an opened-directory fd to its `DirOps`. `resolve_async`
+    /// returns a directory as an `Ext2Node` *FileOps* (see
+    /// `lookup_async`), so `open(dir, O_DIRECTORY)` installs that
+    /// FileOps in the fd table; `sys_getdents64` then needs `as_dir()`
+    /// to recover the `DirOps` view. Returns `None` for non-directories
+    /// so `getdents64` on a regular-file fd is ENOTDIR. The fresh node
+    /// shares the same volume + inode number.
+    fn as_dir(&self) -> Option<Arc<dyn DirOps>> {
+        let st = self.state.lock();
+        if st.stat.mode.file_type != FileType::Dir {
+            return None;
+        }
+        Some(Arc::new(Ext2Node::new(self.volume.clone(), st.inode_no, st.stat)) as Arc<dyn DirOps>)
+    }
 }
 
 impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
