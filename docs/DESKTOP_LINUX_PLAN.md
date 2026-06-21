@@ -80,9 +80,19 @@ never accumulate unverifiable work.
   (marshalled over the socket with SCM_RIGHTS); the server mmaps it — the
   compositor can now see a client's pixel buffer. Proven by `/bin/wl_shm`
   -> `shm-ok` (no new kernel gaps — the SCM_RIGHTS work paid off). On main.
-  Remaining sub-steps: composite the client buffer into a DRM dumb buffer +
-  page-flip (Rungs 3/6); libinput over evdev (Rung 2); a real compositor +
-  client (weston-pixman or a minimal custom one) actually painting a window.
+  Sub-step 4 done: **first composited Wayland frame.** `/bin/mini_compositor`
+  is a minimal Wayland compositor (wl_compositor/wl_surface/wl_shm) whose
+  surface-commit handler reads the client's shared buffer and BLITS IT onto
+  /dev/fb0 (Rung 1). An embedded client paints 0x00C0FFEE, passes it via
+  wl_shm (SCM_RIGHTS), attaches + commits — and the pixel lands on the
+  framebuffer: `comp-ok 1280x800 px=00c0ffee`. The convergence of the whole
+  ladder. Final gap fixed: **frame-backed memfd** — MAP_SHARED of a memfd now
+  aliases the same physical frames (was an eager private copy), so client +
+  compositor share the wl_shm pool. musl-demo CI case. On `main`.
+  Remaining toward a usable desktop: present via DRM page-flip instead of the
+  fbdev blit (Rung 6); libinput over evdev (Rung 2) for input; multiple
+  surfaces / xdg-shell windows; then a real off-the-shelf compositor
+  (weston --use-pixman) + client.
 - The actual compositor. The DRM/KMS present loop + evdev input + the
   Wayland fd-transport are now in place, so the remaining work is the big
   userspace build —
