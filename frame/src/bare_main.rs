@@ -3344,6 +3344,7 @@ fn boot_userspace_init() {
                 // MAP_SHARED, draws + reads back. Proves the
                 // device-mmap keystone end-to-end. Success: `fb-ok`.
                 ("fb_smoke", narf_verification::NARF_FB_SMOKE_ELF),
+                ("scm_smoke", narf_verification::NARF_SCM_SMOKE_ELF),
                 // DRM/KMS dumb-buffer smoke — opens /dev/dri/card0,
                 // GET_CAP(DUMB_BUFFER), CREATE_DUMB, MAP_DUMB, mmap
                 // MAP_SHARED, ADDFB2, SETCRTC. Success: `drm-ok`.

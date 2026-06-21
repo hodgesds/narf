@@ -2287,6 +2287,38 @@ impl SocketFile {
             Ok((n, None))
         }
     }
+
+    /// AF_UNIX `sendmsg` with an SCM_RIGHTS fd batch: writes `buf` to the
+    /// stream and queues `fds` for the peer's next `recvmsg`. Only valid on
+    /// a connected AF_UNIX stream socket.
+    pub fn unix_sendmsg(
+        &self,
+        buf: &[u8],
+        fds: Vec<Arc<dyn FileOps>>,
+    ) -> Result<usize, SockError> {
+        let state = self.state.lock();
+        let tx = match &*state {
+            SocketState::UnixConnected { tx, .. } => tx,
+            _ => return Err(SockError::NotConnected),
+        };
+        if tx.is_closed() {
+            return Err(SockError::Pipe);
+        }
+        let n = tx.write(buf);
+        tx.write_fds(fds);
+        Ok(n)
+    }
+
+    /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
+    /// socket's receive ring (empty for non-unix sockets or when none were
+    /// passed).
+    pub fn unix_take_recv_fds(&self) -> Vec<Arc<dyn FileOps>> {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::UnixConnected { rx, .. } => rx.take_fds().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 // ── In-kernel SPSC byte ring ────────────────────────────────────
@@ -2299,11 +2331,26 @@ pub struct RingBuf {
     closed: AtomicBool,
 }
 
-#[derive(Debug)]
 struct RingInner {
     buf: Vec<u8>,
     head: usize,
     len: usize,
+    /// AF_UNIX SCM_RIGHTS fd-passing: a FIFO of fd batches sent alongside
+    /// the byte stream. Each `sendmsg` carrying SCM_RIGHTS pushes one
+    /// batch; each `recvmsg` that returns data pops the front batch and
+    /// installs the file objects into the receiver's fd table. Wayland's
+    /// shm/dma-buf buffer sharing rides on this.
+    fds: VecDeque<Vec<Arc<dyn FileOps>>>,
+}
+
+impl core::fmt::Debug for RingInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RingInner")
+            .field("head", &self.head)
+            .field("len", &self.len)
+            .field("fd_batches", &self.fds.len())
+            .finish()
+    }
 }
 
 impl RingBuf {
@@ -2313,9 +2360,22 @@ impl RingBuf {
                 buf: alloc::vec![0u8; RING_CAP],
                 head: 0,
                 len: 0,
+                fds: VecDeque::new(),
             }),
             closed: AtomicBool::new(false),
         }
+    }
+
+    /// Queue an SCM_RIGHTS fd batch alongside the byte stream.
+    fn write_fds(&self, fds: Vec<Arc<dyn FileOps>>) {
+        if !fds.is_empty() {
+            self.inner.lock().fds.push_back(fds);
+        }
+    }
+
+    /// Pop the next queued fd batch (FIFO), if any.
+    fn take_fds(&self) -> Option<Vec<Arc<dyn FileOps>>> {
+        self.inner.lock().fds.pop_front()
     }
 
     fn write(&self, src: &[u8]) -> usize {

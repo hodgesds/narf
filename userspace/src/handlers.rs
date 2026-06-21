@@ -17026,6 +17026,21 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
     } else {
         None
     };
+
+    // SCM_RIGHTS fd-passing: parse msg_control for an SOL_SOCKET/SCM_RIGHTS
+    // ancillary message and resolve each int fd to its file object. AF_UNIX
+    // (Wayland) ships shm/dma-buf fds this way.
+    let ctrl_ptr = read_user_u64(msg_ptr + 32);
+    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
+    let passed_fds = parse_scm_rights_fds(ctrl_ptr, ctrl_len);
+    if !passed_fds.is_empty() {
+        // fd-carrying send → AF_UNIX stream path.
+        return match sock.unix_sendmsg(&total, passed_fds) {
+            Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            Err(_) => ctx.set_return(fail),
+        };
+    }
+
     match sock.dispatch_op(crate::socket::SocketOp::Send {
         buf: &total,
         flags,
@@ -17034,6 +17049,108 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
         crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
         _ => ctx.set_return(fail),
     }
+}
+
+/// Parse a `msg_control` buffer for an `SOL_SOCKET` / `SCM_RIGHTS` cmsg and
+/// resolve each passed int fd to its file object in the *sender's* fd table.
+/// Returns an empty vec when there's no fd ancillary data.
+fn parse_scm_rights_fds(
+    ctrl_ptr: u64,
+    ctrl_len: usize,
+) -> alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
+    const SOL_SOCKET: i32 = 1;
+    const SCM_RIGHTS: i32 = 1;
+    // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
+    let mut out = alloc::vec::Vec::new();
+    if ctrl_ptr == 0 || ctrl_len < 16 || ctrl_len > MAX_USER_COPY {
+        return out;
+    }
+    let mut ctrl = alloc::vec![0u8; ctrl_len];
+    // SAFETY: ctrl sized to ctrl_len; copy_from_user range-validates + SMAP.
+    if unsafe { copy_from_user(&mut ctrl, ctrl_ptr) }.is_err() {
+        return out;
+    }
+    let task = current_task_id();
+    // Walk cmsg records (8-byte aligned).
+    let mut off = 0usize;
+    while off + 16 <= ctrl_len {
+        let cmsg_len = u64::from_le_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
+        let level = i32::from_le_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
+        let ctype = i32::from_le_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
+        if cmsg_len < 16 || off + cmsg_len > ctrl_len {
+            break;
+        }
+        if level == SOL_SOCKET && ctype == SCM_RIGHTS {
+            let nfds = (cmsg_len - 16) / 4;
+            for i in 0..nfds {
+                let fpos = off + 16 + i * 4;
+                let fd = i32::from_le_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
+                if fd < 0 {
+                    continue;
+                }
+                if let Some(ops) =
+                    fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()
+                {
+                    out.push(ops);
+                }
+            }
+        }
+        // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
+        off += (cmsg_len + 7) & !7;
+    }
+    out
+}
+
+/// Install received SCM_RIGHTS file objects into the calling task's fd
+/// table and write an SOL_SOCKET/SCM_RIGHTS control message (with the new
+/// fd numbers) back into `msg_control`. Sets `msg_controllen` to the bytes
+/// written (0 when there are no fds or the user control buffer is absent).
+fn install_scm_rights_fds(
+    msg_ptr: u64,
+    fds: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+) {
+    const SOL_SOCKET: i32 = 1;
+    const SCM_RIGHTS: i32 = 1;
+    let ctrl_ptr = read_user_u64(msg_ptr + 32);
+    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
+    if fds.is_empty() {
+        // No ancillary data — report an empty control buffer.
+        let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
+        return;
+    }
+    // Install each file object at a fresh fd.
+    let task = current_task_id();
+    let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
+    for ops in fds {
+        let entry = fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        };
+        if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
+            new_fds.push(newfd as i32);
+        }
+    }
+    // struct cmsghdr (16 B) + the int fd array.
+    let data_len = new_fds.len() * 4;
+    let cmsg_len = 16 + data_len;
+    if ctrl_ptr == 0 || ctrl_len < cmsg_len {
+        // No room for the control message — the fds are installed but the
+        // numbers can't be reported (Linux would set MSG_CTRUNC here).
+        let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
+        return;
+    }
+    let mut cmsg = alloc::vec![0u8; cmsg_len];
+    cmsg[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+    cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+    cmsg[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+    for (i, &nfd) in new_fds.iter().enumerate() {
+        cmsg[16 + i * 4..20 + i * 4].copy_from_slice(&nfd.to_le_bytes());
+    }
+    // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
+    let _ = unsafe { copy_to_user(ctrl_ptr, &cmsg) };
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(cmsg_len as u64).to_le_bytes()) };
 }
 
 /// `recvmsg(fd, msghdr, flags)`. Reverse of sendmsg.
@@ -17102,6 +17219,13 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 let _ = unsafe { copy_to_user(name_ptr, &peer_buf) };
                 write_user_u32(name_len_ptr, (peer.body.len() + 2) as u32);
             }
+
+            // SCM_RIGHTS: install any passed file objects into this task's fd
+            // table and report the new fd numbers in an SOL_SOCKET/SCM_RIGHTS
+            // control message. The mirror of parse_scm_rights_fds on send.
+            let recv_fds = sock.unix_take_recv_fds();
+            install_scm_rights_fds(msg_ptr, recv_fds);
+
             ctx.set_return(SyscallReturn::ok(n as u64));
         }
         _ => ctx.set_return(fail),
