@@ -1246,13 +1246,23 @@ dependency-ordered ladder (full plan + per-rung proofs in
   _DUMB, ADDFB2, SETCRTC (blits into scanout), PAGE_FLIP event delivery,
   GEM_CLOSE. Runs unmodified **libdrm** (`modetest`: enumerate → modeset →
   present SMPTE → ~44 Hz page-flip loop).
+- **`/dev/uinput`** virtual-input device: `UI_DEV_CREATE`/`UI_SET_*BIT` +
+  24-byte event injection, registering a device with the evdev router so it
+  appears as `/dev/input/eventN`. The userspace input-injection path
+  (ydotool/wtype-style).
 - **Wayland** — libffi + libwayland 1.23 (static-musl). A Wayland
-  compositor serves **multiple independent GUI client processes**; each
-  passes a frame-backed shared buffer over the socket (`SCM_RIGHTS`) that
-  the compositor blits to `/dev/fb0`. `/bin/wl_multi` → `multi-ok`.
-- **Kernel-ABI fixes surfaced (help all Linux software)**: `SCM_RIGHTS`
-  fd-passing; frame-backed memfd so `MAP_SHARED` truly aliases physical
-  frames across processes; `recvmsg` `-EAGAIN` on empty non-blocking read;
-  `stat`/`statx` `-ENOENT` for missing files; `socket()` masks
-  `SOCK_CLOEXEC`/`SOCK_NONBLOCK`; `getsockopt(SO_PEERCRED)`; `sys_select`
-  SMAP bracket.
+  compositor maps `xdg_toplevel` windows, serves **multiple independent GUI
+  client processes** (`SCM_RIGHTS` frame-backed shared buffers), presents via
+  DRM/KMS **page-flip** (`/bin/wl_kms`), and delivers **real evdev input**
+  injected through `/dev/uinput` over `wl_seat` (`/bin/wl_evdev`). The
+  headline: `/bin/wl_app` launches an **unmodified off-the-shelf GUI client**
+  — weston 9.0 `simple-shm`, vendored verbatim — which maps a window and
+  renders a 250×250 frame the compositor composites (`app-ok ... win=250x250`).
+- **Kernel-ABI fixes surfaced (help all Linux software)**: `fork` keeps
+  `MAP_SHARED` regions shared instead of COWing them (a process that mmaps a
+  device then forks now writes the real frames — caught by the KMS readback);
+  `SCM_RIGHTS` fd-passing (both directions); frame-backed memfd so
+  `MAP_SHARED` truly aliases physical frames across processes; `recvmsg`
+  `-EAGAIN` on empty non-blocking read; `stat`/`statx` `-ENOENT` for missing
+  files; `socket()` masks `SOCK_CLOEXEC`/`SOCK_NONBLOCK`;
+  `getsockopt(SO_PEERCRED)`; `sys_select` SMAP bracket.

@@ -58,7 +58,7 @@ filesystem. See [`docs/PERSONAS.md`](docs/PERSONAS.md).
 | 3 — Flow | Caps + Narf-Ring + first virtio | **closed** |
 | 4 — Compatibility | relibc / Linux-compat surface | **closed for in-tree shell + coreutils** |
 | 5 — Silicon | Boot on AMD Zen2 Renoir + Phoenix HawkPoint1 laptops | **in progress** |
-| G — Desktop Linux | `/dev/fb0` + evdev + DRM/KMS; unmodified libdrm & libwayland | **Wayland compositor runs multiple GUI apps** |
+| G — Desktop Linux | `/dev/fb0` + evdev + DRM/KMS + `/dev/uinput`; unmodified libdrm & libwayland | **runs an off-the-shelf Wayland GUI app (weston-simple-shm)** |
 
 Today, both arches boot under QEMU and run the full async demo. The
 interactive end-to-end loop (`echo hello world` over `-serial stdio`)
@@ -67,11 +67,15 @@ works through the IRQ-4 → byte ring → fd 0 → shell → fd 1 → UART chain
 
 On the graphics track, NARF exposes Linux device files — `/dev/fb0`
 (fbdev), `/dev/input/event*` (evdev), `/dev/dri/card0` (DRM/KMS
-dumb-buffer modeset) — and runs **unmodified** `libdrm` (`modetest`
-enumerates + modesets + page-flips) and `libwayland`: a Wayland
-compositor serves multiple independent GUI client processes that pass
-shared frame buffers over the socket (`SCM_RIGHTS`) and are blitted to
-the screen. See [`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md).
+dumb-buffer modeset), `/dev/uinput` (virtual input) — and runs
+**unmodified** `libdrm` (`modetest` enumerates + modesets + page-flips)
+and `libwayland`. A Wayland compositor maps `xdg_toplevel` windows,
+presents client buffers via DRM/KMS **page-flip**, and delivers **real
+evdev input** (injected through `/dev/uinput`) over `wl_seat`. The
+headline: an **unmodified off-the-shelf GUI client** — weston's
+`simple-shm`, vendored verbatim — maps a window and renders a frame on
+NARF with zero awareness it isn't Linux. See
+[`docs/DESKTOP_LINUX_PLAN.md`](docs/DESKTOP_LINUX_PLAN.md).
 
 For the full per-feature landing log and live driver portfolio see
 [`STATUS.md`](STATUS.md). For the per-stage subsystem matrix see

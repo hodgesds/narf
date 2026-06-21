@@ -130,12 +130,51 @@ never accumulate unverifiable work.
   `KEY_A`: `input-ok 1280x800 key=30`. This also exercises **`SCM_RIGHTS` in
   the reverse direction** — the keymap fd travels compositor→client (wl_shm's
   buffer fd went client→compositor) — and it worked with no new kernel gaps.
-  musl-demo CI case (`REGEN_wl_input.sh`). On `main`. (Wiring the *real*
-  evdev `/dev/input/event*` stream into `wl_seat` is the follow-on; it needs
-  an input-injection harness, since CI can't generate hardware key events.)
+  musl-demo CI case (`REGEN_wl_input.sh`). On `main`.
+- **Rung 10 (KMS page-flip presentation) — DONE.** The earlier compositors
+  blitted client pixels straight into a `/dev/fb0` mmap; a real stack
+  (weston/Xorg) drives DRM/KMS instead. `/bin/wl_kms` opens `/dev/dri/card0`,
+  allocates a full-screen scanout dumb buffer (`CREATE_DUMB` → `ADDFB2` →
+  `SETCRTC`), runs an xdg-shell compositor, and on the client's commit
+  composites into the *dumb buffer* (never `/dev/fb0`) then `PAGE_FLIP`s the
+  CRTC with `DRM_MODE_PAGE_FLIP_EVENT` and `read()`s the `drm_event_vblank`.
+  Verification reads `/dev/fb0` **read-only**: the pixel is only there because
+  the page-flip presented it. `kms-ok 1280x800 px=00c0ffee flip=1`. **This
+  caught a real latent kernel bug:** `fork` was COWing `MAP_SHARED` regions, so
+  a compositor that mmaps a device then forks rendered into a private copy —
+  fixed (`fork` now keeps SHARED regions shared; the earlier compositors
+  masked it via self-readback). musl-demo CI case. On `main`.
+- **Rung 11 (real evdev → wl_seat bridge) — DONE.** Rung 9 delivered
+  *synthetic* wl_keyboard events; this bridges *real* Linux evdev records.
+  Added a Linux-compatible **`/dev/uinput`** kernel device (the mechanism
+  ydotool/wtype use). `/bin/wl_evdev`'s compositor creates a virtual keyboard
+  via `/dev/uinput`, injects `KEY_A`, and the kernel evdev router delivers it
+  as 24-byte `input_event` records on a fresh `/dev/input/eventN`; the
+  compositor **reads that node** (real evdev wire), translates the `EV_KEY`,
+  and forwards it over `wl_keyboard` to the mapped client: `evdev-ok 1280x800
+  key=30`. The compositor can't tell uinput from a USB keyboard — same path.
+  musl-demo CI case + a `smoke_uinput_loopback` kernel smoke. On `main`.
+- **Rung 12 (first unmodified off-the-shelf GUI app) — DONE.** Every prior
+  test used a hand-written client; this runs an **actual upstream binary** —
+  weston 9.0's `clients/simple-shm.c`, vendored verbatim as `/bin/simple_shm`,
+  linked against stock libwayland. `/bin/wl_app` is the compositor/launcher:
+  it advertises `wl_compositor`/`wl_shm`/`xdg_wm_base`, `fork`+`execve`s
+  `/bin/simple_shm` with `WAYLAND_DISPLAY` set, sends the configure that makes
+  it draw, answers `wl_surface.frame` callbacks so its animation loop runs,
+  and composites its first real frame: `app-ok 1280x800 win=250x250` (250×250
+  = simple-shm's actual surface). A real toolkit client maps + renders on NARF
+  with zero awareness it isn't Linux. musl-demo CI case. On `main`.
 
 ### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
 
+- **`fork` keeps `MAP_SHARED` regions shared** (was COWing them): a process
+  that mmaps a device (framebuffer, DRM dumb buffer) or POSIX shm then forks
+  now keeps writing the real frames in both parent and child — essential for
+  the compositor-forks-client architecture. Caught by Rung 10's KMS readback.
+- **`/dev/uinput`** virtual-input device (`UI_DEV_CREATE`/`UI_SET_*BIT` +
+  24-byte event injection via `write`), registering a device with the evdev
+  router so it appears as `/dev/input/eventN`. Enables userspace input
+  injection (Rung 11).
 - `sendmsg`/`recvmsg` **`SCM_RIGHTS`** fd-passing over AF_UNIX (was ignored).
 - **Frame-backed memfd** so `MAP_SHARED` aliases the same physical frames
   across mappings/processes (was an eager private copy) — the bedrock of all
@@ -149,20 +188,23 @@ never accumulate unverifiable work.
 
 ### Remaining toward a *usable* desktop (not yet done)
 
-- **Real evdev → wl_seat bridge**: the compositor reads the Rung-2
-  `/dev/input/event*` nodes and forwards real hardware events to the focused
-  client (the Wayland-side delivery is proven by Rung 9; this wires the
-  hardware source). Needs an input-injection harness for CI, since QEMU
-  hardware key events can't be generated from the sandbox. Real apps then
-  want libinput, which needs a udev shim.
-- Present via DRM/KMS page-flip instead of the direct fbdev blit (the Rung-6
-  present path) — architecturally-correct presentation.
-- An unmodified toolkit app (an SDL2 or GTK program) mapping a real
-  `xdg_toplevel` and taking input against our compositor — now unblocked by
-  Rungs 8–9.
-- A real off-the-shelf compositor (weston `--use-pixman`) + clients, or Xorg +
-  `xf86-video-modesetting` + a tiny WM. Likely next kernel gaps: PRIME/dma-buf,
+The minimal compositor (map a window, present via KMS, deliver real input,
+run an off-the-shelf client) is now proven end to end. The remaining work is
+breadth — running a *full* stock compositor + richer clients:
+
+- **A complete off-the-shelf compositor** — weston `--use-pixman` (or a
+  wlroots/Pixman one) instead of our minimal hand-written one, driving its own
+  KMS present + libinput. This is the integration that turns the pieces into a
+  real desktop session. Likely needs libinput + a udev shim, and exercises far
+  more of the protocol than our test compositors do.
+- **Richer / GPU clients** — a toolkit app (SDL2, GTK) beyond simple-shm, then
+  GL via Mesa-swrast. Likely next kernel gaps: PRIME/dma-buf buffer sharing,
   more `epoll`/`signalfd`/`timerfd` edges, udev enumeration.
+- **Pointer/touch from real hardware** — Rung 11 bridges real evdev *keys*;
+  extend the bridge to pointer motion/buttons + the virtio-tablet, and feed
+  libinput rather than translating EV_* by hand.
+- **xdg-shell window management** — interactive move/resize/configure cycles,
+  multiple toplevels with focus, popups — vs the single map+present we prove.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
