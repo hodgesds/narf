@@ -315,7 +315,15 @@ fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     let mut ctx = Context::from_waker(&waker);
     // SAFETY: we own `fut` by value; pin to the stack temporary.
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-    for _ in 0..65_536 {
+    // Busy-poll budget. This must be generous enough to cover a future that is
+    // legitimately *waiting* — not stuck — for a long time. The worst case is
+    // contended block I/O: two execve loads on different CPUs serialise on the
+    // ext2 volume's scratch DMA buffer, so the loser busy-spins here while the
+    // winner streams a whole ~1 MiB binary block-by-block. A small budget made
+    // the loser time out → read returns None → execve EINVALs (the "concurrent
+    // pipe stages fail" bug). The bound still exists only as a backstop against
+    // a genuinely wedged future.
+    for _ in 0..4_000_000u64 {
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending => continue,

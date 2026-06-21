@@ -769,7 +769,7 @@ fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     let mut ctx = Context::from_waker(&waker);
     // SAFETY: own `fut` by value; pin to stack temporary.
     let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
-    for _ in 0..65_536 {
+    for _ in 0..4_000_000u64 {
         match pinned.as_mut().poll(&mut ctx) {
             Poll::Ready(v) => return Some(v),
             Poll::Pending => continue,
