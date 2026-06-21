@@ -24,10 +24,13 @@ use crate::{
     loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
 };
 
-/// Default user stack size: 16 KiB. Small enough to fit on boot
-/// images comfortably, big enough for relibc-style startup + a few
-/// argv/envp/auxv qwords on the stack.
-pub const DEFAULT_USER_STACK_BYTES: u64 = 16 * 1024;
+/// Default user stack size: 128 KiB. The stack auto-grows on demand
+/// (`AddressSpace::try_grow_stack` extends it a frame-allocation at a
+/// time down to the mmap-window floor), so this is just the eagerly
+/// mapped floor — kept generous enough that ordinary startup +
+/// moderately deep call chains (e.g. musl `realpath`'s ~8 KiB frame,
+/// recursive library walks) don't immediately fault-grow.
+pub const DEFAULT_USER_STACK_BYTES: u64 = 128 * 1024;
 
 /// Virtual address the user stack is mapped at — just below the
 /// 128-TiB low-half canonical boundary, inside PML4[127]. Stage-4

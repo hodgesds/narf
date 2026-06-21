@@ -791,23 +791,29 @@ impl AddressSpace {
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn try_grow_stack(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
-        let v = vaddr.as_u64() & !0xFFFu64;
+        let v_page = vaddr.as_u64() & !0xFFFu64;
         let mut regions = self.regions.lock();
+        // Find the stack guard at or above the faulting page and within a
+        // bounded gap. A single large frame allocation (`sub rsp, N` followed
+        // by a write near the new top) touches a page SEVERAL pages below the
+        // current stack bottom in one step — it lands BELOW the one-page guard
+        // (so the old "fault must hit the guard region" test failed it as an
+        // ordinary SEGV). We instead grow the stack down to cover the faulting
+        // page in one shot. The bound keeps a wild pointer far below the stack
+        // a real SEGV rather than silently mapping a huge gap.
+        const MAX_GROW: u64 = 256 * 1024; // 64 pages
         let idx = regions
             .iter()
             .position(|r| {
-                let rb = r.base.as_u64();
-                v >= rb && v < rb.saturating_add(r.len)
+                r.perms.contains(RegionPerms::STACK_GUARD) && {
+                    let gb = r.base.as_u64();
+                    gb >= v_page && gb - v_page <= MAX_GROW
+                }
             })
             .ok_or(AddressSpaceError::Unmapped)?;
-        if !regions[idx].perms.contains(RegionPerms::STACK_GUARD) {
-            return Err(AddressSpaceError::Unmapped);
-        }
         let guard_base = regions[idx].base.as_u64();
-        // Reject if the new guard one page below would overlap an
-        // existing region — the user has run out of stack arena
-        // and gets a real SEGV.
-        let new_guard_base = match guard_base.checked_sub(0x1000) {
+        // New guard sits one page below the lowest page we are about to map.
+        let new_guard_base = match v_page.checked_sub(0x1000) {
             Some(b) => b,
             None => return Err(AddressSpaceError::OutOfRange),
         };
@@ -822,39 +828,53 @@ impl AddressSpace {
         if guard_base >= Self::MMAP_WINDOW_TOP && new_guard_base < Self::MMAP_WINDOW_TOP {
             return Err(AddressSpaceError::OutOfRange);
         }
+        // The new footprint we are claiming is [new_guard_base, guard_base):
+        // the fresh guard page plus every page from `v_page` up to (but not
+        // including) the old guard page — which stays region `idx`. Reject if
+        // any OTHER region intersects it: the stack arena has run into the
+        // heap / mmap window and the user gets a real SEGV.
         for (i, r) in regions.iter().enumerate() {
             if i == idx {
                 continue;
             }
             let rb = r.base.as_u64();
             let re = rb.saturating_add(r.len);
-            if new_guard_base < re && rb < new_guard_base + 0x1000 {
+            if rb < guard_base && re > new_guard_base {
                 return Err(AddressSpaceError::Overlap);
             }
         }
 
-        // Promote the existing guard region: allocate + zero
-        // a frame, swap perms to R+W, install the leaf PTE.
-        let phys = crate::frame::alloc_frame()
-            .map_err(|_| AddressSpaceError::OutOfRange)?
-            .start_address();
-        // SAFETY: identity-mapped; freshly-allocated frame is ours
-        // exclusively.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
-        }
-        regions[idx].phys[0] = phys;
-        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
-
+        // Promote: map every page from `v_page` up to and including the old
+        // guard page (`guard_base`) as R+W stack, collecting their frames.
         let flags = PtFlags::USER | PtFlags::WRITABLE | PtFlags::NO_EXEC;
-        // SAFETY: root is valid (AS active); guard region was
-        // bookkept by `map_region`; phys just allocated.
-        // SAFETY: Valid memory or trusted environment
-        match unsafe { map_4kb(self.root, VirtAddr::new(guard_base), phys, flags) } {
-            Ok(()) | Err(MapError::AlreadyMapped) => {}
-            Err(_) => return Err(AddressSpaceError::NotImplemented),
+        let npages = ((guard_base - v_page) / 0x1000) + 1;
+        let mut new_phys: alloc::vec::Vec<crate::PhysAddr> =
+            alloc::vec::Vec::with_capacity(npages as usize);
+        let mut p = v_page;
+        while p <= guard_base {
+            let phys = crate::frame::alloc_frame()
+                .map_err(|_| AddressSpaceError::OutOfRange)?
+                .start_address();
+            // SAFETY: identity-mapped; freshly-allocated frame is ours.
+            // SAFETY: Valid memory or trusted environment
+            unsafe {
+                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+            }
+            // SAFETY: root is valid (AS active); phys just allocated.
+            // SAFETY: Valid memory or trusted environment
+            match unsafe { map_4kb(self.root, VirtAddr::new(p), phys, flags) } {
+                Ok(()) | Err(MapError::AlreadyMapped) => {}
+                Err(_) => return Err(AddressSpaceError::NotImplemented),
+            }
+            new_phys.push(phys);
+            p += 0x1000;
         }
+        // Replace the one-page guard region with the expanded mapped stack
+        // span [v_page, guard_base + 0x1000).
+        regions[idx].base = VirtAddr::new(v_page);
+        regions[idx].len = npages * 0x1000;
+        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
+        regions[idx].phys = new_phys;
 
         // Install a fresh one-page guard region below. Lazy phys
         // (the slot stays unbacked — guard pages never need a
@@ -877,20 +897,23 @@ impl AddressSpace {
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn try_grow_stack(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
-        let v = vaddr.as_u64() & !0xFFFu64;
+        let v_page = vaddr.as_u64() & !0xFFFu64;
         let mut regions = self.regions.lock();
+        // See the x86_64 sibling for the multi-page-grow rationale: a large
+        // frame allocation touches a page several pages below the stack bottom
+        // in one step, landing below the one-page guard. Grow down to cover it.
+        const MAX_GROW: u64 = 256 * 1024; // 64 pages
         let idx = regions
             .iter()
             .position(|r| {
-                let rb = r.base.as_u64();
-                v >= rb && v < rb.saturating_add(r.len)
+                r.perms.contains(RegionPerms::STACK_GUARD) && {
+                    let gb = r.base.as_u64();
+                    gb >= v_page && gb - v_page <= MAX_GROW
+                }
             })
             .ok_or(AddressSpaceError::Unmapped)?;
-        if !regions[idx].perms.contains(RegionPerms::STACK_GUARD) {
-            return Err(AddressSpaceError::Unmapped);
-        }
         let guard_base = regions[idx].base.as_u64();
-        let new_guard_base = match guard_base.checked_sub(0x1000) {
+        let new_guard_base = match v_page.checked_sub(0x1000) {
             Some(b) => b,
             None => return Err(AddressSpaceError::OutOfRange),
         };
@@ -911,29 +934,38 @@ impl AddressSpace {
             }
             let rb = r.base.as_u64();
             let re = rb.saturating_add(r.len);
-            if new_guard_base < re && rb < new_guard_base + 0x1000 {
+            if rb < guard_base && re > new_guard_base {
                 return Err(AddressSpaceError::Overlap);
             }
         }
 
-        let phys = crate::frame::alloc_frame()
-            .map_err(|_| AddressSpaceError::OutOfRange)?
-            .start_address();
-        // SAFETY: phys-as-virt via kernel_mut_ptr stays valid even
-        // under user TTBR0.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
-        }
-        regions[idx].phys[0] = phys;
-        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
-
         let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
-        // SAFETY: see x86_64 sibling.
-        match unsafe { map_4kb(self.root, VirtAddr::new(guard_base), phys, flags) } {
-            Ok(()) | Err(MapError::AlreadyMapped) => {}
-            Err(_) => return Err(AddressSpaceError::NotImplemented),
+        let npages = ((guard_base - v_page) / 0x1000) + 1;
+        let mut new_phys: alloc::vec::Vec<crate::PhysAddr> =
+            alloc::vec::Vec::with_capacity(npages as usize);
+        let mut p = v_page;
+        while p <= guard_base {
+            let phys = crate::frame::alloc_frame()
+                .map_err(|_| AddressSpaceError::OutOfRange)?
+                .start_address();
+            // SAFETY: phys-as-virt via kernel_mut_ptr stays valid even
+            // under user TTBR0.
+            // SAFETY: Valid memory or trusted environment
+            unsafe {
+                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
+            }
+            // SAFETY: see x86_64 sibling.
+            match unsafe { map_4kb(self.root, VirtAddr::new(p), phys, flags) } {
+                Ok(()) | Err(MapError::AlreadyMapped) => {}
+                Err(_) => return Err(AddressSpaceError::NotImplemented),
+            }
+            new_phys.push(phys);
+            p += 0x1000;
         }
+        regions[idx].base = VirtAddr::new(v_page);
+        regions[idx].len = npages * 0x1000;
+        regions[idx].perms = RegionPerms::READ | RegionPerms::WRITE;
+        regions[idx].phys = new_phys;
 
         regions.push(Region {
             base: VirtAddr::new(new_guard_base),
