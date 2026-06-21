@@ -3950,6 +3950,10 @@ pub const NARF_SIMPLE_SHM_ELF: &[u8] = include_bytes!(env!("NARF_SIMPLE_SHM_ELF_
 pub const NARF_WL_APP_ELF: &[u8] = include_bytes!(env!("NARF_WL_APP_ELF_X86_64"));
 #[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
 pub const NARF_WL_APP_ELF: &[u8] = include_bytes!(env!("NARF_WL_APP_ELF_AARCH64"));
+#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_DISTRO_INIT_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_INIT_ELF_X86_64"));
+#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+pub const NARF_DISTRO_INIT_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_INIT_ELF_AARCH64"));
 
 #[cfg(all(
     target_arch = "x86_64",

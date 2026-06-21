@@ -372,6 +372,13 @@ fn main() {
     println!("cargo:rustc-env=NARF_WL_APP_ELF_X86_64={}", wla.display());
     println!("cargo:rustc-env=NARF_WL_APP_ELF_AARCH64=/dev/null");
 
+    // distro_init — chroot into a real Alpine rootfs (mounted at /mnt from
+    // the virtio-blk ext2 image) and exec Alpine's own busybox. Distro boot.
+    println!("cargo:rerun-if-changed=data/musl-demo/distro_init_x86_64");
+    let dist = manifest_dir.join("data/musl-demo/distro_init_x86_64");
+    println!("cargo:rustc-env=NARF_DISTRO_INIT_ELF_X86_64={}", dist.display());
+    println!("cargo:rustc-env=NARF_DISTRO_INIT_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

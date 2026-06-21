@@ -3362,6 +3362,7 @@ fn boot_userspace_init() {
                 ("wl_evdev", narf_verification::NARF_WL_EVDEV_ELF),
                 ("simple_shm", narf_verification::NARF_SIMPLE_SHM_ELF),
                 ("wl_app", narf_verification::NARF_WL_APP_ELF),
+                ("distro_init", narf_verification::NARF_DISTRO_INIT_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),
