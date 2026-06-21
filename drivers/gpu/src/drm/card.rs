@@ -248,6 +248,12 @@ pub struct Card {
     /// Dumb-buffer physical backings. Kept alive here so the memory
     /// is freed when the GEM handle is destroyed (DESTROY_DUMB / GEM_CLOSE).
     pub dumb_backings: Vec<DumbBacking>,
+    /// Pending DRM events (`drm_event_vblank` for PAGE_FLIP completion),
+    /// drained by `read(/dev/dri/cardN)`. A compositor render loop
+    /// PAGE_FLIPs with DRM_MODE_PAGE_FLIP_EVENT, then poll/read()s these.
+    pub events: alloc::collections::VecDeque<Vec<u8>>,
+    /// Monotonic vblank sequence reported in flip-complete events.
+    pub vblank_seq: u32,
 }
 
 impl Card {
@@ -268,7 +274,26 @@ impl Card {
             next_fb_id: 1,
             gem: GemTable::new(),
             dumb_backings: Vec::new(),
+            events: alloc::collections::VecDeque::new(),
+            vblank_seq: 0,
         }
+    }
+
+    /// Queue a `drm_event_vblank` flip-complete event (32 bytes) carrying
+    /// `user_data` + `crtc_id`, to be drained by `read(/dev/dri/cardN)`.
+    /// Linux: `drivers/gpu/drm/drm_vblank.c::send_vblank_event`.
+    pub fn queue_flip_event(&mut self, user_data: u64, crtc_id: u32) {
+        const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+        self.vblank_seq = self.vblank_seq.wrapping_add(1);
+        let mut e = Vec::with_capacity(32);
+        e.extend_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_le_bytes()); // base.type
+        e.extend_from_slice(&32u32.to_le_bytes()); // base.length
+        e.extend_from_slice(&user_data.to_le_bytes());
+        e.extend_from_slice(&0u32.to_le_bytes()); // tv_sec
+        e.extend_from_slice(&0u32.to_le_bytes()); // tv_usec
+        e.extend_from_slice(&self.vblank_seq.to_le_bytes());
+        e.extend_from_slice(&crtc_id.to_le_bytes());
+        self.events.push_back(e);
     }
 
     // ── Connector / CRTC getters ──────────────────────────────────────

@@ -273,15 +273,18 @@ pub fn sys_select(ctx: &mut dyn TrapContext) {
     let timeout_ms: i64 = if tv_ptr.is_null() {
         -1 // block forever
     } else {
-        // SAFETY: `tv_ptr` is the non-null user `timeval` pointer; `nfds` was
-        // already bounds-checked. `read_unaligned` reads `tv_sec` (first i64 of
-        // the 16-byte struct) without an alignment requirement.
-        // SAFETY: Valid memory or trusted environment
-        let sec = unsafe { core::ptr::read_unaligned(tv_ptr as *const i64) };
-        // SAFETY: `tv_ptr.add(8)` is the `tv_usec` field at offset 8, still
-        // within the 16-byte `timeval`; `read_unaligned` needs no alignment.
-        // SAFETY: Valid memory or trusted environment
-        let usec = unsafe { core::ptr::read_unaligned(tv_ptr.add(8) as *const i64) };
+        // Read `struct timeval { i64 tv_sec; i64 tv_usec; }` (16 bytes) via
+        // copy_from_user — a direct deref #PFs under SMAP, which a real musl
+        // select() caller (e.g. libdrm's render loop with a timeout) trips.
+        let mut tvbuf = [0u8; 16];
+        // SAFETY: `tvbuf` is exactly 16 bytes; copy_from_user range-validates
+        // `tv_ptr` and SMAP-brackets the read.
+        if unsafe { crate::handlers::copy_from_user(&mut tvbuf, tv_ptr as u64) }.is_err() {
+            ctx.set_return(fail);
+            return;
+        }
+        let sec = i64::from_le_bytes(tvbuf[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(tvbuf[8..16].try_into().unwrap());
         // Convert to milliseconds; clamp to positive + finite range.
         if sec < 0 || usec < 0 {
             ctx.set_return(fail);

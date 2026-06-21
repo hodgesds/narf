@@ -28,7 +28,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
 
 // ── DriCardFile ────────────────────────────────────────────────────────────
 
@@ -45,8 +45,31 @@ pub struct DriCardFile {
 }
 
 impl FileOps for DriCardFile {
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })
+    /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
+    /// compositor render loop poll/select()s the fd then read()s the
+    /// flip-complete event here. Returns 0 when no event is queued.
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let index = self.index;
+        Box::pin(async move {
+            if let Some(ms) = crate::drm_registry::mode_state(index) {
+                let mut card = ms.lock();
+                if let Some(ev) = card.events.pop_front() {
+                    let n = ev.len().min(buf.len());
+                    buf[..n].copy_from_slice(&ev[..n]);
+                    return Ok(n);
+                }
+            }
+            Ok(0)
+        })
+    }
+
+    /// `POLL_IN` while flip-complete events are queued, so `select`/`poll`
+    /// on the DRM fd wakes the render loop.
+    fn poll_readiness(&self) -> u32 {
+        match crate::drm_registry::mode_state(self.index) {
+            Some(ms) if !ms.lock().events.is_empty() => POLL_IN,
+            _ => 0,
+        }
     }
 
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {

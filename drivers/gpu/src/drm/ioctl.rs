@@ -37,6 +37,8 @@ pub enum IoctlCmd {
     Version = 0x00,
     GemClose = 0x09,
     GetCap = 0x0C,
+    SetMaster = 0x1E,
+    DropMaster = 0x1F,
     PrimeHandleToFd = 0x2D,
     PrimeFdToHandle = 0x2E,
     ModeGetResources = 0xA0,
@@ -69,6 +71,8 @@ impl IoctlCmd {
             0x00 => IoctlCmd::Version,
             0x09 => IoctlCmd::GemClose,
             0x0C => IoctlCmd::GetCap,
+            0x1E => IoctlCmd::SetMaster,
+            0x1F => IoctlCmd::DropMaster,
             0x2D => IoctlCmd::PrimeHandleToFd,
             0x2E => IoctlCmd::PrimeFdToHandle,
             0xA0 => IoctlCmd::ModeGetResources,
@@ -344,6 +348,8 @@ pub fn dispatch(
         | IoctlCmd::ModeGetCrtc
         | IoctlCmd::ModeGetEncoder
         | IoctlCmd::ModeSetGamma
+        | IoctlCmd::SetMaster
+        | IoctlCmd::DropMaster
         | IoctlCmd::ModeObjGetProperties
         | IoctlCmd::ModePageFlip
         | IoctlCmd::ModeCreateDumb

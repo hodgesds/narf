@@ -166,6 +166,9 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // (no hardware gamma LUT), so modetest's post-modeset gamma reset
         // succeeds silently instead of warning `failed to set gamma`.
         IoctlCmd::ModeSetGamma => Ok(0),
+        // SET_MASTER / DROP_MASTER — primary-node fds are already treated
+        // as authenticated master (single-client model); accept + no-op.
+        IoctlCmd::SetMaster | IoctlCmd::DropMaster => Ok(0),
         // Dumb-buffer ioctls — new in Rung 3.
         IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
         IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),
@@ -841,6 +844,10 @@ fn handle_page_flip(
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DrmModePageFlipUapi) };
 
+    // DRM_MODE_PAGE_FLIP_EVENT — queue a flip-complete event the client
+    // reads off the DRM fd after poll/select (the compositor render loop).
+    const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+
     let src_phys: Option<u64>;
     let src_pitch: u32;
     let src_w: u32;
@@ -859,6 +866,13 @@ fn handle_page_flip(
         src_h = fb.height;
         let gem_handle = fb.gem_handle;
         src_phys = card.dumb_backing(gem_handle).map(|b| b.phys);
+
+        // Deliver the completion event immediately — we blit synchronously,
+        // so the new scanout is live by the time the client wakes. A real
+        // vblank-paced delivery is a later refinement.
+        if req.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+            card.queue_flip_event(req.user_data, req.crtc_id);
+        }
     }
 
     if let Some(src) = src_phys {
