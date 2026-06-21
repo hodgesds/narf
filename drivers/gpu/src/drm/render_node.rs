@@ -271,7 +271,7 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         0xBC => Some(IoctlFlags::master_only()),
         // CREATE_DUMB, MAP_DUMB, DESTROY_DUMB — RENDER_ALLOW per Linux.
         // Linux: DRM_RENDER_ALLOW in drm_ioctls[] (drm_ioctl.c).
-        0xB2 | 0xB3 | 0xB4 => Some(IoctlFlags::render_allow()),
+        0xB2..=0xB4 => Some(IoctlFlags::render_allow()),
         // PRIME handle ↔ fd — RENDER_ALLOW (no display authority needed).
         0x2D | 0x2E => Some(IoctlFlags::render_allow()),
         // SYNCOBJ create/destroy/wait/signal — RENDER_ALLOW.

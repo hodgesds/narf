@@ -93,7 +93,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let _pid = ctx.args().arg1 as i32;
     let _cpu = ctx.args().arg2 as i32;
     let _group_fd = ctx.args().arg3 as i32;
-    let flags = ctx.args().arg4 as u64;
+    let flags = ctx.args().arg4;
 
     // Reject unknown flags per Linux
     // PERF_FLAG_FD_NO_GROUP = 1, PERF_FLAG_FD_OUTPUT = 2, PERF_FLAG_PID_CGROUP = 4, PERF_FLAG_FD_CLOEXEC = 8
@@ -115,6 +115,10 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let size_slice =
         unsafe { core::slice::from_raw_parts_mut(&mut size as *mut u32 as *mut u8, 4) };
 
+    // SAFETY: `size_slice` is a 4-byte view of the local `size` u32 (live for this
+    // call); `attr_ptr` is the user-supplied pointer and was checked non-null above.
+    // `copy_from_user` validates the user range and SMAP-brackets the read, so a bad
+    // user address yields Err rather than faulting the kernel.
     if unsafe { copy_from_user(size_slice, attr_ptr + 4) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
         return;
@@ -124,7 +128,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         size = PERF_ATTR_SIZE_VER0;
     }
 
-    if size < PERF_ATTR_SIZE_VER0 || size > 4096 {
+    if !(PERF_ATTR_SIZE_VER0..=4096).contains(&size) {
         ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // E2BIG
         return;
     }
@@ -133,6 +137,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let to_read = core::cmp::min(size as usize, core::mem::size_of::<perf_event_attr>());
 
     // Since perf_event_attr has padding/not perfectly transparent, we read bytes
+    // SAFETY: `attr` is a live local `perf_event_attr`; we form a byte view spanning
+    // exactly its `size_of` so the slice stays within the object. It is only used as
+    // the destination of `copy_from_user` below, which writes at most `to_read` bytes.
     let attr_bytes = unsafe {
         core::slice::from_raw_parts_mut(
             &mut attr as *mut _ as *mut u8,
@@ -140,6 +147,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         )
     };
 
+    // SAFETY: `attr_bytes[..to_read]` is a sub-slice of the live `attr` byte view
+    // (`to_read <= size_of::<perf_event_attr>()`); `attr_ptr` is the non-null user
+    // pointer. `copy_from_user` validates the user range and SMAP-brackets the read.
     if unsafe { copy_from_user(&mut attr_bytes[..to_read], attr_ptr) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
         return;
@@ -150,6 +160,9 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
         let mut extra_byte: u8 = 0;
         for i in core::mem::size_of::<perf_event_attr>()..(size as usize) {
             let extra_slice = core::slice::from_mut(&mut extra_byte);
+            // SAFETY: `extra_slice` is a 1-byte view of the live local `extra_byte`;
+            // `attr_ptr + i` stays within the user-declared `size` window (i < size).
+            // `copy_from_user` validates the user range and SMAP-brackets the read.
             if unsafe { copy_from_user(extra_slice, attr_ptr + i as u64) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
                 return;

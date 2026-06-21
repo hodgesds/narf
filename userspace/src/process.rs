@@ -410,7 +410,6 @@ pub unsafe fn load_user_process_with(
     // AT_SYSINFO_EHDR: hand libc the vDSO base so it can resolve the
     // __vdso_* / __kernel_* symbols (added regardless of interpreter; a
     // static binary that calls getauxval(AT_SYSINFO_EHDR) wants it too).
-    let mut final_aux = final_aux;
     if let Some(base) = vdso_base {
         let tag = AuxEntry::SysInfoEhdr(0).tag();
         if !final_aux.iter().any(|e| e.tag() == tag) {

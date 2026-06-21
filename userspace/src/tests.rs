@@ -4136,6 +4136,10 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
     let image = crate::parse_elf(&bytes).unwrap();
+    // SAFETY: `proc` was just built by `load_user_process_with` from the same
+    // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
+    // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
+    // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0).unwrap() };
 
     // Read back the slot through the AS — same translate-and-cast
@@ -4286,6 +4290,10 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
     let image = crate::parse_elf(&bytes).unwrap();
+    // SAFETY: `proc` was just built by `load_user_process_with` from the same
+    // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
+    // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
+    // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0).unwrap() };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
@@ -4324,7 +4332,7 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
     // rather than silently writing zero. This image has no DT_STRTAB
     // and a zero `st_name`, so the captured name buffer is all-zero —
     // the dedicated `_carries_name` smoke covers the populated path.
-    use crate::{load_user_process_with, LoadBytesError, ProcessLoadError};
+    use crate::{load_user_process_with, LoadBytesError};
 
     const SEG_VA: u64 = 0x0000_0080_0000_1000;
     const SEG_FOFF: u64 = 0x1000;
@@ -4411,6 +4419,10 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
     let image = crate::parse_elf(&bytes).unwrap();
+    // SAFETY: `proc` was just built by `load_user_process_with` from the same
+    // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
+    // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
+    // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // No DT_STRTAB + st_name=0 → name buffer must be empty.
@@ -4434,7 +4446,7 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
     // The loader walks DT_STRTAB and surfaces the symbol name
     // alongside the index. With strtab "\0printf\0exit\0" and
     // st_name=1, the name buffer must read "printf" + NUL-pad.
-    use crate::{load_user_process_with, LoadBytesError, ProcessLoadError};
+    use crate::{load_user_process_with, LoadBytesError};
 
     let strtab = b"\0printf\0exit\0";
     let bytes = build_unresolved_named_elf(strtab);
@@ -4447,6 +4459,10 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
     let image = crate::parse_elf(&bytes).unwrap();
+    // SAFETY: `proc` was just built by `load_user_process_with` from the same
+    // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
+    // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
+    // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             if &name[..6] != b"printf" {
@@ -4471,7 +4487,7 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
     // A 50-byte name must truncate to 32 bytes with no NUL byte
     // anywhere in the buffer — documents the truncation contract
     // explicitly so future churn doesn't silently regress it.
-    use crate::{load_user_process_with, LoadBytesError, ProcessLoadError};
+    use crate::{load_user_process_with, LoadBytesError};
 
     // 50-byte name, leading NUL + name + trailing NUL (preserves
     // SysV's strtab[0] convention).
@@ -4492,6 +4508,10 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
     let image = crate::parse_elf(&bytes).unwrap();
+    // SAFETY: `proc` was just built by `load_user_process_with` from the same
+    // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
+    // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
+    // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
     match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // First 32 bytes must equal the source's first 32 bytes,

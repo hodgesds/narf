@@ -4420,43 +4420,39 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
-            match ops.mmap_frames(offset, len as usize) {
-                Ok(frames) => {
-                    if frames.len() != pages {
-                        const EINVAL: i64 = 22;
-                        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                        return;
-                    }
-                    let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames
-                        .iter()
-                        .map(|&p| narf_memory::PhysAddr::new(p))
-                        .collect();
-                    if as_ref
-                        .map_region(Region {
-                            base: VirtAddr::new(base),
-                            len,
-                            perms: perms | RegionPerms::SHARED,
-                            phys,
-                        })
-                        .is_err()
-                    {
-                        ctx.set_return(SyscallReturn::invalid_op());
-                        return;
-                    }
-                    // SAFETY: `as_ref` is the calling task's AddressSpace (valid
-                    // root); the region was just registered via map_region, so
-                    // materialize installs only its PTEs over borrowed frames.
-                    // SAFETY: Valid memory or trusted environment
-                    if unsafe { as_ref.materialize() }.is_err() {
-                        ctx.set_return(SyscallReturn::invalid_op());
-                        return;
-                    }
-                    ctx.set_return(SyscallReturn::ok(base));
+            // On Err (unsupported, or any device error) we fall through to the
+            // regular file-backed path below, unchanged from before.
+            if let Ok(frames) = ops.mmap_frames(offset, len as usize) {
+                if frames.len() != pages {
+                    const EINVAL: i64 = 22;
+                    ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
                     return;
                 }
-                // Unsupported (or any device error): fall through to the
-                // regular file-backed path below, unchanged from before.
-                Err(_) => {}
+                let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames
+                    .iter()
+                    .map(|&p| narf_memory::PhysAddr::new(p))
+                    .collect();
+                if as_ref
+                    .map_region(Region {
+                        base: VirtAddr::new(base),
+                        len,
+                        perms: perms | RegionPerms::SHARED,
+                        phys,
+                    })
+                    .is_err()
+                {
+                    ctx.set_return(SyscallReturn::invalid_op());
+                    return;
+                }
+                // SAFETY: `as_ref` is the calling task's AddressSpace (valid
+                // root); the region was just registered via map_region, so
+                // materialize installs only its PTEs over borrowed frames.
+                if unsafe { as_ref.materialize() }.is_err() {
+                    ctx.set_return(SyscallReturn::invalid_op());
+                    return;
+                }
+                ctx.set_return(SyscallReturn::ok(base));
+                return;
             }
         }
     }
@@ -15093,7 +15089,7 @@ pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker)
     let mut g = FUTEX_WAITERS.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     m.entry(uaddr)
-        .or_insert_with(alloc::collections::BTreeMap::new)
+        .or_default()
         .insert(task_id, waker);
 }
 
@@ -17097,7 +17093,7 @@ fn parse_scm_rights_fds(
     const SCM_RIGHTS: i32 = 1;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
     let mut out = alloc::vec::Vec::new();
-    if ctrl_ptr == 0 || ctrl_len < 16 || ctrl_len > MAX_USER_COPY {
+    if ctrl_ptr == 0 || !(16..=MAX_USER_COPY).contains(&ctrl_len) {
         return out;
     }
     let mut ctrl = alloc::vec![0u8; ctrl_len];
@@ -17150,6 +17146,9 @@ fn install_scm_rights_fds(
     let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
     if fds.is_empty() {
         // No ancillary data — report an empty control buffer.
+        // SAFETY: writing 8 bytes to the `msg_controllen` field at `msg_ptr + 40`;
+        // `copy_to_user` range-validates the user address and SMAP-brackets the
+        // write, so a bad pointer returns Err rather than faulting the kernel.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return;
     }
@@ -17173,6 +17172,9 @@ fn install_scm_rights_fds(
     if ctrl_ptr == 0 || ctrl_len < cmsg_len {
         // No room for the control message — the fds are installed but the
         // numbers can't be reported (Linux would set MSG_CTRUNC here).
+        // SAFETY: writing 8 bytes to the `msg_controllen` field at `msg_ptr + 40`;
+        // `copy_to_user` range-validates the user address and SMAP-brackets the
+        // write, so a bad pointer returns Err rather than faulting the kernel.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return;
     }
@@ -17185,6 +17187,8 @@ fn install_scm_rights_fds(
     }
     // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
     let _ = unsafe { copy_to_user(ctrl_ptr, &cmsg) };
+    // SAFETY: writing 8 bytes to the `msg_controllen` field at `msg_ptr + 40`;
+    // `copy_to_user` range-validates the user address and SMAP-brackets the write.
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(cmsg_len as u64).to_le_bytes()) };
 }
 

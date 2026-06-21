@@ -627,7 +627,7 @@ fn handle_create_dumb(
         return Err(FsError::InvalidData);
     }
     // Compute pitch (round up to 64-byte stride for alignment).
-    let bpp_bytes = (req.bpp + 7) / 8;
+    let bpp_bytes = req.bpp.div_ceil(8);
     let pitch = req.width * bpp_bytes;
     let raw_size = pitch as u64 * req.height as u64;
     // Round up to page size.

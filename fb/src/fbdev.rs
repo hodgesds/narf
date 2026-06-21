@@ -4,8 +4,8 @@
 //!   - read/write: linear access to pixel buffer (byte-offset indexed).
 //!   - mmap: MAP_SHARED alias of physical frames (via FileOps::mmap_frames).
 //!   - ioctl: FBIOGET_VSCREENINFO (0x4600), FBIOPUT_VSCREENINFO (0x4601),
-//!            FBIOGET_FSCREENINFO (0x4602), FBIOPAN_DISPLAY (0x4606),
-//!            FBIOBLANK (0x4611).
+//!     FBIOGET_FSCREENINFO (0x4602), FBIOPAN_DISPLAY (0x4606),
+//!     FBIOBLANK (0x4611).
 //!
 //! Linux ref: `drivers/video/fbdev/core/fbmem.c`.
 
@@ -285,6 +285,9 @@ impl FileOps for DevFb0 {
                 // Accept and ignore — callers (SDL2, fbset) may attempt to set
                 // xoffset/yoffset for panning; we don't support that but tolerate
                 // the call so startup doesn't fail.
+                // SAFETY: `arg` is the user `struct fb_var_screeninfo *` passed
+                // through by the ioctl syscall path; `read_user` null-checks `arg`
+                // and SMAP-brackets the read, so a bad pointer returns Err.
                 let _: WireVarScreenInfo = unsafe { read_user(arg)? };
                 Ok(0)
             }
@@ -319,6 +322,9 @@ impl FileOps for DevFb0 {
             }
             FBIOPAN_DISPLAY => {
                 // Single-buffer; no virtual scrolling. Accept and ignore.
+                // SAFETY: `arg` is the user `struct fb_var_screeninfo *` passed
+                // through by the ioctl syscall path; `read_user` null-checks `arg`
+                // and SMAP-brackets the read, so a bad pointer returns Err.
                 let _: WireVarScreenInfo = unsafe { read_user(arg)? };
                 Ok(0)
             }
