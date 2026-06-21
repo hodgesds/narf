@@ -35,10 +35,20 @@ never accumulate unverifiable work.
   (Three boot-time bugs the agent's `cargo check` missed were fixed:
   initcall stage ordering, missing SMAP brackets in the ioctl copy
   helpers, and discarded GET_CAP/ADDFB2 results.)
-- Next: a real DRM client — `modetest` (libdrm), then a minimal
-  Wayland compositor (weston `--use-pixman` / wlroots-pixman) or
-  Xorg-on-fbdev. The kernel modeset primitives now exist; the remaining
-  work is porting the userspace stacks + filling their ABI gaps.
+- **Rung 4 (real libdrm client) — DONE & proven end-to-end.** `modetest`
+  (libdrm 2.4.134, static-musl, vendored + REGEN script) enumerates
+  `/dev/dri/card0` via real libdrm: `drmOpenByName` + VERSION open it,
+  then GETRESOURCES / GETCONNECTOR / GETENCODER / GETCRTC /
+  OBJ_GETPROPERTIES list Encoders, Connectors (Virtual-1, 1280x800@60),
+  CRTCs, Planes, Framebuffers — clean exit. Surfaced + fixed real ABI
+  gaps (connector_id offset, missing GETCRTC/GETENCODER, NULL-property
+  cleanup crash). `modetest -M narf-drm` is a `musl-demo` CI case
+  (anchors on `(1280x800)`). On `main`.
+- Next: a minimal Wayland compositor (weston `--use-pixman` /
+  wlroots-pixman) or Xorg-on-fbdev — the first program that *composites*
+  rather than just enumerates. Likely needs SET_MASTER/DROP_MASTER,
+  PRIME/dma-buf, and a Wayland socket; libinput will exercise the evdev
+  surface from Rung 2.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
