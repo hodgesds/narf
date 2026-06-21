@@ -1,9 +1,9 @@
+use crate::fd::{self, FdEntry};
+use crate::handlers::{copy_from_user, current_task_id};
+use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use narf_filesystem::{FileOps, FsError, FsFuture, Stat, Mode, FileType};
-use crate::fd::{self, FdEntry};
-use crate::handlers::{current_task_id, copy_from_user};
-use crate::syscall::{SyscallReturn, TrapContext};
+use narf_filesystem::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 pub const PERF_ATTR_SIZE_VER0: u32 = 64;
 
@@ -108,17 +108,18 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     }
 
     let mut attr = perf_event_attr::default();
-    
+
     // We need to read the size first (u32 at offset 4).
     let mut size: u32 = 0;
     // SAFETY: getting mutable slice of local size variable
-    let size_slice = unsafe { core::slice::from_raw_parts_mut(&mut size as *mut u32 as *mut u8, 4) };
-    
+    let size_slice =
+        unsafe { core::slice::from_raw_parts_mut(&mut size as *mut u32 as *mut u8, 4) };
+
     if unsafe { copy_from_user(size_slice, attr_ptr + 4) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
         return;
     }
-    
+
     if size == 0 {
         size = PERF_ATTR_SIZE_VER0;
     }
@@ -130,10 +131,15 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
 
     // Read the attr structure
     let to_read = core::cmp::min(size as usize, core::mem::size_of::<perf_event_attr>());
-    
+
     // Since perf_event_attr has padding/not perfectly transparent, we read bytes
-    let attr_bytes = unsafe { core::slice::from_raw_parts_mut(&mut attr as *mut _ as *mut u8, core::mem::size_of::<perf_event_attr>()) };
-    
+    let attr_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut attr as *mut _ as *mut u8,
+            core::mem::size_of::<perf_event_attr>(),
+        )
+    };
+
     if unsafe { copy_from_user(&mut attr_bytes[..to_read], attr_ptr) }.is_err() {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
         return;
@@ -164,7 +170,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let cloexec = (flags & 8) != 0; // PERF_FLAG_FD_CLOEXEC
     let install_flags = if cloexec { fd::FD_CLOEXEC } else { 0 };
-    
+
     let fd_num_opt = fd::with_table(task, |t| {
         t.open(FdEntry {
             ops: Arc::new(PerfEventFile { _attr: attr }),
@@ -173,7 +179,7 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             status_flags: 0,
         })
     });
-    
+
     if let Some(fd_num) = fd_num_opt {
         ctx.set_return(SyscallReturn::ok(fd_num as u64));
     } else {

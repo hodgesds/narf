@@ -1018,7 +1018,19 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         Some(i) => i,
         None => return,
     };
-    let (src_ip, dst_ip, src_port, dst_port, our_iss, ack, peer_dst_mac, mss, our_wscale, our_ts, peer_tsval) = {
+    let (
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        our_iss,
+        ack,
+        peer_dst_mac,
+        mss,
+        our_wscale,
+        our_ts,
+        peer_tsval,
+    ) = {
         let t = arc.lock();
         let our_ts = tsval_now();
         (
@@ -1040,7 +1052,12 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
     // sequence number. A wrong TSecr makes a strict peer (a real Linux
     // host over tap; SLIRP regenerates timestamps so it masked this)
     // reject the SYN-ACK and RST the handshake.
-    let opts = encode_syn_options(mss, our_wscale, our_ts, if ack_too { peer_tsval } else { 0 });
+    let opts = encode_syn_options(
+        mss,
+        our_wscale,
+        our_ts,
+        if ack_too { peer_tsval } else { 0 },
+    );
     let flags = if ack_too {
         FLAG_SYN | FLAG_ACK
     } else {
@@ -1971,7 +1988,13 @@ fn reuseport_flow_hash(remote_addr: [u8; 4], remote_port: u16, local_port: u16) 
 fn add_to_listener_accept_queue(arc: &Arc<IrqSafeSpinLock<Tcb>>) -> Option<u32> {
     let (local_addr, local_port, remote_addr, remote_port, id) = {
         let t = arc.lock();
-        (t.local_addr, t.local_port, t.remote_addr, t.remote_port, t.id)
+        (
+            t.local_addr,
+            t.local_port,
+            t.remote_addr,
+            t.remote_port,
+            t.id,
+        )
     };
     // EVERY LISTEN TCB on this (addr, port). Normally exactly one, but a
     // `SO_REUSEPORT`/`SO_REUSEADDR` server (e.g. a multithreaded daemon

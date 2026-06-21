@@ -205,7 +205,6 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         let _ = narf_arch::x86_64::errata::apply_for_current_cpu();
     }
 
-
     // 2a. Per-CPU user-mode entry setup (only when user-task SMP is
     //     built — otherwise APs run kernel tasks only and need none of
     //     it, and skipping it avoids the per-AP GDT/TSS heap blocks

@@ -2306,11 +2306,7 @@ impl SocketFile {
     /// AF_UNIX `sendmsg` with an SCM_RIGHTS fd batch: writes `buf` to the
     /// stream and queues `fds` for the peer's next `recvmsg`. Only valid on
     /// a connected AF_UNIX stream socket.
-    pub fn unix_sendmsg(
-        &self,
-        buf: &[u8],
-        fds: Vec<Arc<dyn FileOps>>,
-    ) -> Result<usize, SockError> {
+    pub fn unix_sendmsg(&self, buf: &[u8], fds: Vec<Arc<dyn FileOps>>) -> Result<usize, SockError> {
         let state = self.state.lock();
         let tx = match &*state {
             SocketState::UnixConnected { tx, .. } => tx,

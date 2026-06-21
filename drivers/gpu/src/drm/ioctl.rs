@@ -288,11 +288,19 @@ pub enum DrmIoctlResult {
     GetConnector(DrmModeGetConnector, alloc::vec::Vec<DrmModeModeInfo>),
     AddFb2(u32),
     RmFb,
-    GetPlaneRes { count_planes: u32 },
+    GetPlaneRes {
+        count_planes: u32,
+    },
     /// CREATE_DUMB result: (handle, pitch, size).
-    CreateDumb { handle: u32, pitch: u32, size: u64 },
+    CreateDumb {
+        handle: u32,
+        pitch: u32,
+        size: u64,
+    },
     /// MAP_DUMB result: fake mmap offset.
-    MapDumb { offset: u64 },
+    MapDumb {
+        offset: u64,
+    },
     /// Generic success with no output payload.
     Ok,
 }

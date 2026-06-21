@@ -51,7 +51,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
 
-use narf_input::evdev::{DeviceId, EventType, EvdevEvent, ROUTER};
+use narf_input::evdev::{DeviceId, EvdevEvent, EventType, ROUTER};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
@@ -367,8 +367,7 @@ impl FileOps for InputEventFile {
             let mut consumed = 0usize;
             let count = buf.len() / LINUX_INPUT_EVENT_SIZE;
             for i in 0..count {
-                let src =
-                    &buf[i * LINUX_INPUT_EVENT_SIZE..(i + 1) * LINUX_INPUT_EVENT_SIZE];
+                let src = &buf[i * LINUX_INPUT_EVENT_SIZE..(i + 1) * LINUX_INPUT_EVENT_SIZE];
                 if let Some(ev) = unpack_linux_event(src) {
                     ROUTER.dispatch(self.device_id, ev);
                 }

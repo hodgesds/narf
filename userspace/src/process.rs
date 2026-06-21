@@ -327,25 +327,26 @@ pub unsafe fn load_user_process_with(
     // stack contract that the smoke tests assert against. We determine
     // this by checking if args/envp/auxv are completely empty.
     #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-    let (stack_top_v, at_random_vaddr) = if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
-        let entropy_va = stack_top_v - 16;
-        let mut key = [0u8; 32];
-        let _src = narf_arch::x86_64::hwrng::fill_key_32(&mut key);
-        let root = address_space.root;
-        for (i, &byte) in key[..16].iter().enumerate() {
-            if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
-                // SAFETY: stack region is mapped+materialised R+W
-                // above; identity-mapped low 4 GiB.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    *(phys as *mut u8) = byte;
+    let (stack_top_v, at_random_vaddr) =
+        if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
+            let entropy_va = stack_top_v - 16;
+            let mut key = [0u8; 32];
+            let _src = narf_arch::x86_64::hwrng::fill_key_32(&mut key);
+            let root = address_space.root;
+            for (i, &byte) in key[..16].iter().enumerate() {
+                if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
+                    // SAFETY: stack region is mapped+materialised R+W
+                    // above; identity-mapped low 4 GiB.
+                    // SAFETY: Valid memory or trusted environment
+                    unsafe {
+                        *(phys as *mut u8) = byte;
+                    }
                 }
             }
-        }
-        (entropy_va, Some(entropy_va))
-    } else {
-        (stack_top_v, None)
-    };
+            (entropy_va, Some(entropy_va))
+        } else {
+            (stack_top_v, None)
+        };
     #[cfg(not(all(feature = "linux-compat", target_arch = "x86_64")))]
     let (stack_top_v, at_random_vaddr): (u64, Option<u64>) = (stack_top_v, None);
 

@@ -450,11 +450,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             cr4 |= narf_arch::x86_64::cr::CR4_OSXSAVE;
             narf_arch::x86_64::cr::write_cr4(cr4);
             narf_arch::x86_64::xsave::enable_default();
-            
+
             let c = narf_arch::x86_64::xsave::caps();
             let _ = core::fmt::Write::write_fmt(
                 &mut console::Writer,
-                core::format_args!("  xsave: xcr0_supp={:x} avx={} avx512={}\n", c.xcr0_supported, c.avx, c.avx512)
+                core::format_args!(
+                    "  xsave: xcr0_supp={:x} avx={} avx512={}\n",
+                    c.xcr0_supported,
+                    c.avx,
+                    c.avx512
+                ),
             );
         }
         // KPTI detect — Renoir + Phoenix come back Posture::Native and
@@ -3400,7 +3405,10 @@ fn boot_userspace_init() {
                 ("modetest", narf_verification::NARF_MODETEST_ELF),
                 ("wl_handshake", narf_verification::NARF_WL_HANDSHAKE_ELF),
                 ("wl_shm", narf_verification::NARF_WL_SHM_ELF),
-                ("mini_compositor", narf_verification::NARF_MINI_COMPOSITOR_ELF),
+                (
+                    "mini_compositor",
+                    narf_verification::NARF_MINI_COMPOSITOR_ELF,
+                ),
                 ("wl_2proc", narf_verification::NARF_WL_2PROC_ELF),
                 ("wl_multi", narf_verification::NARF_WL_MULTI_ELF),
                 ("wl_xdg", narf_verification::NARF_WL_XDG_ELF),

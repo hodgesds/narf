@@ -1739,7 +1739,10 @@ fn smoke_uinput_loopback() -> TestResult {
 
     // Declare capabilities: EV_KEY support + KEY_A. For SET_*BIT the arg is
     // the code VALUE itself, not a user pointer.
-    if ctrl.ioctl(ioc(WRITE, UI_SET_EVBIT, 4), EV_KEY as usize).is_err() {
+    if ctrl
+        .ioctl(ioc(WRITE, UI_SET_EVBIT, 4), EV_KEY as usize)
+        .is_err()
+    {
         return TestResult::Fail("UI_SET_EVBIT failed");
     }
     if ctrl

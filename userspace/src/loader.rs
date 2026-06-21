@@ -866,7 +866,11 @@ unsafe fn process_rela_array(
             }
             _ => {
                 use core::fmt::Write;
-                let _ = writeln!(narf_console::Writer, "Unsupported relocation type: {}", rtype);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "Unsupported relocation type: {}",
+                    rtype
+                );
                 return Err(LoadBytesError::UnsupportedRelocation);
             }
         };

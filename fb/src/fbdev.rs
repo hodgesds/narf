@@ -134,9 +134,7 @@ unsafe fn read_user<T: Copy + Default>(uptr: usize) -> Result<T, FsError> {
     // with_user_access enables user memory reads under SMAP.
     // SAFETY: Valid memory or trusted environment
     let v = unsafe {
-        narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::read_unaligned(uptr as *const T)
-        })
+        narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const T))
     };
     Ok(v)
 }
@@ -225,7 +223,9 @@ impl FileOps for DevFb0 {
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         let info = fbdev_info().ok_or(FsError::Unsupported)?;
         let map_len = info.map_len();
-        let end = (offset as usize).checked_add(len).ok_or(FsError::InvalidData)?;
+        let end = (offset as usize)
+            .checked_add(len)
+            .ok_or(FsError::InvalidData)?;
         if end > map_len {
             return Err(FsError::Unsupported);
         }
@@ -252,10 +252,26 @@ impl FileOps for DevFb0 {
                     yres_virtual: info.height,
                     bits_per_pixel: info.bpp,
                     // XRGB8888: red[16:8], green[8:8], blue[0:8], transp[24:8]
-                    red:    WireBitfield { offset: 16, length: 8, msb_right: 0 },
-                    green:  WireBitfield { offset: 8,  length: 8, msb_right: 0 },
-                    blue:   WireBitfield { offset: 0,  length: 8, msb_right: 0 },
-                    transp: WireBitfield { offset: 24, length: 8, msb_right: 0 },
+                    red: WireBitfield {
+                        offset: 16,
+                        length: 8,
+                        msb_right: 0,
+                    },
+                    green: WireBitfield {
+                        offset: 8,
+                        length: 8,
+                        msb_right: 0,
+                    },
+                    blue: WireBitfield {
+                        offset: 0,
+                        length: 8,
+                        msb_right: 0,
+                    },
+                    transp: WireBitfield {
+                        offset: 24,
+                        length: 8,
+                        msb_right: 0,
+                    },
                     ..WireVarScreenInfo::default()
                 };
                 // SAFETY: `arg` is the user `struct fb_var_screeninfo *` that
@@ -282,9 +298,9 @@ impl FileOps for DevFb0 {
                     id,
                     smem_start: info.phys,
                     smem_len: info.map_len() as u32,
-                    fb_type: 0,   // FB_TYPE_PACKED_PIXELS
+                    fb_type: 0, // FB_TYPE_PACKED_PIXELS
                     type_aux: 0,
-                    visual: 2,    // FB_VISUAL_TRUECOLOR
+                    visual: 2, // FB_VISUAL_TRUECOLOR
                     xpanstep: 0,
                     ypanstep: 0,
                     ywrapstep: 0,
@@ -292,7 +308,7 @@ impl FileOps for DevFb0 {
                     line_length: info.stride_bytes,
                     mmio_start: 0,
                     mmio_len: 0,
-                    accel: 0,     // FB_ACCEL_NONE
+                    accel: 0, // FB_ACCEL_NONE
                     capabilities: 0,
                     reserved: [0; 2],
                 };

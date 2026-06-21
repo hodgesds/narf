@@ -255,21 +255,27 @@ pub fn register_initcalls() {
     // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
     narf_init::register(Stage::Late, "bochs-drm-card", || {
         if narf_graphics_driver::bochs::is_probed() {
-            use drm::card::{Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType};
+            use drm::card::{
+                Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+            };
             let count = drm_registry::count() as u32;
             let card_name = alloc::format!("card{}", count);
             let card = drm_devfs_bridge::BochsCard::new(card_name);
 
             // Build a mode_state Card with 1 CRTC + 1 encoder + 1 connector
             // taken from the bochs scanout geometry.
-            let (w, h) = narf_graphics_driver::bochs::with_controller(|d| {
-                (d.width, d.height)
-            }).unwrap_or((1024, 768));
+            let (w, h) = narf_graphics_driver::bochs::with_controller(|d| (d.width, d.height))
+                .unwrap_or((1024, 768));
 
             let mut kms = Card::new("narf-drm", "narf bochs driver", (1, 0, 0));
             kms.crtcs.push(Crtc {
                 id: 1,
-                mode: Some(Mode { width: w, height: h, refresh_hz: 60, bpp: 32 }),
+                mode: Some(Mode {
+                    width: w,
+                    height: h,
+                    refresh_hz: 60,
+                    bpp: 32,
+                }),
                 enabled: true,
                 primary_fb: None,
                 x: 0,
@@ -288,7 +294,12 @@ pub fn register_initcalls() {
                 connector_type_id: 1,
                 status: ConnectorStatus::Connected,
                 encoder_id: Some(2),
-                modes: alloc::vec![Mode { width: w, height: h, refresh_hz: 60, bpp: 32 }],
+                modes: alloc::vec![Mode {
+                    width: w,
+                    height: h,
+                    refresh_hz: 60,
+                    bpp: 32
+                }],
             });
 
             let idx = drm_registry::register_drm_card(alloc::sync::Arc::new(card));

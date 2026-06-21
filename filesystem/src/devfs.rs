@@ -446,12 +446,19 @@ impl FileOps for DevFb0Proxy {
         })
     }
     fn stat(&self) -> Stat {
-        FB0_NODE.lock().as_ref().map(|n| n.stat()).unwrap_or_else(|| Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode { file_type: FileType::Special, perms: 0o660 },
-            mtime_cycles: 0,
-        })
+        FB0_NODE
+            .lock()
+            .as_ref()
+            .map(|n| n.stat())
+            .unwrap_or_else(|| Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Special,
+                    perms: 0o660,
+                },
+                mtime_cycles: 0,
+            })
     }
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
         match FB0_NODE.lock().clone() {

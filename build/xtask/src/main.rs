@@ -1930,7 +1930,9 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    let mut qemu_args = build.arch.qemu_args(&kernel, &build.display, build.hw_profile);
+    let mut qemu_args = build
+        .arch
+        .qemu_args(&kernel, &build.display, build.hw_profile);
     if let Some(cpio) = cpio_path {
         qemu_args.push("-initrd".into());
         qemu_args.push(cpio.display().to_string());
@@ -2223,8 +2225,16 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
                 let _ = reader_handle.join();
                 let g = captured.lock().unwrap();
                 let cap_str = String::from_utf8_lossy(&g);
-                let tail = if cap_str.len() > 4096 { &cap_str[cap_str.len() - 4096..] } else { &cap_str };
-                bail!("xtask run-interactive: panic after typing — '{}'\nCapture Tail:\n{}", p, tail);
+                let tail = if cap_str.len() > 4096 {
+                    &cap_str[cap_str.len() - 4096..]
+                } else {
+                    &cap_str
+                };
+                bail!(
+                    "xtask run-interactive: panic after typing — '{}'\nCapture Tail:\n{}",
+                    p,
+                    tail
+                );
             }
             Ok(Ev::Prompt) => {}
             Ok(Ev::Eof) => {
@@ -3307,7 +3317,11 @@ fn boot_narf_redis(
             // when the host connect fails. `XTASK_TAP_HOLD=<secs>`.
             if let Ok(h) = std::env::var("XTASK_TAP_HOLD") {
                 if let Ok(secs) = h.parse::<u64>() {
-                    let _ = writeln!(std::io::stdout(), "  [NARF] connect failed; holding guest {secs}s for debug (pid {})", child.id());
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "  [NARF] connect failed; holding guest {secs}s for debug (pid {})",
+                        child.id()
+                    );
                     std::thread::sleep(Duration::from_secs(secs));
                 }
             }
@@ -3464,7 +3478,9 @@ fn boot_linux_redis(
     // Tap mode: same real NIC NARF uses, so the Linux baseline is
     // apples-to-apples over a real backend (the guest self-assigns
     // 10.0.2.15 in its init). Else SLIRP + hostfwd.
-    let linux_tap = std::env::var("XTASK_QEMU_TAP").ok().filter(|s| !s.is_empty());
+    let linux_tap = std::env::var("XTASK_QEMU_TAP")
+        .ok()
+        .filter(|s| !s.is_empty());
     // Match a multi_queue tap (≥2 queues) just like the NARF side, else
     // QEMU can't open it and the Linux baseline silently fails to boot.
     let lq = effective_qemu_queues();
@@ -3587,7 +3603,10 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
     let root = workspace_root()?;
     let server = root.join("verification/data/musl-demo/mt_echo_server_x86_64");
     if !server.exists() {
-        bail!("Linux baseline: mt-echo binary missing at {}", server.display());
+        bail!(
+            "Linux baseline: mt-echo binary missing at {}",
+            server.display()
+        );
     }
     let busybox = {
         let local = root.join("verification/data/musl-demo/busybox_static_x86_64");
@@ -4124,7 +4143,11 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
     let tap_mode = std::env::var_os("XTASK_QEMU_TAP").is_some();
     let queues = std::env::var("XTASK_QEMU_QUEUES").unwrap_or_else(|_| "1".into());
     let accel = std::env::var("XTASK_QEMU_ACCEL").unwrap_or_else(|_| "tcg (default)".into());
-    let backend = if tap_mode { "tap (real NIC)" } else { "SLIRP+hostfwd" };
+    let backend = if tap_mode {
+        "tap (real NIC)"
+    } else {
+        "SLIRP+hostfwd"
+    };
 
     println!(
         "xtask mt-echo-bench: {conns} conns / {client_threads} client thread(s), \
@@ -4178,8 +4201,14 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
             match boot_linux_mt_echo(guest_port, threads) {
                 Ok(mut lchild) => {
                     std::thread::sleep(std::time::Duration::from_millis(300));
-                    let r =
-                        run_loadgen(&loadgen, "10.0.2.15", guest_port, conns, secs, client_threads);
+                    let r = run_loadgen(
+                        &loadgen,
+                        "10.0.2.15",
+                        guest_port,
+                        conns,
+                        secs,
+                        client_threads,
+                    );
                     let _ = lchild.kill();
                     let _ = lchild.wait();
                     match r {

@@ -1580,7 +1580,12 @@ impl AddressSpace {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {} // idempotent
                     Err(e) => {
-                        panic!("materialize map_4kb failed at virt {:x} phys {:x} with {:?}", v.raw(), p.raw(), e);
+                        panic!(
+                            "materialize map_4kb failed at virt {:x} phys {:x} with {:?}",
+                            v.raw(),
+                            p.raw(),
+                            e
+                        );
                     }
                 }
             }
@@ -1630,7 +1635,12 @@ impl AddressSpace {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}
                     Err(e) => {
-                        panic!("materialize map_4kb failed at virt {:x} phys {:x} with {:?}", v.raw(), p.raw(), e);
+                        panic!(
+                            "materialize map_4kb failed at virt {:x} phys {:x} with {:?}",
+                            v.raw(),
+                            p.raw(),
+                            e
+                        );
                     }
                 }
             }

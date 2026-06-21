@@ -298,7 +298,10 @@ fn main() {
     // Wayland wire protocol + transport work on NARF. Recipe: REGEN_wl_handshake.sh.
     println!("cargo:rerun-if-changed=data/musl-demo/wl_handshake_x86_64");
     let wl = manifest_dir.join("data/musl-demo/wl_handshake_x86_64");
-    println!("cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_X86_64={}", wl.display());
+    println!(
+        "cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_X86_64={}",
+        wl.display()
+    );
     println!("cargo:rustc-env=NARF_WL_HANDSHAKE_ELF_AARCH64=/dev/null");
 
     // wl_shm — libwayland wl_shm pool over the Wayland fd-passing path
@@ -312,7 +315,10 @@ fn main() {
     // wl_shm buffer onto /dev/fb0. The convergence of the desktop rungs.
     println!("cargo:rerun-if-changed=data/musl-demo/mini_compositor_x86_64");
     let mc = manifest_dir.join("data/musl-demo/mini_compositor_x86_64");
-    println!("cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_X86_64={}", mc.display());
+    println!(
+        "cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_X86_64={}",
+        mc.display()
+    );
     println!("cargo:rustc-env=NARF_MINI_COMPOSITOR_ELF_AARCH64=/dev/null");
 
     // wl_2proc — two-process Wayland: fork() a compositor (named socket) +
@@ -362,7 +368,10 @@ fn main() {
     // /bin/wl_app. The first real off-the-shelf GUI client. Rung 12.
     println!("cargo:rerun-if-changed=data/musl-demo/simple_shm_x86_64");
     let ssh = manifest_dir.join("data/musl-demo/simple_shm_x86_64");
-    println!("cargo:rustc-env=NARF_SIMPLE_SHM_ELF_X86_64={}", ssh.display());
+    println!(
+        "cargo:rustc-env=NARF_SIMPLE_SHM_ELF_X86_64={}",
+        ssh.display()
+    );
     println!("cargo:rustc-env=NARF_SIMPLE_SHM_ELF_AARCH64=/dev/null");
 
     // wl_app — compositor that fork+execve's /bin/simple_shm and composites
@@ -376,14 +385,20 @@ fn main() {
     // the virtio-blk ext2 image) and exec Alpine's own busybox. Distro boot.
     println!("cargo:rerun-if-changed=data/musl-demo/distro_init_x86_64");
     let dist = manifest_dir.join("data/musl-demo/distro_init_x86_64");
-    println!("cargo:rustc-env=NARF_DISTRO_INIT_ELF_X86_64={}", dist.display());
+    println!(
+        "cargo:rustc-env=NARF_DISTRO_INIT_ELF_X86_64={}",
+        dist.display()
+    );
     println!("cargo:rustc-env=NARF_DISTRO_INIT_ELF_AARCH64=/dev/null");
 
     // distro_desktop — chroot into the Alpine rootfs and run the Wayland
     // compositor (+ weston-simple-shm) from inside the distro. Desktop in distro.
     println!("cargo:rerun-if-changed=data/musl-demo/distro_desktop_x86_64");
     let dd = manifest_dir.join("data/musl-demo/distro_desktop_x86_64");
-    println!("cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_X86_64={}", dd.display());
+    println!(
+        "cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_X86_64={}",
+        dd.display()
+    );
     println!("cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_AARCH64=/dev/null");
 
     // pthread demo binary — exercises clone3 + futex + per-thread

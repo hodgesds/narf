@@ -146,8 +146,8 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicU32;
+use core::sync::atomic::AtomicU64;
 
 use narf_capabilities::{Cap, CapKind, CapType, Spend};
 use narf_lib::sync::IrqSafeSpinLock;

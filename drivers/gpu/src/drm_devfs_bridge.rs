@@ -28,7 +28,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN};
+use narf_filesystem::{
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN,
+};
 
 // ── DriCardFile ────────────────────────────────────────────────────────────
 

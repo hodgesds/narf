@@ -401,8 +401,7 @@ pub struct DrmModeMapDumbUapi {
     pub offset: u64,
 }
 
-const _: () =
-    assert!(core::mem::size_of::<DrmModeMapDumbUapi>() == SZ_DRM_MODE_MAP_DUMB as usize);
+const _: () = assert!(core::mem::size_of::<DrmModeMapDumbUapi>() == SZ_DRM_MODE_MAP_DUMB as usize);
 
 /// `struct drm_mode_destroy_dumb` — DRM_IOCTL_MODE_DESTROY_DUMB.
 /// Linux: `include/uapi/drm/drm_mode.h`.

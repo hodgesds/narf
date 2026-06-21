@@ -1352,165 +1352,168 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
         // Forwarder's home core (see the partition comment above).
         let target_cpu = if partition { pair_idx as u32 } else { 0 };
         // Stackful: virtio-net RX pump.
-        narf_scheduler::spawn_stackful_pinned(async move {
-            // Adaptive (NAPI-style) poll cadence. virtio-net MSI-X RX
-            // completions don't always wake us promptly under SLIRP/TCG
-            // (the device can leave the used-ring interrupt suppressed),
-            // so a fixed 100 ms fallback gated every off-box round-trip
-            // at ~tens of ms. Instead: while frames are flowing, re-poll
-            // on a 1 ms deadline so request/response latency is sub-ms;
-            // after a run of empty polls, back off to 100 ms so an idle
-            // NIC parks instead of spinning the CPU. `idle_rounds`
-            // counts consecutive empty wakes.
-            const FAST_ROUNDS: u32 = 64;
-            let mut idle_rounds: u32 = FAST_ROUNDS;
-            loop {
-                // Snapshot the IRQ generation BEFORE draining (Linux NAPI
-                // re-check pattern). A frame that lands during or after the
-                // drain below bumps the vector's `fire_count` past this
-                // baseline, so the wait at the bottom of the loop resolves
-                // immediately instead of sleeping out the deadline. In the
-                // old wait-then-drain order, a frame arriving in the window
-                // between a drain and the next `wait_for_irq` snapshot was
-                // absorbed into the new baseline and waited the full 1 ms
-                // deadline — that dragged off-box request latency to ~0.7 ms
-                // avg (vs ~0.15 ms when the IRQ edge was caught). Building
-                // the future just snapshots the count; its waker isn't
-                // installed until the first poll (in `timeout` below).
-                let irq_waiter = irq.map(narf_interrupts::wait_for_irq);
-                let mut processed_any = false;
+        narf_scheduler::spawn_stackful_pinned(
+            async move {
+                // Adaptive (NAPI-style) poll cadence. virtio-net MSI-X RX
+                // completions don't always wake us promptly under SLIRP/TCG
+                // (the device can leave the used-ring interrupt suppressed),
+                // so a fixed 100 ms fallback gated every off-box round-trip
+                // at ~tens of ms. Instead: while frames are flowing, re-poll
+                // on a 1 ms deadline so request/response latency is sub-ms;
+                // after a run of empty polls, back off to 100 ms so an idle
+                // NIC parks instead of spinning the CPU. `idle_rounds`
+                // counts consecutive empty wakes.
+                const FAST_ROUNDS: u32 = 64;
+                let mut idle_rounds: u32 = FAST_ROUNDS;
                 loop {
-                    let taken = match with_at(idx, |c| c.rx_take_on(pair_idx)) {
-                        Some(t) => t,
-                        None => return, // controller vanished
-                    };
-                    let (buf, total_len) = match taken {
-                        Some(t) => t,
-                        None => break,
-                    };
-                    // Saw a used-ring entry → the NIC is active; stay in
-                    // fast-poll mode.
-                    processed_any = true;
-                    // virtio-net always prepends a 12-byte header to
-                    // every RX frame. Strip it via Frame::with_offset
-                    // — the bytes stay where the device wrote them.
-                    let payload_len = total_len.saturating_sub(12);
-                    if payload_len == 0 {
-                        // Empty frame (just header); drop it and keep
-                        // draining. `buf` frees on scope exit.
-                        continue;
-                    }
-                    let frame = Frame::with_offset(buf, 12, payload_len);
-                    // Tap: synchronously dispatch the payload through
-                    // the iface RX handler. Only installed for the
-                    // primary controller (idx 0) — the TCP stack hooked
-                    // itself there at boot via `install_rx_drain` /
-                    // `on_rx_frame_from`. Cheap fn-pointer call when no
-                    // handler is installed.
-                    if idx == 0 {
-                        narf_net::iface::on_rx_frame_from("vnet0", frame.payload());
-                        // The tap consumed the frame synchronously and
-                        // completely. The iface's rx_prod/rx_cons
-                        // channel is the *legacy* delivery path and is
-                        // NOT drained in production (only the net unit
-                        // tests pop its `rx_cons`). Pushing here would
-                        // fill the 64-slot ring after 64 frames and then
-                        // spin the pump forever in the try_send/yield
-                        // loop below — observed as an off-box TCP stream
-                        // wedging dead at the 65th received frame. So
-                        // drop the frame now (its DmaBuffer frees on
-                        // scope exit) and keep draining the device.
-                        continue;
-                    }
-                    // Secondary controllers (idx != 0) have no
-                    // synchronous tap, so the channel IS their delivery
-                    // path. Push best-effort: on a full ring DROP the
-                    // frame (TCP will retransmit) rather than spin the
-                    // pump forever — an undrained/slow consumer must not
-                    // wedge RX. Closed ⇒ consumer gone, bail.
-                    {
-                        let mut g = rx_prod.lock();
-                        let prod = match g.as_mut() {
-                            Some(p) => p,
-                            None => return,
+                    // Snapshot the IRQ generation BEFORE draining (Linux NAPI
+                    // re-check pattern). A frame that lands during or after the
+                    // drain below bumps the vector's `fire_count` past this
+                    // baseline, so the wait at the bottom of the loop resolves
+                    // immediately instead of sleeping out the deadline. In the
+                    // old wait-then-drain order, a frame arriving in the window
+                    // between a drain and the next `wait_for_irq` snapshot was
+                    // absorbed into the new baseline and waited the full 1 ms
+                    // deadline — that dragged off-box request latency to ~0.7 ms
+                    // avg (vs ~0.15 ms when the IRQ edge was caught). Building
+                    // the future just snapshots the count; its waker isn't
+                    // installed until the first poll (in `timeout` below).
+                    let irq_waiter = irq.map(narf_interrupts::wait_for_irq);
+                    let mut processed_any = false;
+                    loop {
+                        let taken = match with_at(idx, |c| c.rx_take_on(pair_idx)) {
+                            Some(t) => t,
+                            None => return, // controller vanished
                         };
-                        match prod.try_send(frame) {
-                            Ok(()) => {}
-                            Err(narf_ipc::TrySendError::Closed(_)) => {
-                                *g = None;
-                                return;
+                        let (buf, total_len) = match taken {
+                            Some(t) => t,
+                            None => break,
+                        };
+                        // Saw a used-ring entry → the NIC is active; stay in
+                        // fast-poll mode.
+                        processed_any = true;
+                        // virtio-net always prepends a 12-byte header to
+                        // every RX frame. Strip it via Frame::with_offset
+                        // — the bytes stay where the device wrote them.
+                        let payload_len = total_len.saturating_sub(12);
+                        if payload_len == 0 {
+                            // Empty frame (just header); drop it and keep
+                            // draining. `buf` frees on scope exit.
+                            continue;
+                        }
+                        let frame = Frame::with_offset(buf, 12, payload_len);
+                        // Tap: synchronously dispatch the payload through
+                        // the iface RX handler. Only installed for the
+                        // primary controller (idx 0) — the TCP stack hooked
+                        // itself there at boot via `install_rx_drain` /
+                        // `on_rx_frame_from`. Cheap fn-pointer call when no
+                        // handler is installed.
+                        if idx == 0 {
+                            narf_net::iface::on_rx_frame_from("vnet0", frame.payload());
+                            // The tap consumed the frame synchronously and
+                            // completely. The iface's rx_prod/rx_cons
+                            // channel is the *legacy* delivery path and is
+                            // NOT drained in production (only the net unit
+                            // tests pop its `rx_cons`). Pushing here would
+                            // fill the 64-slot ring after 64 frames and then
+                            // spin the pump forever in the try_send/yield
+                            // loop below — observed as an off-box TCP stream
+                            // wedging dead at the 65th received frame. So
+                            // drop the frame now (its DmaBuffer frees on
+                            // scope exit) and keep draining the device.
+                            continue;
+                        }
+                        // Secondary controllers (idx != 0) have no
+                        // synchronous tap, so the channel IS their delivery
+                        // path. Push best-effort: on a full ring DROP the
+                        // frame (TCP will retransmit) rather than spin the
+                        // pump forever — an undrained/slow consumer must not
+                        // wedge RX. Closed ⇒ consumer gone, bail.
+                        {
+                            let mut g = rx_prod.lock();
+                            let prod = match g.as_mut() {
+                                Some(p) => p,
+                                None => return,
+                            };
+                            match prod.try_send(frame) {
+                                Ok(()) => {}
+                                Err(narf_ipc::TrySendError::Closed(_)) => {
+                                    *g = None;
+                                    return;
+                                }
+                                Err(narf_ipc::TrySendError::Full(_)) => {
+                                    // Frame dropped on scope exit.
+                                }
                             }
-                            Err(narf_ipc::TrySendError::Full(_)) => {
-                                // Frame dropped on scope exit.
+                        }
+                    }
+                    // Adapt cadence: reset to fast-poll if this round drained
+                    // anything (per-queue), else step toward the slow fallback.
+                    if processed_any {
+                        idle_rounds = 0;
+                    } else {
+                        idle_rounds = idle_rounds.saturating_add(1);
+                    }
+                    // Wait for an IRQ newer than the pre-drain baseline (a frame
+                    // that arrived during the drain resolves this immediately),
+                    // or fall back to the adaptive deadline. Non-MSI-X pairs
+                    // (`irq == None`) poll on the sleep cadence.
+                    //
+                    // PER-QUEUE activity gating: fast-poll only while THIS queue
+                    // is bursting (`idle_rounds` resets to 0 on every non-empty
+                    // drain). The earlier NIC-WIDE `nic_active` gate kept EVERY
+                    // poll-only pair hot whenever ANY queue saw traffic — but the
+                    // host tap delivers all flows to RX queue 0 (no RSS spread),
+                    // so the secondary queues NEVER receive yet busy-spun a whole
+                    // core each forever (perf-dump: a poll-only forwarder core at
+                    // ~100% kTk, 0 syscalls). Gating on this queue's own idleness
+                    // lets a dead queue's forwarder park (IRQ-park / slow-poll)
+                    // while the busy queue 0 stays hot (its `idle_rounds` stays
+                    // low under load). If real RSS spreads later, an MSI-X pair
+                    // re-wakes on its own RX IRQ; a poll-only pair re-checks on
+                    // the 2 ms slow-poll — both per-queue, not NIC-wide.
+                    let fast = idle_rounds < FAST_ROUNDS;
+                    match irq_waiter {
+                        Some(w) => {
+                            if fast {
+                                // NAPI sustained-poll: while frames are flowing
+                                // (recent non-empty drain), do NOT park waiting for
+                                // an RX IRQ. Under concurrent load the device
+                                // COALESCES interrupts — frames pile into the ring
+                                // faster than IRQs fire — so parking on the IRQ
+                                // leaves the vcpu HLT'd between batches (measured:
+                                // concurrent redis throughput ran ~96% vcpu-idle,
+                                // capped ~0.43x Linux despite IPC 2.08 and ~4.9M-
+                                // ops/s of CPU headroom). Instead re-queue and
+                                // re-poll the ring next round, keeping the executor
+                                // hot and the ring drained like Linux NAPI. `w` is
+                                // dropped (never polled → no waker installed);
+                                // `idle_rounds` climbs once the burst ends so we
+                                // fall to the IRQ-park below and an idle NIC still
+                                // HLTs and saves power.
+                                drop(w);
+                                narf_scheduler::yield_now().await;
+                            } else {
+                                // Idle: park on the IRQ. The edge resolves `w`
+                                // immediately when caught; the 2 ms deadline only
+                                // backstops a missed/late RX MSI-X so the executor
+                                // can HLT and save power while no traffic flows.
+                                let dl = narf_time::Deadline::after_ms(2);
+                                let _ = narf_time::timeout(dl, w).await;
+                            }
+                        }
+                        None => {
+                            if fast {
+                                narf_scheduler::yield_now().await;
+                            } else {
+                                narf_time::sleep_cycles(slow_poll_cycles).await;
                             }
                         }
                     }
                 }
-                // Adapt cadence: reset to fast-poll if this round drained
-                // anything (per-queue), else step toward the slow fallback.
-                if processed_any {
-                    idle_rounds = 0;
-                } else {
-                    idle_rounds = idle_rounds.saturating_add(1);
-                }
-                // Wait for an IRQ newer than the pre-drain baseline (a frame
-                // that arrived during the drain resolves this immediately),
-                // or fall back to the adaptive deadline. Non-MSI-X pairs
-                // (`irq == None`) poll on the sleep cadence.
-                //
-                // PER-QUEUE activity gating: fast-poll only while THIS queue
-                // is bursting (`idle_rounds` resets to 0 on every non-empty
-                // drain). The earlier NIC-WIDE `nic_active` gate kept EVERY
-                // poll-only pair hot whenever ANY queue saw traffic — but the
-                // host tap delivers all flows to RX queue 0 (no RSS spread),
-                // so the secondary queues NEVER receive yet busy-spun a whole
-                // core each forever (perf-dump: a poll-only forwarder core at
-                // ~100% kTk, 0 syscalls). Gating on this queue's own idleness
-                // lets a dead queue's forwarder park (IRQ-park / slow-poll)
-                // while the busy queue 0 stays hot (its `idle_rounds` stays
-                // low under load). If real RSS spreads later, an MSI-X pair
-                // re-wakes on its own RX IRQ; a poll-only pair re-checks on
-                // the 2 ms slow-poll — both per-queue, not NIC-wide.
-                let fast = idle_rounds < FAST_ROUNDS;
-                match irq_waiter {
-                    Some(w) => {
-                        if fast {
-                            // NAPI sustained-poll: while frames are flowing
-                            // (recent non-empty drain), do NOT park waiting for
-                            // an RX IRQ. Under concurrent load the device
-                            // COALESCES interrupts — frames pile into the ring
-                            // faster than IRQs fire — so parking on the IRQ
-                            // leaves the vcpu HLT'd between batches (measured:
-                            // concurrent redis throughput ran ~96% vcpu-idle,
-                            // capped ~0.43x Linux despite IPC 2.08 and ~4.9M-
-                            // ops/s of CPU headroom). Instead re-queue and
-                            // re-poll the ring next round, keeping the executor
-                            // hot and the ring drained like Linux NAPI. `w` is
-                            // dropped (never polled → no waker installed);
-                            // `idle_rounds` climbs once the burst ends so we
-                            // fall to the IRQ-park below and an idle NIC still
-                            // HLTs and saves power.
-                            drop(w);
-                            narf_scheduler::yield_now().await;
-                        } else {
-                            // Idle: park on the IRQ. The edge resolves `w`
-                            // immediately when caught; the 2 ms deadline only
-                            // backstops a missed/late RX MSI-X so the executor
-                            // can HLT and save power while no traffic flows.
-                            let dl = narf_time::Deadline::after_ms(2);
-                            let _ = narf_time::timeout(dl, w).await;
-                        }
-                    }
-                    None => {
-                        if fast {
-                            narf_scheduler::yield_now().await;
-                        } else {
-                            narf_time::sleep_cycles(slow_poll_cycles).await;
-                        }
-                    }
-                }
-            }
-        }, target_cpu);
+            },
+            target_cpu,
+        );
     }
 
     // Single TX forwarder per device. Drains the tx_consumer once
@@ -1642,7 +1645,11 @@ pub fn count() -> usize {
 /// Active virtio-net queue-pair count on the primary device (1 unless
 /// VIRTIO_NET_F_MQ was negotiated and `VQ_PAIRS_SET` accepted N>1).
 pub fn primary_num_pairs() -> usize {
-    CONTROLLERS.lock().first().map(|c| c.num_pairs()).unwrap_or(0)
+    CONTROLLERS
+        .lock()
+        .first()
+        .map(|c| c.num_pairs())
+        .unwrap_or(0)
 }
 
 /// Run `f` against the first bound controller, if any. Use the

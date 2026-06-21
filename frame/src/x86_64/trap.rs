@@ -234,7 +234,14 @@ mod perf_dump {
             let _ = writeln!(
                 narf_console::TrapWriter,
                 "PCORE cpu={} uTk={} kTk={} sc={} ctx={} pf={} cpl={} rip={:#x}",
-                cpu, pc.user_ticks, pc.kernel_ticks, pc.syscalls, pc.ctx, pc.page_faults, cpl, rip
+                cpu,
+                pc.user_ticks,
+                pc.kernel_ticks,
+                pc.syscalls,
+                pc.ctx,
+                pc.page_faults,
+                cpl,
+                rip
             );
         }
     }

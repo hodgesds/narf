@@ -4420,7 +4420,9 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
                 TestResult::Fail("UnresolvedSymbol.name should be empty without DT_STRTAB")
             }
         }
-        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations"),
+        Err(_) => TestResult::Fail(
+            "expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations",
+        ),
         Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
@@ -4455,7 +4457,9 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
             }
             TestResult::Pass
         }
-        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations"),
+        Err(_) => TestResult::Fail(
+            "expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations",
+        ),
         Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }
@@ -4501,7 +4505,9 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
             }
             TestResult::Pass
         }
-        Err(_) => TestResult::Fail("expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations"),
+        Err(_) => TestResult::Fail(
+            "expected UnresolvedSymbol{idx:1,..}, got different error from apply_relocations",
+        ),
         Ok(_) => TestResult::Fail("expected UnresolvedSymbol error, got Ok"),
     }
 }

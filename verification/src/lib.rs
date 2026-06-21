@@ -2583,8 +2583,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
-        SyscallTable,
-        TrapContext,
+        SyscallTable, TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
@@ -2767,8 +2766,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     use narf_memory::{AddressSpace, Region, RegionPerms, VirtAddr};
     use narf_userspace::{
         install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
-        SyscallTable,
-        TrapContext,
+        SyscallTable, TrapContext,
     };
 
     static SEEN_MAGIC: AtomicU64 = AtomicU64::new(0);
@@ -3383,8 +3381,7 @@ fn smoke_userspace_tls_round_trip() -> TestResult {
     use core::sync::atomic::{AtomicU64, Ordering};
     use narf_userspace::{
         install_global, syscall::__test_clear_global, RawSyscallHandler, Syscall, SyscallHandler,
-        SyscallTable,
-        TrapContext,
+        SyscallTable, TrapContext,
     };
 
     // The user code emits two syscalls:
@@ -3906,57 +3903,136 @@ pub const NARF_MODETEST_ELF: &[u8] = include_bytes!(env!("NARF_MODETEST_ELF_X86_
     any(feature = "boot-init", feature = "user-mode-testbin")
 ))]
 pub const NARF_MODETEST_ELF: &[u8] = include_bytes!(env!("NARF_MODETEST_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_HANDSHAKE_ELF: &[u8] = include_bytes!(env!("NARF_WL_HANDSHAKE_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_HANDSHAKE_ELF: &[u8] = include_bytes!(env!("NARF_WL_HANDSHAKE_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_SHM_ELF: &[u8] = include_bytes!(env!("NARF_WL_SHM_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_SHM_ELF: &[u8] = include_bytes!(env!("NARF_WL_SHM_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_MINI_COMPOSITOR_ELF: &[u8] = include_bytes!(env!("NARF_MINI_COMPOSITOR_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
-pub const NARF_MINI_COMPOSITOR_ELF: &[u8] = include_bytes!(env!("NARF_MINI_COMPOSITOR_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_MINI_COMPOSITOR_ELF: &[u8] =
+    include_bytes!(env!("NARF_MINI_COMPOSITOR_ELF_AARCH64"));
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_2PROC_ELF: &[u8] = include_bytes!(env!("NARF_WL_2PROC_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_2PROC_ELF: &[u8] = include_bytes!(env!("NARF_WL_2PROC_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_MULTI_ELF: &[u8] = include_bytes!(env!("NARF_WL_MULTI_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_MULTI_ELF: &[u8] = include_bytes!(env!("NARF_WL_MULTI_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_XDG_ELF: &[u8] = include_bytes!(env!("NARF_WL_XDG_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_XDG_ELF: &[u8] = include_bytes!(env!("NARF_WL_XDG_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_INPUT_ELF: &[u8] = include_bytes!(env!("NARF_WL_INPUT_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_INPUT_ELF: &[u8] = include_bytes!(env!("NARF_WL_INPUT_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_KMS_ELF: &[u8] = include_bytes!(env!("NARF_WL_KMS_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_KMS_ELF: &[u8] = include_bytes!(env!("NARF_WL_KMS_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_EVDEV_ELF: &[u8] = include_bytes!(env!("NARF_WL_EVDEV_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_EVDEV_ELF: &[u8] = include_bytes!(env!("NARF_WL_EVDEV_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_SIMPLE_SHM_ELF: &[u8] = include_bytes!(env!("NARF_SIMPLE_SHM_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_SIMPLE_SHM_ELF: &[u8] = include_bytes!(env!("NARF_SIMPLE_SHM_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_APP_ELF: &[u8] = include_bytes!(env!("NARF_WL_APP_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_WL_APP_ELF: &[u8] = include_bytes!(env!("NARF_WL_APP_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_DISTRO_INIT_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_INIT_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_DISTRO_INIT_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_INIT_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_DISTRO_DESKTOP_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_DESKTOP_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_DISTRO_DESKTOP_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_DESKTOP_ELF_AARCH64"));
 
 #[cfg(all(
@@ -3994,9 +4070,15 @@ pub const NARF_FB_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_FB_SMOKE_ELF_X86_
     any(feature = "boot-init", feature = "user-mode-testbin")
 ))]
 pub const NARF_FB_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_FB_SMOKE_ELF_AARCH64"));
-#[cfg(all(target_arch = "x86_64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_SCM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_SCM_SMOKE_ELF_X86_64"));
-#[cfg(all(target_arch = "aarch64", any(feature = "boot-init", feature = "user-mode-testbin")))]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_SCM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_SCM_SMOKE_ELF_AARCH64"));
 
 /// `/bin/drm_smoke` — opens `/dev/dri/card0`, GET_CAP(DUMB_BUFFER),

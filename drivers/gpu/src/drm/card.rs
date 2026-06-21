@@ -347,17 +347,29 @@ impl Card {
 
     /// Look up a dumb backing by GEM handle.
     pub fn dumb_backing(&self, gem_handle: u32) -> Option<&DumbBacking> {
-        self.dumb_backings.iter().find(|b| b.gem_handle == gem_handle)
+        self.dumb_backings
+            .iter()
+            .find(|b| b.gem_handle == gem_handle)
     }
 
     /// Look up a dumb backing by mmap offset.
     pub fn dumb_backing_by_offset(&self, mmap_offset: u64) -> Option<&DumbBacking> {
-        self.dumb_backings.iter().find(|b| b.mmap_offset == mmap_offset)
+        self.dumb_backings
+            .iter()
+            .find(|b| b.mmap_offset == mmap_offset)
     }
 
     /// Register a new dumb backing. Returns the gem handle.
-    pub fn register_dumb_backing(&mut self, phys: u64, byte_len: usize, order: u8) -> Result<u32, CardError> {
-        let handle = self.gem.alloc(phys, byte_len).map_err(|_| CardError::TooManyFbs)?;
+    pub fn register_dumb_backing(
+        &mut self,
+        phys: u64,
+        byte_len: usize,
+        order: u8,
+    ) -> Result<u32, CardError> {
+        let handle = self
+            .gem
+            .alloc(phys, byte_len)
+            .map_err(|_| CardError::TooManyFbs)?;
         // Fake mmap offset = handle << 12. Must not alias a real file offset.
         let mmap_offset = (handle as u64) << 12;
         self.dumb_backings.push(DumbBacking {
@@ -372,7 +384,10 @@ impl Card {
 
     /// Remove a dumb backing by GEM handle. Returns (phys, order) for the caller to free.
     pub fn remove_dumb_backing(&mut self, gem_handle: u32) -> Option<(u64, u8)> {
-        let pos = self.dumb_backings.iter().position(|b| b.gem_handle == gem_handle)?;
+        let pos = self
+            .dumb_backings
+            .iter()
+            .position(|b| b.gem_handle == gem_handle)?;
         let b = self.dumb_backings.swap_remove(pos);
         let _ = self.gem.free(gem_handle);
         Some((b.phys, b.order))

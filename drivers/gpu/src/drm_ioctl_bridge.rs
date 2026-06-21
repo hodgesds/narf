@@ -29,7 +29,7 @@ use narf_filesystem::FsError;
 use crate::drm::ioctl::{dispatch, DrmIoctlError, DrmIoctlResult, IoctlCmd};
 use crate::drm::render_node::DrmFileCtx;
 use crate::drm_uapi::{
-    self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmModeCrtcUapi, DrmModeCreateDumbUapi,
+    self, DrmModeAtomicUapi, DrmModeCardResUapi, DrmModeCreateDumbUapi, DrmModeCrtcUapi,
     DrmModeDestroyDumbUapi, DrmModeMapDumbUapi, DrmModePageFlipUapi, DrmVersionUapi,
 };
 
@@ -389,8 +389,16 @@ fn mode_to_bytes(m: &crate::drm::ioctl::DrmModeModeInfo) -> [u8; 68] {
     let mut b = [0u8; 68];
     b[0..4].copy_from_slice(&m.clock.to_le_bytes());
     let u16s = [
-        m.hdisplay, m.hsync_start, m.hsync_end, m.htotal, m.hskew, m.vdisplay, m.vsync_start,
-        m.vsync_end, m.vtotal, m.vscan,
+        m.hdisplay,
+        m.hsync_start,
+        m.hsync_end,
+        m.htotal,
+        m.hskew,
+        m.vdisplay,
+        m.vsync_start,
+        m.vsync_end,
+        m.vtotal,
+        m.vscan,
     ];
     for (i, v) in u16s.iter().enumerate() {
         b[4 + i * 2..6 + i * 2].copy_from_slice(&v.to_le_bytes());
@@ -637,8 +645,7 @@ fn handle_create_dumb(
     };
 
     // Allocate contiguous physical pages via the buddy allocator.
-    let frame = narf_memory::frame::alloc_pages_on(0, order)
-        .map_err(|_| FsError::InvalidData)?;
+    let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::InvalidData)?;
     let phys = frame.start_address().raw();
 
     // Zero the buffer so userspace doesn't see stale kernel data.
@@ -760,9 +767,7 @@ fn free_dumb_backing(
         card.remove_dumb_backing(gem_handle)
     };
     if let Some((phys, order)) = phys_order {
-        let frame = narf_memory::frame::PhysFrame::new(
-            narf_memory::addr::PhysAddr::new(phys),
-        );
+        let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
         narf_memory::frame::free_pages(frame, order);
     }
 }
@@ -800,7 +805,11 @@ fn handle_setcrtc(
 
         // Record the mode and active fb on the crtc.
         if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
-            crtc.primary_fb = if req.fb_id != 0 { Some(req.fb_id) } else { None };
+            crtc.primary_fb = if req.fb_id != 0 {
+                Some(req.fb_id)
+            } else {
+                None
+            };
             crtc.enabled = req.fb_id != 0;
         }
 
@@ -808,7 +817,9 @@ fn handle_setcrtc(
             return Ok(0);
         }
 
-        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::InvalidData)?;
+        let fb = card
+            .framebuffer(req.fb_id)
+            .map_err(|_| FsError::InvalidData)?;
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
@@ -857,10 +868,16 @@ fn handle_page_flip(
 
         // Update the crtc's active fb.
         if let Ok(crtc) = card.crtc_mut(req.crtc_id) {
-            crtc.primary_fb = if req.fb_id != 0 { Some(req.fb_id) } else { None };
+            crtc.primary_fb = if req.fb_id != 0 {
+                Some(req.fb_id)
+            } else {
+                None
+            };
         }
 
-        let fb = card.framebuffer(req.fb_id).map_err(|_| FsError::InvalidData)?;
+        let fb = card
+            .framebuffer(req.fb_id)
+            .map_err(|_| FsError::InvalidData)?;
         src_pitch = fb.pitch;
         src_w = fb.width;
         src_h = fb.height;
@@ -906,11 +923,7 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
         // the allocation bounds (row < dst_h <= src_h, dst_w <= src_w).
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src_row as *const u8,
-                dst_row as *mut u8,
-                row_bytes,
-            );
+            core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
         }
     }
     crate::drm_fb_hook::flush_scanout();
