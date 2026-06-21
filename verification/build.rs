@@ -401,6 +401,16 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_AARCH64=/dev/null");
 
+    // chroot_run — generic Alpine-chroot launcher running /probe.sh (input/
+    // compositor bring-up "run real software, see what breaks" harness).
+    println!("cargo:rerun-if-changed=data/musl-demo/chroot_run_x86_64");
+    let crun = manifest_dir.join("data/musl-demo/chroot_run_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_CHROOT_RUN_ELF_X86_64={}",
+        crun.display()
+    );
+    println!("cargo:rustc-env=NARF_CHROOT_RUN_ELF_AARCH64=/dev/null");
+
     // pthread demo binary — exercises clone3 + futex + per-thread
     // TLS end-to-end. Same dynamic-musl shape as hello_musl_dyn but
     // with -pthread (pulls libpthread, on musl that's libc itself).

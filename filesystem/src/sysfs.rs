@@ -486,23 +486,27 @@ pub fn populate_net_class() {
     }
 }
 
-/// Populate `/sys/class/input/event<N>/` for up to `n` input device slots.
+/// Populate `/sys/class/input/event<N>/` for every registered evdev device.
 /// Linux ref: `evdev_connect` (drivers/input/evdev.c:1306).
 ///
-/// `narf-input` has a global `EventRing` but no per-device registry with
-/// stable names.  We expose stubs for slots 0..n.
-pub fn populate_input_class(n: usize) {
-    let root = get_root();
-    let class_dir = get_or_create_child(&root, "class");
-    let class_input = get_or_create_child(&class_dir, "input");
-
-    for i in 0..n {
-        let slot_name = format!("event{}", i);
-        let kobj = class_device_register(class_input.clone(), &slot_name);
-        let idx = i as u64;
-        kobject_add_attr(&kobj, "name", move || format!("input{}\n", idx));
-        kobject_add_attr(&kobj, "capabilities/key", || "0\n".to_string());
-        kobject_add_attr(&kobj, "capabilities/rel", || "0\n".to_string());
+/// libudev/libinput enumerate input via `/sys/class/input/`: for each node
+/// they read `dev` (`<major>:<minor>`) and `uevent` (MAJOR/MINOR/DEVNAME),
+/// then open `/dev/input/event<N>` and tag it via EVIOCGBIT. We expose one
+/// kobject per device the `narf-input` router actually has (event0 = the
+/// virtio keyboard, event1 = the virtio tablet, …), keyed off
+/// `ROUTER.device_ids()` so sysfs matches the real `/dev/input/` nodes.
+/// Major 13 / minor 64+N is the Linux evdev `dev_t` convention.
+pub fn populate_input_class() {
+    let class_input = class_register("input");
+    for id in narf_input::evdev::ROUTER.device_ids() {
+        let n = id.0.saturating_sub(1);
+        let minor = 64 + n;
+        let kobj = class_device_register(class_input.clone(), &format!("event{}", n));
+        kobject_add_attr(&kobj, "name", move || format!("input{}\n", n));
+        let dev = format!("13:{}\n", minor);
+        kobject_add_attr(&kobj, "dev", move || dev.clone());
+        let uevent = format!("MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\n", minor, n);
+        kobject_add_attr(&kobj, "uevent", move || uevent.clone());
     }
 }
 
@@ -647,6 +651,7 @@ pub fn populate_numa_nodes() {
 pub fn populate_all() {
     populate_block_class();
     populate_net_class();
+    populate_input_class();
     populate_kernel_dir();
     populate_numa_nodes();
     // Stub class directories expected by userspace tooling.
@@ -707,8 +712,8 @@ impl DirOps for SysRoot {
             }));
         }
         // Sub-kobjects look like directories
-        if kobj.get_child(name).is_some() {
-            return Some(Arc::new(SysDirMarker));
+        if let Some(child) = kobj.get_child(name) {
+            return Some(Arc::new(SysDirMarker { kobj: child }));
         }
         None
     }
@@ -744,6 +749,15 @@ impl DirOps for SysRoot {
             .map(|n| (n, FileType::Dir))
             .collect()
     }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>> {
+        let r = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(r) })
+    }
 }
 
 /// A directory that mirrors a `Kobject` node's children + attributes.
@@ -763,8 +777,8 @@ impl DirOps for SysKobjDir {
             }));
         }
         // Child dirs look like files so resolve() can stat them
-        if self.kobj.get_child(name).is_some() {
-            return Some(Arc::new(SysDirMarker));
+        if let Some(child) = self.kobj.get_child(name) {
+            return Some(Arc::new(SysDirMarker { kobj: child }));
         }
         None
     }
@@ -807,12 +821,29 @@ impl DirOps for SysKobjDir {
         }
         all.into_iter().skip(cursor).take(max).collect()
     }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, alloc::vec::Vec<(alloc::string::String, FileType)>> {
+        // getdents64 drives this (not the sync enumerate); without it every
+        // sysfs directory read-dir comes back empty.
+        let r = self.enumerate(cursor, max);
+        Box::pin(async move { Ok(r) })
+    }
 }
 
 /// Marker returned by `lookup` for a child that is a directory.
-/// `stat()` reports `Dir` so `resolve()` knows to descend.
+/// `stat()` reports `Dir` so `resolve()` knows to descend, and `as_dir()`
+/// hands back the child's `SysKobjDir` so `getdents64`/`readdir` can
+/// enumerate it — without this, opening a sysfs subdir (e.g.
+/// `/sys/class/input`) as a file yielded a directory fd with no backing
+/// `DirOps`, so `ls` (and libudev's `/sys/class/*` scan) saw it empty.
 #[derive(Debug)]
-struct SysDirMarker;
+struct SysDirMarker {
+    kobj: Arc<Kobject>,
+}
 
 impl FileOps for SysDirMarker {
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -828,6 +859,11 @@ impl FileOps for SysDirMarker {
             mode: Mode::DIR_RO,
             mtime_cycles: 0,
         }
+    }
+    fn as_dir(&self) -> Option<Arc<dyn DirOps>> {
+        Some(Arc::new(SysKobjDir {
+            kobj: self.kobj.clone(),
+        }))
     }
 }
 

@@ -2415,6 +2415,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 }
             });
 
+            // Populate /sys/class/input/event<N> from the live evdev router.
+            // The early filesystem populate_all() ran before the virtio
+            // keyboard/tablet drivers probed (ROUTER was empty), so re-run it
+            // at Stage::Late once the devices are registered. Idempotent
+            // (get_or_create_child). libudev/libinput enumerate input here.
+            narf_init::register(narf_init::Stage::Late, "sysfs-input-class", || {
+                narf_filesystem::sysfs::populate_input_class();
+                narf_init::InitResult::Ok
+            });
+
             // Make NARF's /dev reachable inside a chrooted /mnt rootfs, so a
             // real distro booted from the virtio-blk image (see distro_init /
             // distro_desktop) can open device files — /dev/fb0, /dev/dri,
@@ -2445,6 +2455,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     console::Writer,
                                     "  mnt-dev-bind: writable /tmp mounted at /mnt/tmp"
                                 );
+                            }
+                            // Bind /sys and /proc into the chroot too — libudev/
+                            // libinput enumerate devices via /sys/class/*, and
+                            // most Linux software pokes /proc. Best-effort.
+                            for (src, dst) in [("/sys", "/mnt/sys"), ("/proc", "/mnt/proc")] {
+                                if mounts.iter().any(|m| m == src)
+                                    && !mounts.iter().any(|m| m == dst)
+                                {
+                                    if narf_filesystem::registry()
+                                        .bind_mount(&auth, src, dst)
+                                        .is_ok()
+                                    {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  mnt-dev-bind: {} bound at {}",
+                                            src,
+                                            dst
+                                        );
+                                    }
+                                }
                             }
                             narf_init::InitResult::Ok
                         }
@@ -3419,6 +3449,7 @@ fn boot_userspace_init() {
                 ("wl_app", narf_verification::NARF_WL_APP_ELF),
                 ("distro_init", narf_verification::NARF_DISTRO_INIT_ELF),
                 ("distro_desktop", narf_verification::NARF_DISTRO_DESKTOP_ELF),
+                ("chroot_run", narf_verification::NARF_CHROOT_RUN_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),
