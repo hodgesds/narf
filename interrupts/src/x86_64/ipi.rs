@@ -314,12 +314,12 @@ pub unsafe fn shoot_range(va: u64, pages: u64, tag: u16) {
     }
 
     // Wait for every other online CPU to advance its ack counter.
-    let mut spins: u32 = 0;
     for cpu in 0..total {
         if cpu == self_cpu {
             continue;
         }
         let i = (cpu as usize).min(MAX_CPUS - 1);
+        let mut spins: u32 = 0;
         while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
             // Service any shootdown a peer published to US while we spin —
             // we hold IRQs masked here (a page-table lock is held by the
@@ -380,12 +380,12 @@ pub unsafe fn shoot_tag_only(tag: u16) {
     unsafe {
         apic::wrmsr_icr(ICR_BROADCAST_SHOOTDOWN);
     }
-    let mut spins: u32 = 0;
     for cpu in 0..total {
         if cpu == self_cpu {
             continue;
         }
         let i = (cpu as usize).min(MAX_CPUS - 1);
+        let mut spins: u32 = 0;
         while ACK_COUNT[i].load(Ordering::Acquire) == snap[i] {
             core::hint::spin_loop();
             spins = spins.wrapping_add(1);

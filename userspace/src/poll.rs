@@ -243,7 +243,24 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
             }
         }
     };
+    let mut old_mask = None;
+    if args.arg3 != 0 && args.arg4 == 8 {
+        let mut buf = [0u8; 8];
+        if unsafe { crate::handlers::copy_from_user(&mut buf, args.arg3) }.is_ok() {
+            let mask = (u64::from_ne_bytes(buf) << 1) as u32;
+            let task = current_task_id();
+            old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
+        } else {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    }
+
     poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout);
+
+    if let Some(old) = old_mask {
+        crate::handlers::set_signal_mask_for_task(current_task_id(), old);
+    }
 }
 
 fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {

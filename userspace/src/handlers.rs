@@ -14909,6 +14909,12 @@ pub fn signal_mask_of(task: u64) -> u32 {
         .unwrap_or(0)
 }
 
+pub(crate) fn set_signal_mask_for_task(task: u64, mask: u32) -> u32 {
+    let mut g = SIGNAL_MASK.lock();
+    let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(task, mask).unwrap_or(0)
+}
+
 fn sys_kill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     #[allow(unused_mut)]
@@ -18016,7 +18022,13 @@ fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
 }
 
 fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
-    let _ = ctx.args();
+    let args = *ctx.args();
+    let flags = args.arg1 as u32;
+    let cloexec = (flags & 0x80000) != 0;
+    let nonblock = (flags & 0o4000) != 0;
+    let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+    let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
+
     let tfd = crate::io_mux::TimerFd::new();
     timerfd_arc_register(&tfd);
     let task = current_task_id();
@@ -18024,8 +18036,8 @@ fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
         t.open(crate::fd::FdEntry {
             ops: tfd,
             offset: 0,
-            flags: 0,
-            status_flags: 0,
+            flags: install_flags,
+            status_flags,
         })
     }) {
         Some(n) => n,
@@ -18040,9 +18052,9 @@ fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
 fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
-    let _flags = args.arg1;
+    let flags = args.arg1 as u32;
     let new_value_ptr = args.arg2;
-    let _old_value_ptr = args.arg3;
+    let old_value_ptr = args.arg3;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
     if new_value_ptr == 0 {
@@ -18072,6 +18084,8 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
     let now = narf_scheduler::narf_time::monotonic_ns();
     let next_fire = if value_total == 0 {
         0
+    } else if (flags & 1) != 0 {
+        value_total // TFD_TIMER_ABSTIME
     } else {
         now.saturating_add(value_total)
     };
@@ -18082,6 +18096,24 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+
+    let (rem_ns, int_ns) = tfd.current();
+    if old_value_ptr != 0 {
+        let mut buf = [0u8; 32];
+        let interval_sec = (int_ns / 1_000_000_000) as i64;
+        let interval_nsec = (int_ns % 1_000_000_000) as i64;
+        let value_sec = (rem_ns / 1_000_000_000) as i64;
+        let value_nsec = (rem_ns % 1_000_000_000) as i64;
+        buf[0..8].copy_from_slice(&interval_sec.to_le_bytes());
+        buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
+        buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
+        buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+        if unsafe { copy_to_user(old_value_ptr, &buf) }.is_err() {
+            ctx.set_return(fail);
+            return;
+        }
+    }
+
     tfd.arm(next_fire, interval_total);
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -18194,13 +18226,15 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
         let sfd = crate::linux_compat::SignalFdFile::new(mask, task);
         signalfd_arc_register(&sfd);
         let cloexec = (flags & crate::linux_compat::SFD_CLOEXEC) != 0;
+        let nonblock = (flags & crate::linux_compat::SFD_NONBLOCK) != 0;
         let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+        let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
         let new_fd = match fd::with_table(task, |t| {
             t.open(crate::fd::FdEntry {
                 ops: sfd,
                 offset: 0,
                 flags: install_flags,
-                status_flags: 0,
+                status_flags,
             })
         }) {
             Some(n) => n,
@@ -18213,14 +18247,21 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
     }
     #[cfg(not(feature = "linux-compat"))]
     {
-        let _ = (fd_arg, flags);
+        let _ = fd_arg;
         let sfd = crate::io_mux::SignalFd::new(mask, task);
+        // `crate::linux_compat` only exists under that feature; use the raw
+        // signalfd4 flag bits here (SFD_CLOEXEC == O_CLOEXEC == 0x80000,
+        // SFD_NONBLOCK == O_NONBLOCK == 0o4000) so this branch builds without it.
+        let cloexec = (flags & 0x80000) != 0;
+        let nonblock = (flags & 0o4000) != 0;
+        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+        let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
         let new_fd = match fd::with_table(task, |t| {
             t.open(crate::fd::FdEntry {
                 ops: sfd,
                 offset: 0,
-                flags: 0,
-                status_flags: 0,
+                flags: install_flags,
+                status_flags,
             })
         }) {
             Some(n) => n,

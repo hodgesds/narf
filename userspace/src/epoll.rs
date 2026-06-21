@@ -327,7 +327,9 @@ fn exclusive_release(fd: i32, owner: u64) {
 
 pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let _flags = args.arg0 as u32; // ignored for now
+    let flags = args.arg0 as u32;
+    let cloexec = (flags & crate::fd::O_CLOEXEC) != 0;
+    let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     let instance = EpollInstance::new();
@@ -338,7 +340,7 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
         t.open(crate::fd::FdEntry {
             ops,
             offset: 0,
-            flags: 0,
+            flags: install_flags,
             status_flags: 0,
         })
     });
@@ -417,17 +419,43 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     }
 }
 
+pub fn sys_epoll_pwait(ctx: &mut dyn TrapContext) {
+    epoll_wait_common(ctx, true);
+}
+
 #[allow(clippy::never_loop)]
 pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
+    epoll_wait_common(ctx, false);
+}
+
+#[allow(clippy::never_loop)]
+fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
     let events_ptr = args.arg1 as *mut u8;
     let maxevents = args.arg2 as usize;
     let timeout_ms = args.arg3 as i32;
+    let sigmask_ptr = args.arg4;
+    let sigsetsize = args.arg5;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
 
+    let mut old_mask = None;
+    if is_pwait && sigmask_ptr != 0 && sigsetsize == 8 {
+        let mut buf = [0u8; 8];
+        if unsafe { crate::handlers::copy_from_user(&mut buf, sigmask_ptr) }.is_ok() {
+            let mask = (u64::from_ne_bytes(buf) << 1) as u32;
+            old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
+        } else {
+            ctx.set_return(fail);
+            return;
+        }
+    }
+
     if events_ptr.is_null() || maxevents == 0 {
+        if let Some(old) = old_mask {
+            crate::handlers::set_signal_mask_for_task(task, old);
+        }
         ctx.set_return(fail);
         return;
     }
@@ -435,6 +463,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
     let instance = match instances_lookup(task, epfd) {
         Some(i) => i,
         None => {
+            if let Some(old) = old_mask {
+                crate::handlers::set_signal_mask_for_task(task, old);
+            }
             ctx.set_return(fail);
             return;
         }
@@ -512,9 +543,15 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 )
                 .is_err()
                 {
+                    if let Some(old) = old_mask {
+                        crate::handlers::set_signal_mask_for_task(task, old);
+                    }
                     ctx.set_return(fail);
                     return;
                 }
+            }
+            if let Some(old) = old_mask {
+                crate::handlers::set_signal_mask_for_task(task, old);
             }
             ctx.set_return(SyscallReturn::ok(n as u64));
             return;
@@ -522,6 +559,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
 
         match deadline_ns {
             Some(0) => {
+                if let Some(old) = old_mask {
+                    crate::handlers::set_signal_mask_for_task(task, old);
+                }
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
@@ -533,6 +573,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                     // SAFETY: Valid memory or trusted environment
                     unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
                 }
+                if let Some(old) = old_mask {
+                    crate::handlers::set_signal_mask_for_task(task, old);
+                }
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
@@ -542,6 +585,9 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                     if let Some(h) = crate::signal_delivery_hook() {
                         if h(ctx, crate::Syscall::EpollWait.raw()) {
                             // Signal delivered. Interrupt syscall with EINTR.
+                            if let Some(old) = old_mask {
+                                crate::handlers::set_signal_mask_for_task(task, old);
+                            }
                             ctx.set_return(SyscallReturn::ok((-4i64) as u64));
                             // SAFETY: `uctx_ptr` is the in-flight task's
                             // `UserTaskCtx` from `CURRENT`, live for this trap;
@@ -553,6 +599,17 @@ pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                         }
                     }
 
+                    // epoll_pwait: restore the caller's signal mask before we
+                    // park. This syscall re-executes from the top on resume
+                    // (RIP rewind below), which re-applies the pwait sigmask and
+                    // re-snapshots the "old" mask. If we left the pwait mask
+                    // applied across the park, that re-snapshot would capture
+                    // the ALREADY-modified mask and the caller's original would
+                    // be lost permanently. (The pre-park signal check above
+                    // already ran with the pwait mask applied.)
+                    if let Some(old) = old_mask {
+                        crate::handlers::set_signal_mask_for_task(task, old);
+                    }
                     // SAFETY: `uctx_ptr` is the in-flight task's `UserTaskCtx`
                     // from `CURRENT`, live for this trap; `state`/`exit_reason`
                     // are its own `UnsafeCell` fields and the `hook` consumes
