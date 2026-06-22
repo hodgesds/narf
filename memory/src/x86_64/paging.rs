@@ -575,6 +575,33 @@ use crate::VirtAddr;
 ///
 /// Walks the PML4 starting at `pml4_phys`, allocating fresh PDPT / PD /
 /// PT frames along the way if they don't exist. Sets the final PT entry
+// ── Per-page-table-root mutation lock ──────────────────────────────
+//
+// `map_4kb` / `unmap_4kb` / `free_user_pml4_tree` read-modify-write the shared
+// PML4/PDPT/PD/PT pages of an address space. Two CPUs running threads of the SAME
+// process (one AddressSpace, live on multiple CPUs) would otherwise race:
+//   - `ensure_next_table` on the same empty slot → both alloc an intermediate
+//     table and one overwrites the other, leaking a table and orphaning every
+//     PTE the loser installed under it (corrupt page-table structure), or
+//   - tear a leaf PTE under a concurrent unmap.
+// The `AddressSpace.regions` lock does NOT cover this — several call sites drop
+// it before walking PTEs (paging is the documented "concurrent modify = UB"
+// hazard above). Serialise the walk here, sharded by root phys so distinct
+// address spaces run in parallel. The lock is held across the local INVLPG /
+// cross-CPU shootdown too: a peer waiting on the same shard is spinning on an
+// IrqSafeSpinLock and so drains the shootdown via the lock-spin hook, leaving the
+// broadcast free to collect its ACKs. `ensure_next_table` is the only nested
+// callee and never re-enters these functions, so the non-reentrant lock is safe.
+const PT_LOCK_SHARDS: usize = 64;
+static PT_LOCKS: [narf_lib::sync::IrqSafeSpinLock<()>; PT_LOCK_SHARDS] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(()) }; PT_LOCK_SHARDS];
+
+#[inline]
+fn pt_lock_for(pml4_phys: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpinLock<()> {
+    // Roots are page-aligned; index by the page number's low bits.
+    &PT_LOCKS[((pml4_phys.raw() >> 12) as usize) & (PT_LOCK_SHARDS - 1)]
+}
+
 /// to point at `phys` with `flags | PRESENT`. `INVLPG`s the target
 /// address so subsequent accesses see the new mapping immediately.
 ///
@@ -582,8 +609,9 @@ use crate::VirtAddr;
 /// - The current address space must identity-map the physical addresses
 ///   of every page-table level touched. Stage 1's low-4-GiB identity
 ///   mapping covers this because page tables are in low RAM.
-/// - `pml4_phys` must point at a valid PML4 owned by the caller —
-///   concurrently modifying it from another CPU is UB.
+/// - `pml4_phys` must point at a valid PML4 owned by the caller. Concurrent
+///   mutation of the SAME root from another CPU is serialised internally via
+///   `pt_lock_for` (see above).
 pub unsafe fn map_4kb(
     pml4_phys: PhysAddr,
     virt: VirtAddr,
@@ -599,6 +627,10 @@ pub unsafe fn map_4kb(
     if phys.raw() & 0xFFF != 0 {
         return Err(MapError::UnalignedPhys);
     }
+
+    // Serialise the page-table walk against concurrent map/unmap on the same
+    // root (held across the whole RMW + INVLPG). See `pt_lock_for`.
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
 
     let idx = WalkIndices::from_virt(virt);
     // Intermediate tables need `USER` whenever the leaf does — the
@@ -677,6 +709,9 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     if virt.raw() & 0xFFF != 0 {
         return Err(MapError::UnalignedVirt);
     }
+
+    // Serialise against concurrent map/unmap on the same root. See `pt_lock_for`.
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
 
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller promises identity reachability.
@@ -761,6 +796,8 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     if pml4_phys.raw() == 0 {
         return;
     }
+    // Serialise teardown against any (stale) concurrent map/unmap on this root.
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
     // SAFETY: identity-reachable per caller contract.
     let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
     // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
