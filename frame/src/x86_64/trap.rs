@@ -1185,13 +1185,13 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         }
     }
 
-    fn perform_sigreturn(&mut self, sc_vaddr: u64) -> bool {
+    fn perform_sigreturn(&mut self, sc_vaddr: u64, is_rt: bool) -> bool {
         // SAFETY: same conditions as deliver_signal — we're at CPL=0
         // holding the trap frame for the calling task; sc_vaddr is
         // the explicit sigcontext addr the trampoline forwarded
         // (originally set in RSI by deliver_signal).
         // SAFETY: Valid memory or trusted environment
-        unsafe { perform_sigreturn(self, sc_vaddr) }
+        unsafe { perform_sigreturn(self, sc_vaddr, is_rt) }
     }
 }
 
@@ -1300,7 +1300,7 @@ pub struct SigContext {
 /// Must be called from the int-0x80 trap-handler context after
 /// kernel_syscall_entry has run; `self.frame` is the live trap
 /// frame about to be popped by iretq.
-unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool {
+unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64, is_rt: bool) -> bool {
     if (ctx.frame.cs & 3) != 3 {
         return false;
     }
@@ -1308,27 +1308,15 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         return false;
     }
 
-    // Heuristic: if signum at offset 144 is 0 but signum at offset 0 (si_signo)
-    // is non-zero, it's likely an rt_sigframe.
-    //
-    // rt_sigframe (Linux x86_64):
-    //   offset 0: pretcode (8)
-    //   offset 8: siginfo (si_signo is here)
-    //   offset 136: ucontext
-    //   offset 176: mcontext (McContext)
-
-    // Read the first 4 bytes to check si_signo.
-    // SAFETY: `sc_vaddr` is the user RSP captured by the trap entry and
-    // checked non-zero above, with `cs & 3 == 3` confirming it came from
-    // CPL=3; the frame layout guarantees at least 4 readable bytes there.
-    // `with_user_access` opens the SMAP window for this CPL=0 read of a
-    // user PTE.
-    // SAFETY: Valid memory or trusted environment
-    let si_signo = unsafe {
-        narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::read_volatile(sc_vaddr as *const i32)
-        })
-    };
+    // `is_rt` is the layout the kernel RECORDED when it delivered this signal
+    // (deliver_signal's `want_siginfo || force_rt`), threaded down from
+    // sys_sigreturn. We must NOT re-derive it from user memory: the previous
+    // code sniffed `si_signo` at sc_vaddr+0 and treated 0<n<64 as rt, but that
+    // word is user-controlled / layout-dependent, and a wrong guess read RIP
+    // from the rt mcontext offset (sc_vaddr+168) over a legacy frame — landing
+    // on the frame's `cs`/`ss` selector fields, so the restored RIP became a
+    // tiny RPL-3 selector value and the iretq #UD'd. rt_sigframe (Linux x86_64):
+    //   off 0 pretcode, off 8 siginfo, off 136 ucontext, off 176 mcontext.
 
     let (
         sc_rip,
@@ -1351,8 +1339,8 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64) -> bool
         sc_rflags,
     );
 
-    if si_signo > 0 && si_signo < 64 {
-        // Assume RT frame. RSP at rt_sigreturn entry points at siginfo
+    if is_rt {
+        // RT frame. RSP at rt_sigreturn entry points at siginfo
         // (restorer popped pretcode).
         // ucontext is at sc_vaddr + 128.
         // mcontext is at sc_vaddr + 128 + 40 = sc_vaddr + 168.

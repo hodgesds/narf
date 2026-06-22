@@ -14407,6 +14407,34 @@ fn sigreturn_use_rsp(task: u64) -> bool {
         .unwrap_or(false)
 }
 
+// Per-task record of the LAST delivered signal frame's layout: `true` ⇒ the
+// kernel laid out an rt_sigframe (McContext at sc_vaddr+168), `false` ⇒ a legacy
+// SigContext. `sys_sigreturn` reads this and hands it to `perform_sigreturn` so
+// the restore reads RIP from the correct offset. Previously the arch code GUESSED
+// rt-vs-legacy by sniffing the user `si_signo` word — a wrong guess (e.g. user
+// data in (0,64) over a legacy frame) read RIP from the rt offset, which lands on
+// the frame's `cs`/`ss` selector fields → control transfer to a tiny RPL-3 address
+// (#UD). The kernel BUILT the frame, so it must record the layout, not re-derive it.
+// `is_rt` mirrors deliver_signal's `want_siginfo || force_rt` decision exactly.
+static SIGRETURN_IS_RT: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, bool>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn set_sigreturn_is_rt(task: u64, is_rt: bool) {
+    let mut g = SIGRETURN_IS_RT.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    map.insert(task, is_rt);
+}
+
+fn sigreturn_is_rt(task: u64) -> bool {
+    SIGRETURN_IS_RT
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        // Default true: modern (rt_sigaction + SA_SIGINFO/restorer) is the
+        // overwhelming case; a missing record means rt.
+        .unwrap_or(true)
+}
+
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
@@ -16242,6 +16270,10 @@ pub(crate) fn default_signal_delivery_restricted(
     // Remember whether this frame is the restorer-based Linux
     // rt_sigframe so `sys_sigreturn` resolves it from RSP.
     set_sigreturn_use_rsp(task, params.restorer != 0);
+    // Record the frame layout we just built so sys_sigreturn restores from the
+    // right offsets — must match deliver_signal's `want_siginfo || force_rt`
+    // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
+    set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
     // Clear only after the rewrite succeeded — a failed
     // delivery (e.g. arch returns false) should leave pending
     // alone so the next trap retries.
@@ -16446,6 +16478,10 @@ pub fn default_sync_signal_delivery(
     let delivered = ctx.deliver_signal(&params);
     if delivered {
         set_sigreturn_use_rsp(task, params.restorer != 0);
+    // Record the frame layout we just built so sys_sigreturn restores from the
+    // right offsets — must match deliver_signal's `want_siginfo || force_rt`
+    // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
+    set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
     }
     delivered
 }
@@ -16571,7 +16607,11 @@ fn sys_sigreturn(ctx: &mut dyn TrapContext) {
         sc_vaddr = ctx.user_rsp();
     }
 
-    if !ctx.perform_sigreturn(sc_vaddr) {
+    // Pass the authoritative frame layout the kernel recorded at delivery so the
+    // arch code reads RIP/regs from the correct offsets instead of guessing from
+    // user memory (which could pull a selector field into RIP → #UD).
+    let is_rt = sigreturn_is_rt(task);
+    if !ctx.perform_sigreturn(sc_vaddr, is_rt) {
         ctx.set_return(SyscallReturn::invalid_op());
     }
 }

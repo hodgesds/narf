@@ -98,8 +98,11 @@ pub trait TrapContext {
     }
 
     /// Restore register state from a SigContext / ucontext_t frame
-    /// on the user stack. Returns true on success.
-    fn perform_sigreturn(&mut self, _sc_vaddr: u64) -> bool {
+    /// on the user stack. `is_rt` is the layout the kernel recorded when
+    /// it delivered the signal (true = rt_sigframe McContext, false =
+    /// legacy SigContext) — the arch code must NOT re-derive it from user
+    /// memory. Returns true on success.
+    fn perform_sigreturn(&mut self, _sc_vaddr: u64, _is_rt: bool) -> bool {
         false
     }
 }
@@ -191,7 +194,7 @@ impl<'a> TrapContext for UserStateCtx<'a> {
     fn deliver_signal(&mut self, _params: &SigDeliveryParams) -> bool {
         false
     }
-    fn perform_sigreturn(&mut self, _sc_vaddr: u64) -> bool {
+    fn perform_sigreturn(&mut self, _sc_vaddr: u64, _is_rt: bool) -> bool {
         false
     }
 }
@@ -3148,12 +3151,16 @@ impl TrapContext for ArgsOnlyCtx {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn perform_sigreturn(&mut self, sc_vaddr: u64) -> bool {
+    fn perform_sigreturn(&mut self, sc_vaddr: u64, _is_rt: bool) -> bool {
         if self.user_state.is_null() {
             return false;
         }
         // SAFETY: as above.
         let state = unsafe { &mut *(self.user_state as *mut narf_scheduler::UserState) };
+        // The UserState delivery path (deliver_signal_into_state) only ever lays
+        // out an rt_sigframe or a minimal no-sigreturn frame — it never builds a
+        // legacy SigContext — so the restore is always rt here; `_is_rt` is carried
+        // for trait symmetry with the live-TrapFrame path that does pick a layout.
         match sigframe::perform_sigreturn_from_state(state, sc_vaddr) {
             Some(restored_rax) => {
                 // The exit asm derives the user-visible RAX from the
