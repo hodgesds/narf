@@ -8482,11 +8482,15 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         }
     }
 
-    // POSIX-shaped inheritance for the non-shared resources.
-    // Wave-81 temporary fix: always copy the table so threads
-    // have an entry in the FD table registry. Shared-offset
-    // semantics for CLONE_FILES are deferred.
-    crate::fd::fork(parent_pid, child_tid.raw());
+    // fd table: CLONE_FILES (every pthread) SHARES one table with the parent —
+    // an fd opened by any thread is visible to all, and close/dup affect all
+    // (Linux semantics weston's worker threads rely on). Without CLONE_FILES
+    // (fork) the child gets an independent COPY.
+    if _share_files {
+        crate::fd::share(parent_pid, child_tid.raw());
+    } else {
+        crate::fd::fork(parent_pid, child_tid.raw());
+    }
 
     // A child (process or thread) inherits its parent's process group,
     // session, and controlling terminal (POSIX). pgid inheritance is what

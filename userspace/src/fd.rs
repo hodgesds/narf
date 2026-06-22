@@ -182,8 +182,33 @@ impl FdTable {
 
 // ── Sharded per-task table ─────────────────────────────────────────
 
-/// `TaskId.raw()` keys.
-type Tables = BTreeMap<u64, FdTable>;
+/// `TaskId.raw()` → the task's fd table. The table is behind an
+/// `Arc<IrqSafeSpinLock<…>>` so that CLONE_FILES threads can SHARE one table
+/// (the same `Arc` is installed under each thread's TaskId; see `share`) while
+/// fork still gets an independent COPY (`fork`). The shard lock guards only the
+/// map (Arc lookup/insert/remove); fd operations run under the per-table inner
+/// lock, so distinct processes don't serialise and a long `poll_blocking` read
+/// holds only its own table's lock, not the whole shard.
+type Tables = BTreeMap<u64, Arc<IrqSafeSpinLock<FdTable>>>;
+
+/// A fresh fd table pre-populated with the three stdio slots routed to the
+/// kernel console (stdin reads EOF until a real backing lands).
+fn fresh_table() -> FdTable {
+    let mut t = FdTable::new();
+    let console: Arc<dyn FileOps> = Arc::new(ConsoleFile::new());
+    for fd in 0..3u32 {
+        t.set(
+            fd,
+            FdEntry {
+                ops: console.clone(),
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        );
+    }
+    t
+}
 
 /// Number of fd-table shards (power of two). The fd table is consulted on
 /// EVERY fd syscall (read/write/epoll resolve fd→FileOps via `with_table`),
@@ -214,44 +239,19 @@ pub fn init() {
 /// fresh table — pre-populated with stdio at fds 0/1/2 — on first
 /// reference. Returns the closure's value.
 pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
-    let mut g = TABLES[table_shard(task_id)].lock();
-    let map = g.as_mut()?;
-    let table = map.entry(task_id).or_insert_with(|| {
-        let mut t = FdTable::new();
-        // Stage-4 default: all three stdio slots route to the
-        // kernel console. stdin reads return 0 (EOF) until a
-        // real keyboard/serial backing lands.
-        let console: Arc<dyn FileOps> = Arc::new(ConsoleFile::new());
-        t.set(
-            0,
-            FdEntry {
-                ops: console.clone(),
-                offset: 0,
-                flags: 0,
-                status_flags: 0,
-            },
-        );
-        t.set(
-            1,
-            FdEntry {
-                ops: console.clone(),
-                offset: 0,
-                flags: 0,
-                status_flags: 0,
-            },
-        );
-        t.set(
-            2,
-            FdEntry {
-                ops: console,
-                offset: 0,
-                flags: 0,
-                status_flags: 0,
-            },
-        );
-        t
-    });
-    Some(op(table))
+    // Get-or-create this task's table Arc under the shard lock, clone the Arc,
+    // then DROP the shard lock before running `op` under the per-table lock.
+    // This keeps the hot shard lock held only for the brief map lookup, and lets
+    // CLONE_FILES siblings (who share one Arc) serialise on the table itself.
+    let arc = {
+        let mut g = TABLES[table_shard(task_id)].lock();
+        let map = g.as_mut()?;
+        map.entry(task_id)
+            .or_insert_with(|| Arc::new(IrqSafeSpinLock::new(fresh_table())))
+            .clone()
+    };
+    let mut table = arc.lock();
+    Some(op(&mut table))
 }
 
 /// Per-tty backing. Reads drain the input ring; writes go to the
@@ -633,16 +633,19 @@ impl FileOps for ConsoleFile {
 ///
 /// Returns the number of fds copied.
 pub fn fork(parent: u64, child: u64) -> usize {
-    // Parent and child may live in different shards, so snapshot the
-    // parent's slots under its shard lock, DROP it, then insert into the
-    // child's shard. (fork is not on the hot path, so two acquisitions are
-    // fine; never hold two shard locks at once → no lock-ordering hazard.)
-    let parent_slots: Vec<Option<FdEntry>> = {
+    // Snapshot the parent's slots (under the parent table's own lock), build an
+    // INDEPENDENT copy in a fresh Arc, install for the child. Never hold two
+    // shard locks at once → no lock-ordering hazard.
+    let parent_arc = {
         let g = TABLES[table_shard(parent)].lock();
         match g.as_ref() {
-            Some(m) => m.get(&parent).map(|t| t.slots.clone()).unwrap_or_default(),
+            Some(m) => m.get(&parent).cloned(),
             None => return 0,
         }
+    };
+    let parent_slots: Vec<Option<FdEntry>> = match parent_arc {
+        Some(a) => a.lock().slots.clone(),
+        None => Vec::new(),
     };
     let copied = parent_slots.iter().filter(|s| s.is_some()).count();
     let mut child_table = FdTable::new();
@@ -650,11 +653,36 @@ pub fn fork(parent: u64, child: u64) -> usize {
     let mut g = TABLES[table_shard(child)].lock();
     match g.as_mut() {
         Some(m) => {
-            m.insert(child, child_table);
+            m.insert(child, Arc::new(IrqSafeSpinLock::new(child_table)));
             copied
         }
         None => 0,
     }
+}
+
+/// CLONE_FILES: install the SAME table `Arc` under the child's TaskId so the
+/// child and parent (and every other thread of the process) share one fd table
+/// — an fd opened by any thread is visible to all, and `close` in one closes it
+/// for all (Linux thread semantics). The table is freed only when the last
+/// sharer `detach`es (Arc refcount). Returns the number of fds in the table.
+pub fn share(parent: u64, child: u64) -> usize {
+    // Get-or-create the parent's table Arc atomically (same logic as
+    // `with_table`'s first-touch), then install that same Arc for the child.
+    let arc = {
+        let mut g = TABLES[table_shard(parent)].lock();
+        let map = match g.as_mut() {
+            Some(m) => m,
+            None => return 0,
+        };
+        map.entry(parent)
+            .or_insert_with(|| Arc::new(IrqSafeSpinLock::new(fresh_table())))
+            .clone()
+    };
+    let n = arc.lock().slots.iter().filter(|s| s.is_some()).count();
+    if let Some(m) = TABLES[table_shard(child)].lock().as_mut() {
+        m.insert(child, arc);
+    }
+    n
 }
 
 /// Drop the entire fd table for `task_id`. Call on task exit so

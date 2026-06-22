@@ -751,6 +751,88 @@ kernel_test_in!(
     smoke_user_task_ctx_unregister_prevents_stale_deref
 );
 
+/// CLONE_FILES shares ONE fd table across threads; fork gets an independent
+/// copy. An fd opened by one CLONE_FILES sibling must be visible to the other
+/// (and vice-versa); a fork child's new fd must NOT appear in the parent.
+fn smoke_fd_clone_files_shares_table_fork_copies() -> TestResult {
+    crate::fd::__test_reset();
+    const PARENT: u64 = 0xFD_01;
+    const THREAD: u64 = 0xFD_02;
+    const FORKED: u64 = 0xFD_03;
+
+    // Parent opens fd 5 (reuse its stdio console ops so we needn't build a
+    // FileOps). `with_table` creates the parent's table on first touch.
+    let made = crate::fd::with_table(PARENT, |t| {
+        let ops = t.get(0).map(|e| e.ops.clone())?;
+        t.set(
+            5,
+            crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        );
+        Some(())
+    })
+    .flatten();
+    if made.is_none() {
+        return TestResult::Fail("could not seed parent fd 5");
+    }
+
+    // CLONE_FILES: thread shares the parent's table.
+    crate::fd::share(PARENT, THREAD);
+    let thread_sees_5 = crate::fd::with_table(THREAD, |t| t.get(5).is_some()).unwrap_or(false);
+
+    // Thread opens fd 6 → must be visible in the parent (shared table).
+    crate::fd::with_table(THREAD, |t| {
+        if let Some(ops) = t.get(0).map(|e| e.ops.clone()) {
+            t.set(
+                6,
+                crate::fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                },
+            );
+        }
+    });
+    let parent_sees_6 = crate::fd::with_table(PARENT, |t| t.get(6).is_some()).unwrap_or(false);
+
+    // fork: independent copy — the forked child's new fd must NOT reach parent.
+    crate::fd::fork(PARENT, FORKED);
+    crate::fd::with_table(FORKED, |t| {
+        if let Some(ops) = t.get(0).map(|e| e.ops.clone()) {
+            t.set(
+                7,
+                crate::fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                },
+            );
+        }
+    });
+    let parent_sees_7 = crate::fd::with_table(PARENT, |t| t.get(7).is_some()).unwrap_or(false);
+
+    if !thread_sees_5 {
+        return TestResult::Fail("CLONE_FILES thread did not see parent's fd (table not shared)");
+    }
+    if !parent_sees_6 {
+        return TestResult::Fail("CLONE_FILES parent did not see thread's new fd (table not shared)");
+    }
+    if parent_sees_7 {
+        return TestResult::Fail("fork child's fd leaked into parent (table not independent)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_fd_clone_files_shares_table_fork_copies
+);
+
 // ── Smoke 7: SIGKILL kills child ──────────────────────────────────────
 //
 // kill(child, SIGKILL) sets the pending bit for SIGKILL (9) on the
