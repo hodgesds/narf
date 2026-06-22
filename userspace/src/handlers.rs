@@ -12628,6 +12628,12 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
 
     let task = current_task_id();
 
+    // POSIX execve: reset caught signal handlers to SIG_DFL — their code
+    // addresses belong to the old image. (Inherited e.g. via fork from a shell
+    // that handles SIGCHLD; without this the next SIGCHLD branches to the stale
+    // handler vaddr in the new image and crashes.) Mask + pending are kept.
+    sigaction_exec_reset(task);
+
     // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
     // bytes, derive comm from argv[0]'s basename (Linux convention).
     set_proc_argv(task, &argv_refs);
@@ -16412,6 +16418,31 @@ pub fn sigaction_fork(parent: u64, child: u64) {
     if let Some(map) = g.as_mut() {
         if let Some(v) = map.get(&parent).copied() {
             map.insert(child, v);
+        }
+    }
+}
+
+/// execve(2) handler reset (POSIX §2.4.3): a successful exec resets every
+/// CAUGHT signal (one with a real handler function) to SIG_DFL, because the
+/// handler's code address belonged to the OLD image and is meaningless — often
+/// unmapped — in the new one. Signals set to SIG_IGN stay ignored; SIG_DFL
+/// (a `None` slot) stays default. The signal MASK and pending set are NOT
+/// touched (POSIX preserves them across exec).
+///
+/// Without this, a child that inherited a handler across fork (e.g. busybox
+/// `sh`'s SIGCHLD handler) and then exec'd a different binary would, on the
+/// next delivery of that signal, jump to the stale handler vaddr — a wild
+/// branch into whatever (if anything) is mapped there in the new image.
+pub fn sigaction_exec_reset(task: u64) {
+    let mut g = SIGACTION_TABLE.lock();
+    if let Some(map) = g.as_mut() {
+        if let Some(slots) = map.get_mut(&task) {
+            for slot in slots.iter_mut() {
+                // handler > 1 ⇒ a real caught handler (0 = SIG_DFL, 1 = SIG_IGN).
+                if matches!(slot, Some(a) if a.handler > 1) {
+                    *slot = None;
+                }
+            }
         }
     }
 }
