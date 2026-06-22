@@ -635,6 +635,79 @@ fn smoke_process_kill_sigusr1_delivery() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_process_kill_sigusr1_delivery);
 
+/// A signal set to SIG_IGN must be silently consumed by the delivery hook,
+/// never "delivered" to a handler. Regression for the bug where SIG_IGN
+/// (stored as handler==1) was passed to deliver_signal, which set the user
+/// RIP to 1 and faulted. Before the fix, `delivered` would be Some(handler=1).
+fn smoke_process_sigign_consumed_not_delivered() -> TestResult {
+    const TASK: u64 = 0xF0_07;
+    const SIGUSR1: u32 = 10;
+    const SIG_IGN: u64 = 1;
+
+    crate::syscall::__test_clear_global();
+    setup_process_state(TASK);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // (1) Set SIGUSR1 disposition to SIG_IGN (handler == 1).
+    LOOKUP_TASK.store(TASK, Ordering::Relaxed);
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: SIGUSR1 as u64,
+            arg1: SIG_IGN,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        teardown_process_state();
+        return TestResult::Fail("sigaction(SIG_IGN) failed");
+    }
+
+    // (2) Raise SIGUSR1 at ourselves.
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: TASK,
+            arg1: SIGUSR1 as u64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+
+    // (3) Run the delivery hook on the way back to user.
+    let mut sctx = SignalCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        going_to_user: true,
+        delivered: None,
+    };
+    default_signal_delivery(&mut sctx, crate::handlers::SYSCALL_NUM_NONE);
+
+    let pending_after = signal_pending_of(TASK);
+    teardown_process_state();
+
+    // The signal must NOT have been delivered to any handler (esp. not vaddr 1).
+    if sctx.delivered.is_some() {
+        return TestResult::Fail("SIG_IGN signal was delivered to a handler — must be consumed");
+    }
+    // And it must not linger pending.
+    if pending_after & (1 << SIGUSR1) != 0 {
+        return TestResult::Fail("SIG_IGN signal left pending after the delivery hook");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_process_sigign_consumed_not_delivered);
+
 // ── Smoke 7: SIGKILL kills child ──────────────────────────────────────
 //
 // kill(child, SIGKILL) sets the pending bit for SIGKILL (9) on the

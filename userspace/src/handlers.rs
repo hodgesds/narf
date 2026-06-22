@@ -16259,6 +16259,20 @@ pub(crate) fn default_signal_delivery_restricted(
             return true;
         }
     };
+    // SIG_IGN (handler == 1) is NOT a real handler: silently consume the
+    // pending signal instead of building a frame and "delivering" it. The old
+    // code passed handler==1 straight to deliver_signal, which set the user
+    // RIP to 1 and returned there → an immediate user fault. SIG_DFL (0) is
+    // stored as `None`, so it never reaches here (the None arm above applies
+    // the default action); a SIG_IGN slot is the only `handler <= 1` case.
+    if action.handler <= 1 {
+        if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+            if let Some(slot) = map.get_mut(&task) {
+                *slot &= !(1u32 << signum);
+            }
+        }
+        return true;
+    }
     // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
     // instance was queued by rt_sigqueueinfo/sigqueue, in which case
     // honour its si_code (SI_QUEUE) + si_value (the sigval payload).
