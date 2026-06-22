@@ -36,24 +36,88 @@ use super::superblock::{ExtFlavour, Superblock};
 /// load-bearing identifier in every `BlockRequest::buffer`. Drop
 /// calls `unregister`, which bumps the epoch + frees the registry
 /// slot + releases the underlying frame.
+/// Number of scratch DMA buffers in the per-volume pool. A device op
+/// borrows one for its whole submit→await→copy span, so this bounds how
+/// many reads/writes can be in flight concurrently before one has to wait
+/// for a buffer. Sized to comfortably cover a multi-stage pipeline's worth
+/// of simultaneous execve loads (each stage streams a binary block-by-block).
+const SCRATCH_POOL_LEN: usize = 16;
+
 #[derive(Debug)]
 struct VolumeIo {
-    /// Owning cap for the registered DMA scratch buffer.
-    cap: Cap<DmaBuffer, Write>,
+    /// Free list of registered DMA scratch buffers. A device op pops one
+    /// (exclusive ownership for its DMA), returns it on completion. A SINGLE
+    /// shared buffer would let two concurrent reads DMA into it and clobber
+    /// each other (the old serialize-via-mutex scheme busy-spun under
+    /// poll_blocking and starved one read under 3-way contention). With a
+    /// pool, concurrent ops use distinct buffers — the block device, not a
+    /// lock, serialises the actual requests.
+    pool: Vec<Cap<DmaBuffer, Write>>,
     /// Logical block size of the underlying device — every
     /// `BlockRequest` is exactly this many bytes.
     lbs: usize,
 }
 
 impl VolumeIo {
+    /// Resolve the first pool buffer. Only the single-threaded mount path
+    /// (which runs before the volume is shared) uses this directly; the
+    /// concurrent runtime path resolves its own acquired buffer.
     fn buffer(&self) -> Option<Arc<DmaBuffer>> {
-        resolve_cap(&self.cap)
+        resolve_cap(self.pool.first()?)
     }
 }
 
 impl Drop for VolumeIo {
     fn drop(&mut self) {
-        unregister(self.cap);
+        // Every buffer is back in the pool by the time the volume drops (an
+        // in-flight op holds an Arc<Ext2Volume>, so the volume outlives it).
+        for &cap in &self.pool {
+            unregister(cap);
+        }
+    }
+}
+
+/// RAII handle to a borrowed scratch buffer: returns it to the pool on drop,
+/// including when a `poll_blocking` timeout drops the owning future mid-op.
+struct ScratchGuard<'a> {
+    io: &'a IrqSafeSpinLock<VolumeIo>,
+    cap: Cap<DmaBuffer, Write>,
+}
+
+impl Drop for ScratchGuard<'_> {
+    fn drop(&mut self) {
+        self.io.lock().pool.push(self.cap);
+    }
+}
+
+/// A future that yields exactly once (Pending then Ready), so a caller can
+/// re-poll under the cooperative executor / `poll_blocking` busy-loop.
+#[derive(Default)]
+struct YieldOnce(bool);
+
+impl core::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<()> {
+        if self.0 {
+            core::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    }
+}
+
+/// Borrow a scratch buffer from the pool, yielding until one is free.
+async fn acquire_scratch(io: &IrqSafeSpinLock<VolumeIo>) -> ScratchGuard<'_> {
+    loop {
+        if let Some(cap) = io.lock().pool.pop() {
+            return ScratchGuard { io, cap };
+        }
+        YieldOnce::default().await;
     }
 }
 
@@ -65,21 +129,12 @@ pub struct Ext2Volume<B: BlockDevice> {
     pub group_descs: Vec<GroupDesc>,
     pub domain: DomainId,
     pub self_weak: Weak<Ext2Volume<B>>,
-    /// Per-volume scratch buffer + cap. Wrapped in a spinlock so
-    /// every device-LBA op holds it for the synchronous-copy span
-    /// only and never across an `await` (the lock would otherwise
-    /// deadlock under cooperative async).
+    /// Per-volume scratch buffer pool + free list. Wrapped in a spinlock
+    /// guarding only the pop/push of the free list and the synchronous
+    /// byte-copy — never held across an `await` (the lock would otherwise
+    /// deadlock under cooperative async). A device op pops its own buffer
+    /// from the pool, so concurrent reads/writes never share scratch.
     io: IrqSafeSpinLock<VolumeIo>,
-    /// Serialises use of the single shared scratch DMA buffer across
-    /// the WHOLE submit→await→copy span. The `io` spinlock above only
-    /// guards the byte-copy, NOT the device DMA — so two concurrent
-    /// reads (e.g. two simultaneous execve loads on different CPUs)
-    /// would both DMA into the one scratch buffer and clobber each
-    /// other's data, corrupting whichever read copied out second. An
-    /// async mutex (held across the `await`, unlike the IRQ-safe
-    /// spinlock) gives the scratch buffer single-owner semantics
-    /// without masking IRQs or deadlocking the cooperative executor.
-    scratch_lock: narf_lib::mutex::Mutex<()>,
     /// JBD2 read-side replay overrides — FS-block → post-replay
     /// bytes. Populated by `Ext2Volume::mount` when an unclean
     /// ext3+ volume is seen; consulted by `read_block` before
@@ -138,7 +193,7 @@ async fn read_byte_range_into_static<B: BlockDevice>(
             lba,
             blocks: 1,
             buffer: io
-                .cap
+                .pool[0]
                 .derive::<Read>()
                 .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
             qos: QosHint::Latency,
@@ -170,10 +225,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // 1024, 2048, 4096 all qualify.
             return Err(FsError::Unsupported);
         }
-        let buffer = alloc_coherent(lbs, domain)
-            .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
-        let cap = register_with_cap(buffer);
-        let io = VolumeIo { cap, lbs };
+        let mut pool = Vec::with_capacity(SCRATCH_POOL_LEN);
+        for _ in 0..SCRATCH_POOL_LEN {
+            let buffer = alloc_coherent(lbs, domain)
+                .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
+            pool.push(register_with_cap(buffer));
+        }
+        let io = VolumeIo { pool, lbs };
 
         // Read 1024 bytes starting at byte 1024 — the superblock.
         // For a 512-byte LBS this is two LBA reads (LBA 2 and LBA
@@ -185,8 +243,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let superblock = match Superblock::parse(&sb_bytes) {
             Some(s) => s,
             None => {
-                unregister(io.cap);
-                core::mem::forget(io); // unregister already ran
+                // `io` drops here, unregistering every pooled buffer.
                 return Err(FsError::Unsupported);
             }
         };
@@ -195,8 +252,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // and inline-data volumes hit this; ext2/3/4 with EXTENTS +
         // 64BIT + FLEX_BG + FILETYPE + RECOVER pass.
         if superblock.check_incompat_features().is_err() {
-            unregister(io.cap);
-            core::mem::forget(io);
+            // `io` drops here, unregistering every pooled buffer.
             return Err(FsError::Unsupported);
         }
 
@@ -256,7 +312,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
-            scratch_lock: narf_lib::mutex::Mutex::new(()),
             journal_overrides,
         }))
     }
@@ -492,20 +547,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     pub async fn read_byte_range(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), FsError> {
         // Fast path — no overrides installed.
         if self.journal_overrides.is_empty() {
-            let (cap, lbs) = {
-                let g = self.io.lock();
-                (g.cap, g.lbs)
-            };
-            return Self::read_byte_range_with(
-                &*self.device,
-                cap,
-                lbs,
-                &self.io,
-                &self.scratch_lock,
-                byte_off,
-                dst,
-            )
-            .await;
+            let lbs = self.io.lock().lbs;
+            return Self::read_byte_range_with(&*self.device, lbs, &self.io, byte_off, dst).await;
         }
         // Walk one FS-block at a time, consulting the override map.
         let bs = self.block_size() as u64;
@@ -522,16 +565,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     continue;
                 }
             }
-            let (cap, lbs) = {
-                let g = self.io.lock();
-                (g.cap, g.lbs)
-            };
+            let lbs = self.io.lock().lbs;
             Self::read_byte_range_with(
                 &*self.device,
-                cap,
                 lbs,
                 &self.io,
-                &self.scratch_lock,
                 abs,
                 &mut dst[cursor..cursor + want],
             )
@@ -546,10 +584,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// byte-granularity write — for sub-LBA spans we read-modify-
     /// write the enclosing sector.
     pub async fn write_byte_range(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
-        let (cap, lbs) = {
-            let g = self.io.lock();
-            (g.cap, g.lbs)
-        };
+        let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {
             let abs = byte_off + cursor as u64;
@@ -557,37 +592,25 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let in_lba = (abs % lbs as u64) as usize;
             let want = core::cmp::min(src.len() - cursor, lbs - in_lba);
 
-            // If we're not writing a full sector, do a RMW. The read takes the
-            // scratch lock internally; it is released before the write below.
+            // If we're not writing a full sector, do a RMW. The read borrows
+            // its own pool buffer and returns it before the write below.
             let mut sector = alloc::vec![0u8; lbs];
             if !(in_lba == 0 && want == lbs) {
-                Self::read_byte_range_with(
-                    &*self.device,
-                    cap,
-                    lbs,
-                    &self.io,
-                    &self.scratch_lock,
-                    lba * lbs as u64,
-                    &mut sector,
-                )
-                .await?;
+                Self::read_byte_range_with(&*self.device, lbs, &self.io, lba * lbs as u64, &mut sector)
+                    .await?;
             }
             sector[in_lba..in_lba + want].copy_from_slice(&src[cursor..cursor + want]);
 
-            // Stage into the DMA buffer, then issue the write — hold the scratch
-            // lock across the whole stage→submit→await span so a concurrent
-            // device op can't clobber the buffer mid-write.
+            // Borrow a private scratch buffer for the whole stage→submit→await
+            // span: no other concurrent device op can touch it (it is ours
+            // until the guard drops), so the staged bytes can't be clobbered.
             {
-                let _scratch_guard = self.scratch_lock.lock().await;
+                let guard = acquire_scratch(&self.io).await;
                 {
-                    let buf = self
-                        .io
-                        .lock()
-                        .buffer()
+                    let buf = resolve_cap(&guard.cap)
                         .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-                    // SAFETY: see read_byte_range_with. The scratch lock gives us
-                    // sole ownership of the buffer for the duration of the copy.
-                    // SAFETY: Valid MMIO bounds or trusted driver environment
+                    // SAFETY: the guard gives us sole ownership of this buffer
+                    // for the duration of the copy. Valid DMA-mapped bounds.
                     let dst = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), lbs) };
                     dst.copy_from_slice(&sector);
                 }
@@ -595,7 +618,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     op: BlockOp::Write { fua: false },
                     lba,
                     blocks: 1,
-                    buffer: cap
+                    buffer: guard
+                        .cap
                         .derive::<Read>()
                         .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
                     qos: QosHint::Latency,
@@ -644,7 +668,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 lba,
                 blocks: 1,
                 buffer: io
-                    .cap
+                    .pool[0]
                     .derive::<Read>()
                     .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
                 qos: QosHint::Latency,
@@ -669,22 +693,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
-    /// Internal helper used by `read_byte_range`. Holds the volume's
-    /// cap-bound buffer for one sector at a time, serialising on
-    /// `io` for the brief synchronous-copy span only.
+    /// Internal helper used by `read_byte_range`. Borrows ONE scratch
+    /// buffer from the pool for the whole call (private to this op — no
+    /// other concurrent device op can use it), then streams the range
+    /// sector-by-sector into it. Holding a pool buffer across `await`s is
+    /// fine: it is not a lock, masks no IRQs, and the block device — not a
+    /// lock — serialises the actual requests, so concurrent reads on other
+    /// CPUs simply use other pool buffers instead of clobbering this one.
     async fn read_byte_range_with(
         device: &B,
-        cap: Cap<DmaBuffer, Write>,
         lbs: usize,
         io_lock: &IrqSafeSpinLock<VolumeIo>,
-        scratch: &narf_lib::mutex::Mutex<()>,
         byte_off: u64,
         dst: &mut [u8],
     ) -> Result<(), FsError> {
-        // Hold the scratch buffer exclusively for the whole submit→await→copy
-        // span: the shared DMA buffer must not be reused by another concurrent
-        // device op (read or write) until we have copied our bytes out.
-        let _scratch_guard = scratch.lock().await;
+        let guard = acquire_scratch(io_lock).await;
         let mut cursor = 0usize;
         while cursor < dst.len() {
             let abs = byte_off + cursor as u64;
@@ -696,7 +719,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 op: BlockOp::Read,
                 lba,
                 blocks: 1,
-                buffer: cap
+                buffer: guard
+                    .cap
                     .derive::<Read>()
                     .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
                 qos: QosHint::Latency,
@@ -705,11 +729,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             let completion = device.submit(req).await;
             completion.result.map_err(FsError::Io)?;
 
-            let buf = io_lock
-                .lock()
-                .buffer()
+            let buf = resolve_cap(&guard.cap)
                 .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: see read_byte_range_into.
+            // SAFETY: see read_byte_range_into. The guard gives us sole
+            // ownership of this buffer for the duration of the copy.
             let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
             dst[cursor..cursor + want].copy_from_slice(&src[in_lba..in_lba + want]);
             cursor += want;
