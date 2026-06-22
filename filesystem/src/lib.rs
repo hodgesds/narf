@@ -497,6 +497,17 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// True when this fd is a non-seekable byte stream (pipe, socket,
+    /// FIFO) rather than a regular file / block device. Linux `sendfile(2)`
+    /// requires the *input* fd to be mmap-capable, so a stream source is
+    /// rejected with `EINVAL` — callers (e.g. busybox `cat`) then fall back
+    /// to a plain `read()`/`write()` loop, which correctly parks on an
+    /// empty-but-open pipe instead of treating a transient 0-byte read as
+    /// EOF. Regular files return the default `false`.
+    fn is_stream(&self) -> bool {
+        false
+    }
+
     /// True when a blocking read on this fd should park on the *input
     /// waker* (woken by the serial/keyboard IRQ) rather than the 1ms
     /// re-poll used for pipes. The console (`/dev/console`, stdin) returns

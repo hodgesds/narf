@@ -173,6 +173,15 @@ impl FileOps for PipeRead {
         !(q.is_empty() && self.shared.writer_closed.load(Ordering::Acquire))
     }
 
+    fn is_stream(&self) -> bool {
+        // A pipe is a non-seekable byte stream: reject it as a `sendfile(2)`
+        // source (EINVAL) so busybox `cat` (which sendfiles pipe→file) falls
+        // back to a read()/write() loop. The sendfile fast path's copy core
+        // treats a transient empty read on a still-open pipe as EOF, silently
+        // truncating to 0 bytes; the read() loop parks correctly instead.
+        true
+    }
+
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
         let q = self.shared.queue.lock();
         let n = core::cmp::min(max, q.len());
