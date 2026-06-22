@@ -4492,6 +4492,62 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // Anonymous MAP_SHARED — Linux makes this a refcounted anonymous shared
+    // object that survives fork: parent and child map the SAME frames and see
+    // each other's writes. NARF backs it with the narf-shmem frame registry
+    // (reached via the syscall vtable, exactly like System V shmat): the frames
+    // are zeroed, registry-owned (reaped by the shmem process-exit observer),
+    // and RegionPerms::SHARED makes `clone_for_fork` ALIAS them into the child
+    // rather than COW-splitting a private copy the parent never sees. Without
+    // this a child's writes — e.g. stress-ng's shared bogo-op counters, which
+    // live in a MAP_SHARED|MAP_ANONYMOUS page mmap'd before each worker fork —
+    // vanish from the parent's view (every counter reads back 0). Degrades to
+    // the private-anonymous path below if the registry is unavailable or the
+    // segment exceeds the per-handle cap (1 MiB); never a hard failure.
+    if flags & MAP_SHARED != 0 && (flags & MAP_ANONYMOUS != 0 || fd < 0) {
+        if let Some(v) = shmem_vtable() {
+            let handle = (v.create)(current_task_id(), len);
+            if handle != 0 {
+                let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+                if (v.frames)(handle, &mut frames_raw) && frames_raw.len() == pages {
+                    let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames_raw
+                        .into_iter()
+                        .map(narf_memory::PhysAddr::new)
+                        .collect();
+                    if as_ref
+                        .map_region(Region {
+                            base: VirtAddr::new(base),
+                            len,
+                            perms: perms | RegionPerms::SHARED,
+                            phys,
+                        })
+                        .is_ok()
+                    {
+                        // SAFETY: `as_ref` is the calling task's AddressSpace
+                        // (valid root); the region was just registered, so
+                        // materialize installs only its PTEs over the registry
+                        // frames.
+                        if unsafe { as_ref.materialize() }.is_ok() {
+                            ctx.set_return(SyscallReturn::ok(base));
+                            return;
+                        }
+                        // Mapped but materialize failed: the region already
+                        // references the registry frames, so leave the segment
+                        // owned by narf-shmem (the exit observer reaps it) and
+                        // report failure rather than risk a dangling region.
+                        ctx.set_return(SyscallReturn::invalid_op());
+                        return;
+                    }
+                }
+                // Not mapped (frames lookup / page-count mismatch / map_region
+                // failed) — no region references the frames, so reap the
+                // just-created segment now, then fall through to private anon.
+                (v.destroy)(handle);
+            }
+        }
+        // Registry unavailable or create failed: degrade to private anonymous.
+    }
+
     let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
     let phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
         // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros
