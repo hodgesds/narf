@@ -2071,6 +2071,25 @@ pub fn run_until_empty() {
         };
         if any_runnable {
             let now = narf_time::now_cycles();
+            // Drain due timer-wheel wakers EVERY round while a task is
+            // runnable — the idle-path `fire_due` below only runs when nothing
+            // is runnable, and the timer ISR can't fire the wheel itself (the
+            // Waker drop hits a Sleepable dealloc, illegal in IRQ context). A
+            // CPU-bound task keeps the executor perpetually non-idle, so an
+            // expired wheel deadline would otherwise never be serviced. That
+            // matters because `apic::on_timer_tick`/`next_arm_target` floors
+            // the next TSC-deadline to `now + MIN_DELTA` (~4µs) whenever the
+            // wheel's earliest deadline is already past — re-arming an
+            // ~250 kHz timer-IRQ storm that preempts the CPU-bound task before
+            // a single user instruction retires. Observed as a `stress-ng`
+            // worker frozen exactly at its `alarm()` SIGALRM-handler entry
+            // (zero forward progress), so its parent's `wait4` hung forever.
+            // `fire_due` is cheap when nothing is due (one wheel-lock + a
+            // deadline compare), so it's safe to call unthrottled here; this
+            // context already drops Wakers via `drain_and_wake` below, so the
+            // alloc is permitted. Servicing the entry clears the past-due
+            // deadline, so the next arm reverts to a full `now + period` slice.
+            let _ = narf_time::timer_wheel::fire_due(now);
             if now.wrapping_sub(last_pump_cycles) >= pump_interval_cycles {
                 last_pump_cycles = now;
                 sleep_pumps::run();
