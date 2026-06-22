@@ -346,9 +346,22 @@ pub fn register_user_task_ctx(task_id: u64, ctx: *mut UserTaskCtx) {
     }
 }
 
-pub fn lookup_user_task_ctx(task_id: u64) -> Option<*mut UserTaskCtx> {
+/// Run `f` against a registered task's `UserTaskCtx` while HOLDING the registry
+/// lock, so the pointer can't dangle mid-deref. The owning future removes its
+/// entry (`unregister_user_task_ctx`) in its poll-EXITED path BEFORE the executor
+/// drops the future's box — and that removal takes this same lock — so while the
+/// entry is present under the lock the box is guaranteed alive. Callers must NOT
+/// block or re-enter the registry inside `f`. Replaces the old pattern of
+/// `lookup_user_task_ctx` returning a raw pointer that the caller dereferenced
+/// AFTER releasing the lock (a cross-CPU use-after-free against task exit).
+pub fn with_user_task_ctx<R>(task_id: u64, f: impl FnOnce(&UserTaskCtx) -> R) -> Option<R> {
     let g = USER_TASK_CTXS.lock();
-    g.as_ref()?.get(&task_id).map(|p| p.0)
+    let ptr = g.as_ref()?.get(&task_id)?.0;
+    // SAFETY: entry-present-under-this-lock ⟹ the owning future has not yet
+    // unregistered (and thus not yet been dropped), so `ptr` targets a live
+    // `UserTaskCtx`. The lock is held for the whole deref.
+    let uctx = unsafe { &*ptr };
+    Some(f(uctx))
 }
 
 pub fn unregister_user_task_ctx(task_id: u64) {
@@ -1414,6 +1427,16 @@ impl core::future::Future for UserTaskFuture {
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
+            // Remove this task's `UserTaskCtx` pointer from the by-id registry
+            // BEFORE the future's box is dropped — otherwise the raw pointer
+            // dangles and a later cross-CPU `wake_signal`/`wake_one` derefs
+            // freed (reused) memory (TaskIds are monotonic, never reused, so the
+            // stale entry never gets overwritten). The registry deliberately
+            // persists across YIELD (a parked task must stay wakeable) and across
+            // EXECVE (the future + ctx are reused for the new image) — only the
+            // true exit removes it. `current_task_id()` here is the same id the
+            // poll registered with at the top of this function.
+            unregister_user_task_ctx(crate::handlers::current_task_id());
             // Fan out to per-pid observers (FB connections, fd
             // tables, future ipc rings) before flipping state so
             // any subsystem that wants to inspect the live process
@@ -1688,6 +1711,7 @@ impl core::future::Future for UserTaskFuture {
         if this.process.address_space.activate().is_err() {
             // No state change — the task essentially never ran
             // user code. Fan out the exit observers and resolve.
+            unregister_user_task_ctx(crate::handlers::current_task_id());
             notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             return core::task::Poll::Ready(());
@@ -1783,6 +1807,7 @@ impl core::future::Future for UserTaskFuture {
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
+            unregister_user_task_ctx(crate::handlers::current_task_id());
             notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             core::task::Poll::Ready(())

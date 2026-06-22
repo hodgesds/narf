@@ -708,6 +708,49 @@ fn smoke_process_sigign_consumed_not_delivered() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_process_sigign_consumed_not_delivered);
 
+/// The per-task UserTaskCtx registry must drop a task's entry on exit, and a
+/// wake must resolve the ctx ONLY while the entry is present (under the lock).
+/// Regression for the use-after-free where the entry was never unregistered, so
+/// a cross-CPU wake_signal/wake_one dereferenced a freed/reused future box.
+fn smoke_user_task_ctx_unregister_prevents_stale_deref() -> TestResult {
+    use core::sync::atomic::Ordering;
+    crate::user_task::user_task_ctx_init();
+    const ID: u64 = 0xF0_44;
+
+    let mut ctx = crate::user_task::UserTaskCtx::new();
+    ctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+    crate::user_task::register_user_task_ctx(ID, &mut ctx as *mut _);
+
+    // Present: a wake resolves it under the lock and clears the infinite deadline.
+    let seen = crate::user_task::with_user_task_ctx(ID, |c| {
+        let d = c.sleep_deadline_ns.load(Ordering::Acquire);
+        if d == u64::MAX {
+            c.sleep_deadline_ns.store(0, Ordering::Release);
+        }
+        d
+    });
+    let cleared = ctx.sleep_deadline_ns.load(Ordering::Acquire);
+
+    // Task exit: unregister BEFORE the box (here `ctx`) would be dropped.
+    crate::user_task::unregister_user_task_ctx(ID);
+    let after = crate::user_task::with_user_task_ctx(ID, |_| 1u32);
+
+    if seen != Some(u64::MAX) {
+        return TestResult::Fail("with_user_task_ctx did not resolve the registered ctx");
+    }
+    if cleared != 0 {
+        return TestResult::Fail("wake-under-lock did not clear the deadline");
+    }
+    if after.is_some() {
+        return TestResult::Fail("ctx still resolvable after unregister — stale-deref / UAF window");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_user_task_ctx_unregister_prevents_stale_deref
+);
+
 // ── Smoke 7: SIGKILL kills child ──────────────────────────────────────
 //
 // kill(child, SIGKILL) sets the pending bit for SIGKILL (9) on the

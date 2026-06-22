@@ -52,19 +52,15 @@ pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
 }
 
 pub fn wake_signal(task_id: u64) {
-    if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
-        // SAFETY: `uctx_ptr` came from `lookup_user_task_ctx`, which returns the
-        // `UserTaskCtx` pointer registered for a live task; the ctx outlives this
-        // borrow and is not mutated through another reference here.
-        // SAFETY: Valid memory or trusted environment
-        let uctx = unsafe { &*uctx_ptr };
+    // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
+    // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
+    crate::user_task::with_user_task_ctx(task_id, |uctx| {
         // If the task is blocked in an infinite wait (pause, epoll_wait),
         // clear the deadline to wake it.
-        let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
-        if deadline == u64::MAX {
+        if uctx.sleep_deadline_ns.load(Ordering::Acquire) == u64::MAX {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
-    }
+    });
     let waker = {
         let mut g = SIGNAL_WAKERS.lock();
         g.as_mut().and_then(|m| m.remove(&task_id))
@@ -183,13 +179,11 @@ pub fn drop_io_waiter(task_id: u64) {
 /// Clear a task's finite sleep deadline (so its re-poll re-checks
 /// readiness) and fire its waker.
 fn wake_one(task_id: u64, w: core::task::Waker) {
-    if let Some(uctx_ptr) = crate::user_task::lookup_user_task_ctx(task_id) {
-        // SAFETY: pointer from `lookup_user_task_ctx` for a live task;
-        // `sleep_deadline_ns` is an atomic field.
-        // SAFETY: Valid memory or trusted environment
-        let uctx = unsafe { &*uctx_ptr };
+    // Deref under the registry lock (see `with_user_task_ctx`) so a concurrent
+    // task-exit + box-drop can't free the ctx mid-deref.
+    crate::user_task::with_user_task_ctx(task_id, |uctx| {
         uctx.sleep_deadline_ns.store(0, Ordering::Release);
-    }
+    });
     w.wake();
 }
 
