@@ -4300,12 +4300,17 @@ fn sys_close(ctx: &mut dyn TrapContext) {
     if let Some(ops) = arc_ops {
         let raw = alloc::sync::Arc::as_ptr(&ops) as *const ();
         if let Some(sock) = socket_arc_lookup(raw) {
+            // Release a bound listener's path slot (no-op for a connected /
+            // socketpair socket). We deliberately do NOT remove the SOCKET_ARCS
+            // resolver entry here: it holds a `Weak` (see socket_arc_register)
+            // that self-invalidates only when the LAST fd to the SocketFile
+            // drops. A socketpair end passed to a forked child (weston's
+            // helper-launch: socketpair → fork → parent closes the child's end)
+            // is closed in the parent while the child still holds its inherited
+            // fd to the same SocketFile — removing the entry on this close is
+            // exactly what made the child's sendmsg/recvmsg unresolvable and
+            // broke the libwayland handshake with EPERM.
             sock.unregister();
-            // Drop the side-table reference too.
-            let mut g = SOCKET_ARCS.lock();
-            if let Some(map) = g.as_mut() {
-                map.remove(&(raw as usize));
-            }
         }
     }
     // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
@@ -16536,20 +16541,41 @@ fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>
 // `Any`, so a downcast isn't possible. Stage-1: register the
 // concrete Arc when the socket is created; look it up by the same
 // raw pointer the FdEntry holds.
+// fd → SocketFile resolver. Holds a `Weak`, NOT a strong `Arc`: the SocketFile
+// is kept alive by its fd-table entries (and, for a listener, the LISTENERS
+// map), so the resolver entry must follow that liveness rather than pin it.
+// A strong ref here made `sys_close` remove the entry to avoid a leak — which
+// broke socketpair-across-fork (weston's helper launch): the parent's close
+// deleted the entry while the child still held an fd to the same SocketFile.
+// With a Weak, a surviving fd keeps the entry resolvable and the entry
+// self-invalidates only when the final fd drops (pruned lazily on lookup).
 static SOCKET_ARCS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::socket::SocketFile>>>,
+    Option<alloc::collections::BTreeMap<usize, alloc::sync::Weak<crate::socket::SocketFile>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn socket_arc_register(arc: &alloc::sync::Arc<crate::socket::SocketFile>) {
     let key = alloc::sync::Arc::as_ptr(arc) as usize;
     let mut g = SOCKET_ARCS.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(key, arc.clone());
+    map.insert(key, alloc::sync::Arc::downgrade(arc));
 }
 
 fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
-    let g = SOCKET_ARCS.lock();
-    g.as_ref()?.get(&(raw as usize)).cloned()
+    let mut g = SOCKET_ARCS.lock();
+    let map = g.as_mut()?;
+    match map.get(&(raw as usize)) {
+        Some(weak) => match weak.upgrade() {
+            Some(arc) => Some(arc),
+            None => {
+                // Last fd dropped: the allocation may have been freed (or
+                // reused). Prune the dead entry so the map can't grow without
+                // bound and a reused address can't resolve to a stale socket.
+                map.remove(&(raw as usize));
+                None
+            }
+        },
+        None => None,
+    }
 }
 
 fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
@@ -16850,6 +16876,9 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             // No executor (kernel-test context): surface EAGAIN.
             ctx.set_return(SyscallReturn::ok((-11i64) as u64));
         }
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -16876,6 +16905,9 @@ fn sys_socket_connect(ctx: &mut dyn TrapContext) {
     };
     match sock.dispatch_op(crate::socket::SocketOp::Connect { addr }) {
         crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -17220,7 +17252,7 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
         // fd-carrying send → AF_UNIX stream path.
         return match sock.unix_sendmsg(&total, passed_fds) {
             Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            Err(_) => ctx.set_return(fail),
+            Err(e) => ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64)),
         };
     }
 
@@ -17230,6 +17262,12 @@ fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
         addr: dest,
     }) {
         crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
+        // Map the real socket error to its errno (EAGAIN/ENOTCONN/EPIPE/…)
+        // instead of the bare -1 sentinel (which musl reads as EPERM and
+        // libwayland treats as a fatal connection error).
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -17419,12 +17457,12 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
 
             ctx.set_return(SyscallReturn::ok(n as u64));
         }
-        // A non-blocking recv with no data must report EAGAIN, not the bare
-        // -1 sentinel (which musl maps to EPERM). libwayland's connection
-        // reader treats anything but EAGAIN as a fatal "failed to read
-        // client connection".
-        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        // Map the real socket error to its errno. A non-blocking recv with no
+        // data must report EAGAIN, not the bare -1 sentinel (which musl maps to
+        // EPERM); libwayland's connection reader treats anything but EAGAIN as a
+        // fatal "failed to process Wayland connection".
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         _ => ctx.set_return(fail),
     }
