@@ -264,6 +264,47 @@ From `verification/…/spec.md` §8:
   must agree). Apply Benjamini-Hochberg FDR (q = 0.05) across the suite.
 - Blocking only if significant **and** beyond declared δ.
 
+## Debugging methodology — kernel crashes, esp. SMP heisenbugs
+
+Hard-won on the weston SMP selector-corruption crash. Apply when a
+fault is intermittent, SMP-dependent, or vanishes when you instrument it.
+
+**Heisenbug rule — instrument the FATAL path, never the hot path.**
+A bug whose timing window any per-trap overhead shifts closed is a
+heisenbug. A `Drop` guard / validator at the top of `rust_trap_handler`
+*will* mask it (confirmed: weston went 0/8 with a trap-frame validator).
+Diagnostics that run *only* in the fatal-exception printer (after the
+crash, never per-trap) are zero-perturbation — put GS base, CR3, wide
+raw stack dumps, struct dumps there freely. A few atomic stores per
+trap are tolerable (a 4-store per-syscall record did NOT mask); branchy
+logic / locks / serial I/O per trap are not.
+
+**Flight recorder** (`frame/x86_64/trap.rs::trace_rec`, when present):
+per-CPU lock-free ring, one `rdtscp` per record (yields TSC *and* cpu id
+from `IA32_TSC_AUX` in ~30 cyc), recorded at the single trap chokepoint,
+dumped per-CPU newest-first by the fatal handler. Per-CPU rings (not one
+shared) — a contended global counter cache-line-bounces every trap and
+perturbs. Record `frame as *const _` (the kernel-stack addr the trap
+landed on) to spot two CPUs' frames overlapping one stack.
+
+**Reading a crash frame:**
+- Values with `(v & 3) == 3` are **segment selectors** (RPL=3). A
+  selector in a code/rip slot ⟹ a seg-register save landed in the wrong
+  place (signal McContext, iretq frame, or a saved trap frame).
+- A fault `rsp` at a *constant offset below a stack-size-aligned top*
+  (e.g. always `top − 0xB60`) ⟹ a specific code path at a fixed call
+  depth, NOT random corruption. Compute it.
+- At a kernel-mode (cs=0x08) fault, `IA32_GS_BASE` must be this CPU's
+  PerCpu (BSP = a high-half static; APs = a low-heap leaked Box). A
+  user-looking / zero base ⟹ swapgs imbalance.
+- Symbolize saved return addresses on the stack + `rbp`/`r14` against
+  `nm -n` to recover the call context the registers point into.
+
+**Localize before fixing.** Rule theories OUT against the code, not by
+assumption (concurrent-poll, sigreturn, TSS-race, RCU were all disproven
+this way). The SMP repro is the oracle: deterministic regressions fail
+the *same* test every run; flaky/heisenbug fails *vary* run-to-run.
+
 ## Quick commands (once `build/` lands)
 
 ```
