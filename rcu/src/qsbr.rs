@@ -184,50 +184,79 @@ pub fn report_idle() {
 pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
     let epoch = GLOBAL_EPOCH.load(Ordering::Acquire);
     let cell = this_cpu();
-    // SAFETY: single-CPU Stage-2 means only this CPU accesses its own
-    // bucket; Stage-3 preserves this invariant by keying off
-    // `current_cpu_id()`. No other handler can interrupt with a
-    // conflicting access because the bucket is only mutated inside
-    // these functions (no `await`, no spinlock).
-    // SAFETY: Valid memory or trusted environment
-    let bucket = unsafe { &mut *cell.bucket.get() };
-    if bucket.len < DEFER_BUCKET_CAP {
-        bucket.slots[bucket.len] = DeferEntry {
-            ptr,
-            dropper: Some(dropper),
-            epoch,
-        };
-        bucket.len += 1;
-    } else {
-        bucket.overflow += 1;
-    }
+    // IRQ-masked: the per-CPU bucket is a lock-free `UnsafeCell`, but
+    // `defer_raw` is reachable from BOTH task context and IRQ context (an
+    // IRQ handler that drops an RCU-protected object defers it here), and
+    // `drain_local_bucket` mutates the SAME bucket. An IRQ landing mid-push
+    // — or a push landing mid-drain — tears a `DeferEntry`, leaving a
+    // half-written `dropper` fn-pointer that `drain_local_bucket` then calls
+    // (→ #UD on a garbage address). Masking IRQs around the only-this-CPU
+    // mutation closes the same-CPU reentrancy window (cross-CPU is a non-issue
+    // — each CPU owns its bucket). See the slab-magazine IRQ-safety precedent.
+    narf_lib::sync::without_interrupts(|| {
+        // SAFETY: IRQs masked, so this CPU is the sole accessor of its own
+        // bucket for the duration of this mutation.
+        let bucket = unsafe { &mut *cell.bucket.get() };
+        if bucket.len < DEFER_BUCKET_CAP {
+            bucket.slots[bucket.len] = DeferEntry {
+                ptr,
+                dropper: Some(dropper),
+                epoch,
+            };
+            bucket.len += 1;
+        } else {
+            bucket.overflow += 1;
+        }
+    });
 }
 
 fn drain_local_bucket(cell: &CpuCell) {
     let min_q = min_last_quiescent();
-    // SAFETY: same invariant as defer_raw.
-    let bucket = unsafe { &mut *cell.bucket.get() };
-    let mut write = 0;
-    for read in 0..bucket.len {
-        let entry = bucket.slots[read];
-        if entry.epoch < min_q {
-            if let Some(f) = entry.dropper {
-                // SAFETY: the pointer came from `Box::into_raw::<T>` via
-                // `enqueue_drop`, and the grace period has elapsed: no
-                // reader is viewing this allocation.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    f(entry.ptr);
+    // Phase 1 — IRQ-masked: lift the grace-period-elapsed entries out of the
+    // per-CPU bucket and compact what remains. Masking IRQs makes this CPU the
+    // sole accessor of its lock-free `UnsafeCell` bucket; without it an IRQ
+    // that calls `defer_raw` mid-compaction tears a `DeferEntry` and we'd later
+    // call a half-written `dropper` fn-pointer (→ #UD). See `defer_raw`.
+    //
+    // Crucially we do NOT run the droppers under the mask: a dropper is
+    // arbitrary `Drop` code that may be slow or re-enter `defer_raw` (deferring
+    // a further drop), which must be free to take its own IRQ mask + push.
+    let mut drained: [DeferEntry; DEFER_BUCKET_CAP] = [DeferEntry {
+        ptr: core::ptr::null_mut(),
+        dropper: None,
+        epoch: 0,
+    }; DEFER_BUCKET_CAP];
+    let mut n = 0usize;
+    narf_lib::sync::without_interrupts(|| {
+        // SAFETY: IRQs masked → sole accessor of this CPU's own bucket.
+        let bucket = unsafe { &mut *cell.bucket.get() };
+        let mut write = 0;
+        for read in 0..bucket.len {
+            let entry = bucket.slots[read];
+            if entry.epoch < min_q {
+                drained[n] = entry;
+                n += 1;
+            } else {
+                if write != read {
+                    bucket.slots[write] = entry;
                 }
+                write += 1;
             }
-        } else {
-            if write != read {
-                bucket.slots[write] = entry;
+        }
+        bucket.len = write;
+    });
+    // Phase 2 — IRQs enabled: invoke the droppers on the lifted entries.
+    for entry in drained.iter().take(n) {
+        if let Some(f) = entry.dropper {
+            // SAFETY: the pointer came from `Box::into_raw::<T>` via
+            // `enqueue_drop`, and the grace period has elapsed: no reader is
+            // viewing this allocation.
+            // SAFETY: Valid memory or trusted environment
+            unsafe {
+                f(entry.ptr);
             }
-            write += 1;
         }
     }
-    bucket.len = write;
 }
 
 fn min_last_quiescent() -> u64 {
