@@ -2218,8 +2218,11 @@ kernel_test_in!(
 
 fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
     // Mount a fresh MemFs at /sl-fail with a regular file `regular`.
-    // SYS_READLINK against it must return the -1 wire sentinel
-    // because `regular` isn't FileType::Symlink — POSIX EINVAL.
+    // SYS_READLINK against it must return the -EINVAL (-22) wire value
+    // because `regular` isn't FileType::Symlink — POSIX requires EINVAL
+    // here so musl's realpath() (which treats anything but EINVAL as
+    // fatal) keeps walking. See handlers.rs sys_readlink + commit
+    // c8fbbcd1.
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -2274,7 +2277,7 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
         fn set_rip(&mut self, _rip: u64) {}
     }
 
-    let path = b"/sl-fail/regular";
+    let path = b"/sl-fail/regular\0";
     let mut buf = [0u8; 32];
     let mut rctx = FakeCtx {
         args: SyscallArgs {
@@ -2296,11 +2299,11 @@ fn smoke_userspace_readlink_on_non_symlink_fails() -> TestResult {
             return TestResult::Fail("Readlink returned non-Ok status");
         }
     };
-    if v != ((-1i64) as u64) {
+    if v != ((-22i64) as u64) {
         let _ = registry().unmount(&mount_handle, "/sl-fail");
         __test_clear_global();
         fd::__test_reset();
-        return TestResult::Fail("Readlink on non-symlink should return -1");
+        return TestResult::Fail("Readlink on non-symlink should return -EINVAL (-22)");
     }
 
     let _ = registry().unmount(&mount_handle, "/sl-fail");
