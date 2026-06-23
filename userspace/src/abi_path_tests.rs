@@ -160,12 +160,10 @@ kernel_test_in!("syscall_abi", smoke_abi_path_rmdir_neg);
 
 fn smoke_abi_path_truncate_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hello")], || {
-        let path = b"/p/f";
-        // LINUX-GAP: NARF-native (ptr,len,size); Linux is (path, length).
-        match call(
-            Syscall::Truncate.raw(),
-            a2(path.as_ptr() as u64, path.len() as u64, 2),
-        ) {
+        let path = b"/p/f\0";
+        // Linux: truncate(const char *path, off_t length) — arg0 NUL-term
+        // path, arg1 length.
+        match call(Syscall::Truncate.raw(), a1(path.as_ptr() as u64, 2)) {
             Some(0) => Ok(()),
             _ => Err("truncate(existing, 2) should return 0"),
         }
@@ -175,11 +173,8 @@ kernel_test_in!("syscall_abi", smoke_abi_path_truncate_pos);
 
 fn smoke_abi_path_truncate_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hello")], || {
-        let path = b"/p/missing";
-        match call(
-            Syscall::Truncate.raw(),
-            a2(path.as_ptr() as u64, path.len() as u64, 0),
-        ) {
+        let path = b"/p/missing\0";
+        match call(Syscall::Truncate.raw(), a1(path.as_ptr() as u64, 0)) {
             Some(0) => Err("truncate(missing) must fail"),
             _ => Ok(()),
         }

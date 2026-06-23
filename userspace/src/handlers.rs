@@ -2496,11 +2496,12 @@ fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
 
 fn sys_truncate(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux: truncate(const char *path, off_t length). arg0 = NUL-terminated
+    // path, arg1 = new length. (Was NARF-native (path_ptr, path_len, size).)
     let ptr = args.arg0;
-    let len = args.arg1 as usize;
-    let new_size = args.arg2;
+    let new_size = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_path(ptr, len) {
+    let path = match copy_user_cstr(ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -2777,11 +2778,12 @@ fn sys_renameat2(ctx: &mut dyn TrapContext) {
 
 fn sys_symlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux: symlinkat(const char *target, int newdirfd, const char *linkpath).
+    // arg0 = target (NUL-term), arg1 = newdirfd, arg2 = linkpath (NUL-term).
+    // (Was NARF-native (target_ptr, target_len, dirfd, link_ptr, link_len).)
     let target_ptr = args.arg0;
-    let target_len = args.arg1;
-    let _dirfd = args.arg2;
-    let link_ptr = args.arg3;
-    let link_len = args.arg4;
+    let _dirfd = args.arg1;
+    let link_ptr = args.arg2;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,
@@ -2804,13 +2806,11 @@ fn sys_symlinkat(ctx: &mut dyn TrapContext) {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
+    // sys_symlink is now Linux-shaped: arg0 = target ptr, arg1 = linkpath ptr.
     let proxy_args = SyscallArgs {
         arg0: target_ptr,
-        arg1: target_len,
-        arg2: link_ptr,
-        arg3: link_len,
-        arg4: 0,
-        arg5: 0,
+        arg1: link_ptr,
+        ..Default::default()
     };
     let mut proxy = Reshape {
         inner: ctx,
@@ -4076,19 +4076,20 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
 
 fn sys_symlink(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // Linux: symlink(const char *target, const char *linkpath). arg0 = target
+    // (NUL-term), arg1 = linkpath (NUL-term). (Was NARF-native (target_ptr,
+    // target_len, link_ptr, link_len).)
     let target_ptr = args.arg0;
-    let target_len = args.arg1 as usize;
-    let link_ptr = args.arg2;
-    let link_len = args.arg3 as usize;
+    let link_ptr = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let target_str = match copy_user_path(target_ptr, target_len) {
+    let target_str = match copy_user_cstr(target_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let link_path = match copy_user_path(link_ptr, link_len) {
+    let link_path = match copy_user_cstr(link_ptr, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(fail);
@@ -5533,9 +5534,21 @@ fn sys_creat(ctx: &mut dyn TrapContext) {
 /// modification times. NARF's in-memory FSes don't track precise file
 /// times yet, so this validates the path and accepts (no-op).
 fn sys_utime_noop(ctx: &mut dyn TrapContext) {
-    match copy_user_cstr(ctx.args().arg0, 4096) {
-        Some(_) => ctx.set_return(SyscallReturn::ok(0)),
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    // NARF doesn't track file mtimes, so the timestamp update is a no-op —
+    // but Linux still validates the path: a name that resolves succeeds (0),
+    // a name that resolves to nothing is -ENOENT, a bad pointer is -EFAULT.
+    let raw = match copy_user_cstr(ctx.args().arg0, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            return;
+        }
+    };
+    let path = resolve_cwd_path(current_task_id(), &raw);
+    if stat_path_dir_aware(&path).is_some() {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
     }
 }
 
@@ -5546,12 +5559,23 @@ fn sys_utime_noop(ctx: &mut dyn TrapContext) {
 fn sys_utimensat(ctx: &mut dyn TrapContext) {
     let path_ptr = ctx.args().arg1;
     if path_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok(0)); // futimens(dirfd) form
+        ctx.set_return(SyscallReturn::ok(0)); // futimens(dirfd) form — operates on the fd
         return;
     }
-    match copy_user_cstr(path_ptr, 4096) {
-        Some(_) => ctx.set_return(SyscallReturn::ok(0)),
-        None => ctx.set_return(SyscallReturn::ok((-14i64) as u64)), // EFAULT
+    // No-op on the timestamps, but validate the path like Linux: resolves → 0,
+    // missing → -ENOENT, bad pointer → -EFAULT.
+    let raw = match copy_user_cstr(path_ptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            return;
+        }
+    };
+    let path = resolve_cwd_path(current_task_id(), &raw);
+    if stat_path_dir_aware(&path).is_some() {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
     }
 }
 
@@ -13456,14 +13480,16 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
 fn sys_statfs(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok(!0u64);
-    let path = match copy_user_str(args.arg0 as *const u8, args.arg1 as usize, 4096) {
-        Ok(s) => s,
-        Err(()) => {
+    // Linux: statfs(const char *path, struct statfs *buf). arg0 = NUL-term
+    // path, arg1 = buf. (Was NARF-native (path_ptr, path_len, buf).)
+    let path = match copy_user_cstr(args.arg0, 4096) {
+        Some(s) => s,
+        None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let buf_ptr = args.arg2;
+    let buf_ptr = args.arg1;
     if fill_statfs_for_path(&path, buf_ptr) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {

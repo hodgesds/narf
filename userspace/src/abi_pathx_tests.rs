@@ -431,19 +431,12 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_neg);
 
 fn smoke_abi_pathx_readlinkat_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        // Create /p2/lnk -> "target" (target/link are NARF-native (ptr,len)).
-        let target = b"target";
-        let link = b"/p2/lnk";
-        let _ = call_raw(
+        // Create /p2/lnk -> "target" (Linux symlinkat: target, dirfd, linkpath).
+        let target = b"target\0";
+        let link = b"/p2/lnk\0";
+        let _ = call(
             Syscall::Symlinkat.raw(),
-            SyscallArgs {
-                arg0: target.as_ptr() as u64,
-                arg1: target.len() as u64,
-                arg2: AT_FDCWD,
-                arg3: link.as_ptr() as u64,
-                arg4: link.len() as u64,
-                arg5: 0,
-            },
+            a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
         );
         let path = b"/p2/lnk\0";
         let mut buf = [0u8; 64];
@@ -571,16 +564,12 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_renameat2_neg);
 
 fn smoke_abi_pathx_statfs_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        let path = b"/p2/f";
+        // Linux: statfs(const char *path, struct statfs *buf).
+        let path = b"/p2/f\0";
         let mut buf = [0u8; 128];
         match call(
             Syscall::Statfs.raw(),
-            a3(
-                path.as_ptr() as u64,
-                path.len() as u64,
-                buf.as_mut_ptr() as u64,
-                0,
-            ),
+            a1(path.as_ptr() as u64, buf.as_mut_ptr() as u64),
         ) {
             Some(0) => Ok(()),
             _ => Err("statfs(existing, buf) should return 0"),
@@ -591,12 +580,9 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_pos);
 
 fn smoke_abi_pathx_statfs_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        let path = b"/p2/f";
+        let path = b"/p2/f\0";
         // buf_ptr == 0 → fill_statfs_for_path returns false → -1 sentinel.
-        match call(
-            Syscall::Statfs.raw(),
-            a3(path.as_ptr() as u64, path.len() as u64, 0, 0),
-        ) {
+        match call(Syscall::Statfs.raw(), a1(path.as_ptr() as u64, 0)) {
             Some(-1) => Ok(()),
             _ => Err("statfs(null buf) was not the -1 sentinel"),
         }
@@ -604,28 +590,19 @@ fn smoke_abi_pathx_statfs_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_neg);
 
-// ── symlink (NARF-native target_ptr, target_len, link_ptr, link_len) ──
+// ── symlink: Linux (const char *target, const char *linkpath), NUL-term ──
 //
-// LINUX-GAP: NARF-native (ptr,len) pairs; Linux is (target, linkpath)
-// both NUL-term. The link location is resolved against cwd; the target
-// stays verbatim.
+// The link location is resolved against cwd; the target stays verbatim.
 
 fn smoke_abi_pathx_symlink_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        let target = b"f";
-        let link = b"/p2/sl";
-        match call_raw(
+        let target = b"f\0";
+        let link = b"/p2/sl\0";
+        match call(
             Syscall::Symlink.raw(),
-            SyscallArgs {
-                arg0: target.as_ptr() as u64,
-                arg1: target.len() as u64,
-                arg2: link.as_ptr() as u64,
-                arg3: link.len() as u64,
-                arg4: 0,
-                arg5: 0,
-            },
+            a1(target.as_ptr() as u64, link.as_ptr() as u64),
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == 0 => Ok(()),
+            Some(0) => Ok(()),
             _ => Err("symlink(target, /p2/sl) should return 0"),
         }
     })
@@ -635,46 +612,30 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_symlink_pos);
 fn smoke_abi_pathx_symlink_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         // Link parent directory missing → symlink fails (-1).
-        let target = b"f";
-        let link = b"/p2/no_such_dir/sl";
-        match call_raw(
+        let target = b"f\0";
+        let link = b"/p2/no_such_dir/sl\0";
+        match call(
             Syscall::Symlink.raw(),
-            SyscallArgs {
-                arg0: target.as_ptr() as u64,
-                arg1: target.len() as u64,
-                arg2: link.as_ptr() as u64,
-                arg3: link.len() as u64,
-                arg4: 0,
-                arg5: 0,
-            },
+            a1(target.as_ptr() as u64, link.as_ptr() as u64),
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == -1 => Ok(()),
+            Some(-1) => Ok(()),
             _ => Err("symlink under a missing parent was not -1"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_symlink_neg);
 
-// ── symlinkat (target_ptr, target_len, dirfd, link_ptr, link_len) ──
-//
-// LINUX-GAP: target/link are NARF-native (ptr,len). dirfd ignored.
+// ── symlinkat: Linux (const char *target, int newdirfd, const char *linkpath) ──
 
 fn smoke_abi_pathx_symlinkat_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        let target = b"f";
-        let link = b"/p2/sla";
-        match call_raw(
+        let target = b"f\0";
+        let link = b"/p2/sla\0";
+        match call(
             Syscall::Symlinkat.raw(),
-            SyscallArgs {
-                arg0: target.as_ptr() as u64,
-                arg1: target.len() as u64,
-                arg2: AT_FDCWD,
-                arg3: link.as_ptr() as u64,
-                arg4: link.len() as u64,
-                arg5: 0,
-            },
+            a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == 0 => Ok(()),
+            Some(0) => Ok(()),
             _ => Err("symlinkat(target, /p2/sla) should return 0"),
         }
     })
@@ -683,20 +644,13 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_symlinkat_pos);
 
 fn smoke_abi_pathx_symlinkat_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        let target = b"f";
-        let link = b"/p2/no_such_dir/sla";
-        match call_raw(
+        let target = b"f\0";
+        let link = b"/p2/no_such_dir/sla\0";
+        match call(
             Syscall::Symlinkat.raw(),
-            SyscallArgs {
-                arg0: target.as_ptr() as u64,
-                arg1: target.len() as u64,
-                arg2: AT_FDCWD,
-                arg3: link.as_ptr() as u64,
-                arg4: link.len() as u64,
-                arg5: 0,
-            },
+            a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == -1 => Ok(()),
+            Some(-1) => Ok(()),
             _ => Err("symlinkat under a missing parent was not -1"),
         }
     })
@@ -916,3 +870,34 @@ fn open_fd(path: &[u8]) -> Result<u32, &'static str> {
         _ => Err("open failed"),
     }
 }
+
+// ── utime / utimensat: missing path → -ENOENT (no-op on times, but the
+//    path is still validated like Linux). ──
+
+fn smoke_abi_pathx_utime_missing_is_enoent() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2/nope\0";
+        match call(Syscall::Utime.raw(), a0(path.as_ptr() as u64)) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("utime(missing path) should return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_utime_missing_is_enoent);
+
+fn smoke_abi_pathx_utimensat_missing_is_enoent() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2/nope\0";
+        // utimensat(dirfd, path, times, flags): a path that names nothing is ENOENT.
+        let args = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Utimensat.raw(), args) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("utimensat(missing path) should return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_utimensat_missing_is_enoent);

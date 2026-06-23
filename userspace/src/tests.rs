@@ -2146,14 +2146,14 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
     }
 
     // ── SYS_SYMLINK: target=/sl-test/target, link=/sl-test/sl ────
-    let target = b"/sl-test/target";
-    let link = b"/sl-test/sl";
+    // Linux symlink(target, linkpath): arg0 = target ptr, arg1 = linkpath ptr,
+    // both NUL-terminated.
+    let target = b"/sl-test/target\0";
+    let link = b"/sl-test/sl\0";
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: target.as_ptr() as u64,
-            arg1: target.len() as u64,
-            arg2: link.as_ptr() as u64,
-            arg3: link.len() as u64,
+            arg1: link.as_ptr() as u64,
             ..Default::default()
         },
         ret: None,
@@ -2192,13 +2192,16 @@ fn smoke_userspace_symlink_create_and_readlink_round_trip() -> TestResult {
             return TestResult::Fail("Readlink returned non-Ok");
         }
     };
-    if n != target.len() {
+    // `target` now carries a trailing NUL for the Linux-shaped symlink call;
+    // the stored link target (and readlink result) excludes it.
+    let want = &target[..target.len() - 1];
+    if n != want.len() {
         let _ = registry().unmount(&mount_handle, "/sl-test");
         __test_clear_global();
         fd::__test_reset();
         return TestResult::Fail("Readlink returned wrong byte count");
     }
-    if &buf[..n] != target {
+    if &buf[..n] != want {
         let _ = registry().unmount(&mount_handle, "/sl-test");
         __test_clear_global();
         fd::__test_reset();
