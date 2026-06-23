@@ -85,7 +85,12 @@ impl TrapContext for AbiCtx {
 }
 
 /// Install the syscall table + a fake task (pid [`FAKE_TASK`]) + a fresh
-/// fd table. Call at the top of every test; pair with [`teardown`].
+/// fd table, AND initialise the real per-task kernel state subsystems
+/// (signal-pending, rlimits, sched params, uid/gid, nice, umask, cwd,
+/// brk, pgid/sid, wait, …) the same way the boot path does — so handler
+/// SUCCESS paths are reachable and the tests cover real behavior, not
+/// just the "state-missing" error branches. Call at the top of every
+/// test; pair with [`teardown`].
 pub fn setup() {
     TASK_SLOT.store(FAKE_TASK, Ordering::Relaxed);
     __test_clear_global();
@@ -95,6 +100,12 @@ pub fn setup() {
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
+    // Real per-task state (resets every test): SIGNAL_PENDING, rlimits,
+    // sched params, creds, nice, umask, etc. Without this, kill/getrlimit/
+    // sched_* and friends only ever hit their "uninitialised → fail" path.
+    crate::handlers::init_per_task_state();
+    // pid<->tid identity for FAKE_TASK so signal/wait/pid syscalls resolve.
+    crate::handlers::register_task_to_pid(FAKE_TASK, FAKE_TASK);
 }
 
 pub fn teardown() {

@@ -1,0 +1,731 @@
+//! Linux syscall ABI conformance — ipc group.
+//!
+//! Covers POSIX message queues (`mq_*`), System V semaphores / message
+//! queues / shared memory (`sem* / msg* / shm*`), and the NARF-native
+//! `shmem_*` registry surface. Shares the harness in
+//! [`crate::abi_test_support`].
+//!
+//! Harness caveats that shape these tests:
+//!   * There is no user address space wired in (`current_address_space()`
+//!     returns `None`), so any handler that maps frames into an AS
+//!     (`shmem_map`, `shmat`, `shmdt`) cannot reach its success path —
+//!     those get a negative/stub test only.
+//!   * `copy_to_user` / `copy_from_user` validate canonicality + length
+//!     only (not user-vs-kernel range), so kernel-stack buffers round-trip
+//!     fine — the side-table IPC objects (`sem*`, `msg*`, `mq_*`) exercise
+//!     full positive paths.
+//!   * The `narf_shmem` syscall vtable is installed by a `Stage::Subsys`
+//!     initcall before the test phase runs, so `shmem_create` / `shmget`
+//!     reach real frame backing.
+#![cfg(feature = "linux-compat")]
+
+use crate::abi_test_support::*;
+
+// IPC flag bits (octal, matching the handlers).
+const IPC_CREAT: u64 = 0o1000;
+const IPC_EXCL: u64 = 0o2000;
+const IPC_RMID: u64 = 0;
+const IPC_STAT: u64 = 2;
+const SETVAL: u64 = 16;
+const GETVAL: u64 = 12;
+
+const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
+
+// ════════════════════════════════════════════════════════════════════
+// POSIX message queues
+// ════════════════════════════════════════════════════════════════════
+
+// ── MqOpen ──────────────────────────────────────────────────────────
+//
+// mq_open(name, oflag, mode, attr). arg0 = NUL-terminated name, arg1 =
+// oflag. O_CREAT with no attr → default 10 x 8192 queue; returns an fd.
+
+fn smoke_abi_ipc_mq_open_pos() -> TestResult {
+    with_setup(|| {
+        let name = b"/abi_mq_open_pos\0";
+        // O_CREAT, no attr (arg3 = 0) → fresh queue, real fd >= 0.
+        let r = call(Syscall::MqOpen.raw(), a1(name.as_ptr() as u64, O_CREAT));
+        match r {
+            Some(fd) if fd >= 0 => Ok(()),
+            Some(_) => Err("mq_open O_CREAT returned a negative value"),
+            None => Err("mq_open returned non-Ok status"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_open_pos);
+
+fn smoke_abi_ipc_mq_open_neg() -> TestResult {
+    with_setup(|| {
+        // No O_CREAT and the name does not exist → ENOENT.
+        let name = b"/abi_mq_open_missing\0";
+        match call(Syscall::MqOpen.raw(), a1(name.as_ptr() as u64, 0)) {
+            Some(v) if v == ENOENT => Ok(()),
+            other => {
+                let _ = other;
+                Err("mq_open of a missing name without O_CREAT must be ENOENT")
+            }
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_open_neg);
+
+// ── MqUnlink ────────────────────────────────────────────────────────
+
+fn smoke_abi_ipc_mq_unlink_pos() -> TestResult {
+    with_setup(|| {
+        let name = b"/abi_mq_unlink_pos\0";
+        // Create then unlink the name → 0.
+        let _ = call(Syscall::MqOpen.raw(), a1(name.as_ptr() as u64, O_CREAT));
+        match call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64)) {
+            Some(0) => Ok(()),
+            _ => Err("mq_unlink of an existing name should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_unlink_pos);
+
+fn smoke_abi_ipc_mq_unlink_neg() -> TestResult {
+    with_setup(|| {
+        let name = b"/abi_mq_unlink_missing\0";
+        match call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64)) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("mq_unlink of a missing name must be ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_unlink_neg);
+
+/// Open a fresh queue and return its fd (or Err string for the body).
+fn open_mq(name: &[u8]) -> Result<u64, &'static str> {
+    match call(Syscall::MqOpen.raw(), a1(name.as_ptr() as u64, O_CREAT)) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("setup: mq_open O_CREAT failed"),
+    }
+}
+
+// ── MqTimedsend ─────────────────────────────────────────────────────
+//
+// mq_timedsend(mqd, msg_ptr, msg_len, msg_prio, timeout). A send into a
+// fresh (non-full) queue returns 0.
+
+fn smoke_abi_ipc_mq_timedsend_pos() -> TestResult {
+    with_setup(|| {
+        let fd = open_mq(b"/abi_mq_send_pos\0")?;
+        let payload = b"hello-mq";
+        let r = call(
+            Syscall::MqTimedsend.raw(),
+            a3(fd, payload.as_ptr() as u64, payload.len() as u64, 0),
+        );
+        match r {
+            Some(0) => Ok(()),
+            _ => Err("mq_timedsend into an empty queue should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_timedsend_pos);
+
+fn smoke_abi_ipc_mq_timedsend_neg() -> TestResult {
+    with_setup(|| {
+        // arg0 is not a valid mqd fd → EBADF.
+        let payload = b"x";
+        match call(
+            Syscall::MqTimedsend.raw(),
+            a3(4242, payload.as_ptr() as u64, payload.len() as u64, 0),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("mq_timedsend on a bad fd must be EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_timedsend_neg);
+
+// ── MqTimedreceive ──────────────────────────────────────────────────
+//
+// mq_timedreceive(mqd, msg_ptr, msg_len, prio_ptr, timeout). The receive
+// buffer must be >= mq_msgsize (8192 default). After a send, a receive
+// returns the byte count.
+
+fn smoke_abi_ipc_mq_timedreceive_pos() -> TestResult {
+    with_setup(|| {
+        let fd = open_mq(b"/abi_mq_recv_pos\0")?;
+        let payload = b"abcd";
+        let s = call(
+            Syscall::MqTimedsend.raw(),
+            a3(fd, payload.as_ptr() as u64, payload.len() as u64, 7),
+        );
+        if s != Some(0) {
+            return Err("setup: mq_timedsend failed");
+        }
+        // Receive buffer must be at least mq_msgsize (8192).
+        let mut rbuf = [0u8; 8192];
+        let r = call(
+            Syscall::MqTimedreceive.raw(),
+            a3(fd, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
+        );
+        match r {
+            Some(n) if n == payload.len() as i64 => {
+                if &rbuf[..4] == payload {
+                    Ok(())
+                } else {
+                    Err("mq_timedreceive returned wrong payload bytes")
+                }
+            }
+            _ => Err("mq_timedreceive should return the message length"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_timedreceive_pos);
+
+fn smoke_abi_ipc_mq_timedreceive_neg() -> TestResult {
+    with_setup(|| {
+        // Bad fd → EBADF (checked before any buffer math).
+        let mut rbuf = [0u8; 8192];
+        match call(
+            Syscall::MqTimedreceive.raw(),
+            a3(4242, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("mq_timedreceive on a bad fd must be EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_timedreceive_neg);
+
+// ── MqGetsetattr ────────────────────────────────────────────────────
+//
+// mq_getsetattr(mqd, newattr_ptr, oldattr_ptr). With new=0 and a 32-byte
+// old buffer, snapshots the queue attrs and returns 0.
+
+fn smoke_abi_ipc_mq_getsetattr_pos() -> TestResult {
+    with_setup(|| {
+        let fd = open_mq(b"/abi_mq_attr_pos\0")?;
+        let mut oldattr = [0u8; 32];
+        let r = call(
+            Syscall::MqGetsetattr.raw(),
+            a2(fd, 0, oldattr.as_mut_ptr() as u64),
+        );
+        if r != Some(0) {
+            return Err("mq_getsetattr (get) should return 0");
+        }
+        // mq_maxmsg lives at bytes 8..16; default is 10.
+        let maxmsg = i64::from_le_bytes(oldattr[8..16].try_into().unwrap());
+        if maxmsg == 10 {
+            Ok(())
+        } else {
+            Err("mq_getsetattr old buffer mq_maxmsg should be the default 10")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_getsetattr_pos);
+
+fn smoke_abi_ipc_mq_getsetattr_neg() -> TestResult {
+    with_setup(|| {
+        let mut oldattr = [0u8; 32];
+        match call(
+            Syscall::MqGetsetattr.raw(),
+            a2(4242, 0, oldattr.as_mut_ptr() as u64),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("mq_getsetattr on a bad fd must be EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_getsetattr_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// System V semaphores
+// ════════════════════════════════════════════════════════════════════
+
+/// semget a private set of `nsems` semaphores; return the id.
+fn make_semset(nsems: u64) -> Result<u64, &'static str> {
+    // key = IPC_PRIVATE (0) always allocates a fresh set.
+    match call(Syscall::Semget.raw(), a2(0, nsems, IPC_CREAT)) {
+        Some(id) if id > 0 => Ok(id as u64),
+        _ => Err("setup: semget IPC_PRIVATE failed"),
+    }
+}
+
+// ── Semget ──────────────────────────────────────────────────────────
+
+fn smoke_abi_ipc_semget_pos() -> TestResult {
+    with_setup(|| {
+        // IPC_PRIVATE, 2 sems, create → new id > 0.
+        match call(Syscall::Semget.raw(), a2(0, 2, IPC_CREAT)) {
+            Some(id) if id > 0 => Ok(()),
+            _ => Err("semget IPC_PRIVATE should return a positive id"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semget_pos);
+
+fn smoke_abi_ipc_semget_neg() -> TestResult {
+    with_setup(|| {
+        // nsems = 0 on a create → EINVAL.
+        match call(Syscall::Semget.raw(), a2(0, 0, IPC_CREAT)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("semget with nsems=0 must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semget_neg);
+
+// ── Semop ───────────────────────────────────────────────────────────
+//
+// semop(semid, sops, nsops). struct sembuf { u16 sem_num; i16 sem_op;
+// i16 sem_flg; } = 6 bytes. A +1 op on sem 0 succeeds → 0.
+
+fn smoke_abi_ipc_semop_pos() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        // sembuf { sem_num=0, sem_op=+1, sem_flg=0 }
+        let mut sop = [0u8; 6];
+        sop[0..2].copy_from_slice(&0u16.to_le_bytes());
+        sop[2..4].copy_from_slice(&1i16.to_le_bytes());
+        match call(Syscall::Semop.raw(), a2(id, sop.as_ptr() as u64, 1)) {
+            Some(0) => Ok(()),
+            _ => Err("semop +1 on a fresh sem should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_pos);
+
+fn smoke_abi_ipc_semop_neg() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        // A -1 op on a zero-valued semaphore would block; non-blocking
+        // handler returns EAGAIN.
+        let mut sop = [0u8; 6];
+        sop[0..2].copy_from_slice(&0u16.to_le_bytes());
+        sop[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        match call(Syscall::Semop.raw(), a2(id, sop.as_ptr() as u64, 1)) {
+            Some(v) if v == EAGAIN => Ok(()),
+            _ => Err("semop -1 on a 0 sem must be EAGAIN (non-blocking)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semop_neg);
+
+// ── Semtimedop ──────────────────────────────────────────────────────
+//
+// Same shape as semop with a trailing timeout (ignored — never blocks).
+
+fn smoke_abi_ipc_semtimedop_pos() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut sop = [0u8; 6];
+        sop[0..2].copy_from_slice(&0u16.to_le_bytes());
+        sop[2..4].copy_from_slice(&2i16.to_le_bytes());
+        // arg3 = timeout pointer (ignored); pass 0.
+        match call(
+            Syscall::Semtimedop.raw(),
+            a3(id, sop.as_ptr() as u64, 1, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("semtimedop +2 should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semtimedop_pos);
+
+fn smoke_abi_ipc_semtimedop_neg() -> TestResult {
+    with_setup(|| {
+        // nsops = 0 → EINVAL (checked before any semid lookup).
+        match call(Syscall::Semtimedop.raw(), a3(1, 0x1000, 0, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("semtimedop nsops=0 must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semtimedop_neg);
+
+// ── Semctl ──────────────────────────────────────────────────────────
+//
+// semctl(semid, semnum, cmd, arg). SETVAL then GETVAL round-trips.
+
+fn smoke_abi_ipc_semctl_pos() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(2)?;
+        // SETVAL sem 1 = 5.
+        let s = call(Syscall::Semctl.raw(), a3(id, 1, SETVAL, 5));
+        if s != Some(0) {
+            return Err("semctl SETVAL should return 0");
+        }
+        // GETVAL sem 1 → 5.
+        match call(Syscall::Semctl.raw(), a3(id, 1, GETVAL, 0)) {
+            Some(5) => Ok(()),
+            _ => Err("semctl GETVAL should read back the SETVAL value"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_pos);
+
+fn smoke_abi_ipc_semctl_neg() -> TestResult {
+    with_setup(|| {
+        // IPC_RMID on a non-existent id → EINVAL.
+        match call(Syscall::Semctl.raw(), a3(987654, 0, IPC_RMID, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("semctl IPC_RMID on a bad id must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// System V message queues
+// ════════════════════════════════════════════════════════════════════
+
+/// msgget a private queue; return the id.
+fn make_msgq() -> Result<u64, &'static str> {
+    match call(Syscall::Msgget.raw(), a1(0, IPC_CREAT)) {
+        Some(id) if id > 0 => Ok(id as u64),
+        _ => Err("setup: msgget IPC_PRIVATE failed"),
+    }
+}
+
+// ── Msgget ──────────────────────────────────────────────────────────
+
+fn smoke_abi_ipc_msgget_pos() -> TestResult {
+    with_setup(|| {
+        // msgget(key=IPC_PRIVATE, msgflg=IPC_CREAT) → new id > 0.
+        match call(Syscall::Msgget.raw(), a1(0, IPC_CREAT)) {
+            Some(id) if id > 0 => Ok(()),
+            _ => Err("msgget IPC_PRIVATE should return a positive id"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgget_pos);
+
+fn smoke_abi_ipc_msgget_neg() -> TestResult {
+    with_setup(|| {
+        // A non-private key with no IPC_CREAT that doesn't exist → ENOENT.
+        match call(Syscall::Msgget.raw(), a1(0x5151, 0)) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("msgget of a missing key without IPC_CREAT must be ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgget_neg);
+
+// ── Msgsnd ──────────────────────────────────────────────────────────
+//
+// msgsnd(msqid, msgp, msgsz, msgflg). msgp = { i64 mtype; u8 mtext[]; }.
+
+fn smoke_abi_ipc_msgsnd_pos() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        // mtype = 1, payload = "ping".
+        let mut buf = [0u8; 8 + 4];
+        buf[0..8].copy_from_slice(&1i64.to_le_bytes());
+        buf[8..12].copy_from_slice(b"ping");
+        match call(Syscall::Msgsnd.raw(), a3(id, buf.as_ptr() as u64, 4, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("msgsnd of a valid message should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgsnd_pos);
+
+fn smoke_abi_ipc_msgsnd_neg() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        // mtype <= 0 is invalid → EINVAL.
+        let mut buf = [0u8; 8 + 2];
+        buf[0..8].copy_from_slice(&0i64.to_le_bytes());
+        match call(Syscall::Msgsnd.raw(), a3(id, buf.as_ptr() as u64, 2, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("msgsnd with mtype<=0 must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgsnd_neg);
+
+// ── Msgrcv ──────────────────────────────────────────────────────────
+//
+// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg). Returns the payload length.
+
+fn smoke_abi_ipc_msgrcv_pos() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut sbuf = [0u8; 8 + 4];
+        sbuf[0..8].copy_from_slice(&1i64.to_le_bytes());
+        sbuf[8..12].copy_from_slice(b"pong");
+        if call(Syscall::Msgsnd.raw(), a3(id, sbuf.as_ptr() as u64, 4, 0)) != Some(0) {
+            return Err("setup: msgsnd failed");
+        }
+        // msgtyp = 0 (any), msgsz = 4.
+        let mut rbuf = [0u8; 8 + 4];
+        let r = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: rbuf.as_mut_ptr() as u64,
+                arg2: 4,
+                arg3: 0,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        if r.status != SyscallReturn::OK {
+            return Err("msgrcv returned non-Ok status");
+        }
+        if r.value as i64 != 4 {
+            return Err("msgrcv should return the 4-byte payload length");
+        }
+        if &rbuf[8..12] == b"pong" {
+            Ok(())
+        } else {
+            Err("msgrcv payload mismatch")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_pos);
+
+fn smoke_abi_ipc_msgrcv_neg() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        // Empty queue (no msgsnd) → ENOMSG (non-blocking).
+        let mut rbuf = [0u8; 8 + 4];
+        let r = call_raw(
+            Syscall::Msgrcv.raw(),
+            SyscallArgs {
+                arg0: id,
+                arg1: rbuf.as_mut_ptr() as u64,
+                arg2: 4,
+                arg3: 0,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        // ENOMSG = -42 (not in the harness errno table).
+        if r.status == SyscallReturn::OK && r.value as i64 == -42 {
+            Ok(())
+        } else {
+            Err("msgrcv on an empty queue must be ENOMSG (-42)")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgrcv_neg);
+
+// ── Msgctl ──────────────────────────────────────────────────────────
+
+fn smoke_abi_ipc_msgctl_pos() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        // IPC_RMID on a live queue → 0.
+        match call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("msgctl IPC_RMID on a live queue should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgctl_pos);
+
+fn smoke_abi_ipc_msgctl_neg() -> TestResult {
+    with_setup(|| {
+        // IPC_RMID on a non-existent id → EINVAL.
+        match call(Syscall::Msgctl.raw(), a2(987654, IPC_RMID, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("msgctl IPC_RMID on a bad id must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_msgctl_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// System V shared memory (linux-compat: sys_shmget_compat / shmat / …)
+// ════════════════════════════════════════════════════════════════════
+
+// ── Shmget ──────────────────────────────────────────────────────────
+//
+// shmget(key, size, shmflg). Backed by the narf-shmem registry (vtable
+// installed by a Subsys initcall before the test phase). key != 0 with
+// IPC_CREAT allocates a real segment; the returned shmid is positive.
+
+fn smoke_abi_ipc_shmget_pos() -> TestResult {
+    with_setup(|| {
+        // A private create (key=0, IPC_CREAT) → positive shmid.
+        match call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT)) {
+            Some(id) if id > 0 => Ok(()),
+            Some(v) => {
+                let _ = v;
+                Err("shmget create returned a non-positive id (vtable wired at boot?)")
+            }
+            None => Err("shmget returned non-Ok status (shmem vtable absent)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmget_pos);
+
+fn smoke_abi_ipc_shmget_neg() -> TestResult {
+    with_setup(|| {
+        // A non-zero key that does not exist and no IPC_CREAT → ENOENT.
+        // This path returns before the vtable is consulted, so it is
+        // deterministic regardless of shmem wiring.
+        match call(Syscall::Shmget.raw(), a2(0x6161, 4096, 0)) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("shmget of a missing key without IPC_CREAT must be ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmget_neg);
+
+// ── Shmat ───────────────────────────────────────────────────────────
+//
+// shmat(shmid, shmaddr, shmflg). The success path maps frames into the
+// caller's address space, which the harness has none of — so only the
+// invalid-shmid error path (returned before the AS lookup) is reachable.
+
+fn smoke_abi_ipc_shmat_neg() -> TestResult {
+    with_setup(|| {
+        // Unknown shmid → EINVAL (segment lookup fails first).
+        match call(Syscall::Shmat.raw(), a2(987654, 0, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("shmat on a bad shmid must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmat_neg);
+
+// ── Shmdt ───────────────────────────────────────────────────────────
+//
+// shmdt(shmaddr). The handler dereferences current_address_space() FIRST,
+// which is None in this harness, so it returns invalid_op() for every
+// input — neither the ok(0) nor the -EINVAL Linux paths are reachable.
+
+fn smoke_abi_ipc_shmdt_neg() -> TestResult {
+    with_setup(|| {
+        // No address space → invalid_op (call() returns None).
+        // LINUX-GAP: Linux returns -EINVAL for an unmapped/unknown addr;
+        // here the missing-AS guard short-circuits to a non-Ok status.
+        match call(Syscall::Shmdt.raw(), a0(0x4000_0000)) {
+            None => Ok(()),
+            Some(_) => Err("shmdt with no address space should be invalid_op (None)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmdt_neg);
+
+// ── Shmctl ──────────────────────────────────────────────────────────
+//
+// shmctl(shmid, cmd, buf). IPC_RMID on an unknown id → -EINVAL; IPC_STAT
+// with buf=0 on an unknown id → -EINVAL. A real positive path needs a
+// segment, which requires the vtable-backed shmget — covered separately.
+
+fn smoke_abi_ipc_shmctl_pos() -> TestResult {
+    with_setup(|| {
+        // Create a real segment, then IPC_STAT (buf=0) → 0.
+        let id = match call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT)) {
+            Some(id) if id > 0 => id as u64,
+            _ => return Err("setup: shmget create failed (shmem vtable absent?)"),
+        };
+        let stat = call(Syscall::Shmctl.raw(), a3(id, IPC_STAT, 0, 0));
+        if stat != Some(0) {
+            return Err("shmctl IPC_STAT (buf=0) on a live segment should return 0");
+        }
+        // Clean up: IPC_RMID → 0.
+        match call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("shmctl IPC_RMID on a live segment should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmctl_pos);
+
+fn smoke_abi_ipc_shmctl_neg() -> TestResult {
+    with_setup(|| {
+        // IPC_RMID on a non-existent id → EINVAL (no vtable dependency).
+        match call(Syscall::Shmctl.raw(), a2(987654, IPC_RMID, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("shmctl IPC_RMID on a bad shmid must be EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmctl_neg);
+
+// ════════════════════════════════════════════════════════════════════
+// NARF-native shmem registry (ShmemCreate / ShmemMap / ShmemDestroy)
+// ════════════════════════════════════════════════════════════════════
+
+// ── ShmemCreate ─────────────────────────────────────────────────────
+//
+// ShmemCreate(len): arg0 = length. Returns an opaque handle (ok) or
+// invalid_op() when the registry rejects it (len=0 → BadLen → handle 0).
+
+fn smoke_abi_ipc_shmem_create_pos() -> TestResult {
+    with_setup(|| {
+        // A 4 KiB segment → positive handle. Destroy it to clean up.
+        match call(Syscall::ShmemCreate.raw(), a0(4096)) {
+            Some(h) if h > 0 => {
+                let _ = call(Syscall::ShmemDestroy.raw(), a0(h as u64));
+                Ok(())
+            }
+            Some(_) => Err("shmem_create returned a non-positive handle"),
+            None => Err("shmem_create returned invalid_op (shmem vtable absent)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_create_pos);
+
+fn smoke_abi_ipc_shmem_create_neg() -> TestResult {
+    with_setup(|| {
+        // len = 0 → registry BadLen → handle 0 → invalid_op (None).
+        // (Also the path taken when the vtable is absent — either way None.)
+        match call(Syscall::ShmemCreate.raw(), a0(0)) {
+            None => Ok(()),
+            Some(_) => Err("shmem_create(0) should be invalid_op (None)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_create_neg);
+
+// ── ShmemMap ────────────────────────────────────────────────────────
+//
+// ShmemMap(handle): maps the owning segment's frames into the AS. The
+// harness has no address space, AND a foreign/unknown handle fails the
+// pid-ownership check first — both lead to invalid_op(). Only the
+// negative path is reachable.
+
+fn smoke_abi_ipc_shmem_map_neg() -> TestResult {
+    with_setup(|| {
+        // Unknown handle → pid_of(handle)=0 != FAKE_TASK → invalid_op.
+        // LINUX-GAP: not a Linux syscall (NARF-native); no errno wire
+        // value — failure is a non-Ok NARF status, not -EINVAL.
+        match call(Syscall::ShmemMap.raw(), a0(987654)) {
+            None => Ok(()),
+            Some(_) => Err("shmem_map of a foreign/unknown handle should be invalid_op (None)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_map_neg);
+
+// ── ShmemDestroy ────────────────────────────────────────────────────
+//
+// ShmemDestroy(handle): the owner destroys its segment (ok(0)); a foreign
+// or unknown handle fails the pid check → invalid_op().
+
+fn smoke_abi_ipc_shmem_destroy_pos() -> TestResult {
+    with_setup(|| {
+        // Create as FAKE_TASK, then destroy as the same task → ok(0).
+        let h = match call(Syscall::ShmemCreate.raw(), a0(4096)) {
+            Some(h) if h > 0 => h as u64,
+            _ => return Err("setup: shmem_create failed (shmem vtable absent?)"),
+        };
+        match call(Syscall::ShmemDestroy.raw(), a0(h)) {
+            Some(0) => Ok(()),
+            _ => Err("shmem_destroy of an owned handle should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_destroy_pos);
+
+fn smoke_abi_ipc_shmem_destroy_neg() -> TestResult {
+    with_setup(|| {
+        // Unknown handle → pid mismatch → invalid_op (None).
+        match call(Syscall::ShmemDestroy.raw(), a0(987654)) {
+            None => Ok(()),
+            Some(_) => Err("shmem_destroy of an unknown handle should be invalid_op (None)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_destroy_neg);

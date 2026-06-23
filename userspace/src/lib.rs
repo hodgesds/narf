@@ -89,6 +89,30 @@ pub mod xdp_socket;
 mod abi_test_support;
 #[cfg(feature = "linux-compat")]
 mod abi_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_async_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_creds_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_fdio_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_fsx_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_ipc_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_mem_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_misc_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_proc_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_sched_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_signal_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_socket_tests;
+#[cfg(feature = "linux-compat")]
+mod abi_time_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;
