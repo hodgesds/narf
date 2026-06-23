@@ -765,8 +765,8 @@ fn smoke_abi_pathx_getdents64_neg() -> TestResult {
             Syscall::Getdents64.raw(),
             a2(9292, buf.as_mut_ptr() as u64, buf.len() as u64),
         ) {
-            Some(-1) => Ok(()),
-            _ => Err("getdents64 on a bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }

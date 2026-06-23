@@ -2238,8 +2238,15 @@ fn sys_pread64(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
         return;
     }
-    let mut kbuf = alloc::vec![0u8; len];
     let task = current_task_id();
+    // Bad fd → -EBADF, checked explicitly so it stays distinct from the
+    // -1 read-error path in the `_` arm below (a blanket change would
+    // mis-map genuine read failures).
+    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        return;
+    }
+    let mut kbuf = alloc::vec![0u8; len];
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
@@ -2282,6 +2289,11 @@ fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
+    // Bad fd → -EBADF, checked explicitly so write errors keep the -1 path.
+    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        return;
+    }
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         let ops = entry.ops.clone();
@@ -4231,10 +4243,16 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     }
     let task = current_task_id();
 
+    // EBADF: the fd isn't open at all (distinct from "open but not a dir").
+    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
     // Pull the DirOps + current cursor off the fd. `as_dir()` is `Some`
-    // only for a DirFdFile (an opened directory); anything else is
-    // ENOTDIR / EBADF. The fd-table lock is released before we touch
-    // the FS (enumerate_async), per the no-reentrancy rule.
+    // only for a DirFdFile (an opened directory); the fd exists (checked
+    // above) so a `None` here means it's a non-directory → -ENOTDIR.
+    // The fd-table lock is released before we touch the FS
+    // (enumerate_async), per the no-reentrancy rule.
     let dir_and_cursor = fd::with_table(task, |t| {
         t.get(fd)
             .and_then(|e| e.ops.as_dir().map(|d| (d, e.offset as usize)))
@@ -4243,7 +4261,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     let (dir, mut cursor) = match dir_and_cursor {
         Some(x) => x,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
             return;
         }
     };

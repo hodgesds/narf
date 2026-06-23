@@ -76,8 +76,8 @@ fn smoke_abi_fdio2_pread64_neg() -> TestResult {
             Syscall::Pread64.raw(),
             a3(5151, buf.as_mut_ptr() as u64, 4, 0),
         ) {
-            Some(-1) => Ok(()),
-            _ => Err("pread64 on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
@@ -120,8 +120,8 @@ fn smoke_abi_fdio2_pwrite64_neg() -> TestResult {
         // bad fd → -1 sentinel.
         // LINUX-GAP: Linux pwrite64(2) on a bad fd returns -EBADF.
         match call(Syscall::Pwrite64.raw(), a3(5252, data.as_ptr() as u64, 1, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("pwrite64 on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }

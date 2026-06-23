@@ -185,8 +185,8 @@ fn smoke_abi_misc_pread64_neg() -> TestResult {
         // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
         let args = a3(99, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
         match call(Syscall::Pread64.raw(), args) {
-            Some(-1) => Ok(()),
-            _ => Err("pread64 on a bad fd should return -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
@@ -213,8 +213,8 @@ fn smoke_abi_misc_pwrite64_neg() -> TestResult {
         // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
         let args = a3(99, payload.as_ptr() as u64, payload.len() as u64, 0);
         match call(Syscall::Pwrite64.raw(), args) {
-            Some(-1) => Ok(()),
-            _ => Err("pwrite64 on a bad fd should return -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
