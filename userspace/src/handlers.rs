@@ -9508,6 +9508,8 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(child_pid));
+        // Reaped — drop the parent record so wait4's ECHILD check is accurate.
+        parent_of_remove(child_pid);
         return child_pid as i64;
     }
     0
@@ -9646,6 +9648,8 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
             let _ = unsafe { copy_to_user(infop, &si) };
         }
         crate::release_pid(crate::ProcessId(child_pid));
+        // Reaped — drop the parent record so wait4's ECHILD check is accurate.
+        parent_of_remove(child_pid);
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -9722,6 +9726,31 @@ fn parent_of_set(child: u64, parent: u64) {
 fn parent_of_get(child: u64) -> Option<u64> {
     let g = PARENT_OF.lock();
     g.as_ref().and_then(|m| m.get(&child).copied())
+}
+
+/// Drop the child→parent record once the child has been reaped (or is an
+/// orphan being auto-released). Lets `has_living_child` correctly report
+/// ECHILD after the last child is reaped — without this, stale entries make
+/// `wait4` think children still exist and block forever.
+fn parent_of_remove(child: u64) {
+    let mut g = PARENT_OF.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&child);
+    }
+}
+
+/// Does `parent` still have at least one unreaped LIVING child matching
+/// `want` (>0 = that exact visible pid; <=0 = any child)? Zombies are handled
+/// by the `PENDING_EXITS` reap path, so this only gates the block-vs-ECHILD
+/// decision once no matching exit is queued: a true result means "a child is
+/// still running, block for it"; false means "no such child — return ECHILD".
+fn has_living_child(parent: u64, want: i64) -> bool {
+    let g = PARENT_OF.lock();
+    match g.as_ref() {
+        Some(m) if want > 0 => m.get(&(want as u64)).copied() == Some(parent),
+        Some(m) => m.values().any(|&p| p == parent),
+        None => false,
+    }
 }
 
 // ── ProcessId ↔ TaskId translation ────────────────────────────────
@@ -9938,7 +9967,22 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(reaped));
+        // The child is gone — drop its parent record so a later wait4 sees
+        // it's no longer a child (otherwise the ECHILD check below stays
+        // blind to the reap and the parent blocks forever).
+        parent_of_remove(reaped);
         ctx.set_return(SyscallReturn::ok(reaped));
+        return;
+    }
+
+    // No matching exit was queued. If the caller has no remaining child that
+    // could ever satisfy this wait, return ECHILD instead of blocking — Linux
+    // semantics. Without this, a parent that has already reaped its last child
+    // blocks forever (observed: stress-ng's parent `wait4(-1)` hanging after
+    // its only worker exited, so the whole run never completes).
+    if !has_living_child(parent, want_pid) {
+        const ECHILD: i64 = 10;
+        ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
         return;
     }
 
