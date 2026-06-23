@@ -157,6 +157,46 @@ static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
     inner: [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS],
 };
 
+/// Per-CPU storage for the cooperative executor's resume context.
+///
+/// `StackfulAdapter::poll` switches into a stackful task and the task
+/// switches back to *this* context when it yields/preempts. Previously
+/// each poll put the `KernelContext` in a STACK LOCAL on the executor
+/// stack and published its address into `KernelTask::exec_ctx`. That
+/// address is only valid for the duration of the poll — once the poll
+/// returns the frame is reclaimed and reused. A late/racy switch-back
+/// read of `exec_ctx` could then land on a since-overwritten executor
+/// stack slot whose `.rip` offset now held a pushed RPL-3 selector,
+/// and `kernel_switch` would restore that as the resume rip → the
+/// recurring #UD at rip=0x3/0x2b in the executor dispatch loop.
+///
+/// Moving the resume context into persistent per-CPU storage removes
+/// the transient-stack-frame aliasing: the pointer the task holds
+/// always targets live, stable memory whose `.rip` is a real saved
+/// return address (or zero), never reused-stack garbage.
+///
+/// SAFETY / correctness: each CPU touches only its own slot, and
+/// `StackfulAdapter`s are only ever polled by the TOP-LEVEL executor
+/// (`run_until_empty`/`run_forever`) — never nested inside another
+/// stackful task's future — so on any one CPU at most one
+/// `poll_to_yield` save↔switch-back pair is in flight at a time. The
+/// slot is freshly written by `kernel_switch`'s save half on every
+/// `poll_to_yield` entry before the task runs, so no task relies on
+/// its contents persisting across the task's own suspension.
+#[cfg(target_arch = "x86_64")]
+struct PerCpuExecCtx {
+    inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
+}
+// SAFETY: each CPU accesses only `inner[its-own-cpu]`, non-re-entrantly
+// (no nested stackful polls), so there is never concurrent or aliasing
+// access to a single slot despite the shared-static `&`.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for PerCpuExecCtx {}
+#[cfg(target_arch = "x86_64")]
+static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
+    inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
+};
+
 #[inline]
 fn this_cpu() -> usize {
     let c = narf_lib::percpu::current_cpu();
@@ -836,11 +876,21 @@ impl Future for StackfulAdapter {
             // `self` is upheld.
             // SAFETY: Valid memory or trusted environment
             let this = unsafe { self.get_unchecked_mut() };
-            let mut exec_ctx = KernelContext::default();
-            // SAFETY: single-threaded; this poll() is the only
-            // active caller of this KernelTask.
+            // Use this CPU's PERSISTENT resume-context slot, not a
+            // stack local. The task stashes this pointer in its
+            // `exec_ctx` and switches back to it on yield/preempt; a
+            // stack-local address would dangle once this poll returns
+            // and a late switch-back could restore selector garbage as
+            // the resume rip (see EXEC_CTX). The slot is single-CPU and
+            // non-re-entrant (top-level executor only).
+            let cpu = this_cpu();
+            // SAFETY: only this CPU touches `EXEC_CTX.inner[cpu]`, and
+            // StackfulAdapters are never polled nested, so there is no
+            // concurrent or aliasing `&mut` to this slot. The borrow ends
+            // when `poll_to_yield` returns (the task has switched back).
+            let exec_ctx: &mut KernelContext = unsafe { &mut *EXEC_CTX.inner[cpu].get() };
             // SAFETY: Valid memory or trusted environment
-            unsafe { this.inner.poll_to_yield(&mut exec_ctx, cx.waker()) }
+            unsafe { this.inner.poll_to_yield(exec_ctx, cx.waker()) }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {

@@ -97,6 +97,25 @@ pub struct KernelContext {
 }
 
 impl KernelContext {
+    /// All-zero context, usable in `const` initializers (e.g. a
+    /// per-CPU static array). A zero context is never switched
+    /// *into* before a `kernel_switch` save half has populated it;
+    /// it only exists so persistent per-CPU storage can be declared
+    /// `const` without a runtime initializer.
+    pub const fn zeroed() -> Self {
+        Self {
+            rbx: 0,
+            rbp: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rsp: 0,
+            rip: 0,
+            rflags: 0,
+        }
+    }
+
     /// Initialize a context for a fresh task: rip = entry, rsp =
     /// stack_top, r15 = arg (a `*mut KernelTask`-style raw ptr the
     /// trampoline pulls out). Stack must be at least 16-byte aligned.
