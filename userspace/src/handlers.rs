@@ -1163,6 +1163,8 @@ fn sys_write(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_modify_fd(task, fd);
             ctx.set_return(SyscallReturn::ok(n as u64));
         }
+        // TODO(linux-gap): bad fd should be -EBADF, but this `_` also catches
+        // write rejections (e.g. sealed memfd → -EPERM) — needs a split.
         _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }
@@ -1402,6 +1404,8 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(n as u64));
             }
         }
+        // TODO(linux-gap): bad fd should be -EBADF, but this `_` also
+        // catches read I/O errors — needs surgical bad-fd-vs-error split.
         _ => ctx.set_return(SyscallReturn::invalid_op()),
     }
 }

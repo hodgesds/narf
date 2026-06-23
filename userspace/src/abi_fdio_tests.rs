@@ -51,11 +51,10 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_read_pos);
 
 fn smoke_abi_fdio_read_neg() -> TestResult {
     with_setup(|| {
-        // read on a bogus fd: handler returns InvalidOp (non-Ok NARF
-        // status) so `call` yields None.
         let mut buf = [0u8; 4];
-        // LINUX-GAP: Linux read(2) on a bad fd returns -EBADF; the NARF
-        // handler reports InvalidOp instead of an errno value.
+        // LINUX-GAP: Linux read(2) on a bad fd returns -EBADF; NARF reports
+        // InvalidOp because the handler's error arm also covers read I/O
+        // errors (can't blanket-map to -EBADF — needs a bad-fd-vs-error split).
         match call_raw(Syscall::Read.raw(), a2(4242, buf.as_mut_ptr() as u64, 4)) {
             r if r.status == SyscallReturn::INVALID_OP => Ok(()),
             _ => Err("read on bad fd was not InvalidOp"),
@@ -80,8 +79,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_write_pos);
 fn smoke_abi_fdio_write_neg() -> TestResult {
     with_setup(|| {
         let data = *b"x";
-        // LINUX-GAP: Linux write(2) on a bad fd returns -EBADF; NARF
-        // reports InvalidOp.
+        // LINUX-GAP: Linux write(2) on a bad fd returns -EBADF; NARF reports
+        // InvalidOp because the handler's error arm also covers write
+        // rejections (e.g. sealed memfd) — can't blanket-map to -EBADF.
         match call_raw(Syscall::Write.raw(), a2(9191, data.as_ptr() as u64, 1)) {
             r if r.status == SyscallReturn::INVALID_OP => Ok(()),
             _ => Err("write on bad fd was not InvalidOp"),
