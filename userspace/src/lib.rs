@@ -85,6 +85,8 @@ pub mod user_task;
 pub mod vdso;
 pub mod xdp_socket;
 
+#[cfg(feature = "linux-compat")]
+mod abi_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;
 mod shell_e2e_tests;
