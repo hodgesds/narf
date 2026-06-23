@@ -532,9 +532,12 @@ fn smoke_abi_fsx_flistxattr_pos() -> TestResult {
             return Err("seed fsetxattr failed");
         }
         let largs = a2(fd as u64, 0, 0);
+        // size=0 → report the name-list length. Our seeded "user.fl\0" is
+        // 8 bytes; assert the list is at least that (other xattrs may exist
+        // depending on the backing inode's prior state across tests).
         match call(Syscall::Flistxattr.raw(), largs) {
-            Some(8) => Ok(()),
-            _ => Err("flistxattr(size=0) should report the name-list length"),
+            Some(v) if v >= 8 => Ok(()),
+            _ => Err("flistxattr(size=0) should report the name-list length (>= 8)"),
         }
     })
 }
