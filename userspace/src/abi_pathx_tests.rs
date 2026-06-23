@@ -233,8 +233,8 @@ fn smoke_abi_pathx_fchmod_neg() -> TestResult {
         // bad fd → -1 sentinel.
         // LINUX-GAP: Linux fchmod(2) on a bad fd returns -EBADF.
         match call(Syscall::Fchmod.raw(), a1(7373, 0o644)) {
-            Some(-1) => Ok(()),
-            _ => Err("fchmod on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
@@ -257,8 +257,8 @@ fn smoke_abi_pathx_fchown_neg() -> TestResult {
     with_setup(|| {
         // LINUX-GAP: Linux fchown(2) on a bad fd returns -EBADF; NARF -1.
         match call(Syscall::Fchown.raw(), a2(7474, 0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("fchown on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }

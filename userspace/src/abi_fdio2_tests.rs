@@ -331,9 +331,9 @@ fn smoke_abi_fdio2_lseek_negative_neg() -> TestResult {
         let fd = open_fd2(b"/abi/f\0")?;
         // A resulting offset < 0 (SEEK_SET to -1) → InvalidOp.
         // LINUX-GAP: Linux lseek(2) to a negative offset returns -EINVAL.
-        match call_raw(Syscall::Lseek.raw(), a2(fd as u64, (-1i64) as u64, 0)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("lseek to a negative offset was not InvalidOp"),
+        match call(Syscall::Lseek.raw(), a2(fd as u64, (-1i64) as u64, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("expected -EINVAL"),
         }
     })
 }
@@ -400,9 +400,9 @@ fn smoke_abi_fdio2_fcntl_dupfd_neg() -> TestResult {
         const F_DUPFD: u64 = 0;
         // F_DUPFD from a bad oldfd → InvalidOp.
         // LINUX-GAP: Linux F_DUPFD on a bad fd returns -EBADF.
-        match call_raw(Syscall::Fcntl.raw(), a2(7654, F_DUPFD, 0)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("F_DUPFD on a bad fd was not InvalidOp"),
+        match call(Syscall::Fcntl.raw(), a2(7654, F_DUPFD, 0)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
@@ -430,9 +430,9 @@ fn smoke_abi_fdio2_dup2_same_fd_neg() -> TestResult {
         // dup2(badfd, badfd): same-fd path verifies validity first → the
         // closed fd is invalid → InvalidOp.
         // LINUX-GAP: Linux dup2(badfd, badfd) returns -EBADF.
-        match call_raw(Syscall::Dup2.raw(), a1(3030, 3030)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("dup2(badfd, badfd) was not InvalidOp"),
+        match call(Syscall::Dup2.raw(), a1(3030, 3030)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }

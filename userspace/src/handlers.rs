@@ -1631,7 +1631,8 @@ fn sys_dup2(ctx: &mut dyn TrapContext) {
         if valid {
             ctx.set_return(SyscallReturn::ok(newfd as u64));
         } else {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // dup2 with an invalid oldfd → -EBADF (was InvalidOp).
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
         }
         return;
     }
@@ -1650,7 +1651,8 @@ fn sys_dup2(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
+        // oldfd not open → -EBADF (was InvalidOp).
+        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
     }
 }
 
@@ -1687,7 +1689,8 @@ fn sys_dup3(ctx: &mut dyn TrapContext) {
     });
     match outcome {
         Some(Some(())) => ctx.set_return(SyscallReturn::ok(newfd as u64)),
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
+        // oldfd not open → -EBADF (was InvalidOp).
+        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
     }
 }
 
@@ -1768,7 +1771,8 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             });
             match outcome {
                 Some(Some(new_fd)) => ctx.set_return(SyscallReturn::ok(new_fd as u64)),
-                _ => ctx.set_return(SyscallReturn::invalid_op()),
+                // F_DUPFD on a fd that isn't open → -EBADF (was InvalidOp).
+                _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
             }
             return;
         }
@@ -3537,7 +3541,8 @@ fn sys_fchmod_or_fchown(ctx: &mut dyn TrapContext) {
     if known {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
     }
 }
 
@@ -3635,7 +3640,8 @@ fn sys_fsync(ctx: &mut dyn TrapContext) {
     if known {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
     }
 }
 
@@ -3770,24 +3776,31 @@ fn sys_lseek(ctx: &mut dyn TrapContext) {
     let offset = args.arg1 as i64;
     let whence = args.arg2;
     let task = current_task_id();
+    // Linux errno: bad fd → -EBADF; bad whence / negative or overflowing
+    // result → -EINVAL (was a blanket InvalidOp).
+    let ebadf = SyscallReturn::ok((-9i64) as u64);
+    let einval = SyscallReturn::ok((-22i64) as u64);
     let outcome = fd::with_table(task, |t| {
-        let entry = t.get_mut(fd)?;
+        let entry = match t.get_mut(fd) {
+            Some(e) => e,
+            None => return Some(ebadf),
+        };
         let base = match whence {
             SEEK_SET => 0i64,
             SEEK_CUR => entry.offset as i64,
             SEEK_END => entry.ops.stat().size as i64,
-            _ => return Some(SyscallReturn::invalid_op()),
+            _ => return Some(einval),
         };
-        let new_off = base.checked_add(offset)?;
-        if new_off < 0 {
-            return Some(SyscallReturn::invalid_op());
-        }
+        let new_off = match base.checked_add(offset) {
+            Some(v) if v >= 0 => v,
+            _ => return Some(einval),
+        };
         entry.offset = new_off as u64;
         Some(SyscallReturn::ok(new_off as u64))
     });
     match outcome {
         Some(Some(r)) => ctx.set_return(r),
-        _ => ctx.set_return(SyscallReturn::invalid_op()),
+        _ => ctx.set_return(ebadf),
     }
 }
 

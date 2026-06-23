@@ -296,9 +296,9 @@ fn smoke_abi_fdio_dup2_neg() -> TestResult {
     with_setup(|| {
         // dup2 from a bad oldfd → InvalidOp.
         // LINUX-GAP: Linux returns -EBADF.
-        match call_raw(Syscall::Dup2.raw(), a1(8888, 50)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("dup2 on bad oldfd was not InvalidOp"),
+        match call(Syscall::Dup2.raw(), a1(8888, 50)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
@@ -413,9 +413,9 @@ fn smoke_abi_fdio_lseek_neg() -> TestResult {
         let fd = open_fd(b"/abi/f\0")?;
         // An unknown whence → InvalidOp.
         // LINUX-GAP: Linux lseek(2) with a bad whence returns -EINVAL.
-        match call_raw(Syscall::Lseek.raw(), a2(fd as u64, 0, 99)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("lseek bad whence was not InvalidOp"),
+        match call(Syscall::Lseek.raw(), a2(fd as u64, 0, 99)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("expected -EINVAL"),
         }
     })
 }
@@ -541,8 +541,8 @@ fn smoke_abi_fdio_fsync_neg() -> TestResult {
         // bad fd → -1 sentinel.
         // LINUX-GAP: Linux fsync(2) returns -EBADF.
         match call(Syscall::Fsync.raw(), a0(4040)) {
-            Some(-1) => Ok(()),
-            _ => Err("fsync on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
@@ -563,8 +563,8 @@ fn smoke_abi_fdio_fdatasync_neg() -> TestResult {
     with_setup(|| {
         // LINUX-GAP: Linux fdatasync(2) returns -EBADF.
         match call(Syscall::Fdatasync.raw(), a0(4041)) {
-            Some(-1) => Ok(()),
-            _ => Err("fdatasync on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
         }
     })
 }
