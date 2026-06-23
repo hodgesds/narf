@@ -973,8 +973,28 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    // Run user tasks on their OWN kernel stack via the no-preempt stackful
+    // adapter. The cooperative executor polls a slot ON THE EXECUTOR STACK; a
+    // *plain* UserTaskFuture would therefore run `enter_user_mode_resume` —
+    // whose synthetic iretq frame pushes the user CS/SS selectors — onto the
+    // shared executor stack, where a stale pushed selector can survive at a
+    // slot a later executor `ret` pops (→ #UD jumping to a selector value).
+    // Giving the user task its own stack confines those pushes. The adapter is
+    // no_preempt: user tasks yield cooperatively via the longjmp machinery, not
+    // timer-driven try_preempt (which is CPL=0-only anyway). x86_64 only —
+    // aarch64's stackful adapter is a stub that completes immediately.
+    #[cfg(target_arch = "x86_64")]
+    let task: BoxedTask = Box::pin(stackful::StackfulAdapter::with_options(
+        f,
+        crate::StackfulOptions {
+            no_preempt: true,
+            ..Default::default()
+        },
+    ));
+    #[cfg(not(target_arch = "x86_64"))]
+    let task: BoxedTask = Box::pin(f);
     let slot = TaskSlot {
-        task: Box::pin(f),
+        task,
         awake: Arc::new(WakeCell {
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
