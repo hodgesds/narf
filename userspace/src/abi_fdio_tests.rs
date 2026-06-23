@@ -220,11 +220,10 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_close_pos);
 
 fn smoke_abi_fdio_close_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux close(2) on a bad fd returns -EBADF; NARF
-        // reports InvalidOp.
-        match call_raw(Syscall::Close.raw(), a0(7777)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("close on bad fd was not InvalidOp"),
+        // close(2) on a fd that isn't open → -EBADF (now Linux-conformant).
+        match call(Syscall::Close.raw(), a0(7777)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("close on a bad fd should return -EBADF (-9)"),
         }
     })
 }

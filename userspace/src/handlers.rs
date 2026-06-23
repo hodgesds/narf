@@ -4318,7 +4318,9 @@ fn sys_close(ctx: &mut dyn TrapContext) {
     if ok {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // POSIX/Linux: close(2) on a fd that isn't open returns -EBADF.
+        // (Was the generic InvalidOp, which musl can't map to an errno.)
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
     }
 }
 
