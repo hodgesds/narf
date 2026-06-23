@@ -2647,13 +2647,16 @@ fn sys_renameat(ctx: &mut dyn TrapContext) {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
+    // sys_rename is Linux-shaped: arg0 = old path ptr, arg1 = new path ptr
+    // (both NUL-terminated). It was previously NARF-native
+    // (old_ptr, old_len, new_ptr, new_len) and this reshape still passed
+    // the lengths — so sys_rename read `old_len` as the new-path pointer
+    // and every renameat(2) failed. Pass the two NUL-terminated pointers.
+    let _ = (old_str, new_str); // validated above; sys_rename re-reads via the ptrs
     let proxy_args = SyscallArgs {
         arg0: old_uptr,
-        arg1: old_str.len() as u64,
-        arg2: new_uptr,
-        arg3: new_str.len() as u64,
-        arg4: 0,
-        arg5: 0,
+        arg1: new_uptr,
+        ..Default::default()
     };
     let mut proxy = Reshape {
         inner: ctx,
@@ -2819,13 +2822,16 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
             self.inner.redirect_to_kernel(rip, rsp)
         }
     }
+    // sys_readlink is Linux-shaped: readlink(path_ptr, buf_ptr, buf_len) in
+    // arg0/arg1/arg2. This reshape used to pass arg1 = path_len (NARF-native
+    // holdover), so sys_readlink read the path length as the output buffer
+    // pointer and every readlinkat(2) wrote to a bogus address / failed.
+    let _ = path_str; // validated above; sys_readlink re-reads via path_uptr
     let proxy_args = SyscallArgs {
         arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: buf_ptr,
-        arg3: buf_len,
-        arg4: 0,
-        arg5: 0,
+        arg1: buf_ptr,
+        arg2: buf_len,
+        ..Default::default()
     };
     let mut proxy = Reshape {
         inner: ctx,
