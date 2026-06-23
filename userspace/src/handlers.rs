@@ -7988,8 +7988,14 @@ fn sys_getpid(ctx: &mut dyn TrapContext) {
         let inner = crate::pid_ns::self_inner_pid(task, outer);
         ctx.set_return(SyscallReturn::ok(inner));
     }
+    // Non-container: return the VISIBLE ProcessId, NOT the raw scheduler
+    // TaskId. fork()'s return value + waitpid() both speak ProcessId and POSIX
+    // requires getpid() to agree (a forked child's getpid() must equal the pid
+    // its parent holds). The pgid/sid/tty boundary helpers translate to/from
+    // this same visible-pid space. Identity fallback for tasks with no
+    // registered pid (early init / kernel-spawned).
     #[cfg(not(feature = "container"))]
-    ctx.set_return(SyscallReturn::ok(task));
+    ctx.set_return(SyscallReturn::ok(task_to_pid_raw(task).unwrap_or(task)));
 }
 
 fn sys_getppid(ctx: &mut dyn TrapContext) {
@@ -8002,7 +8008,15 @@ fn sys_getppid(ctx: &mut dyn TrapContext) {
     // TaskId → visible pid first (identity when no mapping exists), the same
     // way `sys_getpid` resolves the visible pid.
     let me_pid = task_to_pid_raw(me).unwrap_or(me);
-    let ppid = parent_of_get(me_pid).unwrap_or(0);
+    // `parent_of` stores the parent's TaskId (current_task_id() at fork);
+    // translate it to the parent's VISIBLE pid so getppid() agrees with the
+    // parent's own getpid() (identity when unregistered).
+    let parent_task = parent_of_get(me_pid).unwrap_or(0);
+    let ppid = if parent_task == 0 {
+        0
+    } else {
+        task_to_pid_raw(parent_task).unwrap_or(parent_task)
+    };
     ctx.set_return(SyscallReturn::ok(ppid));
 }
 
@@ -10146,7 +10160,14 @@ pub(crate) fn pgid_to_user(task_space_id: u64) -> u64 {
 #[cfg(not(feature = "container"))]
 #[inline]
 pub(crate) fn pgid_to_user(task_space_id: u64) -> u64 {
-    task_space_id
+    // Non-container: visible pid == ProcessId. Translate the internal TaskId
+    // table value to the visible pid (identity for tasks with no registered
+    // pid, e.g. kernel-internal). Keeps the pgid/sid/tty boundary consistent
+    // with getpid(), which also reports the visible ProcessId.
+    if task_space_id == 0 {
+        return 0;
+    }
+    task_to_pid_raw(task_space_id).unwrap_or(task_space_id)
 }
 
 #[cfg(feature = "container")]
@@ -10159,7 +10180,13 @@ pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
 #[cfg(not(feature = "container"))]
 #[inline]
 pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
-    user_pid
+    // Non-container: visible pid == ProcessId. Translate the user-supplied
+    // visible pid to the internal TaskId the pgid/sid/tty tables key on
+    // (identity when unregistered).
+    if user_pid == 0 {
+        return 0;
+    }
+    pid_to_task_raw(user_pid).unwrap_or(user_pid)
 }
 
 /// Process-group id of the currently-polling task. Returns the
