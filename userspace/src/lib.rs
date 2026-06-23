@@ -102,6 +102,8 @@ mod abi_ipc_tests;
 #[cfg(feature = "linux-compat")]
 mod abi_mem_tests;
 #[cfg(feature = "linux-compat")]
+mod abi_path_tests;
+#[cfg(feature = "linux-compat")]
 mod abi_misc_tests;
 #[cfg(feature = "linux-compat")]
 mod abi_proc_tests;
