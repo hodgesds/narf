@@ -706,7 +706,10 @@ fn smoke_process_sigign_consumed_not_delivered() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("userspace/process", smoke_process_sigign_consumed_not_delivered);
+kernel_test_in!(
+    "userspace/process",
+    smoke_process_sigign_consumed_not_delivered
+);
 
 /// The per-task UserTaskCtx registry must drop a task's entry on exit, and a
 /// wake must resolve the ctx ONLY while the entry is present (under the lock).
@@ -742,7 +745,9 @@ fn smoke_user_task_ctx_unregister_prevents_stale_deref() -> TestResult {
         return TestResult::Fail("wake-under-lock did not clear the deadline");
     }
     if after.is_some() {
-        return TestResult::Fail("ctx still resolvable after unregister — stale-deref / UAF window");
+        return TestResult::Fail(
+            "ctx still resolvable after unregister — stale-deref / UAF window",
+        );
     }
     TestResult::Pass
 }
@@ -821,7 +826,9 @@ fn smoke_fd_clone_files_shares_table_fork_copies() -> TestResult {
         return TestResult::Fail("CLONE_FILES thread did not see parent's fd (table not shared)");
     }
     if !parent_sees_6 {
-        return TestResult::Fail("CLONE_FILES parent did not see thread's new fd (table not shared)");
+        return TestResult::Fail(
+            "CLONE_FILES parent did not see thread's new fd (table not shared)",
+        );
     }
     if parent_sees_7 {
         return TestResult::Fail("fork child's fd leaked into parent (table not independent)");

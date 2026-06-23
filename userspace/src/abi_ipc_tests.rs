@@ -18,6 +18,7 @@
 //!     initcall before the test phase runs, so `shmem_create` / `shmget`
 //!     reach real frame backing.
 #![cfg(feature = "linux-compat")]
+#![allow(dead_code)] // errno/flag reference table + harness helpers
 
 use crate::abi_test_support::*;
 
@@ -317,10 +318,7 @@ fn smoke_abi_ipc_semtimedop_pos() -> TestResult {
         sop[0..2].copy_from_slice(&0u16.to_le_bytes());
         sop[2..4].copy_from_slice(&2i16.to_le_bytes());
         // arg3 = timeout pointer (ignored); pass 0.
-        match call(
-            Syscall::Semtimedop.raw(),
-            a3(id, sop.as_ptr() as u64, 1, 0),
-        ) {
+        match call(Syscall::Semtimedop.raw(), a3(id, sop.as_ptr() as u64, 1, 0)) {
             Some(0) => Ok(()),
             _ => Err("semtimedop +2 should return 0"),
         }

@@ -2462,18 +2462,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             for (src, dst) in [("/sys", "/mnt/sys"), ("/proc", "/mnt/proc")] {
                                 if mounts.iter().any(|m| m == src)
                                     && !mounts.iter().any(|m| m == dst)
-                                {
-                                    if narf_filesystem::registry()
+                                    && narf_filesystem::registry()
                                         .bind_mount(&auth, src, dst)
                                         .is_ok()
-                                    {
-                                        let _ = writeln!(
-                                            console::Writer,
-                                            "  mnt-dev-bind: {} bound at {}",
-                                            src,
-                                            dst
-                                        );
-                                    }
+                                {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  mnt-dev-bind: {} bound at {}",
+                                        src,
+                                        dst
+                                    );
                                 }
                             }
                             narf_init::InitResult::Ok

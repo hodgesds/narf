@@ -595,8 +595,8 @@ pub fn populate_input_class() {
         // /sys/dev/char/13:<minor> -> the canonical class dir. realpath()
         // resolves it to .../event<N>, giving udev/libinput sysname "event<N>".
         dev_char.add_symlink(
-            &format!("13:{}", minor),
-            &format!("../../class/input/event{}", n),
+            format!("13:{}", minor),
+            format!("../../class/input/event{}", n),
         );
     }
 }

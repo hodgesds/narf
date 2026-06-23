@@ -2483,8 +2483,9 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Read.raw(), &mut ctx4);
-    if ctx4.ret != Some(SyscallReturn::invalid_op()) {
-        return TestResult::Fail("Read on closed fd should surface invalid_op");
+    // read(2) on a closed fd → -EBADF (Linux-conformant; was InvalidOp).
+    if ctx4.ret != Some(SyscallReturn::ok((-9i64) as u64)) {
+        return TestResult::Fail("Read on closed fd should return -EBADF");
     }
 
     fd::__test_reset();

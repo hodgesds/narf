@@ -69,7 +69,10 @@ fn smoke_abi_mem2_set_mempolicy_bind_nodemask_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem2_set_mempolicy_bind_nodemask_pos);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_set_mempolicy_bind_nodemask_pos
+);
 
 // ── SetMempolicy (238) — top flag bits boundary ──────────────────────
 // `mpol_mode_valid` masks MPOL_MODE_FLAGS (0xc000_0000) before the range
@@ -111,7 +114,6 @@ fn smoke_abi_mem2_get_mempolicy_mode_writeback_pos() -> TestResult {
             arg3: 0,
             arg4: 0,
             arg5: 0,
-            ..Default::default()
         };
         match call(Syscall::GetMempolicy.raw(), args) {
             Some(0) => {
@@ -126,7 +128,10 @@ fn smoke_abi_mem2_get_mempolicy_mode_writeback_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem2_get_mempolicy_mode_writeback_pos);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_get_mempolicy_mode_writeback_pos
+);
 
 // ── GetMempolicy (239) — F_NODE|F_ADDR resolved-node writeback ───────
 // The deepest get_mempolicy branch: with MPOL_F_NODE|MPOL_F_ADDR the
@@ -144,7 +149,6 @@ fn smoke_abi_mem2_get_mempolicy_node_query_pos() -> TestResult {
             arg3: 0,
             arg4: 3,
             arg5: 0,
-            ..Default::default()
         };
         match call(Syscall::GetMempolicy.raw(), args) {
             Some(0) => {
@@ -184,13 +188,12 @@ fn smoke_abi_mem2_move_pages_bad_status_neg() -> TestResult {
             arg3: 0,
             arg4: 0x0001_0000_0000_0000,
             arg5: 0,
-            ..Default::default()
         };
         // LINUX-GAP: Linux move_pages writes per-page status / -EFAULT;
         // NARF matches the -EFAULT shape here for an unwritable pointer.
         match call(Syscall::MovePages.raw(), args) {
             Some(v) if v == EFAULT => Ok(()),
-            Some(v) if v == 0 => Err("move_pages with a bad status ptr should not succeed"),
+            Some(0) => Err("move_pages with a bad status ptr should not succeed"),
             Some(_) => Err("move_pages(bad status) should be -EFAULT"),
             None => Err("move_pages(EFAULT) should be Ok(-EFAULT)"),
         }
@@ -230,13 +233,18 @@ fn smoke_abi_mem2_process_madvise_iovcnt_boundary_neg() -> TestResult {
         let args = a3(999, 0, 1024, 4);
         match call(Syscall::ProcessMadvise.raw(), args) {
             Some(v) if v == EBADF => Ok(()),
-            Some(v) if v == EINVAL => Err("iovcnt==1024 is the cap, not over it (should reach EBADF)"),
+            Some(v) if v == EINVAL => {
+                Err("iovcnt==1024 is the cap, not over it (should reach EBADF)")
+            }
             Some(_) => Err("process_madvise(iovcnt==1024, bad pidfd) should be -EBADF"),
             None => Err("process_madvise(boundary) should be Ok(-EBADF)"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem2_process_madvise_iovcnt_boundary_neg);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_process_madvise_iovcnt_boundary_neg
+);
 
 // ── PkeyFree (331) — high-index boundary ─────────────────────────────
 // abi_mem_tests pins key 0 → EINVAL. The OTHER guard (`key >= 16`) is a
@@ -328,7 +336,10 @@ fn smoke_abi_mem2_pkey_mprotect_unallocated_key_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_mem2_pkey_mprotect_unallocated_key_neg);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_pkey_mprotect_unallocated_key_neg
+);
 
 // ── Mincore (27) — EFAULT path is unreachable (no-AS) note ───────────
 // abi_mem_tests already pins mincore's unaligned-EINVAL and no-AS

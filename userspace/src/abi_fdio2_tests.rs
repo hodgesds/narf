@@ -59,7 +59,10 @@ fn smoke_abi_fdio2_pread64_pos() -> TestResult {
         // Cursor must be unchanged: a following read from offset 0 returns
         // the file head, proving pread did not advance it.
         let mut b2 = [0u8; 2];
-        match call(Syscall::Read.raw(), a2(fd as u64, b2.as_mut_ptr() as u64, 2)) {
+        match call(
+            Syscall::Read.raw(),
+            a2(fd as u64, b2.as_mut_ptr() as u64, 2),
+        ) {
             Some(2) if &b2[..2] == b"ab" => Ok(()),
             _ => Err("pread64 advanced the per-fd cursor"),
         }
@@ -101,12 +104,19 @@ fn smoke_abi_fdio2_pwrite64_pos() -> TestResult {
         let data = *b"XY";
         // pwrite64(fd, data, 2, offset=2) → 2 bytes written at offset 2,
         // cursor untouched.
-        if call(Syscall::Pwrite64.raw(), a3(fd as u64, data.as_ptr() as u64, 2, 2)) != Some(2) {
+        if call(
+            Syscall::Pwrite64.raw(),
+            a3(fd as u64, data.as_ptr() as u64, 2, 2),
+        ) != Some(2)
+        {
             return Err("pwrite64 did not return 2");
         }
         // Read back the whole file from offset 0 to confirm placement.
         let mut buf = [0u8; 8];
-        match call(Syscall::Pread64.raw(), a3(fd as u64, buf.as_mut_ptr() as u64, 6, 0)) {
+        match call(
+            Syscall::Pread64.raw(),
+            a3(fd as u64, buf.as_mut_ptr() as u64, 6, 0),
+        ) {
             Some(6) if &buf[..6] == b"..XY.." => Ok(()),
             _ => Err("pwrite64 did not place bytes at offset 2"),
         }
@@ -119,7 +129,10 @@ fn smoke_abi_fdio2_pwrite64_neg() -> TestResult {
         let data = *b"z";
         // bad fd → -1 sentinel.
         // LINUX-GAP: Linux pwrite64(2) on a bad fd returns -EBADF.
-        match call(Syscall::Pwrite64.raw(), a3(5252, data.as_ptr() as u64, 1, 0)) {
+        match call(
+            Syscall::Pwrite64.raw(),
+            a3(5252, data.as_ptr() as u64, 1, 0),
+        ) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
         }
@@ -275,11 +288,9 @@ fn smoke_abi_fdio2_readv_efault() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_readv_efault);
 
 fn smoke_abi_fdio2_writev_efault() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::Writev.raw(), a2(3, BAD_PTR, 1)) {
-            Some(v) if v == EFAULT => Ok(()),
-            _ => Err("writev with a bad iovec ptr was not -EFAULT"),
-        }
+    with_setup(|| match call(Syscall::Writev.raw(), a2(3, BAD_PTR, 1)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("writev with a bad iovec ptr was not -EFAULT"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_writev_efault);
@@ -352,7 +363,11 @@ fn smoke_abi_fdio2_fcntl_getfl_pos() -> TestResult {
         const O_NONBLOCK: i64 = 0o4000;
         // F_SETFL O_NONBLOCK → 0; F_GETFL reads the status flags back with
         // the O_NONBLOCK bit set (only the settable subset is honoured).
-        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFL, O_NONBLOCK as u64)) != Some(0) {
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd as u64, F_SETFL, O_NONBLOCK as u64),
+        ) != Some(0)
+        {
             return Err("F_SETFL O_NONBLOCK did not return 0");
         }
         match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFL, 0)) {
@@ -459,7 +474,10 @@ fn smoke_abi_fdio2_close_range_cloexec_pos() -> TestResult {
         }
         // The fd is still usable (marked cloexec, not closed).
         let mut buf = [0u8; 2];
-        match call(Syscall::Read.raw(), a2(fd as u64, buf.as_mut_ptr() as u64, 2)) {
+        match call(
+            Syscall::Read.raw(),
+            a2(fd as u64, buf.as_mut_ptr() as u64, 2),
+        ) {
             Some(2) => Ok(()),
             _ => Err("close_range CLOEXEC unexpectedly closed the fd"),
         }
@@ -508,7 +526,11 @@ fn smoke_abi_fdio2_tee_with_data_pos() -> TestResult {
         let (_rd2, wr2) = make_pipe2()?;
         // Feed the source pipe so the peek yields bytes.
         let payload = *b"qrst";
-        if call(Syscall::Write.raw(), a2(wr1 as u64, payload.as_ptr() as u64, 4)) != Some(4) {
+        if call(
+            Syscall::Write.raw(),
+            a2(wr1 as u64, payload.as_ptr() as u64, 4),
+        ) != Some(4)
+        {
             return Err("priming write to source pipe did not return 4");
         }
         // tee duplicates up to 4 bytes into wr2 without consuming wr1.

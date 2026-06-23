@@ -106,18 +106,22 @@ fn smoke_abi_misc_fb_ring_map_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_misc_fb_ring_map_neg);
 
 fn smoke_abi_misc_fb_flush_wait_neg() -> TestResult {
-    with_setup(|| match call_raw(Syscall::FbFlushWait.raw(), a0(1)).status {
-        s if s == SyscallReturn::INVALID_OP => Ok(()),
-        _ => Ok(()),
-    })
+    with_setup(
+        || match call_raw(Syscall::FbFlushWait.raw(), a0(1)).status {
+            s if s == SyscallReturn::INVALID_OP => Ok(()),
+            _ => Ok(()),
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_fb_flush_wait_neg);
 
 fn smoke_abi_misc_fb_disconnect_neg() -> TestResult {
-    with_setup(|| match call_raw(Syscall::FbDisconnect.raw(), a0(1)).status {
-        s if s == SyscallReturn::INVALID_OP => Ok(()),
-        _ => Ok(()),
-    })
+    with_setup(
+        || match call_raw(Syscall::FbDisconnect.raw(), a0(1)).status {
+            s if s == SyscallReturn::INVALID_OP => Ok(()),
+            _ => Ok(()),
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_fb_disconnect_neg);
 
@@ -126,18 +130,22 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_fb_disconnect_neg);
 //    InvalidOp negative is reachable. ──
 
 fn smoke_abi_misc_bootstrap_neg() -> TestResult {
-    with_setup(|| match call_raw(Syscall::Bootstrap.raw(), SyscallArgs::default()).status {
-        s if s == SyscallReturn::INVALID_OP => Ok(()),
-        _ => Err("bootstrap without an address space should be InvalidOp"),
-    })
+    with_setup(
+        || match call_raw(Syscall::Bootstrap.raw(), SyscallArgs::default()).status {
+            s if s == SyscallReturn::INVALID_OP => Ok(()),
+            _ => Err("bootstrap without an address space should be InvalidOp"),
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_bootstrap_neg);
 
 fn smoke_abi_misc_ring_kick_neg() -> TestResult {
-    with_setup(|| match call_raw(Syscall::RingKick.raw(), SyscallArgs::default()).status {
-        s if s == SyscallReturn::INVALID_OP => Ok(()),
-        _ => Err("ring_kick without bootstrapped rings should be InvalidOp"),
-    })
+    with_setup(
+        || match call_raw(Syscall::RingKick.raw(), SyscallArgs::default()).status {
+            s if s == SyscallReturn::INVALID_OP => Ok(()),
+            _ => Err("ring_kick without bootstrapped rings should be InvalidOp"),
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_ring_kick_neg);
 
@@ -417,12 +425,7 @@ fn smoke_abi_misc_request_key_pos() -> TestResult {
         let ktype = b"user\0";
         let desc = b"abi:req\0";
         // Seed the key first, then request it back by (type, desc).
-        let add = a3(
-            ktype.as_ptr() as u64,
-            desc.as_ptr() as u64,
-            0,
-            0,
-        );
+        let add = a3(ktype.as_ptr() as u64, desc.as_ptr() as u64, 0, 0);
         let serial = match call(Syscall::AddKey.raw(), add) {
             Some(s) if s >= 1000 => s,
             _ => return Err("seed add_key failed"),
@@ -514,7 +517,10 @@ fn smoke_abi_misc_landlock_restrict_self_pos() -> TestResult {
         // Build a real ruleset (8-byte attr = handled_access_fs), get its fd,
         // then stack it onto the task: restrict_self(fd, 0) → 0.
         let attr = [0u8; 8];
-        let fd = match call(Syscall::LandlockCreateRuleset.raw(), a2(attr.as_ptr() as u64, 8, 0)) {
+        let fd = match call(
+            Syscall::LandlockCreateRuleset.raw(),
+            a2(attr.as_ptr() as u64, 8, 0),
+        ) {
             Some(fd) if fd >= 0 => fd,
             _ => return Err("create_ruleset to seed restrict_self failed"),
         };
@@ -544,12 +550,7 @@ fn smoke_abi_misc_lsm_list_modules_pos() -> TestResult {
         // size_ptr is in/out: seed it with the required length (2 ids * 8).
         let mut ids = [0u8; 16];
         let mut size = 16u64.to_ne_bytes();
-        let args = a3(
-            ids.as_mut_ptr() as u64,
-            size.as_mut_ptr() as u64,
-            0,
-            0,
-        );
+        let args = a3(ids.as_mut_ptr() as u64, size.as_mut_ptr() as u64, 0, 0);
         // → the active module count (capability + landlock = 2).
         match call(Syscall::LsmListModules.raw(), args) {
             Some(2) => Ok(()),
@@ -638,7 +639,10 @@ fn smoke_abi_misc_delete_module_absent() -> TestResult {
         // A well-formed name that no loaded module owns → a negative errno
         // from the module loader (not a panic, not success).
         let name = b"no_such_module_abi\0";
-        match call(Syscall::DeleteModule.raw(), a1(name.as_ptr() as u64, name.len() as u64 - 1)) {
+        match call(
+            Syscall::DeleteModule.raw(),
+            a1(name.as_ptr() as u64, name.len() as u64 - 1),
+        ) {
             Some(v) if v < 0 => Ok(()),
             _ => Err("delete_module of an absent module should return a negative errno"),
         }

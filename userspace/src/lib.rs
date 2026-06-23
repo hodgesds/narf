@@ -85,45 +85,25 @@ pub mod user_task;
 pub mod vdso;
 pub mod xdp_socket;
 
-#[cfg(feature = "linux-compat")]
-mod abi_test_support;
-#[cfg(feature = "linux-compat")]
-mod abi_tests;
-#[cfg(feature = "linux-compat")]
 mod abi_async_tests;
-#[cfg(feature = "linux-compat")]
 mod abi_creds_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_fdio_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_fsx_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_ipc_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_mem_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_path_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_pathx_tests;
-#[cfg(feature = "linux-compat")]
 mod abi_fdio2_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_mem2_tests;
-#[cfg(feature = "linux-compat")]
-mod abi_proc2_tests;
-#[cfg(feature = "linux-compat")]
+mod abi_fdio_tests;
 mod abi_fsx2_tests;
-#[cfg(feature = "linux-compat")]
+mod abi_fsx_tests;
+mod abi_ipc_tests;
+mod abi_mem2_tests;
+mod abi_mem_tests;
 mod abi_misc_tests;
-#[cfg(feature = "linux-compat")]
+mod abi_path_tests;
+mod abi_pathx_tests;
+mod abi_proc2_tests;
 mod abi_proc_tests;
-#[cfg(feature = "linux-compat")]
 mod abi_sched_tests;
-#[cfg(feature = "linux-compat")]
 mod abi_signal_tests;
-#[cfg(feature = "linux-compat")]
 mod abi_socket_tests;
-#[cfg(feature = "linux-compat")]
+mod abi_test_support;
+mod abi_tests;
 mod abi_time_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;

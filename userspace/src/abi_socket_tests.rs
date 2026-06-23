@@ -256,11 +256,8 @@ fn smoke_abi_socket_pair_pos() -> TestResult {
     with_setup(|| {
         let mut sv = [0u8; 8];
         let n = Syscall::SocketPair.raw();
-        let r = call(
-            n,
-            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
-        )
-        .ok_or("status not Ok")?;
+        let r =
+            call(n, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("status not Ok")?;
         if r != 0 {
             return Err("socketpair(AF_UNIX, SOCK_STREAM) did not return 0");
         }
@@ -280,11 +277,8 @@ fn smoke_abi_socket_pair_neg() -> TestResult {
         let mut sv = [0u8; 8];
         let n = Syscall::SocketPair.raw();
         // AF_INET is not implemented for socketpair → -1.
-        let r = call(
-            n,
-            a3(AF_INET, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
-        )
-        .ok_or("status not Ok")?;
+        let r =
+            call(n, a3(AF_INET, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("status not Ok")?;
         // LINUX-GAP: Linux returns -EOPNOTSUPP (-95); NARF returns -1.
         if r != -1 {
             return Err("socketpair(AF_INET, ...) did not return -1");
@@ -301,8 +295,7 @@ fn smoke_abi_socket_send_pos() -> TestResult {
         // socketpair gives a connected stream pair; send into one half.
         let mut sv = [0u8; 8];
         let pair = Syscall::SocketPair.raw();
-        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64))
-            .ok_or("pair status")?
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
             != 0
         {
             return Err("socketpair setup failed");
@@ -310,11 +303,8 @@ fn smoke_abi_socket_send_pos() -> TestResult {
         let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
         let payload = b"hello-narf";
         let n = Syscall::SocketSend.raw();
-        let r = call(
-            n,
-            a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0),
-        )
-        .ok_or("status not Ok")?;
+        let r = call(n, a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0))
+            .ok_or("status not Ok")?;
         if r != payload.len() as i64 {
             return Err("send() into a connected pair did not return the byte count");
         }
@@ -348,8 +338,7 @@ fn smoke_abi_socket_recv_pos() -> TestResult {
         // Send into one half of a pair, then recv from the other half.
         let mut sv = [0u8; 8];
         let pair = Syscall::SocketPair.raw();
-        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64))
-            .ok_or("pair status")?
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
             != 0
         {
             return Err("socketpair setup failed");
@@ -358,8 +347,11 @@ fn smoke_abi_socket_recv_pos() -> TestResult {
         let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
         let payload = b"abcd";
         let send = Syscall::SocketSend.raw();
-        if call(send, a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0))
-            .ok_or("send status")?
+        if call(
+            send,
+            a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0),
+        )
+        .ok_or("send status")?
             != payload.len() as i64
         {
             return Err("priming send failed");
@@ -383,8 +375,11 @@ fn smoke_abi_socket_recv_neg() -> TestResult {
     with_setup(|| {
         let mut rbuf = [0u8; 8];
         let n = Syscall::SocketRecv.raw();
-        let r = call(n, a3(BAD_FD, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0))
-            .ok_or("status not Ok")?;
+        let r = call(
+            n,
+            a3(BAD_FD, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
+        )
+        .ok_or("status not Ok")?;
         // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
         if r != -1 {
             return Err("recv() on a bad fd did not return -1");
@@ -401,8 +396,7 @@ fn smoke_abi_socket_shutdown_pos() -> TestResult {
         // shutdown() on a connected pair half → Ok(0).
         let mut sv = [0u8; 8];
         let pair = Syscall::SocketPair.raw();
-        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64))
-            .ok_or("pair status")?
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
             != 0
         {
             return Err("socketpair setup failed");
@@ -648,8 +642,7 @@ fn smoke_abi_socket_sendmsg_pos() -> TestResult {
         // Connected pair + a crafted msghdr with one iovec.
         let mut sv = [0u8; 8];
         let pair = Syscall::SocketPair.raw();
-        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64))
-            .ok_or("pair status")?
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
             != 0
         {
             return Err("socketpair setup failed");
@@ -666,7 +659,7 @@ fn smoke_abi_socket_sendmsg_pos() -> TestResult {
         // name = 0, namelen = 0 (offsets 0..12 stay zero)
         msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes()); // iov ptr
         msg[24..32].copy_from_slice(&1u64.to_ne_bytes()); // iovlen = 1
-        // ctrl = 0, ctrllen = 0 (offsets 32..48 stay zero)
+                                                          // ctrl = 0, ctrllen = 0 (offsets 32..48 stay zero)
         let n = Syscall::SocketSendMsg.raw();
         let r = call(n, a2(fd0, msg.as_ptr() as u64, 0)).ok_or("status not Ok")?;
         if r != payload.len() as i64 {
@@ -699,8 +692,7 @@ fn smoke_abi_socket_recvmsg_pos() -> TestResult {
         // Prime one half of a pair, then recvmsg from the other.
         let mut sv = [0u8; 8];
         let pair = Syscall::SocketPair.raw();
-        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64))
-            .ok_or("pair status")?
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
             != 0
         {
             return Err("socketpair setup failed");
@@ -709,8 +701,11 @@ fn smoke_abi_socket_recvmsg_pos() -> TestResult {
         let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
         let payload = b"rcv";
         let send = Syscall::SocketSend.raw();
-        if call(send, a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0))
-            .ok_or("send status")?
+        if call(
+            send,
+            a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0),
+        )
+        .ok_or("send status")?
             != payload.len() as i64
         {
             return Err("priming send failed");
@@ -757,8 +752,8 @@ fn smoke_abi_socket_sock_register_buf_pos() -> TestResult {
     with_setup(|| {
         let backing = [0u8; 64];
         let n = Syscall::SockRegisterBuf.raw();
-        let r = call(n, a1(backing.as_ptr() as u64, backing.len() as u64))
-            .ok_or("status not Ok")?;
+        let r =
+            call(n, a1(backing.as_ptr() as u64, backing.len() as u64)).ok_or("status not Ok")?;
         // Returns a non-negative buffer id (>= 0) on success.
         if r < 0 {
             return Err("sock_register_buf() did not return a valid buffer id");
@@ -788,8 +783,7 @@ fn smoke_abi_socket_sock_send_zc_pos() -> TestResult {
         // Register a buffer, connect a pair, send the registered slice.
         let mut sv = [0u8; 8];
         let pair = Syscall::SocketPair.raw();
-        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64))
-            .ok_or("pair status")?
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
             != 0
         {
             return Err("socketpair setup failed");
@@ -805,11 +799,7 @@ fn smoke_abi_socket_sock_send_zc_pos() -> TestResult {
         }
         let n = Syscall::SockSendZc.raw();
         // sock_send_zc(fd, buf_id, off=0, len=8, flags=0).
-        let r = call(
-            n,
-            a3(fd0, buf_id as u64, 0, backing.len() as u64),
-        )
-        .ok_or("status not Ok")?;
+        let r = call(n, a3(fd0, buf_id as u64, 0, backing.len() as u64)).ok_or("status not Ok")?;
         if r != backing.len() as i64 {
             return Err("sock_send_zc() did not return the sent byte count");
         }

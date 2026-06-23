@@ -49,11 +49,9 @@ fn smoke_abi_time_adjtimex_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_time_adjtimex_pos);
 
 fn smoke_abi_time_adjtimex_neg() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::Adjtimex.raw(), a0(0)) {
-            Some(v) if v == EFAULT => Ok(()),
-            _ => Err("adjtimex(NULL) should return -EFAULT"),
-        }
+    with_setup(|| match call(Syscall::Adjtimex.raw(), a0(0)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("adjtimex(NULL) should return -EFAULT"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_adjtimex_neg);
@@ -392,10 +390,7 @@ fn smoke_abi_time_timer_gettime_pos() -> TestResult {
     with_setup(|| {
         let id = make_timer()?;
         let mut cur = [0i64; 4];
-        match call(
-            Syscall::TimerGettime.raw(),
-            a1(id, cur.as_mut_ptr() as u64),
-        ) {
+        match call(Syscall::TimerGettime.raw(), a1(id, cur.as_mut_ptr() as u64)) {
             Some(0) => Ok(()),
             _ => Err("timer_gettime on a live timer should return 0"),
         }
@@ -536,10 +531,12 @@ kernel_test_in!("syscall_abi", smoke_abi_time_alarm_replace);
 // positive (plain + O_CLOEXEC).
 
 fn smoke_abi_time_timerfd_create_pos() -> TestResult {
-    with_setup(|| match call(Syscall::TimerfdCreate.raw(), a1(CLOCK_MONOTONIC, 0)) {
-        Some(fd) if fd >= 0 => Ok(()),
-        _ => Err("timerfd_create should return a non-negative fd"),
-    })
+    with_setup(
+        || match call(Syscall::TimerfdCreate.raw(), a1(CLOCK_MONOTONIC, 0)) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("timerfd_create should return a non-negative fd"),
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_create_pos);
 

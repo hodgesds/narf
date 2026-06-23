@@ -7,6 +7,7 @@
 //! with a crafted [`AbiCtx`], so the groups are deterministic and immune
 //! to the executor (no user mode, no scheduler).
 #![cfg(feature = "linux-compat")]
+#![allow(dead_code)] // errno/flag reference table + harness helpers
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,8 +19,7 @@ pub use crate::syscall::{
     kernel_syscall_entry, Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
 };
 pub use crate::{
-    fd, install_core_syscalls, install_global, install_task_id_lookup,
-    syscall::__test_clear_global,
+    fd, install_core_syscalls, install_global, install_task_id_lookup, syscall::__test_clear_global,
 };
 
 // ── Linux errno wire values (negative, in `SyscallReturn.value`, status Ok) ──
@@ -130,8 +130,7 @@ pub fn call(num: u32, args: SyscallArgs) -> Option<i64> {
 pub fn call_raw(num: u32, args: SyscallArgs) -> SyscallReturn {
     let mut ctx = AbiCtx { args, ret: None };
     kernel_syscall_entry(num, &mut ctx);
-    ctx.ret
-        .unwrap_or_else(|| SyscallReturn::ok(0xDEAD_u64)) // no set_return => sentinel
+    ctx.ret.unwrap_or_else(|| SyscallReturn::ok(0xDEAD_u64)) // no set_return => sentinel
 }
 
 // ── Arg builders (the rest default to 0) ──

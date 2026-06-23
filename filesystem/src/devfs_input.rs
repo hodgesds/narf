@@ -493,14 +493,8 @@ impl FileOps for InputEventFile {
                 // Our event timestamps are already monotonic; accept + no-op.
                 Ok(0)
             }
-            EVIOC_NR_GPROP
-            | EVIOC_NR_GMTSLOTS
-            | EVIOC_NR_GKEY
-            | EVIOC_NR_GLED
-            | EVIOC_NR_GSND
-            | EVIOC_NR_GSW
-            | EVIOC_NR_GPHYS
-            | EVIOC_NR_GUNIQ => {
+            EVIOC_NR_GPROP | EVIOC_NR_GMTSLOTS | EVIOC_NR_GKEY | EVIOC_NR_GLED | EVIOC_NR_GSND
+            | EVIOC_NR_GSW | EVIOC_NR_GPHYS | EVIOC_NR_GUNIQ => {
                 // Property bitmap, multitouch-slot state, current key/LED/sound/
                 // switch state, and the phys/uniq strings. We synthesise none of
                 // these, but libevdev (libinput's backend) issues them at device

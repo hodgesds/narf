@@ -865,11 +865,9 @@ fn smoke_abi_pathx_utimes_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_pathx_utimes_pos);
 
 fn smoke_abi_pathx_utimes_neg() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::Utimes.raw(), a1(0, 0)) {
-            Some(v) if v == EFAULT => Ok(()),
-            _ => Err("utimes(NULL) was not -EFAULT"),
-        }
+    with_setup(|| match call(Syscall::Utimes.raw(), a1(0, 0)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("utimes(NULL) was not -EFAULT"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_utimes_neg);

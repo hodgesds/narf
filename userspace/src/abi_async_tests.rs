@@ -176,7 +176,7 @@ fn smoke_abi_async_epoll_ctl_pos() -> TestResult {
         // struct epoll_event { u32 events; u64 data; } — read as 12 bytes.
         let mut ev = [0u8; 12];
         ev[0..4].copy_from_slice(&(0x1u32).to_ne_bytes()); // EPOLLIN
-        // EPOLL_CTL_ADD with a (here-arbitrary) target fd → 0.
+                                                           // EPOLL_CTL_ADD with a (here-arbitrary) target fd → 0.
         let args = a3(epfd, EPOLL_CTL_ADD, 5, ev.as_ptr() as u64);
         match call(Syscall::EpollCtl.raw(), args) {
             Some(0) => Ok(()),

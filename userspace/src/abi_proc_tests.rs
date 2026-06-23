@@ -272,10 +272,7 @@ fn smoke_abi_proc_set_tid_address_nonzero() -> TestResult {
         // A non-zero (kernel-stack) pointer is recorded the same way; the
         // return is invariant to the pointer value (it's always the TID).
         let mut slot = [0u8; 8];
-        match call(
-            Syscall::SetTidAddress.raw(),
-            a0(slot.as_mut_ptr() as u64),
-        ) {
+        match call(Syscall::SetTidAddress.raw(), a0(slot.as_mut_ptr() as u64)) {
             Some(v) if v as u64 == FAKE_TASK => Ok(()),
             _ => Err("set_tid_address with a pointer did not return the TID"),
         }
@@ -374,10 +371,7 @@ fn smoke_abi_proc_kcmp_pos() -> TestResult {
         // kcmp(self, self, KCMP_VM, 0, 0): a task shares every resource
         // with itself → 0. KCMP_VM == 1.
         const KCMP_VM: u64 = 1;
-        match call(
-            Syscall::Kcmp.raw(),
-            a3(FAKE_TASK, FAKE_TASK, KCMP_VM, 0),
-        ) {
+        match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, FAKE_TASK, KCMP_VM, 0)) {
             Some(0) => Ok(()),
             _ => Err("kcmp(self,self) did not return 0 (equal)"),
         }
@@ -400,10 +394,7 @@ fn smoke_abi_proc_kcmp_esrch() -> TestResult {
     with_setup(|| {
         // An unknown pid (no PID→TaskId mapping, and != self) → ESRCH.
         const KCMP_VM: u64 = 1;
-        match call(
-            Syscall::Kcmp.raw(),
-            a3(FAKE_TASK, 7_654_321, KCMP_VM, 0),
-        ) {
+        match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, 7_654_321, KCMP_VM, 0)) {
             Some(v) if v == ESRCH => Ok(()),
             _ => Err("kcmp with an unknown pid did not return -ESRCH"),
         }
@@ -534,10 +525,7 @@ fn smoke_abi_proc_wait4_wnohang_no_child() -> TestResult {
         // wait4(-1, NULL, WNOHANG, NULL) with no pending child → 0
         // (no child ready). WNOHANG == 1.
         const WNOHANG: u64 = 1;
-        match call(
-            Syscall::Wait4.raw(),
-            a3((-1i64) as u64, 0, WNOHANG, 0),
-        ) {
+        match call(Syscall::Wait4.raw(), a3((-1i64) as u64, 0, WNOHANG, 0)) {
             Some(0) => Ok(()),
             _ => Err("wait4 WNOHANG with no child did not return 0"),
         }
@@ -689,10 +677,7 @@ fn smoke_abi_proc_execve_missing_path() -> TestResult {
         // status rather than success. The full success path needs a real
         // user address space to load the image into, unreachable here.
         let path = b"/abi/nope\0";
-        let r = call_raw(
-            Syscall::Execve.raw(),
-            a3(path.as_ptr() as u64, 0, 0, 0),
-        );
+        let r = call_raw(Syscall::Execve.raw(), a3(path.as_ptr() as u64, 0, 0, 0));
         if r.status != SyscallReturn::OK || (r.value as i64) < 0 {
             Ok(())
         } else {

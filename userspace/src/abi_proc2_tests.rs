@@ -254,10 +254,7 @@ fn smoke_abi_proc2_kcmp_distinct_order() -> TestResult {
         // the base file (which only checks the equal-self → 0 path) misses.
         const KCMP_FILE: u64 = 0;
         crate::handlers::register_pid_task_mapping(200, 200);
-        match call(
-            Syscall::Kcmp.raw(),
-            a3(FAKE_TASK, 200, KCMP_FILE, 0),
-        ) {
+        match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, 200, KCMP_FILE, 0)) {
             Some(1) | Some(2) => Ok(()),
             _ => Err("kcmp on distinct tasks did not return an ordering (1/2)"),
         }

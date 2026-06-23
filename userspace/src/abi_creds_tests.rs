@@ -191,8 +191,11 @@ fn smoke_abi_creds_setreuid_pos() -> TestResult {
     with_setup(|| {
         // (-1, -1) ⇒ leave both unchanged; Ok(0) when table init, Ok(-1)
         // when not.
-        let r = call(Syscall::Setreuid.raw(), a1(u32::MAX as u64, u32::MAX as u64))
-            .ok_or("setreuid not Ok")?;
+        let r = call(
+            Syscall::Setreuid.raw(),
+            a1(u32::MAX as u64, u32::MAX as u64),
+        )
+        .ok_or("setreuid not Ok")?;
         if r != 0 && r != -1 {
             return Err("setreuid(-1,-1) unexpected value");
         }
@@ -217,8 +220,11 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setreuid_neg);
 // ── setregid ─────────────────────────────────────────────────────────
 fn smoke_abi_creds_setregid_pos() -> TestResult {
     with_setup(|| {
-        let r = call(Syscall::Setregid.raw(), a1(u32::MAX as u64, u32::MAX as u64))
-            .ok_or("setregid not Ok")?;
+        let r = call(
+            Syscall::Setregid.raw(),
+            a1(u32::MAX as u64, u32::MAX as u64),
+        )
+        .ok_or("setregid not Ok")?;
         if r != 0 && r != -1 {
             return Err("setregid(-1,-1) unexpected value");
         }
@@ -537,8 +543,11 @@ fn smoke_abi_creds_sethostname_pos() -> TestResult {
         }
         // Round-trip: gethostname should now read it back.
         let mut buf = [0u8; 64];
-        let got = call(Syscall::GetHostname.raw(), a1(buf.as_mut_ptr() as u64, buf.len() as u64))
-            .ok_or("gethostname not Ok")?;
+        let got = call(
+            Syscall::GetHostname.raw(),
+            a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+        )
+        .ok_or("gethostname not Ok")?;
         if got != name.len() as i64 || &buf[..name.len()] != name {
             return Err("sethostname/gethostname round-trip mismatch");
         }
@@ -671,7 +680,7 @@ fn smoke_abi_creds_umask_neg() -> TestResult {
         // and it still returns a valid (non-negative, <= 0o777) prior
         // mask. Pin that the junk high bits do not leak into the return.
         let r = call(Syscall::Umask.raw(), a0(0xFFFF_F123)).ok_or("umask not Ok")?;
-        if r < 0 || r > 0o777 {
+        if !(0..=0o777).contains(&r) {
             return Err("umask return outside 0..=0o777");
         }
         Ok(())

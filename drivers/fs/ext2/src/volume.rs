@@ -192,8 +192,7 @@ async fn read_byte_range_into_static<B: BlockDevice>(
             op: BlockOp::Read,
             lba,
             blocks: 1,
-            buffer: io
-                .pool[0]
+            buffer: io.pool[0]
                 .derive::<Read>()
                 .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
             qos: QosHint::Latency,
@@ -596,8 +595,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // its own pool buffer and returns it before the write below.
             let mut sector = alloc::vec![0u8; lbs];
             if !(in_lba == 0 && want == lbs) {
-                Self::read_byte_range_with(&*self.device, lbs, &self.io, lba * lbs as u64, &mut sector)
-                    .await?;
+                Self::read_byte_range_with(
+                    &*self.device,
+                    lbs,
+                    &self.io,
+                    lba * lbs as u64,
+                    &mut sector,
+                )
+                .await?;
             }
             sector[in_lba..in_lba + want].copy_from_slice(&src[cursor..cursor + want]);
 
@@ -667,8 +672,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 op: BlockOp::Read,
                 lba,
                 blocks: 1,
-                buffer: io
-                    .pool[0]
+                buffer: io.pool[0]
                     .derive::<Read>()
                     .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
                 qos: QosHint::Latency,

@@ -129,10 +129,10 @@ fn smoke_abi_sched_getrlimit_pos() -> TestResult {
                 if cur == 256 && max == 4096 {
                     Ok(())
                 } else {
-                    Ok(())
+                    Err("getrlimit RLIMIT_NOFILE not the default {256,4096}")
                 }
             }
-            _ => Ok(()),
+            _ => Err("getrlimit(RLIMIT_NOFILE) should return 0"),
         }
     })
 }
@@ -184,10 +184,10 @@ fn smoke_abi_sched_setrlimit_pos() -> TestResult {
                 if cur == 128 && max == 512 {
                     Ok(())
                 } else {
-                    Ok(())
+                    Err("setrlimit didn't persist {128,512}")
                 }
             }
-            _ => Ok(()),
+            _ => Err("getrlimit after setrlimit should return 0"),
         }
     })
 }
@@ -215,12 +215,7 @@ fn smoke_abi_sched_prlimit64_pos() -> TestResult {
         newbuf[..8].copy_from_slice(&64u64.to_ne_bytes());
         newbuf[8..].copy_from_slice(&200u64.to_ne_bytes());
         let mut oldbuf = [0u8; 16];
-        let args = a3(
-            0,
-            7,
-            newbuf.as_ptr() as u64,
-            oldbuf.as_mut_ptr() as u64,
-        );
+        let args = a3(0, 7, newbuf.as_ptr() as u64, oldbuf.as_mut_ptr() as u64);
         match call(Syscall::Prlimit64.raw(), args) {
             Some(0) => {
                 // old* must hold the prior default {256, 4096}.
@@ -229,10 +224,10 @@ fn smoke_abi_sched_prlimit64_pos() -> TestResult {
                 if ocur == 256 && omax == 4096 {
                     Ok(())
                 } else {
-                    Ok(())
+                    Err("prlimit64 old value not the prior default {256,4096}")
                 }
             }
-            _ => Ok(()),
+            _ => Err("prlimit64 set+get should return 0"),
         }
     })
 }
@@ -340,7 +335,10 @@ fn smoke_abi_sched_get_priority_max_bad_policy_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_sched_get_priority_max_bad_policy_neg);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_get_priority_max_bad_policy_neg
+);
 
 // ── sched_get_priority_min(policy) ──────────────────────────────────
 
@@ -369,7 +367,10 @@ fn smoke_abi_sched_get_priority_min_bad_policy_neg() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_sched_get_priority_min_bad_policy_neg);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_get_priority_min_bad_policy_neg
+);
 
 // ── sched_getparam(pid, param*) ─────────────────────────────────────
 // param* is a single i32 (sched_priority). Default 0.
@@ -415,7 +416,10 @@ fn smoke_abi_sched_setparam_pos() -> TestResult {
             _ => return Err("smoke_abi_sched_setparam_pos: unexpected syscall return"),
         }
         let mut rbuf = [0u8; 4];
-        match call(Syscall::SchedGetparam.raw(), a1(0, rbuf.as_mut_ptr() as u64)) {
+        match call(
+            Syscall::SchedGetparam.raw(),
+            a1(0, rbuf.as_mut_ptr() as u64),
+        ) {
             Some(0) if i32::from_ne_bytes(rbuf) == 50 => Ok(()),
             _ => Ok(()),
         }
@@ -687,11 +691,9 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_rseq_pos);
 // pending for FAKE_TASK in the harness).
 
 fn smoke_abi_sched_yield_pos() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::Yield.raw(), a0(0)) {
-            Some(0) => Ok(()),
-            _ => Err("sched_yield should return 0"),
-        }
+    with_setup(|| match call(Syscall::Yield.raw(), a0(0)) {
+        Some(0) => Ok(()),
+        _ => Err("sched_yield should return 0"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_yield_pos);

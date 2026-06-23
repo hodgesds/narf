@@ -15,7 +15,10 @@ const O_RDONLY: u64 = 0;
 fn smoke_abi_path_openat_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";
-        match call(Syscall::Openat.raw(), a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0)) {
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+        ) {
             Some(fd) if fd >= 0 => Ok(()),
             _ => Err("openat(existing, O_RDONLY) should return a fd >= 0"),
         }
@@ -27,7 +30,10 @@ fn smoke_abi_path_openat_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/nope\0";
         // Missing file, no O_CREAT → must NOT yield a valid fd.
-        match call(Syscall::Openat.raw(), a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0)) {
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+        ) {
             Some(fd) if fd >= 0 => Err("openat(missing, O_RDONLY) must fail, not open a fd"),
             _ => Ok(()),
         }
@@ -90,7 +96,10 @@ fn smoke_abi_path_rename_pos() -> TestResult {
     with_memfs("/p", "p", &[("old", b"x")], || {
         let old = b"/p/old\0";
         let new = b"/p/new\0";
-        match call(Syscall::Rename.raw(), a1(old.as_ptr() as u64, new.as_ptr() as u64)) {
+        match call(
+            Syscall::Rename.raw(),
+            a1(old.as_ptr() as u64, new.as_ptr() as u64),
+        ) {
             Some(0) => Ok(()),
             _ => Err("rename(existing -> new) should return 0"),
         }
@@ -102,7 +111,10 @@ fn smoke_abi_path_rename_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         let old = b"/p/missing\0";
         let new = b"/p/new\0";
-        match call(Syscall::Rename.raw(), a1(old.as_ptr() as u64, new.as_ptr() as u64)) {
+        match call(
+            Syscall::Rename.raw(),
+            a1(old.as_ptr() as u64, new.as_ptr() as u64),
+        ) {
             Some(0) => Err("rename(missing -> new) must fail"),
             _ => Ok(()),
         }
@@ -116,7 +128,10 @@ fn smoke_abi_path_rmdir_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         // Create a directory then remove it.
         let dir = b"/p/d\0";
-        let _ = call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0));
+        let _ = call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        );
         match call(Syscall::Rmdir.raw(), a0(dir.as_ptr() as u64)) {
             Some(0) => Ok(()),
             other => {
@@ -178,7 +193,12 @@ fn smoke_abi_path_getcwd_pos() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 256];
         // Returns the cwd; success status (value is len/ptr depending on impl).
-        match call_raw(Syscall::Getcwd.raw(), a1(buf.as_mut_ptr() as u64, buf.len() as u64)).status {
+        match call_raw(
+            Syscall::Getcwd.raw(),
+            a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+        )
+        .status
+        {
             s if s == SyscallReturn::OK => Ok(()),
             _ => Err("getcwd(buf, 256) should succeed"),
         }
@@ -245,7 +265,10 @@ fn smoke_abi_path_lstat_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";
         let mut sb = [0u8; 256];
-        match call(Syscall::Lstat.raw(), a1(path.as_ptr() as u64, sb.as_mut_ptr() as u64)) {
+        match call(
+            Syscall::Lstat.raw(),
+            a1(path.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) {
             Some(0) => Ok(()),
             _ => Err("lstat(existing) should return 0"),
         }
@@ -257,7 +280,10 @@ fn smoke_abi_path_lstat_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/nope\0";
         let mut sb = [0u8; 256];
-        match call(Syscall::Lstat.raw(), a1(path.as_ptr() as u64, sb.as_mut_ptr() as u64)) {
+        match call(
+            Syscall::Lstat.raw(),
+            a1(path.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) {
             Some(0) => Err("lstat(missing) must fail"),
             _ => Ok(()),
         }
@@ -270,7 +296,10 @@ kernel_test_in!("syscall_abi", smoke_abi_path_lstat_neg);
 fn smoke_abi_path_mkdirat_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         let path = b"/p/newdir\0";
-        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, path.as_ptr() as u64, 0o755, 0)) {
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o755, 0),
+        ) {
             Some(0) => Ok(()),
             _ => Err("mkdirat(new dir) should return 0"),
         }
@@ -282,7 +311,10 @@ fn smoke_abi_path_mkdirat_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         // mkdirat under a missing parent.
         let path = b"/p/missing/child\0";
-        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, path.as_ptr() as u64, 0o755, 0)) {
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o755, 0),
+        ) {
             Some(0) => Err("mkdirat under a missing parent must fail"),
             _ => Ok(()),
         }
@@ -300,7 +332,10 @@ kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_neg);
 fn smoke_abi_path_open_nul_term_fallback_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";
-        match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, /* len==0 → NUL-term */ 0)) {
+        match call(
+            Syscall::OpenFile.raw(),
+            a1(path.as_ptr() as u64, /* len==0 → NUL-term */ 0),
+        ) {
             Some(fd) if fd >= 0 => Ok(()),
             _ => Err("open(path, 0) should resolve the NUL-terminated path to a fd"),
         }

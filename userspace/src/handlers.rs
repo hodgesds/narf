@@ -1140,6 +1140,13 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // EBADF: fd not open. Checked before the general write path so a
+    // closed/bad fd is distinct from a write rejection (e.g. sealed memfd),
+    // which stays in the `_` → InvalidOp arm. Special fds returned above.
+    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
@@ -1307,6 +1314,13 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // EBADF: fd not open. Checked before the general read path so a
+    // closed/bad fd is distinct from a read I/O error (which keeps the
+    // `_` → InvalidOp arm). Special fds (console/fanotify) returned above.
+    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
@@ -16533,10 +16547,10 @@ pub fn default_sync_signal_delivery(
     let delivered = ctx.deliver_signal(&params);
     if delivered {
         set_sigreturn_use_rsp(task, params.restorer != 0);
-    // Record the frame layout we just built so sys_sigreturn restores from the
-    // right offsets — must match deliver_signal's `want_siginfo || force_rt`
-    // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
-    set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
+        // Record the frame layout we just built so sys_sigreturn restores from the
+        // right offsets — must match deliver_signal's `want_siginfo || force_rt`
+        // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
+        set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
     }
     delivered
 }
@@ -18453,6 +18467,8 @@ fn sys_timerfd_settime(ctx: &mut dyn TrapContext) {
         buf[8..16].copy_from_slice(&interval_nsec.to_le_bytes());
         buf[16..24].copy_from_slice(&value_sec.to_le_bytes());
         buf[24..32].copy_from_slice(&value_nsec.to_le_bytes());
+        // SAFETY: copy_to_user range-validates `old_value_ptr` and SMAP-brackets
+        // the write of the 32-byte itimerspec `buf`.
         if unsafe { copy_to_user(old_value_ptr, &buf) }.is_err() {
             ctx.set_return(fail);
             return;

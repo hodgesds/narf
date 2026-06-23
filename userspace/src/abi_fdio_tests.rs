@@ -41,7 +41,10 @@ fn smoke_abi_fdio_read_pos() -> TestResult {
         let fd = open_fd(b"/abi/f\0")?;
         let mut buf = [0u8; 8];
         // read(fd, buf, 8) → 2 bytes "hi" at the head of the MemFs file.
-        match call(Syscall::Read.raw(), a2(fd as u64, buf.as_mut_ptr() as u64, 8)) {
+        match call(
+            Syscall::Read.raw(),
+            a2(fd as u64, buf.as_mut_ptr() as u64, 8),
+        ) {
             Some(2) if &buf[..2] == b"hi" => Ok(()),
             _ => Err("read did not return the seeded bytes"),
         }
@@ -52,12 +55,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_read_pos);
 fn smoke_abi_fdio_read_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 4];
-        // LINUX-GAP: Linux read(2) on a bad fd returns -EBADF; NARF reports
-        // InvalidOp because the handler's error arm also covers read I/O
-        // errors (can't blanket-map to -EBADF — needs a bad-fd-vs-error split).
-        match call_raw(Syscall::Read.raw(), a2(4242, buf.as_mut_ptr() as u64, 4)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("read on bad fd was not InvalidOp"),
+        // read(2) on a fd that isn't open → -EBADF (the early fd check keeps
+        // this distinct from read I/O errors, which stay InvalidOp).
+        match call(Syscall::Read.raw(), a2(4242, buf.as_mut_ptr() as u64, 4)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("read on a bad fd should return -EBADF"),
         }
     })
 }
@@ -79,12 +81,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_write_pos);
 fn smoke_abi_fdio_write_neg() -> TestResult {
     with_setup(|| {
         let data = *b"x";
-        // LINUX-GAP: Linux write(2) on a bad fd returns -EBADF; NARF reports
-        // InvalidOp because the handler's error arm also covers write
-        // rejections (e.g. sealed memfd) — can't blanket-map to -EBADF.
-        match call_raw(Syscall::Write.raw(), a2(9191, data.as_ptr() as u64, 1)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("write on bad fd was not InvalidOp"),
+        // write(2) on a fd that isn't open → -EBADF (the early fd check keeps
+        // this distinct from write rejections like a sealed memfd).
+        match call(Syscall::Write.raw(), a2(9191, data.as_ptr() as u64, 1)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("write on a bad fd should return -EBADF"),
         }
     })
 }
@@ -160,7 +161,10 @@ fn smoke_abi_fdio_pwritev_pos() -> TestResult {
         iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
         iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
         // pwritev(fd, iov, 1, offset=0) → 4 bytes.
-        match call(Syscall::Pwritev.raw(), a3(fd as u64, iov.as_ptr() as u64, 1, 0)) {
+        match call(
+            Syscall::Pwritev.raw(),
+            a3(fd as u64, iov.as_ptr() as u64, 1, 0),
+        ) {
             Some(4) => Ok(()),
             _ => Err("pwritev did not return 4"),
         }
@@ -187,7 +191,10 @@ fn smoke_abi_fdio_preadv_pos() -> TestResult {
         iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
         iov[8..].copy_from_slice(&(8u64).to_le_bytes());
         // preadv(fd, iov, 1, offset=2) → reads "cdef" (4 bytes).
-        match call(Syscall::Preadv.raw(), a3(fd as u64, iov.as_ptr() as u64, 1, 2)) {
+        match call(
+            Syscall::Preadv.raw(),
+            a3(fd as u64, iov.as_ptr() as u64, 1, 2),
+        ) {
             Some(4) if &dst[..4] == b"cdef" => Ok(()),
             _ => Err("preadv at offset 2 did not return cdef"),
         }
@@ -196,12 +203,12 @@ fn smoke_abi_fdio_preadv_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio_preadv_pos);
 
 fn smoke_abi_fdio_preadv_neg() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::Preadv.raw(), a3(3, 0x1000, 2000, 0)) {
+    with_setup(
+        || match call(Syscall::Preadv.raw(), a3(3, 0x1000, 2000, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("preadv over IOV_MAX was not -EINVAL"),
-        }
-    })
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_preadv_neg);
 
@@ -429,7 +436,10 @@ fn smoke_abi_fdio_fstat_pos() -> TestResult {
         // fstat(fd, statbuf) → 0 on success (linux Stat struct is large;
         // a 256-byte kernel buffer is ample).
         let mut stat = [0u8; 256];
-        match call(Syscall::Fstat.raw(), a1(fd as u64, stat.as_mut_ptr() as u64)) {
+        match call(
+            Syscall::Fstat.raw(),
+            a1(fd as u64, stat.as_mut_ptr() as u64),
+        ) {
             Some(0) => Ok(()),
             _ => Err("fstat of a valid fd did not return 0"),
         }
@@ -609,11 +619,9 @@ fn smoke_abi_fdio_readahead_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio_readahead_pos);
 
 fn smoke_abi_fdio_readahead_neg() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::Readahead.raw(), a2(3636, 0, 16)) {
-            Some(v) if v == EBADF => Ok(()),
-            _ => Err("readahead on bad fd was not -EBADF"),
-        }
+    with_setup(|| match call(Syscall::Readahead.raw(), a2(3636, 0, 16)) {
+        Some(v) if v == EBADF => Ok(()),
+        _ => Err("readahead on bad fd was not -EBADF"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_readahead_neg);
@@ -630,12 +638,12 @@ fn smoke_abi_fdio_sync_file_range_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio_sync_file_range_pos);
 
 fn smoke_abi_fdio_sync_file_range_neg() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::SyncFileRange.raw(), a3(3737, 0, 16, 0)) {
+    with_setup(
+        || match call(Syscall::SyncFileRange.raw(), a3(3737, 0, 16, 0)) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("sync_file_range on bad fd was not -EBADF"),
-        }
-    })
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_sync_file_range_neg);
 
@@ -937,7 +945,10 @@ fn smoke_abi_fdio_vmsplice_pos() -> TestResult {
         iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
         iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
         // vmsplice(wr, iov, 1, 0) → 2 bytes gathered into the pipe.
-        match call(Syscall::Vmsplice.raw(), a3(wr as u64, iov.as_ptr() as u64, 1, 0)) {
+        match call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) {
             Some(2) => Ok(()),
             _ => Err("vmsplice did not gather 2 bytes"),
         }

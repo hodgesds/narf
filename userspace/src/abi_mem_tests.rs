@@ -129,7 +129,6 @@ fn smoke_abi_mem_mmap_no_as_neg() -> TestResult {
             arg3: 0x22,
             arg4: (-1i64) as u64,
             arg5: 0,
-            ..Default::default()
         };
         // LINUX-GAP: Linux mmap returns a mapped address (or -ENOMEM);
         // with no harness AS the handler returns NARF InvalidOp.
@@ -351,7 +350,6 @@ fn smoke_abi_mem_move_pages_status_pos() -> TestResult {
             arg3: 0,
             arg4: out.as_mut_ptr() as u64,
             arg5: 0,
-            ..Default::default()
         };
         match call(Syscall::MovePages.raw(), args) {
             Some(0) => {
@@ -404,7 +402,10 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_migrate_pages_pos);
 fn smoke_abi_mem_set_mempolicy_home_node_pos() -> TestResult {
     with_setup(|| {
         // addr=0x1000, len=0x1000, home_node=0, flags=0.
-        match call(Syscall::SetMempolicyHomeNode.raw(), a3(0x1000, 0x1000, 0, 0)) {
+        match call(
+            Syscall::SetMempolicyHomeNode.raw(),
+            a3(0x1000, 0x1000, 0, 0),
+        ) {
             Some(0) => Ok(()),
             Some(_) => Err("set_mempolicy_home_node(flags=0) should return 0"),
             None => Err("set_mempolicy_home_node returned non-Ok status"),
@@ -416,7 +417,10 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_set_mempolicy_home_node_pos);
 fn smoke_abi_mem_set_mempolicy_home_node_bad_flags_neg() -> TestResult {
     with_setup(|| {
         // arg3 (flags) non-zero → -EINVAL.
-        match call(Syscall::SetMempolicyHomeNode.raw(), a3(0x1000, 0x1000, 0, 1)) {
+        match call(
+            Syscall::SetMempolicyHomeNode.raw(),
+            a3(0x1000, 0x1000, 0, 1),
+        ) {
             Some(v) if v == EINVAL => Ok(()),
             Some(_) => Err("set_mempolicy_home_node(flags!=0) should be -EINVAL"),
             None => Err("set_mempolicy_home_node(EINVAL) should be Ok(-EINVAL)"),
@@ -476,7 +480,6 @@ fn smoke_abi_mem_get_mempolicy_mems_allowed_pos() -> TestResult {
             arg3: 0,
             arg4: 4,
             arg5: 0,
-            ..Default::default()
         };
         match call(Syscall::GetMempolicy.raw(), args) {
             Some(0) => Ok(()),

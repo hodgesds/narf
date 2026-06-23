@@ -57,10 +57,7 @@ fn smoke_abi_chdir_ignores_old_length_arg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hello")], || {
         let path = b"/abi\0";
         let clean = call(Syscall::Chdir.raw(), a0(path.as_ptr() as u64));
-        let garbage = call(
-            Syscall::Chdir.raw(),
-            a1(path.as_ptr() as u64, 0xdead_beef),
-        );
+        let garbage = call(Syscall::Chdir.raw(), a1(path.as_ptr() as u64, 0xdead_beef));
         if clean != garbage {
             return Err("chdir result changed with garbage in arg1 (still reads a length?)");
         }
@@ -91,7 +88,11 @@ fn smoke_abi_readlink_nonsymlink_is_einval() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hello")], || {
         let path = b"/abi/f\0";
         let mut buf = [0u8; 64];
-        let args = a2(path.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let args = a2(
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        );
         // POSIX/Linux: readlink on an existing non-symlink is EINVAL.
         match call(Syscall::Readlink.raw(), args) {
             Some(v) if v == EINVAL => Ok(()),
@@ -105,7 +106,11 @@ fn smoke_abi_readlink_missing_is_enoent() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hello")], || {
         let path = b"/abi/nope\0";
         let mut buf = [0u8; 64];
-        let args = a2(path.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        let args = a2(
+            path.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        );
         // Linux: a path that names nothing is ENOENT (musl's realpath
         // relies on distinguishing this from EINVAL).
         match call(Syscall::Readlink.raw(), args) {
@@ -119,11 +124,11 @@ kernel_test_in!("syscall_abi", smoke_abi_readlink_missing_is_enoent);
 // ── getpid: returns the calling task's visible pid ──
 
 fn smoke_abi_getpid_returns_task() -> TestResult {
-    with_setup(|| {
-        match call(Syscall::GetPid.raw(), SyscallArgs::default()) {
+    with_setup(
+        || match call(Syscall::GetPid.raw(), SyscallArgs::default()) {
             Some(p) if p as u64 == FAKE_TASK => Ok(()),
             _ => Err("getpid should return the calling task's pid"),
-        }
-    })
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_getpid_returns_task);
