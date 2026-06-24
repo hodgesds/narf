@@ -142,6 +142,14 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// state without ever touching the disk. Empty on clean
     /// volumes and on ext2 (which has no journal).
     journal_overrides: BTreeMap<u64, Vec<u8>>,
+    /// Small LRU of recently-read indirect blocks (device block_no → its
+    /// `block_size` contents). A sequential `map_block` walk of a large file
+    /// hits the same indirect block(s) for every data block; without this
+    /// each data block re-reads its indirect block from disk (O(n·depth)
+    /// device reads — mmap'ing a 161 MiB DSO took minutes). Invalidated
+    /// wholesale on any block write so a freed/rewritten indirect block can't
+    /// be served stale. Capacity covers triple-indirect's live set (l3/l2/l1).
+    indirect_cache: IrqSafeSpinLock<Vec<(u32, Vec<u8>)>>,
 }
 
 /// Free-function indirect-pointer read used by the pre-construction
@@ -312,6 +320,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             journal_overrides,
+            indirect_cache: IrqSafeSpinLock::new(Vec::new()),
         }))
     }
 
@@ -583,6 +592,10 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// byte-granularity write — for sub-LBA spans we read-modify-
     /// write the enclosing sector.
     pub async fn write_byte_range(&self, byte_off: u64, src: &[u8]) -> Result<(), FsError> {
+        // Any device write may touch an indirect block (or free/reallocate
+        // one), so drop the read cache wholesale to avoid serving stale
+        // pointers. Writes are rare next to reads; clearing 8 entries is cheap.
+        self.indirect_cache.lock().clear();
         let lbs = self.io.lock().lbs;
         let mut cursor = 0usize;
         while cursor < src.len() {
@@ -1271,16 +1284,34 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if index >= self.pointers_per_block() as u64 {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
+        let off = (index as usize) * 4;
+        let entry = |buf: &[u8]| {
+            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+        };
+        // Fast path: serve from the indirect-block cache. The lock is dropped
+        // before any await (never held across the device read below).
+        {
+            let cache = self.indirect_cache.lock();
+            if let Some((_, buf)) = cache.iter().find(|(b, _)| *b == block_no) {
+                return Ok(entry(buf));
+            }
+        }
         let bs = self.block_size();
         let mut buf = vec![0u8; bs];
         self.read_block(block_no as u64, &mut buf).await?;
-        let off = (index as usize) * 4;
-        Ok(u32::from_le_bytes([
-            buf[off],
-            buf[off + 1],
-            buf[off + 2],
-            buf[off + 3],
-        ]))
+        let val = entry(&buf);
+        // Insert into the LRU (cap 8, evict oldest). Re-check membership: a
+        // concurrent read may have inserted the same block while we awaited.
+        {
+            let mut cache = self.indirect_cache.lock();
+            if !cache.iter().any(|(b, _)| *b == block_no) {
+                if cache.len() >= 8 {
+                    cache.remove(0);
+                }
+                cache.push((block_no, buf));
+            }
+        }
+        Ok(val)
     }
 }
 
