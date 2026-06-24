@@ -6343,10 +6343,16 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK => r.value as i64,
         _ => return TestResult::Fail("times did not return OK"),
     };
-    // utime synthesised to wall-clock ticks; stime/cutime/cstime
-    // zeroed; wall return matches buf[0] (both source the same ns).
-    if buf[0] != wall || buf[1] != 0 || buf[2] != 0 || buf[3] != 0 {
-        return TestResult::Fail("times did not write the expected tms struct");
+    // The RETURN value is wall-clock uptime in ticks. The tms FIELDS carry
+    // per-task CPU time: utime / cutime are the task's own + reaped-children
+    // CPU ticks (>= 0; not the wall return — that decoupling is the whole
+    // point of the accounting fix), and we never split out system time so
+    // stime / cstime are always zero.
+    if buf[1] != 0 || buf[3] != 0 {
+        return TestResult::Fail("times: stime/cstime must be zero (no user/sys split)");
+    }
+    if buf[0] < 0 || buf[2] < 0 {
+        return TestResult::Fail("times: utime/cutime must be non-negative CPU ticks");
     }
     if wall < 0 {
         return TestResult::Fail("times surfaced a negative wall-clock");

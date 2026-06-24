@@ -9637,6 +9637,10 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
                 *out_status = status;
             }
         }
+        // Charge the reaped child's CPU time to the parent (RUSAGE_CHILDREN
+        // / tms.cutime). Same fold as the synchronous reap path in sys_wait4;
+        // this covers the blocking wait4 + waitid path.
+        let _ = account_reaped_child(parent_id, child_pid);
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(child_pid));
         // Reaped — drop the parent record so wait4's ECHILD check is accurate.
@@ -10056,7 +10060,7 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
     let want_pid = args.arg0 as i64;
     let status_ptr = args.arg1;
     let options = args.arg2 as u32;
-    let _rusage_ptr = args.arg3; // ignored; no resource accounting yet
+    let rusage_ptr = args.arg3; // filled with the reaped child's CPU time
     const WNOHANG: u32 = 1;
 
     let parent = current_task_id();
@@ -10106,6 +10110,13 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
             // SAFETY: Valid memory or trusted environment
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+        }
+        // Charge the reaped child's CPU time to the parent's children
+        // accumulator (RUSAGE_CHILDREN / tms.cutime) and, if the caller
+        // passed a `struct rusage*`, fill ru_utime with it.
+        let child_cpu_ns = account_reaped_child(parent, reaped);
+        if rusage_ptr != 0 {
+            write_rusage_utime(rusage_ptr, child_cpu_ns);
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(reaped));
@@ -11608,27 +11619,36 @@ const CLK_TCK_HZ: u64 = 100;
 fn sys_times(ctx: &mut dyn TrapContext) {
     let out_ptr = ctx.args().arg0;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
-    let ticks: i64 = (ns / (1_000_000_000 / CLK_TCK_HZ)) as i64;
+    // times() RETURNS elapsed wall-clock in ticks (uptime since an
+    // arbitrary epoch) — that part was always right. The `tms` FIELDS,
+    // however, must carry this task's real CPU time, not uptime.
+    let ns_per_tick: u64 = 1_000_000_000 / CLK_TCK_HZ;
+    let uptime_ticks: i64 = (narf_scheduler::narf_time::monotonic_ns() / ns_per_tick) as i64;
+    let task = current_task_id();
+    let utime_ticks: i64 = (cpu_time_ns_of(task) / ns_per_tick) as i64;
+    let cutime_ticks: i64 = (child_cpu_time_ns_of(task) / ns_per_tick) as i64;
     if out_ptr != 0 {
         // Build the tms struct (four i64s: utime, stime, cutime, cstime)
         // in kernel memory, then copy to user under the SMAP bracket.
+        // We don't split user/system time — everything is charged as
+        // utime/cutime, leaving stime/cstime zero.
         let mut kbuf = [0u8; 32];
-        kbuf[..8].copy_from_slice(&ticks.to_ne_bytes()); // utime
-                                                         // stime, cutime, cstime already zero.
-                                                         // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
-                                                         // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
-                                                         // SAFETY: Valid memory or trusted environment
+        kbuf[..8].copy_from_slice(&utime_ticks.to_ne_bytes()); // utime
+        kbuf[16..24].copy_from_slice(&cutime_ticks.to_ne_bytes()); // cutime
+                                                                   // stime, cstime already zero.
+                                                                   // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
+                                                                   // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
+                                                                   // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
             ctx.set_return(fail);
             return;
         }
     }
-    if ticks < 0 {
+    if uptime_ticks < 0 {
         ctx.set_return(fail);
         return;
     }
-    ctx.set_return(SyscallReturn::ok(ticks as u64));
+    ctx.set_return(SyscallReturn::ok(uptime_ticks as u64));
 }
 
 // ── Getrusage — populate the glibc rusage struct ──────────────────
@@ -11645,14 +11665,24 @@ const RUSAGE_TOTAL_I64S: usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
 
 fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let _who = args.arg0 as i64;
+    let who = args.arg0 as i64;
     let out = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out == 0 {
         ctx.set_return(fail);
         return;
     }
-    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+    // RUSAGE_SELF (0) → this task's own CPU time; RUSAGE_CHILDREN (-1) →
+    // accumulated reaped-children CPU time. (Previously this returned
+    // monotonic uptime for every `who`, so every process looked like it
+    // had burned the whole machine's wall-clock as user time.)
+    const RUSAGE_CHILDREN: i64 = -1;
+    let task = current_task_id();
+    let ns: u64 = if who == RUSAGE_CHILDREN {
+        child_cpu_time_ns_of(task)
+    } else {
+        cpu_time_ns_of(task)
+    };
     let utime_sec = (ns / 1_000_000_000) as i64;
     let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
     // Build the rusage struct (RUSAGE_TOTAL_I64S i64s) in kernel
@@ -14653,6 +14683,116 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+// ── Per-task CPU-time accounting (getrusage / times) ────────────────
+//
+// NARF previously reported `monotonic_ns()` (wall-clock uptime since
+// boot) as every process's user CPU time — so getrusage(RUSAGE_SELF)
+// / times() returned the same huge, ever-growing value for every
+// task, inflating e.g. stress-ng's per-stressor usr-time ~17x. These
+// two tables instead track REAL consumed CPU time, keyed by TaskId
+// (tid) — the same key getrusage/times resolve via current_task_id().
+//
+// `TASK_CPU_NS`: nanoseconds this task itself has spent executing in
+// user mode, summed over every user run-slice (accumulated by the
+// UserTaskFuture poll boundary in user_task.rs: it brackets each
+// enter-user-mode → trap-return slice and folds the delta in here).
+//
+// `TASK_CHILD_CPU_NS`: nanoseconds of CPU time charged to this task's
+// REAPED children (RUSAGE_CHILDREN / tms.cutime), folded in by wait4 /
+// waitid when a zombie is collected (Linux charges child time at reap,
+// not at exit).
+static TASK_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static TASK_CHILD_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Fold a completed user run-slice (`delta_ns` of on-CPU user time) into
+/// the currently-running task's accumulated CPU time. Called from the
+/// UserTaskFuture poll on every trap-return. Alloc-free on the hot path
+/// once the task's slot exists; IRQ-safe (the poll runs with IF=0 around
+/// the trap boundary).
+pub fn account_user_cpu_ns(delta_ns: u64) {
+    if delta_ns == 0 {
+        return;
+    }
+    let task = current_task_id();
+    if task == 0 {
+        return;
+    }
+    let mut g = TASK_CPU_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// Test hook: account `delta_ns` to an arbitrary task (the production
+/// path only ever charges the currently-running task). Lets the ABI test
+/// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
+#[doc(hidden)]
+pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
+    let mut g = TASK_CPU_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// This task's own accumulated user CPU time (ns).
+pub fn cpu_time_ns_of(task: u64) -> u64 {
+    TASK_CPU_NS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// Accumulated CPU time (ns) of `task`'s reaped children.
+fn child_cpu_time_ns_of(task: u64) -> u64 {
+    TASK_CHILD_CPU_NS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// Reaping `child` from `parent`: charge the child's total CPU time (its
+/// own + whatever it had already accumulated from its own reaped
+/// grandchildren, per POSIX) to the parent's child-time accumulator, then
+/// drop the child's rows. Returns the child's total CPU ns so wait4 can
+/// also fill its `struct rusage` out-param. Idempotent-safe: a second
+/// reap of an already-dropped child contributes 0.
+pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
+    let child_total = cpu_time_ns_of(child).saturating_add(child_cpu_time_ns_of(child));
+    if parent != 0 {
+        let mut g = TASK_CHILD_CPU_NS.lock();
+        let m = g.get_or_insert_with(BTreeMap::new);
+        let e = m.entry(parent).or_insert(0);
+        *e = e.saturating_add(child_total);
+    }
+    if let Some(m) = TASK_CPU_NS.lock().as_mut() {
+        m.remove(&child);
+    }
+    if let Some(m) = TASK_CHILD_CPU_NS.lock().as_mut() {
+        m.remove(&child);
+    }
+    child_total
+}
+
+/// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory
+/// with `ru_utime` set from `ns` and every other field zero. Best-effort
+/// (a failed copy is swallowed — wait4 still succeeds). Shared by wait4's
+/// rusage out-param.
+fn write_rusage_utime(out_ptr: u64, ns: u64) {
+    let mut kbuf = [0u8; 18 * 8];
+    let sec = (ns / 1_000_000_000) as i64;
+    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    kbuf[..8].copy_from_slice(&sec.to_ne_bytes()); // ru_utime.tv_sec
+    kbuf[8..16].copy_from_slice(&usec.to_ne_bytes()); // ru_utime.tv_usec
+                                                      // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
+                                                      // checked by the caller); copy_to_user range-validates and
+                                                      // SMAP-brackets the 144-byte write.
+    let _ = unsafe { copy_to_user(out_ptr, &kbuf) };
+}
 
 /// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
 /// sigqueue: `(task, signum) -> (si_code, si_value)`. The pending bitmask

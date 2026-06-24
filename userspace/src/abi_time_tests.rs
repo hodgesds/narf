@@ -138,6 +138,67 @@ fn smoke_abi_time_getrusage_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_getrusage_neg);
 
+// Regression: getrusage(RUSAGE_SELF) / times() must report the task's
+// REAL accumulated CPU time, not wall-clock uptime. NARF used to return
+// monotonic_ns() (uptime since boot) for every process, which inflated
+// e.g. stress-ng's per-stressor usr-time ~17x. We assert the delta:
+// accounting a known CPU slice moves ru_utime / tms.utime by ~that
+// amount (uptime would instead drift by only the microseconds between
+// the two reads). Delta-based so it's robust to any prior accumulation.
+fn smoke_abi_time_cpu_accounting() -> TestResult {
+    with_setup(|| {
+        let read_ru_utime_ns = |who: i64| -> Option<u64> {
+            let mut ru = [0u8; 144];
+            match call(
+                Syscall::Getrusage.raw(),
+                a1(who as u64, ru.as_mut_ptr() as u64),
+            ) {
+                Some(0) => {
+                    let sec = i64::from_ne_bytes(ru[0..8].try_into().unwrap());
+                    let usec = i64::from_ne_bytes(ru[8..16].try_into().unwrap());
+                    Some((sec as u64) * 1_000_000_000 + (usec as u64) * 1_000)
+                }
+                _ => None,
+            }
+        };
+        // RUSAGE_SELF reflects accounted CPU time.
+        let self_before = read_ru_utime_ns(0).ok_or("getrusage(RUSAGE_SELF) failed")?;
+        crate::handlers::account_user_cpu_ns(300_000_000); // 300 ms
+        let self_after = read_ru_utime_ns(0).ok_or("getrusage(RUSAGE_SELF) failed")?;
+        if self_after.saturating_sub(self_before) < 250_000_000 {
+            return Err("getrusage(RUSAGE_SELF).ru_utime must track accounted CPU, not uptime");
+        }
+        // times() tms.utime (field 0, ticks at 100 Hz) reflects the same.
+        let mut tms = [0u8; 32];
+        if call(Syscall::Times.raw(), a0(tms.as_mut_ptr() as u64))
+            .filter(|v| *v >= 0)
+            .is_none()
+        {
+            return Err("times(buf) failed");
+        }
+        let utime_ticks = i64::from_ne_bytes(tms[0..8].try_into().unwrap());
+        if utime_ticks < 25 {
+            // 300 ms ⇒ ≥ ~30 ticks; absolute lower bound tolerant of rounding.
+            return Err("times().tms_utime must reflect accounted CPU time");
+        }
+        // RUSAGE_CHILDREN fold: charge a (distinct) child's accumulated CPU
+        // time to the parent's children bucket. `99_001` stands in for a
+        // reaped child; account_reaped_child returns its total and folds it.
+        let child_before = read_ru_utime_ns(-1).ok_or("getrusage(RUSAGE_CHILDREN) failed")?;
+        crate::handlers::__test_account_cpu_ns(99_001, 400_000_000);
+        let folded = crate::handlers::account_reaped_child(FAKE_TASK, 99_001);
+        if folded < 350_000_000 {
+            return Err("account_reaped_child should return the child's accumulated CPU time");
+        }
+        let child_after = read_ru_utime_ns(-1).ok_or("getrusage(RUSAGE_CHILDREN) failed")?;
+        if child_after.saturating_sub(child_before) < 350_000_000 {
+            return Err("getrusage(RUSAGE_CHILDREN) must reflect reaped-child CPU time");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_cpu_accounting);
+
 // ── sleep(ns) — NARF-native raw-nanosecond sleep ──────────────────────
 // ns==0 returns immediately with 0. A non-zero ns busy-waits, so the
 // only deterministic case is the zero-length sleep; there is no error path.

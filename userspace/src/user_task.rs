@@ -1306,6 +1306,13 @@ impl core::future::Future for UserTaskFuture {
             core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
         }
 
+        // Mark the start of this user run-slice for CPU-time accounting
+        // (getrusage / times). Captured here (before setjmp, only read
+        // after the trap-return below — never mutated in between, so it is
+        // longjmp-safe) so the delta covers entry→trap, i.e. the time the
+        // task actually executed in user mode. See `account_user_cpu_ns`.
+        let slice_start_ns = narf_scheduler::narf_time::monotonic_ns();
+
         // setjmp. On the initial call returns 0; the hooks longjmp
         // back here with a non-zero EXIT_REASON_*.
         // SAFETY: jmp is a valid, properly-aligned JmpBuf for the
@@ -1374,6 +1381,16 @@ impl core::future::Future for UserTaskFuture {
                 }
                 TaskState::Exited => unreachable!("guarded above"),
             }
+        }
+
+        // The trap returned control here: this user run-slice just ended.
+        // Charge the elapsed user-mode time to the running task so
+        // getrusage(RUSAGE_SELF) / times() report real consumed CPU time
+        // rather than wall-clock uptime. `current_task_id()` is still this
+        // task (install_current set it at the top of poll, before setjmp).
+        {
+            let now = narf_scheduler::narf_time::monotonic_ns();
+            crate::handlers::account_user_cpu_ns(now.saturating_sub(slice_start_ns));
         }
 
         // Save this task's x87/SSE register file. The trap left the
