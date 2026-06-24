@@ -225,6 +225,34 @@ fn smoke_abi_fdio_close_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_close_pos);
 
+// POSIX open(2): the returned fd is the LOWEST-numbered descriptor not
+// currently open. So after closing a low fd, the next open must reuse it
+// — not bump to a fresh high slot. busybox ash depends on this exact
+// guarantee: to redirect an async job's stdin it does
+// `close(0); if (open("/dev/null") != 0) perror`, asserting the reopened
+// fd is exactly 0. NARF's fd table used to skip 0..=2 unconditionally, so
+// every `cmd &` in the distro died with "can't open '/dev/null'".
+fn smoke_abi_fdio_open_reuses_lowest_closed_fd() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let a = open_fd(b"/abi/f\0")?; // first user fd: 3
+        let b = open_fd(b"/abi/f\0")?; // next: 4
+        if a != 3 || b != 4 {
+            return Err("unexpected initial fd allocation (expected 3,4)");
+        }
+        // Close the lower of the two; the next open MUST reclaim it.
+        match call(Syscall::Close.raw(), a0(a as u64)) {
+            Some(0) => {}
+            _ => return Err("close failed"),
+        }
+        let c = open_fd(b"/abi/f\0")?;
+        if c != a {
+            return Err("open did not reuse the lowest closed fd (POSIX violation)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_open_reuses_lowest_closed_fd);
+
 fn smoke_abi_fdio_close_neg() -> TestResult {
     with_setup(|| {
         // close(2) on a fd that isn't open → -EBADF (now Linux-conformant).

@@ -87,14 +87,16 @@ impl FdTable {
         Self { slots: Vec::new() }
     }
 
-    /// Insert `entry` at the lowest free slot ≥ 3. Slots 0..=2 are
-    /// reserved for stdio; install those via `set` directly.
+    /// Insert `entry` at the lowest free fd. POSIX `open(2)` returns the
+    /// lowest-numbered descriptor not currently open — so when stdio
+    /// occupies 0..=2 this lands at 3+, but a program that closes a low
+    /// fd gets that slot back. busybox ash relies on this: to redirect an
+    /// async job's stdin it does `close(0); if (open("/dev/null") != 0)
+    /// error`, asserting the reopened fd is exactly 0. Skipping 0..=2
+    /// unconditionally made every `cmd &` in the distro fail with
+    /// "can't open '/dev/null'".
     pub fn open(&mut self, entry: FdEntry) -> u32 {
-        // Ensure stdio slots exist.
-        while self.slots.len() < 3 {
-            self.slots.push(None);
-        }
-        for (i, s) in self.slots.iter_mut().enumerate().skip(3) {
+        for (i, s) in self.slots.iter_mut().enumerate() {
             if s.is_none() {
                 *s = Some(entry);
                 return i as u32;
@@ -106,10 +108,11 @@ impl FdTable {
     }
 
     /// Insert `entry` at the lowest free slot ≥ `min`. Used by
-    /// `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC`. Caps `min` at 3 if it
-    /// would otherwise land on the stdio reservations.
+    /// `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC`, which POSIX defines as the
+    /// lowest free fd at or above `min` — honour `min` verbatim (a free
+    /// slot below 3, e.g. a closed stdio fd, is a valid target).
     pub fn open_at_least(&mut self, entry: FdEntry, min: u32) -> u32 {
-        let min = (min as usize).max(3);
+        let min = min as usize;
         while self.slots.len() <= min {
             self.slots.push(None);
         }
