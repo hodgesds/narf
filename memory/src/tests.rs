@@ -6071,6 +6071,7 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
     use crate::x86_64::paging;
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
+    // SAFETY: Testing context; we don't switch CR3 or use it for active execution.
     let a = match unsafe { AddressSpace::new_for_user() } {
         Ok(x) => x,
         Err(_) => return TestResult::Skip("AS alloc failed"),
@@ -6082,14 +6083,13 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
 
     for i in 0..N {
         let b = base + i * SPAN;
-        if a
-            .map_region(Region {
-                base: VirtAddr::new(b),
-                len: SPAN,
-                perms: RegionPerms(0),
-                phys: alloc::vec![PhysAddr::new(0); (SPAN >> 12) as usize],
-            })
-            .is_err()
+        if a.map_region(Region {
+            base: VirtAddr::new(b),
+            len: SPAN,
+            perms: RegionPerms(0),
+            phys: alloc::vec![PhysAddr::new(0); (SPAN >> 12) as usize],
+        })
+        .is_err()
         {
             return TestResult::Fail("reserve (PROT_NONE span) map_region failed");
         }
@@ -6108,14 +6108,13 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
                 }
             }
             let _ = a.punch_fixed(VirtAddr::new(va), 0x1000);
-            if a
-                .map_region(Region {
-                    base: VirtAddr::new(va),
-                    len: 0x1000,
-                    perms: RegionPerms::READ | RegionPerms::WRITE,
-                    phys: alloc::vec![frame],
-                })
-                .is_err()
+            if a.map_region(Region {
+                base: VirtAddr::new(va),
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![frame],
+            })
+            .is_err()
             {
                 return TestResult::Fail("segment MAP_FIXED map_region failed");
             }

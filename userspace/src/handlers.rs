@@ -3246,8 +3246,9 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
-    let stat =
-        fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.stat(), e.ops.rdev(), e.ops.ino())));
+    let stat = fd::with_table(task, |t| {
+        t.get(fd).map(|e| (e.ops.stat(), e.ops.rdev(), e.ops.ino()))
+    });
     let (s, rdev, ino) = match stat {
         Some(Some(triple)) => triple,
         _ => {
@@ -3370,8 +3371,10 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
             return;
         }
         let task = current_task_id();
-        fd::with_table(task, |t| t.get(dirfd as u32).map(|e| (e.ops.stat(), e.ops.ino())))
-            .flatten()
+        fd::with_table(task, |t| {
+            t.get(dirfd as u32).map(|e| (e.ops.stat(), e.ops.ino()))
+        })
+        .flatten()
     } else {
         let raw = match copy_user_cstr(path_uptr, 4096) {
             Some(s) => s,
@@ -20244,6 +20247,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "epoll_pwait",
         RawFnHandler(crate::epoll::sys_epoll_wait),
     );
+    #[cfg(feature = "linux-compat")]
     table.install_raw(
         Syscall::PerfEventOpen,
         "perf_event_open",

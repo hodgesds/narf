@@ -1285,9 +1285,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::Io(narf_block::BlockError::InvalidRange));
         }
         let off = (index as usize) * 4;
-        let entry = |buf: &[u8]| {
-            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-        };
+        let entry =
+            |buf: &[u8]| u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
         // Fast path: serve from the indirect-block cache. The lock is dropped
         // before any await (never held across the device read below).
         {
