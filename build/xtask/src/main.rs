@@ -899,7 +899,37 @@ fn ahci_image_path() -> PathBuf {
     path
 }
 
+/// Set true by the kernel-test runner (`run_cmd_inner` when the build carries
+/// the `kernel-test` feature). When set, `virtio_blk_image_path` returns the
+/// dedicated test disk (`narf-vblk-test.img`) instead of the Alpine-rootfs
+/// path (`narf-vblk.img`), so the two consumers never clobber each other:
+/// the kernel-test wants a tiny ext2 placeholder with the 0x97 LBA-0 pattern
+/// (and NOT a full rootfs, so it isn't auto-root-mounted at `/`), while
+/// musl-demo/stress-ng/oci want the real Alpine rootfs.
+static KERNEL_TEST_DISK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Dedicated kernel-test disk: a minimal ext2 + 0x97 sector-0 pattern, kept
+/// at its own path so the Alpine rootfs at `narf-vblk.img` is never touched.
+/// Idempotent (regenerated when the bytes differ) — safe because nothing else
+/// uses this path.
+fn virtio_blk_test_image_path() -> PathBuf {
+    let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
+    let path = root.join("target").join("narf-vblk-test.img");
+    let img = build_ext2_disk_image(b"hello.txt", b"hello from disk\n");
+    let stale = std::fs::read(&path).map(|b| b != img).unwrap_or(true);
+    if stale {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, &img);
+    }
+    path
+}
+
 fn virtio_blk_image_path() -> PathBuf {
+    if KERNEL_TEST_DISK.load(std::sync::atomic::Ordering::Relaxed) {
+        return virtio_blk_test_image_path();
+    }
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-vblk.img");
     // CREATE-ONLY — do NOT overwrite an existing image. This path is shared:
@@ -1436,6 +1466,14 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             kernel.display()
         );
     }
+
+    // Kernel-test builds get their own virtio-blk disk (narf-vblk-test.img)
+    // so they don't read/clobber the Alpine rootfs at narf-vblk.img. Set
+    // before qemu_args, which resolves the disk path in-process.
+    KERNEL_TEST_DISK.store(
+        args.features.contains("kernel-test"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
