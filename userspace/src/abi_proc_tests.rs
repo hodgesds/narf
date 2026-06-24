@@ -691,6 +691,26 @@ fn smoke_abi_proc_execve_missing_path() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_execve_missing_path);
 
+fn smoke_abi_proc_execve_missing_path_enoent() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        // LINUX ABI: execve of a non-existent path must return -ENOENT, NOT
+        // -EINVAL. execvp(3) PATH-searches by execve'ing each candidate and only
+        // retries the next dir on ENOENT — returning EINVAL aborts the search, so
+        // a binary not in the first PATH entry (e.g. weston in /usr/bin while PATH
+        // starts with /bin) became "can't execute: Invalid argument" despite
+        // existing. Guards that regression.
+        let path = b"/abi/does-not-exist\0";
+        let r = call_raw(Syscall::Execve.raw(), a3(path.as_ptr() as u64, 0, 0, 0));
+        const ENOENT: i64 = -2;
+        if r.status == SyscallReturn::OK && (r.value as i64) == ENOENT {
+            Ok(())
+        } else {
+            Err("execve of a missing path must return -ENOENT (not -EINVAL)")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_execve_missing_path_enoent);
+
 fn smoke_abi_proc_execveat_neg() -> TestResult {
     with_setup(|| {
         // execveat reshapes (dirfd, path, argv, envp, flags) → execve(path,

@@ -1322,38 +1322,43 @@ fn smoke_process_execve_input_validation() -> TestResult {
     }
 
     // (B) too-short ELF (< 64 bytes)
+    // (B) a non-resolvable path pointer is rejected. Linux-ABI execve takes
+    // (path, argv, envp) — arg0 is a path, not an inline ELF. A path that
+    // doesn't resolve must be rejected: -ENOENT (so execvp(3) keeps searching
+    // PATH) or invalid_op — either way never a success.
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 0xDEAD_BEEF,
-            arg1: 32,
+            arg1: 0,
             ..SyscallArgs::default()
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     match ctx.ret {
-        Some(r) if r == SyscallReturn::invalid_op() => {}
+        Some(r) if r.status != SyscallReturn::OK || (r.value as i64) < 0 => {}
         _ => {
             crate::syscall::__test_clear_global();
-            return TestResult::Fail("execve with too-short ELF should return invalid_op");
+            return TestResult::Fail("execve of an unresolvable path should be rejected");
         }
     }
 
-    // (C) oversized ELF (> 64 MiB)
+    // (C) a clearly non-existent absolute path → rejected (-ENOENT).
+    let nope = b"/no/such/binary\0";
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: 0xDEAD_BEEF,
-            arg1: 65 * 1024 * 1024,
+            arg0: nope.as_ptr() as u64,
+            arg1: 0,
             ..SyscallArgs::default()
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
     match ctx.ret {
-        Some(r) if r == SyscallReturn::invalid_op() => {}
+        Some(r) if r.status != SyscallReturn::OK || (r.value as i64) < 0 => {}
         _ => {
             crate::syscall::__test_clear_global();
-            return TestResult::Fail("execve with oversized ELF should return invalid_op");
+            return TestResult::Fail("execve of a non-existent path should be rejected");
         }
     }
 

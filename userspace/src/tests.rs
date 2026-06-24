@@ -9150,8 +9150,10 @@ fn smoke_userspace_execve_rejects_null_ptr() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_execve_rejects_null_ptr);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_userspace_execve_rejects_oversized_elf() -> TestResult {
-    // 64+ MiB cap is the defensive upper bound on `elf_len`.
+fn smoke_userspace_execve_rejects_unresolvable_path() -> TestResult {
+    // Linux-ABI execve(path, argv, envp): arg0 is a path, not an inline ELF.
+    // A garbage / non-resolvable path pointer must be REJECTED (as -ENOENT so
+    // execvp(3) keeps searching PATH, or invalid_op) — never a success.
     crate::syscall::__test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -9160,7 +9162,7 @@ fn smoke_userspace_execve_rejects_oversized_elf() -> TestResult {
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: 0xDEAD_BEEFu64,
-            arg1: 65 * 1024 * 1024, // > 64 MiB
+            arg1: 0,
             arg2: 0,
             arg3: 0,
             arg4: 0,
@@ -9173,54 +9175,69 @@ fn smoke_userspace_execve_rejects_oversized_elf() -> TestResult {
         Some(r) => r,
         None => return TestResult::Fail("no return"),
     };
-    if r != SyscallReturn::invalid_op() {
-        return TestResult::Fail("oversized elf_len should be rejected with invalid_op");
+    if r.status == SyscallReturn::OK && (r.value as i64) >= 0 {
+        return TestResult::Fail("execve of an unresolvable path should be rejected");
     }
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_execve_rejects_oversized_elf);
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_execve_rejects_unresolvable_path
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult {
-    // End-to-end the load side: a valid minimal ELF + valid argv
-    // pack. The handler runs `load_user_process_with` to completion,
-    // updates /proc/[pid]/{argv,comm}, then discovers there's no
-    // active user-task ctx (we're in a kernel-test stub) and bails
-    // with `invalid_op()`. Confirms the load-and-publish path
-    // doesn't fault on a clean input.
+    // End-to-end the load side via the Linux ABI: stage a valid minimal ELF
+    // in a MemFs and execve its PATH (not an inline pointer — execve takes
+    // (path, argv, envp)). The handler resolves + reads the file, runs
+    // `load_user_process_with` to completion, updates /proc/[pid]/{argv,comm},
+    // then discovers there's no active user-task ctx (kernel-test stub) and
+    // bails with `invalid_op()`. Confirms resolve→read→load→publish on clean
+    // input. (Reaching invalid_op — not -ENOENT — proves the path resolved
+    // and the image actually loaded.)
     crate::syscall::__test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
     let elf = build_minimal_elf_for_execve();
-    // argv pack: "init\0" — one NUL-terminated string.
-    let argv: alloc::vec::Vec<u8> = b"init\0".to_vec();
+    let mount = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(
+                &auth,
+                "/execve-load",
+                MemFs::with_seeds("execve-load", &[("init", elf.as_slice())]),
+            )
+            .ok()
+    };
 
+    let path = b"/execve-load/init\0";
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: argv.as_ptr() as u64,
-            arg3: argv.len() as u64,
-            arg4: 0, // empty envp
+            arg0: path.as_ptr() as u64,
+            arg1: 0, // argv = NULL → empty (POSIX)
+            arg2: 0, // envp = NULL → empty
+            arg3: 0,
+            arg4: 0,
             arg5: 0,
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
-    let r = match ctx.ret {
-        Some(r) => r,
-        None => return TestResult::Fail("no return"),
-    };
-    // load completed but no user ctx → bail with invalid_op.
-    if r != SyscallReturn::invalid_op() {
-        return TestResult::Fail("expected invalid_op fallback when no user ctx");
+    let r = ctx.ret;
+    if let Some(h) = &mount {
+        let _ = narf_filesystem::registry().unmount(h, "/execve-load");
     }
     crate::syscall::__test_clear_global();
-    TestResult::Pass
+    // load completed but no user ctx → bail with invalid_op.
+    match r {
+        Some(r) if r == SyscallReturn::invalid_op() => TestResult::Pass,
+        _ => TestResult::Fail("expected invalid_op fallback after load when no user ctx"),
+    }
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
@@ -9855,9 +9872,12 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_execve_with_envp_pack_accepts);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_userspace_execve_rejects_oversized_argv_pack() -> TestResult {
-    // copy_user_pack caps each pack at 64 KiB. An over-cap argv_len
-    // must surface invalid_op without copying.
+fn smoke_userspace_execve_rejects_inline_elf_pointer() -> TestResult {
+    // Legacy-ABI guard. execve was (elf_ptr, elf_len); it is now Linux
+    // (path, argv, envp). Passing the ELF *bytes* as arg0 means the handler
+    // reads the ELF magic as a path string ("\x7fELF…", not absolute), which
+    // cannot resolve — so execve must REJECT it, never silently load the
+    // inline image as if the old ABI were still in effect.
     crate::syscall::__test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -9867,9 +9887,9 @@ fn smoke_userspace_execve_rejects_oversized_argv_pack() -> TestResult {
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: 0xDEAD_BEEF_u64,
-            arg3: 65 * 1024, // > 64 KiB → rejected
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
             arg4: 0,
             arg5: 0,
         },
@@ -9881,16 +9901,16 @@ fn smoke_userspace_execve_rejects_oversized_argv_pack() -> TestResult {
         None => return TestResult::Fail("no return"),
     };
     crate::syscall::__test_clear_global();
-    if r == SyscallReturn::invalid_op() {
+    if r.status != SyscallReturn::OK || (r.value as i64) < 0 {
         TestResult::Pass
     } else {
-        TestResult::Fail("oversized argv pack should be rejected")
+        TestResult::Fail("execve must reject the ELF bytes passed as a path (legacy ABI)")
     }
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "userspace",
-    smoke_userspace_execve_rejects_oversized_argv_pack
+    smoke_userspace_execve_rejects_inline_elf_pointer
 );
 
 // ── userspace/init ─────────────────────────────────────────────────

@@ -12805,17 +12805,30 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
 
     // Resolve a path under the caller's chroot (containers/distros exec
     // `/bin/sh` expecting the chrooted rootfs) and slurp its bytes, capped at
-    // 64 MiB. Returns None on any failure.
-    let read_exec = |p: &str| -> Option<alloc::vec::Vec<u8>> {
+    // 64 MiB. Returns the bytes, or a negative errno on failure. The errno
+    // distinction is load-bearing: `execvp(3)` PATH-searches by execve'ing
+    // each candidate and treating -ENOENT as "try the next dir" but -EINVAL/
+    // -EIO as fatal. Returning EINVAL for a not-found path (the old behaviour)
+    // aborted the search on the first miss, so any binary not in the first
+    // PATH entry (e.g. weston in /usr/bin while PATH starts with /bin) was
+    // "can't execute: Invalid argument" even though it existed.
+    let read_exec = |p: &str| -> Result<alloc::vec::Vec<u8>, i64> {
         let ep = apply_chroot(p);
-        let ops = narf_filesystem::registry()
-            .resolve_absolute(&ep, |fs, rel| {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel)).and_then(|r| r.ok())
-            })
-            .flatten()?;
+        let ops = match narf_filesystem::registry().resolve_absolute(&ep, |fs, rel| {
+            poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+        }) {
+            Some(Some(Ok(o))) => o,
+            // Not found (or no mount) → ENOENT so execvp keeps searching PATH.
+            None | Some(Some(Err(narf_filesystem::FsError::NotFound))) => return Err(-2),
+            // poll_blocking overran, or a real FS error → EIO.
+            Some(None) | Some(Some(Err(_))) => return Err(-5),
+        };
         let file_size = ops.stat().size as usize;
-        if file_size == 0 || file_size > 64 * 1024 * 1024 {
-            return None;
+        if file_size == 0 {
+            return Err(-8); // ENOEXEC — empty file is not an executable
+        }
+        if file_size > 64 * 1024 * 1024 {
+            return Err(-7); // E2BIG
         }
         let mut buf = alloc::vec![0u8; file_size];
         let mut off = 0usize;
@@ -12823,11 +12836,11 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
             match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
                 Some(Ok(0)) => break, // short read at EOF
                 Some(Ok(n)) => off += n,
-                _ => return None,
+                _ => return Err(-5), // EIO
             }
         }
         buf.truncate(off);
-        Some(buf)
+        Ok(buf)
     };
 
     // Step 3: read the image. A leading `#!` is an interpreter directive
@@ -12842,9 +12855,9 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     let mut depth = 0u32;
     loop {
         let buf = match read_exec(&cur_path) {
-            Some(b) => b,
-            None => {
-                ctx.set_return(SyscallReturn::invalid_op());
+            Ok(b) => b,
+            Err(code) => {
+                ctx.set_return(SyscallReturn::ok(code as u64));
                 return;
             }
         };
