@@ -85,6 +85,25 @@ SECTIONS
         __bss_end = .;
     } :data
 
+    /*
+     * The GOT holds runtime-resolved function pointers (e.g. the
+     * compiler-builtins `memcpy`/`memset` reached via `call *GOT(%rip)`).
+     * LLD synthesizes `.got` and places it AFTER .bss regardless of where
+     * an explicit section is written, so it MUST be declared here — after
+     * .bss but BEFORE __kernel_end — and __kernel_end taken past it. Left
+     * implicit, the GOT lands past __kernel_end: the frame allocator (which
+     * reserves only [__kernel_start, __kernel_end)) then hands out the frame
+     * holding live GOT entries and zeroes it on allocation, nulling the
+     * memcpy pointer. The next `call *GOT` from FifoScheduler::pick_next
+     * jumps to 0x0 — the weston/SMP #UD heisenbug (rip=0x3, etc.).
+     */
+    .got : AT(ADDR(.got) - KERNEL_VIRT_BASE) ALIGN(8) {
+        *(.got)
+        *(.got.plt)
+        *(.data.rel.ro .data.rel.ro.*)
+    } :data
+
+    . = ALIGN(4K);
     __kernel_end = . - KERNEL_VIRT_BASE;
 
     /DISCARD/ : {
