@@ -4424,24 +4424,6 @@ fn perms_of_prot(prot: u32) -> RegionPerms {
 
 /// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
 /// zero-padding past EOF (the BSS tail of a file-backed segment).
-fn mmap_read_file(fd: i32, offset: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
-    if fd < 0 {
-        return None;
-    }
-    let task = current_task_id();
-    let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten()?;
-    let mut buf = alloc::vec![0u8; len];
-    let mut done = 0usize;
-    while done < len {
-        match poll_blocking(ops.read(offset + done as u64, &mut buf[done..])) {
-            Some(Ok(0)) | None => break, // EOF / error — rest stays zero
-            Some(Ok(n)) => done += n,
-            Some(Err(_)) => break,
-        }
-    }
-    Some(buf)
-}
-
 fn sys_mmap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let hint = args.arg0;
@@ -4607,12 +4589,21 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
         // each page on first access.
         alloc::vec![narf_memory::PhysAddr::new(0); pages]
     } else {
-        // File-backed MAP_PRIVATE: eagerly copy the file's [offset, offset+
-        // len) bytes into private frames (zero past EOF). ld-musl maps each
-        // PT_LOAD segment of a DSO this way.
+        // File-backed MAP_PRIVATE: stream the file's [offset, offset+len)
+        // bytes straight into per-page private frames (zero past EOF),
+        // reading ONE page at a time. Slurping the whole region into a single
+        // intermediate Vec OOMs the kernel for big DSOs: ld-musl mmaps Mesa's
+        // libgallium (~40 MiB) and libLLVM (~161 MiB) in a single call, and a
+        // lone 40 MiB+ allocation fails even with GiBs of guest RAM. Per-page
+        // frames are a scatter list, so no large contiguous allocation is
+        // needed.
         let len_bytes = len as usize;
-        let bytes = match mmap_read_file(fd, offset, len_bytes) {
-            Some(b) => b,
+        let ops = match fd::with_table(current_task_id(), |t| {
+            t.get(fd as u32).map(|e| e.ops.clone())
+        })
+        .flatten()
+        {
+            Some(o) => o,
             None => {
                 ctx.set_return(SyscallReturn::invalid_op());
                 return;
@@ -4628,16 +4619,22 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
                 }
             };
             let off = i * 4096;
-            let chunk = core::cmp::min(4096, len_bytes - off);
-            // SAFETY: freshly-allocated identity-mapped frame; zero then copy
-            // the (<=4096-byte) file chunk in.
+            let want = core::cmp::min(4096, len_bytes - off);
+            // SAFETY: freshly-allocated identity-mapped frame; zero the whole
+            // page first so any tail past `want` (and past EOF) reads as zero.
             unsafe {
                 core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(off),
-                    frame.raw() as *mut u8,
-                    chunk,
-                );
+            }
+            // SAFETY: `frame` is identity-mapped in the low 4 GiB and `want`
+            // is <= 4096, so the slice stays within the page.
+            let dst = unsafe { core::slice::from_raw_parts_mut(frame.raw() as *mut u8, want) };
+            let mut done = 0usize;
+            while done < want {
+                match poll_blocking(ops.read(offset + off as u64 + done as u64, &mut dst[done..])) {
+                    Some(Ok(0)) | None => break, // EOF / error — rest stays zero
+                    Some(Ok(n)) => done += n,
+                    Some(Err(_)) => break,
+                }
             }
             frames.push(frame);
         }
