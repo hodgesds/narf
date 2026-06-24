@@ -645,13 +645,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_move_mount_relpath_neg);
 fn smoke_abi_fsx2_open_tree_enoent_neg() -> TestResult {
     with_setup(|| {
         let path = b"/abi-no-mount-here\0";
-        let root_present = registry().list().iter().any(|p| p == "/");
         match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
-            // No root mount → the path is genuinely uncovered → -ENOENT.
-            Some(v) if v == ENOENT && !root_present => Ok(()),
-            // Root mounted → fs_arc_at's "/" fallback covers it → a valid fd.
-            Some(v) if v >= 0 && root_present => Ok(()),
-            _ => Err("open_tree: expected -ENOENT (no root mount) or a valid fd (root mounted)"),
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("open_tree: expected -ENOENT"),
         }
     })
 }

@@ -48,7 +48,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use narf_filesystem::devfs_input::{DeviceKind, InputEventFile};
-use narf_input::evdev::{syn, DeviceCaps, DeviceId, DeviceNode, EvdevEvent, EventType, ROUTER};
+use narf_input::evdev::{syn, DeviceCaps, DeviceId, DeviceNode, EventType, ROUTER};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::hid::keyboard::{

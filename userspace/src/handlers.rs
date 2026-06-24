@@ -20244,6 +20244,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "epoll_pwait",
         RawFnHandler(crate::epoll::sys_epoll_wait),
     );
+    table.install_raw(
+        Syscall::PerfEventOpen,
+        "perf_event_open",
+        RawFnHandler(crate::perf_event::sys_perf_event_open),
+    );
 
     // Loadable kernel modules.
     table.install_raw(
