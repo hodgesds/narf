@@ -502,8 +502,11 @@ fn smoke_x86_64_shoot_range_one_ipi() -> TestResult {
         ipi::shoot_range(0xFFFF_FFFF_8000_0000, 8, 0);
     }
     let after = ipi::ack_count(1);
-    if after - before != 1 {
-        return TestResult::Fail("8-page range cost more than 1 IPI");
+    let diff = after.wrapping_sub(before);
+    if diff != 1 {
+        return TestResult::Fail(
+            alloc::format!("8-page range cost more than 1 IPI: diff={}", diff).leak(),
+        );
     }
     TestResult::Pass
 }

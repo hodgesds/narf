@@ -1207,3 +1207,33 @@ fn smoke_sound_sysfs_and_devfs_hook_e2e() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("sysfs_e2e/sound", smoke_sound_sysfs_and_devfs_hook_e2e);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Smoke 13 — drm sysfs /sys/class/drm
+//
+// Linux ref: Documentation/ABI/testing/sysfs-class-drm
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_sysfs_e2e() -> TestResult {
+    sysfs_reset();
+
+    let class = class_register("drm");
+    let card_kobj = class_device_register(class, "card0");
+
+    kobject_add_attr(&card_kobj, "dev", || "226:0\n".to_string());
+
+    match attr_show_trimmed(&card_kobj, "dev").as_deref() {
+        Some("226:0") => {}
+        other => {
+            sysfs_reset();
+            let _ = other;
+            return TestResult::Fail("drm/card0/dev ≠ '226:0'");
+        }
+    }
+
+    sysfs_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("sysfs_e2e/drm", smoke_drm_sysfs_e2e);

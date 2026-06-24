@@ -659,3 +659,120 @@ kernel_test_in!(
     "filesystem/procfs/sys_kernel",
     smoke_kernel_perf_event_paranoid_validation
 );
+
+fn smoke_kernel_domainname_default() -> TestResult {
+    register_all();
+    *DOMAINNAME.lock() = String::from("(none)");
+    match read_sys("kernel/domainname") {
+        Some(s) if s == "(none)\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/domainname default mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_domainname_default
+);
+
+fn smoke_kernel_osrelease_format() -> TestResult {
+    register_all();
+    match read_sys("kernel/osrelease") {
+        Some(s) if !s.trim().is_empty() => TestResult::Pass,
+        _ => TestResult::Fail("kernel/osrelease missing or empty"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_osrelease_format
+);
+
+fn smoke_kernel_version_format() -> TestResult {
+    register_all();
+    match read_sys("kernel/version") {
+        Some(s) if s.contains("NARF") && s.contains("SMP") => TestResult::Pass,
+        _ => TestResult::Fail("kernel/version mismatch"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_version_format);
+
+fn smoke_kernel_threads_max_default() -> TestResult {
+    register_all();
+    THREADS_MAX.store(65536, Ordering::Relaxed);
+    match read_sys("kernel/threads-max") {
+        Some(s) if s == "65536\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/threads-max mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_threads_max_default
+);
+
+fn smoke_kernel_panic_default() -> TestResult {
+    register_all();
+    PANIC_SECS.store(0, Ordering::Relaxed);
+    match read_sys("kernel/panic") {
+        Some(s) if s == "0\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/panic mismatch"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_panic_default);
+
+fn smoke_kernel_panic_on_oops_default() -> TestResult {
+    register_all();
+    PANIC_ON_OOPS.store(0, Ordering::Relaxed);
+    match read_sys("kernel/panic_on_oops") {
+        Some(s) if s == "0\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/panic_on_oops mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_panic_on_oops_default
+);
+
+fn smoke_kernel_sched_rt_runtime_us_default() -> TestResult {
+    register_all();
+    SCHED_RT_RUNTIME_US.store(950000, Ordering::Relaxed);
+    match read_sys("kernel/sched_rt_runtime_us") {
+        Some(s) if s == "950000\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/sched_rt_runtime_us mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_sched_rt_runtime_us_default
+);
+
+fn smoke_kernel_sched_rt_period_us_default() -> TestResult {
+    register_all();
+    SCHED_RT_PERIOD_US.store(1000000, Ordering::Relaxed);
+    match read_sys("kernel/sched_rt_period_us") {
+        Some(s) if s == "1000000\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/sched_rt_period_us mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_sched_rt_period_us_default
+);
+
+fn smoke_kernel_printk_default() -> TestResult {
+    register_all();
+    match read_sys("kernel/printk") {
+        Some(s) if s == "4 4 1 7\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/printk mismatch"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_printk_default);
+
+fn smoke_kernel_entropy_avail_default() -> TestResult {
+    register_all();
+    match read_sys("kernel/random/entropy_avail") {
+        Some(s) if s == "256\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/random/entropy_avail mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_entropy_avail_default
+);
