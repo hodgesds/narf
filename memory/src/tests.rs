@@ -6052,3 +6052,97 @@ fn smoke_pluggable_pager() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_pluggable_pager);
+
+// ── mmap-at-scale: replay ld-musl's per-DSO reserve→MAP_FIXED→mprotect
+//    pattern many times and prove every mapping stays correct ──────────
+//
+// Loading a large shared-library closure (Mesa + LLVM ≈ 48 DSOs) runs, per
+// DSO: (1) reserve the whole span PROT_NONE (lazy/anonymous), (2) MAP_FIXED
+// real segments over it (punch the reservation + install), (3) mprotect a
+// sub-range RO (RELRO). Each operation is fine in isolation, but at scale the
+// region table + page tables must stay consistent across hundreds of
+// split/overlay/mprotect operations. This stamps every segment frame with a
+// unique magic, runs the pattern 80× (> the Mesa closure), then verifies
+// EVERY segment still translates to ITS frame and still holds ITS magic — a
+// regression guard for region-list / MAP_FIXED-overlay / mprotect-split
+// corruption that only shows up under a big dlopen closure.
+#[cfg(target_arch = "x86_64")]
+fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(x) => x,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    const N: u64 = 80;
+    const SPAN: u64 = 6 * 0x1000;
+    let base = 0x0000_4080_0000_0000u64; // the real user mmap-arena range
+    let mut recs: alloc::vec::Vec<(u64, PhysAddr, u64)> = alloc::vec::Vec::new();
+
+    for i in 0..N {
+        let b = base + i * SPAN;
+        if a
+            .map_region(Region {
+                base: VirtAddr::new(b),
+                len: SPAN,
+                perms: RegionPerms(0),
+                phys: alloc::vec![PhysAddr::new(0); (SPAN >> 12) as usize],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("reserve (PROT_NONE span) map_region failed");
+        }
+        for &pg in &[1u64, 3u64] {
+            let va = b + pg * 0x1000;
+            let frame = match crate::alloc_frame() {
+                Ok(f) => f.start_address(),
+                Err(_) => return TestResult::Skip("frame allocator drained"),
+            };
+            let magic = 0xA5A5_0000_0000_0000u64 ^ (i << 12) ^ pg;
+            // SAFETY: freshly-allocated identity-mapped frame; stamp the page.
+            unsafe {
+                let p = frame.kernel_mut_ptr::<u64>();
+                for k in 0..512 {
+                    p.add(k).write(magic);
+                }
+            }
+            let _ = a.punch_fixed(VirtAddr::new(va), 0x1000);
+            if a
+                .map_region(Region {
+                    base: VirtAddr::new(va),
+                    len: 0x1000,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: alloc::vec![frame],
+                })
+                .is_err()
+            {
+                return TestResult::Fail("segment MAP_FIXED map_region failed");
+            }
+            recs.push((va, frame, magic));
+        }
+        // SAFETY: fresh user root; installs only this DSO's PTEs.
+        if unsafe { a.materialize() }.is_err() {
+            return TestResult::Fail("materialize failed under scale");
+        }
+        // RELRO-style: drop the first segment to RO.
+        let _ = a.mprotect_range(VirtAddr::new(b + 0x1000), 0x1000, RegionPerms::READ);
+    }
+
+    for (va, frame, magic) in &recs {
+        // SAFETY: a.root is a live user PML4 from new_for_user.
+        match unsafe { paging::translate(a.root, VirtAddr::new(*va)) } {
+            Some(p) if p == *frame => {}
+            Some(_) => return TestResult::Fail("VA translated to the WRONG frame at scale"),
+            None => return TestResult::Fail("VA lost its mapping at scale"),
+        }
+        // SAFETY: identity-mapped frame; read its first stamped word.
+        let got = unsafe { frame.kernel_ptr::<u64>().read() };
+        if got != *magic {
+            return TestResult::Fail("frame content corrupted at scale");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_mmap_scale_overlay_pattern_stays_consistent);
