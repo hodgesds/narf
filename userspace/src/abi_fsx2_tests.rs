@@ -632,17 +632,26 @@ fn smoke_abi_fsx2_move_mount_relpath_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_move_mount_relpath_neg);
 
-// ── open_tree: ENOENT on an absolute path with no mount ───────────────
+// ── open_tree: ENOENT on an absolute path with no covering mount ──────
 //
-// path is absolute (passes the EINVAL guard) but fs_arc_at returns None →
-// ENOENT. The first file's negative pins EINVAL (relative path).
+// path is absolute (passes the EINVAL guard). open_tree resolves it via
+// `fs_arc_at`, which special-cases a "/" root mount as a fallback matching
+// EVERY absolute path. Whether a root mount is present when this test runs
+// depends on boot-initcall ordering (the initramfs / auto-root disk mount at
+// "/" may or may not have landed yet) — the same flakiness documented on
+// `smoke_filesystem_resolve_absolute`. So accept either outcome: ENOENT when
+// nothing covers the path, or a valid fd when a root mount does cover it.
 
 fn smoke_abi_fsx2_open_tree_enoent_neg() -> TestResult {
     with_setup(|| {
         let path = b"/abi-no-mount-here\0";
+        let root_present = registry().list().iter().any(|p| p == "/");
         match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
-            Some(v) if v == ENOENT => Ok(()),
-            _ => Err("open_tree of an absolute path with no mount must return -ENOENT"),
+            // No root mount → the path is genuinely uncovered → -ENOENT.
+            Some(v) if v == ENOENT && !root_present => Ok(()),
+            // Root mounted → fs_arc_at's "/" fallback covers it → a valid fd.
+            Some(v) if v >= 0 && root_present => Ok(()),
+            _ => Err("open_tree: expected -ENOENT (no root mount) or a valid fd (root mounted)"),
         }
     })
 }
