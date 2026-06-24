@@ -3121,7 +3121,7 @@ pub mod linux_compat {
 // Build a Linux-shaped struct stat from a `narf_filesystem::Stat`.
 // Same conventions as sys_statx (uid/gid/atime not tracked).
 #[cfg(feature = "linux-compat")]
-fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64) -> linux_compat::Stat {
+fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64, ino: u64) -> linux_compat::Stat {
     let ftype_bits: u32 = match s.mode.file_type {
         narf_filesystem::FileType::File => 0o100000,
         narf_filesystem::FileType::Dir => 0o040000,
@@ -3137,7 +3137,15 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64) -> linux_compat::Stat
     };
     linux_compat::Stat {
         st_dev: 0,
-        st_ino: (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff,
+        // Prefer the filesystem's real inode (distinct per file). Only fall
+        // back to the size/mtime hash for synthetic filesystems that report
+        // no inode (ino == 0) — and never for disk files, whose same-size
+        // libraries would otherwise alias and break musl's DSO dedup.
+        st_ino: if ino != 0 {
+            ino
+        } else {
+            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
+        },
         st_nlink: 1,
         st_mode: mode_word,
         st_uid: 0,
@@ -3196,8 +3204,8 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
-    let s = match stat_path_dir_aware(path) {
-        Some(s) => s,
+    let (s, ino) = match stat_ino_path_dir_aware(path) {
+        Some(pair) => pair,
         None => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
             // like libwayland's wl_socket_lock require the real errno.
@@ -3207,7 +3215,7 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     };
     // Path-based stat doesn't carry the FileOps, so rdev isn't available here
     // (device nodes report it via fstat on the opened fd — what libinput uses).
-    let out = linux_stat_from_fs(s, 0);
+    let out = linux_stat_from_fs(s, 0, ino);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment
@@ -3238,15 +3246,16 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
-    let stat = fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.stat(), e.ops.rdev())));
-    let (s, rdev) = match stat {
-        Some(Some(pair)) => pair,
+    let stat =
+        fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.stat(), e.ops.rdev(), e.ops.ino())));
+    let (s, rdev, ino) = match stat {
+        Some(Some(triple)) => triple,
         _ => {
             ctx.set_return(fail);
             return;
         }
     };
-    let out = linux_stat_from_fs(s, rdev);
+    let out = linux_stat_from_fs(s, rdev, ino);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment
@@ -3361,7 +3370,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
             return;
         }
         let task = current_task_id();
-        fd::with_table(task, |t| t.get(dirfd as u32).map(|e| e.ops.stat())).flatten()
+        fd::with_table(task, |t| t.get(dirfd as u32).map(|e| (e.ops.stat(), e.ops.ino())))
+            .flatten()
     } else {
         let raw = match copy_user_cstr(path_uptr, 4096) {
             Some(s) => s,
@@ -3373,11 +3383,11 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         // resolve_cwd_path resolves against the cwd AND re-roots under
         // the task's chroot — applying apply_chroot again double-composes.
         let path_owned = resolve_cwd_path(current_task_id(), &raw);
-        stat_path_dir_aware(&path_owned)
+        stat_ino_path_dir_aware(&path_owned)
     };
 
-    let s = match fs_stat {
-        Some(s) => s,
+    let (s, ino) = match fs_stat {
+        Some(pair) => pair,
         None => {
             // File doesn't exist — report ENOENT, not the bare -1 sentinel
             // (which musl maps to EPERM). Callers that probe for a path's
@@ -3427,7 +3437,11 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         stx_blocks: s.blocks,
         stx_mtime: mtime,
         stx_ctime: mtime,
-        stx_ino: (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff,
+        stx_ino: if ino != 0 {
+            ino
+        } else {
+            (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
+        },
         stx_nlink: 1,
         stx_mask: filled
             & if mask == 0 {
@@ -12489,6 +12503,14 @@ fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesyst
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
+    stat_ino_path_dir_aware(path).map(|(s, _ino)| s)
+}
+
+// Same resolution as `stat_path_dir_aware`, but also returns the file's
+// real inode number (0 for synthetic FS / dir-root synthesis). Used by
+// the stat/statx handlers so the Linux `st_ino` is a stable per-file id
+// rather than a size-derived hash that aliases same-size DSOs.
+fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64)> {
     let file = narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
             if rel.is_empty() {
@@ -12504,7 +12526,7 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
                 // "not found" inside a mounted distro rootfs.
                 poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
                     .and_then(|r| r.ok())
-                    .map(|ops| ops.stat())
+                    .map(|ops| (ops.stat(), ops.ino()))
             }
         })
         .flatten();
@@ -12512,12 +12534,15 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
         return file;
     }
     if resolve_dir_absolute(path).is_some() {
-        return Some(narf_filesystem::Stat {
-            size: 0,
-            blocks: 0,
-            mode: narf_filesystem::Mode::DIR_RW,
-            mtime_cycles: 0,
-        });
+        return Some((
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::DIR_RW,
+                mtime_cycles: 0,
+            },
+            0,
+        ));
     }
     None
 }

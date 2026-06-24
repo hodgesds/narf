@@ -358,6 +358,20 @@ pub trait FileOps: Send + Sync {
     /// cheaply.
     fn stat(&self) -> Stat;
 
+    /// Stable inode identity for this file, unique within its filesystem.
+    /// Disk-backed filesystems return the real on-disk inode number;
+    /// synthetic filesystems leave the default `0` (meaning "no stable
+    /// inode"). Callers that need a Linux `st_ino` MUST use a real value
+    /// here when non-zero — musl's dynamic linker dedups DSOs by
+    /// `(st_dev, st_ino)`, so two distinct libraries that report the same
+    /// inode collapse into one and the second's symbols vanish. A
+    /// synthetic `size`-derived `st_ino` collides for same-size libs (the
+    /// 8 same-size `libxcb-*.so` are the canonical failure), which is why
+    /// this must come from the filesystem, not be fabricated downstream.
+    fn ino(&self) -> u64 {
+        0
+    }
+
     /// Asynchronous stat — required for disk-backed or remote FS.
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move { Ok(self.stat()) })

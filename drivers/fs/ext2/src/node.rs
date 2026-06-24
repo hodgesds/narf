@@ -240,6 +240,12 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         self.state.lock().stat
     }
 
+    fn ino(&self) -> u64 {
+        // Real on-disk inode number — distinct per file, so musl's
+        // DSO dedup by (st_dev, st_ino) never collapses two libraries.
+        self.state.lock().inode_no as u64
+    }
+
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move {
             let _ = self.load_inode().await?;

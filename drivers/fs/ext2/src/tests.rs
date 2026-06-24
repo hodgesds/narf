@@ -498,6 +498,46 @@ fn smoke_ext2_read_partial_offset() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_read_partial_offset);
 
+fn smoke_ext2_ino_is_real_inode_number() -> TestResult {
+    // Regression guard for the musl DSO-dedup bug. ld-musl dedups shared
+    // libraries by (st_dev, st_ino); when ext2 reported no inode and the
+    // syscall layer synthesised st_ino from the file SIZE, the 8 same-size
+    // `libxcb-*.so` (all 18136 bytes) aliased to one inode, so the linker
+    // loaded only the first and every later lib's symbols (e.g.
+    // `xcb_dri2_query_version_reply`) vanished with "symbol not found".
+    // The fix: `FileOps::ino()` returns the real on-disk inode number, so
+    // distinct files always carry distinct inodes regardless of size.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let payload = b"narf-ext2\n";
+    let img = build_ext2_image(payload);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup data failed"),
+    };
+    // `data` is inode 12 in build_ext2_image. Pre-fix, ino() defaulted to
+    // 0 for every node — a universal collision.
+    if file.ino() != 12 {
+        return TestResult::Fail("ext2 ino() is not the real on-disk inode (12)");
+    }
+    // And it must NOT be the size-derived hash that aliased same-size libs:
+    // payload is 10 bytes, so a size<<1 value would be 20, never 12.
+    if file.ino() == (file.stat().size << 1) {
+        return TestResult::Fail("ino() looks size-derived — same-size files would alias");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_ino_is_real_inode_number);
+
 // Ensure the helper is exercised even when some local closures are
 // inlined by the optimizer.
 #[allow(dead_code)]
