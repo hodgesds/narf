@@ -902,22 +902,20 @@ fn ahci_image_path() -> PathBuf {
 fn virtio_blk_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-vblk.img");
-    // Minimal ext2 image containing `/hello.txt` so the boot path's
-    // Stage::Late `mnt-mount-ext2` initcall can mount it at /mnt, plus a
-    // seeded `(i*0x97)&0xFF` pattern at LBA 0 for the raw-sector-read smokes.
-    // Mirrors drivers/fs/ext2/src/tests.rs build_ext2_image.
-    //
-    // Regenerate whenever the on-disk bytes differ from what we'd build (or
-    // the file is absent). The old `if !path.exists()` guard let a stale or
-    // wrong-sized leftover — e.g. an unrelated 64 MiB artifact with a zeroed
-    // sector 0 — permanently shadow the seed, which made the virtio-blk
-    // read-pattern smokes fail with "pattern mismatch".
-    let img = build_ext2_disk_image(b"hello.txt", b"hello from disk\n");
-    let stale = std::fs::read(&path).map(|b| b != img).unwrap_or(true);
-    if stale {
+    // CREATE-ONLY — do NOT overwrite an existing image. This path is shared:
+    // `REGEN_alpine_rootfs.sh` builds the real ~28 MiB Alpine rootfs here for
+    // the musl-demo / stress-ng / oci chroot tests, and xtask "uses it
+    // verbatim when it already exists". Only when it's ABSENT do we drop a
+    // minimal ext2 placeholder containing `/hello.txt` (so the boot's
+    // `mnt-mount-ext2` initcall has something to mount at /mnt, plus a seeded
+    // `(i*0x97)&0xFF` pattern at LBA 0 for the kernel-test raw-sector smokes).
+    // An always-regenerate variant clobbers the Alpine rootfs on every
+    // kernel-test run and breaks musl-demo.
+    if !path.exists() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let img = build_ext2_disk_image(b"hello.txt", b"hello from disk\n");
         let _ = std::fs::write(&path, &img);
     }
     path
