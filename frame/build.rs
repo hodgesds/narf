@@ -11,8 +11,19 @@
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(usmp_active)");
     let smp = std::env::var_os("CARGO_FEATURE_USER_TASK_SMP").is_some();
-    let ktest = std::env::var_os("CARGO_FEATURE_KERNEL_TEST").is_some();
-    if smp && !ktest {
+    let _ktest = std::env::var_os("CARGO_FEATURE_KERNEL_TEST").is_some();
+    // Emit `usmp_active` whenever `user-task-smp` is on — INCLUDING the
+    // kernel-test build. This previously also required `!kernel-test`, on the
+    // theory that the kernel-test APs "only ever run kernel tasks" and so
+    // don't need the per-CPU GDT/TSS/rsp0/IST + larger AP stacks that
+    // `gdt::init_ap`/`percpu::init_ap` install. That was wrong and corrupted
+    // memory: the 16 kernel-test APs shared the BSP's TSS/IST on 4 KiB
+    // stacks, and concurrent traps (notably the TLB-shootdown IPI under
+    // mmap/munmap stress) clobbered each other's stacks — a layout-roulette
+    // garbage-context resume (#GP / #UD rip=0x3) that surfaced as the parked
+    // "sched-vtable-uaf". Per-CPU AP trap stacks are required for SMP
+    // correctness regardless of whether user tasks run on the APs.
+    if smp {
         println!("cargo:rustc-cfg=usmp_active");
     }
 }
