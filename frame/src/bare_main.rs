@@ -1663,9 +1663,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     if started > 0 {
                         narf_scheduler::enable_work_stealing();
                         let _ = writeln!(console::Writer, "  smp: work-stealing enabled");
-                        // User-task SMP migration — ON by default (the
-                        // `user-task-smp` feature is in frame's default set;
-                        // `usmp_active` = that feature AND not kernel-test).
+                        // User-task SMP migration — gated on the
+                        // `user-task-smp` feature (in frame's default set).
+                        // The per-CPU AP hardware setup is unconditional; this
+                        // gate is only the runtime *migration* enable.
                         // The dynamic-linker / shootdown deadlock + AP
                         // EFER/CR4 gaps are fixed, so we actually enable
                         // migration here. Still gated on x2APIC: the cross-CPU
@@ -1675,7 +1676,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // can't invalidate peer TLBs, so a thread group
                         // sharing an address space across cores would
                         // use-after-unmap — there we leave tasks BOOT-pinned.
-                        #[cfg(usmp_active)]
+                        #[cfg(feature = "user-task-smp")]
                         {
                             let x2apic_active = narf_interrupts::x86_64::apic::X2APIC_ACTIVE
                                 .load(core::sync::atomic::Ordering::Acquire);

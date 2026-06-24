@@ -168,12 +168,15 @@ cgroup-all = [
     "cgroup-psi",
 ]
 
-# Default feature set. `user-task-smp` is on by default; it is internally
-# re-gated to the `usmp_active` cfg (this feature AND not `kernel-test`,
-# see build.rs) so the kernel-test harness binary stays byte-identical —
-# migration is runtime-disabled there regardless, and compiling the dead
-# per-AP machinery would shift `.text` enough to tip a marginal-buddy
-# smoke. Strip with `--no-default-features` to pin user tasks to the BSP.
+# Default feature set. `user-task-smp` is on by default. It gates ONLY the
+# user-task-specific per-AP behaviour: runtime cross-CPU migration
+# (`enable_user_task_smp`) and the syscall-body IRQ window (`sti`/`cli`).
+# The per-CPU AP HARDWARE setup — per-CPU GDT/TSS/rsp0/IST, GS.base,
+# EFER.NXE, CR4/SSE/XSAVE parity, and 64 KiB AP stacks — is UNCONDITIONAL:
+# required for any AP to take traps/IRQs/IPIs correctly regardless of whether
+# user tasks run there (sharing the BSP's TSS/IST corrupts memory — that was
+# a long-lived heisenbug). `--no-default-features` pins user tasks to the
+# BSP; the per-CPU AP setup stays on either way.
 default = ["user-task-smp"]
 
 # User-task SMP: let USER tasks migrate onto application processors.

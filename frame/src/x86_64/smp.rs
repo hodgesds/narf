@@ -24,9 +24,6 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::fmt::Write;
 use narf_console::Writer;
 
-#[cfg(not(usmp_active))]
-use narf_memory::alloc_frame;
-#[cfg(usmp_active)]
 use narf_memory::alloc_pages_on;
 
 /// Where the AP trampoline lives at runtime. SIPI vector = 0x08
@@ -43,22 +40,15 @@ const SIPI_VECTOR_PAGE: u8 = (TRAMPOLINE_PHYS >> 12) as u8;
 #[unsafe(no_mangle)]
 static mut AP_STACKS: [u64; narf_lib::percpu::MAX_CPUS] = [0u64; narf_lib::percpu::MAX_CPUS];
 
-/// AP kernel stack order. With user-task SMP enabled, an AP runs the
-/// full executor INCLUDING user-task dispatch (`run_until_empty` → AS
-/// activate → setjmp → `enter_user_mode` → the deep longjmp-return
-/// path), which overflows the 4 KiB WFI-parking stack and corrupts
-/// adjacent state (observed as a bogus victim index panicking in the
-/// work-steal path) — so it needs a larger, contiguous stack
-/// (order-4 = 16 frames = 64 KiB). When `usmp_active` is off (the
-/// kernel-test harness, or a `--no-default-features` build) APs only
-/// ever run kernel tasks, which fit the original single page; keeping it
-/// at one frame avoids the extra boot-time buddy pressure (high-order
-/// blocks × every AP) that can starve a later driver's DMA allocation on
-/// a marginal buddy.
-#[cfg(usmp_active)]
+/// AP kernel stack order. An AP runs the full executor (`run_until_empty`
+/// → dispatch → trap/IPI handling, and under the `user-task-smp` feature
+/// also AS activate → setjmp → `enter_user_mode` → the deep longjmp-return
+/// path), which overflows a 4 KiB stack and corrupts adjacent state — so
+/// it needs a larger, contiguous stack (order-4 = 16 frames = 64 KiB).
+/// This is unconditional: any AP that runs the executor and takes
+/// concurrent traps/IPIs needs the depth, independent of whether user
+/// tasks are scheduled on it.
 const AP_STACK_ORDER: u8 = 4;
-#[cfg(not(usmp_active))]
-const AP_STACK_ORDER: u8 = 0;
 const AP_STACK_PAGES: usize = 1 << AP_STACK_ORDER;
 
 extern "C" {
@@ -225,7 +215,15 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //     TR is valid.
     // SAFETY: kernel mode, IRQs masked, global allocator up (heap was
     // promoted to slab before start_aps); runs exactly once per AP.
-    #[cfg(usmp_active)]
+    //
+    // UNCONDITIONAL: per-CPU GDT/TSS/rsp0 + the four IST stacks, the GS.base
+    // PerCpu pointer, EFER.NXE, and the CR4/SSE/XSAVE parity bits are all
+    // hardware per-CPU state required for an AP to take traps/IRQs/IPIs
+    // correctly and concurrently with other CPUs — NOT a function of whether
+    // user tasks are scheduled here. Sharing the BSP's TSS/IST is always a
+    // latent corruption bug (two CPUs' trap frames collide on one stack), and
+    // skipping OSXSAVE crashes the AP on its first `xsetbv`. The user-task
+    // feature only gates *runtime* migration + the syscall IRQ window.
     unsafe {
         let rsp0_top = super::gdt::init_ap();
         super::percpu::init_ap(id, rsp0_top);
@@ -397,45 +395,16 @@ pub unsafe fn start_aps() -> u32 {
     let mut viable_buf = [0u32; narf_lib::percpu::MAX_CPUS];
     let mut viable_len: usize = 0;
     for logical in 1..total {
-        // With user-task SMP: one CONTIGUOUS order-4 block (64 KiB) —
-        // the AP runs deep user-task dispatch and needs a single
-        // usable stack range (the old per-page loop only used the
-        // first frame's top, assuming contiguity it never guaranteed).
-        #[cfg(usmp_active)]
+        // One CONTIGUOUS order-4 block (64 KiB) per AP — the AP runs the
+        // deep executor dispatch + trap/IPI handling and needs a single
+        // usable stack range (a per-page loop only used the first frame's
+        // top, assuming a contiguity it never guaranteed).
         let stack_top: u64 = match alloc_pages_on(0, AP_STACK_ORDER) {
             Ok(f) => f.start_address().raw() + (AP_STACK_PAGES as u64 * 4096),
             Err(_) => {
                 let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
                 continue;
             }
-        };
-        // Without it (default): APs run kernel tasks only — one page
-        // via the frame allocator, byte-for-byte the pre-branch path.
-        // Crucially this leaves the boot-time buddy state unchanged
-        // from `main`, since the kernel-test buddy is marginal and a
-        // shifted free-list tips a later driver's DMA probe into a
-        // host QEMU SIGSEGV.
-        #[cfg(not(usmp_active))]
-        let stack_top: u64 = {
-            let mut top: u64 = 0;
-            for _ in 0..AP_STACK_PAGES {
-                match alloc_frame() {
-                    Ok(f) => {
-                        let base = f.start_address().raw();
-                        if top == 0 {
-                            top = base + 4096;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
-                        break;
-                    }
-                }
-            }
-            if top == 0 {
-                continue;
-            }
-            top
         };
         // SAFETY: AP_STACKS is in .data; the only writer is the BSP
         // during this start_aps call, before the AP runs.

@@ -81,25 +81,25 @@ const SFMASK_BITS: u64 = RFLAGS_IF | RFLAGS_DF | RFLAGS_TF | RFLAGS_AC;
 // reaching `halt_until_irq` wedges; see `user_task.rs`'s pre-iretq
 // `cli`). The macros expand to a no-op (empty) asm line when off, so
 // the feature-off code path is byte-identical to before.
-#[cfg(usmp_active)]
+#[cfg(feature = "user-task-smp")]
 macro_rules! syscall_irq_on {
     () => {
         "sti"
     };
 }
-#[cfg(not(usmp_active))]
+#[cfg(not(feature = "user-task-smp"))]
 macro_rules! syscall_irq_on {
     () => {
         ""
     };
 }
-#[cfg(usmp_active)]
+#[cfg(feature = "user-task-smp")]
 macro_rules! syscall_irq_off {
     () => {
         "cli"
     };
 }
-#[cfg(not(usmp_active))]
+#[cfg(not(feature = "user-task-smp"))]
 macro_rules! syscall_irq_off {
     () => {
         ""
