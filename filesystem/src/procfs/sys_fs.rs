@@ -396,3 +396,63 @@ kernel_test_in!(
     "filesystem/procfs/sys_fs",
     smoke_fs_lease_break_time_default
 );
+
+fn smoke_fs_nr_open_default() -> TestResult {
+    ensure_registered();
+    NR_OPEN.store(1024, Ordering::Relaxed);
+    match sysctl_read(&["sys", "fs", "nr_open"]) {
+        Some(s) if s == "1024\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/nr_open default should be '1024\\n'"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_nr_open_default);
+
+fn smoke_fs_pipe_user_pages_hard_default() -> TestResult {
+    ensure_registered();
+    PIPE_USER_PAGES_HARD.store(0, Ordering::Relaxed);
+    match sysctl_read(&["sys", "fs", "pipe-user-pages-hard"]) {
+        Some(s) if s == "0\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/pipe-user-pages-hard default should be '0\\n'"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_pipe_user_pages_hard_default);
+
+fn smoke_fs_inotify_max_user_instances_default() -> TestResult {
+    ensure_registered();
+    INOTIFY_MAX_USER_INSTANCES.store(128, Ordering::Relaxed);
+    match sysctl_read(&["sys", "fs", "inotify", "max_user_instances"]) {
+        Some(s) if s == "128\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/inotify/max_user_instances default should be '128\\n'"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_inotify_max_user_instances_default);
+
+fn smoke_fs_inotify_max_queued_events_default() -> TestResult {
+    ensure_registered();
+    INOTIFY_MAX_QUEUED_EVENTS.store(16384, Ordering::Relaxed);
+    match sysctl_read(&["sys", "fs", "inotify", "max_queued_events"]) {
+        Some(s) if s == "16384\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/inotify/max_queued_events default should be '16384\\n'"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_inotify_max_queued_events_default);
+
+fn smoke_fs_aio_max_nr_default() -> TestResult {
+    ensure_registered();
+    AIO_MAX_NR.store(65536, Ordering::Relaxed);
+    match sysctl_read(&["sys", "fs", "aio-max-nr"]) {
+        Some(s) if s == "65536\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/aio-max-nr default should be '65536\\n'"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_aio_max_nr_default);
+
+fn smoke_fs_epoll_max_user_watches_default() -> TestResult {
+    ensure_registered();
+    EPOLL_MAX_USER_WATCHES.store(1048576, Ordering::Relaxed);
+    match sysctl_read(&["sys", "fs", "epoll", "max_user_watches"]) {
+        Some(s) if s == "1048576\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/epoll/max_user_watches default should be '1048576\\n'"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_epoll_max_user_watches_default);
