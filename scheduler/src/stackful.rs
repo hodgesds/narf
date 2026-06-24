@@ -187,10 +187,10 @@ static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
 struct PerCpuExecCtx {
     inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
 }
+#[cfg(target_arch = "x86_64")]
 // SAFETY: each CPU accesses only `inner[its-own-cpu]`, non-re-entrantly
 // (no nested stackful polls), so there is never concurrent or aliasing
 // access to a single slot despite the shared-static `&`.
-#[cfg(target_arch = "x86_64")]
 unsafe impl Sync for PerCpuExecCtx {}
 #[cfg(target_arch = "x86_64")]
 static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
