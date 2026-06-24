@@ -522,12 +522,16 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_pos);
 
 fn smoke_abi_proc_wait4_wnohang_no_child() -> TestResult {
     with_setup(|| {
-        // wait4(-1, NULL, WNOHANG, NULL) with no pending child → 0
-        // (no child ready). WNOHANG == 1.
+        // wait4(-1, NULL, WNOHANG, NULL) with NO children at all → -ECHILD.
+        // Linux (kernel/exit.c __do_wait): notask_error stays -ECHILD and
+        // WNOHANG only turns it into 0 when an *eligible* (living, unreaped)
+        // child exists. FAKE_TASK has no children, so the handler's
+        // has_living_child gate returns -ECHILD before the WNOHANG
+        // short-circuit. WNOHANG == 1.
         const WNOHANG: u64 = 1;
         match call(Syscall::Wait4.raw(), a3((-1i64) as u64, 0, WNOHANG, 0)) {
-            Some(0) => Ok(()),
-            _ => Err("wait4 WNOHANG with no child did not return 0"),
+            Some(v) if v == ECHILD => Ok(()),
+            _ => Err("wait4 WNOHANG with no child must return -ECHILD"),
         }
     })
 }

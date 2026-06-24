@@ -2033,7 +2033,10 @@ fn smoke_wave37_three_children_sequential_reap() -> TestResult {
         }
     }
 
-    // Fourth call: queue empty → 0.
+    // Fourth call: all three children reaped → none remain eligible, so
+    // Linux returns -ECHILD (kernel/exit.c: notask_error stays -ECHILD;
+    // WNOHANG yields 0 only while an eligible-but-unreaped child exists).
+    // The handler's has_living_child gate returns -ECHILD here. ECHILD = -10.
     let mut ctx = StubCtx {
         args: SyscallArgs {
             arg0: (-1i64) as u64,
@@ -2047,10 +2050,10 @@ fn smoke_wave37_three_children_sequential_reap() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
     match ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == -10 => {}
         _ => {
             teardown_process_state();
-            return TestResult::Fail("sequential reap: 4th WNOHANG should return 0");
+            return TestResult::Fail("sequential reap: 4th WNOHANG should return -ECHILD");
         }
     }
 
