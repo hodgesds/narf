@@ -72,12 +72,115 @@ impl WallInstant {
 // is atomic so a concurrent `set_wall_offset` never produces a torn
 // read.
 
-/// Calibration: how many cycles per nanosecond the platform ticks.
-/// 1 cycle ≈ 0.3 ns at 3 GHz; the Stage-4 calibration-from-CPUID
-/// path will replace the hard-coded `CYCLES_PER_NS = 3` with a
-/// measured value. `1` as the default keeps the arithmetic stable
-/// when the platform hasn't calibrated.
+/// Calibration: how many cycles per nanosecond the platform ticks,
+/// as a truncated integer. Kept only for coarse callers (driver
+/// busy-waits) that multiply `ns * cycles_per_ns()`; the precise
+/// time paths use the `(mult, shift)` pairs below. `1` as the
+/// default keeps the arithmetic stable before calibration.
 static CYCLES_PER_NS: AtomicU32 = AtomicU32::new(1);
+
+/// Fixed-point scale for the cycles→ns conversion: `ns = (cyc *
+/// C2N_MULT) >> C2N_SHIFT`, computed via `calc_mult_shift` at
+/// calibration. This mirrors Linux's `cyc2ns` (arch/x86/kernel/tsc.c):
+/// a 64×32→128-bit multiply then a shift is exact to <1 ppm, where the
+/// old integer `cyc / cycles_per_ns` truncated 2.397 GHz → 2 (a ~20%
+/// error). Defaults to the identity (mult=1, shift=0) so an
+/// uncalibrated read returns raw cycles, matching the old `/1` fallback.
+static C2N_MULT: AtomicU32 = AtomicU32::new(1);
+static C2N_SHIFT: AtomicU32 = AtomicU32::new(0);
+
+/// Fixed-point scale for the inverse ns→cycles conversion: `cyc =
+/// (ns * N2C_MULT) >> N2C_SHIFT`. Used by `Deadline::after_ns` and
+/// any duration→cycles path so deadlines land at the true wall time
+/// instead of ~17% short.
+static N2C_MULT: AtomicU32 = AtomicU32::new(1);
+static N2C_SHIFT: AtomicU32 = AtomicU32::new(0);
+
+/// Compute a `(mult, shift)` pair such that `x * mult >> shift`
+/// converts a count measured at `from` Hz into one at `to` Hz, picking
+/// the largest shift (best precision) for which `mult` still fits in
+/// u32. Direct port of Linux `clocks_calc_mult_shift`
+/// (kernel/time/clocksource.c) with `maxsec` bounding the shift so a
+/// `maxsec`-second span can't overflow the runtime multiply; `maxsec
+/// == 0` disables that bound (mult-fits-u32 is then the only limit).
+fn calc_mult_shift(from: u32, to: u32, maxsec: u32) -> (u32, u32) {
+    if from == 0 || to == 0 {
+        return (1, 0);
+    }
+    // Bound the shift so `maxsec` seconds of `from` cycles times mult
+    // stays within 64 bits.
+    let mut sftacc: u32 = 32;
+    let mut tmp = ((maxsec as u64).saturating_mul(from as u64)) >> 32;
+    while tmp != 0 && sftacc > 0 {
+        tmp >>= 1;
+        sftacc -= 1;
+    }
+    // Find the largest shift whose resulting mult fits in `sftacc` bits.
+    let mut sft: u32 = 32;
+    let mut mult: u64 = 1;
+    while sft > 0 {
+        let mut t = (to as u64) << sft;
+        t += (from as u64) / 2; // round-to-nearest
+        t /= from as u64;
+        if (t >> sftacc) == 0 {
+            mult = t;
+            break;
+        }
+        sft -= 1;
+    }
+    (mult as u32, sft)
+}
+
+/// Calibrate every clock-scale constant from the measured TSC
+/// frequency in Hz. Computes Linux-style `mult/shift` fixed-point
+/// pairs for both conversion directions plus the legacy truncated
+/// integer. `arch/` calls this once at boot after frequency discovery.
+pub fn set_clock_hz(hz: u64) {
+    let hz = hz.max(1);
+    // khz fits u32 for any real CPU (≤ ~4.29 THz) and is the unit Linux
+    // feeds clocks_calc_mult_shift: cycles-per-ms ↔ ns-per-ms (1e6).
+    let khz = (hz / 1_000).clamp(1, u32::MAX as u64) as u32;
+    // cycles → ns: from khz (cyc/ms) to NSEC_PER_MSEC (ns/ms).
+    let (c2n_mult, c2n_shift) = calc_mult_shift(khz, 1_000_000, 0);
+    // ns → cycles: the inverse direction.
+    let (n2c_mult, n2c_shift) = calc_mult_shift(1_000_000, khz, 0);
+    C2N_MULT.store(c2n_mult.max(1), Ordering::Release);
+    C2N_SHIFT.store(c2n_shift, Ordering::Release);
+    N2C_MULT.store(n2c_mult.max(1), Ordering::Release);
+    N2C_SHIFT.store(n2c_shift, Ordering::Release);
+    // Legacy truncated integer, preserved for coarse busy-wait callers.
+    let cpns = (hz / 1_000_000_000).clamp(1, 6) as u32;
+    CYCLES_PER_NS.store(cpns, Ordering::Release);
+}
+
+/// Test-only: compute `cycles_to_ns(cyc)` for an explicit TSC `hz`
+/// without mutating the live calibration. Lets a smoke validate the
+/// fixed-point accuracy at a known frequency (e.g. 2.397 GHz, the case
+/// the old integer division got ~20% wrong) with no global side effect.
+#[doc(hidden)]
+pub fn __test_cyc_to_ns_for_hz(hz: u64, cyc: u64) -> u64 {
+    let khz = (hz.max(1) / 1_000).clamp(1, u32::MAX as u64) as u32;
+    let (mult, shift) = calc_mult_shift(khz, 1_000_000, 0);
+    ((cyc as u128 * mult as u128) >> shift) as u64
+}
+
+/// Convert raw TSC cycles to nanoseconds using the calibrated
+/// fixed-point scale. Exact to <1 ppm once calibrated; identity before.
+#[inline]
+pub fn cycles_to_ns(cyc: u64) -> u64 {
+    let mult = C2N_MULT.load(Ordering::Relaxed) as u128;
+    let shift = C2N_SHIFT.load(Ordering::Relaxed);
+    ((cyc as u128 * mult) >> shift) as u64
+}
+
+/// Convert a nanosecond duration to TSC cycles using the calibrated
+/// inverse scale. Use for any "wait N ns" → cycle-count conversion.
+#[inline]
+pub fn ns_to_cycles(ns: u64) -> u64 {
+    let mult = N2C_MULT.load(Ordering::Relaxed) as u128;
+    let shift = N2C_SHIFT.load(Ordering::Relaxed);
+    ((ns as u128 * mult) >> shift) as u64
+}
 
 /// Offset in nanoseconds applied to `monotonic_ns()` to get wall time.
 /// Atomic so the leap-smear worker can update it without locking.
@@ -134,17 +237,19 @@ pub fn begin_leap_smear(
     if window_ns == 0 {
         return Err(WallError::InvalidSmearWindow);
     }
-    let cpns = CYCLES_PER_NS.load(Ordering::Relaxed).max(1) as u64;
-    let end_cycles = now_cycles().saturating_add(window_ns.saturating_mul(cpns));
+    let end_cycles = now_cycles().saturating_add(ns_to_cycles(window_ns));
     SMEAR_END_CYCLES.store(end_cycles, Ordering::Release);
     SMEAR_DELTA_NS_REMAINING.store(delta_ns, Ordering::Release);
     Ok(())
 }
 
-/// Calibrate the cycles-per-ns constant. `arch/` calls this once at
-/// boot after TSC frequency discovery.
+/// Calibrate from an integer cycles-per-ns. Thin wrapper over
+/// `set_clock_hz` (treats `cpns` as `cpns` GHz) so callers that only
+/// have the coarse integer — and tests, which use `cpns == 1` for an
+/// identity cycle↔ns mapping — still populate the mult/shift pairs
+/// consistently. Prefer `set_clock_hz` when the precise Hz is known.
 pub fn set_cycles_per_ns(cpns: u32) {
-    CYCLES_PER_NS.store(cpns.max(1), Ordering::Release);
+    set_clock_hz(cpns.max(1) as u64 * 1_000_000_000);
 }
 
 /// Read the calibrated cycles-per-ns. Returns ≥ 1 even before
@@ -154,10 +259,12 @@ pub fn cycles_per_ns() -> u32 {
     CYCLES_PER_NS.load(Ordering::Relaxed).max(1)
 }
 
-/// Current monotonic-ns since boot (cycles ÷ cycles-per-ns).
+/// Current monotonic-ns since boot. Uses the calibrated mult/shift
+/// fixed-point scale (exact to <1 ppm) rather than the old lossy
+/// integer division.
 #[inline]
 pub fn monotonic_ns() -> u64 {
-    now_cycles() / CYCLES_PER_NS.load(Ordering::Relaxed).max(1) as u64
+    cycles_to_ns(now_cycles())
 }
 
 /// Read the wall-clock. Folds any in-progress leap smear into the
@@ -199,4 +306,8 @@ pub fn __test_reset() {
     SMEAR_END_CYCLES.store(0, Ordering::Release);
     SMEAR_DELTA_NS_REMAINING.store(0, Ordering::Release);
     CYCLES_PER_NS.store(1, Ordering::Release);
+    C2N_MULT.store(1, Ordering::Release);
+    C2N_SHIFT.store(0, Ordering::Release);
+    N2C_MULT.store(1, Ordering::Release);
+    N2C_SHIFT.store(0, Ordering::Release);
 }

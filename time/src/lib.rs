@@ -22,8 +22,9 @@ pub mod wall;
 
 mod tests;
 pub use wall::{
-    begin_leap_smear, cycles_per_ns, monotonic_ns, now_wall, set_cycles_per_ns, set_wall_offset,
-    set_wall_offset_uncapped, WallClock, WallError, WallInstant,
+    begin_leap_smear, cycles_per_ns, cycles_to_ns, monotonic_ns, now_wall, ns_to_cycles,
+    set_clock_hz, set_cycles_per_ns, set_wall_offset, set_wall_offset_uncapped, WallClock,
+    WallError, WallInstant,
 };
 
 use core::future::Future;
@@ -96,14 +97,19 @@ impl Instant {
 pub fn now_cycles() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        // RDTSC — not serialising; good enough for a Stage-1 monotonic tick.
-        // RDTSCP / CPUID-then-RDTSC for the serialising variant land in
-        // the Stage-2 time spec when ordering actually matters.
+        // LFENCE;RDTSC — the fence stops the out-of-order engine from
+        // hoisting/sinking the RDTSC past surrounding loads, so two
+        // reads on the same core never observe time going backwards.
+        // This matches Linux `rdtsc_ordered()` and `arch::tsc::rdtsc`;
+        // bare RDTSC (the old code here) is not ordered and can retire
+        // out of program order, breaking the monotonic guarantee that
+        // the wheel/Instant deadline math relies on.
         let low: u32;
         let high: u32;
-        // SAFETY: RDTSC is legal at CPL=0 and has no memory operand.
+        // SAFETY: LFENCE and RDTSC are legal at CPL=0 with no memory operand.
         unsafe {
             core::arch::asm!(
+                "lfence",
                 "rdtsc",
                 out("eax") low, out("edx") high,
                 options(nomem, nostack, preserves_flags),
@@ -273,8 +279,7 @@ impl Deadline {
     /// when calibration hasn't completed.
     #[inline]
     pub fn after_ns(ns: u64) -> Self {
-        let cpns = wall::cycles_per_ns().max(1) as u64;
-        Self::after_cycles(ns.saturating_mul(cpns))
+        Self::after_cycles(wall::ns_to_cycles(ns))
     }
 
     /// Construct a deadline `us` microseconds from now.
@@ -544,22 +549,14 @@ pub fn calibrate_clocks_with_source() -> (u64, CalibrationSource) {
     (0, CalibrationSource::None)
 }
 
-/// Push `hz` into the wall module as `cycles_per_ns` (clamped to
-/// ≥ 1). Rounds *down*: a fractional Hz/ns ratio (e.g. 3.5 GHz →
-/// 3 cycles/ns) makes `monotonic_ns` report time slightly faster
-/// than reality, which is preferable to slower — timeouts fire
-/// early rather than late on a system where calibration was a
-/// hair off.
+/// Push the measured TSC frequency `hz` into the wall module. Feeds
+/// the full-precision Hz into `set_clock_hz`, which derives Linux-style
+/// mult/shift fixed-point scales for both conversion directions — so a
+/// fractional ratio like 2.397 GHz is preserved to <1 ppm instead of
+/// being truncated to the integer 2 (the old ~20%-fast bug).
 #[cfg(target_arch = "x86_64")]
 fn apply_cycles_per_ns(hz: u64) {
-    // Clamp to [1, 6] cycles/ns. Real CPUs land in [1, 6] —
-    // higher means calibration miscalibrated and `Deadline::after_ms`
-    // would produce cycle counts that put deadlines far in the
-    // future (waits appear stuck). Lower (zero) is already
-    // guarded by the .max(1).
-    let raw = (hz / 1_000_000_000).max(1) as u32;
-    let cpns = raw.min(6);
-    wall::set_cycles_per_ns(cpns);
+    wall::set_clock_hz(hz.max(1));
 }
 
 /// aarch64 calibrate_clocks stub. The Generic Timer's

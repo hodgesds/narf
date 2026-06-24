@@ -2345,6 +2345,42 @@ pub fn run_until_empty() {
     }
 }
 
+/// Is there runnable work on this CPU OTHER than task `current`? Used by the
+/// timer-preempt path to decide whether yielding a CPU-bound task to the
+/// cooperative executor would accomplish anything — if nothing else needs the
+/// CPU, the round-trip (yield -> executor round -> resume the same task) is
+/// pure overhead, so the caller should just let the task keep running.
+///
+/// Ordered cheapest-first: two lock-free atomic checks (pending IRQ-deferred
+/// wakes, an already-due timer-wheel deadline), then a `try_lock` scan of the
+/// ready queue for another awake task. `try_lock` (never `lock`) so the IRQ
+/// path can't spin; a momentarily-contended queue conservatively reports
+/// "yes, preempt".
+pub fn has_other_runnable_work(current: u64) -> bool {
+    // A device/IRQ completion is waiting to wake some task.
+    if narf_lib::deferred_wake::has_pending() {
+        return true;
+    }
+    // A parked sleeper's deadline has already passed.
+    if let Some(d) = narf_time::timer_wheel::next_deadline_cycles_try() {
+        if narf_time::now_cycles() >= d {
+            return true;
+        }
+    }
+    // Another awake task is queued and ready to run.
+    let cpu = narf_lib::percpu::current_cpu();
+    match READY[cpu].try_lock() {
+        Some(q) => q
+            .as_ref()
+            .map(|d| {
+                d.iter()
+                    .any(|s| s.id.raw() != current && s.awake.flag.load(Ordering::Acquire))
+            })
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
 /// Snapshot per-CPU ready-queue depths. Returns one entry per
 /// online CPU as `(cpu_id, len)`. Diagnostic surface — the FB
 /// status panel renders this so a wedged executor is visible

@@ -15235,6 +15235,18 @@ pub fn timer_tick_raise_due_signals() {
 /// The caller MUST gate on returning-to-user (CPL=3): a task interrupted
 /// inside a syscall is at CPL=0 and must not be yanked mid-kernel.
 pub fn timer_preempt_user_task(ctx: &mut dyn TrapContext) {
+    // Only hand a CPU-bound task back to the cooperative executor if something
+    // else actually needs the CPU. With a 1000 Hz tick, yielding on EVERY tick
+    // made a task that never parks spend almost all its wall-clock in the
+    // yield -> executor-round -> resume cycle (measured ~25-94x slower than
+    // native). When nothing else is runnable that round-trip just resumes the
+    // same task, so skip it and let the task keep running; it still takes the
+    // timer IRQ each tick (signal delivery, the alarm SIGALRM that stops it,
+    // wheel arming), so fairness/liveness are preserved the moment any peer
+    // wakes. Voluntary yields (syscall/park) don't come through here.
+    if !narf_scheduler::has_other_runnable_work(current_task_id()) {
+        return;
+    }
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),

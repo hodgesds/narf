@@ -25,6 +25,24 @@ fn smoke_monotonic_advances() -> TestResult {
 }
 kernel_test_in!("time", smoke_monotonic_advances);
 
+fn smoke_clock_scale_fixed_point_accuracy() -> TestResult {
+    // One second of a 2.397 GHz TSC (2_397_000_000 cycles) must convert
+    // to ~1e9 ns. The old integer `cyc / cycles_per_ns` truncated the
+    // scale 2.397 → 2, yielding ~1.2e9 ns (20% fast); the mult/shift
+    // path must be within 1 ppm.
+    let ns = crate::wall::__test_cyc_to_ns_for_hz(2_397_000_000, 2_397_000_000);
+    if ns.abs_diff(1_000_000_000) > 1_000 {
+        return TestResult::Fail("2.397 GHz cyc->ns off by >1 ppm");
+    }
+    // A non-round frequency (3.3 GHz) over a 10 s span: 33e9 cyc → 10e9 ns.
+    let ns2 = crate::wall::__test_cyc_to_ns_for_hz(3_300_000_000, 33_000_000_000);
+    if ns2.abs_diff(10_000_000_000) > 10_000 {
+        return TestResult::Fail("3.3 GHz cyc->ns off by >1 ppm");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("time", smoke_clock_scale_fixed_point_accuracy);
+
 // ── RTC backstops (CMOS / PL031 / Qualcomm PMIC) ──────────────────
 
 fn smoke_rtc_cmos_bcd_to_bin_and_back() -> TestResult {

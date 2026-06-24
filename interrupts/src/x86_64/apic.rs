@@ -954,6 +954,20 @@ static TSC_ARMED: [AtomicU64; MAXC] = [const { AtomicU64::new(u64::MAX) }; MAXC]
 /// storm. ~a few µs at multi-GHz; mirrors Linux clockevents min_delta_ns.
 const MIN_DELTA_CYCLES: u64 = 10_000;
 
+/// Coalescing slack (TSC cycles, ≈ 80 µs at 2.5 GHz) for the wheel-driven
+/// re-arm path. `arm_tsc_deadline_if_earlier` reprograms the one-shot only
+/// when the new deadline is earlier than what's already armed by MORE than
+/// this — so a cluster of sleepers landing just before the already-armed
+/// (typically the 1 kHz periodic) deadline does NOT trigger an MSR write
+/// each. This is the hysteresis/slack Linux gets from hrtimer `_softexpires`
+/// ranges and timer-wheel buckets; without it, ~1 ms sleepers re-arming the
+/// LAPIC a hair early drove the effective IRQ rate to ~5x the configured
+/// 1 kHz. A coalesced timer fires at most `COALESCE_SLACK_CYCLES` late
+/// (bounded because we only skip when armed − target ≤ slack), and the next
+/// periodic tick re-arms to the exact wheel minimum regardless, so precision
+/// for genuinely sub-slack sleeps (which reprogram exactly) is preserved.
+const COALESCE_SLACK_CYCLES: u64 = 200_000;
+
 /// Earliest deadline to arm the one-shot for: the sooner of the next
 /// periodic tick and the earliest wheel deadline, floored to `now +
 /// min_delta` so we never program the past. Pure; unit-tested.
@@ -1016,7 +1030,13 @@ pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
     } else {
         deadline_cycles
     };
-    if target < TSC_ARMED[cpu].load(Ordering::Relaxed) {
+    // Reprogram only when the new target is earlier than the currently-armed
+    // deadline by more than the coalescing slack. `saturating_sub` yields 0
+    // when `target` is at or after the armed value (don't reprogram for a
+    // later deadline), and the full gap when nothing is armed (TSC_ARMED ==
+    // u64::MAX), so the first arm always programs. See COALESCE_SLACK_CYCLES.
+    let armed = TSC_ARMED[cpu].load(Ordering::Relaxed);
+    if armed.saturating_sub(target) > COALESCE_SLACK_CYCLES {
         TSC_ARMED[cpu].store(target, Ordering::Relaxed);
         // SAFETY: TSC-deadline MSR writable (period != 0 gate above);
         // MFENCE mirrors Linux weak_wrmsr_fence (see on_timer_tick).

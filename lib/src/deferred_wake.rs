@@ -98,6 +98,15 @@ pub fn push_pending_iter<I: IntoIterator<Item = Waker>>(wakers: I) {
     }
 }
 
+/// Non-destructive, LOCK-FREE: are there wakers queued but not yet drained?
+/// Two relaxed atomic loads — cheap enough for the 1000 Hz timer-preempt hot
+/// path to ask "would yielding to the executor service pending work?". The
+/// counters are global (not per-CPU); on a single-CPU build that's exact, and
+/// a cross-CPU false positive only costs one extra (harmless) preempt.
+pub fn has_pending() -> bool {
+    QUEUED_WAKERS.load(Ordering::Relaxed) != DRAINED_WAKERS.load(Ordering::Relaxed)
+}
+
 /// Drain this CPU's pending queue and call wake() on each. Must
 /// be called from non-IRQ context (the scheduler's
 /// `run_until_empty` idle path is the canonical caller).
