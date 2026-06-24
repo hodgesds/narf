@@ -201,6 +201,49 @@ fn smoke_tlb_shootdown_bridge_smp_fanout() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/ipi", smoke_tlb_shootdown_bridge_smp_fanout);
 
+/// Regression guard for the per-CPU-AP-trap-stack invariant (commit
+/// c97bf5b4 / e368ef22). When the APs shared the BSP's single TSS/`rsp0`
+/// and the one global `IST_STACKS` on 4 KiB stacks, a *storm* of broadcast
+/// TLB-shootdown IPIs — each landing on every AP at once, where
+/// `on_shootdown_irq` + a concurrent timer tick run on that shared /
+/// undersized trap stack — clobbered each other's saved frames and resumed
+/// a garbage context (`#GP` / `#UD rip=0x3`, QEMU exit 85). It was
+/// mis-diagnosed as a scheduler/heap use-after-free for a long time. With
+/// per-CPU GDT/TSS/`rsp0`/IST + 64 KiB AP stacks (now unconditional) the
+/// path is sound.
+///
+/// This hammers exactly that condition: tens of thousands of synchronous
+/// broadcasts, each spinning until every peer AP has ACK'd, so every AP is
+/// provably taking shootdown IPIs back-to-back, concurrently with its timer
+/// ticks, on its trap stack. If the per-CPU AP trap setup is ever re-gated
+/// behind a feature/cfg (the original bug) the storm crashes the test boot
+/// (exit 85) instead of returning `Pass` — the guard fails loudly.
+#[cfg(target_arch = "x86_64")]
+fn smoke_smp_shootdown_storm_trap_stacks_hold() -> TestResult {
+    use crate::x86_64::apic;
+    use narf_memory::tlb_shootdown;
+    if narf_lib::smp::cpu_count() <= 1 {
+        return TestResult::Skip("UP boot — no peer CPUs to storm");
+    }
+    // Broadcast goes via the x2APIC ICR MSR with no xAPIC fallback.
+    if !apic::x2apic_active() {
+        return TestResult::Skip("shootdown IPI requires x2APIC; xAPIC fallback active");
+    }
+    // 20k synchronous shootdowns of a kernel high-half VA the EuroSys-style
+    // target filter fans out to every peer (same VA the single-shot fanout
+    // smoke above uses, so we know it is not culled).
+    for _ in 0..20_000u32 {
+        tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest {
+            tag: Some(0x5A),
+            addr: Some(0xFFFF_FFFF_8000_0000),
+            size: Some(4096),
+        });
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("interrupts/ipi", smoke_smp_shootdown_storm_trap_stacks_hold);
+
 // ── relocated from verification ──
 
 #[cfg(target_arch = "x86_64")]
