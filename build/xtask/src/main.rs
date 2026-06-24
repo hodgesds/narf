@@ -902,15 +902,22 @@ fn ahci_image_path() -> PathBuf {
 fn virtio_blk_image_path() -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     let path = root.join("target").join("narf-vblk.img");
-    if !path.exists() {
+    // Minimal ext2 image containing `/hello.txt` so the boot path's
+    // Stage::Late `mnt-mount-ext2` initcall can mount it at /mnt, plus a
+    // seeded `(i*0x97)&0xFF` pattern at LBA 0 for the raw-sector-read smokes.
+    // Mirrors drivers/fs/ext2/src/tests.rs build_ext2_image.
+    //
+    // Regenerate whenever the on-disk bytes differ from what we'd build (or
+    // the file is absent). The old `if !path.exists()` guard let a stale or
+    // wrong-sized leftover — e.g. an unrelated 64 MiB artifact with a zeroed
+    // sector 0 — permanently shadow the seed, which made the virtio-blk
+    // read-pattern smokes fail with "pattern mismatch".
+    let img = build_ext2_disk_image(b"hello.txt", b"hello from disk\n");
+    let stale = std::fs::read(&path).map(|b| b != img).unwrap_or(true);
+    if stale {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Minimal ext2 image containing `/hello.txt` so the boot
-        // path's Stage::Late `mnt-mount-ext2` initcall can detect
-        // an ext2 filesystem on the virtio-blk device and mount it
-        // at /mnt. Mirrors drivers/fs/ext2/src/tests.rs build_ext2_image.
-        let img = build_ext2_disk_image(b"hello.txt", b"hello from disk\n");
         let _ = std::fs::write(&path, &img);
     }
     path

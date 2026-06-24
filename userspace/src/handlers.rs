@@ -560,6 +560,7 @@ pub fn init_per_task_state() {
     pgid_init();
     sid_init();
     wait_init();
+    pkey_init();
     #[cfg(feature = "linux-compat")]
     {
         ctty_init();
@@ -5618,6 +5619,16 @@ fn sys_sync_file_range(ctx: &mut dyn TrapContext) {
 /// Per-task allocated-pkey bitmap (bit k set ⇒ key k is allocated).
 static PKEY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BTreeMap<u64, u16>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Reset the per-task pkey bitmaps. Called from `init_per_task_state`
+/// (i.e. on every ABI-test `setup()`) so the table starts clean — without
+/// it, the `pkey_alloc_exhaust` test leaves FAKE_TASK's 15-key bitmap full
+/// and the positive alloc/free tests that run later in the same boot see
+/// -ENOSPC. Matches the per-subsystem reset discipline of every other
+/// per-task global.
+pub fn pkey_init() {
+    *PKEY_TABLE.lock() = None;
+}
 
 /// `pkey_alloc(flags, access_rights)` — allocate the lowest free key.
 fn sys_pkey_alloc(ctx: &mut dyn TrapContext) {
