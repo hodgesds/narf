@@ -642,8 +642,7 @@ fn smoke_abi_fsx2_open_tree_enoent_neg() -> TestResult {
         let path = b"/abi-no-mount-here\0";
         match call(Syscall::OpenTree.raw(), a2(0, path.as_ptr() as u64, 0)) {
             Some(v) if v == ENOENT => Ok(()),
-            Some(v) => Err(alloc::format!("open_tree returned {} instead of {}", v, ENOENT).leak()),
-            _ => Err("open_tree must return -ENOENT"),
+            _ => Err("open_tree of an absolute path with no mount must return -ENOENT"),
         }
     })
 }

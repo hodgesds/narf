@@ -415,7 +415,10 @@ fn smoke_fs_pipe_user_pages_hard_default() -> TestResult {
         _ => TestResult::Fail("fs/pipe-user-pages-hard default should be '0\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_pipe_user_pages_hard_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_pipe_user_pages_hard_default
+);
 
 fn smoke_fs_inotify_max_user_instances_default() -> TestResult {
     ensure_registered();
@@ -425,7 +428,10 @@ fn smoke_fs_inotify_max_user_instances_default() -> TestResult {
         _ => TestResult::Fail("fs/inotify/max_user_instances default should be '128\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_inotify_max_user_instances_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_inotify_max_user_instances_default
+);
 
 fn smoke_fs_inotify_max_queued_events_default() -> TestResult {
     ensure_registered();
@@ -435,7 +441,10 @@ fn smoke_fs_inotify_max_queued_events_default() -> TestResult {
         _ => TestResult::Fail("fs/inotify/max_queued_events default should be '16384\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_inotify_max_queued_events_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_inotify_max_queued_events_default
+);
 
 fn smoke_fs_aio_max_nr_default() -> TestResult {
     ensure_registered();
@@ -455,4 +464,7 @@ fn smoke_fs_epoll_max_user_watches_default() -> TestResult {
         _ => TestResult::Fail("fs/epoll/max_user_watches default should be '1048576\\n'"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_epoll_max_user_watches_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_fs",
+    smoke_fs_epoll_max_user_watches_default
+);

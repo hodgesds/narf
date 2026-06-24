@@ -285,6 +285,22 @@ pub fn sys_open_tree(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let resolved = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
+        if rel.is_empty() {
+            Ok(())
+        } else {
+            narf_filesystem::resolve(fs.root(), rel).map(|_| ())
+        }
+    });
+
+    match resolved {
+        Some(Ok(())) => {} // Exists
+        Some(Err(_)) | None => {
+            ctx.set_return(err(ENOENT));
+            return;
+        }
+    }
+
     let fs = match narf_filesystem::registry().fs_arc_at(&path) {
         Some(fs) => fs,
         None => {

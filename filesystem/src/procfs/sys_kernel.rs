@@ -668,7 +668,10 @@ fn smoke_kernel_domainname_default() -> TestResult {
         _ => TestResult::Fail("kernel/domainname default mismatch"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_domainname_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_domainname_default
+);
 
 fn smoke_kernel_osrelease_format() -> TestResult {
     register_all();
@@ -677,7 +680,10 @@ fn smoke_kernel_osrelease_format() -> TestResult {
         _ => TestResult::Fail("kernel/osrelease missing or empty"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_osrelease_format);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_osrelease_format
+);
 
 fn smoke_kernel_version_format() -> TestResult {
     register_all();
@@ -696,7 +702,10 @@ fn smoke_kernel_threads_max_default() -> TestResult {
         _ => TestResult::Fail("kernel/threads-max mismatch"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_threads_max_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_threads_max_default
+);
 
 fn smoke_kernel_panic_default() -> TestResult {
     register_all();
@@ -716,7 +725,10 @@ fn smoke_kernel_panic_on_oops_default() -> TestResult {
         _ => TestResult::Fail("kernel/panic_on_oops mismatch"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_panic_on_oops_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_panic_on_oops_default
+);
 
 fn smoke_kernel_sched_rt_runtime_us_default() -> TestResult {
     register_all();
@@ -726,7 +738,10 @@ fn smoke_kernel_sched_rt_runtime_us_default() -> TestResult {
         _ => TestResult::Fail("kernel/sched_rt_runtime_us mismatch"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_sched_rt_runtime_us_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_sched_rt_runtime_us_default
+);
 
 fn smoke_kernel_sched_rt_period_us_default() -> TestResult {
     register_all();
@@ -736,7 +751,10 @@ fn smoke_kernel_sched_rt_period_us_default() -> TestResult {
         _ => TestResult::Fail("kernel/sched_rt_period_us mismatch"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_sched_rt_period_us_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_sched_rt_period_us_default
+);
 
 fn smoke_kernel_printk_default() -> TestResult {
     register_all();
@@ -754,4 +772,7 @@ fn smoke_kernel_entropy_avail_default() -> TestResult {
         _ => TestResult::Fail("kernel/random/entropy_avail mismatch"),
     }
 }
-kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_entropy_avail_default);
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_entropy_avail_default
+);
