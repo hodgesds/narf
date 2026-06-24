@@ -18,6 +18,41 @@ fn smoke_abi_signal_kill_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_pos);
 
+// POSIX null signal: `kill(pid, 0)` does existence/permission checking only
+// and queues NOTHING. Regression for the stress-ng bug where a parent probing
+// a child's liveness with kill(child, 0) set pending bit 0, which the delivery
+// loop took as "signal 0" → default-action Terminate, killing the freshly-
+// exec'd child at its entry point before it ran an instruction. The fix must
+// (a) return ok(0) and (b) leave the target's pending mask untouched.
+fn smoke_abi_signal_kill_null_signal() -> TestResult {
+    with_setup(|| {
+        let before = crate::handlers::signal_pending_of(FAKE_TASK);
+        if before != 0 {
+            return Err("precondition: FAKE_TASK should start with no pending signals");
+        }
+        // kill(self, 0): existence probe → ok(0), nothing queued.
+        let r = call(Syscall::Kill.raw(), a1(FAKE_TASK, 0));
+        if r != Some(0) {
+            return Err("kill(self, 0) (null signal) should return 0");
+        }
+        let after = crate::handlers::signal_pending_of(FAKE_TASK);
+        if after != 0 {
+            return Err("kill(self, 0) must NOT set any pending bit (esp. bit 0)");
+        }
+        // Same contract for tkill/tgkill, which share the send path.
+        if call(Syscall::Tkill.raw(), a1(FAKE_TASK, 0)) != Some(0)
+            || call(Syscall::Tgkill.raw(), a2(FAKE_TASK, FAKE_TASK, 0)) != Some(0)
+        {
+            return Err("tkill/tgkill with sig 0 should return 0");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) != 0 {
+            return Err("tkill/tgkill(self, 0) must NOT set any pending bit");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
+
 fn smoke_abi_signal_kill_neg() -> TestResult {
     with_setup(|| {
         // signum >= 32 → invalid_op() (call() decodes that as None).

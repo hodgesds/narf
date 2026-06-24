@@ -108,6 +108,7 @@ stall-watchdog = []
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from
 # narf-userspace.  Stub for Waves 63-67.
 linux-compat = ["narf-userspace/linux-compat"]
+syscall-trace = ["narf-userspace/syscall-trace"]
 
 # Frame-scrub-on-free debug/hardening aids, forwarded to narf-memory.
 # Off by default; each adds a 4 KiB write to the genuine-free path.

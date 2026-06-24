@@ -74,6 +74,8 @@ pub mod poll;
 #[cfg(feature = "linux-compat")]
 pub mod posix_timer;
 pub mod process;
+#[cfg(feature = "linux-compat")]
+pub mod ptrace;
 pub mod select;
 pub mod socket;
 pub mod syscall;

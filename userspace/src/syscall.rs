@@ -2948,10 +2948,42 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let version = syscall_version(num);
     let raw_n = syscall_number(num);
     if let Some(variant) = Syscall::from_raw(raw_n) {
+        #[cfg(feature = "syscall-trace")]
+        if syscall_trace_relevant(variant) {
+            use core::fmt::Write as _;
+            let a = ctx.args();
+            let _ = writeln!(
+                narf_console::Writer,
+                "SYSC {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                table.name_of(variant).unwrap_or("?"),
+                a.arg0,
+                a.arg1,
+                a.arg2,
+                a.arg3,
+            );
+        }
         table.dispatch_ctx_versioned(variant, version, ctx);
     } else {
         ctx.set_return(SyscallReturn::invalid_op());
     }
+}
+
+/// Trace filter: the process-lifecycle syscalls worth logging (spawn/exit/
+/// wait + execve). Deliberately excludes the high-frequency work syscalls so
+/// the `syscall-trace` feature stays usable during a stress workload.
+#[cfg(feature = "syscall-trace")]
+fn syscall_trace_relevant(v: Syscall) -> bool {
+    matches!(
+        v,
+        Syscall::Clone
+            | Syscall::Clone3
+            | Syscall::Fork
+            | Syscall::Vfork
+            | Syscall::Execve
+            | Syscall::Execveat
+            | Syscall::ExitTask
+            | Syscall::Wait4
+    )
 }
 
 #[inline]

@@ -3388,3 +3388,278 @@ kernel_test_in!(
     "userspace/process",
     smoke_wave65_clone_child_cleartid_wakes_on_exit
 );
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_process_ptrace_e2e() -> TestResult {
+    use crate::ptrace::*;
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_02;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    // SAFETY: new_for_user only requires paging to be enabled
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // 1. Fork a child
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let child_pid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork did not return child pid");
+        }
+    };
+
+    let child_task_raw = crate::handlers::pid_to_task_raw(child_pid).unwrap();
+
+    // Instantiate and register a UserTaskCtx for the child so that with_user_task_ctx resolves it.
+    let mut child_uctx = crate::user_task::UserTaskCtx::new();
+    crate::user_task::register_user_task_ctx(child_task_raw, &mut child_uctx as *mut _);
+
+    // 2. Attach to the child using PTRACE_ATTACH
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut attach_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_ATTACH,
+            arg1: child_pid,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut attach_ctx);
+    match attach_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("ptrace PTRACE_ATTACH failed");
+        }
+    }
+
+    // Verify the child now has PARENT as its tracer
+    if get_task_tracer(child_pid) != Some(PARENT) {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child tracer not registered correctly");
+    }
+
+    // Verify child is stopped (SIGSTOP was queued by attach)
+    // Simulate signal delivery for the child: we set the current task to the child,
+    // and invoke default_signal_delivery.
+    LOOKUP_TASK.store(child_task_raw, Ordering::Relaxed);
+    let mut child_ctx = SignalCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        going_to_user: true,
+        delivered: None,
+    };
+    let delivered =
+        crate::handlers::default_signal_delivery(&mut child_ctx, crate::handlers::SYSCALL_NUM_NONE);
+    if !delivered {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("default_signal_delivery did not intercept SIGSTOP");
+    }
+
+    // Verify the child is now ptrace-stopped
+    if !is_task_ptrace_stopped(child_task_raw) {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child is not in ptrace stopped state");
+    }
+
+    // 3. Parent wait4 to reap the stop notification
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut wait_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: child_pid,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 2, // WUNTRACED
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut wait_ctx);
+    match wait_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == child_pid => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("wait4 did not reap stopped child");
+        }
+    }
+    // wstatus should be (SIGSTOP << 8) | 0x7f = (19 << 8) | 0x7f = 0x137f
+    if status != 0x137f {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("wait4 returned wrong wstatus for stopped child");
+    }
+
+    // 4. Parent inspects registers using PTRACE_GETREGS
+    let mut regs = user_regs_struct::default();
+    let mut getregs_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_GETREGS,
+            arg1: child_pid,
+            arg2: 0,
+            arg3: &mut regs as *mut user_regs_struct as u64,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut getregs_ctx);
+    match getregs_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("PTRACE_GETREGS failed");
+        }
+    }
+
+    // 5. Parent modifies a register and sets it using PTRACE_SETREGS
+    regs.rax = 0x12345678;
+
+    let mut setregs_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_SETREGS,
+            arg1: child_pid,
+            arg2: 0,
+            arg3: &regs as *const user_regs_struct as u64,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut setregs_ctx);
+    match setregs_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("PTRACE_SETREGS failed");
+        }
+    }
+
+    // Verify the register value is updated in the child's context
+    let updated_regs = get_task_tracer(child_pid)
+        .and_then(|_| {
+            crate::user_task::with_user_task_ctx(child_task_raw, |uctx| {
+                // SAFETY: child is stopped and registered under the registry lock.
+                unsafe { (*uctx.state.get()).rax }
+            })
+        })
+        .unwrap();
+
+    if updated_regs != 0x12345678 {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("register value not updated in child context");
+    }
+
+    // 6. Resume child using PTRACE_CONT
+    let mut cont_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_CONT,
+            arg1: child_pid,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut cont_ctx);
+    match cont_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("PTRACE_CONT failed");
+        }
+    }
+
+    // Child should not be ptrace-stopped anymore
+    if is_task_ptrace_stopped(child_task_raw) {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child still ptrace-stopped after CONT");
+    }
+
+    // 7. Detach using PTRACE_DETACH
+    let mut detach_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_DETACH,
+            arg1: child_pid,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut detach_ctx);
+    match detach_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("PTRACE_DETACH failed");
+        }
+    }
+
+    // Verify child has no tracer now
+    if is_task_traced(child_pid) {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child still traced after DETACH");
+    }
+
+    crate::user_task::unregister_user_task_ctx(child_task_raw);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("userspace/process", smoke_process_ptrace_e2e);

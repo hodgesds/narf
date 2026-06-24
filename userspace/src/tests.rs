@@ -1792,7 +1792,7 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         delivered: None,
         last_si_addr: 0,
     };
-    let rewrote_unknown = default_sync_signal_delivery(&mut ctx2, 1, SyncFaultInfo::default());
+    let rewrote_unknown = default_sync_signal_delivery(&mut ctx2, 9, SyncFaultInfo::default());
     let unknown_delivered = ctx2.delivered;
 
     __test_clear_global();

@@ -38,6 +38,14 @@ narf-modules      = { path = "../modules" }
 # non-Linux-shaped consumer wants them off.
 default = ["linux-compat"]
 
+# Kernel-side syscall tracer (poor-man's strace; ptrace is a stub). When on,
+# the dispatch point logs process-lifecycle syscalls (clone/fork/execve/exit/
+# wait) with their args, and execve logs the resolved path. Low-noise (these
+# are spawn/exit-frequency, not the millions of per-stressor work syscalls),
+# so it's usable to see what a guest process does before it dies. Off by
+# default.
+syscall-trace = []
+
 # Declared so `#[cfg(feature = "user-mode-e2e")]` in tests
 # don't trip the unexpected_cfgs lint. The frame crate's
 # `user-mode-e2e` feature drives the test-bin runner; this

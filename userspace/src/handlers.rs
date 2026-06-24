@@ -9164,11 +9164,16 @@ const WCONTINUED: u32 = 8;
 
 /// True if `task` is currently job-control stopped.
 pub fn is_task_stopped(task: u64) -> bool {
-    TASK_STOPPED
+    let job_stopped = TASK_STOPPED
         .lock()
         .as_ref()
         .map(|m| m.contains_key(&task))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    #[cfg(feature = "linux-compat")]
+    let ptrace_stopped = crate::ptrace::is_task_ptrace_stopped(task);
+    #[cfg(not(feature = "linux-compat"))]
+    let ptrace_stopped = false;
+    job_stopped || ptrace_stopped
 }
 
 /// Raw pending-signal bitmask for `task` (no mask applied). Used by
@@ -9182,7 +9187,7 @@ pub fn signal_pending_bits(task: u64) -> u32 {
 }
 
 /// AND-out the given signal bits from `task`'s pending set.
-fn clear_pending_signal_bits(task: u64, mask: u32) {
+pub(crate) fn clear_pending_signal_bits(task: u64, mask: u32) {
     if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
         if let Some(slot) = m.get_mut(&task) {
             *slot &= !mask;
@@ -9198,12 +9203,24 @@ fn stopped_wstatus(sig: u32) -> i32 {
 /// WIFCONTINUED-shaped wstatus.
 const CONTINUED_WSTATUS: i32 = 0xffff;
 
+#[inline]
+fn get_wait_recipient(child_pid: u64) -> Option<u64> {
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::ptrace::get_wait_recipient(child_pid)
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        parent_of_get(child_pid)
+    }
+}
+
 /// Queue a stop/continue notification to `child_task`'s parent and
 /// nudge it: stage SIGCHLD and wake any blocking wait4. Does NOT
 /// release the child PID — the child is still alive.
-fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: bool) {
+pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: bool) {
     let child_pid = task_to_pid_raw(child_task).unwrap_or(child_task);
-    let parent = match parent_of_get(child_pid) {
+    let parent = match get_wait_recipient(child_pid) {
         Some(p) => p,
         None => return,
     };
@@ -9363,6 +9380,8 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
 
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
+    #[cfg(feature = "linux-compat")]
+    crate::ptrace::ptrace_init();
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
@@ -9748,7 +9767,7 @@ fn parent_of_set(child: u64, parent: u64) {
     }
 }
 
-fn parent_of_get(child: u64) -> Option<u64> {
+pub(crate) fn parent_of_get(child: u64) -> Option<u64> {
     let g = PARENT_OF.lock();
     g.as_ref().and_then(|m| m.get(&child).copied())
 }
@@ -9771,10 +9790,21 @@ fn parent_of_remove(child: u64) {
 /// still running, block for it"; false means "no such child — return ECHILD".
 fn has_living_child(parent: u64, want: i64) -> bool {
     let g = PARENT_OF.lock();
-    match g.as_ref() {
+    let is_parent = match g.as_ref() {
         Some(m) if want > 0 => m.get(&(want as u64)).copied() == Some(parent),
         Some(m) => m.values().any(|&p| p == parent),
         None => false,
+    };
+    if is_parent {
+        return true;
+    }
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::ptrace::is_tracer_of_any(parent, want)
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        false
     }
 }
 
@@ -9895,7 +9925,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
         crate::pid_ns::clear_ns(child_pid);
     }
 
-    let parent = match parent_of_get(child_pid) {
+    let parent = match get_wait_recipient(child_pid) {
         Some(p) => p,
         None => {
             // No registered parent — orphan. Drain the staged status
@@ -12749,6 +12779,12 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     };
     let path: &str = &path_owned;
 
+    #[cfg(feature = "syscall-trace")]
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(narf_console::Writer, "EXECVE path={}", path);
+    }
+
     // Step 2: copy argv + envp — each a NUL-terminated array of
     // user-mode `char *`, walked until the first null pointer.
     let argv_strs = match copy_user_strarr(argv_uptr, 1024) {
@@ -15063,7 +15099,10 @@ static PROC_AUXV: narf_lib::sync::IrqSafeSpinLock<
 /// `sys_kill` (which expects a syscall trap frame). Mirrors the
 /// `*slot |= 1 << signum` step inside `sys_kill`.
 pub fn raise_signal_pending(task: u64, signum: u32) {
-    if signum >= 32 {
+    // Reject signal 0: it's the POSIX null signal (existence probe), never a
+    // real signal. Setting pending bit 0 would later be taken by the delivery
+    // loop as a Terminate-default "signal 0".
+    if signum == 0 || signum >= 32 {
         return;
     }
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
@@ -15187,7 +15226,8 @@ pub fn ensure_signal_pending_slot(task: u64) {
 /// stop/cont signal). The signal is taken on the same trap's
 /// return-to-user via the preemptive delivery hook.
 pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
-    if signum >= 32 {
+    // Signal 0 is the null signal — never deliverable (see raise_signal_pending).
+    if signum == 0 || signum >= 32 {
         return false;
     }
     let mut g = SIGNAL_PENDING.lock();
@@ -15339,6 +15379,17 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     // but sys_kill takes a ProcessId (pid). Translate.
     if let Some(tid) = pid_to_task_raw(target) {
         target = tid;
+    }
+
+    // POSIX null signal: `kill(pid, 0)` does existence/permission checking
+    // only and queues NOTHING. Programs that probe a child's liveness this
+    // way (timeout(1), stress-ng's launcher) would otherwise set pending
+    // bit 0, which the delivery loop takes as "signal 0" → default-action
+    // Terminate — killing a freshly-exec'd child at its entry point before
+    // it runs an instruction. Mirror sys_pidfd_send_signal's sig-0 probe.
+    if signum == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
     }
 
     // Job-control stop/continue bookkeeping before the bit is set.
@@ -15829,6 +15880,11 @@ fn sys_tgkill(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // Null signal: existence/permission probe only — queue nothing (see sys_kill).
+    if signum == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     signal_stopcont_interaction(tid, signum);
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
@@ -16049,6 +16105,11 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
+    // Null signal: existence/permission probe only — queue nothing (see sys_kill).
+    if signum == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     signal_stopcont_interaction(tid, signum);
     let mut g = SIGNAL_PENDING.lock();
     let map = match g.as_mut() {
@@ -16069,7 +16130,14 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
 /// (observability) is not fully wired to the userspace process
 /// table yet.
 fn sys_ptrace(ctx: &mut dyn TrapContext) {
-    ctx.set_return(SyscallReturn::ok((-38i64) as u64));
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::ptrace::sys_ptrace(ctx);
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        ctx.set_return(SyscallReturn::ok((-38i64) as u64));
+    }
 }
 
 /// `rt_sigpending(set_out, sigsetsize)` — Linux `rt_sigpending(2)`.
@@ -16387,11 +16455,19 @@ pub(crate) fn default_signal_delivery_restricted(
         .as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or(0);
-    let deliverable = pending & !mask & restrict;
+    // `& !1`: bit 0 is the POSIX null signal and is NEVER deliverable. Send
+    // paths already refuse to set it (kill/tkill/tgkill/sigqueue treat sig 0
+    // as an existence probe), but mask it here too so a stray bit-0 raise can
+    // never be taken as "signal 0" → default-action Terminate.
+    let deliverable = pending & !mask & restrict & !1u32;
     if deliverable == 0 {
         return false;
     }
     let signum = deliverable.trailing_zeros();
+    #[cfg(feature = "linux-compat")]
+    if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+        return true;
+    }
 
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
@@ -16530,6 +16606,7 @@ const SIGSEGV: u32 = 11;
 pub fn vector_to_signum(vector: u64) -> Option<u32> {
     match vector {
         0 => Some(SIGFPE),   // #DE divide-by-zero / div overflow
+        1 => Some(SIGTRAP),  // #DB debug / single step
         3 => Some(SIGTRAP),  // #BP breakpoint
         4 => Some(SIGFPE),   // #OF overflow
         6 => Some(SIGILL),   // #UD undefined opcode
@@ -16624,6 +16701,10 @@ pub fn default_sync_signal_delivery(
         Some(s) => s,
         None => return false,
     };
+    #[cfg(feature = "linux-compat")]
+    if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+        return true;
+    }
     let task = current_task_id();
     let action = match sigaction_lookup_full(task, signum as usize) {
         Some(a) => a,
@@ -16651,6 +16732,7 @@ pub fn default_sync_signal_delivery(
     // RIP-flavoured vectors (#UD/#DE/#OF/#BP/#AC) the arch passes
     // RIP through the same field.
     let (si_code, si_addr) = match vector {
+        1 => (2 /* TRAP_TRACE */, info.addr),
         14 => (2 /* SEGV_ACCERR */, info.addr),
         13 => (0x80 /* SI_KERNEL */, info.addr),
         6 => (1 /* ILL_ILLOPC */, info.addr),

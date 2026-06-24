@@ -320,15 +320,14 @@ fn smoke_abi_misc_process_vm_writev_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_process_vm_writev_neg);
 
-// ── Ptrace — pure stub: every request returns -ENOSYS. ──
+// ── Ptrace — implemented: returns -EINVAL when TRACEME has no parent. ──
 
 fn smoke_abi_misc_ptrace_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: ptrace is a stub; every request (here PTRACE_TRACEME=0)
-        // returns -ENOSYS instead of doing anything.
+        // PTRACE_TRACEME = 0; without a parent it returns -EINVAL (-22)
         match call(Syscall::Ptrace.raw(), a0(0)) {
-            Some(v) if v == ENOSYS => Ok(()),
-            _ => Err("ptrace stub should return -ENOSYS"),
+            Some(-22) => Ok(()),
+            _ => Err("ptrace TRACEME should return -EINVAL when parent-less"),
         }
     })
 }
