@@ -192,25 +192,62 @@ pub fn set_user_fpu_hooks(save: fn(), restore: fn()) {
     USER_FPU_RESTORE_HOOK.store(restore as usize, Ordering::Release);
 }
 
-#[inline]
-fn user_fpu_save() {
-    let p = USER_FPU_SAVE_HOOK.load(Ordering::Acquire);
-    if p != 0 {
-        // SAFETY: `p` was stored by `set_user_fpu_hooks` from a real `fn()`.
-        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
-        f();
+/// Publish the CURRENT stackful task's user-FPU (FXSAVE) area. Called by the
+/// userspace `UserTaskFuture::poll` on first entry; stored per-task so a
+/// kernel_switch resume + a task exit never read a stale/freed area.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_fpu(area: *mut u8) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe { (*p).user_fpu.store(area, Ordering::Release) };
     }
 }
 
+/// Read the CURRENT task's user-FPU area, or null if none.
+#[cfg(target_arch = "x86_64")]
 #[inline]
-fn user_fpu_restore() {
-    let p = USER_FPU_RESTORE_HOOK.load(Ordering::Acquire);
-    if p != 0 {
-        // SAFETY: `p` was stored by `set_user_fpu_hooks` from a real `fn()`.
-        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(p) };
-        f();
+fn current_user_fpu() -> *mut u8 {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: in-flight task on this CPU.
+    unsafe { (*p).user_fpu.load(Ordering::Acquire) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn user_fpu_save() {
+    let area = current_user_fpu();
+    if !area.is_null() {
+        // SAFETY: `area` is the in-flight task's 512-byte 16-aligned FXSAVE
+        // area (set by the userspace poll); CR4.OSFXSR is on.
+        unsafe {
+            core::arch::asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+        }
     }
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+fn user_fpu_save() {}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn user_fpu_restore() {
+    let area = current_user_fpu();
+    if !area.is_null() {
+        // SAFETY: as `user_fpu_save`.
+        unsafe {
+            core::arch::asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn user_fpu_restore() {}
 
 /// Top (16-byte-aligned) of the CURRENT stackful task's kernel stack on this
 /// CPU, or 0 if none. The per-task-own-stack user entry resets RSP to this
@@ -368,6 +405,13 @@ pub struct KernelTask {
     /// can read without panicking on a poisoned lock, and the
     /// kernel-stack body can swap in a fresh waker per entry.
     current_waker: narf_lib::sync::IrqSafeSpinLock<Option<Waker>>,
+    /// Per-task user-FPU (FXSAVE) area pointer, published by the userspace
+    /// `UserTaskFuture::poll` on first entry. Lives HERE (not in a per-CPU slot)
+    /// because in the own-stack model a task resumes via `kernel_switch` (not a
+    /// re-poll), so the save/restore must read the CURRENT task's area — a
+    /// per-CPU slot would go stale (last task to poll) or dangle after a task
+    /// exits and its `Box` is freed, fxrstor-ing freed memory.
+    user_fpu: AtomicPtr<u8>,
 }
 
 // SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
@@ -438,6 +482,7 @@ impl KernelTask {
             saved_trap_frame: UnsafeCell::new(zeroed_trap_frame()),
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            user_fpu: AtomicPtr::new(core::ptr::null_mut()),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -892,11 +937,14 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     if no_preempt {
         return false;
     }
+    // SAFETY: live `task_ptr` as established above.
     let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    // SAFETY: live `task_ptr` as established above.
     let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
     if narf_time::now_cycles().saturating_sub(started) < slice {
         return false; // slice not yet used
     }
+    // SAFETY: live `task_ptr` as established above.
     let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
         return false;
@@ -917,6 +965,7 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     // SAFETY: `task.ctx` is the save slot, `exec_ctx` the live executor ctx;
     // kernel_switch saves the trap-handler continuation and resumes the executor.
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
+    // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx.
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
     // ── Resumed here when the executor switches back into this task ──
     let cpu = this_cpu();
@@ -956,6 +1005,7 @@ pub unsafe fn yield_current_stackful() {
     user_fpu_save();
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     let ctx = unsafe { &raw mut (*p).ctx };
+    // DEBUG markers (own-stack bring-up): A=before switch-out, B=resumed.
     // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
     // resumes the executor, returning here when it switches us back in.
     unsafe { kernel_switch(ctx, exec_ctx) };
@@ -968,6 +1018,23 @@ pub unsafe fn yield_current_stackful() {
             .store(narf_time::now_cycles(), Ordering::Release);
     }
     user_fpu_restore();
+}
+
+/// Clone the executor slot-`Waker` of the CURRENT stackful task on this CPU
+/// (the one `poll_to_yield` stashed). The own-stack park path registers THIS
+/// waker with the relevant event source (timer wheel / futex queue / serial
+/// IRQ / wait-child) so firing it sets the task's `awake` flag and the executor
+/// re-polls — the per-task-own-stack analog of the longjmp poll's `cx.waker()`.
+/// `None` if no stackful task is current (e.g. kernel-test context).
+#[cfg(target_arch = "x86_64")]
+pub fn current_stackful_waker() -> Option<Waker> {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: in-flight task on this CPU; `current_waker` is an IrqSafeSpinLock.
+    unsafe { (*p).current_waker.lock().as_ref().cloned() }
 }
 
 /// Mark the CURRENT stackful task complete and `kernel_switch` out — never

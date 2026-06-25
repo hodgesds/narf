@@ -218,6 +218,10 @@ pub fn enter_ptrace_stopped(ctx: &mut dyn TrapContext, task: u64, _tracer: u64, 
             uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                crate::handlers::own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
     }

@@ -372,6 +372,144 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     }
 }
 
+// ── Per-task-own-stack syscall park ─────────────────────────────────
+//
+// In the own-stack model a blocking syscall does NOT longjmp back to the
+// poll's trap-back half (that half no longer runs — the poll diverges on first
+// entry). Instead the handler sets its park state + rewinds RIP exactly as
+// before, then calls `own_stack_park()`, which registers the task's executor
+// slot-`Waker` (so the event source re-polls us) and `kernel_switch`es out via
+// `yield_current_stackful`. On resume it RE-CHECKS the condition (a spurious or
+// early wake re-parks) and only returns once the condition clears — then the
+// caller returns and the sysret tail re-executes the syscall at the rewound RIP
+// (the same "re-execute on wake" contract the longjmp path had). This is the
+// relocation of the poll dispatch's waker-registration to the park site; it
+// mirrors `UserTaskFuture::poll`'s sleep/futex/io/console/signal-stop arms but
+// uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
+// returns a reaped result, not a re-execute) — that handler parks natively.
+
+/// Register `waker` with the park condition's event source and report whether
+/// the task should actually block (`true`) or proceed/re-execute now (`false`,
+/// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
+#[cfg(target_arch = "x86_64")]
+fn park_should_block(
+    uc: &UserTaskCtx,
+    waker: &core::task::Waker,
+    sleep_handle: &mut Option<narf_scheduler::narf_time::timer_wheel::SleepHandle>,
+) -> bool {
+    let task_id = crate::handlers::current_task_id();
+
+    // Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU): stay parked until
+    // SIGCONT clears the stopped flag (SIGKILL=bit 9 still breaks through).
+    if crate::handlers::is_task_stopped(task_id)
+        && (crate::handlers::signal_pending_bits(task_id) & (1 << 9)) == 0
+    {
+        crate::handlers::register_signal_waker(task_id, waker.clone());
+        return true;
+    }
+
+    // Deadline-based park (sleep / nanosleep / pause / blocking poll·epoll·futex).
+    let deadline = uc.sleep_deadline_ns.load(Ordering::Acquire);
+    if deadline != 0 {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        let signal_pending = deadline == u64::MAX && crate::handlers::is_signal_pending(task_id);
+        if now < deadline && !signal_pending {
+            // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
+            if uc.net_io_wait.load(Ordering::Acquire) {
+                crate::handlers::register_io_waiter(task_id, waker.clone());
+                if narf_net::readiness::generation() != uc.epoll_park_gen.load(Ordering::Acquire) {
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    uc.net_io_wait.store(false, Ordering::Release);
+                    return false; // raced ready → re-execute the syscall
+                }
+            }
+            // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
+            let fu = uc.futex_uaddr.load(Ordering::Acquire);
+            if fu != 0 {
+                crate::handlers::futex_register_waiter(fu, task_id, waker.clone());
+                if crate::handlers::futex_gen(fu) != uc.futex_park_gen.load(Ordering::Acquire) {
+                    crate::handlers::futex_drop_waiter(fu, task_id);
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    uc.futex_uaddr.store(0, Ordering::Release);
+                    return false; // raced wake → re-execute (musl re-checks the word)
+                }
+            }
+            // Park on the timer wheel. Infinite parks (u64::MAX) use a ~1-tick
+            // fallback so a lost external wake can't wedge; finite sleeps use
+            // the real deadline. The real wake is the io/futex/signal waker.
+            let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            let fire_cycles = if deadline == u64::MAX {
+                const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @100 Hz
+                now.saturating_add(FALLBACK_NS).saturating_mul(cpns)
+            } else {
+                deadline.saturating_mul(cpns)
+            };
+            let refreshed = sleep_handle.is_some_and(|h| {
+                narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
+            });
+            if !refreshed {
+                *sleep_handle =
+                    narf_scheduler::narf_time::timer_wheel::register(fire_cycles, waker.clone())
+                        .ok();
+            }
+            return true;
+        }
+        // Deadline reached / signal pending → clear and proceed (re-execute).
+        uc.sleep_deadline_ns.store(0, Ordering::Release);
+        uc.net_io_wait.store(false, Ordering::Release);
+        uc.futex_uaddr.store(0, Ordering::Release);
+        if let Some(h) = sleep_handle.take() {
+            narf_scheduler::narf_time::timer_wheel::cancel(h);
+        }
+        return false;
+    }
+
+    // Console blocking-read: register on the serial/keyboard IRQ byte-waker.
+    if uc.console_read_pending.load(Ordering::Acquire) {
+        narf_input::register_byte_waker(waker);
+        if narf_input::pending_input() > 0 {
+            uc.console_read_pending.store(false, Ordering::Release);
+            return false; // a byte is ready → re-execute the read
+        }
+        return true;
+    }
+
+    // No park state set (shouldn't happen on a park site) → proceed.
+    false
+}
+
+/// Own-stack blocking-syscall park: register the slot-waker + `kernel_switch`
+/// out, looping until the park condition clears. Returns to the caller (a
+/// syscall handler that rewound RIP) so the sysret tail re-executes the syscall.
+#[cfg(target_arch = "x86_64")]
+pub fn own_stack_park() {
+    let mut sleep_handle: Option<narf_scheduler::narf_time::timer_wheel::SleepHandle> = None;
+    loop {
+        let waker = match narf_scheduler::stackful::current_stackful_waker() {
+            Some(w) => w,
+            None => break, // no executor (kernel-test) — degrade to one proceed
+        };
+        let uctx = match current_user_task() {
+            Some(u) => u,
+            None => break,
+        };
+        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; single-CPU
+        // cooperative execution means no concurrent &mut to these fields.
+        let uc = unsafe { &*uctx };
+        if !park_should_block(uc, &waker, &mut sleep_handle) {
+            if let Some(h) = sleep_handle.take() {
+                narf_scheduler::narf_time::timer_wheel::cancel(h);
+            }
+            break;
+        }
+        // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
+        unsafe {
+            narf_scheduler::stackful::yield_current_stackful();
+        }
+        // Resumed by the executor — loop and re-check the condition.
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(transparent)]
 pub struct SendPtr<T>(pub *mut T);
@@ -800,6 +938,18 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
+    // Per-task-own-stack model: enabling this flips a trap/syscall from a user
+    // task onto that task's OWN kernel stack with preemption via a clean
+    // kernel_switch (try_preempt_user), retiring the longjmp-out-of-trap-handler
+    // path. VALIDATED to boot the entire interactive system (init → getty →
+    // login → shell → chroot → exec) under SMP=1. Kept OFF for now: stress-ng's
+    // fork/exec/exit churn still wild-jumps to rip=0x3 in the IRQ/timer-preempt
+    // dispatch path (r14 → narf_interrupts::dispatch::SLOTS) — a deeper preempt
+    // bug that survives the own-stack relocation and isn't the FPU slot. Flip
+    // this on to continue that investigation on the (cleaner) own-stack model.
+    if false {
+        narf_scheduler::stackful::enable_user_own_stack();
+    }
 }
 
 /// Per-task x87/SSE register file for `FXSAVE`/`FXRSTOR`.
@@ -1377,7 +1527,7 @@ impl core::future::Future for UserTaskFuture {
         if narf_scheduler::stackful::user_own_stack_enabled() {
             // Publish the FPU area so the scheduler's preempt/park can
             // FXSAVE/FXRSTOR it across a kernel_switch, then restore it now.
-            publish_current_fpu(&this.fpu as *const FpuArea as *mut FpuArea);
+            narf_scheduler::stackful::set_current_user_fpu(&this.fpu as *const FpuArea as *mut u8);
             // SAFETY: live 512-byte 16-aligned FXSAVE image; CR4.OSFXSR set.
             unsafe {
                 core::arch::asm!(

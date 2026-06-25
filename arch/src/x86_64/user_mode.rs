@@ -353,6 +353,7 @@ pub unsafe extern "C" fn enter_user_mode_resume(state: *const UserState) -> ! {
 pub unsafe extern "C" fn enter_user_mode_at_top(rip: u64, user_rsp: u64, stack_top: u64) -> ! {
     naked_asm!(
         // Reset to the empty top of this task's kernel stack first.
+        "cli",
         "mov rsp, rdx",
         "swapgs",
         "push {udata}",                   // ss
@@ -383,6 +384,7 @@ pub unsafe extern "C" fn enter_user_mode_with_arg_at_top(
     stack_top: u64,
 ) -> ! {
     naked_asm!(
+        "cli",
         "mov rsp, rcx",                   // reset to the empty stack top
         "swapgs",
         "push {udata}",                   // ss
@@ -415,6 +417,7 @@ pub unsafe extern "C" fn enter_user_mode_resume_at_top(
 ) -> ! {
     naked_asm!(
         // Reset to the empty top of this task's kernel stack first (rsi).
+        "cli",
         "mov rsp, rsi",
         // Push iretq frame from *state (rdi).
         "mov rax, {udata}",

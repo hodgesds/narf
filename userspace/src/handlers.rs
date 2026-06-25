@@ -1373,6 +1373,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                         .store(true, core::sync::atomic::Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable — hook() longjmps to the executor
@@ -1406,6 +1410,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                         .store(dl, core::sync::atomic::Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable — hook() longjmps to the executor
@@ -7841,6 +7849,10 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                // own-stack: mark complete + kernel_switch out (diverges).
+                narf_scheduler::stackful::exit_current_stackful();
+            }
             hook(uctx);
         }
         // unreachable
@@ -7875,6 +7887,10 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                // own-stack: mark complete + kernel_switch out (diverges).
+                narf_scheduler::stackful::exit_current_stackful();
+            }
             hook(uctx);
         }
         // unreachable
@@ -7929,6 +7945,10 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -7969,6 +7989,10 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -9415,6 +9439,10 @@ fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -9676,6 +9704,98 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
     }
 }
 
+/// Per-task-own-stack blocking wait4/waitid: reap-or-park loop that returns the
+/// reaped result via `set_return` (NOT a re-execute — wait can't pre-bake its
+/// result). Reads its args from the UserTaskCtx (stored by the caller before the
+/// park), registers the slot-waker so `on_child_exit` re-polls us, and
+/// `kernel_switch`es out via `yield_current_stackful` until a child is reapable.
+/// The own-stack analog of `UserTaskFuture::poll`'s wait_child arm.
+#[cfg(target_arch = "x86_64")]
+fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
+    let parent = current_task_id();
+    let uctx = match crate::user_task::current_user_task() {
+        Some(u) => u,
+        None => {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+    };
+    // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
+    let uc = unsafe { &*uctx };
+    let want_pid = uc
+        .wait_child_want_pid
+        .load(core::sync::atomic::Ordering::Acquire);
+    let options = uc
+        .wait_child_options
+        .load(core::sync::atomic::Ordering::Acquire);
+    let status_ptr = uc
+        .wait_child_status_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    let is_waitid = uc
+        .wait_child_is_waitid
+        .load(core::sync::atomic::Ordering::Acquire);
+    loop {
+        let mut status = 0i32;
+        let reaped =
+            crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status);
+        if reaped > 0 {
+            let rax = finish_wait_child(status_ptr, is_waitid, reaped, status);
+            uc.wait_child_pending
+                .store(false, core::sync::atomic::Ordering::Release);
+            ctx.set_return(SyscallReturn::ok(rax));
+            return;
+        }
+        let waker = match narf_scheduler::stackful::current_stackful_waker() {
+            Some(w) => w,
+            None => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+        };
+        crate::user_task::register_wait_child_waker(parent, waker);
+        // Re-check after registering (a child may have exited in the window).
+        let mut status2 = 0i32;
+        let reaped2 =
+            crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status2);
+        if reaped2 > 0 {
+            crate::user_task::drop_wait_child_waker(parent);
+            let rax = finish_wait_child(status_ptr, is_waitid, reaped2, status2);
+            uc.wait_child_pending
+                .store(false, core::sync::atomic::Ordering::Release);
+            ctx.set_return(SyscallReturn::ok(rax));
+            return;
+        }
+        // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
+        unsafe {
+            narf_scheduler::stackful::yield_current_stackful();
+        }
+    }
+}
+
+/// Per-task-own-stack dispatch for a blocking-syscall park site (the own-stack
+/// replacement for the `yield_hook()` longjmp). Routes wait4/waitid to the
+/// reap-or-park loop and every other park (sleep/nanosleep/pause/console/futex/
+/// net-I/O/job-stop) to `own_stack_park`, which registers the slot-waker and
+/// `kernel_switch`es out. Returns when the condition clears; the caller then
+/// `return`s and the sysret tail either re-executes the syscall (rewound RIP)
+/// or returns the baked/reaped result.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
+    let is_wait = crate::user_task::current_user_task().is_some_and(|uctx| {
+        // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
+        unsafe {
+            (*uctx)
+                .wait_child_pending
+                .load(core::sync::atomic::Ordering::Acquire)
+        }
+    });
+    if is_wait {
+        own_stack_wait_child(ctx);
+    } else {
+        crate::user_task::own_stack_park();
+    }
+}
+
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a
 /// child state change for `waitid(2)`. Fills si_signo = SIGCHLD,
 /// si_code (CLD_EXITED / CLD_KILLED / CLD_DUMPED), si_pid, si_uid (0),
@@ -9819,6 +9939,10 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
                 .store(true, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
     }
@@ -10193,6 +10317,10 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // with the reaped child pid before re-entering user mode.
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable — hook() never returns
@@ -12462,6 +12590,10 @@ fn sys_sleep(ctx: &mut dyn TrapContext) {
                 .store(deadline, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -13068,6 +13200,25 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
         narf_scheduler::TaskId(task),
         new_proc.address_space.clone(),
     );
+
+    // Own-stack model: there is no poll trap-back half to apply a staged
+    // ExecRequest after a longjmp. Apply the new image inline — activate the new
+    // AS + TLS, then enter the new entry at the TOP of this task's own kernel
+    // stack (abandoning the execve syscall frames), which DIVERGES.
+    #[cfg(target_arch = "x86_64")]
+    if narf_scheduler::stackful::user_own_stack_enabled() {
+        let entry = new_proc.entry.0.as_u64();
+        let rsp = new_proc.stack_top.as_u64();
+        let _ = new_proc.address_space.activate();
+        if let Some(fb) = new_proc.fs_base {
+            // SAFETY: canonical user vaddr from the new image's TLS staging.
+            unsafe { narf_scheduler::set_user_fs_base(fb) };
+        }
+        let top = narf_scheduler::stackful::current_stackful_stack_top();
+        // SAFETY: new AS active; entry/rsp mapped by the loader; resets RSP to
+        // this task's own kernel-stack top and iretq's into the new image.
+        unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
+    }
 
     // Step 6: package the new image into an ExecRequest and
     // publish via the calling task's UserTaskCtx so the polling
@@ -15565,6 +15716,10 @@ pub fn timer_preempt_user_task(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable when preempted
@@ -15925,6 +16080,10 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable
@@ -16006,6 +16165,10 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -17495,6 +17658,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable — hook() longjmps to the executor
@@ -17641,6 +17808,10 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
             }
@@ -18296,6 +18467,10 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return;
+                }
                 hook(uctx);
             }
             // unreachable
@@ -18579,6 +18754,10 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return;
+                }
                 hook(uctx);
             }
             // unreachable
@@ -18746,6 +18925,10 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return;
+                }
                 hook(uctx);
             }
         }
