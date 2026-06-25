@@ -40,8 +40,8 @@ use crate::drm_ioctl_bridge::dispatch_card;
 use crate::drm_uapi::{
     ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi, DrmModeCardResUapi,
     DrmVersionUapi, DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_ATOMIC,
-    DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_VERSION,
-    IOC_READ, IOC_WRITE,
+    DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_SET_CLIENT_CAP,
+    DRM_IOCTL_VERSION, IOC_READ, IOC_WRITE,
 };
 use alloc::format;
 use alloc::string::String;
@@ -275,13 +275,26 @@ fn smoke_drm_ioctl_set_client_cap_universal_vs_atomic() -> TestResult {
     let mut up = [0u8; 16];
     up[0..8].copy_from_slice(&2u64.to_le_bytes()); // UNIVERSAL_PLANES
     up[8..16].copy_from_slice(&1u64.to_le_bytes());
-    if dispatch_card(idx, DRM_IOCTL_SET_CLIENT_CAP, up.as_mut_ptr() as usize, false) != Ok(0) {
+    if dispatch_card(
+        idx,
+        DRM_IOCTL_SET_CLIENT_CAP,
+        up.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
         return TestResult::Fail("SET_CLIENT_CAP(UNIVERSAL_PLANES) should succeed");
     }
     let mut at = [0u8; 16];
     at[0..8].copy_from_slice(&3u64.to_le_bytes()); // ATOMIC
     at[8..16].copy_from_slice(&1u64.to_le_bytes());
-    if dispatch_card(idx, DRM_IOCTL_SET_CLIENT_CAP, at.as_mut_ptr() as usize, false).is_ok() {
+    if dispatch_card(
+        idx,
+        DRM_IOCTL_SET_CLIENT_CAP,
+        at.as_mut_ptr() as usize,
+        false,
+    )
+    .is_ok()
+    {
         return TestResult::Fail("SET_CLIENT_CAP(ATOMIC) should be rejected for the legacy path");
     }
     TestResult::Pass

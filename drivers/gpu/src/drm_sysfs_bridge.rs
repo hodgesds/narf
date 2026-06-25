@@ -200,4 +200,3 @@ fn populate_card_node(
         kobject_add_attr(&render_kobj, "dev", move || rd.clone());
     }
 }
-

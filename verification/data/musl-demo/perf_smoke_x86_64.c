@@ -55,6 +55,7 @@ int main() {
     uint64_t val1;
     if (read(fd, &val1, sizeof(val1)) < 8) {
         printf("perf_smoke: ERROR - read failed\n");
+        close(fd);
         return 1;
     }
 
@@ -67,17 +68,60 @@ int main() {
     uint64_t val2;
     if (read(fd, &val2, sizeof(val2)) < 8) {
         printf("perf_smoke: ERROR - read failed\n");
+        close(fd);
         return 1;
     }
 
-    if (val2 >= val1) {
-        printf("perf_smoke: OK - cycles delta %llu\n", (unsigned long long)(val2 - val1));
-    } else {
+    if (val2 < val1) {
         printf("perf_smoke: ERROR - cycle counter went backwards: %llu -> %llu\n",
                (unsigned long long)val1, (unsigned long long)val2);
+        close(fd);
+        return 1;
+    }
+    printf("perf_smoke: cycles delta %llu\n", (unsigned long long)(val2 - val1));
+    close(fd);
+
+    // Test custom software syscall counter
+    struct perf_event_attr sw_attr;
+    memset(&sw_attr, 0, sizeof(sw_attr));
+    sw_attr.type = 1; // PERF_TYPE_SOFTWARE
+    sw_attr.size = sizeof(sw_attr);
+    sw_attr.config = 12; // PERF_COUNT_SW_SYSCALLS (custom)
+
+    long fd_sw = perf_event_open(&sw_attr, 0, -1, -1, 0);
+    if (fd_sw < 0) {
+        printf("perf_smoke: ERROR - perf_event_open (software) failed with %ld\n", fd_sw);
         return 1;
     }
 
-    close(fd);
+    uint64_t s1;
+    if (read(fd_sw, &s1, sizeof(s1)) < 8) {
+        printf("perf_smoke: ERROR - software read failed\n");
+        close(fd_sw);
+        return 1;
+    }
+
+    // Trigger exactly 5 syscalls
+    for (int i = 0; i < 5; i++) {
+        getppid();
+    }
+
+    uint64_t s2;
+    if (read(fd_sw, &s2, sizeof(s2)) < 8) {
+        printf("perf_smoke: ERROR - software read failed\n");
+        close(fd_sw);
+        return 1;
+    }
+
+    if (s2 <= s1) {
+        printf("perf_smoke: ERROR - syscall counter did not increment: %llu -> %llu\n",
+               (unsigned long long)s1, (unsigned long long)s2);
+        close(fd_sw);
+        return 1;
+    }
+
+    printf("perf_smoke: OK - syscalls delta %llu\n", (unsigned long long)(s2 - s1));
+    printf("perf_smoke: OK\n");
+    close(fd_sw);
     return 0;
 }
