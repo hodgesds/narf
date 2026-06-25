@@ -399,10 +399,10 @@ pub fn set_kernel_stack_hook(f: fn(u64)) {
 /// Point the running CPU's kernel-entry stack at `top` (or, when `top == 0`,
 /// restore the per-CPU baseline). No-op if no hook is installed.
 ///
-/// DORMANT in Stage 1 — wired into the switch-in/out path in Stage 2.
-#[allow(dead_code)]
+/// Wired into the stackful switch-in/out path (`poll_to_yield`) for the
+/// per-task-own-stack model.
 #[inline]
-fn retarget_kernel_stack(top: u64) {
+pub(crate) fn retarget_kernel_stack(top: u64) {
     let p = SET_KERNEL_STACK_HOOK.load(Ordering::Acquire);
     if p == 0 {
         return;
