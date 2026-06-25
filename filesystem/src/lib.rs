@@ -412,6 +412,21 @@ pub trait FileOps: Send + Sync {
         POLL_IN | POLL_OUT
     }
 
+    /// Absolute monotonic-ns instant at which this file will *next*
+    /// become readable purely on its own timed schedule, if any.
+    ///
+    /// Only time-driven files (a `timerfd`) return `Some`; everything
+    /// else returns `None`. A blocking multiplexer (`epoll`) that parks
+    /// the caller waiting for an explicit readiness *notify* has no other
+    /// way to learn a timerfd's deadline — nothing signals a wake when a
+    /// timer simply elapses — so it consults this to clamp its scheduler
+    /// wake-up. Without it, a timerfd armed inside an `epoll` set with an
+    /// infinite timeout never wakes the waiter (it parks forever); this is
+    /// exactly what drives a Wayland compositor's repaint loop.
+    fn poll_deadline(&self) -> Option<u64> {
+        None
+    }
+
     /// Linux `ioctl(2)` dispatch for this file. `cmd` is the encoded
     /// request word (Linux `_IOC(dir, type, nr, size)`); `arg` is the
     /// raw user-pointer argument the syscall layer received.

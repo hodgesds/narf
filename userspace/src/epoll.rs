@@ -237,6 +237,32 @@ impl EpollInstance {
 
         results
     }
+
+    /// Earliest absolute monotonic-ns deadline at which any fd in the
+    /// interest set will become readable on its own timed schedule (a
+    /// `timerfd`). Returns `None` when no interest fd is time-driven.
+    ///
+    /// A parked `epoll_wait` consults this to clamp its scheduler wake-up:
+    /// timerfd expiries don't fire a readiness *notify*, so without this a
+    /// timerfd armed in an epoll set with an infinite timeout would never
+    /// wake the waiter (it parks forever) — the dead-repaint-loop failure.
+    fn nearest_poll_deadline(&self, task_id: u64) -> Option<u64> {
+        let fds: Vec<i32> = self.inner.lock().interest.keys().copied().collect();
+        let mut earliest: Option<u64> = None;
+        for fd in fds {
+            if fd < 0 {
+                continue;
+            }
+            let dl = fd::with_table(task_id, |t| {
+                t.get(fd as u32).and_then(|e| e.ops.poll_deadline())
+            })
+            .flatten();
+            if let Some(d) = dl {
+                earliest = Some(earliest.map_or(d, |e| e.min(d)));
+            }
+        }
+        earliest
+    }
 }
 
 impl FileOps for EpollInstance {
@@ -624,6 +650,24 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
                         // wakeups (immediate re-poll on TCP data instead
                         // of waiting out the deadline).
                         uc.net_io_wait.store(true, Ordering::Release);
+                        // Clamp the scheduler wake-up to the nearest armed
+                        // timerfd in the interest set. A timerfd expiry does
+                        // NOT fire a readiness notify (unlike socket data), so
+                        // without this clamp a timerfd-driven wait sleeps until
+                        // the full timeout — or, with an infinite timeout (the
+                        // Wayland repaint loop), forever. On wake the syscall
+                        // re-executes from the top and re-polls, finding the
+                        // timer ready. (For a finite timeout this replaces the
+                        // persisted timeout deadline with the earlier timer one;
+                        // since the timer is readable at that instant the re-poll
+                        // returns its event before the timeout path is reached.
+                        // The only lost case is a timer disarmed from another
+                        // thread mid-park, which no single-threaded waiter hits.)
+                        if let Some(timer_dl) = instance.nearest_poll_deadline(task) {
+                            let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
+                            let clamped = if cur == 0 { timer_dl } else { cur.min(timer_dl) };
+                            uc.sleep_deadline_ns.store(clamped, Ordering::Release);
+                        }
                         // Rewind RIP so we re-execute epoll_wait on resume.
                         ctx.set_rip(ctx.rip().wrapping_sub(2));
                         ctx.save_user_state(uc.state.get() as *mut u8);

@@ -4109,6 +4109,22 @@ pub const NARF_DRM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_DRM_SMOKE_ELF_X8
 ))]
 pub const NARF_DRM_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_DRM_SMOKE_ELF_AARCH64"));
 
+/// timerfd-in-epoll wake smoke — reproduces weston's repaint-loop driver
+/// (a timerfd armed via timerfd_settime, blocked on by epoll_wait(-1)).
+/// Success token: `tfd-epoll-ok`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_TFD_EPOLL_SMOKE_ELF: &[u8] =
+    include_bytes!(env!("NARF_TFD_EPOLL_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_TFD_EPOLL_SMOKE_ELF: &[u8] =
+    include_bytes!(env!("NARF_TFD_EPOLL_SMOKE_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

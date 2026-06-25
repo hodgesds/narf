@@ -1781,6 +1781,10 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
         ("drm_smoke", "drm-ok"),
+        // timerfd-in-epoll wake — weston's repaint-loop driver: a timerfd
+        // armed via timerfd_settime, blocked on by epoll_wait(-1). Guards the
+        // path the whole desktop repaint cadence rides on.
+        ("tfd_epoll_smoke", "tfd-epoll-ok"),
         // modetest (real libdrm) enumerates /dev/dri/card0 end-to-end —
         // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
         // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.

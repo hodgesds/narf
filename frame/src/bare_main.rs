@@ -3430,6 +3430,10 @@ fn boot_userspace_init() {
                 // GET_CAP(DUMB_BUFFER), CREATE_DUMB, MAP_DUMB, mmap
                 // MAP_SHARED, ADDFB2, SETCRTC. Success: `drm-ok`.
                 ("drm_smoke", narf_verification::NARF_DRM_SMOKE_ELF),
+                (
+                    "tfd_epoll_smoke",
+                    narf_verification::NARF_TFD_EPOLL_SMOKE_ELF,
+                ),
                 // modetest — real libdrm KMS client (Rung 4 DRM probe).
                 ("modetest", narf_verification::NARF_MODETEST_ELF),
                 ("wl_handshake", narf_verification::NARF_WL_HANDSHAKE_ELF),

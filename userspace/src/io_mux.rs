@@ -228,6 +228,19 @@ impl FileOps for TimerFd {
             0
         }
     }
+
+    /// The armed deadline so a parked `epoll`/`poll` waiter can wake when
+    /// this timer elapses. Already-expired (`expirations > 0`) or disarmed
+    /// (`next_fire_ns == 0`) timers report `None` — the former is reported
+    /// ready by `poll_readiness`, the latter has no schedule.
+    fn poll_deadline(&self) -> Option<u64> {
+        let s = self.state.lock();
+        if s.next_fire_ns == 0 || s.expirations > 0 {
+            None
+        } else {
+            Some(s.next_fire_ns)
+        }
+    }
 }
 
 // ── signalfd ────────────────────────────────────────────────────
