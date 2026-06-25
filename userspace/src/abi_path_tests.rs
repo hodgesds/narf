@@ -317,6 +317,34 @@ fn smoke_abi_path_mkdirat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_neg);
 
+// mkdirat returns the right Linux errnos: EEXIST for an existing name,
+// ENOENT for a missing parent. busybox `mkdir -p` walks each path
+// component and depends on these exactly — EEXIST to skip components
+// that already exist, ENOENT to recurse and create missing parents. A
+// bare -1 (→ musl EPERM) aborted the whole chain, which broke udevd's
+// `mkdir -p /run/udev` on the ext2 rootfs.
+fn smoke_abi_path_mkdirat_errnos() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        let d = b"/p/d\0";
+        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0)) {
+            Some(0) => {}
+            _ => return Err("mkdirat(new) should return 0"),
+        }
+        // Re-create the same dir → EEXIST.
+        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0)) {
+            Some(-17) => {}
+            _ => return Err("mkdirat(existing) should return -EEXIST (-17)"),
+        }
+        // mkdir under a missing parent → ENOENT.
+        let m = b"/p/missing/child\0";
+        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, m.as_ptr() as u64, 0o755, 0)) {
+            Some(-2) => Ok(()),
+            _ => Err("mkdirat(missing parent) should return -ENOENT (-2)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_errnos);
+
 // ── open (OpenFile): NARF-native (ptr,len) with a NUL-term fallback ──
 //
 // sys_open reads arg0=path_ptr, arg1=path_LEN. Crucially it treats len==0 as

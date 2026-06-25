@@ -942,9 +942,9 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let ops = match ops {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
-            match narf_filesystem::registry().resolve_parent_absolute(path, |_fs, parent, leaf| {
-                poll_blocking(parent.create(leaf))
-            }) {
+            // Async parent resolution so O_CREAT works in subdirectories of
+            // a disk-backed (ext2) rootfs, not just sync-resolvable mounts.
+            match resolve_parent_dir_async(path).map(|(parent, leaf)| poll_blocking(parent.create(&leaf))) {
                 Some(Some(Ok(o))) => {
                     created = true;
                     o
@@ -3897,6 +3897,38 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
 // POSIX-style 0 / -1. Mode argument on mkdir is accepted and ignored
 // — NARF doesn't model POSIX permission bits at the FS layer.
 
+/// Resolve the parent directory of an absolute path to a `DirOps`,
+/// driving the ASYNC resolver. The sync `resolve_parent_absolute` walks
+/// via `lookup_dir`, which disk-backed filesystems (ext2) stub because
+/// block reads can't run synchronously — so creating a file or directory
+/// under a subdirectory of a mounted ext2 rootfs (e.g. udevd's
+/// `mkdir("/run/udev")`) resolved no parent and returned a bare -1 →
+/// musl EPERM. Same fix shape as the stat-async path. Returns
+/// `(parent_dir, leaf_name)`.
+fn resolve_parent_dir_async(
+    abs: &str,
+) -> Option<(alloc::sync::Arc<dyn narf_filesystem::DirOps>, alloc::string::String)> {
+    let last = abs.rfind('/')?;
+    let leaf = &abs[last + 1..];
+    if leaf.is_empty() {
+        return None;
+    }
+    let parent_path = if last == 0 { "/" } else { &abs[..last] };
+    let dir = narf_filesystem::registry()
+        .resolve_absolute(parent_path, |fs, rel| {
+            if rel.is_empty() {
+                // Parent is the mount root itself.
+                Some(fs.root())
+            } else {
+                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+                    .and_then(|r| r.ok())
+                    .and_then(|f| f.as_dir())
+            }
+        })
+        .flatten()?;
+    Some((dir, alloc::string::String::from(leaf)))
+}
+
 fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0;
@@ -3909,10 +3941,46 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
         }
     };
     let path = resolve_cwd_path(current_task_id(), &path);
-    let outcome = narf_filesystem::registry()
-        .resolve_parent_absolute(&path, |_fs, parent, leaf| poll_blocking(parent.mkdir(leaf)));
-    match outcome {
-        Some(Some(Ok(_))) => {
+    // Normalise trailing slashes; `mkdir("/")` (or any path that resolves
+    // to the root) always already exists.
+    let path_ref: &str = {
+        let t = path.trim_end_matches('/');
+        if t.is_empty() {
+            "/"
+        } else {
+            t
+        }
+    };
+    // busybox `mkdir -p` walks each path component, relying on Linux
+    // errnos: EEXIST for components that already exist (e.g. `/` and
+    // `/run` before `/run/udev`) and ENOENT to trigger recursion on a
+    // missing parent. A bare -1 → musl EPERM aborts the whole -p chain.
+    if path_ref == "/" {
+        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST (root)
+        return;
+    }
+    let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
+        Some(p) => p,
+        None => {
+            // Parent directory doesn't exist.
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
+        }
+    };
+    // FsError has no AlreadyExists variant (ext2 maps conflicts to
+    // InvalidPath), so detect an existing leaf explicitly for EEXIST.
+    let exists = poll_blocking(parent.lookup_async(&leaf))
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+        || poll_blocking(parent.lookup_dir_async(&leaf))
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+    if exists {
+        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
+        return;
+    }
+    match poll_blocking(parent.mkdir(&leaf)) {
+        Some(Ok(_)) => {
             #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_create(&path, true);
             ctx.set_return(SyscallReturn::ok(0));
