@@ -158,3 +158,36 @@ pub unsafe fn set_kernel_gs_base(user_gs: u64) {
 pub fn bsp_percpu_addr() -> u64 {
     core::ptr::addr_of!(BSP_PERCPU) as u64
 }
+
+/// Retarget this CPU's SYSCALL kernel-stack top — the `gs:[8]` value that
+/// `syscall_entry_x86_64` loads into RSP on a `syscall` from user mode
+/// (`PerCpu.kernel_stack_top`, offset 8). The scheduler points this at the
+/// currently-running user task's OWN kernel stack so a syscall from that task
+/// lands on the task's stack (paired with `gdt::set_kernel_rsp0` for the
+/// interrupt/trap path). Per-CPU: write only from the running CPU at CPL=0
+/// with the kernel GS active (a single `mov gs:[8]`, matching the read side).
+///
+/// # Safety
+/// CPL=0 with kernel GS.base loaded (the swapgs'd state every scheduler path
+/// runs in). The store is to this CPU's own `PerCpu`; no cross-CPU reader.
+#[inline]
+pub unsafe fn set_kernel_stack_top(top: u64) {
+    // SAFETY: caller asserts kernel GS; gs:[8] is `kernel_stack_top`. A plain
+    // store is consistent with the plain `mov rsp, gs:[8]` read in syscall.rs
+    // (single-CPU producer/consumer — no atomic needed).
+    unsafe {
+        core::arch::asm!("mov gs:[8], {t}", t = in(reg) top, options(nostack, preserves_flags));
+    }
+}
+
+/// This CPU's current SYSCALL kernel-stack top (`gs:[8]`). Diagnostic / for
+/// restoring the per-CPU baseline on switch-out.
+#[inline]
+pub fn kernel_stack_top() -> u64 {
+    let top: u64;
+    // SAFETY: reads gs:[8] at CPL=0 with kernel GS — always defined.
+    unsafe {
+        core::arch::asm!("mov {t}, gs:[8]", t = out(reg) top, options(nostack, preserves_flags, readonly));
+    }
+    top
+}

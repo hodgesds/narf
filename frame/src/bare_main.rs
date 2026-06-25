@@ -762,6 +762,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_scheduler::set_idle_backstop_hook(|deadline| {
                 narf_interrupts::x86_64::apic::arm_tsc_deadline_if_earlier(deadline);
             });
+            // Per-task kernel-stack retargeting (Linux `update_task_stack`):
+            // points TSS.rsp0 + SYSCALL gs:[8] at the running user task's own
+            // kernel stack so a trap/syscall lands there, not on a shared
+            // per-CPU stack. DORMANT until the scheduler wires it in (Stage 2);
+            // `top==0` restores the per-CPU baseline.
+            narf_scheduler::set_kernel_stack_hook(super::x86_64::gdt::set_task_kernel_stack);
             // Wire the memory subsystem's `invlpg_global` to
             // broadcast through this IPI surface. After this call,
             // every unmap_4kb fans out to peer CPUs.
