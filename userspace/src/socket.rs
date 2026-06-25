@@ -1558,6 +1558,10 @@ impl SocketFile {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
                 }
+                // Wake a server parked in poll/accept on the listener so it
+                // accepts the new connection immediately (not on a fallback
+                // timer). Untracked key → wake-all fallback.
+                crate::handlers::wake_io_waiters(0);
                 // Configure our (client) end.
                 let mut state = self.state.lock();
                 match &*state {
@@ -2336,6 +2340,15 @@ impl SocketFile {
             return Err(SockError::Pipe);
         }
         let n = tx.write(buf);
+        drop(state);
+        // Wake any peer parked in poll/epoll/recv on the other end of this
+        // ring. AF_UNIX (and loopback INET) sockets carry no kernel TCB, so
+        // they use the untracked (key=0) wake-all fallback — without this a
+        // blocked reader only re-checked on a coarse timer (~2 s/frame for a
+        // Wayland client), instead of waking the instant data lands.
+        if n > 0 {
+            crate::handlers::wake_io_waiters(0);
+        }
         if n == 0 && !buf.is_empty() {
             Err(SockError::WouldBlock)
         } else {
