@@ -298,6 +298,60 @@ pub fn clear_current() {
     current_slot().store(core::ptr::null_mut(), Ordering::Release);
 }
 
+// ── Per-task-own-stack FPU seam ─────────────────────────────────────
+//
+// In the own-stack model the user FPU (x87/SSE) is saved/restored across a
+// kernel_switch by the SCHEDULER (`try_preempt_user`/`yield_current_stackful`),
+// but the FPU area lives here in userspace (`UserTaskFuture::fpu`). The poll
+// publishes a pointer to the in-flight task's FPU area in this CPU's slot; the
+// scheduler drives FXSAVE/FXRSTOR through the installed hooks below.
+static CURRENT_FPU: [AtomicPtr<FpuArea>; narf_lib::percpu::MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const NULL: AtomicPtr<FpuArea> = AtomicPtr::new(core::ptr::null_mut());
+    [NULL; narf_lib::percpu::MAX_CPUS]
+};
+
+#[inline]
+fn fpu_slot() -> &'static AtomicPtr<FpuArea> {
+    &CURRENT_FPU[narf_lib::percpu::current_cpu()]
+}
+
+/// Publish this CPU's in-flight user-task FPU area (or null to clear).
+/// Wired into `UserTaskFuture::poll`'s own-stack entry next.
+#[allow(dead_code)]
+#[inline]
+fn publish_current_fpu(p: *mut FpuArea) {
+    fpu_slot().store(p, Ordering::Release);
+}
+
+/// FXSAVE the running user task's FPU into its published area. Installed as the
+/// scheduler's user-FPU save hook (own-stack model). No-op if unpublished.
+#[cfg(target_arch = "x86_64")]
+pub fn user_fpu_save_current() {
+    let p = fpu_slot().load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: `p` is the in-flight task's 512-byte 16-aligned FpuArea on
+        // this CPU; CR4.OSFXSR is set; the kernel is soft-float so the user
+        // XMM/x87 is still live in hardware at the preempt/park point.
+        unsafe {
+            core::arch::asm!("fxsave [{p}]", p = in(reg) p, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// FXRSTOR the running user task's FPU from its published area. Installed as the
+/// scheduler's user-FPU restore hook (own-stack model). No-op if unpublished.
+#[cfg(target_arch = "x86_64")]
+pub fn user_fpu_restore_current() {
+    let p = fpu_slot().load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: as `user_fpu_save_current`.
+        unsafe {
+            core::arch::asm!("fxrstor [{p}]", p = in(reg) p, options(nostack, preserves_flags));
+        }
+    }
+}
+
 pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     // The in-flight polling routine publishes its ctx in this CPU's
     // `CURRENT` cell right before entering user mode and clears it on
