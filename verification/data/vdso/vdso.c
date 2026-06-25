@@ -20,8 +20,10 @@
 
 struct vvar {
     uint32_t seq; // seqlock: odd while the kernel is updating
-    uint32_t cycles_per_ns; // == time crate CYCLES_PER_NS (>= 1)
+    uint32_t cycles_per_ns; // legacy truncated cyc/ns (coarse fallback only)
     int64_t wall_offset_ns; // realtime_ns = monotonic_ns + wall_offset_ns
+    uint32_t mult; // cycles→ns fixed-point: ns = (cyc * mult) >> shift
+    uint32_t shift; // == time crate C2N_MULT / C2N_SHIFT
 };
 
 struct vdso_timespec {
@@ -65,6 +67,7 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
     const volatile struct vvar *vv = VVAR;
     uint32_t cpns;
     int64_t off;
+    uint32_t mult, shift;
     for (;;) {
         uint32_t seq = __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE);
         if (seq & 1u) {
@@ -72,15 +75,27 @@ static int vdso_now_ns(int clk, uint64_t *out_ns) {
         }
         cpns = vv->cycles_per_ns;
         off = vv->wall_offset_ns;
+        mult = vv->mult;
+        shift = vv->shift;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (seq == __atomic_load_n(&vv->seq, __ATOMIC_ACQUIRE)) {
             break;
         }
     }
-    if (cpns == 0) {
-        cpns = 1;
+    // Match the kernel's monotonic_ns() bit-for-bit: ns = (cyc * mult) >> shift
+    // (exact to <1 ppm). The truncated cyc/cpns is only a pre-calibration
+    // fallback — using it for an absolute deadline (TFD_TIMER_ABSTIME) skews
+    // the wakeup by ~0.1·uptime against the kernel timerfd timebase.
+    uint64_t cyc = read_cycles();
+    uint64_t ns;
+    if (mult != 0) {
+        ns = (uint64_t)(((unsigned __int128)cyc * mult) >> shift);
+    } else {
+        if (cpns == 0) {
+            cpns = 1;
+        }
+        ns = cyc / (uint64_t)cpns;
     }
-    uint64_t ns = read_cycles() / (uint64_t)cpns;
     switch (clk) {
     case CLOCK_MONOTONIC:
     case CLOCK_MONOTONIC_RAW:

@@ -39,6 +39,8 @@ pub const VDSO_VADDR: u64 = VDSO_MAP_BASE + 0x1000;
 const VVAR_SEQ: usize = 0; // u32
 const VVAR_CPNS: usize = 4; // u32
 const VVAR_OFF: usize = 8; // i64
+const VVAR_MULT: usize = 16; // u32 — cycles→ns fixed-point multiplier
+const VVAR_SHIFT: usize = 20; // u32 — cycles→ns fixed-point shift
 
 struct VdsoImage {
     vvar_frame: PhysAddr,
@@ -141,7 +143,13 @@ fn read_u32(frame: PhysAddr, off: usize) -> u32 {
 
 /// Write the vvar fields under a seqlock: bump seq to odd, store the
 /// payload, bump to even. Readers retry while seq is odd or changes.
+///
+/// `mult`/`shift` are the calibrated cycles→ns fixed-point pair (the vDSO
+/// computes `ns = (cyc * mult) >> shift`, matching `monotonic_ns`); they are
+/// pulled from the live clock calibration so a re-publish always reflects the
+/// current scale.
 fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
+    let (mult, shift) = narf_scheduler::narf_time::cyc_to_ns_mult_shift();
     let base = frame.raw() as *mut u8;
     // SAFETY: identity-mapped vvar frame; all offsets within the page.
     unsafe {
@@ -151,6 +159,8 @@ fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
         fence(Ordering::Release);
         core::ptr::write_volatile(base.add(VVAR_CPNS) as *mut u32, cycles_per_ns);
         core::ptr::write_volatile(base.add(VVAR_OFF) as *mut i64, offset_ns);
+        core::ptr::write_volatile(base.add(VVAR_MULT) as *mut u32, mult);
+        core::ptr::write_volatile(base.add(VVAR_SHIFT) as *mut u32, shift);
         fence(Ordering::Release);
         core::ptr::write_volatile(seq_ptr, (seq | 1).wrapping_add(1)); // even
     }

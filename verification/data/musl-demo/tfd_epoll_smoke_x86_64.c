@@ -88,6 +88,32 @@ int main(void) {
     if (dt > worst) worst = dt;
     { uint64_t e = 0; read(tfd, &e, sizeof e); }
 
+    /* step D: ABSTIME timer armed from clock_gettime(CLOCK_MONOTONIC), the way
+     * libwayland's event loop arms its repaint timer. This crosses the vDSO
+     * clock (what clock_gettime reads) and the kernel timerfd clock: if those
+     * timebases diverge, the absolute deadline lands in the wrong frame and the
+     * wakeup is late by ~0.1·uptime — which is what stalled weston's repaint.
+     * (A relative timer can't catch it; the deadline must be ABSOLUTE.) */
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ts.tv_nsec += PERIOD_MS * 1000000L;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        struct itimerspec its = {0};
+        its.it_value = ts;
+        if (timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL) < 0) {
+            w("tfd-epoll-fail: D settime\n"); return 1;
+        }
+        t0 = now_ms();
+        n = epoll_wait(epfd, out, 1, -1);
+        dt = now_ms() - t0;
+        wkv("step-D abstime epoll_n", n); wkv("step-D elapsed_ms", (long)dt);
+        if (n != 1 || out[0].data.fd != tfd) { w("tfd-epoll-fail: D\n"); return 1; }
+        if (dt > worst) worst = dt;
+        { uint64_t e = 0; read(tfd, &e, sizeof e); }
+    }
+
     if (worst > GATE_MS) { w("tfd-epoll-fail: slow\n"); return 1; }
     w("tfd-epoll-ok\n");
     return 0;

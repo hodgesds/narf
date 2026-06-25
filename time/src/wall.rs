@@ -164,6 +164,21 @@ pub fn __test_cyc_to_ns_for_hz(hz: u64, cyc: u64) -> u64 {
     ((cyc as u128 * mult as u128) >> shift) as u64
 }
 
+/// The calibrated cycles→ns fixed-point pair `(mult, shift)` such that
+/// `ns = (cyc * mult) >> shift` — the exact conversion [`cycles_to_ns`] and
+/// hence [`monotonic_ns`] use. Published into the vDSO vvar page so the
+/// vDSO's `CLOCK_MONOTONIC` matches the kernel timebase bit-for-bit instead
+/// of the lossy truncated `cyc / cycles_per_ns` (which diverges ~10–20% on a
+/// non-integer-GHz TSC and breaks `TFD_TIMER_ABSTIME` timerfds armed from a
+/// vDSO clock read).
+#[inline]
+pub fn cyc_to_ns_mult_shift() -> (u32, u32) {
+    (
+        C2N_MULT.load(Ordering::Relaxed).max(1),
+        C2N_SHIFT.load(Ordering::Relaxed),
+    )
+}
+
 /// Convert raw TSC cycles to nanoseconds using the calibrated
 /// fixed-point scale. Exact to <1 ppm once calibrated; identity before.
 #[inline]
