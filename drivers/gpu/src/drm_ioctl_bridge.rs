@@ -591,9 +591,7 @@ const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 
 /// `(plane_id, crtc_index)` for the synthesised primary planes.
-fn synth_planes(
-    card: &crate::drm::card::Card,
-) -> alloc::vec::Vec<(u32, u32)> {
+fn synth_planes(card: &crate::drm::card::Card) -> alloc::vec::Vec<(u32, u32)> {
     (0..card.crtcs.len() as u32)
         .map(|i| (PLANE_ID_BASE + i, i))
         .collect()
@@ -643,7 +641,10 @@ fn handle_getplane(
     let fmt_ptr = u64::from_le_bytes(out[24..32].try_into().unwrap());
     let possible_crtcs = {
         let card = mode_state.lock();
-        match synth_planes(&card).into_iter().find(|(id, _)| *id == plane_id) {
+        match synth_planes(&card)
+            .into_iter()
+            .find(|(id, _)| *id == plane_id)
+        {
             Some((_, crtc_idx)) => 1u32 << crtc_idx,
             None => return Err(FsError::InvalidData),
         }
@@ -652,6 +653,7 @@ fn handle_getplane(
     out[8..12].copy_from_slice(&0u32.to_le_bytes()); // fb_id
     out[12..16].copy_from_slice(&possible_crtcs.to_le_bytes());
     out[16..20].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
+
     // One supported format (XRGB8888); fill the array two-pass.
     if fmt_ptr != 0 && user_fmt_count >= 1 {
         // SAFETY: `fmt_ptr` is the user format-array out-pointer with room
@@ -659,6 +661,7 @@ fn handle_getplane(
         unsafe { copy_out(fmt_ptr as usize, &DRM_FORMAT_XRGB8888.to_le_bytes())? };
     }
     out[20..24].copy_from_slice(&1u32.to_le_bytes()); // count_format_types
+
     // SAFETY: `arg` is the validated 32-byte out-pointer.
     unsafe { copy_out(arg, &out)? };
     Ok(0)
@@ -708,6 +711,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     }
     out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values (range only)
     out[60..64].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_enum_blobs
+
     // SAFETY: `arg` is the validated 64-byte out-pointer.
     unsafe { copy_out(arg, &out)? };
     Ok(0)

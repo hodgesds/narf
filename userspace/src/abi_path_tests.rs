@@ -326,18 +326,27 @@ kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_neg);
 fn smoke_abi_path_mkdirat_errnos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         let d = b"/p/d\0";
-        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0)) {
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0),
+        ) {
             Some(0) => {}
             _ => return Err("mkdirat(new) should return 0"),
         }
         // Re-create the same dir → EEXIST.
-        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0)) {
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0),
+        ) {
             Some(-17) => {}
             _ => return Err("mkdirat(existing) should return -EEXIST (-17)"),
         }
         // mkdir under a missing parent → ENOENT.
         let m = b"/p/missing/child\0";
-        match call(Syscall::Mkdirat.raw(), a3(AT_FDCWD, m.as_ptr() as u64, 0o755, 0)) {
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, m.as_ptr() as u64, 0o755, 0),
+        ) {
             Some(-2) => Ok(()),
             _ => Err("mkdirat(missing parent) should return -ENOENT (-2)"),
         }

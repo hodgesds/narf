@@ -944,7 +944,9 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
             // Async parent resolution so O_CREAT works in subdirectories of
             // a disk-backed (ext2) rootfs, not just sync-resolvable mounts.
-            match resolve_parent_dir_async(path).map(|(parent, leaf)| poll_blocking(parent.create(&leaf))) {
+            match resolve_parent_dir_async(path)
+                .map(|(parent, leaf)| poll_blocking(parent.create(&leaf)))
+            {
                 Some(Some(Ok(o))) => {
                     created = true;
                     o
@@ -3907,7 +3909,10 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
 /// `(parent_dir, leaf_name)`.
 fn resolve_parent_dir_async(
     abs: &str,
-) -> Option<(alloc::sync::Arc<dyn narf_filesystem::DirOps>, alloc::string::String)> {
+) -> Option<(
+    alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    alloc::string::String,
+)> {
     let last = abs.rfind('/')?;
     let leaf = &abs[last + 1..];
     if leaf.is_empty() {

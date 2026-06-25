@@ -665,7 +665,11 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
                         // thread mid-park, which no single-threaded waiter hits.)
                         if let Some(timer_dl) = instance.nearest_poll_deadline(task) {
                             let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
-                            let clamped = if cur == 0 { timer_dl } else { cur.min(timer_dl) };
+                            let clamped = if cur == 0 {
+                                timer_dl
+                            } else {
+                                cur.min(timer_dl)
+                            };
                             uc.sleep_deadline_ns.store(clamped, Ordering::Release);
                         }
                         // Rewind RIP so we re-execute epoll_wait on resume.

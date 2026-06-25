@@ -330,7 +330,13 @@ fn smoke_drm_ioctl_planes_synth_primary() -> TestResult {
     // possible_crtcs.
     let mut pl = [0u8; 32];
     pl[0..4].copy_from_slice(&0x40u32.to_le_bytes());
-    if dispatch_card(idx, DRM_IOCTL_MODE_GETPLANE, pl.as_mut_ptr() as usize, false) != Ok(0) {
+    if dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_GETPLANE,
+        pl.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
         return TestResult::Fail("GETPLANE failed");
     }
     if u32::from_le_bytes(pl[12..16].try_into().unwrap()) == 0 {
