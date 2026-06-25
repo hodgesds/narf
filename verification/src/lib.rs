@@ -2276,14 +2276,19 @@ fn smoke_frame_x86_64_tss_rsp0_and_gs_base() -> TestResult {
     }
     // SAFETY: writing KERNEL_GS_BASE at CPL=0 is documented. We
     // restore it immediately so other tests see the same initial
-    // state.
+    // state. The round-trip value MUST be a CANONICAL address: GS_BASE
+    // (like FS_BASE / KERNEL_GS_BASE) is a base-address MSR, and WRMSR
+    // of a non-canonical value #GPs on real silicon and under KVM. (TCG
+    // doesn't enforce canonicality, which is why a non-canonical
+    // sentinel silently passed in CI but crashed on bare metal / KVM.)
+    const KGS_SENTINEL: u64 = 0x0000_7EAD_CAFE_F00D;
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        msr::wrmsr(IA32_KERNEL_GS_BASE, 0xDEAD_BEEF_CAFE_F00D);
+        msr::wrmsr(IA32_KERNEL_GS_BASE, KGS_SENTINEL);
     }
     // SAFETY: Valid memory or trusted environment
     let kgs_mid = unsafe { msr::rdmsr(IA32_KERNEL_GS_BASE) };
-    if kgs_mid != 0xDEAD_BEEF_CAFE_F00D {
+    if kgs_mid != KGS_SENTINEL {
         // SAFETY: Valid memory or trusted environment
         unsafe {
             msr::wrmsr(IA32_KERNEL_GS_BASE, 0);
