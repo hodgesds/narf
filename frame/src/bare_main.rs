@@ -253,6 +253,75 @@ fn parse_stop_at(cmdline: &str) -> narf_init::Stage {
     last
 }
 
+/// PCID domain-enforcer setup: enable CR4.PCIDE, snapshot the kernel
+/// bootstrap PML4, and allocate + register one private PML4 (with its
+/// per-domain PDPT) for each of the 16 domains.
+///
+/// This MUST run AFTER the MMU handoff (`init_mmu` installs the final
+/// kernel PML4 and rewrites CR3) and AFTER the buddy allocator is
+/// populated from the memory map (`init_from_map`): `pcid::init`
+/// snapshots CR3 as the bootstrap PML4, and `new_user_pml4_on` both
+/// reads CR3 to clone the kernel half AND needs a live buddy to get
+/// frames. Running it in the early-features block (before the handoff)
+/// snapshotted the bootloader's stale PML4 and hit an empty buddy, so
+/// every clone failed → 0 domains registered → strict isolation silently
+/// degraded to the shared-bootstrap fallback (only observable under PCID,
+/// i.e. KVM / real silicon — TCG CI never enables it).
+#[cfg(target_arch = "x86_64")]
+fn setup_pcid_domains() {
+    // SAFETY: PCID is a baseline long-mode feature; the post-handoff CR3
+    // has PCID==0 (init_mmu wrote a clean CR3), as enable_pcide requires.
+    unsafe {
+        narf_arch::x86_64::pcid::enable_pcide();
+        narf_arch::x86_64::pcid::init();
+    }
+    // Spread domain D's PML4 onto NUMA node (D % num_nodes) for locality.
+    let num_nodes = if narf_memory::is_numa_aware() {
+        let mut n = 0usize;
+        for i in 0..narf_memory::FRAME_MAX_NUMA_NODES {
+            if narf_memory::node_free(i) > 0 {
+                n = i + 1;
+            }
+        }
+        n.max(1)
+    } else {
+        1
+    };
+    narf_memory::asid_alloc::allocator_init();
+    narf_memory::per_domain_root::init();
+    let mut registered = 0u8;
+    for domain in 0u8..16 {
+        let node = (domain as usize) % num_nodes;
+        // SAFETY: paging on, buddy populated, identity map covers low frames.
+        match unsafe { narf_memory::paging::new_user_pml4_on(node) } {
+            Ok(phys) => {
+                // SAFETY: domain<16; phys is a valid 4 KiB frame.
+                unsafe {
+                    narf_arch::x86_64::pcid::set_domain_pml4(domain, phys.raw());
+                }
+                let _ = narf_memory::per_domain_root::register_root(
+                    narf_lib::id::DomainId::new(domain),
+                    phys.raw(),
+                );
+                registered += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    // SAFETY: pcid::init has run; PML4s are registered; identity map covers
+    // low frames.
+    let private_pdpts = unsafe { narf_memory::domain::init_per_domain_pdpts() }.unwrap_or_default();
+    narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
+    let _ = writeln!(
+        console::Writer,
+        "  domain enforcer: pcid (CR4.PCIDE=1, {} PML4 clones, \
+         {} private PDPTs at slots 256..=271; cross-domain \
+         access to private VAs faults at PML4 level)",
+        registered,
+        private_pdpts
+    );
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // Status-panel diag: first non-firmware phase. set_phase is a
@@ -547,11 +616,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // Domain-enforcer selection. PKS is the fast path (single
         // WRMSR per crossing); when it's absent — typically AMD
         // silicon or pre-SPR Intel — fall back to the PCID enforcer:
-        // CR3 swap with PCID-preserve. Per-domain PML4 *divergence*
-        // (the part that makes isolation strict instead of nominal)
-        // requires a memory/ surface change and is not yet wired —
-        // unregistered domains share the bootstrap PML4. The CR3
-        // swap path itself is exercised either way.
+        // CR3 swap with PCID-preserve, plus per-domain PML4 *divergence*
+        // (strict isolation) wired in `setup_pcid_domains()` after the MMU
+        // handoff. PKS is armed here; PCID is deferred (see below).
         if feats.pks {
             // SAFETY: CPUID confirmed PKS support.
             unsafe {
@@ -565,96 +632,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 console::Writer,
                 "  domain enforcer: pks (CR4.PKS=1, IA32_PKRS=0 / all-allow)"
             );
-        } else {
-            // PCID fallback. Order matters: enable CR4.PCIDE first
-            // (this requires CR3 to currently have PCID = 0, which is
-            // the case at boot — bootloader hands us a CR3 with the
-            // legacy PWT/PCD bits clear), then snapshot CR3 as the
-            // bootstrap PML4 in `pcid::init`. After init, allocate 16
-            // per-domain PML4s as byte-copies of the bootstrap. Because
-            // the copy preserves the PML4 entries (which are pointers
-            // to PDPT pages), the 16 clones share the same downstream
-            // page tables — KAISER-style fan-out: any kernel-side
-            // mapping change after boot is visible to all 16 domains
-            // automatically. Domain-private mappings (which require
-            // a per-domain PDPT under one PML4 slot) are a follow-up.
-            //
-            // SAFETY: PCID is a baseline x86_64 feature on all
-            // long-mode CPUs, so `enable_pcide` (sets CR4.PCIDE) and
-            // `init` are valid here; the bootloader-provided CR3's low
-            // bits are zero as the PCID code requires.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_arch::x86_64::pcid::enable_pcide();
-                narf_arch::x86_64::pcid::init();
-            }
-            // Allocate + register 16 per-domain PML4 clones, spread
-            // across NUMA nodes. Domain D's PML4 lands on node
-            // (D % num_nodes) so PML4 reads on a CPU local to that
-            // node hit local memory.
-            let num_nodes = if narf_memory::is_numa_aware() {
-                // Count nodes with non-zero free pages.
-                let mut n = 0usize;
-                for i in 0..narf_memory::FRAME_MAX_NUMA_NODES {
-                    if narf_memory::node_free(i) > 0 {
-                        n = i + 1;
-                    }
-                }
-                n.max(1)
-            } else {
-                1
-            };
-            // Initialise the cross-arch per-domain root registry +
-            // ASID/PCID allocator before populating per-domain PML4s.
-            narf_memory::asid_alloc::allocator_init();
-            narf_memory::per_domain_root::init();
-            let mut registered = 0u8;
-            for domain in 0u8..16 {
-                let node = (domain as usize) % num_nodes;
-                // SAFETY: paging on, identity map covers low frames,
-                // alloc_frame_on returns identity-mapped 4 KiB.
-                // SAFETY: Valid memory or trusted environment
-                match unsafe { narf_memory::paging::new_user_pml4_on(node) } {
-                    Ok(phys) => {
-                        // SAFETY: domain<16; phys is a valid 4KiB frame.
-                        unsafe {
-                            narf_arch::x86_64::pcid::set_domain_pml4(domain, phys.raw());
-                        }
-                        // Mirror into the unified registry. Errors
-                        // here are benign — the pcid registry above
-                        // is the authoritative copy.
-                        let _ = narf_memory::per_domain_root::register_root(
-                            narf_lib::id::DomainId::new(domain),
-                            phys.raw(),
-                        );
-                        registered += 1;
-                    }
-                    Err(_) => {
-                        // Out of frames at boot is unexpected, but bail
-                        // out of the loop and run nominal-isolation if so.
-                        break;
-                    }
-                }
-            }
-            // Install per-domain private PDPTs (slot 256+D in each
-            // domain's PML4). After this, accesses to domain D's
-            // private VA range from any other domain hard-fault at
-            // PML4 level.
-            let private_pdpts =
-                // SAFETY: pcid::init has run; PML4s are registered;
-                // identity map still covers low frames.
-                // SAFETY: Valid memory or trusted environment
-                unsafe { narf_memory::domain::init_per_domain_pdpts() }.unwrap_or_default();
-            narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
-            let _ = writeln!(
-                console::Writer,
-                "  domain enforcer: pcid (CR4.PCIDE=1, {} PML4 clones, \
-                 {} private PDPTs at slots 256..=271; cross-domain \
-                 access to private VAs faults at PML4 level)",
-                registered,
-                private_pdpts
-            );
         }
+        // PCID enforcer setup (the !PKS fallback) is DEFERRED to
+        // `setup_pcid_domains()`, called AFTER the MMU handoff + buddy
+        // populate further down. Doing it here snapshotted the stale
+        // bootloader PML4 and hit an empty buddy → 0 domains registered.
+        // See setup_pcid_domains() for the full ordering rationale.
 
         // NX enable. PTE bit 63 (NO_EXEC) is reserved-zero unless
         // IA32_EFER.NXE=1. Flipping the bit at boot makes subsequent
@@ -1107,6 +1090,16 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  mmu: init failed: {e:?}");
                     }
+                }
+
+                // Per-domain PCID PML4s — deferred here, AFTER the MMU
+                // handoff (CR3 is now the final kernel PML4) and the buddy
+                // populate, so the clones snapshot the right PML4 from a live
+                // allocator. PKS systems already armed their enforcer in the
+                // features block above; only the PCID fallback needs this.
+                // SAFETY: a single CPUID read, legal at CPL=0.
+                if !unsafe { narf_arch::x86_64::Features::probe() }.pks {
+                    setup_pcid_domains();
                 }
 
                 // ACPI tables (RSDP → XSDT → SRAT/MADT/MCFG). PVH
