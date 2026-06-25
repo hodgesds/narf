@@ -542,14 +542,34 @@ fn fmt_cap_bitmap(words: &[u64]) -> alloc::string::String {
 fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::string::String {
     use narf_input::evdev::EventType;
     let mut s = format!("EV={:x}\n", caps.evbit);
-    if caps.evbit & (1 << (EventType::Key as u16)) != 0 {
+    let has_key = caps.evbit & (1 << (EventType::Key as u16)) != 0;
+    let has_rel = caps.evbit & (1 << (EventType::Rel as u16)) != 0;
+    let has_abs = caps.evbit & (1 << (EventType::Abs as u16)) != 0;
+    if has_key {
         s.push_str(&format!("KEY={}\n", fmt_cap_bitmap(&caps.keybit.words)));
     }
-    if caps.evbit & (1 << (EventType::Rel as u16)) != 0 {
+    if has_rel {
         s.push_str(&format!("REL={}\n", fmt_cap_bitmap(&caps.relbit.words)));
     }
-    if caps.evbit & (1 << (EventType::Abs as u16)) != 0 {
+    if has_abs {
         s.push_str(&format!("ABS={}\n", fmt_cap_bitmap(&caps.absbit.words)));
+    }
+    // ID_INPUT* properties. On real Linux these are added by udev's
+    // `input_id` builtin (reading the same capability bitmaps) and are
+    // what libinput keys on to accept + classify a device. NARF has no
+    // udevd, so emit them directly in the synthesised uevent — udev reads
+    // uevent-file properties without a database, so libinput's
+    // `evdev_configure_device` sees the device type and stops reporting
+    // "no input devices". Classification mirrors input_id's coarse rules:
+    // a relative pointer is a mouse, an absolute device a touchscreen,
+    // otherwise a key-only device is a keyboard.
+    s.push_str("ID_INPUT=1\n");
+    if has_rel {
+        s.push_str("ID_INPUT_MOUSE=1\n");
+    } else if has_abs {
+        s.push_str("ID_INPUT_TOUCHSCREEN=1\n");
+    } else if has_key {
+        s.push_str("ID_INPUT_KEYBOARD=1\n");
     }
     s
 }
