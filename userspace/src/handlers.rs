@@ -18382,9 +18382,13 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
                 0
             } else {
                 let fd = fd_raw as u32;
-                let readiness =
-                    fd::with_table(task, |t| t.get(fd).map(|e| e.ops.poll_readiness())).flatten();
-                match readiness {
+                // Clone the FileOps out from under the fd-table lock before
+                // polling: a nested-epoll fd's poll_readiness re-enters
+                // `fd::with_table`, which would deadlock the non-reentrant
+                // fd-table lock if held across the call (see epoll.rs
+                // `poll_fd_readiness`).
+                let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+                match ops.map(|o| o.poll_readiness()) {
                     Some(r) => (r & events) as u16,
                     None => narf_filesystem::POLL_NVAL as u16,
                 }
@@ -18555,9 +18559,10 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             } else {
                 *fd as u32
             };
-            let readiness = fd::with_table(task, |t| t.get(fd_u).map(|e| e.ops.poll_readiness()))
-                .flatten()
-                .unwrap_or(0);
+            // Clone the FileOps out before polling so a nested-epoll fd can't
+            // re-enter (and deadlock) the non-reentrant fd-table lock.
+            let ops = fd::with_table(task, |t| t.get(fd_u).map(|e| e.ops.clone())).flatten();
+            let readiness = ops.map(|o| o.poll_readiness()).unwrap_or(0);
             let active = readiness & entry.events;
             if active != 0 {
                 let off = (written * 12) as u64;

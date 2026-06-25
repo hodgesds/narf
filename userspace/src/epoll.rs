@@ -106,6 +106,25 @@ struct EpollInner {
     interest: BTreeMap<i32, EpollItem>,
 }
 
+/// Poll one fd's readiness WITHOUT holding the fd-table lock across the
+/// `poll_readiness()` call. Clones the `Arc<dyn FileOps>` out from under the
+/// (non-reentrant `IrqSafeSpinLock`) fd-table lock, releases it, then polls.
+///
+/// This matters because a NESTED epoll fd's `poll_readiness`
+/// ([`EpollInstance::poll_readiness`]) itself calls `fd::with_table` to poll
+/// its children. If the parent polled it while still holding the fd-table
+/// lock, that re-entry would spin forever on the same lock — and libwayland
+/// nests event loops (an inner `wl_event_loop`'s epoll fd is an event source
+/// in the outer loop), so a Wayland compositor blocks on its very first
+/// `epoll_wait` with no wakeup, ever. Polling outside the lock fixes it.
+fn poll_fd_readiness(task_id: u64, fd: i32) -> u32 {
+    if fd < 0 {
+        return 0;
+    }
+    let ops = fd::with_table(task_id, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
+    ops.map(|o| o.poll_readiness()).unwrap_or(0)
+}
+
 impl EpollInstance {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -180,13 +199,9 @@ impl EpollInstance {
             {
                 continue;
             }
-            // Query current readiness from the fd table.
-            let cur_mask: u32 = fd::with_table(task_id, |t| {
-                t.get(*fd as u32)
-                    .map(|e| e.ops.poll_readiness())
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
+            // Query current readiness — polled outside the fd-table lock so a
+            // nested-epoll child can't deadlock on it (see poll_fd_readiness).
+            let cur_mask: u32 = poll_fd_readiness(task_id, *fd);
 
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
@@ -216,12 +231,7 @@ impl EpollInstance {
             let mut g = self.inner.lock();
             for (fd, item_snap) in &snapshot {
                 if let Some(item) = g.interest.get_mut(fd) {
-                    let cur_mask: u32 = fd::with_table(task_id, |t| {
-                        t.get(*fd as u32)
-                            .map(|e| e.ops.poll_readiness())
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0);
+                    let cur_mask: u32 = poll_fd_readiness(task_id, *fd);
                     item.last_mask = cur_mask;
 
                     if (item_snap.events & EPOLLONESHOT) != 0 {
@@ -284,17 +294,19 @@ impl FileOps for EpollInstance {
     /// epoll-readiness for nested epoll. Returns POLL_IN if any
     /// interests are currently satisfied.
     fn poll_readiness(&self) -> u32 {
+        // Snapshot (fd, events) and release our own lock BEFORE polling the
+        // children: a child poll re-enters `fd::with_table` (and, if epolls
+        // are nested deeper, another `EpollInstance::poll_readiness`), so
+        // holding any lock across it risks the same re-entrant deadlock the
+        // outer epoll path hit. See `poll_fd_readiness`.
+        let snapshot: Vec<(i32, u32)> = {
+            let g = self.inner.lock();
+            g.interest.values().map(|it| (it.fd, it.events)).collect()
+        };
+        let task = current_task_id();
         let mut mask = 0;
-        let g = self.inner.lock();
-        for item in g.interest.values() {
-            let fd = item.fd;
-            let ready = fd::with_table(current_task_id(), |t| {
-                t.get(fd as u32)
-                    .map(|e| e.ops.poll_readiness())
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-            if (ready & item.events) != 0 {
+        for (fd, events) in snapshot {
+            if (poll_fd_readiness(task, fd) & events) != 0 {
                 mask |= narf_filesystem::POLL_IN;
             }
         }
