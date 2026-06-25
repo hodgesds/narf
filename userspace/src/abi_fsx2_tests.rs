@@ -36,7 +36,7 @@ const FSCONFIG_CMD_CREATE: u64 = 6;
 
 // Open a MemFs-backed file via the (linux-compat) open syscall.
 fn open_memfs_fd(path: &[u8]) -> Result<u32, &'static str> {
-    match call(Syscall::OpenFile.raw(), a0(path.as_ptr() as u64)) {
+    match call_open(path.as_ptr() as u64, 0) {
         Some(v) if v >= 0 => Ok(v as u32),
         _ => Err("open of seeded MemFs file should yield an fd"),
     }

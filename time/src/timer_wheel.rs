@@ -257,9 +257,32 @@ pub fn refresh_waker(handle: SleepHandle, waker: Waker) -> bool {
 /// chain) MUST use [`take_due`] instead and call wake() AFTER
 /// exiting IRQ context.
 pub fn fire_due(now_cycles: u64) -> usize {
-    let (taken, n) = take_due(now_cycles);
-    for w in taken.into_iter().flatten() {
-        w.wake();
+    // O(1) stack + SINGLE PASS. Walk slot indices once with a cursor, taking +
+    // waking each slot that is due at entry. Two invariants matter:
+    //   - No ~1 KiB on-stack `[Option<Waker>; MAX_SLEEPERS]`: moving that array
+    //     by value smashed the caller's return chain when this runs from a timer
+    //     IRQ on a user task's own kernel stack (per-task-own-stack model).
+    //   - Each currently-due timer fires AT MOST ONCE per call (matches the old
+    //     `take_due` single pass). A `wake()` may re-register a fresh timer (the
+    //     smoltcp net poll re-arms on every wake) into a now-freed LOWER slot;
+    //     the cursor never revisits it, so that re-registration is deferred to
+    //     the next tick. A re-scan-from-zero loop instead spins forever once a
+    //     poller re-arms with deadline ≤ now, wedging the CPU — observed as
+    //     accept() never completing in net-smoke.
+    // `wake()` runs outside the lock (it re-acquires the wheel on re-register).
+    let mut n = 0usize;
+    for i in 0..MAX_SLEEPERS {
+        let waker = {
+            let mut w = WHEEL.lock();
+            match w.slots[i].as_ref() {
+                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take().map(|s| s.waker),
+                _ => None,
+            }
+        };
+        if let Some(wk) = waker {
+            wk.wake();
+            n += 1;
+        }
     }
     n
 }
@@ -280,19 +303,70 @@ pub fn fire_due(now_cycles: u64) -> usize {
 /// }
 /// ```
 pub fn take_due(now_cycles: u64) -> ([Option<Waker>; MAX_SLEEPERS], usize) {
-    let mut w = WHEEL.lock();
     let mut taken: [Option<Waker>; MAX_SLEEPERS] = [const { None }; MAX_SLEEPERS];
+    let n = take_due_into(now_cycles, &mut taken);
+    (taken, n)
+}
+
+/// Like [`take_due`] but fills a caller-provided `out` buffer instead of
+/// returning a `MAX_SLEEPERS`-element array by value. IRQ-context callers (the
+/// HPET pump, the clockevent tick) MUST use this: returning the ~1 KiB array by
+/// value forces an `sret` copy + a second on-stack buffer, and on a user task's
+/// own kernel stack (the per-task-own-stack model) that fragile large-struct
+/// return was observed to smash the handler's return address under fork/exec
+/// churn (`rip=0x3` wild jumps). Writing in place into the caller's single
+/// buffer avoids the copy entirely.
+pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -> usize {
+    let mut w = WHEEL.lock();
     let mut n = 0usize;
     for (i, slot) in w.slots.iter_mut().enumerate() {
         if let Some(s) = slot.as_ref() {
             if s.deadline_cycles <= now_cycles {
                 let s = slot.take().unwrap();
-                taken[i] = Some(s.waker);
+                out[i] = Some(s.waker);
                 n += 1;
             }
         }
     }
-    (taken, n)
+    n
+}
+
+/// Drain every due waker straight into the per-CPU deferred-wake queue, using
+/// **O(1) stack**. This is the IRQ-context wheel drain — the HPET pump and the
+/// clockevent tick MUST use this, NOT [`take_due`]/[`take_due_into`].
+///
+/// Why: `take_due*` materialise a `MAX_SLEEPERS`-element `[Option<Waker>]`
+/// (~1 KiB) on the stack. In the per-task-own-stack model the timer IRQ runs on
+/// the *user task's own kernel stack* (`TSS.rsp0` points there), and that large
+/// IRQ-path frame — returned/passed by value through the drain — smashed the
+/// handler's return chain under fork/exec churn, producing the `rip=0x3` wild
+/// jump. Draining one waker at a time keeps the IRQ frame tiny.
+///
+/// Wakers are *pushed*, never woken here: `wake()` would drop the `Arc` (a slab
+/// free) in IRQ context. The scheduler's idle path (`drain_and_wake`) wakes +
+/// drops them in a context where freeing is allowed.
+///
+/// The wheel lock is released before each `push_pending` so the wheel and the
+/// deferred-queue locks are never held nested (no lock-ordering hazard).
+///
+/// SINGLE PASS via an index cursor (same invariant as [`fire_due`]): each
+/// currently-due timer is drained at most once; a re-registration into a freed
+/// lower slot is deferred to the next tick, never re-drained this call.
+pub fn drain_due_to_deferred(now_cycles: u64) {
+    for i in 0..MAX_SLEEPERS {
+        // Take this slot's due waker under the wheel lock, then release it
+        // before pushing (the wheel + deferred-queue locks never nest).
+        let waker = {
+            let mut w = WHEEL.lock();
+            match w.slots[i].as_ref() {
+                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take().map(|s| s.waker),
+                _ => None,
+            }
+        };
+        if let Some(wk) = waker {
+            narf_lib::deferred_wake::push_pending_iter(core::iter::once(wk));
+        }
+    }
 }
 
 /// Earliest pending deadline, or `None` if the wheel is

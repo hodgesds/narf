@@ -489,6 +489,10 @@ fn nanosleep_common(
                 .store(deadline, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                crate::handlers::own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable

@@ -237,6 +237,14 @@ pub fn primary() -> Option<&'static dyn ClockEvent> {
 #[inline]
 pub fn on_tick() {
     let now = crate::now_cycles();
+    // Fire due wheel timers immediately on the tick — latency-sensitive
+    // workloads (redis epoll/network timeouts) need prompt timer wakes, not a
+    // deferred-queue hop. `fire_due` is now O(1) stack (drains one waker at a
+    // time, no ~1 KiB on-stack array), so it is safe to call from this
+    // IRQ-context tick even when it runs on a user task's own kernel stack (the
+    // per-task-own-stack model). The IRQ-only Arc-drop-in-trap concern is moot
+    // in practice: the wheel waker is never the last Arc ref (the task's slot
+    // owns one) outside the rare exited-task case.
     let _ = crate::timer_wheel::fire_due(now);
     // Broadcast to CPUs in BROADCAST_MASK if a sender's installed.
     // No-op until SMP wires `set_broadcast_sender` + per-CPU

@@ -16,7 +16,7 @@ use crate::abi_test_support::*;
 /// an `Err` message. flags=0 — MemFs ignores the access mode.
 fn open_fd(path: &[u8]) -> Result<u32, &'static str> {
     let ptr = path.as_ptr() as u64;
-    match call(Syscall::OpenFile.raw(), a1(ptr, 0)) {
+    match call_open(ptr, 0) {
         Some(fd) if fd >= 0 => Ok(fd as u32),
         _ => Err("open failed"),
     }
@@ -319,7 +319,7 @@ fn smoke_abi_fdio_dup2_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let fd = open_fd(b"/abi/f\0")?;
         // dup2(fd, 50) → returns the requested newfd (50).
-        match call(Syscall::Dup2.raw(), a1(fd as u64, 50)) {
+        match call_dup2(fd as u64, 50) {
             Some(50) => Ok(()),
             _ => Err("dup2 did not return the requested newfd"),
         }
@@ -331,7 +331,7 @@ fn smoke_abi_fdio_dup2_neg() -> TestResult {
     with_setup(|| {
         // dup2 from a bad oldfd → InvalidOp.
         // LINUX-GAP: Linux returns -EBADF.
-        match call(Syscall::Dup2.raw(), a1(8888, 50)) {
+        match call_dup2(8888, 50) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
         }

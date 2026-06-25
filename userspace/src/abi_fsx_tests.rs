@@ -24,7 +24,7 @@ const ENODATA: i64 = -61;
 // its fd, or Err if the open failed. Used by the `f*xattr` tests which need
 // a live fd so `xattr_fd_key`/`fd_path_of` resolve to Some(placeholder).
 fn open_memfs_fd(path: &[u8]) -> Result<u32, &'static str> {
-    match call(Syscall::OpenFile.raw(), a0(path.as_ptr() as u64)) {
+    match call_open(path.as_ptr() as u64, 0) {
         Some(v) if v >= 0 => Ok(v as u32),
         _ => Err("open of seeded MemFs file should yield an fd"),
     }

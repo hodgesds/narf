@@ -16,7 +16,7 @@ const ENOKEY: i64 = -126;
 // Open a MemFs-backed file via the Linux open(2) ABI (arg0 = NUL-term
 // absolute path, arg1 = flags) and return its fd. Used by the I/O tests.
 fn open_abi_fd(path: &[u8]) -> Result<u32, &'static str> {
-    match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, 0)) {
+    match call_open(path.as_ptr() as u64, 0) {
         Some(fd) if fd >= 0 => Ok(fd as u32),
         _ => Err("open of seeded MemFs file failed"),
     }

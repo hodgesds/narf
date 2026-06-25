@@ -533,8 +533,23 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // enter_user_mode_resume. It's a no-op (returns) when no polling
         // executor is wired (kernel-test contexts).
         if is_tick && (frame.cs & 3) == 3 {
-            let mut ctx = X86TrapContext::from_int80(frame);
-            narf_userspace::handlers::timer_preempt_user_task(&mut ctx);
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                // Per-task-own-stack model: the user task ran on its own kernel
+                // stack, so this timer trap's frame is on that stack — preempt
+                // with a clean kernel_switch (no longjmp). On resume, the asm
+                // tail below pops GPRs + iretq's the (signal-adjusted) frame
+                // back to the interrupted user instruction.
+                // SAFETY: TrapFrame layout matches narf-scheduler's mirror
+                // (asserted in stackful.rs); `frame` is the live trap frame.
+                unsafe {
+                    let sched_frame_ptr =
+                        frame as *mut TrapFrame as *mut narf_scheduler::stackful::TrapFrame;
+                    narf_scheduler::stackful::try_preempt_user(&mut *sched_frame_ptr);
+                }
+            } else {
+                let mut ctx = X86TrapContext::from_int80(frame);
+                narf_userspace::handlers::timer_preempt_user_task(&mut ctx);
+            }
         }
         return;
     }
@@ -738,6 +753,15 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             options(nostack, preserves_flags));
         }
         let _ = writeln!(TrapWriter, "  cr2:    {:#018x}", cr2);
+    }
+    {
+        let cr3: u64;
+        // SAFETY: reading CR3 at CPL=0 is always defined.
+        unsafe {
+            core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+                options(nostack, preserves_flags));
+        }
+        let _ = writeln!(TrapWriter, "  cr3:    {:#018x}", cr3);
     }
     let _ = writeln!(
         TrapWriter,

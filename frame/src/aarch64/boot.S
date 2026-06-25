@@ -155,8 +155,8 @@ _start:
     orr  x0, x0, #(1 << 8)      /* IRGN0 */
     orr  x0, x0, #(1 << 24)     /* IRGN1 */
     orr  x0, x0, #(2 << 30)     /* TG1=4KB */
-    mov  x1, #2
-    orr  x0, x0, x1, lsl #32    /* IPS=40-bit */
+    mov  x1, #0x62              /* IPS=40-bit, TBI0=1, TBI1=1 */
+    orr  x0, x0, x1, lsl #32
     msr  tcr_el1, x0
     isb
 

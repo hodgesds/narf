@@ -2039,14 +2039,25 @@ fn smoke_userspace_open_routes_through_vfs() -> TestResult {
     // mount prefix is part of the path), arg1 = flags.
     let path = b"/test/hello\0";
     let mut ctx = FakeCtx {
+        #[cfg(target_arch = "x86_64")]
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
             arg1: 0, // flags
             ..Default::default()
         },
+        #[cfg(target_arch = "aarch64")]
+        args: SyscallArgs {
+            arg0: 0xffffffffffffff9c, // AT_FDCWD
+            arg1: path.as_ptr() as u64,
+            arg2: 0, // flags
+            ..Default::default()
+        },
         ret: None,
     };
+    #[cfg(target_arch = "x86_64")]
     kernel_syscall_entry(Syscall::OpenFile.raw(), &mut ctx);
+    #[cfg(target_arch = "aarch64")]
+    kernel_syscall_entry(Syscall::Openat.raw(), &mut ctx);
     let opened_fd = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value as u32,
         _ => return TestResult::Fail("Open did not return Ok"),
@@ -5973,6 +5984,7 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
     // Linux open(2) ABI: arg0 = NUL-terminated absolute path, arg1 = flags.
     let path = b"/pio/f\0";
     let mut ctx = FakeCtx {
+        #[cfg(target_arch = "x86_64")]
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
             arg1: 0, // flags
@@ -5981,9 +5993,19 @@ fn smoke_userspace_pread_pwrite_dont_move_cursor() -> TestResult {
             arg4: 0,
             arg5: 0,
         },
+        #[cfg(target_arch = "aarch64")]
+        args: SyscallArgs {
+            arg0: 0xffffffffffffff9c, // AT_FDCWD
+            arg1: path.as_ptr() as u64,
+            arg2: 0, // flags
+            ..Default::default()
+        },
         ret: None,
     };
+    #[cfg(target_arch = "x86_64")]
     kernel_syscall_entry(Syscall::OpenFile.raw(), &mut ctx);
+    #[cfg(target_arch = "aarch64")]
+    kernel_syscall_entry(Syscall::Openat.raw(), &mut ctx);
     let fd = match ctx.ret {
         Some(r) if r.value != !0u64 => r.value as u32,
         _ => return TestResult::Fail("open /pio/f failed"),
@@ -6343,10 +6365,16 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK => r.value as i64,
         _ => return TestResult::Fail("times did not return OK"),
     };
-    // utime synthesised to wall-clock ticks; stime/cutime/cstime
-    // zeroed; wall return matches buf[0] (both source the same ns).
-    if buf[0] != wall || buf[1] != 0 || buf[2] != 0 || buf[3] != 0 {
-        return TestResult::Fail("times did not write the expected tms struct");
+    // The RETURN value is wall-clock uptime in ticks. The tms FIELDS carry
+    // per-task CPU time: utime / cutime are the task's own + reaped-children
+    // CPU ticks (>= 0; not the wall return — that decoupling is the whole
+    // point of the accounting fix), and we never split out system time so
+    // stime / cstime are always zero.
+    if buf[1] != 0 || buf[3] != 0 {
+        return TestResult::Fail("times: stime/cstime must be zero (no user/sys split)");
+    }
+    if buf[0] < 0 || buf[2] < 0 {
+        return TestResult::Fail("times: utime/cutime must be non-negative CPU ticks");
     }
     if wall < 0 {
         return TestResult::Fail("times surfaced a negative wall-clock");
@@ -6940,14 +6968,25 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         let mut cpath = alloc::vec::Vec::from(path.as_bytes());
         cpath.push(0);
         let mut ctx = FakeCtx {
+            #[cfg(target_arch = "x86_64")]
             args: SyscallArgs {
                 arg0: cpath.as_ptr() as u64,
                 arg1: 0, // flags
                 ..SyscallArgs::default()
             },
+            #[cfg(target_arch = "aarch64")]
+            args: SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: cpath.as_ptr() as u64,
+                arg2: 0, // flags
+                ..SyscallArgs::default()
+            },
             ret: None,
         };
+        #[cfg(target_arch = "x86_64")]
         kernel_syscall_entry(Syscall::OpenFile.raw(), &mut ctx);
+        #[cfg(target_arch = "aarch64")]
+        kernel_syscall_entry(Syscall::Openat.raw(), &mut ctx);
         match ctx.ret {
             Some(r) if r.value != !0u64 => Some(r.value as u32),
             _ => None,
@@ -15887,14 +15926,25 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
     // Linux open(2) ABI: arg0 = NUL-terminated path, arg1 = flags.
     let path = b"/statx-ep/ep\0";
     let mut open_ctx = FakeCtx {
+        #[cfg(target_arch = "x86_64")]
         args: SyscallArgs {
             arg0: path.as_ptr() as u64,
             arg1: 0, // flags
             ..SyscallArgs::default()
         },
+        #[cfg(target_arch = "aarch64")]
+        args: SyscallArgs {
+            arg0: 0xffffffffffffff9c, // AT_FDCWD
+            arg1: path.as_ptr() as u64,
+            arg2: 0, // flags
+            ..SyscallArgs::default()
+        },
         ret: None,
     };
+    #[cfg(target_arch = "x86_64")]
     kernel_syscall_entry(Syscall::OpenFile.raw(), &mut open_ctx);
+    #[cfg(target_arch = "aarch64")]
+    kernel_syscall_entry(Syscall::Openat.raw(), &mut open_ctx);
     let opened_fd = match open_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK => r.value as i32,
         _ => {

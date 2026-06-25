@@ -165,6 +165,264 @@ pub fn a3(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> SyscallArgs {
     }
 }
 
+pub fn call_open(path_ptr: u64, flags: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::OpenFile.raw(), a1(path_ptr, flags))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Openat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: path_ptr,
+                arg2: flags,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_readlink(path_ptr: u64, buf_ptr: u64, len: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Readlink.raw(), a2(path_ptr, buf_ptr, len))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Readlinkat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: path_ptr,
+                arg2: buf_ptr,
+                arg3: len,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_stat(path_ptr: u64, sb_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Stat.raw(), a1(path_ptr, sb_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Newfstatat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: path_ptr,
+                arg2: sb_ptr,
+                arg3: 0, // flags
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_lstat(path_ptr: u64, sb_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Lstat.raw(), a1(path_ptr, sb_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Newfstatat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: path_ptr,
+                arg2: sb_ptr,
+                arg3: 0x100, // AT_SYMLINK_NOFOLLOW
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_dup2(oldfd: u64, newfd: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Dup2.raw(), a1(oldfd, newfd))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if oldfd == newfd {
+            let res = call(Syscall::Fcntl.raw(), a1(oldfd, 1));
+            if res.is_some() && res.unwrap() >= 0 {
+                Some(oldfd as i64)
+            } else {
+                Some(EBADF)
+            }
+        } else {
+            call(Syscall::Dup3.raw(), a2(oldfd, newfd, 0))
+        }
+    }
+}
+
+pub fn call_symlink(target_ptr: u64, link_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Symlink.raw(), a1(target_ptr, link_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Symlinkat.raw(),
+            SyscallArgs {
+                arg0: target_ptr,
+                arg1: 0xffffffffffffff9c,
+                arg2: link_ptr,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_mkdir(path_ptr: u64, mode: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Mkdir.raw(), a1(path_ptr, mode))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Mkdirat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: mode,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_chmod(path_ptr: u64, mode: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Chmod.raw(), a1(path_ptr, mode))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Fchmodat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: mode,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_chown(path_ptr: u64, owner: u64, group: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Chown.raw(), a2(path_ptr, owner, group))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Fchownat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: owner,
+                arg3: group,
+                arg4: 0,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_lchown(path_ptr: u64, owner: u64, group: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Lchown.raw(), a2(path_ptr, owner, group))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Fchownat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: owner,
+                arg3: group,
+                arg4: 0x100,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_access(path_ptr: u64, mode: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Access.raw(), a1(path_ptr, mode))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Faccessat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: mode,
+                arg3: 0,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_utimes(path_ptr: u64, tv_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Utimes.raw(), a1(path_ptr, tv_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Utimensat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: tv_ptr,
+                arg3: 0,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_utime(path_ptr: u64, utx_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Utime.raw(), a1(path_ptr, utx_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Utimensat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c,
+                arg1: path_ptr,
+                arg2: utx_ptr,
+                arg3: 0,
+                ..Default::default()
+            },
+        )
+    }
+}
+
 /// Mount a fresh MemFs (named `fs_name`) at `mount` with `seeds`, run
 /// `body`, unmount + teardown. `fs_name` / `mount` are `'static` because
 /// `MemFs::with_seeds` takes a `&'static str` name. `body` returns

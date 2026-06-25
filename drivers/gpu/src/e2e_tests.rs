@@ -914,7 +914,7 @@ fn smoke_drm_sysfs_dev_attr() -> TestResult {
 
     match card0.attr_show("dev") {
         Some(v) if v == "226:0\n" => {}
-        Some(v) => return TestResult::Fail("dev attr wrong value"),
+        Some(_) => return TestResult::Fail("dev attr wrong value"),
         None => return TestResult::Fail("dev attr missing"),
     }
 
@@ -956,7 +956,7 @@ fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
 
     match device_kobj.attr_show("vendor") {
         Some(v) if v == "0x1002\n" => {}
-        Some(v) => return TestResult::Fail("vendor attr wrong value"),
+        Some(_) => return TestResult::Fail("vendor attr wrong value"),
         None => return TestResult::Fail("vendor attr missing"),
     }
 
@@ -998,7 +998,7 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
 
     match device_kobj.attr_show("device") {
         Some(v) if v == "0x1636\n" => {}
-        Some(v) => return TestResult::Fail("device attr wrong value"),
+        Some(_) => return TestResult::Fail("device attr wrong value"),
         None => return TestResult::Fail("device attr missing"),
     }
 
@@ -1040,7 +1040,7 @@ fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     // FakeDrmCard returns Some("FAKE-BIOS-1.0"), so vbios_version must be present.
     match card0.attr_show("vbios_version") {
         Some(v) if v.contains("FAKE-BIOS-1.0") => {}
-        Some(v) => return TestResult::Fail("vbios_version wrong content"),
+        Some(_) => return TestResult::Fail("vbios_version wrong content"),
         None => return TestResult::Fail("vbios_version attr missing"),
     }
 
@@ -1081,7 +1081,7 @@ fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
 
     match render128.attr_show("dev") {
         Some(v) if v == "226:128\n" => {}
-        Some(v) => return TestResult::Fail("renderD128 dev attr wrong value"),
+        Some(_) => return TestResult::Fail("renderD128 dev attr wrong value"),
         None => return TestResult::Fail("renderD128 dev attr missing"),
     }
 

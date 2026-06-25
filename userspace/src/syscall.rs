@@ -2554,6 +2554,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::PivotRoot, 41),
     #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 51),
+    (Syscall::Truncate, 45),
+    (Syscall::Ftruncate, 46),
     (Syscall::Fallocate, 47),
     (Syscall::Faccessat, 48),
     (Syscall::Chdir, 49),
@@ -2873,6 +2875,23 @@ const NARF_EXTENSION_TABLE: &[(Syscall, u32)] = &[
     // (nanosleep) takes a `timespec*` and now maps to `Syscall::Nanosleep`
     // instead, so native `Sleep` needs its own extension number.
     (Syscall::Sleep, 0x4061),
+    (Syscall::Pause, 0x4062),
+    (Syscall::Dup2, 0x4063),
+    (Syscall::Symlink, 0x4064),
+    (Syscall::Mkdir, 0x4065),
+    (Syscall::Chmod, 0x4066),
+    (Syscall::Chown, 0x4067),
+    (Syscall::Lchown, 0x4068),
+    (Syscall::Utime, 0x4069),
+    (Syscall::Utimes, 0x406a),
+    (Syscall::Access, 0x406b),
+    (Syscall::Poll, 0x406c),
+    (Syscall::Select, 0x406d),
+    (Syscall::Readlink, 0x406e),
+    (Syscall::OpenFile, 0x406f),
+    (Syscall::Pipe, 0x4070),
+    (Syscall::Stat, 0x4071),
+    (Syscall::Lstat, 0x4072),
 ];
 
 impl Syscall {

@@ -110,6 +110,21 @@ static mut TSS: Tss = Tss {
 /// offsets.
 static mut GDT: [u64; 7] = [0; 7];
 
+/// Per-CPU pointer to the TSS the CPU's TR is loaded with — the static `TSS`
+/// for the BSP (CPU 0), each AP's leaked `ApCpuBlock.tss` otherwise. Lets
+/// `set_kernel_rsp0` retarget the CURRENT CPU's `rsp0` at runtime (per-task
+/// kernel stacks under SMP). Filled by `init` (BSP) / `init_ap`; a null entry
+/// falls back to the static `TSS` (pre-init / BSP).
+static TSS_PTRS: [core::sync::atomic::AtomicPtr<Tss>; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) };
+        narf_lib::percpu::MAX_CPUS];
+
+/// Per-CPU baseline kernel-entry stack top (the boot-time `rsp0` stack),
+/// captured lazily on the first per-task retarget so `set_task_kernel_stack(0)`
+/// can restore it. 0 = uncaptured.
+static KERNEL_STACK_BASELINE: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct Pseudo {
@@ -143,6 +158,13 @@ pub unsafe fn init() {
                 .write_unaligned(top);
         }
     }
+
+    // Record the BSP's TSS pointer so `set_kernel_rsp0` retargets the right
+    // TSS (CPU 0) once the scheduler does per-task kernel-stack updates.
+    TSS_PTRS[0].store(
+        core::ptr::addr_of_mut!(TSS),
+        core::sync::atomic::Ordering::Release,
+    );
 
     // ── TSS.rsp0 — kernel stack for user→kernel trap entry ──
     // SAFETY: single-threaded boot, no observer for the static yet.
@@ -249,19 +271,66 @@ pub unsafe fn init() {
 pub unsafe fn set_kernel_rsp0(top: u64) {
     use core::sync::atomic::{compiler_fence, Ordering};
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: single writer (scheduler) + unaligned write is
-    // architecturally fine; the CPU reads rsp0 atomically on trap
-    // entry. Using `write_unaligned` to match the `#[repr(packed)]`
-    // Tss layout.
+    // Write THIS CPU's TSS.rsp0. Per-CPU under SMP: the BSP uses the static
+    // `TSS`, each AP its own leaked `ApCpuBlock.tss` (looked up via TSS_PTRS).
+    // Before the table is filled (early BSP boot) fall back to the static TSS.
+    // (The previous version always wrote the static BSP `TSS`, so a per-task
+    // retarget on an AP was silently a no-op — a latent SMP bug.)
+    let cpu = narf_arch::x86_64::cpu::current_cpu() as usize;
+    let mut tss = TSS_PTRS
+        .get(cpu)
+        .map(|p| p.load(Ordering::Acquire))
+        .unwrap_or_default();
+    if tss.is_null() {
+        tss = core::ptr::addr_of_mut!(TSS);
+    }
+    // SAFETY: `tss` points at this CPU's live TSS; rsp0 is at byte offset 4
+    // (after `_reserved0`). Unaligned write matches the `#[repr(packed)]` Tss;
+    // the CPU reads rsp0 atomically on trap entry.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::addr_of_mut!(TSS)
-            .cast::<u8>()
+        tss.cast::<u8>()
             .add(4 /* offset of rsp0 */)
             .cast::<u64>()
             .write_unaligned(top);
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+/// Retarget the running CPU's kernel-entry stack (TSS.rsp0 + the SYSCALL
+/// `gs:[8]` kernel_stack_top) to `top`, or restore the per-CPU boot baseline
+/// when `top == 0`. Installed into the scheduler via `set_kernel_stack_hook`
+/// so a trap/syscall from the running user task lands on THAT task's own
+/// kernel stack (Linux `update_task_stack` model). Per-CPU; runs on the CPU
+/// that owns the stacks, at CPL=0 with kernel GS (every scheduler path).
+///
+/// DORMANT in Stage 1: installed but not yet called by the scheduler.
+pub fn set_task_kernel_stack(top: u64) {
+    use core::sync::atomic::Ordering;
+    let cpu = narf_arch::x86_64::cpu::current_cpu() as usize;
+    // Lazily capture the boot-time baseline (current gs:[8]) before the first
+    // retarget on this CPU, so `top == 0` can restore it.
+    if let Some(b) = KERNEL_STACK_BASELINE.get(cpu) {
+        if b.load(Ordering::Acquire) == 0 {
+            b.store(super::percpu::kernel_stack_top(), Ordering::Release);
+        }
+    }
+    let target = if top == 0 {
+        KERNEL_STACK_BASELINE
+            .get(cpu)
+            .map(|b| b.load(Ordering::Acquire))
+            .unwrap_or(0)
+    } else {
+        top
+    };
+    if target == 0 {
+        return; // no baseline captured and no explicit top — nothing to do
+    }
+    // SAFETY: CPL=0 with kernel GS (scheduler context); per-CPU writes only.
+    unsafe {
+        set_kernel_rsp0(target);
+        super::percpu::set_kernel_stack_top(target);
+    }
 }
 
 /// Per-AP GDT + TSS + trap stacks, heap-allocated and leaked for the
@@ -328,6 +397,17 @@ pub unsafe fn init_ap() -> u64 {
             .add(4 /* offset of rsp0 */)
             .cast::<u64>()
             .write_unaligned(rsp0_top);
+
+        // Record THIS AP's TSS pointer (keyed by logical id, set in TSC_AUX by
+        // `_ap_start_rust` before this call) so `set_kernel_rsp0` retargets the
+        // AP's own TSS, not the static BSP one, on per-task kernel-stack updates.
+        let cpu = narf_arch::x86_64::cpu::current_cpu() as usize;
+        if let Some(slot) = TSS_PTRS.get(cpu) {
+            slot.store(
+                core::ptr::addr_of_mut!((*block).tss),
+                core::sync::atomic::Ordering::Release,
+            );
+        }
 
         // Build GDT descriptors — identical kernel/user code+data to
         // the BSP GDT (so the live CS / reloaded SS stay valid), with

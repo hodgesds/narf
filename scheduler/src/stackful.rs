@@ -52,7 +52,7 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 #[cfg(target_arch = "x86_64")]
@@ -156,6 +156,127 @@ struct PerCpuTaskPtr {
 static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
     inner: [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS],
 };
+
+// ── Per-task-own-stack user execution model (Stage 2-4) ─────────────
+//
+// OFF (default) = legacy longjmp/synthetic-frame user-task path. ON = user
+// tasks run on their OWN kernel stack with TSS.rsp0/gs:[8] pointed at it, so a
+// trap/syscall lands on that stack and preemption/park is a clean
+// `kernel_switch` (no longjmp). Flipped at boot once validated; the old path is
+// then deleted (Stage 5).
+static USE_OWN_STACK: AtomicBool = AtomicBool::new(false);
+
+/// Enable the per-task-own-stack user execution model. Call once at boot after
+/// the kernel-stack hook + FPU hooks are installed.
+pub fn enable_user_own_stack() {
+    USE_OWN_STACK.store(true, Ordering::Release);
+}
+
+/// Whether the per-task-own-stack model is active.
+#[inline]
+pub fn user_own_stack_enabled() -> bool {
+    USE_OWN_STACK.load(Ordering::Acquire)
+}
+
+// Hooks for saving/restoring the CURRENT user task's FPU (x87/SSE) across a
+// `kernel_switch` out/in. The FPU area lives in userspace (`UserTaskFuture`),
+// so the scheduler drives it through these hooks rather than reaching across
+// the crate boundary. Installed by `narf_userspace` at boot. `0` = not wired.
+static USER_FPU_SAVE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static USER_FPU_RESTORE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the user-FPU save/restore hooks (userspace installs FXSAVE/FXRSTOR of
+/// the running user task's FPU area).
+pub fn set_user_fpu_hooks(save: fn(), restore: fn()) {
+    USER_FPU_SAVE_HOOK.store(save as usize, Ordering::Release);
+    USER_FPU_RESTORE_HOOK.store(restore as usize, Ordering::Release);
+}
+
+/// Publish the CURRENT stackful task's user-FPU (FXSAVE) area. Called by the
+/// userspace `UserTaskFuture::poll` on first entry; stored per-task so a
+/// kernel_switch resume + a task exit never read a stale/freed area.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_fpu(area: *mut u8) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe { (*p).user_fpu.store(area, Ordering::Release) };
+    }
+}
+
+/// Publish the CURRENT stackful task's user address-space CR3. Called by the
+/// userspace `UserTaskFuture::poll` right after `address_space.activate()` (and
+/// the inline execve re-activate) so `poll_to_yield` can restore it on every
+/// kernel_switch resume — see the `user_cr3` field doc.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_cr3(cr3: u64) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe { (*p).user_cr3.store(cr3, Ordering::Release) };
+    }
+}
+
+/// Read the CURRENT task's user-FPU area, or null if none.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn current_user_fpu() -> *mut u8 {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: in-flight task on this CPU.
+    unsafe { (*p).user_fpu.load(Ordering::Acquire) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn user_fpu_save() {
+    let area = current_user_fpu();
+    if !area.is_null() {
+        // SAFETY: `area` is the in-flight task's 512-byte 16-aligned FXSAVE
+        // area (set by the userspace poll); CR4.OSFXSR is on.
+        unsafe {
+            core::arch::asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn user_fpu_save() {}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn user_fpu_restore() {
+    let area = current_user_fpu();
+    if !area.is_null() {
+        // SAFETY: as `user_fpu_save`.
+        unsafe {
+            core::arch::asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn user_fpu_restore() {}
+
+/// Top (16-byte-aligned) of the CURRENT stackful task's kernel stack on this
+/// CPU, or 0 if none. The per-task-own-stack user entry resets RSP to this
+/// before `iretq`-to-user so the kernel stack is empty while the user runs.
+pub fn current_stackful_stack_top() -> u64 {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    // SAFETY: `p` is the in-flight task on this CPU (set by poll_to_yield),
+    // alive for the duration of its run; `stack` is a stable heap allocation.
+    let task = unsafe { &*p };
+    ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64
+}
 
 /// Per-CPU storage for the cooperative executor's resume context.
 ///
@@ -298,6 +419,23 @@ pub struct KernelTask {
     /// can read without panicking on a poisoned lock, and the
     /// kernel-stack body can swap in a fresh waker per entry.
     current_waker: narf_lib::sync::IrqSafeSpinLock<Option<Waker>>,
+    /// Per-task user-FPU (FXSAVE) area pointer, published by the userspace
+    /// `UserTaskFuture::poll` on first entry. Lives HERE (not in a per-CPU slot)
+    /// because in the own-stack model a task resumes via `kernel_switch` (not a
+    /// re-poll), so the save/restore must read the CURRENT task's area — a
+    /// per-CPU slot would go stale (last task to poll) or dangle after a task
+    /// exits and its `Box` is freed, fxrstor-ing freed memory.
+    user_fpu: AtomicPtr<u8>,
+    /// Per-task user address-space CR3, published by the userspace
+    /// `UserTaskFuture::poll` (and the inline execve path) once the AS is
+    /// activated. In the own-stack model a preempted/parked task resumes via
+    /// `kernel_switch` (NOT a re-poll), so nothing re-activates its AS — without
+    /// re-loading CR3 before switching the task back in, it would resume under
+    /// whatever AS the executor last ran (e.g. another task that ran in between)
+    /// and every user-memory access (signal-frame write, iretq fetch) would land
+    /// in the wrong page tables. `poll_to_yield` reloads this before each switch
+    /// into the task. 0 = not yet entered user mode (first poll activates it).
+    user_cr3: AtomicU64,
 }
 
 // SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
@@ -368,6 +506,8 @@ impl KernelTask {
             saved_trap_frame: UnsafeCell::new(zeroed_trap_frame()),
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            user_fpu: AtomicPtr::new(core::ptr::null_mut()),
+            user_cr3: AtomicU64::new(0),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -437,9 +577,40 @@ impl KernelTask {
         // this call; the task's stack was allocated by us and is
         // still alive; the trampoline_entry symbol is in this
         // crate's code segment.
+        // Per-task-own-stack model: point TSS.rsp0 + SYSCALL gs:[8] at THIS
+        // task's own kernel stack before switching in, so a trap/syscall from
+        // the task lands on its own stack (and `try_preempt_user` can preempt
+        // it with a clean kernel_switch). Restored to the per-CPU baseline on
+        // switch-back. Harmless for kernel-only stackful tasks (they take no
+        // CPL3 trap and a CPL0 trap doesn't reload rsp0).
+        let own_stack = USE_OWN_STACK.load(Ordering::Acquire);
+        if own_stack {
+            let top = ((self.stack.as_ptr() as u64) + self.stack.len() as u64) & !0xFu64;
+            crate::retarget_kernel_stack(top);
+            // Re-activate the task's user address space before switching in. A
+            // task that yielded/was-preempted resumes via kernel_switch (NOT a
+            // re-poll), so this is the only point that restores its CR3 — without
+            // it the task would run under whatever AS the executor last used
+            // (e.g. a different task polled in between), faulting on every
+            // user-memory access. Skipped on the first poll (cr3==0): the poll
+            // itself activates the AS and publishes it via set_current_user_cr3.
+            let cr3 = self.user_cr3.load(Ordering::Acquire);
+            if cr3 != 0 {
+                // SAFETY: `cr3` is a CR3 value snapshotted from a prior
+                // `address_space.activate()` of this task's live AS; reloading it
+                // restores that mapping (kernel half is global in every AS).
+                unsafe {
+                    core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                        options(nostack, preserves_flags));
+                }
+            }
+        }
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
+        if own_stack {
+            crate::retarget_kernel_stack(0); // restore the per-CPU baseline
+        }
         self.exec_ctx
             .store(core::ptr::null_mut(), Ordering::Release);
         if self.completed.load(Ordering::Acquire) {
@@ -769,6 +940,182 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
             .store(narf_time::now_cycles(), Ordering::Release);
     }
     true
+}
+
+/// Per-task-own-stack CPL=3 timer preemption — the clean replacement for the
+/// longjmp-based `handlers::timer_preempt_user_task`. The user task ran on its
+/// OWN kernel stack (`TSS.rsp0`), so the timer trap's frame is already sitting
+/// untouched on that stack; we just save the user FPU, `kernel_switch` to the
+/// executor (which leaves the trap frame in place), and on resume restore the
+/// FPU and return true — `common_trap` then pops GPRs + `iretq`s back to the
+/// exact interrupted user instruction. No longjmp, no synthetic resume frame.
+///
+/// Returns false (no preemption) unless the own-stack model is on, the trap is
+/// a user-mode (CPL=3) scheduler-tick, a stackful task is current, its slice is
+/// spent, and an executor context is published.
+///
+/// # Safety
+/// Called only from the LAPIC-timer trap handler, after EOI, with `frame`
+/// pointing at the live trap frame on the current task's kernel stack.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
+    if !USE_OWN_STACK.load(Ordering::Acquire) {
+        return false;
+    }
+    if frame.vector != current_preempt_vector() {
+        return false;
+    }
+    if (frame.cs & 3) != 3 {
+        return false; // kernel-mode trap → that's `try_preempt`'s job
+    }
+    let cpu = this_cpu();
+    let task_ptr = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if task_ptr.is_null() {
+        return false; // no user task currently on this CPU
+    }
+    // SAFETY: `task_ptr` is the in-flight task on this CPU; the Box is kept
+    // alive by the executor's `poll_to_yield` across the user-mode round-trip.
+    let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
+    if no_preempt {
+        return false;
+    }
+    // SAFETY: live `task_ptr` as established above.
+    let started = unsafe { (*task_ptr).tsc_started.load(Ordering::Acquire) };
+    // SAFETY: live `task_ptr` as established above.
+    let slice = unsafe { (*task_ptr).slice_cycles.load(Ordering::Acquire) };
+    if narf_time::now_cycles().saturating_sub(started) < slice {
+        return false; // slice not yet used
+    }
+    // SAFETY: live `task_ptr` as established above.
+    let exec_ctx = unsafe { (*task_ptr).exec_ctx.load(Ordering::Acquire) };
+    if exec_ctx.is_null() {
+        return false;
+    }
+    // Re-arm the slot waker so the executor re-polls us next round.
+    // SAFETY: live task; `current_waker` is an IrqSafeSpinLock.
+    unsafe {
+        let g = (*task_ptr).current_waker.lock();
+        if let Some(w) = g.as_ref() {
+            w.wake_by_ref();
+        }
+        drop(g);
+    }
+    // Save the user FPU before another task clobbers XMM/x87, and clear CURRENT
+    // so a tick during the switch-out window can't re-preempt us.
+    user_fpu_save();
+    CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+    // SAFETY: `task.ctx` is the save slot, `exec_ctx` the live executor ctx;
+    // kernel_switch saves the trap-handler continuation and resumes the executor.
+    let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
+    // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx.
+    unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
+    // ── Resumed here when the executor switches back into this task ──
+    let cpu = this_cpu();
+    // SAFETY: still our live task (poll_to_yield has not returned).
+    unsafe {
+        CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
+        (*task_ptr)
+            .tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+    }
+    user_fpu_restore();
+    let _ = frame;
+    true // common_trap pops GPRs + iretq → user resumes at the interrupted RIP
+}
+
+/// Switch the CURRENT stackful (user) task OUT to its executor via
+/// `kernel_switch`, saving the syscall/yield continuation on the task's own
+/// kernel stack; returns when the executor switches back in. The
+/// per-task-own-stack replacement for the longjmp-based voluntary yield / park
+/// (sys_yield, futex/wait/console park). No-op if no stackful task is current.
+///
+/// # Safety
+/// Called at CPL=0 from a syscall handler running on the current task's own
+/// kernel stack, with a stackful task current on this CPU.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn yield_current_stackful() {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: in-flight task on this CPU.
+    let exec_ctx = unsafe { (*p).exec_ctx.load(Ordering::Acquire) };
+    if exec_ctx.is_null() {
+        return;
+    }
+    user_fpu_save();
+    CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+    // SAFETY: p is a valid non-null pointer to the active user task.
+    let ctx = unsafe { &raw mut (*p).ctx };
+    // DEBUG markers (own-stack bring-up): A=before switch-out, B=resumed.
+    // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
+    // resumes the executor, returning here when it switches us back in.
+    unsafe { kernel_switch(ctx, exec_ctx) };
+    // ── Resumed ──
+    let cpu = this_cpu();
+    // SAFETY: still our live task.
+    unsafe {
+        CURRENT_STACKFUL_TASK.inner[cpu].store(p, Ordering::Release);
+        (*p).tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+    }
+    user_fpu_restore();
+}
+
+/// Clone the executor slot-`Waker` of the CURRENT stackful task on this CPU
+/// (the one `poll_to_yield` stashed). The own-stack park path registers THIS
+/// waker with the relevant event source (timer wheel / futex queue / serial
+/// IRQ / wait-child) so firing it sets the task's `awake` flag and the executor
+/// re-polls — the per-task-own-stack analog of the longjmp poll's `cx.waker()`.
+/// `None` if no stackful task is current (e.g. kernel-test context).
+#[cfg(target_arch = "x86_64")]
+pub fn current_stackful_waker() -> Option<Waker> {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: in-flight task on this CPU; `current_waker` is an IrqSafeSpinLock.
+    unsafe { (*p).current_waker.lock().as_ref().cloned() }
+}
+
+/// Mark the CURRENT stackful task complete and `kernel_switch` out — never
+/// returns (the executor observes `completed` and drops the task). The
+/// per-task-own-stack replacement for the longjmp-based task exit.
+///
+/// # Safety
+/// Called at CPL=0 from the exit path on the current task's own kernel stack.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn exit_current_stackful() -> ! {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe {
+            (*p).completed.store(true, Ordering::Release);
+            let exec_ctx = (*p).exec_ctx.load(Ordering::Acquire);
+            CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+            if !exec_ctx.is_null() {
+                let ctx = &raw mut (*p).ctx;
+                kernel_switch(ctx, exec_ctx);
+            }
+        }
+    }
+    // Unreachable on the executor path (it drops us after observing completed);
+    // halt defensively for the no-executor (test) context.
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Fallback stub for exit_current_stackful on non-x86_64 architectures.
+///
+/// # Safety
+/// This function is not supported on non-x86_64 architectures and will panic.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn exit_current_stackful() -> ! {
+    unreachable!("own-stack is not supported on non-x86_64 architectures");
 }
 
 // The earlier preempt_yield_stub + preempt_yield_stub_body +

@@ -285,7 +285,43 @@ extern "C" fn dispatch_syscall(
         arg4: state.r8,
         arg5: state.r9,
     };
-    narf_userspace::kernel_syscall_entry_plain_with_state(num, &args, state as *mut _ as *mut u8)
+    let ret = narf_userspace::kernel_syscall_entry_plain_with_state(
+        num,
+        &args,
+        state as *mut _ as *mut u8,
+    );
+
+    // SYSRET-canonical guard. Linux forces IRET instead of SYSRET when the
+    // return RIP may be non-canonical ("SYSRET has trouble with uncanonical
+    // addresses" — arch/x86/entry/entry_64.S). NARF's sysret tail
+    // (`syscall_entry_x86_64`) has no such guard: a non-canonical return RIP
+    // makes `sysretq` #GP at CPL=0 AFTER it has already loaded the user RSP and
+    // swapgs'd (syscall.rs `mov rsp,[..]; swapgs; sysretq`) — i.e. the #GP fires
+    // on the USER stack with user GS. NARF's trap entry decides swapgs by CS.RPL
+    // (not by the GS base like Linux's paranoid_entry), so it runs that #GP
+    // handler on the user stack with the wrong GS → wild control transfer (the
+    // `rip=0x3` kernel #UD class). Rewriting a non-canonical RIP to 0 makes the
+    // `sysretq` land in USER mode and fault THERE (#PF, CS=user), which routes
+    // through the normal user-fault → SIGSEGV path: the process dies cleanly and
+    // the kernel survives. The return value is unchanged.
+    state.rip = sysret_safe_rip(state.rip);
+    ret
+}
+
+/// Canonical-address guard for a SYSRET target RIP. Returns `rip` unchanged
+/// when it is canonical (bits [63:47] are a sign-extension of bit 47, the only
+/// form `sysretq` can return to without #GP), and `0` otherwise. `0` is
+/// canonical and unmapped in user space, so a `sysretq` to it faults cleanly in
+/// USER mode rather than #GP'ing at CPL=0 on the user stack. See the call site
+/// in `dispatch_syscall` for the full rationale.
+#[inline]
+pub fn sysret_safe_rip(rip: u64) -> u64 {
+    // Canonical iff sign-extending bit 47 reproduces the value.
+    if ((rip as i64) << 16 >> 16) as u64 == rip {
+        rip
+    } else {
+        0
+    }
 }
 
 /// Program the SYSCALL MSRs and enable EFER.SCE. After this
@@ -353,3 +389,63 @@ pub unsafe fn enable() {
         }
     }
 }
+
+// ── SYSRET-canonical guard tests ───────────────────────────────────
+//
+// `sysret_safe_rip` is the guard that prevents a non-canonical return
+// RIP from reaching `sysretq` (which would #GP at CPL=0 on the user
+// stack — the rip=0x3 wild-jump class). Canonical RIPs pass through
+// unchanged; non-canonical ones are rewritten to 0 (canonical +
+// unmapped → a clean user-mode #PF → SIGSEGV).
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn smoke_x86_64_sysret_canonical_rips_pass_through() -> TestResult {
+    // Canonical low (user) addresses, including the boundary 2^47-1.
+    for &rip in &[
+        0x0u64,
+        0x1000,
+        0x4000_0000,
+        0x0000_7fff_ffff_ffff, // max canonical low half
+    ] {
+        if sysret_safe_rip(rip) != rip {
+            return TestResult::Fail("canonical low RIP was altered");
+        }
+    }
+    // Canonical high (kernel) addresses, including the boundary.
+    for &rip in &[
+        0xffff_8000_0000_0000, // min canonical high half
+        0xffff_ffff_8000_0000, // kernel text
+        0xffff_ffff_ffff_ffff,
+    ] {
+        if sysret_safe_rip(rip) != rip {
+            return TestResult::Fail("canonical high RIP was altered");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sysret_canonical_rips_pass_through
+);
+
+fn smoke_x86_64_sysret_noncanonical_rips_rewritten_to_zero() -> TestResult {
+    // Non-canonical RIPs (bits [63:47] not a sign-extension of bit 47) —
+    // exactly the values that make `sysretq` #GP at CPL=0 on the user
+    // stack — must be neutralised to 0.
+    for &rip in &[
+        0x0000_8000_0000_0000, // first non-canonical above the low half
+        0x1234_5678_9abc_def0,
+        0xdead_beef_dead_beef,
+        0x7fff_ffff_ffff_ffff, // bit 47 clear but high bits set
+        0xffff_7fff_ffff_ffff, // just below the canonical high half
+    ] {
+        if sysret_safe_rip(rip) != 0 {
+            return TestResult::Fail("non-canonical RIP was not rewritten to 0");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sysret_noncanonical_rips_rewritten_to_zero
+);

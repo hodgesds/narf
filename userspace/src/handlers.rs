@@ -1373,6 +1373,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                         .store(true, core::sync::atomic::Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable — hook() longjmps to the executor
@@ -1406,6 +1410,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                         .store(dl, core::sync::atomic::Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable — hook() longjmps to the executor
@@ -7841,6 +7849,18 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
+                // dead, so run its exit bookkeeping HERE before we diverge:
+                // unregister the per-task ctx pointer (else it dangles) and fan
+                // out exit observers — `on_child_exit` drains the staged wstatus
+                // and WAKES a wait4-parked parent. Without this the parent never
+                // wakes (the lost-wakeup idle-halt). Then mark complete +
+                // kernel_switch out.
+                crate::user_task::unregister_user_task_ctx(task);
+                crate::user_task::notify_task_exited(pid, task);
+                narf_scheduler::stackful::exit_current_stackful();
+            }
             hook(uctx);
         }
         // unreachable
@@ -7875,6 +7895,16 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
+                // dead — run its exit bookkeeping here before diverging:
+                // unregister the per-task ctx pointer (else it dangles) and fan
+                // out exit observers (`on_child_exit` drains wstatus + WAKES a
+                // wait4-parked parent — without it the parent hangs forever).
+                crate::user_task::unregister_user_task_ctx(tid);
+                crate::user_task::notify_task_exited(pid, tid);
+                narf_scheduler::stackful::exit_current_stackful();
+            }
             hook(uctx);
         }
         // unreachable
@@ -7929,6 +7959,10 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -7969,6 +8003,10 @@ fn sys_pause(ctx: &mut dyn TrapContext) {
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -9415,6 +9453,10 @@ fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
                 .store(u64::MAX, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -9637,6 +9679,10 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
                 *out_status = status;
             }
         }
+        // Charge the reaped child's CPU time to the parent (RUSAGE_CHILDREN
+        // / tms.cutime). Same fold as the synchronous reap path in sys_wait4;
+        // this covers the blocking wait4 + waitid path.
+        let _ = account_reaped_child(parent_id, child_pid);
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(child_pid));
         // Reaped — drop the parent record so wait4's ECHILD check is accurate.
@@ -9670,6 +9716,103 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
     } else {
         reaped as u64
     }
+}
+
+/// Per-task-own-stack blocking wait4/waitid: reap-or-park loop that returns the
+/// reaped result via `set_return` (NOT a re-execute — wait can't pre-bake its
+/// result). Reads its args from the UserTaskCtx (stored by the caller before the
+/// park), registers the slot-waker so `on_child_exit` re-polls us, and
+/// `kernel_switch`es out via `yield_current_stackful` until a child is reapable.
+/// The own-stack analog of `UserTaskFuture::poll`'s wait_child arm.
+#[cfg(target_arch = "x86_64")]
+fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
+    let parent = current_task_id();
+    let uctx = match crate::user_task::current_user_task() {
+        Some(u) => u,
+        None => {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+    };
+    // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
+    let uc = unsafe { &*uctx };
+    let want_pid = uc
+        .wait_child_want_pid
+        .load(core::sync::atomic::Ordering::Acquire);
+    let options = uc
+        .wait_child_options
+        .load(core::sync::atomic::Ordering::Acquire);
+    let status_ptr = uc
+        .wait_child_status_ptr
+        .load(core::sync::atomic::Ordering::Acquire);
+    let is_waitid = uc
+        .wait_child_is_waitid
+        .load(core::sync::atomic::Ordering::Acquire);
+    loop {
+        let mut status = 0i32;
+        let reaped =
+            crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status);
+        if reaped > 0 {
+            let rax = finish_wait_child(status_ptr, is_waitid, reaped, status);
+            uc.wait_child_pending
+                .store(false, core::sync::atomic::Ordering::Release);
+            ctx.set_return(SyscallReturn::ok(rax));
+            return;
+        }
+        let waker = match narf_scheduler::stackful::current_stackful_waker() {
+            Some(w) => w,
+            None => {
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+        };
+        crate::user_task::register_wait_child_waker(parent, waker);
+        // Re-check after registering (a child may have exited in the window).
+        let mut status2 = 0i32;
+        let reaped2 =
+            crate::user_task::call_wait_child_check(parent, want_pid, options, &mut status2);
+        if reaped2 > 0 {
+            crate::user_task::drop_wait_child_waker(parent);
+            let rax = finish_wait_child(status_ptr, is_waitid, reaped2, status2);
+            uc.wait_child_pending
+                .store(false, core::sync::atomic::Ordering::Release);
+            ctx.set_return(SyscallReturn::ok(rax));
+            return;
+        }
+        // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
+        unsafe {
+            narf_scheduler::stackful::yield_current_stackful();
+        }
+    }
+}
+
+/// Per-task-own-stack dispatch for a blocking-syscall park site (the own-stack
+/// replacement for the `yield_hook()` longjmp). Routes wait4/waitid to the
+/// reap-or-park loop and every other park (sleep/nanosleep/pause/console/futex/
+/// net-I/O/job-stop) to `own_stack_park`, which registers the slot-waker and
+/// `kernel_switch`es out. Returns when the condition clears; the caller then
+/// `return`s and the sysret tail either re-executes the syscall (rewound RIP)
+/// or returns the baked/reaped result.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
+    let is_wait = crate::user_task::current_user_task().is_some_and(|uctx| {
+        // SAFETY: in-flight task's poller-pinned UserTaskCtx; single-CPU access.
+        unsafe {
+            (*uctx)
+                .wait_child_pending
+                .load(core::sync::atomic::Ordering::Acquire)
+        }
+    });
+    if is_wait {
+        own_stack_wait_child(ctx);
+    } else {
+        crate::user_task::own_stack_park();
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
+    unreachable!("own-stack is not supported on non-x86_64 architectures");
 }
 
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a
@@ -9815,6 +9958,10 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
                 .store(true, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
     }
@@ -10056,7 +10203,7 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
     let want_pid = args.arg0 as i64;
     let status_ptr = args.arg1;
     let options = args.arg2 as u32;
-    let _rusage_ptr = args.arg3; // ignored; no resource accounting yet
+    let rusage_ptr = args.arg3; // filled with the reaped child's CPU time
     const WNOHANG: u32 = 1;
 
     let parent = current_task_id();
@@ -10106,6 +10253,13 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // copy_to_user range-validates it and SMAP-brackets the 4-byte write.
             // SAFETY: Valid memory or trusted environment
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
+        }
+        // Charge the reaped child's CPU time to the parent's children
+        // accumulator (RUSAGE_CHILDREN / tms.cutime) and, if the caller
+        // passed a `struct rusage*`, fill ru_utime with it.
+        let child_cpu_ns = account_reaped_child(parent, reaped);
+        if rusage_ptr != 0 {
+            write_rusage_utime(rusage_ptr, child_cpu_ns);
         }
         // Wave-61: PID pool — reaped child's PID returns to the free pool.
         crate::release_pid(crate::ProcessId(reaped));
@@ -10182,6 +10336,10 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
             // with the reaped child pid before re-entering user mode.
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable — hook() never returns
@@ -11608,27 +11766,36 @@ const CLK_TCK_HZ: u64 = 100;
 fn sys_times(ctx: &mut dyn TrapContext) {
     let out_ptr = ctx.args().arg0;
     let fail = SyscallReturn::ok((-1i64) as u64);
-    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
-    let ticks: i64 = (ns / (1_000_000_000 / CLK_TCK_HZ)) as i64;
+    // times() RETURNS elapsed wall-clock in ticks (uptime since an
+    // arbitrary epoch) — that part was always right. The `tms` FIELDS,
+    // however, must carry this task's real CPU time, not uptime.
+    let ns_per_tick: u64 = 1_000_000_000 / CLK_TCK_HZ;
+    let uptime_ticks: i64 = (narf_scheduler::narf_time::monotonic_ns() / ns_per_tick) as i64;
+    let task = current_task_id();
+    let utime_ticks: i64 = (cpu_time_ns_of(task) / ns_per_tick) as i64;
+    let cutime_ticks: i64 = (child_cpu_time_ns_of(task) / ns_per_tick) as i64;
     if out_ptr != 0 {
         // Build the tms struct (four i64s: utime, stime, cutime, cstime)
         // in kernel memory, then copy to user under the SMAP bracket.
+        // We don't split user/system time — everything is charged as
+        // utime/cutime, leaving stime/cstime zero.
         let mut kbuf = [0u8; 32];
-        kbuf[..8].copy_from_slice(&ticks.to_ne_bytes()); // utime
-                                                         // stime, cutime, cstime already zero.
-                                                         // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
-                                                         // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
-                                                         // SAFETY: Valid memory or trusted environment
+        kbuf[..8].copy_from_slice(&utime_ticks.to_ne_bytes()); // utime
+        kbuf[16..24].copy_from_slice(&cutime_ticks.to_ne_bytes()); // cutime
+                                                                   // stime, cstime already zero.
+                                                                   // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
+                                                                   // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
+                                                                   // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(out_ptr, &kbuf) }.is_err() {
             ctx.set_return(fail);
             return;
         }
     }
-    if ticks < 0 {
+    if uptime_ticks < 0 {
         ctx.set_return(fail);
         return;
     }
-    ctx.set_return(SyscallReturn::ok(ticks as u64));
+    ctx.set_return(SyscallReturn::ok(uptime_ticks as u64));
 }
 
 // ── Getrusage — populate the glibc rusage struct ──────────────────
@@ -11645,14 +11812,24 @@ const RUSAGE_TOTAL_I64S: usize = RUSAGE_TIMEVAL_FIELDS + RUSAGE_TAIL_FIELDS;
 
 fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let _who = args.arg0 as i64;
+    let who = args.arg0 as i64;
     let out = args.arg1;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out == 0 {
         ctx.set_return(fail);
         return;
     }
-    let ns: u64 = narf_scheduler::narf_time::monotonic_ns();
+    // RUSAGE_SELF (0) → this task's own CPU time; RUSAGE_CHILDREN (-1) →
+    // accumulated reaped-children CPU time. (Previously this returned
+    // monotonic uptime for every `who`, so every process looked like it
+    // had burned the whole machine's wall-clock as user time.)
+    const RUSAGE_CHILDREN: i64 = -1;
+    let task = current_task_id();
+    let ns: u64 = if who == RUSAGE_CHILDREN {
+        child_cpu_time_ns_of(task)
+    } else {
+        cpu_time_ns_of(task)
+    };
     let utime_sec = (ns / 1_000_000_000) as i64;
     let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
     // Build the rusage struct (RUSAGE_TOTAL_I64S i64s) in kernel
@@ -12432,6 +12609,10 @@ fn sys_sleep(ctx: &mut dyn TrapContext) {
                 .store(deadline, core::sync::atomic::Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -13039,6 +13220,36 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
         new_proc.address_space.clone(),
     );
 
+    // Own-stack model: there is no poll trap-back half to apply a staged
+    // ExecRequest after a longjmp. Apply the new image inline — activate the new
+    // AS + TLS, then enter the new entry at the TOP of this task's own kernel
+    // stack (abandoning the execve syscall frames), which DIVERGES.
+    #[cfg(target_arch = "x86_64")]
+    if narf_scheduler::stackful::user_own_stack_enabled() {
+        let entry = new_proc.entry.0.as_u64();
+        let rsp = new_proc.stack_top.as_u64();
+        let _ = new_proc.address_space.activate();
+        // Publish the new CR3 so a later preempt/park resume re-activates the
+        // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
+        {
+            let cr3: u64;
+            // SAFETY: Reading the current CPU's CR3 register has no side-effects.
+            unsafe {
+                core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+                    options(nostack, nomem, preserves_flags));
+            }
+            narf_scheduler::stackful::set_current_user_cr3(cr3);
+        }
+        if let Some(fb) = new_proc.fs_base {
+            // SAFETY: canonical user vaddr from the new image's TLS staging.
+            unsafe { narf_scheduler::set_user_fs_base(fb) };
+        }
+        let top = narf_scheduler::stackful::current_stackful_stack_top();
+        // SAFETY: new AS active; entry/rsp mapped by the loader; resets RSP to
+        // this task's own kernel-stack top and iretq's into the new image.
+        unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) };
+    }
+
     // Step 6: package the new image into an ExecRequest and
     // publish via the calling task's UserTaskCtx so the polling
     // routine can apply it after the longjmp returns.
@@ -13396,11 +13607,11 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if ptr == 0 {
         return Err(EFAULT);
     }
-    // Reject non-canonical addresses (x86_64 requires bits 48–63 to
+    // Reject non-canonical addresses (x86_64/aarch64 require bits 48–63 to
     // be the sign-extension of bit 47). An address like
     // 0x0001_0000_0000_0000 has bit-48 set but bits 49–63 clear,
-    // which the CPU would fault as a GP on any memory access.
-    #[cfg(target_arch = "x86_64")]
+    // which the CPU would fault on any memory access.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         // Bits 48..=62 must all be 0 (user) or all 1 (kernel).
         // Mask out bit 63 (top-level sign) and check the middle range.
@@ -14654,6 +14865,116 @@ fn sys_clock_settime(ctx: &mut dyn TrapContext) {
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+// ── Per-task CPU-time accounting (getrusage / times) ────────────────
+//
+// NARF previously reported `monotonic_ns()` (wall-clock uptime since
+// boot) as every process's user CPU time — so getrusage(RUSAGE_SELF)
+// / times() returned the same huge, ever-growing value for every
+// task, inflating e.g. stress-ng's per-stressor usr-time ~17x. These
+// two tables instead track REAL consumed CPU time, keyed by TaskId
+// (tid) — the same key getrusage/times resolve via current_task_id().
+//
+// `TASK_CPU_NS`: nanoseconds this task itself has spent executing in
+// user mode, summed over every user run-slice (accumulated by the
+// UserTaskFuture poll boundary in user_task.rs: it brackets each
+// enter-user-mode → trap-return slice and folds the delta in here).
+//
+// `TASK_CHILD_CPU_NS`: nanoseconds of CPU time charged to this task's
+// REAPED children (RUSAGE_CHILDREN / tms.cutime), folded in by wait4 /
+// waitid when a zombie is collected (Linux charges child time at reap,
+// not at exit).
+static TASK_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+static TASK_CHILD_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Fold a completed user run-slice (`delta_ns` of on-CPU user time) into
+/// the currently-running task's accumulated CPU time. Called from the
+/// UserTaskFuture poll on every trap-return. Alloc-free on the hot path
+/// once the task's slot exists; IRQ-safe (the poll runs with IF=0 around
+/// the trap boundary).
+pub fn account_user_cpu_ns(delta_ns: u64) {
+    if delta_ns == 0 {
+        return;
+    }
+    let task = current_task_id();
+    if task == 0 {
+        return;
+    }
+    let mut g = TASK_CPU_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// Test hook: account `delta_ns` to an arbitrary task (the production
+/// path only ever charges the currently-running task). Lets the ABI test
+/// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
+#[doc(hidden)]
+pub fn __test_account_cpu_ns(task: u64, delta_ns: u64) {
+    let mut g = TASK_CPU_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// This task's own accumulated user CPU time (ns).
+pub fn cpu_time_ns_of(task: u64) -> u64 {
+    TASK_CPU_NS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// Accumulated CPU time (ns) of `task`'s reaped children.
+fn child_cpu_time_ns_of(task: u64) -> u64 {
+    TASK_CHILD_CPU_NS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
+/// Reaping `child` from `parent`: charge the child's total CPU time (its
+/// own + whatever it had already accumulated from its own reaped
+/// grandchildren, per POSIX) to the parent's child-time accumulator, then
+/// drop the child's rows. Returns the child's total CPU ns so wait4 can
+/// also fill its `struct rusage` out-param. Idempotent-safe: a second
+/// reap of an already-dropped child contributes 0.
+pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
+    let child_total = cpu_time_ns_of(child).saturating_add(child_cpu_time_ns_of(child));
+    if parent != 0 {
+        let mut g = TASK_CHILD_CPU_NS.lock();
+        let m = g.get_or_insert_with(BTreeMap::new);
+        let e = m.entry(parent).or_insert(0);
+        *e = e.saturating_add(child_total);
+    }
+    if let Some(m) = TASK_CPU_NS.lock().as_mut() {
+        m.remove(&child);
+    }
+    if let Some(m) = TASK_CHILD_CPU_NS.lock().as_mut() {
+        m.remove(&child);
+    }
+    child_total
+}
+
+/// Write a glibc `struct rusage` (18 i64s = 144 bytes) into user memory
+/// with `ru_utime` set from `ns` and every other field zero. Best-effort
+/// (a failed copy is swallowed — wait4 still succeeds). Shared by wait4's
+/// rusage out-param.
+fn write_rusage_utime(out_ptr: u64, ns: u64) {
+    let mut kbuf = [0u8; 18 * 8];
+    let sec = (ns / 1_000_000_000) as i64;
+    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    kbuf[..8].copy_from_slice(&sec.to_ne_bytes()); // ru_utime.tv_sec
+    kbuf[8..16].copy_from_slice(&usec.to_ne_bytes()); // ru_utime.tv_usec
+                                                      // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
+                                                      // checked by the caller); copy_to_user range-validates and
+                                                      // SMAP-brackets the 144-byte write.
+    let _ = unsafe { copy_to_user(out_ptr, &kbuf) };
+}
+
 /// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
 /// sigqueue: `(task, signum) -> (si_code, si_value)`. The pending bitmask
 /// in `SIGNAL_PENDING` collapses duplicates, so standard signals coalesce
@@ -15425,6 +15746,10 @@ pub fn timer_preempt_user_task(ctx: &mut dyn TrapContext) {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable when preempted
@@ -15785,6 +16110,10 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable
@@ -15866,6 +16195,10 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
             hook(uctx);
         }
         // unreachable
@@ -17355,6 +17688,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
                 // unreachable — hook() longjmps to the executor
@@ -17501,6 +17838,10 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                    if narf_scheduler::stackful::user_own_stack_enabled() {
+                        own_stack_block(ctx);
+                        return;
+                    }
                     hook(uctx);
                 }
             }
@@ -18156,6 +18497,10 @@ fn sys_flock(ctx: &mut dyn TrapContext) {
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return;
+                }
                 hook(uctx);
             }
             // unreachable
@@ -18439,6 +18784,10 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return;
+                }
                 hook(uctx);
             }
             // unreachable
@@ -18606,6 +18955,10 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                if narf_scheduler::stackful::user_own_stack_enabled() {
+                    own_stack_block(ctx);
+                    return;
+                }
                 hook(uctx);
             }
         }

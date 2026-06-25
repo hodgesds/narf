@@ -115,8 +115,9 @@ pub use narf_capabilities::Invoke;
 // exists (`narf-scheduler` → `narf-arch`); this just exposes it.
 #[cfg(target_arch = "x86_64")]
 pub use narf_arch::x86_64::{
-    enter_user_mode, enter_user_mode_resume, enter_user_mode_with_arg, longjmp, set_user_fs_base,
-    setjmp, JmpBuf, UserState, USER_RFLAGS,
+    enter_user_mode, enter_user_mode_at_top, enter_user_mode_resume, enter_user_mode_resume_at_top,
+    enter_user_mode_with_arg, enter_user_mode_with_arg_at_top, longjmp, set_user_fs_base, setjmp,
+    JmpBuf, UserState, USER_RFLAGS,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -379,6 +380,40 @@ static IDLE_BACKSTOP_HOOK: AtomicUsize = AtomicUsize::new(0);
 /// TSC-deadline write).
 pub fn set_idle_backstop_hook(f: fn(u64)) {
     IDLE_BACKSTOP_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Installed at boot: retarget the running CPU's kernel-entry stack (TSS.rsp0
+/// and the SYSCALL `gs:[8]` kernel_stack_top) to `top`, so a trap/syscall from
+/// the currently-running user task lands on THAT task's own kernel stack
+/// (Linux `update_task_stack` model). `top == 0` restores the per-CPU baseline
+/// (the boot-time rsp0 stack). A hook keeps `narf-scheduler` free of an
+/// `narf-frame` dependency (frame owns the TSS / PerCpu). `0`-ptr = not
+/// installed (single-CPU / pre-boot) → no-op.
+#[cfg(target_arch = "x86_64")]
+static SET_KERNEL_STACK_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the per-task kernel-stack retargeting (boot installs the TSS.rsp0 +
+/// `gs:[8]` write + lazy per-CPU baseline capture).
+#[cfg(target_arch = "x86_64")]
+pub fn set_kernel_stack_hook(f: fn(u64)) {
+    SET_KERNEL_STACK_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Point the running CPU's kernel-entry stack at `top` (or, when `top == 0`,
+/// restore the per-CPU baseline). No-op if no hook is installed.
+///
+/// Wired into the stackful switch-in/out path (`poll_to_yield`) for the
+/// per-task-own-stack model.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn retarget_kernel_stack(top: u64) {
+    let p = SET_KERNEL_STACK_HOOK.load(Ordering::Acquire);
+    if p == 0 {
+        return;
+    }
+    // SAFETY: `p` was stored by `set_kernel_stack_hook` from a real `fn(u64)`.
+    let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(p) };
+    f(top);
 }
 
 /// Arm the idle backstop ~`ms` milliseconds out, if a hook is installed.
