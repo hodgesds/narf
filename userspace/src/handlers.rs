@@ -9810,6 +9810,11 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
+    unreachable!("own-stack is not supported on non-x86_64 architectures");
+}
+
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a
 /// child state change for `waitid(2)`. Fills si_signo = SIGCHLD,
 /// si_code (CLD_EXITED / CLD_KILLED / CLD_DUMPED), si_pid, si_uid (0),
@@ -13226,9 +13231,9 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
         let _ = new_proc.address_space.activate();
         // Publish the new CR3 so a later preempt/park resume re-activates the
         // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
-        // SAFETY: reading CR3 has no side effects.
         {
             let cr3: u64;
+            // SAFETY: Reading the current CPU's CR3 register has no side-effects.
             unsafe {
                 core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
                     options(nostack, nomem, preserves_flags));
@@ -13602,11 +13607,11 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if ptr == 0 {
         return Err(EFAULT);
     }
-    // Reject non-canonical addresses (x86_64 requires bits 48–63 to
+    // Reject non-canonical addresses (x86_64/aarch64 require bits 48–63 to
     // be the sign-extension of bit 47). An address like
     // 0x0001_0000_0000_0000 has bit-48 set but bits 49–63 clear,
-    // which the CPU would fault as a GP on any memory access.
-    #[cfg(target_arch = "x86_64")]
+    // which the CPU would fault on any memory access.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         // Bits 48..=62 must all be 0 (user) or all 1 (kernel).
         // Mask out bit 63 (top-level sign) and check the middle range.

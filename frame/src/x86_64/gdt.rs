@@ -280,7 +280,7 @@ pub unsafe fn set_kernel_rsp0(top: u64) {
     let mut tss = TSS_PTRS
         .get(cpu)
         .map(|p| p.load(Ordering::Acquire))
-        .unwrap_or(core::ptr::null_mut());
+        .unwrap_or_default();
     if tss.is_null() {
         tss = core::ptr::addr_of_mut!(TSS);
     }

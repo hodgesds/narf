@@ -1046,6 +1046,7 @@ pub unsafe fn yield_current_stackful() {
     }
     user_fpu_save();
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+    // SAFETY: p is a valid non-null pointer to the active user task.
     let ctx = unsafe { &raw mut (*p).ctx };
     // DEBUG markers (own-stack bring-up): A=before switch-out, B=resumed.
     // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
@@ -1106,6 +1107,15 @@ pub unsafe fn exit_current_stackful() -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Fallback stub for exit_current_stackful on non-x86_64 architectures.
+///
+/// # Safety
+/// This function is not supported on non-x86_64 architectures and will panic.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn exit_current_stackful() -> ! {
+    unreachable!("own-stack is not supported on non-x86_64 architectures");
 }
 
 // The earlier preempt_yield_stub + preempt_yield_stub_body +
