@@ -501,7 +501,7 @@ fn smoke_abi_proc_pidfd_getfd_pos() -> TestResult {
         // target_pid == self short-circuits the pid→task resolution so the
         // source table is the caller's own.
         let path = b"/abi/f\0";
-        let srcfd = match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, 0)) {
+        let srcfd = match call_open(path.as_ptr() as u64, 0) {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("open setup failed"),
         };

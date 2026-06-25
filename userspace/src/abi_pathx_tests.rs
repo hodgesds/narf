@@ -22,7 +22,7 @@ fn smoke_abi_pathx_access_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
         const R_OK: u64 = 4;
-        match call(Syscall::Access.raw(), a1(path.as_ptr() as u64, R_OK)) {
+        match call_access(path.as_ptr() as u64, R_OK) {
             Some(0) => Ok(()),
             _ => Err("access(existing, R_OK) should return 0"),
         }
@@ -33,7 +33,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_access_pos);
 fn smoke_abi_pathx_access_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
-        match call(Syscall::Access.raw(), a1(path.as_ptr() as u64, 4)) {
+        match call_access(path.as_ptr() as u64, 4) {
             Some(0) => Err("access(missing) must not return 0"),
             _ => Ok(()),
         }
@@ -46,7 +46,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_access_neg);
 fn smoke_abi_pathx_chmod_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        match call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o644)) {
+        match call_chmod(path.as_ptr() as u64, 0o644) {
             Some(0) => Ok(()),
             _ => Err("chmod(existing) should return 0"),
         }
@@ -57,7 +57,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_chmod_pos);
 fn smoke_abi_pathx_chmod_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
-        match call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o644)) {
+        match call_chmod(path.as_ptr() as u64, 0o644) {
             Some(0) => Err("chmod(missing) must fail"),
             _ => Ok(()),
         }
@@ -70,7 +70,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_chmod_neg);
 fn smoke_abi_pathx_chown_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        match call(Syscall::Chown.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+        match call_chown(path.as_ptr() as u64, 0, 0) {
             Some(0) => Ok(()),
             _ => Err("chown(existing) should return 0"),
         }
@@ -81,7 +81,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_chown_pos);
 fn smoke_abi_pathx_chown_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
-        match call(Syscall::Chown.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+        match call_chown(path.as_ptr() as u64, 0, 0) {
             Some(0) => Err("chown(missing) must fail"),
             _ => Ok(()),
         }
@@ -96,7 +96,7 @@ fn smoke_abi_pathx_lchown_pos() -> TestResult {
         let path = b"/p2/f\0";
         // LINUX-GAP: NARF has no symlink-follow distinction; lchown aliases
         // the chmod/chown path handler (no l-variant semantics).
-        match call(Syscall::Lchown.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+        match call_lchown(path.as_ptr() as u64, 0, 0) {
             Some(0) => Ok(()),
             _ => Err("lchown(existing) should return 0"),
         }
@@ -107,7 +107,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_lchown_pos);
 fn smoke_abi_pathx_lchown_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
-        match call(Syscall::Lchown.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+        match call_lchown(path.as_ptr() as u64, 0, 0) {
             Some(0) => Err("lchown(missing) must fail"),
             _ => Ok(()),
         }
@@ -598,10 +598,7 @@ fn smoke_abi_pathx_symlink_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let target = b"f\0";
         let link = b"/p2/sl\0";
-        match call(
-            Syscall::Symlink.raw(),
-            a1(target.as_ptr() as u64, link.as_ptr() as u64),
-        ) {
+        match call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) {
             Some(0) => Ok(()),
             _ => Err("symlink(target, /p2/sl) should return 0"),
         }
@@ -614,10 +611,7 @@ fn smoke_abi_pathx_symlink_neg() -> TestResult {
         // Link parent directory missing → symlink fails (-1).
         let target = b"f\0";
         let link = b"/p2/no_such_dir/sl\0";
-        match call(
-            Syscall::Symlink.raw(),
-            a1(target.as_ptr() as u64, link.as_ptr() as u64),
-        ) {
+        match call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) {
             Some(-1) => Ok(()),
             _ => Err("symlink under a missing parent was not -1"),
         }
@@ -786,7 +780,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_neg);
 fn smoke_abi_pathx_utime_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        match call(Syscall::Utime.raw(), a1(path.as_ptr() as u64, 0)) {
+        match call_utime(path.as_ptr() as u64, 0) {
             Some(0) => Ok(()),
             _ => Err("utime(path) should return 0"),
         }
@@ -797,7 +791,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_utime_pos);
 fn smoke_abi_pathx_utime_neg() -> TestResult {
     with_setup(|| {
         // NULL path → copy_user_cstr fails → -EFAULT.
-        match call(Syscall::Utime.raw(), a1(0, 0)) {
+        match call_utime(0, 0) {
             Some(v) if v == EFAULT => Ok(()),
             _ => Err("utime(NULL) was not -EFAULT"),
         }
@@ -810,7 +804,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_utime_neg);
 fn smoke_abi_pathx_utimes_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        match call(Syscall::Utimes.raw(), a1(path.as_ptr() as u64, 0)) {
+        match call_utimes(path.as_ptr() as u64, 0) {
             Some(0) => Ok(()),
             _ => Err("utimes(path) should return 0"),
         }
@@ -819,7 +813,7 @@ fn smoke_abi_pathx_utimes_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_pathx_utimes_pos);
 
 fn smoke_abi_pathx_utimes_neg() -> TestResult {
-    with_setup(|| match call(Syscall::Utimes.raw(), a1(0, 0)) {
+    with_setup(|| match call_utimes(0, 0) {
         Some(v) if v == EFAULT => Ok(()),
         _ => Err("utimes(NULL) was not -EFAULT"),
     })
@@ -865,7 +859,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_utimensat_neg);
 /// Open `path` (NUL-terminated, absolute) and return its fd. flags=0;
 /// a path that names a directory yields a DirFdFile fd (for getdents64).
 fn open_fd(path: &[u8]) -> Result<u32, &'static str> {
-    match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, 0)) {
+    match call_open(path.as_ptr() as u64, 0) {
         Some(fd) if fd >= 0 => Ok(fd as u32),
         _ => Err("open failed"),
     }
@@ -877,7 +871,7 @@ fn open_fd(path: &[u8]) -> Result<u32, &'static str> {
 fn smoke_abi_pathx_utime_missing_is_enoent() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/nope\0";
-        match call(Syscall::Utime.raw(), a0(path.as_ptr() as u64)) {
+        match call_utime(path.as_ptr() as u64, 0) {
             Some(v) if v == ENOENT => Ok(()),
             _ => Err("utime(missing path) should return -ENOENT"),
         }

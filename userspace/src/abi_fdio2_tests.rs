@@ -17,7 +17,7 @@ use crate::abi_test_support::*;
 /// Open `path` (a `&[u8]` ending in NUL) and return the fd. flags=0.
 fn open_fd2(path: &[u8]) -> Result<u32, &'static str> {
     let ptr = path.as_ptr() as u64;
-    match call(Syscall::OpenFile.raw(), a1(ptr, 0)) {
+    match call_open(ptr, 0) {
         Some(fd) if fd >= 0 => Ok(fd as u32),
         _ => Err("open failed"),
     }
@@ -432,7 +432,7 @@ fn smoke_abi_fdio2_dup2_same_fd_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let fd = open_fd2(b"/abi/f\0")?;
         // dup2(fd, fd) on a valid fd is a no-op that returns fd.
-        match call(Syscall::Dup2.raw(), a1(fd as u64, fd as u64)) {
+        match call_dup2(fd as u64, fd as u64) {
             Some(v) if v == fd as i64 => Ok(()),
             _ => Err("dup2(fd, fd) on a valid fd did not return fd"),
         }
@@ -445,7 +445,7 @@ fn smoke_abi_fdio2_dup2_same_fd_neg() -> TestResult {
         // dup2(badfd, badfd): same-fd path verifies validity first → the
         // closed fd is invalid → InvalidOp.
         // LINUX-GAP: Linux dup2(badfd, badfd) returns -EBADF.
-        match call(Syscall::Dup2.raw(), a1(3030, 3030)) {
+        match call_dup2(3030, 3030) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
         }

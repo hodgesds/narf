@@ -260,10 +260,7 @@ fn smoke_abi_path_lstat_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";
         let mut sb = [0u8; 256];
-        match call(
-            Syscall::Lstat.raw(),
-            a1(path.as_ptr() as u64, sb.as_mut_ptr() as u64),
-        ) {
+        match call_lstat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) {
             Some(0) => Ok(()),
             _ => Err("lstat(existing) should return 0"),
         }
@@ -275,10 +272,7 @@ fn smoke_abi_path_lstat_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/nope\0";
         let mut sb = [0u8; 256];
-        match call(
-            Syscall::Lstat.raw(),
-            a1(path.as_ptr() as u64, sb.as_mut_ptr() as u64),
-        ) {
+        match call_lstat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) {
             Some(0) => Err("lstat(missing) must fail"),
             _ => Ok(()),
         }
@@ -364,10 +358,7 @@ kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_errnos);
 fn smoke_abi_path_open_nul_term_fallback_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";
-        match call(
-            Syscall::OpenFile.raw(),
-            a1(path.as_ptr() as u64, /* len==0 → NUL-term */ 0),
-        ) {
+        match call_open(path.as_ptr() as u64, 0) {
             Some(fd) if fd >= 0 => Ok(()),
             _ => Err("open(path, 0) should resolve the NUL-terminated path to a fd"),
         }
@@ -378,7 +369,7 @@ kernel_test_in!("syscall_abi", smoke_abi_path_open_nul_term_fallback_pos);
 fn smoke_abi_path_open_missing_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/nope\0";
-        match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, 0)) {
+        match call_open(path.as_ptr() as u64, 0) {
             Some(fd) if fd >= 0 => Err("open(missing, 0) must not return a fd"),
             _ => Ok(()),
         }

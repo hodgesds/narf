@@ -1834,6 +1834,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_scheduler::enable_work_stealing();
                     let _ = writeln!(console::Writer, "  smp: work-stealing enabled");
                 }
+
+                // Promote bump arena to slab allocator so allocations/deallocations
+                // are managed dynamically and avoid static bump arena exhaustion.
+                {
+                    narf_memory::reserve_for_slab_promotion();
+                    let _ = writeln!(
+                        console::Writer,
+                        "  heap: promoting bump→slab (bootstrap used: {} / {} bytes)",
+                        narf_memory::heap::used_bytes(),
+                        narf_memory::heap::capacity_bytes()
+                    );
+                    narf_memory::heap::promote_to_slab();
+                    narf_memory::diag::set_phase(narf_memory::diag::BootPhase::HeapUp);
+                    let _ = writeln!(console::Writer, "  heap: slab is live");
+                }
             }
 
             // ── PCIe driver registration + dispatch ───────────────

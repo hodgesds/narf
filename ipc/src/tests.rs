@@ -1410,9 +1410,14 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
         let (p, c) = crate::channel::<u64, 4>();
         let ptr = p.__ring_ptr_for_test() as u64;
         // Heap allocations land below the 4 GiB early identity-
-        // map ceiling and above 0 (Arc::as_ptr is never null on
-        // a live Arc).
-        if ptr == 0 || ptr >= (4u64 << 30) {
+        // map ceiling on x86_64, and above 0 (Arc::as_ptr is never
+        // null on a live Arc).
+        #[cfg(target_arch = "x86_64")]
+        let is_bad = ptr == 0 || ptr >= (4u64 << 30);
+        #[cfg(not(target_arch = "x86_64"))]
+        let is_bad = ptr == 0;
+
+        if is_bad {
             bad_count += 1;
             if sample_bad == 0 {
                 sample_bad = ptr;
