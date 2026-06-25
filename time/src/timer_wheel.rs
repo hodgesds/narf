@@ -257,30 +257,31 @@ pub fn refresh_waker(handle: SleepHandle, waker: Waker) -> bool {
 /// chain) MUST use [`take_due`] instead and call wake() AFTER
 /// exiting IRQ context.
 pub fn fire_due(now_cycles: u64) -> usize {
-    // O(1) stack: take one due waker under the lock, release, wake it, repeat.
-    // Never build a `MAX_SLEEPERS`-element array on the stack — moving that
-    // ~1 KiB by value smashed the caller's return chain when this runs from a
-    // timer IRQ on a user task's own kernel stack (the per-task-own-stack
-    // model). `wake()` runs outside the lock (it may re-register).
+    // O(1) stack + SINGLE PASS. Walk slot indices once with a cursor, taking +
+    // waking each slot that is due at entry. Two invariants matter:
+    //   - No ~1 KiB on-stack `[Option<Waker>; MAX_SLEEPERS]`: moving that array
+    //     by value smashed the caller's return chain when this runs from a timer
+    //     IRQ on a user task's own kernel stack (per-task-own-stack model).
+    //   - Each currently-due timer fires AT MOST ONCE per call (matches the old
+    //     `take_due` single pass). A `wake()` may re-register a fresh timer (the
+    //     smoltcp net poll re-arms on every wake) into a now-freed LOWER slot;
+    //     the cursor never revisits it, so that re-registration is deferred to
+    //     the next tick. A re-scan-from-zero loop instead spins forever once a
+    //     poller re-arms with deadline ≤ now, wedging the CPU — observed as
+    //     accept() never completing in net-smoke.
+    // `wake()` runs outside the lock (it re-acquires the wheel on re-register).
     let mut n = 0usize;
-    loop {
+    for i in 0..MAX_SLEEPERS {
         let waker = {
             let mut w = WHEEL.lock();
-            let mut found = None;
-            for slot in w.slots.iter_mut() {
-                if matches!(slot.as_ref(), Some(s) if s.deadline_cycles <= now_cycles) {
-                    found = slot.take().map(|s| s.waker);
-                    break;
-                }
+            match w.slots[i].as_ref() {
+                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take().map(|s| s.waker),
+                _ => None,
             }
-            found
         };
-        match waker {
-            Some(w) => {
-                w.wake();
-                n += 1;
-            }
-            None => break,
+        if let Some(wk) = waker {
+            wk.wake();
+            n += 1;
         }
     }
     n
@@ -347,23 +348,23 @@ pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -
 ///
 /// The wheel lock is released before each `push_pending` so the wheel and the
 /// deferred-queue locks are never held nested (no lock-ordering hazard).
+///
+/// SINGLE PASS via an index cursor (same invariant as [`fire_due`]): each
+/// currently-due timer is drained at most once; a re-registration into a freed
+/// lower slot is deferred to the next tick, never re-drained this call.
 pub fn drain_due_to_deferred(now_cycles: u64) {
-    loop {
-        // Take ONE due waker under the wheel lock, then release it.
+    for i in 0..MAX_SLEEPERS {
+        // Take this slot's due waker under the wheel lock, then release it
+        // before pushing (the wheel + deferred-queue locks never nest).
         let waker = {
             let mut w = WHEEL.lock();
-            let mut found = None;
-            for slot in w.slots.iter_mut() {
-                if matches!(slot.as_ref(), Some(s) if s.deadline_cycles <= now_cycles) {
-                    found = slot.take().map(|s| s.waker);
-                    break;
-                }
+            match w.slots[i].as_ref() {
+                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take().map(|s| s.waker),
+                _ => None,
             }
-            found
         };
-        match waker {
-            Some(w) => narf_lib::deferred_wake::push_pending_iter(core::iter::once(w)),
-            None => break,
+        if let Some(wk) = waker {
+            narf_lib::deferred_wake::push_pending_iter(core::iter::once(wk));
         }
     }
 }

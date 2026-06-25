@@ -975,7 +975,9 @@ pub fn install_user_task_hooks() {
     // readiness window also fails on the pre-own-stack base, so it is partly a
     // pre-existing issue) — track before relying on own-stack for the redis
     // throughput path.
-    narf_scheduler::stackful::enable_user_own_stack();
+    if false {
+        narf_scheduler::stackful::enable_user_own_stack();
+    }
 }
 
 /// Per-task x87/SSE register file for `FXSAVE`/`FXRSTOR`.
