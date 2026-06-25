@@ -11,7 +11,7 @@
 //!   card<N>/
 //!     name                   → "card<N>\n"
 //!     dev                    → "226:<N>\n"          (major 226 = DRM)
-//!     uevent                 → static DEVTYPE + DRIVER
+//!     uevent                 → MAJOR/MINOR/DEVNAME + DEVTYPE + DRIVER
 //!     device/
 //!       vendor               → "0x1002\n" / "0x1234\n"
 //!       device               → "0x1636\n" / "0x1111\n"
@@ -69,6 +69,17 @@ pub fn populate_drm_class() {
     }
 }
 
+/// The `/sys/class/drm/card<N>/uevent` body. MAJOR + DEVNAME are
+/// load-bearing for libudev (it derives the device node `/dev/${DEVNAME}`
+/// and devnum from MAJOR:MINOR); weston's `find_primary_gpu` skips any
+/// card with no devnode. Linux ref: drm_sysfs.c + device_add's dev_uevent.
+pub(crate) fn card_uevent(idx: u32, driver: &str) -> String {
+    format!(
+        "MAJOR={}\nMINOR={}\nDEVNAME=dri/card{}\nDEVTYPE=drm_minor\nDRIVER={}\n",
+        DRM_MAJOR, idx, idx, driver
+    )
+}
+
 /// Build the kobject subtree for one DRM card.
 fn populate_card_node(
     class_drm: Arc<narf_filesystem::sysfs::Kobject>,
@@ -94,14 +105,18 @@ fn populate_card_node(
         kobject_add_attr(&kobj, "dev", move || dev_str.clone());
     }
 
-    // `uevent` — static DEVTYPE + DRIVER fields.
-    // Linux ref: drm_sysfs.c::drm_connector_uevent + drm_device_add_groups.
+    // `uevent` — MAJOR/MINOR/DEVNAME plus DEVTYPE + DRIVER. The
+    // MAJOR + DEVNAME pair is load-bearing: libudev computes a device's
+    // node path as `/dev/${DEVNAME}` and its devnum from MAJOR:MINOR, so
+    // without them `udev_device_get_devnode()` returns NULL. weston's
+    // `find_primary_gpu` skips any DRM device with no devnode, failing
+    // with "no drm device found" even though /dev/dri/card<N> exists.
+    // Linux ref: drm_sysfs.c::drm_class_dev_uevent (adds DEVNAME via
+    // device_add → dev_uevent → add_uevent_var "DEVNAME").
     {
         let driver = String::from(card.driver());
         let idx_copy = idx;
-        kobject_add_attr(&kobj, "uevent", move || {
-            format!("DEVTYPE=drm_minor\nDRIVER={}\nMINOR={}\n", driver, idx_copy)
-        });
+        kobject_add_attr(&kobj, "uevent", move || card_uevent(idx_copy, &driver));
     }
 
     // ── device/ sub-kobject ──────────────────────────────────────────
@@ -185,3 +200,4 @@ fn populate_card_node(
         kobject_add_attr(&render_kobj, "dev", move || rd.clone());
     }
 }
+

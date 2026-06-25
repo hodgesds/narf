@@ -38,6 +38,28 @@ fn smoke_drivers_gpu_mode_and_family() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_drivers_gpu_mode_and_family);
 
+// libudev derives a DRM device's node path from DEVNAME and its devnum
+// from MAJOR:MINOR. With either missing, udev_device_get_devnode() returns
+// NULL and weston's find_primary_gpu reports "no drm device found" even
+// though /dev/dri/card0 exists. Guard the card0 uevent shape. The DRM
+// sysfs bridge is linux-compat-only, so this test follows that gate.
+#[cfg(feature = "linux-compat")]
+fn smoke_drm_card_uevent_has_major_and_devname() -> TestResult {
+    let u = crate::drm_sysfs_bridge::card_uevent(0, "narf-drm");
+    if !u.contains("MAJOR=226\n") {
+        return TestResult::Fail("drm card uevent missing MAJOR=226");
+    }
+    if !u.contains("DEVNAME=dri/card0\n") {
+        return TestResult::Fail("drm card uevent missing DEVNAME=dri/card0");
+    }
+    if !u.contains("MINOR=0\n") {
+        return TestResult::Fail("drm card uevent missing MINOR=0");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("drivers/gpu", smoke_drm_card_uevent_has_major_and_devname);
+
 fn smoke_bochs_display_probed_at_boot() -> TestResult {
     use narf_graphics_driver::bochs;
     if bochs::is_probed() {

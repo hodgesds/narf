@@ -37,7 +37,9 @@ narf-drivers-backlight = { path = "../backlight" }
 
 [features]
 linux-compat = ["narf-filesystem/linux-compat"]
-kernel-test = []
+# Tests cover linux-compat-only code (the DRM sysfs class bridge), so the
+# kernel-test build must compile those paths.
+kernel-test = ["linux-compat"]
 
 [lints]
 workspace = true

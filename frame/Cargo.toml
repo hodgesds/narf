@@ -106,8 +106,10 @@ stall-watchdog = []
 
 # Linux-shaped syscall surface: epoll, eventfd, timerfd, clone3,
 # mprotect, madvise, and dynamic-linker plumbing.  Forwarded from
-# narf-userspace.  Stub for Waves 63-67.
-linux-compat = ["narf-userspace/linux-compat"]
+# narf-userspace.  Also forwarded to narf-drivers-gpu so the DRM sysfs
+# class (/sys/class/drm/card<N>) is populated — without it libudev finds
+# no GPU and weston's drm-backend fails with "no drm device found".
+linux-compat = ["narf-userspace/linux-compat", "narf-drivers-gpu/linux-compat"]
 syscall-trace = ["narf-userspace/syscall-trace"]
 
 # Frame-scrub-on-free debug/hardening aids, forwarded to narf-memory.
