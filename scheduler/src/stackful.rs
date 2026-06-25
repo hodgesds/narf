@@ -205,6 +205,20 @@ pub fn set_current_user_fpu(area: *mut u8) {
     }
 }
 
+/// Publish the CURRENT stackful task's user address-space CR3. Called by the
+/// userspace `UserTaskFuture::poll` right after `address_space.activate()` (and
+/// the inline execve re-activate) so `poll_to_yield` can restore it on every
+/// kernel_switch resume — see the `user_cr3` field doc.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_cr3(cr3: u64) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe { (*p).user_cr3.store(cr3, Ordering::Release) };
+    }
+}
+
 /// Read the CURRENT task's user-FPU area, or null if none.
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -412,6 +426,16 @@ pub struct KernelTask {
     /// per-CPU slot would go stale (last task to poll) or dangle after a task
     /// exits and its `Box` is freed, fxrstor-ing freed memory.
     user_fpu: AtomicPtr<u8>,
+    /// Per-task user address-space CR3, published by the userspace
+    /// `UserTaskFuture::poll` (and the inline execve path) once the AS is
+    /// activated. In the own-stack model a preempted/parked task resumes via
+    /// `kernel_switch` (NOT a re-poll), so nothing re-activates its AS — without
+    /// re-loading CR3 before switching the task back in, it would resume under
+    /// whatever AS the executor last ran (e.g. another task that ran in between)
+    /// and every user-memory access (signal-frame write, iretq fetch) would land
+    /// in the wrong page tables. `poll_to_yield` reloads this before each switch
+    /// into the task. 0 = not yet entered user mode (first poll activates it).
+    user_cr3: AtomicU64,
 }
 
 // SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
@@ -483,6 +507,7 @@ impl KernelTask {
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
+            user_cr3: AtomicU64::new(0),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -562,6 +587,23 @@ impl KernelTask {
         if own_stack {
             let top = ((self.stack.as_ptr() as u64) + self.stack.len() as u64) & !0xFu64;
             crate::retarget_kernel_stack(top);
+            // Re-activate the task's user address space before switching in. A
+            // task that yielded/was-preempted resumes via kernel_switch (NOT a
+            // re-poll), so this is the only point that restores its CR3 — without
+            // it the task would run under whatever AS the executor last used
+            // (e.g. a different task polled in between), faulting on every
+            // user-memory access. Skipped on the first poll (cr3==0): the poll
+            // itself activates the AS and publishes it via set_current_user_cr3.
+            let cr3 = self.user_cr3.load(Ordering::Acquire);
+            if cr3 != 0 {
+                // SAFETY: `cr3` is a CR3 value snapshotted from a prior
+                // `address_space.activate()` of this task's live AS; reloading it
+                // restores that mapping (kernel half is global in every AS).
+                unsafe {
+                    core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
+                        options(nostack, preserves_flags));
+                }
+            }
         }
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };

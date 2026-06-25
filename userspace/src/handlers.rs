@@ -7850,7 +7850,15 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
-                // own-stack: mark complete + kernel_switch out (diverges).
+                // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
+                // dead, so run its exit bookkeeping HERE before we diverge:
+                // unregister the per-task ctx pointer (else it dangles) and fan
+                // out exit observers — `on_child_exit` drains the staged wstatus
+                // and WAKES a wait4-parked parent. Without this the parent never
+                // wakes (the lost-wakeup idle-halt). Then mark complete +
+                // kernel_switch out.
+                crate::user_task::unregister_user_task_ctx(task);
+                crate::user_task::notify_task_exited(pid, task);
                 narf_scheduler::stackful::exit_current_stackful();
             }
             hook(uctx);
@@ -7888,7 +7896,13 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
-                // own-stack: mark complete + kernel_switch out (diverges).
+                // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
+                // dead — run its exit bookkeeping here before diverging:
+                // unregister the per-task ctx pointer (else it dangles) and fan
+                // out exit observers (`on_child_exit` drains wstatus + WAKES a
+                // wait4-parked parent — without it the parent hangs forever).
+                crate::user_task::unregister_user_task_ctx(tid);
+                crate::user_task::notify_task_exited(pid, tid);
                 narf_scheduler::stackful::exit_current_stackful();
             }
             hook(uctx);
@@ -13210,6 +13224,17 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
         let entry = new_proc.entry.0.as_u64();
         let rsp = new_proc.stack_top.as_u64();
         let _ = new_proc.address_space.activate();
+        // Publish the new CR3 so a later preempt/park resume re-activates the
+        // post-execve AS (not the pre-execve one) — see set_current_user_cr3.
+        // SAFETY: reading CR3 has no side effects.
+        {
+            let cr3: u64;
+            unsafe {
+                core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+                    options(nostack, nomem, preserves_flags));
+            }
+            narf_scheduler::stackful::set_current_user_cr3(cr3);
+        }
         if let Some(fb) = new_proc.fs_base {
             // SAFETY: canonical user vaddr from the new image's TLS staging.
             unsafe { narf_scheduler::set_user_fs_base(fb) };

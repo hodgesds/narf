@@ -471,6 +471,22 @@ fn park_should_block(
             uc.console_read_pending.store(false, Ordering::Release);
             return false; // a byte is ready → re-execute the read
         }
+        // ALSO arm a ~1-tick wheel fallback (like the deadline parks above):
+        // the serial/keyboard byte-waker is a single non-Arc registry slot, so
+        // a dropped/overwritten byte-ring wake would otherwise wedge the reader
+        // (e.g. getty/login at boot) forever. The fallback re-runs this check on
+        // the next tick — a robust backstop for any lost type-specific wake.
+        let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+        let now = narf_scheduler::narf_time::monotonic_ns();
+        const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
+        let fire = now.saturating_add(FALLBACK_NS).saturating_mul(cpns);
+        let refreshed = sleep_handle.is_some_and(|h| {
+            narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
+        });
+        if !refreshed {
+            *sleep_handle =
+                narf_scheduler::narf_time::timer_wheel::register(fire, waker.clone()).ok();
+        }
         return true;
     }
 
@@ -938,15 +954,22 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
-    // Per-task-own-stack model: enabling this flips a trap/syscall from a user
-    // task onto that task's OWN kernel stack with preemption via a clean
-    // kernel_switch (try_preempt_user), retiring the longjmp-out-of-trap-handler
-    // path. VALIDATED to boot the entire interactive system (init → getty →
-    // login → shell → chroot → exec) under SMP=1. Kept OFF for now: stress-ng's
-    // fork/exec/exit churn still wild-jumps to rip=0x3 in the IRQ/timer-preempt
-    // dispatch path (r14 → narf_interrupts::dispatch::SLOTS) — a deeper preempt
-    // bug that survives the own-stack relocation and isn't the FPU slot. Flip
-    // this on to continue that investigation on the (cleaner) own-stack model.
+    // Per-task-own-stack model: flips a trap/syscall from a user task onto that
+    // task's OWN kernel stack with preemption via a clean kernel_switch
+    // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.
+    //
+    // STATUS 2026-06-25: the rip=0x3 stress-ng crash is FIXED (it was a ~1 KiB
+    // `[Option<Waker>; 64]` array passed/returned BY VALUE through the timer-IRQ
+    // wheel drain, which smashed the handler's return chain when that IRQ runs
+    // on the user task's own kernel stack — see `timer_wheel::take_due_into` /
+    // `drain_due_to_deferred`). With the flag ON the model now boots reliably and
+    // survives stress-ng fork/exec/memcpy churn (12+ rounds, no fault). Two
+    // own-stack-specific lost-wakeups were also fixed: the wait4 exit-observer
+    // fan-out (exit_current_stackful) and the console-read park's missing
+    // ~1-tick fallback. BUT it is NOT YET the default: `redis-server` does not
+    // reach "Ready to accept connections" under own-stack (a startup
+    // lost-wakeup/latency issue in the epoll/futex path), and churn throughput
+    // is markedly slower. Re-enable to continue that bring-up.
     if false {
         narf_scheduler::stackful::enable_user_own_stack();
     }
@@ -1468,6 +1491,20 @@ impl core::future::Future for UserTaskFuture {
         // Activate the user AS. `addr_space.activate()` does the
         // MOV CR3 on x86_64.
         let _ = this.process.address_space.activate();
+
+        // Own-stack model: publish the just-loaded CR3 so the scheduler can
+        // re-activate this AS on every kernel_switch resume (preempt/park) —
+        // the poll runs only ONCE, so this is the sole point that records it.
+        // SAFETY: reading CR3 has no side effects.
+        #[cfg(target_arch = "x86_64")]
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            let cr3: u64;
+            unsafe {
+                core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+                    options(nostack, nomem, preserves_flags));
+            }
+            narf_scheduler::stackful::set_current_user_cr3(cr3);
+        }
 
         // Program the per-task TLS thread pointer. Done after CR3
         // is in place — `IA32_FS_BASE` doesn't depend on the
