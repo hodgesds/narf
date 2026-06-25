@@ -162,6 +162,11 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         IoctlCmd::ModeGetEncoder => handle_getencoder(&mode_state, arg, &ctx),
         IoctlCmd::ModeGetCrtc => handle_getcrtc(&mode_state, arg, &ctx),
         IoctlCmd::ModeObjGetProperties => handle_obj_getproperties(&mode_state, arg, &ctx),
+        // Universal planes (synthesised PRIMARY plane per CRTC) — weston
+        // needs these to find an output's primary plane on the legacy path.
+        IoctlCmd::ModeGetPlaneRes => handle_getplane_res(&mode_state, arg, &ctx),
+        IoctlCmd::ModeGetPlane => handle_getplane(&mode_state, arg, &ctx),
+        IoctlCmd::ModeGetProperty => handle_getproperty(arg),
         // SETGAMMA — accept + no-op. We scan out the framebuffer verbatim
         // (no hardware gamma LUT), so modetest's post-modeset gamma reset
         // succeeds silently instead of warning `failed to set gamma`.
@@ -568,23 +573,184 @@ fn handle_set_client_cap(arg: usize) -> Result<u64, FsError> {
     }
 }
 
-/// DRM_IOCTL_MODE_OBJ_GETPROPERTIES — struct drm_mode_obj_get_properties
-/// (24 bytes): props_ptr, prop_values_ptr, count_props, obj_id, obj_type.
-/// We expose no object properties yet, so report `count_props = 0` and
-/// succeed — returning ENOTTY made libdrm hand modetest a NULL property
-/// set that it dereferenced on cleanup (SIGSEGV).
-///
-/// Linux ref: `drivers/gpu/drm/drm_mode_object.c::drm_mode_obj_get_properties_ioctl`.
-fn handle_obj_getproperties(
-    _mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+// ── Universal planes (legacy-modeset minimum) ─────────────────────────
+//
+// weston's drm-backend enumerates a CRTC's PRIMARY plane through the
+// universal-planes UAPI even on the legacy modeset path — without it,
+// `Failed to find primary plane for output` and the output won't enable.
+// narf-drm has no real plane objects, so synthesise exactly one immutable
+// PRIMARY plane per CRTC: plane `PLANE_ID_BASE + i` serves CRTC index `i`
+// (possible_crtcs = 1<<i). Linux ref: drivers/gpu/drm/drm_plane.c.
+const PLANE_ID_BASE: u32 = 0x40;
+/// Property id of the plane "type" enum (a separate id space from objects).
+const PLANE_TYPE_PROP_ID: u32 = 0x50;
+const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 1;
+const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
+/// DRM_FORMAT_XRGB8888 — the one scanout format the pixman path uses.
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+
+/// `(plane_id, crtc_index)` for the synthesised primary planes.
+fn synth_planes(
+    card: &crate::drm::card::Card,
+) -> alloc::vec::Vec<(u32, u32)> {
+    (0..card.crtcs.len() as u32)
+        .map(|i| (PLANE_ID_BASE + i, i))
+        .collect()
+}
+
+/// DRM_IOCTL_MODE_GETPLANERESOURCES — `struct drm_mode_get_plane_res
+/// { __u64 plane_id_ptr; __u32 count_planes; }` (16 bytes). Two-pass:
+/// fill the id array iff the caller's count is large enough, always
+/// report the real count.
+fn handle_getplane_res(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
     arg: usize,
     _ctx: &DrmFileCtx,
 ) -> Result<u64, FsError> {
-    // SAFETY: `arg` is the validated user/kernel ioctl pointer (24 bytes).
-    let mut bytes = unsafe { copy_in(arg, 24)? };
-    // count_props is at offset 16 (after props_ptr + prop_values_ptr).
-    bytes[16..20].copy_from_slice(&0u32.to_le_bytes());
-    // SAFETY: `arg` is the validated 24-byte out-pointer.
+    // SAFETY: `arg` is the validated 16-byte ioctl pointer.
+    let mut bytes = unsafe { copy_in(arg, 16)? };
+    let plane_id_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let user_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let planes = synth_planes(&mode_state.lock());
+    if plane_id_ptr != 0 && user_count as usize >= planes.len() {
+        let mut buf: Vec<u8> = Vec::with_capacity(planes.len() * 4);
+        for (id, _) in &planes {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        // SAFETY: `plane_id_ptr` is the user out-array; we write exactly
+        // `planes.len()` <= `user_count` ids of 4 bytes each.
+        unsafe { copy_out(plane_id_ptr as usize, &buf)? };
+    }
+    bytes[8..12].copy_from_slice(&(planes.len() as u32).to_le_bytes());
+    // SAFETY: `arg` is the validated 16-byte out-pointer.
+    unsafe { copy_out(arg, &bytes)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_GETPLANE — `struct drm_mode_get_plane` (32 bytes):
+/// plane_id, crtc_id, fb_id, possible_crtcs, gamma_size,
+/// count_format_types, format_type_ptr.
+fn handle_getplane(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    _ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated 32-byte ioctl pointer.
+    let mut out = unsafe { copy_in(arg, 32)? };
+    let plane_id = u32::from_le_bytes(out[0..4].try_into().unwrap());
+    let user_fmt_count = u32::from_le_bytes(out[20..24].try_into().unwrap());
+    let fmt_ptr = u64::from_le_bytes(out[24..32].try_into().unwrap());
+    let possible_crtcs = {
+        let card = mode_state.lock();
+        match synth_planes(&card).into_iter().find(|(id, _)| *id == plane_id) {
+            Some((_, crtc_idx)) => 1u32 << crtc_idx,
+            None => return Err(FsError::InvalidData),
+        }
+    };
+    out[4..8].copy_from_slice(&0u32.to_le_bytes()); // crtc_id (unbound)
+    out[8..12].copy_from_slice(&0u32.to_le_bytes()); // fb_id
+    out[12..16].copy_from_slice(&possible_crtcs.to_le_bytes());
+    out[16..20].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
+    // One supported format (XRGB8888); fill the array two-pass.
+    if fmt_ptr != 0 && user_fmt_count >= 1 {
+        // SAFETY: `fmt_ptr` is the user format-array out-pointer with room
+        // for >=1 u32 (checked above).
+        unsafe { copy_out(fmt_ptr as usize, &DRM_FORMAT_XRGB8888.to_le_bytes())? };
+    }
+    out[20..24].copy_from_slice(&1u32.to_le_bytes()); // count_format_types
+    // SAFETY: `arg` is the validated 32-byte out-pointer.
+    unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_GETPROPERTY — `struct drm_mode_get_property` (size from
+/// the ioctl). We only describe the plane "type" enum property. weston
+/// reads its `name` ("type") to identify the primary plane; the enum
+/// entries (Overlay/Primary/Cursor) round out a well-formed reply.
+fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
+    // struct drm_mode_get_property:
+    //   u64 values_ptr;        // 0   (enum entries write here for ENUM props)
+    //   u64 enum_blob_ptr;     // 8
+    //   u32 prop_id;           // 16  (in)
+    //   u32 flags;             // 20  (out)
+    //   char name[32];         // 24  (out)
+    //   u32 count_values;      // 56  (in/out)
+    //   u32 count_enum_blobs;  // 60  (in/out)
+    // = 64 bytes.
+    // SAFETY: `arg` is the validated 64-byte ioctl pointer.
+    let mut out = unsafe { copy_in(arg, 64)? };
+    let prop_id = u32::from_le_bytes(out[16..20].try_into().unwrap());
+    if prop_id != PLANE_TYPE_PROP_ID {
+        return Err(FsError::InvalidData);
+    }
+    out[20..24].copy_from_slice(&(DRM_MODE_PROP_ENUM | DRM_MODE_PROP_IMMUTABLE).to_le_bytes());
+    out[24..56].fill(0);
+    let name = b"type";
+    out[24..24 + name.len()].copy_from_slice(name);
+    // For an ENUM property the entries go to ENUM_BLOB_PTR (offset 8) and
+    // are counted by count_enum_blobs (offset 60); values_ptr/count_values
+    // are for range properties and stay zero. Each entry is
+    // `drm_mode_property_enum { __u64 value; char name[32]; }` = 40 bytes.
+    let enums: [(u64, &[u8]); 3] = [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
+    let enum_blob_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
+    let user_enum_count = u32::from_le_bytes(out[60..64].try_into().unwrap());
+    if enum_blob_ptr != 0 && user_enum_count as usize >= enums.len() {
+        let mut buf = alloc::vec![0u8; enums.len() * 40];
+        for (i, (val, nm)) in enums.iter().enumerate() {
+            let base = i * 40;
+            buf[base..base + 8].copy_from_slice(&val.to_le_bytes());
+            buf[base + 8..base + 8 + nm.len()].copy_from_slice(nm);
+        }
+        // SAFETY: `enum_blob_ptr` is the user enum-array out-pointer sized
+        // for `user_enum_count` >= 3 entries of 40 bytes each.
+        unsafe { copy_out(enum_blob_ptr as usize, &buf)? };
+    }
+    out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values (range only)
+    out[60..64].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_enum_blobs
+    // SAFETY: `arg` is the validated 64-byte out-pointer.
+    unsafe { copy_out(arg, &out)? };
+    Ok(0)
+}
+
+/// DRM_IOCTL_MODE_OBJ_GETPROPERTIES — `struct drm_mode_obj_get_properties`
+/// (28 bytes): props_ptr, prop_values_ptr, count_props@16, obj_id@20,
+/// obj_type@24. A synthesised plane carries exactly one property — the
+/// immutable "type" = PRIMARY that weston reads to pick a primary plane.
+/// Every other object exposes none (`count_props = 0`); returning ENOTTY
+/// made libdrm hand modetest a NULL property set it dereferenced (SIGSEGV).
+///
+/// Linux ref: `drivers/gpu/drm/drm_mode_object.c::drm_mode_obj_get_properties_ioctl`.
+fn handle_obj_getproperties(
+    mode_state: &alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<crate::drm::card::Card>>,
+    arg: usize,
+    _ctx: &DrmFileCtx,
+) -> Result<u64, FsError> {
+    // SAFETY: `arg` is the validated 28-byte ioctl pointer.
+    let mut bytes = unsafe { copy_in(arg, 28)? };
+    let props_ptr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let values_ptr = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let user_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let obj_id = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+
+    let is_plane = synth_planes(&mode_state.lock())
+        .iter()
+        .any(|(id, _)| *id == obj_id);
+    if is_plane {
+        if props_ptr != 0 && values_ptr != 0 && user_count >= 1 {
+            // props_ptr is a u32 array (property ids); prop_values_ptr is a
+            // u64 array (values).
+            // SAFETY: both are user out-pointers with room for >=1 entry.
+            unsafe {
+                copy_out(props_ptr as usize, &PLANE_TYPE_PROP_ID.to_le_bytes())?;
+                copy_out(values_ptr as usize, &DRM_PLANE_TYPE_PRIMARY.to_le_bytes())?;
+            }
+        }
+        bytes[16..20].copy_from_slice(&1u32.to_le_bytes()); // count_props = 1
+    } else {
+        bytes[16..20].copy_from_slice(&0u32.to_le_bytes()); // no properties
+    }
+    // SAFETY: `arg` is the validated 28-byte out-pointer.
     unsafe { copy_out(arg, &bytes)? };
     Ok(0)
 }

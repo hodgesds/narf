@@ -40,8 +40,8 @@ use crate::drm_ioctl_bridge::dispatch_card;
 use crate::drm_uapi::{
     ioc, ioc_dir, ioc_nr, ioc_size, ioc_type, iow, iowr, DrmModeAtomicUapi, DrmModeCardResUapi,
     DrmVersionUapi, DRM_IOCTL_BASE, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_ATOMIC,
-    DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_SET_CLIENT_CAP,
-    DRM_IOCTL_VERSION, IOC_READ, IOC_WRITE,
+    DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETRESOURCES,
+    DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_VERSION, IOC_READ, IOC_WRITE,
 };
 use alloc::format;
 use alloc::string::String;
@@ -302,6 +302,60 @@ fn smoke_drm_ioctl_set_client_cap_universal_vs_atomic() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_ioctl_set_client_cap_universal_vs_atomic
+);
+
+// ── Universal planes: synthesised PRIMARY plane per CRTC ───────────────
+//
+// weston's drm-backend needs a CRTC's PRIMARY plane (via GETPLANERESOURCES
+// + GETPLANE + the "type" property) to enable an output, even on the
+// legacy modeset path. narf-drm synthesises one immutable PRIMARY plane
+// per CRTC; this checks the whole reply chain.
+fn smoke_drm_ioctl_planes_synth_primary() -> TestResult {
+    let idx = register_test_card();
+    // GETPLANERESOURCES → at least one plane.
+    let mut req = [0u8; 16];
+    if dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_GETPLANERESOURCES,
+        req.as_mut_ptr() as usize,
+        false,
+    ) != Ok(0)
+    {
+        return TestResult::Fail("GETPLANERESOURCES failed");
+    }
+    if u32::from_le_bytes(req[8..12].try_into().unwrap()) < 1 {
+        return TestResult::Fail("expected >= 1 synthesised plane");
+    }
+    // GETPLANE on the first plane (PLANE_ID_BASE = 0x40) → non-empty
+    // possible_crtcs.
+    let mut pl = [0u8; 32];
+    pl[0..4].copy_from_slice(&0x40u32.to_le_bytes());
+    if dispatch_card(idx, DRM_IOCTL_MODE_GETPLANE, pl.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("GETPLANE failed");
+    }
+    if u32::from_le_bytes(pl[12..16].try_into().unwrap()) == 0 {
+        return TestResult::Fail("plane has empty possible_crtcs");
+    }
+    // OBJ_GETPROPERTIES(plane) → the "type" property reads PRIMARY (1).
+    let mut props = [0u32; 1];
+    let mut vals = [0u64; 1];
+    let mut og = [0u8; 28];
+    og[0..8].copy_from_slice(&(props.as_mut_ptr() as u64).to_le_bytes());
+    og[8..16].copy_from_slice(&(vals.as_mut_ptr() as u64).to_le_bytes());
+    og[16..20].copy_from_slice(&1u32.to_le_bytes()); // count_props (room)
+    og[20..24].copy_from_slice(&0x40u32.to_le_bytes()); // obj_id = plane
+    let obj_getprops = iowr(DRM_IOCTL_BASE, 0xB9, 28);
+    if dispatch_card(idx, obj_getprops, og.as_mut_ptr() as usize, false) != Ok(0) {
+        return TestResult::Fail("OBJ_GETPROPERTIES failed");
+    }
+    if vals[0] != 1 {
+        return TestResult::Fail("plane 'type' property should be PRIMARY (1)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_ioctl_planes_synth_primary
 );
 
 // ── 6. Render-node fd rejects SETCRTC with PermissionDenied ────────────
