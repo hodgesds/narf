@@ -257,9 +257,31 @@ pub fn refresh_waker(handle: SleepHandle, waker: Waker) -> bool {
 /// chain) MUST use [`take_due`] instead and call wake() AFTER
 /// exiting IRQ context.
 pub fn fire_due(now_cycles: u64) -> usize {
-    let (taken, n) = take_due(now_cycles);
-    for w in taken.into_iter().flatten() {
-        w.wake();
+    // O(1) stack: take one due waker under the lock, release, wake it, repeat.
+    // Never build a `MAX_SLEEPERS`-element array on the stack — moving that
+    // ~1 KiB by value smashed the caller's return chain when this runs from a
+    // timer IRQ on a user task's own kernel stack (the per-task-own-stack
+    // model). `wake()` runs outside the lock (it may re-register).
+    let mut n = 0usize;
+    loop {
+        let waker = {
+            let mut w = WHEEL.lock();
+            let mut found = None;
+            for slot in w.slots.iter_mut() {
+                if matches!(slot.as_ref(), Some(s) if s.deadline_cycles <= now_cycles) {
+                    found = slot.take().map(|s| s.waker);
+                    break;
+                }
+            }
+            found
+        };
+        match waker {
+            Some(w) => {
+                w.wake();
+                n += 1;
+            }
+            None => break,
+        }
     }
     n
 }
@@ -280,19 +302,70 @@ pub fn fire_due(now_cycles: u64) -> usize {
 /// }
 /// ```
 pub fn take_due(now_cycles: u64) -> ([Option<Waker>; MAX_SLEEPERS], usize) {
-    let mut w = WHEEL.lock();
     let mut taken: [Option<Waker>; MAX_SLEEPERS] = [const { None }; MAX_SLEEPERS];
+    let n = take_due_into(now_cycles, &mut taken);
+    (taken, n)
+}
+
+/// Like [`take_due`] but fills a caller-provided `out` buffer instead of
+/// returning a `MAX_SLEEPERS`-element array by value. IRQ-context callers (the
+/// HPET pump, the clockevent tick) MUST use this: returning the ~1 KiB array by
+/// value forces an `sret` copy + a second on-stack buffer, and on a user task's
+/// own kernel stack (the per-task-own-stack model) that fragile large-struct
+/// return was observed to smash the handler's return address under fork/exec
+/// churn (`rip=0x3` wild jumps). Writing in place into the caller's single
+/// buffer avoids the copy entirely.
+pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -> usize {
+    let mut w = WHEEL.lock();
     let mut n = 0usize;
     for (i, slot) in w.slots.iter_mut().enumerate() {
         if let Some(s) = slot.as_ref() {
             if s.deadline_cycles <= now_cycles {
                 let s = slot.take().unwrap();
-                taken[i] = Some(s.waker);
+                out[i] = Some(s.waker);
                 n += 1;
             }
         }
     }
-    (taken, n)
+    n
+}
+
+/// Drain every due waker straight into the per-CPU deferred-wake queue, using
+/// **O(1) stack**. This is the IRQ-context wheel drain — the HPET pump and the
+/// clockevent tick MUST use this, NOT [`take_due`]/[`take_due_into`].
+///
+/// Why: `take_due*` materialise a `MAX_SLEEPERS`-element `[Option<Waker>]`
+/// (~1 KiB) on the stack. In the per-task-own-stack model the timer IRQ runs on
+/// the *user task's own kernel stack* (`TSS.rsp0` points there), and that large
+/// IRQ-path frame — returned/passed by value through the drain — smashed the
+/// handler's return chain under fork/exec churn, producing the `rip=0x3` wild
+/// jump. Draining one waker at a time keeps the IRQ frame tiny.
+///
+/// Wakers are *pushed*, never woken here: `wake()` would drop the `Arc` (a slab
+/// free) in IRQ context. The scheduler's idle path (`drain_and_wake`) wakes +
+/// drops them in a context where freeing is allowed.
+///
+/// The wheel lock is released before each `push_pending` so the wheel and the
+/// deferred-queue locks are never held nested (no lock-ordering hazard).
+pub fn drain_due_to_deferred(now_cycles: u64) {
+    loop {
+        // Take ONE due waker under the wheel lock, then release it.
+        let waker = {
+            let mut w = WHEEL.lock();
+            let mut found = None;
+            for slot in w.slots.iter_mut() {
+                if matches!(slot.as_ref(), Some(s) if s.deadline_cycles <= now_cycles) {
+                    found = slot.take().map(|s| s.waker);
+                    break;
+                }
+            }
+            found
+        };
+        match waker {
+            Some(w) => narf_lib::deferred_wake::push_pending_iter(core::iter::once(w)),
+            None => break,
+        }
+    }
 }
 
 /// Earliest pending deadline, or `None` if the wheel is

@@ -166,8 +166,12 @@ fn pump_irq() {
     // Calling wake() here (via the old `fire_due`) panics on
     // the alloc-context check when a wake's Arc drop is the
     // last reference.
-    let (taken, _n) = narf_time::timer_wheel::take_due(now);
-    narf_lib::deferred_wake::push_pending(taken);
+    // O(1)-stack drain straight into the deferred-wake queue. Must NOT use
+    // `take_due*` here: their ~1 KiB on-stack waker array, on the user task's
+    // own kernel stack (the per-task-own-stack model), smashed this IRQ
+    // handler's return chain under fork/exec churn (rip=0x3). See
+    // `timer_wheel::drain_due_to_deferred`.
+    narf_time::timer_wheel::drain_due_to_deferred(now);
     if let Some(next) = narf_time::timer_wheel::next_deadline_cycles() {
         wheel_arm(next);
     }

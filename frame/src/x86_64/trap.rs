@@ -754,6 +754,15 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         }
         let _ = writeln!(TrapWriter, "  cr2:    {:#018x}", cr2);
     }
+    {
+        let cr3: u64;
+        // SAFETY: reading CR3 at CPL=0 is always defined.
+        unsafe {
+            core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
+                options(nostack, preserves_flags));
+        }
+        let _ = writeln!(TrapWriter, "  cr3:    {:#018x}", cr3);
+    }
     let _ = writeln!(
         TrapWriter,
         "  rip:    {:#018x}   cs:     {:#018x}",
