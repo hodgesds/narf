@@ -1367,6 +1367,56 @@ impl core::future::Future for UserTaskFuture {
         // task actually executed in user mode. See `account_user_cpu_ns`.
         let slice_start_ns = narf_scheduler::narf_time::monotonic_ns();
 
+        // ── Per-task-own-stack model (the new path) ──────────────────
+        // The task runs on its OWN kernel stack with TSS.rsp0 / SYSCALL gs:[8]
+        // pointed at it (set by `poll_to_yield`). Enter user mode at the TOP of
+        // that stack — `*_at_top` resets RSP so the kernel stack is EMPTY while
+        // the user runs — and let the task live via traps (`try_preempt_user`)
+        // + the scheduler park/exit primitives. This diverges; the poll is NOT
+        // re-entered (the trap continuation is saved in the KernelTask ctx).
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            // Publish the FPU area so the scheduler's preempt/park can
+            // FXSAVE/FXRSTOR it across a kernel_switch, then restore it now.
+            publish_current_fpu(&this.fpu as *const FpuArea as *mut FpuArea);
+            // SAFETY: live 512-byte 16-aligned FXSAVE image; CR4.OSFXSR set.
+            unsafe {
+                core::arch::asm!(
+                    "fxrstor [{p}]",
+                    p = in(reg) &this.fpu as *const FpuArea,
+                    options(nostack, preserves_flags),
+                );
+            }
+            let top = narf_scheduler::stackful::current_stackful_stack_top();
+            let _ = slice_start_ns; // CPU accounting on the own-stack path TODO
+            match this.state {
+                TaskState::Initial => {
+                    this.state = TaskState::Running;
+                    let entry = this.process.entry.0.as_u64();
+                    let rsp = this.process.stack_top.as_u64();
+                    // SAFETY: AS activated + entry/rsp mapped by construction;
+                    // never returns (iretq into CPL=3 on this task's stack top).
+                    if let Some(arg) = this.process.entry_arg {
+                        unsafe {
+                            narf_scheduler::enter_user_mode_with_arg_at_top(entry, rsp, arg, top)
+                        }
+                    } else {
+                        unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) }
+                    }
+                }
+                TaskState::Running => {
+                    narf_lib::perf::ctx_switch();
+                    // SAFETY: `ctx.state` holds a prior trap-from-user snapshot
+                    // (fork child / re-image); resume it on the empty stack top.
+                    unsafe {
+                        narf_scheduler::enter_user_mode_resume_at_top(this.ctx.state.get(), top)
+                    }
+                }
+                TaskState::Exited => unreachable!("guarded above"),
+            }
+            // unreachable — the `*_at_top` calls diverge.
+        }
+
+        // ── Legacy longjmp model (the old path) ──────────────────────
         // setjmp. On the initial call returns 0; the hooks longjmp
         // back here with a non-zero EXIT_REASON_*.
         // SAFETY: jmp is a valid, properly-aligned JmpBuf for the

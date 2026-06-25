@@ -80,8 +80,8 @@ pub use cpuid::Features;
 pub use hwrng::{fill_key_32, HwRngSource};
 pub use user_mode::{
     enter_user_mode, enter_user_mode_at_top, enter_user_mode_resume, enter_user_mode_resume_at_top,
-    enter_user_mode_with_arg, longjmp, set_user_fs_base, setjmp, JmpBuf, UserState, IA32_FS_BASE,
-    USER_RFLAGS,
+    enter_user_mode_with_arg, enter_user_mode_with_arg_at_top, longjmp, set_user_fs_base, setjmp,
+    JmpBuf, UserState, IA32_FS_BASE, USER_RFLAGS,
 };
 
 /// x86_64's concrete `DomainPrimitive` type. All methods forward to

@@ -367,6 +367,37 @@ pub unsafe extern "C" fn enter_user_mode_at_top(rip: u64, user_rsp: u64, stack_t
     );
 }
 
+/// Like [`enter_user_mode_with_arg`] but FIRST resets RSP to `stack_top` (the
+/// task's own kernel-stack top). The per-task-own-stack first-entry for a
+/// `clone(2)`/pthread start that delivers `arg` in RDI.
+///
+/// SysV: `rip`=rdi, `user_rsp`=rsi, `arg`=rdx, `stack_top`=rcx.
+///
+/// # Safety
+/// Same as [`enter_user_mode_at_top`]; `arg` is the SysV first integer arg.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_with_arg_at_top(
+    rip: u64,
+    user_rsp: u64,
+    arg: u64,
+    stack_top: u64,
+) -> ! {
+    naked_asm!(
+        "mov rsp, rcx",                   // reset to the empty stack top
+        "swapgs",
+        "push {udata}",                   // ss
+        "push rsi",                       // user rsp
+        "push {rflags}",                  // rflags (IF=1)
+        "push {ucode}",                   // cs
+        "push rdi",                       // rip
+        "mov rdi, rdx",                   // arg → first SysV integer arg (RDI)
+        "iretq",
+        udata  = const UDATA_SEL,
+        ucode  = const UCODE_SEL,
+        rflags = const USER_RFLAGS,
+    );
+}
+
 /// Like [`enter_user_mode_resume`] but FIRST resets RSP to `stack_top`
 /// (the task's own kernel-stack top), abandoning the caller's frames — the
 /// per-task-own-stack analog used to resume a saved [`UserState`] (e.g. a
