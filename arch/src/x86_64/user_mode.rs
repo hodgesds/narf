@@ -335,3 +335,84 @@ pub unsafe extern "C" fn enter_user_mode_resume(state: *const UserState) -> ! {
         ucode = const UCODE_SEL,
     );
 }
+
+/// Like [`enter_user_mode`] but FIRST resets RSP to `stack_top` (the task's
+/// own kernel-stack top), abandoning the caller's frames. Used by the
+/// per-task-own-stack execution model: after the `iretq` the kernel stack is
+/// EMPTY while the user runs, so a subsequent trap (with `TSS.rsp0 =
+/// stack_top`) lands on an empty stack and preemption is a clean `kernel_switch`
+/// — no longjmp, no synthetic resume frame.
+///
+/// SysV: `rip`=rdi, `user_rsp`=rsi, `stack_top`=rdx.
+///
+/// # Safety
+/// Same as [`enter_user_mode`], plus: `stack_top` is the 16-byte-aligned top of
+/// this task's live kernel stack, and the caller's frames below it are dead
+/// (this never returns, so abandoning them is sound).
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_at_top(rip: u64, user_rsp: u64, stack_top: u64) -> ! {
+    naked_asm!(
+        // Reset to the empty top of this task's kernel stack first.
+        "mov rsp, rdx",
+        "swapgs",
+        "push {udata}",                   // ss
+        "push rsi",                       // user rsp
+        "push {rflags}",                  // rflags (IF=1)
+        "push {ucode}",                   // cs
+        "push rdi",                       // rip
+        "iretq",
+        udata  = const UDATA_SEL,
+        ucode  = const UCODE_SEL,
+        rflags = const USER_RFLAGS,
+    );
+}
+
+/// Like [`enter_user_mode_resume`] but FIRST resets RSP to `stack_top`
+/// (the task's own kernel-stack top), abandoning the caller's frames — the
+/// per-task-own-stack analog used to resume a saved [`UserState`] (e.g. a
+/// `fork(2)` child's first run) with the kernel stack left empty.
+///
+/// SysV: `state`=rdi, `stack_top`=rsi.
+///
+/// # Safety
+/// Same as [`enter_user_mode_resume`], plus `stack_top` is the top of this
+/// task's live kernel stack.
+#[unsafe(naked)]
+pub unsafe extern "C" fn enter_user_mode_resume_at_top(
+    state: *const UserState,
+    stack_top: u64,
+) -> ! {
+    naked_asm!(
+        // Reset to the empty top of this task's kernel stack first (rsi).
+        "mov rsp, rsi",
+        // Push iretq frame from *state (rdi).
+        "mov rax, {udata}",
+        "push rax",                       // ss
+        "push qword ptr [rdi + 8*17]",    // user rsp
+        "push qword ptr [rdi + 8*16]",    // rflags
+        "mov rax, {ucode}",
+        "push rax",                       // cs
+        "push qword ptr [rdi + 8*15]",    // rip
+        // Restore GPRs (rdi loaded last so it can serve as base; rsi is
+        // overwritten here, after we no longer need stack_top).
+        "mov r15, [rdi + 8*0]",
+        "mov r14, [rdi + 8*1]",
+        "mov r13, [rdi + 8*2]",
+        "mov r12, [rdi + 8*3]",
+        "mov r11, [rdi + 8*4]",
+        "mov r10, [rdi + 8*5]",
+        "mov r9,  [rdi + 8*6]",
+        "mov r8,  [rdi + 8*7]",
+        "mov rbp, [rdi + 8*8]",
+        "mov rsi, [rdi + 8*10]",
+        "mov rdx, [rdi + 8*11]",
+        "mov rcx, [rdi + 8*12]",
+        "mov rbx, [rdi + 8*13]",
+        "mov rax, [rdi + 8*14]",
+        "mov rdi, [rdi + 8*9]",
+        "swapgs",
+        "iretq",
+        udata = const UDATA_SEL,
+        ucode = const UCODE_SEL,
+    );
+}
