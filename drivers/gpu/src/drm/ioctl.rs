@@ -37,6 +37,7 @@ pub enum IoctlCmd {
     Version = 0x00,
     GemClose = 0x09,
     GetCap = 0x0C,
+    SetClientCap = 0x0D,
     SetMaster = 0x1E,
     DropMaster = 0x1F,
     PrimeHandleToFd = 0x2D,
@@ -54,7 +55,9 @@ pub enum IoctlCmd {
     ModeDestroyDumb = 0xB4,
     ModeAddFb2 = 0xB8,
     ModeObjGetProperties = 0xB9,
+    ModeGetProperty = 0xAA,
     ModeGetPlaneRes = 0xB5,
+    ModeGetPlane = 0xB6,
     ModeAtomic = 0xBC,
     SyncobjCreate = 0xBF,
     SyncobjDestroy = 0xC0,
@@ -71,6 +74,7 @@ impl IoctlCmd {
             0x00 => IoctlCmd::Version,
             0x09 => IoctlCmd::GemClose,
             0x0C => IoctlCmd::GetCap,
+            0x0D => IoctlCmd::SetClientCap,
             0x1E => IoctlCmd::SetMaster,
             0x1F => IoctlCmd::DropMaster,
             0x2D => IoctlCmd::PrimeHandleToFd,
@@ -83,6 +87,8 @@ impl IoctlCmd {
             0xA7 => IoctlCmd::ModeGetConnector,
             0xA8 => IoctlCmd::ModeRmFb,
             0xB9 => IoctlCmd::ModeObjGetProperties,
+            0xAA => IoctlCmd::ModeGetProperty,
+            0xB6 => IoctlCmd::ModeGetPlane,
             0xB0 => IoctlCmd::ModePageFlip,
             0xB2 => IoctlCmd::ModeCreateDumb,
             0xB3 => IoctlCmd::ModeMapDumb,
@@ -358,7 +364,10 @@ pub fn dispatch(
         | IoctlCmd::ModeSetGamma
         | IoctlCmd::SetMaster
         | IoctlCmd::DropMaster
+        | IoctlCmd::SetClientCap
         | IoctlCmd::ModeObjGetProperties
+        | IoctlCmd::ModeGetProperty
+        | IoctlCmd::ModeGetPlane
         | IoctlCmd::ModePageFlip
         | IoctlCmd::ModeCreateDumb
         | IoctlCmd::ModeMapDumb

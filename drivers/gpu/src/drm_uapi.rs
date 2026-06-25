@@ -200,6 +200,10 @@ pub const DRM_IOCTL_MODE_GETCRTC: u32 = iowr(DRM_IOCTL_BASE, 0xA1, SZ_DRM_MODE_C
 /// DRM_IOCTL_MODE_SETCRTC = _IOWR('d', 0xa2, struct drm_mode_crtc).
 pub const DRM_IOCTL_MODE_SETCRTC: u32 = iowr(DRM_IOCTL_BASE, 0xA2, SZ_DRM_MODE_CRTC);
 
+/// DRM_IOCTL_SET_CLIENT_CAP = _IOW('d', 0x0d, struct drm_set_client_cap)
+/// — `{ __u64 capability; __u64 value; }` (16 bytes).
+pub const DRM_IOCTL_SET_CLIENT_CAP: u32 = iow(DRM_IOCTL_BASE, 0x0D, 16);
+
 /// DRM_IOCTL_MODE_GETENCODER = _IOWR('d', 0xa6, struct drm_mode_get_encoder).
 pub const DRM_IOCTL_MODE_GETENCODER: u32 = iowr(DRM_IOCTL_BASE, 0xA6, SZ_DRM_MODE_GET_ENCODER);
 

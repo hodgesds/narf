@@ -169,6 +169,12 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // SET_MASTER / DROP_MASTER — primary-node fds are already treated
         // as authenticated master (single-client model); accept + no-op.
         IoctlCmd::SetMaster | IoctlCmd::DropMaster => Ok(0),
+        // SET_CLIENT_CAP — opt into UAPI behaviours. We accept
+        // UNIVERSAL_PLANES (weston REQUIRES it — it enumerates the
+        // primary plane through the universal-planes UAPI) but reject
+        // ATOMIC so weston falls back to legacy SETCRTC modeset, which
+        // narf-drm implements (full atomic-commit is not wired yet).
+        IoctlCmd::SetClientCap => handle_set_client_cap(arg),
         // Dumb-buffer ioctls — new in Rung 3.
         IoctlCmd::ModeCreateDumb => handle_create_dumb(&mode_state, arg, &ctx),
         IoctlCmd::ModeMapDumb => handle_map_dumb(&mode_state, arg, &ctx),
@@ -537,6 +543,29 @@ fn handle_getcrtc(
     // SAFETY: `arg` is the validated user/kernel out-pointer (104 bytes).
     unsafe { copy_out(arg, &out)? };
     Ok(0)
+}
+
+/// DRM_IOCTL_SET_CLIENT_CAP — `struct drm_set_client_cap { __u64
+/// capability; __u64 value; }` (16 bytes). We accept UNIVERSAL_PLANES
+/// (mandatory for weston's plane enumeration) and reject the rest —
+/// notably ATOMIC, so weston uses legacy SETCRTC modeset.
+///
+/// Linux ref: `drivers/gpu/drm/drm_ioctl.c::drm_setclientcap`.
+fn handle_set_client_cap(arg: usize) -> Result<u64, FsError> {
+    /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (include/uapi/drm/drm.h).
+    const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+    // SAFETY: `arg` is the validated 16-byte ioctl argument pointer.
+    let bytes = unsafe { copy_in(arg, 16)? };
+    let cap = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    match cap {
+        DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
+        // ATOMIC + every other cap: unsupported → EINVAL. A non-zero
+        // return tells the client the cap isn't available; weston then
+        // drives modeset through the legacy path.
+        _ => Err(FsError::InvalidData),
+    }
 }
 
 /// DRM_IOCTL_MODE_OBJ_GETPROPERTIES — struct drm_mode_obj_get_properties
