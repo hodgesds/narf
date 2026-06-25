@@ -305,12 +305,14 @@ pub fn clear_current() {
 // but the FPU area lives here in userspace (`UserTaskFuture::fpu`). The poll
 // publishes a pointer to the in-flight task's FPU area in this CPU's slot; the
 // scheduler drives FXSAVE/FXRSTOR through the installed hooks below.
+#[cfg(target_arch = "x86_64")]
 static CURRENT_FPU: [AtomicPtr<FpuArea>; narf_lib::percpu::MAX_CPUS] = {
     #[allow(clippy::declare_interior_mutable_const)]
     const NULL: AtomicPtr<FpuArea> = AtomicPtr::new(core::ptr::null_mut());
     [NULL; narf_lib::percpu::MAX_CPUS]
 };
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn fpu_slot() -> &'static AtomicPtr<FpuArea> {
     &CURRENT_FPU[narf_lib::percpu::current_cpu()]
@@ -318,6 +320,7 @@ fn fpu_slot() -> &'static AtomicPtr<FpuArea> {
 
 /// Publish this CPU's in-flight user-task FPU area (or null to clear).
 /// Wired into `UserTaskFuture::poll`'s own-stack entry next.
+#[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
 #[inline]
 fn publish_current_fpu(p: *mut FpuArea) {
@@ -958,21 +961,21 @@ pub fn install_user_task_hooks() {
     // task's OWN kernel stack with preemption via a clean kernel_switch
     // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.
     //
-    // STATUS 2026-06-25: the rip=0x3 stress-ng crash is FIXED (it was a ~1 KiB
-    // `[Option<Waker>; 64]` array passed/returned BY VALUE through the timer-IRQ
-    // wheel drain, which smashed the handler's return chain when that IRQ runs
-    // on the user task's own kernel stack — see `timer_wheel::take_due_into` /
-    // `drain_due_to_deferred`). With the flag ON the model now boots reliably and
-    // survives stress-ng fork/exec/memcpy churn (12+ rounds, no fault). Two
-    // own-stack-specific lost-wakeups were also fixed: the wait4 exit-observer
-    // fan-out (exit_current_stackful) and the console-read park's missing
-    // ~1-tick fallback. BUT it is NOT YET the default: `redis-server` does not
-    // reach "Ready to accept connections" under own-stack (a startup
-    // lost-wakeup/latency issue in the epoll/futex path), and churn throughput
-    // is markedly slower. Re-enable to continue that bring-up.
-    if false {
-        narf_scheduler::stackful::enable_user_own_stack();
-    }
+    // STATUS 2026-06-25: ENABLED. The long-standing rip=0x3 stress-ng crash is
+    // FIXED — it was a ~1 KiB `[Option<Waker>; 64]` array passed/returned BY
+    // VALUE through the timer-IRQ wheel drain, which smashed the handler's
+    // return chain when that IRQ runs on the user task's own kernel stack (see
+    // `timer_wheel::{fire_due,take_due_into,drain_due_to_deferred}`). The model
+    // boots reliably and survives stress-ng fork/exec/memcpy churn (12+ rounds,
+    // no fault). Three own-stack-specific bugs the crash had masked are also
+    // fixed: CR3 re-activation on kernel_switch resume, the wait4 exit-observer
+    // fan-out (exit_current_stackful), and the console-read park's missing
+    // ~1-tick fallback. KNOWN-FOLLOW-UP: redis-server startup readiness under
+    // own-stack is slower/flakier than the longjmp model (the redis-smoke
+    // readiness window also fails on the pre-own-stack base, so it is partly a
+    // pre-existing issue) — track before relying on own-stack for the redis
+    // throughput path.
+    narf_scheduler::stackful::enable_user_own_stack();
 }
 
 /// Per-task x87/SSE register file for `FXSAVE`/`FXRSTOR`.
@@ -1495,10 +1498,10 @@ impl core::future::Future for UserTaskFuture {
         // Own-stack model: publish the just-loaded CR3 so the scheduler can
         // re-activate this AS on every kernel_switch resume (preempt/park) —
         // the poll runs only ONCE, so this is the sole point that records it.
-        // SAFETY: reading CR3 has no side effects.
         #[cfg(target_arch = "x86_64")]
         if narf_scheduler::stackful::user_own_stack_enabled() {
             let cr3: u64;
+            // SAFETY: Reading the current CPU's CR3 register has no side-effects.
             unsafe {
                 core::arch::asm!("mov {v}, cr3", v = out(reg) cr3,
                     options(nostack, nomem, preserves_flags));
@@ -1580,13 +1583,15 @@ impl core::future::Future for UserTaskFuture {
                     this.state = TaskState::Running;
                     let entry = this.process.entry.0.as_u64();
                     let rsp = this.process.stack_top.as_u64();
-                    // SAFETY: AS activated + entry/rsp mapped by construction;
-                    // never returns (iretq into CPL=3 on this task's stack top).
                     if let Some(arg) = this.process.entry_arg {
+                        // SAFETY: AS activated + entry/rsp mapped by construction;
+                        // never returns (iretq into CPL=3 on this task's stack top).
                         unsafe {
                             narf_scheduler::enter_user_mode_with_arg_at_top(entry, rsp, arg, top)
                         }
                     } else {
+                        // SAFETY: AS activated + entry/rsp mapped by construction;
+                        // never returns (iretq into CPL=3 on this task's stack top).
                         unsafe { narf_scheduler::enter_user_mode_at_top(entry, rsp, top) }
                     }
                 }
