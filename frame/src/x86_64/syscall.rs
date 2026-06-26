@@ -232,6 +232,25 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
         "mov r8,  [rsp + 56]",   // r8
         "mov r9,  [rsp + 48]",   // r9
 
+        // Restore the callee-saved user registers from the UserState slots too.
+        // For an ordinary syscall this is a no-op: the SysV C dispatcher already
+        // PRESERVES rbx/rbp/r12-r15, so the live values equal the snapshot. But a
+        // handler that PARKS does so via `kernel_switch` (own-stack model), whose
+        // switch-back restores the KERNEL's callee-saved registers at the yield
+        // point — NOT the user's. Without reloading them here, a re-executed /
+        // resumed syscall returns to userspace with garbage rbp/rbx/r12-r15: the
+        // caller's frame pointer is clobbered (observed as chroot_run's
+        // `##UFAULT## rbp=0x0`, and as a parked accept()/read() resuming with a
+        // corrupt frame so the server never echoes — net-smoke flake). Linux's
+        // syscall ABI mandates these are preserved across a syscall; reloading
+        // from the entry snapshot guarantees it for the park/resume path.
+        "mov rbx, [rsp + 104]",  // rbx
+        "mov rbp, [rsp + 64]",   // rbp
+        "mov r12, [rsp + 24]",   // r12
+        "mov r13, [rsp + 16]",   // r13
+        "mov r14, [rsp + 8]",    // r14
+        "mov r15, [rsp + 0]",    // r15
+
         // Reload user RIP, RFLAGS from saved slots for sysretq.
         "mov rcx, [rsp + 120]",                // user RIP
         "mov r11, [rsp + 128]",                // user RFLAGS
