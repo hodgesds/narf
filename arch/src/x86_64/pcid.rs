@@ -236,7 +236,10 @@ fn cr3_for_domain(domain: u8) -> u64 {
 /// the saved value can be written back via `restore`.
 #[inline]
 pub unsafe fn save() -> SavedPcid {
-    if !is_active() {
+    // Per-CPU PCIDE gate: a CR3 write with NOFLUSH (bit 63) #GPs when
+    // CR4.PCIDE=0, and a hypervisor can leave PCIDE off on some CPUs (see
+    // `pcide_enabled`). No PCIDE ⟹ no PCID-tagged CR3 to preserve ⟹ no-op.
+    if !is_active() || !pcide_enabled() {
         return SavedPcid(0);
     }
     // SAFETY: CR3 read at CPL=0.
@@ -252,7 +255,8 @@ pub unsafe fn save() -> SavedPcid {
 /// restore).
 #[inline]
 pub unsafe fn restore(s: SavedPcid) {
-    if !is_active() || s.0 == 0 {
+    // Per-CPU PCIDE gate (see `save`): NOFLUSH CR3 writes #GP when PCIDE=0.
+    if !is_active() || !pcide_enabled() || s.0 == 0 {
         return;
     }
     // SAFETY: write back the snapshot CR3 with NOFLUSH set so the
@@ -302,7 +306,10 @@ pub unsafe fn set_rights(domain: u8, _rights: DomainRights) {
 pub unsafe fn enter_domain(kernel_domain: u8, driver_domain: u8) -> SavedPcid {
     debug_assert!((kernel_domain as usize) < NUM_DOMAINS);
     debug_assert!((driver_domain as usize) < NUM_DOMAINS);
-    if !is_active() {
+    // Per-CPU PCIDE gate (see `save`): the CR3 write below sets NOFLUSH, which
+    // #GPs when CR4.PCIDE=0. A PCIDE-off CPU can't do PCID isolation anyway, so
+    // skip the domain switch (no-op) rather than fault.
+    if !is_active() || !pcide_enabled() {
         return SavedPcid(0);
     }
     // SAFETY: CR3 read+write at CPL=0; PCIDE on; PML4 phys mapped.
@@ -418,4 +425,19 @@ pub fn invpcid_supported() -> bool {
     // SAFETY: leaf 7 always defined.
     let (_, ebx, _, _) = unsafe { crate::x86_64::cpuid::cpuid(7, 0) };
     ebx & (1 << 10) != 0
+}
+
+/// `true` iff CR4.PCIDE is set on THIS CPU. Distinct from
+/// [`invpcid_supported`] (the INVPCID *instruction*, CPUID(7).EBX[10]) and
+/// from PCID *support* (CPUID(1).ECX[17], gated in [`enable_pcide`]): a
+/// hypervisor can expose INVPCID-the-instruction on a vCPU while NOT
+/// advertising PCID — observed under QEMU `-cpu max`+KVM, where the BSP sees
+/// CPUID(1).ECX[17]=1 (PCIDE enabled) but APs see it 0 (so `enable_pcide`
+/// no-op'd and CR4.PCIDE stayed 0). Executing INVPCID with a NON-ZERO PCID
+/// descriptor #GPs whenever CR4.PCIDE=0, so any shootdown that issues a
+/// tagged INVPCID must check this on the executing CPU first.
+#[inline]
+pub fn pcide_enabled() -> bool {
+    // SAFETY: reading CR4 at CPL=0 is always defined.
+    unsafe { cr::read_cr4() & cr::CR4_PCIDE != 0 }
 }

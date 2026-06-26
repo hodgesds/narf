@@ -258,6 +258,14 @@ fn smoke_pcid_cr3_roundtrip() -> TestResult {
     if !pcid::is_active() {
         return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
     }
+    // `enter_domain` does a NOFLUSH CR3 swap, which #GPs (and is therefore
+    // correctly no-op'd) when CR4.PCIDE is off — a hypervisor can expose the
+    // PCID *enforcer* paths while not advertising PCID to this CPU (QEMU
+    // `-cpu max`+KVM leaves PCIDE off). Without PCIDE there is no CR3.PCID to
+    // round-trip, so skip rather than assert tagging that can't happen here.
+    if !pcid::pcide_enabled() {
+        return TestResult::Skip("CR4.PCIDE not enabled (hypervisor doesn't expose PCID)");
+    }
 
     // SAFETY: CR3 read at CPL=0.
     let cr3_before = unsafe { cr::read_cr3() };
