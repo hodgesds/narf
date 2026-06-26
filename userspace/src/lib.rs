@@ -122,16 +122,17 @@ pub use pipe::{pipe_pair, PipeRead, PipeWrite};
 
 pub use elf::{parse as parse_elf, ElfError};
 pub use handlers::{
-    abi_file_op_bridge, active_user_as, bootstrap_init, bootstrap_live_count, brk_init,
-    clear_exit_landing, clear_mempolicy_for_fault, cwd_init, cwd_of, default_signal_delivery,
-    default_sync_signal_delivery, exit_landing, hostname_init, init_per_task_state,
-    install_address_space_lookup, install_core_syscalls, install_signal_delivery_hook,
-    install_sync_signal_hook, install_task_id_lookup, nice_init, pgid_init, prctl_init,
-    publish_mempolicy_for_fault, rlimit_init, sched_param_init, set_exit_landing, shared_rings_for,
-    sid_init, sigaction_init, sigaction_lookup, signal_delivery_hook, signal_init, signal_mask_of,
-    signal_pending_of, spawn_dispatcher_for, sync_signal_hook, take_kernel_ends, take_user_ends,
-    uidgid_init, umask_init, vector_to_signum, SharedRingPair, SyncFaultInfo, TaskRings,
-    UserRingEnds, BOOTSTRAP_SHARED_RING_DEPTH,
+    abi_file_op_bridge, active_user_as, address_space_lookup, bootstrap_init, bootstrap_live_count,
+    brk_init, clear_exit_landing, clear_mempolicy_for_fault, cwd_init, cwd_of,
+    default_signal_delivery, default_sync_signal_delivery, exit_landing, hostname_init,
+    init_per_task_state, install_address_space_lookup, install_core_syscalls,
+    install_signal_delivery_hook, install_sync_signal_hook, install_task_id_lookup, nice_init,
+    pgid_init, prctl_init, publish_mempolicy_for_fault, restore_address_space_lookup, rlimit_init,
+    sched_param_init, set_exit_landing, shared_rings_for, sid_init, sigaction_init,
+    sigaction_lookup, signal_delivery_hook, signal_init, signal_mask_of, signal_pending_of,
+    spawn_dispatcher_for, sync_signal_hook, take_kernel_ends, take_user_ends, uidgid_init,
+    umask_init, vector_to_signum, SharedRingPair, SyncFaultInfo, TaskRings, UserRingEnds,
+    BOOTSTRAP_SHARED_RING_DEPTH,
 };
 pub use loader::{
     apply_relocations, load_elf_bytes, load_elf_into_at, load_into, EntryPoint, LoadBytesError,

@@ -349,6 +349,18 @@ pub fn install_address_space_lookup(lookup: AsLookupFn) {
     *AS_LOOKUP.lock() = Some(lookup);
 }
 
+/// Snapshot the currently-installed AS lookup (for save/restore around a
+/// test that temporarily swaps in its own). `None` if none is installed.
+pub fn address_space_lookup() -> Option<AsLookupFn> {
+    *AS_LOOKUP.lock()
+}
+
+/// Restore (or clear) the AS lookup — the counterpart to
+/// `install_address_space_lookup` that also accepts `None`.
+pub fn restore_address_space_lookup(lookup: Option<AsLookupFn>) {
+    *AS_LOOKUP.lock() = lookup;
+}
+
 fn current_address_space() -> Option<Arc<AddressSpace>> {
     let f = *AS_LOOKUP.lock();
     f.and_then(|lookup| lookup())
@@ -17197,8 +17209,18 @@ pub fn default_sync_signal_delivery(
         // right offsets — must match deliver_signal's `want_siginfo || force_rt`
         // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
         set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
+        return true;
     }
-    delivered
+    // The handler's signal frame couldn't be placed — `deliver_signal` only
+    // fails here when the target user stack is unwritable, i.e. it overflowed
+    // during delivery (classically a SIGSEGV handler that itself faults,
+    // walking the stack down one rt_sigframe at a time). Linux's response is
+    // `force_sigsegv`: reset the disposition to default and apply it. Returning
+    // `false` would instead fall through to the kernel panic surface — taking
+    // the whole system down for one runaway user task. Terminate the task so
+    // the kernel survives.
+    terminate_current_task(ctx, task, signum, false);
+    true
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────

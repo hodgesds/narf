@@ -16,6 +16,48 @@ use core::fmt::Write;
 
 use narf_console::TrapWriter;
 
+/// Ensure every page in the user range `[lo, hi)` is present and writable in
+/// the active user address space, backing demand-paged / growable-stack pages
+/// on the way (the same recovery the `#PF` handler would do on a real touch).
+///
+/// Returns `false` if any page cannot be backed — i.e. the range runs off the
+/// end of a fixed mapping (a genuine stack overflow). This is the guard that
+/// keeps `deliver_signal`'s CPL=0 frame writes from faulting *un-recoverably*
+/// and panicking the whole kernel when a user task overflows its stack during
+/// signal delivery (e.g. a SIGSEGV handler that itself faults, walking the
+/// stack down one rt_sigframe at a time). On `false` the caller force-applies
+/// the signal's default action (terminate) — Linux's `force_sigsegv` model —
+/// so the offending task dies and the kernel survives.
+#[cfg(target_arch = "x86_64")]
+fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
+    use narf_memory::AddressSpaceError;
+    let Some(as_arc) = narf_userspace::active_user_as() else {
+        // No active user AS — a kernel-internal delivery (or a unit test
+        // driving a kernel-buffer "stack"). Nothing to back / can't check;
+        // don't block. Only a delivery to a *real* user task (AS present) but
+        // an unbacked target page is the overflow we must refuse.
+        return true;
+    };
+    let mut p = lo & !0xFFFu64;
+    while p < hi {
+        let v = narf_memory::VirtAddr::new(p);
+        // SAFETY: the active CR3 belongs to this AS (we're in its trap
+        // context); the identity map is live. `demand_alloc_page` backs a
+        // demand slot and reports `AlignmentMismatch` for an already-present
+        // page (both mean "writable now"); `try_grow_stack` promotes a guard
+        // page. Anything else means the page is unbacked and not growable.
+        let backed = matches!(
+            unsafe { as_arc.demand_alloc_page(v) },
+            Ok(()) | Err(AddressSpaceError::AlignmentMismatch)
+        ) || unsafe { as_arc.try_grow_stack(v) }.is_ok();
+        if !backed {
+            return false;
+        }
+        p = p.wrapping_add(0x1000);
+    }
+    true
+}
+
 /// Scheduler-stall watchdog. Detects a *global forward-progress stall*
 /// (the kernel keeps taking timer ticks but USER SYSCALLS stop advancing —
 /// the signature of the intermittent SMP wedge: workers parked/stuck while
@@ -655,11 +697,24 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // Demand-alloc surfaced Unmapped: vaddr might land
                 // in a STACK_GUARD region. try_grow_stack promotes
                 // the guard to a real stack page and installs a
-                // fresh guard below; on success the user-mode
+                // fresh guard below; on success the faulting
                 // instruction retries and lands on the freshly
                 // backed page. POSIX.1-2017 §2.2.2 — stack
                 // auto-extension is implementation-defined.
-                if from_user {
+                //
+                // Also grow on a CPL=0 (supervisor) fault when cr2 is
+                // in the user half: `deliver_signal` writes the signal
+                // frame onto the user stack from kernel mode, and a
+                // large frame (rt_sigframe ≈ a few hundred bytes) below
+                // a near-page-boundary RSP lands in the guard page — a
+                // not-present write fault with U=0. Without this the
+                // kernel-mode write panics instead of growing the stack
+                // (hit by stress-ng under heavy SMP churn, where signals
+                // are delivered far more often near a stack boundary).
+                // try_grow_stack only ever promotes a real STACK_GUARD
+                // region, so a non-stack user vaddr still falls through
+                // to the SEGV/panic surface.
+                if from_user || cr2_in_user_half {
                     // SAFETY: same identity-map argument.
                     if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
                         return;
@@ -1087,6 +1142,18 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         };
         let raw_rsp = stack_top.wrapping_sub(frame_size);
         let new_rsp = (raw_rsp & !0xFu64) | 0x8;
+
+        // Back the frame's target pages first. The writes below run at CPL=0
+        // through the SMAP window, so a not-present page they touch faults in
+        // KERNEL mode; if that page is a genuine stack overflow (not growable),
+        // the `#PF` is unrecoverable and panics the whole kernel. Pre-faulting
+        // here turns "can't place the signal frame" into a clean `false`
+        // return → the caller applies the default action (terminate the task),
+        // matching Linux's `force_sigsegv`. Growable / demand pages get backed
+        // as a side effect, so legitimate deliveries proceed unchanged.
+        if !ensure_user_range_writable(new_rsp, new_rsp.wrapping_add(frame_size)) {
+            return false;
+        }
 
         let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
             self.frame.rip.wrapping_sub(2)
@@ -1621,6 +1688,71 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_rewinds_saved_rip);
+
+/// Robustness: when a signal is delivered to a *real* user task (an active
+/// address space is present) but the target stack range can't be backed —
+/// a stack overflow during delivery, e.g. a SIGSEGV handler that itself
+/// faults and walks the stack down one rt_sigframe at a time —
+/// `deliver_signal` must REFUSE (return false) so the caller force-applies
+/// the default action (terminate). Letting the CPL=0 frame write fault
+/// unrecoverably instead panics the whole kernel for one runaway task; this
+/// is the SMP `chroot_run` #PF that the pre-fault guard closes (Linux's
+/// `force_sigsegv` model).
+fn smoke_x86_64_deliver_signal_refuses_unbacked_user_stack() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_memory::AddressSpace;
+
+    // Present an EMPTY address space: every user vaddr is unbacked and not
+    // growable (no STACK_GUARD region), so the pre-fault can't back the
+    // frame. `AddressSpace::empty()` has root=0, but the unbacked path never
+    // dereferences the root (no region matches → Unmapped before any walk).
+    fn empty_as_lookup() -> Option<Arc<AddressSpace>> {
+        Some(Arc::new(AddressSpace::empty()))
+    }
+
+    let saved = narf_userspace::address_space_lookup();
+    narf_userspace::install_address_space_lookup(empty_as_lookup);
+
+    // A canonical user-half RSP with nothing mapped beneath it. SA_SIGINFO
+    // selects the largest (rt_sigframe) layout — the case most prone to
+    // straddle an unmapped page.
+    let user_rsp = 0x0000_7fff_0000_0000u64;
+    let mut frame = smoke_signal_trap_frame(0xC0FF_EE00_1234_5678, user_rsp);
+    let params = SigDeliveryParams {
+        handler: 0xDEAD_BEEF_F00D_F00D,
+        restorer: 0,
+        signum: 11,
+        flags: SA_SIGINFO,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code: 0,
+        si_addr: 0,
+        si_value: 0,
+    };
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    let refused = !ctx.deliver_signal(&params);
+
+    // Restore the original lookup BEFORE returning so the live kernel /
+    // other tests see their real per-task AS resolver again.
+    narf_userspace::restore_address_space_lookup(saved);
+
+    if !refused {
+        return TestResult::Fail(
+            "deliver_signal placed a frame on an unbacked user stack (would #PF-panic the kernel)",
+        );
+    }
+    // A refused delivery must not have mutated the trap frame (no partial
+    // write / RIP redirect to the handler).
+    if frame.rip != 0xC0FF_EE00_1234_5678 {
+        return TestResult::Fail("deliver_signal mutated RIP despite refusing delivery");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_deliver_signal_refuses_unbacked_user_stack
+);
 
 /// SA_RESTART cleared: even on a restartable syscall, the saved
 /// RIP must NOT be rewound — the syscall returns EINTR and the
