@@ -17686,14 +17686,22 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-                    // Pure deadline re-poll park (re-check the listen queue /
-                    // socket op every ~1ms), NOT a futex or net-io readiness
-                    // wait — clear those classifier flags so a stale non-zero
-                    // `futex_uaddr` can't mis-route this park into the futex
-                    // branch of `park_should_block` (which parks on a queue that
-                    // never wakes → a blocking accept()/recv() hangs forever).
+                    // Park on NET-I/O READINESS (the TCP stack `readiness::notify`s
+                    // the listener when a connection becomes accept-ready, and a
+                    // socket when data arrives) with the ~1ms deadline as a mere
+                    // backstop. Without net_io_wait the park only re-polled every
+                    // ~1ms off the timer wheel — and under own-stack cooperative
+                    // scheduling with other busy tasks (redis bg threads) that
+                    // wheel service is delayed enough that the connection/data
+                    // sits ACK'd-but-unread past the client's deadline (net-smoke
+                    // echo flake). Snapshot the readiness generation for the
+                    // check→park lost-wake guard (park_should_block re-executes if
+                    // it moved). Clear a stale `futex_uaddr` so this can't be
+                    // mis-routed into the futex branch.
                     uc.futex_uaddr.store(0, Ordering::Release);
-                    uc.net_io_wait.store(false, Ordering::Release);
+                    uc.net_io_wait.store(true, Ordering::Release);
+                    uc.epoll_park_gen
+                        .store(narf_net::readiness::generation(), Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     if narf_scheduler::stackful::user_own_stack_enabled() {
@@ -17844,14 +17852,22 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-                    // Pure deadline re-poll park (re-check the listen queue /
-                    // socket op every ~1ms), NOT a futex or net-io readiness
-                    // wait — clear those classifier flags so a stale non-zero
-                    // `futex_uaddr` can't mis-route this park into the futex
-                    // branch of `park_should_block` (which parks on a queue that
-                    // never wakes → a blocking accept()/recv() hangs forever).
+                    // Park on NET-I/O READINESS (the TCP stack `readiness::notify`s
+                    // the listener when a connection becomes accept-ready, and a
+                    // socket when data arrives) with the ~1ms deadline as a mere
+                    // backstop. Without net_io_wait the park only re-polled every
+                    // ~1ms off the timer wheel — and under own-stack cooperative
+                    // scheduling with other busy tasks (redis bg threads) that
+                    // wheel service is delayed enough that the connection/data
+                    // sits ACK'd-but-unread past the client's deadline (net-smoke
+                    // echo flake). Snapshot the readiness generation for the
+                    // check→park lost-wake guard (park_should_block re-executes if
+                    // it moved). Clear a stale `futex_uaddr` so this can't be
+                    // mis-routed into the futex branch.
                     uc.futex_uaddr.store(0, Ordering::Release);
-                    uc.net_io_wait.store(false, Ordering::Release);
+                    uc.net_io_wait.store(true, Ordering::Release);
+                    uc.epoll_park_gen
+                        .store(narf_net::readiness::generation(), Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     if narf_scheduler::stackful::user_own_stack_enabled() {
