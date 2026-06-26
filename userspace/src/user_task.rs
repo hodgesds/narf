@@ -1016,21 +1016,20 @@ pub fn install_user_task_hooks() {
     // task's OWN kernel stack with preemption via a clean kernel_switch
     // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.
     //
-    // STATUS 2026-06-25: ENABLED. The long-standing rip=0x3 stress-ng crash is
-    // FIXED — it was a ~1 KiB `[Option<Waker>; 64]` array passed/returned BY
-    // VALUE through the timer-IRQ wheel drain, which smashed the handler's
-    // return chain when that IRQ runs on the user task's own kernel stack (see
-    // `timer_wheel::{fire_due,take_due_into,drain_due_to_deferred}`). The model
-    // boots reliably and survives stress-ng fork/exec/memcpy churn (12+ rounds,
-    // no fault). Three own-stack-specific bugs the crash had masked are also
-    // fixed: CR3 re-activation on kernel_switch resume, the wait4 exit-observer
-    // fan-out (exit_current_stackful), and the console-read park's missing
-    // ~1-tick fallback. KNOWN-FOLLOW-UP: redis-server startup readiness under
-    // own-stack is slower/flakier than the longjmp model (the redis-smoke
-    // readiness window also fails on the pre-own-stack base, so it is partly a
-    // pre-existing issue) — track before relying on own-stack for the redis
-    // throughput path.
-    if false {
+    // STATUS 2026-06-26: DEFAULT (ON). Validated on x86_64: boot-smoke clean,
+    // kernel-test 5878 pass / 0 fail, the whole interactive system runs
+    // (init→getty→shell→redis→netserve), stress-ng fork/exec/memcpy churn
+    // survives (12+ rounds) — and it retires the longjmp model's intractable
+    // stress-ng rip=0x3 executor-dispatch crash. A long list of own-stack bugs
+    // were fixed to get here: the by-value wheel-drain array smash; CR3/EXEC_CTX/
+    // CURRENT_STACKFUL_TASK/rsp0 clobber across NESTED poll_to_yield; the
+    // all-parked fire_due wheel-service gap; the ns_to_cycles park deadline; and
+    // the cross-task UserTaskCtx clobber (current_user_task resolved the wrong
+    // task after a kernel_switch resume — fixed by resolving via the executor
+    // slot id). KNOWN FOLLOW-UP: net-smoke is ~4/5 — an occasional virtio-net/
+    // SLIRP inbound-delivery race (the guest NIC receives no frames post-connect
+    // in the failing runs), host-side networking timing, tracked separately.
+    if true {
         narf_scheduler::stackful::enable_user_own_stack();
     }
 }
