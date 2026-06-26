@@ -285,12 +285,20 @@ impl Card {
     pub fn queue_flip_event(&mut self, user_data: u64, crtc_id: u32) {
         const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
         self.vblank_seq = self.vblank_seq.wrapping_add(1);
+        // Real CLOCK_MONOTONIC vblank timestamp. weston (and any DRM client that
+        // sets DRM_CAP_TIMESTAMP_MONOTONIC, which weston does) reads tv_sec/tv_usec
+        // off the flip-complete event to pace its repaint loop and to stamp
+        // wl_surface frame callbacks. A hardcoded [0,0] made every flip look like
+        // it happened at t=0, so the compositor's frame clock never advanced.
+        let mono_ns = narf_time::wall::monotonic_ns();
+        let tv_sec = (mono_ns / 1_000_000_000) as u32;
+        let tv_usec = ((mono_ns % 1_000_000_000) / 1_000) as u32;
         let mut e = Vec::with_capacity(32);
         e.extend_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_le_bytes()); // base.type
         e.extend_from_slice(&32u32.to_le_bytes()); // base.length
         e.extend_from_slice(&user_data.to_le_bytes());
-        e.extend_from_slice(&0u32.to_le_bytes()); // tv_sec
-        e.extend_from_slice(&0u32.to_le_bytes()); // tv_usec
+        e.extend_from_slice(&tv_sec.to_le_bytes()); // tv_sec
+        e.extend_from_slice(&tv_usec.to_le_bytes()); // tv_usec
         e.extend_from_slice(&self.vblank_seq.to_le_bytes());
         e.extend_from_slice(&crtc_id.to_le_bytes());
         self.events.push_back(e);
