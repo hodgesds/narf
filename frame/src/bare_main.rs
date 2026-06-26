@@ -3448,6 +3448,10 @@ fn boot_userspace_init() {
                     "tfd_epoll_smoke",
                     narf_verification::NARF_TFD_EPOLL_SMOKE_ELF,
                 ),
+                (
+                    "unix_epoll_smoke",
+                    narf_verification::NARF_UNIX_EPOLL_SMOKE_ELF,
+                ),
                 // modetest — real libdrm KMS client (Rung 4 DRM probe).
                 ("modetest", narf_verification::NARF_MODETEST_ELF),
                 ("wl_handshake", narf_verification::NARF_WL_HANDSHAKE_ELF),

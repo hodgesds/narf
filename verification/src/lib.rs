@@ -4129,6 +4129,23 @@ pub const NARF_TFD_EPOLL_SMOKE_ELF: &[u8] = include_bytes!(env!("NARF_TFD_EPOLL_
 pub const NARF_TFD_EPOLL_SMOKE_ELF: &[u8] =
     include_bytes!(env!("NARF_TFD_EPOLL_SMOKE_ELF_AARCH64"));
 
+/// AF_UNIX + epoll_wait(-1) serve smoke — regression for the bug where a server
+/// blocked on an INFINITE-timeout epoll_wait never broke out to serve a
+/// unix-socket peer (AF_UNIX wake didn't bump the readiness generation).
+/// Success token: `uxe-ok`.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_UNIX_EPOLL_SMOKE_ELF: &[u8] =
+    include_bytes!(env!("NARF_UNIX_EPOLL_SMOKE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_UNIX_EPOLL_SMOKE_ELF: &[u8] =
+    include_bytes!(env!("NARF_UNIX_EPOLL_SMOKE_ELF_AARCH64"));
+
 #[cfg(all(
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")

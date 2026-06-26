@@ -776,6 +776,29 @@ impl FileOps for SocketFile {
         })
     }
 
+    fn read_should_block(&self) -> bool {
+        // `read`/`recv` maps an empty ring to `Ok(0)`, which is indistinguishable
+        // from a real EOF by byte count alone. `sys_read` only blocks a 0-byte
+        // read when this returns true; the default is `false`, so WITHOUT this a
+        // blocking recv on an empty-but-open socket returns a spurious EOF the
+        // instant it finds no data — a blocking server (e.g. one that accept()s
+        // then read()s a request, rather than poll()ing first like libwayland)
+        // sees "peer closed" and gives up. Block while the rx side is still OPEN;
+        // a genuine peer-close (rx closed) correctly falls through to EOF. Use
+        // `!is_closed()` (not `!has_data()`) so data arriving between the read and
+        // this check still re-executes the read instead of returning EOF.
+        let state = self.state.lock();
+        match &*state {
+            SocketState::UnixConnected { rx, .. }
+            | SocketState::InetConnected { rx, .. }
+            | SocketState::Inet6Connected { rx, .. } => !rx.is_closed(),
+            SocketState::UnixDgram { inbox, .. } | SocketState::InetDgram { inbox, .. } => {
+                inbox.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn stat(&self) -> Stat {
         Stat {
             size: 0,
@@ -1560,8 +1583,13 @@ impl SocketFile {
                 }
                 // Wake a server parked in poll/accept on the listener so it
                 // accepts the new connection immediately (not on a fallback
-                // timer). Untracked key → wake-all fallback.
-                crate::handlers::wake_io_waiters(0);
+                // timer). notify(0) wakes AND bumps the readiness generation, so
+                // a server blocked in accept/epoll_wait with an INFINITE timeout
+                // (deadline never passes) actually breaks out of its re-park to
+                // re-run the accept check — a bare wake would just re-park it
+                // forever (the connection sits unaccepted; observed as weston
+                // never serving an external client). See the send path above.
+                narf_net::readiness::notify(0);
                 // Configure our (client) end.
                 let mut state = self.state.lock();
                 match &*state {
@@ -2346,8 +2374,18 @@ impl SocketFile {
         // they use the untracked (key=0) wake-all fallback — without this a
         // blocked reader only re-checked on a coarse timer (~2 s/frame for a
         // Wayland client), instead of waking the instant data lands.
+        //
+        // Go through `readiness::notify` (not a bare `wake_io_waiters`) so the
+        // notify GENERATION is bumped too: a task parked in epoll_wait(-1) /
+        // poll with an INFINITE timeout (deadline = u64::MAX never passes — e.g.
+        // weston's main loop) only breaks out of its re-park when the lost-wake
+        // guard sees `readiness::generation()` advance. A bare wake just re-polls
+        // the task, which re-parks without re-running collect_ready, so the data
+        // is never collected and the peer is never served (a finite-timeout
+        // dispatcher like wl_2proc's `dispatch(50)` masked this via its deadline
+        // re-execute). notify(0) calls the same wake hook AND bumps the gen.
         if n > 0 {
-            crate::handlers::wake_io_waiters(0);
+            narf_net::readiness::notify(0);
         }
         if n == 0 && !buf.is_empty() {
             Err(SockError::WouldBlock)
