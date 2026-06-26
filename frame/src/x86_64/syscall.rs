@@ -285,11 +285,32 @@ extern "C" fn dispatch_syscall(
         arg4: state.r8,
         arg5: state.r9,
     };
-    let ret = narf_userspace::kernel_syscall_entry_plain_with_state(
+    // Capture the post-syscall return RIP before the handler runs. A blocking
+    // handler that parks for re-execution rewinds this by 2 (the `syscall`
+    // instruction width) so the task re-issues the syscall on resume.
+    let entry_rip = state.rip;
+    let mut ret = narf_userspace::kernel_syscall_entry_plain_with_state(
         num,
         &args,
         state as *mut _ as *mut u8,
     );
+
+    // RESTART semantics (Linux ERESTART). If the handler rewound RIP to
+    // re-execute the syscall (own-stack park: console-read / nanosleep / futex /
+    // accept / epoll_wait …), the user's `rax` MUST be restored to the syscall
+    // NUMBER so the re-issued `syscall` dispatches correctly — and the status
+    // MUST be Ok so the return asm doesn't fold `rax` to -EINVAL(-22).
+    //
+    // The longjmp model never needed this: it longjmp'd out of the handler,
+    // bypassing the syscall-return asm, and restored the saved `rax` (= number)
+    // via `enter_user_mode_resume`. The own-stack park instead returns NORMALLY
+    // through `dispatch_syscall` + the return asm, so a park that left a non-Ok
+    // status folded `rax` to -22; the re-issued `syscall` then used -22 as its
+    // number → spurious EINVAL (observed as redis's `epoll_wait: Invalid
+    // argument` panic under own-stack).
+    if state.rip == entry_rip.wrapping_sub(2) {
+        ret = narf_userspace::SyscallReturn::ok(num as u64);
+    }
 
     // SYSRET-canonical guard. Linux forces IRET instead of SYSRET when the
     // return RIP may be non-canonical ("SYSRET has trouble with uncanonical
