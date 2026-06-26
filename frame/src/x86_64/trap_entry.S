@@ -200,3 +200,46 @@ common_trap:
      */
     iretq
 .size common_trap, . - common_trap
+
+/*
+ * run_irq_dispatch_on_stack(TrapFrame *frame in rdi)
+ *
+ * Run `irq_dispatch_body(frame)` on this CPU's dedicated per-CPU hardirq
+ * stack (Linux `call_on_irqstack`), so the IRQ-dispatch body (on_irq + EOI,
+ * incl. the timer-wheel drain) never consumes the interrupted task's own
+ * kernel stack. A faithful port of Linux's `call_on_stack`:
+ *   - save the caller's RSP into the irq stack's top-8 slot,
+ *   - switch RSP to the irq stack,
+ *   - call the body (frame stays in RDI across the swap),
+ *   - pop the saved RSP back, restoring the caller's stack.
+ *
+ * Nesting guard (gs:[32], hardirq_inuse): if already on the irq stack, run
+ * directly on the current stack instead of re-switching (which would clobber
+ * the saved-RSP slot). NARF IRQ gates enter IF=0 and the body never `sti`s,
+ * so genuine nesting does not occur here; the guard is defensive.
+ *
+ * Preconditions: kernel GS is live (common_trap swapgs'd on user entry),
+ * IF=0. gs:[24] = irq_stack_top (already top-8), gs:[32] = hardirq_inuse.
+ * Clobbers rax, r11 (caller-saved scratch).
+ */
+.global run_irq_dispatch_on_stack
+.type   run_irq_dispatch_on_stack, @function
+run_irq_dispatch_on_stack:
+    mov rax, gs:[32]                 /* hardirq_inuse */
+    test rax, rax
+    jnz 1f                           /* already on irq stack: run directly */
+
+    mov rax, 1
+    mov gs:[32], rax                 /* inuse = 1 (store via reg — gs:[] takes no imm) */
+    mov r11, gs:[24]                 /* r11 = irq_stack_top (top - 8) */
+    mov [r11], rsp                   /* save caller rsp into the top-8 slot */
+    mov rsp, r11                     /* switch to the hardirq stack */
+    call irq_dispatch_body           /* rdi (frame) preserved across the swap */
+    pop rsp                          /* restore caller rsp from [old top-8] */
+    xor eax, eax
+    mov gs:[32], rax                 /* inuse = 0 */
+    ret
+
+1:
+    jmp irq_dispatch_body            /* tail-call on the current stack; rdi intact */
+.size run_irq_dispatch_on_stack, . - run_irq_dispatch_on_stack

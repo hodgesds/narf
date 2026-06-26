@@ -92,6 +92,29 @@ struct KernelRsp0Stack([u8; KERNEL_RSP0_BYTES]);
 
 static mut KERNEL_RSP0_STACK: KernelRsp0Stack = KernelRsp0Stack([0; KERNEL_RSP0_BYTES]);
 
+/// Dedicated per-CPU **hardirq stack** (Linux model). A device interrupt's
+/// dispatch body (`on_irq` + EOI, which contains the timer-wheel drain and all
+/// device handlers) is switched onto this stack so it never consumes the
+/// interrupted task's own kernel stack. 16 KiB matches Linux's `IRQ_STACK_SIZE`.
+/// This is the BSP instance; each AP gets its own inside `ApCpuBlock`.
+const IRQ_STACK_BYTES: usize = 16 * 1024;
+
+#[repr(C, align(16))]
+struct IrqStack([u8; IRQ_STACK_BYTES]);
+
+static mut BSP_IRQ_STACK: IrqStack = IrqStack([0; IRQ_STACK_BYTES]);
+
+/// Top (highest address) of the BSP's hardirq stack. `percpu::init_bsp`
+/// publishes `top - 8` into `gs:[24]`.
+pub fn bsp_irq_stack_top() -> u64 {
+    // SAFETY: address-of a static; no deref.
+    unsafe {
+        core::ptr::addr_of!(BSP_IRQ_STACK)
+            .cast::<u8>()
+            .add(IRQ_STACK_BYTES) as u64
+    }
+}
+
 static mut TSS: Tss = Tss {
     _reserved0: 0,
     rsp0: 0,
@@ -345,6 +368,10 @@ struct ApCpuBlock {
     gdt: [u64; 7],
     tss: Tss,
     rsp0_stack: [u8; KERNEL_RSP0_BYTES],
+    /// This AP's dedicated hardirq stack — genuinely per-CPU (lives in the
+    /// per-AP leaked block, never shared with another CPU). See the
+    /// shared-TSS/IST corruption lesson that motivated per-CPU AP stacks.
+    irq_stack: [u8; IRQ_STACK_BYTES],
     ist_stacks: [[u8; IST_STACK_BYTES]; 4],
 }
 
@@ -354,6 +381,8 @@ struct ApCpuBlock {
 /// the data segments + `LTR`. Returns the top of this CPU's `rsp0`
 /// stack so the caller can mirror it into `PerCpu.kernel_stack_top`
 /// for the SYSCALL entry path (which reads `gs:8`, not `TSS.rsp0`).
+/// Also returns the top of this CPU's dedicated hardirq stack (for
+/// `PerCpu.irq_stack_top` at `gs:24`), as the tuple `(rsp0_top, irq_top)`.
 ///
 /// Mirrors [`init`] but writes a freshly-allocated per-CPU block
 /// instead of the BSP statics. Loading `gs` to the kernel-data
@@ -365,7 +394,7 @@ struct ApCpuBlock {
 /// Must run once per AP, in kernel mode with IRQs masked, after the
 /// global allocator is up. The returned stack top stays valid for the
 /// lifetime of the system (the block is leaked).
-pub unsafe fn init_ap() -> u64 {
+pub unsafe fn init_ap() -> (u64, u64) {
     use alloc::alloc::{alloc_zeroed, Layout};
 
     let layout = Layout::new::<ApCpuBlock>();
@@ -397,6 +426,11 @@ pub unsafe fn init_ap() -> u64 {
             .add(4 /* offset of rsp0 */)
             .cast::<u64>()
             .write_unaligned(rsp0_top);
+
+        // This AP's dedicated hardirq stack top (for `gs:[24]`).
+        let irq_top = core::ptr::addr_of_mut!((*block).irq_stack)
+            .cast::<u8>()
+            .add(IRQ_STACK_BYTES) as u64;
 
         // Record THIS AP's TSS pointer (keyed by logical id, set in TSC_AUX by
         // `_ap_start_rust` before this call) so `set_kernel_rsp0` retargets the
@@ -461,7 +495,7 @@ pub unsafe fn init_ap() -> u64 {
              options(nomem, nostack, preserves_flags));
         compiler_fence(Ordering::SeqCst);
 
-        rsp0_top
+        (rsp0_top, irq_top)
     }
 }
 

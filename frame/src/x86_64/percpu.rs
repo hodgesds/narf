@@ -36,9 +36,30 @@ pub struct PerCpu {
     pub kernel_stack_top: AtomicU64,
     /// Identity: which CPU this instance describes. BSP = 0.
     pub cpu_id: u32,
+    /// Pad so `irq_stack_top` lands at offset 24 (`gs:[24]`).
+    _pad0: u32,
+    /// Top (minus 8, Linux convention) of this CPU's dedicated hardirq
+    /// stack. The IRQ-dispatch body (`on_irq` + EOI — incl. the timer-
+    /// wheel drain) is switched onto this stack so it never runs on the
+    /// interrupted task's own kernel stack (Linux `call_on_irqstack`).
+    /// Read in asm at `gs:[24]`.
+    pub irq_stack_top: AtomicU64,
+    /// Nesting guard: non-zero while the CPU is already running on its
+    /// hardirq stack, so a (future) nested IRQ runs on the current stack
+    /// instead of re-switching and clobbering the saved-RSP slot. Read /
+    /// written in asm at `gs:[32]`. Single-CPU producer/consumer (IF=0 in
+    /// the dispatch window), same discipline as `kernel_stack_top`.
+    pub hardirq_inuse: AtomicU64,
     /// Padding to 64-byte cache-line alignment.
-    _pad: [u32; 5],
+    _pad: [u32; 6],
 }
+
+// Layout is load-bearing: the SYSCALL stub reads `gs:[8]` and the IRQ-stack
+// shim reads `gs:[24]`/`gs:[32]`. Lock these offsets at compile time.
+const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_stack_top) == 8);
+const _: () = assert!(core::mem::offset_of!(PerCpu, irq_stack_top) == 24);
+const _: () = assert!(core::mem::offset_of!(PerCpu, hardirq_inuse) == 32);
+const _: () = assert!(core::mem::size_of::<PerCpu>() == 64);
 
 impl PerCpu {
     pub const fn new(cpu_id: u32) -> Self {
@@ -46,7 +67,10 @@ impl PerCpu {
             user_rsp_save: AtomicU64::new(0),
             kernel_stack_top: AtomicU64::new(0),
             cpu_id,
-            _pad: [0; 5],
+            _pad0: 0,
+            irq_stack_top: AtomicU64::new(0),
+            hardirq_inuse: AtomicU64::new(0),
+            _pad: [0; 6],
         }
     }
 }
@@ -82,6 +106,12 @@ pub unsafe fn init_bsp() {
         .kernel_stack_top
         .store(super::gdt::kernel_rsp0(), Ordering::Release);
 
+    // Publish this CPU's hardirq stack top (minus 8, Linux convention) so the
+    // IRQ-dispatch shim can switch onto it via `gs:[24]`.
+    BSP_PERCPU
+        .irq_stack_top
+        .store(super::gdt::bsp_irq_stack_top() - 8, Ordering::Release);
+
     // SAFETY: writing GS_BASE and KERNEL_GS_BASE at CPL=0 is a
     // documented operation. `msr::wrmsr` carries the
     // `compiler_fence(SeqCst)` pair from arch/ §4.
@@ -110,10 +140,12 @@ pub unsafe fn init_bsp() {
 /// installed this AP's TSS *and reloaded `gs`* (which zeroes GS.base —
 /// this call restores it). `kernel_stack_top` must be the top of this
 /// AP's `rsp0` stack as returned by `gdt::init_ap`.
-pub unsafe fn init_ap(cpu_id: u32, kernel_stack_top: u64) {
+pub unsafe fn init_ap(cpu_id: u32, kernel_stack_top: u64, irq_stack_top: u64) {
     let pc: &'static PerCpu = alloc::boxed::Box::leak(alloc::boxed::Box::new(PerCpu::new(cpu_id)));
     pc.kernel_stack_top
         .store(kernel_stack_top, Ordering::Release);
+    // This AP's own hardirq stack top (minus 8) — read at `gs:[24]`.
+    pc.irq_stack_top.store(irq_stack_top - 8, Ordering::Release);
     let addr = pc as *const PerCpu as u64;
 
     // SAFETY: writing GS_BASE / KERNEL_GS_BASE at CPL=0 is always
