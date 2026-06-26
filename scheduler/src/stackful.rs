@@ -567,12 +567,28 @@ impl KernelTask {
         // we've used our slice.
         self.tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
-        // CURRENT_STACKFUL_TASK is managed by task_body_rust
-        // (set at top of each poll iter, cleared before yield).
-        // The executor side touching it would open a race window
-        // between switch-back-from-task and the clear, during
-        // which a timer tick could mistakenly preempt the
-        // already-yielded task and overwrite its ctx.
+        // CURRENT_STACKFUL_TASK is SET to the running task by task_body_rust
+        // (at the top of each poll iter) and CLEARED by it before each yield.
+        // The executor side must not *set* it to the task (that would let a
+        // timer tick preempt an already-yielded task and overwrite its ctx).
+        // But it MUST snapshot + restore the value that was live on entry:
+        // `poll_to_yield` can run NESTED — a stackful task doing a synchronous
+        // in-kernel wait ticks `sleep_pumps` → `scheduler_step_pump` →
+        // `poll_one_round`, which polls another stackful task through this very
+        // function. That inner task's `task_body_rust` clears CURRENT to null
+        // on its yield; without restoring it, the OUTER task resumes its
+        // sync-wait with CURRENT == null and every subsequent
+        // `current_stackful_waker()` / `try_preempt` sees "no task running" —
+        // so an own-stack blocking syscall (epoll_wait) can't register its
+        // wake, breaks out of `own_stack_park`, and busy-re-executes forever
+        // (observed: redis after startup wedged the single executor, starving
+        // netserve). Restoring the snapshot after the switch-back is null for
+        // the top-level executor (preserving the "null while the executor
+        // runs" invariant) and the outer task for a nested poll.
+        let saved_current = {
+            let cpu = this_cpu();
+            CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire)
+        };
         // SAFETY: ctx + exec_ctx both live for the duration of
         // this call; the task's stack was allocated by us and is
         // still alive; the trampoline_entry symbol is in this
@@ -584,6 +600,19 @@ impl KernelTask {
         // switch-back. Harmless for kernel-only stackful tasks (they take no
         // CPL3 trap and a CPL0 trap doesn't reload rsp0).
         let own_stack = USE_OWN_STACK.load(Ordering::Acquire);
+        // Snapshot the rsp0 live on entry. For the top-level executor this is the
+        // per-CPU baseline; for a NESTED poll (a running stackful task pumping
+        // `poll_one_round` from a sync wait) it is the OUTER task's own stack
+        // top. Restored verbatim on switch-back instead of `retarget(0)` — which
+        // would force the baseline and leave the outer user task's later
+        // syscalls landing on the executor stack, corrupting the saved switch
+        // context (observed as a wild-`rip` #UD/#PF right after redis's first
+        // epoll park, once the CURRENT_STACKFUL_TASK clobber above was fixed).
+        let saved_rsp0 = if own_stack {
+            crate::current_kernel_stack_top()
+        } else {
+            0
+        };
         if own_stack {
             let top = ((self.stack.as_ptr() as u64) + self.stack.len() as u64) & !0xFu64;
             crate::retarget_kernel_stack(top);
@@ -605,11 +634,47 @@ impl KernelTask {
                 }
             }
         }
+        // Snapshot the shared per-CPU EXEC_CTX slot's CONTENTS. `poll_to_yield`
+        // can run NESTED — a stackful task doing a synchronous in-kernel wait
+        // ticks sleep_pumps → poll_one_round, which polls ANOTHER stackful task
+        // (the virtio-net forwarder) through this same function. All nesting
+        // levels share the single per-CPU `EXEC_CTX` slot (made persistent by
+        // 902f31cf to dodge transient-stack-frame aliasing). The inner poll's
+        // `kernel_switch` SAVE overwrites the slot with the INNER executor
+        // continuation; when the inner task switches back, the slot still holds
+        // a stale inner continuation, so when the OUTER task later parks it
+        // switches to that dead frame → a wild-rip #GP/#UD (observed exactly at
+        // redis's first epoll park, after it nest-polled the forwarder during
+        // startup: the park read exec_ctx.rsp on redis's OWN stack instead of
+        // the boot stack). Save the slot on entry and restore it on switch-back
+        // so the shared slot behaves per-nesting-level. Cheap (~72-byte struct).
+        // SAFETY: `exec_ctx` is a live `&mut KernelContext` (the per-CPU EXEC_CTX
+        // slot) valid for this call; reading a `Copy`-layout POD struct from it
+        // is sound and leaves the source intact.
+        let prev_exec = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
+        // Restore the EXEC_CTX slot contents that were live before this poll, so
+        // a nested poll leaves the OUTER task's saved continuation intact (see
+        // the snapshot comment above).
+        // SAFETY: `exec_ctx` is the same live `&mut KernelContext` written above;
+        // writing back the snapshotted POD value is sound (no aliasing — we hold
+        // the only reference on this single-CPU cooperative path).
+        unsafe { core::ptr::write(exec_ctx as *mut KernelContext, prev_exec) };
         if own_stack {
-            crate::retarget_kernel_stack(0); // restore the per-CPU baseline
+            // Restore the rsp0 that was live on entry (baseline at top level, the
+            // outer task's stack top when nested) — NOT an unconditional baseline.
+            crate::retarget_kernel_stack(saved_rsp0);
+        }
+        // Restore the CURRENT_STACKFUL_TASK that was live before this poll. The
+        // just-yielded task cleared it to null; for a nested poll this puts the
+        // OUTER (still-running) task back so its sync-wait keeps a valid
+        // identity (see the snapshot comment above). For the top-level executor
+        // the saved value is null, so the invariant is preserved.
+        {
+            let cpu = this_cpu();
+            CURRENT_STACKFUL_TASK.inner[cpu].store(saved_current, Ordering::Release);
         }
         self.exec_ctx
             .store(core::ptr::null_mut(), Ordering::Release);
@@ -1048,7 +1113,6 @@ pub unsafe fn yield_current_stackful() {
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     // SAFETY: p is a valid non-null pointer to the active user task.
     let ctx = unsafe { &raw mut (*p).ctx };
-    // DEBUG markers (own-stack bring-up): A=before switch-out, B=resumed.
     // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
     // resumes the executor, returning here when it switches us back in.
     unsafe { kernel_switch(ctx, exec_ctx) };

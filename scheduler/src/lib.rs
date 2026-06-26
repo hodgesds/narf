@@ -399,6 +399,35 @@ pub fn set_kernel_stack_hook(f: fn(u64)) {
     SET_KERNEL_STACK_HOOK.store(f as usize, Ordering::Release);
 }
 
+/// Reads the running CPU's current SYSCALL kernel-stack top (`gs:[8]`). Boot
+/// installs `percpu::kernel_stack_top`. Used by `poll_to_yield` to snapshot the
+/// rsp0 that was live on entry so a NESTED poll (a stackful task pumping
+/// `poll_one_round` from a sync wait) restores the OUTER task's stack top on
+/// switch-back instead of blindly resetting to the executor baseline — which
+/// would leave the outer user task's subsequent syscalls landing on the
+/// executor stack and corrupting its saved switch context.
+#[cfg(target_arch = "x86_64")]
+static GET_KERNEL_STACK_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the kernel-stack-top reader (boot installs `percpu::kernel_stack_top`).
+#[cfg(target_arch = "x86_64")]
+pub fn set_get_kernel_stack_hook(f: fn() -> u64) {
+    GET_KERNEL_STACK_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Current rsp0 / `gs:[8]` top, or 0 if no reader is installed.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn current_kernel_stack_top() -> u64 {
+    let p = GET_KERNEL_STACK_HOOK.load(Ordering::Acquire);
+    if p == 0 {
+        return 0;
+    }
+    // SAFETY: `p` was stored by `set_get_kernel_stack_hook` from a `fn() -> u64`.
+    let f: fn() -> u64 = unsafe { core::mem::transmute::<usize, fn() -> u64>(p) };
+    f()
+}
+
 /// Point the running CPU's kernel-entry stack at `top` (or, when `top == 0`,
 /// restore the per-CPU baseline). No-op if no hook is installed.
 ///
@@ -2176,6 +2205,27 @@ pub fn run_until_empty() {
                 // halt/spin idle path.
                 continue;
             }
+            // Service the timer wheel before committing to a halt. This is
+            // the ONE place a fully-idle executor reaches, and `fire_due`
+            // otherwise runs only in the `any_runnable` branch above (which
+            // needs a task ALREADY awake). The LAPIC TSC-deadline ISR
+            // (`apic::on_timer_tick`) re-arms the timer but deliberately
+            // never drops Wakers from IRQ context, so a wheel deadline whose
+            // IRQ just woke this HLT — or one that already passed — is only
+            // ACTUALLY fired here. Without this, a fully-parked executor
+            // halts on the armed deadline, wakes on its IRQ, finds nothing
+            // awake (the sleeper was never fired), and re-halts: the timer
+            // wheel stalls and every wheel-backed sleeper strands (the
+            // virtio-net RX forwarder's 2 ms backstop, redis epoll timeouts,
+            // nanosleep). The longjmp model masked this because its user-task
+            // adapters self-wake every round, keeping `any_runnable` true;
+            // the own-stack model lets a parked user task genuinely clear its
+            // awake flag, so the executor actually reaches this branch.
+            // Non-IRQ context here, so the expired Waker's `Sleepable`
+            // dealloc on drop is legal (same as the `any_runnable` fire_due).
+            if narf_time::timer_wheel::fire_due(narf_time::now_cycles()) > 0 {
+                continue;
+            }
             // Idle path. Nothing is runnable — HLT the CPU until an
             // interrupt instead of spinning a core hot. Linux does the
             // same: an idle CPU halts and the timer tick (or any device
@@ -2207,6 +2257,7 @@ pub fn run_until_empty() {
             // SMP: feature-off / kernel-test deliberately keep the IF=0
             // spin (their executor wakes come from synchronous code, not
             // IRQs, and a hlt there would wedge with no IRQ to wake it).
+            //
             if user_task_smp_enabled() {
                 // SAFETY: enabling IRQs between polls is the executor's
                 // natural state; nothing here holds an IRQ-unsafe lock.

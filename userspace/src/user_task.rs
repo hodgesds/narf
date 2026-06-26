@@ -374,17 +374,33 @@ pub fn user_fpu_restore_current() {
 }
 
 pub fn current_user_task() -> Option<*mut UserTaskCtx> {
-    // The in-flight polling routine publishes its ctx in this CPU's
-    // `CURRENT` cell right before entering user mode and clears it on
-    // the way back out, so it reflects exactly the task whose trap we're
-    // handling on this CPU.
-    // We deliberately do NOT fall back to the task-id registry here:
-    // its entries point at the poller's stack-pinned `UserTaskCtx`,
-    // which is only live while that task is the in-flight one — a
-    // lookup by id can hand back a pointer to a future that has since
-    // unwound (notably in the in-kernel test harness, where `CURRENT`
-    // is never set). `wake_signal` consults the registry directly when
-    // it genuinely needs to poke a parked task by id.
+    // Own-stack model: a task RESUMES from a park via `kernel_switch`, NOT a
+    // re-poll, so `UserTaskFuture::poll`'s `install_current` does NOT re-run —
+    // the per-CPU `CURRENT` cell keeps pointing at whichever task was last
+    // FRESHLY polled, even after the executor switched to a different task. A
+    // syscall handler (e.g. `sys_futex`) reading `current_user_task()` while a
+    // RESUMED task runs would then operate on the WRONG task's `UserTaskCtx` —
+    // a redis worker's futex wrote its wait-state into netserve's ctx, wedging
+    // netserve's accept() into an infinite futex wait (net-smoke echo hang).
+    // The executor's `current_task_id()` (the slot it is polling) is ALWAYS
+    // correct, so resolve the ctx by id through the registry. The registry
+    // entry for the IN-FLIGHT task is guaranteed live (a task only
+    // unregisters in its own exit path, which can't run while it is the task
+    // executing this lookup). Fall back to the `CURRENT` cell when the registry
+    // has no entry (the in-kernel test harness never registers).
+    #[cfg(target_arch = "x86_64")]
+    if narf_scheduler::stackful::user_own_stack_enabled() {
+        let id = crate::handlers::current_task_id();
+        let g = USER_TASK_CTXS.lock();
+        if let Some(m) = g.as_ref() {
+            if let Some(p) = m.get(&id) {
+                return Some(p.0);
+            }
+        }
+    }
+    // Longjmp model (and the fallback): the in-flight polling routine publishes
+    // its ctx in this CPU's `CURRENT` cell right before entering user mode and
+    // clears it on the way back out.
     let p = current_slot().load(Ordering::Acquire);
     if p.is_null() {
         None
@@ -458,12 +474,22 @@ fn park_should_block(
             // Park on the timer wheel. Infinite parks (u64::MAX) use a ~1-tick
             // fallback so a lost external wake can't wedge; finite sleeps use
             // the real deadline. The real wake is the io/futex/signal waker.
-            let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+            //
+            // The wheel deadline is ABSOLUTE TSC cycles compared against
+            // `now_cycles()` in `fire_due`. `deadline`/`now` are absolute
+            // monotonic NANOSECONDS (from `monotonic_ns()` = `cycles_to_ns`).
+            // Convert with `ns_to_cycles` — the PRECISE mult-shift inverse of
+            // that `cycles_to_ns` — NOT `* cycles_per_ns()`: the latter is a
+            // truncated-integer rate that rounds the wrong way, putting the
+            // deadline far in the future so a pure-deadline park (a blocking
+            // `accept()` with no io/futex waker) NEVER fires and the task
+            // strands. This only bit the own-stack park path; the longjmp
+            // `UserTaskFuture::poll` already used `ns_to_cycles`.
             let fire_cycles = if deadline == u64::MAX {
                 const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @100 Hz
-                now.saturating_add(FALLBACK_NS).saturating_mul(cpns)
+                narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS))
             } else {
-                deadline.saturating_mul(cpns)
+                narf_scheduler::narf_time::ns_to_cycles(deadline)
             };
             let refreshed = sleep_handle.is_some_and(|h| {
                 narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
@@ -497,10 +523,11 @@ fn park_should_block(
         // a dropped/overwritten byte-ring wake would otherwise wedge the reader
         // (e.g. getty/login at boot) forever. The fallback re-runs this check on
         // the next tick — a robust backstop for any lost type-specific wake.
-        let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
+        // Convert via `ns_to_cycles` (precise inverse of `cycles_to_ns`), NOT
+        // `* cycles_per_ns()` — see the deadline-park note above.
         let now = narf_scheduler::narf_time::monotonic_ns();
         const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
-        let fire = now.saturating_add(FALLBACK_NS).saturating_mul(cpns);
+        let fire = narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
         let refreshed = sleep_handle.is_some_and(|h| {
             narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
         });
@@ -543,6 +570,16 @@ pub fn own_stack_park() {
         unsafe {
             narf_scheduler::stackful::yield_current_stackful();
         }
+        // ── Resumed via kernel_switch (NOT a re-poll) ── re-publish this task's
+        // `CURRENT` cell: `install_current` runs only in `UserTaskFuture::poll`,
+        // which does not re-run on an own-stack resume, so the executor's
+        // intervening fresh-polls of OTHER tasks left `CURRENT` pointing at the
+        // wrong ctx. A syscall handler reading `current_user_task()` for this
+        // resumed task would otherwise touch a DIFFERENT task's `UserTaskCtx`
+        // (observed: a redis worker's futex wrote its wait-state into netserve's
+        // ctx → netserve's accept() wedged into an infinite futex wait → net
+        // echo hang).
+        install_current(uctx);
         // Resumed by the executor — loop and re-check the condition.
     }
 }

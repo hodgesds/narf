@@ -17686,6 +17686,14 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+                    // Pure deadline re-poll park (re-check the listen queue /
+                    // socket op every ~1ms), NOT a futex or net-io readiness
+                    // wait — clear those classifier flags so a stale non-zero
+                    // `futex_uaddr` can't mis-route this park into the futex
+                    // branch of `park_should_block` (which parks on a queue that
+                    // never wakes → a blocking accept()/recv() hangs forever).
+                    uc.futex_uaddr.store(0, Ordering::Release);
+                    uc.net_io_wait.store(false, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     if narf_scheduler::stackful::user_own_stack_enabled() {
@@ -17836,6 +17844,14 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 unsafe {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+                    // Pure deadline re-poll park (re-check the listen queue /
+                    // socket op every ~1ms), NOT a futex or net-io readiness
+                    // wait — clear those classifier flags so a stale non-zero
+                    // `futex_uaddr` can't mis-route this park into the futex
+                    // branch of `park_should_block` (which parks on a queue that
+                    // never wakes → a blocking accept()/recv() hangs forever).
+                    uc.futex_uaddr.store(0, Ordering::Release);
+                    uc.net_io_wait.store(false, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     if narf_scheduler::stackful::user_own_stack_enabled() {

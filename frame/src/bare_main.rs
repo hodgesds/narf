@@ -751,6 +751,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // per-CPU stack. DORMANT until the scheduler wires it in (Stage 2);
             // `top==0` restores the per-CPU baseline.
             narf_scheduler::set_kernel_stack_hook(super::x86_64::gdt::set_task_kernel_stack);
+            // Reader counterpart: lets `poll_to_yield` snapshot the live rsp0 so a
+            // nested poll restores the OUTER task's stack top, not the baseline.
+            narf_scheduler::set_get_kernel_stack_hook(super::x86_64::percpu::kernel_stack_top);
             // Wire the memory subsystem's `invlpg_global` to
             // broadcast through this IPI surface. After this call,
             // every unmap_4kb fans out to peer CPUs.
