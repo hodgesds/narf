@@ -196,6 +196,23 @@ pub struct UserTaskCtx {
     /// until a keystroke arrives — no busy-poll. Cleared by the poll once
     /// bytes are available, and the read re-executes (RIP was rewound).
     pub console_read_pending: AtomicBool,
+
+    /// Absolute monotonic-ns deadline of an *in-flight* `epoll_wait`/`poll`
+    /// call, or `0` when no such call is parked. `u64::MAX` is never stored
+    /// (infinite-timeout waits leave this `0`).
+    ///
+    /// Distinct from `sleep_deadline_ns`, which is the scheduler's wake
+    /// signal and is CLEARED by `UserTaskFuture::poll` the moment the
+    /// deadline expires. `epoll_wait`/`poll` RIP-rewind and RE-EXECUTE on
+    /// every wake (to re-check fd readiness), so they cannot recover their
+    /// original deadline from the cleared `sleep_deadline_ns` — they would
+    /// recompute a fresh `now + timeout` each wake and re-arm forever (a
+    /// pure-timeout `epoll_wait` that should return 0 never would). This
+    /// field is owned by the syscall handler: set on the FIRST entry of a
+    /// finite-timeout wait, reused verbatim across re-executions, and
+    /// cleared on return. The scheduler never touches it, so a fresh call
+    /// after an unrelated `sleep(2)` can't inherit a stale deadline.
+    pub blocking_deadline_ns: AtomicU64,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -231,6 +248,7 @@ impl UserTaskCtx {
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
+            blocking_deadline_ns: AtomicU64::new(0),
         }
     }
 }

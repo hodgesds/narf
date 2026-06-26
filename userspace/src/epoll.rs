@@ -548,15 +548,24 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
             if timeout_ms == 0 {
                 Some(0)
             } else if timeout_ms > 0 {
-                let persisted = uctx.sleep_deadline_ns.load(Ordering::Acquire);
-                if persisted != 0 && persisted != u64::MAX {
-                    Some(persisted)
+                // Reuse the deadline from a prior re-execution of THIS call if
+                // one is in flight. `blocking_deadline_ns` (unlike
+                // `sleep_deadline_ns`) survives the scheduler clearing the wake
+                // signal on timeout expiry, so a pure-timeout wait re-executed
+                // past its deadline detects expiry below instead of computing a
+                // fresh `now + timeout` and re-arming forever.
+                let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+                let d = if persisted != 0 {
+                    persisted
                 } else {
                     let d = narf_scheduler::narf_time::monotonic_ns()
                         .saturating_add((timeout_ms as u64) * 1_000_000);
-                    uctx.sleep_deadline_ns.store(d, Ordering::Release);
-                    Some(d)
-                }
+                    uctx.blocking_deadline_ns.store(d, Ordering::Release);
+                    d
+                };
+                // Re-publish the scheduler wake signal (cleared on each expiry).
+                uctx.sleep_deadline_ns.store(d, Ordering::Release);
+                Some(d)
             } else {
                 uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
                 None
@@ -573,7 +582,10 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
                 // `CURRENT`, live for this trap; `sleep_deadline_ns` is an atomic
                 // field, so the store needs only a valid pointer.
                 // SAFETY: Valid memory or trusted environment
-                unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
+                unsafe {
+                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                };
             }
             for (i, (events, data)) in ready[..n].iter().enumerate() {
                 if write_epoll_event(
@@ -611,7 +623,10 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
                     // `CURRENT`, live for this trap; `sleep_deadline_ns` is an
                     // atomic field, so the store needs only a valid pointer.
                     // SAFETY: Valid memory or trusted environment
-                    unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
+                    unsafe {
+                        (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                        (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                    };
                 }
                 if let Some(old) = old_mask {
                     crate::handlers::set_signal_mask_for_task(task, old);
@@ -634,7 +649,10 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
                             // `sleep_deadline_ns` is an atomic field, so the
                             // store needs only a valid pointer.
                             // SAFETY: Valid memory or trusted environment
-                            unsafe { (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release) };
+                            unsafe {
+                                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                            };
                             return;
                         }
                     }

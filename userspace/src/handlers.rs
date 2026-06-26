@@ -18706,8 +18706,32 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
         return;
     }
     let task = current_task_id();
+    // Absolute timeout deadline. `sys_poll` parks in ~1ms chunks and
+    // RE-EXECUTES the whole syscall on each wake, so the deadline must be
+    // PERSISTED across re-executions — recomputing `now + timeout_ms` every
+    // chunk would push the deadline 1ms into the future forever and a
+    // pure-timeout poll (nothing ever ready) would never expire. Stash it in
+    // `blocking_deadline_ns` (which the scheduler never clears) on the first
+    // entry and reuse it thereafter; cleared on every return below.
     let deadline_ns = if timeout_ms < 0 {
         None
+    } else if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: `uctx` is the live per-task UserTaskCtx for this trap.
+        let persisted = unsafe { (*uctx).blocking_deadline_ns.load(Ordering::Acquire) };
+        let d = if persisted != 0 {
+            persisted
+        } else {
+            let d = narf_scheduler::narf_time::monotonic_ns()
+                .saturating_add((timeout_ms as u64).saturating_mul(1_000_000));
+            // Only a finite, non-zero timeout needs to survive re-execution; a
+            // `timeout_ms == 0` poll returns immediately below before parking.
+            if timeout_ms > 0 {
+                // SAFETY: as above.
+                unsafe { (*uctx).blocking_deadline_ns.store(d, Ordering::Release) };
+            }
+            d
+        };
+        Some(d)
     } else {
         let now = narf_scheduler::narf_time::monotonic_ns();
         Some(now.saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
@@ -18747,6 +18771,10 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
             // Copy revents back to user under SMAP bracket.
             // SAFETY: pollfds_ptr validated above; AS active.
             let _ = unsafe { copy_to_user(pollfds_ptr, &user_buf) };
+            if let Some(uctx) = crate::user_task::current_user_task() {
+                // SAFETY: live per-task ctx; clear the in-flight poll deadline.
+                unsafe { (*uctx).blocking_deadline_ns.store(0, Ordering::Release) };
+            }
             ctx.set_return(SyscallReturn::ok(ready));
             return;
         }
@@ -18758,6 +18786,10 @@ fn sys_poll(ctx: &mut dyn TrapContext) {
                 // AS is still active; copy_to_user re-validates and SMAP-brackets the write.
                 // SAFETY: Valid memory or trusted environment
                 let _ = unsafe { copy_to_user(pollfds_ptr, &user_buf) };
+                if let Some(uctx) = crate::user_task::current_user_task() {
+                    // SAFETY: live per-task ctx; clear the in-flight poll deadline.
+                    unsafe { (*uctx).blocking_deadline_ns.store(0, Ordering::Release) };
+                }
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
