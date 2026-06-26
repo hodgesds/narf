@@ -1704,6 +1704,135 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// `set_current_user_fs_base` must publish the user FS_BASE (TLS pointer)
+    /// into the CURRENTLY-running stackful task's own per-task `user_fs_base`
+    /// slot — the value `poll_to_yield` reloads on a later kernel_switch
+    /// resume. This is the foundation of the own-stack/SMP TLS fix: a
+    /// multithreaded task resumes via kernel_switch (NOT a re-poll), so the
+    /// poll-time `set_user_fs_base` is bypassed; without the per-task slot a
+    /// resumed thread runs on another thread's TLS and faults on `fs:[0]`.
+    /// Mirrors the `user_cr3` publish.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_fs_base_published_to_current_task() -> TestResult {
+        use core::sync::atomic::AtomicU64;
+        const FS: u64 = 0x0000_7fab_cd00_0000;
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+
+        struct PublishFs;
+        impl Future for PublishFs {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                // task_body_rust set CURRENT_STACKFUL_TASK to us before this
+                // poll, so the publish targets THIS task's slot.
+                set_current_user_fs_base(FS);
+                let cpu = this_cpu();
+                let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+                if !p.is_null() {
+                    // SAFETY: the in-flight task on this CPU during its own poll.
+                    SEEN.store(
+                        unsafe { (*p).user_fs_base.load(Ordering::Acquire) },
+                        Ordering::Release,
+                    );
+                }
+                Poll::Ready(())
+            }
+        }
+        SEEN.store(0, Ordering::Release);
+
+        let mut task = KernelTask::new(PublishFs);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: standard stackful poll, same as the sibling smokes.
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        if r != Poll::Ready(()) {
+            return TestResult::Fail("expected Ready");
+        }
+        if SEEN.load(Ordering::Acquire) != FS {
+            return TestResult::Fail("fs_base not published to the current task slot");
+        }
+        // Persisted on the task's own KernelTask slot — exactly what
+        // poll_to_yield reloads on the next switch-in.
+        if task.user_fs_base.load(Ordering::Acquire) != FS {
+            return TestResult::Fail("fs_base did not persist on the per-task slot");
+        }
+        TestResult::Pass
+    }
+
+    /// End-to-end: under own-stack, `poll_to_yield` must RELOAD the task's
+    /// published FS_BASE into the IA32_FS_BASE MSR before switching the task
+    /// back in. Models the SMP bug directly: the task publishes its TLS base
+    /// and yields; the test then CLOBBERS the MSR (as a peer task's fresh poll
+    /// would); on resume the task reads IA32_FS_BASE and must observe ITS OWN
+    /// base, not the clobbered one. Skipped when own-stack is off (the reload
+    /// only lives on that path; the longjmp model re-publishes via re-poll).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_fs_base_reloaded_on_kernel_switch_resume() -> TestResult {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        const FS: u64 = 0x0000_7fcc_dd00_0000;
+        const CLOBBER: u64 = 0x0000_1111_2222_0000;
+        const IA32_FS_BASE: u32 = 0xC000_0100;
+        static PHASE: AtomicU32 = AtomicU32::new(0);
+        static OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+        // The reload lives only on the own-stack poll_to_yield path. Enable it
+        // for the duration and restore the prior setting afterwards so the rest
+        // of the suite is unaffected. (The kernel-stack getter hook is wired in
+        // bare_main before tests run, so the own-stack rsp0 save/restore in
+        // poll_to_yield is valid here.)
+        let saved_own_stack = USE_OWN_STACK.load(Ordering::Acquire);
+        USE_OWN_STACK.store(true, Ordering::Release);
+
+        struct FsResume;
+        impl Future for FsResume {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let ph = PHASE.fetch_add(1, Ordering::AcqRel);
+                if ph == 0 {
+                    // Publish our TLS base, then yield so the executor regains
+                    // control (and the test can trash the MSR).
+                    set_current_user_fs_base(FS);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                // Resumed via kernel_switch — poll_to_yield must have reloaded
+                // FS_BASE for us. Read it straight from the MSR.
+                // SAFETY: rdmsr of IA32_FS_BASE is unconditional at CPL=0.
+                let v = unsafe { narf_arch::x86_64::msr::rdmsr(IA32_FS_BASE) };
+                OBSERVED.store(v, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+        PHASE.store(0, Ordering::Release);
+        OBSERVED.store(0, Ordering::Release);
+
+        let mut task = KernelTask::new(FsResume);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: standard stackful poll.
+        let r1 = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        // A peer task's fresh poll would leave a different FS_BASE in the MSR;
+        // simulate that here.
+        // SAFETY: writing IA32_FS_BASE is unconditional at CPL=0; the kernel
+        // uses GS (not FS) for per-CPU state, so trashing FS_BASE is inert.
+        unsafe { narf_arch::x86_64::msr::wrmsr(IA32_FS_BASE, CLOBBER) };
+        let r2 = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        // Restore a benign FS_BASE + the own-stack flag regardless of outcome.
+        // SAFETY: as above.
+        unsafe { narf_arch::x86_64::msr::wrmsr(IA32_FS_BASE, 0) };
+        USE_OWN_STACK.store(saved_own_stack, Ordering::Release);
+
+        if r1 != Poll::Pending {
+            return TestResult::Fail("first poll should yield Pending");
+        }
+        if r2 != Poll::Ready(()) {
+            return TestResult::Fail("resume should complete");
+        }
+        if OBSERVED.load(Ordering::Acquire) != FS {
+            return TestResult::Fail("FS_BASE not reloaded on kernel_switch resume");
+        }
+        TestResult::Pass
+    }
+
     /// Multiple stackful tasks can be created and polled
     /// independently in sequence, each on its own stack. Catches
     /// state-bleed bugs between distinct KernelTask instances.
@@ -3528,5 +3657,15 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_concurrency_atomic_pool_no_double_lease
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_user_fs_base_published_to_current_task
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_user_fs_base_reloaded_on_kernel_switch_resume
     );
 }

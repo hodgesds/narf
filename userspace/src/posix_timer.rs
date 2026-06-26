@@ -865,3 +865,127 @@ pub fn next_fire_of(task: u64, id: u32) -> Option<u64> {
 pub fn __test_run_pump() {
     posix_timer_pump();
 }
+
+// ── ITIMER_REAL IRQ fast-path lifecycle smokes ──────────────────────
+//
+// `itimer_real_check_due_irq` is the alloc-free hardirq-context half that
+// makes a CPU-bound task's `setitimer(ITIMER_REAL)` actually fire (the slow
+// `sleep_pumps` half only runs when *some* task parks). It is the mechanism a
+// stress-ng worker relies on to be told to stop. These pin its three load-
+// bearing behaviours — fire-when-due, one-shot-disarm, periodic-re-arm — which
+// were verified live during the SMP `chroot_run` investigation but had no unit
+// guard (only the syscall-ABI `setitimer`/`getitimer` smokes existed).
+
+/// A unique task id for the smokes — well outside any real PID so it can't
+/// collide with a live task's ITIMER_REAL slot in the shared `ITIMERS` map.
+#[cfg(target_arch = "x86_64")]
+const ITIMER_SMOKE_TASK: u64 = 0xFEED_0000_0000_0001;
+
+/// One-shot ITIMER_REAL: doesn't fire before its deadline, fires exactly at/
+/// after it, then DISARMS (next_fire_ns -> 0) and never re-fires.
+#[cfg(target_arch = "x86_64")]
+fn smoke_itimer_real_oneshot_fires_then_disarms() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let task = ITIMER_SMOKE_TASK;
+    // One-shot (interval 0) due at t=1000.
+    __test_arm_itimer_real(task, 1000, 0);
+    if itimer_real_check_due_irq(task, 999) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("one-shot fired before its deadline");
+    }
+    if !itimer_real_check_due_irq(task, 1000) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("one-shot did not fire at its deadline");
+    }
+    if __test_itimer_real_next_fire(task) != 0 {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("one-shot did not disarm after firing");
+    }
+    if itimer_real_check_due_irq(task, 5000) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("disarmed one-shot fired again");
+    }
+    // Leave the slot clean.
+    __test_arm_itimer_real(task, 0, 0);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+narf_kernel_test::kernel_test_in!(
+    "userspace/posix_timer",
+    smoke_itimer_real_oneshot_fires_then_disarms
+);
+
+/// Periodic ITIMER_REAL: fires at each deadline and RE-ARMS by exactly one
+/// interval; a single check that lands many intervals late catches up in one
+/// step (advances `next_fire_ns` strictly past `now`), mirroring Linux's
+/// `it_real_fn` overrun handling.
+#[cfg(target_arch = "x86_64")]
+fn smoke_itimer_real_periodic_rearms_and_catches_up() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let task = ITIMER_SMOKE_TASK;
+    // Periodic: first fire at 1000, interval 500.
+    __test_arm_itimer_real(task, 1000, 500);
+    if !itimer_real_check_due_irq(task, 1000) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("periodic did not fire at first deadline");
+    }
+    if __test_itimer_real_next_fire(task) != 1500 {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("periodic did not re-arm to next interval (1500)");
+    }
+    if itimer_real_check_due_irq(task, 1400) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("periodic fired before its re-armed deadline");
+    }
+    if !itimer_real_check_due_irq(task, 1600) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("periodic did not fire at second deadline");
+    }
+    if __test_itimer_real_next_fire(task) != 2000 {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("periodic did not re-arm to 2000");
+    }
+    // Catch-up: a check far past several deadlines fires once and snaps the
+    // next deadline strictly past `now` (no re-fire storm).
+    if !itimer_real_check_due_irq(task, 10_000) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("periodic did not fire on a late catch-up check");
+    }
+    let next = __test_itimer_real_next_fire(task);
+    if next <= 10_000 {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("catch-up left next_fire_ns at/behind now");
+    }
+    __test_arm_itimer_real(task, 0, 0);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+narf_kernel_test::kernel_test_in!(
+    "userspace/posix_timer",
+    smoke_itimer_real_periodic_rearms_and_catches_up
+);
+
+/// A check for a task with NO armed ITIMER_REAL slot is a no-op (returns
+/// false), never spuriously raising SIGALRM — the common case on every tick
+/// for tasks that never call `setitimer`/`alarm`.
+#[cfg(target_arch = "x86_64")]
+fn smoke_itimer_real_unarmed_never_fires() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    // A different unique id, left unarmed.
+    let task = 0xFEED_0000_0000_0002;
+    if itimer_real_check_due_irq(task, u64::MAX) {
+        return TestResult::Fail("unarmed ITIMER_REAL spuriously fired");
+    }
+    // Explicitly disarmed slot (next_fire_ns == 0) also never fires.
+    __test_arm_itimer_real(task, 0, 0);
+    if itimer_real_check_due_irq(task, u64::MAX) {
+        __test_arm_itimer_real(task, 0, 0);
+        return TestResult::Fail("explicitly-disarmed ITIMER_REAL fired");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+narf_kernel_test::kernel_test_in!(
+    "userspace/posix_timer",
+    smoke_itimer_real_unarmed_never_fires
+);
