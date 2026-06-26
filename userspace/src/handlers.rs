@@ -8939,6 +8939,13 @@ fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
             unsafe {
                 narf_scheduler::set_user_fs_base(addr);
             }
+            // Publish to the own-stack kernel_switch resume slot too: a
+            // park/preempt resumes WITHOUT re-running `UserTaskFuture::poll`, so
+            // `poll_to_yield` reloads FS_BASE from the per-task slot — it must
+            // reflect this arch_prctl, else the next resume reverts to the stale
+            // published value and the task's TLS reads fault.
+            #[cfg(target_arch = "x86_64")]
+            narf_scheduler::stackful::set_current_user_fs_base(addr);
             // Publish to the polling-future override so a
             // subsequent timer-driven re-poll restores THIS
             // FS_BASE, not the load-time synthetic-TLS value

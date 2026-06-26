@@ -1594,6 +1594,12 @@ impl core::future::Future for UserTaskFuture {
             unsafe {
                 narf_scheduler::set_user_fs_base(fs_base);
             }
+            // Publish for the own-stack kernel_switch resume path: a
+            // preempted/parked task resumes WITHOUT re-running this poll, so
+            // `poll_to_yield` must reload FS_BASE from the per-task slot or the
+            // task runs on another thread's TLS (SMP multithread TLS corruption).
+            #[cfg(target_arch = "x86_64")]
+            narf_scheduler::stackful::set_current_user_fs_base(fs_base);
         }
 
         // Interrupts off across the iretq. The trap handler

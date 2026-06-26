@@ -219,6 +219,20 @@ pub fn set_current_user_cr3(cr3: u64) {
     }
 }
 
+/// Publish the CURRENT stackful task's user `FS_BASE` (TLS) MSR value. Called by
+/// the userspace `UserTaskFuture::poll` and the `arch_prctl(ARCH_SET_FS)` handler
+/// whenever they (re)apply FS_BASE, so a kernel_switch resume can restore it
+/// per-task (see the `user_fs_base` field doc).
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_fs_base(fs_base: u64) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe { (*p).user_fs_base.store(fs_base, Ordering::Release) };
+    }
+}
+
 /// Read the CURRENT task's user-FPU area, or null if none.
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -436,6 +450,19 @@ pub struct KernelTask {
     /// in the wrong page tables. `poll_to_yield` reloads this before each switch
     /// into the task. 0 = not yet entered user mode (first poll activates it).
     user_cr3: AtomicU64,
+    /// Per-task user `FS_BASE` (the TLS / thread-pointer MSR), published by the
+    /// userspace `UserTaskFuture::poll` and the `arch_prctl(ARCH_SET_FS)` handler.
+    /// Same resume-bypass rationale as `user_cr3`: under own-stack a preempted/
+    /// parked task resumes via `kernel_switch` (NOT a re-poll), so the poll-time
+    /// `set_user_fs_base` never re-runs. Without reloading FS_BASE before switching
+    /// the task back in, a multithreaded process resumes a thread on ANOTHER
+    /// thread's TLS — the executor left the FS_BASE MSR set to the last
+    /// freshly-polled task's value — and the thread's first `fs:[0]` TCB read
+    /// faults at NULL (looping forever if it caught SIGSEGV with a handler that
+    /// itself reads TLS — the SMP `chroot_run` runaway-SIGSEGV hang).
+    /// `poll_to_yield` reloads this before each switch into the task. 0 = no TLS
+    /// / not yet published.
+    user_fs_base: AtomicU64,
 }
 
 // SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
@@ -508,6 +535,7 @@ impl KernelTask {
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
             user_cr3: AtomicU64::new(0),
+            user_fs_base: AtomicU64::new(0),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -631,6 +659,20 @@ impl KernelTask {
                 unsafe {
                     core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
                         options(nostack, preserves_flags));
+                }
+            }
+            // Restore the task's user FS_BASE (TLS) MSR too — same resume-bypass
+            // rationale as CR3 above. A multithreaded task resumes via
+            // kernel_switch, NOT a re-poll, so without this it runs on whatever
+            // FS_BASE the last freshly-polled task installed and its first user
+            // TLS access (`fs:[0]`) faults. Skipped on the first poll / a TLS-less
+            // task (fs_base==0): the poll itself sets and publishes FS_BASE.
+            let fs_base = self.user_fs_base.load(Ordering::Acquire);
+            if fs_base != 0 {
+                // SAFETY: `fs_base` is a canonical user vaddr published from this
+                // task's poll-time `set_user_fs_base` (stage_tls / arch_prctl).
+                unsafe {
+                    narf_arch::x86_64::user_mode::set_user_fs_base(fs_base);
                 }
             }
         }
