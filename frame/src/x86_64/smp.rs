@@ -225,8 +225,8 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     // skipping OSXSAVE crashes the AP on its first `xsetbv`. The user-task
     // feature only gates *runtime* migration + the syscall IRQ window.
     unsafe {
-        let rsp0_top = super::gdt::init_ap();
-        super::percpu::init_ap(id, rsp0_top);
+        let (rsp0_top, irq_top) = super::gdt::init_ap();
+        super::percpu::init_ap(id, rsp0_top, irq_top);
         super::syscall::enable();
         // EFER.NXE — the BSP sets this in bare_main before userspace;
         // each AP must set it too. Without it, every user data/stack PTE

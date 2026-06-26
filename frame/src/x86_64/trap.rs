@@ -331,6 +331,34 @@ fn vector_name(v: u64) -> &'static str {
     }
 }
 
+unsafe extern "C" {
+    /// Asm shim (`trap_entry.S`): runs `irq_dispatch_body(frame)` on this CPU's
+    /// dedicated hardirq stack (`gs:[24]`), unless already nested on it
+    /// (`gs:[32]`), in which case it runs on the current stack. Kernel GS must
+    /// be live (it is — `common_trap` swapgs'd on user entry).
+    fn run_irq_dispatch_on_stack(frame: *mut TrapFrame);
+}
+
+/// The external-interrupt dispatch body, run on the per-CPU hardirq stack by
+/// [`run_irq_dispatch_on_stack`]. Contains `on_irq` (and thus the timer-wheel
+/// drain + every device handler) + EOI, bracketed by the trap-handler-depth
+/// marker. Kept OFF the interrupted task's kernel stack so a deep dispatch
+/// cannot smash it (Linux runs hardirq + softirq handlers on the irq stack).
+/// `frame` is accessed only through the pointer, so it stays valid on the
+/// original (task) stack.
+#[unsafe(no_mangle)]
+extern "C" fn irq_dispatch_body(frame: *mut TrapFrame) {
+    // SAFETY: `frame` is the live trap frame on the entry stack (shim contract).
+    let frame = unsafe { &mut *frame };
+    narf_lib::context::enter_trap_handler();
+    narf_interrupts::on_irq(frame.vector as u8);
+    // SAFETY: APIC is initialised before interrupts are enabled.
+    unsafe {
+        narf_interrupts::eoi();
+    }
+    narf_lib::context::exit_trap_handler();
+}
+
 /// Rust-side trap dispatch. Called from `common_trap` in `trap_entry.S`
 /// with a mutable pointer to the `TrapFrame` on the trap stack.
 ///
@@ -452,13 +480,19 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         // panic), but synchronous on_irq calls from smoke tests
         // need direct wakes (the test driver doesn't run the
         // executor that drains the deferred queue).
-        narf_lib::context::enter_trap_handler();
-        narf_interrupts::on_irq(frame.vector as u8);
-        // SAFETY: APIC is initialised before interrupts are enabled.
+        // Run the IRQ-dispatch body (on_irq + EOI — which contains the
+        // timer-wheel drain and every device handler) on this CPU's
+        // dedicated hardirq stack, NOT the interrupted task's own kernel
+        // stack (Linux `call_on_irqstack`). `frame` is passed by pointer
+        // and read through it regardless of which stack the body runs on.
+        // The preempt/signal tail below stays on the task stack so a
+        // `kernel_switch` continuation is never stranded on the shared
+        // IRQ stack (Linux reschedules on the thread stack).
+        // SAFETY: kernel GS is live (common_trap swapgs'd on user entry);
+        // gs:[24]/gs:[32] are set up per-CPU by percpu::init_bsp/init_ap.
         unsafe {
-            narf_interrupts::eoi();
+            run_irq_dispatch_on_stack(frame as *mut TrapFrame);
         }
-        narf_lib::context::exit_trap_handler();
         if is_tick {
             // Preemption hook for stackful kernel tasks. Runs AFTER
             // EOI so that yielding to the executor doesn't leave
