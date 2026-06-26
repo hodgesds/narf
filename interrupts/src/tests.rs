@@ -1357,31 +1357,33 @@ fn smoke_ipi_ack_count_cpu_index_clamps() -> TestResult {
 kernel_test_in!("interrupts/ipi", smoke_ipi_ack_count_cpu_index_clamps);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_ipi_handler_bumps_counters_on_self() -> TestResult {
-    // on_shootdown_irq() bumps ever_received and ack_count for
-    // the current CPU, even with no pending VA (no INVLPG path
-    // taken). Establishes the counter contract independent of
-    // the broadcast machinery.
+fn smoke_ipi_handler_noop_does_not_count() -> TestResult {
+    // Counter contract: a no-op on_shootdown_irq() (no pending VA/tag — a stray
+    // or already-drained re-entry) must NOT bump ever_received/ack_count. A CPU
+    // can reach the handler twice for one shootdown — once draining via
+    // poll_pending_shootdown (lock-spin), once when the IPI is actually delivered
+    // — and double-counting there broke shoot_range's per-IPI accounting under
+    // SMP (an 8-page range registered 2 acks under 16-vCPU KVM). The positive
+    // path (a real request bumps the counter once) is covered by the
+    // shoot_range / invpcid_path_taken broadcast tests.
     use crate::x86_64::ipi::{ack_count, ever_received, on_shootdown_irq};
     let cpu = narf_lib::percpu::current_cpu() as u32;
     let ack_before = ack_count(cpu);
     let ev_before = ever_received(cpu);
-    // SAFETY: called from kernel-test context at CPL=0 with no
-    // pending VA — handler skips the INVLPG path.
-    // SAFETY: Valid memory or trusted environment
+    // SAFETY: CPL=0; no pending request published, so the handler is a no-op.
     unsafe {
         on_shootdown_irq();
     }
-    if ack_count(cpu) != ack_before + 1 {
-        return TestResult::Fail("ack_count didn't increment by 1");
+    if ack_count(cpu) != ack_before {
+        return TestResult::Fail("no-op shootdown bumped ack_count");
     }
-    if ever_received(cpu) != ev_before + 1 {
-        return TestResult::Fail("ever_received didn't increment by 1");
+    if ever_received(cpu) != ev_before {
+        return TestResult::Fail("no-op shootdown bumped ever_received");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("interrupts/ipi", smoke_ipi_handler_bumps_counters_on_self);
+kernel_test_in!("interrupts/ipi", smoke_ipi_handler_noop_does_not_count);
 
 // ── deep interrupts/hpet ─────────────────────────────────────────
 
@@ -1684,6 +1686,14 @@ fn smoke_ipi_shootdown_handler_invpcid_path_taken() -> TestResult {
     }
     if !narf_arch::x86_64::pcid::invpcid_supported() {
         return TestResult::Skip("CPU lacks INVPCID");
+    }
+    // INVPCID with a non-zero PCID also requires CR4.PCIDE on the EXECUTING CPU;
+    // a hypervisor can expose the instruction while leaving PCIDE off (QEMU
+    // `-cpu max`+KVM leaves PCIDE off on APs — and here on all CPUs). When PCIDE
+    // is off the handler correctly falls back to INVLPG instead of #GP-ing, so
+    // the INVPCID counter legitimately won't advance — skip rather than assert.
+    if !narf_arch::x86_64::pcid::pcide_enabled() {
+        return TestResult::Skip("CR4.PCIDE not enabled (hypervisor doesn't expose PCID)");
     }
     let peers = (narf_lib::smp::cpu_count() - 1) as u64;
     let before = ipi::invpcid_path_taken();

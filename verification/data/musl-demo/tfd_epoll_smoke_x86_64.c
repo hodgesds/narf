@@ -13,10 +13,14 @@
  *   step B: does it wake epoll_wait() with a *finite* timeout *at the
  *           timer deadline* (not on a coarse fallback)?               (timerfd-in-epoll)
  *   step C: does it wake epoll_wait(-1)?                              (the weston pattern)
+ *   step D: ABSTIME timerfd armed off clock_gettime (vDSO/kernel clock match)
+ *   step E: does a PURE-timeout epoll_wait (no fd ready) return at its deadline?
+ *   step F: ditto for poll(2) — libwayland's client-side blocking primitive.
  *
  * Each armed timer is ~30ms out, so a correct waker lands every step well under
  * the 250ms gate. The pre-fix bug woke step B only on epoll's ~2s park fallback
- * (~2200ms) and hung step C forever — both caught here.
+ * (~2200ms) and hung step C forever; steps E/F pin a later regression where a
+ * pure-timeout epoll_wait/poll re-armed its deadline forever and never returned.
  */
 #define _GNU_SOURCE 1
 #include <stdio.h>
@@ -112,6 +116,55 @@ int main(void) {
         if (n != 1 || out[0].data.fd != tfd) { w("tfd-epoll-fail: D\n"); return 1; }
         if (dt > worst) worst = dt;
         { uint64_t e = 0; read(tfd, &e, sizeof e); }
+    }
+
+    /* step E: PLAIN epoll timeout on an EMPTY interest set — no fd ready and
+     * no timerfd, so the wakeup MUST come from the scheduler honouring the
+     * timeout deadline, not a fd becoming readable. This is exactly what
+     * libwayland's event loop does every idle tick: wl_event_loop_dispatch(
+     * loop, ms) -> epoll_wait(epfd, ev, n, ms).
+     *
+     * The regression this pins: epoll_wait RIP-rewinds and RE-EXECUTES on every
+     * wake (to re-check readiness), but the scheduler clears its wake-signal
+     * (sleep_deadline_ns) the instant the deadline expires — so the re-executed
+     * call recomputed a FRESH `now + timeout` deadline and re-armed forever. A
+     * pure-timeout epoll_wait NEVER returned (hung, not just slow), which
+     * stalled every idle tick of a real compositor. Fixed by persisting the
+     * deadline in a field the scheduler doesn't touch (blocking_deadline_ns). */
+    epoll_ctl(epfd, EPOLL_CTL_DEL, tfd, NULL);
+    {
+        int64_t t1 = now_ms();
+        int m = epoll_wait(epfd, out, 1, 120); /* 120ms timeout, empty set */
+        int64_t de = now_ms() - t1;
+        wkv("step-E plain_n", m);
+        wkv("step-E elapsed_ms", (long)de);
+        if (m != 0) {
+            w("tfd-epoll-fail: E expected-timeout\n");
+            return 1;
+        }
+        if (de < 90 || de > 400) {
+            w("tfd-epoll-fail: E timeout not honored at the deadline\n");
+            return 1;
+        }
+    }
+
+    /* step F: the same pure-timeout regression via poll(2) — libwayland's
+     * client side (wl_display_dispatch / roundtrip) blocks in poll(), which
+     * shares the re-execute-and-recompute hazard (it parks in ~1ms chunks and
+     * re-enters the syscall on each). A poll() on a fd set with nothing ready
+     * must return 0 at the deadline, not hang. */
+    {
+        struct pollfd none = { .fd = -1, .events = POLLIN };
+        int64_t t1 = now_ms();
+        int m = poll(&none, 1, 120);
+        int64_t de = now_ms() - t1;
+        wkv("step-F poll_n", m);
+        wkv("step-F elapsed_ms", (long)de);
+        if (m != 0) { w("tfd-epoll-fail: F expected-timeout\n"); return 1; }
+        if (de < 90 || de > 400) {
+            w("tfd-epoll-fail: F timeout not honored at the deadline\n");
+            return 1;
+        }
     }
 
     if (worst > GATE_MS) { w("tfd-epoll-fail: slow\n"); return 1; }

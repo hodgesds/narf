@@ -140,6 +140,16 @@ pub unsafe fn on_shootdown_irq() {
     let pages = PENDING_PAGES[i].load(Ordering::Acquire);
     let tag = PENDING_TAG[i].load(Ordering::Acquire);
 
+    // Did this invocation have a real request to service? A CPU can reach here
+    // twice for one shootdown: once by draining via `poll_pending_shootdown`
+    // (lock-spin) which clears the slots, and again when the actual IPI is
+    // delivered (a "stray" no-op, per this fn's contract). Both used to bump
+    // ACK_COUNT, so a peer that drained-then-took-the-IPI ack'd TWICE — benign
+    // for the sender (it waits for ANY advance) but it made the per-IPI accounting
+    // wrong (observed under 16-vCPU KVM as `shoot_range` of 8 pages registering 2
+    // acks). Only ack when we actually consumed a pending request.
+    let had_work = va != 0 || tag != 0;
+
     // Three shapes:
     //   - tag != 0, va == 0  → "flush every TLB entry for this tag"
     //     (INVPCID type 1). Used by `shoot_tag_only`.
@@ -154,7 +164,19 @@ pub unsafe fn on_shootdown_irq() {
     // INVPCID encoding per Intel SDM Vol 2 INVPCID instruction
     // reference; type semantics per SDM Vol 3 §4.10.4.
     if tag != 0 {
-        let invpcid_ok = narf_arch::x86_64::pcid::invpcid_supported();
+        // INVPCID with a NON-ZERO PCID descriptor requires BOTH the INVPCID
+        // instruction AND CR4.PCIDE=1 — otherwise it #GP(0). A hypervisor can
+        // expose INVPCID-the-instruction on a vCPU while NOT advertising PCID
+        // (CPUID(1).ECX[17]): observed under QEMU `-cpu max`+KVM, where the BSP
+        // gets PCIDE but the APs do not, so `enable_pcide()` no-op'd on the APs
+        // and their CR4.PCIDE stayed 0. A tag-carrying shootdown broadcast then
+        // #GP'd on every such AP (16 of them concurrently → a fatal-handler
+        // soup that masqueraded as an unrelated SMP "heisenbug"). Gate on the
+        // EXECUTING CPU's CR4.PCIDE, not just the instruction, and fall back to
+        // a PCID-agnostic flush — a PCIDE-off CPU has no PCID-tagged entries, so
+        // INVLPG (per-VA) or a CR3 reload (tag-only) covers the same ground.
+        let invpcid_ok = narf_arch::x86_64::pcid::invpcid_supported()
+            && narf_arch::x86_64::pcid::pcide_enabled();
         if invpcid_ok {
             INVPCID_PATH_TAKEN.fetch_add(1, Ordering::Relaxed);
             if va == 0 {
@@ -190,6 +212,18 @@ pub unsafe fn on_shootdown_irq() {
                     );
                 }
             }
+        } else {
+            // Tag-only flush (va == 0) with no usable INVPCID/PCIDE on this CPU:
+            // we can't selectively drop a single PCID, and this CPU has no
+            // PCID-tagged entries anyway (CR4.PCIDE=0 ⟹ everything is PCID 0).
+            // Reload CR3 to drop all non-global entries — the domain's mappings
+            // (non-global) are covered. Mapping changes are boot-rare.
+            // SAFETY: writing back the current CR3 at CPL=0 is always legal and
+            // flushes non-global TLB entries.
+            unsafe {
+                let c = narf_arch::x86_64::cr::read_cr3();
+                narf_arch::x86_64::cr::write_cr3(c);
+            }
         }
     } else if va != 0 {
         let n = if pages == 0 { 1 } else { pages };
@@ -209,8 +243,12 @@ pub unsafe fn on_shootdown_irq() {
     PENDING_VA[i].store(0, Ordering::Release);
     PENDING_PAGES[i].store(0, Ordering::Release);
     PENDING_TAG[i].store(0, Ordering::Release);
-    EVER_RECEIVED[i].fetch_add(1, Ordering::Relaxed);
-    ACK_COUNT[i].fetch_add(1, Ordering::Release);
+    // Only ack/count a real service — a stray no-op re-entry (slots already
+    // drained) must not double-count (see `had_work`).
+    if had_work {
+        EVER_RECEIVED[i].fetch_add(1, Ordering::Relaxed);
+        ACK_COUNT[i].fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Service a TLB shootdown a peer published to THIS cpu, if one is

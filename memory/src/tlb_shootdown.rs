@@ -390,7 +390,13 @@ pub fn shootdown_range(pcid: u16, va: u64, pages: u64) {
 #[cfg(target_arch = "x86_64")]
 fn apply_local(req: ShootdownRequest) {
     use narf_arch::x86_64::pcid;
-    if !pcid::invpcid_supported() {
+    // INVPCID with a non-zero PCID #GPs unless CR4.PCIDE=1, AND a hypervisor can
+    // expose the INVPCID instruction on a vCPU while NOT advertising PCID
+    // (CPUID(1).ECX[17]) — seen under QEMU `-cpu max`+KVM, where `enable_pcide`
+    // no-op'd so CR4.PCIDE stayed 0. Require BOTH the instruction and PCIDE; on a
+    // PCIDE-off CPU there are no PCID-tagged entries, so the MOV-CR3 self-flush
+    // below (drops all non-global entries) is a correct, if coarser, substitute.
+    if !pcid::invpcid_supported() || !pcid::pcide_enabled() {
         // Fall back to MOV-CR3 self-flush -- global pages stay.
         // SAFETY: CR4.PCIDE may or may not be on; this is a
         // best-effort cleanup and CR3 read/write is always legal
