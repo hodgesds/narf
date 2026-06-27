@@ -204,7 +204,7 @@ async fn device_read_into<B: BlockDevice>(
         let in_lba = (abs % lbs as u64) as usize;
         let remaining = dst.len() - cursor;
         // Blocks that cover [in_lba, in_lba+remaining), capped to the buffer.
-        let need_blocks = (in_lba + remaining + lbs - 1) / lbs;
+        let need_blocks = (in_lba + remaining).div_ceil(lbs);
         let n_blocks = need_blocks.min(buf_blocks).max(1);
         let span = n_blocks * lbs; // bytes the device writes into the buffer
         let take = remaining.min(span - in_lba); // bytes to copy out this round
@@ -222,8 +222,8 @@ async fn device_read_into<B: BlockDevice>(
         let completion = device.submit(req).await;
         completion.result.map_err(FsError::Io)?;
 
-        let buf = resolve_cap(scratch)
-            .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
+        let buf =
+            resolve_cap(scratch).ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
         // SAFETY: `scratch` is exclusively owned for this op; the device wrote
         // `span` (<= scratch_bytes) bytes from its start, so the slice is valid.
         let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), span) };

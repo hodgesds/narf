@@ -488,7 +488,11 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
             // expiry fires no readiness notify).
             if let Some(timer_dl) = poll_nearest_deadline(task, &fds) {
                 let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
-                let clamped = if cur == 0 { timer_dl } else { cur.min(timer_dl) };
+                let clamped = if cur == 0 {
+                    timer_dl
+                } else {
+                    cur.min(timer_dl)
+                };
                 uc.sleep_deadline_ns.store(clamped, Ordering::Release);
             }
             // Rewind RIP over the 2-byte syscall so we re-execute poll on wake.
