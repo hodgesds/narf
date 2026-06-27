@@ -526,6 +526,133 @@ impl VirtioBlkPci {
         Ok(())
     }
 
+    /// Read `count` contiguous 512-byte sectors from `sector` in ONE virtio
+    /// request — a single submit→poll round-trip instead of one per sector.
+    /// `count` is clamped to 1..=8 (the 4 KiB DMA scratch page holds 8
+    /// sectors); `out` must be at least `count*512` bytes. This is the batched
+    /// counterpart to `read_sector`: a sequential file read (ext2 streaming a
+    /// DSO) pays ~1/8 the `responsive_spin_until` round-trips.
+    pub fn read_sectors(
+        &self,
+        sector: u64,
+        count: u16,
+        out: &mut [u8],
+    ) -> Result<(), VirtioPciError> {
+        let count = count.clamp(1, 8);
+        let bytes = count as usize * 512;
+        if out.len() < bytes {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+        let pool_phys = self.pool.phys_addr().raw();
+        let header_phys = pool_phys;
+        let status_phys = pool_phys + 16;
+        // SAFETY: identity-mapped DMA buffer.
+        unsafe {
+            core::ptr::write_volatile(
+                header_phys as *mut BlkHeader,
+                BlkHeader {
+                    type_tag: VIRTIO_BLK_T_IN,
+                    _resv: 0,
+                    sector,
+                },
+            );
+            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+        }
+
+        let payload =
+            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+        let payload_phys = payload.phys_addr().raw();
+        // SAFETY: page-sized DMA buffer; zero the bytes we'll read so a missed
+        // device write shows up clearly.
+        unsafe {
+            for i in 0..bytes {
+                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, 0);
+            }
+        }
+
+        let descs = [
+            VirtqDesc {
+                addr: header_phys,
+                len: 16,
+                flags: 0,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: payload_phys,
+                len: bytes as u32,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+            VirtqDesc {
+                addr: status_phys,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+        ];
+
+        let head = {
+            let mut g = self.queue.lock();
+            let q = g.as_mut().ok_or(VirtioPciError::NoQueues)?;
+            q.add_buffer(&descs).ok_or(VirtioPciError::QueueTooSmall)?
+        };
+
+        let notify_off = (self.queue_notify_off as u64) * (self.notify_off_multiplier as u64);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: notify cap region is identity-mapped MMIO.
+        unsafe {
+            self.notify.write16(notify_off, 0);
+        }
+
+        let mut q_err = false;
+        let done = narf_scheduler::responsive_spin_until(
+            || {
+                let elem = {
+                    let mut g = self.queue.lock();
+                    match g.as_mut() {
+                        Some(q) => q.poll_used(),
+                        None => {
+                            q_err = true;
+                            return true;
+                        }
+                    }
+                };
+                matches!(elem, Some((id, _)) if id == head as u32)
+            },
+            narf_time::Deadline::after_ms(1_000),
+        );
+        if q_err {
+            return Err(VirtioPciError::NoQueues);
+        }
+        if !done {
+            return Err(VirtioPciError::QueueTooSmall);
+        }
+
+        // SAFETY: identity-mapped DMA.
+        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        if status != VIRTIO_BLK_S_OK {
+            let mut g = self.queue.lock();
+            if let Some(q) = g.as_mut() {
+                q.free_chain(head);
+            }
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+
+        // SAFETY: identity-mapped 4 KiB page; copy `bytes` out.
+        unsafe {
+            for (i, slot) in out[..bytes].iter_mut().enumerate() {
+                *slot = core::ptr::read_volatile((payload_phys + i as u64) as *const u8);
+            }
+        }
+
+        let mut g = self.queue.lock();
+        if let Some(q) = g.as_mut() {
+            q.free_chain(head);
+        }
+        let _ = payload;
+        Ok(())
+    }
+
     /// Negotiated queue size.
     pub fn queue_size(&self) -> u16 {
         self.qsize
@@ -983,18 +1110,29 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         n_blocks: u16,
         out: &mut [u8],
     ) -> Result<(), narf_block::BlockIoError> {
-        if n_blocks != 1 {
-            return Err(narf_block::BlockIoError::BufferTooSmall);
+        if n_blocks == 0 {
+            return Ok(());
         }
-        if out.len() < 512 {
+        let need = n_blocks as usize * 512;
+        if out.len() < need {
             return Err(narf_block::BlockIoError::BufferTooSmall);
         }
         let g = CONTROLLER.lock();
         let dev = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        let mut tmp = [0u8; 512];
-        dev.read_sector(lba, &mut tmp)
+        // Batch up to 8 sectors (one 4 KiB DMA page) per virtio round-trip,
+        // instead of one sector per request.
+        let mut done: u16 = 0;
+        while done < n_blocks {
+            let chunk = core::cmp::min(8, n_blocks - done);
+            let off = done as usize * 512;
+            dev.read_sectors(
+                lba + done as u64,
+                chunk,
+                &mut out[off..off + chunk as usize * 512],
+            )
             .map_err(|_| narf_block::BlockIoError::DriverError)?;
-        out[..512].copy_from_slice(&tmp);
+            done += chunk;
+        }
         Ok(())
     }
     fn write(&self, lba: u64, n_blocks: u16, data: &[u8]) -> Result<(), narf_block::BlockIoError> {
