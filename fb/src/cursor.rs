@@ -157,6 +157,12 @@ pub fn drain_and_render(fb: &FbWriter) {
     if !moved {
         return;
     }
+    // A userspace compositor owns the scanout — it draws its own cursor.
+    // Drain pointer events (above) so the ring doesn't fill, but don't
+    // paint the kernel sprite over the desktop.
+    if narf_console::fb_user_owned() {
+        return;
+    }
     // Snapshot-restore-then-draw cycle.
     let mut g = SAVED.lock();
     if let Some(prev) = g.take() {

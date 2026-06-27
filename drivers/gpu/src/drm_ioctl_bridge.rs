@@ -1111,6 +1111,13 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
         Some(i) => i,
         None => return,
     };
+    // A real DRM client is now driving the scanout — hand the framebuffer
+    // over to it: detach the kernel console FB hook and suppress the FB
+    // status-panel / cursor painters so they stop bleeding kernel chrome
+    // over the compositor's pixels. Idempotent, so calling it on every
+    // SETCRTC / page flip is cheap. Released when the last card node closes
+    // (see `DriCardFile`'s Drop).
+    narf_console::fb_take_for_user();
     let dst_w = info.width.min(src_w);
     let dst_h = info.height.min(src_h);
     let row_bytes = (dst_w as usize) * 4;

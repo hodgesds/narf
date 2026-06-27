@@ -9,7 +9,7 @@
 #![deny(missing_debug_implementations)]
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use narf_lib::sync::{IrqSafeSpinLock, OnceLock};
 use narf_memory::{PhysAddr, VirtAddr};
@@ -239,6 +239,44 @@ pub fn take_fb_hook() -> usize {
 /// FB console was ever installed).
 pub fn restore_fb_hook(prior: usize) {
     FB_HOOK.store(prior, Ordering::Release);
+}
+
+/// True while a userspace scanout owner (a DRM master compositor, or a
+/// `Syscall::FbConnect` handle holder) has taken the framebuffer. The FB
+/// status-panel / cursor painters in `narf_fb` consult this and suppress
+/// themselves so they don't paint kernel chrome over the user's pixels.
+static FB_USER_OWNED: AtomicBool = AtomicBool::new(false);
+/// Token saved by [`fb_take_for_user`] so [`fb_release_from_user`] can put
+/// the console FB hook back exactly as it was.
+static FB_USER_SAVED_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// A userspace scanout owner takes the framebuffer: detach the console FB
+/// hook (kernel glyphs stop painting) and flag ownership so `narf_fb`'s
+/// status-panel + cursor painters suppress themselves. Idempotent — a
+/// second take while already owned is a no-op, so the DRM blit path may
+/// call it on every page flip.
+pub fn fb_take_for_user() {
+    if FB_USER_OWNED.swap(true, Ordering::AcqRel) {
+        return; // already owned
+    }
+    let prior = take_fb_hook();
+    FB_USER_SAVED_HOOK.store(prior, Ordering::Release);
+}
+
+/// Hand the framebuffer back to the kernel console: re-attach the FB hook
+/// and clear the ownership flag. Idempotent — releasing when not owned is
+/// a no-op. Called when the last DRM master node closes.
+pub fn fb_release_from_user() {
+    if !FB_USER_OWNED.swap(false, Ordering::AcqRel) {
+        return; // wasn't owned
+    }
+    let prior = FB_USER_SAVED_HOOK.swap(0, Ordering::AcqRel);
+    restore_fb_hook(prior);
+}
+
+/// Whether a userspace scanout owner currently holds the framebuffer.
+pub fn fb_user_owned() -> bool {
+    FB_USER_OWNED.load(Ordering::Acquire)
 }
 
 /// Panic sink — no allocation, no re-entry, lock-free.

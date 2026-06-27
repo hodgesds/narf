@@ -1036,7 +1036,12 @@ pub fn register_initcalls() {
         // ever blocking init/shell.
         narf_scheduler::spawn_stackful(async move {
             loop {
-                status::paint(&writer);
+                // Suppress the kernel status panel while a userspace
+                // compositor (DRM master) owns the scanout — otherwise it
+                // bleeds kernel chrome over the desktop.
+                if !narf_console::fb_user_owned() {
+                    status::paint(&writer);
+                }
                 narf_time::sleep_cycles(800_000_000).await;
             }
         });

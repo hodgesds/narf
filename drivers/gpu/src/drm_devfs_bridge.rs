@@ -46,6 +46,30 @@ pub struct DriCardFile {
     index: u32,
 }
 
+/// Number of live `DriCardFile` (DRM master node) handles. When it falls
+/// back to zero — the last compositor's `card<N>` fd closed (typically at
+/// process exit) — we hand the framebuffer back to the kernel console so
+/// post-compositor kernel logs are visible again.
+static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+impl DriCardFile {
+    fn new(index: u32) -> Self {
+        LIVE_CARD_FILES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        DriCardFile { index }
+    }
+}
+
+impl Drop for DriCardFile {
+    fn drop(&mut self) {
+        // Last master node closed → release the framebuffer back to the
+        // kernel console (no-op if a DRM client never took it over).
+        if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
+            narf_console::fb_release_from_user();
+        }
+    }
+}
+
 impl FileOps for DriCardFile {
     /// Drain one pending DRM event (`drm_event_vblank`) into `buf`. The
     /// compositor render loop poll/select()s the fd then read()s the
@@ -174,7 +198,7 @@ impl DirOps for DriDir {
             if let Ok(idx) = rest.parse::<u32>() {
                 // Only expose registered cards.
                 if (idx as usize) < crate::drm_registry::count() {
-                    return Some(Arc::new(DriCardFile { index: idx }));
+                    return Some(Arc::new(DriCardFile::new(idx)));
                 }
             }
         }
