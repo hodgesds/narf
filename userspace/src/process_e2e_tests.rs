@@ -3668,3 +3668,198 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("userspace/process", smoke_process_ptrace_e2e);
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_process_coredump_e2e() -> TestResult {
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_02;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    crate::handlers::cwd_init();
+
+    // 1. Create a parent address space
+    // SAFETY: new_for_user is safe to call when paging is enabled.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Set CWD of PARENT to /tmp so child inherits it and coredump writes succeed.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let tmp_path = b"/tmp\0";
+    let mut chdir_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: tmp_path.as_ptr() as u64,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Chdir.raw(), &mut chdir_ctx);
+    if !matches!(chdir_ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("chdir(/tmp) failed");
+    }
+
+    // 2. Fork a child
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let child_pid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork did not return child pid");
+        }
+    };
+
+    let child_task_raw = crate::handlers::pid_to_task_raw(child_pid).unwrap();
+
+    // 3. Register a UserTaskCtx for the child
+    let mut child_uctx = crate::user_task::UserTaskCtx::new();
+    crate::user_task::register_user_task_ctx(child_task_raw, &mut child_uctx as *mut _);
+
+    // 4. Set register state in child
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: child_uctx is local to this test thread, and get() returns a valid mutable pointer to UserState.
+    unsafe {
+        let state = &mut *child_uctx.state.get();
+        state.rip = 0x11223344;
+        state.rsp = 0x55667788;
+        state.rax = 0xbeef;
+    }
+
+    // 5. Force termination with core_dumped = true
+    crate::user_task::install_current(&mut child_uctx as *mut _);
+    let mut term_ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    crate::handlers::terminate_current_task(&mut term_ctx, child_task_raw, 11, true);
+    crate::user_task::clear_current();
+    crate::user_task::notify_task_exited(child_pid, child_pid);
+
+    // 6. Parent wait4 to reap status
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut wait_ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: child_pid,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut wait_ctx);
+    match wait_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == child_pid => {}
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("wait4 did not reap terminated child");
+        }
+    }
+
+    // wstatus should report SIGSEGV (11) and coredumped (0x80) -> 0x8b
+    if status != 0x8b {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("wait4 status did not report coredump bit");
+    }
+
+    // 7. Verify core file in VFS
+    let core_path = crate::handlers::resolve_cwd_path(PARENT, "core");
+    let (parent_dir, leaf) = match crate::handlers::resolve_parent_dir_async(&core_path) {
+        Some(x) => x,
+        None => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("could not resolve parent dir for core");
+        }
+    };
+
+    let file = match parent_dir.lookup(&leaf) {
+        Some(f) => f,
+        None => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("core file was not created");
+        }
+    };
+
+    let mut header = [0u8; 64];
+    let n = match crate::handlers::poll_blocking(file.read(0, &mut header)) {
+        Some(Ok(x)) => x,
+        _ => {
+            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("failed to read core header");
+        }
+    };
+
+    if n < 64 {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("core file is too short");
+    }
+
+    if header[0..4] != [0x7F, b'E', b'L', b'F'] {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("core file has bad magic");
+    }
+
+    if header[4] != 2 {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("core file is not 64-bit");
+    }
+
+    let e_type = u16::from_le_bytes([header[16], header[17]]);
+    if e_type != 4 {
+        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("core file has wrong e_type");
+    }
+
+    // Clean up
+    let _ = crate::handlers::poll_blocking(parent_dir.unlink(&leaf));
+    crate::user_task::unregister_user_task_ctx(child_task_raw);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("userspace/process", smoke_process_coredump_e2e);

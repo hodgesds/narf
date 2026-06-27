@@ -43,6 +43,7 @@ pub mod container;
 #[cfg(feature = "linux-compat")]
 pub mod linux_compat;
 
+pub mod coredump;
 pub mod elf;
 pub mod ephemeral_port;
 pub mod epoll;

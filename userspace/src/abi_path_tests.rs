@@ -46,7 +46,7 @@ kernel_test_in!("syscall_abi", smoke_abi_path_openat_neg);
 fn smoke_abi_path_creat_pos() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/created\0";
-        match call(Syscall::Creat.raw(), a1(path.as_ptr() as u64, 0o644)) {
+        match call_creat(path.as_ptr() as u64, 0o644) {
             Some(fd) if fd >= 0 => Ok(()),
             _ => Err("creat(new file) should return a fd >= 0"),
         }
@@ -58,7 +58,7 @@ fn smoke_abi_path_creat_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         // Parent directory does not exist → cannot create.
         let path = b"/p/no_such_dir/x\0";
-        match call(Syscall::Creat.raw(), a1(path.as_ptr() as u64, 0o644)) {
+        match call_creat(path.as_ptr() as u64, 0o644) {
             Some(fd) if fd >= 0 => Err("creat under a missing dir must fail"),
             _ => Ok(()),
         }
@@ -71,7 +71,7 @@ kernel_test_in!("syscall_abi", smoke_abi_path_creat_neg);
 fn smoke_abi_path_unlink_pos() -> TestResult {
     with_memfs("/p", "p", &[("victim", b"x")], || {
         let path = b"/p/victim\0";
-        match call(Syscall::Unlink.raw(), a0(path.as_ptr() as u64)) {
+        match call_unlink(path.as_ptr() as u64) {
             Some(0) => Ok(()),
             _ => Err("unlink(existing) should return 0"),
         }
@@ -82,7 +82,7 @@ kernel_test_in!("syscall_abi", smoke_abi_path_unlink_pos);
 fn smoke_abi_path_unlink_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         let path = b"/p/nope\0";
-        match call(Syscall::Unlink.raw(), a0(path.as_ptr() as u64)) {
+        match call_unlink(path.as_ptr() as u64) {
             Some(0) => Err("unlink(missing) must not return success"),
             _ => Ok(()),
         }
@@ -96,10 +96,7 @@ fn smoke_abi_path_rename_pos() -> TestResult {
     with_memfs("/p", "p", &[("old", b"x")], || {
         let old = b"/p/old\0";
         let new = b"/p/new\0";
-        match call(
-            Syscall::Rename.raw(),
-            a1(old.as_ptr() as u64, new.as_ptr() as u64),
-        ) {
+        match call_rename(old.as_ptr() as u64, new.as_ptr() as u64) {
             Some(0) => Ok(()),
             _ => Err("rename(existing -> new) should return 0"),
         }
@@ -111,10 +108,7 @@ fn smoke_abi_path_rename_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         let old = b"/p/missing\0";
         let new = b"/p/new\0";
-        match call(
-            Syscall::Rename.raw(),
-            a1(old.as_ptr() as u64, new.as_ptr() as u64),
-        ) {
+        match call_rename(old.as_ptr() as u64, new.as_ptr() as u64) {
             Some(0) => Err("rename(missing -> new) must fail"),
             _ => Ok(()),
         }
@@ -132,7 +126,7 @@ fn smoke_abi_path_rmdir_pos() -> TestResult {
             Syscall::Mkdirat.raw(),
             a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
         );
-        match call(Syscall::Rmdir.raw(), a0(dir.as_ptr() as u64)) {
+        match call_rmdir(dir.as_ptr() as u64) {
             Some(0) => Ok(()),
             other => {
                 // Some backends don't support mkdir on MemFs; only assert the
@@ -148,7 +142,7 @@ kernel_test_in!("syscall_abi", smoke_abi_path_rmdir_pos);
 fn smoke_abi_path_rmdir_neg() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         let dir = b"/p/nope\0";
-        match call(Syscall::Rmdir.raw(), a0(dir.as_ptr() as u64)) {
+        match call_rmdir(dir.as_ptr() as u64) {
             Some(0) => Err("rmdir(missing) must fail"),
             _ => Ok(()),
         }

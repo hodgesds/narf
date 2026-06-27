@@ -579,8 +579,8 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
     // Same guarantee for the slab. Catches the case where a slab
     // class is grown from a buddy frame past the early MMU
     // identity-map ceiling (4 GiB) — every slab object inside
-    // that frame would then page-fault on first access.
     use core::alloc::Layout;
+    #[cfg(target_arch = "x86_64")]
     let usable_bytes: u64 = 4u64 << 30;
     // Cover every size class (16 .. 4096) to stress every class's
     // grow path. Each class returns its first block from a freshly
@@ -594,6 +594,7 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
             match crate::slab::alloc(layout) {
                 Ok(p) => {
                     let raw = p.as_ptr() as u64;
+                    #[cfg(target_arch = "x86_64")]
                     if raw >= usable_bytes {
                         for (q, ql) in held.drain(..) {
                             // SAFETY: the operation upholds its documented invariant (see surrounding context).

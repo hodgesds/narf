@@ -302,7 +302,7 @@ fn raw_waker() -> RawWaker {
 /// internally polled, so async FS futures complete after at most a
 /// handful of re-polls). Bounded to 65 536 iterations as a hard
 /// safety cap; returns `None` on overrun (caller surfaces EIO).
-fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
     use core::pin::Pin;
     // SAFETY: same waker as poll_once; never delivers wake events.
     let waker = unsafe { Waker::from_raw(raw_waker()) };
@@ -3927,7 +3927,7 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
 /// `mkdir("/run/udev")`) resolved no parent and returned a bare -1 →
 /// musl EPERM. Same fix shape as the stat-async path. Returns
 /// `(parent_dir, leaf_name)`.
-fn resolve_parent_dir_async(
+pub(crate) fn resolve_parent_dir_async(
     abs: &str,
 ) -> Option<(
     alloc::sync::Arc<dyn narf_filesystem::DirOps>,
@@ -7836,7 +7836,12 @@ fn sys_madvise(ctx: &mut dyn TrapContext) {
 //     the staged wstatus is still recorded and we mark the syscall's
 //     return as Ok(0); test harnesses fire `notify_task_exited`
 //     manually.
-fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, core_dumped: bool) {
+pub(crate) fn terminate_current_task(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    signum: u32,
+    core_dumped: bool,
+) {
     let pid = task_to_pid_raw(task).unwrap_or(task);
     use core::fmt::Write;
     let _ = writeln!(
@@ -7847,7 +7852,7 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
         core_dumped,
         ctx.rip()
     );
-    stage_pending_termination(task, encode_signaled_status(signum, core_dumped));
+    stage_pending_termination(pid, encode_signaled_status(signum, core_dumped));
 
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -7860,6 +7865,9 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
         unsafe {
             let uc = &*uctx;
             ctx.save_user_state(uc.state.get() as *mut u8);
+            if core_dumped {
+                crate::coredump::write_coredump(task, signum, &*uc.state.get());
+            }
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
@@ -7876,6 +7884,17 @@ fn terminate_current_task(ctx: &mut dyn TrapContext, task: u64, signum: u32, cor
             hook(uctx);
         }
         // unreachable
+    }
+
+    if core_dumped {
+        if let Some(uctx) = crate::user_task::current_user_task() {
+            // SAFETY: uctx is valid.
+            unsafe {
+                let uc = &*uctx;
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                crate::coredump::write_coredump(task, signum, &*uc.state.get());
+            }
+        }
     }
     // Test / no-polling-future path: caller (the signal hook) is
     // responsible for not re-entering user mode. Smokes drive
@@ -12758,7 +12777,7 @@ fn normalize_abs(p: &str) -> alloc::string::String {
 /// Turn a user-supplied path (absolute or relative to `task`'s cwd)
 /// into a normalized absolute path. Relative paths are joined onto the
 /// task's current working directory; `.`/`..` are collapsed.
-fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
+pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     let normalized = if path.starts_with('/') {
         normalize_abs(path)
     } else {

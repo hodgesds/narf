@@ -1815,6 +1815,7 @@ pub mod tests {
         // SAFETY: writing IA32_FS_BASE is unconditional at CPL=0; the kernel
         // uses GS (not FS) for per-CPU state, so trashing FS_BASE is inert.
         unsafe { narf_arch::x86_64::msr::wrmsr(IA32_FS_BASE, CLOBBER) };
+        // SAFETY: standard stackful poll.
         let r2 = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         // Restore a benign FS_BASE + the own-stack flag regardless of outcome.
         // SAFETY: as above.
