@@ -265,7 +265,87 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// One readiness pass over `fds`: fills each `revents`, returns the ready
+/// count. The blocking-park path uses this for its pre-park scan (the spin
+/// path keeps using `do_poll`). Same per-fd rules as `do_poll`: negative fd
+/// ignored, closed fd → POLLNVAL, open fd → `poll_readiness() & (events|ERR|HUP|NVAL)`.
+fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
+    let mut n_ready = 0usize;
+    fd::with_table(task_id, |t| {
+        for item in fds.iter_mut() {
+            if item.fd < 0 {
+                item.revents = 0;
+                continue;
+            }
+            match t.get(item.fd as u32) {
+                None => {
+                    item.revents = POLL_NVAL as u16;
+                    n_ready += 1;
+                }
+                Some(e) => {
+                    let mask = e.ops.poll_readiness();
+                    let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
+                    let ready = (mask as u16) & (item.events | always);
+                    item.revents = ready;
+                    if ready != 0 {
+                        n_ready += 1;
+                    }
+                }
+            }
+        }
+    });
+    n_ready
+}
+
+/// True iff a blocking wait on `fds` can safely PARK rather than busy-poll:
+/// every open fd must wake a parked waiter — a socket (fires `readiness::notify`)
+/// or a timerfd (advertises a `poll_deadline` the park clamps to). A "silent"
+/// source (pipe/eventfd/tty) that becomes ready via a write firing no notify
+/// would be missed until the coarse fallback (or sleep out a finite timeout),
+/// so any such fd — or a closed fd (handle its POLLNVAL on the spin path) —
+/// forces the prompt busy-poll. Requires at least one open fd.
+fn poll_all_parkable(task_id: u64, fds: &[PollFd]) -> bool {
+    let mut any = false;
+    let mut all = true;
+    fd::with_table(task_id, |t| {
+        for item in fds.iter() {
+            if item.fd < 0 {
+                continue;
+            }
+            match t.get(item.fd as u32) {
+                Some(e) => {
+                    any = true;
+                    if !(e.ops.readiness_notifies() || e.ops.poll_deadline().is_some()) {
+                        all = false;
+                    }
+                }
+                None => all = false,
+            }
+        }
+    });
+    any && all
+}
+
+/// Earliest absolute monotonic-ns deadline at which any fd becomes ready with
+/// no readiness `notify` — i.e. an armed timerfd expiry. A parked poll clamps
+/// its scheduler wake-up to this. Mirrors `EpollInstance::nearest_poll_deadline`.
+fn poll_nearest_deadline(task_id: u64, fds: &[PollFd]) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    fd::with_table(task_id, |t| {
+        for item in fds.iter() {
+            if item.fd < 0 {
+                continue;
+            }
+            if let Some(d) = t.get(item.fd as u32).and_then(|e| e.ops.poll_deadline()) {
+                best = Some(best.map_or(d, |b: u64| b.min(d)));
+            }
+        }
+    });
+    best
+}
+
 fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
+    use core::sync::atomic::Ordering;
     let fail = SyscallReturn::ok((-1i64) as u64);
 
     // Upper bound on nfds to prevent OOM from hostile input.
@@ -273,6 +353,8 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         ctx.set_return(fail);
         return;
     }
+
+    let task = current_task_id();
 
     if nfds == 0 {
         // poll({}, 0, timeout_ms) is legal; it just sleeps for timeout_ms.
@@ -297,12 +379,133 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         }
     };
 
-    let task = current_task_id();
-    let n = do_poll(task, &mut fds, timeout);
+    let uctx_opt = crate::user_task::current_user_task();
 
-    // Write revents back to user memory.
-    // SAFETY: same pointer/length as parse step; user AS still active.
+    // A blocking wait whose every fd wakes a parked waiter PARKS instead of
+    // busy-spinning — that frees the cooperative own-stack CPU (a Wayland
+    // client looping `poll(-1)` on its display socket otherwise pins it and
+    // starves the compositor). Everything else — non-blocking, no task context,
+    // or any silent (pipe/eventfd/tty) fd — keeps the original prompt busy-poll
+    // (it catches a notify-less readiness edge immediately, which the parked
+    // path could only see on its fallback tick / would sleep out a timeout).
+    let can_park = timeout != 0 && uctx_opt.is_some() && poll_all_parkable(task, &fds);
+    if !can_park {
+        let n = do_poll(task, &mut fds, timeout);
+        // SAFETY: same pointer/length as the parse step; user AS still active.
+        unsafe { write_pollfds(ptr, &fds) };
+        ctx.set_return(SyscallReturn::ok(n as u64));
+        return;
+    }
+
+    // ── Park path. Mirrors `epoll_wait_common`. ──
+    // SAFETY: `current_user_task()` returned Some, checked in `can_park`.
+    let uctx_ptr = uctx_opt.unwrap();
+
+    // Reset net-I/O-wait + snapshot the readiness generation BEFORE the scan so
+    // a `notify` racing our scan→park window is caught by the park routine's
+    // lost-wake guard. Re-armed every cycle (the syscall re-executes on wake).
+    // SAFETY: in-flight task's UserTaskCtx, live for this trap; atomics.
+    unsafe {
+        (*uctx_ptr).net_io_wait.store(false, Ordering::Release);
+        (*uctx_ptr)
+            .epoll_park_gen
+            .store(narf_net::readiness::generation(), Ordering::Release);
+    }
+
+    // Park deadline. `blocking_deadline_ns` persists across the RIP-rewind
+    // re-executions so a finite timeout detects expiry instead of re-arming
+    // now+timeout forever (the scheduler clears `sleep_deadline_ns` on expiry).
+    let deadline_ns: Option<u64> = {
+        // SAFETY: as above.
+        let uctx = unsafe { &*uctx_ptr };
+        if timeout > 0 {
+            let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
+            let d = if persisted != 0 {
+                persisted
+            } else {
+                let d = narf_scheduler::narf_time::monotonic_ns()
+                    .saturating_add((timeout as u64) * 1_000_000);
+                uctx.blocking_deadline_ns.store(d, Ordering::Release);
+                d
+            };
+            uctx.sleep_deadline_ns.store(d, Ordering::Release);
+            Some(d)
+        } else {
+            // Infinite (timeout < 0).
+            uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+            None
+        }
+    };
+
+    // One readiness pass.
+    let ready = poll_scan(task, &mut fds);
+    if ready > 0 {
+        // SAFETY: as above.
+        unsafe {
+            (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+            (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+        }
+        // SAFETY: same pointer/length as the parse step.
+        unsafe { write_pollfds(ptr, &fds) };
+        ctx.set_return(SyscallReturn::ok(ready as u64));
+        return;
+    }
+
+    // Finite timeout already elapsed across re-executions → return 0.
+    if let Some(d) = deadline_ns {
+        if d != u64::MAX && narf_scheduler::narf_time::monotonic_ns() >= d {
+            // SAFETY: as above.
+            unsafe {
+                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+            }
+            // SAFETY: same pointer/length.
+            unsafe { write_pollfds(ptr, &fds) };
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+    }
+
+    // Park: register the net-I/O waker + a timer fallback, re-execute on wake.
+    if let Some(hook) = crate::user_task::yield_hook() {
+        // A pending unblocked signal interrupts the wait with -EINTR.
+        if let Some(h) = crate::signal_delivery_hook() {
+            if h(ctx, crate::Syscall::Poll.raw()) {
+                // SAFETY: clearing this task's own park deadlines.
+                unsafe {
+                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                }
+                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // EINTR
+                return;
+            }
+        }
+        // SAFETY: in-flight task's UserTaskCtx; we park exactly this task.
+        unsafe {
+            let uc = &*uctx_ptr;
+            uc.net_io_wait.store(true, Ordering::Release);
+            // Clamp the scheduler wake-up to the nearest armed timerfd (its
+            // expiry fires no readiness notify).
+            if let Some(timer_dl) = poll_nearest_deadline(task, &fds) {
+                let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
+                let clamped = if cur == 0 { timer_dl } else { cur.min(timer_dl) };
+                uc.sleep_deadline_ns.store(clamped, Ordering::Release);
+            }
+            // Rewind RIP over the 2-byte syscall so we re-execute poll on wake.
+            ctx.set_rip(ctx.rip().wrapping_sub(2));
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                crate::handlers::own_stack_block(ctx);
+                return;
+            }
+            hook(uctx_ptr);
+        }
+        // unreachable
+    }
+
+    // No yield hook (early boot): can't block — report nothing ready.
+    // SAFETY: same pointer/length.
     unsafe { write_pollfds(ptr, &fds) };
-
-    ctx.set_return(SyscallReturn::ok(n as u64));
+    ctx.set_return(SyscallReturn::ok(0));
 }
