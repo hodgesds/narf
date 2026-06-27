@@ -487,6 +487,13 @@ impl Arch {
                     "-device".into(),
                     "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                 ]);
+                // `XTASK_QEMU_QMP=<path>` exposes a QMP control socket so a host
+                // tool can drive QEMU (e.g. `screendump` to capture what the
+                // guest is scanning out). Off unless the env var is set.
+                if let Ok(sock) = std::env::var("XTASK_QEMU_QMP") {
+                    args.push("-qmp".into());
+                    args.push(format!("unix:{sock},server,nowait"));
+                }
 
                 let virtio = matches!(profile, HwProfile::Full | HwProfile::VirtioOnly);
                 let legacy = matches!(profile, HwProfile::Full | HwProfile::LegacyOnly);
