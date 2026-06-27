@@ -1,7 +1,9 @@
 //! Userspace ELF coredump generator.
 
 use crate::handlers::{poll_blocking, resolve_cwd_path, resolve_parent_dir_async};
-use crate::user_task::{with_user_task_ctx, UserState};
+#[cfg(target_arch = "x86_64")]
+use crate::user_task::with_user_task_ctx;
+use crate::user_task::UserState;
 use alloc::vec::Vec;
 use narf_filesystem::{FileOps, FsError};
 use narf_memory::PhysAddr;
