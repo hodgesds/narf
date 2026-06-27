@@ -799,6 +799,16 @@ impl FileOps for SocketFile {
         }
     }
 
+    /// A readiness transition on a socket fires `readiness::notify` (the
+    /// AF_UNIX send/connect paths and the TCP receive path both call it), so a
+    /// `poll`/`epoll` waiter parked on a socket is woken promptly. This lets
+    /// the blocking-poll fast path PARK an all-socket wait instead of
+    /// busy-spinning — without it a Wayland client blocked in `poll(-1)` on its
+    /// display fd pins a CPU and starves the cooperative own-stack executor.
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     fn stat(&self) -> Stat {
         Stat {
             size: 0,
@@ -2433,6 +2443,15 @@ impl SocketFile {
         }
         let n = tx.write(buf);
         tx.write_fds(fds);
+        drop(state);
+        // Wake a peer parked in poll/epoll/recv on the other end — same as
+        // `do_send`. An fd-passing `sendmsg` (SCM_RIGHTS) is how libseat hands a
+        // compositor its DRM/input fds; without this, a client blocked in
+        // `poll(-1)` on the libseat socket never learns the reply arrived and
+        // stalls device setup until a coarse fallback tick. `notify` (not a bare
+        // `wake_io_waiters`) also bumps the readiness generation so an
+        // infinite-timeout waiter breaks its re-park via the lost-wake guard.
+        narf_net::readiness::notify(0);
         Ok(n)
     }
 

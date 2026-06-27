@@ -427,6 +427,19 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// Whether a readiness transition on this file fires a
+    /// `narf_net::readiness::notify`, so a parked `poll`/`epoll` waiter is
+    /// woken promptly rather than only on a coarse fallback tick. Sockets
+    /// (which `notify` on send/connect/data) override to `true`; "silent"
+    /// sources — pipes, eventfds, ttys — leave it `false`, and a blocking
+    /// `poll` over any of them must keep its prompt re-scan instead of
+    /// parking (it would otherwise sleep out a finite timeout / miss the edge
+    /// until the fallback). A `timerfd` returns `false` here but advertises a
+    /// `poll_deadline`, which the park path clamps its wake-up to.
+    fn readiness_notifies(&self) -> bool {
+        false
+    }
+
     /// Linux `ioctl(2)` dispatch for this file. `cmd` is the encoded
     /// request word (Linux `_IOC(dir, type, nr, size)`); `arg` is the
     /// raw user-pointer argument the syscall layer received.
