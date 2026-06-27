@@ -2466,6 +2466,64 @@ fn smoke_memory_mmap_arena_fails_closed_at_ceiling() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_mmap_arena_fails_closed_at_ceiling);
 
+/// Regression: an in-place `mremap` grow (`grow_region`) MUST advance the
+/// monotonic mmap bump cursor past the grown region, exactly as a fresh
+/// `map_region` does. Before the fix, `grow_region` extended the region's
+/// length without bumping the cursor, so the next `reserve_mmap_va` handed
+/// back a VA *inside* the grown tail and the follow-up `map_region` failed
+/// with `Overlap` — surfacing in userspace as a spurious `mmap`/`malloc`
+/// failure (musl's mallocng grows its arenas with mremap, so weston's
+/// desktop-shell hit it and "could not allocate closure" → the compositor
+/// quit). All regions are lazy (phys == 0); we only exercise VA bookkeeping.
+fn smoke_memory_grow_region_bumps_mmap_cursor() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    // Map a 1-page region at the bump cursor.
+    let base = a.reserve_mmap_va(0x1000);
+    if base == 0 {
+        return TestResult::Fail("first reserve_mmap_va failed");
+    }
+    if a
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![crate::PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("initial map_region failed");
+    }
+    // Grow it in place to 4 pages — the mremap-style path.
+    if a.grow_region(VirtAddr::new(base), 0x4000).is_err() {
+        return TestResult::Fail("grow_region failed");
+    }
+    // The next reservation MUST land past the grown region (the bug:
+    // cursor not bumped → a VA inside the grown tail comes back).
+    let next = a.reserve_mmap_va(0x1000);
+    if next == 0 {
+        return TestResult::Fail("second reserve_mmap_va failed");
+    }
+    if next < base + 0x4000 {
+        return TestResult::Fail("reserve handed back a VA inside the grown region");
+    }
+    // And mapping there must succeed — never collide with the grown region.
+    if a
+        .map_region(Region {
+            base: VirtAddr::new(next),
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![crate::PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("post-grow map_region overlapped the grown region");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_grow_region_bumps_mmap_cursor);
+
 /// Buddy allocator invariant: a sequence of N back-to-back
 /// `alloc_frame` calls without any intervening `free_frame` MUST
 /// return N distinct physical frames. A failure here is the root

@@ -399,6 +399,16 @@ impl AddressSpace {
             region.phys.push(PhysAddr::new(0));
         }
         region.len = new_len;
+        let (rb, rl) = (base.as_u64(), new_len);
+        drop(regions);
+        // Keep the mmap-allocation cursor past the grown region, exactly as
+        // `map_region` does for a fresh mapping. Without this, an in-place
+        // `mremap` grow extends the region past the monotonic bump cursor;
+        // a later `reserve_mmap_va` then hands back a VA *inside* the grown
+        // tail, and `map_region` rejects it as Overlap — surfacing as a
+        // spurious `mmap`/`malloc` failure (musl's mallocng grows arenas
+        // this way, so a heavy client like weston's desktop-shell hits it).
+        self.bump_mmap_cursor_past(rb, rl);
         Ok(())
     }
 
