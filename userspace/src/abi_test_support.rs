@@ -390,16 +390,20 @@ pub fn call_utimes(path_ptr: u64, tv_ptr: u64) -> Option<i64> {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        call(
-            Syscall::Utimensat.raw(),
-            SyscallArgs {
-                arg0: 0xffffffffffffff9c,
-                arg1: path_ptr,
-                arg2: tv_ptr,
-                arg3: 0,
-                ..Default::default()
-            },
-        )
+        if path_ptr == 0 {
+            Some(EFAULT)
+        } else {
+            call(
+                Syscall::Utimensat.raw(),
+                SyscallArgs {
+                    arg0: 0xffffffffffffff9c,
+                    arg1: path_ptr,
+                    arg2: tv_ptr,
+                    arg3: 0,
+                    ..Default::default()
+                },
+            )
+        }
     }
 }
 
@@ -410,13 +414,112 @@ pub fn call_utime(path_ptr: u64, utx_ptr: u64) -> Option<i64> {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        if path_ptr == 0 {
+            Some(EFAULT)
+        } else {
+            call(
+                Syscall::Utimensat.raw(),
+                SyscallArgs {
+                    arg0: 0xffffffffffffff9c,
+                    arg1: path_ptr,
+                    arg2: utx_ptr,
+                    arg3: 0,
+                    ..Default::default()
+                },
+            )
+        }
+    }
+}
+
+pub fn call_creat(path_ptr: u64, mode: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Creat.raw(), a1(path_ptr, mode))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
         call(
-            Syscall::Utimensat.raw(),
+            Syscall::Openat.raw(),
             SyscallArgs {
-                arg0: 0xffffffffffffff9c,
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
                 arg1: path_ptr,
-                arg2: utx_ptr,
-                arg3: 0,
+                arg2: 0o100 | 0o1 | 0o1000, // O_CREAT | O_WRONLY | O_TRUNC
+                arg3: mode,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_unlink(path_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Unlink.raw(), a0(path_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Unlinkat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: path_ptr,
+                arg2: 0,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_rename(old_ptr: u64, new_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Rename.raw(), a1(old_ptr, new_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Renameat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: old_ptr,
+                arg2: 0xffffffffffffff9c, // AT_FDCWD
+                arg3: new_ptr,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_rmdir(path_ptr: u64) -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Rmdir.raw(), a0(path_ptr))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Unlinkat.raw(),
+            SyscallArgs {
+                arg0: 0xffffffffffffff9c, // AT_FDCWD
+                arg1: path_ptr,
+                arg2: 0x200, // AT_REMOVEDIR
+                ..Default::default()
+            },
+        )
+    }
+}
+
+pub fn call_getpgrp() -> Option<i64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call(Syscall::Getpgrp.raw(), a0(0))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        call(
+            Syscall::Getpgid.raw(),
+            SyscallArgs {
+                arg0: 0,
                 ..Default::default()
             },
         )

@@ -124,7 +124,7 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_neg);
 // ── getpgrp(2) — caller's pgid, no args ──
 
 fn smoke_abi_proc_getpgrp_pos() -> TestResult {
-    with_setup(|| match call(Syscall::Getpgrp.raw(), a0(0)) {
+    with_setup(|| match call_getpgrp() {
         Some(v) if v >= 0 => Ok(()),
         Some(_) => Err("getpgrp returned negative"),
         None => Err("getpgrp returned non-Ok status"),

@@ -2539,6 +2539,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::EpollCreate, 20), // epoll_create1
     (Syscall::EpollCtl, 21),
     (Syscall::EpollWait, 22), // epoll_pwait
+    (Syscall::EpollPwait, 22),
     (Syscall::Dup, 23),
     (Syscall::Dup3, 24),
     (Syscall::Fcntl, 25),
@@ -2755,7 +2756,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Mlockall, 230),
     (Syscall::Munlockall, 231),
     (Syscall::MemfdSecret, 447),
-    (Syscall::ProcessMadvise, 233),
+    (Syscall::ProcessMadvise, 440),
     (Syscall::MovePages, 239),
     (Syscall::SetMempolicyHomeNode, 450),
     (Syscall::MigratePages, 238),
@@ -2892,6 +2893,7 @@ const NARF_EXTENSION_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Pipe, 0x4070),
     (Syscall::Stat, 0x4071),
     (Syscall::Lstat, 0x4072),
+    (Syscall::Alarm, 0x4073),
 ];
 
 impl Syscall {

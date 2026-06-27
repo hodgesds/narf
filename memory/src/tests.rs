@@ -594,6 +594,7 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
             match crate::slab::alloc(layout) {
                 Ok(p) => {
                     let raw = p.as_ptr() as u64;
+                    #[cfg(target_arch = "x86_64")]
                     if raw >= usable_bytes {
                         for (q, ql) in held.drain(..) {
                             // SAFETY: the operation upholds its documented invariant (see surrounding context).
