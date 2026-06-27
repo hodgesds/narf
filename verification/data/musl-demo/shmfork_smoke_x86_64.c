@@ -1,29 +1,26 @@
-// shmfork_smoke — MAP_SHARED|MAP_ANONYMOUS + fork stop-propagation.
+// shmfork_smoke — MAP_SHARED|MAP_ANONYMOUS + signal-driven fork stop-propagation.
 //
-// REPRO for an OPEN bug (deterministic, reproduces even at NARF_QEMU_SMP=1):
-// a write to a MAP_SHARED|MAP_ANONYMOUS page made from a SIGNAL HANDLER is not
-// observed by forked children, even though a DIRECT write to the same page is.
-// This is the kernel-level cause of the SMP `chroot_run` (stress-ng) hang: a
-// worker spins on a shared "keep going" flag whose stop-write is driven from
-// the parent's SIGALRM handler, so the worker never stops.
+// Regression test for the SMP `chroot_run` (stress-ng) hang. A parent stops its
+// CPU-bound worker children by writing a shared "keep going" flag from a SIGALRM
+// handler while blocked in waitpid — the stress-ng pattern. This exercised two
+// kernel signal bugs (both fixed; this was NOT a MAP_SHARED coherence bug):
+//   (1) setitimer(ITIMER_REAL) SIGALRM was not delivered to a parent parked in
+//       waitpid under spinner load — the timer-IRQ check only inspected the
+//       interrupted (child) task, and wait4 wasn't signal-interruptible. Fixed:
+//       itimer_real_collect_all_due_irq scans every task's ITIMER_REAL from the
+//       tick + raise/wake; wait4 registers a signal waker and returns EINTR.
+//   (2) the signal mask was never restored on sigreturn, so the auto-blocked
+//       SIGALRM stayed masked forever and a SECOND alarm never fired. Fixed:
+//       SIGRETURN_SAVED_MASK saved at delivery, restored in sys_sigreturn.
 //
-// Two phases over ONE shared page:
-//   phase1-direct  (control): parent forks NKIDS spinners, then writes the
-//                  sentinel DIRECTLY. Children observe it -> OK. Proves the
-//                  MAP_SHARED frame is aliased into the children and coherent.
-//   phase2-sigalrm (bug):     parent forks NKIDS spinners, arms
-//                  setitimer(ITIMER_REAL) and blocks in waitpid; its SIGALRM
-//                  handler writes the same shared page. The handler RUNS (it
-//                  reads its own write back as SENTINEL) yet the children never
-//                  observe it and spin to the cap -> TIMEOUT.
-//
-// What was ruled out while narrowing this (see the session notes): signal
-// delivery itself works (the handler runs), the itimer fires, the parent's CR3
-// at delivery equals its normal CR3, no COW fault hits the shared page, no
-// demand-fault hits the shared region, and the page tables show parent AND each
-// child mapping the SAME shared frame R/W both at fork+materialize and at
-// delivery time. The remaining question: why the child reads stale-0 from a
-// frame the page tables say it shares with the parent.
+// Three phases over ONE shared page (all must print OK):
+//   phase1-direct  : parent writes the sentinel DIRECTLY -> children observe it.
+//                    Proves the MAP_SHARED frame is aliased + coherent.
+//   phase2-sigalrm : parent arms setitimer(ITIMER_REAL) + blocks in waitpid; the
+//                    SIGALRM handler writes the shared page. Exercises bug (1).
+//   phase3-raise   : parent delivers SIGALRM synchronously via raise(). Running
+//                    AFTER phase2, it exercises bug (2) — the mask must have been
+//                    restored after phase2's handler or this SIGALRM stays masked.
 //
 // Not in the musl-demo CI auto-run list (like chroot_run); run manually:
 //   XTASK_QEMU_ACCEL=kvm cargo xtask run-interactive --arch=x86_64 \
@@ -42,7 +39,7 @@
 #define NKIDS 8
 #define SENTINEL 0xABCDu
 // Spin cap: large enough a coherent write is always seen well before it,
-// bounded so the buggy phase terminates (a few seconds) instead of hanging.
+// bounded so a regressed phase terminates (a few seconds) instead of hanging.
 #define SPIN_CAP 6000000000ULL
 
 static volatile uint32_t *g_flags; // shared page, NKIDS slots
@@ -84,9 +81,18 @@ static int spawn_and_wait(volatile uint32_t *flags, int via_alarm) {
         struct sigaction sa = {0};
         sa.sa_handler = on_alarm;
         sigaction(SIGALRM, &sa, 0);
-        struct itimerval it = {0};
-        it.it_value.tv_usec = 200000; // 200ms one-shot
-        setitimer(ITIMER_REAL, &it, 0);
+        if (via_alarm == 2) {
+            // DIAGNOSTIC: deliver SIGALRM SYNCHRONOUSLY via raise() after the
+            // children spin up — isolates handler-context write coherence from
+            // itimer SIGALRM delivery to a parked parent.
+            for (volatile uint64_t d = 0; d < 20000000ULL; d++) {
+            }
+            raise(SIGALRM);
+        } else {
+            struct itimerval it = {0};
+            it.it_value.tv_usec = 200000; // 200ms one-shot
+            setitimer(ITIMER_REAL, &it, 0);
+        }
     } else {
         // Control: direct write after letting the children start spinning.
         for (volatile uint64_t d = 0; d < 20000000ULL; d++) {
@@ -120,8 +126,10 @@ int main(void) {
     printf("SHMFORK: phase1-direct %s\n", p1 ? "OK" : "TIMEOUT");
     int p2 = spawn_and_wait(flags, 1);
     printf("SHMFORK: phase2-sigalrm %s\n", p2 ? "OK" : "TIMEOUT");
+    int p3 = spawn_and_wait(flags, 2);
+    printf("SHMFORK: phase3-raise %s\n", p3 ? "OK" : "TIMEOUT");
 
-    int ok = p1 && p2;
+    int ok = p1 && p2 && p3;
     printf("SHMFORK: %s\n", ok ? "ALL-CHILDREN-SAW-FLAG" : "SOME-CHILD-TIMEOUT");
     return ok ? 0 : 1;
 }

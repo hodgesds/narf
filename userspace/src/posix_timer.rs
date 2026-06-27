@@ -789,6 +789,52 @@ pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
     true
 }
 
+/// IRQ-context scan of **every** task's ITIMER_REAL slot — the multi-task
+/// generalization of [`itimer_real_check_due_irq`]. For each due slot it
+/// advances (periodic) / disarms (one-shot) the deadline under the lock and
+/// records the owning task id in `out`; returns the number written (bounded
+/// by `out.len()` — any overflow stays due and is caught next tick).
+///
+/// Why this exists: the single-current-task check only ever inspects the
+/// *interrupted* task's slot. But a task that arms `setitimer(ITIMER_REAL)`
+/// and then PARKS (e.g. blocks in `waitpid`) is never the interrupted task
+/// while sibling CPU-bound tasks run — and the sleep-pump that would catch
+/// the parked owner starves under that load (each busy task holds its CPU's
+/// executor, so no round runs). Linux's `it_real_fn` is a per-process
+/// hrtimer that fires regardless of which task is on-CPU; this restores that
+/// semantics. Fully alloc-free (advance-in-place under the existing
+/// `IrqSafeSpinLock`); the caller raises + wakes each returned task.
+pub fn itimer_real_collect_all_due_irq(now: u64, out: &mut [u64]) -> usize {
+    let mut n = 0usize;
+    let mut g = ITIMERS.lock();
+    let map = match g.as_mut() {
+        Some(m) => m,
+        None => return 0,
+    };
+    for (task, slots) in map.iter_mut() {
+        if n >= out.len() {
+            // No room to record this owner — leave its slot due so the next
+            // tick re-finds it rather than advancing past a lost expiry.
+            break;
+        }
+        let slot = &mut slots[ITIMER_REAL as usize];
+        if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
+            continue;
+        }
+        if slot.interval_ns == 0 {
+            slot.next_fire_ns = 0;
+        } else {
+            let fires = ((now - slot.next_fire_ns) / slot.interval_ns).saturating_add(1);
+            slot.next_fire_ns = slot
+                .next_fire_ns
+                .saturating_add(slot.interval_ns.saturating_mul(fires));
+        }
+        out[n] = *task;
+        n += 1;
+    }
+    n
+}
+
 /// Sleep-pump: walks every per-task timer table, fires expired
 /// signals via the existing `raise_signal_pending` path. Re-arms
 /// periodic timers. Counts missed expiries into `overrun`.

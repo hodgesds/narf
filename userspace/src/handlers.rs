@@ -9785,7 +9785,15 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
-        crate::user_task::register_wait_child_waker(parent, waker);
+        crate::user_task::register_wait_child_waker(parent, waker.clone());
+        // wait4 is signal-interruptible (Linux). Register a SIGNAL waker too so
+        // an asynchronously-raised signal — e.g. the parent's own ITIMER_REAL
+        // SIGALRM that stops its CPU-bound workers, fired from the timer tick
+        // (`timer_tick_raise_due_signals`) while we block here — wakes this
+        // loop even though no child has exited. Without it the owner of a
+        // setitimer(ITIMER_REAL) blocked in wait4 never takes its SIGALRM: the
+        // kernel cause of the SMP chroot_run / stress-ng hang.
+        crate::handlers::register_signal_waker(parent, waker);
         // Re-check after registering (a child may have exited in the window).
         let mut status2 = 0i32;
         let reaped2 =
@@ -9796,6 +9804,27 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
             uc.wait_child_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             ctx.set_return(SyscallReturn::ok(rax));
+            return;
+        }
+        // A deliverable signal is pending — abandon the wait with EINTR. The
+        // syscall-return path (the caller returns straight after this) runs
+        // the signal-delivery hook, so the handler executes and the syscall
+        // returns -EINTR; musl's waitpid loop then re-issues the wait.
+        if is_signal_pending(parent) {
+            crate::user_task::drop_wait_child_waker(parent);
+            uc.wait_child_pending
+                .store(false, core::sync::atomic::Ordering::Release);
+            // Deliver the pending signal NOW. The own-stack syscall return
+            // (`dispatch_syscall` + its sysret asm) runs NO delivery hook, so
+            // unlike the trap-return paths we must set up the handler frame
+            // here: `maybe_deliver_signal_before_yield` bakes -EINTR into the
+            // saved state and invokes the signal-delivery hook, so the handler
+            // runs on this sysret and the syscall returns -EINTR (musl's
+            // waitpid loop then re-issues the wait). If no hook is installed
+            // (test contexts) fall back to a bare -EINTR.
+            if !maybe_deliver_signal_before_yield(ctx, SYSCALL_NUM_NONE) {
+                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+            }
             return;
         }
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
@@ -15085,6 +15114,30 @@ fn sigreturn_is_rt(task: u64) -> bool {
         .unwrap_or(true)
 }
 
+// Pre-handler signal mask, saved when a signal is delivered so `sys_sigreturn`
+// can restore it. POSIX: on return from a handler the signal mask in effect
+// just before the handler ran is restored — crucially undoing the auto-block of
+// the delivered signal. Without this the auto-blocked signal stays masked
+// forever, so a SECOND occurrence is never delivered (observed: a second
+// setitimer(ITIMER_REAL)/raise SIGALRM never firing after the first handler ran
+// — whichever alarm phase ran second hung). Single-slot per task, matching the
+// SIGRETURN_IS_RT / SIGRETURN_USE_RSP records (nested handlers share NARF's
+// existing single-record limitation). Only the async delivery path records here
+// (it is the one that auto-blocks); a `None` on return leaves the mask alone.
+static SIGRETURN_SAVED_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn set_sigreturn_saved_mask(task: u64, mask: u32) {
+    let mut g = SIGRETURN_SAVED_MASK.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    map.insert(task, mask);
+}
+
+fn take_sigreturn_saved_mask(task: u64) -> Option<u32> {
+    let mut g = SIGRETURN_SAVED_MASK.lock();
+    g.as_mut().and_then(|m| m.remove(&task))
+}
+
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
@@ -15698,17 +15751,29 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
 /// interrupts disabled from the trap handler. The raised signal is then
 /// delivered by `signal_delivery_hook` on the same trap's return to user.
 pub fn timer_tick_raise_due_signals() {
-    let task = current_task_id();
-    if task == 0 {
-        return;
-    }
     #[cfg(feature = "linux-compat")]
     {
         let now = narf_scheduler::narf_time::monotonic_ns();
-        if crate::posix_timer::itimer_real_check_due_irq(task, now) {
-            // SIGALRM (14). Slot was pre-created when the timer was armed;
-            // the full timer-IRQ delivery hook takes it on this trap return.
-            let _ = raise_signal_pending_irq(task, 14);
+        // Scan EVERY armed ITIMER_REAL slot, not just the interrupted task's.
+        // The owner of a `setitimer(ITIMER_REAL)` is frequently PARKED (e.g.
+        // blocked in waitpid while CPU-bound children spin) — so it's never
+        // the interrupted task, and the sleep-pump that would catch it
+        // starves under that load. Without this scan the parked owner's
+        // SIGALRM never fires (the kernel cause of the SMP chroot_run /
+        // stress-ng hang, where a parent stops its workers via an alarm).
+        let mut due: [u64; 64] = [0; 64];
+        let n = crate::posix_timer::itimer_real_collect_all_due_irq(now, &mut due);
+        for &t in &due[..n] {
+            // SIGALRM (14). Slot was pre-created when the timer was armed, so
+            // this only sets a bit in an existing entry (never allocates).
+            let _ = raise_signal_pending_irq(t, 14);
+            // Wake the owner if it's parked so waitpid/pause returns EINTR and
+            // SIGALRM is delivered on its return-to-user. For the currently
+            // running owner (the original CPU-bound case) this is a harmless
+            // no-op — it has no parked waker and takes the signal on this
+            // trap's return. Every lock `wake_signal` touches is an
+            // `IrqSafeSpinLock`, so this is safe from the timer ISR.
+            wake_signal(t);
         }
     }
 }
@@ -17010,6 +17075,17 @@ pub(crate) fn default_signal_delivery_restricted(
             *slot &= !(1u32 << signum);
         }
     }
+    // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
+    // undoing the auto-block below. Captured BEFORE the SA_NODEFER OR so the
+    // restored value is the mask in effect when the handler was entered.
+    {
+        let cur = SIGNAL_MASK
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&task).copied())
+            .unwrap_or(0);
+        set_sigreturn_saved_mask(task, cur);
+    }
     // SA_NODEFER: skip the auto-block. Default: add the delivered
     // signal to the mask so the handler runs without re-entrancy.
     if (action.flags & SA_NODEFER) == 0 {
@@ -17357,6 +17433,15 @@ fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     let is_rt = sigreturn_is_rt(task);
     if !ctx.perform_sigreturn(sc_vaddr, is_rt) {
         ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    // POSIX: restore the signal mask that was in effect before the handler ran,
+    // undoing the auto-block of the delivered signal. Only the async delivery
+    // path records a saved mask; a `None` (e.g. a sync-fault handler return)
+    // leaves the mask untouched. Without this the delivered signal stays blocked
+    // forever and a second occurrence is never taken.
+    if let Some(saved) = take_sigreturn_saved_mask(task) {
+        let _ = set_signal_mask_for_task(task, saved);
     }
 }
 

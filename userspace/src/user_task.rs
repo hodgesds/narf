@@ -1484,9 +1484,43 @@ impl core::future::Future for UserTaskFuture {
                         .store(false, Ordering::Release);
                     // Fall through to re-enter user mode.
                 } else {
-                    // Truly no child yet — park until `on_child_exit`
-                    // wakes us.  Do NOT call wake_by_ref here.
-                    return core::task::Poll::Pending;
+                    // Truly no child yet. wait4 is signal-interruptible
+                    // (Linux): register a SIGNAL waker so an asynchronously
+                    // raised signal — e.g. the parent's own ITIMER_REAL
+                    // SIGALRM that stops its workers, fired from the timer
+                    // tick while we park here — wakes us even though no child
+                    // has exited. If a deliverable signal is already pending,
+                    // abandon the wait with EINTR: bake -EINTR into the saved
+                    // frame, clear the wait state, and fall through to
+                    // re-enter user mode, where the delivery hook runs the
+                    // handler and the syscall returns -EINTR (musl's waitpid
+                    // loop re-issues the wait, which then reaps). Without this
+                    // a parent blocked in wait4 while CPU-bound children spin
+                    // never takes its SIGALRM — the SMP chroot_run/stress-ng
+                    // hang.
+                    crate::handlers::register_signal_waker(task_pid, cx.waker().clone());
+                    if crate::handlers::is_signal_pending(task_pid) {
+                        drop_wait_child_waker(task_pid);
+                        // SAFETY: `state.get()` is the `*mut UserState` backing
+                        // this future's saved frame; we own it (Pin-stable) and
+                        // no other handle aliases it here.
+                        unsafe {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                let us = &mut *this.ctx.state.get();
+                                us.rax = (-4i64) as u64; // -EINTR
+                            }
+                        }
+                        this.ctx.wait_child_pending.store(false, Ordering::Release);
+                        this.ctx
+                            .wait_child_is_waitid
+                            .store(false, Ordering::Release);
+                        // Fall through to re-enter user mode (delivers SIGALRM).
+                    } else {
+                        // Truly park until `on_child_exit` or `wake_signal`
+                        // fires our waker.  Do NOT call wake_by_ref here.
+                        return core::task::Poll::Pending;
+                    }
                 }
             }
         }
@@ -2060,7 +2094,33 @@ impl core::future::Future for UserTaskFuture {
                         .wait_child_is_waitid
                         .store(false, Ordering::Release);
                 } else {
-                    return core::task::Poll::Pending;
+                    // wait4 is signal-interruptible (Linux): register a SIGNAL
+                    // waker so an async signal (e.g. ITIMER_REAL SIGALRM fired
+                    // from the timer tick while parked) wakes us even with no
+                    // child exit; if a deliverable signal is already pending,
+                    // abandon the wait with EINTR and fall through to deliver.
+                    // See the x86_64 poll for the full rationale.
+                    crate::handlers::register_signal_waker(task_pid, cx.waker().clone());
+                    if crate::handlers::is_signal_pending(task_pid) {
+                        drop_wait_child_waker(task_pid);
+                        // SAFETY: `state.get()` is the `*mut UserState` backing
+                        // this future's saved frame; we own it (Pin-stable) and
+                        // no other handle aliases it here.
+                        unsafe {
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                let us = &mut *this.ctx.state.get();
+                                us.x[0] = (-4i64) as u64; // -EINTR
+                            }
+                        }
+                        this.ctx.wait_child_pending.store(false, Ordering::Release);
+                        this.ctx
+                            .wait_child_is_waitid
+                            .store(false, Ordering::Release);
+                        // Fall through to re-enter user mode (delivers SIGALRM).
+                    } else {
+                        return core::task::Poll::Pending;
+                    }
                 }
             }
         }
