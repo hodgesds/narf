@@ -3474,6 +3474,7 @@ fn boot_userspace_init() {
                 ("distro_init", narf_verification::NARF_DISTRO_INIT_ELF),
                 ("distro_desktop", narf_verification::NARF_DISTRO_DESKTOP_ELF),
                 ("chroot_run", narf_verification::NARF_CHROOT_RUN_ELF),
+                ("shmfork_smoke", narf_verification::NARF_SHMFORK_SMOKE_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
                 ("net6_smoke", narf_verification::NARF_NET6_SMOKE_ELF),
                 ("unix_smoke", narf_verification::NARF_UNIX_SMOKE_ELF),
