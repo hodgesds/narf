@@ -43,6 +43,15 @@ use super::superblock::{ExtFlavour, Superblock};
 /// of simultaneous execve loads (each stage streams a binary block-by-block).
 const SCRATCH_POOL_LEN: usize = 16;
 
+/// Size of each scratch DMA buffer. A multi-block `BlockRequest` reads up to
+/// this many contiguous device bytes per submit, so a sequential file read
+/// pays one submit→await round-trip per buffer instead of one per logical
+/// block — with a 512-byte LBS that's 8 LBAs per request, so mmap'ing a big
+/// DSO does ~8× fewer device round-trips. Capped at a single 4 KiB page
+/// because `narf_io::alloc_coherent` allocates at most one page per buffer
+/// (a larger contiguous coherent region would need a descriptor chain).
+const SCRATCH_BUF_BYTES: usize = 4096;
+
 #[derive(Debug)]
 struct VolumeIo {
     /// Free list of registered DMA scratch buffers. A device op pops one
@@ -53,18 +62,11 @@ struct VolumeIo {
     /// pool, concurrent ops use distinct buffers — the block device, not a
     /// lock, serialises the actual requests.
     pool: Vec<Cap<DmaBuffer, Write>>,
-    /// Logical block size of the underlying device — every
-    /// `BlockRequest` is exactly this many bytes.
+    /// Logical block size of the underlying device.
     lbs: usize,
-}
-
-impl VolumeIo {
-    /// Resolve the first pool buffer. Only the single-threaded mount path
-    /// (which runs before the volume is shared) uses this directly; the
-    /// concurrent runtime path resolves its own acquired buffer.
-    fn buffer(&self) -> Option<Arc<DmaBuffer>> {
-        resolve_cap(self.pool.first()?)
-    }
+    /// Byte size of each pooled scratch buffer (a multiple of `lbs`, >= `lbs`).
+    /// Bounds how many blocks one multi-block `BlockRequest` can read at once.
+    scratch_bytes: usize,
 }
 
 impl Drop for VolumeIo {
@@ -180,27 +182,38 @@ async fn read_indirect_static<B: BlockDevice>(
     ]))
 }
 
-/// Free-function variant of `Ext2Volume::read_byte_range_into`
-/// usable from other free helpers.
-async fn read_byte_range_into_static<B: BlockDevice>(
+/// Read `dst.len()` device bytes starting at `byte_off` into `dst`, using one
+/// exclusively-owned scratch buffer `scratch` of `scratch_bytes` (a multiple of
+/// `lbs`). The whole range is contiguous on the device, so each submit reads as
+/// many LBAs as fit in the scratch buffer (`blocks: n`) in a single round-trip
+/// — the old code read one LBA per submit, so a large sequential read paid one
+/// park→IRQ→wake per logical block (the dominant cost of mmap'ing big DSOs).
+async fn device_read_into<B: BlockDevice>(
     device: &B,
-    io: &VolumeIo,
+    lbs: usize,
+    scratch_bytes: usize,
+    scratch: &Cap<DmaBuffer, Write>,
     byte_off: u64,
     dst: &mut [u8],
 ) -> Result<(), FsError> {
-    let lbs = io.lbs;
+    let buf_blocks = (scratch_bytes / lbs).max(1);
     let mut cursor = 0usize;
     while cursor < dst.len() {
         let abs = byte_off + cursor as u64;
         let lba = abs / lbs as u64;
         let in_lba = (abs % lbs as u64) as usize;
-        let want = core::cmp::min(dst.len() - cursor, lbs - in_lba);
+        let remaining = dst.len() - cursor;
+        // Blocks that cover [in_lba, in_lba+remaining), capped to the buffer.
+        let need_blocks = (in_lba + remaining + lbs - 1) / lbs;
+        let n_blocks = need_blocks.min(buf_blocks).max(1);
+        let span = n_blocks * lbs; // bytes the device writes into the buffer
+        let take = remaining.min(span - in_lba); // bytes to copy out this round
 
         let req = BlockRequest {
             op: BlockOp::Read,
             lba,
-            blocks: 1,
-            buffer: io.pool[0]
+            blocks: n_blocks as u32,
+            buffer: scratch
                 .derive::<Read>()
                 .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
             qos: QosHint::Latency,
@@ -209,15 +222,26 @@ async fn read_byte_range_into_static<B: BlockDevice>(
         let completion = device.submit(req).await;
         completion.result.map_err(FsError::Io)?;
 
-        let buf = io
-            .buffer()
+        let buf = resolve_cap(scratch)
             .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-        // SAFETY: see Ext2Volume::read_byte_range_into.
-        let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
-        dst[cursor..cursor + want].copy_from_slice(&src[in_lba..in_lba + want]);
-        cursor += want;
+        // SAFETY: `scratch` is exclusively owned for this op; the device wrote
+        // `span` (<= scratch_bytes) bytes from its start, so the slice is valid.
+        let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), span) };
+        dst[cursor..cursor + take].copy_from_slice(&src[in_lba..in_lba + take]);
+        cursor += take;
     }
     Ok(())
+}
+
+/// Free-function variant of `Ext2Volume::read_byte_range_into`
+/// usable from other free helpers.
+async fn read_byte_range_into_static<B: BlockDevice>(
+    device: &B,
+    io: &VolumeIo,
+    byte_off: u64,
+    dst: &mut [u8],
+) -> Result<(), FsError> {
+    device_read_into(device, io.lbs, io.scratch_bytes, &io.pool[0], byte_off, dst).await
 }
 
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
@@ -232,13 +256,23 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // 1024, 2048, 4096 all qualify.
             return Err(FsError::Unsupported);
         }
+        // Scratch buffers hold one multi-block read each. Round the target up
+        // to an `lbs` multiple and never smaller than one block.
+        let scratch_bytes = {
+            let n = SCRATCH_BUF_BYTES.div_ceil(lbs).max(1);
+            n * lbs
+        };
         let mut pool = Vec::with_capacity(SCRATCH_POOL_LEN);
         for _ in 0..SCRATCH_POOL_LEN {
-            let buffer = alloc_coherent(lbs, domain)
+            let buffer = alloc_coherent(scratch_bytes, domain)
                 .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
             pool.push(register_with_cap(buffer));
         }
-        let io = VolumeIo { pool, lbs };
+        let io = VolumeIo {
+            pool,
+            lbs,
+            scratch_bytes,
+        };
 
         // Read 1024 bytes starting at byte 1024 — the superblock.
         // For a 512-byte LBS this is two LBA reads (LBA 2 and LBA
@@ -673,41 +707,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         byte_off: u64,
         dst: &mut [u8],
     ) -> Result<(), FsError> {
-        let lbs = io.lbs;
-        let mut cursor = 0usize;
-        while cursor < dst.len() {
-            let abs = byte_off + cursor as u64;
-            let lba = abs / lbs as u64;
-            let in_lba = (abs % lbs as u64) as usize;
-            let want = core::cmp::min(dst.len() - cursor, lbs - in_lba);
-
-            let req = BlockRequest {
-                op: BlockOp::Read,
-                lba,
-                blocks: 1,
-                buffer: io.pool[0]
-                    .derive::<Read>()
-                    .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
-                qos: QosHint::Latency,
-                user_tag: 0,
-            };
-            let completion = device.submit(req).await;
-            completion.result.map_err(FsError::Io)?;
-
-            let buf = io
-                .buffer()
-                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: the registry holds the only `Arc<DmaBuffer>`
-            // outside this clone; ext2 mount serialises sector ops
-            // via the outer spinlock so no other CPU/task is racing
-            // the buffer bytes during this copy. Identity-mapped
-            // phys backs the read.
-            // SAFETY: Valid MMIO bounds or trusted driver environment
-            let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
-            dst[cursor..cursor + want].copy_from_slice(&src[in_lba..in_lba + want]);
-            cursor += want;
-        }
-        Ok(())
+        device_read_into(device, io.lbs, io.scratch_bytes, &io.pool[0], byte_off, dst).await
     }
 
     /// Internal helper used by `read_byte_range`. Borrows ONE scratch
@@ -724,37 +724,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         byte_off: u64,
         dst: &mut [u8],
     ) -> Result<(), FsError> {
+        let scratch_bytes = io_lock.lock().scratch_bytes;
         let guard = acquire_scratch(io_lock).await;
-        let mut cursor = 0usize;
-        while cursor < dst.len() {
-            let abs = byte_off + cursor as u64;
-            let lba = abs / lbs as u64;
-            let in_lba = (abs % lbs as u64) as usize;
-            let want = core::cmp::min(dst.len() - cursor, lbs - in_lba);
-
-            let req = BlockRequest {
-                op: BlockOp::Read,
-                lba,
-                blocks: 1,
-                buffer: guard
-                    .cap
-                    .derive::<Read>()
-                    .map_err(|_| FsError::Io(narf_block::BlockError::PermissionDenied))?,
-                qos: QosHint::Latency,
-                user_tag: 0,
-            };
-            let completion = device.submit(req).await;
-            completion.result.map_err(FsError::Io)?;
-
-            let buf = resolve_cap(&guard.cap)
-                .ok_or(FsError::Io(narf_block::BlockError::PermissionDenied))?;
-            // SAFETY: see read_byte_range_into. The guard gives us sole
-            // ownership of this buffer for the duration of the copy.
-            let src = unsafe { core::slice::from_raw_parts(buf.as_ptr(), lbs) };
-            dst[cursor..cursor + want].copy_from_slice(&src[in_lba..in_lba + want]);
-            cursor += want;
-        }
-        Ok(())
+        device_read_into(device, lbs, scratch_bytes, &guard.cap, byte_off, dst).await
     }
 
     /// `(group, index)` for an inode number. Inode numbers are
