@@ -1774,7 +1774,20 @@ impl AddressSpace {
                 // Private region: bump the COW refcount on every backing
                 // frame, then strip WRITE so both ASes start the post-fork
                 // window read-only and split on first write.
+                //
+                // Skip unbacked (phys == 0) demand-paged slots: there is no
+                // frame to share yet, so COW doesn't apply. `materialize`
+                // already skips phys == 0, and each AS independently demand-
+                // faults its own zeroed frame on first access (equivalent for
+                // anonymous zero-fill pages until written). Calling inc_ref(0)
+                // registered a bogus "frame 0" refcount entry that climbed into
+                // the thousands across a large demand-paged region's fork, and
+                // the matching dec_ref(0) on teardown risked free_frame(0) /
+                // frame-0 reuse — corruption surfacing far away.
                 for &p in r.phys.iter() {
+                    if p.raw() == 0 {
+                        continue;
+                    }
                     let _ = crate::frame::cow::inc_ref(p);
                 }
                 r.perms = RegionPerms(r.perms.0 & !RegionPerms::WRITE.0);
