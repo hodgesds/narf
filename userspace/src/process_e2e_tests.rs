@@ -3695,12 +3695,34 @@ fn smoke_process_coredump_e2e() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Set CWD of PARENT to /tmp so child inherits it and coredump writes succeed.
+    // Mount a writable in-memory FS at a MOUNT POINT and make it PARENT's cwd,
+    // so the forked child inherits it and the coredump's `create("core")` lands
+    // in a filesystem that links the new file for a later `lookup`. The original
+    // test chdir'd into a bare "/tmp", but in the kernel-test VFS that is not a
+    // mount point (so `chdir` silently failed — its failure is in the return
+    // VALUE, not the OK status the old check looked at) and the root FS's
+    // `create` is not lookup-able. Both made the core land somewhere the test
+    // couldn't verify even though the dump itself wrote fine.
+    const CORE_DIR: &str = "/core_test";
+    let core_mount_auth = narf_filesystem::bootstrap_mount_authority();
+    let _core_mount = match narf_filesystem::registry().mount(
+        &core_mount_auth,
+        CORE_DIR,
+        narf_filesystem::MemFs::new("core_test"),
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("mount MemFs for coredump");
+        }
+    };
+
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
-    let tmp_path = b"/tmp\0";
+    let dir_path = b"/core_test\0";
     let mut chdir_ctx = StubCtx {
         args: SyscallArgs {
-            arg0: tmp_path.as_ptr() as u64,
+            arg0: dir_path.as_ptr() as u64,
             arg1: 0,
             arg2: 0,
             arg3: 0,
@@ -3710,10 +3732,12 @@ fn smoke_process_coredump_e2e() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Chdir.raw(), &mut chdir_ctx);
-    if !matches!(chdir_ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+    // chdir reports failure via the return VALUE (-1), not the status (both are
+    // `SyscallReturn::ok(..)`) — check the value so a failed chdir is caught.
+    if !matches!(chdir_ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
-        return TestResult::Fail("chdir(/tmp) failed");
+        return TestResult::Fail("chdir(/core_test) failed");
     }
 
     // 2. Fork a child
