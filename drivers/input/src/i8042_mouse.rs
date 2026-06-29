@@ -40,7 +40,7 @@ use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 
 use narf_arch::x86_64::io_port::{inb, outb};
 use narf_input::{
-    evdev::{dispatch_rel_to_node, key, rel, DeviceCaps, DeviceNode, ROUTER},
+    evdev::{dispatch_pointer_to_node, key, rel, DeviceCaps, DeviceNode, ROUTER},
     push_global, InputEvent, PointerButtons, PointerEvent,
 };
 
@@ -81,6 +81,9 @@ pub struct State {
     phase: AtomicU8,
     rel_dx_acc: AtomicI32,
     rel_dy_acc: AtomicI32,
+    /// Last reported button bitmask (bit0=left, bit1=right, bit2=middle),
+    /// so evdev `EV_KEY` events are emitted only on press/release edges.
+    prev_buttons: AtomicU8,
     initialized: core::sync::atomic::AtomicBool,
 }
 
@@ -91,6 +94,7 @@ impl State {
             phase: AtomicU8::new(0),
             rel_dx_acc: AtomicI32::new(0),
             rel_dy_acc: AtomicI32::new(0),
+            prev_buttons: AtomicU8::new(0),
             initialized: core::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -304,6 +308,41 @@ pub fn mouse_evdev_node() -> Option<Arc<DeviceNode>> {
     MOUSE_EVDEV_NODE.lock().clone()
 }
 
+/// Route a decoded packet (`dx`/`dy` motion + raw button byte `b0`) to the
+/// evdev node as one frame. Button `EV_KEY` events are emitted only on
+/// press/release edges (compared against `STATE.prev_buttons`) so a held
+/// button isn't re-reported every packet. Without this the compositor saw
+/// motion but never clicks.
+fn dispatch_packet_to_evdev(dx: i32, dy: i32, b0: u8) {
+    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
+    // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
+    // so the pointee outlives this borrow. Non-null checked just above.
+    let node_ref: &DeviceNode = unsafe { &*raw };
+
+    let cur_btn = b0 & 0x07; // bit0 left, bit1 right, bit2 middle
+    let prev_btn = STATE.prev_buttons.swap(cur_btn, Ordering::AcqRel);
+    let changed = cur_btn ^ prev_btn;
+    let mut changes: [(u16, bool); 3] = [(0, false); 3];
+    let mut n = 0;
+    if changed & 0x01 != 0 {
+        changes[n] = (key::BTN_LEFT, cur_btn & 0x01 != 0);
+        n += 1;
+    }
+    if changed & 0x02 != 0 {
+        changes[n] = (key::BTN_RIGHT, cur_btn & 0x02 != 0);
+        n += 1;
+    }
+    if changed & 0x04 != 0 {
+        changes[n] = (key::BTN_MIDDLE, cur_btn & 0x04 != 0);
+        n += 1;
+    }
+    dispatch_pointer_to_node(node_ref, dx, dy, &changes[..n]);
+}
+
 /// IRQ-12 handler. Reads one byte from 0x60, advances the 3-byte
 /// packet state machine, and on completion pushes a PointerEvent
 /// + accumulates the relative delta.
@@ -371,17 +410,8 @@ pub unsafe fn on_irq12() {
     // Legacy global ring (for cursor pump / FB status panel).
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
 
-    // Evdev routing.
-    // SAFETY: pointer written once in init() before IRQs armed; Arc kept alive.
-    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
-    if !raw.is_null() {
-        // SAFETY: `raw` is the `Arc::as_ptr` of the node stored once in `init()`
-        // before IRQ 12 is armed; the Arc is held alive in `MOUSE_EVDEV_NODE`,
-        // so the pointee outlives this borrow. Non-null checked just above.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let node_ref: &DeviceNode = unsafe { &*raw };
-        dispatch_rel_to_node(node_ref, dx, dy);
-    }
+    // Evdev routing — motion + button edges in one frame.
+    dispatch_packet_to_evdev(dx, dy, b0);
 }
 
 #[doc(hidden)]
@@ -425,11 +455,6 @@ pub fn feed_byte_for_test(byte: u8) {
     STATE.rel_dx_acc.fetch_add(dx, Ordering::Relaxed);
     STATE.rel_dy_acc.fetch_add(dy, Ordering::Relaxed);
     let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
-    // Evdev routing (also from test feed path).
-    let raw = MOUSE_NODE_PTR.load(Ordering::Acquire);
-    if !raw.is_null() {
-        // SAFETY: see on_irq12.
-        let node_ref: &DeviceNode = unsafe { &*raw };
-        dispatch_rel_to_node(node_ref, dx, dy);
-    }
+    // Evdev routing (also from test feed path) — motion + button edges.
+    dispatch_packet_to_evdev(dx, dy, b0);
 }

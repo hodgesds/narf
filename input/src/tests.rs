@@ -33,6 +33,57 @@ fn smoke_input_ring_push_pop_round_trip() -> TestResult {
 }
 kernel_test_in!("input", smoke_input_ring_push_pop_round_trip);
 
+/// `dispatch_pointer_to_node` must emit relative motion AND button
+/// transitions in a single evdev frame (one `SYN_REPORT`). Regression for
+/// the PS/2 mouse only forwarding motion to evdev — clicks never reached
+/// the compositor because the button `EV_KEY` events were dropped.
+fn smoke_input_evdev_pointer_frame_carries_button() -> TestResult {
+    use crate::evdev::{
+        dispatch_pointer_to_node, key, rel, DeviceCaps, EventType, ROUTER,
+    };
+
+    let mut caps = DeviceCaps::new();
+    caps.add_rel(rel::REL_X);
+    caps.add_rel(rel::REL_Y);
+    caps.add_key(key::BTN_LEFT);
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = match ROUTER.open_reader(id) {
+        Some(r) => r,
+        None => return TestResult::Fail("open_reader failed"),
+    };
+
+    // One packet: move (5, -3) with the left button going down.
+    dispatch_pointer_to_node(&node, 5, -3, &[(key::BTN_LEFT, true)]);
+
+    // Expect: REL_X=5, REL_Y=-3, KEY BTN_LEFT=1, then SYN_REPORT.
+    let mut saw_relx = false;
+    let mut saw_rely = false;
+    let mut saw_btn = false;
+    let mut saw_syn = false;
+    while let Some(ev) = reader.poll_event() {
+        match ev.type_ {
+            EventType::Rel if ev.code == rel::REL_X && ev.value == 5 => saw_relx = true,
+            EventType::Rel if ev.code == rel::REL_Y && ev.value == -3 => saw_rely = true,
+            EventType::Key if ev.code == key::BTN_LEFT && ev.value == 1 => saw_btn = true,
+            EventType::Syn => saw_syn = true,
+            _ => {}
+        }
+    }
+    ROUTER.unregister_device(id);
+
+    if !saw_relx || !saw_rely {
+        return TestResult::Fail("motion REL_X/REL_Y missing from pointer frame");
+    }
+    if !saw_btn {
+        return TestResult::Fail("button BTN_LEFT press missing from pointer frame");
+    }
+    if !saw_syn {
+        return TestResult::Fail("SYN_REPORT frame terminator missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_evdev_pointer_frame_carries_button);
+
 fn smoke_input_ring_overflow_drops_oldest() -> TestResult {
     use crate::{EventRing, InputEvent, KeyCode, KeyEvent, Modifiers};
     let r = EventRing::new(2);

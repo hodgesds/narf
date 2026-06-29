@@ -722,3 +722,45 @@ pub fn dispatch_rel_to_node(node: &DeviceNode, dx: i32, dy: i32) {
     }
     node.dispatch(EvdevEvent::syn_report(now));
 }
+
+/// Dispatch a full pointer frame — relative motion **plus** button
+/// transitions — to `node` as a single evdev frame (one `SYN_REPORT`),
+/// matching how a real mouse packet is reported. `btn_changes` carries
+/// `(EV_KEY code, pressed)` for each button whose state changed this
+/// packet (drivers must emit on edges only, like Linux). A fully-empty
+/// frame (no motion, no button change) is skipped so idle packets don't
+/// spam consumers.
+///
+/// Used by `drivers/input/src/i8042_mouse.rs` so the compositor sees
+/// clicks, not just motion.
+pub fn dispatch_pointer_to_node(node: &DeviceNode, dx: i32, dy: i32, btn_changes: &[(u16, bool)]) {
+    if dx == 0 && dy == 0 && btn_changes.is_empty() {
+        return;
+    }
+    let now = narf_time::now_cycles();
+    if dx != 0 {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Rel,
+            code: rel::REL_X,
+            value: dx,
+        });
+    }
+    if dy != 0 {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Rel,
+            code: rel::REL_Y,
+            value: dy,
+        });
+    }
+    for &(code, pressed) in btn_changes {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Key,
+            code,
+            value: if pressed { 1 } else { 0 },
+        });
+    }
+    node.dispatch(EvdevEvent::syn_report(now));
+}
