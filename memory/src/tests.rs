@@ -2484,14 +2484,13 @@ fn smoke_memory_grow_region_bumps_mmap_cursor() -> TestResult {
     if base == 0 {
         return TestResult::Fail("first reserve_mmap_va failed");
     }
-    if a
-        .map_region(Region {
-            base: VirtAddr::new(base),
-            len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![crate::PhysAddr::new(0)],
-        })
-        .is_err()
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![crate::PhysAddr::new(0)],
+    })
+    .is_err()
     {
         return TestResult::Fail("initial map_region failed");
     }
@@ -2509,14 +2508,13 @@ fn smoke_memory_grow_region_bumps_mmap_cursor() -> TestResult {
         return TestResult::Fail("reserve handed back a VA inside the grown region");
     }
     // And mapping there must succeed — never collide with the grown region.
-    if a
-        .map_region(Region {
-            base: VirtAddr::new(next),
-            len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![crate::PhysAddr::new(0)],
-        })
-        .is_err()
+    if a.map_region(Region {
+        base: VirtAddr::new(next),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![crate::PhysAddr::new(0)],
+    })
+    .is_err()
     {
         return TestResult::Fail("post-grow map_region overlapped the grown region");
     }
