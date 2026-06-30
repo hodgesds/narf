@@ -1600,6 +1600,9 @@ kernel_test_in!("acpi/smbios", smoke_smbios_memory_device_type_constants);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_acpi_srat_topology_present() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+    }
     // The xtask QEMU config publishes 2 NUMA nodes via `-numa
     // node,...,memdev=memN`, so SRAT must be present and decode
     // CPU+memory affinity. Synthetic-body tests scrub the shared
@@ -1626,6 +1629,9 @@ kernel_test_in!("acpi", smoke_acpi_srat_topology_present);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_acpi_srat_memory_node_lookup() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+    }
     // QEMU splits 256 MiB across two memdevs; the first chunk
     // starts at the legacy low-RAM base and the second above it.
     // Check that *something* in the second-half address space maps
@@ -1690,6 +1696,9 @@ kernel_test_in!("acpi", smoke_acpi_srat_synthetic_lapic_entry);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_acpi_madt_topology_present() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU QEMU config; NARF_QEMU_SMP shrinks the vCPU count");
+    }
     // The xtask QEMU config has 2 CPUs; MADT must enumerate both
     // and expose the LAPIC base.
     let rsdp = match crate::cached_rsdp() {
@@ -1743,6 +1752,9 @@ kernel_test_in!("acpi", smoke_acpi_mcfg_ecam_base);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_acpi_hmat_latency_lookup() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops hmat=on + -numa");
+    }
     // The xtask QEMU config publishes a 2x2 HMAT lat/bw matrix:
     // same-node latency 10 ns, cross-node 20 ns. Verify the parser
     // returns sane values for both axes.
@@ -1771,6 +1783,9 @@ kernel_test_in!("acpi", smoke_acpi_hmat_latency_lookup);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_acpi_hmat_mem_attrs_present() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops hmat=on + -numa");
+    }
     let rsdp = match crate::cached_rsdp() {
         Some(p) => p,
         None => return TestResult::Fail("no boot-time RSDP cached"),

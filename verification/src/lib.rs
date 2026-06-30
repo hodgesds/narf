@@ -1832,6 +1832,9 @@ kernel_test!(smoke_smp_x86_64_cpuid_count);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+    }
     // alloc_frame_on(node) should return a frame whose physical
     // address falls within `node`'s SRAT memory range. Re-parse
     // SRAT first because synthetic-body tests earlier in the
@@ -1868,6 +1871,9 @@ kernel_test!(smoke_frame_alloc_on_node_returns_local);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_free_routes_to_owning_node() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+    }
     // free_frame() must use the frame's physical address to choose
     // the destination bin — not the current CPU's node. Allocate
     // from node 1, free, then re-alloc from node 1 and confirm we
@@ -1906,6 +1912,9 @@ kernel_test!(smoke_frame_free_routes_to_owning_node);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_numa_slit_distance_matrix() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+    }
     // The QEMU NUMA host wires a 2-node SLIT with local=10/remote=20
     // (`-numa dist,...`). Re-parse SRAT + SLIT from the cached boot
     // RSDP (synthetic-body tests upstream may have scrubbed the shared
@@ -1955,6 +1964,9 @@ kernel_test!(smoke_numa_slit_distance_matrix);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_numa_mempolicy_bind_steers_alloc() -> TestResult {
+    if !narf_lib::smp::is_online(1) {
+        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+    }
     // MPOL_BIND enforcement: with the active policy bound to node 1,
     // a policied allocation must land in node 1's SRAT memory range.
     // Then MPOL_PREFERRED node 0 must land in node 0's range.
