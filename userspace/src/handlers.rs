@@ -15780,9 +15780,18 @@ pub fn timer_tick_raise_due_signals() {
         // starves under that load. Without this scan the parked owner's
         // SIGALRM never fires (the kernel cause of the SMP chroot_run /
         // stress-ng hang, where a parent stops its workers via an alarm).
-        let mut due: [u64; 64] = [0; 64];
-        let n = crate::posix_timer::itimer_real_collect_all_due_irq(now, &mut due);
-        for &t in &due[..n] {
+        //
+        // O(1)-stack drain: take one due owner at a time, then raise + wake it
+        // OUTSIDE the ITIMERS lock. We MUST NOT collect the owners into a large
+        // on-stack `[u64; N]` buffer here: this runs in the timer ISR on the
+        // *user task's own kernel stack* (per-task-own-stack model), and a
+        // ~512 B array on that IRQ-path frame deterministically smashed this
+        // handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn
+        // — the same "no big on-stack array in IRQ context" hazard the timer
+        // wheel documents (`timer_wheel::drain_due_to_deferred`).
+        let mut after: Option<u64> = None;
+        while let Some(t) = crate::posix_timer::itimer_real_take_one_due_irq(now, after) {
+            after = Some(t);
             // SIGALRM (14). Slot was pre-created when the timer was armed, so
             // this only sets a bit in an existing entry (never allocates).
             let _ = raise_signal_pending_irq(t, 14);

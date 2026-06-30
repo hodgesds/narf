@@ -804,19 +804,30 @@ pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
 /// hrtimer that fires regardless of which task is on-CPU; this restores that
 /// semantics. Fully alloc-free (advance-in-place under the existing
 /// `IrqSafeSpinLock`); the caller raises + wakes each returned task.
-pub fn itimer_real_collect_all_due_irq(now: u64, out: &mut [u64]) -> usize {
-    let mut n = 0usize;
-    let mut g = ITIMERS.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => return 0,
+///
+/// **O(1) stack.** Returns the lowest task id strictly greater than `after`
+/// (or the lowest of all, when `after` is `None`) whose `ITIMER_REAL` is due
+/// at `now`, advancing that slot in place so a subsequent call skips it.
+/// `None` means no more are due. The caller loops, feeding the previous result
+/// back as `after`, raising + waking each returned task between calls (so
+/// `wake_signal` never runs under the `ITIMERS` lock).
+///
+/// This replaces an earlier `collect_all(out: &mut [u64])` form: returning the
+/// owners through a `[u64; 64]` (~512 B) buffer put that array on the timer
+/// IRQ's stack — the *user task's own kernel stack* under the per-task-own-stack
+/// model — and that large IRQ-path frame deterministically smashed the timer
+/// handler's return chain (`rip=0x3` #UD) under stress-ng fork/exec churn. Same
+/// hazard the timer-wheel drain documents (`timer_wheel::drain_due_to_deferred`):
+/// no big on-stack buffer in IRQ context.
+pub fn itimer_real_take_one_due_irq(now: u64, after: Option<u64>) -> Option<u64> {
+    use core::ops::Bound;
+    let lower = match after {
+        Some(a) => Bound::Excluded(a),
+        None => Bound::Unbounded,
     };
-    for (task, slots) in map.iter_mut() {
-        if n >= out.len() {
-            // No room to record this owner — leave its slot due so the next
-            // tick re-finds it rather than advancing past a lost expiry.
-            break;
-        }
+    let mut g = ITIMERS.lock();
+    let map = g.as_mut()?;
+    for (task, slots) in map.range_mut((lower, Bound::Unbounded)) {
         let slot = &mut slots[ITIMER_REAL as usize];
         if slot.next_fire_ns == 0 || now < slot.next_fire_ns {
             continue;
@@ -829,10 +840,9 @@ pub fn itimer_real_collect_all_due_irq(now: u64, out: &mut [u64]) -> usize {
                 .next_fire_ns
                 .saturating_add(slot.interval_ns.saturating_mul(fires));
         }
-        out[n] = *task;
-        n += 1;
+        return Some(*task);
     }
-    n
+    None
 }
 
 /// Sleep-pump: walks every per-task timer table, fires expired
