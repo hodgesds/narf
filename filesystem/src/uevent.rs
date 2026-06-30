@@ -28,8 +28,33 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
+
+// ── Poller wake hook ──────────────────────────────────────────────────
+//
+// A uevent emit must wake any `NETLINK_KOBJECT_UEVENT` monitor parked in
+// poll/epoll, else udevd / `udevadm monitor` only see events on the coarse
+// fallback tick. The wake lives in the net/socket layer (readiness gen +
+// io-waiter wake); this crate can't depend on it, so the userspace layer
+// installs it via `set_wake_hook` at boot. Stored as `fn() as usize`.
+static WAKE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the post-emit wake callback (typically `narf_net::readiness::
+/// notify`). Called once during userspace bring-up.
+pub fn set_wake_hook(f: fn()) {
+    WAKE_HOOK.store(f as usize, Ordering::Release);
+}
+
+fn fire_wake() {
+    let h = WAKE_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: only ever stored as `fn() as usize` by `set_wake_hook`.
+        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+        f();
+    }
+}
 
 // ── Constants ─────────────────────────────────────────────────────────
 
@@ -98,6 +123,36 @@ impl UeventEnv {
         }
         s.push('\n'); // double-newline terminator
         s
+    }
+
+    /// Render to the on-the-wire **kernel netlink uevent** format that
+    /// libudev / udevd parse off `NETLINK_KOBJECT_UEVENT` (group 1):
+    /// a `"<action>@<devpath>\0"` header line, then NUL-separated
+    /// `KEY=value\0` records. Linux ref: `kobject_uevent_env`
+    /// (lib/kobject_uevent.c) building `env->buf`.
+    pub fn to_netlink_bytes(&self) -> Vec<u8> {
+        let action = self.action.as_str();
+        let mut buf: Vec<u8> = Vec::new();
+        // Header: "action@devpath\0"
+        buf.extend_from_slice(action.as_bytes());
+        buf.push(b'@');
+        buf.extend_from_slice(self.devpath.as_bytes());
+        buf.push(0);
+        let mut kv = |k: &str, v: &str, buf: &mut Vec<u8>| {
+            buf.extend_from_slice(k.as_bytes());
+            buf.push(b'=');
+            buf.extend_from_slice(v.as_bytes());
+            buf.push(0);
+        };
+        kv("ACTION", action, &mut buf);
+        kv("DEVPATH", &self.devpath, &mut buf);
+        kv("SUBSYSTEM", &self.subsystem, &mut buf);
+        let seq = alloc::format!("{}", self.seqnum);
+        kv("SEQNUM", &seq, &mut buf);
+        for (k, v) in &self.extras {
+            kv(k, v, &mut buf);
+        }
+        buf
     }
 }
 
@@ -177,6 +232,9 @@ pub fn emit_with_extras(
         extras,
     };
     UEVENT_RING.lock().push(env);
+    // Wake any netlink monitor parked in poll/epoll (drop the ring lock
+    // first — the hook may take other locks).
+    fire_wake();
 }
 
 /// How many events are currently in the ring.

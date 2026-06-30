@@ -17631,8 +17631,15 @@ fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let cloexec = raw_type & crate::fd::O_CLOEXEC != 0;
     let nonblock = raw_type & crate::fd::O_NONBLOCK != 0;
     // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL; other
-    // families return EOPNOTSUPP. We support SOCK_STREAM today.
-    if domain != crate::socket::AF_UNIX || kind != crate::socket::SOCK_STREAM {
+    // families return EOPNOTSUPP. We back STREAM, SEQPACKET and DGRAM with
+    // the same connected AF_UNIX pair — systemd-udev creates a
+    // SOCK_DGRAM/SOCK_SEQPACKET worker-IPC pair at startup and self-frames
+    // its messages, so byte-stream delivery is sufficient.
+    let kind_ok = matches!(
+        kind,
+        crate::socket::SOCK_STREAM | crate::socket::SOCK_SEQPACKET | crate::socket::SOCK_DGRAM
+    );
+    if domain != crate::socket::AF_UNIX || !kind_ok {
         ctx.set_return(fail);
         return;
     }
@@ -18323,6 +18330,35 @@ fn parse_scm_rights_fds(
     out
 }
 
+/// Write an `SOL_SOCKET` / `SCM_CREDENTIALS` control message into
+/// `msg_control` naming the KERNEL as the message sender
+/// (`struct ucred { pid=0, uid=0, gid=0 }`). Required for netlink uevent
+/// recvmsg: systemd's libudev sets `SO_PASSCRED` and rejects any uevent
+/// whose recvmsg lacks credentials with uid 0. `msg_controllen` is set to
+/// the bytes written, or 0 when the user control buffer is absent/too small.
+fn install_netlink_creds(msg_ptr: u64) {
+    const SOL_SOCKET: i32 = 1;
+    const SCM_CREDENTIALS: i32 = 2;
+    let ctrl_ptr = read_user_u64(msg_ptr + 32);
+    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
+    // cmsghdr(16) + struct ucred{pid,uid,gid}(12).
+    let cmsg_len = 16 + 12usize;
+    if ctrl_ptr == 0 || ctrl_len < cmsg_len {
+        // SAFETY: 8-byte write to msg_controllen; copy_to_user range-checks + SMAP.
+        let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
+        return;
+    }
+    let mut cmsg = alloc::vec![0u8; cmsg_len];
+    cmsg[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+    cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+    cmsg[12..16].copy_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+    // struct ucred { pid=0, uid=0, gid=0 } — bytes 16..28 already zero.
+    // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
+    let _ = unsafe { copy_to_user(ctrl_ptr, &cmsg) };
+    // SAFETY: 8-byte write to msg_controllen at msg_ptr+40.
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(cmsg_len as u64).to_le_bytes()) };
+}
+
 /// Install received SCM_RIGHTS file objects into the calling task's fd
 /// table and write an SOL_SOCKET/SCM_RIGHTS control message (with the new
 /// fd numbers) back into `msg_control`. Sets `msg_controllen` to the bytes
@@ -18450,11 +18486,20 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 write_user_u32(name_len_ptr, (peer.body.len() + 2) as u32);
             }
 
-            // SCM_RIGHTS: install any passed file objects into this task's fd
-            // table and report the new fd numbers in an SOL_SOCKET/SCM_RIGHTS
-            // control message. The mirror of parse_scm_rights_fds on send.
-            let recv_fds = sock.unix_take_recv_fds();
-            install_scm_rights_fds(msg_ptr, recv_fds);
+            if sock.domain == crate::socket::AF_NETLINK {
+                // Netlink uevent: attach SCM_CREDENTIALS naming the KERNEL as
+                // sender (pid/uid/gid = 0). systemd's libudev sets SO_PASSCRED
+                // and silently drops any uevent whose recvmsg carries no
+                // sender credentials with uid 0 — so this is required for
+                // udevd / `udevadm monitor` to accept our broadcasts.
+                install_netlink_creds(msg_ptr);
+            } else {
+                // SCM_RIGHTS: install any passed file objects into this task's
+                // fd table and report the new fd numbers in an SOL_SOCKET/
+                // SCM_RIGHTS control message. Mirror of parse_scm_rights_fds.
+                let recv_fds = sock.unix_take_recv_fds();
+                install_scm_rights_fds(msg_ptr, recv_fds);
+            }
 
             ctx.set_return(SyscallReturn::ok(n as u64));
         }

@@ -57,7 +57,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::uevent::{emit, UeventAction};
+use crate::uevent::UeventAction;
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
 // ── NUMA topology weak hooks ──────────────────────────────────────────
@@ -418,8 +418,27 @@ where
 
 /// Emit a uevent for `kobj` with `action`.
 /// Linux ref: `kobject_uevent` (lib/kobject_uevent.c:639).
+/// Map the string written to a `uevent` file ("add" / "change" / "remove"
+/// / "online" / "offline" …) to a [`UeventAction`]. Unknown verbs fall
+/// back to `Change` (matches Linux's `kobject_action_type` leniency for
+/// the common trigger verbs). Linux ref: `kobject_synth_uevent`.
+fn uevent_action_from_write(data: &[u8]) -> UeventAction {
+    let s = core::str::from_utf8(data).unwrap_or("").trim();
+    let verb = s.split_whitespace().next().unwrap_or("");
+    match verb {
+        "add" => UeventAction::Add,
+        "remove" => UeventAction::Remove,
+        _ => UeventAction::Change,
+    }
+}
+
 pub fn kobject_emit_uevent(kobj: &Kobject, action: UeventAction) {
-    let devpath = kobj.path();
+    // DEVPATH is relative to the sysfs mount: udev/udevd read `/sys$DEVPATH`,
+    // so it must NOT carry the `/sys` prefix (else they look up
+    // `/sys/sys/...` and the device is never found). `kobj.path()` returns
+    // the absolute `/sys/...` path; strip the mount prefix.
+    let full = kobj.path();
+    let devpath = full.strip_prefix("/sys").unwrap_or(&full).to_string();
     // subsystem = the class parent's name, or "kernel" fallback.
     // Linux uses kobject's kset name here; we use the parent name.
     let subsystem = kobj
@@ -427,7 +446,22 @@ pub fn kobject_emit_uevent(kobj: &Kobject, action: UeventAction) {
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "kernel".to_string());
-    emit(action, devpath, subsystem);
+    // Make the netlink message self-contained: fold the device's
+    // synthesised `uevent` attr (MAJOR=/MINOR=/DEVNAME=/EV=/KEY=/…) into
+    // the broadcast as extras, so udevd + the input_id builtin get the
+    // full property set without re-reading sysfs. Drop the mandatory trio
+    // (we set those from the env) to avoid duplicates.
+    let mut extras: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+    if let Some(text) = kobj.attr_show("uevent") {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                if !matches!(k, "ACTION" | "DEVPATH" | "SUBSYSTEM" | "SEQNUM") {
+                    extras.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
+    crate::uevent::emit_with_extras(action, devpath, subsystem, extras);
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
@@ -608,7 +642,24 @@ pub fn populate_input_class() {
             "MAJOR=13\nMINOR={}\nDEVNAME=input/event{}\n{}",
             minor, n, caps_lines
         );
-        kobject_add_attr(&kobj, "uevent", move || uevent.clone());
+        // Writable so `udevadm trigger` (which writes "add"/"change" to the
+        // uevent file) makes the kernel broadcast a netlink uevent → udevd
+        // populates /run/udev/data → libinput/libudev can enumerate the
+        // device. Weak ref into the store so the attr closure doesn't pin
+        // the kobject in a cycle. Linux ref: `uevent_store`
+        // (drivers/base/core.c:2453).
+        let weak = alloc::sync::Arc::downgrade(&kobj);
+        kobject_add_writable_attr(
+            &kobj,
+            "uevent",
+            move || uevent.clone(),
+            move |data: &[u8]| {
+                if let Some(k) = weak.upgrade() {
+                    kobject_emit_uevent(&k, uevent_action_from_write(data));
+                }
+                Ok(())
+            },
+        );
         // Mark the class node's subsystem (real Linux has this link).
         kobj.add_symlink("subsystem", "../../../class/input");
 

@@ -48,9 +48,31 @@ pub const AF_NETLINK: u16 = 16;
 /// device-uevent messages off it; we bridge it to the kernel uevent ring.
 pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 
+/// `sockaddr_nl` body (the bytes after the 2-byte `nl_family`) identifying
+/// the KERNEL as a uevent's sender: `nl_pad=0`, `nl_pid=0` (kernel),
+/// `nl_groups=1` (the KERNEL uevent group). libudev/udevd reject monitor
+/// messages whose source pid is non-zero, so a uevent recv must report this.
+fn kernel_nl_sockaddr_body() -> Vec<u8> {
+    // nl_pad(2)=0, nl_pid(4)=0, nl_groups(4)=1 — little-endian.
+    alloc::vec![0u8, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+}
+
+/// Post-uevent-emit wake: bump the readiness generation + wake io waiters
+/// so a parked `NETLINK_KOBJECT_UEVENT` monitor's poll/epoll resumes and
+/// reads the new event. Installed into `narf_filesystem::uevent` when a
+/// netlink socket is created.
+fn uevent_wake_hook() {
+    narf_net::readiness::notify(0);
+}
+
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
 pub const SOCK_RAW: u32 = 3;
+/// `SOCK_SEQPACKET` — reliable, connection-oriented, message-boundary-
+/// preserving. systemd-udev's control socket (`udev_ctrl`) uses this over
+/// AF_UNIX. We back it with the AF_UNIX stream machinery; udev_ctrl frames
+/// its own fixed-size messages, so byte-stream delivery is sufficient.
+pub const SOCK_SEQPACKET: u32 = 5;
 
 pub const SHUT_RD: u32 = 0;
 pub const SHUT_WR: u32 = 1;
@@ -453,6 +475,11 @@ impl SocketFile {
                 state: Arc::new(crate::xdp_socket::XdpSocketState::new()),
             }
         } else if domain == AF_NETLINK {
+            // Wire the post-emit wake so a uevent emitted while this monitor
+            // is parked in poll/epoll wakes it (the ring lives in the fs
+            // crate, which can't reach the net readiness layer directly).
+            // Idempotent — a plain atomic store.
+            narf_filesystem::uevent::set_wake_hook(uevent_wake_hook);
             // Start at the ring's oldest buffered event so a freshly-opened
             // monitor still observes the boot-time device-add uevents (libudev
             // de-dups these against its sysfs enumerate).
@@ -941,7 +968,7 @@ impl SocketFile {
             _ => {}
         }
         match (self.domain, self.kind) {
-            (AF_UNIX, SOCK_STREAM) => self.dispatch_unix_stream(op),
+            (AF_UNIX, SOCK_STREAM) | (AF_UNIX, SOCK_SEQPACKET) => self.dispatch_unix_stream(op),
             (AF_INET, SOCK_STREAM) => self.dispatch_inet_stream(op),
             (AF_INET, SOCK_DGRAM) => self.dispatch_inet_dgram(op),
             (AF_INET, SOCK_RAW) => self.dispatch_inet_raw(op),
@@ -974,11 +1001,22 @@ impl SocketFile {
                 };
                 match ev {
                     Some(env) => {
-                        let text = env.to_text();
-                        let bytes = text.as_bytes();
+                        // Kernel netlink uevent wire format (NUL-separated,
+                        // `action@devpath` header) so libudev/udevd parse it.
+                        let bytes = env.to_netlink_bytes();
                         let n = core::cmp::min(buf.len(), bytes.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
-                        SocketOpResult::Received { n, peer: None }
+                        // Sender is the kernel: sockaddr_nl{family=AF_NETLINK,
+                        // pid=0, groups=1}. libudev rejects monitor messages
+                        // whose source pid != 0, so we must report it.
+                        let peer = SockAddr {
+                            family: AF_NETLINK,
+                            body: kernel_nl_sockaddr_body(),
+                        };
+                        SocketOpResult::Received {
+                            n,
+                            peer: Some(peer),
+                        }
                     }
                     None => SocketOpResult::Err(SockError::WouldBlock),
                 }
