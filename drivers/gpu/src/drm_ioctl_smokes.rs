@@ -297,6 +297,30 @@ fn smoke_drm_ioctl_set_client_cap_universal_vs_atomic() -> TestResult {
     {
         return TestResult::Fail("SET_CLIENT_CAP(ATOMIC) should be rejected for the legacy path");
     }
+    // STEREO_3D (1) and ASPECT_RATIO (4) are pure client opt-ins needing no
+    // driver support — Linux accepts them on a non-atomic driver, so we do too.
+    for cap in [1u64, 4u64] {
+        let mut c = [0u8; 16];
+        c[0..8].copy_from_slice(&cap.to_le_bytes());
+        c[8..16].copy_from_slice(&1u64.to_le_bytes());
+        if dispatch_card(idx, DRM_IOCTL_SET_CLIENT_CAP, c.as_mut_ptr() as usize, false) != Ok(0) {
+            return TestResult::Fail("SET_CLIENT_CAP(STEREO_3D/ASPECT_RATIO) should succeed");
+        }
+    }
+    // value > 1 on a boolean opt-in is EINVAL (Linux parity).
+    let mut bad = [0u8; 16];
+    bad[0..8].copy_from_slice(&2u64.to_le_bytes()); // UNIVERSAL_PLANES
+    bad[8..16].copy_from_slice(&2u64.to_le_bytes()); // value 2 → invalid
+    if dispatch_card(idx, DRM_IOCTL_SET_CLIENT_CAP, bad.as_mut_ptr() as usize, false).is_ok() {
+        return TestResult::Fail("SET_CLIENT_CAP with value>1 should be rejected");
+    }
+    // WRITEBACK_CONNECTORS (5) needs atomic → rejected.
+    let mut wb = [0u8; 16];
+    wb[0..8].copy_from_slice(&5u64.to_le_bytes());
+    wb[8..16].copy_from_slice(&1u64.to_le_bytes());
+    if dispatch_card(idx, DRM_IOCTL_SET_CLIENT_CAP, wb.as_mut_ptr() as usize, false).is_ok() {
+        return TestResult::Fail("SET_CLIENT_CAP(WRITEBACK_CONNECTORS) should be rejected (no atomic)");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

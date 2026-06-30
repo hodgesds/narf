@@ -551,24 +551,44 @@ fn handle_getcrtc(
 }
 
 /// DRM_IOCTL_SET_CLIENT_CAP — `struct drm_set_client_cap { __u64
-/// capability; __u64 value; }` (16 bytes). We accept UNIVERSAL_PLANES
-/// (mandatory for weston's plane enumeration) and reject the rest —
-/// notably ATOMIC, so weston uses legacy SETCRTC modeset.
+/// capability; __u64 value; }` (16 bytes).
+///
+/// We mirror Linux `drm_setclientcap` for a driver WITHOUT `DRIVER_ATOMIC`:
+/// the pure client opt-in flags that need no driver support are accepted
+/// (STEREO_3D, UNIVERSAL_PLANES, ASPECT_RATIO), with `value > 1` rejected
+/// as EINVAL exactly as Linux does. ATOMIC and WRITEBACK_CONNECTORS require
+/// atomic modeset, which narf-drm lacks, so they're rejected — weston then
+/// drives modeset through the legacy SETCRTC path. UNIVERSAL_PLANES is the
+/// one weston hard-requires (it enumerates the primary plane through it).
 ///
 /// Linux ref: `drivers/gpu/drm/drm_ioctl.c::drm_setclientcap`.
 fn handle_set_client_cap(arg: usize) -> Result<u64, FsError> {
-    /// `DRM_CLIENT_CAP_UNIVERSAL_PLANES` (include/uapi/drm/drm.h).
+    // include/uapi/drm/drm.h DRM_CLIENT_CAP_*.
+    const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
     const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+    const DRM_CLIENT_CAP_ASPECT_RATIO: u64 = 4;
     // SAFETY: `arg` is the validated 16-byte ioctl argument pointer.
     let bytes = unsafe { copy_in(arg, 16)? };
     let cap = u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]);
+    let value = u64::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ]);
     match cap {
-        DRM_CLIENT_CAP_UNIVERSAL_PLANES => Ok(0),
-        // ATOMIC + every other cap: unsupported → EINVAL. A non-zero
-        // return tells the client the cap isn't available; weston then
-        // drives modeset through the legacy path.
+        DRM_CLIENT_CAP_STEREO_3D
+        | DRM_CLIENT_CAP_UNIVERSAL_PLANES
+        | DRM_CLIENT_CAP_ASPECT_RATIO => {
+            // Boolean opt-in: Linux rejects any value > 1.
+            if value > 1 {
+                Err(FsError::InvalidData)
+            } else {
+                Ok(0)
+            }
+        }
+        // ATOMIC, WRITEBACK_CONNECTORS, and every other cap need atomic
+        // modeset (absent here) → EINVAL. A non-zero return tells the client
+        // the cap isn't available; weston falls back to the legacy path.
         _ => Err(FsError::InvalidData),
     }
 }
