@@ -1162,6 +1162,25 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     if exec_ctx.is_null() {
         return false;
     }
+    // Own-stack invariant tripwire (CPL3 side). The user task ran on its OWN
+    // kernel stack via TSS.rsp0 (poll_to_yield retargets it), so a CPL3→CPL0
+    // timer trap lands its frame at rsp0 = this task's stack top. If `frame`
+    // is NOT inside the current task's stack, rsp0 desynced and the trap frame
+    // sits on the WRONG (executor) stack — the same rsp0/own-stack corruption
+    // as the CPL0 path (see try_preempt). Catch it with attribution.
+    let frame_addr = frame as *const TrapFrame as u64;
+    // SAFETY: live KernelTask per the CURRENT_STACKFUL_TASK invariant above.
+    let task_ref: &KernelTask = unsafe { &*task_ptr };
+    let stk_base = task_ref.stack.as_ptr() as u64;
+    let stk_top = stk_base + task_ref.stack.len() as u64;
+    if frame_addr < stk_base || frame_addr >= stk_top {
+        panic!(
+            "CTXGUARD try_preempt_user cpu={}: user-preempt trap frame {:#018x} is OUTSIDE \
+             the current task's kernel stack [{:#018x},{:#018x}) — rsp0/own-stack desync; \
+             frame.rip={:#018x} frame.cs={:#x}",
+            cpu, frame_addr, stk_base, stk_top, frame.rip, frame.cs,
+        );
+    }
     // Re-arm the slot waker so the executor re-polls us next round.
     // SAFETY: live task; `current_waker` is an IrqSafeSpinLock.
     unsafe {
