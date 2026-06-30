@@ -3235,8 +3235,8 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
-    let (s, ino) = match stat_ino_path_dir_aware(path) {
-        Some(pair) => pair,
+    let (s, ino, rdev) = match stat_ino_path_dir_aware(path) {
+        Some(triple) => triple,
         None => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
             // like libwayland's wl_socket_lock require the real errno.
@@ -3244,9 +3244,10 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Path-based stat doesn't carry the FileOps, so rdev isn't available here
-    // (device nodes report it via fstat on the opened fd — what libinput uses).
-    let out = linux_stat_from_fs(s, 0, ino);
+    // Report the device node's rdev (major:minor) for PATH stat too: seatd /
+    // libudev validate a device's type from a path stat before opening it, so
+    // a 0 rdev makes them reject evdev nodes (weston input never opens).
+    let out = linux_stat_from_fs(s, rdev, ino);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment
@@ -3403,7 +3404,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         }
         let task = current_task_id();
         fd::with_table(task, |t| {
-            t.get(dirfd as u32).map(|e| (e.ops.stat(), e.ops.ino()))
+            t.get(dirfd as u32)
+                .map(|e| (e.ops.stat(), e.ops.ino(), e.ops.rdev()))
         })
         .flatten()
     } else {
@@ -3420,8 +3422,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         stat_ino_path_dir_aware(&path_owned)
     };
 
-    let (s, ino) = match fs_stat {
-        Some(pair) => pair,
+    let (s, ino, rdev) = match fs_stat {
+        Some(triple) => triple,
         None => {
             // File doesn't exist — report ENOENT, not the bare -1 sentinel
             // (which musl maps to EPERM). Callers that probe for a path's
@@ -3432,6 +3434,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // dev_t (small encoding (major<<8)|minor) → statx major/minor fields.
+    let (rdev_major, rdev_minor) = (((rdev >> 8) & 0xfff) as u32, (rdev & 0xff) as u32);
 
     let ftype_bits: u16 = match s.mode.file_type {
         narf_filesystem::FileType::File => 0o100000,
@@ -3477,6 +3481,8 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
             (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
         },
         stx_nlink: 1,
+        stx_rdev_major: rdev_major,
+        stx_rdev_minor: rdev_minor,
         stx_mask: filled
             & if mask == 0 {
                 filled
@@ -12858,14 +12864,14 @@ fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesyst
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
-    stat_ino_path_dir_aware(path).map(|(s, _ino)| s)
+    stat_ino_path_dir_aware(path).map(|(s, _ino, _rdev)| s)
 }
 
 // Same resolution as `stat_path_dir_aware`, but also returns the file's
 // real inode number (0 for synthetic FS / dir-root synthesis). Used by
 // the stat/statx handlers so the Linux `st_ino` is a stable per-file id
 // rather than a size-derived hash that aliases same-size DSOs.
-fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64)> {
+fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64)> {
     let file = narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
             if rel.is_empty() {
@@ -12881,7 +12887,11 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64)> {
                 // "not found" inside a mounted distro rootfs.
                 poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
                     .and_then(|r| r.ok())
-                    .map(|ops| (ops.stat(), ops.ino()))
+                    // rdev() is needed by seatd/libudev, which validate a
+                    // device node's type via the MAJOR:MINOR from a PATH
+                    // stat (not just fstat) — a 0 rdev reads as "not an
+                    // evdev/drm device" and they refuse to open it.
+                    .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
             }
         })
         .flatten();
@@ -12896,6 +12906,7 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64)> {
                 mode: narf_filesystem::Mode::DIR_RW,
                 mtime_cycles: 0,
             },
+            0,
             0,
         ));
     }
