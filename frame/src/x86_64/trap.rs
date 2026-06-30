@@ -899,6 +899,39 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     );
     let _ = writeln!(TrapWriter, "  r15:    {:#018x}", frame.r15);
 
+    // Stack dump: for a control-flow corruption (e.g. RIP at a near-null
+    // address) the faulting RIP is useless — the call chain and the
+    // corrupted return address live on the stack. Dump raw words from RSP
+    // so they can be resolved offline against the kernel ELF
+    // (`addr2line -e <elf>`). Guard RSP: 8-aligned and canonical, so a
+    // wild RSP doesn't cascade into a double fault here.
+    let sp = frame.rsp;
+    let canonical = sp >= 0x1000
+        && sp & 0x7 == 0
+        && (sp < 0x0000_8000_0000_0000 || sp >= 0xFFFF_8000_0000_0000);
+    if canonical {
+        let _ = writeln!(TrapWriter, "  stack @ rsp {:#018x}:", sp);
+        for row in 0..10u64 {
+            let base = sp + row * 32;
+            let mut w = [0u64; 4];
+            for (i, slot) in w.iter_mut().enumerate() {
+                // SAFETY: `base` is canonical + 8-aligned; the kernel stack
+                // is mapped. A torn RSP is the only risk and is bounded by
+                // the canonical guard above (worst case a single nested #PF,
+                // which re-enters this handler with the registers already
+                // printed).
+                *slot = unsafe {
+                    core::ptr::read_volatile((base + (i as u64) * 8) as *const u64)
+                };
+            }
+            let _ = writeln!(
+                TrapWriter,
+                "    {:#018x}: {:016x} {:016x} {:016x} {:016x}",
+                base, w[0], w[1], w[2], w[3]
+            );
+        }
+    }
+
     // SAFETY: after a fatal exception we have no policy to resume; exit with
     // a non-zero code so xtask / verification can see the failure.
     // SAFETY: Valid memory or trusted environment
