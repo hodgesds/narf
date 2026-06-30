@@ -353,7 +353,8 @@ fn this_cpu() -> usize {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn ctx_looks_sane(ctx: &KernelContext) -> bool {
-    let canon = |a: u64| a >= 0x1000 && (a < 0x0000_8000_0000_0000 || a >= 0xFFFF_8000_0000_0000);
+    let canon =
+        |a: u64| a >= 0x1000 && !(0x0000_8000_0000_0000..0xFFFF_8000_0000_0000).contains(&a);
     canon(ctx.rip) && canon(ctx.rsp) && ctx.rsp & 0x7 == 0
 }
 
@@ -1199,6 +1200,8 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
     // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx.
     guard_switch_into("preempt_yield:exec_ctx", unsafe { &*exec_ctx });
+    // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx;
+    // kernel_switch saves the trap-handler continuation and resumes the executor.
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
     // ── Resumed here when the executor switches back into this task ──
     let cpu = this_cpu();
@@ -1243,6 +1246,8 @@ pub unsafe fn yield_current_stackful() {
     // resumes the executor, returning here when it switches us back in.
     // SAFETY: exec_ctx non-null (checked above); the executor populated it.
     guard_switch_into("yield_current_stackful:exec_ctx", unsafe { &*exec_ctx });
+    // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
+    // resumes the executor, returning here when it switches us back in.
     unsafe { kernel_switch(ctx, exec_ctx) };
     // ── Resumed ──
     let cpu = this_cpu();

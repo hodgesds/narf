@@ -138,7 +138,7 @@ impl UeventEnv {
         buf.push(b'@');
         buf.extend_from_slice(self.devpath.as_bytes());
         buf.push(0);
-        let mut kv = |k: &str, v: &str, buf: &mut Vec<u8>| {
+        let kv = |k: &str, v: &str, buf: &mut Vec<u8>| {
             buf.extend_from_slice(k.as_bytes());
             buf.push(b'=');
             buf.extend_from_slice(v.as_bytes());

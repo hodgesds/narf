@@ -325,6 +325,186 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
+/// Kernel core-dump: on a fatal exception, stream a minimal ELF core
+/// (`NT_PRSTATUS` registers + a `PT_LOAD` of the live kernel stack) out COM2
+/// (0x2F8). Route COM2 to a host file with QEMU `-serial file:<path>` (it is
+/// the kernel's 2nd serial; the console stays on COM1), then analyze with
+/// `gdb target/x86_64-unknown-none/debug/narf-frame <path>` for a real
+/// backtrace of a kernel crash (e.g. the SMP rip=0x3 #UD). A user-process
+/// coredump can't capture this — the smash is on the kernel stack.
+#[cfg(target_arch = "x86_64")]
+mod kcore {
+    use super::TrapFrame;
+    use core::arch::asm;
+
+    const COM2: u16 = 0x2F8;
+
+    #[inline]
+    unsafe fn outb(port: u16, val: u8) {
+        // SAFETY: `out` to a fixed legacy ISA I/O port; no memory access.
+        unsafe {
+            asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+        }
+    }
+    #[inline]
+    unsafe fn inb(port: u16) -> u8 {
+        let v: u8;
+        // SAFETY: `in` from a fixed legacy ISA I/O port; no memory access.
+        unsafe {
+            asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
+        }
+        v
+    }
+    unsafe fn init() {
+        // SAFETY: programs the COM2 UART via legacy ISA port I/O.
+        unsafe {
+            outb(COM2 + 1, 0x00); // no IRQs
+            outb(COM2 + 3, 0x80); // DLAB
+            outb(COM2, 0x01); // 115200 lo
+            outb(COM2 + 1, 0x00); // hi
+            outb(COM2 + 3, 0x03); // 8N1
+            outb(COM2 + 2, 0xC7); // FIFO
+            outb(COM2 + 4, 0x0B); // DTR/RTS/OUT2
+        }
+    }
+    unsafe fn put(b: u8) {
+        // SAFETY: polls the COM2 LSR then writes its data port (port I/O only).
+        unsafe {
+            let mut spin = 0u32;
+            while inb(COM2 + 5) & 0x20 == 0 {
+                spin += 1;
+                if spin > 2_000_000 {
+                    break;
+                }
+            }
+            outb(COM2, b);
+        }
+    }
+    unsafe fn put_bytes(s: &[u8]) {
+        for &b in s {
+            // SAFETY: `put` writes the COM2 data port.
+            unsafe { put(b) };
+        }
+    }
+    unsafe fn u16le(v: u16) {
+        // SAFETY: `put_bytes` writes the COM2 data port.
+        unsafe { put_bytes(&v.to_le_bytes()) };
+    }
+    unsafe fn u32le(v: u32) {
+        // SAFETY: `put_bytes` writes the COM2 data port.
+        unsafe { put_bytes(&v.to_le_bytes()) };
+    }
+    unsafe fn u64le(v: u64) {
+        // SAFETY: `put_bytes` writes the COM2 data port.
+        unsafe { put_bytes(&v.to_le_bytes()) };
+    }
+
+    /// Stream the ELF core for `frame` out COM2.
+    pub unsafe fn dump(frame: &TrapFrame) {
+        // SAFETY: fatal-path COM2 port I/O plus read_volatile of the live
+        // kernel stack window (guarded canonical range below).
+        unsafe {
+            init();
+            // 4 pages from rsp's page upward (the kernel stack grows down,
+            // so the live caller frames sit at/above rsp — capture enough to
+            // walk a deep call chain).
+            let stack_lo = frame.rsp & !0xFFFu64;
+            let stack_len: u64 = 0x4000;
+
+            let phoff: u64 = 64;
+            let note_off: u64 = phoff + 2 * 56; // 176
+            let note_sz: u64 = 12 + 8 + 336; // Nhdr + "CORE\0\0\0\0" + prstatus = 356
+            let load_off: u64 = note_off + note_sz; // 532
+
+            // ── ELF header (ET_CORE, EM_X86_64) ──
+            put_bytes(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            u16le(4);
+            u16le(62);
+            u32le(1);
+            u64le(0);
+            u64le(phoff);
+            u64le(0);
+            u32le(0);
+            u16le(64);
+            u16le(56);
+            u16le(2);
+            u16le(0);
+            u16le(0);
+            u16le(0);
+            // ── Phdr PT_NOTE ──
+            u32le(4);
+            u32le(0);
+            u64le(note_off);
+            u64le(0);
+            u64le(0);
+            u64le(note_sz);
+            u64le(0);
+            u64le(0);
+            // ── Phdr PT_LOAD (kernel stack) ──
+            u32le(1);
+            u32le(6);
+            u64le(load_off);
+            u64le(stack_lo);
+            u64le(stack_lo);
+            u64le(stack_len);
+            u64le(stack_len);
+            u64le(0x1000);
+            // ── PT_NOTE: NT_PRSTATUS ──
+            u32le(5);
+            u32le(336);
+            u32le(1);
+            put_bytes(b"CORE\0\0\0\0");
+            // prstatus head (112 bytes), pr_cursig (offset 12) = SIGILL(4)
+            let mut head = [0u8; 112];
+            head[12] = 4;
+            put_bytes(&head);
+            // pr_reg: 27 u64s in user_regs_struct order
+            let regs: [u64; 27] = [
+                frame.r15,
+                frame.r14,
+                frame.r13,
+                frame.r12,
+                frame.rbp,
+                frame.rbx,
+                frame.r11,
+                frame.r10,
+                frame.r9,
+                frame.r8,
+                frame.rax,
+                frame.rcx,
+                frame.rdx,
+                frame.rsi,
+                frame.rdi,
+                frame.rax, // orig_rax
+                frame.rip,
+                frame.cs,
+                frame.rflags,
+                frame.rsp,
+                frame.ss,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0, // fs_base, gs_base, ds, es, fs, gs
+            ];
+            for r in regs {
+                u64le(r);
+            }
+            u32le(0); // pr_fpvalid
+            u32le(0); // pad
+                      // ── PT_LOAD data: the kernel stack window ──
+            let mut a = stack_lo;
+            let end = stack_lo + stack_len;
+            while a < end {
+                let b = core::ptr::read_volatile(a as *const u8);
+                put(b);
+                a += 1;
+            }
+        }
+    }
+}
+
 impl core::fmt::Debug for TrapFrame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
@@ -908,7 +1088,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     let sp = frame.rsp;
     let canonical = sp >= 0x1000
         && sp & 0x7 == 0
-        && (sp < 0x0000_8000_0000_0000 || sp >= 0xFFFF_8000_0000_0000);
+        && !(0x0000_8000_0000_0000..0xFFFF_8000_0000_0000).contains(&sp);
     if canonical {
         let _ = writeln!(TrapWriter, "  stack @ rsp {:#018x}:", sp);
         for row in 0..10u64 {
@@ -920,9 +1100,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // the canonical guard above (worst case a single nested #PF,
                 // which re-enters this handler with the registers already
                 // printed).
-                *slot = unsafe {
-                    core::ptr::read_volatile((base + (i as u64) * 8) as *const u64)
-                };
+                *slot = unsafe { core::ptr::read_volatile((base + (i as u64) * 8) as *const u64) };
             }
             let _ = writeln!(
                 TrapWriter,
@@ -931,6 +1109,19 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             );
         }
     }
+
+    // Kernel core dump out COM2 (captured by QEMU `-serial file:<path>`), so a
+    // kernel crash can be analyzed offline in gdb. Harmless if COM2 isn't routed.
+    let _ = writeln!(
+        TrapWriter,
+        "*** writing kernel core to COM2 (capture with QEMU -serial file:) ***"
+    );
+    // SAFETY: fatal path, single-threaded-enough; COM2 is the standard 2nd ISA
+    // serial and `frame` is the live trap frame.
+    unsafe {
+        kcore::dump(frame);
+    }
+    let _ = writeln!(TrapWriter, "*** kernel core written ***");
 
     // SAFETY: after a fatal exception we have no policy to resume; exit with
     // a non-zero code so xtask / verification can see the failure.

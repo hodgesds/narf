@@ -487,6 +487,16 @@ impl Arch {
                     "-device".into(),
                     "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                 ]);
+                // `NARF_QEMU_COM2_FILE=<path>` routes a *second* serial (COM2,
+                // 0x2F8) to a host file. Appended AFTER `-serial stdio` so QEMU
+                // assigns it COM2 (stdio stays COM1, the console). The kernel's
+                // fatal-trap core dumper (frame trap.rs `mod kcore`) streams an
+                // ELF core out 0x2F8, so a kernel crash under this run leaves an
+                // analyzable core at <path> for offline gdb. Off unless set.
+                if let Ok(path) = std::env::var("NARF_QEMU_COM2_FILE") {
+                    args.push("-serial".into());
+                    args.push(format!("file:{path}"));
+                }
                 // `XTASK_QEMU_QMP=<path>` exposes a QMP control socket so a host
                 // tool can drive QEMU (e.g. `screendump` to capture what the
                 // guest is scanning out). Off unless the env var is set.
