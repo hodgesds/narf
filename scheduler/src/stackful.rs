@@ -1012,6 +1012,29 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         return false; // no executor to switch to
     }
 
+    // Own-stack invariant tripwire. A CPL0 timer tick that preempts THIS task
+    // must have landed on the task's OWN kernel stack: `poll_to_yield`
+    // retargets TSS.rsp0 to it, and a CPL0→CPL0 trap pushes onto the current
+    // rsp (= this task's stack). If `frame` is NOT inside the current task's
+    // stack, the rsp0 / own-stack handoff desynced and we are about to
+    // save-and-switch off a trap frame sitting on the WRONG (executor) stack —
+    // zeroing/garbaging its return slots is precisely the intermittent RIP≈0
+    // #UD. Catch it with attribution instead of silently corrupting.
+    let frame_addr = frame as *const TrapFrame as u64;
+    // SAFETY: live KernelTask per the CURRENT_STACKFUL_TASK invariant above;
+    // `stack` is a `Box<[u8]>` whose base/len bound the task's kernel stack.
+    let task_ref: &KernelTask = unsafe { &*task_ptr };
+    let stk_base = task_ref.stack.as_ptr() as u64;
+    let stk_top = stk_base + task_ref.stack.len() as u64;
+    if frame_addr < stk_base || frame_addr >= stk_top {
+        panic!(
+            "CTXGUARD try_preempt cpu={}: preempt trap frame {:#018x} is OUTSIDE the \
+             current task's kernel stack [{:#018x},{:#018x}) — rsp0/own-stack desync; \
+             frame.rip={:#018x} frame.cs={:#x}",
+            cpu, frame_addr, stk_base, stk_top, frame.rip, frame.cs,
+        );
+    }
+
     // Arm the executor's slot waker so we get re-polled when the
     // executor runs out of other ready tasks. Without this, the
     // slot's `awake` flag stays at the false the last poll
