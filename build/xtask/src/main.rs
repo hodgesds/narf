@@ -629,16 +629,21 @@ impl Arch {
                             "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
                         ]);
                     }
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
-                    ]);
-                    // Absolute-pointing tablet so /dev/input/event* covers
-                    // EV_ABS (ABS_X/ABS_Y) alongside the keyboard's EV_KEY.
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    // `XTASK_QEMU_NO_VIRTIO_INPUT=1` drops the virtio
+                    // keyboard/tablet so QEMU routes input to the q35 i8042
+                    // PS/2 kbd+mouse (which weston discovers via the udev DB).
+                    if std::env::var_os("XTASK_QEMU_NO_VIRTIO_INPUT").is_none() {
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                        ]);
+                        // Absolute-pointing tablet so /dev/input/event* covers
+                        // EV_ABS (ABS_X/ABS_Y) alongside the keyboard's EV_KEY.
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
+                        ]);
+                    }
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
@@ -789,16 +794,21 @@ impl Arch {
                             "virtio-balloon-pci,disable-legacy=on,disable-modern=off".into(),
                         ]);
                     }
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
-                    ]);
-                    // Absolute-pointing tablet so /dev/input/event* covers
-                    // EV_ABS (ABS_X/ABS_Y) alongside the keyboard's EV_KEY.
-                    args.extend_from_slice(&[
-                        "-device".into(),
-                        "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
-                    ]);
+                    // `XTASK_QEMU_NO_VIRTIO_INPUT=1` drops the virtio
+                    // keyboard/tablet so QEMU routes input to the q35 i8042
+                    // PS/2 kbd+mouse (which weston discovers via the udev DB).
+                    if std::env::var_os("XTASK_QEMU_NO_VIRTIO_INPUT").is_none() {
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "virtio-keyboard-pci,disable-legacy=on,disable-modern=off".into(),
+                        ]);
+                        // Absolute-pointing tablet so /dev/input/event* covers
+                        // EV_ABS (ABS_X/ABS_Y) alongside the keyboard's EV_KEY.
+                        args.extend_from_slice(&[
+                            "-device".into(),
+                            "virtio-tablet-pci,disable-legacy=on,disable-modern=off".into(),
+                        ]);
+                    }
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),

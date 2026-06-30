@@ -35,6 +35,9 @@ use narf_input::{
     abs, push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, KeyCode, PointerButtons,
     PointerEvent, TouchEvent,
 };
+use narf_input::evdev::{
+    dispatch_pointer_to_node, DeviceCaps, DeviceNode, EvdevEvent, EventType, ROUTER,
+};
 
 /// True when `code` belongs to the Linux evdev BTN_* range but
 /// isn't already routed to PointerButtons or MT-slot-0 by the
@@ -257,6 +260,71 @@ unsafe fn read_device_metadata(
     (name, axis_info, led_bits)
 }
 
+/// Classify a virtio-input device from its advertised EV bits and
+/// register a matching evdev node so a userspace compositor (libinput)
+/// can read it on `/dev/input/event*`. Returns `(node, is_keyboard)`.
+///
+/// - A device with REL_X or ABS_X (mouse / tablet) becomes a RELATIVE
+///   mouse node (EV_REL + BTN_LEFT/RIGHT/MIDDLE). Absolute tablets are
+///   converted to relative deltas in `drain_events`, so we don't have to
+///   publish abs ranges through the evdev ioctl layer.
+/// - A device with keyboard key codes becomes an EV_KEY passthrough node
+///   carrying exactly the keys the device advertises.
+/// - Anything else (pure multi-touch screens, for now) → `None`.
+///
+/// # Safety
+/// `region` must be a mapped virtio-input device-config region.
+unsafe fn register_evdev_node(
+    region: &crate::pci::VirtioRegion,
+    axis_info: &[Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
+) -> (Option<alloc::sync::Arc<DeviceNode>>, bool) {
+    let bit = |buf: &[u8], n: usize, code: usize| {
+        let byte = code / 8;
+        byte < n && (buf[byte] >> (code % 8)) & 1 != 0
+    };
+
+    // EV_REL bitmap — REL_X tells us this is a relative mouse.
+    let mut rel_bits = [0u8; 128];
+    // SAFETY: caller-asserted mapped region.
+    let nrel = unsafe { read_cfg(region, CFG_EV_BITS, EV_REL as u8, &mut rel_bits) };
+    let has_rel = bit(&rel_bits, nrel, REL_X as usize);
+    // ABS_X advertised ⇒ absolute pointer (tablet).
+    let has_abs = axis_info
+        .get(abs::ABS_X as usize)
+        .map(|a| a.is_some())
+        .unwrap_or(false);
+
+    if has_rel || has_abs {
+        let mut caps = DeviceCaps::new();
+        caps.add_rel(REL_X);
+        caps.add_rel(REL_Y);
+        caps.add_key(BTN_LEFT);
+        caps.add_key(BTN_RIGHT);
+        caps.add_key(BTN_MIDDLE);
+        let (_id, node) = ROUTER.register_device(caps);
+        return (Some(node), false);
+    }
+
+    // EV_KEY bitmap — a real keyboard advertises the alphanumeric block.
+    let mut key_bits = [0u8; 128];
+    // SAFETY: caller-asserted mapped region.
+    let nkey = unsafe { read_cfg(region, CFG_EV_BITS, EV_KEY as u8, &mut key_bits) };
+    // KEY_ESC = 1, KEY_A = 30 (input-event-codes.h). Either present ⇒ kbd.
+    let is_kbd = bit(&key_bits, nkey, 1) || bit(&key_bits, nkey, 30);
+    if is_kbd {
+        let mut caps = DeviceCaps::new();
+        for code in 0..nkey * 8 {
+            if bit(&key_bits, nkey, code) {
+                caps.add_key(code as u16);
+            }
+        }
+        let (_id, node) = ROUTER.register_device(caps);
+        return (Some(node), true);
+    }
+
+    (None, false)
+}
+
 #[derive(Debug)]
 struct Queues {
     event_q: Virtqueue,
@@ -329,6 +397,25 @@ pub struct VirtioInputPci {
     /// modifier state in sync_leds so only transitions hit
     /// statusQ.
     last_leds: core::sync::atomic::AtomicU8,
+    /// Evdev node this device is exposed as on `/dev/input/event*`, so a
+    /// userspace compositor (libinput) can read it. Pointer devices
+    /// (mouse / abs tablet) register a RELATIVE mouse node — the tablet's
+    /// absolute axes are converted to relative deltas, sidestepping the
+    /// evdev abs-range plumbing; keyboards register an EV_KEY passthrough
+    /// node. `None` for device classes we don't yet expose (pure MT
+    /// touchscreens). Drained in `drain_events`, which runs in the pump
+    /// task (not IRQ), so dispatching here may lock/alloc.
+    evdev_node: Option<alloc::sync::Arc<DeviceNode>>,
+    /// `true` when `evdev_node` is a keyboard (raw EV_KEY passthrough);
+    /// `false` when it's a pointer (abs→rel + button edges at EV_SYN).
+    evdev_is_kbd: bool,
+    /// Last absolute X / Y sample (tablet) so ABS_X/ABS_Y convert to REL
+    /// deltas for the relative evdev node. `i32::MIN` = no prior sample.
+    last_abs_x: core::sync::atomic::AtomicI32,
+    last_abs_y: core::sync::atomic::AtomicI32,
+    /// Button bitset (bit0 L, bit1 R, bit2 M) last dispatched to the
+    /// evdev pointer node, for press/release edge detection at EV_SYN.
+    prev_evdev_buttons: core::sync::atomic::AtomicU8,
 }
 
 #[derive(Debug)]
@@ -554,6 +641,14 @@ impl VirtioInputPci {
             None => (alloc::string::String::new(), [None; ABS_BOUNDS_LEN], 0u8),
         };
 
+        // Expose the device on /dev/input/event* so a userspace
+        // compositor (weston via libinput) can read it.
+        let (evdev_node, evdev_is_kbd) = match device_cfg.as_ref() {
+            // SAFETY: device-cfg region was just mapped above.
+            Some(r) => unsafe { register_evdev_node(r, &axis_info) },
+            None => (None, false),
+        };
+
         // Scratch buffer for outbound EV_LED events. One 4 KiB
         // page is enough for LED_SLOTS × 8-byte events with room
         // to spare.
@@ -584,6 +679,11 @@ impl VirtioInputPci {
             status_q_notify_off,
             led_bits,
             last_leds: core::sync::atomic::AtomicU8::new(0),
+            evdev_node,
+            evdev_is_kbd,
+            last_abs_x: core::sync::atomic::AtomicI32::new(i32::MIN),
+            last_abs_y: core::sync::atomic::AtomicI32::new(i32::MIN),
+            prev_evdev_buttons: core::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -778,6 +878,19 @@ impl VirtioInputPci {
             match etype {
                 EV_KEY => {
                     let pressed = value != 0;
+                    // Keyboard evdev passthrough: forward the raw key to
+                    // the node so libinput sees real key events. (Pointer
+                    // devices forward buttons at EV_SYN instead.)
+                    if self.evdev_is_kbd {
+                        if let Some(node) = &self.evdev_node {
+                            node.dispatch(EvdevEvent {
+                                time: narf_time::now_cycles(),
+                                type_: EventType::Key,
+                                code,
+                                value: value as i32,
+                            });
+                        }
+                    }
                     // Mouse buttons (BTN_*) live in the EV_KEY code
                     // space but map onto PointerButtons, not KeyCode.
                     let btn = match code {
@@ -896,6 +1009,22 @@ impl VirtioInputPci {
                             slot.dirty = true;
                         }
                     } else {
+                        // Pointer abs→rel: a tablet reports ABS_X/ABS_Y;
+                        // convert to relative deltas (fed into the same
+                        // accumulators as a real mouse) so both the
+                        // global-ring cursor AND the relative evdev mouse
+                        // node track motion without abs-range plumbing.
+                        if code == abs::ABS_X {
+                            let last = self.last_abs_x.swap(signed, Ordering::AcqRel);
+                            if last != i32::MIN {
+                                self.rel_dx_acc.fetch_add(signed - last, Ordering::Relaxed);
+                            }
+                        } else if code == abs::ABS_Y {
+                            let last = self.last_abs_y.swap(signed, Ordering::AcqRel);
+                            if last != i32::MIN {
+                                self.rel_dy_acc.fetch_add(signed - last, Ordering::Relaxed);
+                            }
+                        }
                         // Non-MT absolute axis (tablet ABS_X/Y,
                         // joystick stick, hat, tilt, pressure for
                         // single-touch styluses, …). Push raw —
@@ -918,6 +1047,35 @@ impl VirtioInputPci {
                         PointerButtons::from_bits_truncate(self.buttons.load(Ordering::Acquire));
                     if dx != 0 || dy != 0 || buttons != PointerButtons::EMPTY {
                         let _ = push_global(InputEvent::Pointer(PointerEvent { dx, dy, buttons }));
+                    }
+                    // Evdev frame flush so a userspace compositor sees it.
+                    if let Some(node) = &self.evdev_node {
+                        if self.evdev_is_kbd {
+                            node.dispatch(EvdevEvent::syn_report(narf_time::now_cycles()));
+                        } else {
+                            // Pointer node: relative motion + button
+                            // press/release edges, one evdev frame.
+                            let cur = (buttons.contains(PointerButtons::LEFT) as u8)
+                                | ((buttons.contains(PointerButtons::RIGHT) as u8) << 1)
+                                | ((buttons.contains(PointerButtons::MIDDLE) as u8) << 2);
+                            let prev = self.prev_evdev_buttons.swap(cur, Ordering::AcqRel);
+                            let changed = cur ^ prev;
+                            let mut edges: [(u16, bool); 3] = [(0, false); 3];
+                            let mut n = 0;
+                            if changed & 1 != 0 {
+                                edges[n] = (BTN_LEFT, cur & 1 != 0);
+                                n += 1;
+                            }
+                            if changed & 2 != 0 {
+                                edges[n] = (BTN_RIGHT, cur & 2 != 0);
+                                n += 1;
+                            }
+                            if changed & 4 != 0 {
+                                edges[n] = (BTN_MIDDLE, cur & 4 != 0);
+                                n += 1;
+                            }
+                            dispatch_pointer_to_node(node, dx, dy, &edges[..n]);
+                        }
                     }
                     // Flush every dirty MT slot as one Touch event.
                     // Pulled out under the lock so concurrent EV_ABS
