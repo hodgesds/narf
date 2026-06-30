@@ -342,6 +342,42 @@ fn this_cpu() -> usize {
     }
 }
 
+/// A `KernelContext` is only ever switched *into* after a `kernel_switch`
+/// SAVE half populated it (`rip` = a real return-PC, `rsp` = a live kernel
+/// stack) or `KernelContext::fresh` set a trampoline entry + stack top. A
+/// near-null / non-canonical / mis-aligned `rip`/`rsp` therefore means the
+/// context was corrupted (the own-stack nesting / work-steal handoff race
+/// the scheduler has historically hit). Switching into it would `jmp` to a
+/// wild address — the classic intermittent RIP≈0 #UD. Catch it at the
+/// switch point and panic cleanly WITH attribution instead.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn ctx_looks_sane(ctx: &KernelContext) -> bool {
+    let canon = |a: u64| a >= 0x1000 && (a < 0x0000_8000_0000_0000 || a >= 0xFFFF_8000_0000_0000);
+    canon(ctx.rip) && canon(ctx.rsp) && ctx.rsp & 0x7 == 0
+}
+
+/// Validate a context immediately before `kernel_switch`-ing into it.
+/// `label` names the switch site so a fired guard pinpoints which half
+/// (task `ctx` vs executor `exec_ctx`) was corrupt.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn guard_switch_into(label: &str, ctx: &KernelContext) {
+    if !ctx_looks_sane(ctx) {
+        panic!(
+            "CTXGUARD {label} cpu={}: refusing kernel_switch into corrupt context — \
+             rip={:#018x} rsp={:#018x} rbp={:#018x} rbx={:#018x} r12={:#018x} r15={:#018x}",
+            this_cpu(),
+            ctx.rip,
+            ctx.rsp,
+            ctx.rbp,
+            ctx.rbx,
+            ctx.r12,
+            ctx.r15,
+        );
+    }
+}
+
 #[inline]
 const fn zeroed_trap_frame() -> TrapFrame {
     TrapFrame {
@@ -694,6 +730,7 @@ impl KernelTask {
         // slot) valid for this call; reading a `Copy`-layout POD struct from it
         // is sound and leaves the source intact.
         let prev_exec = unsafe { core::ptr::read(exec_ctx as *const KernelContext) };
+        guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // ── We are resumed here when the task yields back ──
@@ -856,6 +893,8 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         }
         // SAFETY: exec_ctx outlives this call (executor's stack
         // is alive in its `poll_to_yield`).
+        // SAFETY: exec_ctx non-null (checked above).
+        guard_switch_into("try_preempt:exec_ctx", unsafe { &*exec_ctx });
         // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(&mut task.ctx, exec_ctx) };
         // ── We resume here when the executor switches us back ──
@@ -1019,6 +1058,8 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // and `exec_ctx` is the non-null executor context published by the
     // in-progress poll_to_yield; kernel_switch saves the current callee-saved
     // state / RFLAGS into the former and restores the latter.
+    // SAFETY: exec_ctx non-null (executor published it).
+    guard_switch_into("preempt_trap:exec_ctx", unsafe { &*exec_ctx });
     // SAFETY: Valid memory or trusted environment
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
 
@@ -1115,6 +1156,7 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     // kernel_switch saves the trap-handler continuation and resumes the executor.
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
     // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx.
+    guard_switch_into("preempt_yield:exec_ctx", unsafe { &*exec_ctx });
     unsafe { kernel_switch(task_ctx_ptr, exec_ctx) };
     // ── Resumed here when the executor switches back into this task ──
     let cpu = this_cpu();
@@ -1157,6 +1199,8 @@ pub unsafe fn yield_current_stackful() {
     let ctx = unsafe { &raw mut (*p).ctx };
     // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
     // resumes the executor, returning here when it switches us back in.
+    // SAFETY: exec_ctx non-null (checked above); the executor populated it.
+    guard_switch_into("yield_current_stackful:exec_ctx", unsafe { &*exec_ctx });
     unsafe { kernel_switch(ctx, exec_ctx) };
     // ── Resumed ──
     let cpu = this_cpu();
@@ -1204,6 +1248,8 @@ pub unsafe fn exit_current_stackful() -> ! {
             CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
             if !exec_ctx.is_null() {
                 let ctx = &raw mut (*p).ctx;
+                // SAFETY: exec_ctx non-null (checked); executor populated it.
+                guard_switch_into("exit_current_stackful:exec_ctx", &*exec_ctx);
                 kernel_switch(ctx, exec_ctx);
             }
         }
