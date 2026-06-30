@@ -15984,6 +15984,178 @@ fn smoke_userspace_statx_at_empty_path_uses_dirfd() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_statx_at_empty_path_uses_dirfd);
 
 #[cfg(feature = "linux-compat")]
+fn smoke_userspace_statx_device_node_reports_rdev() -> TestResult {
+    // Regression: a device node's FileOps::rdev() must surface in
+    // statx's stx_rdev_major/minor. seatd / libudev validate a device's
+    // type from its MAJOR:MINOR; a 0 rdev reads as "not a device" and
+    // they refuse to open it (the weston-input EINVAL). Open a synthetic
+    // char device (major 13, minor 64) and statx(fd, AT_EMPTY_PATH).
+    use crate::{
+        fd,
+        handlers::linux_compat::{Statx, AT_EMPTY_PATH},
+        install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_capabilities::{Cap, Grant};
+    use narf_filesystem::{
+        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FileType, FsFuture,
+        FsInstance, Mode, MountPoint, Stat,
+    };
+
+    // (major << 8) | minor for the small-number range; 13 = Linux evdev.
+    const DEV_RDEV: u64 = (13 << 8) | 64;
+    struct RdevFile;
+    impl FileOps for RdevFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Special,
+                    perms: 0o660,
+                },
+                mtime_cycles: 0,
+            }
+        }
+        fn rdev(&self) -> u64 {
+            DEV_RDEV
+        }
+    }
+    struct RdevDir;
+    impl DirOps for RdevDir {
+        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+            if name == "evdev" {
+                Some(Arc::new(RdevFile))
+            } else {
+                None
+            }
+        }
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+    struct RdevFs;
+    impl FsInstance for RdevFs {
+        fn root(&self) -> Arc<dyn DirOps> {
+            Arc::new(RdevDir)
+        }
+        fn name(&self) -> &str {
+            "statx-rdev"
+        }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let _ = registry().mount(&auth, "/statx-rdev", RdevFs);
+
+    fd::__test_reset();
+    fd::init();
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xE004);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+    }
+
+    let path = b"/statx-rdev/evdev\0";
+    let mut open_ctx = FakeCtx {
+        #[cfg(target_arch = "x86_64")]
+        args: SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: 0,
+            ..SyscallArgs::default()
+        },
+        #[cfg(target_arch = "aarch64")]
+        args: SyscallArgs {
+            arg0: 0xffffffffffffff9c, // AT_FDCWD
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    #[cfg(target_arch = "x86_64")]
+    kernel_syscall_entry(Syscall::OpenFile.raw(), &mut open_ctx);
+    #[cfg(target_arch = "aarch64")]
+    kernel_syscall_entry(Syscall::Openat.raw(), &mut open_ctx);
+    let opened_fd = match open_ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK => r.value as i32,
+        _ => {
+            fd::__test_reset();
+            __test_clear_global();
+            return TestResult::Fail("open of synthetic device node failed");
+        }
+    };
+
+    let empty: &[u8] = b"\0";
+    let mut out = Statx::default();
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: opened_fd as u64,
+            arg1: empty.as_ptr() as u64,
+            arg2: AT_EMPTY_PATH as u64,
+            arg3: 0xFFF,
+            arg4: &mut out as *mut Statx as u64,
+            arg5: 0,
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Statx.raw(), &mut ctx);
+
+    fd::__test_reset();
+    __test_clear_global();
+
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        return TestResult::Fail("statx of device node did not return Ok(0)");
+    }
+    if out.stx_rdev_major != 13 {
+        return TestResult::Fail("stx_rdev_major != 13 (rdev not plumbed through statx)");
+    }
+    if out.stx_rdev_minor != 64 {
+        return TestResult::Fail("stx_rdev_minor != 64");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("userspace", smoke_userspace_statx_device_node_reports_rdev);
+
+#[cfg(feature = "linux-compat")]
 fn smoke_userspace_linux_stat_layout_offsets() -> TestResult {
     // Compile-time check that linux_compat::Stat field offsets match
     // the Linux x86_64 ABI (man 2 stat).
