@@ -25,7 +25,7 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -358,6 +358,37 @@ impl core::fmt::Debug for DeviceNode {
     }
 }
 
+/// Wake hook fired after an evdev event is dispatched. `wake_readers`
+/// only wakes the async `Reader` wakers; the SYSCALL layer (a blocking
+/// `read`, or a `poll`/`epoll` on `/dev/input/event*`) parks on the net
+/// readiness system, which lives in another crate. The userspace layer
+/// installs this (→ `narf_net::readiness::notify`) so those waiters resume.
+/// Stored as `fn() as usize`.
+static DISPATCH_WAKE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the post-dispatch wake callback (typically
+/// `narf_net::readiness::notify`). Called once during boot.
+pub fn set_dispatch_wake_hook(f: fn()) {
+    DISPATCH_WAKE_HOOK.store(f as usize, Ordering::Release);
+}
+
+fn fire_dispatch_wake() {
+    // The wake path allocates (a Vec of wakers), so it must NOT run from
+    // IRQ context — the i8042 keyboard/mouse dispatch from IRQ12/IRQ1, and
+    // a Sleepable allocation there panics. Task-context dispatchers (the
+    // virtio-input pump) still wake their readers; IRQ-sourced events ride
+    // the poll fallback tick / the next task-context wake.
+    if narf_lib::context::in_irq() {
+        return;
+    }
+    let h = DISPATCH_WAKE_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: only ever stored as `fn() as usize` by `set_dispatch_wake_hook`.
+        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+        f();
+    }
+}
+
 impl DeviceNode {
     fn new(id: DeviceId, caps: DeviceCaps) -> Self {
         Self {
@@ -390,6 +421,13 @@ impl DeviceNode {
         }
         self.push_count.fetch_add(1, Ordering::Relaxed);
         g.wake_readers();
+        drop(g);
+        // Also wake the syscall-layer waiters: a `read`/`poll`/`epoll` on
+        // /dev/input/event* parks on the net readiness system (a separate
+        // crate), which `wake_readers`' async wakers don't reach. Without
+        // this, a compositor sees the device but never its events. Dropped
+        // the ring lock first — the hook takes other locks.
+        fire_dispatch_wake();
         true
     }
 

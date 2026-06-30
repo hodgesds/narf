@@ -213,6 +213,15 @@ pub fn wake_io_waiters(key: u64) {
     wake_all_io_waiters();
 }
 
+/// Evdev dispatch wake bridge: bump the readiness generation + wake all
+/// io-waiters so a `read`/`poll`/`epoll` parked on /dev/input/event*
+/// resumes when an input driver dispatches an event. Installed into
+/// `narf_input::evdev` at boot. `notify(0)` = wake-all (input events
+/// aren't keyed by a TCB id).
+fn evdev_dispatch_wake() {
+    narf_net::readiness::notify(0);
+}
+
 /// Wake every task parked on net I/O readiness (the conservative
 /// fallback for untracked keys — loopback / unix / not-yet-owned).
 fn wake_all_io_waiters() {
@@ -9581,6 +9590,11 @@ pub fn wait_init() {
     // rather than at their next wheel deadline. Latency-only; safe to
     // install unconditionally (no-op until a task parks on net I/O).
     narf_net::readiness::set_hook(wake_io_waiters);
+    // Same wake, for evdev: a `read`/`poll`/`epoll` on /dev/input/event*
+    // parks on the net readiness system, but an input driver dispatching an
+    // event only wakes its async `Reader` slots. Bridge the two so a
+    // compositor (weston/libinput) actually receives input it's parked on.
+    narf_input::evdev::set_dispatch_wake_hook(evdev_dispatch_wake);
     crate::pidfd::init();
     // Wave-65: clone3 CLONE_CHILD_CLEARTID + set_tid_address(2)
     // bookkeeping. The table holds per-task user-pointer slots;
