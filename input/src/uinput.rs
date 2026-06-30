@@ -63,7 +63,7 @@ impl UserDevice {
     /// Convenience: inject a key press (`value = 1`) or release (`value = 0`)
     /// followed by `EV_SYN SYN_REPORT`.
     pub fn inject_key(&self, code: u16, pressed: bool) {
-        let now = narf_time::now_cycles();
+        let now = narf_time::monotonic_ns();
         use crate::evdev::EventType;
         let ev = EvdevEvent {
             time: now,
@@ -81,7 +81,7 @@ impl UserDevice {
     /// generating noise in the stream).
     pub fn inject_rel(&self, rel_x: i32, rel_y: i32) {
         use crate::evdev::{rel, EventType};
-        let now = narf_time::now_cycles();
+        let now = narf_time::monotonic_ns();
         if rel_x != 0 {
             self.node.dispatch(EvdevEvent {
                 time: now,

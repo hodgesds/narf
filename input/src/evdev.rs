@@ -123,8 +123,11 @@ pub mod key {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct EvdevEvent {
-    /// Kernel-monotonic timestamp (TSC cycles). Maps to `time` in Linux
-    /// `struct input_event`.
+    /// Kernel-monotonic timestamp in **nanoseconds**
+    /// (`narf_time::monotonic_ns`). Maps to `time` in Linux
+    /// `struct input_event`. The unit is load-bearing: libinput derives
+    /// pointer velocity from inter-event time deltas — see
+    /// `pack_linux_event` in `filesystem/src/devfs_input.rs`.
     pub time: u64,
     /// Event type — one of the `EventType` discriminants.
     pub type_: EventType,
@@ -436,7 +439,7 @@ impl DeviceNode {
     /// stream ended. Mirrors Linux `evdev_cleanup` / `input_unregister_device`.
     pub fn remove(&self) {
         self.alive.store(false, Ordering::Release);
-        let now = narf_time::now_cycles();
+        let now = narf_time::monotonic_ns();
         let mut g = self.inner.lock();
         g.push(EvdevEvent::syn_dropped(now));
         g.wake_readers();

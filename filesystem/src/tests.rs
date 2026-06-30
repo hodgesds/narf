@@ -1399,9 +1399,9 @@ fn smoke_dev_input_read_one_event_correct_layout() -> TestResult {
     caps.add_key(KEY_A);
     let (id, node) = ROUTER.register_device(caps);
 
-    // Pick a time that yields non-zero tv_sec AND tv_usec when split as
-    // microseconds (sec = time / 1e6, usec = time % 1e6).
-    let now = 2_000_500u64;
+    // `time` is monotonic nanoseconds; the split is sec = ns / 1e9,
+    // usec = (ns % 1e9) / 1000. Pick a value giving tv_sec=2, tv_usec=500.
+    let now = 2_000_500_000u64;
     let sent = EvdevEvent {
         time: now,
         type_: EventType::Key,

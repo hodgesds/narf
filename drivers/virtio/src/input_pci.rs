@@ -884,7 +884,7 @@ impl VirtioInputPci {
                     if self.evdev_is_kbd {
                         if let Some(node) = &self.evdev_node {
                             node.dispatch(EvdevEvent {
-                                time: narf_time::now_cycles(),
+                                time: narf_time::monotonic_ns(),
                                 type_: EventType::Key,
                                 code,
                                 value: value as i32,
@@ -1051,7 +1051,7 @@ impl VirtioInputPci {
                     // Evdev frame flush so a userspace compositor sees it.
                     if let Some(node) = &self.evdev_node {
                         if self.evdev_is_kbd {
-                            node.dispatch(EvdevEvent::syn_report(narf_time::now_cycles()));
+                            node.dispatch(EvdevEvent::syn_report(narf_time::monotonic_ns()));
                         } else {
                             // Pointer node: relative motion + button
                             // press/release edges, one evdev frame.

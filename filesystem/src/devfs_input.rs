@@ -76,16 +76,19 @@ pub(crate) const LINUX_INPUT_EVENT_SIZE: usize = 24;
 
 /// Pack one internal `EvdevEvent` into a 24-byte Linux `input_event`.
 ///
-/// The internal `time` is a TSC-monotonic u64; we split it into the
-/// `timeval` seconds/microseconds fields by treating it as a microsecond
-/// count (`tv_sec = time / 1_000_000`, `tv_usec = time % 1_000_000`).
-/// evdev consumers only ever subtract timestamps for relative timing, so
-/// the absolute epoch is irrelevant — only monotonicity matters, which
-/// the TSC source guarantees.
+/// The internal `time` is monotonic **nanoseconds** (`narf_time::monotonic_ns`);
+/// we split it into the `timeval` seconds/microseconds fields:
+/// `tv_sec = ns / 1e9`, `tv_usec = (ns % 1e9) / 1000`.
+///
+/// Getting the UNIT right matters: libinput derives pointer velocity from the
+/// time delta between consecutive events. If `time` were raw TSC cycles
+/// (~3.3e9/s) packed as if it were microseconds, every dt would be ~3300×
+/// too large, velocity ~3300× too small, and the pointer-accel curve would
+/// map it to ~0 px — input is read but the cursor never moves.
 fn pack_linux_event(ev: &EvdevEvent) -> [u8; LINUX_INPUT_EVENT_SIZE] {
     let mut out = [0u8; LINUX_INPUT_EVENT_SIZE];
-    let tv_sec = (ev.time / 1_000_000) as i64;
-    let tv_usec = (ev.time % 1_000_000) as i64;
+    let tv_sec = (ev.time / 1_000_000_000) as i64;
+    let tv_usec = ((ev.time % 1_000_000_000) / 1_000) as i64;
     out[0..8].copy_from_slice(&tv_sec.to_le_bytes());
     out[8..16].copy_from_slice(&tv_usec.to_le_bytes());
     out[16..18].copy_from_slice(&(ev.type_ as u16).to_le_bytes());
@@ -97,8 +100,8 @@ fn pack_linux_event(ev: &EvdevEvent) -> [u8; LINUX_INPUT_EVENT_SIZE] {
 /// Unpack a 24-byte Linux `input_event` into an internal `EvdevEvent`.
 ///
 /// Returns `None` if the `type` field is not a recognised `EV_*` code.
-/// The `timeval` is collapsed back to a TSC-style u64 microsecond count
-/// (`tv_sec * 1_000_000 + tv_usec`); uinput callers normally zero it and
+/// The `timeval` is collapsed back to a monotonic-ns u64
+/// (`tv_sec * 1e9 + tv_usec * 1000`); uinput callers normally zero it and
 /// let the kernel timestamp, but we preserve whatever they sent.
 fn unpack_linux_event(buf: &[u8]) -> Option<EvdevEvent> {
     if buf.len() < LINUX_INPUT_EVENT_SIZE {
@@ -111,8 +114,8 @@ fn unpack_linux_event(buf: &[u8]) -> Option<EvdevEvent> {
     let value = i32::from_le_bytes(buf[20..24].try_into().ok()?);
     let type_ = EventType::from_raw(raw_type)?;
     let time = (tv_sec as u64)
-        .wrapping_mul(1_000_000)
-        .wrapping_add(tv_usec as u64);
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add((tv_usec as u64).wrapping_mul(1_000));
     Some(EvdevEvent {
         time,
         type_,
