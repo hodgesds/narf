@@ -241,18 +241,26 @@ impl DeviceCaps {
     pub fn add_key(&mut self, c: u16) {
         self.keybit.set(c);
         self.evbit |= 1 << (EventType::Key as u16);
+        // Every evdev device that emits events also reports EV_SYN (the
+        // kernel sets it unconditionally). libevdev/libinput reject a
+        // device whose EVIOCGBIT(0) bitmap lacks EV_SYN — without this,
+        // weston drops every input device after reading its (otherwise
+        // correct) caps.
+        self.evbit |= 1 << (EventType::Syn as u16);
     }
 
     /// Declare support for `EV_REL` axis `c`.
     pub fn add_rel(&mut self, c: u16) {
         self.relbit.set(c);
         self.evbit |= 1 << (EventType::Rel as u16);
+        self.evbit |= 1 << (EventType::Syn as u16);
     }
 
     /// Declare support for `EV_ABS` axis `c`.
     pub fn add_abs(&mut self, c: u16) {
         self.absbit.set(c);
         self.evbit |= 1 << (EventType::Abs as u16);
+        self.evbit |= 1 << (EventType::Syn as u16);
     }
 
     /// Return `true` if `(type_, code)` is in the capability set.
