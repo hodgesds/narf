@@ -2474,6 +2474,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     "  mnt-dev-bind: writable /tmp mounted at /mnt/tmp"
                                 );
                             }
+                            // And a writable /run (tmpfs). udevd + most daemons
+                            // keep runtime state here (control socket, queue,
+                            // watch dir, /run/udev/data, /run/user/<uid>) which
+                            // need unlink/rename + nested dirs the ext2 rootfs
+                            // lacks. On real Linux /run is always tmpfs.
+                            if !mounts.iter().any(|m| m == "/mnt/run") {
+                                let run = narf_filesystem::MemFs::new("tmpfs");
+                                let _ = narf_filesystem::registry().mount(&auth, "/mnt/run", run);
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  mnt-dev-bind: writable /run mounted at /mnt/run"
+                                );
+                            }
                             // Bind /sys and /proc into the chroot too — libudev/
                             // libinput enumerate devices via /sys/class/*, and
                             // most Linux software pokes /proc. Best-effort.

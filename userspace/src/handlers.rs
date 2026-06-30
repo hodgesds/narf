@@ -3941,14 +3941,31 @@ pub(crate) fn resolve_parent_dir_async(
     let parent_path = if last == 0 { "/" } else { &abs[..last] };
     let dir = narf_filesystem::registry()
         .resolve_absolute(parent_path, |fs, rel| {
-            if rel.is_empty() {
-                // Parent is the mount root itself.
-                Some(fs.root())
-            } else {
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
-                    .and_then(|r| r.ok())
-                    .and_then(|f| f.as_dir())
+            // Walk `rel` segment-by-segment as DIRECTORIES. We can't use
+            // `resolve_async` here: it resolves to a FileOps and returns
+            // NotFound for a directory-only final component (e.g. a MemFs
+            // subdir, whose `lookup` yields None for Dir entries), so the
+            // parent of a nested create never resolved → EPERM. Prefer the
+            // async dir-lookup (ext2 needs block reads); fall back to the
+            // sync `lookup_dir` for filesystems that stub the async form.
+            let mut dir = fs.root();
+            for seg in rel.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg == ".." {
+                    return None;
+                }
+                let next = match poll_blocking(dir.lookup_dir_async(seg)) {
+                    Some(Ok(d)) => d,
+                    Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
+                        dir.lookup_dir(seg)?
+                    }
+                    Some(Err(_)) => return None,
+                };
+                dir = next;
             }
+            Some(dir)
         })
         .flatten()?;
     Some((dir, alloc::string::String::from(leaf)))
