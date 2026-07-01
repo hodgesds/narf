@@ -1833,7 +1833,9 @@ kernel_test!(smoke_smp_x86_64_cpuid_count);
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_on_node_returns_local() -> TestResult {
     if !narf_lib::smp::is_online(1) {
-        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+        return TestResult::Skip(
+            "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
+        );
     }
     // alloc_frame_on(node) should return a frame whose physical
     // address falls within `node`'s SRAT memory range. Re-parse
@@ -1872,7 +1874,9 @@ kernel_test!(smoke_frame_alloc_on_node_returns_local);
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_free_routes_to_owning_node() -> TestResult {
     if !narf_lib::smp::is_online(1) {
-        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+        return TestResult::Skip(
+            "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
+        );
     }
     // free_frame() must use the frame's physical address to choose
     // the destination bin — not the current CPU's node. Allocate
@@ -1913,7 +1917,9 @@ kernel_test!(smoke_frame_free_routes_to_owning_node);
 #[cfg(target_arch = "x86_64")]
 fn smoke_numa_slit_distance_matrix() -> TestResult {
     if !narf_lib::smp::is_online(1) {
-        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+        return TestResult::Skip(
+            "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
+        );
     }
     // The QEMU NUMA host wires a 2-node SLIT with local=10/remote=20
     // (`-numa dist,...`). Re-parse SRAT + SLIT from the cached boot
@@ -1965,7 +1971,9 @@ kernel_test!(smoke_numa_slit_distance_matrix);
 #[cfg(target_arch = "x86_64")]
 fn smoke_numa_mempolicy_bind_steers_alloc() -> TestResult {
     if !narf_lib::smp::is_online(1) {
-        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+        return TestResult::Skip(
+            "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
+        );
     }
     // MPOL_BIND enforcement: with the active policy bound to node 1,
     // a policied allocation must land in node 1's SRAT memory range.

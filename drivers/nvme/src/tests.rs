@@ -587,7 +587,9 @@ fn smoke_nvme_multi_queue_granted() -> TestResult {
     if !narf_lib::smp::is_online(1) {
         // I/O queue pairs scale with the online CPU count; a 1-vCPU
         // boot (NARF_QEMU_SMP=1) legitimately grants a single pair.
-        return TestResult::Skip("needs >= 2 vCPUs for multiple I/O queue pairs; NARF_QEMU_SMP shrinks the count");
+        return TestResult::Skip(
+            "needs >= 2 vCPUs for multiple I/O queue pairs; NARF_QEMU_SMP shrinks the count",
+        );
     }
     // Validates the NVMe Set Features (FID 0x07, Number of Queues)
     // round trip + multi-queue create path against the QEMU NVMe

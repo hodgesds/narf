@@ -31,12 +31,12 @@ use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
+use narf_input::evdev::{
+    dispatch_pointer_to_node, DeviceCaps, DeviceNode, EvdevEvent, EventType, ROUTER,
+};
 use narf_input::{
     abs, push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, KeyCode, PointerButtons,
     PointerEvent, TouchEvent,
-};
-use narf_input::evdev::{
-    dispatch_pointer_to_node, DeviceCaps, DeviceNode, EvdevEvent, EventType, ROUTER,
 };
 
 /// True when `code` belongs to the Linux evdev BTN_* range but

@@ -38,9 +38,7 @@ kernel_test_in!("input", smoke_input_ring_push_pop_round_trip);
 /// the PS/2 mouse only forwarding motion to evdev — clicks never reached
 /// the compositor because the button `EV_KEY` events were dropped.
 fn smoke_input_evdev_pointer_frame_carries_button() -> TestResult {
-    use crate::evdev::{
-        dispatch_pointer_to_node, key, rel, DeviceCaps, EventType, ROUTER,
-    };
+    use crate::evdev::{dispatch_pointer_to_node, key, rel, DeviceCaps, EventType, ROUTER};
 
     let mut caps = DeviceCaps::new();
     caps.add_rel(rel::REL_X);

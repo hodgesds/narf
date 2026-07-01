@@ -50,8 +50,7 @@ pub struct DriCardFile {
 /// back to zero — the last compositor's `card<N>` fd closed (typically at
 /// process exit) — we hand the framebuffer back to the kernel console so
 /// post-compositor kernel logs are visible again.
-static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static LIVE_CARD_FILES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl DriCardFile {
     fn new(index: u32) -> Self {

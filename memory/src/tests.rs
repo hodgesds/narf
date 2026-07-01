@@ -1315,7 +1315,9 @@ kernel_test_in!("memory", smoke_slab_magazine_hot_path);
 #[cfg(target_arch = "x86_64")]
 fn smoke_frame_alloc_per_node_distribution() -> TestResult {
     if !narf_lib::smp::is_online(1) {
-        return TestResult::Skip("needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs");
+        return TestResult::Skip(
+            "needs the default multi-CPU/NUMA QEMU config; NARF_QEMU_SMP drops -numa + APs",
+        );
     }
     // After SRAT-driven rebalance, each NUMA node should hold a
     // non-trivial slice of free frames. With QEMU's 2-node config
