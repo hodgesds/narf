@@ -480,11 +480,18 @@ impl SocketFile {
             // crate, which can't reach the net readiness layer directly).
             // Idempotent — a plain atomic store.
             narf_filesystem::uevent::set_wake_hook(uevent_wake_hook);
-            // Start at the ring's oldest buffered event so a freshly-opened
-            // monitor still observes the boot-time device-add uevents (libudev
-            // de-dups these against its sysfs enumerate).
+            // Start at the ring TAIL — a netlink uevent monitor only receives
+            // events broadcast *after* it binds (Linux `NETLINK_KOBJECT_UEVENT`
+            // is not replayed on connect). Replaying the buffered boot-time
+            // "add" events to a late-connecting monitor is actively harmful:
+            // libudev/libinput does NOT de-dup them against its sysfs
+            // enumerate — it re-runs `evdev_device_create` for each replayed
+            // "add", and that second add tears the already-created input device
+            // back down (weston loses all keyboards/pointers ~5s after start).
+            // Existing devices are discovered via `udev_enumerate` (sysfs
+            // scan), not the monitor, so tail-start loses nothing.
             SocketState::NetlinkUevent {
-                reader: narf_filesystem::uevent::UeventReader::from_start(),
+                reader: narf_filesystem::uevent::UeventReader::new(),
             }
         } else {
             SocketState::Fresh
