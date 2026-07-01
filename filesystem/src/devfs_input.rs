@@ -438,6 +438,16 @@ impl FileOps for InputEventFile {
         0
     }
 
+    /// evdev's `read()` blocks internally on an empty ring (matching Linux
+    /// blocking-fd semantics). A non-blocking caller — libinput opens the
+    /// node `O_RDWR|O_NONBLOCK` — must get `EAGAIN` instead. Opting in here
+    /// makes `sys_read` poll the read future once and return `EAGAIN` on an
+    /// empty ring rather than spin-pumping `poll_blocking` for millions of
+    /// iterations and surfacing the wrong errno.
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
     /// `EVIOCG*` capability ioctls — what evdev readers (evtest,
     /// libinput) issue right after `open()` to learn the device's
     /// version, id, name, and supported event/key/axis bits.

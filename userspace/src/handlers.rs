@@ -872,6 +872,12 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let mnt_ptr = args.arg2;
     let mnt_len = args.arg3 as usize;
     let flags = args.arg4;
+    // Preserve the settable open flags (O_NONBLOCK | O_APPEND | O_DIRECT)
+    // into the fd's status flags. Historically `open()` dropped these and
+    // only `fcntl(F_SETFL)` could set them, so a file opened `O_NONBLOCK`
+    // (as libinput opens evdev nodes) read as a blocking fd — see
+    // `InputEventFile::nonblock_read_eagain`.
+    let open_status_flags = (flags as u32) & crate::fd::O_SETFL_MASK;
     // user-runtime's `open` wrapper checks `r == !0u64` for failure
     // (the asm wrapper observes only the value register, not the
     // status word), so the kernel must mirror that sentinel rather
@@ -1048,7 +1054,7 @@ fn sys_open(ctx: &mut dyn TrapContext) {
             ops,
             offset: 0,
             flags: 0,
-            status_flags: 0,
+            status_flags: open_status_flags,
         })
     }) {
         Some(n) => n,
@@ -1345,12 +1351,32 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     }
+    // Closure error channel: `Err(true)` ⇒ return EAGAIN, `Err(false)` ⇒
+    // invalid-op sentinel (bad fd / read error).
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
-            None => return Err(()),
+            None => return Err(false),
         };
         let off = entry.offset;
+        let nonblock = entry.status_flags & crate::fd::O_NONBLOCK != 0;
+        // Non-blocking read on an fd that blocks internally on empty (evdev
+        // nodes): poll the future once and surface EAGAIN rather than
+        // spin-pumping `poll_blocking` for millions of iterations (which then
+        // returns the wrong errno). Regular files (default false) keep the
+        // blocking drive — Linux ignores O_NONBLOCK on them; sockets/pipes
+        // resolve on the first poll so this path is equivalent for them.
+        if nonblock && entry.ops.nonblock_read_eagain() {
+            return match poll_once(entry.ops.read(off, &mut kbuf)) {
+                Some(Ok(n)) if n > 0 => {
+                    entry.offset = off.saturating_add(n as u64);
+                    Ok((n, false, false))
+                }
+                // Empty / would-block ⇒ EAGAIN.
+                Some(Ok(_)) | None => Err(true),
+                Some(Err(_)) => Err(false),
+            };
+        }
         let res = poll_blocking(entry.ops.read(off, &mut kbuf))
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
@@ -1358,7 +1384,6 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                 // Block decision: a 0-byte read on a pipe whose writer is
                 // still open must wait for data (POSIX), not return a
                 // spurious EOF — unless the fd is O_NONBLOCK.
-                let nonblock = entry.status_flags & crate::fd::O_NONBLOCK != 0;
                 let should_block = n == 0 && !nonblock && entry.ops.read_should_block();
                 // Console fds park on the input waker (serial/keyboard IRQ)
                 // instead of the 1ms re-poll, so an interactive shell truly
@@ -1367,7 +1392,7 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                 entry.offset = off.saturating_add(n as u64);
                 Ok((n, should_block, input_block))
             }
-            Err(_) => Err(()),
+            Err(_) => Err(false),
         }
     });
     match outcome {
@@ -1449,6 +1474,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             } else {
                 ctx.set_return(SyscallReturn::ok(n as u64));
             }
+        }
+        // Non-blocking read with nothing ready → EAGAIN (errno 11).
+        Some(Err(true)) => {
+            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
         }
         // TODO(linux-gap): bad fd should be -EBADF, but this `_` also
         // catches read I/O errors — needs surgical bad-fd-vs-error split.

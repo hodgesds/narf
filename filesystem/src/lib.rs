@@ -559,6 +559,19 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// True when a non-blocking (`O_NONBLOCK`) read that finds no data ready
+    /// should return `EAGAIN` immediately instead of being driven to
+    /// completion by the blocking spin-pump. evdev device nodes
+    /// (`InputEventFile`) block *internally* on an empty ring; a non-blocking
+    /// reader — libinput opens evdev `O_NONBLOCK` — must get `EAGAIN` at once,
+    /// not a multi-million-iteration `poll_blocking` busy-poll that then
+    /// surfaces the wrong errno. Default `false` (regular files keep the
+    /// blocking drive — Linux ignores `O_NONBLOCK` on regular files; sockets
+    /// and pipes resolve on the first poll so they are unaffected either way).
+    fn nonblock_read_eagain(&self) -> bool {
+        false
+    }
+
     /// If this file is a pidfd (from `pidfd_open`), return the target
     /// process's pid. Used by `pidfd_send_signal(2)` to resolve the
     /// fd to a pid without a downcast / Any dance. Default: `None`.
