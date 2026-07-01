@@ -154,13 +154,18 @@ pub fn drain_and_render(fb: &FbWriter) {
         // p.buttons is dropped on the floor — future click
         // handling will read PointerButtons from the same channel.
     }
-    if !moved {
+    // A userspace compositor owns the scanout. Don't paint the kernel
+    // console sprite over the desktop — but DO render the compositor's
+    // own pointer from the DRM cursor-ioctl state. weston (drm-backend)
+    // sets the cursor via DRM_IOCTL_MODE_CURSOR; without a HW cursor
+    // plane the move is otherwise a no-op and the pointer is invisible.
+    // render_user_cursor short-circuits when nothing changed, so it's
+    // cheap to call every pump tick.
+    if narf_console::fb_user_owned() {
+        render_user_cursor(fb);
         return;
     }
-    // A userspace compositor owns the scanout — it draws its own cursor.
-    // Drain pointer events (above) so the ring doesn't fill, but don't
-    // paint the kernel sprite over the desktop.
-    if narf_console::fb_user_owned() {
+    if !moved {
         return;
     }
     // Snapshot-restore-then-draw cycle.
@@ -180,6 +185,149 @@ pub fn drain_and_render(fb: &FbWriter) {
             w: W,
             h: H,
         });
+        MOVES.fetch_add(1, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compositor ("user") cursor.
+//
+// A userspace compositor (weston drm-backend) owns the scanout and draws its
+// own UI, but it expects the kernel/HW to draw the pointer via the DRM cursor
+// ioctl (DRM_IOCTL_MODE_CURSOR{,2}). NARF synthesises a single CRTC with no
+// real hardware cursor plane, so the DRM bridge funnels the cursor state here
+// and we composite a sprite onto the scanout ourselves — same snapshot /
+// restore discipline as the console cursor, just driven by ioctl state instead
+// of the global pointer ring, and active *while* the FB is user-owned.
+// ---------------------------------------------------------------------------
+
+/// Arrow sprite footprint.
+const ARROW_W: u32 = 12;
+const ARROW_H: u32 = 19;
+
+/// Left-tip pointer arrow as a row-major bitmap. Bit `c` (LSB = leftmost
+/// column) set ⇒ draw a white pixel; clear ⇒ transparent (background shows
+/// through). A solid wedge with a short tail — recognisable as a pointer
+/// without needing per-pixel alpha.
+const ARROW_FILL: [u16; ARROW_H as usize] = [
+    0b0000_0000_0001,
+    0b0000_0000_0011,
+    0b0000_0000_0111,
+    0b0000_0000_1111,
+    0b0000_0001_1111,
+    0b0000_0011_1111,
+    0b0000_0111_1111,
+    0b0000_1111_1111,
+    0b0001_1111_1111,
+    0b0011_1111_1111,
+    0b0000_0111_1111,
+    0b0000_0111_0011,
+    0b0000_0010_0011,
+    0b0000_0000_0011,
+    0b0000_0000_0001,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Renderer-private state. The cursor *position / visibility* lives in
+/// `narf_console` (the neutral crate the DRM bridge and this renderer share);
+/// here we only track the saved background under the last-drawn sprite and
+/// the last position we drew at (to skip redundant redraws of an idle
+/// pointer).
+static USER_SAVED: IrqSafeSpinLock<Option<SavedRect>> = IrqSafeSpinLock::new(None);
+static USER_LAST_X: AtomicU32 = AtomicU32::new(u32::MAX);
+static USER_LAST_Y: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Render the pointer over a user-owned (compositor) scanout. When the
+/// compositor drives the cursor through the DRM cursor ioctl we honour its
+/// position + visibility; otherwise we fall back to the kernel pointer
+/// position accumulated from the global input ring, so the user still gets a
+/// tracking pointer even when the compositor's own input path isn't wired up
+/// (e.g. weston failing to create its libinput devices).
+fn render_user_cursor(fb: &FbWriter) {
+    let (ux, uy, visible, managed) = narf_console::user_cursor_state();
+    if managed {
+        if visible {
+            render_cursor_at(fb, ux, uy);
+        } else {
+            erase_cursor(fb);
+        }
+    } else {
+        // Fall back to the global-ring pointer position. POS_X/POS_Y is
+        // u32::MAX until the first event / FB-attach centring.
+        let x = POS_X.load(Ordering::Relaxed);
+        let y = POS_Y.load(Ordering::Relaxed);
+        if x != u32::MAX {
+            render_cursor_at(fb, x, y);
+        }
+    }
+}
+
+/// Erase the currently-drawn cursor sprite (restore the saved background).
+fn erase_cursor(fb: &FbWriter) {
+    let mut g = USER_SAVED.lock();
+    if let Some(prev) = g.take() {
+        let _ = restore(fb, &prev);
+    }
+    USER_LAST_X.store(u32::MAX, Ordering::Release);
+    USER_LAST_Y.store(u32::MAX, Ordering::Release);
+}
+
+/// Composite the arrow sprite at `(ux, uy)` onto the scanout, snapshotting
+/// the pixels underneath so the next move can restore them. No-op when the
+/// sprite is already drawn at that position (idle pointer = zero MMIO).
+fn render_cursor_at(fb: &FbWriter, ux: u32, uy: u32) {
+    // Clamp the sprite box fully on-screen.
+    let x = ux.min(fb.width().saturating_sub(ARROW_W));
+    let y = uy.min(fb.height().saturating_sub(ARROW_H));
+    if USER_LAST_X.load(Ordering::Acquire) == x && USER_LAST_Y.load(Ordering::Acquire) == y {
+        return;
+    }
+
+    let mut g = USER_SAVED.lock();
+    // Erase the previous sprite first.
+    if let Some(prev) = g.take() {
+        let _ = restore(fb, &prev);
+    }
+
+    // Snapshot the background under the new box, then overlay the arrow.
+    let mut buf = {
+        // SAFETY: same exclusivity contract as snapshot() above.
+        // SAFETY: Valid memory or trusted environment
+        let fbm = unsafe { fb.scanout_for_cursor() };
+        let mut v = Vec::with_capacity((ARROW_W * ARROW_H) as usize);
+        for row in 0..ARROW_H {
+            for col in 0..ARROW_W {
+                v.push(
+                    fbm.read_pixel(x + col, y + row)
+                        .unwrap_or(Pixel32(0xFF00_0000)),
+                );
+            }
+        }
+        v
+    };
+    let saved_pixels = buf.clone();
+    for row in 0..ARROW_H {
+        let fill = ARROW_FILL[row as usize];
+        for col in 0..ARROW_W {
+            if (fill >> col) & 1 != 0 {
+                buf[(row * ARROW_W + col) as usize] = CURSOR_COLOUR;
+            }
+        }
+    }
+    if fb.blit(Rect::new(x, y, ARROW_W, ARROW_H), &buf).is_ok() {
+        let _ = fb.flush(Rect::new(x, y, ARROW_W, ARROW_H));
+        *g = Some(SavedRect {
+            pixels: saved_pixels,
+            x,
+            y,
+            w: ARROW_W,
+            h: ARROW_H,
+        });
+        USER_LAST_X.store(x, Ordering::Release);
+        USER_LAST_Y.store(y, Ordering::Release);
         MOVES.fetch_add(1, Ordering::Release);
     }
 }

@@ -45,6 +45,7 @@ pub enum IoctlCmd {
     ModeGetResources = 0xA0,
     ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
+    ModeCursor = 0xA3,
     ModeSetGamma = 0xA5,
     ModeGetEncoder = 0xA6,
     ModeGetConnector = 0xA7,
@@ -58,6 +59,7 @@ pub enum IoctlCmd {
     ModeGetProperty = 0xAA,
     ModeGetPlaneRes = 0xB5,
     ModeGetPlane = 0xB6,
+    ModeCursor2 = 0xBB,
     ModeAtomic = 0xBC,
     SyncobjCreate = 0xBF,
     SyncobjDestroy = 0xC0,
@@ -82,6 +84,7 @@ impl IoctlCmd {
             0xA0 => IoctlCmd::ModeGetResources,
             0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
+            0xA3 => IoctlCmd::ModeCursor,
             0xA5 => IoctlCmd::ModeSetGamma,
             0xA6 => IoctlCmd::ModeGetEncoder,
             0xA7 => IoctlCmd::ModeGetConnector,
@@ -95,6 +98,7 @@ impl IoctlCmd {
             0xB4 => IoctlCmd::ModeDestroyDumb,
             0xB8 => IoctlCmd::ModeAddFb2,
             0xB5 => IoctlCmd::ModeGetPlaneRes,
+            0xBB => IoctlCmd::ModeCursor2,
             0xBC => IoctlCmd::ModeAtomic,
             0xBF => IoctlCmd::SyncobjCreate,
             0xC0 => IoctlCmd::SyncobjDestroy,
@@ -371,6 +375,10 @@ pub fn dispatch(
         | IoctlCmd::ModePageFlip
         | IoctlCmd::ModeCreateDumb
         | IoctlCmd::ModeMapDumb
+        // CURSOR / CURSOR2 are handled in the bridge (they drive narf_fb's
+        // software cursor); they never reach this generic dispatcher.
+        | IoctlCmd::ModeCursor
+        | IoctlCmd::ModeCursor2
         | IoctlCmd::ModeDestroyDumb => Err(DrmIoctlError::UnknownCmd),
         IoctlCmd::Unknown => Err(DrmIoctlError::UnknownCmd),
     }

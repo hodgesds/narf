@@ -187,6 +187,13 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // SETCRTC / PAGE_FLIP — blit dumb buffer into the active scanout.
         IoctlCmd::ModeSetCrtc => handle_setcrtc(&mode_state, arg, &ctx),
         IoctlCmd::ModePageFlip => handle_page_flip(&mode_state, arg, &ctx),
+        // CURSOR / CURSOR2 — no hardware cursor plane; funnel the pointer
+        // position + visibility into narf_console so narf_fb's cursor
+        // renderer composites a sprite onto the scanout. Without this the
+        // compositor's pointer is invisible (the ioctl would otherwise be a
+        // silent no-op through the generic path).
+        IoctlCmd::ModeCursor => handle_cursor(arg, false),
+        IoctlCmd::ModeCursor2 => handle_cursor(arg, true),
         // GEM_CLOSE — free dumb backing if present.
         IoctlCmd::GemClose => handle_gem_close(&mode_state, arg, &ctx),
         // Everything else: copy a generic buffer in, hand to the
@@ -819,6 +826,55 @@ fn handle_atomic(
         Ok(()) => Ok(0),
         Err(_) => Err(FsError::InvalidData),
     }
+}
+
+/// DRM_IOCTL_MODE_CURSOR / CURSOR2 — set the pointer sprite + position.
+///
+/// `struct drm_mode_cursor` is `{ flags, crtc_id, x, y, width, height,
+/// handle }` (7 × u32 = 28 bytes); CURSOR2 appends `{ hot_x, hot_y }`
+/// (36 bytes). We have no hardware cursor plane, so we don't consume the
+/// BO bitmap — instead we drive narf_fb's software cursor sprite from the
+/// position + visibility. `DRM_MODE_CURSOR_BO` with handle 0 hides the
+/// pointer; a non-zero handle shows it; `DRM_MODE_CURSOR_MOVE` repositions.
+///
+/// Linux ref: `drivers/gpu/drm/drm_plane.c::drm_mode_cursor_common`.
+fn handle_cursor(arg: usize, with_hotspot: bool) -> Result<u64, FsError> {
+    const DRM_MODE_CURSOR_BO: u32 = 0x01;
+    const DRM_MODE_CURSOR_MOVE: u32 = 0x02;
+    let want = if with_hotspot { 36 } else { 28 };
+    // SAFETY: `arg` is the validated ioctl argument pointer; `copy_in`
+    // bounds-checks `want` against IOCTL_MAX_BUF before copying.
+    let bytes = unsafe { copy_in(arg, want)? };
+    let rd_u32 = |off: usize| {
+        u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+    };
+    let rd_i32 = |off: usize| rd_u32(off) as i32;
+    let flags = rd_u32(0);
+    let x = rd_i32(8);
+    let y = rd_i32(12);
+    let handle = rd_u32(24);
+    // CURSOR2 reports the hotspot — the active point inside the BO. Our
+    // sprite's tip is at its own top-left, so shift the draw position by the
+    // hotspot to keep the tip under the true pointer.
+    let (hot_x, hot_y) = if with_hotspot {
+        (rd_i32(28), rd_i32(32))
+    } else {
+        (0, 0)
+    };
+
+    if flags & DRM_MODE_CURSOR_BO != 0 {
+        if handle == 0 {
+            narf_console::user_cursor_hide();
+        } else {
+            narf_console::user_cursor_show();
+        }
+    }
+    if flags & DRM_MODE_CURSOR_MOVE != 0 {
+        let px = (x + hot_x).max(0) as u32;
+        let py = (y + hot_y).max(0) as u32;
+        narf_console::user_cursor_move(px, py);
+    }
+    Ok(0)
 }
 
 /// DRM_IOCTL_MODE_CREATE_DUMB — allocate a dumb buffer (physically

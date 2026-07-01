@@ -279,6 +279,56 @@ pub fn fb_user_owned() -> bool {
     FB_USER_OWNED.load(Ordering::Acquire)
 }
 
+// ── Compositor pointer cursor ──────────────────────────────────────────
+//
+// A userspace compositor that owns the scanout (weston drm-backend) draws
+// its pointer through the DRM cursor ioctl (DRM_IOCTL_MODE_CURSOR{,2}).
+// NARF has no hardware cursor plane, so the DRM bridge funnels that state
+// here and `narf_fb`'s cursor renderer composites a sprite from it. This
+// crate is the neutral meeting point: `narf-drivers-gpu` (the DRM bridge)
+// and `narf-fb` (the renderer) both depend on it, but a direct dep between
+// them would cycle.
+static CURSOR_X: AtomicUsize = AtomicUsize::new(0);
+static CURSOR_Y: AtomicUsize = AtomicUsize::new(0);
+static CURSOR_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Set the first time the compositor drives the cursor through the DRM
+/// ioctl. Until then the renderer falls back to the kernel pointer
+/// position (the global input ring) so the user still gets a tracking
+/// pointer even when the compositor's own input path isn't wired up.
+static CURSOR_MANAGED: AtomicBool = AtomicBool::new(false);
+
+/// Move the compositor cursor to scanout pixel `(x, y)` (sprite top-left).
+/// Called from the DRM `DRM_MODE_CURSOR_MOVE` path.
+pub fn user_cursor_move(x: u32, y: u32) {
+    CURSOR_X.store(x as usize, Ordering::Release);
+    CURSOR_Y.store(y as usize, Ordering::Release);
+    CURSOR_MANAGED.store(true, Ordering::Release);
+}
+
+/// Show the compositor cursor (`DRM_MODE_CURSOR_BO` with a non-zero handle).
+pub fn user_cursor_show() {
+    CURSOR_VISIBLE.store(true, Ordering::Release);
+    CURSOR_MANAGED.store(true, Ordering::Release);
+}
+
+/// Hide the compositor cursor (`DRM_MODE_CURSOR_BO` with handle 0).
+pub fn user_cursor_hide() {
+    CURSOR_VISIBLE.store(false, Ordering::Release);
+    CURSOR_MANAGED.store(true, Ordering::Release);
+}
+
+/// Current compositor-cursor state: `(x, y, visible, managed)`. When
+/// `managed` is false the compositor has never driven the cursor, so the
+/// renderer should fall back to the kernel pointer position.
+pub fn user_cursor_state() -> (u32, u32, bool, bool) {
+    (
+        CURSOR_X.load(Ordering::Acquire) as u32,
+        CURSOR_Y.load(Ordering::Acquire) as u32,
+        CURSOR_VISIBLE.load(Ordering::Acquire),
+        CURSOR_MANAGED.load(Ordering::Acquire),
+    )
+}
+
 /// Panic sink — no allocation, no re-entry, lock-free.
 ///
 /// Bypasses the regular `CONSOLE.lock` because the panicking
