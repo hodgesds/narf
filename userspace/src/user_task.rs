@@ -33,7 +33,6 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::UserState;
 
@@ -1405,8 +1404,12 @@ impl core::future::Future for UserTaskFuture {
                         us.rax = rax;
                     }
                 }
-                this.task.uctx.wait_child_pending.store(false, Ordering::Release);
-                this.task.uctx
+                this.task
+                    .uctx
+                    .wait_child_pending
+                    .store(false, Ordering::Release);
+                this.task
+                    .uctx
                     .wait_child_is_waitid
                     .store(false, Ordering::Release);
                 // Fall through to re-enter user mode with the result.
@@ -1443,8 +1446,12 @@ impl core::future::Future for UserTaskFuture {
                             us.rax = rax;
                         }
                     }
-                    this.task.uctx.wait_child_pending.store(false, Ordering::Release);
-                    this.task.uctx
+                    this.task
+                        .uctx
+                        .wait_child_pending
+                        .store(false, Ordering::Release);
+                    this.task
+                        .uctx
                         .wait_child_is_waitid
                         .store(false, Ordering::Release);
                     // Fall through to re-enter user mode.
@@ -1476,8 +1483,12 @@ impl core::future::Future for UserTaskFuture {
                                 us.rax = (-4i64) as u64; // -EINTR
                             }
                         }
-                        this.task.uctx.wait_child_pending.store(false, Ordering::Release);
-                        this.task.uctx
+                        this.task
+                            .uctx
+                            .wait_child_pending
+                            .store(false, Ordering::Release);
+                        this.task
+                            .uctx
                             .wait_child_is_waitid
                             .store(false, Ordering::Release);
                         // Fall through to re-enter user mode (delivers SIGALRM).
@@ -1504,7 +1515,8 @@ impl core::future::Future for UserTaskFuture {
             // pending_bytes() — the unified discipline drains both rings,
             // so a keystroke alone must un-park a blocked console read.
             if narf_input::pending_input() > 0 {
-                this.task.uctx
+                this.task
+                    .uctx
                     .console_read_pending
                     .store(false, Ordering::Release);
                 // fall through to resume + re-execute the read
@@ -1662,7 +1674,10 @@ impl core::future::Future for UserTaskFuture {
                     // SAFETY: `ctx.state` holds a prior trap-from-user snapshot
                     // (fork child / re-image); resume it on the empty stack top.
                     unsafe {
-                        narf_scheduler::enter_user_mode_resume_at_top(this.task.uctx.state.get(), top)
+                        narf_scheduler::enter_user_mode_resume_at_top(
+                            this.task.uctx.state.get(),
+                            top,
+                        )
                     }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
@@ -2030,8 +2045,12 @@ impl core::future::Future for UserTaskFuture {
                         us.x[0] = rax;
                     }
                 }
-                this.task.uctx.wait_child_pending.store(false, Ordering::Release);
-                this.task.uctx
+                this.task
+                    .uctx
+                    .wait_child_pending
+                    .store(false, Ordering::Release);
+                this.task
+                    .uctx
                     .wait_child_is_waitid
                     .store(false, Ordering::Release);
             } else {
@@ -2059,8 +2078,12 @@ impl core::future::Future for UserTaskFuture {
                             us.x[0] = rax;
                         }
                     }
-                    this.task.uctx.wait_child_pending.store(false, Ordering::Release);
-                    this.task.uctx
+                    this.task
+                        .uctx
+                        .wait_child_pending
+                        .store(false, Ordering::Release);
+                    this.task
+                        .uctx
                         .wait_child_is_waitid
                         .store(false, Ordering::Release);
                 } else {
@@ -2083,8 +2106,12 @@ impl core::future::Future for UserTaskFuture {
                                 us.x[0] = (-4i64) as u64; // -EINTR
                             }
                         }
-                        this.task.uctx.wait_child_pending.store(false, Ordering::Release);
-                        this.task.uctx
+                        this.task
+                            .uctx
+                            .wait_child_pending
+                            .store(false, Ordering::Release);
+                        this.task
+                            .uctx
                             .wait_child_is_waitid
                             .store(false, Ordering::Release);
                         // Fall through to re-enter user mode (delivers SIGALRM).

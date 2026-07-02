@@ -90,6 +90,19 @@ pub fn __test_reset() {
     *ITIMERS.lock() = Some(BTreeMap::new());
 }
 
+/// Exit-time disarm: drop the dying task's POSIX timers and interval
+/// timers so an expiry after exit can't raise a phantom signal into a
+/// dead tid (or, once pids recycle, the wrong process). Part of the
+/// `release_task_tables` teardown sweep.
+pub fn release_task_timers(task: u64) {
+    if let Some(m) = TIMERS.lock().as_mut() {
+        m.remove(&task);
+    }
+    if let Some(m) = ITIMERS.lock().as_mut() {
+        m.remove(&task);
+    }
+}
+
 /// Test hook — directly arm a task's ITIMER_REAL slot, bypassing the
 /// `setitimer` syscall path (which needs a TrapContext + user-memory
 /// copy). Lets the in-kernel test drive `itimer_real_check_due_irq`

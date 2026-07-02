@@ -726,7 +726,9 @@ fn smoke_task_refcount_lifetime() -> TestResult {
     const PID: u64 = 0xF0_45;
 
     let task = crate::task::Task::new_registered(TID, PID);
-    task.uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+    task.uctx
+        .sleep_deadline_ns
+        .store(u64::MAX, Ordering::Release);
 
     // (1) Resolvable; wake-style access clears the infinite deadline.
     let seen = crate::user_task::with_user_task_ctx(TID, |c| {
@@ -773,6 +775,81 @@ fn smoke_task_refcount_lifetime() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_task_refcount_lifetime);
+
+/// Exit must run the master per-task table sweep (release_task_tables):
+/// every tid-keyed row — signal state, parked wakers, /proc mirrors,
+/// foreground-console slot, robust-list head, interval timers — drops
+/// when the exit observers fire, and the dying task's children are
+/// orphanized (their PARENT_OF rows removed so later exits auto-release).
+/// Regression for the ~40-table teardown leak class (tids are monotonic,
+/// so a missed row lived forever and kept receiving signals/timer fires).
+fn smoke_exit_sweeps_task_tables() -> TestResult {
+    const TID: u64 = 0xF1_00;
+    const PID: u64 = 0xF1_01;
+    const CHILD_PID: u64 = 0xF1_02;
+    const FUTEX_UADDR: u64 = 0xF1_000;
+
+    fn noop_waker() -> core::task::Waker {
+        use core::task::{RawWaker, RawWakerVTable, Waker};
+        const VT: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &VT),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        // SAFETY: all vtable fns ignore the (null) data pointer.
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) }
+    }
+
+    // Observer state is test-global and a prior test's teardown clears
+    // it — re-register the real exit-observer chain (on_child_exit +
+    // the table sweep) so notify_task_exited exercises production
+    // wiring, then clear again on the way out.
+    crate::user_task::__test_clear_exit_observers();
+    crate::handlers::wait_init();
+
+    let task = crate::task::Task::new_registered(TID, PID);
+
+    // Populate a representative row in each sweep-covered table.
+    crate::handlers::raise_signal_pending(TID, 10); // SIGUSR1
+    crate::handlers::register_signal_waker(TID, noop_waker());
+    crate::handlers::register_io_waiter(TID, noop_waker());
+    crate::handlers::futex_register_waiter(FUTEX_UADDR, TID, noop_waker());
+    crate::handlers::set_proc_argv(TID, &["victim"]);
+    crate::handlers::set_proc_comm(TID, "victim");
+    crate::handlers::__test_parent_of_set(CHILD_PID, TID); // running child
+    crate::handlers::__test_set_foreground_task(TID);
+    crate::handlers::__test_set_robust_list(TID, 0xdead_0000, 24);
+    crate::posix_timer::__test_arm_itimer_real(TID, u64::MAX, 1_000_000);
+
+    let before = crate::handlers::__test_task_table_residue(TID);
+    // Bits 0,3,4,5,6,7,8,10,11 must be populated pre-exit (mask 0xDF9).
+    if before & 0xDF9 != 0xDF9 {
+        crate::task::release_task(TID);
+        return TestResult::Fail("test setup failed to populate the tables");
+    }
+
+    // A garbage robust-list head must not crash the exit-time walk
+    // (it runs on EVERY exit; unreadable user memory ends it quietly).
+    crate::handlers::__test_robust_walk(TID);
+
+    // Exit: observer fan-out runs on_child_exit + the table sweep.
+    crate::task::mark_zombie(TID);
+    crate::user_task::notify_task_exited(PID, TID);
+
+    let residue = crate::handlers::__test_task_table_residue(TID);
+    crate::task::release_task(TID);
+    let _ = task;
+    crate::user_task::__test_clear_exit_observers();
+    if residue != 0 {
+        return TestResult::Fail("exit left per-task table residue (see bitmask)");
+    }
+    if crate::posix_timer::__test_itimer_real_next_fire(TID) != 0 {
+        return TestResult::Fail("exit left an armed ITIMER_REAL for the dead tid");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_exit_sweeps_task_tables);
 
 /// CLONE_FILES shares ONE fd table across threads; fork gets an independent
 /// copy. An fd opened by one CLONE_FILES sibling must be visible to the other

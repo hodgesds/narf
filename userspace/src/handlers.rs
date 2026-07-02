@@ -5219,6 +5219,95 @@ static ROBUST_LIST_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, (u64, u64)>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Exit-time robust-futex walk (Linux `exit_robust_list`). Runs in the
+/// DYING task's own syscall/trap context — the user AS is still active,
+/// so plain `copy_from_user`/`copy_to_user` resolve the list — before
+/// the exit bookkeeping tears anything down.
+///
+/// For every lock in the thread's registered robust list whose owner
+/// field matches the dying tid: set FUTEX_OWNER_DIED (preserving
+/// FUTEX_WAITERS), bump the wake generation, and wake one waiter — so
+/// a peer blocked on a robust pthread_mutex held by a dying thread
+/// recovers with EOWNERDEAD instead of deadlocking forever.
+///
+/// Layout (uapi <linux/futex.h>, x86_64):
+///   struct robust_list       { struct robust_list *next; }        // +0
+///   struct robust_list_head  { struct robust_list list;           // +0
+///                               long futex_offset;                // +8
+///                               struct robust_list *list_op_pending } // +16
+pub(crate) fn robust_list_exit_walk(tid: u64) {
+    const FUTEX_TID_MASK: u32 = 0x3FFF_FFFF;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+    const FUTEX_WAITERS_BIT: u32 = 0x8000_0000;
+    /// Linux ROBUST_LIST_LIMIT — bounds a malicious/corrupt circular list.
+    const ROBUST_LIST_LIMIT: usize = 2048;
+
+    let head = {
+        let g = ROBUST_LIST_TABLE.lock();
+        match g.as_ref().and_then(|m| m.get(&tid)) {
+            Some(&(head, _len)) if head != 0 => head,
+            _ => return,
+        }
+    };
+
+    let read_u64 = |uaddr: u64| -> Option<u64> {
+        let mut b = [0u8; 8];
+        // SAFETY: copy_from_user range-validates + SMAP-brackets the read.
+        unsafe { copy_from_user(&mut b, uaddr).ok()? };
+        Some(u64::from_le_bytes(b))
+    };
+
+    let futex_offset = match read_u64(head.wrapping_add(8)) {
+        Some(v) => v as i64,
+        None => return,
+    };
+    let pending = read_u64(head.wrapping_add(16)).unwrap_or(0);
+
+    let handle_lock = |entry: u64| {
+        let uaddr = entry.wrapping_add(futex_offset as u64);
+        if uaddr == 0 || uaddr & 3 != 0 {
+            return;
+        }
+        let mut b = [0u8; 4];
+        // SAFETY: copy_from_user range-validates + SMAP-brackets the read.
+        if unsafe { copy_from_user(&mut b, uaddr) }.is_err() {
+            return;
+        }
+        let word = u32::from_le_bytes(b);
+        if u64::from(word & FUTEX_TID_MASK) != tid {
+            return;
+        }
+        let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
+        // SAFETY: copy_to_user range-validates + SMAP-brackets the write.
+        let _ = unsafe { copy_to_user(uaddr, &new.to_le_bytes()) };
+        futex_bump_counter(uaddr);
+        futex_wake_waiters(uaddr, 1);
+    };
+
+    // Walk the list. Termination: `next == head` (the head's own list
+    // node is the sentinel); 0/unreadable ends the walk defensively.
+    let mut entry = match read_u64(head) {
+        Some(e) => e,
+        None => return,
+    };
+    let mut steps = 0usize;
+    while entry != head && entry != 0 && steps < ROBUST_LIST_LIMIT {
+        // The pending lock (mid acquire/release) is handled once,
+        // below, per Linux semantics — skip it during the walk.
+        if entry != pending {
+            handle_lock(entry);
+        }
+        entry = match read_u64(entry) {
+            Some(e) => e,
+            None => break,
+        };
+        steps += 1;
+    }
+    if pending != 0 {
+        handle_lock(pending);
+    }
+}
+
 /// `set_robust_list(head, len)` — register the calling thread's robust
 /// futex list head.
 fn sys_set_robust_list(ctx: &mut dyn TrapContext) {
@@ -7914,6 +8003,10 @@ pub(crate) fn terminate_current_task(
         ctx.rip()
     );
     stage_pending_termination(pid, encode_signaled_status(signum, core_dumped));
+    // Robust-futex owner-died walk — must run HERE, in the dying task's
+    // own trap context (its user AS is still active for the user-memory
+    // reads/writes), before any teardown.
+    robust_list_exit_walk(task);
 
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -7971,6 +8064,9 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
     let tid = current_task_id();
     let pid = task_to_pid_raw(tid).unwrap_or(tid);
     stage_pending_termination(pid, wstatus as i32);
+    // Robust-futex owner-died walk — in-task context, before teardown
+    // (see terminate_current_task).
+    robust_list_exit_walk(tid);
 
     // Polling-future path: if a UserTaskCtx is installed AND an
     // exit hook is registered, save the user state, mark the
@@ -9622,6 +9718,9 @@ pub fn wait_init() {
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
     crate::user_task::register_exit_observer(on_child_exit);
+    // AFTER on_child_exit: the master per-task table sweep + orphan
+    // handling (parent notification must run against intact state).
+    crate::user_task::register_exit_observer(task_tables_exit_observer);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same
@@ -10188,9 +10287,361 @@ fn release_reaped_task(child_pid: u64) {
         if let Some(t) = crate::task::task_get(tid) {
             if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE {
                 crate::task::release_task(tid);
+                // Reap-time pid↔tid unbinding. PIDs are recycled
+                // (lowest-free), so a surviving PID_TO_TASK row would
+                // point the pid's NEXT owner-lookup at this dead tid —
+                // signals/waits misrouted to a corpse — and the stale
+                // TASK_TO_PID row would translate this dead tid to a
+                // pid someone else now owns. Removed only at reap:
+                // the zombie window still needs both directions
+                // (kill(pid) on a zombie, wstatus threading).
+                if let Some(m) = PID_TO_TASK.lock().as_mut() {
+                    if m.get(&child_pid) == Some(&tid) {
+                        m.remove(&child_pid);
+                    }
+                }
+                if let Some(m) = TASK_TO_PID.lock().as_mut() {
+                    m.remove(&tid);
+                }
             }
         }
     }
+}
+
+// ── Exit-time per-task table sweep (release_task_tables) ────────────
+//
+// One master teardown for every tid-keyed table, run from the exit-
+// observer fan-out. Before this existed, cleanup was bolted on
+// table-by-table and ~40 tables were missed entirely — every exited
+// task leaked its signal state, credentials, cwd, scheduling params,
+// wakers, and timers forever (tids are monotonic, so nothing ever
+// overwrote the stale rows), and pid-keyed leftovers were actively
+// dangerous once the pid recycled.
+//
+// Tables deliberately NOT swept here:
+//   - CLEAR_CHILD_TID       — `fire_clear_child_tid_on_exit` takes it
+//                             (observer order must not matter),
+//   - TASK_STOPPED          — on_child_exit already removes it,
+//   - PENDING_TERMINATION   — drained by on_child_exit (wstatus),
+//   - TASK_CPU_NS/CHILD     — needed at reap (account_reaped_child),
+//   - PID_TO_TASK/TASK_TO_PID — needed through the zombie window,
+//                             removed at reap (release_reaped_task),
+//   - fd table              — fd::detach (on_child_exit) owns it.
+fn release_task_tables(tid: u64) {
+    // Signal state.
+    if let Some(m) = SIGNAL_PENDING.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SIGNAL_MASK.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SIGACTION_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SIG_ALTSTACK.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SIGQUEUE_INFO.lock().as_mut() {
+        m.retain(|&(t, _), _| t != tid);
+    }
+    if let Some(m) = SIGRETURN_USE_RSP.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SIGRETURN_IS_RT.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SIGRETURN_SAVED_MASK.lock().as_mut() {
+        m.remove(&tid);
+    }
+
+    // Parked-waker registrations. All wakers are Arc<WakeCell>, so a
+    // stale entry is "only" a leak + a spurious wake — but under task
+    // churn (threads dying while parked) the growth is unbounded.
+    drop_signal_waker(tid);
+    drop_io_waiter(tid);
+    crate::user_task::drop_wait_child_waker(tid);
+    if let Some(m) = FUTEX_WAITERS.lock().as_mut() {
+        m.retain(|_, waiters| {
+            waiters.remove(&tid);
+            !waiters.is_empty()
+        });
+    }
+    for shard in TCB_OWNER.iter() {
+        if let Some(m) = shard.lock().as_mut() {
+            m.retain(|_, owner| *owner != tid);
+        }
+    }
+
+    // Identity / credentials / per-task knobs.
+    if let Some(m) = UIDGID_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = CAP_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PGID_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SID_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    #[cfg(feature = "linux-compat")]
+    if let Some(m) = CTTY_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = RLIMIT_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PRCTL_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = NICE_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SCHED_PARAM_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = SCHED_ATTR_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = UMASK_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+
+    // Filesystem view.
+    if let Some(m) = CWD_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    #[cfg(feature = "linux-compat")]
+    if let Some(m) = ROOT_DIR_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = BRK_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+
+    // Memory policy.
+    if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = MBIND_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PKEY_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+
+    // /proc mirrors.
+    if let Some(m) = PROC_ARGV.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PROC_COMM.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PROC_ENVIRON.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PROC_AUXV.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PROC_OOM_ADJ.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = PROC_COREDUMP_FILTER.lock().as_mut() {
+        m.remove(&tid);
+    }
+
+    // Terminal + locks + misc.
+    if let Some(m) = TASK_TERMIOS.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = FLOCK_TABLE.lock().as_mut() {
+        // flock(2) exclusive locks die with their owner. Shared holds
+        // are an anonymous count and can't be attributed — left to the
+        // fd-close path (pre-existing behaviour).
+        for e in m.values_mut() {
+            if e.exclusive_owner == tid {
+                e.exclusive_owner = 0;
+            }
+        }
+    }
+    if let Some(m) = BOOTSTRAP_TABLE.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = ROBUST_LIST_TABLE.lock().as_mut() {
+        // The owner-died walk already ran in the task's own exit
+        // context (robust_list_exit_walk); this is just the row.
+        m.remove(&tid);
+    }
+
+    // Timers: a post-mortem expiry must not raise a phantom signal.
+    crate::posix_timer::release_task_timers(tid);
+
+    // Console signal routing: if the dying task was the recorded
+    // foreground reader, ^C/^Z must stop resolving to its corpse.
+    let _ = FOREGROUND_TASK.compare_exchange(
+        tid,
+        0,
+        core::sync::atomic::Ordering::AcqRel,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Orphan-handling half of exit: the dying task's children lose their
+/// parent. NARF's pid-1 is a stub that never waits, so Linux-style
+/// reparent-to-init would accumulate zombies forever; instead children
+/// are ORPHANIZED — their PARENT_OF rows drop, so their own exits take
+/// on_child_exit's no-parent branch and auto-release (equivalent to
+/// init running with SA_NOCLDWAIT). Children that ALREADY exited and
+/// sit unreaped in the dying parent's PENDING_EXITS queue are released
+/// here — before this existed they leaked their pid + Task forever and
+/// a parent-of-a-dead-parent chain could strand a wait4 sleeper.
+fn orphanize_children_of(parent_tid: u64) {
+    // Already-exited, never-reaped children: release now.
+    let stale: alloc::vec::Vec<(u64, i32)> = {
+        let mut g = PENDING_EXITS.lock();
+        g.as_mut()
+            .and_then(|m| m.remove(&parent_tid))
+            .unwrap_or_default()
+    };
+    for (child_pid, _status) in stale {
+        release_reaped_task(child_pid);
+        crate::release_pid(crate::ProcessId(child_pid));
+        parent_of_remove(child_pid);
+    }
+    // Queued stop/continue job-control reports die with the waiter.
+    if let Some(m) = PENDING_STOPCONT.lock().as_mut() {
+        m.remove(&parent_tid);
+    }
+    // Still-running children: orphanize so their eventual exit takes
+    // the auto-release branch instead of notifying a corpse.
+    if let Some(m) = PARENT_OF.lock().as_mut() {
+        m.retain(|_, parent| *parent != parent_tid);
+    }
+}
+
+/// Exit observer running AFTER `on_child_exit` (parent notification
+/// must see the dying task's pgid/sid intact): the master per-task
+/// teardown. `_pid` is the visible pid; all swept tables key on tid.
+fn task_tables_exit_observer(_pid: u64, tid: u64) {
+    release_task_tables(tid);
+    orphanize_children_of(tid);
+}
+
+/// Test-only: bitmask of per-task tables still holding rows for `tid`.
+/// Bit assignments documented inline; 0 = fully swept.
+#[doc(hidden)]
+pub fn __test_task_table_residue(tid: u64) -> u32 {
+    let mut r = 0u32;
+    let has = |present: bool, bit: u32| if present { bit } else { 0 };
+    r |= has(
+        SIGNAL_PENDING
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 0,
+    );
+    r |= has(
+        SIGNAL_MASK
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 1,
+    );
+    r |= has(
+        SIGACTION_TABLE
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 2,
+    );
+    r |= has(
+        SIGNAL_WAKERS
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 3,
+    );
+    r |= has(
+        IO_WAKERS[io_waker_shard(tid)]
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 4,
+    );
+    r |= has(
+        FUTEX_WAITERS
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.values().any(|w| w.contains_key(&tid))),
+        1 << 5,
+    );
+    r |= has(
+        PROC_ARGV
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 6,
+    );
+    r |= has(
+        PROC_COMM
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 7,
+    );
+    r |= has(
+        PARENT_OF
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.values().any(|&p| p == tid)),
+        1 << 8,
+    );
+    r |= has(
+        PENDING_STOPCONT
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 9,
+    );
+    r |= has(FOREGROUND_TASK.load(Ordering::Acquire) == tid, 1 << 10);
+    r |= has(
+        ROBUST_LIST_TABLE
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&tid)),
+        1 << 11,
+    );
+    r
+}
+
+/// Test-only: `parent_of_set` passthrough (the real fn is file-private).
+#[doc(hidden)]
+pub fn __test_parent_of_set(child: u64, parent: u64) {
+    parent_of_set(child, parent);
+}
+
+/// Test-only: seed a robust-list head for `tid` without a TrapContext.
+#[doc(hidden)]
+pub fn __test_set_robust_list(tid: u64, head: u64, len: u64) {
+    let mut g = ROBUST_LIST_TABLE.lock();
+    g.get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(tid, (head, len));
+}
+
+/// Test-only: run the exit-time robust walk directly.
+#[doc(hidden)]
+pub fn __test_robust_walk(tid: u64) {
+    robust_list_exit_walk(tid);
+}
+
+/// Test-only: set the console foreground task slot.
+#[doc(hidden)]
+pub fn __test_set_foreground_task(tid: u64) {
+    FOREGROUND_TASK.store(tid, Ordering::Release);
 }
 
 /// Does `parent` still have at least one unreaped LIVING child matching
