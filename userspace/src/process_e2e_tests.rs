@@ -711,50 +711,68 @@ kernel_test_in!(
     smoke_process_sigign_consumed_not_delivered
 );
 
-/// The per-task UserTaskCtx registry must drop a task's entry on exit, and a
-/// wake must resolve the ctx ONLY while the entry is present (under the lock).
-/// Regression for the use-after-free where the entry was never unregistered, so
-/// a cross-CPU wake_signal/wake_one dereferenced a freed/reused future box.
-fn smoke_user_task_ctx_unregister_prevents_stale_deref() -> TestResult {
+/// Refcounted task-lifetime contract (`crate::task`):
+///   1. a registered task resolves via `with_user_task_ctx`, and the
+///      `Arc` keeps its `UserTaskCtx` alive WITHOUT holding the
+///      registry lock across the deref;
+///   2. a ZOMBIE (exited, unreaped) task still resolves — Linux
+///      find-task semantics — and its exit state is readable;
+///   3. after `release_task` (reap) the tid no longer resolves, but a
+///      still-held `Arc` keeps the memory alive (no UAF for stragglers
+///      — the property the old raw-pointer registry could not give).
+fn smoke_task_refcount_lifetime() -> TestResult {
     use core::sync::atomic::Ordering;
-    crate::user_task::user_task_ctx_init();
-    const ID: u64 = 0xF0_44;
+    const TID: u64 = 0xF0_44;
+    const PID: u64 = 0xF0_45;
 
-    let mut ctx = crate::user_task::UserTaskCtx::new();
-    ctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
-    crate::user_task::register_user_task_ctx(ID, &mut ctx as *mut _);
+    let task = crate::task::Task::new_registered(TID, PID);
+    task.uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
 
-    // Present: a wake resolves it under the lock and clears the infinite deadline.
-    let seen = crate::user_task::with_user_task_ctx(ID, |c| {
+    // (1) Resolvable; wake-style access clears the infinite deadline.
+    let seen = crate::user_task::with_user_task_ctx(TID, |c| {
         let d = c.sleep_deadline_ns.load(Ordering::Acquire);
         if d == u64::MAX {
             c.sleep_deadline_ns.store(0, Ordering::Release);
         }
         d
     });
-    let cleared = ctx.sleep_deadline_ns.load(Ordering::Acquire);
-
-    // Task exit: unregister BEFORE the box (here `ctx`) would be dropped.
-    crate::user_task::unregister_user_task_ctx(ID);
-    let after = crate::user_task::with_user_task_ctx(ID, |_| 1u32);
-
     if seen != Some(u64::MAX) {
-        return TestResult::Fail("with_user_task_ctx did not resolve the registered ctx");
+        crate::task::release_task(TID);
+        return TestResult::Fail("with_user_task_ctx did not resolve the registered task");
     }
-    if cleared != 0 {
-        return TestResult::Fail("wake-under-lock did not clear the deadline");
+    if task.uctx.sleep_deadline_ns.load(Ordering::Acquire) != 0 {
+        crate::task::release_task(TID);
+        return TestResult::Fail("registry access did not hit the SAME uctx the Arc owns");
     }
-    if after.is_some() {
-        return TestResult::Fail(
-            "ctx still resolvable after unregister — stale-deref / UAF window",
-        );
+
+    // (2) Zombie stays resolvable until reaped.
+    crate::task::mark_zombie(TID);
+    let z = crate::task::task_get(TID);
+    match z {
+        Some(ref t) if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE => {}
+        _ => {
+            crate::task::release_task(TID);
+            return TestResult::Fail("zombie task must stay resolvable until reaped");
+        }
+    }
+
+    // (3) Reap: tid stops resolving; outstanding Arcs stay valid.
+    let straggler = z.unwrap();
+    crate::task::release_task(TID);
+    if crate::user_task::with_user_task_ctx(TID, |_| 1u32).is_some() {
+        return TestResult::Fail("task still resolvable after release_task (reap)");
+    }
+    // The straggler Arc still owns live memory — this deref must be
+    // sound (the old raw-pointer registry made this exact access a UAF).
+    if straggler.uctx.sleep_deadline_ns.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("straggler Arc read wrong data after reap");
+    }
+    if straggler.tid != TID || straggler.pid.load(Ordering::Relaxed) != PID {
+        return TestResult::Fail("straggler Arc identity corrupted after reap");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "userspace/process",
-    smoke_user_task_ctx_unregister_prevents_stale_deref
-);
+kernel_test_in!("userspace/process", smoke_task_refcount_lifetime);
 
 /// CLONE_FILES shares ONE fd table across threads; fork gets an independent
 /// copy. An fd opened by one CLONE_FILES sibling must be visible to the other
@@ -3436,9 +3454,8 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 
     let child_task_raw = crate::handlers::pid_to_task_raw(child_pid).unwrap();
 
-    // Instantiate and register a UserTaskCtx for the child so that with_user_task_ctx resolves it.
-    let mut child_uctx = crate::user_task::UserTaskCtx::new();
-    crate::user_task::register_user_task_ctx(child_task_raw, &mut child_uctx as *mut _);
+    // The fork above registered the child's refcounted Task, so
+    // with_user_task_ctx resolves its real UserTaskCtx directly.
 
     // 2. Attach to the child using PTRACE_ATTACH
     LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
@@ -3457,7 +3474,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     match attach_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("ptrace PTRACE_ATTACH failed");
@@ -3466,7 +3483,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 
     // Verify the child now has PARENT as its tracer
     if get_task_tracer(child_pid) != Some(PARENT) {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("child tracer not registered correctly");
@@ -3485,7 +3502,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     let delivered =
         crate::handlers::default_signal_delivery(&mut child_ctx, crate::handlers::SYSCALL_NUM_NONE);
     if !delivered {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("default_signal_delivery did not intercept SIGSTOP");
@@ -3493,7 +3510,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 
     // Verify the child is now ptrace-stopped
     if !is_task_ptrace_stopped(child_task_raw) {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("child is not in ptrace stopped state");
@@ -3517,7 +3534,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     match wait_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == child_pid => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("wait4 did not reap stopped child");
@@ -3525,7 +3542,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     }
     // wstatus should be (SIGSTOP << 8) | 0x7f = (19 << 8) | 0x7f = 0x137f
     if status != 0x137f {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("wait4 returned wrong wstatus for stopped child");
@@ -3548,7 +3565,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     match getregs_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("PTRACE_GETREGS failed");
@@ -3573,7 +3590,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     match setregs_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("PTRACE_SETREGS failed");
@@ -3591,7 +3608,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
         .unwrap();
 
     if updated_regs != 0x12345678 {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("register value not updated in child context");
@@ -3613,7 +3630,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     match cont_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("PTRACE_CONT failed");
@@ -3622,7 +3639,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 
     // Child should not be ptrace-stopped anymore
     if is_task_ptrace_stopped(child_task_raw) {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("child still ptrace-stopped after CONT");
@@ -3644,7 +3661,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     match detach_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == 0 => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("PTRACE_DETACH failed");
@@ -3653,13 +3670,13 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 
     // Verify child has no tracer now
     if is_task_traced(child_pid) {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("child still traced after DETACH");
     }
 
-    crate::user_task::unregister_user_task_ctx(child_task_raw);
+    crate::task::release_task(child_task_raw);
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
     narf_memory::frame::cow::__test_clear();
@@ -3757,22 +3774,26 @@ fn smoke_process_coredump_e2e() -> TestResult {
 
     let child_task_raw = crate::handlers::pid_to_task_raw(child_pid).unwrap();
 
-    // 3. Register a UserTaskCtx for the child
-    let mut child_uctx = crate::user_task::UserTaskCtx::new();
-    crate::user_task::register_user_task_ctx(child_task_raw, &mut child_uctx as *mut _);
+    // 3. The fork registered the child's refcounted Task — write the
+    // register state into its REAL UserTaskCtx.
+    let child_task = crate::task::task_get(child_task_raw).expect("fork registered child task");
 
     // 4. Set register state in child
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: child_uctx is local to this test thread, and get() returns a valid mutable pointer to UserState.
+    // SAFETY: the child task is not enqueued-running in this stubbed
+    // test context, so no other CPU touches its uctx.
     unsafe {
-        let state = &mut *child_uctx.state.get();
+        let state = &mut *child_task.uctx.state.get();
         state.rip = 0x11223344;
         state.rsp = 0x55667788;
         state.rax = 0xbeef;
     }
 
     // 5. Force termination with core_dumped = true
-    crate::user_task::install_current(&mut child_uctx as *mut _);
+    crate::user_task::install_current(
+        &child_task.uctx as *const crate::user_task::UserTaskCtx
+            as *mut crate::user_task::UserTaskCtx,
+    );
     let mut term_ctx = StubCtx {
         args: SyscallArgs::default(),
         ret: None,
@@ -3799,7 +3820,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     match wait_ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == child_pid => {}
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("wait4 did not reap terminated child");
@@ -3808,7 +3829,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
 
     // wstatus should report SIGSEGV (11) and coredumped (0x80) -> 0x8b
     if status != 0x8b {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("wait4 status did not report coredump bit");
@@ -3819,7 +3840,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     let (parent_dir, leaf) = match crate::handlers::resolve_parent_dir_async(&core_path) {
         Some(x) => x,
         None => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("could not resolve parent dir for core");
@@ -3829,7 +3850,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     let file = match parent_dir.lookup(&leaf) {
         Some(f) => f,
         None => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("core file was not created");
@@ -3840,7 +3861,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     let n = match crate::handlers::poll_blocking(file.read(0, &mut header)) {
         Some(Ok(x)) => x,
         _ => {
-            crate::user_task::unregister_user_task_ctx(child_task_raw);
+            crate::task::release_task(child_task_raw);
             teardown_process_state();
             *PROC_PARENT_AS.lock() = None;
             return TestResult::Fail("failed to read core header");
@@ -3848,21 +3869,21 @@ fn smoke_process_coredump_e2e() -> TestResult {
     };
 
     if n < 64 {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("core file is too short");
     }
 
     if header[0..4] != [0x7F, b'E', b'L', b'F'] {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("core file has bad magic");
     }
 
     if header[4] != 2 {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("core file is not 64-bit");
@@ -3870,7 +3891,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
 
     let e_type = u16::from_le_bytes([header[16], header[17]]);
     if e_type != 4 {
-        crate::user_task::unregister_user_task_ctx(child_task_raw);
+        crate::task::release_task(child_task_raw);
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("core file has wrong e_type");
@@ -3878,7 +3899,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
 
     // Clean up
     let _ = crate::handlers::poll_blocking(parent_dir.unlink(&leaf));
-    crate::user_task::unregister_user_task_ctx(child_task_raw);
+    crate::task::release_task(child_task_raw);
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
     narf_memory::frame::cow::__test_clear();

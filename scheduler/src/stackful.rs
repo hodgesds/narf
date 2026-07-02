@@ -1299,13 +1299,19 @@ pub unsafe fn exit_current_stackful() -> ! {
                 guard_switch_into("exit_current_stackful:exec_ctx", &*exec_ctx);
                 kernel_switch(ctx, exec_ctx);
             }
+            // A completed task must never be switched back into.
+            panic!(
+                "exit_current_stackful cpu={cpu}: executor switched back into a \
+                 COMPLETED task (or exec_ctx was null at exit) — slot-drop \
+                 ordering violated"
+            );
         }
     }
-    // Unreachable on the executor path (it drops us after observing completed);
-    // halt defensively for the no-executor (test) context.
-    loop {
-        core::hint::spin_loop();
-    }
+    // No stackful task current at an exit site: this CPU has lost its
+    // executor continuation and can never reschedule — going quiet here
+    // used to be a silent spin-loop that presented as "task N never
+    // scheduled again". Panic with attribution instead.
+    panic!("exit_current_stackful cpu={cpu}: no CURRENT stackful task at exit — lost executor continuation");
 }
 
 /// Fallback stub for exit_current_stackful on non-x86_64 architectures.

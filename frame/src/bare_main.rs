@@ -3290,7 +3290,6 @@ fn boot_userspace_init() {
         };
         let pid = proc.pid;
         let entry = proc.entry.0.as_u64();
-        let addr_space = proc.address_space.clone();
         let _ = writeln!(
             console::Writer,
             "  boot-init: spawning {name} pid={} entry={:#x}",
@@ -3304,10 +3303,9 @@ fn boot_userspace_init() {
         // CHILDREN — the actual workload — spawn with `user_task()` and
         // migrate freely (see do_clone3 / sys_fork). `unthrottled()` is
         // the BOOT-pinned spec.
-        let tid = narf_scheduler::spawn_user(
-            UserTaskFuture::new(proc),
+        let tid = narf_userspace::user_task::spawn_user_process(
+            proc,
             narf_scheduler::TaskSpec::unthrottled(),
-            addr_space,
         );
         // Register PID <-> TID mapping so syscalls like kill(pid) work.
         narf_userspace::handlers::register_pid_task_mapping(pid.raw(), tid.raw());

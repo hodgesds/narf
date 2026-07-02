@@ -7933,12 +7933,13 @@ pub(crate) fn terminate_current_task(
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
                 // dead, so run its exit bookkeeping HERE before we diverge:
-                // unregister the per-task ctx pointer (else it dangles) and fan
-                // out exit observers — `on_child_exit` drains the staged wstatus
-                // and WAKES a wait4-parked parent. Without this the parent never
-                // wakes (the lost-wakeup idle-halt). Then mark complete +
-                // kernel_switch out.
-                crate::user_task::unregister_user_task_ctx(task);
+                // flip the refcounted task to ZOMBIE (it stays resolvable,
+                // carrying its exit status, until the parent reaps) and fan
+                // out exit observers — `on_child_exit` drains the staged
+                // wstatus and WAKES a wait4-parked parent. Without this the
+                // parent never wakes (the lost-wakeup idle-halt). Then mark
+                // complete + kernel_switch out.
+                crate::task::mark_zombie(task);
                 crate::user_task::notify_task_exited(pid, task);
                 narf_scheduler::stackful::exit_current_stackful();
             }
@@ -7989,11 +7990,12 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_EXITED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // own-stack: the poll's EXIT_REASON_EXITED trap-back half is
-                // dead — run its exit bookkeeping here before diverging:
-                // unregister the per-task ctx pointer (else it dangles) and fan
-                // out exit observers (`on_child_exit` drains wstatus + WAKES a
-                // wait4-parked parent — without it the parent hangs forever).
-                crate::user_task::unregister_user_task_ctx(tid);
+                // dead — run its exit bookkeeping here before diverging: flip
+                // the refcounted task to ZOMBIE (resolvable until reaped) and
+                // fan out exit observers (`on_child_exit` drains wstatus +
+                // WAKES a wait4-parked parent — without it the parent hangs
+                // forever).
+                crate::task::mark_zombie(tid);
                 crate::user_task::notify_task_exited(pid, tid);
                 narf_scheduler::stackful::exit_current_stackful();
             }
@@ -8769,16 +8771,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     };
     let _ = DEFAULT_USER_STACK_BYTES;
 
-    let future = match child_state {
-        Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
-        None => crate::user_task::UserTaskFuture::new(proc),
-    };
     // Snapshot the AS root phys before the Arc is moved into the
     // scheduler — needed by the exit-observer to write the
     // clear_child_tid futex word after the slot is reaped.
     let child_as_root = child_as.root;
-    let child_tid =
-        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::user_task(), child_as);
+    let child_tid = match child_state {
+        Some(state) => crate::user_task::spawn_user_process_resume(
+            proc,
+            state,
+            narf_scheduler::TaskSpec::user_task(),
+        ),
+        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
+    };
 
     // Register the (visible-pid → TaskId) binding. For
     // CLONE_THREAD children visible_pid == parent's pid, so the
@@ -9258,14 +9262,16 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
         entry_arg: None,
     };
 
-    let future = match child_state {
-        Some(state) => crate::user_task::UserTaskFuture::resume_with(proc, state),
+    let child_tid = match child_state {
+        Some(state) => crate::user_task::spawn_user_process_resume(
+            proc,
+            state,
+            narf_scheduler::TaskSpec::user_task(),
+        ),
         // Fallback if save_user_state didn't fire (test contexts
         // with synthetic TrapContexts whose stub returns false).
-        None => crate::user_task::UserTaskFuture::new(proc),
+        None => crate::user_task::spawn_user_process(proc, narf_scheduler::TaskSpec::user_task()),
     };
-    let child_tid =
-        narf_scheduler::spawn_user(future, narf_scheduler::TaskSpec::user_task(), child_as);
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
@@ -9618,7 +9624,11 @@ pub fn wait_init() {
     crate::user_task::register_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
-    crate::user_task::user_task_ctx_init();
+    // Abnormal slot drops (budget kill / revoked cap) must run the same
+    // exit teardown as a normal exit — without this hook the dropped
+    // task's refcounted `Task` would stay RUNNING forever and its exit
+    // observers (fd teardown, SIGCHLD, parent wake) would never fire.
+    narf_scheduler::set_slot_reap_hook(crate::task::slot_reap_handler);
     signal_waker_init();
     io_waker_init();
     // Wake epoll/poll waiters the instant inbound TCP data lands,
@@ -9727,6 +9737,14 @@ fn take_pending_termination(task: u64) -> Option<i32> {
     g.as_mut().and_then(|m| m.remove(&task))
 }
 
+/// Stage a SIGKILL wstatus for a task the SCHEDULER destroyed without
+/// running its exit path (budget kill / revoked cap — the abnormal
+/// slot-drop). Called by `crate::task::slot_reap_handler` so wait4
+/// reports the abrupt death like a kill(2) would.
+pub(crate) fn stage_killed_termination(pid: u64) {
+    stage_pending_termination(pid, encode_signaled_status(9, false));
+}
+
 /// Callback invoked by `UserTaskFuture::poll` when `wait_child_pending`
 /// is set: tries to drain one matching entry from the parent's pending-
 /// exits queue.
@@ -9787,9 +9805,11 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         // / tms.cutime). Same fold as the synchronous reap path in sys_wait4;
         // this covers the blocking wait4 + waitid path.
         let _ = account_reaped_child(parent_id, child_pid);
-        // Wave-61: PID pool — reaped child's PID returns to the free pool.
+        // Reaped — release the refcounted Task, return the PID to the
+        // free pool, and drop the parent record so wait4's ECHILD check
+        // is accurate.
+        release_reaped_task(child_pid);
         crate::release_pid(crate::ProcessId(child_pid));
-        // Reaped — drop the parent record so wait4's ECHILD check is accurate.
         parent_of_remove(child_pid);
         return child_pid as i64;
     }
@@ -10054,6 +10074,7 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
             // range-validates the 128-byte write.
             let _ = unsafe { copy_to_user(infop, &si) };
         }
+        release_reaped_task(child_pid);
         crate::release_pid(crate::ProcessId(child_pid));
         // Reaped — drop the parent record so wait4's ECHILD check is accurate.
         parent_of_remove(child_pid);
@@ -10147,6 +10168,28 @@ fn parent_of_remove(child: u64) {
     let mut g = PARENT_OF.lock();
     if let Some(m) = g.as_mut() {
         m.remove(&child);
+    }
+}
+
+/// `release_task()` half of a reap: drop the task-registry reference for
+/// the reaped child so the `Arc<Task>` (and its `UserTaskCtx`) can free
+/// once the executor slot's ref is gone too. Called from every path that
+/// fully reaps a child pid (sync wait4/waitid, the blocking reap check,
+/// and the orphan auto-release). Resolves pid→tid through the fork-time
+/// mapping — still intact at reap time because nothing removes it before
+/// this point.
+fn release_reaped_task(child_pid: u64) {
+    if let Some(tid) = pid_to_task_raw(child_pid) {
+        // Only release a task that actually ran its exit path. A
+        // CLONE_THREAD sibling's exit stages a reap entry under the
+        // SHARED tgid, and `pid_to_task_raw(tgid)` resolves to the
+        // group LEADER — releasing the leader while it still runs
+        // would strand every self-lookup it makes afterwards.
+        if let Some(t) = crate::task::task_get(tid) {
+            if t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE {
+                crate::task::release_task(tid);
+            }
+        }
     }
 }
 
@@ -10296,9 +10339,11 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
         Some(p) => p,
         None => {
             // No registered parent — orphan. Drain the staged status
-            // so a re-used pid doesn't see stale state, and return the
-            // PID to the pool immediately since no one will reap it.
+            // so a re-used pid doesn't see stale state, release the
+            // refcounted Task, and return the PID to the pool
+            // immediately since no one will reap it.
             let _ = take_pending_termination(child_pid);
+            release_reaped_task(child_pid);
             crate::release_pid(crate::ProcessId(child_pid));
             return;
         }
@@ -10394,7 +10439,9 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         if rusage_ptr != 0 {
             write_rusage_utime(rusage_ptr, child_cpu_ns);
         }
-        // Wave-61: PID pool — reaped child's PID returns to the free pool.
+        // Reaped — release the refcounted Task, then return the PID to
+        // the free pool.
+        release_reaped_task(reaped);
         crate::release_pid(crate::ProcessId(reaped));
         // The child is gone — drop its parent record so a later wait4 sees
         // it's no longer a child (otherwise the ECHILD check below stays

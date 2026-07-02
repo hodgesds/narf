@@ -1025,6 +1025,38 @@ where
     spawn_with_spec(f, TaskSpec::budgeted(budget, cap))
 }
 
+/// Reserve a fresh `TaskId` without enqueuing anything. User-task
+/// spawns allocate the id FIRST so the caller can register the task's
+/// refcounted `Task` object (keyed by this id) BEFORE the task becomes
+/// runnable — otherwise the task could run, syscall, and look itself up
+/// in the registry before the spawner finished registering it.
+pub fn alloc_task_id() -> TaskId {
+    TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Hook invoked whenever the executor DROPS a task slot through a path
+/// that is not the task's own `Poll::Ready` completion — budget-cap
+/// revocation and `ChargeOutcome::Kill`. Without this, an abnormally
+/// dropped USER task would bypass the entire exit teardown (task
+/// registry, exit observers, fd tables, SIGCHLD), leaving its
+/// refcounted `Task` stranded as RUNNING forever. Installed once at
+/// boot by `narf_userspace`.
+static SLOT_REAP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_slot_reap_hook(f: fn(TaskId)) {
+    SLOT_REAP_HOOK.store(f as usize, Ordering::Release);
+}
+
+fn notify_slot_reaped(id: TaskId) {
+    let p = SLOT_REAP_HOOK.load(Ordering::Acquire);
+    if p != 0 {
+        // SAFETY: `p` was stored by `set_slot_reap_hook` from a real
+        // `fn(TaskId)`; fn pointers are 'static.
+        let f: fn(TaskId) = unsafe { core::mem::transmute::<usize, fn(TaskId)>(p) };
+        f(id);
+    }
+}
+
 /// Spawn a user-mode task carrying its own address space. Every
 /// poll of the task's future is preceded by `addr_space.activate()`,
 /// which on x86_64 issues a `MOV CR3` (with the right `compiler_fence`
@@ -1032,11 +1064,14 @@ where
 /// `MSR TTBR0_EL1 + DSB + TLBI VMALLE1 + DSB + ISB` sequence. Both
 /// paths are live; the only `NotImplemented` returns now come from
 /// arches outside the {x86_64, aarch64} matrix (they log + proceed).
-pub fn spawn_user<F>(f: F, spec: TaskSpec, addr_space: Arc<AddressSpace>) -> TaskId
+///
+/// `id` MUST come from [`alloc_task_id`]; the caller registers its
+/// task object under that id before calling this, so the task is
+/// resolvable from its very first instruction.
+pub fn spawn_user<F>(id: TaskId, f: F, spec: TaskSpec, addr_space: Arc<AddressSpace>) -> TaskId
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     // Run user tasks on their OWN kernel stack via the no-preempt stackful
     // adapter. The cooperative executor polls a slot ON THE EXECUTOR STACK; a
     // *plain* UserTaskFuture would therefore run `enter_user_mode_resume` —
@@ -1627,6 +1662,9 @@ pub fn poll_one_round() -> usize {
         settle_donation(&mut slot);
         if let Some(ref cap) = slot.spec.budget_cap {
             if cap.check_live().is_err() {
+                // Abnormal drop (not the task's own Ready) — let the
+                // task-lifetime layer run exit teardown for the slot.
+                notify_slot_reaped(slot.id);
                 continue;
             }
         }
@@ -1694,7 +1732,10 @@ pub fn poll_one_round() -> usize {
                 // Stage-5 fair-share enforcement (§3.4).
                 use crate::budget::ChargeOutcome;
                 match outcome {
-                    ChargeOutcome::Kill => continue,
+                    ChargeOutcome::Kill => {
+                        notify_slot_reaped(slot.id);
+                        continue;
+                    }
                     ChargeOutcome::Demote => slot.spec.class = SchedClass::Idle,
                     ChargeOutcome::Throttle => {
                         slot.awake.flag.store(false, Ordering::Release);
@@ -1841,7 +1882,10 @@ pub fn run_until_empty() {
             // drops the task O(1). No cap attached → skip the check.
             if let Some(ref cap) = slot.spec.budget_cap {
                 if cap.check_live().is_err() {
-                    // Task is off the scheduler: drop the slot.
+                    // Task is off the scheduler: drop the slot. Abnormal
+                    // drop — run the task-lifetime exit teardown so a user
+                    // task can't bypass observers/registry cleanup.
+                    notify_slot_reaped(slot.id);
                     continue;
                 }
             }
@@ -2038,7 +2082,9 @@ pub fn run_until_empty() {
                     match outcome {
                         ChargeOutcome::Kill => {
                             // Drop the slot. `overruns` already
-                            // ticked; no refund.
+                            // ticked; no refund. Abnormal drop — run
+                            // the task-lifetime exit teardown.
+                            notify_slot_reaped(slot.id);
                             continue;
                         }
                         ChargeOutcome::Demote => {

@@ -33,8 +33,6 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use alloc::collections::BTreeMap;
-use narf_lib::sync::IrqSafeSpinLock;
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use narf_scheduler::UserState;
@@ -383,19 +381,17 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
     // a redis worker's futex wrote its wait-state into netserve's ctx, wedging
     // netserve's accept() into an infinite futex wait (net-smoke echo hang).
     // The executor's `current_task_id()` (the slot it is polling) is ALWAYS
-    // correct, so resolve the ctx by id through the registry. The registry
-    // entry for the IN-FLIGHT task is guaranteed live (a task only
-    // unregisters in its own exit path, which can't run while it is the task
-    // executing this lookup). Fall back to the `CURRENT` cell when the registry
-    // has no entry (the in-kernel test harness never registers).
+    // correct, so resolve the ctx by id through the refcounted task registry.
+    // The returned raw pointer targets the `Arc<Task>`-owned `UserTaskCtx`,
+    // which stays valid until the LAST `Arc` drops — the registry holds one
+    // ref until reap, and the in-flight task's own future holds another, so
+    // a self-lookup can never dangle. Fall back to the `CURRENT` cell when
+    // the registry has no entry (the in-kernel test harness never registers).
     #[cfg(target_arch = "x86_64")]
     if narf_scheduler::stackful::user_own_stack_enabled() {
         let id = crate::handlers::current_task_id();
-        let g = USER_TASK_CTXS.lock();
-        if let Some(m) = g.as_ref() {
-            if let Some(p) = m.get(&id) {
-                return Some(p.0);
-            }
+        if let Some(t) = crate::task::task_get(id) {
+            return Some(&t.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         }
     }
     // Longjmp model (and the fallback): the in-flight polling routine publishes
@@ -584,57 +580,16 @@ pub fn own_stack_park() {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-#[repr(transparent)]
-pub struct SendPtr<T>(pub *mut T);
-// SAFETY: `SendPtr` is a raw `*mut UserTaskCtx` newtype stored in the
-// `USER_TASK_CTXS` registry. The pointer targets a poller-pinned
-// `UserTaskCtx` that is only dereferenced on the single cooperative
-// CPU while that task is in flight; the wrapper carries no ownership,
-// so transferring it across the (single-CPU) executor is sound.
-unsafe impl<T> Send for SendPtr<T> {}
-// SAFETY: as above — the wrapper only hands back the bare pointer; any
-// dereference happens on the single cooperative CPU, so shared `&`
-// access across the registry never races a live `&mut`.
-unsafe impl<T> Sync for SendPtr<T> {}
-
-static USER_TASK_CTXS: IrqSafeSpinLock<Option<BTreeMap<u64, SendPtr<UserTaskCtx>>>> =
-    IrqSafeSpinLock::new(None);
-
-pub fn user_task_ctx_init() {
-    *USER_TASK_CTXS.lock() = Some(BTreeMap::new());
-}
-
-pub fn register_user_task_ctx(task_id: u64, ctx: *mut UserTaskCtx) {
-    let mut g = USER_TASK_CTXS.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task_id, SendPtr(ctx));
-    }
-}
-
-/// Run `f` against a registered task's `UserTaskCtx` while HOLDING the registry
-/// lock, so the pointer can't dangle mid-deref. The owning future removes its
-/// entry (`unregister_user_task_ctx`) in its poll-EXITED path BEFORE the executor
-/// drops the future's box — and that removal takes this same lock — so while the
-/// entry is present under the lock the box is guaranteed alive. Callers must NOT
-/// block or re-enter the registry inside `f`. Replaces the old pattern of
-/// `lookup_user_task_ctx` returning a raw pointer that the caller dereferenced
-/// AFTER releasing the lock (a cross-CPU use-after-free against task exit).
+/// Run `f` against a task's `UserTaskCtx`, resolved through the
+/// refcounted task registry (`crate::task`). The returned `Arc<Task>`
+/// keeps the ctx alive for the duration of `f` WITHOUT holding any
+/// registry lock across the callback — the refcount, not a
+/// deref-under-lock convention, is what makes this sound. Zombie
+/// (exited-but-unreaped) tasks still resolve; poking their park state
+/// is harmless and matches Linux's find-task-by-vpid semantics.
 pub fn with_user_task_ctx<R>(task_id: u64, f: impl FnOnce(&UserTaskCtx) -> R) -> Option<R> {
-    let g = USER_TASK_CTXS.lock();
-    let ptr = g.as_ref()?.get(&task_id)?.0;
-    // SAFETY: entry-present-under-this-lock ⟹ the owning future has not yet
-    // unregistered (and thus not yet been dropped), so `ptr` targets a live
-    // `UserTaskCtx`. The lock is held for the whole deref.
-    let uctx = unsafe { &*ptr };
-    Some(f(uctx))
-}
-
-pub fn unregister_user_task_ctx(task_id: u64) {
-    let mut g = USER_TASK_CTXS.lock();
-    if let Some(m) = g.as_mut() {
-        m.remove(&task_id);
-    }
+    let t = crate::task::task_get(task_id)?;
+    Some(f(&t.uctx))
 }
 
 // ── Polling-routine hooks ─────────────────────────────────────────
@@ -1085,7 +1040,12 @@ impl FpuArea {
 #[cfg(target_arch = "x86_64")]
 pub struct UserTaskFuture {
     process: crate::UserProcess,
-    ctx: UserTaskCtx,
+    /// The refcounted task object (registered in `crate::task::TASKS`
+    /// at spawn). The future's clone keeps `task.uctx` alive for as
+    /// long as the executor can possibly run this task, so every raw
+    /// `*mut UserTaskCtx` the trap/park paths publish stays valid even
+    /// if the task is concurrently reaped by its parent.
+    task: alloc::sync::Arc<crate::task::Task>,
     jmp: UnsafeCell<JmpBuf>,
     state: TaskState,
     /// Snapshot of the kernel's CR3 captured on the first poll so
@@ -1127,13 +1087,15 @@ unsafe impl Send for UserTaskFuture {}
 
 #[cfg(target_arch = "x86_64")]
 impl UserTaskFuture {
-    /// Construct a fresh polling future for `process`. The future
-    /// is not yet on any ready queue — hand it to
-    /// `narf_scheduler::spawn_user` to schedule it.
-    pub fn new(process: crate::UserProcess) -> Self {
+    /// Construct a fresh polling future for `process`, bound to its
+    /// pre-registered refcounted `task` (see
+    /// `crate::task::Task::new_registered`). The future is not yet on
+    /// any ready queue — hand it to `narf_scheduler::spawn_user`
+    /// under the same reserved `TaskId`.
+    pub fn new(process: crate::UserProcess, task: alloc::sync::Arc<crate::task::Task>) -> Self {
         Self {
             process,
-            ctx: UserTaskCtx::new(),
+            task,
             jmp: UnsafeCell::new(JmpBuf::default()),
             state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
@@ -1154,17 +1116,20 @@ impl UserTaskFuture {
     /// `int 0x80` returns. The `process.entry` / `process.stack_top`
     /// fields on the parent's `UserProcess` aren't consulted here —
     /// they're only meaningful for the load-time path.
-    pub fn resume_with(process: crate::UserProcess, state: UserState) -> Self {
-        let ctx = UserTaskCtx::new();
-        // SAFETY: we just constructed `ctx` and own the only handle
-        // to it; nobody else can race the cell write.
-        // SAFETY: Valid memory or trusted environment
+    pub fn resume_with(
+        process: crate::UserProcess,
+        task: alloc::sync::Arc<crate::task::Task>,
+        state: UserState,
+    ) -> Self {
+        // SAFETY: the task was just registered and has never been
+        // enqueued — no other CPU can touch its `uctx` yet, so the
+        // cell write cannot race.
         unsafe {
-            *ctx.state.get() = state;
+            *task.uctx.state.get() = state;
         }
         Self {
             process,
-            ctx,
+            task,
             jmp: UnsafeCell::new(JmpBuf::default()),
             // Skip `Initial` so the first poll takes the
             // `enter_user_mode_resume` arm and walks the saved
@@ -1258,7 +1223,7 @@ impl core::future::Future for UserTaskFuture {
         // then return Pending. The scale is tuned for ~1 ms per
         // park iteration: short enough not to perturb other tasks,
         // long enough to keep heap pressure flat.
-        let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
+        let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
             // An asynchronously-raised signal (e.g. SIGALRM from an
@@ -1278,7 +1243,7 @@ impl core::future::Future for UserTaskFuture {
                 // our waker so inbound TCP data wakes us immediately
                 // (crate::handlers::wake_io_waiters via the net
                 // readiness hook) instead of waiting out the deadline.
-                if this.ctx.net_io_wait.load(Ordering::Acquire) {
+                if this.task.uctx.net_io_wait.load(Ordering::Acquire) {
                     crate::handlers::register_io_waiter(
                         crate::handlers::current_task_id(),
                         cx.waker().clone(),
@@ -1292,10 +1257,10 @@ impl core::future::Future for UserTaskFuture {
                     // the now-ready event), and self-wake to force that
                     // re-poll immediately.
                     if narf_net::readiness::generation()
-                        != this.ctx.epoll_park_gen.load(Ordering::Acquire)
+                        != this.task.uctx.epoll_park_gen.load(Ordering::Acquire)
                     {
-                        this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        this.ctx.net_io_wait.store(false, Ordering::Release);
+                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        this.task.uctx.net_io_wait.store(false, Ordering::Release);
                         cx.waker().wake_by_ref();
                         return core::task::Poll::Pending;
                     }
@@ -1307,7 +1272,7 @@ impl core::future::Future for UserTaskFuture {
                 // wake counter advanced since the syscall's snapshot, a wake
                 // raced us — clear the park and self-wake to re-enter user
                 // mode (musl re-checks the word) instead of sleeping it out.
-                let fu = this.ctx.futex_uaddr.load(Ordering::Acquire);
+                let fu = this.task.uctx.futex_uaddr.load(Ordering::Acquire);
                 if fu != 0 {
                     crate::handlers::futex_register_waiter(
                         fu,
@@ -1315,11 +1280,11 @@ impl core::future::Future for UserTaskFuture {
                         cx.waker().clone(),
                     );
                     if crate::handlers::futex_gen(fu)
-                        != this.ctx.futex_park_gen.load(Ordering::Acquire)
+                        != this.task.uctx.futex_park_gen.load(Ordering::Acquire)
                     {
                         crate::handlers::futex_drop_waiter(fu, crate::handlers::current_task_id());
-                        this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
-                        this.ctx.futex_uaddr.store(0, Ordering::Release);
+                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        this.task.uctx.futex_uaddr.store(0, Ordering::Release);
                         cx.waker().wake_by_ref();
                         return core::task::Poll::Pending;
                     }
@@ -1393,9 +1358,9 @@ impl core::future::Future for UserTaskFuture {
             // sys_sleep call doesn't see stale state, cancel any wheel slot,
             // then fall through to the normal resume path (which re-enters
             // user mode; a pending signal is delivered on the next return).
-            this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
-            this.ctx.net_io_wait.store(false, Ordering::Release);
-            this.ctx.futex_uaddr.store(0, Ordering::Release);
+            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+            this.task.uctx.net_io_wait.store(false, Ordering::Release);
+            this.task.uctx.futex_uaddr.store(0, Ordering::Release);
             if let Some(h) = this.sleep_handle.take() {
                 narf_scheduler::narf_time::timer_wheel::cancel(h);
             }
@@ -1410,10 +1375,10 @@ impl core::future::Future for UserTaskFuture {
         // the reap should succeed and we write the result into the
         // saved UserState.rax before falling through to re-enter
         // user mode.
-        if this.ctx.wait_child_pending.load(Ordering::Acquire) {
-            let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
-            let wait_options = this.ctx.wait_child_options.load(Ordering::Acquire);
-            let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
+        if this.task.uctx.wait_child_pending.load(Ordering::Acquire) {
+            let want_pid = this.task.uctx.wait_child_want_pid.load(Ordering::Acquire);
+            let wait_options = this.task.uctx.wait_child_options.load(Ordering::Acquire);
+            let status_ptr = this.task.uctx.wait_child_status_ptr.load(Ordering::Acquire);
             // Use the scheduler TaskId (set by CURRENT_TASK before this poll)
             // as the key to look up PENDING_EXITS. `sys_fork` stores the
             // parent's TaskId (`current_task_id()`) into PARENT_OF and
@@ -1426,7 +1391,7 @@ impl core::future::Future for UserTaskFuture {
                 // siginfo_t (waitid) to the user pointer and put the
                 // syscall result (reaped pid for wait4, 0 for waitid)
                 // into the saved RAX, then clear the pending flags.
-                let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                let is_waitid = this.task.uctx.wait_child_is_waitid.load(Ordering::Acquire);
                 let rax =
                     crate::handlers::finish_wait_child(status_ptr, is_waitid, reaped, child_status);
                 // SAFETY: `state.get()` is the `*mut UserState` (== `*mut
@@ -1436,12 +1401,12 @@ impl core::future::Future for UserTaskFuture {
                 unsafe {
                     #[cfg(target_arch = "x86_64")]
                     {
-                        let us = &mut *this.ctx.state.get();
+                        let us = &mut *this.task.uctx.state.get();
                         us.rax = rax;
                     }
                 }
-                this.ctx.wait_child_pending.store(false, Ordering::Release);
-                this.ctx
+                this.task.uctx.wait_child_pending.store(false, Ordering::Release);
+                this.task.uctx
                     .wait_child_is_waitid
                     .store(false, Ordering::Release);
                 // Fall through to re-enter user mode with the result.
@@ -1459,7 +1424,7 @@ impl core::future::Future for UserTaskFuture {
                     // we just stored (no spurious self-wake needed),
                     // write the result, clear pending, fall through.
                     drop_wait_child_waker(task_pid);
-                    let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                    let is_waitid = this.task.uctx.wait_child_is_waitid.load(Ordering::Acquire);
                     let rax = crate::handlers::finish_wait_child(
                         status_ptr,
                         is_waitid,
@@ -1474,12 +1439,12 @@ impl core::future::Future for UserTaskFuture {
                     unsafe {
                         #[cfg(target_arch = "x86_64")]
                         {
-                            let us = &mut *this.ctx.state.get();
+                            let us = &mut *this.task.uctx.state.get();
                             us.rax = rax;
                         }
                     }
-                    this.ctx.wait_child_pending.store(false, Ordering::Release);
-                    this.ctx
+                    this.task.uctx.wait_child_pending.store(false, Ordering::Release);
+                    this.task.uctx
                         .wait_child_is_waitid
                         .store(false, Ordering::Release);
                     // Fall through to re-enter user mode.
@@ -1507,12 +1472,12 @@ impl core::future::Future for UserTaskFuture {
                         unsafe {
                             #[cfg(target_arch = "x86_64")]
                             {
-                                let us = &mut *this.ctx.state.get();
+                                let us = &mut *this.task.uctx.state.get();
                                 us.rax = (-4i64) as u64; // -EINTR
                             }
                         }
-                        this.ctx.wait_child_pending.store(false, Ordering::Release);
-                        this.ctx
+                        this.task.uctx.wait_child_pending.store(false, Ordering::Release);
+                        this.task.uctx
                             .wait_child_is_waitid
                             .store(false, Ordering::Release);
                         // Fall through to re-enter user mode (delivers SIGALRM).
@@ -1533,13 +1498,13 @@ impl core::future::Future for UserTaskFuture {
         // to re-enter user mode so the read re-runs and drains it. Else
         // return Pending with NO wake_by_ref — the task truly idles until a
         // keystroke, so the executor can halt instead of busy-polling.
-        if this.ctx.console_read_pending.load(Ordering::Acquire) {
+        if this.task.uctx.console_read_pending.load(Ordering::Acquire) {
             narf_input::register_byte_waker(cx.waker());
             // pending_input() (serial bytes + keyboard keys), not
             // pending_bytes() — the unified discipline drains both rings,
             // so a keystroke alone must un-park a blocked console read.
             if narf_input::pending_input() > 0 {
-                this.ctx
+                this.task.uctx
                     .console_read_pending
                     .store(false, Ordering::Release);
                 // fall through to resume + re-execute the read
@@ -1548,8 +1513,9 @@ impl core::future::Future for UserTaskFuture {
             }
         }
 
-        let task_id = crate::handlers::current_task_id();
-        register_user_task_ctx(task_id, &mut this.ctx as *mut _);
+        // (Task registration happens at spawn time — `crate::task::
+        // Task::new_registered` runs before the slot is enqueued, so
+        // the task is resolvable from its very first instruction.)
 
         // Snapshot kernel CR3 EVERY poll, not once. The kernel
         // root can shift between polls — when the page allocator
@@ -1578,7 +1544,7 @@ impl core::future::Future for UserTaskFuture {
         // JmpBuf to longjmp through. Stored before any state
         // transition so a trap that lands mid-setup still finds
         // valid slots.
-        install_current(&mut this.ctx as *mut _);
+        install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Activate the user AS. `addr_space.activate()` does the
@@ -1614,7 +1580,7 @@ impl core::future::Future for UserTaskFuture {
         // ld-musl, which does ARCH_SET_FS early in
         // `__init_libc`, would then read a stale FS_BASE and
         // SIGSEGV on the next TCB-pointer access.
-        let override_fs = this.ctx.pending_fs_base.load(Ordering::Acquire);
+        let override_fs = this.task.uctx.pending_fs_base.load(Ordering::Acquire);
         let effective_fs = if override_fs != u64::MAX {
             Some(override_fs)
         } else {
@@ -1696,7 +1662,7 @@ impl core::future::Future for UserTaskFuture {
                     // SAFETY: `ctx.state` holds a prior trap-from-user snapshot
                     // (fork child / re-image); resume it on the empty stack top.
                     unsafe {
-                        narf_scheduler::enter_user_mode_resume_at_top(this.ctx.state.get(), top)
+                        narf_scheduler::enter_user_mode_resume_at_top(this.task.uctx.state.get(), top)
                     }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
@@ -1769,7 +1735,7 @@ impl core::future::Future for UserTaskFuture {
                     // returns — iretq resumes the saved user frame.
                     narf_lib::perf::ctx_switch();
                     // SAFETY: Valid memory or trusted environment
-                    unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
+                    unsafe { narf_scheduler::enter_user_mode_resume(this.task.uctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
             }
@@ -1836,16 +1802,13 @@ impl core::future::Future for UserTaskFuture {
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
-            // Remove this task's `UserTaskCtx` pointer from the by-id registry
-            // BEFORE the future's box is dropped — otherwise the raw pointer
-            // dangles and a later cross-CPU `wake_signal`/`wake_one` derefs
-            // freed (reused) memory (TaskIds are monotonic, never reused, so the
-            // stale entry never gets overwritten). The registry deliberately
-            // persists across YIELD (a parked task must stay wakeable) and across
-            // EXECVE (the future + ctx are reused for the new image) — only the
-            // true exit removes it. `current_task_id()` here is the same id the
-            // poll registered with at the top of this function.
-            unregister_user_task_ctx(crate::handlers::current_task_id());
+            // Flip the refcounted task to ZOMBIE. It stays resolvable
+            // (carrying its exit code) until the parent reaps it —
+            // `crate::task::release_task` drops the registry ref there.
+            // The future's own `Arc<Task>` keeps the `UserTaskCtx`
+            // alive until the executor drops this slot, so no wake can
+            // dangle regardless of ordering.
+            crate::task::mark_zombie(crate::handlers::current_task_id());
             // Fan out to per-pid observers (FB connections, fd
             // tables, future ipc rings) before flipping state so
             // any subsystem that wants to inspect the live process
@@ -1863,7 +1826,8 @@ impl core::future::Future for UserTaskFuture {
             // brk top, and signal handler table — those live in
             // crate-side tables keyed by pid, untouched here.
             let req_ptr = this
-                .ctx
+                .task
+                .uctx
                 .pending_exec
                 .swap(core::ptr::null_mut(), Ordering::AcqRel);
             if !req_ptr.is_null() {
@@ -1910,7 +1874,8 @@ impl core::future::Future for UserTaskFuture {
 #[cfg(target_arch = "aarch64")]
 pub struct UserTaskFuture {
     process: crate::UserProcess,
-    ctx: UserTaskCtx,
+    /// Refcounted task object — see the x86_64 sibling's field doc.
+    task: alloc::sync::Arc<crate::task::Task>,
     jmp: UnsafeCell<JmpBuf>,
     state: TaskState,
     /// Snapshot of the kernel's TTBR0_EL1 captured on the first
@@ -1938,12 +1903,13 @@ unsafe impl Send for UserTaskFuture {}
 
 #[cfg(target_arch = "aarch64")]
 impl UserTaskFuture {
-    /// Construct a fresh polling future for `process`. Hand to
-    /// `narf_scheduler::spawn_user` to schedule it.
-    pub fn new(process: crate::UserProcess) -> Self {
+    /// Construct a fresh polling future for `process`, bound to its
+    /// pre-registered refcounted `task`. Hand to
+    /// `narf_scheduler::spawn_user` under the same reserved `TaskId`.
+    pub fn new(process: crate::UserProcess, task: alloc::sync::Arc<crate::task::Task>) -> Self {
         Self {
             process,
-            ctx: UserTaskCtx::new(),
+            task,
             jmp: UnsafeCell::new(JmpBuf::default()),
             state: TaskState::Initial,
             saved_ttbr0: core::cell::Cell::new(None),
@@ -1956,15 +1922,19 @@ impl UserTaskFuture {
     /// sp)`. Used by `sys_fork` so the child wakes at the
     /// parent's post-`svc #0` PC with x0=0 / x1=0 (POSIX fork
     /// return).
-    pub fn resume_with(process: crate::UserProcess, state: UserState) -> Self {
-        let ctx = UserTaskCtx::new();
-        // SAFETY: just constructed `ctx`; sole owner.
+    pub fn resume_with(
+        process: crate::UserProcess,
+        task: alloc::sync::Arc<crate::task::Task>,
+        state: UserState,
+    ) -> Self {
+        // SAFETY: the task was just registered and never enqueued —
+        // no other CPU can touch its `uctx` yet.
         unsafe {
-            *ctx.state.get() = state;
+            *task.uctx.state.get() = state;
         }
         Self {
             process,
-            ctx,
+            task,
             jmp: UnsafeCell::new(JmpBuf::default()),
             state: TaskState::Running,
             saved_ttbr0: core::cell::Cell::new(None),
@@ -2011,7 +1981,7 @@ impl core::future::Future for UserTaskFuture {
 
         // sys_sleep park-via-deadline + throttle (mirrors x86_64 —
         // see the sibling poll body for the rationale).
-        let deadline = this.ctx.sleep_deadline_ns.load(Ordering::Acquire);
+        let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
             // Break an infinite park on an async pending signal — see the
@@ -2028,14 +1998,14 @@ impl core::future::Future for UserTaskFuture {
                 cx.waker().wake_by_ref();
                 return core::task::Poll::Pending;
             }
-            this.ctx.sleep_deadline_ns.store(0, Ordering::Release);
+            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
 
         // sys_wait4 cooperative parking (mirrors x86_64 poll body).
-        if this.ctx.wait_child_pending.load(Ordering::Acquire) {
-            let want_pid = this.ctx.wait_child_want_pid.load(Ordering::Acquire);
-            let wait_options = this.ctx.wait_child_options.load(Ordering::Acquire);
-            let status_ptr = this.ctx.wait_child_status_ptr.load(Ordering::Acquire);
+        if this.task.uctx.wait_child_pending.load(Ordering::Acquire) {
+            let want_pid = this.task.uctx.wait_child_want_pid.load(Ordering::Acquire);
+            let wait_options = this.task.uctx.wait_child_options.load(Ordering::Acquire);
+            let status_ptr = this.task.uctx.wait_child_status_ptr.load(Ordering::Acquire);
             // Use the scheduler TaskId (set by CURRENT_TASK before this poll)
             // as the key to look up PENDING_EXITS. `sys_fork` stores the
             // parent's TaskId (`current_task_id()`) into PARENT_OF and
@@ -2044,7 +2014,7 @@ impl core::future::Future for UserTaskFuture {
             let mut child_status = 0i32;
             let reaped = call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status);
             if reaped > 0 {
-                let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                let is_waitid = this.task.uctx.wait_child_is_waitid.load(Ordering::Acquire);
                 let rax =
                     crate::handlers::finish_wait_child(status_ptr, is_waitid, reaped, child_status);
                 // SAFETY: `state.get()` is the `*mut UserState`
@@ -2056,12 +2026,12 @@ impl core::future::Future for UserTaskFuture {
                     #[cfg(target_arch = "aarch64")]
                     {
                         // On aarch64 x0 is the return register.
-                        let us = &mut *this.ctx.state.get();
+                        let us = &mut *this.task.uctx.state.get();
                         us.x[0] = rax;
                     }
                 }
-                this.ctx.wait_child_pending.store(false, Ordering::Release);
-                this.ctx
+                this.task.uctx.wait_child_pending.store(false, Ordering::Release);
+                this.task.uctx
                     .wait_child_is_waitid
                     .store(false, Ordering::Release);
             } else {
@@ -2071,7 +2041,7 @@ impl core::future::Future for UserTaskFuture {
                     call_wait_child_check(task_pid, want_pid, wait_options, &mut child_status2);
                 if reaped2 > 0 {
                     drop_wait_child_waker(task_pid);
-                    let is_waitid = this.ctx.wait_child_is_waitid.load(Ordering::Acquire);
+                    let is_waitid = this.task.uctx.wait_child_is_waitid.load(Ordering::Acquire);
                     let rax = crate::handlers::finish_wait_child(
                         status_ptr,
                         is_waitid,
@@ -2085,12 +2055,12 @@ impl core::future::Future for UserTaskFuture {
                     unsafe {
                         #[cfg(target_arch = "aarch64")]
                         {
-                            let us = &mut *this.ctx.state.get();
+                            let us = &mut *this.task.uctx.state.get();
                             us.x[0] = rax;
                         }
                     }
-                    this.ctx.wait_child_pending.store(false, Ordering::Release);
-                    this.ctx
+                    this.task.uctx.wait_child_pending.store(false, Ordering::Release);
+                    this.task.uctx
                         .wait_child_is_waitid
                         .store(false, Ordering::Release);
                 } else {
@@ -2109,12 +2079,12 @@ impl core::future::Future for UserTaskFuture {
                         unsafe {
                             #[cfg(target_arch = "aarch64")]
                             {
-                                let us = &mut *this.ctx.state.get();
+                                let us = &mut *this.task.uctx.state.get();
                                 us.x[0] = (-4i64) as u64; // -EINTR
                             }
                         }
-                        this.ctx.wait_child_pending.store(false, Ordering::Release);
-                        this.ctx
+                        this.task.uctx.wait_child_pending.store(false, Ordering::Release);
+                        this.task.uctx
                             .wait_child_is_waitid
                             .store(false, Ordering::Release);
                         // Fall through to re-enter user mode (delivers SIGALRM).
@@ -2125,8 +2095,8 @@ impl core::future::Future for UserTaskFuture {
             }
         }
 
-        let task_id = crate::handlers::current_task_id();
-        register_user_task_ctx(task_id, &mut this.ctx as *mut _);
+        // (Task registration happens at spawn time — see the x86_64
+        // sibling poll for the rationale.)
 
         // Snapshot kernel TTBR0_EL1 once. Subsequent polls land
         // back here via the trap path; we restore on the way out.
@@ -2146,14 +2116,14 @@ impl core::future::Future for UserTaskFuture {
         if this.process.address_space.activate().is_err() {
             // No state change — the task essentially never ran
             // user code. Fan out the exit observers and resolve.
-            unregister_user_task_ctx(crate::handlers::current_task_id());
+            crate::task::mark_zombie(crate::handlers::current_task_id());
             notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             return core::task::Poll::Ready(());
         }
 
         // Publish per-task pointers the trap path consults.
-        install_current(&mut this.ctx as *mut _);
+        install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
 
         // Program the per-task TLS thread pointer if the binary
@@ -2203,7 +2173,7 @@ impl core::future::Future for UserTaskFuture {
                     // ctx.state via TrapContext::save_user_state.
                     narf_lib::perf::ctx_switch();
                     // SAFETY: Valid memory or trusted environment
-                    unsafe { narf_scheduler::enter_user_mode_resume(this.ctx.state.get()) }
+                    unsafe { narf_scheduler::enter_user_mode_resume(this.task.uctx.state.get()) }
                 }
                 TaskState::Exited => unreachable!("guarded above"),
             }
@@ -2242,7 +2212,7 @@ impl core::future::Future for UserTaskFuture {
 
         let reason = saved as u32;
         if reason == EXIT_REASON_EXITED {
-            unregister_user_task_ctx(crate::handlers::current_task_id());
+            crate::task::mark_zombie(crate::handlers::current_task_id());
             notify_task_exited(this.process.pid.raw(), crate::handlers::current_task_id());
             this.state = TaskState::Exited;
             core::task::Poll::Ready(())
@@ -2290,11 +2260,15 @@ pub struct UserTaskFuture {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 impl UserTaskFuture {
-    pub fn new(process: crate::UserProcess) -> Self {
+    pub fn new(process: crate::UserProcess, _task: alloc::sync::Arc<crate::task::Task>) -> Self {
         Self { _process: process }
     }
 
-    pub fn resume_with(process: crate::UserProcess, _state: UserState) -> Self {
+    pub fn resume_with(
+        process: crate::UserProcess,
+        _task: alloc::sync::Arc<crate::task::Task>,
+        _state: UserState,
+    ) -> Self {
         Self { _process: process }
     }
 }
@@ -2312,3 +2286,37 @@ impl core::future::Future for UserTaskFuture {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn install_user_task_hooks() {}
+
+// ── User-task spawn entry points ────────────────────────────────────
+//
+// ALL user-task spawns (boot init, fork, clone) go through these two
+// helpers so the refcounted `Task` is registered under its reserved
+// `TaskId` BEFORE the slot is enqueued — the task must be resolvable
+// via `crate::task::task_get` from its very first instruction.
+
+/// Reserve a `TaskId`, register the refcounted `Task`, and enqueue a
+/// fresh polling future for `process` under that id.
+pub fn spawn_user_process(
+    process: crate::UserProcess,
+    spec: narf_scheduler::TaskSpec,
+) -> narf_scheduler::TaskId {
+    let id = narf_scheduler::alloc_task_id();
+    let addr_space = process.address_space.clone();
+    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
+    let future = UserTaskFuture::new(process, task);
+    narf_scheduler::spawn_user(id, future, spec, addr_space)
+}
+
+/// Same as [`spawn_user_process`] but seeds the child with a saved
+/// `UserState` snapshot (fork/clone resume-into-child).
+pub fn spawn_user_process_resume(
+    process: crate::UserProcess,
+    state: UserState,
+    spec: narf_scheduler::TaskSpec,
+) -> narf_scheduler::TaskId {
+    let id = narf_scheduler::alloc_task_id();
+    let addr_space = process.address_space.clone();
+    let task = crate::task::Task::new_registered(id.raw(), process.pid.raw());
+    let future = UserTaskFuture::resume_with(process, task, state);
+    narf_scheduler::spawn_user(id, future, spec, addr_space)
+}

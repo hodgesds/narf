@@ -23,8 +23,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::process::{load_user_process, load_user_process_with, ProcessLoadError};
-use crate::user_task::UserTaskFuture;
-use narf_scheduler::{spawn_user, TaskId, TaskSpec};
+use crate::user_task::spawn_user_process;
+use narf_scheduler::{TaskId, TaskSpec};
 
 /// Errors specific to PID-1 spawn.
 #[derive(Debug)]
@@ -57,9 +57,7 @@ impl From<ProcessLoadError> for InitError {
 pub unsafe fn spawn_pid1_from_bytes(bytes: &[u8]) -> Result<TaskId, InitError> {
     // SAFETY: forwarding the caller's contract.
     let process = unsafe { load_user_process(bytes)? };
-    let addr_space = process.address_space.clone();
-    let future = UserTaskFuture::new(process);
-    Ok(spawn_user(future, TaskSpec::default(), addr_space))
+    Ok(spawn_user_process(process, TaskSpec::default()))
 }
 
 /// Load `bytes` as PID 1 with the given argv + envp. Useful for
@@ -74,9 +72,7 @@ pub unsafe fn spawn_pid1_with_argv(
 ) -> Result<TaskId, InitError> {
     // SAFETY: forwarding.
     let process = unsafe { load_user_process_with(bytes, argv, envp, &[])? };
-    let addr_space = process.address_space.clone();
-    let future = UserTaskFuture::new(process);
-    Ok(spawn_user(future, TaskSpec::default(), addr_space))
+    Ok(spawn_user_process(process, TaskSpec::default()))
 }
 
 /// Convenience: read `path` from the staged initramfs and spawn
@@ -115,9 +111,7 @@ pub unsafe fn spawn_pid1_from_bytes_report(bytes: &[u8]) -> Result<Pid1SpawnRepo
     let process = unsafe { load_user_process(bytes)? };
     let entry = process.entry.0.raw();
     let stack_top = process.stack_top.as_u64();
-    let addr_space = process.address_space.clone();
-    let future = UserTaskFuture::new(process);
-    let task_id = spawn_user(future, TaskSpec::default(), addr_space);
+    let task_id = spawn_user_process(process, TaskSpec::default());
     Ok(Pid1SpawnReport {
         task_id,
         entry,

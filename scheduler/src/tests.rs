@@ -528,6 +528,7 @@ fn smoke_scheduler_spawn_user_carries_address_space() -> TestResult {
     let arc_a = Arc::new(a);
 
     let tid = spawn_user(
+        crate::alloc_task_id(),
         async {
             RAN.fetch_add(1, Ordering::Relaxed);
         },
@@ -618,6 +619,7 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     let arc_as = Arc::new(user_as);
 
     let _tid = spawn_user(
+        crate::alloc_task_id(),
         async {
             // No-op user-task body. The bug isn't in the body —
             // it's that the scheduler leaks CR3 to the *next*
@@ -772,6 +774,7 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_cr3() -> TestResult {
     let arc_as = Arc::new(user_as);
 
     let _utid = spawn_user(
+        crate::alloc_task_id(),
         async {
             USER_RAN.store(true, Ordering::Relaxed);
         },
@@ -867,6 +870,7 @@ fn smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0() -> TestResult {
     let arc_as = Arc::new(user_as);
 
     let _utid = spawn_user(
+        crate::alloc_task_id(),
         async {
             USER_RAN.store(true, Ordering::Relaxed);
         },

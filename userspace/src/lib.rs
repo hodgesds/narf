@@ -82,6 +82,7 @@ pub mod socket;
 pub mod syscall;
 #[cfg(feature = "linux-compat")]
 pub mod sysvipc;
+pub mod task;
 #[cfg(target_arch = "x86_64")]
 pub mod tls;
 pub mod user_task;
