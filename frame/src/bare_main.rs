@@ -3062,7 +3062,7 @@ fn boot_userspace_init() {
     use narf_userspace::{
         bootstrap_init, brk_init, cwd_init, install_address_space_lookup, install_core_syscalls,
         install_global, install_task_id_lookup, install_user_task_hooks, load_user_process_with,
-        sigaction_init, signal_init, SyscallTable, UserTaskFuture,
+        sigaction_init, signal_init, SyscallTable,
     };
 
     let bytes = narf_verification::NARF_INIT_ELF;
