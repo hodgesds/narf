@@ -10187,6 +10187,9 @@ fn smoke_userspace_tkill_targets_specific_tid() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Register the target tid so it exists for the signal target check
+    // (tkill now returns ESRCH for an unknown tid — Linux parity).
+    crate::handlers::register_task_to_pid(0xBBBB, 0xBBBB);
     // tkill TID=0xBBBB with signum=10 (SIGUSR1).
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
@@ -10234,6 +10237,10 @@ fn smoke_userspace_tgkill_routes_via_tid() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // Register tid 0xDDDD as a member of thread-group 0xCCCC, so the
+    // target exists AND the (tgid,tid) consistency check passes — both
+    // required now that tgkill enforces Linux ESRCH semantics.
+    crate::handlers::register_task_to_pid(0xDDDD, 0xCCCC);
     // tgkill TGID=0xCCCC TID=0xDDDD SIG=15 (SIGTERM).
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
@@ -10978,10 +10985,14 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     let r = ctx.ret.unwrap_or(SyscallReturn::ok(0));
     __test_clear_global();
     crate::handlers::__test_signal_reset();
-    if r == SyscallReturn::invalid_op() {
+    // Linux parity: an out-of-range signum returns -EINVAL (was an
+    // InvalidOp NARF status before the signal-parity pass). The signum
+    // check fires before the target existence check, so 0xBEEF's
+    // (non)existence is irrelevant here.
+    if r == SyscallReturn::ok((-22i64) as u64) {
         TestResult::Pass
     } else {
-        TestResult::Fail("signum 32 must be rejected")
+        TestResult::Fail("signum 32 must be rejected with -EINVAL")
     }
 }
 kernel_test_in!(
@@ -14597,6 +14608,12 @@ fn smoke_sys_kill_sigterm_marks_pending() -> TestResult {
     install_global(t);
 
     let target: u64 = 0xC5_2099;
+    // kill() now returns ESRCH for an unknown target and routes real
+    // pids through kill_process (which resolves via the task registry),
+    // so register the target as a live task, not just in the pid map.
+    crate::task::release_task(target);
+    let _ = crate::task::Task::new_registered(target, target);
+    crate::handlers::register_pid_task_mapping(target, target);
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -14670,6 +14687,11 @@ fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
     install_global(t);
 
     let target: u64 = 0xC5_2199;
+    // Register the target as a live task so kill_process resolves it
+    // via the registry (ESRCH parity).
+    crate::task::release_task(target);
+    let _ = crate::task::Task::new_registered(target, target);
+    crate::handlers::register_pid_task_mapping(target, target);
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -14919,16 +14941,10 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
 
     crate::handlers::register_pid_task_mapping(0, 0);
 
-    // Raise SIGUSR1 (10) on task 0 (the test task lookup is unset → 0).
-    let mut ctx = FakeCtx {
-        args: SyscallArgs {
-            arg0: 0,
-            arg1: 10,
-            ..SyscallArgs::default()
-        },
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    // Raise SIGUSR1 (10) on the signalfd owner (task 0). Direct raise
+    // rather than kill(0) — see the signalfd_epoll test for why
+    // (kill(0) is now the caller's process group, Linux parity).
+    crate::handlers::raise_signal_pending(0, 10);
 
     // Read the 128-byte signalfd_siginfo.
     let mut buf = [0u8; 128];
@@ -15067,16 +15083,13 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     };
     kernel_syscall_entry(Syscall::EpollCtl.raw(), &mut ctx);
 
-    // Raise SIGUSR2.
-    let mut ctx = FakeCtx {
-        args: SyscallArgs {
-            arg0: 0,
-            arg1: 12,
-            ..SyscallArgs::default()
-        },
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Kill.raw(), &mut ctx);
+    // Raise SIGUSR2 for the signalfd's owner (task 0). This test
+    // exercises signalfd + epoll wakeup, not kill(2) routing — and
+    // kill(0) now means "the caller's process group" (Linux parity),
+    // which for the artificial task-0 owner has no pgrp. Set the
+    // pending bit directly, which is exactly what the old kill(pid=0)
+    // literal-target path did.
+    crate::handlers::raise_signal_pending(0, 12);
 
     // epoll_wait timeout=0 → should immediately see 1 ready event.
     let mut events = [0u8; 12 * 4];

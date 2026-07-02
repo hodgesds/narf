@@ -315,6 +315,12 @@ pub enum Syscall {
     /// Exit the current task. Linux `exit` (x86_64=60, aarch64=93).
     ExitTask,
 
+    /// Exit the whole thread group. Linux `exit_group` (x86_64=231,
+    /// aarch64=94). Kills every other thread in the caller's group
+    /// before the caller exits (Linux `do_group_exit`); for a
+    /// single-threaded process it behaves exactly like `exit`.
+    ExitGroup,
+
     /// Yield the CPU. Returns when rescheduled. Linux `sched_yield`
     /// (x86_64=24, aarch64=124).
     Yield,
@@ -2469,16 +2475,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::ArchPrctl, 158),   // arch_prctl (x86_64 only)
     (Syscall::EpollCreate, 291), // epoll_create1
     // Linux 231 = exit_group. Glibc/musl emit exit_group out of
-    // __libc_start_main's exit path; mapping it to the same
-    // handler as plain exit (60 → ExitTask) lets a real
-    // musl-static binary terminate cleanly. NARF doesn't have
-    // thread groups yet, so exit_group ≡ exit for a single-thread
-    // task; once clone(CLONE_THREAD) lands, exit_group will need
-    // to fan out to siblings — that's a follow-up.
-    // Placed AFTER (ExitTask, 60) so `Syscall::ExitTask.raw()`
-    // (which returns the first match) still resolves to 60 for
-    // in-tree callers; only `from_raw(231)` finds this row.
-    (Syscall::ExitTask, 231), // exit_group
+    // __libc_start_main's exit path. It has its own handler that
+    // zaps the caller's CLONE_THREAD siblings before exiting
+    // (Linux do_group_exit); for a single-threaded process it is
+    // identical to plain exit.
+    (Syscall::ExitGroup, 231), // exit_group
     (Syscall::Pipe2, 293),
     (Syscall::Dup3, 292),
     (Syscall::Prlimit64, 302),
@@ -2587,11 +2588,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdCreate, 85),
     (Syscall::TimerfdSettime, 86),
     (Syscall::TimerfdGettime, 87),
-    (Syscall::ExitTask, 93), // exit
-    // Linux aarch64 94 = exit_group. See x86_64 commentary above
-    // the (ExitTask, 231) row for rationale. `raw(ExitTask)` still
-    // returns 93 since this row sits after the 93 row.
-    (Syscall::ExitTask, 94), // exit_group
+    (Syscall::ExitTask, 93),  // exit
+    (Syscall::ExitGroup, 94), // exit_group (zaps siblings; see x86_64 231)
     (Syscall::Unshare, 97),
     // Wave-67 — Linux aarch64 setns = 268.
     (Syscall::Setns, 268),
@@ -3003,6 +3001,7 @@ fn syscall_trace_relevant(v: Syscall) -> bool {
             | Syscall::Execve
             | Syscall::Execveat
             | Syscall::ExitTask
+            | Syscall::ExitGroup
             | Syscall::Wait4
     )
 }

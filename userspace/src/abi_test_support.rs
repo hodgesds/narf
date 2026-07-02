@@ -106,6 +106,13 @@ pub fn setup() {
     crate::handlers::init_per_task_state();
     // pid<->tid identity for FAKE_TASK so signal/wait/pid syscalls resolve.
     crate::handlers::register_task_to_pid(FAKE_TASK, FAKE_TASK);
+    crate::handlers::register_pid_task_mapping(FAKE_TASK, FAKE_TASK);
+    // Refcounted-task registry entry: tkill/tgkill/kill now report
+    // ESRCH for tids the registry doesn't know, so the harness task
+    // must exist like a real spawned task would.
+    if crate::task::task_get(FAKE_TASK).is_none() {
+        let _ = crate::task::Task::new_registered(FAKE_TASK, FAKE_TASK);
+    }
 }
 
 pub fn teardown() {

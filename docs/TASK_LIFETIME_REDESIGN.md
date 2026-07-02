@@ -208,20 +208,32 @@ set by the new image), and sweeps FD_CLOEXEC.
 
 ## 4. Implementation stages (each = one commit, boot-verified)
 
-1. **task.rs core**: `Task`/`TASKS`/`task_get`, `UserTaskFuture` holds
-   `Arc<Task>`, delete `USER_TASK_CTXS`+`SendPtr`+`with_user_task_ctx`
-   (callers → `task_get`), spawn-time registration, exit → ZOMBIE →
-   reap `release_task`. Scheduler slot-reap hook (H1). CURRENT_FPU
-   clear + exit_current_stackful panic (H2, H3).
-2. **release_task_tables sweep**: purge all §6 tables on exit; reparent
-   to init; robust-list walk; posix-timer/itimer exit observer; waker-
-   table purge; PID_TO_TASK/TASK_TO_PID/cpu-rows at reap.
-3. **thread groups**: ThreadGroup + SigHand sharing, sigmask
-   inheritance, exit_group zap, shared pending, kill routing +
-   ESRCH/EINVAL/oldact/force-unblock fixes, sigaltstack-on-exec reset.
-4. **execve hardening**: FD_CLOEXEC sweep, stale-uaddr clears.
-5. Regression tests per stage (abi_signal/abi_proc suites) + boot smoke
-   + `NARF_QEMU_SMP=1` full kernel-test run.
+1. **task.rs core** — DONE (commit dffb4cc8). `Task`/`TASKS`/`task_get`,
+   `UserTaskFuture` holds `Arc<Task>`, deleted
+   `USER_TASK_CTXS`+`SendPtr` (callers → `task_get`), spawn-time
+   registration, exit → ZOMBIE → reap `release_task`. Scheduler
+   slot-reap hook (H1). exit_current_stackful panic (H3).
+2. **release_task_tables sweep** — DONE (commit 354141e0). Master exit
+   sweep over every tid-keyed table; orphan handling (auto-release
+   dead-parent children, drop PARENT_OF); robust-futex owner-died walk;
+   posix/itimer disarm; waker-table purge; PID_TO_TASK/TASK_TO_PID at
+   reap.
+3. **thread groups + signal parity** — DONE (this stage). SigHand
+   `Arc`-shared on CLONE_SIGHAND/CLONE_THREAD (deep-copy on fork),
+   sigmask inheritance, dedicated `exit_group` that zaps siblings +
+   `group_exiting` flag, `kill()` pgrp/broadcast/zombie routing +
+   fatal-SIGKILL group fan-out, ESRCH on missing target (kill/tkill/
+   tgkill/rt_[tg]sigqueueinfo), EINVAL + SIGKILL/SIGSTOP-uncatchable in
+   rt_sigaction, SIGKILL/SIGSTOP force-unblock in procmask/suspend,
+   rt_sigaction oldact write-back, tgkill (tgid,tid) check,
+   sigaltstack + robust-list + clear_child_tid cleared on execve,
+   FD_CLOEXEC sweep on execve, pgrp-delivery wakes parked targets.
+4. **remaining parity (follow-up)**: RT-signal queue depth (still
+   coalesces), ITIMER_VIRTUAL/PROF (only ITIMER_REAL fires), full
+   "any thread may dequeue a process-directed signal" shared-pending
+   set, orphaned-pgrp SIGHUP. Pinned in §5.
+5. Regression tests per stage (abi_signal/process_e2e suites) + boot
+   smoke + full kernel-test run (KVM + TCG).
 
 ## 5. Linux-parity matrix (all in scope — brought to parity, not pinned)
 

@@ -8058,6 +8058,44 @@ pub(crate) fn terminate_current_task(
 
 // ── ExitTask — redirect to a kernel-registered landing ─────────────
 
+/// `exit_group(2)` — terminate the whole thread group (Linux
+/// `do_group_exit`). Zap every OTHER live thread in the caller's group
+/// (SIGKILL pending + wake; they self-terminate on their next delivery
+/// point — trap return worst case) and set the group-exiting flag so
+/// wait4 reports the group's exit code, then fall through to exit the
+/// caller. For a single-threaded process this is exactly `exit`.
+fn sys_exit_group(ctx: &mut dyn TrapContext) {
+    let tid = current_task_id();
+    let pid = task_to_pid_raw(tid).unwrap_or(tid);
+    if let Some(t) = crate::task::task_get(tid) {
+        t.group_exiting
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+    // Find live CLONE_THREAD siblings sharing this visible pid.
+    let siblings: alloc::vec::Vec<u64> = {
+        let g = TASK_TO_PID.lock();
+        g.as_ref()
+            .map(|m| {
+                m.iter()
+                    .filter(|&(&t, &p)| p == pid && t != tid)
+                    .map(|(&t, _)| t)
+                    .filter(|&t| {
+                        crate::task::task_get(t).is_some_and(|t| {
+                            t.state.load(core::sync::atomic::Ordering::Acquire)
+                                == crate::task::TASK_RUNNING
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for s in siblings {
+        raise_signal_pending(s, 9); // SIGKILL
+        wake_signal(s);
+    }
+    sys_exit_task(ctx);
+}
+
 fn sys_exit_task(ctx: &mut dyn TrapContext) {
     let exit_code = ctx.args().arg0 as u32;
     let wstatus = (exit_code & 0xff) << 8;
@@ -8719,13 +8757,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     let share_thread = (flags & CLONE_THREAD) != 0;
     let share_fs = (flags & CLONE_FS) != 0;
     let _share_files = (flags & CLONE_FILES) != 0;
-    let _share_sighand = (flags & CLONE_SIGHAND) != 0;
+    let share_sighand = (flags & CLONE_SIGHAND) != 0;
     let _share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
 
     // CLONE_THREAD requires CLONE_VM + CLONE_SIGHAND in Linux.
     // We enforce CLONE_VM (without a shared AS the child can't
-    // observe the parent's memory) but accept CLONE_SIGHAND as
-    // a behavioural-only flag.
+    // observe the parent's memory); CLONE_SIGHAND shares the live
+    // sigaction table below.
     if share_thread && !share_vm {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -8987,13 +9025,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     }
 
     if !share_vm {
-        // brk and sigaction map onto AS state; only meaningful for
-        // a non-VM clone (a true fork). For thread spawns the
-        // parent's brk/sigaction stay reachable through the shared
-        // AS and the per-tid sigaction lookup.
+        // brk maps onto AS state; only meaningful for a non-VM clone
+        // (a true fork).
         brk_fork(parent_pid, child_tid.raw());
+    }
+    // Signal-handler table: CLONE_SIGHAND (mandatory for CLONE_THREAD)
+    // SHARES the parent's live sighand — a handler installed by any
+    // thread is visible to the whole group (Linux sighand_struct
+    // semantics; musl's setxid/cancellation machinery depends on it —
+    // before this, a pthread had an EMPTY handler table and any signal
+    // sent to it took the default action and killed it). Everything
+    // else deep-copies (fork semantics).
+    if share_sighand || share_thread {
+        sigaction_share(parent_pid, child_tid.raw());
+    } else {
         sigaction_fork(parent_pid, child_tid.raw());
     }
+    // The signal MASK is inherited by every clone flavour (Linux
+    // copy_process copies blocked unconditionally). A new thread that
+    // started with an empty mask would take signals its creator had
+    // deliberately blocked.
+    signal_mask_fork(parent_pid, child_tid.raw());
 
     // CLONE_PARENT_SETTID: write child TID to *parent_tid in the
     // parent's AS (still active here — we haven't returned to the
@@ -9382,6 +9434,7 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     uidgid_fork(parent_pid, child_tid.raw());
     brk_fork(parent_pid, child_tid.raw());
     sigaction_fork(parent_pid, child_tid.raw());
+    signal_mask_fork(parent_pid, child_tid.raw());
     // POSIX: inherit the parent's process group, session, and controlling
     // terminal. pgid inheritance keeps a forked foreground job in the
     // terminal's foreground pgrp (no spurious SIGTTIN on its first read).
@@ -13839,6 +13892,24 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     // that handles SIGCHLD; without this the next SIGCHLD branches to the stale
     // handler vaddr in the new image and crashes.) Mask + pending are kept.
     sigaction_exec_reset(task);
+    // The alternate signal stack, robust-list head, and clear_child_tid
+    // uaddr all point into the OLD image's address space — Linux clears
+    // all three on exec. A surviving sigaltstack sp would have the next
+    // SA_ONSTACK delivery build a frame at an address the new image
+    // repurposed (wild user-stack write); a surviving clear_child_tid
+    // would zero an arbitrary word in the new image on exit.
+    if let Some(m) = SIG_ALTSTACK.lock().as_mut() {
+        m.remove(&task);
+    }
+    if let Some(m) = ROBUST_LIST_TABLE.lock().as_mut() {
+        m.remove(&task);
+    }
+    let _ = take_clear_child_tid(task);
+    // FD_CLOEXEC sweep: close every fd marked close-on-exec (Linux
+    // does this in the exec path). Without it, O_CLOEXEC fds leak
+    // across exec — an fd-table leak that is also a sandbox-escape
+    // vector (a descriptor the new image was never meant to inherit).
+    crate::fd::close_cloexec(task);
 
     // /proc/[pid]/cmdline + comm: preserve argv as NUL-separated
     // bytes, derive comm from argv[0]'s basename (Linux convention).
@@ -15649,6 +15720,24 @@ pub fn is_signal_pending(task_id: u64) -> bool {
 static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// fork/clone inheritance of the signal mask (Linux `copy_process`
+/// copies `blocked` unconditionally, for threads and forks alike).
+/// Without it a new thread starts with an EMPTY mask and takes
+/// signals its creator had deliberately blocked.
+pub(crate) fn signal_mask_fork(parent: u64, child: u64) {
+    let mut g = SIGNAL_MASK.lock();
+    if let Some(m) = g.as_mut() {
+        if let Some(mask) = m.get(&parent).copied() {
+            m.insert(child, mask);
+        }
+    }
+}
+
+/// SIGKILL(9)/SIGSTOP(19) can never be blocked — Linux silently strips
+/// them from every mask install (`sigdelsetmask(&blocked, sigmask(
+/// SIGKILL) | sigmask(SIGSTOP))`). NARF masks store signal N at bit N.
+const UNBLOCKABLE_MASK: u32 = (1 << 9) | (1 << 19);
+
 // Per-task flag recording whether the most recently delivered signal
 // frame is the Linux `rt_sigframe` (restorer-based) layout. The Linux
 // `rt_sigreturn` (x86_64 #15) takes no argument — the frame is found
@@ -16244,7 +16333,11 @@ pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
         return false;
     }
     for t in targets {
+        signal_stopcont_interaction(t, signum);
         raise_signal_pending(t, signum);
+        // Kick parked targets — without the wake a pgrp SIGTERM to a
+        // blocked task waits out its wheel-fallback deadline.
+        wake_signal(t);
     }
     true
 }
@@ -16466,63 +16559,189 @@ pub(crate) fn set_signal_mask_for_task(task: u64, mask: u32) -> u32 {
     map.insert(task, mask).unwrap_or(0)
 }
 
+/// Send `signum` to the single process named by outer pid `pid`.
+/// Resolves the group leader; if the leader is already a zombie the
+/// signal still "succeeds" (Linux: signalling a zombie is a no-op
+/// success), and if the leader tid is dead but live CLONE_THREAD
+/// siblings remain, one of them takes delivery. A fatal SIGKILL fans
+/// out to every live thread in the group (Linux group-kill).
+/// Returns false when no such process exists (→ ESRCH).
+fn kill_process(pid: u64, signum: u32) -> bool {
+    let Some(leader_tid) = pid_to_task_raw(pid) else {
+        return false;
+    };
+    let Some(leader) = crate::task::task_get(leader_tid) else {
+        return false;
+    };
+    // Collect group member tids (leader + CLONE_THREAD tids mapping to
+    // the same visible pid) under the TASK_TO_PID lock, THEN filter by
+    // liveness — `task_get` takes the TASKS lock, which must never be
+    // acquired while holding TASK_TO_PID (lock-order discipline).
+    let candidates: alloc::vec::Vec<u64> = {
+        let g = TASK_TO_PID.lock();
+        g.as_ref()
+            .map(|m| {
+                m.iter()
+                    .filter(|&(_, &p)| p == pid)
+                    .map(|(&t, _)| t)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let members: alloc::vec::Vec<u64> = candidates
+        .into_iter()
+        .filter(|&t| {
+            crate::task::task_get(t)
+                .is_some_and(|t| t.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
+        })
+        .collect();
+    if members.is_empty() {
+        // Whole group already exited (zombie awaiting reap): success,
+        // signal discarded.
+        return leader.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE;
+    }
+    if signum == 9 {
+        // Fatal group kill: every live thread dies.
+        for t in members {
+            signal_stopcont_interaction(t, signum);
+            raise_signal_pending(t, signum);
+            wake_signal(t);
+        }
+        return true;
+    }
+    // Process-directed: deliver to the leader if alive, else the first
+    // live sibling. (Full shared-pending "any thread with it unblocked
+    // may dequeue" semantics are a follow-up; see the redesign doc.)
+    let target = if members.contains(&leader_tid) {
+        leader_tid
+    } else {
+        members[0]
+    };
+    signal_stopcont_interaction(target, signum);
+    raise_signal_pending(target, signum);
+    wake_signal(target);
+    true
+}
+
+/// Does a signal target tid exist? A live task satisfies at least one
+/// of: the refcounted registry (real spawned tasks), the tid→pid map
+/// (also true for real tasks and for boot-init tasks that predate the
+/// registry), or being the caller itself (self is always alive). A
+/// truly unknown tid satisfies none → the caller gets ESRCH, instead
+/// of the old behaviour of setting a pending bit on a phantom key.
+fn signal_target_exists(tid: u64) -> bool {
+    if crate::task::task_get(tid).is_some() || tid == current_task_id() {
+        return true;
+    }
+    TASK_TO_PID
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&tid))
+}
+
 fn sys_kill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    #[allow(unused_mut)]
-    let mut target = args.arg0;
+    let spec = args.arg0 as i64;
     let signum = args.arg1 as u32;
+    let einval = SyscallReturn::ok((-22i64) as u64);
+    let esrch = SyscallReturn::ok((-3i64) as u64);
     if signum >= 32 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(einval);
         return;
     }
-    // Wave-67 — translate the user-supplied pid (interpreted as
-    // in-namespace per Linux semantics) to the outer pid that the
-    // signal-delivery path is keyed on. Targets that the calling
-    // task cannot see in its namespace fail loudly. Outside-the-
-    // namespace callers (root NS) can still address by outer pid
-    // because the root NS resolver is the identity.
-    #[cfg(feature = "container")]
-    {
-        let caller = current_task_id();
-        match crate::pid_ns::resolve_inner_pid(caller, target) {
-            Some(outer) => target = outer,
-            None => {
-                ctx.set_return(SyscallReturn::invalid_op());
-                return;
+
+    // Linux kill(2) target forms:
+    //   pid > 0   → that process
+    //   pid == 0  → every process in the CALLER's process group
+    //   pid == -1 → every process the caller may signal (except init)
+    //   pid < -1  → every process in process group -pid
+    let delivered = match spec {
+        1.. => {
+            #[allow(unused_mut)]
+            let mut target = spec as u64;
+            // Wave-67 — translate the user-supplied pid (interpreted as
+            // in-namespace per Linux semantics) to the outer pid the
+            // delivery path is keyed on.
+            #[cfg(feature = "container")]
+            {
+                let caller = current_task_id();
+                match crate::pid_ns::resolve_inner_pid(caller, target) {
+                    Some(outer) => target = outer,
+                    None => {
+                        ctx.set_return(esrch);
+                        return;
+                    }
+                }
+            }
+            // Existence check FIRST so `kill(pid, 0)` (the POSIX
+            // liveness probe) reports ESRCH for a vanished target and
+            // queues NOTHING for a live one.
+            let target_tid = pid_to_task_raw(target).unwrap_or(target);
+            let exists = signal_target_exists(target_tid);
+            if !exists {
+                false
+            } else if signum == 0 {
+                true
+            } else if pid_to_task_raw(target).is_some() {
+                kill_process(target, signum)
+            } else {
+                // Raw-tid fallback (boot-init spawned tasks).
+                signal_stopcont_interaction(target, signum);
+                raise_signal_pending(target, signum);
+                wake_signal(target);
+                true
             }
         }
-    }
-    // Wave-65 follow-up: SIGNAL_PENDING is keyed by TaskId (tid),
-    // but sys_kill takes a ProcessId (pid). Translate.
-    if let Some(tid) = pid_to_task_raw(target) {
-        target = tid;
-    }
-
-    // POSIX null signal: `kill(pid, 0)` does existence/permission checking
-    // only and queues NOTHING. Programs that probe a child's liveness this
-    // way (timeout(1), stress-ng's launcher) would otherwise set pending
-    // bit 0, which the delivery loop takes as "signal 0" → default-action
-    // Terminate — killing a freshly-exec'd child at its entry point before
-    // it runs an instruction. Mirror sys_pidfd_send_signal's sig-0 probe.
-    if signum == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Job-control stop/continue bookkeeping before the bit is set.
-    signal_stopcont_interaction(target, signum);
-    let mut g = SIGNAL_PENDING.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
+        0 => {
+            let pgrp = read_pgid(current_task_id());
+            if pgrp == 0 {
+                false
+            } else if signum == 0 {
+                true
+            } else {
+                deliver_signal_to_pgrp(pgrp, signum)
+            }
+        }
+        -1 => {
+            // Broadcast: every process with a registered pid except
+            // init (pid 1) and the caller itself, per Linux.
+            let self_tid = current_task_id();
+            let targets: alloc::vec::Vec<(u64, u64)> = {
+                let g = PID_TO_TASK.lock();
+                g.as_ref()
+                    .map(|m| {
+                        m.iter()
+                            .filter(|&(&p, &t)| p != 1 && t != self_tid)
+                            .map(|(&p, &t)| (p, t))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let mut any = false;
+            for (p, _t) in targets {
+                if signum == 0 {
+                    any = true;
+                } else {
+                    any |= kill_process(p, signum);
+                }
+            }
+            any
+        }
+        _ => {
+            let pgrp = (-spec) as u64;
+            if signum == 0 {
+                pgrp != 0
+            } else {
+                deliver_signal_to_pgrp(pgrp, signum)
+            }
         }
     };
-    let slot = map.entry(target).or_insert(0);
-    *slot |= 1u32 << signum;
-    wake_signal(target);
-    ctx.set_return(SyscallReturn::ok(0));
+
+    ctx.set_return(if delivered {
+        SyscallReturn::ok(0)
+    } else {
+        esrch
+    });
 }
 
 /// `rt_sigqueueinfo(pid, sig, info)` — queue `sig` to `pid`. NARF's
@@ -16537,6 +16756,11 @@ fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         return;
     }
     let target = pid_to_task_raw(a.arg0).unwrap_or(a.arg0);
+    // ESRCH for a vanished target (Linux rt_sigqueueinfo(2)).
+    if !signal_target_exists(target) {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        return;
+    }
     capture_queued_siginfo(target, sig, a.arg2);
     raise_signal_pending(target, sig); // ORs the pending bit + wakes
     ctx.set_return(SyscallReturn::ok(0));
@@ -16567,6 +16791,13 @@ fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         return;
     }
     let target = pid_to_task_raw(a.arg1).unwrap_or(a.arg1);
+    // ESRCH for a vanished target + tgid consistency (see sys_tgkill).
+    if !signal_target_exists(target)
+        || (a.arg0 != 0 && task_to_pid_raw(target).unwrap_or(target) != a.arg0)
+    {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        return;
+    }
     capture_queued_siginfo(target, sig, a.arg3);
     raise_signal_pending(target, sig);
     ctx.set_return(SyscallReturn::ok(0));
@@ -16998,11 +17229,26 @@ fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
 /// will matter once threading lands).
 fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let _tgid = args.arg0;
+    let tgid = args.arg0;
     let tid = args.arg1;
     let signum = args.arg2 as u32;
+    let esrch = SyscallReturn::ok((-3i64) as u64);
     if signum >= 32 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // ESRCH for a dead/never-existed tid — no more phantom pending
+    // bits on arbitrary numeric keys.
+    if !signal_target_exists(tid) {
+        ctx.set_return(esrch);
+        return;
+    }
+    // The (tgid, tid) consistency check is tgkill's whole point over
+    // tkill: it prevents a recycled tid in ANOTHER process from
+    // absorbing the signal. Our tids never recycle, but the check is
+    // still Linux-visible semantics (musl relies on ESRCH here).
+    if tgid != 0 && task_to_pid_raw(tid).unwrap_or(tid) != tgid {
+        ctx.set_return(esrch);
         return;
     }
     // Null signal: existence/permission probe only — queue nothing (see sys_kill).
@@ -17011,16 +17257,7 @@ fn sys_tgkill(ctx: &mut dyn TrapContext) {
         return;
     }
     signal_stopcont_interaction(tid, signum);
-    let mut g = SIGNAL_PENDING.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let slot = map.entry(tid).or_insert(0);
-    *slot |= 1u32 << signum;
+    raise_signal_pending(tid, signum);
     wake_signal(tid);
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -17096,6 +17333,9 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
                 return;
             }
         }
+        // Linux strips SIGKILL/SIGSTOP from every installed mask —
+        // a task must never be able to block its own fatal kill.
+        *slot &= !UNBLOCKABLE_MASK;
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -17227,7 +17467,12 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
     let tid = args.arg0;
     let signum = args.arg1 as u32;
     if signum >= 32 {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // ESRCH for a dead/never-existed tid (Linux tkill(2)).
+    if !signal_target_exists(tid) {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
         return;
     }
     // Null signal: existence/permission probe only — queue nothing (see sys_kill).
@@ -17236,16 +17481,7 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
         return;
     }
     signal_stopcont_interaction(tid, signum);
-    let mut g = SIGNAL_PENDING.lock();
-    let map = match g.as_mut() {
-        Some(m) => m,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
-    let slot = map.entry(tid).or_insert(0);
-    *slot |= 1u32 << signum;
+    raise_signal_pending(tid, signum);
     wake_signal(tid);
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -17329,7 +17565,8 @@ fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     // Userspace `sigset_t` bit N-1 == signal N; NARF's mask uses bit N (see
     // sys_sigprocmask / signalfd). Shift `<<1` so an unblocked signal here
     // actually becomes deliverable while suspended.
-    let mask = (u64::from_ne_bytes(buf) << 1) as u32;
+    // SIGKILL/SIGSTOP can never be blocked, in a suspend mask either.
+    let mask = ((u64::from_ne_bytes(buf) << 1) as u32) & !UNBLOCKABLE_MASK;
     let task = current_task_id();
 
     // Temporarily install the new mask.
@@ -17692,12 +17929,15 @@ pub(crate) fn default_signal_delivery_restricted(
         }
     }
     // SA_RESETHAND: one-shot — clear the handler so the next
-    // occurrence falls through to the default action.
+    // occurrence falls through to the default action. Cleared in the
+    // (possibly shared) live sighand, per Linux thread-group semantics.
     if (action.flags & SA_RESETHAND) != 0 {
-        if let Some(map) = SIGACTION_TABLE.lock().as_mut() {
-            if let Some(slots) = map.get_mut(&task) {
-                slots[signum as usize] = None;
-            }
+        let h = {
+            let g = SIGACTION_TABLE.lock();
+            g.as_ref().and_then(|m| m.get(&task).cloned())
+        };
+        if let Some(h) = h {
+            h.lock()[signum as usize] = None;
         }
     }
     true
@@ -17933,9 +18173,27 @@ pub struct SigAction {
     pub flags: u32,
 }
 
-static SIGACTION_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<BTreeMap<u64, [Option<SigAction>; NSIG]>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+/// A thread group's shared signal-handler table — Linux
+/// `sighand_struct`. Held by `Arc` so CLONE_SIGHAND/CLONE_THREAD
+/// children observe the LIVE table (a handler installed by any thread
+/// is instantly visible to all siblings), while plain fork deep-copies.
+pub type SigHand = alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<[Option<SigAction>; NSIG]>>;
+
+fn new_sighand() -> SigHand {
+    alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new([None; NSIG]))
+}
+
+static SIGACTION_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, SigHand>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Get (or create) `task`'s sighand reference. The `Arc` clone lets
+/// callers operate on the table after the registry lock is released;
+/// lock ordering is always SIGACTION_TABLE → inner sighand.
+fn sighand_of(task: u64) -> Option<SigHand> {
+    let mut g = SIGACTION_TABLE.lock();
+    let map = g.as_mut()?;
+    Some(map.entry(task).or_insert_with(new_sighand).clone())
+}
 
 /// Initialise the per-task sigaction registry. Boot calls this once
 /// before any user task can issue `Syscall::Sigaction`.
@@ -17943,16 +18201,37 @@ pub fn sigaction_init() {
     *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
 }
 
-/// fork(2) inheritance: copy `parent`'s sigaction handler table
-/// to `child`. POSIX: handlers are inherited; pending signals
-/// are not (they live in a separate table whose default-empty
-/// state is the correct child starting point).
+/// fork(2) inheritance: DEEP-copy `parent`'s handler table to `child`
+/// (a post-fork sigaction() in one process must not affect the other).
+/// POSIX: handlers are inherited; pending signals are not.
 pub fn sigaction_fork(parent: u64, child: u64) {
+    let snapshot = {
+        let g = SIGACTION_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&parent).cloned())
+            .map(|h| *h.lock())
+    };
+    if let Some(v) = snapshot {
+        let mut g = SIGACTION_TABLE.lock();
+        if let Some(map) = g.as_mut() {
+            map.insert(
+                child,
+                alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(v)),
+            );
+        }
+    }
+}
+
+/// CLONE_SIGHAND / CLONE_THREAD inheritance: `child` SHARES `parent`'s
+/// live handler table (Linux `sighand_struct` refcount semantics). A
+/// handler installed by either is immediately visible to both — what
+/// pthreads rely on (musl installs its setxid/cancel handlers once,
+/// from one thread, for the whole group).
+pub fn sigaction_share(parent: u64, child: u64) {
     let mut g = SIGACTION_TABLE.lock();
     if let Some(map) = g.as_mut() {
-        if let Some(v) = map.get(&parent).copied() {
-            map.insert(child, v);
-        }
+        let h = map.entry(parent).or_insert_with(new_sighand).clone();
+        map.insert(child, h);
     }
 }
 
@@ -17967,16 +18246,30 @@ pub fn sigaction_fork(parent: u64, child: u64) {
 /// `sh`'s SIGCHLD handler) and then exec'd a different binary would, on the
 /// next delivery of that signal, jump to the stale handler vaddr — a wild
 /// branch into whatever (if anything) is mapped there in the new image.
+///
+/// Also UNSHARES the table (fresh `Arc`), mirroring Linux's
+/// `unshare_sighand` in execve: the post-exec image must not keep a
+/// live handler table shared with pre-exec CLONE_SIGHAND siblings.
 pub fn sigaction_exec_reset(task: u64) {
-    let mut g = SIGACTION_TABLE.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(slots) = map.get_mut(&task) {
-            for slot in slots.iter_mut() {
-                // handler > 1 ⇒ a real caught handler (0 = SIG_DFL, 1 = SIG_IGN).
-                if matches!(slot, Some(a) if a.handler > 1) {
-                    *slot = None;
-                }
+    let snapshot = {
+        let g = SIGACTION_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.get(&task).cloned())
+            .map(|h| *h.lock())
+    };
+    if let Some(mut v) = snapshot {
+        for slot in v.iter_mut() {
+            // handler > 1 ⇒ a real caught handler (0 = SIG_DFL, 1 = SIG_IGN).
+            if matches!(slot, Some(a) if a.handler > 1) {
+                *slot = None;
             }
+        }
+        let mut g = SIGACTION_TABLE.lock();
+        if let Some(map) = g.as_mut() {
+            map.insert(
+                task,
+                alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(v)),
+            );
         }
     }
 }
@@ -17985,6 +18278,19 @@ pub fn sigaction_exec_reset(task: u64) {
 #[doc(hidden)]
 pub fn __test_sigaction_reset() {
     *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Test hook: install a handler vaddr for `(task, signum)` directly,
+/// through the same shared-sighand path a real `rt_sigaction` uses.
+#[doc(hidden)]
+pub fn __test_set_sigaction(task: u64, signum: usize, handler: u64) {
+    if let Some(h) = sighand_of(task) {
+        h.lock()[signum] = Some(SigAction {
+            handler,
+            restorer: 0,
+            flags: 0,
+        });
+    }
 }
 
 /// Diagnostic: peek the recorded handler vaddr for `(task, signum)`.
@@ -17997,13 +18303,15 @@ pub fn sigaction_lookup(task: u64, signum: usize) -> Option<u64> {
 /// handler + flags. Used by the signal delivery path to know
 /// whether to honour SA_ONSTACK / SA_SIGINFO / SA_NODEFER.
 pub fn sigaction_lookup_full(task: u64, signum: usize) -> Option<SigAction> {
-    let g = SIGACTION_TABLE.lock();
-    let map = g.as_ref()?;
-    let slots = map.get(&task)?;
     if signum >= NSIG {
         return None;
     }
-    slots[signum]
+    let h = {
+        let g = SIGACTION_TABLE.lock();
+        g.as_ref()?.get(&task)?.clone()
+    };
+    let slot = h.lock()[signum];
+    slot
 }
 
 fn sys_sigreturn(ctx: &mut dyn TrapContext) {
@@ -20175,13 +20483,50 @@ fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let signum = args.arg0 as usize;
     let act_ptr = args.arg1;
-    let _oact_ptr = args.arg2;
+    let oact_ptr = args.arg2;
     let sigsetsize = args.arg3 as usize;
 
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    let fail = SyscallReturn::ok((-1i64) as u64); // -EPERM (legacy shape)
+    let einval = SyscallReturn::ok((-22i64) as u64);
     if signum >= NSIG || sigsetsize != 8 {
-        ctx.set_return(fail);
+        ctx.set_return(einval);
         return;
+    }
+    // Linux: SIGKILL and SIGSTOP cannot be caught, ignored, or have
+    // their action changed at all when `act` is non-NULL.
+    if act_ptr != 0 && (signum == 9 || signum == 19) {
+        ctx.set_return(einval);
+        return;
+    }
+
+    let task = current_task_id();
+    let h = match sighand_of(task) {
+        Some(h) => h,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+
+    // Read out the PRIOR action first so oldact reflects the
+    // pre-change state even when act also updates it.
+    let prior = h.lock()[signum];
+    if oact_ptr != 0 {
+        // Linux `struct sigaction`: sa_handler(8) sa_flags(8)
+        // sa_restorer(8) sa_mask(8). sa_mask isn't modelled per-action;
+        // report empty.
+        let mut out = [0u8; 32];
+        if let Some(a) = prior {
+            out[0..8].copy_from_slice(&a.handler.to_ne_bytes());
+            out[8..16].copy_from_slice(&u64::from(a.flags).to_ne_bytes());
+            out[16..24].copy_from_slice(&a.restorer.to_ne_bytes());
+        }
+        // SAFETY: `oact_ptr` is the user oldact pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
+        if unsafe { copy_to_user(oact_ptr, &out) }.is_err() {
+            ctx.set_return(fail);
+            return;
+        }
     }
 
     if act_ptr != 0 {
@@ -20196,18 +20541,8 @@ fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
         let handler = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
         let flags = u64::from_ne_bytes(buf[8..16].try_into().unwrap()) as u32;
         let restorer = u64::from_ne_bytes(buf[16..24].try_into().unwrap());
-        let task = current_task_id();
 
-        let mut g = SIGACTION_TABLE.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
-            None => {
-                ctx.set_return(fail);
-                return;
-            }
-        };
-        let slots = map.entry(task).or_insert([None; NSIG]);
-        slots[signum] = if handler == 0 {
+        h.lock()[signum] = if handler == 0 {
             None
         } else {
             Some(SigAction {
@@ -20233,15 +20568,14 @@ fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     let prior = {
-        let mut g = SIGACTION_TABLE.lock();
-        let map = match g.as_mut() {
-            Some(m) => m,
+        let h = match sighand_of(task) {
+            Some(h) => h,
             None => {
                 ctx.set_return(SyscallReturn::invalid_op());
                 return;
             }
         };
-        let slots = map.entry(task).or_insert([None; NSIG]);
+        let mut slots = h.lock();
         let prior = slots[signum];
         slots[signum] = if new_handler == 0 {
             None
@@ -20828,6 +21162,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Times, "times", RawFnHandler(sys_times));
     table.install_raw(Syscall::Getrusage, "getrusage", RawFnHandler(sys_getrusage));
     table.install_raw(Syscall::ExitTask, "exit", RawFnHandler(sys_exit_task));
+    table.install_raw(
+        Syscall::ExitGroup,
+        "exit_group",
+        RawFnHandler(sys_exit_group),
+    );
     table.install_raw(Syscall::Yield, "yield", RawFnHandler(sys_yield));
     table.install_raw(Syscall::Sleep, "sleep", RawFnHandler(sys_sleep));
     table.install_raw(Syscall::Brk, "brk", RawFnHandler(sys_brk));

@@ -172,6 +172,23 @@ impl FdTable {
         }
     }
 
+    /// Close every fd marked `FD_CLOEXEC` (the exec path). Returns the
+    /// number closed. Dropping each `Some` entry releases its
+    /// `Arc<dyn FileLike>` reference (closing the underlying object
+    /// when this was the last holder).
+    pub fn close_cloexec_slots(&mut self) -> usize {
+        let mut n = 0;
+        for slot in self.slots.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.flags & FD_CLOEXEC != 0 {
+                    *slot = None;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Borrow the entry at `fd` without removing it.
     pub fn get(&self, fd: u32) -> Option<&FdEntry> {
         self.slots.get(fd as usize).and_then(Option::as_ref)
@@ -685,6 +702,23 @@ pub fn share(parent: u64, child: u64) -> usize {
     if let Some(m) = TABLES[table_shard(child)].lock().as_mut() {
         m.insert(child, arc);
     }
+    n
+}
+
+/// Close every `FD_CLOEXEC`-marked fd for `task_id` (the exec path).
+/// Returns the count closed; no-op if the task has no table (never
+/// opened an fd). Shares one fd table with CLONE_FILES siblings, so a
+/// CLOEXEC close is visible to them too — matching Linux, where exec
+/// unshares files first; NARF's exec implies a non-shared table.
+pub fn close_cloexec(task_id: u64) -> usize {
+    let arc = {
+        let g = TABLES[table_shard(task_id)].lock();
+        match g.as_ref().and_then(|m| m.get(&task_id).cloned()) {
+            Some(a) => a,
+            None => return 0,
+        }
+    };
+    let n = arc.lock().close_cloexec_slots();
     n
 }
 

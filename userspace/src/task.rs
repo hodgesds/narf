@@ -54,6 +54,10 @@ pub struct Task {
     /// Raw wstatus staged at exit (also mirrored in the pending-
     /// termination table until the reap plumbing migrates here).
     pub exit_code: AtomicI32,
+    /// Set by `exit_group(2)` (Linux `signal->group_exit`): the whole
+    /// thread group is terminating. Consulted so a sibling that races
+    /// the group exit reports the group's status.
+    pub group_exiting: core::sync::atomic::AtomicBool,
     /// Per-task user context: saved `UserState`, park/wait flags,
     /// futex/epoll generations. Owned HERE (not by the future) so its
     /// address is valid for as long as ANY `Arc<Task>` lives.
@@ -71,6 +75,7 @@ impl Task {
             pid: AtomicU64::new(pid),
             state: AtomicU32::new(TASK_RUNNING),
             exit_code: AtomicI32::new(0),
+            group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
         });
         TASKS.lock().insert(tid, t.clone());

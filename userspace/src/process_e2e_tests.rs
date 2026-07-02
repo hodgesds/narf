@@ -132,6 +132,14 @@ fn setup_process_state(task_id: u64) {
     crate::handlers::pgid_init();
     crate::handlers::sid_init();
     crate::handlers::wait_init();
+    // Refcounted-task registry entry for the test's principal task, so
+    // kill/tkill/tgkill (which now ESRCH on unknown tids) and the
+    // task-lifetime paths resolve it like a real spawned task. A stale
+    // entry from a prior test under the same id is replaced.
+    crate::task::release_task(task_id);
+    let _ = crate::task::Task::new_registered(task_id, task_id);
+    crate::handlers::register_task_to_pid(task_id, task_id);
+    crate::handlers::register_pid_task_mapping(task_id, task_id);
 }
 
 static LOOKUP_TASK: AtomicU64 = AtomicU64::new(0);
@@ -954,6 +962,12 @@ fn smoke_process_sigkill_sets_pending() -> TestResult {
 
     crate::syscall::__test_clear_global();
     setup_process_state(PARENT);
+    // Register CHILD as a live task in the refcounted registry + pid
+    // map so kill(CHILD, SIGKILL) resolves it (kill now ESRCHes an
+    // unknown target — Linux parity).
+    crate::task::release_task(CHILD);
+    let _ = crate::task::Task::new_registered(CHILD, CHILD);
+    crate::handlers::register_pid_task_mapping(CHILD, CHILD);
 
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -3298,6 +3312,130 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
 }
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("userspace/process", smoke_wave65_clone3_vm_thread_shared_as);
+
+/// CLONE_SIGHAND/CLONE_THREAD share the LIVE signal-handler table: a
+/// handler installed by any thread is instantly visible to the whole
+/// group. Before the thread-group parity pass, CLONE_SIGHAND was
+/// parsed then discarded, so a worker thread had an EMPTY handler
+/// table and any signal to it took the default action (killing it) —
+/// which broke musl's setxid/pthread_cancel machinery. A plain fork,
+/// by contrast, must DEEP-COPY (post-fork installs stay private).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
+    use narf_memory::AddressSpace;
+    const PARENT: u64 = 0xF0_67;
+    const SIGUSR1: usize = 10;
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    crate::handlers::register_pid_task_mapping(PARENT, PARENT);
+
+    // SAFETY: paging is up in the smoke context.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as.clone());
+    install_address_space_lookup(lookup_proc_parent_as);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Parent installs a SIGUSR1 handler at a known vaddr.
+    crate::handlers::__test_set_sigaction(PARENT, SIGUSR1, 0xCAFE_1000);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct TestCloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+    }
+    let spawn = |flags: u64| -> Option<u64> {
+        let ca = TestCloneArgs {
+            flags,
+            stack: 0x7fff_fff0_0000,
+            stack_size: 0x1_0000,
+            ..Default::default()
+        };
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: &ca as *const TestCloneArgs as u64,
+                arg1: core::mem::size_of::<TestCloneArgs>() as u64,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => Some(r.value),
+            _ => None,
+        }
+    };
+
+    let fail = |msg: &'static str| -> TestResult {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        TestResult::Fail(msg)
+    };
+
+    // Thread clone: CLONE_VM|CLONE_THREAD|CLONE_SIGHAND — exercises the
+    // real do_clone3 sharing path (the desktop-critical case).
+    let thread_tid = match spawn(0x0000_0100 | 0x0001_0000 | 0x0000_0800) {
+        Some(t) => t,
+        None => return fail("thread clone3 failed"),
+    };
+    // A distinct fork-style tid whose handler table is deep-copied
+    // from the parent via the fork primitive (deterministic — avoids
+    // depending on the full clone3 non-VM fork path in a stub context).
+    const FORK_TID: u64 = 0xF0_68;
+    crate::handlers::sigaction_fork(PARENT, FORK_TID);
+
+    // (1) The thread sees the parent's handler (shared table).
+    if crate::handlers::sigaction_lookup(thread_tid, SIGUSR1) != Some(0xCAFE_1000) {
+        return fail("CLONE_SIGHAND thread did not inherit the shared handler");
+    }
+    // (2) The fork child sees it too (fork copies at clone time).
+    if crate::handlers::sigaction_lookup(FORK_TID, SIGUSR1) != Some(0xCAFE_1000) {
+        return fail("fork child did not inherit a copy of the handler");
+    }
+    // (3) A LATER install by the parent propagates to the thread
+    // (shared table) but NOT to the fork child (deep copy).
+    crate::handlers::__test_set_sigaction(PARENT, SIGUSR1, 0xBEEF_2000);
+    if crate::handlers::sigaction_lookup(thread_tid, SIGUSR1) != Some(0xBEEF_2000) {
+        return fail("shared sighand: thread must see the parent's LATER install");
+    }
+    if crate::handlers::sigaction_lookup(FORK_TID, SIGUSR1) != Some(0xCAFE_1000) {
+        return fail("fork child's handler table must be independent after clone");
+    }
+    // (4) And an install by the THREAD is visible to the parent —
+    // proves the Arc is shared both ways, not a one-time copy.
+    crate::handlers::__test_set_sigaction(thread_tid, 12, 0x1234_0000); // SIGUSR2
+    if crate::handlers::sigaction_lookup(PARENT, 12) != Some(0x1234_0000) {
+        return fail("shared sighand: parent must see the THREAD's install");
+    }
+
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    crate::handlers::__test_sigaction_reset();
+    TestResult::Pass
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!(
+    "userspace/process",
+    smoke_clone_thread_shares_sighand_fork_copies
+);
 
 #[cfg(feature = "linux-compat")]
 fn smoke_wave65_set_tid_address_records_and_returns_tid() -> TestResult {

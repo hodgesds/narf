@@ -55,12 +55,16 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
 
 fn smoke_abi_signal_kill_neg() -> TestResult {
     with_setup(|| {
-        // signum >= 32 → invalid_op() (call() decodes that as None).
-        // LINUX-GAP: Linux returns -EINVAL here, NARF reports NARF
-        // InvalidOp (non-Ok status) rather than an Ok(-EINVAL) shape.
+        // signum >= 32 → -EINVAL (Linux parity; was a non-Ok InvalidOp
+        // shape before the signal-parity pass).
         let r = call(Syscall::Kill.raw(), a1(FAKE_TASK, 64));
-        if r.is_some() {
-            return Err("kill(self, 64) should be a non-Ok (InvalidOp) status");
+        if r != Some(-22) {
+            return Err("kill(self, 64) should return -EINVAL");
+        }
+        // A nonexistent target → -ESRCH (was ok(0) before parity).
+        let r = call(Syscall::Kill.raw(), a1(0xDEAD_BEEF, 10));
+        if r != Some(-3) {
+            return Err("kill(nonexistent, SIGUSR1) should return -ESRCH");
         }
         Ok(())
     })
@@ -105,11 +109,21 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigaction_pos);
 
 fn smoke_abi_signal_rt_sigaction_neg() -> TestResult {
     with_setup(|| {
-        // sigsetsize != 8 → ok(-1).
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the Ok(-1) shape.
+        // sigsetsize != 8 → -EINVAL (Linux parity; was ok(-1) before).
         let r = call(Syscall::RtSigaction.raw(), a3(10, 0, 0, 16));
-        if r != Some(-1) {
-            return Err("rt_sigaction with sigsetsize!=8 should return -1");
+        if r != Some(-22) {
+            return Err("rt_sigaction with sigsetsize!=8 should return -EINVAL");
+        }
+        // SIGKILL(9)/SIGSTOP(19) can't have their action changed with a
+        // non-NULL act → -EINVAL (Linux; previously silently accepted).
+        // Pass a bogus non-zero act ptr; the signum check fires first.
+        let r = call(Syscall::RtSigaction.raw(), a3(9, 0x1000, 0, 8));
+        if r != Some(-22) {
+            return Err("rt_sigaction(SIGKILL, act, ...) should return -EINVAL");
+        }
+        let r = call(Syscall::RtSigaction.raw(), a3(19, 0x1000, 0, 8));
+        if r != Some(-22) {
+            return Err("rt_sigaction(SIGSTOP, act, ...) should return -EINVAL");
         }
         Ok(())
     })
@@ -440,11 +454,20 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_tgkill_pos);
 
 fn smoke_abi_signal_tgkill_neg() -> TestResult {
     with_setup(|| {
-        // sig (arg2) >= 32 → invalid_op() (None).
-        // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
+        // sig (arg2) >= 32 → -EINVAL (Linux parity; was InvalidOp before).
         let r = call(Syscall::Tgkill.raw(), a2(FAKE_TASK, FAKE_TASK, 64));
-        if r.is_some() {
-            return Err("tgkill(.., 64) should be a non-Ok (InvalidOp) status");
+        if r != Some(-22) {
+            return Err("tgkill(.., 64) should return -EINVAL");
+        }
+        // Dead tid → -ESRCH (was silently ok before parity).
+        let r = call(Syscall::Tgkill.raw(), a2(FAKE_TASK, 0xDEAD, 10));
+        if r != Some(-3) {
+            return Err("tgkill(.., dead_tid, ..) should return -ESRCH");
+        }
+        // (tgid, tid) mismatch → -ESRCH (tid exists, tgid wrong).
+        let r = call(Syscall::Tgkill.raw(), a2(0xBAD2, FAKE_TASK, 10));
+        if r != Some(-3) {
+            return Err("tgkill(wrong_tgid, self, ..) should return -ESRCH");
         }
         Ok(())
     })
@@ -469,13 +492,44 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_pos);
 
 fn smoke_abi_signal_tkill_neg() -> TestResult {
     with_setup(|| {
-        // sig >= 32 → invalid_op() (None).
-        // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
+        // sig >= 32 → -EINVAL (Linux parity; was InvalidOp before).
         let r = call(Syscall::Tkill.raw(), a1(FAKE_TASK, 64));
-        if r.is_some() {
-            return Err("tkill(self, 64) should be a non-Ok (InvalidOp) status");
+        if r != Some(-22) {
+            return Err("tkill(self, 64) should return -EINVAL");
+        }
+        // Dead tid → -ESRCH.
+        let r = call(Syscall::Tkill.raw(), a1(0xDEAD, 10));
+        if r != Some(-3) {
+            return Err("tkill(dead_tid, ..) should return -ESRCH");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_neg);
+
+// ── SIGKILL/SIGSTOP cannot be blocked ────────────────────────────────
+// sigprocmask must silently strip SIGKILL(9)/SIGSTOP(19) from any
+// installed block set (Linux parity — a task must never be able to
+// block its own fatal kill). Regression for the pre-parity gap where a
+// blocked SIGKILL made a task uninterruptible.
+fn smoke_abi_signal_sigkill_unblockable() -> TestResult {
+    with_setup(|| {
+        // Build a user sigset with SIGKILL + SIGSTOP set. Userspace
+        // sigset_t puts signal N at bit N-1.
+        let set: u64 = (1u64 << (9 - 1)) | (1u64 << (19 - 1));
+        let buf = set.to_ne_bytes();
+        let set_ptr = buf.as_ptr() as u64;
+        // SIG_BLOCK = 0. Install, then read the mask back.
+        if call(Syscall::Sigprocmask.raw(), a3(0, set_ptr, 0, 8)) != Some(0) {
+            return Err("sigprocmask(SIG_BLOCK, {SIGKILL,SIGSTOP}) should return 0");
+        }
+        // The stored mask (NARF keys signal N at bit N) must have
+        // neither SIGKILL nor SIGSTOP set.
+        let stored = crate::handlers::signal_mask_of(FAKE_TASK);
+        if stored & ((1 << 9) | (1 << 19)) != 0 {
+            return Err("SIGKILL/SIGSTOP must be stripped from the installed block mask");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_sigkill_unblockable);
