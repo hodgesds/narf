@@ -7257,6 +7257,84 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_futex_wait_and_wake_no_op);
 
+/// FUTEX_WAKE_OP (op 5) must atomically read-modify-write `*uaddr2` per the
+/// encoded op AND wake (up to `val`) waiters on `uaddr` — Linux
+/// `futex_wake_op`. Regression: op 5 fell through to the `_ => fail` arm
+/// (returned -1, woke nobody), so glibc/Qt pthread_cond_signal dropped its
+/// wake and a Qt6 app (kcalc) deadlocked at startup — its worker thread
+/// signalled the main thread via FUTEX_WAKE_OP and the main thread never woke.
+fn smoke_userspace_futex_wake_op_rmw() -> TestResult {
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Encoded op: FUTEX_OP_ADD oparg=5 (newval = *uaddr2 + 5),
+    // FUTEX_OP_CMP_GT cmparg=0 (wake uaddr2 waiters iff oldval > 0).
+    // Layout: [31:28]=op [27:24]=cmp [23:12]=oparg [11:0]=cmparg.
+    let encoded: u64 = (1 << 28) | (4 << 24) | (5 << 12);
+    let mut word: u32 = 10;
+    let uaddr2 = &mut word as *mut u32 as u64;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0xF00D,  // uaddr — used only as a wait-queue key (no memory access)
+            arg1: 5,       // FUTEX_WAKE_OP
+            arg2: 1,       // nr_wake
+            arg3: 1,       // nr_wake2
+            arg4: uaddr2,  // uaddr2 (the RMW target)
+            arg5: encoded, // encoded op
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Futex.raw(), &mut ctx);
+
+    // Must succeed with a non-negative woken count (0 here — no waiters),
+    // NOT the old -1 "unimplemented op" result.
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) >= 0 => {}
+        _ => {
+            __test_clear_global();
+            return TestResult::Fail("FUTEX_WAKE_OP returned an error (op unimplemented?)");
+        }
+    }
+    // The atomic RMW must have applied: 10 + 5 = 15.
+    if word != 15 {
+        __test_clear_global();
+        return TestResult::Fail("FUTEX_WAKE_OP did not RMW *uaddr2 (expected 10+5=15)");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex_wake_op_rmw);
+
 fn smoke_userspace_memfd_create_returns_writable_fd() -> TestResult {
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,

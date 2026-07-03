@@ -16825,9 +16825,83 @@ fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
+/// `FUTEX_WAKE_OP` (5): atomically RMW a second futex word, wake `val`
+/// waiters on `uaddr`, and — if the pre-RMW value satisfies an encoded
+/// comparison — wake `val2` waiters on `uaddr2`. glibc's (and Qt's)
+/// pthread_cond_signal/broadcast use this to wake a condvar waiter while
+/// bumping the condvar's internal sequence word in one call. Without it,
+/// a Qt6 worker thread's wake of the main thread was dropped and the app
+/// deadlocked at startup (the kcalc QtWayland-init hang).
+const FUTEX_WAKE_OP: u64 = 5;
+/// `FUTEX_WAIT_BITSET` (9) / `FUTEX_WAKE_BITSET` (10): wait/wake gated by
+/// a 32-bit bitmask. NARF's wait queue is per-uaddr (not per-bit), so we
+/// treat them as plain WAIT/WAKE — a superset wake is always safe, and
+/// the common musl/glibc callers pass FUTEX_BITSET_MATCH_ANY.
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE: u64 = 0x80;
 const FUTEX_CLOCK_REALTIME: u64 = 0x100;
 const FUTEX_OP_MASK: u64 = !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
+
+/// Perform `FUTEX_WAKE_OP` (Linux `kernel/futex/core.c::futex_wake_op`).
+/// `nr_wake`/`nr_wake2` = arg2/arg3, `uaddr2` = arg4, `encoded_op` = arg5.
+/// Returns the syscall result (total woken, or a negative errno).
+fn futex_wake_op(uaddr: u64, nr_wake: u32, nr_wake2: u32, uaddr2: u64, encoded_op: u32) -> i64 {
+    const EFAULT: i64 = 14;
+    if uaddr2 == 0 {
+        return -EFAULT;
+    }
+    // Decode the op word: [31:28]=op (bit 0x8 = OPARG_SHIFT), [27:24]=cmp,
+    // [23:12]=oparg (12b), [11:0]=cmparg (12b).
+    let op_raw = (encoded_op >> 28) & 0xF;
+    let oparg_shift = op_raw & 0x8 != 0;
+    let op = op_raw & 0x7;
+    let cmp = (encoded_op >> 24) & 0xF;
+    let mut oparg = (encoded_op >> 12) & 0xFFF;
+    let cmparg = (encoded_op & 0xFFF) as i32;
+    if oparg_shift {
+        oparg = 1u32 << (oparg & 31);
+    }
+    // Atomically-ish RMW *uaddr2 (single-CPU cooperative for the handler;
+    // matches NARF's other user-word futex accesses).
+    let mut b = [0u8; 4];
+    // SAFETY: copy_from_user range-validates uaddr2 + SMAP-brackets the read.
+    if unsafe { copy_from_user(&mut b, uaddr2) }.is_err() {
+        return -EFAULT;
+    }
+    let oldval = u32::from_ne_bytes(b);
+    let newval = match op {
+        0 => oparg,                      // FUTEX_OP_SET
+        1 => oldval.wrapping_add(oparg), // FUTEX_OP_ADD
+        2 => oldval | oparg,             // FUTEX_OP_OR
+        3 => oldval & !oparg,            // FUTEX_OP_ANDN
+        4 => oldval ^ oparg,             // FUTEX_OP_XOR
+        _ => return -22,                 // EINVAL — unknown op
+    };
+    // SAFETY: copy_to_user range-validates uaddr2 + SMAP-brackets the write.
+    if unsafe { copy_to_user(uaddr2, &newval.to_ne_bytes()) }.is_err() {
+        return -EFAULT;
+    }
+    // Wake `nr_wake` on uaddr unconditionally.
+    futex_bump_counter(uaddr);
+    let mut woken = futex_wake_waiters(uaddr, nr_wake) as i64;
+    // Conditionally wake `nr_wake2` on uaddr2 if (oldval CMP cmparg).
+    let ov = oldval as i32;
+    let cond = match cmp {
+        0 => ov == cmparg, // FUTEX_OP_CMP_EQ
+        1 => ov != cmparg, // NE
+        2 => ov < cmparg,  // LT
+        3 => ov <= cmparg, // LE
+        4 => ov > cmparg,  // GT
+        5 => ov >= cmparg, // GE
+        _ => return -22,   // EINVAL
+    };
+    if cond {
+        futex_bump_counter(uaddr2);
+        woken += futex_wake_waiters(uaddr2, nr_wake2) as i64;
+    }
+    woken
+}
 
 /// Per-uaddr wait counter. FUTEX_WAKE bumps it; FUTEX_WAIT samples
 /// it before parking and re-samples on every poll iteration —
@@ -16962,7 +17036,24 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
             (*uctx).futex_uaddr.store(0, Ordering::Release);
         }
     }
+    // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
+    // queue (the bitmask only narrows WHICH wakes match; a superset wake is
+    // safe and musl/glibc pass MATCH_ANY). The bitset timeout is ABSOLUTE in
+    // Linux, but NARF's wait path uses the deadline only as a lost-wake
+    // backstop (the real wake is the futex wake), so the relative/absolute
+    // distinction doesn't affect correctness here.
+    let op = if op == FUTEX_WAIT_BITSET {
+        FUTEX_WAIT
+    } else if op == FUTEX_WAKE_BITSET {
+        FUTEX_WAKE
+    } else {
+        op
+    };
     match op {
+        FUTEX_WAKE_OP => {
+            let r = futex_wake_op(uaddr, val, args.arg3 as u32, args.arg4, args.arg5 as u32);
+            ctx.set_return(SyscallReturn::ok(r as u64));
+        }
         FUTEX_WAIT => {
             // REAL blocking futex. Sample *uaddr; if it already differs from
             // `val`, the wait condition no longer holds — return 0 (caller's
