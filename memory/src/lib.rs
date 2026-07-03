@@ -85,7 +85,7 @@ pub const KERNEL_PHYS_OFFSET: u64 = 0;
 pub use frame::alloc_frame_on_strict;
 pub use frame::{
     alloc_frame, alloc_frame_anywhere, alloc_frame_on, alloc_pages_on, current_frame_alloc_name,
-    free_frame, init_from_map, install_frame_alloc, is_numa_aware, node_free,
+    free_frame, free_pages, init_from_map, install_frame_alloc, is_numa_aware, node_free,
     rebalance_to_topology, release_early_ceiling, reserve_for_slab_promotion, stats as frame_stats,
     validate_no_overlap as frame_validate_no_overlap, BuddyFrameAlloc, BumpFrameAlloc, FrameAlloc,
     FrameAllocError, FrameStats, MemAlloc, PhysFrame, UsableRegion, BUDDY_FRAME_ALLOC,

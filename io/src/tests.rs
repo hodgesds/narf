@@ -374,22 +374,36 @@ fn smoke_io_coherency_variants_distinct() -> TestResult {
 kernel_test_in!("io", smoke_io_coherency_variants_distinct);
 
 fn smoke_io_dma_buffer_accessors() -> TestResult {
-    // alloc_coherent caps requests at one page; pick 3000 bytes
-    // (rounds up to 4096 internally).
-    use crate::{alloc_coherent, Coherency, IoError};
+    // alloc_coherent rounds requests up to a power-of-two page count and
+    // backs them with that many physically-contiguous frames.
+    use crate::{alloc_coherent, free_coherent, Coherency, IoError};
     use narf_lib::id::DomainId;
     let buf = match alloc_coherent(3000, DomainId::DRIVER_0) {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("alloc_coherent failed"),
     };
-    // alloc_with rounds len up to PAGE_SIZE.
+    // 3000 rounds up to one page.
     if buf.len() != 4096 {
-        return TestResult::Fail("len wasn't page-rounded");
+        return TestResult::Fail("sub-page len wasn't page-rounded");
     }
-    // Confirm > page rejects with NoMemory.
-    match alloc_coherent(5000, DomainId::DRIVER_0) {
+    // A multi-page request now SUCCEEDS with a contiguous buffer: 64 KiB
+    // rounds to an order-4 block, so len == 65536.
+    match alloc_coherent(64 * 1024, DomainId::DRIVER_0) {
+        Ok(big) => {
+            if big.len() != 64 * 1024 {
+                return TestResult::Fail("64 KiB alloc len != 65536");
+            }
+            if big.phys_addr().raw() & (narf_memory::PAGE_SIZE - 1) != 0 {
+                return TestResult::Fail("multi-page buffer not page-aligned");
+            }
+            free_coherent(big);
+        }
+        Err(_) => return TestResult::Fail("64 KiB contiguous alloc rejected"),
+    }
+    // Above MAX_DMA_ORDER (256 KiB) still rejects with NoMemory.
+    match alloc_coherent(1 << 20, DomainId::DRIVER_0) {
         Err(IoError::NoMemory) => {}
-        _ => return TestResult::Fail("oversized alloc didn't reject"),
+        _ => return TestResult::Fail("1 MiB alloc (over MAX_DMA_ORDER) didn't reject"),
     }
     match alloc_coherent(0, DomainId::DRIVER_0) {
         Err(IoError::NoMemory) => {}

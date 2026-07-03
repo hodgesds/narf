@@ -35,6 +35,12 @@ pub const VIRTIO_BLK_PCI_DEVICE: u16 = 0x1042;
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
 
+/// Max sectors per virtio-blk read round-trip. 128 × 512 B = 64 KiB, the
+/// size of one contiguous coherent payload (order-4 buddy block). Bounds
+/// how much `read_sectors` transfers per submit; a fallback drops to 8
+/// sectors if the 64 KiB contiguous DMA buffer can't be allocated.
+pub const MAX_READ_SECTORS: u16 = 128;
+
 /// virtio-blk completion status.
 pub const VIRTIO_BLK_S_OK: u8 = 0;
 
@@ -538,7 +544,12 @@ impl VirtioBlkPci {
         count: u16,
         out: &mut [u8],
     ) -> Result<(), VirtioPciError> {
-        let count = count.clamp(1, 8);
+        // Up to MAX_READ_SECTORS (64 KiB) per virtio round-trip. The payload
+        // is a single physically-contiguous coherent buffer (alloc_coherent
+        // now spans multiple pages), covered by one data descriptor — so a
+        // large sequential read (mmap'ing a Mesa/Qt6 DSO) pays one submit per
+        // 64 KiB instead of one per 4 KiB.
+        let count = count.clamp(1, MAX_READ_SECTORS);
         let bytes = count as usize * 512;
         if out.len() < bytes {
             return Err(VirtioPciError::QueueTooSmall);
@@ -560,10 +571,10 @@ impl VirtioBlkPci {
         }
 
         let payload =
-            alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
+            alloc_coherent(bytes, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         let payload_phys = payload.phys_addr().raw();
-        // SAFETY: page-sized DMA buffer; zero the bytes we'll read so a missed
-        // device write shows up clearly.
+        // SAFETY: coherent DMA buffer of >= `bytes`; zero the bytes we'll read
+        // so a missed device write shows up clearly.
         unsafe {
             for i in 0..bytes {
                 core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, 0);
@@ -1119,18 +1130,32 @@ impl narf_block::BlockDeviceSync for VirtioBlkBlockSync {
         }
         let g = CONTROLLER.lock();
         let dev = g.as_ref().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
-        // Batch up to 8 sectors (one 4 KiB DMA page) per virtio round-trip,
-        // instead of one sector per request.
+        // Batch up to MAX_READ_SECTORS (64 KiB) per virtio round-trip. If the
+        // large contiguous DMA buffer can't be allocated (fragmentation), fall
+        // back to an 8-sector (4 KiB) request, which always fits an order-0
+        // page — correctness first, speed when memory allows.
         let mut done: u16 = 0;
         while done < n_blocks {
-            let chunk = core::cmp::min(8, n_blocks - done);
+            let want = core::cmp::min(MAX_READ_SECTORS, n_blocks - done);
             let off = done as usize * 512;
-            dev.read_sectors(
+            let chunk = match dev.read_sectors(
                 lba + done as u64,
-                chunk,
-                &mut out[off..off + chunk as usize * 512],
-            )
-            .map_err(|_| narf_block::BlockIoError::DriverError)?;
+                want,
+                &mut out[off..off + want as usize * 512],
+            ) {
+                Ok(()) => want,
+                Err(_) if want > 8 => {
+                    let small = 8u16.min(n_blocks - done);
+                    dev.read_sectors(
+                        lba + done as u64,
+                        small,
+                        &mut out[off..off + small as usize * 512],
+                    )
+                    .map_err(|_| narf_block::BlockIoError::DriverError)?;
+                    small
+                }
+                Err(_) => return Err(narf_block::BlockIoError::DriverError),
+            };
             done += chunk;
         }
         Ok(())

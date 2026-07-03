@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_capabilities::{Cap, CapError, CapKind, CapOp, CapType};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{alloc_frame, free_frame, FrameAllocError, PhysAddr, PhysFrame, PAGE_SIZE};
+use narf_memory::{alloc_pages_on, free_pages, FrameAllocError, PhysAddr, PhysFrame, PAGE_SIZE};
 
 // ── Operations ──────────────────────────────────────────────────────
 
@@ -173,6 +173,9 @@ pub enum Coherency {
 pub struct DmaBuffer {
     phys: PhysAddr,
     len: usize,
+    /// Buddy allocation order (`1 << order` frames). Recorded so `Drop` /
+    /// `free_coherent` return the whole contiguous block, not just the head.
+    order: u8,
     domain: DomainId,
     coherency: Coherency,
     freed: bool,
@@ -288,8 +291,7 @@ impl CapType for DmaBuffer {
 impl Drop for DmaBuffer {
     fn drop(&mut self) {
         if !self.freed {
-            let frame = PhysFrame::new(self.phys);
-            free_frame(frame);
+            free_pages(PhysFrame::new(self.phys), self.order);
             self.freed = true;
         }
     }
@@ -301,24 +303,36 @@ pub fn alloc_coherent(len: usize, domain: DomainId) -> Result<DmaBuffer, IoError
 
 pub fn free_coherent(mut buf: DmaBuffer) {
     if !buf.freed {
-        let frame = PhysFrame::new(buf.phys);
-        free_frame(frame);
+        free_pages(PhysFrame::new(buf.phys), buf.order);
         buf.freed = true;
     }
 }
 
+/// Largest single coherent DMA buffer, expressed as a buddy order.
+/// order 6 = 64 pages = 256 KiB — big enough for a 64 KiB block-driver
+/// payload with headroom, small enough that the physically-contiguous
+/// allocation stays reliable under fragmentation.
+const MAX_DMA_ORDER: u8 = 6;
+
 fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaBuffer, IoError> {
     let page = PAGE_SIZE as usize;
-    if len > page {
-        return Err(IoError::NoMemory);
-    }
     if len == 0 {
         return Err(IoError::NoMemory);
     }
+    // Round the request up to a power-of-two page count and allocate that
+    // many PHYSICALLY-CONTIGUOUS frames from the buddy, so a device can DMA
+    // the whole buffer through a single (phys, len) descriptor — the block
+    // driver reads up to 64 KiB per virtio round-trip instead of one page.
+    let pages = len.div_ceil(page);
+    let order = pages.next_power_of_two().trailing_zeros() as u8;
+    if order > MAX_DMA_ORDER {
+        return Err(IoError::NoMemory);
+    }
+    let alloc_bytes = page << order;
 
-    let frame = alloc_frame()?;
+    let frame = alloc_pages_on(0, order)?;
     let phys = frame.start_address();
-    // Zero-fill the buffer. `alloc_frame` returns recycled frames
+    // Zero-fill the buffer. `alloc_pages_on` returns recycled frames
     // un-zeroed; drivers that build descriptor rings, completion
     // queues, or any phase-tagged structure on top of the buffer
     // rely on starting from a known-zero state. Without this,
@@ -334,11 +348,12 @@ fn alloc_with(len: usize, domain: DomainId, coherency: Coherency) -> Result<DmaB
     // thread is in a user-task TTBR0/CR3 context.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, page);
+        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, alloc_bytes);
     }
     Ok(DmaBuffer {
         phys,
-        len: page,
+        len: alloc_bytes,
+        order,
         domain,
         coherency,
         freed: false,

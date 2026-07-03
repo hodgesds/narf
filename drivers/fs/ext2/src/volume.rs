@@ -46,11 +46,12 @@ const SCRATCH_POOL_LEN: usize = 16;
 /// Size of each scratch DMA buffer. A multi-block `BlockRequest` reads up to
 /// this many contiguous device bytes per submit, so a sequential file read
 /// pays one submit→await round-trip per buffer instead of one per logical
-/// block — with a 512-byte LBS that's 8 LBAs per request, so mmap'ing a big
-/// DSO does ~8× fewer device round-trips. Capped at a single 4 KiB page
-/// because `narf_io::alloc_coherent` allocates at most one page per buffer
-/// (a larger contiguous coherent region would need a descriptor chain).
-const SCRATCH_BUF_BYTES: usize = 4096;
+/// block — with a 512-byte LBS that's 128 LBAs per request, so mmap'ing a big
+/// DSO (Mesa/Qt6, MBs) does ~128× fewer device round-trips than a per-block
+/// read (16× fewer than the previous 4 KiB buffer). `narf_io::alloc_coherent`
+/// now backs this with a single physically-contiguous 64 KiB (order-4) region,
+/// which the virtio-blk driver DMAs through one data descriptor.
+const SCRATCH_BUF_BYTES: usize = 65536;
 
 #[derive(Debug)]
 struct VolumeIo {
