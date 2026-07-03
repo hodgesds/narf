@@ -694,7 +694,12 @@ fn smoke_scheduler_user_task_poll_restores_kernel_ttbr0() -> TestResult {
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
     let arc_as = Arc::new(user_as);
 
-    let _tid = spawn_user(async {}, TaskSpec::unthrottled(), Arc::clone(&arc_as));
+    let _tid = spawn_user(
+        crate::alloc_task_id(),
+        async {},
+        TaskSpec::unthrottled(),
+        Arc::clone(&arc_as),
+    );
 
     crate::run_until_empty();
 
