@@ -13,10 +13,12 @@ fn smoke_probe_catches_page_fault() -> TestResult {
     use core::arch::asm;
     use narf_arch::x86_64::probe;
 
-    // Address above our 4-GiB identity map. The MMU handoff installed a
-    // PML4 with PDPT[0..=3] = 1-GiB huge pages covering phys 0..=4 GiB.
-    // Anything at 4 GiB and above has no PML4 entry and will #PF.
-    let unmapped: u64 = 0x0000_0001_0000_0000;
+    // An address the kernel PML4 deliberately leaves unmapped. The low
+    // identity map now covers 0..512 GiB (PML4[0]), and PML4[1] maps the
+    // high-MMIO window 513 GiB..1 TiB but SKIPS its PDPT[0] — the
+    // 512..513 GiB slot reserved for user space — so a kernel write to
+    // 512 GiB walks a present PML4[1] into a not-present PDPT[0] and #PFs.
+    let unmapped: u64 = 0x0000_0080_0000_0000;
 
     let recovery: u64;
     // SAFETY: LEA of a local label is always safe.
@@ -76,7 +78,11 @@ fn smoke_nx_enforces_no_exec() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    let virt = VirtAddr::new(0x3_0000_1000);
+    // Map at 1 TiB (PML4[2]): outside the low identity map (0..512 GiB,
+    // where every 1-GiB slot is a huge page map_4kb can't sub-divide)
+    // and in the kernel PML4's empty user-reserved range, so map_4kb
+    // builds fresh intermediate tables for a real 4 KiB leaf.
+    let virt = VirtAddr::new(0x0000_0100_0000_1000);
     let phys = frame.start_address();
     let flags = PtFlags::WRITABLE | PtFlags::NO_EXEC;
 
