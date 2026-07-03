@@ -1062,7 +1062,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 // SAFETY: Valid memory or trusted environment
                 match unsafe { narf_memory::mmu::init_mmu() } {
                     Ok(pml4) => {
-                        // The new PML4 identity-maps 0..=4 GiB, so the
+                        // The new PML4 identity-maps 0..512 GiB, so the
                         // UART (I/O port on x86_64) is reachable and
                         // console::remap_to_virtual with an identity
                         // address is correct.
@@ -1071,6 +1071,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             console::Writer,
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
+                        );
+
+                        // The kernel direct map now covers all installed
+                        // RAM (the low 512 GiB identity window), so the
+                        // frame allocator may hand out frames above 4 GiB.
+                        // Drop the early phys ceiling that kept pre-MMU
+                        // allocations inside boot.S's 4 GiB identity map;
+                        // without this, RAM relocated above the q35 PCI
+                        // hole (QEMU -m ≥ 4G, real 16 GiB laptops) stays
+                        // permanently unusable.
+                        narf_memory::release_early_ceiling();
+                        let s = narf_memory::frame_stats();
+                        let _ = writeln!(
+                            console::Writer,
+                            "  frames: ceiling released, {} MiB free now allocatable",
+                            (s.free as u64) * narf_memory::PAGE_SIZE / (1024 * 1024)
                         );
 
                         // Real-HW bring-up aid: install the FB

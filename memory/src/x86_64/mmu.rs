@@ -165,10 +165,23 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // boot.S's table), so writes go to the intended physical memory.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        // Low-identity PML4 + PDPT (first 4 GiB).
+        // Low-identity PML4 + PDPT. Fill the whole PDPT (512 × 1 GiB
+        // huge pages) so virt 0..512 GiB identity-maps phys 0..512 GiB.
+        // The old map stopped at 4 GiB, which forced the frame
+        // allocator's `EARLY_PHYS_CEILING` to permanently exclude all
+        // RAM above 4 GiB: on a q35 PCI-hole split (QEMU -m ≥ 4G, real
+        // 16 GiB laptops) usable RAM is relocated to start at phys
+        // 4 GiB, so anything past the boundary was untouchable and a
+        // direct `phys.raw() as *mut T` access would #PF. Blanketing
+        // the low 512 GiB makes every installed frame reachable by an
+        // identity (phys == virt) pointer; unpopulated gaps in that
+        // range are simply never accessed (the buddy only hands out
+        // real RAM). 512 GiB is the PDPT's full reach and dwarfs any
+        // supported machine. Caller releases the ceiling once this
+        // map is live.
         let pml4_lo_entry = PageTableEntry::new(pdpt_lo_addr, flags_ptr);
         write_identity::<PageTableEntry>(pml4_addr, pml4_lo_entry);
-        for gib in 0u64..=3 {
+        for gib in 0u64..512 {
             let phys = PhysAddr::new(gib << 30);
             let entry = PageTableEntry::new(phys, flags_1gb);
             let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
@@ -218,7 +231,7 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // before calling us so a panic across the CR3 swap is visible.
     //
     // Step 4: swap CR3. Any access from this instruction forward uses
-    // the new PML4. The new mapping identity-covers 0..=4 GiB, which
+    // the new PML4. The new mapping identity-covers 0..512 GiB, which
     // includes:
     //   - the kernel image (loaded at phys 0x100000)
     //   - the UART (I/O ports, not memory, so MMU-irrelevant)
