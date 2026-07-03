@@ -456,6 +456,168 @@ fn smoke_ext2_mount_ramblock_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_mount_ramblock_round_trip);
 
+/// Build a minimal EXT4 image: same block layout as `build_ext2_image`,
+/// but the superblock sets the EXTENTS incompat feature and every inode
+/// stores an extent tree in its `i_block[]` region instead of the
+/// direct/indirect pointer chain. This exercises the ext4 read path —
+/// `map_block` → `map_block_extents` — end to end (the thing a real
+/// `mkfs.ext4` rootfs uses that a legacy ext2 image never touches).
+fn build_ext4_extent_image(file_data: &[u8]) -> Vec<u8> {
+    const BS: usize = 1024;
+    const TOTAL_BLOCKS: u32 = 64;
+    const INODES_PER_GROUP: u32 = 32;
+    const INODE_SIZE: u16 = 128;
+    const BLOCKS_PER_GROUP: u32 = 64;
+
+    let mut img = vec![0u8; BS * TOTAL_BLOCKS as usize];
+
+    // Superblock at byte 1024.
+    let sb = 1024usize;
+    put_u32(&mut img, sb, INODES_PER_GROUP);
+    put_u32(&mut img, sb + 4, TOTAL_BLOCKS);
+    put_u32(&mut img, sb + 20, 1); // s_first_data_block
+    put_u32(&mut img, sb + 24, 0); // s_log_block_size → 1024
+    put_u32(&mut img, sb + 32, BLOCKS_PER_GROUP);
+    put_u32(&mut img, sb + 40, INODES_PER_GROUP);
+    put_u16(&mut img, sb + 56, 0xEF53); // magic
+    put_u32(&mut img, sb + 76, 1); // s_rev_level = 1
+    put_u16(&mut img, sb + 88, INODE_SIZE);
+    put_u32(&mut img, sb + 96, 0x40); // s_feature_incompat = INCOMPAT_EXTENTS
+
+    // Block group descriptor at start of block 2.
+    let gdt = 2 * BS;
+    put_u32(&mut img, gdt, 3); // block bitmap
+    put_u32(&mut img, gdt + 4, 4); // inode bitmap
+    put_u32(&mut img, gdt + 8, 5); // inode table
+    put_u16(&mut img, gdt + 16, 1); // used dirs (root)
+
+    // Bitmaps (blocks 3, 4) — mark blocks 0..=10 and inodes 1,2,12 used.
+    img[3 * BS] = 0xFF;
+    img[3 * BS + 1] = 0x07;
+    img[4 * BS] = 0b0000_0011;
+    img[4 * BS + 1] = 0b0000_1000;
+
+    let itab = 5 * BS;
+
+    // Write an extent-tree root (header + one leaf extent) into an inode's
+    // 60-byte i_block region, mapping logical block 0 → `phys` for `len`.
+    fn write_extent_root(img: &mut [u8], inode_off: usize, phys: u32, len: u16) {
+        put_u32(img, inode_off + 32, 0x0008_0000); // i_flags: EXT4_EXTENTS_FL
+        let ib = inode_off + 40; // i_block[0]
+        put_u16(img, ib, 0xF30A); // eh_magic
+        put_u16(img, ib + 2, 1); // eh_entries
+        put_u16(img, ib + 4, 4); // eh_max
+        put_u16(img, ib + 6, 0); // eh_depth (0 = leaf)
+        put_u32(img, ib + 8, 0); // eh_generation
+        put_u32(img, ib + 12, 0); // ee_block (logical 0)
+        put_u16(img, ib + 16, len); // ee_len
+        put_u16(img, ib + 18, 0); // ee_start_hi
+        put_u32(img, ib + 20, phys); // ee_start_lo
+    }
+
+    // Root directory inode (#2) at table index 1 — extent → dir data (blk 9).
+    let root_off = itab + INODE_SIZE as usize;
+    put_u16(&mut img, root_off, 0x4000 | 0o755); // S_IFDIR | 0755
+    put_u32(&mut img, root_off + 4, BS as u32); // size = 1 block
+    put_u32(&mut img, root_off + 28, (BS / 512) as u32); // i_blocks
+    write_extent_root(&mut img, root_off, 9, 1);
+
+    // File inode (#12) at table index 11 — extent → file data (blk 10).
+    let file_off = itab + 11 * INODE_SIZE as usize;
+    put_u16(&mut img, file_off, 0x8000 | 0o644); // S_IFREG | 0644
+    put_u32(&mut img, file_off + 4, file_data.len() as u32);
+    put_u32(
+        &mut img,
+        file_off + 28,
+        file_data.len().div_ceil(512) as u32,
+    );
+    if !file_data.is_empty() {
+        write_extent_root(&mut img, file_off, 10, 1);
+    }
+
+    // Root directory data (block 9): ".", "..", "data" → inode 12.
+    let rd = 9 * BS;
+    put_u32(&mut img, rd, 2);
+    put_u16(&mut img, rd + 4, 12);
+    img[rd + 6] = 1;
+    img[rd + 7] = ftype::DIR;
+    img[rd + 8] = b'.';
+    put_u32(&mut img, rd + 12, 2);
+    put_u16(&mut img, rd + 16, 12);
+    img[rd + 18] = 2;
+    img[rd + 19] = ftype::DIR;
+    img[rd + 20] = b'.';
+    img[rd + 21] = b'.';
+    let e3 = rd + 24;
+    let name = b"data";
+    put_u32(&mut img, e3, 12);
+    put_u16(&mut img, e3 + 4, (BS - 24) as u16);
+    img[e3 + 6] = name.len() as u8;
+    img[e3 + 7] = ftype::REGULAR;
+    img[e3 + 8..e3 + 8 + name.len()].copy_from_slice(name);
+
+    // File data (block 10).
+    if !file_data.is_empty() {
+        let data_off = 10 * BS;
+        img[data_off..data_off + file_data.len()].copy_from_slice(file_data);
+    }
+
+    img
+}
+
+fn smoke_ext4_mount_extent_round_trip() -> TestResult {
+    // End-to-end ext4: mount an EXTENT-based image, enumerate the root,
+    // look up `data`, and read it back — driving the extent-tree block
+    // mapping the legacy indirect-block test never touches.
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let payload = b"narf-ext4-extents\n";
+    let img = build_ext4_extent_image(payload);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("Ext2Volume::mount (ext4) failed"),
+    };
+
+    let root = volume.root();
+    let entries = match poll_once(root.enumerate_async(0, 16)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("enumerate_async (ext4) failed"),
+    };
+    if !entries
+        .iter()
+        .any(|(n, t)| n == "data" && *t == FileType::File)
+    {
+        return TestResult::Fail("ext4 enumerate did not list `data`");
+    }
+
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("ext4 lookup_async data failed"),
+    };
+    if file.stat().size != payload.len() as u64 {
+        return TestResult::Fail("ext4 stat.size mismatch");
+    }
+    let mut buf = [0u8; 32];
+    let n = match poll_once(file.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("ext4 file.read (extent path) failed"),
+    };
+    if n != payload.len() || &buf[..n] != payload {
+        return TestResult::Fail("ext4 file content mismatch — extent map wrong");
+    }
+    match poll_once(root.lookup_async("nope")) {
+        Some(Err(FsError::NotFound)) => {}
+        _ => return TestResult::Fail("ext4 lookup of missing name should NotFound"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_mount_extent_round_trip);
+
 fn smoke_ext2_read_partial_offset() -> TestResult {
     // Read from a non-zero offset in the middle of the data block to
     // exercise the (logical block, in-block byte) split inside
