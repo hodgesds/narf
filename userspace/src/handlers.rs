@@ -20066,7 +20066,7 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
                 return;
             }
         }
-        // Yield 1ms.
+        // Park until a watched fd becomes ready (or a ~1ms backstop tick).
         if let (Some(uctx), Some(hook)) = (
             crate::user_task::current_user_task(),
             crate::user_task::yield_hook(),
@@ -20081,6 +20081,24 @@ fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             unsafe {
                 let uc = &*uctx;
                 uc.sleep_deadline_ns.store(dl, Ordering::Release);
+                // Park on NET-I/O READINESS, not just the ~1ms timer-wheel
+                // backstop. A socket/pipe/eventfd transition fires
+                // `readiness::notify`, which wakes a registered net-I/O waiter
+                // PROMPTLY; without this an epoll_wait park re-polled only off
+                // the wheel, and under own-stack cooperative scheduling with
+                // other busy tasks (a heavy Wayland client like a Qt6 app) that
+                // wheel service is delayed enough that the readable fd sits
+                // unserviced for many hundreds of ms per hop — so a compositor
+                // idle in epoll_wait(-1) took tens of seconds to serve a new
+                // client's first request (weston never composited kcalc). The
+                // accept/poll parks already do this; epoll_wait was the gap.
+                // Snapshot the readiness generation for the check→park lost-wake
+                // guard (park_should_block re-executes if it advanced). Clear a
+                // stale futex_uaddr so this can't be mis-routed to the futex arm.
+                uc.futex_uaddr.store(0, Ordering::Release);
+                uc.net_io_wait.store(true, Ordering::Release);
+                uc.epoll_park_gen
+                    .store(narf_net::readiness::generation(), Ordering::Release);
                 ctx.save_user_state(uc.state.get() as *mut u8);
                 *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                 if narf_scheduler::stackful::user_own_stack_enabled() {
