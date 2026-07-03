@@ -52,6 +52,11 @@ pub mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{ioremap, mmu, paging};
 
+#[cfg(target_arch = "x86_64")]
+pub use addr::{
+    direct_map_activate, direct_map_live, KERNEL_DIRECT_MAP_BASE, KERNEL_DIRECT_MAP_PML4_BASE,
+    KERNEL_DIRECT_MAP_PML4_SLOTS,
+};
 pub use addr::{PhysAddr, VirtAddr};
 
 #[cfg(feature = "cgroup")]

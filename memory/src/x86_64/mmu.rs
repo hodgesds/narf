@@ -104,7 +104,21 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
 ///     into — the same physical pages become reachable at both low
 ///     and high virtual addresses.
 ///
+///   * PML4[384 + i] → the high-half **kernel direct map**: one PDPT
+///     per 512 GiB of installed RAM (`max_ram_phys`), each mapping
+///     `KERNEL_DIRECT_MAP_BASE + P` to physical `P` via 1-GiB huge
+///     pages. This is what lets the kernel reach RAM above 512 GiB —
+///     the low identity map stops at PML4[0] (512 GiB) because
+///     PML4[1..255] is claimed by user address space, so high RAM needs
+///     its own kernel-only window. `direct_map_activate` publishes it
+///     after the CR3 swap; `PhysAddr::kernel_mut_ptr` then adds the
+///     offset.
+///
 /// Returns the physical address of the new PML4.
+///
+/// `max_ram_phys` is the exclusive top of installed RAM (bytes); the
+/// direct map is sized to cover `[0, max_ram_phys)` rounded up to a
+/// 512 GiB PML4-slot boundary.
 ///
 /// This function is the *memory/* half of the `console/` §3.1
 /// handoff protocol; the caller (`frame/main.rs`) is responsible for
@@ -118,7 +132,7 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
 /// - Every address range the kernel will access after this call must
 ///   be covered by the identity map being built (currently the low
 ///   4 GiB + the high-half -2 GiB window).
-pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
+pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // Use BSS-resident page tables (see `EarlyPageTables` doc) so
     // the four storage buffers are guaranteed to be in the
     // boot.S 4-GiB identity-mapped window. Asking the frame
@@ -227,6 +241,53 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
         write_identity::<PageTableEntry>(hh_slot, hh_entry);
     }
 
+    // High-half kernel direct map (PML4[384 + chunk]). Give the kernel a
+    // window that reaches RAM above 512 GiB, which the low identity map
+    // can't cover (PML4[1..255] is user address space). Slot 384 clears
+    // both the PCID per-domain private range (PML4[256..271], which
+    // domain.rs *overwrites* per domain) and the kernel image
+    // (PML4[511]); see KERNEL_DIRECT_MAP_BASE. Each PML4 slot spans
+    // 512 GiB, so one BSS PDPT of 512 × 1-GiB huge pages covers each
+    // 512-GiB chunk of RAM. PML4[256..512] is copied verbatim into every
+    // per-domain / user PML4 (see x86_64/paging.rs), so the direct map
+    // reaches every address space without extra work.
+    //
+    // Built ONLY when installed RAM actually exceeds the low identity
+    // map (512 GiB): below that every frame is reachable at `phys ==
+    // virt` and the map is pure overhead, and its mere presence in the
+    // cloned PML4s perturbs the PCID per-domain isolation setup. So on
+    // all real hardware and QEMU up to 512 GiB the kernel runs on the
+    // low identity map alone, exactly as before this feature.
+    const CHUNK_BYTES: u64 = 512u64 << 30; // one PML4 slot = 512 GiB
+    let build_direct_map = max_ram_phys > crate::addr::LOW_IDENTITY_LIMIT;
+    if build_direct_map {
+        let want_chunks = max_ram_phys.div_ceil(CHUNK_BYTES).max(1);
+        let dmap_chunks = want_chunks.min(crate::addr::KERNEL_DIRECT_MAP_PML4_SLOTS as u64);
+        for chunk in 0..dmap_chunks {
+            // PDPT frames come from the buddy: the early phys ceiling is
+            // still armed (the caller releases it only after we return),
+            // so each is < 4 GiB and reachable through the boot identity
+            // map for the fill writes below. This alloc only runs on
+            // > 512 GiB machines, so a small-RAM boot's frame layout is
+            // untouched.
+            let pdpt = crate::frame::alloc_frame()?.start_address();
+            // SAFETY: `pdpt` is < 4 GiB, identity-mapped by boot.S, so the
+            // raw pointer is valid for a 4 KiB zero + entry writes.
+            unsafe {
+                PageTable::zero_at(pdpt.as_mut_ptr::<PageTable>());
+                for gib in 0u64..512 {
+                    let phys = PhysAddr::new(chunk * CHUNK_BYTES + (gib << 30));
+                    let entry = PageTableEntry::new(phys, flags_1gb);
+                    let slot = PhysAddr::new(pdpt.raw() + gib * 8);
+                    write_identity::<PageTableEntry>(slot, entry);
+                }
+                let pml4_idx = crate::addr::KERNEL_DIRECT_MAP_PML4_BASE as u64 + chunk;
+                let pml4_slot = PhysAddr::new(pml4_addr.raw() + pml4_idx * 8);
+                write_identity::<PageTableEntry>(pml4_slot, PageTableEntry::new(pdpt, flags_ptr));
+            }
+        }
+    }
+
     // Step 3 from console/ §3.1: *caller* prints the handoff line
     // before calling us so a panic across the CR3 swap is visible.
     //
@@ -244,6 +305,16 @@ pub unsafe fn init_mmu() -> Result<PhysAddr, MmuError> {
     // SAFETY: Valid memory or trusted environment
     unsafe {
         write_cr3(pml4_addr);
+    }
+
+    // If we installed the high-half direct map, publish it so the
+    // kernel RAM accessors switch >= 512 GiB frames to the offset
+    // window. AFTER the CR3 swap: until now kernel_mut_ptr must stay on
+    // identity (the boot CR3 has no high-half map). When no direct map
+    // was built (RAM <= 512 GiB) the flag stays false and every frame is
+    // reached at `phys == virt` through the low identity map.
+    if build_direct_map {
+        crate::addr::direct_map_activate();
     }
 
     // Step 5: *caller* notifies the console with a post-switch

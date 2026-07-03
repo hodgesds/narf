@@ -378,6 +378,27 @@ impl Arch {
         }
     }
 
+    /// Clamp a `max`-family QEMU CPU model's advertised physical-address
+    /// width to 40 bits (1 TiB) unless the caller already pinned
+    /// `phys-bits`. `-cpu max` otherwise reports the host's width (often
+    /// 46-52 bits), which makes QEMU park the q35 64-bit PCI hole — and
+    /// every 64-bit device BAR (NVMe, virtio) — up near the top of that
+    /// space (~14 TiB observed at -m 8192). NARF maps MMIO through the
+    /// identity window, whose high-MMIO range only covers phys
+    /// [512 GiB, 1 TiB), so a BAR above 1 TiB #PFs on first register
+    /// access once RAM is large enough to push the hole up. Capping to
+    /// 40 bits keeps the hole inside [~992 GiB, 1 TiB) — within the
+    /// mapped window — and mirrors real laptops, whose firmware already
+    /// parks BARs at 512 GiB-1016 GiB. Non-`max` explicit models
+    /// (EPYC-Rome/Genoa) are left untouched.
+    fn clamp_cpu_phys_bits(cpu: String) -> String {
+        if cpu.contains("max") && !cpu.contains("phys-bits") {
+            format!("{cpu},phys-bits=40")
+        } else {
+            cpu
+        }
+    }
+
     fn qemu_args(self, kernel: &Path, display: &str, profile: HwProfile) -> Vec<String> {
         let kernel = kernel.display().to_string();
         let display = display.to_string();
@@ -389,7 +410,9 @@ impl Arch {
                 // matches Renoir's BIOS behavior where x2APIC is
                 // refused. Example:
                 //   NARF_QEMU_CPU="max,-x2apic,-tsc-deadline"
-                let cpu = std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into());
+                let cpu = Self::clamp_cpu_phys_bits(
+                    std::env::var("NARF_QEMU_CPU").unwrap_or_else(|_| "max".into()),
+                );
                 // `NARF_QEMU_SMP` shrinks the vCPU count and drops the
                 // 2-socket HMAT/NUMA topology that assumes 16 CPUs.
                 // Bringing up + emulating 16 APs under TCG (no KVM, as on

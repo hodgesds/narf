@@ -298,6 +298,167 @@ fn smoke_pcid_cr3_roundtrip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_pcid_cr3_roundtrip);
 
+// ── high-half kernel direct map ───────────────────────────────────
+//
+// `init_mmu` installs a direct map at PML4[384..510] (base
+// `KERNEL_DIRECT_MAP_BASE = 0xFFFF_C000_0000_0000`) so the kernel can
+// reach RAM above 512 GiB — which the low identity map can't cover,
+// since PML4[1..255] is user address space. Slot 384 clears both the
+// PCID per-domain range (PML4[256..271]) and the kernel image
+// (PML4[511]). `PhysAddr::kernel_mut_ptr` OR's in the base once the map
+// is live. These smokes run on the CI 1-2 GiB machine (so they exercise
+// the low end of the map), but the mechanism they validate is identical
+// for high frames; a >512 GiB boot is validated separately by hand.
+
+/// The direct map is activated and structurally correct: PML4[384] of
+/// the live kernel PML4 is a present PDPT whose entries identity-map
+/// physical RAM via 1-GiB huge pages (virt `BASE + P` → phys `P`).
+#[cfg(target_arch = "x86_64")]
+fn smoke_direct_map_installed() -> TestResult {
+    use crate::PhysAddr;
+    use narf_arch::x86_64::cr;
+
+    if !crate::direct_map_live() {
+        // Built only when RAM > 512 GiB; the CI machine is smaller, so
+        // there is nothing to inspect. The >512 GiB path is exercised
+        // by a manual large-RAM boot.
+        return TestResult::Skip("direct map not built (RAM <= 512 GiB)");
+    }
+
+    // Walk the live kernel PML4. Page-table frames are < 4 GiB, so the
+    // low identity map (`as_ptr`) reaches them regardless of the direct
+    // map. SAFETY: CR3 read at CPL=0.
+    let cr3 = unsafe { cr::read_cr3() };
+    let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
+
+    // PML4[384] = the first direct-map slot (covers phys [0, 512 GiB)).
+    let base = crate::KERNEL_DIRECT_MAP_PML4_BASE as u64;
+    let e_ptr = PhysAddr::new(pml4_phys + base * 8).as_ptr::<u64>();
+    // SAFETY: PML4 base is identity-mapped; offset base*8 is in-page.
+    let e0 = unsafe { core::ptr::read_volatile(e_ptr) };
+    if e0 & 1 == 0 {
+        return TestResult::Fail("PML4[384] (direct map) not present");
+    }
+    let pdpt_phys = e0 & 0x000F_FFFF_FFFF_F000;
+
+    // Spot-check several 1-GiB huge-page entries map the right phys.
+    for gib in [0u64, 1, 3, 7, 511] {
+        let ep = PhysAddr::new(pdpt_phys + gib * 8).as_ptr::<u64>();
+        // SAFETY: PDPT base is identity-mapped; offset in-page.
+        let e = unsafe { core::ptr::read_volatile(ep) };
+        if e & 1 == 0 {
+            return TestResult::Fail("direct-map PDPT entry not present");
+        }
+        if e & (1 << 7) == 0 {
+            return TestResult::Fail("direct-map entry not a 1-GiB huge page");
+        }
+        // 1-GiB huge-page frame bits are [51:30].
+        let mapped = e & 0x000F_FFFF_C000_0000;
+        if mapped != (gib << 30) {
+            return TestResult::Fail("direct-map entry maps wrong physical address");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_direct_map_installed);
+
+/// The kernel RAM accessors are consistent: low frames (< 512 GiB, all
+/// that exist on the CI machine) stay identity-mapped so `ptr == phys`
+/// — that identity is what keeps the mass of `phys as *mut` code correct
+/// — and a real frame is dereferenceable through `kernel_mut_ptr`.
+#[cfg(target_arch = "x86_64")]
+fn smoke_direct_map_low_frame_is_identity() -> TestResult {
+    use crate::PhysAddr;
+
+    // Valid whether or not the direct map was built: a < 512 GiB frame
+    // is identity-mapped either way (the direct map only offsets frames
+    // the low identity map can't reach).
+    let frame = match crate::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame failed"),
+    };
+    let phys: PhysAddr = frame.start_address();
+    let id_ptr = phys.as_mut_ptr::<u64>();
+    let km_ptr = phys.kernel_mut_ptr::<u64>();
+
+    let result = (|| {
+        // A < 512 GiB frame must map identity: kernel_mut_ptr == phys.
+        if km_ptr as u64 != phys.raw() {
+            return TestResult::Fail("low frame not identity-mapped by kernel_mut_ptr");
+        }
+        if !core::ptr::eq(km_ptr, id_ptr) {
+            return TestResult::Fail("kernel_mut_ptr != as_mut_ptr for a low frame");
+        }
+        // from_kernel_ptr must round-trip.
+        if PhysAddr::from_kernel_ptr(km_ptr).raw() != phys.raw() {
+            return TestResult::Fail("from_kernel_ptr did not round-trip a low frame");
+        }
+        // Dereferenceable through kernel_mut_ptr.
+        let sentinel: u64 = 0xA5A5_1234_DEAD_BEEF;
+        // SAFETY: `phys` is a freshly-allocated, exclusively-owned frame.
+        unsafe {
+            core::ptr::write_volatile(km_ptr, sentinel);
+            if core::ptr::read_volatile(phys.as_ptr::<u64>()) != sentinel {
+                return TestResult::Fail("kernel_mut_ptr write not visible via identity");
+            }
+        }
+        TestResult::Pass
+    })();
+
+    crate::free_frame(frame);
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_direct_map_low_frame_is_identity);
+
+/// The direct-map address arithmetic is correct for a frame the low
+/// identity map can't reach (>= 512 GiB): `kernel_mut_ptr` applies the
+/// offset, the result lands inside the direct-map window, and
+/// `from_kernel_ptr` inverts it. Uses a synthetic phys — the map is
+/// installed for [0, RAM), so this validates the transform, not a
+/// dereference (a >512 GiB dereference needs a >512 GiB boot, checked
+/// by hand).
+#[cfg(target_arch = "x86_64")]
+fn smoke_direct_map_high_phys_offset() -> TestResult {
+    use crate::PhysAddr;
+
+    if !crate::direct_map_live() {
+        // The offset only applies when the direct map was built
+        // (RAM > 512 GiB); on the smaller CI machine kernel_mut_ptr is
+        // pure identity, so there is no offset to validate here.
+        return TestResult::Skip("direct map not built (RAM <= 512 GiB)");
+    }
+
+    // First slot the identity map can't reach.
+    let high = PhysAddr::new(600u64 << 30); // 600 GiB
+    let km = high.kernel_mut_ptr::<u8>() as u64;
+
+    // Must be offset into the direct-map window, not identity.
+    if km == high.raw() {
+        return TestResult::Fail("high frame was NOT offset (still identity)");
+    }
+    if km < crate::KERNEL_DIRECT_MAP_BASE {
+        return TestResult::Fail("high frame VA is below the direct-map base");
+    }
+    // Offset must equal base + phys (the map is base | phys, disjoint).
+    if km != crate::KERNEL_DIRECT_MAP_BASE + high.raw() {
+        return TestResult::Fail("direct-map VA != base + phys");
+    }
+    // The VA must decode to the expected PML4 slot (384 + phys/512GiB).
+    let expect_slot = crate::KERNEL_DIRECT_MAP_PML4_BASE as u64 + (600 / 512);
+    if (km >> 39) & 0x1FF != expect_slot {
+        return TestResult::Fail("direct-map VA lands in the wrong PML4 slot");
+    }
+    // Round-trip back to phys.
+    if PhysAddr::from_kernel_ptr(km as *const u8).raw() != high.raw() {
+        return TestResult::Fail("from_kernel_ptr did not round-trip a high frame");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_direct_map_high_phys_offset);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pcid_per_domain_pml4s_distinct() -> TestResult {
     use narf_arch::x86_64::pcid;
@@ -1020,6 +1181,20 @@ kernel_test_in!("memory/asid_alloc", smoke_asid_rollover_bumps_generation);
 fn smoke_per_domain_root_register_lookup() -> TestResult {
     use crate::per_domain_root;
     use narf_lib::id::DomainId;
+
+    // `register_root` mirrors into the LIVE PCID domain registry
+    // (`pcid::set_domain_pml4`) and `__reset_for_test` clears the root
+    // table — with a live enforcer this scribbles a fake phys over a real
+    // driver domain's boot PML4 (DomainId::DRIVER_1 == 10) and breaks
+    // smoke_pcid_domain_private_slots_isolated depending on link order.
+    // The isolation smoke only runs when the enforcer is active, so gate
+    // this pure-logic test to the complementary case; it still runs on CI
+    // (TCG, no PCID) where the registry isn't live.
+    #[cfg(target_arch = "x86_64")]
+    if narf_arch::x86_64::pcid::is_active() {
+        return TestResult::Skip("PCID enforcer live — would corrupt the boot domain registry");
+    }
+
     per_domain_root::__reset_for_test();
     let d = DomainId::DRIVER_1;
     let phys = 0x4_0000u64;
@@ -3758,6 +3933,13 @@ kernel_test_in!(
 fn smoke_per_domain_root_double_register_rejected() -> TestResult {
     use crate::per_domain_root::{__reset_for_test, register_root, unregister_root, AllocError};
     use narf_lib::id::DomainId;
+    // register_root mirrors a fake phys into the live PCID registry (here
+    // for SCRATCH == domain 15); skip when the enforcer is live so it
+    // can't corrupt boot isolation. See smoke_per_domain_root_register_lookup.
+    #[cfg(target_arch = "x86_64")]
+    if narf_arch::x86_64::pcid::is_active() {
+        return TestResult::Skip("PCID enforcer live — would corrupt the boot domain registry");
+    }
     __reset_for_test();
     unregister_root(DomainId::SCRATCH);
     let dom = DomainId::SCRATCH;

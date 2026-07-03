@@ -502,7 +502,12 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
 }
 
 unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
-    let phys = crate::PhysAddr::new(ptr.as_ptr() as u64);
+    // `alloc_large` handed out `frame.start_address().kernel_mut_ptr()`,
+    // so invert that mapping to recover the frame — a plain
+    // `PhysAddr::new(ptr)` would treat the direct-map VA as a physical
+    // address and free the wrong frame (buddy double-alloc) once the
+    // high-half direct map is live.
+    let phys = crate::PhysAddr::from_kernel_ptr(ptr.as_ptr());
     let frame = PhysFrame::new(phys);
     let n_pages = layout.size().div_ceil(PAGE_SIZE_USIZE);
     let order = pages_to_order(n_pages).unwrap_or(0);

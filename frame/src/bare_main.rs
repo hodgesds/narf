@@ -1057,10 +1057,21 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             #[cfg(target_arch = "x86_64")]
             {
                 let _ = writeln!(console::Writer, "  mmu: handoff...");
+                // Top of installed RAM — the high-half kernel direct map
+                // is sized to cover [0, max_ram_phys) so frames above
+                // 512 GiB (which the low identity map can't reach) are
+                // still accessible via PhysAddr::kernel_mut_ptr.
+                let max_ram_phys = info
+                    .memory_map
+                    .iter()
+                    .filter(|r| r.kind == narf_boot::MemRegionKind::Usable)
+                    .map(|r| r.start.raw() + r.len)
+                    .max()
+                    .unwrap_or(0);
                 // SAFETY: BSP, interrupts disabled (boot.S CLI + IDT
                 // doesn't unmask), allocator populated above.
                 // SAFETY: Valid memory or trusted environment
-                match unsafe { narf_memory::mmu::init_mmu() } {
+                match unsafe { narf_memory::mmu::init_mmu(max_ram_phys) } {
                     Ok(pml4) => {
                         // The new PML4 identity-maps 0..512 GiB, so the
                         // UART (I/O port on x86_64) is reachable and

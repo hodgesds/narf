@@ -62,11 +62,34 @@ impl PhysAddr {
     /// 1 GiB block at PA `0x4000_0000` into VA
     /// `0xFFFF_FF80_4000_0000` — the same VA you'd get by OR'ing
     /// the offset into the PA.
+    ///
+    /// On x86_64 this OR's in [`KERNEL_DIRECT_MAP_BASE`] once
+    /// [`direct_map_activate`] has run — the high-half kernel direct
+    /// map `init_mmu` installs, which reaches RAM above 512 GiB that
+    /// cannot be identity-mapped (PML4[2..255] belongs to user address
+    /// space). Before activation (early boot, only < 4 GiB frames
+    /// exist) it falls back to the boot identity map. OR (not ADD,
+    /// mirroring aarch64's `KERNEL_PHYS_OFFSET`) is deliberate: for a
+    /// true physical address (bits 46-47 clear, i.e. < 64 TiB) it
+    /// equals `base + phys` and lands in the direct map, but for a
+    /// value already inside the kernel window (a kernel VA some callers
+    /// wrap in a `PhysAddr` and relied on the old x86_64 identity no-op
+    /// for) it is idempotent instead of overflowing.
     #[inline]
     pub fn kernel_mut_ptr<T>(self) -> *mut T {
         #[cfg(target_arch = "x86_64")]
         {
-            self.0 as *mut T
+            // Only frames the low identity map (PML4[0], 0..512 GiB)
+            // can't reach need the direct-map offset. Keeping frames
+            // below LOW_IDENTITY_LIMIT identity-mapped means `ptr ==
+            // phys` for all real hardware and every < 512 GiB machine,
+            // so the large body of code that assumes it stays correct;
+            // only genuine high RAM takes the offset path.
+            if direct_map_live() && self.0 >= LOW_IDENTITY_LIMIT {
+                (self.0 | KERNEL_DIRECT_MAP_BASE) as *mut T
+            } else {
+                self.0 as *mut T
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -83,7 +106,12 @@ impl PhysAddr {
     pub fn kernel_ptr<T>(self) -> *const T {
         #[cfg(target_arch = "x86_64")]
         {
-            self.0 as *const T
+            // See `kernel_mut_ptr`: low frames stay identity-mapped.
+            if direct_map_live() && self.0 >= LOW_IDENTITY_LIMIT {
+                (self.0 | KERNEL_DIRECT_MAP_BASE) as *const T
+            } else {
+                self.0 as *const T
+            }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -94,6 +122,102 @@ impl PhysAddr {
             self.0 as *const T
         }
     }
+
+    /// Inverse of [`Self::kernel_mut_ptr`] / [`Self::kernel_ptr`]:
+    /// recover the physical address from a pointer those returned. Use
+    /// this — never `PhysAddr::new(ptr as u64)` — whenever code that got
+    /// a kernel-RAM pointer needs the underlying frame again (e.g. to
+    /// free it). Treating the pointer as a physical address is only
+    /// correct while the kernel accessor is the identity map; once the
+    /// high-half direct map is live the pointer carries the offset and
+    /// the naive cast frees the wrong frame (buddy double-alloc).
+    #[inline]
+    pub fn from_kernel_ptr<T>(ptr: *const T) -> Self {
+        let v = ptr as u64;
+        #[cfg(target_arch = "x86_64")]
+        {
+            // A direct-map pointer is >= KERNEL_DIRECT_MAP_BASE; anything
+            // below that is a low identity pointer (ptr == phys). This
+            // mirrors `kernel_mut_ptr`'s LOW_IDENTITY_LIMIT gate.
+            if v >= KERNEL_DIRECT_MAP_BASE {
+                PhysAddr::new(v & !KERNEL_DIRECT_MAP_BASE)
+            } else {
+                PhysAddr::new(v)
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            PhysAddr::new(v & !crate::KERNEL_PHYS_OFFSET)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            PhysAddr::new(v)
+        }
+    }
+}
+
+/// Base of the x86_64 high-half kernel direct map — PML4[384]. Kernel
+/// access to a physical frame is `KERNEL_DIRECT_MAP_BASE | phys` once
+/// the map is live; mirrors aarch64's `KERNEL_PHYS_OFFSET`. This is a
+/// separate window from the low identity map (0..512 GiB) precisely so
+/// RAM above 512 GiB — which the identity map can't reach because
+/// PML4[2..255] is user address space — is still reachable by the
+/// kernel.
+///
+/// Slot choice: PML4[256..271] is the PCID per-domain private VA range
+/// (`x86_64/domain.rs`, which *overwrites* those slots per domain), and
+/// PML4[511] is the kernel image higher-half — both off-limits.
+/// PML4[384..510] is free. PML4[384] specifically is `0b11 << 46`
+/// (bits 46-47 set, bits 0..46 clear), so `base | phys == base + phys`
+/// for any `phys < 64 TiB` (the OR trick) while remaining idempotent
+/// for a kernel VA a caller might wrap in a `PhysAddr`. The map spans
+/// PML4[384..510] (127 slots = 63.5 TiB), sized at boot to installed
+/// RAM. `init_mmu` builds it and calls [`direct_map_activate`] after
+/// the CR3 swap.
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_DIRECT_MAP_BASE: u64 = 0xFFFF_C000_0000_0000;
+
+/// Physical addresses below this are covered by the low identity map
+/// (PML4[0], built by `init_mmu` as 512 × 1-GiB huge pages) and are
+/// reached at `phys == virt`; `kernel_mut_ptr` only applies the
+/// direct-map offset to frames at or above it. 512 GiB = the identity
+/// map's full reach before PML4[1] (user + high-MMIO) begins.
+#[cfg(target_arch = "x86_64")]
+pub const LOW_IDENTITY_LIMIT: u64 = 512u64 << 30;
+
+/// First PML4 slot of the direct map (`KERNEL_DIRECT_MAP_BASE >> 39`).
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_DIRECT_MAP_PML4_BASE: usize = 384;
+
+/// Number of PML4 slots available to the direct map: PML4[384..=510]
+/// (511 is the kernel image). 127 × 512 GiB = 63.5 TiB of RAM.
+#[cfg(target_arch = "x86_64")]
+pub const KERNEL_DIRECT_MAP_PML4_SLOTS: usize = 127;
+
+/// False until `init_mmu` has installed the high-half direct map and
+/// swapped CR3. While false, [`PhysAddr::kernel_mut_ptr`] uses the boot
+/// identity map — correct because every frame that exists before the
+/// handoff is < 4 GiB (the early phys ceiling) and thus inside boot.S's
+/// identity window. Flipping to offset addressing only after the map is
+/// live keeps the accessor valid across the whole boot, without a
+/// separate early/late code path at each of its ~50 call sites.
+#[cfg(target_arch = "x86_64")]
+static DIRECT_MAP_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Publish that the high-half direct map is installed. Called once by
+/// `init_mmu` immediately after the CR3 swap.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn direct_map_activate() {
+    DIRECT_MAP_LIVE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the high-half direct map is live. Used by the kernel RAM
+/// accessors to pick the offset vs. identity window.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn direct_map_live() -> bool {
+    DIRECT_MAP_LIVE.load(core::sync::atomic::Ordering::Acquire)
 }
 
 impl VirtAddr {
