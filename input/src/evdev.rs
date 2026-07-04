@@ -702,7 +702,12 @@ pub mod abs {
 ///
 /// Used by `drivers/input/src/i8042.rs` and test smokes.
 pub fn dispatch_key_to_node(node: &DeviceNode, code: u16, pressed: bool) {
-    let now = narf_time::now_cycles();
+    // Monotonic NANOSECONDS, matching `pack_linux_event`'s timeval split.
+    // NOT `now_cycles()` (raw TSC): libinput derives pointer velocity from the
+    // dt between consecutive events, and cycles (~3.3e9/s) packed as ns make
+    // every dt ~3.3x too large, velocity ~3.3x too small, so the pointer-accel
+    // curve maps real motion to ~0 px and the compositor's pointer never moves.
+    let now = narf_time::monotonic_ns();
     node.dispatch(EvdevEvent {
         time: now,
         type_: EventType::Key,
@@ -752,7 +757,12 @@ pub fn snapshot_devices() -> Vec<DeviceSnapshot> {
 ///
 /// Used by `drivers/input/src/i8042_mouse.rs` and test smokes.
 pub fn dispatch_rel_to_node(node: &DeviceNode, dx: i32, dy: i32) {
-    let now = narf_time::now_cycles();
+    // Monotonic NANOSECONDS, matching `pack_linux_event`'s timeval split.
+    // NOT `now_cycles()` (raw TSC): libinput derives pointer velocity from the
+    // dt between consecutive events, and cycles (~3.3e9/s) packed as ns make
+    // every dt ~3.3x too large, velocity ~3.3x too small, so the pointer-accel
+    // curve maps real motion to ~0 px and the compositor's pointer never moves.
+    let now = narf_time::monotonic_ns();
     if dx != 0 {
         node.dispatch(EvdevEvent {
             time: now,
@@ -786,7 +796,12 @@ pub fn dispatch_pointer_to_node(node: &DeviceNode, dx: i32, dy: i32, btn_changes
     if dx == 0 && dy == 0 && btn_changes.is_empty() {
         return;
     }
-    let now = narf_time::now_cycles();
+    // Monotonic NANOSECONDS, matching `pack_linux_event`'s timeval split.
+    // NOT `now_cycles()` (raw TSC): libinput derives pointer velocity from the
+    // dt between consecutive events, and cycles (~3.3e9/s) packed as ns make
+    // every dt ~3.3x too large, velocity ~3.3x too small, so the pointer-accel
+    // curve maps real motion to ~0 px and the compositor's pointer never moves.
+    let now = narf_time::monotonic_ns();
     if dx != 0 {
         node.dispatch(EvdevEvent {
             time: now,
