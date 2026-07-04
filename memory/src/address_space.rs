@@ -1621,6 +1621,19 @@ impl AddressSpace {
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {} // idempotent
+                    // A user region VA that lands in the low-4 GiB window hits
+                    // a 2 MiB / 1 GiB huge page in the kernel identity map that
+                    // every user PML4 shares via PML4[0]. We can't split it —
+                    // the table is shared with the kernel, and overriding an
+                    // identity-mapped low frame would steal a page the kernel
+                    // may need. This fires for a non-PIE ELF image loaded at
+                    // the classic 0x400000. FAIL THE LOAD gracefully — a user
+                    // binary must never panic the kernel — so the caller's
+                    // materialize() error path tears the AS down and the exec
+                    // returns an error instead of taking the whole system out.
+                    Err(MapError::EncounteredHugePage) => {
+                        return Err(AddressSpaceError::Overlap);
+                    }
                     Err(e) => {
                         panic!(
                             "materialize map_4kb failed at virt {:x} phys {:x} with {:?}",
