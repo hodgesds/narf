@@ -325,6 +325,31 @@ unsafe fn register_evdev_node(
     (None, false)
 }
 
+/// Map an absolute tablet coordinate `v` onto a nominal ~1024-unit pixel
+/// span using the device's advertised range, so an absolute pointer can be
+/// tracked as a relative mouse without the pointer flying off screen.
+///
+/// A tablet reports its position over the full 0..range space (QEMU's
+/// virtio-tablet uses 0..0x7FFF), so a raw `signed - last` delta is ~32× the
+/// on-screen pixel distance. Callers take the difference of two `abs_to_px`
+/// results as the relative delta; because each is derived from an absolute
+/// sample, sub-pixel motion isn't lost the way scaling a tiny per-event delta
+/// by integer division would.
+fn abs_to_px(v: i32, info: Option<narf_input::AxisInfo>) -> i32 {
+    // Nominal pixel span the full axis maps to. Exactness doesn't matter —
+    // libinput applies its own pointer acceleration on top — it only needs to
+    // be pixel-scale rather than device-unit-scale.
+    const NOMINAL: i64 = 1024;
+    match info {
+        Some(a) if a.max > a.min => {
+            (((v.clamp(a.min, a.max) - a.min) as i64 * NOMINAL) / (a.max - a.min) as i64) as i32
+        }
+        // No range advertised: fall back to a fixed ~1/32 shrink so the raw
+        // 0..0x7FFF sample still lands in pixel scale.
+        _ => v / 32,
+    }
+}
+
 #[derive(Debug)]
 struct Queues {
     event_q: Virtqueue,
@@ -1009,20 +1034,38 @@ impl VirtioInputPci {
                             slot.dirty = true;
                         }
                     } else {
-                        // Pointer abs→rel: a tablet reports ABS_X/ABS_Y;
-                        // convert to relative deltas (fed into the same
-                        // accumulators as a real mouse) so both the
-                        // global-ring cursor AND the relative evdev mouse
-                        // node track motion without abs-range plumbing.
+                        // Pointer abs→rel: a tablet (e.g. QEMU virtio-tablet)
+                        // reports an absolute ABS_X/ABS_Y position over its own
+                        // 0..range coordinate space; convert to relative deltas
+                        // (fed into the same accumulators as a real mouse) so
+                        // both the global-ring cursor AND the relative evdev
+                        // mouse node track it — libinput handles a relative
+                        // pointer reliably, whereas absolute-pointer motion is
+                        // not delivered for an ID_INPUT_MOUSE device.
+                        //
+                        // The delta MUST be scaled into pixel space: the raw
+                        // `signed - last` is in device units (a full-screen
+                        // sweep spans the whole 0..0x7FFF range, ~32× the pixel
+                        // width), so an unscaled delta slams the pointer to a
+                        // screen edge on the first move and every click lands in
+                        // the wrong place. `abs_to_px` maps each sample onto a
+                        // nominal pixel span via the device's advertised range,
+                        // and the delta is the difference of two pixel positions
+                        // — computing from absolute samples each event avoids the
+                        // precision loss of scaling tiny per-event deltas.
                         if code == abs::ABS_X {
+                            let info = self.axis_info.get(abs::ABS_X as usize).and_then(|a| *a);
                             let last = self.last_abs_x.swap(signed, Ordering::AcqRel);
                             if last != i32::MIN {
-                                self.rel_dx_acc.fetch_add(signed - last, Ordering::Relaxed);
+                                let d = abs_to_px(signed, info) - abs_to_px(last, info);
+                                self.rel_dx_acc.fetch_add(d, Ordering::Relaxed);
                             }
                         } else if code == abs::ABS_Y {
+                            let info = self.axis_info.get(abs::ABS_Y as usize).and_then(|a| *a);
                             let last = self.last_abs_y.swap(signed, Ordering::AcqRel);
                             if last != i32::MIN {
-                                self.rel_dy_acc.fetch_add(signed - last, Ordering::Relaxed);
+                                let d = abs_to_px(signed, info) - abs_to_px(last, info);
+                                self.rel_dy_acc.fetch_add(d, Ordering::Relaxed);
                             }
                         }
                         // Non-MT absolute axis (tablet ABS_X/Y,
