@@ -19,7 +19,10 @@
 //! `sys_poll` is called from `handlers.rs`; `do_poll` is the shared
 //! body re-used by `sys_select` / `sys_pselect6`.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use narf_filesystem::FileOps;
 
 use crate::fd;
 
@@ -54,35 +57,52 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
 
     loop {
         // --- one pass: query every fd ---
-        let mut n_ready = 0usize;
-        fd::with_table(task_id, |t| {
-            for item in fds.iter_mut() {
-                if item.fd < 0 {
-                    // POSIX: negative fd → ignored, revents = 0.
-                    item.revents = 0;
-                    continue;
-                }
-                match t.get(item.fd as u32) {
-                    None => {
-                        // fd not open → POLLNVAL regardless of events.
-                        item.revents = POLL_NVAL as u16;
-                        n_ready += 1;
+        // Snapshot each open fd's `Arc<dyn FileOps>` under the fd-table lock,
+        // then release the lock BEFORE calling `poll_readiness()`. A nested
+        // epoll fd's `poll_readiness` re-enters `fd::with_table` to poll its
+        // children; polling while still holding the (non-reentrant) lock
+        // deadlocks the task — libinput/libwayland nest event loops, so a
+        // `poll()` over an inner-epoll fd would otherwise hang. Mirrors
+        // `poll_fd_readiness` / `EpollInstance::poll_readiness`.
+        let ops: Vec<Option<Arc<dyn FileOps>>> = fd::with_table(task_id, |t| {
+            fds.iter()
+                .map(|item| {
+                    if item.fd < 0 {
+                        None
+                    } else {
+                        t.get(item.fd as u32).map(|e| e.ops.clone())
                     }
-                    Some(e) => {
-                        let mask = e.ops.poll_readiness();
-                        // OR in ERR/HUP/NVAL so they're always returned
-                        // even if the caller didn't ask for them (POSIX).
-                        let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
-                        let want = item.events | always;
-                        let ready = (mask as u16) & want;
-                        item.revents = ready;
-                        if ready != 0 {
-                            n_ready += 1;
-                        }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+        let mut n_ready = 0usize;
+        for (item, slot) in fds.iter_mut().zip(ops.iter()) {
+            if item.fd < 0 {
+                // POSIX: negative fd → ignored, revents = 0.
+                item.revents = 0;
+                continue;
+            }
+            match slot {
+                None => {
+                    // fd not open → POLLNVAL regardless of events.
+                    item.revents = POLL_NVAL as u16;
+                    n_ready += 1;
+                }
+                Some(o) => {
+                    let mask = o.poll_readiness();
+                    // OR in ERR/HUP/NVAL so they're always returned
+                    // even if the caller didn't ask for them (POSIX).
+                    let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
+                    let want = item.events | always;
+                    let ready = (mask as u16) & want;
+                    item.revents = ready;
+                    if ready != 0 {
+                        n_ready += 1;
                     }
                 }
             }
-        });
+        }
 
         if n_ready > 0 {
             return n_ready;
@@ -270,30 +290,42 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
 /// path keeps using `do_poll`). Same per-fd rules as `do_poll`: negative fd
 /// ignored, closed fd → POLLNVAL, open fd → `poll_readiness() & (events|ERR|HUP|NVAL)`.
 fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
-    let mut n_ready = 0usize;
-    fd::with_table(task_id, |t| {
-        for item in fds.iter_mut() {
-            if item.fd < 0 {
-                item.revents = 0;
-                continue;
-            }
-            match t.get(item.fd as u32) {
-                None => {
-                    item.revents = POLL_NVAL as u16;
-                    n_ready += 1;
+    // Snapshot ops under the lock, poll OUTSIDE it — a nested epoll fd's
+    // `poll_readiness` re-enters the fd-table lock (see `do_poll`).
+    let ops: Vec<Option<Arc<dyn FileOps>>> = fd::with_table(task_id, |t| {
+        fds.iter()
+            .map(|item| {
+                if item.fd < 0 {
+                    None
+                } else {
+                    t.get(item.fd as u32).map(|e| e.ops.clone())
                 }
-                Some(e) => {
-                    let mask = e.ops.poll_readiness();
-                    let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
-                    let ready = (mask as u16) & (item.events | always);
-                    item.revents = ready;
-                    if ready != 0 {
-                        n_ready += 1;
-                    }
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    let mut n_ready = 0usize;
+    for (item, slot) in fds.iter_mut().zip(ops.iter()) {
+        if item.fd < 0 {
+            item.revents = 0;
+            continue;
+        }
+        match slot {
+            None => {
+                item.revents = POLL_NVAL as u16;
+                n_ready += 1;
+            }
+            Some(o) => {
+                let mask = o.poll_readiness();
+                let always = (POLL_ERR | POLL_HUP | POLL_NVAL) as u16;
+                let ready = (mask as u16) & (item.events | always);
+                item.revents = ready;
+                if ready != 0 {
+                    n_ready += 1;
                 }
             }
         }
-    });
+    }
     n_ready
 }
 
