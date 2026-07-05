@@ -548,10 +548,22 @@ impl FileOps for InputEventFile {
                 }
             }
             nr if (EVIOC_NR_GABS_BASE..EVIOC_NR_GABS_BASE + 0x40).contains(&nr) => {
-                // EVIOCGABS(abs): nr = 0x40 + abs.  struct input_absinfo
-                // is six i32s; we report all-zero limits (no calibration
-                // data synthesised for the virtual pointer).
-                let absinfo = [0u8; 24];
+                // EVIOCGABS(abs): nr = 0x40 + abs.  struct input_absinfo is six
+                // i32s { value, minimum, maximum, fuzz, flat, resolution }.
+                // Report the device's real range so libinput can map an
+                // absolute pointer onto the output — an all-zero range makes
+                // libinput discard the axis and the pointer never moves.
+                let axis = (nr - EVIOC_NR_GABS_BASE) as u16;
+                let caps = ROUTER.caps(self.device_id).ok_or(FsError::NotFound)?;
+                let mut absinfo = [0u8; 24];
+                if let Some(info) = caps.abs_info(axis) {
+                    absinfo[0..4].copy_from_slice(&0i32.to_le_bytes()); // value
+                    absinfo[4..8].copy_from_slice(&info.min.to_le_bytes());
+                    absinfo[8..12].copy_from_slice(&info.max.to_le_bytes());
+                    absinfo[12..16].copy_from_slice(&info.fuzz.to_le_bytes());
+                    absinfo[16..20].copy_from_slice(&info.flat.to_le_bytes());
+                    absinfo[20..24].copy_from_slice(&info.res.to_le_bytes());
+                }
                 // SAFETY: `arg` is the user `struct input_absinfo *`.
                 let n = unsafe { copy_to_user_bytes(arg, &absinfo)? };
                 Ok(n as u64)

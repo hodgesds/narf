@@ -970,6 +970,35 @@ pub fn scanout_dims() -> (u32, u32) {
     )
 }
 
+/// Absolute cursor position in pixels, published by an absolute-pointer driver
+/// (virtio-tablet). `u32::MAX` = unset (no absolute device seen yet → the
+/// cursor renderer keeps accumulating relative deltas). An absolute pointer
+/// reports a true screen position every frame, so the drawn cursor can sit
+/// exactly under the host pointer instead of drifting from an arbitrary origin.
+static CURSOR_ABS_X: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+static CURSOR_ABS_Y: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Publish the absolute cursor position (scanout pixels). Called by the
+/// virtio-tablet driver each input frame.
+pub fn set_cursor_abs_px(x: u32, y: u32) {
+    CURSOR_ABS_X.store(x, Ordering::Relaxed);
+    CURSOR_ABS_Y.store(y, Ordering::Relaxed);
+}
+
+/// Latest absolute cursor position in pixels, or `None` if no absolute pointer
+/// has reported yet.
+pub fn cursor_abs_px() -> Option<(u32, u32)> {
+    let x = CURSOR_ABS_X.load(Ordering::Relaxed);
+    let y = CURSOR_ABS_Y.load(Ordering::Relaxed);
+    if x == u32::MAX {
+        None
+    } else {
+        Some((x, y))
+    }
+}
+
 /// Advance the global modifier state by the effect of pressing /
 /// releasing `code` and return the post-event state. Drivers use
 /// this to stamp `KeyEvent::modifiers`. Called automatically by

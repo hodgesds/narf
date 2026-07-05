@@ -228,6 +228,10 @@ pub struct DeviceCaps {
     pub relbit: CapBitmap,
     /// Supported `EV_ABS` axis codes.
     pub absbit: CapBitmap,
+    /// Per-axis absolute-range info (`min`/`max`/…), keyed by ABS code.
+    /// Reported to userspace via `EVIOCGABS` — libinput needs a non-zero
+    /// range to map an absolute pointer's position onto the output.
+    pub abs_info: Vec<(u16, crate::AxisInfo)>,
     /// Bitmask of supported event types (bit = `EventType as u16`).
     pub evbit: u32,
 }
@@ -261,6 +265,24 @@ impl DeviceCaps {
         self.absbit.set(c);
         self.evbit |= 1 << (EventType::Abs as u16);
         self.evbit |= 1 << (EventType::Syn as u16);
+    }
+
+    /// Declare an `EV_ABS` axis `c` together with its range `info`. The range
+    /// is what makes an absolute pointer usable: libinput maps the reported
+    /// position onto the output using `min`/`max` from `EVIOCGABS`, and drops
+    /// the axis entirely if the range is empty.
+    pub fn add_abs_info(&mut self, c: u16, info: crate::AxisInfo) {
+        self.add_abs(c);
+        self.abs_info.retain(|(code, _)| *code != c);
+        self.abs_info.push((c, info));
+    }
+
+    /// Look up the range info for ABS axis `c`, if declared.
+    pub fn abs_info(&self, c: u16) -> Option<crate::AxisInfo> {
+        self.abs_info
+            .iter()
+            .find(|(code, _)| *code == c)
+            .map(|(_, i)| *i)
     }
 
     /// Return `true` if `(type_, code)` is in the capability set.
@@ -816,6 +838,51 @@ pub fn dispatch_pointer_to_node(node: &DeviceNode, dx: i32, dy: i32, btn_changes
             type_: EventType::Rel,
             code: rel::REL_Y,
             value: dy,
+        });
+    }
+    for &(code, pressed) in btn_changes {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Key,
+            code,
+            value: if pressed { 1 } else { 0 },
+        });
+    }
+    node.dispatch(EvdevEvent::syn_report(now));
+}
+
+/// Dispatch an absolute-pointer frame — absolute `ABS_X`/`ABS_Y` position
+/// plus button transitions — to `node` as a single evdev frame. This is how a
+/// QEMU virtio-tablet reports: libinput maps the raw absolute values onto the
+/// output via the device's `EVIOCGABS` range and emits
+/// `POINTER_MOTION_ABSOLUTE`, so the compositor's pointer (and clicks) sit at
+/// the true host-pointer position rather than an accumulated relative guess.
+/// `moved` selects whether the axes are (re-)sent this frame; a button-only
+/// frame carries no motion.
+pub fn dispatch_abs_pointer_to_node(
+    node: &DeviceNode,
+    abs_x: i32,
+    abs_y: i32,
+    moved: bool,
+    btn_changes: &[(u16, bool)],
+) {
+    if !moved && btn_changes.is_empty() {
+        return;
+    }
+    // Monotonic NANOSECONDS — see the note in `dispatch_pointer_to_node`.
+    let now = narf_time::monotonic_ns();
+    if moved {
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Abs,
+            code: abs::ABS_X,
+            value: abs_x,
+        });
+        node.dispatch(EvdevEvent {
+            time: now,
+            type_: EventType::Abs,
+            code: abs::ABS_Y,
+            value: abs_y,
         });
     }
     for &(code, pressed) in btn_changes {

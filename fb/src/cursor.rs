@@ -158,6 +158,18 @@ pub fn drain_and_render(fb: &FbWriter) {
         // p.buttons is dropped on the floor — future click
         // handling will read PointerButtons from the same channel.
     }
+    // An absolute pointer (virtio-tablet) publishes a true screen position;
+    // prefer it over the relative accumulation so the cursor sits exactly under
+    // the host pointer (no origin drift). Clamp the sprite fully on-screen.
+    if let Some((ax, ay)) = narf_input::cursor_abs_px() {
+        let nx = ax.min(fb.width().saturating_sub(W));
+        let ny = ay.min(fb.height().saturating_sub(H));
+        if nx != POS_X.load(Ordering::Relaxed) || ny != POS_Y.load(Ordering::Relaxed) {
+            POS_X.store(nx, Ordering::Release);
+            POS_Y.store(ny, Ordering::Release);
+            moved = true;
+        }
+    }
     // A userspace compositor owns the scanout. Don't paint the kernel
     // console sprite over the desktop — but DO render the compositor's
     // own pointer from the DRM cursor-ioctl state. weston (drm-backend)

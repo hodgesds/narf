@@ -124,6 +124,55 @@ fn smoke_sysfs_kobject_create_with_parent() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_create_with_parent);
 
+/// An absolute pointer (ABS axes + mouse buttons, no relative axes) must be
+/// tagged `ID_INPUT_MOUSE`, NOT `ID_INPUT_TOUCHSCREEN` — that tag is what makes
+/// libinput deliver it as a wl_pointer with `POINTER_MOTION_ABSOLUTE`. Tagging
+/// it as a touchscreen routes it through touch handling and starves apps of
+/// pointer/click events.
+fn smoke_sysfs_abs_pointer_tagged_id_input_mouse() -> TestResult {
+    use narf_input::evdev::{key, DeviceCaps};
+    use narf_input::{abs, AxisInfo};
+
+    let range = AxisInfo {
+        min: 0,
+        max: 0x7FFF,
+        fuzz: 0,
+        flat: 0,
+        res: 0,
+    };
+    let mut caps = DeviceCaps::new();
+    caps.add_abs_info(abs::ABS_X, range);
+    caps.add_abs_info(abs::ABS_Y, range);
+    caps.add_key(key::BTN_LEFT);
+
+    let uevent = crate::sysfs::evdev_caps_uevent(&caps);
+    if !uevent.contains("ID_INPUT_MOUSE=1") {
+        return TestResult::Fail("absolute pointer not tagged ID_INPUT_MOUSE");
+    }
+    if uevent.contains("ID_INPUT_TOUCHSCREEN") {
+        return TestResult::Fail("absolute pointer wrongly tagged ID_INPUT_TOUCHSCREEN");
+    }
+    if !uevent.contains("ABS=") {
+        return TestResult::Fail("ABS capability bitmap missing from uevent");
+    }
+    if uevent.contains("REL=") {
+        return TestResult::Fail("absolute pointer must not advertise REL axes");
+    }
+
+    // A touchscreen (abs axes, NO mouse buttons) still classifies as a
+    // touchscreen — the split must not mis-tag genuine touch devices.
+    let mut touch = DeviceCaps::new();
+    touch.add_abs_info(abs::ABS_X, range);
+    touch.add_abs_info(abs::ABS_Y, range);
+    let tue = crate::sysfs::evdev_caps_uevent(&touch);
+    if !tue.contains("ID_INPUT_TOUCHSCREEN=1") {
+        return TestResult::Fail("buttonless absolute device should stay a touchscreen");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_abs_pointer_tagged_id_input_mouse);
+
 // ── Test 2: Kobject attr show ──────────────────────────────────────────
 
 #[cfg(feature = "linux-compat")]

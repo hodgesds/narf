@@ -32,7 +32,8 @@ use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use narf_input::evdev::{
-    dispatch_pointer_to_node, DeviceCaps, DeviceNode, EvdevEvent, EventType, ROUTER,
+    dispatch_abs_pointer_to_node, dispatch_pointer_to_node, DeviceCaps, DeviceNode, EvdevEvent,
+    EventType, ROUTER,
 };
 use narf_input::{
     abs, push_global, push_key, AbsoluteEvent, ButtonEvent, InputEvent, KeyCode, PointerButtons,
@@ -274,10 +275,22 @@ unsafe fn read_device_metadata(
 ///
 /// # Safety
 /// `region` must be a mapped virtio-input device-config region.
+/// What kind of evdev node a device was registered as — selects how the driver
+/// dispatches its frames (relative deltas, absolute position, or key events).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum EvdevKind {
+    /// Relative pointer (real mouse): `EV_REL` deltas + buttons.
+    Pointer,
+    /// Absolute pointer (virtio-tablet): `EV_ABS` position + buttons.
+    AbsPointer,
+    /// Keyboard: `EV_KEY` passthrough.
+    Keyboard,
+}
+
 unsafe fn register_evdev_node(
     region: &crate::pci::VirtioRegion,
     axis_info: &[Option<narf_input::AxisInfo>; ABS_BOUNDS_LEN],
-) -> (Option<alloc::sync::Arc<DeviceNode>>, bool) {
+) -> (Option<alloc::sync::Arc<DeviceNode>>, EvdevKind) {
     let bit = |buf: &[u8], n: usize, code: usize| {
         let byte = code / 8;
         byte < n && (buf[byte] >> (code % 8)) & 1 != 0
@@ -294,7 +307,8 @@ unsafe fn register_evdev_node(
         .map(|a| a.is_some())
         .unwrap_or(false);
 
-    if has_rel || has_abs {
+    // A real relative mouse: EV_REL deltas + buttons.
+    if has_rel {
         let mut caps = DeviceCaps::new();
         caps.add_rel(REL_X);
         caps.add_rel(REL_Y);
@@ -302,7 +316,39 @@ unsafe fn register_evdev_node(
         caps.add_key(BTN_RIGHT);
         caps.add_key(BTN_MIDDLE);
         let (_id, node) = ROUTER.register_device(caps);
-        return (Some(node), false);
+        return (Some(node), EvdevKind::Pointer);
+    }
+
+    // An absolute pointer (QEMU virtio-tablet): ABS_X/ABS_Y with their real
+    // ranges + mouse buttons, and NO relative axes. Combined with the
+    // ID_INPUT_MOUSE tag (sysfs) this is exactly a Linux absolute pointing
+    // device — libinput maps the reported position onto the output and emits
+    // POINTER_MOTION_ABSOLUTE, so the compositor pointer and clicks land at the
+    // true host-pointer position instead of an accumulated relative guess.
+    if has_abs {
+        let default_range = narf_input::AxisInfo {
+            min: 0,
+            max: 0x7FFF,
+            fuzz: 0,
+            flat: 0,
+            res: 0,
+        };
+        let x_info = axis_info
+            .get(abs::ABS_X as usize)
+            .and_then(|a| *a)
+            .unwrap_or(default_range);
+        let y_info = axis_info
+            .get(abs::ABS_Y as usize)
+            .and_then(|a| *a)
+            .unwrap_or(default_range);
+        let mut caps = DeviceCaps::new();
+        caps.add_abs_info(abs::ABS_X, x_info);
+        caps.add_abs_info(abs::ABS_Y, y_info);
+        caps.add_key(BTN_LEFT);
+        caps.add_key(BTN_RIGHT);
+        caps.add_key(BTN_MIDDLE);
+        let (_id, node) = ROUTER.register_device(caps);
+        return (Some(node), EvdevKind::AbsPointer);
     }
 
     // EV_KEY bitmap — a real keyboard advertises the alphanumeric block.
@@ -319,10 +365,10 @@ unsafe fn register_evdev_node(
             }
         }
         let (_id, node) = ROUTER.register_device(caps);
-        return (Some(node), true);
+        return (Some(node), EvdevKind::Keyboard);
     }
 
-    (None, false)
+    (None, EvdevKind::Pointer)
 }
 
 /// Map an absolute tablet coordinate `v` onto the on-screen pixel `span` of
@@ -434,9 +480,9 @@ pub struct VirtioInputPci {
     /// touchscreens). Drained in `drain_events`, which runs in the pump
     /// task (not IRQ), so dispatching here may lock/alloc.
     evdev_node: Option<alloc::sync::Arc<DeviceNode>>,
-    /// `true` when `evdev_node` is a keyboard (raw EV_KEY passthrough);
-    /// `false` when it's a pointer (abs→rel + button edges at EV_SYN).
-    evdev_is_kbd: bool,
+    /// How to dispatch this device's frames: relative pointer, absolute
+    /// pointer (tablet → EV_ABS position), or keyboard passthrough.
+    evdev_kind: EvdevKind,
     /// Last absolute X / Y sample (tablet) so ABS_X/ABS_Y convert to REL
     /// deltas for the relative evdev node. `i32::MIN` = no prior sample.
     last_abs_x: core::sync::atomic::AtomicI32,
@@ -671,10 +717,10 @@ impl VirtioInputPci {
 
         // Expose the device on /dev/input/event* so a userspace
         // compositor (weston via libinput) can read it.
-        let (evdev_node, evdev_is_kbd) = match device_cfg.as_ref() {
+        let (evdev_node, evdev_kind) = match device_cfg.as_ref() {
             // SAFETY: device-cfg region was just mapped above.
             Some(r) => unsafe { register_evdev_node(r, &axis_info) },
-            None => (None, false),
+            None => (None, EvdevKind::Pointer),
         };
 
         // Scratch buffer for outbound EV_LED events. One 4 KiB
@@ -708,7 +754,7 @@ impl VirtioInputPci {
             led_bits,
             last_leds: core::sync::atomic::AtomicU8::new(0),
             evdev_node,
-            evdev_is_kbd,
+            evdev_kind,
             last_abs_x: core::sync::atomic::AtomicI32::new(i32::MIN),
             last_abs_y: core::sync::atomic::AtomicI32::new(i32::MIN),
             prev_evdev_buttons: core::sync::atomic::AtomicU8::new(0),
@@ -909,7 +955,7 @@ impl VirtioInputPci {
                     // Keyboard evdev passthrough: forward the raw key to
                     // the node so libinput sees real key events. (Pointer
                     // devices forward buttons at EV_SYN instead.)
-                    if self.evdev_is_kbd {
+                    if self.evdev_kind == EvdevKind::Keyboard {
                         if let Some(node) = &self.evdev_node {
                             node.dispatch(EvdevEvent {
                                 time: narf_time::monotonic_ns(),
@@ -1099,11 +1145,11 @@ impl VirtioInputPci {
                     }
                     // Evdev frame flush so a userspace compositor sees it.
                     if let Some(node) = &self.evdev_node {
-                        if self.evdev_is_kbd {
+                        if self.evdev_kind == EvdevKind::Keyboard {
                             node.dispatch(EvdevEvent::syn_report(narf_time::monotonic_ns()));
                         } else {
-                            // Pointer node: relative motion + button
-                            // press/release edges, one evdev frame.
+                            // Pointer node: button press/release edges, one
+                            // evdev frame — shared by relative and absolute.
                             let cur = (buttons.contains(PointerButtons::LEFT) as u8)
                                 | ((buttons.contains(PointerButtons::RIGHT) as u8) << 1)
                                 | ((buttons.contains(PointerButtons::MIDDLE) as u8) << 2);
@@ -1123,7 +1169,39 @@ impl VirtioInputPci {
                                 edges[n] = (BTN_MIDDLE, cur & 4 != 0);
                                 n += 1;
                             }
-                            dispatch_pointer_to_node(node, dx, dy, &edges[..n]);
+                            if self.evdev_kind == EvdevKind::AbsPointer {
+                                // Absolute pointer: report the true device
+                                // position; libinput maps it onto the output
+                                // and emits POINTER_MOTION_ABSOLUTE.
+                                let ax = self.last_abs_x.load(Ordering::Acquire);
+                                let ay = self.last_abs_y.load(Ordering::Acquire);
+                                let moved = dx != 0 || dy != 0;
+                                dispatch_abs_pointer_to_node(node, ax, ay, moved, &edges[..n]);
+                            } else {
+                                dispatch_pointer_to_node(node, dx, dy, &edges[..n]);
+                            }
+                        }
+                    }
+                    // Absolute pointer: drive the kernel-drawn cursor from the
+                    // true position too, so it sits exactly under the host
+                    // pointer (WYSIWYG) instead of accumulating from an
+                    // arbitrary origin — matches where the compositor puts its
+                    // pointer, so clicks land under the visible cursor.
+                    if self.evdev_kind == EvdevKind::AbsPointer {
+                        let raw_x = self.last_abs_x.load(Ordering::Acquire);
+                        let raw_y = self.last_abs_y.load(Ordering::Acquire);
+                        // i32::MIN = no sample seen yet (see last_abs_* init).
+                        if raw_x != i32::MIN && raw_y != i32::MIN {
+                            let (scan_w, scan_h) = narf_input::scanout_dims();
+                            let xi = self.axis_info.get(abs::ABS_X as usize).and_then(|a| *a);
+                            let yi = self.axis_info.get(abs::ABS_Y as usize).and_then(|a| *a);
+                            let px = abs_to_px(raw_x, xi, scan_w as i64)
+                                .clamp(0, scan_w.saturating_sub(1) as i32)
+                                as u32;
+                            let py = abs_to_px(raw_y, yi, scan_h as i64)
+                                .clamp(0, scan_h.saturating_sub(1) as i32)
+                                as u32;
+                            narf_input::set_cursor_abs_px(px, py);
                         }
                     }
                     // Flush every dirty MT slot as one Touch event.

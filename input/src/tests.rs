@@ -82,6 +82,74 @@ fn smoke_input_evdev_pointer_frame_carries_button() -> TestResult {
 }
 kernel_test_in!("input", smoke_input_evdev_pointer_frame_carries_button);
 
+fn smoke_input_evdev_abs_pointer_frame_is_absolute() -> TestResult {
+    use crate::evdev::{dispatch_abs_pointer_to_node, key, DeviceCaps, EventType, ROUTER};
+    use crate::{abs, AxisInfo};
+
+    // An absolute pointer (virtio-tablet): ABS_X/ABS_Y with a range + buttons,
+    // and crucially NO relative axes.
+    let range = AxisInfo {
+        min: 0,
+        max: 0x7FFF,
+        fuzz: 0,
+        flat: 0,
+        res: 0,
+    };
+    let mut caps = DeviceCaps::new();
+    caps.add_abs_info(abs::ABS_X, range);
+    caps.add_abs_info(abs::ABS_Y, range);
+    caps.add_key(key::BTN_LEFT);
+    // The range must round-trip so EVIOCGABS can report it (libinput drops an
+    // absolute axis with an empty range).
+    if caps.abs_info(abs::ABS_X).map(|a| a.max) != Some(0x7FFF) {
+        return TestResult::Fail("abs_info range did not round-trip through DeviceCaps");
+    }
+    if caps.relbit.get(crate::evdev::rel::REL_X) {
+        return TestResult::Fail("absolute pointer must not advertise REL_X");
+    }
+
+    let (id, node) = ROUTER.register_device(caps);
+    let reader = match ROUTER.open_reader(id) {
+        Some(r) => r,
+        None => return TestResult::Fail("open_reader failed"),
+    };
+
+    // One frame: absolute position (16000, 12000) with the left button down.
+    dispatch_abs_pointer_to_node(&node, 16000, 12000, true, &[(key::BTN_LEFT, true)]);
+
+    let mut saw_absx = false;
+    let mut saw_absy = false;
+    let mut saw_btn = false;
+    let mut saw_syn = false;
+    let mut saw_rel = false;
+    while let Some(ev) = reader.poll_event() {
+        match ev.type_ {
+            EventType::Abs if ev.code == abs::ABS_X && ev.value == 16000 => saw_absx = true,
+            EventType::Abs if ev.code == abs::ABS_Y && ev.value == 12000 => saw_absy = true,
+            EventType::Key if ev.code == key::BTN_LEFT && ev.value == 1 => saw_btn = true,
+            EventType::Rel => saw_rel = true,
+            EventType::Syn => saw_syn = true,
+            _ => {}
+        }
+    }
+    ROUTER.unregister_device(id);
+
+    if saw_rel {
+        return TestResult::Fail("absolute pointer frame must not emit EV_REL");
+    }
+    if !saw_absx || !saw_absy {
+        return TestResult::Fail("absolute ABS_X/ABS_Y position missing from frame");
+    }
+    if !saw_btn {
+        return TestResult::Fail("button BTN_LEFT press missing from absolute frame");
+    }
+    if !saw_syn {
+        return TestResult::Fail("SYN_REPORT frame terminator missing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("input", smoke_input_evdev_abs_pointer_frame_is_absolute);
+
 fn smoke_input_ring_overflow_drops_oldest() -> TestResult {
     use crate::{EventRing, InputEvent, KeyCode, KeyEvent, Modifiers};
     let r = EventRing::new(2);

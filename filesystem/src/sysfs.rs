@@ -573,7 +573,7 @@ fn fmt_cap_bitmap(words: &[u64]) -> alloc::string::String {
 /// `60-input-id` builtin) reads these to set `ID_INPUT*` — without them
 /// libinput skips the device entirely. Linux ref: `input_add_uevent_bm_var`
 /// (drivers/input/input.c).
-fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::string::String {
+pub(crate) fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::string::String {
     use narf_input::evdev::EventType;
     let mut s = format!("EV={:x}\n", caps.evbit);
     let has_key = caps.evbit & (1 << (EventType::Key as u16)) != 0;
@@ -598,7 +598,17 @@ fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::string::Str
     // a relative pointer is a mouse, an absolute device a touchscreen,
     // otherwise a key-only device is a keyboard.
     s.push_str("ID_INPUT=1\n");
+    // BTN_LEFT (0x110) present ⇒ the device carries mouse buttons.
+    let has_mouse_btn = caps.keybit.get(0x110);
     if has_rel {
+        s.push_str("ID_INPUT_MOUSE=1\n");
+    } else if has_abs && has_mouse_btn {
+        // Absolute axes + mouse buttons + no direct-touch property = an
+        // absolute pointer (QEMU virtio-tablet). udev's input_id tags this
+        // ID_INPUT_MOUSE, and libinput turns it into a wl_pointer that reports
+        // POINTER_MOTION_ABSOLUTE — so the pointer sits at the true host
+        // position. Tagging it TOUCHSCREEN instead would route it through
+        // touch handling and starve apps of pointer/click events.
         s.push_str("ID_INPUT_MOUSE=1\n");
     } else if has_abs {
         s.push_str("ID_INPUT_TOUCHSCREEN=1\n");
