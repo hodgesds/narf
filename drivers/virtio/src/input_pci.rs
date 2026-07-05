@@ -325,8 +325,8 @@ unsafe fn register_evdev_node(
     (None, false)
 }
 
-/// Map an absolute tablet coordinate `v` onto a nominal ~1024-unit pixel
-/// span using the device's advertised range, so an absolute pointer can be
+/// Map an absolute tablet coordinate `v` onto the on-screen pixel `span` of
+/// its axis using the device's advertised range, so an absolute pointer can be
 /// tracked as a relative mouse without the pointer flying off screen.
 ///
 /// A tablet reports its position over the full 0..range space (QEMU's
@@ -335,20 +335,23 @@ unsafe fn register_evdev_node(
 /// results as the relative delta; because each is derived from an absolute
 /// sample, sub-pixel motion isn't lost the way scaling a tiny per-event delta
 /// by integer division would.
-fn abs_to_px(v: i32, info: Option<narf_input::AxisInfo>) -> i32 {
-    // Nominal pixel span the full axis maps to. Exactness doesn't matter —
-    // libinput applies its own pointer acceleration on top — it only needs to
-    // be pixel-scale rather than device-unit-scale.
-    const NOMINAL: i64 = 1024;
+///
+/// `span` is the pixel extent of *this* axis (scanout width for ABS_X, height
+/// for ABS_Y). The device range is square but the screen usually isn't, so
+/// using one nominal span for both axes stretches the shorter one — mapping
+/// each axis onto its real dimension keeps motion 1:1 with the host pointer.
+fn abs_to_px(v: i32, info: Option<narf_input::AxisInfo>, span: i64) -> i32 {
     match info {
         Some(a) if a.max > a.min => {
-            (((v.clamp(a.min, a.max) - a.min) as i64 * NOMINAL) / (a.max - a.min) as i64) as i32
+            (((v.clamp(a.min, a.max) - a.min) as i64 * span) / (a.max - a.min) as i64) as i32
         }
         // No range advertised: fall back to a fixed ~1/32 shrink so the raw
         // 0..0x7FFF sample still lands in pixel scale.
         _ => v / 32,
     }
 }
+
+mod abs_px_tests;
 
 #[derive(Debug)]
 struct Queues {
@@ -1053,18 +1056,21 @@ impl VirtioInputPci {
                         // and the delta is the difference of two pixel positions
                         // — computing from absolute samples each event avoids the
                         // precision loss of scaling tiny per-event deltas.
+                        let (scan_w, scan_h) = narf_input::scanout_dims();
                         if code == abs::ABS_X {
                             let info = self.axis_info.get(abs::ABS_X as usize).and_then(|a| *a);
                             let last = self.last_abs_x.swap(signed, Ordering::AcqRel);
                             if last != i32::MIN {
-                                let d = abs_to_px(signed, info) - abs_to_px(last, info);
+                                let d = abs_to_px(signed, info, scan_w as i64)
+                                    - abs_to_px(last, info, scan_w as i64);
                                 self.rel_dx_acc.fetch_add(d, Ordering::Relaxed);
                             }
                         } else if code == abs::ABS_Y {
                             let info = self.axis_info.get(abs::ABS_Y as usize).and_then(|a| *a);
                             let last = self.last_abs_y.swap(signed, Ordering::AcqRel);
                             if last != i32::MIN {
-                                let d = abs_to_px(signed, info) - abs_to_px(last, info);
+                                let d = abs_to_px(signed, info, scan_h as i64)
+                                    - abs_to_px(last, info, scan_h as i64);
                                 self.rel_dy_acc.fetch_add(d, Ordering::Relaxed);
                             }
                         }

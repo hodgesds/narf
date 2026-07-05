@@ -134,6 +134,10 @@ fn restore(fb: &FbWriter, save: &SavedRect) -> Result<(), crate::FbWriteError> {
 /// `narf_input::pop_key` / `pop_ascii_byte` / `pop_scroll`.
 pub fn drain_and_render(fb: &FbWriter) {
     init_centre(fb);
+    // Publish the live scanout size so the absolute-pointer driver
+    // (virtio-tablet) maps each axis onto its true on-screen extent
+    // instead of a square nominal span (which stretches the shorter axis).
+    narf_input::set_scanout_dims(fb.width(), fb.height());
     let mut moved = false;
     // Bound the drain by ring capacity (256) so a producer that's
     // outpacing us doesn't trap the loop.

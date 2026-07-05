@@ -937,6 +937,39 @@ pub fn current_modifiers() -> Modifiers {
     Modifiers::from_bits_truncate(MODIFIER_STATE.load(core::sync::atomic::Ordering::Acquire))
 }
 
+/// Active scanout pixel dimensions, published by the framebuffer layer so
+/// absolute-pointer drivers can map each axis onto its true on-screen extent.
+///
+/// A tablet/touchscreen reports its position over a *square* device range
+/// (QEMU virtio-tablet: 0..0x7FFF on both axes) that covers the whole screen.
+/// Scaling both axes to one nominal span stretches the shorter axis — on a
+/// 1024×768 output, mapping Y to a 1024-px span runs the pointer 1024/768 ≈
+/// 1.33× fast vertically. Mapping each axis onto its real dimension keeps the
+/// reconstructed motion 1:1 with the host pointer on both axes. Defaults to
+/// 1024×768 (the common mode) until the fb layer publishes the live scanout.
+static SCANOUT_W: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1024);
+static SCANOUT_H: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(768);
+
+/// Publish the active scanout's pixel dimensions. Called from the fb cursor
+/// pump as it resolves the active scanout; zero values are ignored so a
+/// half-initialised mode never clobbers a good one.
+pub fn set_scanout_dims(w: u32, h: u32) {
+    if w != 0 {
+        SCANOUT_W.store(w, Ordering::Relaxed);
+    }
+    if h != 0 {
+        SCANOUT_H.store(h, Ordering::Relaxed);
+    }
+}
+
+/// `(width, height)` of the active scanout in pixels.
+pub fn scanout_dims() -> (u32, u32) {
+    (
+        SCANOUT_W.load(Ordering::Relaxed),
+        SCANOUT_H.load(Ordering::Relaxed),
+    )
+}
+
 /// Advance the global modifier state by the effect of pressing /
 /// releasing `code` and return the post-event state. Drivers use
 /// this to stamp `KeyEvent::modifiers`. Called automatically by
