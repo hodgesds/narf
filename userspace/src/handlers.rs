@@ -1360,13 +1360,23 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         };
         let off = entry.offset;
         let nonblock = entry.status_flags & crate::fd::O_NONBLOCK != 0;
-        // Non-blocking read on an fd that blocks internally on empty (evdev
-        // nodes): poll the future once and surface EAGAIN rather than
-        // spin-pumping `poll_blocking` for millions of iterations (which then
-        // returns the wrong errno). Regular files (default false) keep the
-        // blocking drive — Linux ignores O_NONBLOCK on them; sockets/pipes
-        // resolve on the first poll so this path is equivalent for them.
-        if nonblock && entry.ops.nonblock_read_eagain() {
+        // evdev device nodes (`nonblock_read_eagain`) provide EAGAIN-on-empty
+        // semantics UNCONDITIONALLY — independent of the fd's O_NONBLOCK bit.
+        //
+        // Why not gate on `nonblock`: libinput/libevdev consume evdev nodes with
+        // a drain-to-EAGAIN loop and are structurally incompatible with a
+        // BLOCKING evdev fd (the sync loop never terminates; the post-epoll read
+        // must not stall the single-threaded dispatch). Their fds SHOULD be
+        // O_NONBLOCK, but when weston opens an input device through libseat/seatd
+        // the fd arrives over SCM_RIGHTS, and NARF installs received fds with
+        // status_flags = 0 (O_NONBLOCK is dropped — it lives per-FdEntry, not on
+        // the shared FileOps). The old `nonblock &&` gate then sent that fd down
+        // the `poll_blocking` path, which busy-spins the empty-ring read future
+        // ~4M times and finally returns Err(ReadOnly) → read() reports EIO →
+        // libinput treats the read error as device-removal and `EPOLL_CTL_DEL`s
+        // the device, so the pointer goes dead. Surfacing EAGAIN here (what an
+        // evdev node is *for*) fixes that and matches how these devices are used.
+        if entry.ops.nonblock_read_eagain() {
             return match poll_once(entry.ops.read(off, &mut kbuf)) {
                 Some(Ok(n)) if n > 0 => {
                     entry.offset = off.saturating_add(n as u64);
