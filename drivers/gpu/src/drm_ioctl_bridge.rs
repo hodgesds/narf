@@ -612,7 +612,7 @@ const PLANE_ID_BASE: u32 = 0x40;
 /// Property id of the plane "type" enum (a separate id space from objects).
 const PLANE_TYPE_PROP_ID: u32 = 0x50;
 const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
-const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 1;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 /// DRM_FORMAT_XRGB8888 — the one scanout format the pixman path uses.
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -720,9 +720,23 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
     out[24..24 + name.len()].copy_from_slice(name);
     // For an ENUM property the entries go to ENUM_BLOB_PTR (offset 8) and
     // are counted by count_enum_blobs (offset 60); values_ptr/count_values
-    // are for range properties and stay zero. Each entry is
-    // `drm_mode_property_enum { __u64 value; char name[32]; }` = 40 bytes.
+    // (offsets 0 and 56) MUST ALSO be populated with the valid enum values.
+    // `modetest` iterates over both and asserts they are present.
+    // Each enum entry is `drm_mode_property_enum { __u64 value; char name[32]; }` = 40 bytes.
     let enums: [(u64, &[u8]); 3] = [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
+
+    let values_ptr = u64::from_le_bytes(out[0..8].try_into().unwrap());
+    let user_values_count = u32::from_le_bytes(out[56..60].try_into().unwrap());
+    if values_ptr != 0 && user_values_count as usize >= enums.len() {
+        let mut buf = alloc::vec![0u8; enums.len() * 8];
+        for (i, (val, _)) in enums.iter().enumerate() {
+            buf[i * 8..i * 8 + 8].copy_from_slice(&val.to_le_bytes());
+        }
+        // SAFETY: `values_ptr` is the user array out-pointer sized
+        // for `user_values_count` >= 3 entries of 8 bytes each.
+        unsafe { copy_out(values_ptr as usize, &buf)? };
+    }
+
     let enum_blob_ptr = u64::from_le_bytes(out[8..16].try_into().unwrap());
     let user_enum_count = u32::from_le_bytes(out[60..64].try_into().unwrap());
     if enum_blob_ptr != 0 && user_enum_count as usize >= enums.len() {
@@ -736,7 +750,7 @@ fn handle_getproperty(arg: usize) -> Result<u64, FsError> {
         // for `user_enum_count` >= 3 entries of 40 bytes each.
         unsafe { copy_out(enum_blob_ptr as usize, &buf)? };
     }
-    out[56..60].copy_from_slice(&0u32.to_le_bytes()); // count_values (range only)
+    out[56..60].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_values
     out[60..64].copy_from_slice(&(enums.len() as u32).to_le_bytes()); // count_enum_blobs
 
     // SAFETY: `arg` is the validated 64-byte out-pointer.
