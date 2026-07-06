@@ -10576,6 +10576,8 @@ fn release_task_tables(tid: u64) {
     }
 
     // Timers: a post-mortem expiry must not raise a phantom signal.
+    // POSIX timers only exist in the linux-compat build.
+    #[cfg(feature = "linux-compat")]
     crate::posix_timer::release_task_timers(tid);
 
     // Console signal routing: if the dying task was the recorded
@@ -13949,6 +13951,8 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     if let Some(m) = ROBUST_LIST_TABLE.lock().as_mut() {
         m.remove(&task);
     }
+    // clear_child_tid tracking is a linux-compat-only path.
+    #[cfg(feature = "linux-compat")]
     let _ = take_clear_child_tid(task);
     // FD_CLOEXEC sweep: close every fd marked close-on-exec (Linux
     // does this in the exec path). Without it, O_CLOEXEC fds leak

@@ -791,6 +791,9 @@ kernel_test_in!("userspace/process", smoke_task_refcount_lifetime);
 /// orphanized (their PARENT_OF rows removed so later exits auto-release).
 /// Regression for the ~40-table teardown leak class (tids are monotonic,
 /// so a missed row lived forever and kept receiving signals/timer fires).
+// Exercises ITIMER_REAL teardown (posix_timer test hooks), which only exist in
+// the linux-compat build.
+#[cfg(feature = "linux-compat")]
 fn smoke_exit_sweeps_task_tables() -> TestResult {
     const TID: u64 = 0xF1_00;
     const PID: u64 = 0xF1_01;
@@ -857,6 +860,7 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     }
     TestResult::Pass
 }
+#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace/process", smoke_exit_sweeps_task_tables);
 
 /// CLONE_FILES shares ONE fd table across threads; fork gets an independent
