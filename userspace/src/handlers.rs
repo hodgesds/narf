@@ -17374,7 +17374,12 @@ fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
     // Every word still matches: park on the first real word (bounded, like
     // futex_wait), then resume as a spurious wake of index 0 (the caller
     // re-checks all of them).
-    futex_wait_core(ctx, park_uaddr, read_user_u32(park_uaddr), FUTEX2_PARK_CAP_NS);
+    futex_wait_core(
+        ctx,
+        park_uaddr,
+        read_user_u32(park_uaddr),
+        FUTEX2_PARK_CAP_NS,
+    );
 }
 
 /// Linux tgkill(2): like kill but with an explicit (tgid, tid)
