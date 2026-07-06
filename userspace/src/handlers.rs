@@ -5260,9 +5260,26 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
         }
     };
 
+    // The robust-list head and every node/lock pointer are fully
+    // user-controlled and may be bogus (robust_smoke deliberately registers
+    // head = 0x1234abcd0000). `copy_from_user` range-validates canonicality
+    // but has no page-fault fixup, so a raw read of an unmapped-but-canonical
+    // address faults the kernel fatally. Probe the current address space first
+    // — an unmapped address ends the walk instead of crashing. (Linux's
+    // exit_robust_list relies on get_user fault fixup for the same safety.)
+    let user_mapped = |uaddr: u64| -> bool {
+        current_address_space()
+            .map(|as_ref| as_ref.lookup(VirtAddr::new(uaddr)).is_some())
+            .unwrap_or(false)
+    };
+
     let read_u64 = |uaddr: u64| -> Option<u64> {
+        if !user_mapped(uaddr) {
+            return None;
+        }
         let mut b = [0u8; 8];
-        // SAFETY: copy_from_user range-validates + SMAP-brackets the read.
+        // SAFETY: mapping-probed above; copy_from_user range-validates +
+        // SMAP-brackets the read.
         unsafe { copy_from_user(&mut b, uaddr).ok()? };
         Some(u64::from_le_bytes(b))
     };
@@ -5278,8 +5295,14 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
         if uaddr == 0 || uaddr & 3 != 0 {
             return;
         }
+        // Same defense as the list walk: the futex word address derives from
+        // user-controlled pointers + offset and may be unmapped.
+        if !user_mapped(uaddr) {
+            return;
+        }
         let mut b = [0u8; 4];
-        // SAFETY: copy_from_user range-validates + SMAP-brackets the read.
+        // SAFETY: mapping-probed above; copy_from_user range-validates +
+        // SMAP-brackets the read.
         if unsafe { copy_from_user(&mut b, uaddr) }.is_err() {
             return;
         }
@@ -6040,7 +6063,14 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
             return;
         }
     };
-    if pid != current_task_id() {
+    // Detect a self-target across BOTH id spaces: `pid` here is whatever the
+    // caller passed, and getpid() returns the VISIBLE ProcessId
+    // (task_to_pid_raw), not the raw scheduler TaskId. Comparing only against
+    // current_task_id() misfires for any task whose visible pid differs from
+    // its tid — it then takes the cross-AS path and fails on address_space_of
+    // returning None → ESRCH (observed as pvm_smoke `pvm-fail: readv`).
+    let self_pid = task_to_pid_raw(current_task_id()).unwrap_or_else(current_task_id);
+    if pid != current_task_id() && pid != self_pid {
         match pid_to_task_raw(pid) {
             Some(tid) => match narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)) {
                 Some(r) if Arc::ptr_eq(&r, &cur_as) => {}
