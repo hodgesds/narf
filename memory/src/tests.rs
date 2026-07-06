@@ -160,7 +160,13 @@ fn smoke_pks_enforces_deny_all() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    let virt = VirtAddr::new(0x2_0000_1000);
+    // Map at 1 TiB + 8 GiB (PML4[2]): outside the low identity map
+    // (0..512 GiB, filled with 1-GiB huge pages that map_4kb can't
+    // sub-divide → EncounteredHugePage) and in the kernel PML4's empty
+    // user-reserved range, so map_4kb builds a real 4 KiB leaf. The old
+    // 0x2_0000_1000 (8 GiB) fell inside a huge page once the low map grew
+    // from 4 GiB to 512 GiB, which is what made this test start failing.
+    let virt = VirtAddr::new(0x0000_0102_0000_1000);
     let phys = frame.start_address();
     let flags = PtFlags::WRITABLE | PtFlags::pk(9);
 
@@ -1064,7 +1070,12 @@ fn smoke_domain_switch() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    let virt = VirtAddr::new(0x4_0000_1000);
+    // Map at 1 TiB + 16 GiB (PML4[2]): outside the low identity map
+    // (0..512 GiB of 1-GiB huge pages map_4kb can't sub-divide) and in the
+    // kernel PML4's empty user-reserved range, so map_4kb builds a real
+    // 4 KiB leaf. The old 0x4_0000_1000 (16 GiB) fell inside a huge page
+    // once the low map grew from 4 GiB to 512 GiB → map_4kb failed.
+    let virt = VirtAddr::new(0x0000_0104_0000_1000);
     let phys = frame.start_address();
     let driver_pk = DomainId::DRIVER_0.raw(); // 9
 
