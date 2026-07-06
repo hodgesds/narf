@@ -975,10 +975,8 @@ pub fn scanout_dims() -> (u32, u32) {
 /// cursor renderer keeps accumulating relative deltas). An absolute pointer
 /// reports a true screen position every frame, so the drawn cursor can sit
 /// exactly under the host pointer instead of drifting from an arbitrary origin.
-static CURSOR_ABS_X: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
-static CURSOR_ABS_Y: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
+static CURSOR_ABS_X: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+static CURSOR_ABS_Y: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Publish the absolute cursor position (scanout pixels). Called by the
 /// virtio-tablet driver each input frame.

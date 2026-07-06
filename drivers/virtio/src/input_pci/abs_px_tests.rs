@@ -92,8 +92,14 @@ fn smoke_abs_to_px_no_axisinfo_fallback() -> TestResult {
     TestResult::Pass
 }
 
-kernel_test_in!("drivers/virtio/input_pci", smoke_abs_to_px_full_sweep_is_span);
-kernel_test_in!("drivers/virtio/input_pci", smoke_abs_to_px_midpoint_per_axis);
+kernel_test_in!(
+    "drivers/virtio/input_pci",
+    smoke_abs_to_px_full_sweep_is_span
+);
+kernel_test_in!(
+    "drivers/virtio/input_pci",
+    smoke_abs_to_px_midpoint_per_axis
+);
 kernel_test_in!(
     "drivers/virtio/input_pci",
     smoke_abs_to_px_monotonic_and_clamped
