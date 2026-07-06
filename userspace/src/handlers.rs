@@ -7835,7 +7835,12 @@ fn sys_process_madvise(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    if target_pid != task {
+    // The pidfd was opened on getpid() = the VISIBLE ProcessId, so a self
+    // pidfd's target_pid is the visible pid, not the raw TaskId — accept either
+    // as "self" (otherwise a self-directed process_madvise wrongly EPERMs, seen
+    // as mem2_smoke `mem2-fail: process_madvise`).
+    let self_pid = task_to_pid_raw(task).unwrap_or(task);
+    if target_pid != task && target_pid != self_pid {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM (foreign AS)
         return;
     }
@@ -17250,15 +17255,28 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
     ctx.set_return(SyscallReturn::ok(0));
 }
 
+/// Bounded cooperative-park cap for the futex2 wait ops. Unlike the classic
+/// `sys_futex` FUTEX_WAIT — whose no-timeout park is infinite (`u64::MAX`) and
+/// only ever resumed by a FUTEX_WAKE waker (matching Linux block-until-woken) —
+/// the futex2 `futex_wait`/`futex_waitv` are documented (and smoke-tested) to
+/// park via a *bounded* yield and resume with 0, letting the caller's recheck
+/// loop re-arm. Passing 0 here would map to an infinite deadline that the poll
+/// routine's one-tick fallback re-parks forever (never resuming to user mode),
+/// so a self-directed wait with no concurrent waker hangs. A finite cap makes
+/// the park expire → resume 0 (POSIX-permitted spurious wake); a real waker
+/// still fires promptly through the per-uaddr wait queue well before the cap.
+const FUTEX2_PARK_CAP_NS: u64 = 50_000_000; // 50 ms
+
 /// Linux futex2 `futex_wait(uaddr, val, mask, flags, timeout, clockid)`
 /// (x86_64=455, aarch64=455). The futex2 split of the classic FUTEX_WAIT
 /// op: same wait word, value-checked, but carries an explicit `mask` and
 /// a `flags` word selecting the access size (FUTEX2_SIZE_U32, the only
 /// width NARF parks on). `timeout` is an absolute `timespec*`; the
-/// cooperative park is already bounded, so we don't decode it precisely.
+/// cooperative park is bounded (see `FUTEX2_PARK_CAP_NS`), so we don't
+/// decode it precisely.
 fn sys_futex_wait(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    futex_wait_core(ctx, args.arg0, args.arg1 as u32, 0);
+    futex_wait_core(ctx, args.arg0, args.arg1 as u32, FUTEX2_PARK_CAP_NS);
 }
 
 /// Linux futex2 `futex_wake(uaddr, mask, nr, flags)` (x86_64=454,
@@ -17349,9 +17367,10 @@ fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
             park_uaddr = uaddr;
         }
     }
-    // Every word still matches: park on the first real word, then resume as
-    // a spurious wake of index 0 (the caller re-checks all of them).
-    futex_wait_core(ctx, park_uaddr, read_user_u32(park_uaddr), 0);
+    // Every word still matches: park on the first real word (bounded, like
+    // futex_wait), then resume as a spurious wake of index 0 (the caller
+    // re-checks all of them).
+    futex_wait_core(ctx, park_uaddr, read_user_u32(park_uaddr), FUTEX2_PARK_CAP_NS);
 }
 
 /// Linux tgkill(2): like kill but with an explicit (tgid, tid)
