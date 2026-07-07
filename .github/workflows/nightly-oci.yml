@@ -95,9 +95,38 @@ jobs:
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           XTASK_RI_ECHO_TIMEOUT_SECS: "900"
+          # Route COM2 to a file so a kernel crash here (an intermittent #UD has
+          # been seen during container teardown — a corrupt fn-pointer/vtable
+          # call, same class as the open task-#87 SMP corruption) yields a
+          # DECODABLE core (NT_PRSTATUS + a PT_LOAD of the kernel stack), not
+          # just a scrolled register dump. Decode: `gdb <kernel-elf> <core>
+          # -ex bt`.
+          NARF_QEMU_COM2_FILE: "${{ runner.temp }}/oci-core.bin"
         run: >
           cargo xtask run-interactive
           --arch=x86_64
           --features container
           --cmd "oci_smoke"
           --expect "oci-uts-isolated"
+      # Only when a crash core was actually written: stage it + the matching
+      # kernel ELF for upload. Skips the ~230 MB ELF entirely on a clean run.
+      - name: stage crash artifacts (only if core captured)
+        id: core
+        if: always()
+        run: |
+          if [ -s "${{ runner.temp }}/oci-core.bin" ]; then
+            cp target/x86_64-unknown-none/debug/narf-frame "${{ runner.temp }}/narf-frame"
+            echo "crashed=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -f "${{ runner.temp }}/oci-core.bin"
+            echo "crashed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: upload kernel core + ELF (on crash)
+        if: always() && steps.core.outputs.crashed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-kernel-core
+          path: |
+            ${{ runner.temp }}/oci-core.bin
+            ${{ runner.temp }}/narf-frame
+          if-no-files-found: ignore
