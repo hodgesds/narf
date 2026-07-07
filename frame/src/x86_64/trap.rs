@@ -1083,12 +1083,15 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // address) the faulting RIP is useless — the call chain and the
     // corrupted return address live on the stack. Dump raw words from RSP
     // so they can be resolved offline against the kernel ELF
-    // (`addr2line -e <elf>`). Guard RSP: 8-aligned and canonical, so a
-    // wild RSP doesn't cascade into a double fault here.
-    let sp = frame.rsp;
-    let canonical = sp >= 0x1000
-        && sp & 0x7 == 0
-        && !(0x0000_8000_0000_0000..0xFFFF_8000_0000_0000).contains(&sp);
+    // (`addr2line -e <elf>`). ALIGN RSP DOWN to 8 rather than requiring
+    // 8-alignment: a control-flow corruption often leaves RSP itself
+    // misaligned (e.g. the observed wild-`rip` #UD had `rsp` ending in 0xC),
+    // and skipping the dump there loses exactly the crash we most need it for.
+    // Still guard canonical + non-null so a wild RSP can't cascade to a double
+    // fault.
+    let sp = frame.rsp & !0x7u64;
+    let canonical =
+        sp >= 0x1000 && !(0x0000_8000_0000_0000..0xFFFF_8000_0000_0000).contains(&sp);
     if canonical {
         let _ = writeln!(TrapWriter, "  stack @ rsp {:#018x}:", sp);
         for row in 0..10u64 {
@@ -1107,6 +1110,48 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 "    {:#018x}: {:016x} {:016x} {:016x} {:016x}",
                 base, w[0], w[1], w[2], w[3]
             );
+        }
+
+        // Filtered backtrace: for a control-flow corruption the faulting RIP is
+        // garbage, but the stack still holds the return addresses of the frames
+        // that led here. Scan a window of stack words for values inside the
+        // kernel .text range and print them (with their offset from
+        // __text_start, so `addr2line -e <elf> <off>` names each frame) — the
+        // approximate call chain, no offline stack-word triage needed.
+        // SAFETY: __text_start/__text_end are linker-provided kernel-VA symbols.
+        extern "C" {
+            static __text_start: u8;
+            static __text_end: u8;
+        }
+        let tstart = core::ptr::addr_of!(__text_start) as u64;
+        let tend = core::ptr::addr_of!(__text_end) as u64;
+        if tend > tstart {
+            let _ = writeln!(
+                TrapWriter,
+                "  backtrace (stack words in kernel .text [{:#x}..{:#x}], +off = addr2line):",
+                tstart, tend
+            );
+            let mut printed = 0u32;
+            for i in 0..128u64 {
+                if printed >= 16 {
+                    break;
+                }
+                // SAFETY: same canonical/aligned RSP guard as the dump above.
+                let v = unsafe { core::ptr::read_volatile((sp + i * 8) as *const u64) };
+                if v >= tstart && v < tend {
+                    let _ = writeln!(
+                        TrapWriter,
+                        "    [{:#06x}] {:#018x}  (+{:#x})",
+                        i * 8,
+                        v,
+                        v - tstart
+                    );
+                    printed += 1;
+                }
+            }
+            if printed == 0 {
+                let _ = writeln!(TrapWriter, "    (no .text return addresses found in window)");
+            }
         }
     }
 
