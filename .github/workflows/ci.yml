@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Nightly + on-demand runs so the non-blocking task-#87 repro job can keep
+  # trying to catch the rare SMP migration #UD with a decodable core, without
+  # taxing every push (it is gated to these events — see the job's `if:`).
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -305,7 +311,103 @@ jobs:
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           NARF_QEMU_SMP: "1"
+          # Route a 2nd serial (COM2) to a file so a kernel core is captured if
+          # the guest ever #UD/#GP/#PFs here despite the SMP=1 pin. The trap
+          # handler writes an ELF core (NT_PRSTATUS + a PT_LOAD of the kernel
+          # stack) out COM2 (see frame/src/x86_64/trap.rs).
+          NARF_QEMU_COM2_FILE: "${{ runner.temp }}/netsmoke-core.bin"
         run: cargo xtask net-smoke --arch=x86_64
+      # Drop the core file unless it actually holds a crash dump (QEMU creates
+      # it empty when no core is written), so the upload only fires on a crash.
+      - name: keep core only if non-empty
+        if: always()
+        run: '[ -s "${{ runner.temp }}/netsmoke-core.bin" ] || rm -f "${{ runner.temp }}/netsmoke-core.bin"'
+      - name: upload kernel core (net-smoke)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netsmoke-kernel-core
+          path: ${{ runner.temp }}/netsmoke-core.bin
+          if-no-files-found: ignore
+
+  # Best-effort reproducer + core-capture for the OPEN task-#87 SMP user-task
+  # migration #UD (redis's clone(2) bio threads faulting with a corrupt resumed
+  # context when migrated across APs). NON-BLOCKING (`continue-on-error`): it is
+  # a diagnostic, not a gate — it exists solely to catch one crash with a
+  # decodable kernel core. Runs redis-smoke at a MULTI-vCPU MTTCG machine (where
+  # the race lives; redis-smoke's own default pins SMP=1 to hide it) a handful
+  # of times, breaks on the first crash, and uploads the COM2 core + serial log.
+  # Decode with: gdb target/x86_64-unknown-none/debug/narf-frame <core> -ex bt
+  # (or read the `backtrace (stack words in kernel .text)` lines in the log and
+  # `addr2line -e <kernel-elf> <+off>`).
+  task87-repro:
+    name: task-#87 SMP migration repro (non-blocking)
+    # Nightly + manual only — this runs several slow MTTCG boots purely to try
+    # to catch the rare crash; skip it on push/PR so it never delays a merge.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # Generous: a cold-cache kernel build + several slow MTTCG boots must finish
+    # so the `if: always()` upload step can publish a captured core.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rust-src llvm-tools-preview rustfmt
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 cpio mtools dosfstools e2fsprogs ovmf \
+            musl-tools clang lld linux-libc-dev
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Cache build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-x86_64-task87-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: target-${{ runner.os }}-x86_64-
+      - name: redis-smoke repro loop (multi-vCPU MTTCG)
+        env:
+          XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
+          # SMP>1 (override redis-smoke's SMP=1 pin) + MTTCG = the race window.
+          NARF_QEMU_SMP: "16"
+          XTASK_QEMU_ACCEL: "tcg,thread=multi"
+        run: |
+          set -u
+          out="${{ runner.temp }}/cores"
+          mkdir -p "$out"
+          core="${{ runner.temp }}/core.bin"
+          log="${{ runner.temp }}/run.log"
+          for i in $(seq 1 6); do
+            echo "=== task-#87 repro iteration $i/6 ==="
+            rm -f "$core"
+            NARF_QEMU_COM2_FILE="$core" cargo xtask redis-smoke --arch=x86_64 2>&1 | tee "$log" || true
+            if grep -q "CPU EXCEPTION" "$log" || [ -s "$core" ]; then
+              echo "::warning::task-#87 CRASH reproduced on iteration $i — uploading core + serial log"
+              cp "$core" "$out/kcore.bin" 2>/dev/null || true
+              cp "$log" "$out/crash.log"
+              break
+            fi
+          done
+          # Artifact dir is empty (upload skipped) unless a crash was captured.
+          ls -la "$out" || true
+      - name: upload cores + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task87-cores
+          path: ${{ runner.temp }}/cores
+          if-no-files-found: ignore
 
   kernel-test:
     name: kernel-test (x86_64)
