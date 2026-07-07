@@ -490,9 +490,28 @@ fn park_should_block(
                 narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
             });
             if !refreshed {
-                *sleep_handle =
-                    narf_scheduler::narf_time::timer_wheel::register(fire_cycles, waker.clone())
-                        .ok();
+                match narf_scheduler::narf_time::timer_wheel::register(fire_cycles, waker.clone()) {
+                    Ok(h) => *sleep_handle = Some(h),
+                    Err(_) => {
+                        // Timer wheel saturated (single global 64-slot wheel): we
+                        // could NOT arm the lost-wake fallback timer. Blocking now
+                        // would rely SOLELY on the io/futex/signal waker; if that
+                        // wake then raced the idle-halt Dekker fence, the task
+                        // could strand with no fallback re-poll. This asymmetry
+                        // (own-stack park blocked anyway; `UserTaskFuture::poll`
+                        // ALREADY self-wakes on this exact failure) is a residual
+                        // permanent-wedge window that survives the futex seqlock
+                        // fix — the wheel saturates far more readily under SMP
+                        // (per-CPU idle-arming + concurrent parks contend one
+                        // global wheel). Mirror the poll path: DON'T block —
+                        // return false so own_stack_park re-executes and busy-
+                        // rechecks the condition, retrying the wheel next round
+                        // (it frees as other sleepers fire). Bounded busy-poll
+                        // under transient pressure, never a permanent wedge.
+                        uc.sleep_deadline_ns.store(0, Ordering::Release);
+                        return false;
+                    }
+                }
             }
             return true;
         }
