@@ -826,6 +826,17 @@ impl FileOps for SocketFile {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }
             | SocketState::Inet6Connected { rx, .. } => !rx.is_closed(),
+            // Kernel-TCP-over-NIC (off-box) sockets: the rx lives in the TCB,
+            // not a RingBuf here, so `readable()` is the authority — it's true
+            // when RX data is buffered OR the peer closed / the connection is
+            // dead (read returns EOF). Block a 0-byte read only while the
+            // connection is OPEN-but-empty (`!readable`). WITHOUT this arm an
+            // `InetWired` socket fell to `_ => false`, so a blocking server
+            // that accept()s then read()s (netserve) saw a spurious EOF the
+            // instant it read before the peer's first segment arrived — the
+            // off-box net-smoke `netserve-fail: read` under slow (TCG) timing;
+            // masked under KVM only because the data always beat the read.
+            SocketState::InetWired { tcb_id, .. } => !narf_net::tcp_stack::readable(*tcb_id),
             SocketState::UnixDgram { inbox, .. } | SocketState::InetDgram { inbox, .. } => {
                 inbox.is_empty()
             }

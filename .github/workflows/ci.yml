@@ -287,9 +287,20 @@ jobs:
       # accept(2), ingress-aware ARP, and the virtio-net RX/TX path
       # end-to-end with an external client. GHA's TCG QEMU is slow under
       # load; bump the prompt deadline.
+      # Force SINGLE-threaded TCG. GHA has no KVM, so QEMU falls back to TCG,
+      # and newer QEMU defaults TCG to MTTCG (thread=multi) for x86-on-x86.
+      # NARF's virtio-net + user-mode-SLIRP traffic intermittently trips an
+      # MTTCG re-entrant-BQL bug in QEMU itself — it aborts mid-round-trip with
+      #   ERROR:.../cpus.c: qemu_mutex_lock_iothread_impl: assertion failed:
+      #   (!qemu_mutex_iothread_locked())
+      # which surfaces here as a spurious `echo mismatch — got ""`. Reproduced
+      # locally with `XTASK_QEMU_ACCEL=tcg,thread=multi`; never with
+      # `thread=single`. Single-threaded is slower but the prompt deadline
+      # already covers it. (Unset locally → KVM, unaffected.)
       - name: cargo xtask net-smoke
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
+          XTASK_QEMU_ACCEL: "tcg,thread=single"
         run: cargo xtask net-smoke --arch=x86_64
 
   kernel-test:
