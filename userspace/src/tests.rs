@@ -7390,7 +7390,9 @@ fn smoke_userspace_exit_observer_group_dead_once() -> TestResult {
     // NOT group-dead yet — process teardown must not have fired, or the
     // still-live third thread's process state would be freed under it.
     if PROCESS_HITS.load(Ordering::Relaxed) != 0 {
-        return TestResult::Fail("process observer fired before the last thread (double-free window)");
+        return TestResult::Fail(
+            "process observer fired before the last thread (double-free window)",
+        );
     }
     if THREAD_HITS.load(Ordering::Relaxed) != 2 {
         return TestResult::Fail("thread observer must fire once per exiting thread");
