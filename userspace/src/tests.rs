@@ -7257,6 +7257,93 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_futex_wait_and_wake_no_op);
 
+/// FUTEX_WAIT is a seqlock read: the per-uaddr wake generation MUST be sampled
+/// BEFORE the futex word is read, so that a FUTEX_WAKE racing between the word
+/// read and the waiter's park is caught by the park guard (`futex_gen(uaddr)
+/// != park_gen`). Regression for the intermittent SMP lost-wakeup: sampling
+/// the generation AFTER the word read captured the POST-wake value, the waiter
+/// parked, the guard saw "no change", and a contended pthread mutex/condvar
+/// deadlocked (`futex_contend_smoke` hung under the 16-vCPU topology; clean at
+/// SMP=1, where no waker can run in the read→park window).
+///
+/// `futex_wait_seqlock_read` takes the word read as a closure; here the
+/// closure BUMPS the generation while it runs, modelling a wake landing
+/// EXACTLY during the read. A correct (gen-before-value) implementation
+/// returns the PRE-bump generation, so the live generation is now strictly
+/// ahead of the snapshot → the guard fires. The old (value-before-gen) bug
+/// returned the post-bump generation, equal to the live one → guard misses.
+fn smoke_userspace_futex_wait_seqlock_gen_before_value() -> TestResult {
+    use crate::handlers::{__test_futex_bump_counter, futex_gen, futex_wait_seqlock_read};
+
+    // A uaddr no other test touches. Reason about deltas, not absolutes: the
+    // per-uaddr counter is process-global and never reset.
+    const U: u64 = 0x5EC0_1000;
+    let base = futex_gen(U);
+
+    // Seqlock read whose word-read closure injects a racing FUTEX_WAKE (a
+    // generation bump) at the instant it runs.
+    let (gen, val) = match futex_wait_seqlock_read(U, || {
+        __test_futex_bump_counter(U); // a wake races DURING the value read
+        Some(0x1234)
+    }) {
+        Some(x) => x,
+        None => return TestResult::Fail("seqlock read reported a spurious fault"),
+    };
+
+    if val != 0x1234 {
+        return TestResult::Fail("seqlock read returned the wrong word value");
+    }
+    // The generation was sampled BEFORE the closure's bump → equals the
+    // pre-read baseline, NOT the bumped value. This is the whole fix.
+    if gen != base {
+        return TestResult::Fail(
+            "gen sampled AFTER the word read — a racing FUTEX_WAKE would be lost",
+        );
+    }
+    // Because the sample predates the bump, the live generation is now ahead
+    // of the snapshot → the park guard (`live != park_gen`) fires and the
+    // waiter re-checks instead of parking (no lost wake, no SMP deadlock).
+    if futex_gen(U) == gen {
+        return TestResult::Fail("park guard would MISS the racing wake (gen not advanced)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_futex_wait_seqlock_gen_before_value
+);
+
+/// Complement to the ordering test: with NO wake racing the read, the
+/// generation the waiter would park on equals the live generation, so the
+/// guard does NOT false-fire (a spurious re-check on every uncontended wait
+/// would defeat the point of blocking). Pins that `futex_wait_seqlock_read`
+/// only reports a change when one genuinely happened.
+fn smoke_userspace_futex_wait_seqlock_no_false_wake() -> TestResult {
+    use crate::handlers::{futex_gen, futex_wait_seqlock_read};
+
+    const U: u64 = 0x5EC0_2000;
+    let base = futex_gen(U);
+    let (gen, val) = match futex_wait_seqlock_read(U, || Some(9)) {
+        Some(x) => x,
+        None => return TestResult::Fail("seqlock read reported a spurious fault"),
+    };
+    if val != 9 {
+        return TestResult::Fail("seqlock read returned the wrong word value");
+    }
+    if gen != base {
+        return TestResult::Fail("gen snapshot moved without any wake");
+    }
+    // No race → the park guard sees `live == park_gen` → the waiter parks.
+    if futex_gen(U) != gen {
+        return TestResult::Fail("live gen advanced with no FUTEX_WAKE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_futex_wait_seqlock_no_false_wake
+);
+
 /// FUTEX_WAKE_OP (op 5) must atomically read-modify-write `*uaddr2` per the
 /// encoded op AND wake (up to `val`) waiters on `uaddr` — Linux
 /// `futex_wake_op`. Regression: op 5 fell through to the `_ => fail` arm
@@ -9946,43 +10033,70 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
-    // execve must accept a populated envp pack alongside argv (the
-    // existing smokes pass envp = (0, 0)). Confirms `copy_user_pack`
-    // is called for both arg2/arg3 and arg4/arg5 and that a valid
-    // envp doesn't reject the call.
+    // execve must accept a POPULATED envp (and argv) alongside a real path.
+    // Uses the Linux ABI — (path, argv, envp), each a user pointer; argv/envp
+    // are NULL-terminated arrays of `char *`. Stages a minimal ELF in a MemFs
+    // (like execve_loads_elf_then_bails) so the path resolves + loads, then the
+    // kernel-test stub has no user ctx and bails with invalid_op(). Reaching
+    // invalid_op — not an earlier error — proves the argv AND the multi-entry
+    // envp arrays both parsed cleanly.
+    //
+    // (Regression: the previous version passed the stale NARF-native shape
+    // (elf_ptr, elf_len, argv_ptr/len, envp_ptr/len). The handler cut over to
+    // the Linux ABI long ago, so it read `elf.len()` as `argv` and parsed
+    // garbage from low identity-mapped memory — the outcome depended on that
+    // memory's contents and flipped with test order.)
     crate::syscall::__test_clear_global();
+    // The assertion is "execve reached the NO-user-ctx bail", so clear any
+    // user ctx a prior test left in the process-global CURRENT cell
+    // (`__test_clear_global` only clears the syscall table).
+    crate::user_task::clear_current();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
     install_global(t);
 
     let elf = build_minimal_elf_for_execve();
-    let argv = b"sh\0".to_vec();
-    let envp = b"PATH=/bin\0LANG=C\0".to_vec();
+    let mount = {
+        use narf_filesystem::{bootstrap_mount_authority, registry, MemFs};
+        let auth = bootstrap_mount_authority();
+        registry()
+            .mount(
+                &auth,
+                "/execve-envp",
+                MemFs::with_seeds("execve-envp", &[("init", elf.as_slice())]),
+            )
+            .ok()
+    };
+
+    // argv = ["sh", NULL]; envp = ["PATH=/bin", "LANG=C", NULL] — real
+    // NUL-terminated C strings referenced by NULL-terminated pointer arrays.
+    let path = b"/execve-envp/init\0";
+    let a0 = b"sh\0";
+    let e0 = b"PATH=/bin\0";
+    let e1 = b"LANG=C\0";
+    let argv_arr: [u64; 2] = [a0.as_ptr() as u64, 0];
+    let envp_arr: [u64; 3] = [e0.as_ptr() as u64, e1.as_ptr() as u64, 0];
     let mut ctx = StubCtx {
         args: SyscallArgs {
-            arg0: elf.as_ptr() as u64,
-            arg1: elf.len() as u64,
-            arg2: argv.as_ptr() as u64,
-            arg3: argv.len() as u64,
-            arg4: envp.as_ptr() as u64,
-            arg5: envp.len() as u64,
+            arg0: path.as_ptr() as u64,
+            arg1: argv_arr.as_ptr() as u64,
+            arg2: envp_arr.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
         },
         ret: None,
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
-    let r = match ctx.ret {
-        Some(r) => r,
-        None => return TestResult::Fail("no return"),
-    };
+    let r = ctx.ret;
+    if let Some(h) = &mount {
+        let _ = narf_filesystem::registry().unmount(h, "/execve-envp");
+    }
     crate::syscall::__test_clear_global();
-    // Load completes, then the no-ctx path returns invalid_op —
-    // same shape as smoke_userspace_execve_loads_elf_then_bails_*.
-    // A reject would surface SOMETHING else (handler bailed before
-    // the load) which would mean the envp parse failed.
-    if r == SyscallReturn::invalid_op() {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("execve with valid envp didn't reach the no-user-ctx bail")
+    // Path resolved + image loaded + argv/envp parsed → no user ctx → invalid_op.
+    match r {
+        Some(r) if r == SyscallReturn::invalid_op() => TestResult::Pass,
+        _ => TestResult::Fail("execve with a populated envp didn't reach the no-user-ctx bail"),
     }
 }
 #[cfg(target_arch = "x86_64")]

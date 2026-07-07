@@ -8610,55 +8610,49 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
         _ => return,
     };
     let uaddr = entry.uaddr;
-    // Resolve the dying task's address space. For CLONE_THREAD
-    // children this is the same Arc as the parent; for non-thread
-    // forks it's the child's own AS. `address_space_of` consults
-    // the scheduler's task table — works because we run during the
-    // exit-observer fan-out, before the scheduler reaps the slot.
-    // Always fire the futex wake first. pthread_join's contract is
-    // "the wake fires when the thread exits"; even if we can't
-    // resolve the user word (the address space was torn down before
-    // we got here, or the smoke ran with a synthetic uaddr that
-    // isn't mapped through the user AS), the futex counter still
-    // bumps so any waiter using the same uaddr observes the wake.
-    // Bump the counter (lost-wakeup gen guard) AND fire every parked
-    // waiter on the real wait queue (a joiner blocked in FUTEX_WAIT must
-    // wake promptly, not at the wheel fallback).
+    // ORDER IS LOAD-BEARING: write the child-tid word to 0 BEFORE bumping the
+    // futex counter + waking waiters. pthread_join FUTEX_WAITs while
+    // `*child_tid == old_tid`; when we wake it, it re-reads the word and must
+    // already see 0, or it re-parks and only the ~10 ms wheel fallback rescues
+    // it (a lost-wake-shaped join stall). This mirrors a mutex unlock (write
+    // the word, THEN wake) — the reverse of the previous order here.
+    //
+    // Write zero into *uaddr via the page tables of the AS the task ran in
+    // (its PML4 phys was stashed at clone time, so this works even after the
+    // scheduler reaps the slot). Best-effort: if the AS was already torn down
+    // (or the word crosses a page / doesn't resolve), skip the write but still
+    // fire the wake below — the counter bump covers any waiter on this uaddr.
+    let root = entry.as_root;
+    if root.as_u64() != 0 {
+        let page = uaddr & !0xFFFu64;
+        let off = uaddr & 0xFFFu64;
+        // A 4-byte futex word crossing a page boundary is structurally invalid
+        // (futex words must be naturally aligned) — skip the write only.
+        if off + 4 <= 4096 {
+            // SAFETY: `root` is the exited task's recorded page-table root
+            // (non-zero, checked above); `translate` walks it read-only to
+            // resolve the page-aligned user `page` to its current phys frame.
+            // SAFETY: Valid memory or trusted environment
+            if let Some(phys) = unsafe {
+                narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
+            } {
+                // SAFETY: identity-mapped low RAM; the AS Arc keeps the backing
+                // frame alive across this write.
+                // SAFETY: Valid memory or trusted environment
+                unsafe {
+                    *((phys.as_u64() + off) as *mut u32) = 0;
+                }
+            }
+        }
+    }
+
+    // NOW bump the counter (lost-wakeup gen guard) AND fire every parked waiter
+    // on the real wait queue — AFTER the word write above, so a joiner's
+    // wake→re-read observes the cleared (0) word and proceeds instead of
+    // re-parking. `futex_bump_counter` takes the counter lock (release); the
+    // joiner's next FUTEX_WAIT gen-snapshot (acquire) then sees the prior write.
     futex_bump_counter(uaddr);
     futex_wake_waiters(uaddr, u32::MAX);
-
-    // Write zero into *uaddr via the page tables of the AS the
-    // task ran in. We stashed the PML4 phys at clone time, so this
-    // works even after the scheduler reaps the task's slot.
-    let root = entry.as_root;
-    if root.as_u64() == 0 {
-        return;
-    }
-    let page = uaddr & !0xFFFu64;
-    let off = uaddr & 0xFFFu64;
-    if off + 4 > 4096 {
-        // Crossing a page boundary on a 4-byte futex word is
-        // structurally invalid (futex words are required to be
-        // naturally aligned); drop the clear-side write but keep
-        // the futex wake we already fired above.
-        return;
-    }
-    // SAFETY: `root` is the exited task's recorded page-table root (non-zero,
-    // checked above); `translate` walks that table read-only to resolve the
-    // page-aligned user `page` to its current phys frame.
-    // SAFETY: Valid memory or trusted environment
-    let phys = match unsafe {
-        narf_memory::x86_64::paging::translate(root, narf_memory::VirtAddr::new(page))
-    } {
-        Some(p) => p,
-        None => return,
-    };
-    // SAFETY: identity-mapped low 4 GiB; the AS Arc keeps the
-    // backing frame alive across this write.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        *((phys.as_u64() + off) as *mut u32) = 0;
-    }
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
@@ -16992,6 +16986,35 @@ pub fn futex_gen(uaddr: u64) -> u64 {
     futex_wake_counter(uaddr)
 }
 
+/// `FUTEX_WAIT` seqlock read: sample the per-uaddr wake generation FIRST,
+/// then read the futex word. This ORDER is load-bearing. The generation is a
+/// seqlock the waiter reads as "sample gen → read value → (at park) recheck
+/// gen": a `FUTEX_WAKE` that races between the word read and the park
+/// registration bumps the generation PAST this snapshot, so the park guard
+/// (`futex_gen(uaddr) != futex_park_gen`) detects it and the waiter re-checks
+/// instead of parking. Sampling the generation AFTER the word read loses that
+/// wake — the waiter captures the post-bump generation, parks, and the guard
+/// sees "no change": the classic futex lost-wakeup that deadlocks a contended
+/// pthread mutex/condvar under SMP (invisible at SMP=1, where no waker can run
+/// between the read and the park). Returns `(gen, *uaddr)`, or `None` if
+/// `read_word` reports a fault. `read_word` is a closure so the exact
+/// user-memory read (or, in tests, an injected racing bump) is the caller's.
+pub(crate) fn futex_wait_seqlock_read(
+    uaddr: u64,
+    read_word: impl FnOnce() -> Option<u32>,
+) -> Option<(u64, u32)> {
+    let gen = futex_wake_counter(uaddr);
+    let current = read_word()?;
+    Some((gen, current))
+}
+
+/// Test-only: bump a uaddr's wake generation (models a `FUTEX_WAKE`), so a
+/// seqlock-ordering test can inject a wake that races the futex-word read.
+#[doc(hidden)]
+pub fn __test_futex_bump_counter(uaddr: u64) {
+    futex_bump_counter(uaddr);
+}
+
 /// Per-uaddr blocking-futex wait queue: futex word → (task id → Waker).
 /// `FUTEX_WAIT` registers the caller's waker here (via the user-task poll
 /// routine) and truly parks; `FUTEX_WAKE` pops up to `val` wakers and fires
@@ -17121,15 +17144,24 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
-            let mut buf4 = [0u8; 4];
-            // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked above);
-            // copy_from_user range-validates it and SMAP-brackets the 4-byte read.
-            // SAFETY: Valid memory or trusted environment
-            let current = if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
-                u32::from_ne_bytes(buf4)
-            } else {
-                ctx.set_return(fail);
-                return;
+            // Seqlock read: sample the wake generation BEFORE reading `*uaddr`
+            // (see `futex_wait_seqlock_read` — sampling after the read loses a
+            // racing FUTEX_WAKE and deadlocks a contended mutex/condvar on SMP).
+            let (gen, current) = match futex_wait_seqlock_read(uaddr, || {
+                let mut buf4 = [0u8; 4];
+                // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked
+                // above); copy_from_user range-validates it + SMAP-brackets the read.
+                if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
+                    Some(u32::from_ne_bytes(buf4))
+                } else {
+                    None
+                }
+            }) {
+                Some(x) => x,
+                None => {
+                    ctx.set_return(fail);
+                    return;
+                }
             };
             if current != val {
                 ctx.set_return(SyscallReturn::ok(0));
@@ -17145,10 +17177,6 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
             } else {
                 narf_scheduler::narf_time::monotonic_ns().saturating_add(timeout_ns)
             };
-            // Snapshot the per-uaddr wake counter BEFORE publishing the wait
-            // so the poll routine can detect a FUTEX_WAKE that races in
-            // between (lost-wakeup guard).
-            let gen = futex_wake_counter(uaddr);
             if let (Some(uctx), Some(hook)) = (
                 crate::user_task::current_user_task(),
                 crate::user_task::yield_hook(),
@@ -17210,14 +17238,23 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    let mut buf4 = [0u8; 4];
-    // SAFETY: copy_from_user range-validates `uaddr` and SMAP-brackets the
-    // 4-byte read; a fault surfaces as Err below.
-    let current = if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
-        u32::from_ne_bytes(buf4)
-    } else {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-        return;
+    // Seqlock read: sample the wake generation BEFORE reading `*uaddr` (see
+    // `futex_wait_seqlock_read` — sampling after the read loses a racing
+    // FUTEX_WAKE and deadlocks a contended mutex/condvar under SMP).
+    let (gen, current) = match futex_wait_seqlock_read(uaddr, || {
+        let mut buf4 = [0u8; 4];
+        // SAFETY: copy_from_user range-validates `uaddr` + SMAP-brackets the read.
+        if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
+            Some(u32::from_ne_bytes(buf4))
+        } else {
+            None
+        }
+    }) {
+        Some(x) => x,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        }
     };
     if current != val {
         ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
@@ -17233,7 +17270,6 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
     } else {
         narf_scheduler::narf_time::monotonic_ns().saturating_add(park_cap_ns)
     };
-    let gen = futex_wake_counter(uaddr);
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
