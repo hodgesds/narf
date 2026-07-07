@@ -223,25 +223,49 @@ kernel_test_in!(
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn smoke_rand_histogram_uniform() -> TestResult {
+    // Chi-squared goodness-of-fit test for uniformity over the 256 byte values.
+    //
+    // The previous version failed if ANY of the 256 buckets exceeded a 4-sigma
+    // per-bucket count (MAX_COUNT=32 at mean 16, sigma≈3.99). Across 256 buckets
+    // that is a multiple-comparisons trap: even a PERFECT generator trips one
+    // 4-sigma bucket at ~256 * P(Poisson(16) >= 33) ≈ 4% per run, so it flaked
+    // in CI on a healthy ChaCha20 CSPRNG. Chi-squared is a single family-wise
+    // statistic — no per-bucket trap — that still catches a degenerate
+    // generator decisively (a stuck/biased byte yields chi-squared in the
+    // hundreds of thousands, vs the 255-dof mean of 255 for a uniform source).
+    //
+    // Integer arithmetic only (kernel test context — no FPU). With EXPECTED=16,
+    //   chi2 = sum((count - 16)^2) / 16,
+    // so we accumulate sum_sq = sum((count-16)^2) and compare against a scaled
+    // threshold. chi2(255) has mean 255, std ~22.6; CHI2_MAX=512 is ~11 std
+    // above the mean (P(false fail) < 1e-25 for a uniform source), while real
+    // degeneracy blows far past it.
     const N: usize = 4096;
-    const MAX_COUNT: usize = 32;
+    const BUCKETS: usize = 256;
+    const EXPECTED: i64 = (N / BUCKETS) as i64; // 16
+    const CHI2_MAX: i64 = 512;
+    const SUM_SQ_MAX: i64 = CHI2_MAX * EXPECTED; // chi2 = sum_sq / EXPECTED
 
     let bytes = match read_dev_node("urandom", N) {
         Some(v) => v,
         None => return TestResult::Fail("/dev/urandom 4096-byte read failed"),
     };
 
-    let mut hist = [0u32; 256];
+    let mut hist = [0u32; BUCKETS];
     for &b in &bytes {
         hist[b as usize] += 1;
     }
 
+    let mut sum_sq: i64 = 0;
     for &count in hist.iter() {
-        if count as usize > MAX_COUNT {
-            return TestResult::Fail(
-                "histogram bucket exceeds 4-sigma threshold (generator may be degenerate)",
-            );
-        }
+        let d = count as i64 - EXPECTED;
+        sum_sq += d * d;
+    }
+
+    if sum_sq > SUM_SQ_MAX {
+        return TestResult::Fail(
+            "urandom byte histogram failed chi-squared uniformity (generator may be degenerate)",
+        );
     }
     TestResult::Pass
 }
