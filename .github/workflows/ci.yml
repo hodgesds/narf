@@ -293,20 +293,23 @@ jobs:
       # accept(2), ingress-aware ARP, and the virtio-net RX/TX path
       # end-to-end with an external client. GHA's TCG QEMU is slow under
       # load; bump the prompt deadline.
-      # Pin to a SINGLE vCPU. Two distinct intermittent failures hit this job
-      # under GHA's default 16-vCPU TCG machine, both fixed by SMP=1:
-      #   1. The `qemu-net` boot-init also spawns `redis-server` alongside
-      #      netserve; redis's clone(2) bio threads hit the open task-#87 SMP
-      #      user-task MIGRATION race (a corrupt resumed context → wild-`rip`
-      #      #UD/#PF; "never reproduces single-CPU"). redis-smoke pins SMP=1 for
-      #      exactly this reason; net-smoke didn't, so it inherited the crash.
-      #   2. Newer QEMU defaults TCG to MTTCG (thread=multi) for x86-on-x86, and
-      #      NARF's virtio-net + SLIRP traffic intermittently trips a QEMU
-      #      re-entrant-BQL abort (`qemu_mutex_lock_iothread_impl: assertion
-      #      failed (!qemu_mutex_iothread_locked())`). One vCPU means no MTTCG.
-      # Both surface here as a spurious `echo mismatch — got ""`. net-smoke's
-      # actual coverage (off-box TCP serve, ARP, virtio-net RX/TX to an external
-      # client) is single-connection and needs no SMP. (Unset locally → KVM.)
+      #
+      # `cargo xtask net-smoke` sets the `no_redis` kernel cmdline flag, so the
+      # `qemu-net` boot-init runs netserve ALONE — without it, redis-server's
+      # heavy multi-threaded startup starved netserve's RX forwarder on the
+      # single CI vcpu under TCG and dragged the echo past the host deadline
+      # (a spurious `echo mismatch — got ""`; the historical ~20% flake).
+      #
+      # Still pin a SINGLE vCPU: newer QEMU defaults TCG to MTTCG
+      # (thread=multi) for x86-on-x86, and NARF's virtio-net + SLIRP traffic
+      # intermittently trips a QEMU host-side re-entrant-BQL abort
+      # (`qemu_mutex_lock_iothread_impl: assertion failed
+      # (!qemu_mutex_iothread_locked())`) — a QEMU bug, not NARF. One vCPU
+      # means no MTTCG. net-smoke's coverage (off-box TCP serve, ARP,
+      # virtio-net RX/TX to an external client) is single-connection and needs
+      # no SMP. (The redis-migration #UD that also motivated SMP=1 is now moot:
+      # redis isn't spawned here, and task-#87 is fixed — group_dead teardown.)
+      # (Unset locally → KVM.)
       - name: cargo xtask net-smoke
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"

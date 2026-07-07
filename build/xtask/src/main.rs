@@ -2536,6 +2536,21 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         "XTASK_QEMU_HOSTFWD",
         format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
     );
+    // Suppress the redis-server auto-spawn: net-smoke only exercises
+    // netserve, and redis's heavy multi-threaded startup starves
+    // netserve's RX forwarder on a single (CI) vcpu under TCG, dragging
+    // the off-box echo past the host read deadline — the historical ~20%
+    // net-smoke flake. redis-smoke keeps redis (it doesn't set this).
+    // Preserve any caller-provided kernel cmdline.
+    {
+        let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+        let combined = if existing.is_empty() {
+            "no_redis".to_string()
+        } else {
+            format!("{existing} no_redis")
+        };
+        std::env::set_var("XTASK_QEMU_APPEND", combined);
+    }
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);

@@ -3851,9 +3851,16 @@ fn boot_userspace_init() {
         // skip IPv6 + RDB/AOF persistence so it serves from RAM only; the
         // host-side `cargo xtask redis-smoke` harness then does SET/GET
         // over the hostfwd port. Suppressed under `mt-echo`, which
-        // dedicates the box to the multithreaded benchmark workload.
+        // dedicates the box to the multithreaded benchmark workload — and
+        // under the `no_redis` cmdline flag, which `cargo xtask net-smoke`
+        // sets so redis's heavy startup can't starve netserve's RX path on
+        // a single CI vcpu past the host deadline (the net-smoke flake).
         #[cfg(not(feature = "mt-echo"))]
-        if !narf_verification::NARF_REDIS_SERVER_ELF.is_empty() {
+        if !narf_boot::cmdline()
+            .split_whitespace()
+            .any(|t| t == "no_redis")
+            && !narf_verification::NARF_REDIS_SERVER_ELF.is_empty()
+        {
             spawn_one_argv(
                 "redis-server",
                 narf_verification::NARF_REDIS_SERVER_ELF,
