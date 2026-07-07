@@ -1090,8 +1090,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
     // Still guard canonical + non-null so a wild RSP can't cascade to a double
     // fault.
     let sp = frame.rsp & !0x7u64;
-    let canonical =
-        sp >= 0x1000 && !(0x0000_8000_0000_0000..0xFFFF_8000_0000_0000).contains(&sp);
+    let canonical = sp >= 0x1000 && !(0x0000_8000_0000_0000..0xFFFF_8000_0000_0000).contains(&sp);
     if canonical {
         let _ = writeln!(TrapWriter, "  stack @ rsp {:#018x}:", sp);
         for row in 0..10u64 {
@@ -1150,7 +1149,10 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 }
             }
             if printed == 0 {
-                let _ = writeln!(TrapWriter, "    (no .text return addresses found in window)");
+                let _ = writeln!(
+                    TrapWriter,
+                    "    (no .text return addresses found in window)"
+                );
             }
         }
     }
