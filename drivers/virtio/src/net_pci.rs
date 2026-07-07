@@ -1310,26 +1310,27 @@ impl VirtioNetPci {
                     // original anyway — the stack already drained
                     // it logically.
                     drop(replacement);
-                    let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
-                    compiler_fence(Ordering::SeqCst);
-                    // SAFETY: identity-mapped notify region.
-                    unsafe {
-                        self.notify.write16(off, pair.rx_qidx);
-                    }
                     return Some((original, len));
                 }
             }
         };
         // Park the replacement in its slot for the next rx_take.
         pair.rx_buffers.lock()[new_head as usize] = Some(replacement);
-        // Re-notify the device about the refill.
-        let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped notify region.
-        unsafe {
-            self.notify.write16(off, pair.rx_qidx);
-        }
         Some((original, len))
+    }
+
+    /// Notify the device that new RX buffers have been posted to the avail ring.
+    /// This should be called *after* a batch of `rx_take`s to avoid kicking
+    /// the device synchronously for every single frame (mimicking Linux NAPI).
+    pub fn rx_notify(&self, pair_idx: usize) {
+        if let Some(pair) = self.pairs.get(pair_idx) {
+            let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped notify region.
+            unsafe {
+                self.notify.write16(off, pair.rx_qidx);
+            }
+        }
     }
 }
 
@@ -1667,6 +1668,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     // Adapt cadence: reset to fast-poll if this round drained
                     // anything (per-queue), else step toward the slow fallback.
                     if processed_any {
+                        with_at(idx, |c| c.rx_notify(pair_idx));
                         idle_rounds = 0;
                     } else {
                         idle_rounds = idle_rounds.saturating_add(1);
@@ -1836,7 +1838,10 @@ fn vnet0_drain_fn() -> bool {
         narf_net::iface::on_rx_frame_from("vnet0", &buf.as_slice()[12..end]);
     }
     // Recycle the consumed buffer into the RX frame pool instead of freeing.
-    with_controller(|c| c.rx_buf_release(buf));
+    with_controller(|c| {
+        c.rx_buf_release(buf);
+        c.rx_notify(0);
+    });
     true
 }
 

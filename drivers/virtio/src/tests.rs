@@ -634,7 +634,14 @@ fn smoke_virtio_net_pci_rx_arp() -> TestResult {
     // actually published an arrival.
     let mut any = 0u32;
     for _ in 0..2_000_000u32 {
-        let taken = net_pci::with_controller(|c| c.rx_take()).flatten();
+        let taken = net_pci::with_controller(|c| {
+            let t = c.rx_take();
+            if t.is_some() {
+                c.rx_notify(0);
+            }
+            t
+        })
+        .flatten();
         if let Some((_buf, len)) = taken {
             any = len;
             break;

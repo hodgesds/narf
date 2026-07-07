@@ -304,8 +304,8 @@ jobs:
       # (thread=multi) for x86-on-x86, and NARF's virtio-net + SLIRP traffic
       # intermittently trips a QEMU host-side re-entrant-BQL abort
       # (`qemu_mutex_lock_iothread_impl: assertion failed
-      # (!qemu_mutex_iothread_locked())`) — a QEMU bug, not NARF. One vCPU
-      # means no MTTCG. net-smoke's coverage (off-box TCP serve, ARP,
+      # (!qemu_mutex_iothread_locked())`) — a QEMU bug, not NARF. We force
+      # thread=single to truly disable MTTCG. net-smoke's coverage (off-box TCP serve, ARP,
       # virtio-net RX/TX to an external client) is single-connection and needs
       # no SMP. (The redis-migration #UD that also motivated SMP=1 is now moot:
       # redis isn't spawned here, and task-#87 is fixed — group_dead teardown.)
@@ -314,6 +314,7 @@ jobs:
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           NARF_QEMU_SMP: "1"
+          XTASK_QEMU_ACCEL: "tcg,thread=single"
           # Route a 2nd serial (COM2) to a file so a kernel core is captured if
           # the guest ever #UD/#GP/#PFs here despite the SMP=1 pin. The trap
           # handler writes an ELF core (NT_PRSTATUS + a PT_LOAD of the kernel
