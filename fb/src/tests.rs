@@ -549,7 +549,7 @@ fn smoke_fb_exit_observer_reaps_handles() -> TestResult {
     use crate::registry::{__reset_for_test, connect, count, disconnect_all_for_pid};
     use crate::{clear_test_scanout, install_test_scanout};
     use narf_userspace::user_task::{
-        __test_clear_exit_observers, notify_task_exited, register_exit_observer,
+        __test_clear_exit_observers, notify_task_exited, register_process_exit_observer,
     };
 
     install_test_scanout(64, 64);
@@ -557,8 +557,9 @@ fn smoke_fb_exit_observer_reaps_handles() -> TestResult {
     __test_clear_exit_observers();
 
     // Register the FB exit observer (boot-time wiring; the
-    // verification harness re-applies it here).
-    register_exit_observer(|pid, _tid| {
+    // verification harness re-applies it here). Process-scoped: FB
+    // connections are per-pid and reaped once the process is gone.
+    register_process_exit_observer(|pid, _tid| {
         let _ = disconnect_all_for_pid(pid);
     });
 

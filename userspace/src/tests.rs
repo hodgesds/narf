@@ -7344,6 +7344,83 @@ kernel_test_in!(
     smoke_userspace_futex_wait_seqlock_no_false_wake
 );
 
+/// Multi-threaded `exit_group` must run PROCESS-scoped exit observers
+/// EXACTLY ONCE — on the group's last thread (`group_dead`) — while
+/// THREAD-scoped observers run for EVERY thread. This is Linux's
+/// `group_dead = atomic_dec_and_test(&signal->live)` gate. Regression:
+/// the OCI container-teardown #UD, where a concurrent multi-thread
+/// exit_group ran the per-pid reap once per thread, double-freeing the
+/// PID pool and scribbling the observer list into a wild `fn(u64,u64)`
+/// slot → ring-0 call to a low garbage address. Drives the fan-out
+/// directly through `notify_task_exited` with a 3-thread group.
+fn smoke_userspace_exit_observer_group_dead_once() -> TestResult {
+    use crate::handlers::{__test_thread_group_live_reset, thread_group_live_inc};
+    use crate::user_task::{
+        __test_clear_exit_observers, notify_task_exited, register_process_exit_observer,
+        register_thread_exit_observer,
+    };
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static THREAD_HITS: AtomicU32 = AtomicU32::new(0);
+    static PROCESS_HITS: AtomicU32 = AtomicU32::new(0);
+
+    fn thread_obs(_pid: u64, _tid: u64) {
+        THREAD_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn process_obs(_pid: u64, _tid: u64) {
+        PROCESS_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    __test_clear_exit_observers();
+    __test_thread_group_live_reset();
+    THREAD_HITS.store(0, Ordering::Relaxed);
+    PROCESS_HITS.store(0, Ordering::Relaxed);
+    register_thread_exit_observer(thread_obs);
+    register_process_exit_observer(process_obs);
+
+    // Thread group pid=5000 with THREE threads: the implicit main plus
+    // two CLONE_THREAD siblings (two `inc`s → tracked live count 3).
+    const PID: u64 = 5000;
+    thread_group_live_inc(PID); // 2nd thread joins (count 1→2)
+    thread_group_live_inc(PID); // 3rd thread joins (count 2→3)
+
+    // First two of the three threads exit (distinct tids, shared pid).
+    notify_task_exited(PID, 5000);
+    notify_task_exited(PID, 5001);
+    // NOT group-dead yet — process teardown must not have fired, or the
+    // still-live third thread's process state would be freed under it.
+    if PROCESS_HITS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("process observer fired before the last thread (double-free window)");
+    }
+    if THREAD_HITS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("thread observer must fire once per exiting thread");
+    }
+    // Last thread exits → group_dead → process teardown fires ONCE.
+    notify_task_exited(PID, 5002);
+    if THREAD_HITS.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("thread observer count wrong after the last thread");
+    }
+    if PROCESS_HITS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("process observer must fire exactly once on group_dead");
+    }
+
+    // An untracked single-threaded process is implicitly its own last
+    // thread → process teardown fires immediately on its sole exit.
+    notify_task_exited(6000, 6000);
+    if PROCESS_HITS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("untracked single-threaded exit must be group_dead");
+    }
+    if THREAD_HITS.load(Ordering::Relaxed) != 4 {
+        return TestResult::Fail("thread observer must fire for the single-threaded exit too");
+    }
+
+    // Leave the registry cleared so later tests re-wire their own.
+    __test_clear_exit_observers();
+    __test_thread_group_live_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_exit_observer_group_dead_once);
+
 /// FUTEX_WAKE_OP (op 5) must atomically read-modify-write `*uaddr2` per the
 /// encoded op AND wake (up to `val`) waiters on `uaddr` — Linux
 /// `futex_wake_op`. Regression: op 5 fell through to the `_ => fail` arm

@@ -8661,12 +8661,13 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, _tid_raw: u64) {
     // the table never gets populated, so this is a no-op.
 }
 
-/// Register the clear_child_tid observer with `register_exit_observer`.
-/// Idempotent and safe to call before `clear_child_tid_init` (the
-/// observer no-ops on an unpopulated table).
+/// Register the clear_child_tid observer (THREAD-scoped: fires per
+/// exiting thread — pthread_join waits on the per-`tid` clear_child_tid
+/// futex). Idempotent and safe to call before `clear_child_tid_init`
+/// (the observer no-ops on an unpopulated table).
 #[cfg(feature = "linux-compat")]
 pub fn install_clear_child_tid_observer() {
-    crate::user_task::register_exit_observer(fire_clear_child_tid_on_exit);
+    crate::user_task::register_thread_exit_observer(fire_clear_child_tid_on_exit);
 }
 
 /// Linux `struct clone_args` — uapi shape from <linux/sched.h>.
@@ -8948,6 +8949,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // scheduler — needed by the exit-observer to write the
     // clear_child_tid futex word after the slot is reaped.
     let child_as_root = child_as.root;
+    // A new thread joins the group — bump `signal->live` BEFORE the
+    // child is spawned/enqueued. Under SMP another CPU can pick up and
+    // EXIT the child the instant it's runnable; a not-yet-counted first
+    // sibling would then `dec` from absent→group_dead and reap the whole
+    // still-live process out from under its main thread. Linux
+    // increments in copy_process under tasklist_lock, pre-wake. No
+    // fallible step separates this from the spawn, so it can't leak.
+    if share_thread {
+        thread_group_live_inc(child_visible_pid);
+    }
     let child_tid = match child_state {
         Some(state) => crate::user_task::spawn_user_process_resume(
             proc,
@@ -9809,10 +9820,18 @@ pub fn wait_init() {
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
     pid_task_map_init();
-    crate::user_task::register_exit_observer(on_child_exit);
-    // AFTER on_child_exit: the master per-task table sweep + orphan
-    // handling (parent notification must run against intact state).
-    crate::user_task::register_exit_observer(task_tables_exit_observer);
+    // THREAD-scoped (every thread exit): release this thread's fd-table
+    // ref + job-control state, then sweep its per-task tables and
+    // orphanize its children. Both key on `tid`; the reap below keys on
+    // `pid`, so they're independent of ordering.
+    crate::user_task::register_thread_exit_observer(on_thread_exit);
+    crate::user_task::register_thread_exit_observer(task_tables_exit_observer);
+    // PROCESS-scoped (last thread of the group only): hand the process
+    // to its parent (wait4 reap + SIGCHLD + waker) or auto-release if
+    // orphaned. Gated on `group_dead` so a multi-threaded exit_group
+    // reaps the pid exactly once (was per-thread → double `release_pid`,
+    // the OCI teardown #UD).
+    crate::user_task::register_process_exit_observer(on_child_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same
@@ -9849,7 +9868,7 @@ pub fn wait_init() {
     // signals through the signal subsystem.
     #[cfg(feature = "cgroup")]
     {
-        crate::user_task::register_exit_observer(cgroup_exit_observer);
+        crate::user_task::register_process_exit_observer(cgroup_exit_observer);
         narf_filesystem::cgroupfs::install_kill_hook(cgroup_kill_hook);
         narf_filesystem::cgroupfs::install_freeze_hook(cgroup_freeze_hook);
     }
@@ -9866,10 +9885,12 @@ pub fn wait_init() {
 /// thread exiting doesn't prematurely vacate the whole process's
 /// membership.
 #[cfg(feature = "cgroup")]
-fn cgroup_exit_observer(pid: u64, tid: u64) {
-    if pid_to_task_raw(pid) == Some(tid) {
-        narf_filesystem::cgroupfs::task_exited(pid);
-    }
+fn cgroup_exit_observer(pid: u64, _tid: u64) {
+    // PROCESS-scoped: fires once, on `group_dead`. No leader-guard —
+    // the group-dead gate already ensures a single call, and the last
+    // thread of the group need not be the registered leader (a
+    // `pid_to_task_raw(pid) == tid` check would then wrongly skip it).
+    narf_filesystem::cgroupfs::task_exited(pid);
 }
 
 /// `cgroup.kill` hook — SIGKILL (9) the named process.
@@ -10811,6 +10832,51 @@ pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
         .insert(task_raw, pid_raw);
 }
 
+/// Linux `signal->live`: per-thread-group (per-`pid`) count of live
+/// threads. Only ever holds entries for MULTI-threaded groups — a
+/// single-threaded process is never inserted (its implicit count is 1)
+/// and reports `group_dead` on its sole exit. The last thread to
+/// decrement to zero is `group_dead` and runs the process-scoped exit
+/// observers exactly once (see `user_task::notify_task_exited`).
+static THREAD_GROUP_LIVE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// A `CLONE_THREAD` child joined thread-group `pid`. The group's
+/// implicit main thread counts as 1, so the first extra thread makes
+/// the tracked count 2; each subsequent thread adds one.
+pub fn thread_group_live_inc(pid: u64) {
+    let mut g = THREAD_GROUP_LIVE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(pid).or_insert(1);
+    *e = e.saturating_add(1);
+}
+
+/// A thread of group `pid` exited. Returns `true` iff it was the LAST
+/// live thread (`group_dead`) — the caller then runs process-scoped
+/// teardown exactly once. An untracked group (single-threaded, never
+/// `inc`'d) is implicitly its own last thread and returns `true`.
+pub fn thread_group_live_dec(pid: u64) -> bool {
+    let mut g = THREAD_GROUP_LIVE.lock();
+    let Some(m) = g.as_mut() else { return true };
+    match m.get_mut(&pid) {
+        None => true,
+        Some(n) if *n <= 1 => {
+            m.remove(&pid);
+            true
+        }
+        Some(n) => {
+            *n -= 1;
+            false
+        }
+    }
+}
+
+/// Test-only: reset the live-thread accounting.
+#[doc(hidden)]
+pub fn __test_thread_group_live_reset() {
+    *THREAD_GROUP_LIVE.lock() = Some(BTreeMap::new());
+}
+
 /// Translate a user-visible ProcessId to the scheduler TaskId. Returns
 /// `None` when the pid was never registered (kernel-internal tasks,
 /// boot tasks spawned before the table was inited, etc.).
@@ -10849,19 +10915,33 @@ pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
 /// `default_sync_signal_delivery` when no handler is installed and
 /// the default action is Terminate/CoreDump); we drain it here and
 /// publish the WIFSIGNALED-shaped wstatus to wait4.
-fn on_child_exit(child_pid: u64, child_tid: u64) {
-    // Release the exiting task's fd table so every FileOps `Arc` it held
-    // drops. This is what lets a pipe's write end actually close when its
-    // last writer exits — without it `writer_closed` never flips and a
-    // reader (a shell's `$(...)` capture) never sees EOF. Also frees
-    // file/socket handles so they don't leak across the task's lifetime.
-    crate::fd::detach(child_tid);
+/// THREAD-scoped exit observer: per-`tid` teardown that runs for EVERY
+/// exiting thread (not just the group's last). Keyed on the scheduler
+/// TaskId, so a `CLONE_THREAD` sibling releases its OWN fd-table ref
+/// and job-control state; the shared fd table (one `Arc` per thread)
+/// frees when the last sibling detaches.
+fn on_thread_exit(_pid: u64, tid: u64) {
+    // Release the exiting thread's fd-table ref so every FileOps `Arc`
+    // it held drops. This is what lets a pipe's write end actually close
+    // when its last writer exits — without it `writer_closed` never
+    // flips and a reader (a shell's `$(...)` capture) never sees EOF.
+    // Also frees file/socket handles so they don't leak.
+    crate::fd::detach(tid);
     // Job control: a task that dies while stopped (e.g. SIGKILL'd) must
     // not leave a stale TASK_STOPPED entry — the TaskId could later be
-    // recycled. The exit observer carries the dying task's TaskId.
+    // recycled.
     if let Some(m) = TASK_STOPPED.lock().as_mut() {
-        m.remove(&child_tid);
+        m.remove(&tid);
     }
+}
+
+/// PROCESS-scoped exit observer: per-`pid` reap that runs EXACTLY ONCE,
+/// on the group's last thread (`group_dead`). Notifies pidfd watchers,
+/// releases the PID namespace slot, and hands the process to its parent
+/// (wait4 reap entry + SIGCHLD + waker) — or, if orphaned, releases the
+/// task and returns the PID. Running this per thread double-freed the
+/// PID pool and the parent's reap queue (the OCI teardown #UD).
+fn on_child_exit(child_pid: u64, _child_tid: u64) {
     // Wave-61: notify any pidfd_open()'d watchers that the target
     // exited, regardless of whether a parent reaps it.
     crate::pidfd::notify_exit(child_pid);

@@ -148,11 +148,11 @@ fn smoke_shmem_exit_observer_reaps_handles() -> TestResult {
     // must reap every shmem region the dying pid owned.
     use crate::{__reset_for_test, count, create, destroy_all_for_pid};
     use narf_userspace::user_task::{
-        __test_clear_exit_observers, notify_task_exited, register_exit_observer,
+        __test_clear_exit_observers, notify_task_exited, register_process_exit_observer,
     };
     __reset_for_test();
     __test_clear_exit_observers();
-    register_exit_observer(|pid, _tid| {
+    register_process_exit_observer(|pid, _tid| {
         let _ = destroy_all_for_pid(pid);
     });
     let pid_dies = 9101u64;

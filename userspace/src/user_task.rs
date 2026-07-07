@@ -649,50 +649,84 @@ pub fn install_execve_hook(hook: ExitHook) {
     EXECVE_HOOK.store(hook as *mut (), Ordering::Release);
 }
 
-// ── Process-exit observers ────────────────────────────────────────
+// ── Process/thread-exit observers ─────────────────────────────────
 //
-// Subsystems that hold per-process resources (FB connections, fd
-// tables, ipc rings) register an observer here. When a polled
-// UserTaskFuture sees EXIT_REASON_EXITED, every registered observer
-// is invoked with the dying process's pid before the future resolves
-// to Ready. Observers run in plain kernel context (not in the trap
-// path) and may take spinlocks / call into other subsystems.
+// Exit teardown splits by SCOPE, exactly as Linux splits per-task
+// `do_exit` work from the `group_dead` process-wide work:
+//
+//   * THREAD-scoped observers fire for EVERY exiting thread, keyed on
+//     its unique `tid` (clear_child_tid futex, the thread's fd-table
+//     ref, per-task signal tables).
+//   * PROCESS-scoped observers fire EXACTLY ONCE per thread group —
+//     when its LAST live thread exits (Linux `group_dead =
+//     atomic_dec_and_test(&signal->live)`). These do per-`pid`
+//     teardown (parent SIGCHLD/wait4 reap, pidfd notify, cgroup
+//     membership, per-pid IPC/FB resources). Running them once per
+//     thread double-frees process-global state — that was the OCI
+//     container-teardown #UD, where a multi-threaded exit_group ran
+//     `release_pid` twice concurrently and scribbled this very
+//     observer list (a corrupt `fn(u64,u64)` slot → ring-0 call to a
+//     wild low address).
 //
 // Observers are append-only — there's no unregister. The intent is
-// boot-time wiring, not runtime hot-swap.
+// boot-time wiring, not runtime hot-swap. Both fan-outs run in plain
+// kernel context (not the trap path) and may take spinlocks.
 
 pub type ExitObserver = fn(pid: u64, tid: u64);
 
-static EXIT_OBSERVERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<ExitObserver>> =
+static THREAD_EXIT_OBSERVERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<ExitObserver>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-/// Register a callback to fire when a polled user task transitions
-/// to Exited. Invoked exactly once per task with `(pid, tid)`:
-///   * `pid` — the user-visible process group id. For
-///     `CLONE_THREAD` children this equals the parent's pid, so
-///     thread-aware bookkeeping (clear_child_tid, futex wait
-///     queues) must key on `tid` instead.
-///   * `tid` — the scheduler's `TaskId.raw()` for the exited
-///     task. Always distinct from sibling threads.
-pub fn register_exit_observer(o: ExitObserver) {
-    EXIT_OBSERVERS.lock().push(o);
+static PROCESS_EXIT_OBSERVERS: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<ExitObserver>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+/// Register a THREAD-scoped exit callback — fires for every exiting
+/// thread with `(pid, tid)`:
+///   * `pid` — the user-visible thread-group id (shared by
+///     `CLONE_THREAD` siblings).
+///   * `tid` — the scheduler's `TaskId.raw()`, unique per thread;
+///     per-thread bookkeeping (clear_child_tid, fd-table ref, signal
+///     tables) keys on this.
+pub fn register_thread_exit_observer(o: ExitObserver) {
+    THREAD_EXIT_OBSERVERS.lock().push(o);
 }
 
-/// Fan out the exit notification. Called by `UserTaskFuture::poll`
-/// when it sees `EXIT_REASON_EXITED`. Also exposed for test
-/// harnesses that want to drive the observer fan-out without
-/// running a full polling future.
+/// Register a PROCESS-scoped exit callback — fires exactly once, on the
+/// `group_dead` transition (the last thread of `pid` to exit). `tid` is
+/// that last thread's id; process teardown must key on `pid`, not `tid`
+/// (the last thread need not be the group leader).
+pub fn register_process_exit_observer(o: ExitObserver) {
+    PROCESS_EXIT_OBSERVERS.lock().push(o);
+}
+
+/// Fan out the exit notification. Called by `UserTaskFuture::poll` (or
+/// the own-stack exit path) when a task hits `EXIT_REASON_EXITED`. Also
+/// exposed for test harnesses that drive the fan-out directly.
+///
+/// Every exiting thread runs the THREAD-scoped observers; the LAST
+/// thread of the group additionally runs the PROCESS-scoped ones. The
+/// `group_dead` decision is `thread_group_live_dec` — the atomic
+/// decrement-and-test of the group's live-thread count (Linux
+/// `signal->live`). Must be called EXACTLY ONCE per task exit, or the
+/// count under/over-shoots.
 pub fn notify_task_exited(pid: u64, tid: u64) {
-    let observers = EXIT_OBSERVERS.lock().clone();
-    for o in observers.iter() {
+    let thread = THREAD_EXIT_OBSERVERS.lock().clone();
+    for o in thread.iter() {
         o(pid, tid);
+    }
+    if crate::handlers::thread_group_live_dec(pid) {
+        let process = PROCESS_EXIT_OBSERVERS.lock().clone();
+        for o in process.iter() {
+            o(pid, tid);
+        }
     }
 }
 
 /// Test-only reset.
 #[doc(hidden)]
 pub fn __test_clear_exit_observers() {
-    EXIT_OBSERVERS.lock().clear();
+    THREAD_EXIT_OBSERVERS.lock().clear();
+    PROCESS_EXIT_OBSERVERS.lock().clear();
 }
 
 /// Test-only reset.
