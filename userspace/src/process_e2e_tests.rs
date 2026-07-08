@@ -863,6 +863,63 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace/process", smoke_exit_sweeps_task_tables);
 
+/// The exit-time robust-futex walk reads fully user-controlled pointers
+/// with a fixup-less `copy_from_user`, gated by a "is this mapped?" probe.
+/// That probe MUST consult the hardware page tables, not the region (VMA)
+/// list — region membership does NOT imply a present page. A process can
+/// register a robust head inside a PROT_NONE / unbacked region (or the
+/// region list can go stale under teardown), and a region-membership gate
+/// then green-lights a raw read of an addressable-but-unmapped page, which
+/// #PFs the kernel fatally (the class that surfaced as robust_smoke's
+/// head=0x1234abcd0000 crash). This pins the divergence: for an address a
+/// PROT_NONE region covers, `lookup` says Some but the page-presence gate
+/// must say false.
+fn smoke_robust_walk_gate_is_page_presence_not_vma() -> TestResult {
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::sync::Arc;
+
+    // SAFETY: `new_for_user` only needs paging enabled; kernel-test runs
+    // after boot has installed the page tables.
+    let as_ = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => return TestResult::Fail("AddressSpace::new_for_user"),
+    };
+
+    // A PROT_NONE (perms=0), unbacked (phys=0) region: recorded in the VMA
+    // list but with NO page-table entry installed (never materialized).
+    const POISON: u64 = 0x1234_abcd_0000;
+    let region = Region {
+        base: VirtAddr::new(POISON),
+        len: 0x1000,
+        perms: RegionPerms(0),
+        phys: alloc::vec![PhysAddr::new(0)],
+    };
+    if as_.map_region(region).is_err() {
+        return TestResult::Fail("map_region(PROT_NONE) rejected");
+    }
+
+    let probe = POISON + 8; // robust_list_head.futex_offset — the field the
+                            // walk reads first (the cr2 in the original crash).
+
+    // Region membership: the VMA covers the address...
+    if as_.lookup(VirtAddr::new(probe)).is_none() {
+        return TestResult::Fail("PROT_NONE region should cover the probe addr");
+    }
+    // ...but there is no present page, so the presence gate MUST reject it.
+    // Under the old VMA-membership gate this returned true and the walk
+    // then did a fixup-less `copy_from_user` → fatal kernel #PF. The gate
+    // now walks the page tables (exactly what the read hits), so it says no.
+    if crate::handlers::__test_user_page_present(&as_, probe) {
+        return TestResult::Fail("page-presence gate false-positived a PROT_NONE region");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process",
+    smoke_robust_walk_gate_is_page_presence_not_vma
+);
+
 /// CLONE_FILES shares ONE fd table across threads; fork gets an independent
 /// copy. An fd opened by one CLONE_FILES sibling must be visible to the other
 /// (and vice-versa); a fork child's new fd must NOT appear in the parent.
