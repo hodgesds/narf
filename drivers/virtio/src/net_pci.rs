@@ -1000,10 +1000,10 @@ impl VirtioNetPci {
         // above, do a bounded reclaim-retry; if still full, drop the
         // frame (return Err) rather than ever busy-waiting on the
         // device. TCP/upper layers retransmit.
-        let head = {
+        let (head, needs_kick) = {
             let mut q = pair.tx_queue.lock();
             let q = q.as_mut().ok_or(VirtioPciError::NoQueues)?;
-            match submit(q) {
+            let head = match submit(q) {
                 Some(h) => h,
                 None => {
                     // Ring full. Bounded retry: re-drain completions a
@@ -1038,7 +1038,8 @@ impl VirtioNetPci {
                         None => return Err(VirtioPciError::QueueTooSmall),
                     }
                 }
-            }
+            };
+            (head, q.needs_kick())
         };
 
         // Park the buffer in its descriptor slot so it stays alive
@@ -1054,12 +1055,14 @@ impl VirtioNetPci {
             // `buf` drops here — harmless, just no in-flight tracking.
         }
 
-        let off = (pair.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped. Fire-and-forget: kick the device
-        // and return — completion is reclaimed lazily on the next TX.
-        unsafe {
-            self.notify.write16(off, pair.tx_qidx);
+        if needs_kick {
+            let off = (pair.tx_notify_off as u64) * (self.notify_off_multiplier as u64);
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped. Fire-and-forget: kick the device
+            // and return — completion is reclaimed lazily on the next TX.
+            unsafe {
+                self.notify.write16(off, pair.tx_qidx);
+            }
         }
         Ok(())
     }

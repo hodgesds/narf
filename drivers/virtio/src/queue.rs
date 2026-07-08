@@ -281,6 +281,16 @@ impl Virtqueue {
         unsafe { core::ptr::read_volatile(self.used_base().add(1)) }
     }
 
+    /// Returns true if the device requested a notification (kick) for this queue.
+    /// In VIRTIO 1.0 (without EVENT_IDX), this is checked via the `used` ring's
+    /// flags. If `VIRTQ_USED_F_NO_NOTIFY` (bit 0) is set, the device is actively
+    /// processing the queue and does not need a kick.
+    pub fn needs_kick(&self) -> bool {
+        // SAFETY: used ring is identity-mapped DMA; offset +0 = flags.
+        let flags = unsafe { core::ptr::read_volatile(self.used_base()) };
+        (flags & 1) == 0
+    }
+
     pub fn poll_used(&mut self) -> Option<(u32, u32)> {
         // Used ring layout: flags(u16), idx(u16), ring[N](VirtqUsedElem), avail_event(u16)
         // SAFETY: used_base+1 is the u16 `idx` field of this queue's used ring
