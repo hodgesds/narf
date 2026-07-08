@@ -4066,6 +4066,16 @@ pub const NARF_DISTRO_DESKTOP_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_DESK
     target_arch = "x86_64",
     any(feature = "boot-init", feature = "user-mode-testbin")
 ))]
+pub const NARF_DISTRO_KDE_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_KDE_ELF_X86_64"));
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
+pub const NARF_DISTRO_KDE_ELF: &[u8] = include_bytes!(env!("NARF_DISTRO_KDE_ELF_AARCH64"));
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "boot-init", feature = "user-mode-testbin")
+))]
 pub const NARF_CHROOT_RUN_ELF: &[u8] = include_bytes!(env!("NARF_CHROOT_RUN_ELF_X86_64"));
 #[cfg(all(
     target_arch = "aarch64",

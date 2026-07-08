@@ -3511,6 +3511,7 @@ fn boot_userspace_init() {
                 ("wl_app", narf_verification::NARF_WL_APP_ELF),
                 ("distro_init", narf_verification::NARF_DISTRO_INIT_ELF),
                 ("distro_desktop", narf_verification::NARF_DISTRO_DESKTOP_ELF),
+                ("distro_kde", narf_verification::NARF_DISTRO_KDE_ELF),
                 ("chroot_run", narf_verification::NARF_CHROOT_RUN_ELF),
                 ("shmfork_smoke", narf_verification::NARF_SHMFORK_SMOKE_ELF),
                 ("net_smoke", narf_verification::NARF_NET_SMOKE_ELF),
