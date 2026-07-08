@@ -188,6 +188,12 @@ jobs:
             lld \
             linux-libc-dev
 
+      # Ubuntu's QEMU 8.2 crashes NARF on GHA (pervasive per-process-exit
+      # #UD/#GP that never reproduces on newer QEMU / locally); build a newer
+      # one so the guest matches local behaviour. Cached after first build.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        uses: ./.github/actions/setup-qemu
+
       - name: Cache cargo registry + git
         uses: actions/cache@v4
         with:
@@ -451,6 +457,11 @@ jobs:
             ovmf \
             musl-tools \
             linux-libc-dev
+
+      # Ubuntu's QEMU 8.2 flakes the kernel-test suite on GHA ("QEMU exited
+      # None" — silent abort/timeout, no crash dump); build a newer one.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        uses: ./.github/actions/setup-qemu
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4
