@@ -875,8 +875,8 @@ kernel_test_in!("userspace/process", smoke_exit_sweeps_task_tables);
 /// PROT_NONE region covers, `lookup` says Some but the page-presence gate
 /// must say false.
 fn smoke_robust_walk_gate_is_page_presence_not_vma() -> TestResult {
-    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
     use alloc::sync::Arc;
+    use narf_memory::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
     // SAFETY: `new_for_user` only needs paging enabled; kernel-test runs
     // after boot has installed the page tables.
