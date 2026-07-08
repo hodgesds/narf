@@ -3,7 +3,6 @@
 //! Spec: VirtIO 1.2 §3.2.1 "Split Virtqueues".
 //!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 
-use core::sync::atomic::{compiler_fence, Ordering};
 use narf_memory::PAGE_SIZE;
 
 /// A single descriptor in the descriptor table.
@@ -33,7 +32,7 @@ pub struct VirtqUsedElem {
 /// Helper to ensure memory ordering when talking to the device.
 #[inline]
 pub fn virtio_fence() {
-    compiler_fence(Ordering::SeqCst);
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Layout manager for a Split Virtqueue.
@@ -286,6 +285,7 @@ impl Virtqueue {
     /// flags. If `VIRTQ_USED_F_NO_NOTIFY` (bit 0) is set, the device is actively
     /// processing the queue and does not need a kick.
     pub fn needs_kick(&self) -> bool {
+        virtio_fence();
         // SAFETY: used ring is identity-mapped DMA; offset +0 = flags.
         let flags = unsafe { core::ptr::read_volatile(self.used_base()) };
         (flags & 1) == 0

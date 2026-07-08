@@ -1327,11 +1327,19 @@ impl VirtioNetPci {
     /// the device synchronously for every single frame (mimicking Linux NAPI).
     pub fn rx_notify(&self, pair_idx: usize) {
         if let Some(pair) = self.pairs.get(pair_idx) {
-            let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
-            compiler_fence(Ordering::SeqCst);
-            // SAFETY: identity-mapped notify region.
-            unsafe {
-                self.notify.write16(off, pair.rx_qidx);
+            let needs_kick = {
+                pair.rx_queue
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|q| q.needs_kick())
+            };
+            if needs_kick {
+                let off = (pair.rx_notify_off as u64) * (self.notify_off_multiplier as u64);
+                compiler_fence(Ordering::SeqCst);
+                // SAFETY: identity-mapped notify region.
+                unsafe {
+                    self.notify.write16(off, pair.rx_qidx);
+                }
             }
         }
     }
