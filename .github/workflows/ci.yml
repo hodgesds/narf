@@ -188,6 +188,12 @@ jobs:
             lld \
             linux-libc-dev
 
+      # Ubuntu's QEMU 8.2 crashes NARF on GHA (pervasive per-process-exit
+      # #UD/#GP that never reproduces on newer QEMU / locally); build a newer
+      # one so the guest matches local behaviour. Cached after first build.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        uses: ./.github/actions/setup-qemu
+
       - name: Cache cargo registry + git
         uses: actions/cache@v4
         with:
@@ -269,6 +275,12 @@ jobs:
             lld \
             linux-libc-dev
 
+      # Ubuntu ships QEMU 8.2, which aborts under MTTCG + virtio-net + SLIRP
+      # with the re-entrant-BQL assertion. Build a newer QEMU (>= 9.0, past
+      # the fix) so net-smoke can run under real MTTCG. Cached after first build.
+      - name: Set up newer QEMU (past the 8.2 MTTCG BQL bug)
+        uses: ./.github/actions/setup-qemu
+
       - name: Cache cargo registry + git
         uses: actions/cache@v4
         with:
@@ -300,20 +312,22 @@ jobs:
       # single CI vcpu under TCG and dragged the echo past the host deadline
       # (a spurious `echo mismatch — got ""`; the historical ~20% flake).
       #
-      # Still pin a SINGLE vCPU: newer QEMU defaults TCG to MTTCG
-      # (thread=multi) for x86-on-x86, and NARF's virtio-net + SLIRP traffic
-      # intermittently trips a QEMU host-side re-entrant-BQL abort
-      # (`qemu_mutex_lock_iothread_impl: assertion failed
-      # (!qemu_mutex_iothread_locked())`) — a QEMU bug, not NARF. One vCPU
-      # means no MTTCG. net-smoke's coverage (off-box TCP serve, ARP,
-      # virtio-net RX/TX to an external client) is single-connection and needs
-      # no SMP. (The redis-migration #UD that also motivated SMP=1 is now moot:
-      # redis isn't spawned here, and task-#87 is fixed — group_dead teardown.)
-      # (Unset locally → KVM.)
+      # Run under REAL MTTCG (thread=multi). The QEMU 8.2 re-entrant-BQL
+      # abort (`qemu_mutex_lock_iothread_impl: assertion failed
+      # (!qemu_mutex_iothread_locked())`) that used to force a SMP=1 pin is a
+      # QEMU bug fixed in >= 9.0 — the "Set up newer QEMU" step above provides
+      # it. Combined with this branch's virtio-net barrier/kick fixes (a real
+      # hardware fence at `needs_kick`, so the store->load ordering the device
+      # observes is correct), the guest side is now MTTCG-safe. SMP stays 1:
+      # net-smoke is a single off-box connection and needs no extra vCPUs, and
+      # 1-vCPU MTTCG still drives the exact BQL code path that used to abort.
+      # `cargo xtask net-smoke` sets `no_redis` (netserve alone). (Unset accel
+      # locally → KVM.)
       - name: cargo xtask net-smoke
         env:
           XTASK_RI_PROMPT_TIMEOUT_SECS: "900"
           NARF_QEMU_SMP: "1"
+          XTASK_QEMU_ACCEL: "tcg,thread=multi"
           # Route a 2nd serial (COM2) to a file so a kernel core is captured if
           # the guest ever #UD/#GP/#PFs here despite the SMP=1 pin. The trap
           # handler writes an ELF core (NT_PRSTATUS + a PT_LOAD of the kernel
@@ -443,6 +457,11 @@ jobs:
             ovmf \
             musl-tools \
             linux-libc-dev
+
+      # Ubuntu's QEMU 8.2 flakes the kernel-test suite on GHA ("QEMU exited
+      # None" — silent abort/timeout, no crash dump); build a newer one.
+      - name: Set up newer QEMU (past the 8.2 instability)
+        uses: ./.github/actions/setup-qemu
 
       - name: Cache cargo registry + git
         uses: actions/cache@v4

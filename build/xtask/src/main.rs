@@ -624,11 +624,12 @@ impl Arch {
                     };
                     let dev = if queues > 1 {
                         format!(
-                            "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mq=on,vectors={}",
+                            "virtio-net-pci,netdev=n0,tx=timer,disable-legacy=on,disable-modern=off,mq=on,vectors={}",
                             2 * queues + 2
                         )
                     } else {
-                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into()
+                        "virtio-net-pci,netdev=n0,tx=timer,disable-legacy=on,disable-modern=off"
+                            .into()
                     };
                     args.extend_from_slice(&["-netdev".into(), n0, "-device".into(), dev]);
                     // Optional wire capture for debugging: `XTASK_QEMU_NETDUMP=<path>`
@@ -789,11 +790,12 @@ impl Arch {
                     };
                     let dev = if queues > 1 {
                         format!(
-                            "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off,mq=on,vectors={}",
+                            "virtio-net-pci,netdev=n0,tx=timer,disable-legacy=on,disable-modern=off,mq=on,vectors={}",
                             2 * queues + 2
                         )
                     } else {
-                        "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off".into()
+                        "virtio-net-pci,netdev=n0,tx=timer,disable-legacy=on,disable-modern=off"
+                            .into()
                     };
                     args.extend_from_slice(&["-netdev".into(), n0, "-device".into(), dev]);
                     // Optional wire capture for debugging: `XTASK_QEMU_NETDUMP=<path>`
@@ -919,7 +921,7 @@ fn qemu_virt_dtb_path() -> PathBuf {
             .arg("-netdev")
             .arg("user,id=n0")
             .arg("-device")
-            .arg("virtio-net-pci,netdev=n0")
+            .arg("virtio-net-pci,netdev=n0,tx=timer")
             .arg("-netdev")
             .arg("user,id=n1")
             .arg("-device")
@@ -3682,15 +3684,18 @@ fn boot_linux_redis(
     let (linux_netdev, linux_dev) = match &linux_tap {
         Some(tap) if lq > 1 => (
             format!("tap,id=n0,ifname={tap},script=no,downscript=no,queues={lq}"),
-            format!("virtio-net-pci,netdev=n0,mq=on,vectors={}", 2 * lq + 2),
+            format!(
+                "virtio-net-pci,netdev=n0,tx=timer,mq=on,vectors={}",
+                2 * lq + 2
+            ),
         ),
         Some(tap) => (
             format!("tap,id=n0,ifname={tap},script=no,downscript=no"),
-            "virtio-net-pci,netdev=n0".to_string(),
+            "virtio-net-pci,netdev=n0,tx=timer".to_string(),
         ),
         None => (
             format!("user,id=n0,hostfwd=tcp:127.0.0.1:{host_port}-:{guest_port}"),
-            "virtio-net-pci,netdev=n0".to_string(),
+            "virtio-net-pci,netdev=n0,tx=timer".to_string(),
         ),
     };
     cmd.args(["-netdev", &linux_netdev, "-device", &linux_dev]);
@@ -3911,12 +3916,15 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
     let (netdev, device) = if queues > 1 {
         (
             format!("tap,id=n0,ifname={tap},script=no,downscript=no,queues={queues}"),
-            format!("virtio-net-pci,netdev=n0,mq=on,vectors={}", 2 * queues + 2),
+            format!(
+                "virtio-net-pci,netdev=n0,tx=timer,mq=on,vectors={}",
+                2 * queues + 2
+            ),
         )
     } else {
         (
             format!("tap,id=n0,ifname={tap},script=no,downscript=no"),
-            "virtio-net-pci,netdev=n0".to_string(),
+            "virtio-net-pci,netdev=n0,tx=timer".to_string(),
         )
     };
     let mut cmd = Command::new("qemu-system-x86_64");

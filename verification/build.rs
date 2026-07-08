@@ -401,6 +401,15 @@ fn main() {
     );
     println!("cargo:rustc-env=NARF_DISTRO_DESKTOP_ELF_AARCH64=/dev/null");
 
+    // distro_kde — chroot into the Alpine KDE rootfs and run startplasma-wayland.
+    println!("cargo:rerun-if-changed=data/musl-demo/distro_kde_x86_64");
+    let dk = manifest_dir.join("data/musl-demo/distro_kde_x86_64");
+    println!(
+        "cargo:rustc-env=NARF_DISTRO_KDE_ELF_X86_64={}",
+        dk.display()
+    );
+    println!("cargo:rustc-env=NARF_DISTRO_KDE_ELF_AARCH64=/dev/null");
+
     // chroot_run — generic Alpine-chroot launcher running /probe.sh (input/
     // compositor bring-up "run real software, see what breaks" harness).
     println!("cargo:rerun-if-changed=data/musl-demo/chroot_run_x86_64");

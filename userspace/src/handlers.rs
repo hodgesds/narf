@@ -5229,6 +5229,28 @@ static ROBUST_LIST_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, (u64, u64)>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Is `uaddr` backed by a PRESENT page in `as_ref`'s hardware page
+/// tables? This is the correct precondition for a fixup-less
+/// `copy_from_user`: region (VMA) membership does not imply a present
+/// page, so probing the page tables — exactly the translation the CPU's
+/// read will perform — is what keeps a bogus-but-canonical user pointer
+/// (robust_smoke's head=0x1234abcd0000) from faulting the kernel fatally.
+#[cfg(target_arch = "x86_64")]
+fn user_page_present(as_ref: &AddressSpace, uaddr: u64) -> bool {
+    // SAFETY: called from the dying task's own exit context with its AS
+    // active, so `root` is the live, identity-reachable PML4; `translate`
+    // only reads page-table memory reachable from that root.
+    unsafe { narf_memory::x86_64::paging::translate(as_ref.root, VirtAddr::new(uaddr)).is_some() }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn user_page_present(as_ref: &AddressSpace, uaddr: u64) -> bool {
+    // aarch64 `paging::translate` isn't wired at this tier (same story as
+    // the loader's `user_vaddr_to_kernel_ptr`); userspace is a stub on
+    // aarch64 regardless, so fall back to region membership.
+    as_ref.lookup(VirtAddr::new(uaddr)).is_some()
+}
+
 /// Exit-time robust-futex walk (Linux `exit_robust_list`). Runs in the
 /// DYING task's own syscall/trap context — the user AS is still active,
 /// so plain `copy_from_user`/`copy_to_user` resolve the list — before
@@ -5267,9 +5289,17 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
     // address faults the kernel fatally. Probe the current address space first
     // — an unmapped address ends the walk instead of crashing. (Linux's
     // exit_robust_list relies on get_user fault fixup for the same safety.)
+    //
+    // The probe MUST match what the raw read actually hits: the hardware
+    // PAGE TABLES, not the region (VMA) list. Region membership does not
+    // imply a present page — a reserved / PROT_NONE / not-yet-faulted
+    // region, or a stale/corrupt region entry, false-positives, and the
+    // fixup-less read then faults fatally anyway. `user_page_present`
+    // walks the page tables (exactly the CPU's translation), so it says
+    // "no" for head=0x1234abcd0000 regardless of the region list.
     let user_mapped = |uaddr: u64| -> bool {
         current_address_space()
-            .map(|as_ref| as_ref.lookup(VirtAddr::new(uaddr)).is_some())
+            .map(|as_ref| user_page_present(&as_ref, uaddr))
             .unwrap_or(false)
     };
 
@@ -10751,6 +10781,13 @@ pub fn __test_set_robust_list(tid: u64, head: u64, len: u64) {
 #[doc(hidden)]
 pub fn __test_robust_walk(tid: u64) {
     robust_list_exit_walk(tid);
+}
+
+/// Test-only: expose the robust-walk's page-presence gate so a test can
+/// prove region (VMA) membership is NOT mistaken for a present page.
+#[doc(hidden)]
+pub fn __test_user_page_present(as_ref: &AddressSpace, uaddr: u64) -> bool {
+    user_page_present(as_ref, uaddr)
 }
 
 /// Test-only: set the console foreground task slot.
