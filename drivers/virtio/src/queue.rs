@@ -3,6 +3,7 @@
 //! Spec: VirtIO 1.2 §3.2.1 "Split Virtqueues".
 //!   <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html>
 
+use core::sync::atomic::{compiler_fence, Ordering};
 use narf_memory::PAGE_SIZE;
 
 /// A single descriptor in the descriptor table.
@@ -29,10 +30,41 @@ pub struct VirtqUsedElem {
     pub len: u32,
 }
 
-/// Helper to ensure memory ordering when talking to the device.
+// Virtqueue memory barriers, split by ordering requirement (the Linux
+// `virt_wmb`/`virt_rmb`/`virt_mb` model). The device is a peer agent
+// (QEMU I/O thread under KVM/MTTCG, or real hardware), so the driver's
+// ring accesses must be ordered *as the device observes them*.
+//
+// x86 is TSO: it never reorders store→store or load→load, so `wmb`/`rmb`
+// need only a compiler barrier (matching Linux, where they compile to
+// `barrier()`). It *does* reorder store→load, so a full barrier must be a
+// real hardware `mfence` — a compiler barrier is not enough there. The
+// three-way split keeps the cheap barrier on the hot wmb/rmb paths while
+// using a true fence exactly where store→load ordering demands it.
+
+/// Write barrier: order prior ring-entry stores before a following index
+/// publication the device reads (store→store).
 #[inline]
-pub fn virtio_fence() {
-    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+pub fn virtio_wmb() {
+    compiler_fence(Ordering::Release);
+}
+
+/// Read barrier: order a prior index load before following ring-entry
+/// loads (load→load).
+#[inline]
+pub fn virtio_rmb() {
+    compiler_fence(Ordering::Acquire);
+}
+
+/// Full barrier: order a prior store to a ring index before a following
+/// load of the device's own ring state (store→load). MUST be a real
+/// hardware fence on x86 — the CPU is permitted to reorder store→load, so
+/// a compiler barrier here lets the driver read a stale device flag (e.g.
+/// `needs_kick`) and skip a notification the device needed, wedging the
+/// queue.
+#[inline]
+pub fn virtio_mb() {
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// Layout manager for a Split Virtqueue.
@@ -265,7 +297,7 @@ impl Virtqueue {
             // ring-entry store ordered before the idx publication.
             core::ptr::write_volatile(ring.add(slot), head);
 
-            virtio_fence();
+            virtio_wmb();
             self.avail_idx = self.avail_idx.wrapping_add(1);
             core::ptr::write_volatile(self.avail_base().add(1), self.avail_idx);
         }
@@ -285,7 +317,11 @@ impl Virtqueue {
     /// flags. If `VIRTQ_USED_F_NO_NOTIFY` (bit 0) is set, the device is actively
     /// processing the queue and does not need a kick.
     pub fn needs_kick(&self) -> bool {
-        virtio_fence();
+        // Full barrier: our prior `avail_idx` store (in `submit`) must be
+        // visible to the device before we load its NO_NOTIFY flag, or the
+        // store→load reorder x86 permits lets us read a stale flag and skip
+        // a kick the device needed. Requires a real hardware fence.
+        virtio_mb();
         // SAFETY: used ring is identity-mapped DMA; offset +0 = flags.
         let flags = unsafe { core::ptr::read_volatile(self.used_base()) };
         (flags & 1) == 0
@@ -308,7 +344,7 @@ impl Virtqueue {
             return None;
         }
 
-        virtio_fence();
+        virtio_rmb();
         // SAFETY: used_base+2 skips the flags+idx u16 header to the
         // VirtqUsedElem ring array; the cast is to the ring's actual element
         // type. The ring base is 4-byte aligned per VirtqueueLayout::new,
