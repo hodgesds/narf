@@ -872,6 +872,17 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let mnt_ptr = args.arg2;
     let mnt_len = args.arg3 as usize;
     let flags = args.arg4;
+    // O_TMPFILE (open an unnamed temp inode inside a directory): NARF's VFS
+    // has no unnamed-inode support, so honouring the flag as-written opens
+    // the DIRECTORY itself and a later write() to that fd EINVALs. Return
+    // -EOPNOTSUPP so Qt's QSaveFile (and libc tmpfile) fall back to a named
+    // temp + rename, which NARF supports. Without this EVERY KDE ksycoca /
+    // kconfig write fails with "Invalid argument" and startplasma stalls.
+    const O_TMPFILE: u64 = 0o20_000_000; // __O_TMPFILE bit (x86_64)
+    if flags & O_TMPFILE != 0 {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+        return;
+    }
     // Preserve the settable open flags (O_NONBLOCK | O_APPEND | O_DIRECT)
     // into the fd's status flags. Historically `open()` dropped these and
     // only `fcntl(F_SETFL)` could set them, so a file opened `O_NONBLOCK`
