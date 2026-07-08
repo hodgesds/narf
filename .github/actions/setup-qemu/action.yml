@@ -1,0 +1,61 @@
+name: "Set up newer QEMU"
+description: >
+  Build (and cache) a qemu-system-x86_64 newer than Ubuntu's, then prepend
+  it to PATH. Ubuntu 24.04 ships QEMU 8.2, which has an MTTCG re-entrant-BQL
+  bug (`qemu_mutex_lock_iothread_impl: assertion failed`) that aborts under
+  NARF's virtio-net + user-mode-SLIRP traffic. It is fixed in QEMU >= 9.0
+  (the BQL rework); this action provides a version past it so the guest can
+  run under real MTTCG (thread=multi). xtask resolves `qemu-system-x86_64`
+  via PATH, so no xtask change is needed.
+
+inputs:
+  version:
+    description: "QEMU release to build (must be >= 9.0 to clear the BQL bug)"
+    required: false
+    default: "9.2.0"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache QEMU ${{ inputs.version }}
+      id: cache-qemu
+      uses: actions/cache@v4
+      with:
+        path: ~/qemu-install
+        key: qemu-${{ inputs.version }}-${{ runner.os }}
+
+    - name: Build QEMU ${{ inputs.version }}
+      if: steps.cache-qemu.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        # Build deps. libslirp-dev is REQUIRED: QEMU >= 8.0 dropped the
+        # bundled slirp, and net-smoke's off-box test uses `-netdev user`
+        # hostfwd.
+        # QEMU installs its own meson (bundled wheel) into an in-tree venv
+        # via python/scripts/mkvenv.py, which needs `distlib` importable —
+        # python3-distlib provides it (its absence is a "found no usable
+        # distlib" configure failure). python3-venv + python3-pip complete
+        # the bootstrap. libslirp-dev is required for `-netdev user` hostfwd.
+        sudo apt-get install -y --no-install-recommends \
+          build-essential ninja-build pkg-config \
+          python3-venv python3-pip python3-distlib \
+          libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev flex bison
+        curl -fL "https://download.qemu.org/qemu-${{ inputs.version }}.tar.xz" -o /tmp/qemu.tar.xz
+        tar -xf /tmp/qemu.tar.xz -C /tmp
+        cd "/tmp/qemu-${{ inputs.version }}"
+        ./configure \
+          --target-list=x86_64-softmmu \
+          --prefix="$HOME/qemu-install" \
+          --enable-slirp \
+          --disable-docs
+        make -j"$(nproc)"
+        make install
+
+    - name: Prepend QEMU to PATH + verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "$HOME/qemu-install/bin" >> "$GITHUB_PATH"
+        "$HOME/qemu-install/bin/qemu-system-x86_64" --version
