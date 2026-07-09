@@ -900,7 +900,14 @@ impl FileOps for SocketFile {
             | SocketState::InetConnected { rx, tx, .. }
             | SocketState::Inet6Connected { rx, tx, .. } => {
                 let mut bits = 0;
-                if rx.has_data() {
+                // Linux reports POLLIN on a peer-closed stream socket too, so
+                // the reader's normal readable path runs, read() returns 0
+                // (EOF), and it tears the connection down. Reporting only
+                // POLLHUP (no POLLIN) here made dbus-daemon busy-spin on a
+                // hung-up client fd — epoll kept returning it ready, but with
+                // no POLLIN dbus never entered its read/disconnect path and
+                // looped forever, wedging the whole session bus (Plasma stall).
+                if rx.has_data() || rx.is_closed() {
                     bits |= narf_filesystem::POLL_IN;
                 }
                 if tx.has_space() {
