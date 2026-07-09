@@ -3675,6 +3675,38 @@ fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// `fchmodat(dirfd, path, mode, flags)` / `fchmodat2(..., flags)`.
+/// Split from `sys_fchmodat_or_fchownat` because a chmod's `arg2` is a
+/// MODE (a chown's is a uid) — and a directory's mode is observable via
+/// `stat`, which dbus/systemd read to reject a group/other-writable
+/// `XDG_RUNTIME_DIR`. So `chmod 0700` on a tmpfs dir must actually take.
+/// musl implements `chmod(2)` as `fchmodat(AT_FDCWD, path, mode, 0)`, so
+/// every libc chmod lands here. Files keep the accept-and-ignore
+/// behaviour (NARF has no per-file mode enforcement).
+fn sys_fchmodat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let path_uptr = args.arg1;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    let raw = match copy_user_cstr(path_uptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let path = resolve_cwd_path(current_task_id(), &raw);
+    if let Some(dir) = resolve_dir_absolute(&path) {
+        dir.set_dir_mode((args.arg2 as u32 & 0o7777) as u16);
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    if stat_path_dir_aware(&path).is_some() {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
 // ── fchmod / fchown — accept-and-ignore on known fd ───────────────
 //
 // NARF has no per-file permission bits or owner; the kernel
@@ -13660,12 +13692,18 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u6
     if file.is_some() {
         return file;
     }
-    if resolve_dir_absolute(path).is_some() {
+    if let Some(dir) = resolve_dir_absolute(path) {
+        // Report the directory's real (chmod-settable) mode, not a
+        // hardcoded 0o777 — dbus/systemd reject XDG_RUNTIME_DIR unless
+        // it is not group/other-writable, so `chmod 0700` must show.
         return Some((
             narf_filesystem::Stat {
                 size: 0,
                 blocks: 0,
-                mode: narf_filesystem::Mode::DIR_RW,
+                mode: narf_filesystem::Mode {
+                    file_type: narf_filesystem::FileType::Dir,
+                    perms: dir.dir_mode(),
+                },
                 mtime_cycles: 0,
             },
             0,
@@ -13697,10 +13735,16 @@ impl narf_filesystem::FileOps for DirFdFile {
         alloc::boxed::Box::pin(async move { Err(narf_filesystem::FsError::InvalidPath) })
     }
     fn stat(&self) -> narf_filesystem::Stat {
+        // Report the directory's real (chmod-settable) mode. A hardcoded
+        // 0o777 made dbus/systemd reject XDG_RUNTIME_DIR as group/other-
+        // writable even after `chmod 0700`.
         narf_filesystem::Stat {
             size: 0,
             blocks: 0,
-            mode: narf_filesystem::Mode::DIR_RW,
+            mode: narf_filesystem::Mode {
+                file_type: narf_filesystem::FileType::Dir,
+                perms: self.dir.dir_mode(),
+            },
             mtime_cycles: 0,
         }
     }
@@ -21888,11 +21932,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "fchown",
         RawFnHandler(sys_fchmod_or_fchown),
     );
-    table.install_raw(
-        Syscall::Fchmodat,
-        "fchmodat",
-        RawFnHandler(sys_fchmodat_or_fchownat),
-    );
+    table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat));
     table.install_raw(
         Syscall::Fchownat,
         "fchownat",

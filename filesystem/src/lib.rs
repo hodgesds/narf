@@ -741,6 +741,21 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// This directory's permission bits (low 12 bits of the mode).
+    /// Default `0o755` (rwxr-xr-x) — deliberately NOT group/other-
+    /// writable: dbus/systemd reject `XDG_RUNTIME_DIR` (and refuse to
+    /// create a session bus) if a directory stats as world-writable,
+    /// which a hardcoded `0o777` used to make every dir look. A writable
+    /// filesystem (memfs) overrides with a `chmod`-settable value so
+    /// `chmod(2)` on a directory reflects in `stat`.
+    fn dir_mode(&self) -> u16 {
+        0o755
+    }
+
+    /// Set this directory's permission bits. Default no-op (read-only
+    /// filesystems ignore it); memfs stores it so `dir_mode` reflects it.
+    fn set_dir_mode(&self, _perms: u16) {}
+
     // ── Stage-4 r/w surface ──────────────────────────────────────
 
     /// Remove the file entry named `name` from this directory.

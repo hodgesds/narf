@@ -249,6 +249,11 @@ enum Entry {
 /// subdirectory created via `mkdir` are `MemDir`s.
 struct MemDir {
     entries: IrqSafeSpinLock<BTreeMap<String, Entry>>,
+    /// Directory permission bits (low 12). Defaults to 0o777; `chmod(2)`
+    /// on the directory updates it so `stat` reflects the real mode —
+    /// dbus/systemd require `XDG_RUNTIME_DIR` to not be group/other-
+    /// writable, so `chmod 0700` on a tmpfs dir must actually take.
+    perms: AtomicU32,
 }
 
 impl fmt::Debug for MemDir {
@@ -356,10 +361,19 @@ impl DirOps for MemDir {
             }
             let d = Arc::new(MemDir {
                 entries: IrqSafeSpinLock::new(BTreeMap::new()),
+                perms: AtomicU32::new(0o755),
             });
             g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
             Ok(d as Arc<dyn DirOps>)
         })
+    }
+
+    fn dir_mode(&self) -> u16 {
+        (self.perms.load(Ordering::Relaxed) & 0o7777) as u16
+    }
+
+    fn set_dir_mode(&self, perms: u16) {
+        self.perms.store((perms & 0o7777) as u32, Ordering::Relaxed);
     }
 
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
@@ -437,6 +451,7 @@ impl MemFs {
             name,
             root: Arc::new(MemDir {
                 entries: IrqSafeSpinLock::new(BTreeMap::new()),
+                perms: AtomicU32::new(0o755),
             }),
         }
     }
