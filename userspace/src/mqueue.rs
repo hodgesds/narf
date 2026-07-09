@@ -660,6 +660,33 @@ struct InotifyFile {
 }
 
 impl FileOps for InotifyFile {
+    /// Readable ONLY when events are queued (an inotify fd is never
+    /// writable and has no EOF). Without this override the always-ready
+    /// default (POLL_IN|POLL_OUT) makes an epoll-driven consumer busy-spin:
+    /// epoll reports ready, read() returns 0 (no events), loop — which
+    /// wedged dbus-daemon watching its config dirs and stalled the whole
+    /// Plasma session bus.
+    fn poll_readiness(&self) -> u32 {
+        let has_events = with_inotify(|m| {
+            m.get(&self.id)
+                .map(|s| !s.events.is_empty())
+                .unwrap_or(false)
+        });
+        if has_events {
+            narf_filesystem::POLL_IN
+        } else {
+            0
+        }
+    }
+    /// A blocking read with no queued events must PARK (POSIX), not return
+    /// a spurious 0 — inotify has no end-of-file.
+    fn read_should_block(&self) -> bool {
+        with_inotify(|m| {
+            m.get(&self.id)
+                .map(|s| s.events.is_empty())
+                .unwrap_or(false)
+        })
+    }
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let id = self.id;
         Box::pin(async move {
