@@ -4866,11 +4866,30 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
             // is <= 4096, so the slice stays within the page.
             let dst = unsafe { core::slice::from_raw_parts_mut(frame.raw() as *mut u8, want) };
             let mut done = 0usize;
+            // `stalls` bounds retries after a poll_blocking budget-exhaustion so a
+            // genuinely wedged read still fails closed instead of hanging forever.
+            let mut stalls = 0u32;
             while done < want {
                 match poll_blocking(ops.read(offset + off as u64 + done as u64, &mut dst[done..])) {
-                    Some(Ok(0)) | None => break, // EOF / error — rest stays zero
-                    Some(Ok(n)) => done += n,
-                    Some(Err(_)) => break,
+                    Some(Ok(0)) => break, // real EOF — rest stays zero (past file end)
+                    Some(Ok(n)) => {
+                        done += n;
+                        stalls = 0;
+                    }
+                    Some(Err(_)) => break, // read error — rest stays zero
+                    // `None` = poll_blocking's busy-poll budget ran out while the
+                    // read was still *waiting* (contended ext2 scratch DMA under a
+                    // concurrent execve storm — e.g. KDE launching dozens of procs
+                    // at once), NOT a real EOF. Treating it as EOF silently
+                    // zero-fills the rest of the page, corrupting a mmap'd DSO (it
+                    // truncated a libdbus .rodata string → every dbus client sent a
+                    // malformed Hello → no session bus → Plasma stalled). Retry.
+                    None => {
+                        stalls += 1;
+                        if stalls > 4096 {
+                            break;
+                        }
+                    }
                 }
             }
             frames.push(frame);
