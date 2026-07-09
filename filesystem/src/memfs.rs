@@ -397,13 +397,16 @@ impl DirOps for MemDir {
     fn rename<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let mut g = self.entries.lock();
-            if !g.contains_key(old_name) {
-                return Err(FsError::NotFound);
-            }
-            if g.contains_key(new_name) {
-                return Err(FsError::Busy);
-            }
-            let entry = g.remove(old_name).unwrap();
+            let entry = match g.remove(old_name) {
+                Some(e) => e,
+                None => return Err(FsError::NotFound),
+            };
+            // POSIX rename(2) ATOMICALLY REPLACES an existing destination —
+            // that is the whole point of the write-temp-then-rename atomic-
+            // save idiom (Qt QSaveFile, KConfig, most config/cache writers).
+            // The old code rejected an existing `new_name` with EBUSY, so
+            // every REWRITE of an existing file failed (KDE reported it as
+            // "Disk full?"). `insert` overwrites whatever was there.
             g.insert(new_name.to_string(), entry);
             Ok(())
         })
