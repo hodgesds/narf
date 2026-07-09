@@ -1060,6 +1060,19 @@ fn sys_open(ctx: &mut dyn TrapContext) {
         ops
     };
 
+    // Directory fd: a real fs directory resolves to its raw node, whose
+    // read() yields 0 and whose poll_readiness() is the always-ready default.
+    // A program that opens a directory and adds it to epoll (dbus-daemon
+    // watching its service dirs) then busy-spins: epoll always reports it
+    // ready, read returns 0, loop. Wrap it in DirFdFile so the fd behaves
+    // like a directory — read/write are rejected, getdents64 rides `as_dir`,
+    // and poll reports NOT readable (so epoll never spuriously wakes on it).
+    let ops = if let Some(dirops) = ops.as_dir() {
+        alloc::sync::Arc::new(DirFdFile { dir: dirops }) as Arc<dyn narf_filesystem::FileOps>
+    } else {
+        ops
+    };
+
     let new_fd = match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops,
@@ -13693,6 +13706,13 @@ impl narf_filesystem::FileOps for DirFdFile {
     }
     fn as_dir(&self) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
         Some(self.dir.clone())
+    }
+    /// A directory fd has no readable/writable stream (read/write are
+    /// EISDIR; enumeration is getdents64). Report NOT ready so a poll/epoll
+    /// consumer never spuriously wakes on it — the always-ready FileOps
+    /// default made dbus-daemon busy-spin on an epoll'd service directory.
+    fn poll_readiness(&self) -> u32 {
+        0
     }
 }
 
