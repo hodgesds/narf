@@ -335,6 +335,32 @@ pub(crate) fn poll_blocking<F: core::future::Future>(mut fut: F) -> Option<F::Ou
     None
 }
 
+/// Poll a block-I/O future to completion, keeping the SAME future alive for the
+/// entire wait. Unlike `poll_blocking`'s small budget, this uses a huge backstop
+/// so a merely-contended read (KDE launching dozens of procs at once, all
+/// streaming binaries off ext2) completes rather than timing out. Crucially it
+/// NEVER drops the future mid-flight: a dropped read leaves its in-flight
+/// virtio-blk request DMA'ing into a scratch buffer that has been returned to
+/// the pool and reused → corruption. Only a genuinely-wedged device reaches the
+/// ceiling (returns None); callers that must not truncate treat that as a hard
+/// stop, not EOF.
+pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    // SAFETY: same no-op waker as poll_blocking; the block-completion IRQ / pump
+    // advances the future's readiness, which the re-poll observes.
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut ctx = Context::from_waker(&waker);
+    // SAFETY: we own `fut` by value; pin to the stack temporary.
+    let mut pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    for _ in 0..2_000_000_000u64 {
+        match pinned.as_mut().poll(&mut ctx) {
+            Poll::Ready(v) => return Some(v),
+            Poll::Pending => continue,
+        }
+    }
+    None
+}
+
 // ── Per-task AS lookup shim ────────────────────────────────────────
 //
 // Handlers need the current task's AddressSpace. `scheduler` is
@@ -4866,30 +4892,26 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
             // is <= 4096, so the slice stays within the page.
             let dst = unsafe { core::slice::from_raw_parts_mut(frame.raw() as *mut u8, want) };
             let mut done = 0usize;
-            // `stalls` bounds retries after a poll_blocking budget-exhaustion so a
-            // genuinely wedged read still fails closed instead of hanging forever.
-            let mut stalls = 0u32;
             while done < want {
-                match poll_blocking(ops.read(offset + off as u64 + done as u64, &mut dst[done..])) {
-                    Some(Ok(0)) => break, // real EOF — rest stays zero (past file end)
-                    Some(Ok(n)) => {
-                        done += n;
-                        stalls = 0;
-                    }
+                // Poll each read to COMPLETION, keeping the one future alive for
+                // the whole wait (`poll_io_to_completion`, huge backstop) — never
+                // drop it mid-request. The old code used `poll_blocking` (a small
+                // 4M budget) and treated its timeout (`None`) as EOF, silently
+                // zero-filling the page tail under a concurrent-execve storm (KDE
+                // launching dozens of procs): that truncated a mmap'd DSO — it
+                // lopped a libdbus `.rodata` string "/org/freedesktop/DBus" → "/",
+                // so every forked dbus client sent a malformed Hello, killing the
+                // session bus and stalling Plasma. Dropping a read future mid-DMA
+                // ALSO left an in-flight virtio-blk request writing into a scratch
+                // buffer that had been returned to the pool and reused → garbage.
+                // Holding the future to completion fixes both: the scratch buffer
+                // is released only after its DMA finishes.
+                match poll_io_to_completion(
+                    ops.read(offset + off as u64 + done as u64, &mut dst[done..]),
+                ) {
+                    Some(Ok(0)) | None => break, // real EOF (or wedged device) — rest stays zero
+                    Some(Ok(n)) => done += n,
                     Some(Err(_)) => break, // read error — rest stays zero
-                    // `None` = poll_blocking's busy-poll budget ran out while the
-                    // read was still *waiting* (contended ext2 scratch DMA under a
-                    // concurrent execve storm — e.g. KDE launching dozens of procs
-                    // at once), NOT a real EOF. Treating it as EOF silently
-                    // zero-fills the rest of the page, corrupting a mmap'd DSO (it
-                    // truncated a libdbus .rodata string → every dbus client sent a
-                    // malformed Hello → no session bus → Plasma stalled). Retry.
-                    None => {
-                        stalls += 1;
-                        if stalls > 4096 {
-                            break;
-                        }
-                    }
                 }
             }
             frames.push(frame);
