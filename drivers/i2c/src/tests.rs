@@ -347,6 +347,7 @@ fn smoke_i801_smbus_rejects_transfer_when_disabled() -> TestResult {
     let (phys, _len) = make_synthetic_mmio(false);
     let mmio = narf_bus::MmioRegion {
         phys,
+        virt: phys.raw(),
         len: 32,
         kind: narf_bus::BarKind::Mmio32 {
             prefetchable: false,

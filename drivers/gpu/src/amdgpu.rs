@@ -1598,8 +1598,10 @@ unsafe fn read_vbios_version_from_rom(
     let rom_phys = rom_phys_base as u64;
 
     // Map a small probe window to read the PCI ROM header (first 3 bytes).
+    // Identity-mapped ROM window, so virt == phys.
     let probe_region = MmioRegion {
         phys: PhysAddr::new(rom_phys),
+        virt: rom_phys,
         len: 512,
         kind: BarKind::Mmio32 {
             prefetchable: false,
@@ -1632,9 +1634,10 @@ unsafe fn read_vbios_version_from_rom(
     // Hard cap: real AMD VBIOSes are <= 256 KiB.
     .min(256 * 1024);
 
-    // Re-map with the full ROM size.
+    // Re-map with the full ROM size. Identity-mapped, so virt == phys.
     let region = MmioRegion {
         phys: PhysAddr::new(rom_phys),
+        virt: rom_phys,
         len: rom_size,
         kind: BarKind::Mmio32 {
             prefetchable: false,

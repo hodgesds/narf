@@ -6,11 +6,11 @@
 //! its own. The MSI-X table programmer (msix.rs) uses this to find the
 //! BAR named by `MsixTable::bir()`.
 //!
-//! Today the kernel's identity map covers the q35 ECAM + low 4 GiB,
-//! so the "map" step is a value-by-value (PhysAddr, len) pair that the
-//! caller dereferences as MMIO. Once the kernel grows a separate ioremap
-//! for above-4-GiB BARs, `map_bar` becomes the place that allocates a
-//! VMA and updates the page tables; callers don't need to change.
+//! `map_bar` is NARF's `pci_iomap`: it `ioremap`s the BAR window into a
+//! kernel VA (`MmioRegion.virt`) and the accessors deref that — so BARs
+//! above the boot identity map (64-bit BARs a large-`phys-bits` host
+//! parks far above 4 GiB) are reachable, matching Linux, which never
+//! dereferences `pci_resource_start` directly.
 //!
 //! BAR sizing is the standard PCI ritual:
 //!   1. Read original BAR value (preserve type/prefetch bits).
@@ -193,12 +193,18 @@ pub unsafe fn read_bar(device: &BusDevice, idx: u8) -> Result<Bar, BarError> {
 
 /// Map a device's BAR for MMIO access.
 ///
-/// Stage-3 implementation: the kernel's identity map covers the low
-/// 4 GiB and the q35 ECAM, so for every BAR a Stage-3 driver can
-/// possibly hold, the returned `(phys, size)` pair is directly
-/// dereferenceable. When kernel-side ioremap arrives this function
-/// becomes the place that allocates a VMA + updates page tables — the
-/// returned shape stays the same.
+/// This is NARF's `pci_iomap` (`drivers/pci/iomap.c`): the BAR's
+/// physical window is `ioremap`'d into a fresh kernel VA and the
+/// returned `MmioRegion.virt` is what the accessors dereference. That
+/// makes BARs the boot identity map doesn't cover — 64-bit BARs a
+/// large-`phys-bits` host (e.g. KVM `-cpu host`) places far above
+/// 4 GiB — reachable, exactly as Linux never derefs `pci_resource_start`
+/// directly but always maps it first. Uncached (`Device`) for control
+/// BARs; write-combining for prefetchable windows (framebuffers/ROMs).
+///
+/// If `ioremap` fails (or the BAR is unprogrammed), `virt` falls back
+/// to the raw phys — correct for the low BARs the boot map already
+/// covers, and no worse than the pre-ioremap behaviour otherwise.
 ///
 /// # Safety
 /// See `read_bar`: `device` must be PCIe and the caller must hold
@@ -211,20 +217,57 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
         // `read_bar` and use `outb/inb` directly.
         return Err(BarError::NotPcie);
     }
+
+    let phys = bar.phys.raw();
+    // Unprogrammed BAR (phys == 0) or zero-size: nothing to ioremap;
+    // keep the raw phys so behaviour matches the old identity-map path.
+    let virt = if phys == 0 || bar.size == 0 {
+        phys
+    } else {
+        use narf_memory::ioremap::{ioremap, MmioAttrs};
+        // ioremap requires page-aligned phys + page-multiple len; a BAR
+        // base is naturally aligned to its size (>= 16 bytes) but not
+        // necessarily to a page, so map from the containing page.
+        let page_off = phys & 0xFFF;
+        let aligned_phys = phys - page_off;
+        let map_len = (bar.size + page_off + 0xFFF) & !0xFFF;
+        let attrs = match bar.kind {
+            BarKind::Mmio32 { prefetchable: true } | BarKind::Mmio64 { prefetchable: true } => {
+                MmioAttrs::WriteCombining
+            }
+            _ => MmioAttrs::Device,
+        };
+        // SAFETY: `device` ownership is the caller's contract (see fn
+        // safety); `map_len` covers the full BAR window from its page
+        // base. ioremap installs the VA→phys PTEs with the right memtype.
+        match unsafe { ioremap(aligned_phys, map_len, attrs) } {
+            Ok(m) => m.virt + page_off,
+            Err(_) => phys,
+        }
+    };
+
     Ok(MmioRegion {
         phys: bar.phys,
+        virt,
         len: bar.size,
         kind: bar.kind,
     })
 }
 
-/// A mapped MMIO region. Stage-3 representation: the physical base is
-/// directly dereferenceable through the kernel's identity map, so MMIO
+/// A mapped MMIO region. `virt` is the kernel virtual address the
+/// device window is reachable at — from `ioremap` when `map_bar`
+/// mapped it (the Linux `pci_iomap` model: BARs above the boot
+/// identity map get their own VA), or equal to `phys` for regions a
+/// caller built directly over an identity-mapped window. All MMIO
 /// reads/writes go through this handle's `read32` / `write32` helpers
-/// which do the volatile + barrier dance.
+/// (which deref `virt`) and do the volatile + barrier dance. `phys`
+/// is retained for callers that record or re-derive the BAR base.
 #[derive(Copy, Clone, Debug)]
 pub struct MmioRegion {
     pub phys: PhysAddr,
+    /// Dereferenceable kernel VA for MMIO access. `== phys.raw()` for
+    /// identity-mapped regions; an ioremap VA for above-map BARs.
+    pub virt: u64,
     pub len: u64,
     pub kind: BarKind,
 }
@@ -240,7 +283,7 @@ impl MmioRegion {
         // SAFETY: caller-asserted in-range; arch::mmio supplies the
         // volatile + arch-correct barrier.
         // SAFETY: Valid memory or trusted environment
-        unsafe { narf_arch::mmio::read8(self.phys.raw() + offset) }
+        unsafe { narf_arch::mmio::read8(self.virt + offset) }
     }
 
     /// Write an 8-bit MMIO byte at `offset`.
@@ -251,7 +294,7 @@ impl MmioRegion {
     pub unsafe fn write8(&self, offset: u64, value: u8) {
         // SAFETY: caller-asserted in-range.
         unsafe {
-            narf_arch::mmio::write8(self.phys.raw() + offset, value);
+            narf_arch::mmio::write8(self.virt + offset, value);
         }
     }
 
@@ -265,7 +308,7 @@ impl MmioRegion {
         // SAFETY: caller-asserted in-range, naturally-aligned;
         // arch::mmio supplies the volatile + arch-correct barrier.
         // SAFETY: Valid memory or trusted environment
-        unsafe { narf_arch::mmio::read16(self.phys.raw() + offset) }
+        unsafe { narf_arch::mmio::read16(self.virt + offset) }
     }
 
     /// Write a naturally-aligned 16-bit MMIO word at `offset`.
@@ -277,7 +320,7 @@ impl MmioRegion {
     pub unsafe fn write16(&self, offset: u64, value: u16) {
         // SAFETY: caller-asserted in-range, naturally-aligned.
         unsafe {
-            narf_arch::mmio::write16(self.phys.raw() + offset, value);
+            narf_arch::mmio::write16(self.virt + offset, value);
         }
     }
 
@@ -290,7 +333,7 @@ impl MmioRegion {
     #[inline]
     pub unsafe fn read32(&self, offset: u64) -> u32 {
         // SAFETY: caller-asserted in-range, naturally-aligned.
-        unsafe { narf_arch::mmio::read32(self.phys.raw() + offset) }
+        unsafe { narf_arch::mmio::read32(self.virt + offset) }
     }
 
     /// Write a naturally-aligned 32-bit MMIO word at `offset`.
@@ -301,7 +344,7 @@ impl MmioRegion {
     pub unsafe fn write32(&self, offset: u64, value: u32) {
         // SAFETY: caller-asserted in-range, naturally-aligned.
         unsafe {
-            narf_arch::mmio::write32(self.phys.raw() + offset, value);
+            narf_arch::mmio::write32(self.virt + offset, value);
         }
     }
 }
