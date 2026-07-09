@@ -453,6 +453,14 @@ pub enum AuxEntry {
     Random(u64),
     /// Secure-execution flag (set-uid / set-gid context).
     Secure(bool),
+    /// Real user ID (`AT_UID` = 11).
+    Uid(u32),
+    /// Effective user ID (`AT_EUID` = 12).
+    Euid(u32),
+    /// Real group ID (`AT_GID` = 13).
+    Gid(u32),
+    /// Effective group ID (`AT_EGID` = 14).
+    Egid(u32),
     /// Base address of the vDSO ELF header (`AT_SYSINFO_EHDR` = 33). libc
     /// parses the vDSO from here to resolve `__vdso_*` / `__kernel_*`.
     SysInfoEhdr(u64),
@@ -474,6 +482,10 @@ impl AuxEntry {
             AuxEntry::Hwcap(_) => 16,
             AuxEntry::Random(_) => 25,
             AuxEntry::Secure(_) => 23,
+            AuxEntry::Uid(_) => 11,
+            AuxEntry::Euid(_) => 12,
+            AuxEntry::Gid(_) => 13,
+            AuxEntry::Egid(_) => 14,
             AuxEntry::SysInfoEhdr(_) => 33,
         }
     }

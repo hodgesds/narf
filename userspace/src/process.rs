@@ -394,6 +394,19 @@ pub unsafe fn load_user_process_with(
             AuxEntry::Phdr(at_phdr),
             AuxEntry::PhEnt(e_phentsize as u32),
             AuxEntry::PhNum(e_phnum as u32),
+            // musl's __init_libc enters "secure mode" (issetugid()/
+            // secure_getenv() report set-uid) UNLESS the auxv presents
+            // AT_UID==AT_EUID, AT_GID==AT_EGID, and AT_SECURE==0. Real Linux
+            // always emits these; NARF must too, or every process looks
+            // set-uid — which makes libdbus (via issetugid) refuse the
+            // session bus ("Unable to autolaunch when setuid") and stalls
+            // startplasma/plasmashell. NARF processes are uid 0 (root) with
+            // uid==euid, so emit a consistent, non-secure set.
+            AuxEntry::Uid(0),
+            AuxEntry::Euid(0),
+            AuxEntry::Gid(0),
+            AuxEntry::Egid(0),
+            AuxEntry::Secure(false),
         ] {
             let tag = default.tag();
             if !final_aux.iter().any(|e| e.tag() == tag) {
@@ -729,6 +742,10 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
                 0
             }
         }
+        AuxEntry::Uid(v) => v as u64,
+        AuxEntry::Euid(v) => v as u64,
+        AuxEntry::Gid(v) => v as u64,
+        AuxEntry::Egid(v) => v as u64,
         AuxEntry::SysInfoEhdr(v) => v,
     };
     (key, val)
