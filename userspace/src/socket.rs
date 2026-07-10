@@ -100,6 +100,7 @@ pub const SO_LINGER: u32 = 13;
 pub const SO_REUSEPORT: u32 = 15;
 pub const SO_PEERCRED: u32 = 17;
 pub const SO_BINDTODEVICE: u32 = 25;
+pub const SO_ACCEPTCONN: u32 = 30;
 pub const SO_PROTOCOL: u32 = 38;
 pub const SO_DOMAIN: u32 = 39;
 
@@ -859,7 +860,7 @@ impl FileOps for SocketFile {
             size: 0,
             blocks: 0,
             mode: Mode {
-                file_type: narf_filesystem::FileType::Special,
+                file_type: narf_filesystem::FileType::Socket,
                 perms: 0o600,
             },
             mtime_cycles: 0,
@@ -991,6 +992,18 @@ impl SocketFile {
                 }
                 return match self.local_addr() {
                     Some(a) => SocketOpResult::Addr(a),
+                    // An *accepted* AF_UNIX socket has no bound local path, but
+                    // libdbus's `_dbus_socket_can_pass_unix_fd()` getsockname()s
+                    // the connection and enables SCM_RIGHTS fd-passing only if
+                    // `sa_family == AF_UNIX`. Returning an error made dbus-daemon
+                    // reply ERROR to NEGOTIATE_UNIX_FD, so a peer (elogind) could
+                    // not pass an fd back — e.g. the session-controller fd in the
+                    // CreateSession reply → "Not supported" → no logind session.
+                    // Report a minimal AF_UNIX sockaddr (family only, empty path).
+                    None if self.domain == AF_UNIX => SocketOpResult::Addr(SockAddr {
+                        family: AF_UNIX,
+                        body: alloc::vec::Vec::new(),
+                    }),
                     None => SocketOpResult::Err(SockError::NotConnected),
                 };
             }
@@ -1396,6 +1409,22 @@ impl SocketFile {
             let e = self.take_pending_error();
             let val = e.map(|e| e.errno() as u32).unwrap_or(0);
             return write_u32(buf, val);
+        }
+        // SO_ACCEPTCONN: 1 if the socket is `listen()`ing, else 0. Handled
+        // before the `options` lock so we never nest state under options.
+        // systemd's is_socket_internal() (behind sd_is_socket, which gates
+        // sd-bus SCM_RIGHTS fd-passing) getsockopt()s this whenever the
+        // `listening` arg is >= 0 — including sd_bus's
+        // sd_is_socket(fd, AF_UNIX, 0, 0). An error here made accept_fd false
+        // → no NEGOTIATE_UNIX_FD → elogind CreateSession "Not supported".
+        if level == SOL_SOCKET && name == SO_ACCEPTCONN {
+            let listening = matches!(
+                &*self.state.lock(),
+                SocketState::UnixListener { .. }
+                    | SocketState::InetListener { .. }
+                    | SocketState::Inet6Listener { .. }
+            );
+            return write_bool(buf, listening);
         }
         let opts = self.options.lock();
         match (level, name) {

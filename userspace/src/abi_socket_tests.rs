@@ -9,6 +9,7 @@ const SOCK_STREAM: u64 = 1;
 const SOL_SOCKET: u64 = 1;
 const SO_REUSEADDR: u64 = 2;
 const SO_TYPE: u64 = 3;
+const SO_ACCEPTCONN: u64 = 30;
 const SHUT_RDWR: u64 = 2;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
@@ -594,6 +595,98 @@ fn smoke_abi_socket_getsockopt_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_getsockopt_neg);
+
+// getsockopt(SO_ACCEPTCONN) is the gate systemd's is_socket_internal() (behind
+// sd_is_socket, which decides whether sd-bus negotiates SCM_RIGHTS fd-passing)
+// probes whenever its `listening` arg is >= 0 — e.g. sd_bus's
+// sd_is_socket(fd, AF_UNIX, 0, 0). A fresh (non-listening) socket must report 0;
+// an error there disables NEGOTIATE_UNIX_FD and breaks elogind CreateSession.
+fn smoke_abi_socket_acceptconn_not_listening() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let mut val = [0u8; 4];
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_ACCEPTCONN,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        let r = call(Syscall::SocketGetSockOpt.raw(), args).ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("getsockopt(SO_ACCEPTCONN) did not return 0");
+        }
+        if u32::from_ne_bytes(val) != 0 {
+            return Err("SO_ACCEPTCONN on a non-listening socket was not 0");
+        }
+        if u32::from_ne_bytes(optlen) != 4 {
+            return Err("getsockopt(SO_ACCEPTCONN) did not update optlen to 4");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_acceptconn_not_listening);
+
+fn smoke_abi_socket_acceptconn_listening() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-acceptconn");
+        if call(Syscall::SocketBind.raw(), a2(fd, addr.as_ptr() as u64, alen))
+            .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() pre-listen failed");
+        }
+        if call(Syscall::SocketListen.raw(), a1(fd, 16)).ok_or("listen status")? != 0 {
+            return Err("listen() failed");
+        }
+        let mut val = [0u8; 4];
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_ACCEPTCONN,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        let r = call(Syscall::SocketGetSockOpt.raw(), args).ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("getsockopt(SO_ACCEPTCONN) did not return 0");
+        }
+        if u32::from_ne_bytes(val) != 1 {
+            return Err("SO_ACCEPTCONN on a listening socket was not 1");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_acceptconn_listening);
+
+// A socket fd must `fstat` as S_IFSOCK (0o140000), not a char device. systemd's
+// is_socket_internal() rejects any fd whose st_mode fails S_ISSOCK before it
+// even looks at the family — so without this, sd-bus fd-passing never turns on.
+fn smoke_abi_socket_fstat_is_sock() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        // Linux x86_64 `struct stat` (this suite is linux-compat, so Fstat
+        // routes to sys_fstat_linux): st_dev(8) st_ino(8) st_nlink(8) then
+        // st_mode(u32) at offset 24.
+        let mut stat = [0u8; 256];
+        let r = call(Syscall::Fstat.raw(), a1(fd, stat.as_mut_ptr() as u64))
+            .ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("fstat of a socket fd did not return 0");
+        }
+        let mode = u32::from_ne_bytes([stat[24], stat[25], stat[26], stat[27]]);
+        if mode & 0o170000 != 0o140000 {
+            return Err("socket fd did not fstat as S_IFSOCK");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_fstat_is_sock);
 
 // ──────────────────────────── SocketSetSockOpt ────────────────────────
 

@@ -179,6 +179,13 @@ pub enum FileType {
     Dir,
     Symlink,
     Special,
+    /// AF_UNIX / AF_INET socket fd. Reported as `S_IFSOCK` so that
+    /// `S_ISSOCK(st_mode)` consumers — notably systemd/sd-bus's
+    /// `sd_is_socket()`, which gates SCM_RIGHTS fd-passing negotiation
+    /// (`NEGOTIATE_UNIX_FD`) on it — recognise a socket fd. Without this a
+    /// socket `fstat`s as a char device and elogind refuses to pass the
+    /// session-controller fd in its CreateSession reply ("Not supported").
+    Socket,
 }
 
 /// Stat result. `mode` is a stub: Stage 3 reports `(FileType, perms)`

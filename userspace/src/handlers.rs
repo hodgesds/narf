@@ -2229,6 +2229,7 @@ impl StatBuf {
             narf_filesystem::FileType::Dir => 0o040000,
             narf_filesystem::FileType::Symlink => 0o120000,
             narf_filesystem::FileType::Special => 0o020000,
+            narf_filesystem::FileType::Socket => 0o140000,
         };
         Self {
             size: s.size,
@@ -2785,38 +2786,46 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
 /// request is routed to the directory-create path for correctness.
 fn sys_mknodat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // mknodat(dirfd, path, mode, dev): path=arg1, mode=arg2.
+    let ret = mknod_common(args.arg1, args.arg2);
+    ctx.set_return(ret);
+}
+
+/// Linux `mknod(path, mode, dev)` — x86_64 syscall 133. musl's `mknod()`
+/// routes here (not through mknodat). path=arg0, mode=arg1.
+fn sys_mknod(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ret = mknod_common(args.arg0, args.arg1);
+    ctx.set_return(ret);
+}
+
+/// Shared node-creation used by both `mknod` and `mknodat`. Creates the node
+/// as a regular file (or a directory for S_IFDIR); see `sys_mknodat` docs.
+fn mknod_common(path_uptr: u64, mode: u64) -> SyscallReturn {
     let fail = SyscallReturn::ok((-1i64) as u64);
     const S_IFMT: u64 = 0o170000;
     const S_IFDIR: u64 = 0o040000;
-    // dirfd = arg0, path = arg1, mode = arg2, dev = arg3.
-    let path = match copy_user_cstr(args.arg1, 4096) {
+    let path = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
+        None => return fail,
     };
-    let mode = args.arg2;
     let path = resolve_cwd_path(current_task_id(), &path);
     let path_ref = {
         let t = path.trim_end_matches('/');
         if t.is_empty() {
-            ctx.set_return(fail);
-            return;
+            return fail;
         }
         t
     };
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
-            return;
+            return SyscallReturn::ok((-2i64) as u64); // -ENOENT
         }
     };
     // Already exists → -EEXIST (Linux mknod semantics).
     if poll_blocking(parent.lookup_async(&leaf)).map(|r| r.is_ok()) == Some(true) {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
-        return;
+        return SyscallReturn::ok((-17i64) as u64); // -EEXIST
     }
     let created = if (mode & S_IFMT) == S_IFDIR {
         poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true)
@@ -2824,9 +2833,9 @@ fn sys_mknodat(ctx: &mut dyn TrapContext) {
         poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
     };
     if created {
-        ctx.set_return(SyscallReturn::ok(0));
+        SyscallReturn::ok(0)
     } else {
-        ctx.set_return(fail);
+        fail
     }
 }
 
@@ -3318,6 +3327,7 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64, ino: u64) -> linux_co
         narf_filesystem::FileType::Dir => 0o040000,
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
+        narf_filesystem::FileType::Socket => 0o140000,
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
     let cpns = narf_time::cycles_per_ns().max(1) as u64;
@@ -3602,6 +3612,7 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         narf_filesystem::FileType::Dir => 0o040000,
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
+        narf_filesystem::FileType::Socket => 0o140000,
     };
     let mode_word: u16 = ftype_bits | (s.mode.perms & 0o7777);
 
@@ -4543,6 +4554,7 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
         narf_filesystem::FileType::Dir => 1,
         narf_filesystem::FileType::Symlink => 2,
         narf_filesystem::FileType::Special => 3,
+        narf_filesystem::FileType::Socket => 4,
     };
     // Build the 8-byte header in kernel memory, then copy the whole
     // record (header + name) into user space under the SMAP bracket.
@@ -4638,6 +4650,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
             narf_filesystem::FileType::Dir => 4,      // DT_DIR
             narf_filesystem::FileType::Symlink => 10, // DT_LNK
             narf_filesystem::FileType::Special => 2,  // DT_CHR
+            narf_filesystem::FileType::Socket => 12,  // DT_SOCK
         };
         // Build the dirent record in kernel memory, then copy it into
         // user space under the SMAP bracket.
@@ -14493,6 +14506,7 @@ fn copy_user_pack(
 // is the privilege boundary. Today we accept any caller; once UID/
 // GID land we'll gate on UID==0 (root) per POSIX `mount(2)`.
 
+#[allow(dead_code)]
 fn copy_user_str(ptr: *const u8, len: usize, cap: usize) -> Result<alloc::string::String, ()> {
     if len == 0 || ptr.is_null() || len > cap {
         return Err(());
@@ -22125,6 +22139,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Unlinkat, "unlinkat", RawFnHandler(sys_unlinkat));
     table.install_raw(Syscall::Mkdirat, "mkdirat", RawFnHandler(sys_mkdirat));
     table.install_raw(Syscall::Mknodat, "mknodat", RawFnHandler(sys_mknodat));
+    table.install_raw(Syscall::Mknod, "mknod", RawFnHandler(sys_mknod));
     table.install_raw(Syscall::Renameat, "renameat", RawFnHandler(sys_renameat));
     table.install_raw(Syscall::Symlinkat, "symlinkat", RawFnHandler(sys_symlinkat));
     table.install_raw(
