@@ -119,6 +119,21 @@ fn populate_card_node(
         kobject_add_attr(&kobj, "uevent", move || card_uevent(idx_copy, &driver));
     }
 
+    // `subsystem` symlink → the drm class dir. eudev/libudev derive a
+    // device's subsystem from the basename of this link's target; elogind
+    // only marks a seat graphical (`seat_can_graphical`) when it can attach a
+    // device whose subsystem is "drm". Without it the card enumerates with no
+    // subsystem and never makes seat0 graphical. Linux ref: device_add →
+    // sysfs_create_link("subsystem").
+    kobj.add_symlink("subsystem", "../../../class/drm");
+
+    // `/sys/dev/char/226:<N>` → this card. eudev resolves a device by devnum
+    // through here; elogind's `master-of-seat` tag enumeration then does
+    // sd_device_new_from_device_id("c226:<N>") which needs this link. Without
+    // it the DRM card is invisible to udev-based seat attachment, so
+    // seat0.CanGraphical stays false and the compositor's TakeDevice fails.
+    narf_filesystem::sysfs::register_char_dev_link(DRM_MAJOR, idx, "drm", &card_name);
+
     // ── device/ sub-kobject ──────────────────────────────────────────
     //
     // Linux exposes PCI IDs under card<N>/device/ as symlink to the
@@ -199,4 +214,8 @@ fn populate_card_node(
         let rd = format!("{}:{}\n", DRM_MAJOR, render_idx);
         kobject_add_attr(&render_kobj, "dev", move || rd.clone());
     }
+    render_kobj.add_symlink("subsystem", "../../../class/drm");
+    // Render nodes aren't seat masters, but a `/sys/dev/char` link keeps them
+    // enumerable by devnum (Mesa's render-worker device lookup).
+    narf_filesystem::sysfs::register_char_dev_link(DRM_MAJOR, render_idx, "drm", &render_name);
 }

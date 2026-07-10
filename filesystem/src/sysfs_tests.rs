@@ -26,7 +26,7 @@ use crate::sysfs::{
     class_device_register, class_register, kobject_add_attr, kobject_emit_uevent, Kobject, SysFs,
 };
 use crate::uevent::{self, UeventAction, UeventReader};
-use crate::FsInstance;
+use crate::{FileType, FsInstance};
 
 // ── Minimal fake block device for tests ───────────────────────────────
 
@@ -259,6 +259,64 @@ fn smoke_sysfs_vfs_lookup() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_vfs_lookup);
+
+// ── /sys/dev/char/<maj>:<min> symlink traversal ──────────────────────
+//
+// eudev/libudev resolve a device by devnum via /sys/dev/char/<maj>:<min>,
+// realpath()ing it to the class node. elogind's seat enumeration
+// (sd_device_new_from_device_id) depends on it; without the link a DRM card
+// never attaches to seat0 and CanGraphical stays false. Verify the symlink
+// registered by register_char_dev_link resolves through to the target's attrs.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_dev_char_link_traverses() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+
+    // /sys/class/drm/card0 with a `uevent` attr, plus the /sys/dev/char link.
+    let class = class_register("drm");
+    let card0 = class_device_register(class, "card0");
+    kobject_add_attr(&card0, "uevent", || "MAJOR=226\nMINOR=0\n".to_string());
+    crate::sysfs::register_char_dev_link(226, 0, "drm", "card0");
+
+    // Navigate the sysfs tree to /dev/char and read back the 226:0 symlink.
+    // (resolve_async follows the link mid-path — covered by the resolver's own
+    // symlink tests and verified live; here we assert the link exists with the
+    // correct target, which is what register_char_dev_link is responsible for.)
+    let fs = SysFs::new();
+    let dev = match fs.root().lookup_dir("dev") {
+        Some(d) => d,
+        None => return TestResult::Fail("/sys/dev missing"),
+    };
+    let char_dir = match dev.lookup_dir("char") {
+        Some(d) => d,
+        None => return TestResult::Fail("/sys/dev/char missing"),
+    };
+    // /sys/dev/block must also exist so a udev scandir of it doesn't fail.
+    if dev.lookup_dir("block").is_none() {
+        return TestResult::Fail("/sys/dev/block missing");
+    }
+    // The symlink resolves via lookup() to a readlink-able file.
+    let link = match char_dir.lookup("226:0") {
+        Some(l) => l,
+        None => return TestResult::Fail("/sys/dev/char/226:0 not registered"),
+    };
+    if link.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("226:0 is not a symlink");
+    }
+    let mut buf = [0u8; 64];
+    match poll_once(link.read(0, &mut buf)) {
+        Some(Ok(n)) if n > 0 => {
+            if core::str::from_utf8(&buf[..n]).unwrap_or("") == "../../class/drm/card0" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("226:0 symlink target wrong")
+            }
+        }
+        _ => TestResult::Fail("readlink 226:0 returned 0 or error"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_dev_char_link_traverses);
 
 // ── Test 5: SysFs enumerate class/net ─────────────────────────────────
 

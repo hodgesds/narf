@@ -378,6 +378,47 @@ pub fn class_device_register(class: Arc<Kobject>, name: &str) -> Arc<Kobject> {
     get_or_create_child(&class, name)
 }
 
+/// Register a `/sys/dev/char/<major>:<minor>` symlink pointing at the
+/// canonical `/sys/class/<class>/<name>` node (and ensure `/sys/dev/block`
+/// exists so a udev scandir of it doesn't fail).
+///
+/// eudev / libudev's `sd_device_new_from_devnum` resolves a device *by
+/// devnum* by reading `/sys/dev/char/<maj>:<min>` and `realpath()`-ing it to
+/// the class dir; elogind's seat enumeration (`add_match_tag("master-of-seat")`
+/// → `sd_device_new_from_device_id("c<maj>:<min>")`) goes through the same
+/// path. Without this link the device is invisible to udev-based lookups, so
+/// e.g. a DRM card never attaches to a seat and `seat0.CanGraphical` stays
+/// false → the compositor's `TakeDevice` finds no GPU.
+///
+/// Linux ref: `device_add` → `device_create_sys_dev_entry`
+/// (drivers/base/core.c) which makes the `/sys/dev/{char,block}/<maj>:<min>`
+/// symlinks.
+pub fn register_char_dev_link(major: u32, minor: u32, class: &str, name: &str) {
+    let root = get_root();
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_char = get_or_create_child(&dev_dir, "char");
+    // udev scandir()s both dirs and fails the whole enumerate if either is
+    // missing — keep /sys/dev/block present even when no block dev linked yet.
+    let _dev_block = get_or_create_child(&dev_dir, "block");
+    dev_char.add_symlink(
+        format!("{}:{}", major, minor),
+        format!("../../class/{}/{}", class, name),
+    );
+}
+
+/// Like [`register_char_dev_link`] but for block devices
+/// (`/sys/dev/block/<major>:<minor>`).
+pub fn register_block_dev_link(major: u32, minor: u32, class: &str, name: &str) {
+    let root = get_root();
+    let dev_dir = get_or_create_child(&root, "dev");
+    let _dev_char = get_or_create_child(&dev_dir, "char");
+    let dev_block = get_or_create_child(&dev_dir, "block");
+    dev_block.add_symlink(
+        format!("{}:{}", major, minor),
+        format!("../../class/{}/{}", class, name),
+    );
+}
+
 /// Add a text attribute to a kobject.
 /// Linux ref: `sysfs_create_file` → `kernfs_create_file_ns`
 ///            (fs/sysfs/file.c:413).
@@ -619,7 +660,6 @@ pub(crate) fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::
 }
 
 pub fn populate_input_class() {
-    let root = get_root();
     let class_input = class_register("input");
     // /sys/dev/char/<maj>:<min> — udev (libudev/libudev-zero) enumerates from
     // HERE, not /sys/class. On real Linux each entry is a SYMLINK into
@@ -628,12 +668,6 @@ pub fn populate_input_class() {
     // We mirror that: the canonical node is /sys/class/input/eventN (carrying
     // uevent + caps + subsystem), and /sys/dev/char/13:<minor> is a symlink to
     // it, so realpath lands on .../eventN.
-    let dev_dir = get_or_create_child(&root, "dev");
-    let dev_char = get_or_create_child(&dev_dir, "char");
-    // udev scans BOTH /sys/dev/block and /sys/dev/char and fails the whole
-    // enumerate if either directory is missing (scandir -1). Ensure block
-    // exists even when empty.
-    let _dev_block = get_or_create_child(&dev_dir, "block");
     for id in narf_input::evdev::ROUTER.device_ids() {
         let n = id.0.saturating_sub(1);
         let minor = 64 + n;
@@ -675,10 +709,7 @@ pub fn populate_input_class() {
 
         // /sys/dev/char/13:<minor> -> the canonical class dir. realpath()
         // resolves it to .../event<N>, giving udev/libinput sysname "event<N>".
-        dev_char.add_symlink(
-            format!("13:{}", minor),
-            format!("../../class/input/event{}", n),
-        );
+        register_char_dev_link(13, minor, "input", &format!("event{}", n));
     }
 }
 
