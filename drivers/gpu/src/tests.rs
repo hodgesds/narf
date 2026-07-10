@@ -60,6 +60,26 @@ fn smoke_drm_card_uevent_has_major_and_devname() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu", smoke_drm_card_uevent_has_major_and_devname);
 
+// A DRM node's `st_rdev` must encode DRM_MAJOR(226):minor, or logind's
+// TakeDevice (sd_device_new_from_devnum on the node's rdev) fails ENODEV and a
+// session compositor never gets the GPU fd. dev_t = (major<<8)|minor here.
+fn smoke_drm_node_rdev_encodes_major_226() -> TestResult {
+    if crate::drm_devfs_bridge::card_rdev(0) != (226 << 8) {
+        return TestResult::Fail("card0 rdev is not 226:0");
+    }
+    if crate::drm_devfs_bridge::card_rdev(1) != ((226 << 8) | 1) {
+        return TestResult::Fail("card1 rdev is not 226:1");
+    }
+    if crate::drm_devfs_bridge::render_rdev(0) != ((226 << 8) | 128) {
+        return TestResult::Fail("renderD128 rdev is not 226:128");
+    }
+    if crate::drm_devfs_bridge::card_rdev(0) == 0 {
+        return TestResult::Fail("card0 rdev is 0 (the bug: devnum lookup fails)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_drm_node_rdev_encodes_major_226);
+
 fn smoke_bochs_display_probed_at_boot() -> TestResult {
     use narf_graphics_driver::bochs;
     if bochs::is_probed() {

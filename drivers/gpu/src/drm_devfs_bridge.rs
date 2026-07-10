@@ -32,6 +32,22 @@ use narf_filesystem::{
     DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat, POLL_IN,
 };
 
+/// `st_rdev` for `/dev/dri/card<N>` — `DRM_MAJOR`(226):minor(`index`).
+/// dev_t = `(major << 8) | minor` for this small-number range.
+///
+/// Load-bearing: logind's `TakeDevice` (and `udevadm --name`, and libdrm's
+/// device matching) resolve a node via `sd_device_new_from_devnum` on the
+/// node's `st_rdev`. A 0 rdev makes that lookup fail — `TakeDevice` returns
+/// ENODEV, so a session compositor (kwin/weston) can never obtain the GPU fd.
+pub(crate) fn card_rdev(index: u32) -> u64 {
+    (226u64 << 8) | index as u64
+}
+
+/// `st_rdev` for `/dev/dri/renderD<N+128>` — minor `128 + index`.
+pub(crate) fn render_rdev(index: u32) -> u64 {
+    (226u64 << 8) | (128 + index as u64)
+}
+
 // ── DriCardFile ────────────────────────────────────────────────────────────
 
 /// Placeholder file for `/dev/dri/card<N>` (DRM master node).
@@ -115,6 +131,11 @@ impl FileOps for DriCardFile {
         }
     }
 
+    /// `st_rdev` = DRM_MAJOR(226):minor(card index). See [`card_rdev`].
+    fn rdev(&self) -> u64 {
+        card_rdev(self.index)
+    }
+
     /// DRM_IOCTL_* dispatch for `/dev/dri/card<N>`. Primary-node fd
     /// implies authenticated master per `DrmFileCtx::primary_master`
     /// so the modesetting ioctls are reachable.
@@ -167,6 +188,11 @@ impl FileOps for DriRenderFile {
             },
             mtime_cycles: 0,
         }
+    }
+
+    /// `st_rdev` = DRM_MAJOR(226):minor(128 + card index). See [`render_rdev`].
+    fn rdev(&self) -> u64 {
+        render_rdev(self.index)
     }
 
     /// DRM_IOCTL_* dispatch for `/dev/dri/renderD<N+128>`. Render-node
