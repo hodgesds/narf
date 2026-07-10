@@ -633,8 +633,11 @@ fn smoke_abi_socket_acceptconn_listening() -> TestResult {
     with_setup(|| {
         let fd = open_unix_stream()?;
         let (addr, alen) = unix_sockaddr(b"/abi-acceptconn");
-        if call(Syscall::SocketBind.raw(), a2(fd, addr.as_ptr() as u64, alen))
-            .ok_or("bind status")?
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
             != 0
         {
             return Err("bind() pre-listen failed");
@@ -674,8 +677,8 @@ fn smoke_abi_socket_fstat_is_sock() -> TestResult {
         // routes to sys_fstat_linux): st_dev(8) st_ino(8) st_nlink(8) then
         // st_mode(u32) at offset 24.
         let mut stat = [0u8; 256];
-        let r = call(Syscall::Fstat.raw(), a1(fd, stat.as_mut_ptr() as u64))
-            .ok_or("status not Ok")?;
+        let r =
+            call(Syscall::Fstat.raw(), a1(fd, stat.as_mut_ptr() as u64)).ok_or("status not Ok")?;
         if r != 0 {
             return Err("fstat of a socket fd did not return 0");
         }
