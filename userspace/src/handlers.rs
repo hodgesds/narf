@@ -19789,6 +19789,12 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 // SAFETY: name_ptr is a user VA.
                 let _ = unsafe { copy_to_user(name_ptr, &peer_buf) };
                 write_user_u32(name_len_ptr, (peer.body.len() + 2) as u32);
+            } else {
+                // No source address (connected socket): `msg_namelen` is a kernel
+                // OUTPUT field and must be set to 0, not left holding the caller's
+                // input buffer size — otherwise a peer-address-reading recvmsg
+                // parses garbage from an untouched name buffer.
+                write_user_u32(name_len_ptr, 0);
             }
 
             if sock.domain == crate::socket::AF_NETLINK {
