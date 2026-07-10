@@ -389,6 +389,119 @@ fn smoke_abi_socket_recv_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_recv_neg);
 
+// ── Non-blocking empty-but-open stream must EAGAIN, never a phantom 0 ──
+// Regression for the AF_UNIX read/recv spurious-EOF bug: a non-blocking read
+// or recv on an empty-but-OPEN stream socket returned 0 (which the caller
+// reads as EOF / peer-hangup) instead of -EAGAIN. GLib's GDBus/GSocket poll
+// loop treated that phantom 0 as a hangup and the KDE session-bus handshake
+// (and libdbus's next marshalled message) desynced. `read_should_block()` is
+// true exactly while the peer is still open, so EOF (peer closed) stays 0.
+const SOCK_NONBLOCK: u64 = 0x800;
+const MSG_DONTWAIT: u64 = 0x40;
+
+fn make_pair(kind: u64) -> Result<(u64, u64), &'static str> {
+    let mut sv = [0u8; 8];
+    let pair = Syscall::SocketPair.raw();
+    if call(pair, a3(AF_UNIX, kind, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")? != 0 {
+        return Err("socketpair setup failed");
+    }
+    let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+    let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+    Ok((fd0, fd1))
+}
+
+fn smoke_abi_socket_read_nonblock_empty_eagain() -> TestResult {
+    with_setup(|| {
+        let (_fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let mut rbuf = [0u8; 16];
+        let read = Syscall::Read.raw();
+        let r = call(read, a2(fd1, rbuf.as_mut_ptr() as u64, rbuf.len() as u64))
+            .ok_or("status not Ok")?;
+        if r != EAGAIN {
+            return Err("read() on an empty-but-open O_NONBLOCK socket returned a phantom 0/EOF instead of -EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_read_nonblock_empty_eagain);
+
+fn smoke_abi_socket_recv_dontwait_empty_eagain() -> TestResult {
+    with_setup(|| {
+        // A *blocking* pair, but MSG_DONTWAIT forces non-blocking semantics:
+        // an empty-open ring must EAGAIN immediately, never park.
+        let (_fd0, fd1) = make_pair(SOCK_STREAM)?;
+        let mut rbuf = [0u8; 16];
+        let recv = Syscall::SocketRecv.raw();
+        let r = call(
+            recv,
+            a3(
+                fd1,
+                rbuf.as_mut_ptr() as u64,
+                rbuf.len() as u64,
+                MSG_DONTWAIT,
+            ),
+        )
+        .ok_or("status not Ok")?;
+        if r != EAGAIN {
+            return Err("recv(MSG_DONTWAIT) on an empty-but-open socket did not return -EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_recv_dontwait_empty_eagain);
+
+fn smoke_abi_socket_read_nonblock_then_data() -> TestResult {
+    with_setup(|| {
+        // The EAGAIN must be transient: once data lands, the same non-blocking
+        // read delivers it (proves we didn't just wire read() to always EAGAIN).
+        let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let payload = b"xyz";
+        let send = Syscall::SocketSend.raw();
+        if call(
+            send,
+            a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0),
+        )
+        .ok_or("send status")?
+            != payload.len() as i64
+        {
+            return Err("priming send failed");
+        }
+        let mut rbuf = [0u8; 16];
+        let read = Syscall::Read.raw();
+        let r = call(read, a2(fd1, rbuf.as_mut_ptr() as u64, rbuf.len() as u64))
+            .ok_or("status not Ok")?;
+        if r != payload.len() as i64 {
+            return Err("non-blocking read() did not deliver buffered data");
+        }
+        if &rbuf[..payload.len()] != payload {
+            return Err("non-blocking read() delivered wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_read_nonblock_then_data);
+
+fn smoke_abi_socket_read_eof_after_peer_shutdown() -> TestResult {
+    with_setup(|| {
+        // A genuine EOF (peer half shut down) must still return 0, NOT EAGAIN —
+        // the fix distinguishes empty-open (EAGAIN) from closed (EOF).
+        let (fd0, fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let shutdown = Syscall::SocketShutdown.raw();
+        if call(shutdown, a1(fd0, SHUT_RDWR)).ok_or("shutdown status")? != 0 {
+            return Err("shutdown(fd0) failed");
+        }
+        let mut rbuf = [0u8; 16];
+        let read = Syscall::Read.raw();
+        let r = call(read, a2(fd1, rbuf.as_mut_ptr() as u64, rbuf.len() as u64))
+            .ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("read() after peer shutdown did not return 0 (EOF)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_read_eof_after_peer_shutdown);
+
 // ─────────────────────────── SocketShutdown ───────────────────────────
 
 fn smoke_abi_socket_shutdown_pos() -> TestResult {

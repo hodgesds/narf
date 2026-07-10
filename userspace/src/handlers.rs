@@ -1441,9 +1441,22 @@ fn sys_read(ctx: &mut dyn TrapContext) {
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
             Ok(n) => {
-                // Block decision: a 0-byte read on a pipe whose writer is
+                // A NON-BLOCKING read that finds an empty-but-open stream
+                // (socket/pipe) must report EAGAIN, not a bare 0 — the caller
+                // would mis-read that 0 as EOF. `read_should_block()` is true
+                // exactly when the stream is open-but-empty (a real peer-close
+                // makes it false, so a genuine EOF still returns 0). GLib's
+                // GSocket/GDBus runs its own poll loop over O_NONBLOCK fds and
+                // treats `read()==0` as a peer hangup; the spurious EOF during
+                // the dbus EXTERNAL auth line-read ("Unexpected lack of content
+                // trying to read a line") killed the KDE session bus. musl's
+                // stdio/recv wrappers likewise expect EAGAIN, never a phantom 0.
+                if n == 0 && nonblock && entry.ops.read_should_block() {
+                    return Err(true); // EAGAIN
+                }
+                // Block decision: a 0-byte read on a pipe/socket whose writer is
                 // still open must wait for data (POSIX), not return a
-                // spurious EOF — unless the fd is O_NONBLOCK.
+                // spurious EOF — unless the fd is O_NONBLOCK (handled above).
                 let should_block = n == 0 && !nonblock && entry.ops.read_should_block();
                 // Console fds park on the input waker (serial/keyboard IRQ)
                 // instead of the 1ms re-poll, so an interactive shell truly
@@ -19276,6 +19289,19 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
+    // A recv is non-blocking if the fd is O_NONBLOCK or the call carries
+    // MSG_DONTWAIT (0x40). Such a recv must return EAGAIN the instant the ring
+    // is empty-but-open — NEVER park. GLib's GSocket does exactly non-blocking
+    // recv() + its own poll loop; parking here stalls its dbus auth handshake,
+    // and the old "set 0 then yield" path could even surface a spurious 0 (EOF).
+    const MSG_DONTWAIT: u32 = 0x40;
+    let nonblock = (flags & MSG_DONTWAIT) != 0
+        || fd::with_table(current_task_id(), |t| {
+            t.get(fd)
+                .map(|e| e.status_flags & crate::fd::O_NONBLOCK != 0)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     let mut buf = alloc::vec![0u8; buf_len];
     let result = sock.dispatch_op(crate::socket::SocketOp::Recv {
         buf: &mut buf,
@@ -19290,6 +19316,9 @@ fn sys_socket_recv(ctx: &mut dyn TrapContext) {
                 return;
             }
             ctx.set_return(SyscallReturn::ok(n as u64));
+        }
+        crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) if nonblock => {
+            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
         }
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
             // Yield ~1ms; libc loops.
