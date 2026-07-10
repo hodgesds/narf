@@ -7344,6 +7344,48 @@ kernel_test_in!(
     smoke_userspace_futex_wait_seqlock_no_false_wake
 );
 
+/// A blocking park's lost-wake fallback timer must fire a ~10 ms backstop for
+/// BOTH infinite parks AND finite io-wait parks (poll/epoll with a real
+/// timeout), while a plain finite sleep still fires at its real deadline.
+/// Pins the fix for a QtDBus worker poll()ing the system bus with the 25 s
+/// D-Bus method timeout: a lost cross-core io-wake used to strand it the full
+/// 25 s (wheel armed at the real deadline) instead of self-healing in ~10 ms.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_park_io_wait_fallback_backstop() -> TestResult {
+    use crate::user_task::park_fire_deadline_ns;
+    const FB: u64 = 10_000_000; // 10 ms in ns
+    let now = 1_000_000_000; // arbitrary "now"
+
+    // Infinite park → ~10 ms backstop regardless of io-wait.
+    if park_fire_deadline_ns(u64::MAX, now, false) != now + FB {
+        return TestResult::Fail("infinite park did not use the 10ms backstop");
+    }
+    if park_fire_deadline_ns(u64::MAX, now, true) != now + FB {
+        return TestResult::Fail("infinite io-wait park did not use the 10ms backstop");
+    }
+
+    // Finite io-wait park with a FAR deadline (25 s) → clamped to now+10 ms.
+    let far = now + 25_000_000_000;
+    if park_fire_deadline_ns(far, now, true) != now + FB {
+        return TestResult::Fail("finite io-wait park was not clamped to the 10ms backstop");
+    }
+
+    // Finite NON-io park (plain sleep) → fires at the real deadline, unclamped.
+    if park_fire_deadline_ns(far, now, false) != far {
+        return TestResult::Fail("finite sleep park was wrongly clamped");
+    }
+
+    // A finite io-wait park whose deadline is already < 10 ms out must NOT be
+    // pushed OUT to 10 ms (never overshoot the real deadline).
+    let near = now + 2_000_000; // 2 ms
+    if park_fire_deadline_ns(near, now, true) != near {
+        return TestResult::Fail("near io-wait deadline was overshot past the real deadline");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_park_io_wait_fallback_backstop);
+
 /// Multi-threaded `exit_group` must run PROCESS-scoped exit observers
 /// EXACTLY ONCE — on the group's last thread (`group_dead`) — while
 /// THREAD-scoped observers run for EVERY thread. This is Linux's

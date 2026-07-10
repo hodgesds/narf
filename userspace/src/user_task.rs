@@ -420,6 +420,31 @@ pub fn current_user_task() -> Option<*mut UserTaskCtx> {
 // uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
 // returns a reaped result, not a re-execute) — that handler parks natively.
 
+/// Absolute-ns time at which to fire the lost-wake fallback timer for a park
+/// with the given absolute `deadline_ns`.
+///
+/// - Infinite parks (`u64::MAX`: pause / blocking poll·epoll·futex with no
+///   timeout) fire a ~10 ms backstop so a lost external wake self-heals.
+/// - FINITE **io-wait** parks (poll/epoll with a real timeout whose real wake
+///   is the io waker) ALSO get the ~10 ms backstop — clamped to never overshoot
+///   the real deadline. Without this a lost cross-core io-wake strands the task
+///   until the full finite deadline; a QtDBus worker poll()ing the system bus
+///   with the 25 s D-Bus method timeout otherwise sleeps out the whole 25 s, so
+///   kwin's `GetSession`/`TakeControl` times out and never opens the GPU. The
+///   working io-waker still short-circuits the common case; this only bounds the
+///   worst case, matching what infinite parks already do.
+/// - Other finite parks (plain `sleep`/`nanosleep`) fire at their real deadline.
+pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: bool) -> u64 {
+    const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
+    if deadline_ns == u64::MAX {
+        now_ns.saturating_add(FALLBACK_NS)
+    } else if net_io_wait {
+        now_ns.saturating_add(FALLBACK_NS).min(deadline_ns)
+    } else {
+        deadline_ns
+    }
+}
+
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
 /// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
@@ -480,12 +505,9 @@ fn park_should_block(
             // `accept()` with no io/futex waker) NEVER fires and the task
             // strands. This only bit the own-stack park path; the longjmp
             // `UserTaskFuture::poll` already used `ns_to_cycles`.
-            let fire_cycles = if deadline == u64::MAX {
-                const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @100 Hz
-                narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS))
-            } else {
-                narf_scheduler::narf_time::ns_to_cycles(deadline)
-            };
+            let fire_ns =
+                park_fire_deadline_ns(deadline, now, uc.net_io_wait.load(Ordering::Acquire));
+            let fire_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
             let refreshed = sleep_handle.is_some_and(|h| {
                 narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
             });
@@ -1387,7 +1409,16 @@ impl core::future::Future for UserTaskFuture {
                 // re-polling us every 1ms. Register once; refresh across any
                 // spurious re-poll so we never leak a slot.
                 let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
-                let deadline_cycles = deadline.saturating_mul(cpns);
+                // Finite io-wait park: clamp the wheel fire to a ~10ms lost-wake
+                // backstop (same rationale as `park_fire_deadline_ns` in the
+                // own-stack path) so a lost cross-core io-wake self-heals in
+                // ~10ms instead of stranding until a long finite deadline.
+                let fire_ns = park_fire_deadline_ns(
+                    deadline,
+                    now,
+                    this.task.uctx.net_io_wait.load(Ordering::Acquire),
+                );
+                let deadline_cycles = fire_ns.saturating_mul(cpns);
                 let refreshed = this.sleep_handle.is_some_and(|h| {
                     narf_scheduler::narf_time::timer_wheel::refresh_waker(h, cx.waker().clone())
                 });
