@@ -19806,6 +19806,18 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 install_scm_rights_fds(msg_ptr, recv_fds);
             }
 
+            // `msg_flags` (msghdr offset 48) is a kernel OUTPUT field — Linux
+            // always sets it on return (0, or MSG_TRUNC/MSG_CTRUNC/MSG_EOR).
+            // NARF left it untouched, so it held whatever the caller's stack
+            // had. libdbus's `_dbus_read_socket_with_unix_fds` checks
+            // `msg_flags & MSG_CTRUNC` and, if set, treats it as a SERIOUS error
+            // ("lost fds") — corrupting the connection right after the Hello
+            // reply, so the next message it marshalled/sent came out garbage
+            // (a lone 0x71 byte) and the bus dropped it → no KDE session bus.
+            // We deliver the whole datagram/stream chunk and never truncate
+            // ancillary data here, so the correct value is 0.
+            write_user_u32(msg_ptr + 48, 0);
+
             ctx.set_return(SyscallReturn::ok(n as u64));
         }
         // Map the real socket error to its errno. A non-blocking recv with no
