@@ -567,7 +567,7 @@ impl Arch {
                         "-vga".into(),
                         "none".into(),
                         "-device".into(),
-                        "bochs-display".into(),
+                        "bochs-display,id=bochs0".into(),
                     ]);
                     args.extend_from_slice(&[
                         "-audiodev".into(),
@@ -680,7 +680,7 @@ impl Arch {
                     }
                     args.extend_from_slice(&[
                         "-device".into(),
-                        "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
+                        "virtio-gpu-pci,id=vgpu0,disable-legacy=on,disable-modern=off".into(),
                     ]);
                     if !legacy {
                         args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
@@ -846,7 +846,7 @@ impl Arch {
                     }
                     args.extend_from_slice(&[
                         "-device".into(),
-                        "virtio-gpu-pci,disable-legacy=on,disable-modern=off".into(),
+                        "virtio-gpu-pci,id=vgpu0,disable-legacy=on,disable-modern=off".into(),
                     ]);
                     args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
                     args.extend_from_slice(&[
