@@ -233,7 +233,17 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
         let map_len = (bar.size + page_off + 0xFFF) & !0xFFF;
         let attrs = match bar.kind {
             BarKind::Mmio32 { prefetchable: true } | BarKind::Mmio64 { prefetchable: true } => {
-                MmioAttrs::WriteCombining
+                // Prefetchable window (framebuffer/ROM): write-combining on
+                // x86 (PAT) coalesces writes; aarch64's MmioAttrs has no WC
+                // variant, so fall back to write-back (cacheable) there.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    MmioAttrs::WriteCombining
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    MmioAttrs::WriteBack
+                }
             }
             _ => MmioAttrs::Device,
         };

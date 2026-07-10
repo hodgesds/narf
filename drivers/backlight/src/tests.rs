@@ -428,6 +428,7 @@ mod smokes {
         let phys = narf_memory::PhysAddr::new(raw.as_ptr() as u64);
         let mmio = narf_driver_runtime::MmioRegion {
             phys,
+            virt: phys.raw(),
             len: 1024,
             kind: narf_driver_runtime::BarKind::Mmio32 {
                 prefetchable: false,
