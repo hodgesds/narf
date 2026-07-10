@@ -498,6 +498,12 @@ pub enum Syscall {
     /// through SYS_MKDIR.
     Mkdirat,
 
+    /// Linux `mknod(2)` / `mknodat(2)`. Creates a filesystem node.
+    /// NARF has no FIFO/socket/device node types, so every node is
+    /// created as a regular file — enough for callers (elogind's
+    /// session `.ref` fifo) that only need the node to EXIST + open.
+    Mknodat,
+
     /// `arg0 = old_dirfd`, `arg1 = old_path_ptr`,
     /// `arg2 = old_path_len`, `arg3 = new_dirfd`,
     /// `arg4 = new_path_ptr`, `arg5 = new_path_len`. Linux
@@ -2446,6 +2452,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Tgkill, 234),
     (Syscall::Openat, 257),
     (Syscall::Mkdirat, 258),
+    (Syscall::Mknodat, 259),
     (Syscall::Pselect6, 270),
     (Syscall::Fchownat, 260),
     (Syscall::Newfstatat, 262),
@@ -2547,6 +2554,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Ioctl, 29),
     (Syscall::Flock, 32),
     (Syscall::Mkdirat, 34),
+    (Syscall::Mknodat, 33),
     (Syscall::Unlinkat, 35),
     (Syscall::Symlinkat, 36),
     (Syscall::Renameat, 38),

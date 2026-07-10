@@ -474,30 +474,31 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_open_by_handle_at_efault_neg);
 fn smoke_abi_fsx2_mount_bind_pos() -> TestResult {
     with_setup(|| {
         // Seed a real source mount so bind_mount has something to clone.
-        let src_source = b"none";
-        let src_target = b"/abi-bind-src";
-        let tmpfs = b"tmpfs";
+        // Linux mount(2) ABI: (source, target, fstype, flags, data), NUL-term.
+        let src_source = b"none\0";
+        let src_target = b"/abi-bind-src\0";
+        let tmpfs = b"tmpfs\0";
         let margs = SyscallArgs {
             arg0: src_source.as_ptr() as u64,
-            arg1: src_source.len() as u64,
-            arg2: src_target.as_ptr() as u64,
-            arg3: src_target.len() as u64,
-            arg4: tmpfs.as_ptr() as u64,
-            arg5: (tmpfs.len() as u64) << 32,
+            arg1: src_target.as_ptr() as u64,
+            arg2: tmpfs.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
         };
         if call(Syscall::Mount.raw(), margs) != Some(0) {
             return Err("source tmpfs setup mount failed");
         }
         // Now bind /abi-bind-src → /abi-bind-dst.
-        let target = b"/abi-bind-dst";
-        let fstype = b"bind";
+        let target = b"/abi-bind-dst\0";
+        let fstype = b"bind\0";
         let args = SyscallArgs {
             arg0: src_target.as_ptr() as u64,
-            arg1: src_target.len() as u64,
-            arg2: target.as_ptr() as u64,
-            arg3: target.len() as u64,
-            arg4: fstype.as_ptr() as u64,
-            arg5: (fstype.len() as u64) << 32,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
         };
         match call(Syscall::Mount.raw(), args) {
             Some(0) => Ok(()),
@@ -515,15 +516,15 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_pos);
 
 fn smoke_abi_fsx2_mount_badtarget_neg() -> TestResult {
     with_setup(|| {
-        let source = b"none";
-        let fstype = b"tmpfs";
+        let source = b"none\0";
+        let fstype = b"tmpfs\0";
         let args = SyscallArgs {
             arg0: source.as_ptr() as u64,
-            arg1: source.len() as u64,
-            arg2: 0x0001_0000_0000_0000, // unreadable target
-            arg3: 8,
-            arg4: fstype.as_ptr() as u64,
-            arg5: (fstype.len() as u64) << 32,
+            arg1: 0x0001_0000_0000_0000, // unreadable target (Linux ABI arg1)
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
         };
         // LINUX-GAP: Linux returns -EFAULT for a bad target pointer; NARF
         // collapses every mount copy-failure into the bare -1 sentinel.

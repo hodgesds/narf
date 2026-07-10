@@ -62,28 +62,26 @@ fn set_task(id: u64) {
     crate::install_task_id_lookup(smoke_task_shim);
 }
 
-// Build a SyscallArgs for sys_mount with all three strings.
-// arg0/arg1: source ptr/len; arg2/arg3: target ptr/len;
-// arg4: fstype_ptr; arg5: (fstype_len << 32) | flags.
+// Build a SyscallArgs for sys_mount. Linux mount(2) ABI:
+// (source, target, fstype, flags, data). All strings are NUL-terminated —
+// pass byte literals WITH a trailing `\0`.
 fn mount_args(source: &[u8], target: &[u8], fstype: &[u8], flags: u64) -> SyscallArgs {
     SyscallArgs {
         arg0: source.as_ptr() as u64,
-        arg1: source.len() as u64,
-        arg2: target.as_ptr() as u64,
-        arg3: target.len() as u64,
-        arg4: fstype.as_ptr() as u64,
-        arg5: ((fstype.len() as u64) << 32) | (flags & 0xFFFF_FFFF),
+        arg1: target.as_ptr() as u64,
+        arg2: fstype.as_ptr() as u64,
+        arg3: flags,
+        arg4: 0,
+        ..Default::default()
     }
 }
 
+// Linux umount2(2) ABI: (target, flags), NUL-terminated target.
 fn unmount_args(target: &[u8], flags: u64) -> SyscallArgs {
     SyscallArgs {
         arg0: target.as_ptr() as u64,
-        arg1: target.len() as u64,
-        arg2: flags,
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
+        arg1: flags,
+        ..Default::default()
     }
 }
 
@@ -125,9 +123,9 @@ fn smoke_mount_tmpfs() -> TestResult {
     // Call sys_mount via the syscall dispatcher to exercise the
     // wire-up. Use the lower-level path: we know SyscallTable is set
     // up; if it isn't, fall through to direct handler invocation.
-    let source = b"tmpfs";
-    let target = b"/tmp";
-    let fstype = b"tmpfs";
+    let source = b"tmpfs\0";
+    let target = b"/tmp\0";
+    let fstype = b"tmpfs\0";
     let mut ctx = StubCtx {
         args: mount_args(source, target, fstype, 0),
         ret: None,
@@ -160,9 +158,9 @@ fn smoke_umount_tmpfs() -> TestResult {
     let _ = unmount_for_test("/tmp");
 
     // Mount.
-    let target = b"/tmp";
+    let target = b"/tmp\0";
     let mut ctx = StubCtx {
-        args: mount_args(b"tmpfs", target, b"tmpfs", 0),
+        args: mount_args(b"tmpfs\0", target, b"tmpfs\0", 0),
         ret: None,
     };
     crate::handlers::sys_mount_for_test(&mut ctx);
@@ -207,7 +205,7 @@ fn smoke_chroot_rewrites_paths() -> TestResult {
     // Mount a tmpfs at /jail so chroot has a real target.
     let _ = unmount_for_test("/jail");
     let mut mctx = StubCtx {
-        args: mount_args(b"tmpfs", b"/jail", b"tmpfs", 0),
+        args: mount_args(b"tmpfs\0", b"/jail\0", b"tmpfs\0", 0),
         ret: None,
     };
     crate::handlers::sys_mount_for_test(&mut mctx);
@@ -267,7 +265,7 @@ fn smoke_pivot_root_basic() -> TestResult {
     let _ = unmount_for_test("/new_root");
     let _ = unmount_for_test("/new_root/old");
     let mut m1 = StubCtx {
-        args: mount_args(b"tmpfs", b"/new_root", b"tmpfs", 0),
+        args: mount_args(b"tmpfs\0", b"/new_root\0", b"tmpfs\0", 0),
         ret: None,
     };
     crate::handlers::sys_mount_for_test(&mut m1);
@@ -275,7 +273,7 @@ fn smoke_pivot_root_basic() -> TestResult {
         return TestResult::Fail("mount /new_root failed");
     }
     let mut m2 = StubCtx {
-        args: mount_args(b"tmpfs", b"/new_root/old", b"tmpfs", 0),
+        args: mount_args(b"tmpfs\0", b"/new_root/old\0", b"tmpfs\0", 0),
         ret: None,
     };
     crate::handlers::sys_mount_for_test(&mut m2);
@@ -285,7 +283,7 @@ fn smoke_pivot_root_basic() -> TestResult {
     }
 
     let mut pctx = StubCtx {
-        args: pivot_args(b"/new_root", b"/new_root/old"),
+        args: pivot_args(b"/new_root\0", b"/new_root/old\0"),
         ret: None,
     };
     crate::handlers::sys_pivot_root_for_test(&mut pctx);

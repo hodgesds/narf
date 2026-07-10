@@ -602,16 +602,17 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_fremovexattr_neg);
 
 fn smoke_abi_fsx_mount_pos() -> TestResult {
     with_setup(|| {
-        let source = b"none";
-        let target = b"/abi-tmpfs";
-        let fstype = b"tmpfs";
+        // Linux mount(2) ABI: (source, target, fstype, flags, data), NUL-term.
+        let source = b"none\0";
+        let target = b"/abi-tmpfs\0";
+        let fstype = b"tmpfs\0";
         let args = SyscallArgs {
             arg0: source.as_ptr() as u64,
-            arg1: source.len() as u64,
-            arg2: target.as_ptr() as u64,
-            arg3: target.len() as u64,
-            arg4: fstype.as_ptr() as u64,
-            arg5: (fstype.len() as u64) << 32, // len in high 32, flags=0 low
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0, // flags
+            arg4: 0, // data
+            ..Default::default()
         };
         match call(Syscall::Mount.raw(), args) {
             Some(0) => Ok(()),
@@ -624,16 +625,16 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_pos);
 fn smoke_abi_fsx_mount_neg() -> TestResult {
     with_setup(|| {
         // Unknown block-device source + unknown fstype → -1 sentinel.
-        let source = b"nodevhere";
-        let target = b"/abi-bad";
-        let fstype = b"ext9";
+        let source = b"nodevhere\0";
+        let target = b"/abi-bad\0";
+        let fstype = b"ext9\0";
         let args = SyscallArgs {
             arg0: source.as_ptr() as u64,
-            arg1: source.len() as u64,
-            arg2: target.as_ptr() as u64,
-            arg3: target.len() as u64,
-            arg4: fstype.as_ptr() as u64,
-            arg5: (fstype.len() as u64) << 32,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
         };
         // LINUX-GAP: Linux returns -ENODEV/-ENOENT here; NARF uses a bare
         // -1 sentinel for every mount failure.
@@ -653,21 +654,22 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_neg);
 
 fn smoke_abi_fsx_umount2_pos() -> TestResult {
     with_setup(|| {
-        let source = b"none";
-        let target = b"/abi-umnt";
-        let fstype = b"tmpfs";
+        let source = b"none\0";
+        let target = b"/abi-umnt\0";
+        let fstype = b"tmpfs\0";
         let margs = SyscallArgs {
             arg0: source.as_ptr() as u64,
-            arg1: source.len() as u64,
-            arg2: target.as_ptr() as u64,
-            arg3: target.len() as u64,
-            arg4: fstype.as_ptr() as u64,
-            arg5: (fstype.len() as u64) << 32,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
         };
         if call(Syscall::Mount.raw(), margs) != Some(0) {
             return Err("setup mount failed");
         }
-        let uargs = a2(target.as_ptr() as u64, target.len() as u64, 0);
+        // Linux umount2(2): (target, flags), NUL-term target.
+        let uargs = a1(target.as_ptr() as u64, 0);
         match call(Syscall::Umount2.raw(), uargs) {
             Some(0) => Ok(()),
             _ => Err("umount2 of a freshly-mounted path should return 0"),
@@ -678,8 +680,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_pos);
 
 fn smoke_abi_fsx_umount2_neg() -> TestResult {
     with_setup(|| {
-        let target = b"/abi-not-mounted";
-        let uargs = a2(target.as_ptr() as u64, target.len() as u64, 0);
+        let target = b"/abi-not-mounted\0";
+        let uargs = a1(target.as_ptr() as u64, 0);
         // LINUX-GAP: Linux returns -EINVAL for a path that isn't a mount
         // point; NARF uses the -1 sentinel.
         match call(Syscall::Umount2.raw(), uargs) {

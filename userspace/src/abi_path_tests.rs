@@ -305,6 +305,65 @@ fn smoke_abi_path_mkdirat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_neg);
 
+// mknodat: NARF has no FIFO/device node types, so a node is created as a
+// regular file — but it must EXIST and be openable, which elogind's
+// per-session `.ref` FIFO (and /run/systemd/inaccessible/* nodes) depend on.
+// Without mknodat, elogind's CreateSession failed EINVAL → no logind session
+// (which a Wayland compositor needs to TakeDevice the GPU).
+fn smoke_abi_path_mknodat_fifo_pos() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        const S_IFIFO: u64 = 0o010000;
+        let path = b"/p/sess.ref\0";
+        // mknodat(AT_FDCWD, path, S_IFIFO|0600, dev=0) creates the node.
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) != Some(0)
+        {
+            return Err("mknodat(FIFO) at a fresh path should return 0");
+        }
+        // It now exists → a second mknodat is -EEXIST, proving the node landed.
+        match call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) {
+            Some(-17) => Ok(()), // -EEXIST
+            _ => Err("mknodat over an existing node should be -EEXIST"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_fifo_pos);
+
+fn smoke_abi_path_mknodat_eexist() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        // "f" already exists → mknod over it is -EEXIST, not a clobber.
+        let path = b"/p/f\0";
+        match call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o100600, 0),
+        ) {
+            Some(-17) => Ok(()),
+            _ => Err("mknodat over an existing file should be -EEXIST"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_eexist);
+
+fn smoke_abi_path_mknodat_enoent() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        // mknodat under a missing parent must fail (not return 0).
+        let path = b"/p/missing/child\0";
+        match call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o100600, 0),
+        ) {
+            Some(0) => Err("mknodat under a missing parent must fail"),
+            _ => Ok(()),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_enoent);
+
 // mkdirat returns the right Linux errnos: EEXIST for an existing name,
 // ENOENT for a missing parent. busybox `mkdir -p` walks each path
 // component and depends on these exactly — EEXIST to skip components

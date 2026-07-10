@@ -2772,6 +2772,64 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
     sys_mkdir(&mut proxy);
 }
 
+/// Linux `mknodat(dirfd, pathname, mode, dev)` (and `mknod`, which musl
+/// routes through mknodat with AT_FDCWD). Creates a filesystem node.
+///
+/// NARF has no FIFO / socket / character / block node types, so every
+/// non-directory node is created as a regular file. That's enough for the
+/// callers that matter: elogind/systemd create a per-session `.ref` FIFO
+/// (and `/run/systemd/inaccessible/{reg,fifo,sock,chr,blk}` sandbox nodes)
+/// and only need the node to EXIST and be openable — without it, elogind's
+/// `CreateSession` fails with EINVAL and no logind session is ever created
+/// (which a Wayland compositor needs to TakeDevice the GPU). A `S_IFDIR`
+/// request is routed to the directory-create path for correctness.
+fn sys_mknodat(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fail = SyscallReturn::ok((-1i64) as u64);
+    const S_IFMT: u64 = 0o170000;
+    const S_IFDIR: u64 = 0o040000;
+    // dirfd = arg0, path = arg1, mode = arg2, dev = arg3.
+    let path = match copy_user_cstr(args.arg1, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(fail);
+            return;
+        }
+    };
+    let mode = args.arg2;
+    let path = resolve_cwd_path(current_task_id(), &path);
+    let path_ref = {
+        let t = path.trim_end_matches('/');
+        if t.is_empty() {
+            ctx.set_return(fail);
+            return;
+        }
+        t
+    };
+    let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
+        Some(p) => p,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
+        }
+    };
+    // Already exists → -EEXIST (Linux mknod semantics).
+    if poll_blocking(parent.lookup_async(&leaf)).map(|r| r.is_ok()) == Some(true) {
+        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
+        return;
+    }
+    let created = if (mode & S_IFMT) == S_IFDIR {
+        poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true)
+    } else {
+        poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
+    };
+    if created {
+        ctx.set_return(SyscallReturn::ok(0));
+    } else {
+        ctx.set_return(fail);
+    }
+}
+
 fn sys_renameat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _old_dirfd = args.arg0;
@@ -14730,20 +14788,33 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok(!0u64);
 
-    let source = match copy_user_str(args.arg0 as *const u8, args.arg1 as usize, 256) {
-        Ok(s) => s,
-        Err(()) => {
+    // Linux `mount(2)`: (const char *source, const char *target,
+    // const char *filesystemtype, unsigned long mountflags, const void *data).
+    // All strings are NUL-terminated; there are NO explicit length args.
+    //   arg0 = source, arg1 = target, arg2 = fstype, arg3 = flags, arg4 = data.
+    // This handler previously used a NARF-native (ptr, len, ...) shape with
+    // fstype_len/flags packed into arg5 — so a musl-built caller's Linux-ABI
+    // call was mis-parsed (arg1 read as a length, etc.) and returned EPERM.
+    // That silently broke every real mount: elogind's per-user tmpfs at
+    // /run/user/0 failed → CreateSession failed → no logind session for kwin.
+    let source = copy_user_cstr(args.arg0, 4096).unwrap_or_default();
+    let target_raw = match copy_user_cstr(args.arg1, 4096) {
+        Some(s) => s,
+        None => {
             ctx.set_return(fail);
             return;
         }
     };
-    let target_raw = match copy_user_str(args.arg2 as *const u8, args.arg3 as usize, 256) {
-        Ok(s) => s,
-        Err(()) => {
-            ctx.set_return(fail);
-            return;
-        }
+    // fstype may be NULL for MS_REMOUNT / MS_BIND / MS_MOVE.
+    let fstype = if args.arg2 == 0 {
+        alloc::string::String::new()
+    } else {
+        copy_user_cstr(args.arg2, 256).unwrap_or_default()
     };
+    let flags = args.arg3;
+    // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=…"); accepted but
+    // not parsed — NARF's MemFs has no per-mount options yet.
+
     // Resolve target under the calling task's chroot.
     let target = apply_chroot(target_raw.as_str());
     // Resolve source under chroot too when it's a path (bind / tmpfs
@@ -14754,20 +14825,6 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     } else {
         source.clone()
     };
-    // Wave-71: ABI fix — 64-bit pointers cannot be packed with lengths.
-    // arg4 is the full fstype_ptr. arg5 packs fstype_len in the top
-    // 32 bits and MS_* flags in the bottom 32 bits.
-    let fstype_ptr = args.arg4 as *const u8;
-    let fstype_len = (args.arg5 >> 32) as usize;
-    let fstype = match copy_user_str(fstype_ptr, fstype_len, 32) {
-        Ok(s) => s,
-        Err(()) => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // arg5 carries the MS_* flag word.
-    let flags = args.arg5 & 0xFFFF_FFFF;
     // Silence-the-warning swallow for option bits we accept but
     // don't yet act on; they're documented above.
     let _ =
@@ -14838,15 +14895,18 @@ const UMOUNT_NOFOLLOW: u64 = 1 << 3;
 fn sys_umount2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok(!0u64);
-    let target_raw = match copy_user_str(args.arg0 as *const u8, args.arg1 as usize, 256) {
-        Ok(s) => s,
-        Err(()) => {
+    // Linux `umount2(2)`: (const char *target, int flags). `target` is a
+    // NUL-terminated path; there is no length arg. (Was NARF-native
+    // (ptr, len, flags), which mis-read a musl caller's flags as the length.)
+    let target_raw = match copy_user_cstr(args.arg0, 4096) {
+        Some(s) => s,
+        None => {
             ctx.set_return(fail);
             return;
         }
     };
     let target = apply_chroot(target_raw.as_str());
-    let flags = args.arg2;
+    let flags = args.arg1;
     // We accept MNT_FORCE / MNT_DETACH / MNT_EXPIRE / UMOUNT_NOFOLLOW
     // but the registry doesn't yet track in-flight refs against a
     // mount, so the pop-by-path is unconditional. The flag word is
@@ -22064,6 +22124,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Statx, "statx", RawFnHandler(sys_statx));
     table.install_raw(Syscall::Unlinkat, "unlinkat", RawFnHandler(sys_unlinkat));
     table.install_raw(Syscall::Mkdirat, "mkdirat", RawFnHandler(sys_mkdirat));
+    table.install_raw(Syscall::Mknodat, "mknodat", RawFnHandler(sys_mknodat));
     table.install_raw(Syscall::Renameat, "renameat", RawFnHandler(sys_renameat));
     table.install_raw(Syscall::Symlinkat, "symlinkat", RawFnHandler(sys_symlinkat));
     table.install_raw(
