@@ -590,6 +590,39 @@ fn smoke_abi_pathx_statfs_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_neg);
 
+// statfs must fill `struct statfs` (f_type FIRST), not a statvfs. Regression
+// for the layout bug where f_type read back as a block size, so every
+// f_type==<MAGIC> check (e.g. elogind detecting cgroup2) failed.
+fn smoke_abi_pathx_statfs_ftype() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let path = b"/p2/f\0";
+        let mut buf = [0u8; 128];
+        if call(
+            Syscall::Statfs.raw(),
+            a1(path.as_ptr() as u64, buf.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("statfs(existing, buf) should return 0");
+        }
+        // f_type at offset 0 — a memfs reports TMPFS_MAGIC (0x01021994).
+        let f_type = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        if f_type != 0x0102_1994 {
+            return Err("statfs f_type (offset 0) was not TMPFS_MAGIC — wrong struct layout");
+        }
+        // f_bsize at offset 8 must be the 4096 block size, not the magic.
+        let f_bsize = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]);
+        if f_bsize != 4096 {
+            return Err("statfs f_bsize (offset 8) was not 4096");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_ftype);
+
 // ── symlink: Linux (const char *target, const char *linkpath), NUL-term ──
 //
 // The link location is resolved against cwd; the target stays verbatim.

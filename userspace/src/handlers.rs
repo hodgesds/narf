@@ -14865,51 +14865,67 @@ fn sys_umount2(ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Layout for the user's statfs buffer. Matches POSIX-2017
-/// `<sys/statvfs.h>` `struct statvfs` for the fields userspace
-/// programs actually read; we don't currently fill flags / fsid.
+/// Linux x86_64 `struct statfs` (fs/statfs). The FIRST field is `f_type`,
+/// the filesystem super-magic — programs like elogind statfs a path and check
+/// `f_type == CGROUP2_SUPER_MAGIC` to detect an already-mounted cgroup2. The
+/// previous shape here was a `statvfs` (started with `f_bsize`), so `f_type`
+/// read back as a block size and every magic check failed. 15 × u64 = 120 B.
 #[repr(C)]
 #[derive(Default)]
 struct StatfsBuf {
-    bsize: u64,   // block size in bytes
-    frsize: u64,  // fragment size (== bsize on simple FSes)
-    blocks: u64,  // total blocks
-    bfree: u64,   // free blocks
-    bavail: u64,  // free blocks available to non-root
-    files: u64,   // total inodes
-    ffree: u64,   // free inodes
-    namemax: u64, // max filename length
+    f_type: u64,    // filesystem super-magic
+    f_bsize: u64,   // block size in bytes
+    f_blocks: u64,  // total blocks
+    f_bfree: u64,   // free blocks
+    f_bavail: u64,  // free blocks available to non-root
+    f_files: u64,   // total inodes
+    f_ffree: u64,   // free inodes
+    f_fsid: u64,    // fs id (two int32; unused → 0)
+    f_namelen: u64, // max filename length
+    f_frsize: u64,  // fragment size
+    f_flags: u64,   // mount flags (unused)
+    f_spare0: u64,
+    f_spare1: u64,
+    f_spare2: u64,
+    f_spare3: u64,
 }
+
+// Linux super-magics (include/uapi/linux/magic.h) userspace probes for.
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+const SYSFS_MAGIC: u64 = 0x6265_6572;
+const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+const EXT2_SUPER_MAGIC: u64 = 0xEF53;
 
 fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
     if buf_ptr == 0 {
         return false;
     }
-    // The registered Arc<dyn FsInstance> doesn't (yet) expose a
-    // statfs trait method, so we fill a synthetic shape that
-    // satisfies POSIX-shaped readers. Real per-FS values land when
-    // FsInstance grows a `statfs()` method.
-    let _covered = narf_filesystem::registry()
-        .resolve_absolute(path, |fs, _rel| !fs.name().is_empty())
-        .unwrap_or(false);
+    // Map the filesystem covering `path` to its Linux super-magic so callers
+    // detect the fs type (elogind → CGROUP2_SUPER_MAGIC at /sys/fs/cgroup).
+    let fs_name = narf_filesystem::registry()
+        .resolve_absolute(path, |fs, _rel| alloc::string::String::from(fs.name()));
+    let f_type = match fs_name.as_deref() {
+        Some("cgroup2") | Some("cgroup") => CGROUP2_SUPER_MAGIC,
+        Some("sysfs") => SYSFS_MAGIC,
+        Some("procfs") | Some("proc") => PROC_SUPER_MAGIC,
+        Some(n) if n.starts_with("ext") => EXT2_SUPER_MAGIC,
+        Some(_) => TMPFS_MAGIC, // tmpfs / devtmpfs / shm / other memfs-backed
+        None => return false,   // no mount covers the path
+    };
     let stat = StatfsBuf {
-        bsize: 4096,
-        frsize: 4096,
-        blocks: 0,
-        bfree: 0,
-        bavail: 0,
-        files: 0,
-        ffree: 0,
-        namemax: 255,
+        f_type,
+        f_bsize: 4096,
+        f_namelen: 255,
+        f_frsize: 4096,
+        ..Default::default()
     };
     // Copy the statfs struct to user space under the SMAP bracket.
-    // SAFETY: StatfsBuf is repr(C) of eight u64s with no padding; transmuting it to
-    // a `[u8; size_of::<StatfsBuf>()]` reinterprets its bytes 1:1.
-    // SAFETY: Valid memory or trusted environment
+    // SAFETY: StatfsBuf is repr(C) of fifteen u64s with no padding; transmuting
+    // it to a `[u8; size_of::<StatfsBuf>()]` reinterprets its bytes 1:1.
     let bytes: [u8; core::mem::size_of::<StatfsBuf>()] = unsafe { core::mem::transmute(stat) };
     // SAFETY: `buf_ptr` is the user statfs buffer (non-zero, checked above);
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
-    // SAFETY: Valid memory or trusted environment
     unsafe { copy_to_user(buf_ptr, &bytes) }.is_ok()
 }
 

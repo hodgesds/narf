@@ -2532,6 +2532,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     );
                                 }
                             }
+                            // The /sys bind above does NOT carry the nested
+                            // cgroup-v2 mount at /sys/fs/cgroup, so a chrooted
+                            // session manager (elogind/logind/systemd) statfs'ing
+                            // the chroot's /sys/fs/cgroup finds nothing and
+                            // exit(1)s. Mount a fresh cgroup-v2 hierarchy at the
+                            // chroot path so it sees CGROUP2_SUPER_MAGIC and can
+                            // create its own child cgroups there.
+                            #[cfg(feature = "cgroup")]
+                            if !mounts.iter().any(|m| m == "/mnt/sys/fs/cgroup") {
+                                let cg = narf_filesystem::cgroupfs::CgroupFs::new();
+                                if narf_filesystem::registry()
+                                    .mount(&auth, "/mnt/sys/fs/cgroup", cg)
+                                    .is_ok()
+                                {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  mnt-dev-bind: cgroup2 mounted at /mnt/sys/fs/cgroup"
+                                    );
+                                }
+                            }
                             narf_init::InitResult::Ok
                         }
                         Err(e) => {

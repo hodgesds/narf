@@ -973,6 +973,22 @@ impl SocketFile {
         // common across all family backends.
         match op {
             SocketOp::GetSockName => {
+                // AF_NETLINK has no bound local_addr, but systemd/elogind's
+                // sd_device_monitor getsockname()s the netlink socket right
+                // after bind to learn the kernel-assigned nl_pid — a failure
+                // there aborts "create udev watchers" → "Failed to fully start
+                // up daemon". Synthesize sockaddr_nl body = nl_pad(2) +
+                // nl_pid(4, unique non-zero) + nl_groups(4).
+                if self.domain == AF_NETLINK {
+                    static NL_PID: AtomicU32 = AtomicU32::new(0);
+                    let pid = NL_PID.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    let mut body = alloc::vec![0u8; 10];
+                    body[2..6].copy_from_slice(&pid.to_le_bytes());
+                    return SocketOpResult::Addr(SockAddr {
+                        family: AF_NETLINK,
+                        body,
+                    });
+                }
                 return match self.local_addr() {
                     Some(a) => SocketOpResult::Addr(a),
                     None => SocketOpResult::Err(SockError::NotConnected),
