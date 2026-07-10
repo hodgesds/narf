@@ -41,6 +41,137 @@ fn smoke_abi_path_openat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_openat_neg);
 
+// ── openat with a real directory fd (dirfd-relative resolution) ──
+//
+// sd-device's chase_symlinks walks a path one openat() per component against
+// parent-directory fds; ignoring dirfd broke every udev/libudev device lookup.
+
+fn smoke_abi_path_openat_dirfd_relative() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        // Open the mount directory as a directory fd.
+        let dirp = b"/p\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dirp.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening /p as a directory fd failed"),
+        };
+        // openat(dfd, "f") must resolve relative to /p → /p/f (a real dirfd,
+        // not ignored-as-AT_FDCWD which would look for "f" in the cwd).
+        let rel = b"f\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(dfd, rel.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("openat(dirfd, \"f\") did not resolve relative to the dir fd"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_openat_dirfd_relative);
+
+// ── O_NOFOLLOW / O_PATH symlink + readlinkat(dirfd) ──
+//
+// chase_symlinks opens each component O_PATH|O_NOFOLLOW, fstat()s it, and
+// readlinkat()s a symlink relative to its parent-dir fd to resolve it.
+
+fn smoke_abi_path_openat_nofollow_symlink() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        const ELOOP: i64 = -40;
+        // /p/lnk -> f
+        let target = b"f\0";
+        let link = b"/p/lnk\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64).unwrap_or(-1) != 0 {
+            return Err("symlink(/p/lnk -> f) creation failed");
+        }
+        let p = b"/p/lnk\0";
+        // O_NOFOLLOW (no O_PATH) on a symlink → -ELOOP (must not follow).
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, p.as_ptr() as u64, O_NOFOLLOW, 0),
+        ) {
+            Some(r) if r == ELOOP => {}
+            _ => return Err("open(O_NOFOLLOW) on a symlink did not return -ELOOP"),
+        }
+        // O_NOFOLLOW|O_PATH opens the symlink node itself (fd >= 0).
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, p.as_ptr() as u64, O_NOFOLLOW | O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("open(O_NOFOLLOW|O_PATH) did not open the symlink node"),
+        }
+        // readlinkat relative to a dir fd resolves the target verbatim.
+        let dirp = b"/p\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dirp.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening /p dir fd failed"),
+        };
+        let rel = b"lnk\0";
+        let mut rlbuf = [0u8; 64];
+        let n = call(
+            Syscall::Readlinkat.raw(),
+            a3(
+                dfd,
+                rel.as_ptr() as u64,
+                rlbuf.as_mut_ptr() as u64,
+                rlbuf.len() as u64,
+            ),
+        )
+        .ok_or("readlinkat status")?;
+        if n <= 0 {
+            return Err("readlinkat(dirfd, \"lnk\") failed");
+        }
+        if &rlbuf[..n as usize] != b"f" {
+            return Err("readlinkat(dirfd, \"lnk\") returned the wrong target");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_openat_nofollow_symlink);
+
+// ── fstatfs reports the fd's own filesystem magic ──
+//
+// sd-device's fd_is_fs_type(fd, SYSFS_MAGIC) fstatfs()es an opened /sys node
+// and rejects it unless f_type == SYSFS_MAGIC. A synthetic "/" answer broke
+// every udev device lookup; fstatfs must reflect the fd's actual mount.
+
+fn smoke_abi_path_fstatfs_reports_fd_fs() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        // MemFs is not sysfs/proc/cgroup/ext → fill_statfs maps it to TMPFS.
+        const TMPFS_MAGIC: u64 = 0x0102_1994;
+        let path = b"/p/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open /p/f failed"),
+        };
+        let mut buf = [0u8; 128];
+        let r = call(Syscall::Fstatfs.raw(), a1(fd, buf.as_mut_ptr() as u64))
+            .ok_or("fstatfs status")?;
+        if r != 0 {
+            return Err("fstatfs of a valid fd did not return 0");
+        }
+        // Linux `struct statfs`: f_type is the first 8-byte field.
+        let f_type = u64::from_ne_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        if f_type != TMPFS_MAGIC {
+            return Err("fstatfs did not report the fd's own filesystem magic");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_fstatfs_reports_fd_fs);
+
 // ── creat: NUL-term path, returns a fd ──
 
 fn smoke_abi_path_creat_pos() -> TestResult {

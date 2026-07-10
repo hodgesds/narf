@@ -898,6 +898,34 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     let mnt_ptr = args.arg2;
     let mnt_len = args.arg3 as usize;
     let flags = args.arg4;
+    // Copy path from userspace into kernel buffer under SMAP bracket.
+    // Use the *raw* copy (no chroot) — `open_impl`'s `resolve_cwd_path` is the
+    // single point that re-roots under the task's chroot. Using the
+    // chroot-applying `copy_user_path` here would compose the chroot
+    // prefix twice (e.g. `/init` → `/jail/jail/init`).
+    let path_owned_raw = match copy_user_path_raw(path_ptr, path_len) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
+    };
+    open_impl(ctx, path_owned_raw, flags, mnt_ptr, mnt_len);
+}
+
+/// Shared open path. Resolves `path_owned_raw` (relative paths against the
+/// task cwd + chroot in the absolute-mount form) and installs the fd. Split
+/// out of `sys_open` so `sys_openat` can prepend a directory-fd's path and
+/// reuse the exact same resolution / permission / O_CREAT / directory-fd /
+/// inotify logic — a real `dirfd` is what sd-device's `chase_symlinks` (behind
+/// libudev / elogind seat enumeration) walks with, one `openat` per component.
+fn open_impl(
+    ctx: &mut dyn TrapContext,
+    path_owned_raw: alloc::string::String,
+    flags: u64,
+    mnt_ptr: u64,
+    mnt_len: usize,
+) {
     // O_TMPFILE (open an unnamed temp inode inside a directory): NARF's VFS
     // has no unnamed-inode support, so honouring the flag as-written opens
     // the DIRECTORY itself and a later write() to that fd EINVALs. Return
@@ -920,29 +948,62 @@ fn sys_open(ctx: &mut dyn TrapContext) {
     // status word), so the kernel must mirror that sentinel rather
     // than the generic `invalid_op` shape.
     let fail = SyscallReturn::ok(!0u64);
-    // Copy path from userspace into kernel buffer under SMAP bracket.
-    // Use the *raw* copy (no chroot) — `resolve_cwd_path` below is the
-    // single point that re-roots under the task's chroot. Using the
-    // chroot-applying `copy_user_path` here would compose the chroot
-    // prefix twice (e.g. `/init` → `/jail/jail/init`).
-    let path_owned = match copy_user_path_raw(path_ptr, path_len) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
     let task = current_task_id();
     // Resolve relative paths against the task's cwd and collapse
     // `.`/`..` (absolute-mount form only; the explicit-mount form below
     // keeps its already-relative-to-the-mount path). This is what makes
     // `ls` (which opens ".") and any relative open work from a shell.
     let path_owned = if mnt_len == 0 {
-        resolve_cwd_path(task, &path_owned)
+        resolve_cwd_path(task, &path_owned_raw)
     } else {
-        path_owned
+        path_owned_raw
     };
     let path: &str = &path_owned;
+
+    // O_NOFOLLOW: don't follow a final-component symlink. With O_PATH this
+    // opens the symlink node ITSELF (the caller then readlink()s it); without
+    // O_PATH, POSIX open(O_NOFOLLOW) on a symlink is -ELOOP. sd-device's
+    // chase_symlinks opens each component O_PATH|O_NOFOLLOW, fstat()s it, and
+    // readlinkat()s any symlink to resolve it to its target — following it
+    // here instead reported the pre-resolution path (`/sys/dev/char/226:0`),
+    // which sd-device then rejects as "outside of sysfs". Resolve the parent
+    // (following symlinks) and look the leaf up WITHOUT following it.
+    const O_NOFOLLOW: u64 = 0o400000;
+    const O_PATH: u64 = 0o10000000;
+    if flags & O_NOFOLLOW != 0 && mnt_len == 0 {
+        let leaf = narf_filesystem::registry()
+            .resolve_parent_absolute(path, |_fs, parent, leaf| parent.lookup(leaf))
+            .flatten();
+        if let Some(lops) = leaf {
+            if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
+                if flags & O_PATH == 0 {
+                    ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+                    return;
+                }
+                let new_fd = fd::with_table(task, |t| {
+                    t.open(crate::fd::FdEntry {
+                        ops: lops,
+                        offset: 0,
+                        flags: 0,
+                        status_flags: open_status_flags,
+                    })
+                });
+                match new_fd {
+                    Some(n) => {
+                        #[cfg(feature = "linux-compat")]
+                        crate::mqueue::register_fd_path(task, n, path);
+                        ctx.set_return(SyscallReturn::ok(n as u64));
+                    }
+                    None => ctx.set_return(fail),
+                }
+                return;
+            }
+            // Not a symlink (a regular file leaf) — fall through to the normal
+            // resolve; O_NOFOLLOW only constrains symlinks.
+        }
+        // Leaf absent via parent-lookup (a directory-only node, or O_CREAT) —
+        // fall through to the directory / O_CREAT handling below.
+    }
 
     // Two shapes:
     // - Absolute: arg2/arg3 = (0, 0). The path itself is `/foo/bar`;
@@ -3024,10 +3085,10 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `ssize_t readlinkat(int dirfd, const char *path,
     // char *buf, size_t bufsiz)`.
-    let _dirfd = args.arg0;
+    let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
-    let buf_ptr = args.arg2;
-    let buf_len = args.arg3;
+    let buf_ptr = args.arg2 as *mut u8;
+    let buf_len = args.arg3 as usize;
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
@@ -3035,44 +3096,21 @@ fn sys_readlinkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
+    // Honour a real directory fd (see sys_openat): resolve a relative path
+    // against the directory backing `dirfd`. chase_symlinks readlinkat()s a
+    // component relative to its parent-dir fd.
+    const AT_FDCWD: i64 = -100;
+    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
+        path_str
+    } else {
+        match fd_path_of(current_task_id(), dirfd as u32) {
+            Some(dir) if dir.starts_with('/') => {
+                alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
+            }
+            _ => path_str,
         }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    // sys_readlink is Linux-shaped: readlink(path_ptr, buf_ptr, buf_len) in
-    // arg0/arg1/arg2. This reshape used to pass arg1 = path_len (NARF-native
-    // holdover), so sys_readlink read the path length as the output buffer
-    // pointer and every readlinkat(2) wrote to a bogus address / failed.
-    let _ = path_str; // validated above; sys_readlink re-reads via path_uptr
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: buf_ptr,
-        arg2: buf_len,
-        ..Default::default()
     };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_readlink(&mut proxy);
+    readlink_impl(ctx, effective, buf_ptr, buf_len);
 }
 
 // ── access / chmod / chown — legacy entry points ───────────────────
@@ -3697,7 +3735,7 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
     // musl's `openat(AT_FDCWD, "...", O_RDONLY, 0)` hit our
     // handler with arg2 = O_RDONLY = 0 → zero-length path →
     // EINVAL on every open. See [[project_narf_native_vs_linux_abis]].)
-    let _dirfd = args.arg0;
+    let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let flags = args.arg2;
     let _mode = args.arg3;
@@ -3708,44 +3746,29 @@ fn sys_openat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Reshape into a sys_open call: (path_ptr, path_len, mount_ptr,
-    // mount_len, flags). sys_open re-reads the path from the
-    // original user pointer with our measured length.
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
+    // Honour a real directory fd: `openat(dirfd, relpath)` resolves `relpath`
+    // against the directory backing `dirfd`. Absolute paths and AT_FDCWD
+    // resolve as before. sd-device's `chase_symlinks` (behind libudev and
+    // elogind's seat-device enumeration) walks a path with one `openat` per
+    // component against parent-directory fds; ignoring `dirfd` made every
+    // such lookup fail ("Failed to chase symlinks in …") → no DRM card ever
+    // attached to a seat. `fd_path_of` returns the dir's chroot-relative path,
+    // so joining a relative component and letting `open_impl` re-apply the
+    // chroot keeps a chrooted process (e.g. elogind under /mnt) resolving in
+    // its own namespace.
+    const AT_FDCWD: i64 = -100;
+    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
+        path_str
+    } else {
+        match fd_path_of(current_task_id(), dirfd as u32) {
+            Some(dir) if dir.starts_with('/') => {
+                alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
+            }
+            // Unknown / non-directory fd → best-effort cwd-relative resolve.
+            _ => path_str,
         }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let proxy_args = SyscallArgs {
-        arg0: path_uptr,
-        arg1: path_str.len() as u64,
-        arg2: 0,
-        arg3: 0,
-        arg4: flags,
-        arg5: 0,
     };
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: proxy_args,
-    };
-    sys_open(&mut proxy);
+    open_impl(ctx, effective, flags, 0, 0);
 }
 
 // ── fchmodat / fchownat — *at-keyed mode/owner ─────────────────────
@@ -4350,18 +4373,31 @@ fn sys_readlink(ctx: &mut dyn TrapContext) {
     let path_ptr = args.arg0;
     let buf_ptr = args.arg1 as *mut u8;
     let buf_len = args.arg2 as usize;
+    let raw = match copy_user_cstr(path_ptr, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+    };
+    readlink_impl(ctx, raw, buf_ptr, buf_len);
+}
+
+/// Shared readlink path. Split out of `sys_readlink` so `sys_readlinkat` can
+/// prepend a directory-fd's path: sd-device's `chase_symlinks` readlinkat()s
+/// a symlink relative to its parent-directory fd, so ignoring the dirfd made
+/// the symlink chase fail.
+fn readlink_impl(
+    ctx: &mut dyn TrapContext,
+    raw: alloc::string::String,
+    buf_ptr: *mut u8,
+    buf_len: usize,
+) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     if buf_ptr.is_null() || buf_len == 0 {
         ctx.set_return(fail);
         return;
     }
-    let raw = match copy_user_cstr(path_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
     let path = resolve_cwd_path(current_task_id(), &raw);
@@ -15650,14 +15686,19 @@ pub fn apply_chroot_for_test(p: &str) -> alloc::string::String {
 fn sys_fstatfs(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok(!0u64);
-    let _fd = args.arg0 as i32;
+    let fd = args.arg0 as u32;
     let buf_ptr = args.arg1;
-    // Resolving fd → mount-path requires the fd table to record the
-    // mount that opened it; we do not (yet) plumb that through. As
-    // an interim, return synthetic stats for "/" — every fd lives
-    // under some mount, and "/" is the lowest-information answer
-    // POSIX permits.
-    if fill_statfs_for_path("/", buf_ptr) {
+    // Report the statfs of the filesystem backing THIS fd (not a synthetic
+    // "/"). The per-fd backing path recorded at open() maps back to its mount,
+    // whose super-magic `fill_statfs_for_path` derives. sd-device's
+    // `fd_is_fs_type(fd, SYSFS_MAGIC)` fstatfs()es an opened /sys/... device
+    // node and rejects it ("outside of sysfs") unless f_type == SYSFS_MAGIC —
+    // so a synthetic "/" answer (ext2/tmpfs magic) broke every udev device
+    // lookup. Fall back to "/" for fds with no path (pipes, sockets, eventfd).
+    let path = fd_path_of(current_task_id(), fd)
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or_else(|| alloc::string::String::from("/"));
+    if fill_statfs_for_path(&path, buf_ptr) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
