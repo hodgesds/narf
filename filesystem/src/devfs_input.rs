@@ -438,6 +438,20 @@ impl FileOps for InputEventFile {
         0
     }
 
+    /// The evdev node is a PARKABLE readiness source: a poll/epoll set
+    /// containing it may block instead of busy-spinning. Event dispatch
+    /// wakes syscall-layer waiters (`evdev` calls `fire_dispatch_wake` →
+    /// `narf_net::readiness::notify`), so a parked poll resumes promptly.
+    /// Without this the node defaulted "silent" (false), poisoning the
+    /// whole poll set — a compositor polling {wayland, DRM, dbus, and the
+    /// four /dev/input/event* nodes via libinput} then busy-polls at 100%
+    /// CPU and, under the cooperative own-stack scheduler, starves every
+    /// same-CPU peer (the residual launcher/plasmashell starvation after
+    /// the eventfd + DRM-fd fixes). Same bug class.
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     /// evdev's `read()` blocks internally on an empty ring (matching Linux
     /// blocking-fd semantics). A non-blocking caller — libinput opens the
     /// node `O_RDWR|O_NONBLOCK` — must get `EAGAIN` instead. Opting in here
