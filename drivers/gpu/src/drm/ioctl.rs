@@ -403,6 +403,15 @@ fn handle_version(card: &Card) -> Result<DrmIoctlResult, DrmIoctlError> {
     };
     copy_str_to_buf(&mut v.name, card.driver_name);
     copy_str_to_buf(&mut v.desc, card.driver_desc);
+    // DRIVER_DATE — a driver-wide constant in Linux (drm drivers always set
+    // a non-empty date). It MUST be non-empty: libdrm's drmGetVersion only
+    // allocates version->date when the first VERSION ioctl reports date_len
+    // != 0, then drmCopyVersion does an UNCONDITIONAL strdup(version->date).
+    // An empty date left version->date NULL, so Mesa GBM's gbm_create_device
+    // -> drmGetVersion -> strdup(NULL) segfaulted a kwin worker thread the
+    // instant it probed the GPU node. Same hazard applies to name/desc, so
+    // keep all three non-empty.
+    copy_str_to_buf(&mut v.date, "20250101");
     Ok(DrmIoctlResult::Version(v))
 }
 

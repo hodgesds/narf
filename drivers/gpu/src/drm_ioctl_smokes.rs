@@ -194,6 +194,18 @@ fn smoke_drm_ioctl_version_writes_driver_name() -> TestResult {
     if req.version_major != 1 {
         return TestResult::Fail("version_major != 1");
     }
+    // name, date AND desc must ALL come back non-empty. libdrm's
+    // drmGetVersion only allocates version->{name,date,desc} when the
+    // corresponding _len is non-zero on the first ioctl, then drmCopyVersion
+    // does an UNCONDITIONAL strdup on each — an empty field leaves a NULL
+    // pointer and strdup(NULL) segfaults the caller (Mesa GBM's
+    // gbm_create_device crashed a kwin worker thread exactly this way).
+    if req.date_len == 0 || req.date_len > date_buf.len() as u64 {
+        return TestResult::Fail("version date_len empty/out of range");
+    }
+    if req.desc_len == 0 || req.desc_len > desc_buf.len() as u64 {
+        return TestResult::Fail("version desc_len empty/out of range");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

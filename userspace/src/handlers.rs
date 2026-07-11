@@ -18726,6 +18726,24 @@ pub fn default_sync_signal_delivery(
                     info.addr,
                     ctx.rip()
                 );
+                // Dump plausible return addresses off the faulting stack so
+                // the CALLER can be symbolized (a leaf like strlen faults with
+                // [rsp] == its caller's return address). Print only words that
+                // land in an executable window — the ld-musl interp bias
+                // (0x4000_0000_0000) or the mmap DSO arena (0x4080_.. up).
+                let rsp = ctx.user_rsp();
+                for i in 0..32u64 {
+                    let mut w = [0u8; 8];
+                    // SAFETY: copy_from_user range-validates the source VA and
+                    // SMAP-brackets the read; a bad slot just errors out.
+                    if unsafe { copy_from_user(&mut w, rsp.wrapping_add(i * 8)) }.is_err() {
+                        break;
+                    }
+                    let v = u64::from_le_bytes(w);
+                    if (0x0000_4000_0000_0000..0x0000_7F00_0000_0000).contains(&v) {
+                        let _ = writeln!(narf_console::Writer, "  stk[{}]={:x}", i, v);
+                    }
+                }
             }
             match default_signal_action(signum) {
                 DefaultAction::Terminate => {
