@@ -113,6 +113,21 @@ impl FileOps for DriCardFile {
         }
     }
 
+    /// The DRM card fd is a PARKABLE readiness source: a poll/epoll set
+    /// containing it may block instead of busy-spinning. Without this the
+    /// fd defaulted "silent" (readiness_notifies == false), which poisons
+    /// the whole poll set — a compositor's main-loop poll over {wayland,
+    /// DRM, input, dbus} then busy-polls at 100% CPU and, under the
+    /// cooperative own-stack scheduler, starves every same-CPU peer (the
+    /// exact starvation that stalled kwin's launcher before plasmashell
+    /// could paint; same class as the eventfd fix). Flip-complete events
+    /// are queued synchronously by SETCRTC/PAGE_FLIP and read straight
+    /// after the ioctl (not via a parked poll), and any parked poll self-
+    /// heals within the ~10 ms backstop, so no explicit wake is required.
+    fn readiness_notifies(&self) -> bool {
+        true
+    }
+
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::InvalidData) })
     }
