@@ -794,6 +794,15 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Create an S_IFSOCK node named `name` (the inode Linux materialises
+    /// for a pathname AF_UNIX `bind()`), with the given permission bits.
+    /// Default: unsupported — filesystems that can't hold a socket inode
+    /// leave the bound path invisible (`bind` still succeeds; connection
+    /// routing is independent of this node). tmpfs/memfs override it.
+    fn create_socket<'a>(&'a self, _name: &'a str, _perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
     /// Create a new empty subdirectory named `name`.
     fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move { Err(FsError::Unsupported) })

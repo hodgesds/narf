@@ -437,6 +437,77 @@ fn smoke_filesystem_memfs_unlink_round_trip() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_memfs_unlink_round_trip);
 
+/// A pathname AF_UNIX `bind()` materialises an S_IFSOCK inode in Linux;
+/// NARF does the same via `DirOps::create_socket`. This exercises the
+/// memfs (tmpfs) implementation directly: create a socket node, confirm it
+/// `stat`s as `FileType::Socket` (so `[ -S ]`/`ls -l` see a socket, not a
+/// regular file), and that it can be unlinked. Without the socket type,
+/// wayland/dbus/shell probes of the bound socket path misread it.
+fn smoke_filesystem_memfs_socket_node() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, MemFs, MountPoint};
+    use narf_capabilities::{Cap, Grant};
+
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: the vtable's clone/wake/drop are all no-ops over a null
+        // data pointer, so the RawWaker upholds the Waker contract trivially.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block and is
+        // never moved after being pinned here.
+        let fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
+        match fut.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("test-socknode", &[]);
+    let mount_handle = match registry().mount(&auth, "/test_socknode", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    // bind() side: create the socket inode.
+    let created = registry().resolve_parent_absolute("/test_socknode/sock", |_fs, parent, leaf| {
+        poll_once(parent.create_socket(leaf, 0o755))
+    });
+    if !matches!(created, Some(Some(Ok(_)))) {
+        let _ = registry().unmount(&mount_handle, "/test_socknode");
+        return TestResult::Fail("create_socket failed on memfs");
+    }
+
+    // stat() must report S_IFSOCK, not S_IFREG.
+    let is_sock = registry().resolve_absolute("/test_socknode/sock", |fs, rel| {
+        crate::resolve(fs.root(), rel)
+            .map(|f| f.stat().mode.file_type == crate::FileType::Socket)
+            .unwrap_or(false)
+    });
+    if is_sock != Some(true) {
+        let _ = registry().unmount(&mount_handle, "/test_socknode");
+        return TestResult::Fail("bound socket path did not stat as S_IFSOCK");
+    }
+
+    // unlink() removes the node (dbus/wayland unlink a stale socket path).
+    let unl = registry().resolve_parent_absolute("/test_socknode/sock", |_fs, parent, leaf| {
+        poll_once(parent.unlink(leaf))
+    });
+    if !matches!(unl, Some(Some(Ok(())))) {
+        let _ = registry().unmount(&mount_handle, "/test_socknode");
+        return TestResult::Fail("unlink of socket node failed");
+    }
+
+    let _ = registry().unmount(&mount_handle, "/test_socknode");
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_memfs_socket_node);
+
 fn smoke_filesystem_devfs_null_zero() -> TestResult {
     use crate::{bootstrap_mount_authority, registry, DevFs};
     use core::pin::Pin;

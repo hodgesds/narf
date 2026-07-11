@@ -2687,6 +2687,22 @@ type Inet6Map = BTreeMap<([u8; 16], u16), Arc<SocketFile>>;
 static LISTENERS: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
 
+/// Release a bound AF_UNIX pathname from the stream + dgram registries so
+/// the address can be re-bound. Called by `unlink(2)` on a socket path —
+/// dbus/wayland `unlink()` a stale socket before re-`bind()`-ing it, and
+/// in Linux removing the socket inode frees the address. Returns true if
+/// an entry was actually removed (the path was a live bound socket).
+pub fn unbind_path(path: &str) -> bool {
+    let mut removed = false;
+    if let Some(map) = LISTENERS.lock().as_mut() {
+        removed |= map.remove(path).is_some();
+    }
+    if let Some(map) = UNIX_DGRAM_BOUND.lock().as_mut() {
+        removed |= map.remove(path).is_some();
+    }
+    removed
+}
+
 /// AF_INET listener registry keyed by (ip, port). Loopback only
 /// today; non-loopback addrs are accepted at bind() but no
 /// connect path serves them until the NIC TX side wires in.

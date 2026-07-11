@@ -52,6 +52,13 @@ struct MemFile {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
+    /// True when this node is a bound AF_UNIX socket (created by `bind()`
+    /// on a pathname address). `stat`/`enumerate` then report S_IFSOCK so
+    /// `stat`/`[ -S ]`/`ls -l`/`unlink` on the socket path behave like
+    /// Linux (a pathname socket is a real filesystem inode). Immutable
+    /// after creation — a plain `bool`, not an atomic, to stay off the
+    /// per-node heap-cost path the atomics above were chosen for.
+    sock: bool,
 }
 
 impl MemFile {
@@ -62,6 +69,7 @@ impl MemFile {
             perms: AtomicU32::new(DEFAULT_PERMS as u32),
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
+            sock: false,
         }
     }
 
@@ -73,6 +81,18 @@ impl MemFile {
             perms: AtomicU32::new((perms & 0o777) as u32),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
+            sock: false,
+        }
+    }
+
+    /// Mint a pathname-AF_UNIX-socket node (S_IFSOCK) with the given perms.
+    fn new_socket(perms: u16) -> Self {
+        MemFile {
+            bytes: IrqSafeSpinLock::new(Vec::new()),
+            perms: AtomicU32::new((perms & 0o777) as u32),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
+            sock: true,
         }
     }
 }
@@ -142,7 +162,11 @@ impl FileOps for MemFile {
             size: g.len() as u64,
             blocks: (g.len() as u64).div_ceil(512),
             mode: Mode {
-                file_type: FileType::File,
+                file_type: if self.sock {
+                    FileType::Socket
+                } else {
+                    FileType::File
+                },
                 perms: (self.perms.load(Ordering::Relaxed) & 0o777) as u16,
             },
             mtime_cycles: 0,
@@ -310,6 +334,7 @@ impl DirOps for MemDir {
             .take(max)
             .map(|(name, entry)| {
                 let ft = match entry {
+                    Entry::File(f) if f.sock => FileType::Socket,
                     Entry::File(_) => FileType::File,
                     Entry::Dir(_) => FileType::Dir,
                     Entry::Symlink(_) => FileType::Symlink,
@@ -348,6 +373,24 @@ impl DirOps for MemDir {
                 return Err(FsError::Busy);
             }
             let f = Arc::new(MemFile::new(Vec::new()));
+            g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
+            Ok(f as Arc<dyn FileOps>)
+        })
+    }
+
+    /// Create an S_IFSOCK node — the filesystem inode Linux materialises
+    /// when a pathname AF_UNIX socket is `bind()`-ed. Makes the bound path
+    /// `stat`/`[ -S ]`/`ls`/`unlink`-visible (wayland, dbus, and shells all
+    /// probe the socket path this way). Connection routing still goes
+    /// through the socket layer's LISTENERS registry; this node is the
+    /// filesystem-visible marker.
+    fn create_socket<'a>(&'a self, name: &'a str, perms: u16) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            let f = Arc::new(MemFile::new_socket(perms));
             g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
             Ok(f as Arc<dyn FileOps>)
         })

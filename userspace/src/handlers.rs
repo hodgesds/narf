@@ -2983,6 +2983,33 @@ fn mknod_common(path_uptr: u64, mode: u64) -> SyscallReturn {
     }
 }
 
+/// Materialise the S_IFSOCK filesystem node for a pathname AF_UNIX
+/// `bind()` (Linux creates a real socket inode at the path). Best-effort:
+/// abstract-namespace sockets (leading NUL) get no node, and a filesystem
+/// that can't hold a socket inode just leaves the path invisible — bind
+/// still succeeds either way (connection routing is the LISTENERS
+/// registry, independent of this node). Makes `stat`/`[ -S ]`/`ls`/
+/// `unlink`/`chmod` on the bound path behave like Linux — wayland, dbus,
+/// and shells all probe the socket path this way.
+pub(crate) fn create_unix_socket_node(path: &str) {
+    // Abstract namespace (sun_path[0] == '\0') has no filesystem presence.
+    if path.is_empty() || path.starts_with('\0') {
+        return;
+    }
+    let abs = resolve_cwd_path(current_task_id(), path);
+    let path_ref = abs.trim_end_matches('/');
+    if path_ref.is_empty() {
+        return;
+    }
+    if let Some((parent, leaf)) = resolve_parent_dir_async(path_ref) {
+        // 0o755: the socket node's mode; apps chmod it afterwards. If a
+        // stale node already occupies the name the app should have
+        // unlink'd it first — ignore the collision (bind already vetted
+        // the address via LISTENERS).
+        let _ = poll_blocking(parent.create_socket(&leaf, 0o755));
+    }
+}
+
 fn sys_renameat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _old_dirfd = args.arg0;
@@ -4222,6 +4249,10 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
         }
     };
     let path = resolve_cwd_path(current_task_id(), &path);
+    // If this path is a live bound AF_UNIX socket, release its address so
+    // it can be re-bound (Linux frees the address when the socket inode is
+    // unlinked — dbus/wayland unlink a stale socket before re-binding).
+    let was_socket = crate::socket::unbind_path(&path);
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&path, |_fs, parent, leaf| {
             poll_blocking(parent.unlink(leaf))
@@ -4232,6 +4263,9 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_delete(&path, false);
             ctx.set_return(SyscallReturn::ok(0));
         }
+        // The address was freed even if no filesystem node backed the path
+        // (e.g. the bind's fs couldn't hold a socket inode) — still success.
+        _ if was_socket => ctx.set_return(SyscallReturn::ok(0)),
         _ => ctx.set_return(fail),
     }
 }
@@ -19309,8 +19343,23 @@ fn sys_socket_bind(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // A pathname AF_UNIX bind materialises a real S_IFSOCK inode in Linux.
+    // Grab the path before the op consumes `addr` (family is checked in the
+    // op; AF_UNIX bodies are the sun_path bytes).
+    let unix_path: Option<alloc::string::String> = if addr.family == crate::socket::AF_UNIX {
+        core::str::from_utf8(&addr.body)
+            .ok()
+            .map(|s| alloc::string::String::from(s.trim_end_matches('\0')))
+    } else {
+        None
+    };
     match sock.dispatch_op(crate::socket::SocketOp::Bind { addr }) {
-        crate::socket::SocketOpResult::Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
+        crate::socket::SocketOpResult::Ok(_) => {
+            if let Some(p) = unix_path {
+                create_unix_socket_node(&p);
+            }
+            ctx.set_return(SyscallReturn::ok(0))
+        }
         _ => ctx.set_return(fail),
     }
 }
