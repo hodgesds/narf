@@ -3634,6 +3634,11 @@ fn boot_userspace_init() {
                     "futex_contend_smoke",
                     narf_verification::NARF_FUTEX_CONTEND_SMOKE_ELF,
                 ),
+                // Condvar broadcast handoff: the FUTEX_REQUEUE path.
+                (
+                    "condbcast_smoke",
+                    narf_verification::NARF_CONDBCAST_SMOKE_ELF,
+                ),
                 // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
                 ("keyring_smoke", narf_verification::NARF_KEYRING_SMOKE_ELF),
                 // Linux-compat round 22: inotify real event delivery.

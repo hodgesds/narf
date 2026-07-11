@@ -564,6 +564,7 @@ fn main() {
         "psched_smoke",
         "futex2_smoke",
         "futex_contend_smoke",
+        "condbcast_smoke",
         "keyring_smoke",
         "inotify2_smoke",
         "fanotify_smoke",

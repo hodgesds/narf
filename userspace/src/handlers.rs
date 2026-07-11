@@ -17380,6 +17380,24 @@ fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
+/// `FUTEX_REQUEUE` (3) / `FUTEX_CMP_REQUEUE` (4): wake up to `val` waiters
+/// on `uaddr`, then MOVE up to `val2` more onto `uaddr2`'s wait queue
+/// WITHOUT waking them (they wake on a later `FUTEX_WAKE` of `uaddr2`).
+/// CMP additionally fails with -EAGAIN unless `*uaddr == val3`.
+///
+/// musl's condvar depends on this: `pthread_cond_broadcast` wakes only the
+/// oldest waiter directly; each woken waiter then hands off to the next via
+/// `unlock_requeue(&node.prev->barrier, &m->_m_lock, ...)`, which zeroes
+/// the next waiter's barrier word and REQUEUES its (still-parked) kernel
+/// wait onto the mutex so the eventual mutex unlock wakes it. Returning a
+/// non-ENOSYS error here made musl treat the requeue as done — the waiter
+/// stayed parked on a barrier word nobody would ever wake again (musl's
+/// `unlock()` only wakes when the swap saw 2, and the word was already 0)
+/// — a permanent, deterministic strand of any broadcast to >= 2 parked
+/// waiters. That is the `condbcast_smoke` hang and the mechanism behind
+/// the "SMP scheduler-resume strand" class of wedges.
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
 /// `FUTEX_WAKE_OP` (5): atomically RMW a second futex word, wake `val`
 /// waiters on `uaddr`, and — if the pre-RMW value satisfies an encoded
 /// comparison — wake `val2` waiters on `uaddr2`. glibc's (and Qt's)
@@ -17596,12 +17614,153 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
     count
 }
 
+/// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` core: wake up to `n_wake` waiters on
+/// `uaddr`, then MOVE up to `n_move` of the remaining waiters onto
+/// `uaddr2`'s wait queue without firing their wakers (Linux
+/// `futex_requeue`). Returns `(woken, moved)`.
+///
+/// The queue move happens under the single `FUTEX_WAITERS` table lock
+/// (both per-uaddr queues live in one map under one lock, so there is no
+/// two-queue lock-ordering hazard). After the move — with the table lock
+/// DROPPED — each mover's park state is retargeted to the destination
+/// word: `futex_park_gen` is set to a destination-generation snapshot
+/// taken BEFORE the queue move (so a `FUTEX_WAKE(uaddr2)` racing the move
+/// bumps past the snapshot and the waiter's gen guard fires), then
+/// `futex_uaddr`/`futex_val` flip to the destination word and `new_val`
+/// (the caller-sampled current `*uaddr2`). A backstop re-poll that
+/// interleaves anywhere in this window is caught by the park loop's word
+/// re-validation (`futex_park_should_stay`): the source word was already
+/// rewritten by the userspace caller (musl stores the barrier word before
+/// issuing the requeue), so a stale-state re-check proceeds to userspace
+/// and re-evaluates there — a bounded spurious wake, never a lost one.
+fn futex_requeue_waiters(
+    uaddr: u64,
+    uaddr2: u64,
+    n_wake: u32,
+    n_move: u32,
+    new_val: u32,
+) -> (usize, usize) {
+    // Wake side first, exactly like FUTEX_WAKE: bump the source generation
+    // (so a waiter racing its park registration re-checks), then pop + fire.
+    futex_bump_counter(uaddr);
+    let woken = futex_wake_waiters(uaddr, n_wake);
+    if n_move == 0 {
+        return (woken, 0);
+    }
+    // Destination-generation snapshot BEFORE the queue move (see above).
+    let gen2 = futex_wake_counter(uaddr2);
+    let moved: alloc::vec::Vec<u64> = {
+        let mut g = FUTEX_WAITERS.lock();
+        let Some(m) = g.as_mut() else {
+            return (woken, 0);
+        };
+        let Some(set) = m.get_mut(&uaddr) else {
+            return (woken, 0);
+        };
+        let take: alloc::vec::Vec<u64> = set.keys().take(n_move as usize).copied().collect();
+        let mut movers: alloc::vec::Vec<(u64, core::task::Waker)> =
+            alloc::vec::Vec::with_capacity(take.len());
+        for tid in take {
+            if let Some(w) = set.remove(&tid) {
+                movers.push((tid, w));
+            }
+        }
+        if set.is_empty() {
+            m.remove(&uaddr);
+        }
+        let dst = m.entry(uaddr2).or_default();
+        let mut tids = alloc::vec::Vec::with_capacity(movers.len());
+        for (tid, w) in movers {
+            dst.insert(tid, w);
+            tids.push(tid);
+        }
+        tids
+    };
+    // Retarget each mover's park state OUTSIDE the table lock (the task
+    // registry lock in with_user_task_ctx must never nest inside it).
+    for tid in &moved {
+        crate::user_task::with_user_task_ctx(*tid, |uc| {
+            uc.futex_park_gen.store(gen2, Ordering::Release);
+            uc.futex_val.store(new_val, Ordering::Release);
+            uc.futex_uaddr.store(uaddr2, Ordering::Release);
+        });
+    }
+    (woken, moved.len())
+}
+
+/// Read the 4-byte futex word at user address `uaddr` in the CURRENT
+/// address space. `None` on fault/unmapped. Used by `FUTEX_CMP_REQUEUE`'s
+/// `*uaddr == val3` check and by the park loop's word re-validation.
+pub(crate) fn futex_read_user_word(uaddr: u64) -> Option<u32> {
+    if uaddr == 0 {
+        return None;
+    }
+    let mut b = [0u8; 4];
+    // SAFETY: copy_from_user range-validates the user pointer and
+    // SMAP-brackets the read.
+    if unsafe { copy_from_user(&mut b, uaddr) }.is_ok() {
+        Some(u32::from_ne_bytes(b))
+    } else {
+        None
+    }
+}
+
+/// Decide whether a parked `FUTEX_WAIT` should STAY parked on its next
+/// park-loop re-check (the ~10 ms wheel-backstop re-poll): only while BOTH
+/// no `FUTEX_WAKE` generation has landed on the word (`gen_now ==
+/// park_gen`) AND the futex word itself still holds the value the waiter
+/// parked on (`word_now == Some(expected)`).
+///
+/// The word re-validation is the load-bearing half. Futex protocols may
+/// change the word WITHOUT a wake on the old word — musl's
+/// `unlock_requeue` stores the barrier word and then only requeues; a
+/// robust-futex owner death rewrites the word; any PI/handoff scheme does
+/// the same — and Linux waiters tolerate that because every spurious
+/// return re-checks the word in userspace. NARF's own-stack park loop
+/// swallows the backstop wake INSIDE the kernel, so before this check a
+/// silently-rewritten word meant the waiter re-parked forever on a word
+/// nobody would ever wake again — the permanent variant of the SMP strand
+/// (`condbcast_smoke`). An unreadable word (`None` — AS torn down,
+/// unmapped) also proceeds: never re-park on memory we cannot re-check.
+pub(crate) fn futex_park_should_stay(
+    gen_now: u64,
+    park_gen: u64,
+    word_now: Option<u32>,
+    expected: u32,
+) -> bool {
+    gen_now == park_gen && word_now == Some(expected)
+}
+
 /// Test-only accessor for the futex wake counter — Wave-65 smokes
 /// observe CLONE_CHILD_CLEARTID's exit-side futex wake by reading
 /// this counter before/after the exit notification.
 #[doc(hidden)]
 pub fn __test_futex_wake_counter(uaddr: u64) -> u64 {
     futex_wake_counter(uaddr)
+}
+
+/// Test-only: register a waiter / requeue / count parked waiters, so the
+/// kernel-test suite can pin the FUTEX_REQUEUE queue-move semantics
+/// without a user address space.
+#[doc(hidden)]
+pub fn __test_futex_requeue(uaddr: u64, uaddr2: u64, n_wake: u32, n_move: u32) -> (usize, usize) {
+    futex_requeue_waiters(uaddr, uaddr2, n_wake, n_move, 0)
+}
+
+#[doc(hidden)]
+pub fn __test_futex_waiter_count(uaddr: u64) -> usize {
+    let g = FUTEX_WAITERS.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&uaddr).map(|s| s.len()))
+        .unwrap_or(0)
+}
+
+/// Test-only FUTEX_WAKE equivalent (gen bump + pop-and-fire), so tests can
+/// drive the wake side of the wait queue without a TrapContext.
+#[doc(hidden)]
+pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
+    futex_bump_counter(uaddr);
+    futex_wake_waiters(uaddr, n)
 }
 
 fn sys_futex(ctx: &mut dyn TrapContext) {
@@ -17698,6 +17857,11 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
                 unsafe {
                     let uc = &*uctx;
                     uc.futex_park_gen.store(gen, Ordering::Release);
+                    // Expected word value — the park loop re-validates the
+                    // word against this on every backstop re-check, so a
+                    // word rewritten WITHOUT a wake (requeue handoffs,
+                    // robust-owner death) unparks instead of stranding.
+                    uc.futex_val.store(val, Ordering::Release);
                     uc.futex_uaddr.store(uaddr, Ordering::Release);
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
@@ -17722,6 +17886,51 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
             futex_bump_counter(uaddr);
             let woken = futex_wake_waiters(uaddr, val);
             ctx.set_return(SyscallReturn::ok(woken as u64));
+        }
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // futex(uaddr, REQUEUE, nr_wake, nr_requeue, uaddr2[, val3]):
+            // wake up to `val` waiters on uaddr, move up to `arg3` more
+            // onto uaddr2. CMP_REQUEUE first requires `*uaddr == val3`
+            // (-EAGAIN otherwise; Linux futex(2)). Linux returns the count
+            // WOKEN for REQUEUE, woken + requeued for CMP_REQUEUE.
+            const EAGAIN: i64 = 11;
+            const EFAULT: i64 = 14;
+            let uaddr2 = args.arg4;
+            if uaddr2 == 0 {
+                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                return;
+            }
+            if op == FUTEX_CMP_REQUEUE {
+                match futex_read_user_word(uaddr) {
+                    Some(cur) if cur == args.arg5 as u32 => {}
+                    Some(_) => {
+                        ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
+                        return;
+                    }
+                    None => {
+                        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                        return;
+                    }
+                }
+            }
+            // Sample the destination word for the movers' park-loop word
+            // re-validation: a requeued waiter now waits for *uaddr2 to
+            // change (the mutex handoff), so its expected value must be
+            // the destination word as of the requeue. The requeuing
+            // caller shares the movers' address space (futexes requeue
+            // within one process), so reading it here resolves correctly.
+            // An unreadable destination keeps expected at the sampled 0 —
+            // the movers' next backstop re-check then proceeds to
+            // userspace and re-evaluates there (spurious, never lost).
+            let new_val = futex_read_user_word(uaddr2).unwrap_or(0);
+            let (woken, moved) =
+                futex_requeue_waiters(uaddr, uaddr2, val, args.arg3 as u32, new_val);
+            let r = if op == FUTEX_CMP_REQUEUE {
+                woken + moved
+            } else {
+                woken
+            };
+            ctx.set_return(SyscallReturn::ok(r as u64));
         }
         _ => ctx.set_return(fail),
     }
@@ -17791,6 +18000,8 @@ fn futex_wait_core(ctx: &mut dyn TrapContext, uaddr: u64, val: u32, park_cap_ns:
         unsafe {
             let uc = &*uctx;
             uc.futex_park_gen.store(gen, Ordering::Release);
+            // Park-loop word re-validation snapshot (see sys_futex).
+            uc.futex_val.store(val, Ordering::Release);
             uc.futex_uaddr.store(uaddr, Ordering::Release);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);

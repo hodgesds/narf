@@ -120,6 +120,16 @@ pub struct UserTaskCtx {
     /// check→register window (lost-wakeup race) and the task self-wakes to
     /// re-enter user mode instead of sleeping. Mirrors `epoll_park_gen`.
     pub futex_park_gen: AtomicU64,
+    /// The futex word value this task's `FUTEX_WAIT` parked on. The park
+    /// loop re-reads the word on every backstop re-check and proceeds when
+    /// it no longer matches (`handlers::futex_park_should_stay`) — the
+    /// Linux-parity guard against wakeless word rewrites (musl's condvar
+    /// `unlock_requeue` barrier handoff, robust-owner death): userspace
+    /// futex protocols are entitled to change the word without waking the
+    /// old word, and waiters must re-check rather than re-park forever.
+    /// Retargeted alongside `futex_uaddr` when a `FUTEX_REQUEUE` moves
+    /// this waiter to a new word.
+    pub futex_val: AtomicU32,
     /// Set non-null by `sys_execve` to hand a freshly-built
     /// `ExecRequest` to the polling routine. The routine takes
     /// ownership via `Box::from_raw` after the EXECVE longjmp
@@ -237,6 +247,7 @@ impl UserTaskCtx {
             epoll_park_gen: AtomicU64::new(0),
             futex_uaddr: AtomicU64::new(0),
             futex_park_gen: AtomicU64::new(0),
+            futex_val: AtomicU32::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
@@ -481,14 +492,34 @@ fn park_should_block(
                 }
             }
             // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
+            //
+            // The stay-parked decision checks BOTH the per-uaddr wake
+            // generation (a FUTEX_WAKE raced the check→register window)
+            // AND the futex word itself (`futex_park_should_stay`). The
+            // word re-validation is what keeps a wakeless word rewrite —
+            // musl's condvar `unlock_requeue` barrier handoff, a robust
+            // owner death — from re-parking this task forever on a word
+            // nobody will ever wake again: Linux waiters get the same
+            // safety from re-checking the word in userspace after any
+            // (possibly spurious) futex_wait return, and this park loop
+            // otherwise swallows the backstop wake inside the kernel.
+            // NOTE: `fu` may have been retargeted by a FUTEX_REQUEUE while
+            // this task was parked — the load below naturally re-registers
+            // on the new word with the retargeted gen/val snapshots.
             let fu = uc.futex_uaddr.load(Ordering::Acquire);
             if fu != 0 {
                 crate::handlers::futex_register_waiter(fu, task_id, waker.clone());
-                if crate::handlers::futex_gen(fu) != uc.futex_park_gen.load(Ordering::Acquire) {
+                let stay = crate::handlers::futex_park_should_stay(
+                    crate::handlers::futex_gen(fu),
+                    uc.futex_park_gen.load(Ordering::Acquire),
+                    crate::handlers::futex_read_user_word(fu),
+                    uc.futex_val.load(Ordering::Acquire),
+                );
+                if !stay {
                     crate::handlers::futex_drop_waiter(fu, task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     uc.futex_uaddr.store(0, Ordering::Release);
-                    return false; // raced wake → re-execute (musl re-checks the word)
+                    return false; // wake landed / word changed → re-execute (musl re-checks)
                 }
             }
             // Park on the timer wheel. Infinite parks (u64::MAX) use a ~1-tick
@@ -1353,9 +1384,18 @@ impl core::future::Future for UserTaskFuture {
                         crate::handlers::current_task_id(),
                         cx.waker().clone(),
                     );
-                    if crate::handlers::futex_gen(fu)
-                        != this.task.uctx.futex_park_gen.load(Ordering::Acquire)
-                    {
+                    // Same stay-parked decision as the own-stack park loop:
+                    // gen guard for a racing FUTEX_WAKE plus the futex-word
+                    // re-validation that keeps a wakeless word rewrite
+                    // (musl condvar requeue handoff, robust-owner death)
+                    // from re-parking this task forever.
+                    let stay = crate::handlers::futex_park_should_stay(
+                        crate::handlers::futex_gen(fu),
+                        this.task.uctx.futex_park_gen.load(Ordering::Acquire),
+                        crate::handlers::futex_read_user_word(fu),
+                        this.task.uctx.futex_val.load(Ordering::Acquire),
+                    );
+                    if !stay {
                         crate::handlers::futex_drop_waiter(fu, crate::handlers::current_task_id());
                         this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
                         this.task.uctx.futex_uaddr.store(0, Ordering::Release);

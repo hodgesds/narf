@@ -7344,6 +7344,120 @@ kernel_test_in!(
     smoke_userspace_futex_wait_seqlock_no_false_wake
 );
 
+/// `FUTEX_REQUEUE` core semantics: wake up to `nr_wake` waiters on the
+/// source word, MOVE up to `nr_requeue` more onto the destination word's
+/// queue WITHOUT firing their wakers, and bump the source generation so a
+/// registration racing the requeue re-checks. musl's condvar broadcast
+/// handoff (`unlock_requeue`: store the barrier word, then requeue the
+/// still-parked next waiter onto the mutex) depends on exactly this; the
+/// old `_ => -1` arm silently dropped the move and permanently stranded
+/// every broadcast waiter past the first (`condbcast_smoke` hang — the
+/// permanent form of the SMP scheduler-resume strand).
+fn smoke_userspace_futex_requeue_moves_waiters() -> TestResult {
+    use crate::handlers::{
+        __test_futex_requeue, __test_futex_waiter_count, futex_gen, futex_register_waiter,
+        futex_wake_waiters_for_test,
+    };
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    // Counting waker: an Arc<AtomicU32> bumped by wake/wake_by_ref.
+    fn counting_waker(counter: Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw in counting_waker/clone_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the refcount handed to this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: caller still owns the waker (and its refcount).
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: consumes the refcount owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: vtable matches the Arc<AtomicU32> representation.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(counter) as *const (), &VTAB)) }
+    }
+
+    // Words no other test touches.
+    const U1: u64 = 0x5EC0_3000;
+    const U2: u64 = 0x5EC0_3004;
+
+    let c1 = Arc::new(AtomicU32::new(0));
+    let c2 = Arc::new(AtomicU32::new(0));
+    futex_register_waiter(U1, 9001, counting_waker(c1.clone()));
+    futex_register_waiter(U1, 9002, counting_waker(c2.clone()));
+
+    let gen1_before = futex_gen(U1);
+    // Wake 1, requeue 1 → BTreeMap order pops the lowest tid (9001) for the
+    // wake and moves 9002.
+    let (woken, moved) = __test_futex_requeue(U1, U2, 1, 1);
+    if (woken, moved) != (1, 1) {
+        return TestResult::Fail("requeue did not report (1 woken, 1 moved)");
+    }
+    if futex_gen(U1) != gen1_before + 1 {
+        return TestResult::Fail("requeue did not bump the source wake generation");
+    }
+    if c1.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("the woken waiter's waker did not fire");
+    }
+    if c2.load(Ordering::Acquire) != 0 {
+        return TestResult::Fail("the REQUEUED waiter was woken — requeue must move, not wake");
+    }
+    if __test_futex_waiter_count(U1) != 0 || __test_futex_waiter_count(U2) != 1 {
+        return TestResult::Fail("waiter queues after requeue are wrong");
+    }
+    // A later wake on the DESTINATION word reaches the moved waiter.
+    if futex_wake_waiters_for_test(U2, u32::MAX) != 1 || c2.load(Ordering::Acquire) != 1 {
+        return TestResult::Fail("wake on the destination word did not reach the moved waiter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex_requeue_moves_waiters);
+
+/// The park loop's stay-parked decision (`futex_park_should_stay`) must
+/// re-validate the futex WORD, not just the wake generation. A word
+/// rewritten WITHOUT a wake on it (musl `unlock_requeue`'s barrier store,
+/// robust-owner death) previously re-parked the waiter forever: the ~10 ms
+/// wheel backstop woke the task, the gen guard saw "no wake", and the park
+/// loop swallowed the re-check inside the kernel without ever re-reading
+/// the word — converting a one-tick latency blip into a permanent strand.
+fn smoke_userspace_futex_park_word_revalidation() -> TestResult {
+    use crate::handlers::futex_park_should_stay;
+
+    // Unchanged gen + unchanged word → keep blocking.
+    if !futex_park_should_stay(7, 7, Some(2), 2) {
+        return TestResult::Fail("unchanged gen+word must stay parked");
+    }
+    // A wake generation advanced → proceed (classic gen guard).
+    if futex_park_should_stay(8, 7, Some(2), 2) {
+        return TestResult::Fail("advanced gen must unpark");
+    }
+    // The WORD changed with no wake (requeue handoff) → proceed. This is
+    // the case that used to strand forever.
+    if futex_park_should_stay(7, 7, Some(0), 2) {
+        return TestResult::Fail("silently-rewritten word must unpark");
+    }
+    // Word unreadable (AS torn down / unmapped) → never re-park on memory
+    // we cannot re-check.
+    if futex_park_should_stay(7, 7, None, 2) {
+        return TestResult::Fail("unreadable word must unpark");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
+
 /// A blocking park's lost-wake fallback timer must fire a ~10 ms backstop for
 /// BOTH infinite parks AND finite io-wait parks (poll/epoll with a real
 /// timeout), while a plain finite sleep still fires at its real deadline.

@@ -1918,13 +1918,18 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         ("psched_smoke", "psched-ok"),
         // Linux-compat round 20: futex2 wait/wake/requeue/waitv.
         ("futex2_smoke", "futex2-ok"),
-        // NOTE: `futex_contend_smoke` (N-thread mutex + join + condvar
-        // ping-pong) is NOT in this shared-boot list — it runs in its own
-        // reduced-SMP fresh boot below (see SMP_REDUCED_FRESH_BOOT). Under
-        // the full 16-vCPU/2-socket-NUMA topology it nondeterministically
-        // strands a worker pthread parked in a futex wait (an open
-        // scheduler-resume race, same class as the weston blocker), so it
-        // must not share this VM or it hangs the whole batch.
+        // Condvar broadcast handoff — the FUTEX_REQUEUE path. Regression
+        // for the permanent broadcast-waiter strand (requeue silently
+        // dropped + the park loop never re-reading the futex word).
+        ("condbcast_smoke", "condbcast-ok"),
+        // Contended futex (N-thread mutex + join + condvar ping-pong).
+        // Back in the shared-boot batch at the FULL 16-vCPU/2-socket-NUMA
+        // topology: the strand class that forced its SMP=1 pin is fixed
+        // (FUTEX_REQUEUE implemented, park-loop futex-word re-validation,
+        // spawn→idle-AP resched kick) and the case hammers clean at
+        // SMP=16 — see condbcast_smoke above for the permanent-strand
+        // regression pin.
+        ("futex_contend_smoke", "futex-contend-ok"),
         // Linux-compat round 21: keyrings (add_key/request_key/keyctl).
         ("keyring_smoke", "keyring-ok"),
         // Linux-compat round 22: inotify real event delivery.
@@ -1973,16 +1978,14 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
     // bugs still surface.
     let (mut passed, mut failed, main_failed) = run_interactive_multi(args, cases)?;
 
-    // Retry any shared-boot case that failed. The open SMP scheduler-resume
-    // strand (a blocking-syscall-parked task — e.g. an `epoll_wait` — not
-    // being rescheduled on an idle-halted AP; see SMP_REDUCED_FRESH_BOOT
-    // below) can hang ANY case at a low per-boot rate, not just
-    // futex_contend. Re-run each failed case ALONE in a fresh boot: a
+    // Retry any shared-boot case that failed once, alone in a fresh boot: a
     // genuinely-broken case still fails (it fails both times and stays
-    // counted), but a one-off strand — which is far less likely with a
-    // single lightly-loaded process in the VM — clears. This is the same
-    // deferred-fix workaround as the futex_contend SMP pin, applied to the
-    // rare tail. KNOWN-GAP: absorbs, does not fix, the scheduler race.
+    // counted), but a one-off environmental flake (host scheduling jitter
+    // on a loaded runner, SLIRP timing) clears. The SMP scheduler-resume
+    // strand class this retry originally absorbed is fixed (FUTEX_REQUEUE +
+    // park-loop futex-word re-validation + spawn→idle-AP resched kick); the
+    // retry is kept as a cheap general flake bound for the long shared-boot
+    // batch.
     for (cmdline, expect) in &main_failed {
         eprintln!("\nmusl-demo (retry after strand): {cmdline}");
         let (p, _f, _) = run_interactive_multi(
@@ -2019,41 +2022,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         failed += f;
     }
 
-    // Reduced-SMP fresh-boot cases. `futex_contend_smoke` drives heavy
-    // contended cross-thread futex traffic (4-thread mutex + pthread_join
-    // + a condvar ping-pong). Under the full 16-vCPU/2-socket-NUMA
-    // topology this batch normally uses, it nondeterministically strands a
-    // worker pthread parked in a futex wait — the thread never gets
-    // rescheduled and `exit_group` later zaps it (SIGKILL in musl's
-    // `__wait` loop), hanging the run. That is a pre-existing SMP
-    // scheduler-resume race (a parked waiter on an idle-halted AP not
-    // being kicked), the same class of bug as the open weston
-    // scheduler-resume blocker — NOT a futex-correctness bug in this test.
-    //
-    // Repro rate: ~1/16 boots strand at SMP=4, 0/16 at SMP=1 (verified by
-    // hammering the case 16x per vCPU count). A single CPU has no AP to
-    // halt, so the strand cannot occur; the test still exercises the full
-    // futex WAIT/WAKE + CLONE_CHILD_CLEARTID join + condvar signal/wait
-    // paths (5 cooperatively-scheduled threads), so its coverage is
-    // intact. Pin it to one vCPU until the scheduler race is fixed.
-    //
-    // KNOWN-GAP: full-topology (parallel) coverage of contended futex is
-    // deferred to whoever fixes the SMP scheduler-resume race.
-    const SMP_REDUCED_FRESH_BOOT: &[(&str, &str)] = &[("futex_contend_smoke", "futex-contend-ok")];
-    {
-        let prev = std::env::var_os("NARF_QEMU_SMP");
-        std::env::set_var("NARF_QEMU_SMP", "1");
-        for case in SMP_REDUCED_FRESH_BOOT {
-            eprintln!("\nmusl-demo (fresh boot, SMP=1 workaround): {}", case.0);
-            let (p, f, _) = run_interactive_multi(args, core::slice::from_ref(case))?;
-            passed += p;
-            failed += f;
-        }
-        match prev {
-            Some(v) => std::env::set_var("NARF_QEMU_SMP", v),
-            None => std::env::remove_var("NARF_QEMU_SMP"),
-        }
-    }
+    // (The former SMP_REDUCED_FRESH_BOOT SMP=1 pin for `futex_contend_smoke`
+    // is retired: the SMP scheduler-resume strand class it worked around is
+    // fixed — FUTEX_REQUEUE implemented, park-loop futex-word re-validation,
+    // spawn→idle-AP resched kick — and the case now runs in the shared-boot
+    // batch above at the full 16-vCPU/2-socket-NUMA topology.)
 
     eprintln!("\nmusl-demo summary: {} passed, {} failed", passed, failed);
     if failed > 0 {
