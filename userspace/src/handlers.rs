@@ -1588,6 +1588,28 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                     let uc = &*uctx;
                     uc.sleep_deadline_ns
                         .store(dl, core::sync::atomic::Ordering::Release);
+                    // Park on NET-I/O READINESS so a peer's `write` → `notify(0)`
+                    // wakes this blocking `read()` PROMPTLY, with the ~1ms
+                    // deadline as a mere backstop — mirroring `recv`/`accept`.
+                    // Without net_io_wait a blocking POSIX `read()` on an empty
+                    // AF_UNIX socket only re-polled off the 1ms timer wheel (no
+                    // io-waiter, no lost-wake gen guard), so under own-stack
+                    // cooperative scheduling with other busy tasks the reply sat
+                    // unread past the client's deadline — a real asymmetry vs
+                    // `recv`, and a likely cause of flaky D-Bus round-trips (Qt/
+                    // libdbus read the bus socket via read()). Snapshot the
+                    // readiness generation for the check→park lost-wake guard;
+                    // clear a stale futex_uaddr so this can't mis-route into the
+                    // futex branch. Harmless for pipes (no notify → the 1ms
+                    // backstop still fires exactly as before).
+                    uc.futex_uaddr
+                        .store(0, core::sync::atomic::Ordering::Release);
+                    uc.net_io_wait
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    uc.epoll_park_gen.store(
+                        narf_net::readiness::generation(),
+                        core::sync::atomic::Ordering::Release,
+                    );
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                     if narf_scheduler::stackful::user_own_stack_enabled() {
