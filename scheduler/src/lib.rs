@@ -479,6 +479,17 @@ pub fn dbg_resched_counts() -> (u64, u64) {
     )
 }
 
+/// Test-only: force a CPU's published halted flag, so the kernel-test
+/// suite can pin the cross-core wake/spawn kick protocol (`enqueue_on` →
+/// `resched_remote`) without a second physical CPU. Never call outside
+/// tests — the flag is owned by that CPU's idle path.
+#[doc(hidden)]
+pub fn __test_set_cpu_halted(cpu: usize, halted: bool) {
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        CPU_HALTED[cpu].store(halted, Ordering::SeqCst);
+    }
+}
+
 #[inline]
 fn resched_remote(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
@@ -889,10 +900,28 @@ fn enqueue_on(cpu: usize, slot: TaskSlot) {
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-    let mut q = READY[cpu].lock();
-    q.as_mut()
-        .expect("scheduler: spawn before init")
-        .push_back(slot);
+    let awake = slot.awake.flag.load(Ordering::Acquire);
+    {
+        let mut q = READY[cpu].lock();
+        q.as_mut()
+            .expect("scheduler: spawn before init")
+            .push_back(slot);
+    }
+    // A spawn IS a wake: a freshly-enqueued runnable slot on a REMOTE CPU
+    // needs the same reschedule kick a cross-core `Waker::wake` sends, or
+    // an idle-halted target only notices it at its next timer tick (~10 ms
+    // spawn-to-first-poll latency for every pthread_create landing on an
+    // idle AP — the round-robin `user_ap_affinity` placement makes that
+    // the COMMON case for thread spawns). `resched_remote` pairs with the
+    // idle side's Dekker handshake (both `run_until_empty`'s parked-queue
+    // halt and `run_forever`'s empty-queue halt publish CPU_HALTED): the
+    // push above is the "set the wake" half, the fence + halted-check +
+    // IPI live in resched_remote. Sent AFTER the queue lock is dropped —
+    // never IPI while holding a runqueue lock (the no-op resched handler
+    // takes no locks, but the discipline keeps the surface inversion-free).
+    if awake {
+        resched_remote(cpu as u32);
+    }
 }
 
 /// Queue a new task on the ready queue. Requires `init()` to have run.
@@ -2714,6 +2743,12 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
 /// leave its `last_quiescent` stuck below the current epoch and
 /// stall every subsequent grace period kernel-wide.
 pub fn run_forever() -> ! {
+    let cpu = narf_lib::percpu::current_cpu();
+    let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
+        cpu
+    } else {
+        0
+    };
     loop {
         run_until_empty();
         // Idle path: declare ourselves out of RCU consideration so
@@ -2732,7 +2767,69 @@ pub fn run_forever() -> ! {
                 narf_arch::enable_interrupts();
             }
         }
-        narf_arch::halt_until_irq();
+        // ── Dekker-participating empty-queue halt ──
+        // This is the OTHER idle halt (run_until_empty's covers a CPU whose
+        // queue still holds parked slots; this one covers a CPU whose queue
+        // is EMPTY — exactly where a fresh spawn lands). It used to be a
+        // bare `halt_until_irq()` OUTSIDE the CPU_HALTED protocol, which
+        // broke the spawn kick twice over: `enqueue_on`'s `resched_remote`
+        // saw halted=false and SKIPPED the IPI, and even a sent IPI could
+        // be consumed in the check→HLT window (the documented
+        // `halt_until_irq` race). Publish HALTED, fence, RE-CHECK the
+        // queue + pending deferred wakes, and commit with the atomic
+        // `sti;hlt;cli` — the same handshake as run_until_empty's idle
+        // path, minus the wheel/backstop machinery (an empty CPU has no
+        // sleepers to serve; the periodic tick still bounds any residual
+        // miss).
+        let race_free_halt = narf_time::tick_reliable() && narf_arch::interrupts_enabled();
+        if race_free_halt {
+            // SAFETY: re-enabled below (or by the sti;hlt;cli halt).
+            // Masking IRQs across the halted-publish + re-scan + HLT is
+            // what closes the IPI-before-HLT race.
+            unsafe {
+                narf_arch::disable_interrupts();
+            }
+        }
+        CPU_HALTED[cpu].store(true, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let work_arrived = {
+            let nonempty = READY[cpu]
+                .lock()
+                .as_ref()
+                .map(|d| !d.is_empty())
+                .unwrap_or(false);
+            nonempty || narf_lib::deferred_wake::has_pending()
+        };
+        if work_arrived {
+            CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            if race_free_halt {
+                // SAFETY: restore the IRQ state we masked above; work is
+                // already queued so we loop straight back to polling.
+                unsafe {
+                    narf_arch::enable_interrupts();
+                }
+            }
+            continue;
+        }
+        if race_free_halt {
+            // SAFETY: CPL=0, IF=0 on entry (masked above); the arch
+            // primitive is the Linux safe_halt sti;hlt;cli, so an IPI (or
+            // any IRQ) that raced into the commit window still wakes it.
+            unsafe {
+                narf_arch::idle_halt_then_disable();
+            }
+            CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+            // SAFETY: restore the enabled state this idle path runs with.
+            unsafe {
+                narf_arch::enable_interrupts();
+            }
+        } else {
+            // Unreliable-tick / IF=0 contexts (kernel-test, InitialCount
+            // fallback): the bounded `halt_until_irq` (spin when IF=0)
+            // keeps the pre-existing behaviour.
+            narf_arch::halt_until_irq();
+            CPU_HALTED[cpu].store(false, Ordering::SeqCst);
+        }
     }
 }
 

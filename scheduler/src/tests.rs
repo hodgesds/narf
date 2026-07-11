@@ -457,6 +457,73 @@ fn smoke_scheduler_per_cpu_pin_to_bsp() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_per_cpu_pin_to_bsp);
 
+/// A spawn IS a wake: `enqueue_on` placing a runnable slot on a REMOTE
+/// idle-halted CPU must kick that CPU through the reschedule-IPI path
+/// (`resched_remote`), exactly like a cross-core `Waker::wake`. Before the
+/// fix, a fresh task enqueued onto an idle AP (every pthread_create under
+/// the round-robin `user_ap_affinity` placement) was only noticed at the
+/// target's next timer tick — and `run_forever`'s empty-queue halt sat
+/// OUTSIDE the CPU_HALTED protocol entirely, so the kick would have been
+/// skipped even if sent. Asserted through the `dbg_resched_counts` SENT
+/// counter, which `resched_remote` bumps independently of the (boot-only)
+/// IPI hook, so the test needs no second physical CPU: it marks CPU 1
+/// online + halted, spawns a CPU-1-preferred task, and requires exactly
+/// one kick; the not-halted control run must skip instead.
+fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
+    use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+
+    crate::__reset_queues_for_test();
+
+    // Pretend CPU 1 is an online, idle-halted AP. Restored below.
+    // SAFETY: test-scoped bookkeeping bit; no CPU actually runs on it.
+    unsafe {
+        narf_lib::smp::mark_online(1);
+    }
+    crate::__test_set_cpu_halted(1, true);
+
+    let spec = TaskSpec {
+        affinity: Affinity {
+            allowed: crate::affinity::CpuSet::ALL,
+            preferred: Some(CpuId(1)),
+        },
+        ..TaskSpec::unthrottled()
+    };
+
+    let (sent_before, _) = crate::dbg_resched_counts();
+    let _ = spawn_with_spec(async {}, spec);
+    let (sent_after, skip_mid) = crate::dbg_resched_counts();
+
+    // Control: a spawn to the same remote CPU while it is NOT halted must
+    // skip the IPI (the target's pre-halt re-scan covers it).
+    crate::__test_set_cpu_halted(1, false);
+    let spec2 = TaskSpec {
+        affinity: Affinity {
+            allowed: crate::affinity::CpuSet::ALL,
+            preferred: Some(CpuId(1)),
+        },
+        ..TaskSpec::unthrottled()
+    };
+    let _ = spawn_with_spec(async {}, spec2);
+    let (sent_final, skip_final) = crate::dbg_resched_counts();
+
+    // Restore: CPU 1 back offline, queues cleared (the two slots parked on
+    // CPU 1's queue have no CPU to run them).
+    narf_lib::smp::mark_offline(1);
+    crate::__reset_queues_for_test();
+
+    if sent_after != sent_before + 1 {
+        return TestResult::Fail("spawn onto a halted remote CPU did not send a resched kick");
+    }
+    if sent_final != sent_after {
+        return TestResult::Fail("spawn onto a running remote CPU sent a spurious resched IPI");
+    }
+    if skip_final == skip_mid {
+        return TestResult::Fail("not-halted spawn was not counted as a skipped cross-core wake");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_spawn_kicks_halted_remote_cpu);
+
 fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     // With work-stealing on and per-CPU queues seeded across two
     // NUMA nodes, a steal should pull from a same-node victim first.
