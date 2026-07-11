@@ -59,6 +59,13 @@ pub unsafe fn enter_winprocess(proc: &WinProcess) -> ! {
     }
 }
 
+/// aarch64 stub of the per-arch entry — see the x86_64 variant above.
+///
+/// # Safety
+/// Same contract as the x86_64 variant (interrupts disabled, trap stack
+/// set up, `load_pe` completed). The body currently panics — aarch64 has
+/// no user-mode entry primitive yet — so no unsafe operation is actually
+/// performed; the signature stays `unsafe` for cross-arch parity.
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn enter_winprocess(_proc: &WinProcess) -> ! {
     // aarch64 user-mode entry primitive doesn't exist in the
