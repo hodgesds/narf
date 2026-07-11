@@ -7386,6 +7386,36 @@ fn smoke_userspace_park_io_wait_fallback_backstop() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_park_io_wait_fallback_backstop);
 
+/// An eventfd's `write` must fire a readiness notify (and it must advertise
+/// `readiness_notifies()`), so a blocking `poll`/`epoll` containing an eventfd
+/// can PARK instead of busy-spinning. glib's main loop wakes its worker via an
+/// eventfd write; without the notify a Qt/glib client (kwin) busy-spun its
+/// event loop and — under the cooperative own-stack scheduler — starved a
+/// same-CPU peer (dbus-daemon), stalling D-Bus round-trips ~25s.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_eventfd_write_fires_readiness_notify() -> TestResult {
+    use narf_filesystem::FileOps;
+    let ev = crate::io_mux::EventFd::new(0, 0);
+    if !ev.readiness_notifies() {
+        return TestResult::Fail("eventfd readiness_notifies() must be true so a poll can park");
+    }
+    let before = narf_net::readiness::generation();
+    // write() adds to the counter and must bump the readiness generation.
+    let r = crate::handlers::poll_blocking(ev.write(0, &1u64.to_le_bytes()));
+    if !matches!(r, Some(Ok(8))) {
+        return TestResult::Fail("eventfd write(8 bytes) did not return 8");
+    }
+    if narf_net::readiness::generation() <= before {
+        return TestResult::Fail("eventfd write() did not bump the readiness generation");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_eventfd_write_fires_readiness_notify
+);
+
 /// Multi-threaded `exit_group` must run PROCESS-scoped exit observers
 /// EXACTLY ONCE — on the group's last thread (`group_dead`) — while
 /// THREAD-scoped observers run for EVERY thread. This is Linux's

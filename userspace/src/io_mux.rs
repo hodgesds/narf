@@ -77,6 +77,19 @@ impl FileOps for EventFd {
                 return Err(FsError::InvalidPath);
             }
             let _ = self.counter.fetch_add(add, Ordering::AcqRel);
+            // Wake any task parked in poll/epoll on this eventfd. Without a
+            // readiness notify an eventfd was a "silent" source, so a blocking
+            // poll containing one could NOT park — it fell back to a busy spin
+            // (poll_all_parkable == false). glib's main loop wakes its worker
+            // via an eventfd write, so a Qt/glib client (kwin) polling its bus
+            // socket + a glib wakeup eventfd busy-spun the whole time, and under
+            // the cooperative own-stack scheduler that starved a same-CPU peer
+            // (dbus-daemon couldn't service elogind's GetConnectionUnixUser →
+            // kwin's GetSession timed out at 25s → "no graphical session"). With
+            // this notify the eventfd is parkable, so the poll parks and this
+            // write wakes it promptly. notify(0) = wake-all (an eventfd carries
+            // no kernel TCB key); best-effort, mirrors the AF_UNIX send path.
+            narf_net::readiness::notify(0);
             Ok(8)
         })
     }
@@ -91,6 +104,12 @@ impl FileOps for EventFd {
             },
             mtime_cycles: 0,
         }
+    }
+
+    /// eventfd `write` fires `readiness::notify` (above), so a blocking poll
+    /// over an eventfd can PARK instead of busy-spinning — the write wakes it.
+    fn readiness_notifies(&self) -> bool {
+        true
     }
 
     fn poll_readiness(&self) -> u32 {
