@@ -8321,6 +8321,13 @@ pub(crate) fn terminate_current_task(
     // own trap context (its user AS is still active for the user-memory
     // reads/writes), before any teardown.
     robust_list_exit_walk(task);
+    // A fatal (default Terminate/CoreDump) signal kills the ENTIRE thread
+    // group in Linux (get_signal -> do_group_exit), not just the faulting
+    // thread. Zap every live sibling so a fault in ONE worker thread of a
+    // multithreaded process (e.g. a Qt/kwin render thread dereferencing bad
+    // memory) tears the whole process down instead of leaving the leader a
+    // hung zombie that `kill -0` still reports alive.
+    zap_thread_group(task, pid);
 
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -8378,9 +8385,14 @@ pub(crate) fn terminate_current_task(
 /// point — trap return worst case) and set the group-exiting flag so
 /// wait4 reports the group's exit code, then fall through to exit the
 /// caller. For a single-threaded process this is exactly `exit`.
-fn sys_exit_group(ctx: &mut dyn TrapContext) {
-    let tid = current_task_id();
-    let pid = task_to_pid_raw(tid).unwrap_or(tid);
+/// Tear down the whole thread group of `tid` (visible `pid`): flag it
+/// group-exiting and zap every OTHER live CLONE_THREAD sibling with a
+/// pending SIGKILL + wake (they self-terminate on their next delivery
+/// point — trap return worst case). Shared by `exit_group(2)` and the
+/// fatal-signal path: in Linux a default Terminate/CoreDump signal kills
+/// the ENTIRE thread group (`get_signal` -> `do_group_exit`), not just
+/// the faulting thread.
+pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
     if let Some(t) = crate::task::task_get(tid) {
         t.group_exiting
             .store(true, core::sync::atomic::Ordering::Release);
@@ -8407,6 +8419,12 @@ fn sys_exit_group(ctx: &mut dyn TrapContext) {
         raise_signal_pending(s, 9); // SIGKILL
         wake_signal(s);
     }
+}
+
+fn sys_exit_group(ctx: &mut dyn TrapContext) {
+    let tid = current_task_id();
+    let pid = task_to_pid_raw(tid).unwrap_or(tid);
+    zap_thread_group(tid, pid);
     sys_exit_task(ctx);
 }
 
@@ -18683,6 +18701,32 @@ pub fn default_sync_signal_delivery(
             // map to Terminate or CoreDump only; Ignore/Stop/Continue
             // never appear in this table. Anything that's neither is
             // a kernel bug — fall through to the panic surface.
+            // Diagnostic: a fatal CPU fault with no user handler. Log the
+            // cause vector + faulting VA alongside the terminate line so a
+            // crash can be symbolized against the process's mmap layout —
+            // RIP alone is ambiguous across the many shared libraries a
+            // desktop app maps (kwin, Qt, Mesa, glibc/musl, ...).
+            {
+                use core::fmt::Write;
+                let cause = match vector {
+                    6 => "#UD",
+                    13 => "#GP",
+                    14 => "#PF",
+                    17 => "#AC",
+                    0 => "#DE",
+                    _ => "fault",
+                };
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "fatal-fault: task={} sig={} {} vec={} faultva={:x} rip={:x}",
+                    task,
+                    signum,
+                    cause,
+                    vector,
+                    info.addr,
+                    ctx.rip()
+                );
+            }
             match default_signal_action(signum) {
                 DefaultAction::Terminate => {
                     terminate_current_task(ctx, task, signum, false);

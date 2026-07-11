@@ -1065,6 +1065,55 @@ fn smoke_process_sigkill_sets_pending() -> TestResult {
 }
 kernel_test_in!("userspace/process", smoke_process_sigkill_sets_pending);
 
+// ── Fatal signal tears down the whole thread group ────────────────────
+//
+// In Linux a default Terminate/CoreDump signal kills the ENTIRE thread
+// group (get_signal -> do_group_exit), not just the faulting thread.
+// `zap_thread_group` — shared by `exit_group(2)` and the fatal-signal
+// path in `terminate_current_task` — must flag the group exiting and
+// set SIGKILL pending on every OTHER live CLONE_THREAD sibling so they
+// self-terminate on their next delivery point.
+//
+// Regression: a SIGSEGV in one worker thread of a multithreaded process
+// (a Qt/kwin render thread) used to terminate only the faulting task,
+// leaving the leader a hung zombie that `kill -0` still reported alive.
+fn smoke_fatal_signal_zaps_thread_group() -> TestResult {
+    const PID: u64 = 0xF1_00; // visible pid == thread-group leader tid
+    const SIB: u64 = 0xF1_01; // a CLONE_THREAD sibling in the same group
+    const SIGKILL: u32 = 9;
+
+    crate::syscall::__test_clear_global();
+    setup_process_state(PID);
+    // Register leader + sibling as live tasks sharing the visible pid.
+    crate::task::release_task(PID);
+    crate::task::release_task(SIB);
+    let leader = crate::task::Task::new_registered(PID, PID);
+    let _sib = crate::task::Task::new_registered(SIB, PID);
+    crate::handlers::register_task_to_pid(PID, PID);
+    crate::handlers::register_task_to_pid(SIB, PID);
+
+    // A fatal signal on the leader tears the whole group down.
+    crate::handlers::zap_thread_group(PID, PID);
+
+    let sib_pending = signal_pending_of(SIB);
+    let group_exiting = leader
+        .group_exiting
+        .load(core::sync::atomic::Ordering::Acquire);
+
+    crate::task::release_task(PID);
+    crate::task::release_task(SIB);
+    teardown_process_state();
+
+    if sib_pending & (1 << SIGKILL) == 0 {
+        return TestResult::Fail("sibling thread not SIGKILL-zapped by group teardown");
+    }
+    if !group_exiting {
+        return TestResult::Fail("group_exiting flag not set on thread-group teardown");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/process", smoke_fatal_signal_zaps_thread_group);
+
 // ── Smoke 8: sa_mask blocks reentry ───────────────────────────────────
 //
 // Install SIGUSR1 with sa_mask = SIGUSR1 (SA_NODEFER not set).
