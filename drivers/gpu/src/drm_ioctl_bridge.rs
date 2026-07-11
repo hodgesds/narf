@@ -174,6 +174,22 @@ pub fn dispatch_card(card_index: u32, cmd: u32, arg: usize, render: bool) -> Res
         // SET_MASTER / DROP_MASTER — primary-node fds are already treated
         // as authenticated master (single-client model); accept + no-op.
         IoctlCmd::SetMaster | IoctlCmd::DropMaster => Ok(0),
+        // GET_MAGIC / AUTH_MAGIC — the DRM magic-token dance a compositor
+        // does to confirm it's authenticated on its GPU fd. A primary-node fd
+        // IS the authenticated master here, so hand back a fixed non-zero
+        // magic (drm_auth.magic = u32 @ offset 0) and accept the auth. Without
+        // these the ioctls fell through to the generic path → UnknownCmd →
+        // ENOTTY, and kwin aborted: "Failed to authenticate the drm magic
+        // token ... Not a tty" — right after TakeDevice handed it the fd.
+        IoctlCmd::GetMagic => {
+            if arg != 0 {
+                // SAFETY: `arg` is the user drm_auth ptr; copy_out
+                // range-validates it and SMAP-brackets the 4-byte write.
+                unsafe { copy_out(arg, &1u32.to_le_bytes())? };
+            }
+            Ok(0)
+        }
+        IoctlCmd::AuthMagic => Ok(0),
         // SET_CLIENT_CAP — opt into UAPI behaviours. We accept
         // UNIVERSAL_PLANES (weston REQUIRES it — it enumerates the
         // primary plane through the universal-planes UAPI) but reject

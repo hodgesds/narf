@@ -35,6 +35,8 @@ use super::render_node::{check_permission, ioctl_flags, DrmFileCtx, PermError};
 #[repr(u32)]
 pub enum IoctlCmd {
     Version = 0x00,
+    GetMagic = 0x02,
+    AuthMagic = 0x11,
     GemClose = 0x09,
     GetCap = 0x0C,
     SetClientCap = 0x0D,
@@ -74,6 +76,8 @@ impl IoctlCmd {
     pub fn from_raw(raw: u32) -> Self {
         match raw & 0xFF {
             0x00 => IoctlCmd::Version,
+            0x02 => IoctlCmd::GetMagic,
+            0x11 => IoctlCmd::AuthMagic,
             0x09 => IoctlCmd::GemClose,
             0x0C => IoctlCmd::GetCap,
             0x0D => IoctlCmd::SetClientCap,
@@ -362,7 +366,11 @@ pub fn dispatch(
         | IoctlCmd::PrimeFdToHandle => Err(DrmIoctlError::UnknownCmd),
         // Dumb-buffer / modeset ioctls — handled in the bridge with
         // full serialisation of the in/out structs.
-        IoctlCmd::ModeSetCrtc
+        // GET_MAGIC / AUTH_MAGIC are handled in the bridge (primary-node fd is
+        // the authenticated master); they never reach this generic dispatcher.
+        IoctlCmd::GetMagic
+        | IoctlCmd::AuthMagic
+        | IoctlCmd::ModeSetCrtc
         | IoctlCmd::ModeGetCrtc
         | IoctlCmd::ModeGetEncoder
         | IoctlCmd::ModeSetGamma
