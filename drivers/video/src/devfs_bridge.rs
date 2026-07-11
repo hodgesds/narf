@@ -248,6 +248,13 @@ impl FileOps for VideoFile {
         }
     }
 
+    /// `st_rdev` = VIDEO_MAJOR(81):minor(video index). dev_t = (major<<8)|minor.
+    /// A 0 rdev (the default) breaks udev/libv4l devnum resolution. Linux:
+    /// `include/uapi/linux/major.h` VIDEO4LINUX_MAJOR = 81.
+    fn rdev(&self) -> u64 {
+        (81u64 << 8) | self.dev.lock().index as u64
+    }
+
     /// `POLL_IN` when a frame is ready.
     fn poll_readiness(&self) -> u32 {
         if self.dev.lock().has_frame() {

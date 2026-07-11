@@ -148,6 +148,13 @@ impl FileOps for RfcommPort {
         Box::pin(async move { Ok(len) })
     }
 
+    fn rdev(&self) -> u64 {
+        // RFCOMM_MAJOR = 216; minor = rfcomm index. dev_t = (major<<8)|minor.
+        // A 0 rdev (the default) breaks udev/sd_device devnum resolution and
+        // any st_rdev-matching consumer.
+        (216u64 << 8) | self.minor as u64
+    }
+
     fn stat(&self) -> Stat {
         let rx_len = self.rx.lock().buf.len() as u64;
         Stat {

@@ -249,6 +249,12 @@ impl FileOps for DevTpm0 {
         }
     }
 
+    /// `st_rdev` = TPM_MAJOR(10):minor(224) for `/dev/tpm0`.
+    /// dev_t = (major<<8)|minor. Linux: `drivers/char/tpm` TPM_MINOR = 224.
+    fn rdev(&self) -> u64 {
+        (10u64 << 8) | 224
+    }
+
     /// `POLL_IN` when a response is pending; `POLL_OUT` always.
     ///
     /// Linux ref: `tpm_common_poll` (tpm-dev-common.c:211).
@@ -430,6 +436,12 @@ impl FileOps for DevTpmRm0 {
             },
             mtime_cycles: 0,
         }
+    }
+
+    /// `st_rdev` = TPM_MAJOR(10):minor(225) for `/dev/tpmrm0` (resource mgr).
+    /// dev_t = (major<<8)|minor. Linux: TPMRM_MINOR = 225.
+    fn rdev(&self) -> u64 {
+        (10u64 << 8) | 225
     }
 
     fn poll_readiness(&self) -> u32 {

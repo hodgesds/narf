@@ -303,6 +303,13 @@ impl FileOps for TtyUsbFile {
         }
     }
 
+    /// `st_rdev` = USB_SERIAL major(188):minor(ttyUSB index). dev_t =
+    /// (major<<8)|minor. A 0 rdev (the default) breaks udev devnum resolution.
+    /// Linux: `Documentation/admin-guide/devices` ttyUSB major = 188.
+    fn rdev(&self) -> u64 {
+        (188u64 << 8) | self.port.lock().index as u64
+    }
+
     /// `POLL_IN` when RX ring has bytes; `POLL_OUT` always (TX has space).
     fn poll_readiness(&self) -> u32 {
         let has_rx = self.port.lock().rx.has_data();

@@ -220,6 +220,14 @@ impl FileOps for DevFb0 {
         }
     }
 
+    /// `st_rdev` = FB_MAJOR(29):minor(0). dev_t = (major<<8)|minor. A 0 rdev
+    /// (the default) makes udev/sd_device devnum lookups and any consumer that
+    /// matches `st_rdev` (fbset, plymouth, some compositors) fail to identify
+    /// the node. Linux: `include/uapi/linux/major.h` FB_MAJOR = 29.
+    fn rdev(&self) -> u64 {
+        29u64 << 8 // FB_MAJOR(29):minor(0)
+    }
+
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         let info = fbdev_info().ok_or(FsError::Unsupported)?;
         let map_len = info.map_len();
