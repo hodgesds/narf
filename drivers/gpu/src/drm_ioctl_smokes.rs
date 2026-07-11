@@ -696,6 +696,7 @@ fn smoke_drm_map_dumb_resolves_to_phys() -> TestResult {
             byte_len: fake_size,
             order: 0,
             mmap_offset,
+            refcount: 1,
         });
         crate::drm_registry::register_drm_card_with_state(
             Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
@@ -756,6 +757,7 @@ fn smoke_drm_prime_export_aliases_dumb_frames() -> TestResult {
             byte_len: fake_size,
             order: 1,
             mmap_offset: (handle as u64) << 12,
+            refcount: 1,
         });
         crate::drm_registry::register_drm_card_with_state(
             Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
@@ -791,6 +793,56 @@ kernel_test_in!(
     smoke_drm_prime_export_aliases_dumb_frames
 );
 
+// ── 15c. Dumb backing is refcounted: survives GEM_CLOSE while fb-held ──
+//
+// Linux GEM objects are refcounted; a framebuffer (ADDFB2) holds a ref, so
+// closing the GEM handle does NOT free the buffer. Regression: kwin/Mesa
+// GBM closes its GEM handle right after ADDFB2, and NARF freed the backing
+// immediately → SETCRTC found no scanout source (src_phys=None, blit
+// skipped, frame reused by the next CREATE_DUMB = a use-after-free).
+fn smoke_drm_dumb_backing_survives_gem_close_while_fb_held() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    let mut card = make_test_card();
+    let fake_phys = 0xB00B_0000u64;
+    let handle = card.gem.alloc(fake_phys, 4096).unwrap();
+    card.dumb_backings.push(DumbBacking {
+        gem_handle: handle,
+        phys: fake_phys,
+        byte_len: 4096,
+        order: 0,
+        mmap_offset: (handle as u64) << 12,
+        refcount: 1,
+    });
+    // ADDFB2 takes a reference (refcount 1 -> 2). XR24 = 0x34325258.
+    let fb = card.addfb2(64, 64, 0x3432_5258, 256, handle).unwrap();
+
+    // Client closes the GEM handle — backing MUST survive (fb holds a ref).
+    if card.remove_dumb_backing(handle).is_some() {
+        return TestResult::Fail("backing freed on GEM_CLOSE while a fb referenced it");
+    }
+    if card.dumb_backing(handle).is_none() {
+        return TestResult::Fail("backing gone after GEM_CLOSE — SETCRTC would find no source");
+    }
+
+    // RMFB drops the last reference — now the frames are freed.
+    match card.rmfb(fb) {
+        Ok(Some((phys, order))) if phys == fake_phys && order == 0 => {}
+        Ok(other) => {
+            let _ = other;
+            return TestResult::Fail("RMFB did not free the backing on the last ref drop");
+        }
+        Err(_) => return TestResult::Fail("RMFB errored"),
+    }
+    if card.dumb_backing(handle).is_some() {
+        return TestResult::Fail("backing still present after its last reference dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_dumb_backing_survives_gem_close_while_fb_held
+);
+
 // ── 16. SETCRTC with valid fb_id succeeds (no live scanout in test) ────
 
 #[allow(dead_code)]
@@ -810,6 +862,7 @@ fn smoke_drm_setcrtc_with_fb_succeeds() -> TestResult {
             byte_len: fake_size,
             order: 0,
             mmap_offset: (handle as u64) << 12,
+            refcount: 1,
         });
         // Register a framebuffer backed by this handle.
         let fb_id = card

@@ -216,6 +216,14 @@ pub struct DumbBacking {
     pub order: u8,
     /// Fake mmap offset returned by MAP_DUMB (gem_handle << 12).
     pub mmap_offset: u64,
+    /// Reference count — Linux GEM objects are refcounted so a buffer
+    /// survives handle close while a framebuffer (ADDFB2) still points at
+    /// it. Starts at 1 (the GEM handle); ADDFB2 increments, GEM_CLOSE /
+    /// DESTROY_DUMB and RMFB decrement; the frames are freed only when it
+    /// reaches 0. Without this a compositor that closes its GEM handle
+    /// right after ADDFB2 (kwin via Mesa GBM) loses its scanout buffer
+    /// mid-flight and SETCRTC finds no source to blit.
+    pub refcount: u32,
 }
 
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
@@ -386,16 +394,28 @@ impl Card {
             byte_len,
             order,
             mmap_offset,
+            refcount: 1,
         });
         Ok(handle)
     }
 
-    /// Remove a dumb backing by GEM handle. Returns (phys, order) for the caller to free.
+    /// Drop one reference on the dumb backing named by `gem_handle`
+    /// (GEM_CLOSE / DESTROY_DUMB / RMFB). Returns `Some((phys, order))`
+    /// for the caller to buddy-free ONLY when the last reference is
+    /// dropped; `None` while other references (a live framebuffer, another
+    /// handle) keep the buffer alive. The GEM handle stays allocated until
+    /// the buffer is truly freed so its number can't be reused for a
+    /// different backing while lookups still key on it.
     pub fn remove_dumb_backing(&mut self, gem_handle: u32) -> Option<(u64, u8)> {
         let pos = self
             .dumb_backings
             .iter()
             .position(|b| b.gem_handle == gem_handle)?;
+        let b = &mut self.dumb_backings[pos];
+        b.refcount = b.refcount.saturating_sub(1);
+        if b.refcount > 0 {
+            return None;
+        }
         let b = self.dumb_backings.swap_remove(pos);
         let _ = self.gem.free(gem_handle);
         Some((b.phys, b.order))
@@ -436,6 +456,16 @@ impl Card {
         }
         let id = self.next_fb_id;
         self.next_fb_id = self.next_fb_id.wrapping_add(1).max(1);
+        // The framebuffer takes a reference on its backing buffer so it
+        // survives the client closing the GEM handle (Linux drm_framebuffer
+        // holds a gem object ref). Non-dumb handles have no backing to pin.
+        if let Some(b) = self
+            .dumb_backings
+            .iter_mut()
+            .find(|b| b.gem_handle == gem_handle)
+        {
+            b.refcount = b.refcount.saturating_add(1);
+        }
         self.framebuffers.push(Framebuffer {
             id,
             width,
@@ -447,17 +477,20 @@ impl Card {
         Ok(id)
     }
 
-    /// Remove a previously registered framebuffer.
+    /// Remove a previously registered framebuffer (RMFB). Drops the
+    /// framebuffer's reference on its backing buffer; returns
+    /// `Some((phys, order))` for the caller to buddy-free if that was the
+    /// buffer's last reference.
     ///
     /// Linux equivalent: `drm_mode_rmfb`.
-    pub fn rmfb(&mut self, fb_id: u32) -> Result<(), CardError> {
+    pub fn rmfb(&mut self, fb_id: u32) -> Result<Option<(u64, u8)>, CardError> {
         let pos = self
             .framebuffers
             .iter()
             .position(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)?;
-        self.framebuffers.swap_remove(pos);
-        Ok(())
+        let fb = self.framebuffers.swap_remove(pos);
+        Ok(self.remove_dumb_backing(fb.gem_handle))
     }
 
     /// Look up a framebuffer by id.

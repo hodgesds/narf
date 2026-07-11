@@ -512,7 +512,13 @@ fn handle_rmfb(card: &mut Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoctlEr
         return Err(DrmIoctlError::BadSize);
     }
     let fb_id = u32::from_le_bytes(arg[0..4].try_into().unwrap());
-    card.rmfb(fb_id)?;
+    // RMFB drops the framebuffer's ref on its backing buffer; if that was
+    // the last ref, buddy-free the frames here (the client already closed
+    // the GEM handle, which was deferred while the fb held the buffer).
+    if let Some((phys, order)) = card.rmfb(fb_id)? {
+        let frame = narf_memory::frame::PhysFrame::new(narf_memory::addr::PhysAddr::new(phys));
+        narf_memory::frame::free_pages(frame, order);
+    }
     Ok(DrmIoctlResult::RmFb)
 }
 
