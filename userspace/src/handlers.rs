@@ -16631,11 +16631,9 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         let g = BRK_TABLE.lock();
         g.as_ref().and_then(|m| m.get(&pid).copied()).unwrap_or(0)
     };
-    // Stack top — from the AS's regions table, look for the top
-    // RW-X region with the user-stack base. Stage-1 just reports
-    // the standard DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES.
-    let stack_top =
-        crate::process::DEFAULT_USER_STACK_BASE + crate::process::DEFAULT_USER_STACK_BYTES;
+    // Stack top — the exclusive high end of the user-stack region.
+    // Stage-1 just reports the standard fixed top.
+    let stack_top = crate::process::DEFAULT_USER_STACK_TOP;
     // Comm name — from the PROC_COMM table (written at exec time
     // or via prctl(PR_SET_NAME)). Falls back to a "task-N"
     // default when no name has been set.

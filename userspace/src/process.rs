@@ -24,18 +24,37 @@ use crate::{
     loader::LoadBytesError, AuxEntry, EntryPoint, ProcessId,
 };
 
-/// Default user stack size: 128 KiB. The stack auto-grows on demand
-/// (`AddressSpace::try_grow_stack` extends it a frame-allocation at a
-/// time down to the mmap-window floor), so this is just the eagerly
-/// mapped floor — kept generous enough that ordinary startup +
-/// moderately deep call chains (e.g. musl `realpath`'s ~8 KiB frame,
-/// recursive library walks) don't immediately fault-grow.
+/// Eagerly-committed top-of-stack window: 128 KiB of real frames at the
+/// high end of the reserved stack region. argv/envp/auxv/AT_RANDOM are
+/// laid out here at load time, and ordinary startup call chains run
+/// inside it. Everything below is reserved-but-lazy (see
+/// `DEFAULT_USER_STACK_RESERVED`) and demand-zeroes on first access.
 pub const DEFAULT_USER_STACK_BYTES: u64 = 128 * 1024;
 
-/// Virtual address the user stack is mapped at — just below the
-/// 128-TiB low-half canonical boundary, inside PML4[127]. Stage-4
-/// refinement will let the loader pick per-process.
-pub const DEFAULT_USER_STACK_BASE: u64 = 0x0000_7FFF_FFFC_0000;
+/// Reserved virtual extent of the main-thread stack region: a full
+/// RLIMIT_STACK (8 MiB, matching `sys_getrlimit`). This must be the
+/// *reserved* span, not just the committed window, because musl's
+/// main-thread `pthread_getattr_np` reports the stack size by probing
+/// downward with `mremap` until it reaches the stack region's base
+/// (the one address where `grow_region` returns Ok) — so the reported
+/// size equals the region's VA length. Qt/QML's V4 engine derives its
+/// C++ recursion limit from that value; if the region were only 128 KiB
+/// V4 computes a ~128 KiB budget and throws "Maximum call stack size
+/// exceeded" on modest recursion (e.g. plasmashell's desktop-layout.js).
+/// Only the top `DEFAULT_USER_STACK_BYTES` are physically backed up
+/// front; the rest costs one lazy `phys 0` slot each (no RAM until
+/// touched).
+pub const DEFAULT_USER_STACK_RESERVED: u64 = 8 * 1024 * 1024;
+
+/// Exclusive top of the user stack region (highest byte + 1). RSP starts
+/// just below here; argv/auxv are laid downward from it. Sits just below
+/// the 128-TiB low-half canonical boundary, inside PML4[255].
+pub const DEFAULT_USER_STACK_TOP: u64 = 0x0000_7FFF_FFFE_0000;
+
+/// Low (base) virtual address of the user stack region — `TOP - RESERVED`.
+/// The `[stack]` VMA in `/proc/[pid]/maps` is matched by this base.
+/// Stage-4 refinement will let the loader pick per-process.
+pub const DEFAULT_USER_STACK_BASE: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_RESERVED;
 
 /// Everything the kernel holds about a loaded-but-not-yet-running
 /// user process.
@@ -241,14 +260,28 @@ pub unsafe fn load_user_process_with(
         }
     }
 
-    // Allocate + map a user stack. Pages come from the global
-    // frame allocator (a freelist — frames are not contiguous in
-    // general), so we collect each one into a per-page scatter list
-    // for the Region.
-    let pages = (DEFAULT_USER_STACK_BYTES + 0xFFF) >> 12;
+    // Allocate + map a user stack. The region reserves a full
+    // RLIMIT_STACK of VA (`DEFAULT_USER_STACK_RESERVED`) but only
+    // eagerly backs the top `DEFAULT_USER_STACK_BYTES` — where argv/
+    // envp/auxv live and startup runs. The lower pages are lazy
+    // (`phys 0`): demand-zeroed on first access exactly like anonymous
+    // mmap, so a deep recursion grows the committed footprint on demand
+    // without pinning 8 MiB of RAM per process. Reserving the full VA
+    // extent is what lets musl's main-thread `pthread_getattr_np` report
+    // a real 8 MiB stack (see `DEFAULT_USER_STACK_RESERVED`). Frames come
+    // from the global freelist (not contiguous), so we build a per-page
+    // scatter list ordered low→high; index 0 == region base.
+    let total_pages = (DEFAULT_USER_STACK_RESERVED >> 12) as usize;
+    let commit_pages = ((DEFAULT_USER_STACK_BYTES + 0xFFF) >> 12) as usize;
+    let lazy_pages = total_pages - commit_pages;
     let mut stack_phys_list: alloc::vec::Vec<PhysAddr> =
-        alloc::vec::Vec::with_capacity(pages as usize);
-    for _ in 0..pages {
+        alloc::vec::Vec::with_capacity(total_pages);
+    // Low pages: reserved-but-lazy (demand-zero on fault).
+    for _ in 0..lazy_pages {
+        stack_phys_list.push(PhysAddr::new(0));
+    }
+    // Top pages: eagerly-allocated zeroed frames for the argv/auxv block.
+    for _ in 0..commit_pages {
         let f = narf_memory::alloc_frame().map_err(|_| ProcessLoadError::StackAllocFailed)?;
         let phys = f.start_address();
         // Zero the stack page.
@@ -272,7 +305,7 @@ pub unsafe fn load_user_process_with(
     address_space
         .map_region(Region {
             base: VirtAddr::new(DEFAULT_USER_STACK_BASE),
-            len: pages * 4096,
+            len: DEFAULT_USER_STACK_RESERVED,
             perms: stack_perms,
             phys: stack_phys_list,
         })
@@ -311,7 +344,7 @@ pub unsafe fn load_user_process_with(
     // SAFETY: Valid memory or trusted environment
     unsafe { address_space.materialize() }.map_err(|_| ProcessLoadError::StackMaterializeFailed)?;
 
-    let stack_bytes = pages * 4096;
+    let stack_bytes = DEFAULT_USER_STACK_RESERVED;
     let stack_top_v = DEFAULT_USER_STACK_BASE + stack_bytes;
 
     // AT_RANDOM: 16 bytes of CSPRNG-grade entropy living at the top

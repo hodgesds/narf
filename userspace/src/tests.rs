@@ -3440,7 +3440,7 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     // `load_user_process`, confirm the returned UserProcess has a
     // fresh pid, a materialised AS with both the code segment and
     // a mapped user stack at DEFAULT_USER_STACK_BASE.
-    use crate::{load_user_process, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES};
+    use crate::{load_user_process, DEFAULT_USER_STACK_TOP};
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
 
@@ -3484,7 +3484,7 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
     if proc.entry.0 != VirtAddr::new(0x0000_0080_0000_1111) {
         return TestResult::Fail("entry mis-decoded");
     }
-    if proc.stack_top.as_u64() != DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES {
+    if proc.stack_top.as_u64() != DEFAULT_USER_STACK_TOP {
         return TestResult::Fail("stack_top mis-computed");
     }
 
@@ -3514,14 +3514,17 @@ fn smoke_userspace_load_user_process_builds_runnable_image() -> TestResult {
         return TestResult::Fail("code segment not materialized");
     }
 
-    // Stack PTE installed — check the first page.
+    // Stack PTE installed — check the top committed page. Only the top
+    // DEFAULT_USER_STACK_BYTES of the reserved region are eagerly backed;
+    // the low pages (including DEFAULT_USER_STACK_BASE) are lazy/demand-
+    // zero and have no PTE until first access.
     // SAFETY: same live loader-built root as above; only walks its tables for the
-    // stack-base vaddr.
+    // top committed stack vaddr.
     // SAFETY: Valid memory or trusted environment
     let stack_phys = unsafe {
         paging::translate(
             proc.address_space.root,
-            VirtAddr::new(DEFAULT_USER_STACK_BASE),
+            VirtAddr::new(DEFAULT_USER_STACK_TOP - 0x1000),
         )
     };
     if stack_phys.is_none() {
@@ -3542,7 +3545,7 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
     // the new RSP is inside the stack region and that walking the
     // argv pointer-array yields the right strings.
     use crate::{
-        load_user_process_with, AuxEntry, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_BYTES,
+        load_user_process_with, AuxEntry, DEFAULT_USER_STACK_BASE, DEFAULT_USER_STACK_TOP,
     };
     use narf_memory::x86_64::paging;
     use narf_memory::VirtAddr;
@@ -3585,7 +3588,7 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
         Err(_) => return TestResult::Fail("load_user_process_with failed"),
     };
 
-    let stack_top = DEFAULT_USER_STACK_BASE + DEFAULT_USER_STACK_BYTES;
+    let stack_top = DEFAULT_USER_STACK_TOP;
     let new_rsp = proc.stack_top.as_u64();
     if new_rsp >= stack_top || new_rsp < DEFAULT_USER_STACK_BASE {
         return TestResult::Fail("rsp not inside stack region");
