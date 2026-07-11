@@ -329,35 +329,6 @@ fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
     n_ready
 }
 
-/// True iff a blocking wait on `fds` can safely PARK rather than busy-poll:
-/// every open fd must wake a parked waiter — a socket (fires `readiness::notify`)
-/// or a timerfd (advertises a `poll_deadline` the park clamps to). A "silent"
-/// source (pipe/eventfd/tty) that becomes ready via a write firing no notify
-/// would be missed until the coarse fallback (or sleep out a finite timeout),
-/// so any such fd — or a closed fd (handle its POLLNVAL on the spin path) —
-/// forces the prompt busy-poll. Requires at least one open fd.
-fn poll_all_parkable(task_id: u64, fds: &[PollFd]) -> bool {
-    let mut any = false;
-    let mut all = true;
-    fd::with_table(task_id, |t| {
-        for item in fds.iter() {
-            if item.fd < 0 {
-                continue;
-            }
-            match t.get(item.fd as u32) {
-                Some(e) => {
-                    any = true;
-                    if !(e.ops.readiness_notifies() || e.ops.poll_deadline().is_some()) {
-                        all = false;
-                    }
-                }
-                None => all = false,
-            }
-        }
-    });
-    any && all
-}
-
 /// Earliest absolute monotonic-ns deadline at which any fd becomes ready with
 /// no readiness `notify` — i.e. an armed timerfd expiry. A parked poll clamps
 /// its scheduler wake-up to this. Mirrors `EpollInstance::nearest_poll_deadline`.
@@ -413,14 +384,22 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
 
     let uctx_opt = crate::user_task::current_user_task();
 
-    // A blocking wait whose every fd wakes a parked waiter PARKS instead of
-    // busy-spinning — that frees the cooperative own-stack CPU (a Wayland
-    // client looping `poll(-1)` on its display socket otherwise pins it and
-    // starves the compositor). Everything else — non-blocking, no task context,
-    // or any silent (pipe/eventfd/tty) fd — keeps the original prompt busy-poll
-    // (it catches a notify-less readiness edge immediately, which the parked
-    // path could only see on its fallback tick / would sleep out a timeout).
-    let can_park = timeout != 0 && uctx_opt.is_some() && poll_all_parkable(task, &fds);
+    // A blocking wait PARKS instead of busy-spinning — that frees the
+    // cooperative own-stack CPU. Busy-polling pins the core at 100% and, since
+    // the spin only drives kernel `sleep_pump`s (never yielding to same-CPU
+    // user tasks), starves every peer: a compositor looping poll() over
+    // {wayland, DRM, input, dbus, ...} otherwise wedges the whole session.
+    //
+    // We park even when the set contains a "silent" fd (pipe/eventfd/tty — one
+    // that becomes ready via a write firing no readiness notify). The park path
+    // already arms the ~10 ms lost-wake backstop (`net_io_wait` below →
+    // `park_fire_deadline_ns`, clamped under any finite timeout), so a silent
+    // readiness edge is picked up within one backstop tick by the re-executed
+    // scan rather than being missed — a bounded ≤10 ms latency in place of a
+    // 100%-CPU spin. A closed fd is caught by `poll_scan`'s POLLNVAL on the
+    // first pass below (immediate return, no park). Only a non-blocking poll or
+    // one with no task context (early boot) still takes the one-shot busy path.
+    let can_park = timeout != 0 && uctx_opt.is_some();
     if !can_park {
         let n = do_poll(task, &mut fds, timeout);
         // SAFETY: same pointer/length as the parse step; user AS still active.
