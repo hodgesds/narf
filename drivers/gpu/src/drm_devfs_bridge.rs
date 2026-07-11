@@ -152,6 +152,95 @@ impl FileOps for DriCardFile {
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         crate::drm_ioctl_bridge::dispatch_mmap(self.index, offset, len)
     }
+
+    /// This IS a DRM master card node — hand back its index so
+    /// `sys_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD)` can export a GEM handle
+    /// on this card as a fresh dma-buf fd.
+    fn as_drm_card_index(&self) -> Option<u32> {
+        Some(self.index)
+    }
+}
+
+// ── PrimeDmaBufFile ─────────────────────────────────────────────────────────
+
+/// The fd handed back by `DRM_IOCTL_PRIME_HANDLE_TO_FD` — a dma-buf
+/// exporting a dumb buffer's physical frames. Mesa GBM's `gbm_bo_get_fd`
+/// needs this fd to CPU-mmap the buffer it renders into (the kwin QPainter
+/// swapchain). The frames are the SAME contiguous pages the GEM handle's
+/// dumb backing owns, so a client's writes land exactly where the scanout
+/// blit (SETCRTC / page-flip) reads from.
+///
+/// The buffer memory stays owned by the Card's `DumbBacking` (freed on GEM
+/// close); this file only borrows the frames for mmap, so Drop is a no-op.
+#[derive(Debug)]
+pub struct PrimeDmaBufFile {
+    /// Physical base of the contiguous dumb allocation.
+    phys: u64,
+    /// Byte length (page-rounded).
+    byte_len: usize,
+    /// The GEM handle this dma-buf was exported from. `PRIME_FD_TO_HANDLE`
+    /// re-imports the fd back to this same handle (single-card round-trip:
+    /// a compositor exports its render buffer, then imports it to build a
+    /// KMS framebuffer to scan out).
+    gem_handle: u32,
+}
+
+impl FileOps for PrimeDmaBufFile {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // A dma-buf is not byte-readable; it is mmap'd. read() → 0 (EOF).
+        Box::pin(async move { Ok(0) })
+    }
+
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::InvalidData) })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: self.byte_len as u64,
+            blocks: (self.byte_len as u64).div_ceil(512),
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    /// Alias the dumb buffer's contiguous frames into the caller's AS.
+    /// `sys_mmap(MAP_SHARED)` calls this; the compositor then CPU-draws
+    /// straight into the scanout-source frames. `offset` is a byte offset
+    /// into the buffer (0 for a whole-buffer map, as gbm/kwin issue).
+    fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+        if offset as usize + len > self.byte_len || offset % 4096 != 0 {
+            return Err(FsError::InvalidData);
+        }
+        let pages = len / 4096;
+        let base = self.phys + offset;
+        Ok((0..pages as u64).map(|i| base + i * 4096).collect())
+    }
+
+    /// This fd is an exported DRM buffer — hand back the GEM handle it
+    /// wraps so `PRIME_FD_TO_HANDLE` can re-import it.
+    fn as_prime_gem_handle(&self) -> Option<u32> {
+        Some(self.gem_handle)
+    }
+}
+
+/// Export the dumb buffer named by `gem_handle` on card `card_index` as an
+/// mmap-able dma-buf `FileOps` (the `DRM_IOCTL_PRIME_HANDLE_TO_FD` export
+/// side). Registered as `narf_filesystem`'s DRM PRIME hook so the syscall
+/// layer — which owns the fd table — can install it as a real fd. Returns
+/// `None` if the handle has no dumb backing on that card.
+pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn FileOps>> {
+    let ms = crate::drm_registry::mode_state(card_index)?;
+    let card = ms.lock();
+    let backing = card.dumb_backing(gem_handle)?;
+    Some(Arc::new(PrimeDmaBufFile {
+        phys: backing.phys,
+        byte_len: backing.byte_len,
+        gem_handle,
+    }))
 }
 
 // ── DriRenderFile ──────────────────────────────────────────────────────────

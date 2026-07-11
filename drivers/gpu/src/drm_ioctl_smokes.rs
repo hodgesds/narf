@@ -734,6 +734,63 @@ fn smoke_drm_map_dumb_resolves_to_phys() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm_ioctl", smoke_drm_map_dumb_resolves_to_phys);
 
+// ── 15b. PRIME_HANDLE_TO_FD export aliases the dumb buffer frames ──────
+//
+// prime_export_fileops must find the GEM handle's dumb backing and return
+// a FileOps whose mmap_frames aliases the SAME contiguous frames — that's
+// what lets Mesa GBM's gbm_bo_get_fd hand kwin a CPU-mmap-able QPainter
+// swapchain buffer. Regression: PRIME_HANDLE_TO_FD used to ENOTTY, so
+// kwin logged "drmPrimeHandleToFD() failed: Not a tty" and could not
+// allocate a swapchain buffer.
+fn smoke_drm_prime_export_aliases_dumb_frames() -> TestResult {
+    use crate::drm::card::DumbBacking;
+    let idx = {
+        let name = format!("card{}", crate::drm_registry::count());
+        let mut card = make_test_card();
+        let fake_phys = 0xCAFE_0000u64;
+        let fake_size = 2 * 4096usize; // two pages
+        let handle = card.gem.alloc(fake_phys, fake_size).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys: fake_phys,
+            byte_len: fake_size,
+            order: 1,
+            mmap_offset: (handle as u64) << 12,
+        });
+        crate::drm_registry::register_drm_card_with_state(
+            Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
+            card,
+        )
+    };
+
+    // Unknown handle → None (the ioctl maps this to ENOENT).
+    if crate::drm_devfs_bridge::prime_export_fileops(idx, 999).is_some() {
+        return TestResult::Fail("PRIME export returned a file for a bogus handle");
+    }
+
+    // First GemTable::alloc yields handle 1.
+    let dmabuf = match crate::drm_devfs_bridge::prime_export_fileops(idx, 1) {
+        Some(f) => f,
+        None => return TestResult::Fail("PRIME export returned None for a live handle"),
+    };
+    // A whole-buffer mmap must alias both fake frames, in order.
+    match dmabuf.mmap_frames(0, 2 * 4096) {
+        Ok(v) if v == alloc::vec![0xCAFE_0000u64, 0xCAFE_0000u64 + 4096] => {}
+        Ok(_) => return TestResult::Fail("PRIME dma-buf mmap_frames returned wrong frames"),
+        Err(_) => return TestResult::Fail("PRIME dma-buf mmap_frames errored"),
+    }
+    // The dma-buf must round-trip back to its GEM handle (FD_TO_HANDLE):
+    // a compositor exports its buffer then imports it to build a KMS fb.
+    match dmabuf.as_prime_gem_handle() {
+        Some(1) => TestResult::Pass,
+        _ => TestResult::Fail("PRIME dma-buf did not round-trip to its GEM handle"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_prime_export_aliases_dumb_frames
+);
+
 // ── 16. SETCRTC with valid fb_id succeeds (no live scanout in test) ────
 
 #[allow(dead_code)]

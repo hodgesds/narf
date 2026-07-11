@@ -311,6 +311,10 @@ pub fn register_initcalls() {
     // Linux ref: drm_dev_register (drivers/gpu/drm/drm_drv.c).
     narf_init::register(Stage::Late, "drm-devfs-bridge", || {
         drm_devfs_bridge::install_dri_dir();
+        // Let the syscall layer export a GEM handle as a dma-buf fd
+        // (DRM_IOCTL_PRIME_HANDLE_TO_FD): Mesa GBM's gbm_bo_get_fd needs it
+        // to CPU-mmap the kwin QPainter swapchain buffer.
+        narf_filesystem::install_drm_prime_export_hook(drm_devfs_bridge::prime_export_fileops);
         InitResult::Ok
     });
     // DRM sysfs bridge: populate /sys/class/drm/.

@@ -2265,6 +2265,67 @@ fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         return;
     }
+    // DRM_IOCTL_PRIME_HANDLE_TO_FD (_IOWR('d'=0x64, 0x2d, drm_prime_handle)):
+    // export a GEM handle on a DRM card as a fresh mmap-able dma-buf fd. Like
+    // TIOCGPTPEER, the fd-allocation side must live HERE (the syscall layer
+    // owns the fd table); the gpu driver only supplies the buffer FileOps via
+    // the registered PRIME hook. Mesa GBM's gbm_bo_get_fd relies on this to
+    // CPU-mmap the kwin QPainter swapchain buffer — without it kwin logged
+    // "drmPrimeHandleToFD() failed: Not a tty" and could not render.
+    if (cmd & 0xFF) == 0x2d && ((cmd >> 8) & 0xFF) == 0x64 {
+        if let Some(card_idx) = ops.as_drm_card_index() {
+            // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
+            let handle = read_user_u32(arg as u64);
+            let dmabuf = match narf_filesystem::drm_prime_export(card_idx, handle) {
+                Some(o) => o,
+                None => {
+                    const ENOENT: i64 = 2;
+                    ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
+                    return;
+                }
+            };
+            // DRM passes DRM_CLOEXEC (0x1) / DRM_RDWR (0x2) in `flags`.
+            let prime_flags = read_user_u32(arg as u64 + 4);
+            let new_fd = fd::with_table(task, |t| {
+                t.open(fd::FdEntry {
+                    ops: dmabuf,
+                    offset: 0,
+                    flags: if prime_flags & 0x1 != 0 { 1 } else { 0 }, // CLOEXEC
+                    status_flags: 0,
+                })
+            });
+            match new_fd {
+                Some(f) => {
+                    write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+            }
+            return;
+        }
+    }
+    // DRM_IOCTL_PRIME_FD_TO_HANDLE (_IOWR('d'=0x64, 0x2e, drm_prime_handle)):
+    // re-import a PRIME dma-buf fd back to a GEM handle on this card — the
+    // partner of HANDLE_TO_FD. A compositor exports its render buffer, then
+    // imports it to build a scannable KMS framebuffer. Without it kwin logged
+    // "drmPrimeFDToHandle() failed" → "Failed to create dumb framebuffer" →
+    // "Applying output config failed!".
+    if (cmd & 0xFF) == 0x2e && ((cmd >> 8) & 0xFF) == 0x64 && ops.as_drm_card_index().is_some() {
+        // struct drm_prime_handle { u32 handle; u32 flags; s32 fd; }
+        let dmabuf_fd = read_user_u32(arg as u64 + 8);
+        let buf_ops = fd::with_table(task, |t| t.get(dmabuf_fd).map(|e| e.ops.clone())).flatten();
+        match buf_ops.and_then(|o| o.as_prime_gem_handle()) {
+            Some(h) => {
+                write_user_u32(arg as u64, h); // drm_prime_handle.handle
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            None => {
+                const EINVAL: i64 = 22;
+                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+            }
+        }
+        return;
+    }
     match ops.ioctl(cmd, arg) {
         Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
         Err(narf_filesystem::FsError::Unsupported) => {

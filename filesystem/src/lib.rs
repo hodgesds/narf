@@ -500,6 +500,25 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this fd is a DRM master card node (`/dev/dri/cardN`), return its
+    /// card index. Used by `sys_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD)` to
+    /// export a GEM handle as a fresh mmap-able dma-buf fd (the fd-alloc
+    /// side lives in the syscall layer, mirroring TIOCGPTPEER). Default:
+    /// not a DRM card.
+    fn as_drm_card_index(&self) -> Option<u32> {
+        None
+    }
+
+    /// If this fd is a DRM PRIME dma-buf (exported via
+    /// `DRM_IOCTL_PRIME_HANDLE_TO_FD`), return the GEM handle it wraps. Used
+    /// by `sys_ioctl(DRM_IOCTL_PRIME_FD_TO_HANDLE)` to re-import the buffer
+    /// back to its handle (a compositor exports its render buffer then
+    /// imports it to build a scannable KMS framebuffer). Default: not a
+    /// PRIME dma-buf.
+    fn as_prime_gem_handle(&self) -> Option<u32> {
+        None
+    }
+
     /// If this fd is a terminal a process can have as its controlling tty,
     /// return its stable id: [`TTY_ID_CONSOLE`] for the boot console, or
     /// the `/dev/pts/<N>` index for a PTY slave. `None` for non-ttys. Used
@@ -1097,6 +1116,36 @@ fn alloc_mount_ns_id() -> u64 {
     // pointer; non-zero confirms it was installed.
     let f: fn() -> u64 = unsafe { core::mem::transmute::<usize, fn() -> u64>(v) };
     f()
+}
+
+/// Hook exporting a DRM GEM handle as an mmap-able dma-buf `FileOps`.
+/// Installed by the gpu driver (which owns the card / dumb-buffer tables)
+/// so `sys_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD)` in the syscall layer — the
+/// only layer that owns the fd table — can turn a `(card_index,
+/// gem_handle)` pair into a shareable, CPU-mmap-able buffer fd. Until
+/// installed, PRIME export reports `None` (ioctl → ENODEV).
+static DRM_PRIME_EXPORT_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the DRM PRIME export hook (gpu `prime_export_fileops`).
+pub fn install_drm_prime_export_hook(f: fn(u32, u32) -> Option<Arc<dyn FileOps>>) {
+    DRM_PRIME_EXPORT_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Export the dumb buffer named by `gem_handle` on card `card_index` as an
+/// mmap-able dma-buf `FileOps`, or `None` if the handle is unknown or the
+/// hook was never installed.
+pub fn drm_prime_export(card_index: u32, gem_handle: u32) -> Option<Arc<dyn FileOps>> {
+    let v = DRM_PRIME_EXPORT_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by install_drm_prime_export_hook as exactly this
+    // `fn(u32, u32) -> Option<Arc<dyn FileOps>>` pointer; non-zero confirms
+    // it was installed.
+    let f: fn(u32, u32) -> Option<Arc<dyn FileOps>> =
+        unsafe { core::mem::transmute::<usize, fn(u32, u32) -> Option<Arc<dyn FileOps>>>(v) };
+    f(card_index, gem_handle)
 }
 
 /// Snapshot-shaped mount table. Holds an owned Vec of mounts so a
