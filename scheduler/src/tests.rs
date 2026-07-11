@@ -472,6 +472,22 @@ kernel_test_in!("scheduler", smoke_scheduler_per_cpu_pin_to_bsp);
 fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
     use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
 
+    // This test commandeers CPU 1 as a FAKE idle-halted AP (`mark_online` +
+    // `__test_set_cpu_halted`) and asserts against the GLOBAL resched
+    // counters. Both only hold when no REAL AP is live: at SMP>1 CPU 1 is a
+    // genuine core that manages its own `CPU_HALTED` bit and issues its own
+    // reschedules, and every other AP bumps the shared `RESCHED_SENT`/`SKIP`
+    // counters concurrently — so the faked state and the counter deltas are
+    // both polluted (the negative "running target sent no IPI" assertion
+    // false-fails). The kick logic itself is exercised for real by the
+    // condbcast/futex_contend cases at the full 16-vCPU topology; here we
+    // pin the decision deterministically, which is only possible at SMP=1.
+    if narf_lib::smp::online_count() > 1 {
+        return TestResult::Skip(
+            "needs SMP=1 — a live AP pollutes CPU_HALTED[1] and the global resched counters",
+        );
+    }
+
     crate::__reset_queues_for_test();
 
     // Pretend CPU 1 is an online, idle-halted AP. Restored below.
