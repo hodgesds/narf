@@ -1589,6 +1589,34 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         // SAFETY: Valid memory or trusted environment
         unsafe { perform_sigreturn(self, sc_vaddr, is_rt) }
     }
+
+    fn dump_gprs(&self) {
+        use core::fmt::Write;
+        let f = &self.frame;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  gpr: rax={:x} rbx={:x} rcx={:x} rdx={:x} rsi={:x} rdi={:x} rbp={:x}",
+            f.rax,
+            f.rbx,
+            f.rcx,
+            f.rdx,
+            f.rsi,
+            f.rdi,
+            f.rbp
+        );
+        let _ = writeln!(
+            narf_console::Writer,
+            "  gpr: r8={:x} r9={:x} r10={:x} r11={:x} r12={:x} r13={:x} r14={:x} r15={:x}",
+            f.r8,
+            f.r9,
+            f.r10,
+            f.r11,
+            f.r12,
+            f.r13,
+            f.r14,
+            f.r15
+        );
+    }
 }
 
 /// Linux-compatible `struct sigcontext` / `struct mcontext_t` on

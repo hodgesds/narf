@@ -105,6 +105,12 @@ pub trait TrapContext {
     fn perform_sigreturn(&mut self, _sc_vaddr: u64, _is_rt: bool) -> bool {
         false
     }
+
+    /// Diagnostic: dump the full general-purpose register file to the
+    /// kernel console (fatal-fault path). Default is a no-op; real trap
+    /// frames override it. Used to symbolize a faulting instruction's
+    /// operands (e.g. a corrupted heap pointer held in r13/r15).
+    fn dump_gprs(&self) {}
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

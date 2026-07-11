@@ -19030,6 +19030,11 @@ pub fn default_sync_signal_delivery(
                     info.addr,
                     ctx.rip()
                 );
+                // Dump the GP register file — a faulting instruction's
+                // operands (e.g. a corrupted heap/meta pointer in r13/r15)
+                // pin whether the fault is a slightly-off pointer (adjacent
+                // overwrite / stale TLB) or a wild value (deeper corruption).
+                ctx.dump_gprs();
                 // Dump plausible return addresses off the faulting stack so
                 // the CALLER can be symbolized (a leaf like strlen faults with
                 // [rsp] == its caller's return address). Print only words that
