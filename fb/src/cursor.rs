@@ -279,15 +279,22 @@ fn render_user_cursor(fb: &FbWriter) {
         USER_LAST_Y.store(u32::MAX, Ordering::Release);
     }
     let (ux, uy, visible, managed) = narf_console::user_cursor_state();
-    if managed {
+    // Treat the compositor as owning the pointer only once it has actually
+    // *shown* a real cursor. A compositor with no cursor theme (kwin on a
+    // rootfs with no Xcursor set) only ever *hides* the HW cursor — that
+    // flips `managed` but never `ever_shown`, so without this gate the
+    // `erase_cursor` branch would suppress the kernel pointer and the user
+    // would have no visible pointer at all despite live input.
+    if managed && narf_console::user_cursor_ever_shown() {
         if visible {
             render_cursor_at(fb, ux, uy);
         } else {
             erase_cursor(fb);
         }
     } else {
-        // Fall back to the global-ring pointer position. POS_X/POS_Y is
-        // u32::MAX until the first event / FB-attach centring.
+        // Fall back to the kernel pointer position, driven by the input
+        // layer (virtio-tablet absolute position / global pointer ring).
+        // POS_X/POS_Y is u32::MAX until the first event / FB-attach centring.
         let x = POS_X.load(Ordering::Relaxed);
         let y = POS_Y.load(Ordering::Relaxed);
         if x != u32::MAX {

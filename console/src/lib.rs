@@ -296,6 +296,14 @@ static CURSOR_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// position (the global input ring) so the user still gets a tracking
 /// pointer even when the compositor's own input path isn't wired up.
 static CURSOR_MANAGED: AtomicBool = AtomicBool::new(false);
+/// Set the first time the compositor *shows* a real cursor (`MODE_CURSOR_BO`
+/// with a non-zero handle). A compositor with no cursor theme (kwin on a
+/// rootfs that ships no Xcursor set) only ever *hides* the HW cursor — that
+/// still flips `CURSOR_MANAGED`, which would otherwise suppress the kernel's
+/// input-driven fallback pointer and leave the user with no pointer at all.
+/// Gating "the compositor owns the cursor" on this flag keeps the fallback
+/// alive for that case while still yielding to a compositor that draws its own.
+static CURSOR_EVER_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Move the compositor cursor to scanout pixel `(x, y)` (sprite top-left).
 /// Called from the DRM `DRM_MODE_CURSOR_MOVE` path.
@@ -309,6 +317,7 @@ pub fn user_cursor_move(x: u32, y: u32) {
 pub fn user_cursor_show() {
     CURSOR_VISIBLE.store(true, Ordering::Release);
     CURSOR_MANAGED.store(true, Ordering::Release);
+    CURSOR_EVER_SHOWN.store(true, Ordering::Release);
 }
 
 /// Hide the compositor cursor (`DRM_MODE_CURSOR_BO` with handle 0).
@@ -327,6 +336,14 @@ pub fn user_cursor_state() -> (u32, u32, bool, bool) {
         CURSOR_VISIBLE.load(Ordering::Acquire),
         CURSOR_MANAGED.load(Ordering::Acquire),
     )
+}
+
+/// Whether the compositor has ever shown a real cursor via `MODE_CURSOR_BO`.
+/// The FB renderer treats the compositor as owning the pointer only when this
+/// is true; a compositor that only ever hides the HW cursor (no cursor theme)
+/// leaves this false, so the kernel's input-driven fallback pointer stays live.
+pub fn user_cursor_ever_shown() -> bool {
+    CURSOR_EVER_SHOWN.load(Ordering::Acquire)
 }
 
 /// Generation counter bumped every time a userspace compositor blits a full
