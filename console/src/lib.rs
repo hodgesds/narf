@@ -329,6 +329,27 @@ pub fn user_cursor_state() -> (u32, u32, bool, bool) {
     )
 }
 
+/// Generation counter bumped every time a userspace compositor blits a full
+/// frame over the scanout (the DRM `SETCRTC` / page-flip path in
+/// `drivers-gpu::drm_ioctl_bridge::blit_to_scanout`). The FB cursor renderer
+/// watches this: a bump means the frame under the pointer sprite was
+/// repainted, so the pixels it snapshotted before drawing are now stale — it
+/// must drop that snapshot *without* restoring it (the blit already painted
+/// the clean background) and re-composite the sprite over the fresh frame.
+/// Without this the compositor's repaint erased the pointer and the renderer,
+/// seeing no cursor *move*, never redrew it — the pointer went invisible.
+static SCANOUT_GEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Bump the scanout generation. Called after a full-frame compositor blit.
+pub fn bump_scanout_gen() {
+    SCANOUT_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Current scanout generation. See [`bump_scanout_gen`].
+pub fn scanout_gen() -> usize {
+    SCANOUT_GEN.load(Ordering::Acquire)
+}
+
 /// Panic sink — no allocation, no re-entry, lock-free.
 ///
 /// Bypasses the regular `CONSOLE.lock` because the panicking

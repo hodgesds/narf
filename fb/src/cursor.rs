@@ -18,7 +18,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use narf_graphics::Pixel32;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -255,6 +255,10 @@ const ARROW_FILL: [u16; ARROW_H as usize] = [
 static USER_SAVED: IrqSafeSpinLock<Option<SavedRect>> = IrqSafeSpinLock::new(None);
 static USER_LAST_X: AtomicU32 = AtomicU32::new(u32::MAX);
 static USER_LAST_Y: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Last compositor-blit generation the user-cursor renderer observed. A
+/// change means the frame under the sprite was repainted (see
+/// `narf_console::bump_scanout_gen`).
+static USER_LAST_GEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Render the pointer over a user-owned (compositor) scanout. When the
 /// compositor drives the cursor through the DRM cursor ioctl we honour its
@@ -263,6 +267,17 @@ static USER_LAST_Y: AtomicU32 = AtomicU32::new(u32::MAX);
 /// tracking pointer even when the compositor's own input path isn't wired up
 /// (e.g. weston failing to create its libinput devices).
 fn render_user_cursor(fb: &FbWriter) {
+    // If the compositor blitted a fresh full frame since we last drew, the
+    // pixels we snapshotted under the sprite are stale (the blit repainted
+    // them and erased our sprite). Drop the snapshot WITHOUT restoring — the
+    // blit already painted the clean background — and force a redraw at the
+    // current position by clearing the "last drawn at" short-circuit.
+    let gen = narf_console::scanout_gen();
+    if gen != USER_LAST_GEN.swap(gen, Ordering::AcqRel) {
+        *USER_SAVED.lock() = None;
+        USER_LAST_X.store(u32::MAX, Ordering::Release);
+        USER_LAST_Y.store(u32::MAX, Ordering::Release);
+    }
     let (ux, uy, visible, managed) = narf_console::user_cursor_state();
     if managed {
         if visible {

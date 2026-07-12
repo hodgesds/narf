@@ -1238,6 +1238,11 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
             core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
         }
     }
+    // Tell the FB cursor renderer the frame was fully repainted so it drops
+    // its now-stale saved-background snapshot and re-composites the pointer
+    // over the fresh frame (otherwise the compositor's repaint would leave the
+    // pointer erased until the next cursor *move*).
+    narf_console::bump_scanout_gen();
     crate::drm_fb_hook::flush_scanout();
 }
 
