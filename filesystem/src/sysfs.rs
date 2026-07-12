@@ -480,12 +480,22 @@ pub fn kobject_emit_uevent(kobj: &Kobject, action: UeventAction) {
     // the absolute `/sys/...` path; strip the mount prefix.
     let full = kobj.path();
     let devpath = full.strip_prefix("/sys").unwrap_or(&full).to_string();
-    // subsystem = the class parent's name, or "kernel" fallback.
-    // Linux uses kobject's kset name here; we use the parent name.
+    // subsystem = basename of the `subsystem` symlink target if present
+    // (matches how udev derives it, and stays correct when a device is
+    // rooted under /sys/devices/... rather than directly under its class
+    // dir — e.g. evdev nodes at /sys/devices/.../inputN/eventN whose parent
+    // kobject is `inputN`, not the `input` class). Falls back to the parent
+    // kobject's name, then "kernel". Linux uses the kobject's kset name.
     let subsystem = kobj
-        .parent
-        .as_ref()
-        .map(|p| p.name.clone())
+        .get_symlink("subsystem")
+        .and_then(|t| {
+            t.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| kobj.parent.as_ref().map(|p| p.name.clone()))
         .unwrap_or_else(|| "kernel".to_string());
     // Make the netlink message self-contained: fold the device's
     // synthesised `uevent` attr (MAJOR=/MINOR=/DEVNAME=/EV=/KEY=/…) into
@@ -661,20 +671,50 @@ pub(crate) fn evdev_caps_uevent(caps: &narf_input::evdev::DeviceCaps) -> alloc::
 
 pub fn populate_input_class() {
     let class_input = class_register("input");
-    // /sys/dev/char/<maj>:<min> — udev (libudev/libudev-zero) enumerates from
-    // HERE, not /sys/class. On real Linux each entry is a SYMLINK into
-    // /sys/devices/.../input/eventN; udev realpath()s it and libinput insists
-    // the resolved sysname start with "event" (drivers reject anything else).
-    // We mirror that: the canonical node is /sys/class/input/eventN (carrying
-    // uevent + caps + subsystem), and /sys/dev/char/13:<minor> is a symlink to
-    // it, so realpath lands on .../eventN.
+    let root = get_root();
+    // Mirror Linux's /sys/devices/.../inputN/eventN topology. This is
+    // load-bearing for logind: elogind's `session_device_verify` (TakeDevice)
+    // classifies an evdev node then requires a *parent* device whose subsystem
+    // is "input" via `sd_device_get_parent_with_subsystem_devtype(dev,"input")`
+    // — DRM nodes skip this, evdev nodes do not. A flat /sys/class/input/eventN
+    // has no such parent, so TakeDevice returns -ENODEV and libinput never
+    // opens the device (kwin: "Failed to open /dev/input/eventN (No such
+    // device)"). Rooting eventN under an `inputN` parent (subsystem=input)
+    // gives the walk a device to find. The seat tag then attaches to the
+    // parent `inputN` (via /run/udev/data/+input:inputN); Linux ref:
+    // drivers/input/input.c `input_register_device` (creates input%d) +
+    // evdev.c (creates event%d as its child).
+    let devices = get_or_create_child(&root, "devices");
+    let platform = get_or_create_child(&devices, "platform");
+    let narf_input = get_or_create_child(&platform, "narf-input");
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_char = get_or_create_child(&dev_dir, "char");
+    // udev scandir()s both /sys/dev/{char,block}; keep block present too.
+    let _dev_block = get_or_create_child(&dev_dir, "block");
+
     for id in narf_input::evdev::ROUTER.device_ids() {
         let n = id.0.saturating_sub(1);
         let minor = 64 + n;
-        let kobj = class_device_register(class_input.clone(), &format!("event{}", n));
-        kobject_add_attr(&kobj, "name", move || format!("input{}\n", n));
-        let dev = format!("13:{}\n", minor);
-        kobject_add_attr(&kobj, "dev", move || dev.clone());
+
+        // ── Parent input device: /sys/devices/platform/narf-input/inputN ──
+        let inputn = Kobject::new_child(narf_input.clone(), format!("input{}", n));
+        kobject_add_attr(&inputn, "name", move || format!("narf-input{}\n", n));
+        // A `uevent` file is what sd_device_new_from_syspath uses to accept a
+        // directory as a device (so the parent walk resolves it).
+        {
+            let pu = format!("PRODUCT=0/0/0/0\nNAME=\"narf-input{}\"\n", n);
+            kobject_add_attr(&inputn, "uevent", move || pu.clone());
+        }
+        // subsystem → /sys/class/input (basename "input"). From
+        // /sys/devices/platform/narf-input/inputN that is four levels up.
+        inputn.add_symlink("subsystem", "../../../../class/input");
+
+        // ── evdev char node: …/inputN/eventN ──
+        let eventn = Kobject::new_child(inputn.clone(), format!("event{}", n));
+        {
+            let dev = format!("13:{}\n", minor);
+            kobject_add_attr(&eventn, "dev", move || dev.clone());
+        }
         // Capability bitmaps (EV/KEY/REL/ABS) so udev tags ID_INPUT* and
         // libinput classifies + opens the device. Sourced from the live
         // router so they match what EVIOCGBIT reports on /dev/input/eventN.
@@ -687,14 +727,12 @@ pub fn populate_input_class() {
             minor, n, caps_lines
         );
         // Writable so `udevadm trigger` (which writes "add"/"change" to the
-        // uevent file) makes the kernel broadcast a netlink uevent → udevd
-        // populates /run/udev/data → libinput/libudev can enumerate the
-        // device. Weak ref into the store so the attr closure doesn't pin
-        // the kobject in a cycle. Linux ref: `uevent_store`
-        // (drivers/base/core.c:2453).
-        let weak = alloc::sync::Arc::downgrade(&kobj);
+        // uevent file) makes the kernel broadcast a netlink uevent. Weak ref
+        // so the attr closure doesn't pin the kobject in a cycle. Linux ref:
+        // `uevent_store` (drivers/base/core.c:2453).
+        let weak = alloc::sync::Arc::downgrade(&eventn);
         kobject_add_writable_attr(
-            &kobj,
+            &eventn,
             "uevent",
             move || uevent.clone(),
             move |data: &[u8]| {
@@ -704,12 +742,28 @@ pub fn populate_input_class() {
                 Ok(())
             },
         );
-        // Mark the class node's subsystem (real Linux has this link).
-        kobj.add_symlink("subsystem", "../../../class/input");
+        // subsystem → /sys/class/input (five levels up from the event node).
+        eventn.add_symlink("subsystem", "../../../../../class/input");
 
-        // /sys/dev/char/13:<minor> -> the canonical class dir. realpath()
-        // resolves it to .../event<N>, giving udev/libinput sysname "event<N>".
-        register_char_dev_link(13, minor, "input", &format!("event{}", n));
+        // ── /sys/class/input/{inputN,eventN} → the /sys/devices nodes ──
+        // Linux makes the class entries symlinks into /sys/devices.
+        class_input.add_symlink(
+            format!("input{}", n),
+            format!("../../devices/platform/narf-input/input{}", n),
+        );
+        class_input.add_symlink(
+            format!("event{}", n),
+            format!("../../devices/platform/narf-input/input{}/event{}", n, n),
+        );
+
+        // ── /sys/dev/char/13:<minor> → the evdev node under /sys/devices ──
+        // sd_device_new_from_devnum('c',13:<minor>) realpath()s this link;
+        // landing under /sys/devices/.../inputN/eventN gives it a walkable
+        // "input" parent (unlike the old /sys/class/input/eventN target).
+        dev_char.add_symlink(
+            format!("13:{}", minor),
+            format!("../../devices/platform/narf-input/input{}/event{}", n, n),
+        );
     }
 }
 
