@@ -1593,6 +1593,17 @@ impl<'a> TrapContext for X86TrapContext<'a> {
     fn dump_gprs(&self) {
         use core::fmt::Write;
         let f = &self.frame;
+        // #PF error code bits: P(0)=1 protection vs 0 not-present,
+        // W(1)=write, U(2)=user, RSVD(3), I(4)=instr-fetch.
+        let ec = f.error_code;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  pf-errcode={:#x} [P={} W={} U={}]",
+            ec,
+            ec & 1,
+            (ec >> 1) & 1,
+            (ec >> 2) & 1
+        );
         let _ = writeln!(
             narf_console::Writer,
             "  gpr: rax={:x} rbx={:x} rcx={:x} rdx={:x} rsi={:x} rdi={:x} rbp={:x}",

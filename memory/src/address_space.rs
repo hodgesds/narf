@@ -686,8 +686,29 @@ impl AddressSpace {
                 return Err(AddressSpaceError::OutOfRange);
             }
             if r.phys[i].raw() != 0 {
-                // Already backed — spurious fault (TLB stale).
-                return Err(AddressSpaceError::AlignmentMismatch);
+                // Already backed, yet this CPU took a not-present #PF for it.
+                // The leaf PTE in memory is valid (a peer CPU demand-faulted
+                // this page and, installing its leaf, allocated a fresh
+                // intermediate page-table page) — but THIS CPU's paging-
+                // structure cache still holds the pre-fault "not present"
+                // intermediate entry. x86 issues no shootdown for a
+                // not-present→present transition, so the stale entry lingers
+                // and the page-walk keeps missing. INVLPG for the faulting VA
+                // flushes this CPU's TLB + paging-structure caches for it;
+                // reporting success lets the faulting instruction re-walk and
+                // observe the present PTE.
+                //
+                // Before this fix the spurious fault fell through to
+                // try_grow_stack → fatal — the SMP-only mallocng heap crash:
+                // two threads demand-fault the same fresh group page
+                // concurrently, and the one that loses the regions-lock race
+                // looped-faulted forever on a page that was actually mapped.
+                // SAFETY: INVLPG is always safe; `v` is the page-aligned
+                // faulting VA whose leaf PTE this AS owns.
+                unsafe {
+                    crate::x86_64::paging::invlpg(VirtAddr::new(v));
+                }
+                return Ok(());
             }
             // Allocate + zero the fresh frame, honoring the faulting
             // task's NUMA mempolicy (set_mempolicy/mbind). DEFAULT
@@ -747,7 +768,18 @@ impl AddressSpace {
                 return Err(AddressSpaceError::OutOfRange);
             }
             if r.phys[i].raw() != 0 {
-                return Err(AddressSpaceError::AlignmentMismatch);
+                // Already backed, yet this CPU faulted: a peer installed the
+                // leaf (allocating a fresh table page) while this CPU's TLB /
+                // walk caches still held the pre-fault miss. Invalidate the
+                // stale entry locally and report success so the faulting
+                // instruction re-walks and sees the present descriptor. See
+                // the x86_64 twin for the full SMP-mallocng rationale.
+                // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
+                // page-aligned faulting VA owned by this AS.
+                unsafe {
+                    crate::aarch64::paging::tlb_invalidate_vae1(VirtAddr::new(v));
+                }
+                return Ok(());
             }
             let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
                 .map_err(|_| AddressSpaceError::OutOfRange)?

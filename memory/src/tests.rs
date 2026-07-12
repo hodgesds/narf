@@ -4119,7 +4119,7 @@ kernel_test_in!("memory", smoke_memory_demand_alloc_installs_pte);
 /// trap handler retries cleanly without double-allocating.
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
-    use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let a = match unsafe { AddressSpace::new_for_user() } {
@@ -4138,14 +4138,20 @@ fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
         phys: alloc::vec![frame],
     })
     .expect("map_region");
+    // A demand fault on an ALREADY-backed page is a spurious not-present
+    // fault (a peer CPU installed the leaf while this CPU's paging-structure
+    // cache still held the miss). demand_alloc_page must RECOVER it: INVLPG
+    // the stale entry and return Ok so the faulting instruction re-walks and
+    // succeeds. (It used to return AlignmentMismatch, which the #PF handler
+    // treated as unhandled → fatal — the SMP mallocng heap-corruption crash.)
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
     core::mem::forget(a);
     match r {
-        Err(AddressSpaceError::AlignmentMismatch) => TestResult::Pass,
-        other => {
-            let _ = other;
-            TestResult::Fail("backed slot didn't surface spurious-fault sentinel")
+        Ok(()) => TestResult::Pass,
+        Err(e) => {
+            let _ = e;
+            TestResult::Fail("backed-slot spurious fault not recovered (expected Ok)")
         }
     }
 }

@@ -106,10 +106,10 @@ pub trait TrapContext {
         false
     }
 
-    /// Diagnostic: dump the full general-purpose register file to the
-    /// kernel console (fatal-fault path). Default is a no-op; real trap
-    /// frames override it. Used to symbolize a faulting instruction's
-    /// operands (e.g. a corrupted heap pointer held in r13/r15).
+    /// Diagnostic: dump the full general-purpose register file (plus the
+    /// #PF error code) to the kernel console (fatal-fault path). Default is a
+    /// no-op; real trap frames override it. Used to symbolize a faulting
+    /// instruction's operands (e.g. a corrupted heap pointer held in r13/r15).
     fn dump_gprs(&self) {}
 }
 
