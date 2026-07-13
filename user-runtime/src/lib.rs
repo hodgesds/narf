@@ -3004,15 +3004,9 @@ pub fn fchownat(dirfd: i32, path: &str, uid: u32, gid: u32, flags: i32) -> i32 {
 /// file. Returns a fresh fd or -1.
 #[inline]
 pub fn memfd_create(name: &str, flags: u32) -> i32 {
-    // SAFETY: SYS_MEMFD_CREATE signature: (name_ptr, name_len, flags).
-    let r = unsafe {
-        syscall3(
-            SYS_MEMFD_CREATE,
-            name.as_ptr() as u64,
-            name.len() as u64,
-            flags as u64,
-        )
-    };
+    // Linux memfd_create(2) ABI: (name_ptr, flags). The kernel ignores the
+    // name; only `flags` matters (and must land in arg1 so musl callers agree).
+    let r = unsafe { syscall2(SYS_MEMFD_CREATE, name.as_ptr() as u64, flags as u64) };
     if r as i64 == -1 {
         -1
     } else {

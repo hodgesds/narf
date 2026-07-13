@@ -65,8 +65,9 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_brk_shrink_neg);
 
 fn smoke_abi_mem_memfd_create_pos() -> TestResult {
     with_setup(|| {
+        // Linux memfd_create(2): (name_ptr, flags). flags=0.
         let name = b"abi-memfd\0";
-        let args = a3(name.as_ptr() as u64, (name.len() - 1) as u64, 0, 0);
+        let args = a3(name.as_ptr() as u64, 0, 0, 0);
         match call(Syscall::MemfdCreate.raw(), args) {
             Some(fd) if fd >= 0 => Ok(()),
             Some(_) => Err("memfd_create should return a non-negative fd"),
@@ -79,8 +80,9 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_memfd_create_pos);
 fn smoke_abi_mem_memfd_create_cloexec_pos() -> TestResult {
     with_setup(|| {
         // MFD_CLOEXEC (bit 0) is honoured; still yields a valid fd.
+        // Linux memfd_create(2): (name_ptr, flags). flags=MFD_CLOEXEC=1.
         let name = b"abi-memfd-cx\0";
-        let args = a3(name.as_ptr() as u64, (name.len() - 1) as u64, 1, 0);
+        let args = a3(name.as_ptr() as u64, 1, 0, 0);
         match call(Syscall::MemfdCreate.raw(), args) {
             Some(fd) if fd >= 0 => Ok(()),
             Some(_) => Err("memfd_create(CLOEXEC) should return a valid fd"),

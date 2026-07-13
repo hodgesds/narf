@@ -4003,10 +4003,12 @@ fn sys_fchmod_or_fchown(ctx: &mut dyn TrapContext) {
 fn sys_memfd_create(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _name_ptr = args.arg0;
-    let _name_len = args.arg1;
-    // NARF-shape layout: (name_ptr, name_len, flags) — three args
-    // because narf-libc serialises the C string length separately.
-    let _flags = args.arg2 as u32;
+    // Linux memfd_create(2) ABI: (const char *name, unsigned int flags) —
+    // flags in arg1. The kernel ignores the (NUL-terminated) name. Reading
+    // flags from arg2 (an old NARF-native 3-arg shape) dropped MFD_ALLOW_SEALING
+    // for every musl caller (foot/kwin put flags in rsi=arg1), so F_ADD_SEALS
+    // then returned -EPERM and Wayland SHM-buffer sealing failed.
+    let _flags = args.arg1 as u32;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
     #[cfg(feature = "linux-compat")]
