@@ -429,7 +429,7 @@ mod smokes {
         // ~800 KiB stack frame.
         let buf: Box<[u8]> = alloc::vec![0u8; 0xC9000].into_boxed_slice();
         let raw = Box::leak(buf);
-        let bar_len = raw.len();
+        let bar_len = raw.len() as u64;
         let phys = narf_memory::PhysAddr::new(raw.as_ptr() as u64);
         let mmio = narf_driver_runtime::MmioRegion {
             phys,
