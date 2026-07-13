@@ -3006,6 +3006,8 @@ pub fn fchownat(dirfd: i32, path: &str, uid: u32, gid: u32, flags: i32) -> i32 {
 pub fn memfd_create(name: &str, flags: u32) -> i32 {
     // Linux memfd_create(2) ABI: (name_ptr, flags). The kernel ignores the
     // name; only `flags` matters (and must land in arg1 so musl callers agree).
+    // SAFETY: `name.as_ptr()` is a valid readable pointer for the syscall; the
+    // kernel does not retain it past the call and `flags` is a plain scalar.
     let r = unsafe { syscall2(SYS_MEMFD_CREATE, name.as_ptr() as u64, flags as u64) };
     if r as i64 == -1 {
         -1
