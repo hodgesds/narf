@@ -38,7 +38,10 @@ use alloc::vec::Vec;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 #[cfg(feature = "linux-compat")]
-use crate::sysfs::{class_device_register, class_register, kobject_emit_uevent};
+use crate::sysfs::{
+    class_device_register, class_register, kobject_add_writable_attr, kobject_emit_uevent,
+    uevent_action_from_write,
+};
 use crate::uevent::{self, UeventAction, UeventReader};
 
 // ── Minimal fake block device ─────────────────────────────────────────────
@@ -588,6 +591,84 @@ fn smoke_uevent_e2e_input_register_fires_add() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_input_register_fires_add);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 10b — a sysfs "add" WRITE triggers a netlink ADD (udevadm-trigger path)
+//
+// Every other smoke calls kobject_emit_uevent() directly. This one drives the
+// REAL coldplug path udev uses: `udevadm trigger --action=add` walks /sys and
+// writes "add" to each device's `uevent` file; sysfs `attr_store` must invoke
+// the WRITABLE attr's store closure, which broadcasts the netlink uevent.
+//
+// This is the regression guard for making the parent `inputN` device node's
+// `uevent` writable (sysfs.rs populate_input_class): a read-only uevent attr
+// returns None from attr_store, so `trigger` is a silent no-op and udevd never
+// sees a parent-device ADD → never writes /run/udev/data/+input:inputN. A device
+// whose uevent is write-triggerable is what lets real udevd coldplug replace the
+// launcher's hand-seeded seat-tag DB. Linux ref: uevent_store (core.c:2453).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_e2e_sysfs_write_add_triggers_emit() -> TestResult {
+    reset();
+
+    let class_input = class_register("input");
+    let kobj = class_device_register(class_input, "input99-e2e");
+    // Mirror the parent-inputN production wiring: a WRITABLE `uevent` attr whose
+    // store closure emits a netlink uevent for this kobject (weak ref, no cycle).
+    let weak = Arc::downgrade(&kobj);
+    kobject_add_writable_attr(
+        &kobj,
+        "uevent",
+        || "NAME=\"narf-input99\"\n".to_string(),
+        move |data: &[u8]| {
+            if let Some(k) = weak.upgrade() {
+                kobject_emit_uevent(&k, uevent_action_from_write(data));
+            }
+            Ok(())
+        },
+    );
+
+    // Start the monitor AFTER registration so only the write's ADD is in view.
+    let mut reader = UeventReader::new();
+
+    // The actual `echo add > /sys/.../uevent`.
+    match kobj.attr_store("uevent", b"add") {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("attr_store('uevent','add') errored"),
+        None => {
+            return TestResult::Fail(
+                "uevent attr not writable (attr_store returned None) — the ReadOnly bug",
+            )
+        }
+    }
+
+    let evs = reader.drain(10);
+    let ev = evs
+        .iter()
+        .find(|e| e.action == UeventAction::Add && e.devpath.contains("input99-e2e"));
+    let ev = match ev {
+        Some(e) => e,
+        None => return TestResult::Fail("sysfs 'add' write did not broadcast an ADD uevent"),
+    };
+    if ev.subsystem != "input" {
+        return TestResult::Fail("write-triggered ADD SUBSYSTEM != 'input'");
+    }
+
+    // A write of "change" must map to a Change action, not Add (real mapping).
+    let mut reader2 = UeventReader::new();
+    if kobj.attr_store("uevent", b"change").is_none() {
+        return TestResult::Fail("second write to uevent attr returned None");
+    }
+    let evs2 = reader2.drain(10);
+    if !evs2.iter().any(|e| e.action == UeventAction::Change) {
+        return TestResult::Fail("write 'change' did not broadcast a CHANGE uevent");
+    }
+
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("uevent_e2e", smoke_uevent_e2e_sysfs_write_add_triggers_emit);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Smoke 11 — Format compliance: required keys in Linux order

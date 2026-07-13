@@ -463,7 +463,7 @@ where
 /// / "online" / "offline" …) to a [`UeventAction`]. Unknown verbs fall
 /// back to `Change` (matches Linux's `kobject_action_type` leniency for
 /// the common trigger verbs). Linux ref: `kobject_synth_uevent`.
-fn uevent_action_from_write(data: &[u8]) -> UeventAction {
+pub(crate) fn uevent_action_from_write(data: &[u8]) -> UeventAction {
     let s = core::str::from_utf8(data).unwrap_or("").trim();
     let verb = s.split_whitespace().next().unwrap_or("");
     match verb {
@@ -700,10 +700,30 @@ pub fn populate_input_class() {
         let inputn = Kobject::new_child(narf_input.clone(), format!("input{}", n));
         kobject_add_attr(&inputn, "name", move || format!("narf-input{}\n", n));
         // A `uevent` file is what sd_device_new_from_syspath uses to accept a
-        // directory as a device (so the parent walk resolves it).
+        // directory as a device (so the parent walk resolves it). Writable, like
+        // the child eventN below: `udevadm trigger --action=add` walks /sys and
+        // writes "add" to every device's uevent file — including this parent
+        // input *device* node. Without a store, that write hits ReadOnly and no
+        // parent-device ADD is ever broadcast, so real udevd never runs its
+        // input rules against inputN and never writes /run/udev/data/+input:inputN
+        // (the seat-tag DB file libinput needs — see the topology comment above).
+        // In Linux EVERY kobject's uevent attr is writable (`uevent_store`,
+        // drivers/base/core.c:2453); mirror that. Weak ref avoids a closure↔kobject
+        // refcount cycle.
         {
             let pu = format!("PRODUCT=0/0/0/0\nNAME=\"narf-input{}\"\n", n);
-            kobject_add_attr(&inputn, "uevent", move || pu.clone());
+            let weak = alloc::sync::Arc::downgrade(&inputn);
+            kobject_add_writable_attr(
+                &inputn,
+                "uevent",
+                move || pu.clone(),
+                move |data: &[u8]| {
+                    if let Some(k) = weak.upgrade() {
+                        kobject_emit_uevent(&k, uevent_action_from_write(data));
+                    }
+                    Ok(())
+                },
+            );
         }
         // subsystem → /sys/class/input (basename "input"). From
         // /sys/devices/platform/narf-input/inputN that is four levels up.
