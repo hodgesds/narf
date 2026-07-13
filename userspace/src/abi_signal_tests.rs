@@ -72,19 +72,22 @@ fn smoke_abi_signal_kill_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_neg);
 
 // ── Pause ───────────────────────────────────────────────────────────
-// sys_pause: with no live user task / yield hook (the kernel-test
-// context), it pumps once then returns ok(-1). The blocking success
-// path is unreachable here; only the immediate-return path is tested.
+// sys_pause: the harness now REACHES the blocking path. `setup()` registers
+// FAKE_TASK in the refcounted task registry, so `current_user_task()` resolves
+// (it looks the ctx up by id), and the booted kernel-test kernel has a global
+// yield-hook installed — so `sys_pause` takes the block branch, which bakes in
+// -EINTR before parking. In the harness there is no own-stack context to park
+// into, so the park returns immediately, leaving the -EINTR the handler set.
+// (Before the refcounted-task-registry change `current_user_task()` was None,
+// so pause hit the immediate fallback and returned -1 — that assumption is now
+// stale.) -EINTR is the correct Linux pause(2) result for an interrupted wait.
 
 fn smoke_abi_signal_pause_neg() -> TestResult {
     with_setup(|| {
-        // No yield-hook / user task in the harness, no deliverable
-        // pending signal → fallback path returns ok(-1).
-        // LINUX-GAP: pause(2) blocks until a handled signal arrives and
-        // then returns -EINTR; the harness can't park, so it surfaces -1.
+        // Blocking path taken → pause(2) surfaces -EINTR (Linux parity).
         let r = call(Syscall::Pause.raw(), a0(0));
-        if r != Some(-1) {
-            return Err("pause should return -1 in the non-blocking harness path");
+        if r != Some(-4) {
+            return Err("pause should return -EINTR (-4) via the blocking path");
         }
         Ok(())
     })
