@@ -19,20 +19,24 @@ use core::arch::asm;
 pub unsafe fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
     let (a, c, d): (u32, u32, u32);
     let b: u64;
-    // LLVM reserves rbx; the conventional workaround is to save it
-    // around CPUID via push/pop and move the result into a scratch
-    // register that Rust can see.
+    // LLVM reserves rbx; save/restore it through a scratch register rather
+    // than the stack. The old `push rbx`/`pop rbx` form was declared
+    // `options(nostack)`, which is a lie — under optimization the compiler
+    // then keeps live data in the red zone that `push rbx` clobbers, so
+    // release builds silently returned wrong CPUID values (mis-detected
+    // vendor/features). Using a scratch reg keeps `nostack` truthful.
     // SAFETY: CPUID is always legal at CPL=0; we preserve rbx.
     unsafe {
         asm!(
-            "push rbx",
+            "mov {tmp:r}, rbx",
             "cpuid",
             "mov {b:r}, rbx",
-            "pop rbx",
+            "mov rbx, {tmp:r}",
             inout("eax") leaf => a,
             inout("ecx") sub  => c,
             out("edx") d,
             b = out(reg) b,
+            tmp = out(reg) _,
             options(nostack, preserves_flags),
         );
     }
