@@ -278,9 +278,12 @@ struct BuildArgs {
     #[arg(long, value_enum, default_value_t = Arch::X86_64)]
     arch: Arch,
 
-    /// Build with `--release`.
+    /// Build in debug mode. Default is `--release` (optimized): NARF under
+    /// QEMU with software rendering is slow enough that debug builds make
+    /// interactive use (KDE, boots) painful, so release is preferred for all
+    /// builds. Pass `--debug` when you need debug assertions / gdb symbols.
     #[arg(long)]
-    release: bool,
+    debug: bool,
 
     /// Crate to build.
     #[arg(long, default_value = "narf-frame")]
@@ -1476,7 +1479,7 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         .arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z")
         .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
-    if args.release {
+    if !args.debug {
         cmd.arg("--release");
     }
     if !args.features.is_empty() {
@@ -1488,7 +1491,7 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         bail!("cargo build failed with status {status}");
     }
 
-    let profile = if args.release { "release" } else { "debug" };
+    let profile = if args.debug { "debug" } else { "release" };
     let out = root.join("target").join(args.arch.triple()).join(profile);
     Ok(out)
 }

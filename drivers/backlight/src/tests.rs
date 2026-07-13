@@ -422,14 +422,19 @@ mod smokes {
     fn smoke_intel_backlight_pwm_roundtrip() -> TestResult {
         __reset_all_for_test();
 
-        // 1 KiB fake BAR0.
-        let buf: Box<[u8; 1024]> = Box::new([0u8; 1024]);
+        // Fake BAR0 large enough to actually cover the BXT PWM registers at
+        // ~0xC8254/0xC8258 (the old 1 KiB buffer put every access out of
+        // bounds — it happened to land on adjacent heap in debug but not in
+        // release). Heap-allocated (boxed slice, not a stack array) to avoid a
+        // ~800 KiB stack frame.
+        let buf: Box<[u8]> = alloc::vec![0u8; 0xC9000].into_boxed_slice();
         let raw = Box::leak(buf);
+        let bar_len = raw.len();
         let phys = narf_memory::PhysAddr::new(raw.as_ptr() as u64);
         let mmio = narf_driver_runtime::MmioRegion {
             phys,
             virt: phys.raw(),
-            len: 1024,
+            len: bar_len,
             kind: narf_driver_runtime::BarKind::Mmio32 {
                 prefetchable: false,
             },

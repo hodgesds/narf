@@ -203,8 +203,15 @@ fn smoke_gpio_register_irq_rejects_conflicting_handler() -> TestResult {
     __reset_dispatch_for_test();
     let (p, l) = make_synthetic_mmio();
     let drv = AmdFchGpio::new("conflict".to_string(), p, l, None);
-    fn h1(_p: u16) {}
-    fn h2(_p: u16) {}
+    // Distinct bodies so release identical-code-folding can't merge these into
+    // one function pointer (which would make the "different handler" test a
+    // no-op — h2 == h1 — and the conflict never gets rejected).
+    fn h1(_p: u16) {
+        core::hint::black_box(1u8);
+    }
+    fn h2(_p: u16) {
+        core::hint::black_box(2u8);
+    }
     let cfg = GpioIrqConfig {
         level_triggered: true,
         polarity: 0,
