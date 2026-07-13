@@ -263,11 +263,13 @@ impl EpollInstance {
             if fd < 0 {
                 continue;
             }
-            let dl = fd::with_table(task_id, |t| {
-                t.get(fd as u32).and_then(|e| e.ops.poll_deadline())
-            })
-            .flatten();
-            if let Some(d) = dl {
+            // Snapshot the ops under the fd-table lock, query the
+            // deadline OUTSIDE it — a nested epoll child's
+            // `poll_deadline` re-enters `fd::with_table` (same
+            // re-entrancy as `poll_fd_readiness`).
+            let ops =
+                fd::with_table(task_id, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
+            if let Some(d) = ops.and_then(|o| o.poll_deadline()) {
                 earliest = Some(earliest.map_or(d, |e| e.min(d)));
             }
         }
@@ -291,46 +293,176 @@ impl FileOps for EpollInstance {
         }
     }
 
-    /// epoll-readiness for nested epoll. Returns POLL_IN if any
-    /// interests are currently satisfied.
+    /// epoll-readiness for nested epoll / `poll(2)` over an epoll fd.
+    /// Returns POLL_IN iff `epoll_wait` would deliver at least one event
+    /// — the filters MUST mirror `collect_ready`, or a `poll` that
+    /// reports the epoll fd readable pairs with an `epoll_wait` that
+    /// returns 0 events and the caller's event loop spins forever
+    /// (Linux ep_eventpoll_poll likewise reflects the ready list, so an
+    /// already-consumed EPOLLET edge does NOT count as readable).
     fn poll_readiness(&self) -> u32 {
-        // Snapshot (fd, events) and release our own lock BEFORE polling the
-        // children: a child poll re-enters `fd::with_table` (and, if epolls
-        // are nested deeper, another `EpollInstance::poll_readiness`), so
-        // holding any lock across it risks the same re-entrant deadlock the
-        // outer epoll path hit. See `poll_fd_readiness`.
-        let snapshot: Vec<(i32, u32)> = {
+        // Cross-table cycle backstop — see `POLL_NEST_DEPTH`.
+        let Some(_nest) = NestGuard::enter() else {
+            return 0;
+        };
+        // Snapshot the interest set and release our own lock BEFORE
+        // polling the children: a child poll re-enters `fd::with_table`
+        // (and, if epolls are nested deeper, another
+        // `EpollInstance::poll_readiness`), so holding any lock across
+        // it risks the same re-entrant deadlock the outer epoll path
+        // hit. See `poll_fd_readiness`.
+        let snapshot: Vec<(i32, u32, u32)> = {
             let g = self.inner.lock();
-            g.interest.values().map(|it| (it.fd, it.events)).collect()
+            g.interest
+                .values()
+                .map(|it| (it.fd, it.events, it.last_mask))
+                .collect()
         };
         let task = current_task_id();
-        let mut mask = 0;
-        for (fd, events) in snapshot {
-            if (poll_fd_readiness(task, fd) & events) != 0 {
-                mask |= narf_filesystem::POLL_IN;
+        for (fd, events, last_mask) in snapshot {
+            // Disarmed EPOLLONESHOT items deliver nothing.
+            if (events & EPOLLONESHOT) != 0
+                && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
+            {
+                continue;
             }
+            let cur = poll_fd_readiness(task, fd);
+            let want = events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+            let ready = cur & want;
+            if ready == 0 {
+                continue;
+            }
+            // EPOLLET: readable only on a rising edge, same as
+            // `collect_ready`. (The EPOLLEXCLUSIVE claim is deliberately
+            // NOT mirrored — a readiness QUERY must not claim the fd.)
+            if (events & EPOLLET) != 0 && (ready & !last_mask) == 0 {
+                continue;
+            }
+            return narf_filesystem::POLL_IN;
         }
-        mask
+        0
+    }
+
+    /// Forward the nearest child timerfd deadline so a `poll(2)` over
+    /// this epoll fd clamps its park to it. A timerfd expiry fires no
+    /// readiness notify, and `poll_nearest_deadline` only queries the
+    /// DIRECT fds in the poll set — without this forwarding, a
+    /// `poll(-1)` over an epoll whose only wake source is a nested
+    /// timerfd parks forever (the ~10 ms backstop re-checks the park
+    /// condition but never re-runs the readiness scan).
+    fn poll_deadline(&self) -> Option<u64> {
+        // Cross-table cycle backstop — see `POLL_NEST_DEPTH`.
+        let _nest = NestGuard::enter()?;
+        self.nearest_poll_deadline(current_task_id())
+    }
+
+    /// Recover the concrete instance from an `Arc<dyn FileOps>` — how
+    /// `epoll_ctl`/`epoll_wait` resolve an epfd via the fd table.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }
 
-// ── Registry — (task_id, fd) → instance ──────────────────────────────
-// In real Linux the instance is an `anon_inode` file and may be
-// shared across fork or sent via SCM_RIGHTS. NARF Stage 4 stubs it
-// as a global registry keyed by the creator's task id + the fd
-// number.
-/// Registry map: `(task_id, epfd)` → epoll instance.
-type EpollRegistry = BTreeMap<(u64, u32), Arc<EpollInstance>>;
-static EPOLL_INSTANCES: IrqSafeSpinLock<Option<EpollRegistry>> = IrqSafeSpinLock::new(None);
+// ── Instance resolution — through the fd table, like Linux ──────────
+// The instance IS the fd's `FileOps` object, so resolve `epfd` through
+// the caller's fd table and downcast — exactly how Linux recovers the
+// `eventpoll` from the `struct file`. An earlier design kept a global
+// registry keyed by `(creating task id, epfd)`; that key is wrong for
+// every path where the fd outlives or escapes its creating thread:
+// a CLONE_FILES sibling (kwin_wayland waits on an epoll another thread
+// created — the registry miss made `epoll_wait` fail -1 while `poll`
+// on the same fd reported it readable via the shared fd table, so the
+// caller span ppoll↔epoll_pwait at 100% CPU and wedged the whole
+// cooperative session at PSTEP-WAYLAND), a dup'd epfd, and a
+// fork-inherited one. Resolving through the table fixes all four and
+// drops the instance with its last fd reference instead of leaking it.
 
-fn instances_lookup(task: u64, epfd: u32) -> Option<Arc<EpollInstance>> {
-    EPOLL_INSTANCES.lock().as_ref()?.get(&(task, epfd)).cloned()
+/// Clone `epfd`'s `Arc<dyn FileOps>` out of `task`'s fd table.
+fn epoll_ops(task: u64, epfd: u32) -> Option<Arc<dyn FileOps>> {
+    fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten()
 }
 
-fn instances_insert(task: u64, epfd: u32, instance: Arc<EpollInstance>) {
-    let mut g = EPOLL_INSTANCES.lock();
-    let map = g.get_or_insert_with(BTreeMap::new);
-    map.insert((task, epfd), instance);
+/// View an fd's ops as an `EpollInstance`, if it is one.
+fn as_epoll(ops: &Arc<dyn FileOps>) -> Option<&EpollInstance> {
+    ops.as_any()?.downcast_ref::<EpollInstance>()
+}
+
+// ── Nested-epoll bounds ──────────────────────────────────────────────
+
+/// Maximum epoll-inside-epoll nesting depth, matching Linux's cap
+/// (`fs/eventpoll.c` ep_loop_check rejects paths 5 deep with ELOOP).
+/// libwayland/libinput legitimately nest 2-3 levels; 5 leaves headroom.
+const EP_MAX_NESTS: u32 = 5;
+
+/// Per-CPU recursion depth for the poll-time child walks
+/// (`poll_readiness` / `poll_deadline`). `epoll_ctl` already refuses to
+/// build a same-table cycle (see `epoll_reaches`), but a cycle stitched
+/// together through two DIFFERENT fd tables (fork-shared or
+/// SCM_RIGHTS-passed epoll fds whose interest fds only resolve in the
+/// peer's table) is invisible to that check — without this backstop it
+/// would recurse until the kernel stack overflows. Safe as a per-CPU
+/// counter: the walk is synchronous (no await/park inside) and no IRQ
+/// path calls `poll_readiness`.
+static POLL_NEST_DEPTH: [core::sync::atomic::AtomicU32; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Scope guard for one level of `POLL_NEST_DEPTH`. `enter` refuses
+/// (returns `None`) beyond `EP_MAX_NESTS` levels.
+struct NestGuard {
+    cpu: usize,
+}
+
+impl NestGuard {
+    fn enter() -> Option<Self> {
+        let cpu = narf_lib::percpu::current_cpu();
+        let d = &POLL_NEST_DEPTH[cpu];
+        if d.load(Ordering::Relaxed) >= EP_MAX_NESTS {
+            return None;
+        }
+        d.fetch_add(1, Ordering::Relaxed);
+        Some(Self { cpu })
+    }
+}
+
+impl Drop for NestGuard {
+    fn drop(&mut self) {
+        POLL_NEST_DEPTH[self.cpu].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// DFS from `from`'s interest set looking for `needle` (a cycle back to
+/// the containing epoll) or nesting deeper than [`EP_MAX_NESTS`].
+/// Mirrors Linux `fs/eventpoll.c`:ep_loop_check_proc. Child fds are
+/// resolved through the CALLER's fd table (interest records store fd
+/// numbers, not file refs — LINUX-GAP: an epoll passed via SCM_RIGHTS
+/// re-resolves against the receiver's table); non-epoll children are
+/// leaves. Snapshots each interest set so no epoll lock is held across
+/// the recursive step.
+fn epoll_reaches(
+    task: u64,
+    from: &EpollInstance,
+    needle: *const EpollInstance,
+    depth: u32,
+) -> bool {
+    if depth >= EP_MAX_NESTS {
+        return true;
+    }
+    let fds: Vec<i32> = from.inner.lock().interest.keys().copied().collect();
+    for fd in fds {
+        if fd < 0 {
+            continue;
+        }
+        let Some(ops) = epoll_ops(task, fd as u32) else {
+            continue;
+        };
+        let Some(child) = as_epoll(&ops) else {
+            continue;
+        };
+        if core::ptr::eq(child, needle) || epoll_reaches(task, child, needle, depth + 1) {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Exclusive wakeup registry ────────────────────────────────────────
@@ -370,8 +502,10 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
     let fail = SyscallReturn::ok((-1i64) as u64);
 
-    let instance = EpollInstance::new();
-    let ops = instance.clone() as Arc<dyn FileOps>;
+    // The fd entry's ops Arc is the ONLY owner handle: every later
+    // epoll_ctl/epoll_wait recovers the instance from the fd table
+    // (`epoll_ops` + `as_epoll`), and closing the last fd drops it.
+    let ops = EpollInstance::new() as Arc<dyn FileOps>;
 
     let task = current_task_id();
     let new_fd = fd::with_table(task, |t| {
@@ -384,10 +518,7 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     });
 
     match new_fd {
-        Some(fd) => {
-            instances_insert(task, fd, instance);
-            ctx.set_return(SyscallReturn::ok(fd as u64));
-        }
+        Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),
         None => ctx.set_return(fail),
     }
 }
@@ -401,10 +532,17 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
 
-    let instance = match instances_lookup(task, epfd) {
-        Some(i) => i,
+    let ops = match epoll_ops(task, epfd) {
+        Some(o) => o,
         None => {
             ctx.set_return(fail);
+            return;
+        }
+    };
+    let instance = match as_epoll(&ops) {
+        Some(i) => i,
+        None => {
+            ctx.set_return(fail); // not an epoll fd (Linux: EINVAL)
             return;
         }
     };
@@ -422,6 +560,24 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
+            // Nested-epoll hardening, mirroring Linux ep_loop_check:
+            // refuse an ADD that would make this epoll reachable from
+            // itself (a cycle turns the recursive readiness poll into
+            // unbounded kernel recursion) or nest epolls deeper than
+            // EP_MAX_NESTS. Linux returns ELOOP; this file's error
+            // convention is a bare -1 (LINUX-GAP: no per-errno codes).
+            if tfd >= 0 {
+                if let Some(tops) = epoll_ops(task, tfd as u32) {
+                    if let Some(target) = as_epoll(&tops) {
+                        if core::ptr::eq(target, instance)
+                            || epoll_reaches(task, target, instance, 1)
+                        {
+                            ctx.set_return(fail);
+                            return;
+                        }
+                    }
+                }
+            }
             if instance.ctl_add(tfd, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
@@ -500,13 +656,26 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
         return;
     }
 
-    let instance = match instances_lookup(task, epfd) {
-        Some(i) => i,
+    // Resolve through the fd table (NOT a creating-thread registry) so a
+    // CLONE_FILES sibling, a dup'd fd, or a fork-inherited epfd all wait
+    // on the same instance `poll(2)` sees — see `epoll_ops`.
+    let ops = match epoll_ops(task, epfd) {
+        Some(o) => o,
         None => {
             if let Some(old) = old_mask {
                 crate::handlers::set_signal_mask_for_task(task, old);
             }
             ctx.set_return(fail);
+            return;
+        }
+    };
+    let instance = match as_epoll(&ops) {
+        Some(i) => i,
+        None => {
+            if let Some(old) = old_mask {
+                crate::handlers::set_signal_mask_for_task(task, old);
+            }
+            ctx.set_return(fail); // not an epoll fd (Linux: EINVAL)
             return;
         }
     };
@@ -729,9 +898,9 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
 
 // ── Test reset ───────────────────────────────────────────────────────
 
-/// Clear the epoll instance registry + exclusive holders. Test hook.
+/// Clear the exclusive-wakeup holders. Test hook. (Instances need no
+/// reset — they live and die with their fd-table entries.)
 #[doc(hidden)]
 pub fn __test_reset() {
-    *EPOLL_INSTANCES.lock() = Some(BTreeMap::new());
     *EXCLUSIVE_HOLDERS.lock() = Some(BTreeMap::new());
 }

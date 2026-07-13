@@ -647,6 +647,26 @@ pub fn own_stack_park() {
         // ctx → netserve's accept() wedged into an infinite futex wait → net
         // echo hang).
         install_current(uctx);
+        // An io-wait park (a readiness scan parked in poll/epoll/blocking
+        // read) must RE-EXECUTE its syscall after ANY wake — including the
+        // ~10 ms lost-wake backstop — so the readiness SCAN re-runs. Silent
+        // sources (a pipe write, a timerfd expiry behind a nested epoll)
+        // fire no readiness notify: re-checking only the park CONDITION
+        // here finds the deadline unexpired + the generation unchanged and
+        // re-parks forever, sleeping out an infinite-timeout poll no matter
+        // how ready its fds are. Breaking out re-executes the rewound
+        // syscall, whose pre-park sequence re-arms the park state — so a
+        // spurious wake costs one bounded re-scan, matching the wake_one()
+        // (clear-deadline → re-execute) contract. Non-io parks
+        // (sleep/futex/console/job-stop) keep the re-check loop.
+        if uc.net_io_wait.load(Ordering::Acquire) {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            uc.net_io_wait.store(false, Ordering::Release);
+            if let Some(h) = sleep_handle.take() {
+                narf_scheduler::narf_time::timer_wheel::cancel(h);
+            }
+            break;
+        }
         // Resumed by the executor — loop and re-check the condition.
     }
 }

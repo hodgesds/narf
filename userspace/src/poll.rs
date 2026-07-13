@@ -333,17 +333,22 @@ fn poll_scan(task_id: u64, fds: &mut [PollFd]) -> usize {
 /// no readiness `notify` — i.e. an armed timerfd expiry. A parked poll clamps
 /// its scheduler wake-up to this. Mirrors `EpollInstance::nearest_poll_deadline`.
 fn poll_nearest_deadline(task_id: u64, fds: &[PollFd]) -> Option<u64> {
+    // Snapshot ops under the fd-table lock, query `poll_deadline` OUTSIDE
+    // it — an epoll fd forwards to its children through `fd::with_table`
+    // (same re-entrancy as `poll_readiness`; see `poll_scan`).
+    let ops: Vec<Arc<dyn FileOps>> = fd::with_table(task_id, |t| {
+        fds.iter()
+            .filter(|item| item.fd >= 0)
+            .filter_map(|item| t.get(item.fd as u32).map(|e| e.ops.clone()))
+            .collect()
+    })
+    .unwrap_or_default();
     let mut best: Option<u64> = None;
-    fd::with_table(task_id, |t| {
-        for item in fds.iter() {
-            if item.fd < 0 {
-                continue;
-            }
-            if let Some(d) = t.get(item.fd as u32).and_then(|e| e.ops.poll_deadline()) {
-                best = Some(best.map_or(d, |b: u64| b.min(d)));
-            }
+    for o in &ops {
+        if let Some(d) = o.poll_deadline() {
+            best = Some(best.map_or(d, |b: u64| b.min(d)));
         }
-    });
+    }
     best
 }
 

@@ -12280,6 +12280,338 @@ fn smoke_epoll_1000_fds_one_ready() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_1000_fds_one_ready);
 
+// ── Epoll instance identity + nested-epoll agreement smokes ──────────
+//
+// Regression tests for the PSTEP-WAYLAND livelock: the epoll instance
+// used to live in a registry keyed by (creating task id, epfd), so a
+// CLONE_FILES sibling thread's epoll_wait missed it and failed -1 while
+// poll() on the same fd (resolved via the SHARED fd table) reported it
+// readable — kwin_wayland span ppoll↔epoll_pwait at 100% CPU forever.
+// Instances now resolve through the fd table (`as_any` downcast).
+
+/// Same-process sibling (CLONE_FILES fd-table share): epoll created
+/// under one task id must be waitable/ctl-able under the sibling's.
+fn smoke_epoll_shared_fd_table_cross_thread_wait() -> TestResult {
+    // Own the current-task switch: setup_poll_test pins a fixed id.
+    crate::syscall::__test_clear_global();
+    crate::fd::__test_reset();
+    crate::fd::init();
+    crate::handlers::init_per_task_state();
+    crate::epoll::__test_reset();
+
+    const CREATOR: u64 = 0xEF01;
+    const SIBLING: u64 = 0xEF02;
+    static CUR_TASK: AtomicU64 = AtomicU64::new(CREATOR);
+    fn task_lu() -> u64 {
+        CUR_TASK.load(AtomicOrd::Relaxed)
+    }
+    crate::install_task_id_lookup(task_lu);
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // CREATOR builds the epoll + adds a ready fd.
+    let r = call(Syscall::EpollCreate, SyscallArgs::default());
+    if r.status != SyscallReturn::OK || r.value == (-1i64) as u64 {
+        return TestResult::Fail("epoll_create1 failed");
+    }
+    let epfd = r.value as u32;
+    let watched = install_ready_file(CREATOR, narf_filesystem::POLL_IN);
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    ev[4..12].copy_from_slice(&0xD00D_u64.to_ne_bytes());
+    let r = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.value != 0 {
+        return TestResult::Fail("creator's epoll_ctl ADD failed");
+    }
+
+    // SIBLING shares the fd table (CLONE_FILES) and waits on the epfd.
+    crate::fd::share(CREATOR, SIBLING);
+    CUR_TASK.store(SIBLING, AtomicOrd::Relaxed);
+    let mut out_ev = [0u8; 12 * 4];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    // Park the lookup back on the creator id — a later test that installs
+    // no lookup of its own shouldn't inherit the sibling id.
+    CUR_TASK.store(CREATOR, AtomicOrd::Relaxed);
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail(
+            "sibling thread's epoll_wait must see the shared instance (was: registry miss → -1)",
+        );
+    }
+    let data = u64::from_ne_bytes(out_ev[4..12].try_into().unwrap_or([0; 8]));
+    if data != 0xD00D {
+        return TestResult::Fail("sibling's epoll_wait returned wrong .data");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_shared_fd_table_cross_thread_wait);
+
+/// dup'd epfd aliases the same instance: ctl through the dup, wait
+/// through the original.
+fn smoke_epoll_dup_fd_aliases_same_instance() -> TestResult {
+    let task = setup_poll_test();
+
+    let r = call(Syscall::EpollCreate, SyscallArgs::default());
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("epoll_create1 failed");
+    }
+    let epfd = r.value as u32;
+    // dup the epfd by cloning its fd entry (same Arc, new slot).
+    let dup = crate::fd::with_table(task, |t| {
+        let entry = t.get(epfd).cloned();
+        entry.map(|e| t.open(e))
+    })
+    .flatten();
+    let Some(dupfd) = dup else {
+        return TestResult::Fail("dup of epfd failed");
+    };
+
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    ev[4..12].copy_from_slice(&7u64.to_ne_bytes());
+    let r = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: dupfd as u64, // ctl via the DUP
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.value != 0 {
+        return TestResult::Fail("epoll_ctl via dup'd epfd failed");
+    }
+    let mut out_ev = [0u8; 12 * 4];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64, // wait via the ORIGINAL
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.status != SyscallReturn::OK || r.value != 1 {
+        return TestResult::Fail("epoll_wait via original epfd missed the dup-added item");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_dup_fd_aliases_same_instance);
+
+/// poll(2) readability of an epoll fd must AGREE with epoll_wait: an
+/// EPOLLET edge already consumed by epoll_wait is NOT readable (Linux
+/// ep_eventpoll_poll reflects the ready list). Divergence here makes a
+/// poll-over-epoll event loop spin: poll says ready, wait delivers 0.
+fn smoke_epoll_fd_poll_readiness_matches_epoll_wait_et() -> TestResult {
+    let task = setup_poll_test();
+
+    let r = call(Syscall::EpollCreate, SyscallArgs::default());
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("epoll_create1 failed");
+    }
+    let epfd = r.value as u32;
+    let watched = install_ready_file(task, narf_filesystem::POLL_IN);
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&(crate::epoll::EPOLLIN | crate::epoll::EPOLLET).to_ne_bytes());
+    ev[4..12].copy_from_slice(&1u64.to_ne_bytes());
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: watched as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+
+    let epoll_ops = crate::fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten();
+    let Some(epoll_ops) = epoll_ops else {
+        return TestResult::Fail("epfd not in fd table");
+    };
+
+    // Fresh edge: both epoll_wait and the epoll fd's own readiness agree.
+    if epoll_ops.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("fresh ET edge: epoll fd must poll readable");
+    }
+    let mut out_ev = [0u8; 12 * 4];
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.value != 1 {
+        return TestResult::Fail("fresh ET edge: epoll_wait must deliver it");
+    }
+
+    // Edge consumed, level still high: epoll_wait delivers nothing more,
+    // so the epoll fd must NOT poll readable either.
+    let r = call(
+        Syscall::EpollWait,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: out_ev.as_mut_ptr() as u64,
+            arg2: 4,
+            arg3: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+    if r.value != 0 {
+        return TestResult::Fail("consumed ET edge: epoll_wait must return 0");
+    }
+    if epoll_ops.poll_readiness() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail(
+            "consumed ET edge: epoll fd must NOT poll readable (poll↔epoll_wait spin)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_fd_poll_readiness_matches_epoll_wait_et
+);
+
+/// epoll_ctl must refuse self-add and 2-cycles (Linux: ELOOP) while
+/// still allowing legitimate finite nesting (libwayland nests 2-3).
+fn smoke_epoll_ctl_rejects_cycles_allows_finite_nesting() -> TestResult {
+    let task = setup_poll_test();
+    let _ = task;
+
+    let mk = || {
+        let r = call(Syscall::EpollCreate, SyscallArgs::default());
+        r.value as u32
+    };
+    let (ep_a, ep_b, ep_c) = (mk(), mk(), mk());
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    let add = |epfd: u32, tfd: u32, ev_ptr: u64| {
+        call(
+            Syscall::EpollCtl,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: tfd as u64,
+                arg3: ev_ptr,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+
+    // Self-add refused.
+    if add(ep_a, ep_a, ev.as_ptr() as u64) == 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("epoll_ctl must refuse adding an epoll to itself");
+    }
+    // Finite chain A ⊇ B ⊇ C allowed.
+    if add(ep_a, ep_b, ev.as_ptr() as u64) != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("legitimate 2-level epoll nesting must work");
+    }
+    if add(ep_b, ep_c, ev.as_ptr() as u64) != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("legitimate 3-level epoll nesting must work");
+    }
+    // Closing the loop C ⊇ A refused.
+    let r = add(ep_c, ep_a, ev.as_ptr() as u64);
+    crate::syscall::__test_clear_global();
+    if r == 0 {
+        return TestResult::Fail("epoll_ctl must refuse an A→B→C→A cycle");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_ctl_rejects_cycles_allows_finite_nesting
+);
+
+/// An epoll fd forwards its nearest child timerfd deadline through
+/// `poll_deadline`, so a `poll(2)` park over the epoll fd clamps its
+/// wake-up to the timer instead of sleeping forever (a timerfd expiry
+/// fires no readiness notify).
+fn smoke_epoll_fd_forwards_nested_timerfd_poll_deadline() -> TestResult {
+    let task = setup_poll_test();
+
+    let r = call(Syscall::EpollCreate, SyscallArgs::default());
+    if r.status != SyscallReturn::OK {
+        return TestResult::Fail("epoll_create1 failed");
+    }
+    let epfd = r.value as u32;
+
+    // Install an armed timerfd (absolute deadline well in the future).
+    let tfd_ops = crate::io_mux::TimerFd::new();
+    let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(500_000_000);
+    tfd_ops.arm(deadline, 0);
+    let tfd = crate::fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: tfd_ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        })
+    })
+    .unwrap();
+
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epfd as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: tfd as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    crate::syscall::__test_clear_global();
+
+    let epoll_ops = crate::fd::with_table(task, |t| t.get(epfd).map(|e| e.ops.clone())).flatten();
+    let Some(epoll_ops) = epoll_ops else {
+        return TestResult::Fail("epfd not in fd table");
+    };
+    match epoll_ops.poll_deadline() {
+        Some(d) if d == deadline => TestResult::Pass,
+        Some(_) => TestResult::Fail("epoll fd forwarded a WRONG nested timerfd deadline"),
+        None => TestResult::Fail(
+            "epoll fd must forward a nested timerfd deadline (poll(-1) parks forever without it)",
+        ),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_fd_forwards_nested_timerfd_poll_deadline
+);
+
 // ── Wave-64 eventfd / timerfd / event-loop integration smokes ────────
 //
 // These exercise the syscall surface for `eventfd2(2)`, `timerfd_create
@@ -15628,8 +15960,9 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: name.as_ptr() as u64,
-            arg1: name.len() as u64,
-            arg2: MFD_ALLOW_SEALING as u64,
+            // Linux memfd_create(2) ABI: (name_ptr, flags) — flags in arg1.
+            // The kernel ignores the name; only the flags word matters.
+            arg1: MFD_ALLOW_SEALING as u64,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -15780,8 +16113,9 @@ fn smoke_userspace_memfd_seal_seal_blocks_further_seals() -> TestResult {
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: name.as_ptr() as u64,
-            arg1: name.len() as u64,
-            arg2: MFD_ALLOW_SEALING as u64,
+            // Linux memfd_create(2) ABI: (name_ptr, flags) — flags in arg1.
+            // The kernel ignores the name; only the flags word matters.
+            arg1: MFD_ALLOW_SEALING as u64,
             ..SyscallArgs::default()
         },
         ret: None,
