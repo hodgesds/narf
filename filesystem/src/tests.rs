@@ -1887,3 +1887,99 @@ fn smoke_uinput_loopback() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs_input", smoke_uinput_loopback);
+
+/// MemFs hard links: `DirOps::link` must alias the SAME backing node
+/// (a write through one name is visible through the other — the
+/// Arc-clone-as-inode-refcount model), refuse to replace an existing
+/// destination (EEXIST shape, unlike rename's atomic replace), refuse
+/// a directory source, and report NotFound for a missing source.
+fn smoke_filesystem_memfs_link_aliases_node() -> TestResult {
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        use core::pin::Pin;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        // SAFETY: raw_waker() returns a vtable whose no-op/no-clone fns are sound for a
+        // single-threaded test poll; the RawWaker is not used after this scope.
+        // SAFETY: Valid memory or trusted environment
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block; we do not move it.
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    use crate::{bootstrap_mount_authority, registry, FsError, MemFs, MountPoint};
+    use narf_capabilities::{Cap, Grant};
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("test-link", &[("orig", b"aa"), ("taken", b"x")]);
+    let mount_handle = match registry().mount(&auth, "/test_link", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    // link orig → alias: success.
+    let r = registry().resolve_parent_absolute("/test_link/orig", |_fs, parent, leaf| {
+        poll_once(parent.link(leaf, "alias"))
+    });
+    if !matches!(r, Some(Some(Ok(())))) {
+        let _ = registry().unmount(&mount_handle, "/test_link");
+        return TestResult::Fail("link(orig, alias) should succeed");
+    }
+
+    // Write through `orig`, read through `alias` — one backing node.
+    let wrote = registry().resolve_absolute("/test_link/orig", |fs, rel| {
+        crate::resolve(fs.root(), rel)
+            .ok()
+            .and_then(|ops| poll_once(ops.write(0, b"zz")))
+            .is_some_and(|r| r.is_ok())
+    });
+    if wrote != Some(true) {
+        let _ = registry().unmount(&mount_handle, "/test_link");
+        return TestResult::Fail("write through orig failed");
+    }
+    let read_back = registry().resolve_absolute("/test_link/alias", |fs, rel| {
+        let mut buf = [0u8; 2];
+        crate::resolve(fs.root(), rel)
+            .ok()
+            .and_then(|ops| poll_once(ops.read(0, &mut buf)))
+            .is_some_and(|r| r.is_ok())
+            .then_some(buf)
+    });
+    if read_back != Some(Some(*b"zz")) {
+        let _ = registry().unmount(&mount_handle, "/test_link");
+        return TestResult::Fail("write via orig not visible via alias (not one node)");
+    }
+
+    // Existing destination → Busy (EEXIST shape).
+    let r = registry().resolve_parent_absolute("/test_link/orig", |_fs, parent, leaf| {
+        poll_once(parent.link(leaf, "taken"))
+    });
+    if !matches!(r, Some(Some(Err(FsError::Busy)))) {
+        let _ = registry().unmount(&mount_handle, "/test_link");
+        return TestResult::Fail("link onto an existing name must be Busy");
+    }
+
+    // Missing source → NotFound.
+    let r = registry().resolve_parent_absolute("/test_link/ghost", |_fs, parent, leaf| {
+        poll_once(parent.link(leaf, "whatever"))
+    });
+    if !matches!(r, Some(Some(Err(FsError::NotFound)))) {
+        let _ = registry().unmount(&mount_handle, "/test_link");
+        return TestResult::Fail("link from a missing source must be NotFound");
+    }
+
+    let _ = registry().unmount(&mount_handle, "/test_link");
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_memfs_link_aliases_node);

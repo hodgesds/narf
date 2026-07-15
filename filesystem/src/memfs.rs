@@ -468,6 +468,32 @@ impl DirOps for MemDir {
             Ok(())
         })
     }
+
+    fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            // link(2) NEVER replaces an existing destination — EEXIST
+            // (unlike rename's atomic-replace contract above).
+            if g.contains_key(new_name) {
+                return Err(FsError::Busy);
+            }
+            // Cloning the Arc IS the hard link: both names now alias the
+            // one backing node, so a write through either is visible via
+            // the other, and the node lives until the last name (or open
+            // fd) drops it — exactly the inode refcount model. A symlink
+            // entry links the symlink itself (linkat(2) default without
+            // AT_SYMLINK_FOLLOW). Directories can't be hard-linked
+            // (Linux: EPERM).
+            let aliased = match g.get(old_name) {
+                None => return Err(FsError::NotFound),
+                Some(Entry::Dir(_)) => return Err(FsError::InvalidPath),
+                Some(Entry::File(f)) => Entry::File(Arc::clone(f)),
+                Some(Entry::Symlink(s)) => Entry::Symlink(Arc::clone(s)),
+            };
+            g.insert(new_name.to_string(), aliased);
+            Ok(())
+        })
+    }
 }
 
 /// Mutable in-memory FS. Mount-time seeding is supported via

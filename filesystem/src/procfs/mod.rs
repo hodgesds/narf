@@ -148,6 +148,80 @@ type CoredumpGetFn = fn(u64) -> u32;
 type CoredumpSetFn = fn(u64, u32) -> Result<(), FsError>;
 type OomScoreFn = fn(u64) -> i32;
 
+// ── /proc/<pid>/exe + cwd + root path hooks ─────────────────────
+//
+// Three magic symlinks [[proc-magic-links]] that lsof, readelf,
+// debuggers, and container runtimes rely on. All three are optional:
+// when the hook is not installed the link renders an empty target
+// (stat still reports S_IFLNK so the node type is correct).
+//
+// Linux refs:
+//   `fs/proc/base.c:proc_exe_link`   — exe path via mm->exe_file
+//   `fs/proc/base.c:proc_cwd_link`   — cwd from task->fs->pwd
+//   `fs/proc/base.c:proc_root_link`  — root from task->fs->root
+
+/// `pid -> absolute path of the task's executable` (e.g. `/bin/sh`).
+/// Wiring point: `sys_execve` already calls `set_proc_argv`; the kernel
+/// side should call `set_proc_exe_path(pid, path)` (or install the hook
+/// below) immediately after the new executable image is loaded.
+type ExePathFn = fn(u64) -> Option<String>;
+
+/// `pid -> absolute path of the task's current working directory`.
+type CwdPathFn = fn(u64) -> Option<String>;
+
+/// `pid -> absolute path of the task's root` (chroot/container root).
+type RootPathFn = fn(u64) -> Option<String>;
+
+static EXE_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
+static CWD_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
+static ROOT_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire the three magic-symlink path hooks.  Called once at boot after
+/// `install_proc_ext_hooks`.  All three are optional; pass a stub
+/// returning `None` for any path the kernel side does not yet track.
+///
+/// Kernel-side wiring note: see `/tmp/narf_fs_agent_notes.md` for
+/// exactly where each hook should be called.
+pub fn install_proc_path_hooks(exe: ExePathFn, cwd: CwdPathFn, root: RootPathFn) {
+    EXE_PATH_HOOK.store(exe as usize, Ordering::Release);
+    CWD_PATH_HOOK.store(cwd as usize, Ordering::Release);
+    ROOT_PATH_HOOK.store(root as usize, Ordering::Release);
+}
+
+/// Return the absolute exe path for `pid`, or `None` if no hook is installed
+/// or the task has no recorded executable path.
+pub(crate) fn hook_exe_path(pid: u64) -> Option<String> {
+    let v = EXE_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by install_proc_path_hooks as an ExePathFn fn-pointer; non-zero confirms it.
+    let f: ExePathFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+/// Return the absolute cwd path for `pid`, or `None` if no hook is installed.
+pub(crate) fn hook_cwd_path(pid: u64) -> Option<String> {
+    let v = CWD_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by install_proc_path_hooks as a CwdPathFn fn-pointer; non-zero confirms it.
+    let f: CwdPathFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+/// Return the absolute root path for `pid`, or `None` if no hook is installed.
+pub(crate) fn hook_root_path(pid: u64) -> Option<String> {
+    let v = ROOT_PATH_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by install_proc_path_hooks as a RootPathFn fn-pointer; non-zero confirms it.
+    let f: RootPathFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
 static FD_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
 static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -949,6 +1023,23 @@ impl DirOps for ProcPidDir {
                 DirEntry {
                     name: "cgroup",
                     file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "statm",
+                    file_type: FileType::File,
+                },
+                // Magic symlinks [[proc-magic-links]].
+                DirEntry {
+                    name: "exe",
+                    file_type: FileType::Symlink,
+                },
+                DirEntry {
+                    name: "cwd",
+                    file_type: FileType::Symlink,
+                },
+                DirEntry {
+                    name: "root",
+                    file_type: FileType::Symlink,
                 },
                 // user-ns id maps.
                 DirEntry {

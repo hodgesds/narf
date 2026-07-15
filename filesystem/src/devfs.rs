@@ -824,6 +824,66 @@ impl FileOps for DevConsole {
     }
 }
 
+// ── /dev/fd + /dev/stdin /dev/stdout /dev/stderr ─────────────────────
+//
+// Linux models these as symlinks that tools like `bash -c 'cat /dev/fd/0'`
+// and musl `fopen("/dev/stdin", …)` rely on.  They point into /proc/self:
+//
+//   /dev/fd      → /proc/self/fd          (directory symlink)
+//   /dev/stdin   → /proc/self/fd/0        (character-device symlink)
+//   /dev/stdout  → /proc/self/fd/1
+//   /dev/stderr  → /proc/self/fd/2
+//
+// Linux ref: `init/do_mounts.c` — the /dev/fd symlink is created by the
+// devtmpfs init path; /dev/stdin etc. live in glibc's `/lib/udev/rules.d`
+// or are created by `mknod` in the distro's initrd.  In any case the
+// standard targets are /proc/self/fd/*.
+//
+// [[devfs-symlinks]] The VFS walker in `resolve_async` follows any node
+// whose stat() reports `FileType::Symlink` by reading its target and
+// re-resolving, so a simple readable node with the right stat suffices.
+
+/// A static symlink inside /dev — stat() is S_IFLNK, read() returns the
+/// target string verbatim (the shape sys_readlink and resolve_async use).
+#[derive(Debug)]
+struct DevSymlink {
+    /// Symlink target (absolute path).
+    target: &'static str,
+}
+
+impl FileOps for DevSymlink {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let bytes = self.target.as_bytes();
+        let start = offset as usize;
+        let n = if start >= bytes.len() {
+            0
+        } else {
+            let avail = bytes.len() - start;
+            let n = avail.min(buf.len());
+            buf[..n].copy_from_slice(&bytes[start..start + n]);
+            n
+        };
+        Box::pin(async move { Ok(n) })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+    fn stat(&self) -> Stat {
+        // size MUST equal the target length: sys_readlink sizes its
+        // staging buffer from st.size so size:0 makes readlink return
+        // an empty string.  See the same note in ProcFdFile::stat.
+        Stat {
+            size: self.target.len() as u64,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 /// `DevFs` root directory — exposes `null` and `zero` as fixed
 /// children. No mutation surface (the trait defaults return
 /// `Unsupported` on every override-able method).
@@ -832,6 +892,19 @@ struct DevDir;
 impl DirOps for DevDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
+            // Static symlinks [[devfs-symlinks]].
+            "fd" => Some(Arc::new(DevSymlink {
+                target: "/proc/self/fd",
+            }) as Arc<dyn FileOps>),
+            "stdin" => Some(Arc::new(DevSymlink {
+                target: "/proc/self/fd/0",
+            }) as Arc<dyn FileOps>),
+            "stdout" => Some(Arc::new(DevSymlink {
+                target: "/proc/self/fd/1",
+            }) as Arc<dyn FileOps>),
+            "stderr" => Some(Arc::new(DevSymlink {
+                target: "/proc/self/fd/2",
+            }) as Arc<dyn FileOps>),
             "null" => Some(Arc::new(DevNull) as Arc<dyn FileOps>),
             "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
             "full" => Some(Arc::new(crate::devfs_misc::DevFull) as Arc<dyn FileOps>),
@@ -901,6 +974,23 @@ impl DirOps for DevDir {
         // satisfy `&'static str` so they don't appear here; use
         // `enumerate()` for a full readdir listing.
         const ENTRIES: &[DirEntry] = &[
+            // Symlinks [[devfs-symlinks]].
+            DirEntry {
+                name: "fd",
+                file_type: FileType::Symlink,
+            },
+            DirEntry {
+                name: "stdin",
+                file_type: FileType::Symlink,
+            },
+            DirEntry {
+                name: "stdout",
+                file_type: FileType::Symlink,
+            },
+            DirEntry {
+                name: "stderr",
+                file_type: FileType::Symlink,
+            },
             DirEntry {
                 name: "null",
                 file_type: FileType::Special,
@@ -990,6 +1080,11 @@ impl DirOps for DevDir {
         // devices that share a name with a static entry are skipped
         // (static entry wins, matching Linux's static-node precedence).
         let static_entries: &[(&str, FileType)] = &[
+            // Symlinks [[devfs-symlinks]].
+            ("fd", FileType::Symlink),
+            ("stdin", FileType::Symlink),
+            ("stdout", FileType::Symlink),
+            ("stderr", FileType::Symlink),
             ("null", FileType::Special),
             ("zero", FileType::Special),
             ("full", FileType::Special),
@@ -1080,3 +1175,149 @@ pub fn mount_default() {
     let auth = crate::bootstrap_mount_authority();
     let _ = crate::registry().mount(&auth, "/dev", DevFs::new());
 }
+
+// ── DevSymlink + /dev/fd smokes ───────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// Poll one future exactly once using a no-op waker (same helper
+/// pattern as `procfs::poll_once`, duplicated here to avoid an
+/// inter-module `pub(crate)` dependency).
+fn poll_once_devfs<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|data| RawWaker::new(data, &VTABLE), |_| {}, |_| {}, |_| {});
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: VTABLE is a valid no-op vtable; the waker never outlives this stack frame.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = core::pin::pin!(fut);
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+/// Smoke: /dev/fd lookup returns a Symlink-typed node.
+fn smoke_dev_fd_is_symlink() -> TestResult {
+    let dir = DevDir;
+    match dir.lookup("fd") {
+        Some(f) if f.stat().mode.file_type == FileType::Symlink => TestResult::Pass,
+        Some(_) => TestResult::Fail("/dev/fd not reported as a symlink"),
+        None => TestResult::Fail("/dev/fd lookup returned None"),
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_fd_is_symlink);
+
+/// Smoke: /dev/stdin resolves to /proc/self/fd/0.
+fn smoke_dev_stdin_target() -> TestResult {
+    let dir = DevDir;
+    let node = match dir.lookup("stdin") {
+        Some(n) => n,
+        None => return TestResult::Fail("/dev/stdin lookup returned None"),
+    };
+    if node.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("/dev/stdin not a symlink");
+    }
+    let mut buf = [0u8; 64];
+    match poll_once_devfs(node.read(0, &mut buf)) {
+        Some(Ok(n)) if n > 0 => {
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+            if s == "/proc/self/fd/0" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("/dev/stdin target is not /proc/self/fd/0")
+            }
+        }
+        _ => TestResult::Fail("/dev/stdin read failed"),
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_stdin_target);
+
+/// Smoke: /dev/stdout resolves to /proc/self/fd/1.
+fn smoke_dev_stdout_target() -> TestResult {
+    let dir = DevDir;
+    let node = match dir.lookup("stdout") {
+        Some(n) => n,
+        None => return TestResult::Fail("/dev/stdout lookup returned None"),
+    };
+    let mut buf = [0u8; 64];
+    match poll_once_devfs(node.read(0, &mut buf)) {
+        Some(Ok(n)) if n > 0 => {
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+            if s == "/proc/self/fd/1" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("/dev/stdout target is not /proc/self/fd/1")
+            }
+        }
+        _ => TestResult::Fail("/dev/stdout read failed"),
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_stdout_target);
+
+/// Smoke: /dev/stderr resolves to /proc/self/fd/2.
+fn smoke_dev_stderr_target() -> TestResult {
+    let dir = DevDir;
+    let node = match dir.lookup("stderr") {
+        Some(n) => n,
+        None => return TestResult::Fail("/dev/stderr lookup returned None"),
+    };
+    let mut buf = [0u8; 64];
+    match poll_once_devfs(node.read(0, &mut buf)) {
+        Some(Ok(n)) if n > 0 => {
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+            if s == "/proc/self/fd/2" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("/dev/stderr target is not /proc/self/fd/2")
+            }
+        }
+        _ => TestResult::Fail("/dev/stderr read failed"),
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_stderr_target);
+
+/// Smoke: /dev/fd stat().size == len("/proc/self/fd") = 13.
+fn smoke_dev_fd_stat_size() -> TestResult {
+    let dir = DevDir;
+    let node = match dir.lookup("fd") {
+        Some(n) => n,
+        None => return TestResult::Fail("/dev/fd lookup returned None"),
+    };
+    let expected = "/proc/self/fd".len() as u64;
+    let actual = node.stat().size;
+    if actual == expected {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("/dev/fd stat().size does not match target length")
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_fd_stat_size);
+
+/// Smoke: iter() lists fd/stdin/stdout/stderr as Symlink entries.
+fn smoke_dev_dir_iter_contains_symlinks() -> TestResult {
+    let dir = DevDir;
+    let mut found_fd = false;
+    let mut found_stdin = false;
+    let mut found_stdout = false;
+    let mut found_stderr = false;
+    for entry in dir.iter() {
+        if entry.file_type != FileType::Symlink {
+            continue;
+        }
+        match entry.name {
+            "fd" => found_fd = true,
+            "stdin" => found_stdin = true,
+            "stdout" => found_stdout = true,
+            "stderr" => found_stderr = true,
+            _ => {}
+        }
+    }
+    if found_fd && found_stdin && found_stdout && found_stderr {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("iter() missing one or more of fd/stdin/stdout/stderr symlinks")
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_dir_iter_contains_symlinks);

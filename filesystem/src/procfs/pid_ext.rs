@@ -25,9 +25,9 @@ use core::fmt::Write as _;
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
-    hook_auxv, hook_coredump_get, hook_coredump_set, hook_environ, hook_fd_path, hook_nice,
-    hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits, slice_read, task_info,
-    ProcDirMarker,
+    hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
+    hook_fd_path, hook_nice, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
+    hook_root_path, slice_read, task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -51,6 +51,18 @@ pub enum PidExtField {
     Mountstats,
     Personality,
     Cgroup,
+    /// `/proc/<pid>/statm` — 7-field page-count memory summary.
+    /// Linux ref: `fs/proc/array.c:proc_pid_statm`.
+    Statm,
+    /// `/proc/<pid>/exe` — magic symlink to the task's executable image.
+    /// Linux ref: `fs/proc/base.c:proc_exe_link`.
+    Exe,
+    /// `/proc/<pid>/cwd` — magic symlink to the task's current working dir.
+    /// Linux ref: `fs/proc/base.c:proc_cwd_link`.
+    Cwd,
+    /// `/proc/<pid>/root` — magic symlink to the task's root (chroot/ns root).
+    /// Linux ref: `fs/proc/base.c:proc_root_link`.
+    Root,
 }
 
 /// A single extended per-pid file with bound `pid`.
@@ -102,6 +114,52 @@ impl FileOps for PidExtFile {
         })
     }
     fn stat(&self) -> Stat {
+        // Magic symlinks [[proc-magic-links]] must report S_IFLNK so that
+        // sys_readlink and the VFS walker treat them correctly.  size must
+        // equal the target length: sys_readlink sizes its staging buffer from
+        // st.size, so size:0 would make readlink return an empty string.
+        match self.field {
+            PidExtField::Exe => {
+                let size = hook_exe_path(self.pid).map(|p| p.len()).unwrap_or(0) as u64;
+                return Stat {
+                    size,
+                    blocks: 0,
+                    mode: Mode {
+                        file_type: FileType::Symlink,
+                        perms: 0o777,
+                    },
+                    mtime_cycles: 0,
+                };
+            }
+            PidExtField::Cwd => {
+                let size = hook_cwd_path(self.pid).map(|p| p.len()).unwrap_or(0) as u64;
+                return Stat {
+                    size,
+                    blocks: 0,
+                    mode: Mode {
+                        file_type: FileType::Symlink,
+                        perms: 0o777,
+                    },
+                    mtime_cycles: 0,
+                };
+            }
+            PidExtField::Root => {
+                // Default size 1, matching read()'s "/" fallback for a
+                // task with no chroot — a 0 here makes readlink_impl size
+                // a 0-byte staging buffer and return an empty target.
+                let size = hook_root_path(self.pid).map(|p| p.len()).unwrap_or(1) as u64;
+                return Stat {
+                    size,
+                    blocks: 0,
+                    mode: Mode {
+                        file_type: FileType::Symlink,
+                        perms: 0o777,
+                    },
+                    mtime_cycles: 0,
+                };
+            }
+            _ => {}
+        }
         let writable = matches!(
             self.field,
             PidExtField::OomScoreAdj | PidExtField::CoredumpFilter
@@ -140,6 +198,11 @@ pub fn lookup_pid_ext(pid: u64, name: &str) -> Option<PidExtFile> {
         "mountstats" => PidExtField::Mountstats,
         "personality" => PidExtField::Personality,
         "cgroup" => PidExtField::Cgroup,
+        "statm" => PidExtField::Statm,
+        // Magic symlinks [[proc-magic-links]].
+        "exe" => PidExtField::Exe,
+        "cwd" => PidExtField::Cwd,
+        "root" => PidExtField::Root,
         _ => return None,
     };
     Some(PidExtFile { pid, field })
@@ -173,6 +236,15 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
         PidExtField::Mountinfo => render_mountinfo(pid).into_bytes(),
         PidExtField::Mountstats => render_mountstats(pid).into_bytes(),
         PidExtField::Personality => b"00000000\n".to_vec(),
+        PidExtField::Statm => render_statm(pid).into_bytes(),
+        // Magic symlinks — read() returns the target path verbatim so
+        // that sys_readlink (which calls file.read()) gets the string.
+        // [[proc-magic-links]] stat() reports S_IFLNK (see PidExtFile::stat).
+        PidExtField::Exe => hook_exe_path(pid).unwrap_or_default().into_bytes(),
+        PidExtField::Cwd => hook_cwd_path(pid).unwrap_or_default().into_bytes(),
+        PidExtField::Root => hook_root_path(pid)
+            .unwrap_or_else(|| "/".to_string())
+            .into_bytes(),
         PidExtField::Cgroup => {
             // Linux v2 shape: "0::<path>\n". With the cgroup feature
             // this reports the process's real cgroup; otherwise the
@@ -439,6 +511,80 @@ fn render_mountstats(_pid: u64) -> String {
         let _ = writeln!(s, "device rootfs mounted on / with fstype rootfs");
     }
     s
+}
+
+/// `/proc/<pid>/statm` — seven space-separated page-count fields.
+///
+/// Linux format (fs/proc/array.c:proc_pid_statm):
+///   `size resident shared text lib data dt\n`
+///
+/// Field meanings (all in pages, page = 4 KiB):
+///   size     — total virtual memory pages (VmSize / PAGE_SIZE)
+///   resident — resident set pages (VmRSS / PAGE_SIZE)
+///   shared   — shared pages (file-backed resident pages)
+///   text     — text (code) pages
+///   lib      — library pages (always 0 in Linux ≥2.6)
+///   data     — data + stack pages
+///   dt       — dirty pages (always 0 in Linux ≥2.6)
+///
+/// We derive `size` from the sum of all VMA spans and `resident` from
+/// the anonymous + file-backed extents (same denominator — the kernel
+/// tracks these separately only with a page-table walk, which NARF
+/// doesn't have yet). Fields without a data source are zeroed with a
+/// TODO comment, matching the style of `render_io` and other partial
+/// files in this module.
+///
+/// Linux ref: `fs/proc/array.c:proc_pid_statm`.
+fn render_statm(pid: u64) -> String {
+    const PAGE_SIZE: u64 = 4096;
+    let info = task_info(pid);
+    // size: sum of all mapped VMA spans, in pages.
+    let size_pages = info
+        .as_ref()
+        .map(|i| {
+            i.vmas
+                .iter()
+                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    // resident: approximated as equal to size (no page-table walk yet).
+    // TODO: wire a per-task RSS counter from the page-fault path once
+    // narf_memory exposes per-task resident-set accounting.
+    let resident_pages = size_pages;
+    // shared: file-backed resident pages — no data source yet.
+    // TODO: populate from the VMA `shared` flag once page-cache RSS is tracked.
+    let shared_pages: u64 = 0;
+    // text: executable VMA pages.
+    let text_pages = info
+        .as_ref()
+        .map(|i| {
+            i.vmas
+                .iter()
+                .filter(|v| v.executable && !v.writable)
+                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    // lib: always 0 on Linux ≥2.6.
+    let lib_pages: u64 = 0;
+    // data: writable non-executable VMA pages (heap + stack + data).
+    let data_pages = info
+        .as_ref()
+        .map(|i| {
+            i.vmas
+                .iter()
+                .filter(|v| v.writable && !v.executable)
+                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+    // dt: dirty pages — always 0 on Linux ≥2.6.
+    let dt_pages: u64 = 0;
+    format!(
+        "{} {} {} {} {} {} {}\n",
+        size_pages, resident_pages, shared_pages, text_pages, lib_pages, data_pages, dt_pages
+    )
 }
 
 // ── /proc/<pid>/fd/<n> directory ────────────────────────────────────
@@ -1009,3 +1155,112 @@ fn smoke_fdinfo_has_pos_and_flags() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_fdinfo_has_pos_and_flags);
+
+// ── statm + magic symlink smokes ────────────────────────────────────────
+
+/// Smoke: `render_statm` produces exactly 7 space-separated fields + newline.
+fn smoke_statm_has_seven_fields() -> TestResult {
+    let out = render_statm(u64::MAX); // no task-info hook → all zeros
+    let trimmed = out.trim_end_matches('\n');
+    let fields: alloc::vec::Vec<&str> = trimmed.split(' ').collect();
+    if fields.len() == 7 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("render_statm must produce exactly 7 space-separated fields")
+    }
+}
+kernel_test_in!("filesystem/procfs/pid_ext", smoke_statm_has_seven_fields);
+
+/// Smoke: all statm fields are valid decimal integers ≥ 0.
+fn smoke_statm_fields_are_decimal() -> TestResult {
+    let out = render_statm(u64::MAX);
+    let trimmed = out.trim_end_matches('\n');
+    for field in trimmed.split(' ') {
+        if field.parse::<u64>().is_err() {
+            return TestResult::Fail("render_statm field is not a non-negative integer");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs/pid_ext", smoke_statm_fields_are_decimal);
+
+/// Smoke: pid dir listing contains exe, cwd, root, statm entries.
+fn smoke_pid_ext_lookup_magic_entries() -> TestResult {
+    // lookup_pid_ext must recognise all four new names.
+    for name in &["exe", "cwd", "root", "statm"] {
+        if lookup_pid_ext(1, name).is_none() {
+            return TestResult::Fail("lookup_pid_ext missing magic entry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_pid_ext_lookup_magic_entries
+);
+
+/// Smoke: exe/cwd/root stat() reports FileType::Symlink.
+fn smoke_magic_links_stat_as_symlink() -> TestResult {
+    for field in &[PidExtField::Exe, PidExtField::Cwd, PidExtField::Root] {
+        let f = PidExtFile {
+            pid: 1,
+            field: *field,
+        };
+        if f.stat().mode.file_type != FileType::Symlink {
+            return TestResult::Fail("magic link must stat as S_IFLNK");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_magic_links_stat_as_symlink
+);
+
+/// Smoke: exe/cwd read() return empty bytes when no hook is installed
+/// (hook_exe_path / hook_cwd_path return None → unwrap_or_default → "").
+fn smoke_magic_links_empty_without_hook() -> TestResult {
+    use super::poll_once;
+    for field in &[PidExtField::Exe, PidExtField::Cwd] {
+        let f = PidExtFile {
+            pid: 1,
+            field: *field,
+        };
+        let mut buf = [0u8; 64];
+        match poll_once(f.read(0, &mut buf)) {
+            Some(Ok(0)) => {} // expected: empty target
+            Some(Ok(_)) => return TestResult::Fail("magic link without hook should return empty"),
+            _ => return TestResult::Fail("magic link read failed"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_magic_links_empty_without_hook
+);
+
+/// Smoke: root read() returns "/" when no hook installed (default fallback).
+fn smoke_root_link_defaults_to_slash() -> TestResult {
+    use super::poll_once;
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::Root,
+    };
+    let mut buf = [0u8; 8];
+    match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) if n > 0 => {
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+            if s == "/" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("root link without hook should default to '/'")
+            }
+        }
+        _ => TestResult::Fail("root link read failed"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_root_link_defaults_to_slash
+);
