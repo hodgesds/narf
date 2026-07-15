@@ -6435,14 +6435,18 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
         return TestResult::Fail("getrusage did not return OK");
     }
-    // ru_utime.tv_sec / tv_usec from monotonic_ns; everything else
-    // zero.
+    // ru_utime (0-1), ru_stime (2-3, real since the kernel-time
+    // bracket landed), and ru_maxrss (4) may all be non-zero now;
+    // the 13 tail fields stay zero.
     if buf[0] < 0 || buf[1] < 0 {
         return TestResult::Fail("ru_utime negative");
     }
-    for &field in &buf[2..18] {
+    if buf[2] < 0 || buf[3] < 0 || buf[4] < 0 {
+        return TestResult::Fail("ru_stime/ru_maxrss negative");
+    }
+    for &field in &buf[5..18] {
         if field != 0 {
-            return TestResult::Fail("non-utime field of rusage was not zero");
+            return TestResult::Fail("tail field of rusage was not zero");
         }
     }
 

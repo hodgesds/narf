@@ -10773,7 +10773,7 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
     // Both are consumed unconditionally so nothing goes stale.
     let rusage_ptr = take_wait_rusage_ptr(current_task_id());
     let snap = take_exit_rusage(reaped as u64);
-    if !is_waitid && rusage_ptr != 0 {
+    if rusage_ptr != 0 {
         let (ns, kb) = snap.unwrap_or((0, 0));
         write_rusage_utime(rusage_ptr, ns, kb);
     }
@@ -10903,6 +10903,11 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         }
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
         unsafe {
+            // Mark the park so the kernel-time bracket skips this
+            // syscall's fold (see UserTaskCtx::parked_in_syscall).
+            (*uctx)
+                .parked_in_syscall
+                .store(true, core::sync::atomic::Ordering::Release);
             narf_scheduler::stackful::yield_current_stackful();
         }
     }
@@ -10987,6 +10992,7 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
     let id = args.arg1 as i64;
     let infop = args.arg2;
     let options = args.arg3 as u32;
+    let rusage_ptr = args.arg4; // Linux waitid's 5th arg — glibc's wait4 shim uses it
     const P_ALL: u32 = 0;
     const P_PID: u32 = 1;
     const P_PGID: u32 = 2;
@@ -11043,6 +11049,15 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
             // range-validates the 128-byte write.
             let _ = unsafe { copy_to_user(infop, &si) };
         }
+        // Charge the child's CPU to the parent (this path skipped the
+        // fold wait4 does — RUSAGE_CHILDREN never saw waitid-reaped
+        // children) and fill the 5th-arg rusage like wait4.
+        let child_cpu_ns = account_reaped_child(parent, child_pid);
+        let snap = take_exit_rusage(child_pid);
+        if rusage_ptr != 0 {
+            let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
+            write_rusage_utime(rusage_ptr, ns, kb);
+        }
         release_reaped_task(child_pid);
         crate::release_pid(crate::ProcessId(child_pid));
         // Reaped — drop the parent record so wait4's ECHILD check is accurate.
@@ -11069,10 +11084,9 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
         // state before the yield hook hands the task to the executor.
         unsafe {
             let uc = &*uctx;
-            // Invalidate any stale wait4 rusage pointer — waitid's
-            // rusage arg isn't wired, but a leftover slot from an
-            // aborted wait4 must never be written through here.
-            set_wait_rusage_ptr(current_task_id(), 0);
+            // Stage waitid's own 5th-arg rusage pointer (also
+            // invalidates any stale wait4 slot).
+            set_wait_rusage_ptr(current_task_id(), rusage_ptr);
             uc.wait_child_is_waitid
                 .store(true, core::sync::atomic::Ordering::Release);
             uc.wait_child_want_pid
@@ -11319,6 +11333,9 @@ fn release_task_tables(tid: u64) {
         m.remove(&tid);
     }
     if let Some(m) = TASK_START_NS.lock().as_mut() {
+        m.remove(&tid);
+    }
+    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
         m.remove(&tid);
     }
     // POSIX record locks: drop everything this task still holds, or a
@@ -13496,16 +13513,17 @@ fn sys_times(ctx: &mut dyn TrapContext) {
     let uptime_ticks: i64 = (narf_scheduler::narf_time::monotonic_ns() / ns_per_tick) as i64;
     let task = current_task_id();
     let utime_ticks: i64 = (cpu_time_ns_of(task) / ns_per_tick) as i64;
+    let stime_ticks: i64 = (kern_time_ns_of(task) / ns_per_tick) as i64;
     let cutime_ticks: i64 = (child_cpu_time_ns_of(task) / ns_per_tick) as i64;
     if out_ptr != 0 {
         // Build the tms struct (four i64s: utime, stime, cutime, cstime)
         // in kernel memory, then copy to user under the SMAP bracket.
-        // We don't split user/system time — everything is charged as
-        // utime/cutime, leaving stime/cstime zero.
+        // stime = in-syscall time (kernel_syscall_entry's bracket);
+        // cstime stays 0 (the children fold is one aggregate number).
         let mut kbuf = [0u8; 32];
         kbuf[..8].copy_from_slice(&utime_ticks.to_ne_bytes()); // utime
+        kbuf[8..16].copy_from_slice(&stime_ticks.to_ne_bytes()); // stime
         kbuf[16..24].copy_from_slice(&cutime_ticks.to_ne_bytes()); // cutime
-                                                                   // stime, cstime already zero.
                                                                    // SAFETY: `out_ptr` is the user `struct tms` pointer (non-zero, checked);
                                                                    // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
                                                                    // SAFETY: Valid memory or trusted environment
@@ -13568,7 +13586,17 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let mut kbuf = [0u8; RUSAGE_TOTAL_I64S * 8];
     kbuf[..8].copy_from_slice(&utime_sec.to_ne_bytes()); // ru_utime.tv_sec
     kbuf[8..16].copy_from_slice(&utime_usec.to_ne_bytes()); // ru_utime.tv_usec
-                                                            // ru_stime (16..32) stays 0 — no kernel-time split.
+                                                            // ru_stime: in-syscall time (RUSAGE_SELF; the children aggregate is
+                                                            // utime-only — TASK_CHILD_CPU_NS folds one number).
+    let stime_ns: u64 = if who == RUSAGE_CHILDREN {
+        0
+    } else {
+        kern_time_ns_of(task)
+    };
+    let stime_sec = (stime_ns / 1_000_000_000) as i64;
+    let stime_usec = ((stime_ns % 1_000_000_000) / 1_000) as i64;
+    kbuf[16..24].copy_from_slice(&stime_sec.to_ne_bytes()); // ru_stime.tv_sec
+    kbuf[24..32].copy_from_slice(&stime_usec.to_ne_bytes()); // ru_stime.tv_usec
     kbuf[32..40].copy_from_slice(&maxrss_kb.to_ne_bytes()); // ru_maxrss (KB)
                                                             // SAFETY: `out` is the user `struct rusage` pointer (non-zero, checked above);
                                                             // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
@@ -16891,6 +16919,38 @@ pub fn account_user_cpu_ns(delta_ns: u64) {
     *e = e.saturating_add(delta_ns);
 }
 
+/// Time this task has spent inside syscall handlers (ns) — the
+/// ru_stime / tms_stime / stat-field-15 source. Folded by
+/// `kernel_syscall_entry`'s dispatch bracket; same shape and cost as
+/// the user-time fold above (one map lock per syscall).
+static TASK_KERN_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Fold a completed syscall's handler duration into the current task's
+/// kernel-time accumulator. Called from `kernel_syscall_entry`.
+pub fn account_kernel_cpu_ns(delta_ns: u64) {
+    if delta_ns == 0 {
+        return;
+    }
+    let task = current_task_id();
+    if task == 0 {
+        return;
+    }
+    let mut g = TASK_KERN_NS.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let e = m.entry(task).or_insert(0);
+    *e = e.saturating_add(delta_ns);
+}
+
+/// This task's accumulated in-syscall (kernel) CPU time (ns).
+pub fn kern_time_ns_of(task: u64) -> u64 {
+    TASK_KERN_NS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0)
+}
+
 /// Test hook: account `delta_ns` to an arbitrary task (the production
 /// path only ever charges the currently-running task). Lets the ABI test
 /// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
@@ -17532,7 +17592,9 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
                 readable: prot.contains(RegionPerms::READ),
                 writable: prot.contains(RegionPerms::WRITE),
                 executable: prot.contains(RegionPerms::EXEC),
-                shared: false,
+                // From the UN-stripped perms — prot_only() drops the
+                // SHARED bit. Feeds maps' s/p column + statm's shared.
+                shared: r.perms.contains(RegionPerms::SHARED),
                 label,
             });
         }
@@ -17554,6 +17616,7 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         pgrp: read_pgid(tid),
         session: read_sid(tid),
         utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
+        stime_ticks: kern_time_ns_of(tid) / NS_PER_TICK,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
     })
 }

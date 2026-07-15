@@ -3096,7 +3096,31 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
                 a.arg3,
             );
         }
+        // Kernel-time accounting (getrusage ru_stime / times tms_stime /
+        // /proc stat field 15): bracket the handler with two monotonic
+        // reads. A handler that parks/longjmps out (yield, blocking
+        // wait, exit) never reaches the fold — correct, since blocked
+        // time is not CPU time; only its pre-park work is undercounted.
+        let t0 = narf_scheduler::narf_time::monotonic_ns();
         table.dispatch_ctx_versioned(variant, version, ctx);
+        // Own-stack parks RETURN through this point after arbitrarily
+        // long sleeps — the parked flag (set at every kernel_switch
+        // yield) tells us the measured span includes off-CPU time, so
+        // skip the fold (the longjmp park paths never get here at all;
+        // skipping keeps both park styles consistently undercounted).
+        let parked = crate::user_task::current_user_task()
+            .map(|u| {
+                // SAFETY: in-flight task's poller-pinned UserTaskCtx.
+                unsafe {
+                    (*u).parked_in_syscall
+                        .swap(false, core::sync::atomic::Ordering::AcqRel)
+                }
+            })
+            .unwrap_or(false);
+        if !parked {
+            let dt = narf_scheduler::narf_time::monotonic_ns().saturating_sub(t0);
+            crate::handlers::account_kernel_cpu_ns(dt);
+        }
     } else {
         ctx.set_return(SyscallReturn::invalid_op());
     }

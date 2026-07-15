@@ -182,6 +182,14 @@ pub struct UserTaskCtx {
     /// on a successful reap. `0` = caller passed NULL (discard).
     /// For a `waitid(2)` wait this instead holds the `siginfo_t*`.
     pub wait_child_status_ptr: AtomicU64,
+    /// True when this task parked (own-stack kernel_switch yield) at
+    /// some point inside the CURRENT syscall. Under own-stack a parked
+    /// syscall RETURNS through `kernel_syscall_entry`'s kernel-time
+    /// bracket, which would otherwise fold the entire parked span —
+    /// seconds of wall-clock — into stime. The bracket swaps this flag
+    /// and skips the fold when set (matching the longjmp paths, which
+    /// never reach the fold at all).
+    pub parked_in_syscall: core::sync::atomic::AtomicBool,
 
     /// Distinguishes `waitid(2)` from `wait4(2)` for the blocking
     /// path: when set, the reap writes a `siginfo_t` to
@@ -253,6 +261,7 @@ impl UserTaskCtx {
             wait_child_pending: AtomicBool::new(false),
             wait_child_want_pid: AtomicI64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
+            parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
@@ -635,6 +644,7 @@ pub fn own_stack_park() {
         }
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
         unsafe {
+            (*uctx).parked_in_syscall.store(true, Ordering::Release);
             narf_scheduler::stackful::yield_current_stackful();
         }
         // ── Resumed via kernel_switch (NOT a re-poll) ── re-publish this task's
