@@ -178,7 +178,7 @@ pub fn drop_io_waiter(task_id: u64) {
 /// instead of re-parking on the stale deadline.
 /// Clear a task's finite sleep deadline (so its re-poll re-checks
 /// readiness) and fire its waker.
-fn wake_one(task_id: u64, w: core::task::Waker) {
+pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
     // Deref under the registry lock (see `with_user_task_ctx`) so a concurrent
     // task-exit + box-drop can't free the ctx mid-deref.
     crate::user_task::with_user_task_ctx(task_id, |uctx| {
@@ -1971,6 +1971,19 @@ fn flock_size() -> usize {
     core::mem::size_of::<UFlock>()
 }
 
+/// Clear the current task's F_SETLKW park routing (uctx.flock_key).
+/// Every fcntl lock-path exit calls this so a stale key can't make a
+/// later unrelated park register on the flock waiter queue.
+fn clear_flock_routing() {
+    if let Some(u) = crate::user_task::current_user_task() {
+        // SAFETY: in-flight task's poller-pinned UserTaskCtx.
+        unsafe {
+            (*u).flock_key
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -2101,13 +2114,34 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
             }
             // F_SETLK / F_SETLKW.
             match crate::fd::locks::try_set(key, req) {
-                Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+                Ok(()) => {
+                    // A re-executed SETLKW arrives here with the uctx
+                    // routing still set — clear it so a later unrelated
+                    // park can't spuriously register on the flock queue.
+                    clear_flock_routing();
+                    if uf.l_type == crate::fd::locks::F_UNLCK {
+                        // A range was released — wake every parked
+                        // F_SETLKW waiter on this file so it retries NOW
+                        // instead of riding out its 1 ms backstop. Fired
+                        // after the waiter lock drops (drain collects).
+                        for (tid, w) in crate::fd::locks::drain_waiters(key) {
+                            wake_one(tid, w);
+                        }
+                    } else {
+                        // Acquire (possibly a re-executed SETLKW that just
+                        // won): retire any waiter entry left from the park.
+                        crate::fd::locks::drop_waiter(key, task);
+                    }
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
                 Err(_) if cmd == F_SETLKW => {
                     // Blocking acquire. Linux F_SETLKW is signal-
                     // interruptible (EINTR) — check before parking so a
                     // pending signal breaks the wait instead of being
                     // starved by the retry loop.
                     if is_signal_pending(task) {
+                        crate::fd::locks::drop_waiter(key, task);
+                        clear_flock_routing();
                         ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
                         return;
                     }
@@ -2140,6 +2174,11 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                             // as the blocking pipe-read park).
                             uc.futex_uaddr
                                 .store(0, core::sync::atomic::Ordering::Release);
+                            // Route the park to the lock key's waiter queue
+                            // (park_should_block registers the waker there),
+                            // so the holder's unlock wakes us immediately.
+                            uc.flock_key
+                                .store(key, core::sync::atomic::Ordering::Release);
                             uc.sleep_deadline_ns
                                 .store(dl, core::sync::atomic::Ordering::Release);
                             ctx.save_user_state(uc.state.get() as *mut u8);
@@ -2152,6 +2191,8 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         }
                         // unreachable when parked
                     }
+                    crate::fd::locks::drop_waiter(key, task);
+                    clear_flock_routing();
                     ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                 }
                 Err(_) => {
@@ -11338,10 +11379,17 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_KERN_NS.lock().as_mut() {
         m.remove(&tid);
     }
-    // POSIX record locks: drop everything this task still holds, or a
-    // crashed holder pins every F_SETLKW waiter forever (the blocking
-    // retry loop only ends when the conflict clears).
-    crate::fd::locks::release_owner(tid);
+    // POSIX record locks: normally already drained (fd::detach runs
+    // first in exit-observer order and wakes the waiters); this second
+    // pass is the backstop for any path that tears down tables without
+    // detaching fds. Also retire this task's own waiter entries (it
+    // may die while parked on someone else's lock).
+    for key in crate::fd::locks::release_owner(tid) {
+        for (waiter, w) in crate::fd::locks::drain_waiters(key) {
+            wake_one(waiter, w);
+        }
+    }
+    crate::fd::locks::drop_waiter_owner(tid);
     if let Some(m) = PROC_ENVIRON.lock().as_mut() {
         m.remove(&tid);
     }

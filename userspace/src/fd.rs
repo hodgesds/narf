@@ -729,9 +729,17 @@ pub fn detach(task_id: u64) {
         map.remove(&task_id);
     }
     // Drop any advisory POSIX locks the task held so its peers can
-    // make progress on shared inodes.
+    // make progress on shared inodes — and wake their F_SETLKW waiters
+    // NOW. This is the FIRST of the two exit-path release_owner calls
+    // (release_task_tables runs after and finds the table already
+    // drained), so the immediate wake must fire from here or a waiter
+    // blocked on a dead holder only gets its 1 ms backstop.
     #[cfg(feature = "linux-compat")]
-    locks::release_owner(task_id);
+    for key in locks::release_owner(task_id) {
+        for (waiter, w) in locks::drain_waiters(key) {
+            crate::handlers::wake_one(waiter, w);
+        }
+    }
 }
 
 /// Test/reset hook — wipe every per-task table. Lets independent
@@ -845,21 +853,83 @@ pub mod locks {
     }
 
     /// Drop every lock owned by `owner`. Call on task exit so leaked
-    /// locks don't pin out other tasks forever.
-    pub fn release_owner(owner: u64) {
+    /// locks don't pin out other tasks forever. Returns the keys that
+    /// actually lost a lock — the caller wakes their F_SETLKW waiters
+    /// (the wake needs `wake_one`, which lives with the handlers).
+    pub fn release_owner(owner: u64) -> Vec<usize> {
         let mut g = TABLE.lock();
         let map = match g.as_mut() {
             Some(m) => m,
-            None => return,
+            None => return Vec::new(),
         };
-        for bucket in map.values_mut() {
+        let mut touched = Vec::new();
+        for (key, bucket) in map.iter_mut() {
+            let before = bucket.len();
             bucket.retain(|l| l.owner != owner);
+            if bucket.len() != before {
+                touched.push(*key);
+            }
         }
         map.retain(|_, v| !v.is_empty());
+        touched
+    }
+
+    // ── F_SETLKW waiters ─────────────────────────────────────────────
+    //
+    // key → (tid → waker). Registered by `park_should_block` while a
+    // task is parked in a blocked F_SETLKW (the uctx `flock_key` field
+    // routes it here, exactly like `futex_uaddr` routes to the futex
+    // queue); drained-and-woken by the unlock paths so a waiter retries
+    // IMMEDIATELY instead of riding out its 1 ms wheel backstop. The
+    // backstop stays armed — it bounds the register-vs-unlock race
+    // window to one period, so a missed wake degrades, never wedges.
+    static WAITERS: IrqSafeSpinLock<Option<BTreeMap<usize, BTreeMap<u64, core::task::Waker>>>> =
+        IrqSafeSpinLock::new(None);
+
+    pub fn register_waiter(key: usize, tid: u64, waker: core::task::Waker) {
+        let mut g = WAITERS.lock();
+        g.get_or_insert_with(BTreeMap::new)
+            .entry(key)
+            .or_default()
+            .insert(tid, waker);
+    }
+
+    pub fn drop_waiter(key: usize, tid: u64) {
+        let mut g = WAITERS.lock();
+        if let Some(m) = g.as_mut() {
+            if let Some(set) = m.get_mut(&key) {
+                set.remove(&tid);
+                if set.is_empty() {
+                    m.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Drop `tid` from every key's waiter set (task exit).
+    pub fn drop_waiter_owner(tid: u64) {
+        let mut g = WAITERS.lock();
+        if let Some(m) = g.as_mut() {
+            for set in m.values_mut() {
+                set.remove(&tid);
+            }
+            m.retain(|_, s| !s.is_empty());
+        }
+    }
+
+    /// Take every waiter parked on `key`. The caller fires the wakes
+    /// AFTER this lock is dropped (wake() may re-enter the scheduler).
+    pub fn drain_waiters(key: usize) -> Vec<(u64, core::task::Waker)> {
+        let mut g = WAITERS.lock();
+        g.as_mut()
+            .and_then(|m| m.remove(&key))
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default()
     }
 
     #[doc(hidden)]
     pub fn __test_reset() {
         *TABLE.lock() = Some(BTreeMap::new());
+        *WAITERS.lock() = Some(BTreeMap::new());
     }
 }

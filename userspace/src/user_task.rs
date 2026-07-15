@@ -190,6 +190,13 @@ pub struct UserTaskCtx {
     /// and skips the fold when set (matching the longjmp paths, which
     /// never reach the fold at all).
     pub parked_in_syscall: core::sync::atomic::AtomicBool,
+    /// Non-zero while this task is parked in a blocked F_SETLKW: the
+    /// lock-table key it waits on. `park_should_block` registers the
+    /// task's waker on `fd::locks`' per-key waiter queue through this,
+    /// exactly like `futex_uaddr` routes to the futex queue, so an
+    /// unlock wakes the waiter immediately instead of after its 1 ms
+    /// wheel backstop.
+    pub flock_key: core::sync::atomic::AtomicUsize,
 
     /// Distinguishes `waitid(2)` from `wait4(2)` for the blocking
     /// path: when set, the reap writes a `siginfo_t` to
@@ -262,6 +269,7 @@ impl UserTaskCtx {
             wait_child_want_pid: AtomicI64::new(0),
             wait_child_status_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
+            flock_key: core::sync::atomic::AtomicUsize::new(0),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
@@ -531,6 +539,16 @@ fn park_should_block(
                     return false; // wake landed / word changed → re-execute (musl re-checks)
                 }
             }
+            // Blocked F_SETLKW: register on the lock key's waiter queue so
+            // the holder's unlock (or exit) wakes this task immediately. No
+            // re-check-after-register here — the request's full range isn't
+            // carried in the ctx; an unlock that raced the registration is
+            // caught by the 1 ms wheel backstop below, so the race costs one
+            // backstop period, never a wedge.
+            let fk = uc.flock_key.load(Ordering::Acquire);
+            if fk != 0 {
+                crate::fd::locks::register_waiter(fk, task_id, waker.clone());
+            }
             // Park on the timer wheel. Infinite parks (u64::MAX) use a ~1-tick
             // fallback so a lost external wake can't wedge; finite sleeps use
             // the real deadline. The real wake is the io/futex/signal waker.
@@ -571,6 +589,11 @@ fn park_should_block(
                         // (it frees as other sleepers fire). Bounded busy-poll
                         // under transient pressure, never a permanent wedge.
                         uc.sleep_deadline_ns.store(0, Ordering::Release);
+                        // Clear the flock routing too — this exit skips the
+                        // proceed-branch cleanup below, and a stale key would
+                        // make the task's NEXT unrelated park register on the
+                        // flock waiter queue.
+                        uc.flock_key.store(0, Ordering::Release);
                         return false;
                     }
                 }
@@ -581,6 +604,9 @@ fn park_should_block(
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
         uc.futex_uaddr.store(0, Ordering::Release);
+        // The waiter-queue entry (if any) is dropped by the re-executed
+        // fcntl's exit paths, which know the key; just clear the routing.
+        uc.flock_key.store(0, Ordering::Release);
         if let Some(h) = sleep_handle.take() {
             narf_scheduler::narf_time::timer_wheel::cancel(h);
         }

@@ -1076,3 +1076,83 @@ fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_setlkw_conflict_paths);
+
+// ── F_SETLKW unlock wake: waiters drain + deadline clears ──
+//
+// The waiter fast path: a parked SETLKW registers (key, tid, waker);
+// the holder's F_UNLCK drains the queue and wake_one clears each
+// waiter's sleep deadline so its re-poll retries immediately (the 1 ms
+// wheel entry stays armed purely as the lost-wake backstop).
+fn smoke_abi_fdio_setlkw_unlock_wakes_waiters() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        fn noop_waker() -> core::task::Waker {
+            use core::task::{RawWaker, RawWakerVTable, Waker};
+            fn rw() -> RawWaker {
+                unsafe fn cl(_: *const ()) -> RawWaker {
+                    rw()
+                }
+                unsafe fn nop(_: *const ()) {}
+                const V: RawWakerVTable = RawWakerVTable::new(cl, nop, nop, nop);
+                RawWaker::new(core::ptr::null(), &V)
+            }
+            // SAFETY: no-op vtable, single-threaded test scope.
+            unsafe { Waker::from_raw(rw()) }
+        }
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const F_SETLK: u64 = 6;
+        let path = b"/p/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p/f, O_RDWR) should succeed"),
+        };
+        let key = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
+            t.get(fd as u32)
+                .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+        })
+        .flatten()
+        .ok_or("fd should resolve to an ops key")?;
+        // Hold a write lock, park a fake waiter on the key with a live
+        // finite deadline (what a real SETLKW park leaves behind).
+        let wr: [i64; 4] = [1, 0, 0, 0];
+        if call(Syscall::Fcntl.raw(), a2(fd, F_SETLK, wr.as_ptr() as u64)) != Some(0) {
+            return Err("taking the write lock should succeed");
+        }
+        const WAITER: u64 = 0x7B01;
+        crate::handlers::register_task_to_pid(WAITER, WAITER);
+        crate::handlers::register_pid_task_mapping(WAITER, WAITER);
+        if crate::task::task_get(WAITER).is_none() {
+            let _ = crate::task::Task::new_registered(WAITER, WAITER);
+        }
+        if let Some(t) = crate::task::task_get(WAITER) {
+            t.uctx
+                .sleep_deadline_ns
+                .store(55, core::sync::atomic::Ordering::Release);
+        }
+        crate::fd::locks::register_waiter(key, WAITER, noop_waker());
+        // Unlock through the real syscall: the Ok arm must drain + wake.
+        let un: [i64; 4] = [2, 0, 0, 0]; // F_UNLCK
+        if call(Syscall::Fcntl.raw(), a2(fd, F_SETLK, un.as_ptr() as u64)) != Some(0) {
+            return Err("F_UNLCK should succeed");
+        }
+        let deadline = crate::task::task_get(WAITER)
+            .map(|t| {
+                t.uctx
+                    .sleep_deadline_ns
+                    .load(core::sync::atomic::Ordering::Acquire)
+            })
+            .unwrap_or(u64::MAX);
+        let leftover = crate::fd::locks::drain_waiters(key).len();
+        crate::handlers::release_reaped_task(WAITER); // registry hygiene
+        if deadline != 0 {
+            return Err("unlock must clear the parked waiter's sleep deadline");
+        }
+        if leftover != 0 {
+            return Err("unlock must drain the key's waiter queue");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_setlkw_unlock_wakes_waiters);
