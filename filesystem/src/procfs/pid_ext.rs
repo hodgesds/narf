@@ -552,9 +552,18 @@ fn render_statm(pid: u64) -> String {
     // TODO: wire a per-task RSS counter from the page-fault path once
     // narf_memory exposes per-task resident-set accounting.
     let resident_pages = size_pages;
-    // shared: file-backed resident pages — no data source yet.
-    // TODO: populate from the VMA `shared` flag once page-cache RSS is tracked.
-    let shared_pages: u64 = 0;
+    // shared: MAP_SHARED VMA pages — the `shared` flag every VMA
+    // already carries (same residency approximation as `resident`).
+    let shared_pages = info
+        .as_ref()
+        .map(|i| {
+            i.vmas
+                .iter()
+                .filter(|v| v.shared)
+                .map(|v| (v.end.saturating_sub(v.start)) / PAGE_SIZE)
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
     // text: executable VMA pages.
     let text_pages = info
         .as_ref()

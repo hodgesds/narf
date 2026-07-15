@@ -69,8 +69,9 @@ pub struct ProcTaskInfo {
     pub pgrp: u64,
     pub session: u64,
     /// Consumed user CPU time in USER_HZ (100) ticks — stat field 14.
-    /// stime stays 0 (no kernel-time split; see getrusage).
     pub utime_ticks: u64,
+    /// In-syscall (kernel) CPU time in USER_HZ ticks — stat field 15.
+    pub stime_ticks: u64,
     /// Creation time in USER_HZ ticks since boot — stat field 22; `ps`
     /// composes it with /proc/stat's btime for wall start times.
     pub starttime_ticks: u64,
@@ -1763,14 +1764,26 @@ fn gen_stat() -> String {
     let mut s = String::new();
     let up_ns = narf_time::monotonic_ns();
     // USER_HZ = 100 → jiffies are centiseconds.
-    let idle = up_ns / 10_000_000;
+    let elapsed = up_ns / 10_000_000;
     let depths = narf_scheduler::cpu_queue_depths();
-    let ncpu = depths.len().max(1) as u64;
-    // Aggregate: user nice system idle iowait irq softirq steal guest gnice.
-    let _ = writeln!(s, "cpu  0 0 0 {} 0 0 0 0 0 0", idle);
+    // Per-CPU lines with REAL idle time — the scheduler folds each
+    // CPU's actual sleep (HLT / idle pump) into a per-cpu counter
+    // (`narf_scheduler::cpu_idle_ns`) — and busy derived as
+    // elapsed − idle in the `user` column (NARF has no per-cpu
+    // user/system/irq split). htop-class per-core bars are real now.
+    // Columns: user nice system idle iowait irq softirq steal guest gnice.
+    let mut busy_sum: u64 = 0;
+    let mut idle_sum: u64 = 0;
+    let mut cpu_lines = String::new();
     for (cpu, _) in &depths {
-        let _ = writeln!(s, "cpu{} 0 0 0 {} 0 0 0 0 0 0", cpu, idle / ncpu);
+        let idle = (narf_scheduler::cpu_idle_ns(*cpu as usize) / 10_000_000).min(elapsed);
+        let busy = elapsed.saturating_sub(idle);
+        busy_sum += busy;
+        idle_sum += idle;
+        let _ = writeln!(cpu_lines, "cpu{} {} 0 0 {} 0 0 0 0 0 0", cpu, busy, idle);
     }
+    let _ = writeln!(s, "cpu  {} 0 0 {} 0 0 0 0 0 0", busy_sum, idle_sum);
+    s.push_str(&cpu_lines);
     let _ = writeln!(s, "intr 0");
     let _ = writeln!(s, "ctxt 0");
     // btime = wall-now minus uptime (UNIX seconds the system booted).
@@ -1848,7 +1861,7 @@ fn render_stat(info: &ProcTaskInfo) -> String {
         .sum();
     let rss_pages = vsize / 4096; // no per-page residency — VmRSS mirrors VmSize
     format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} 0 0 0 20 0 1 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 1 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         info.pid,
         info.comm,
         info.state,
@@ -1856,6 +1869,7 @@ fn render_stat(info: &ProcTaskInfo) -> String {
         info.pgrp,
         info.session,
         info.utime_ticks,
+        info.stime_ticks,
         info.starttime_ticks,
         vsize,
         rss_pages,
@@ -2240,6 +2254,7 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         pgrp: 3,
         session: 4,
         utime_ticks: 5,
+        stime_ticks: 9,
         starttime_ticks: 6,
     };
     let line = render_stat(&info);
@@ -2252,8 +2267,8 @@ fn smoke_pid_stat_real_fields() -> TestResult {
     if f[3] != "2" || f[4] != "3" || f[5] != "4" {
         return TestResult::Fail("ppid/pgrp/session must land in fields 4-6");
     }
-    if f[13] != "5" {
-        return TestResult::Fail("utime must land in field 14");
+    if f[13] != "5" || f[14] != "9" {
+        return TestResult::Fail("utime/stime must land in fields 14-15");
     }
     if f[21] != "6" || f[22] != "8192" || f[23] != "2" {
         return TestResult::Fail("starttime/vsize/rss must land in fields 22-24");
@@ -2261,3 +2276,44 @@ fn smoke_pid_stat_real_fields() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs", smoke_pid_stat_real_fields);
+
+/// /proc/stat per-cpu lines carry real idle jiffies now (the
+/// scheduler's idle_wait bracket) with busy = elapsed − idle in the
+/// user column. Shape checks: aggregate + one line per CPU, 11 tokens
+/// each, aggregate = per-cpu sums, idle ≤ elapsed.
+fn smoke_stat_per_cpu_lines_real_idle() -> TestResult {
+    let s = gen_stat();
+    let mut agg: Option<(u64, u64)> = None;
+    let mut busy_sum = 0u64;
+    let mut idle_sum = 0u64;
+    let mut cpus = 0usize;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("cpu") {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() != 11 {
+                return TestResult::Fail("cpu lines must have 11 tokens");
+            }
+            let user: u64 = toks[1].parse().unwrap_or(u64::MAX);
+            let idle: u64 = toks[4].parse().unwrap_or(u64::MAX);
+            if user == u64::MAX || idle == u64::MAX {
+                return TestResult::Fail("cpu busy/idle must be integers");
+            }
+            if rest.starts_with(' ') {
+                agg = Some((user, idle));
+            } else {
+                cpus += 1;
+                busy_sum += user;
+                idle_sum += idle;
+            }
+        }
+    }
+    if cpus == 0 {
+        return TestResult::Fail("stat must render at least cpu0");
+    }
+    match agg {
+        Some((b, i)) if b == busy_sum && i == idle_sum => TestResult::Pass,
+        Some(_) => TestResult::Fail("aggregate cpu line must equal per-cpu sums"),
+        None => TestResult::Fail("aggregate cpu line missing"),
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_stat_per_cpu_lines_real_idle);
