@@ -1796,8 +1796,36 @@ pub fn poll_one_round() -> usize {
 /// independent of IRQ delivery. Costs 100% CPU while idle on such hosts —
 /// the price of an undependable tick, paid only where TSC-deadline is
 /// unavailable. `narf_time::set_tick_reliable` publishes which case we're in.
-#[inline]
+/// Per-CPU accumulated idle time (ns) — the real data behind
+/// /proc/stat's per-cpu idle column. Folded around `idle_wait`'s
+/// actual sleep (HLT or the tick-unreliable pump slice); the adaptive
+/// halt-poll spin windows (bounded ~60µs, see run_until_empty) are
+/// deliberately NOT counted — they're latency polling, and at their
+/// scale the distinction is noise for a 100Hz-tick consumer.
+static PERCPU_IDLE_NS: [core::sync::atomic::AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Accumulated idle ns for `cpu` since boot (0 for an out-of-range id).
+pub fn cpu_idle_ns(cpu: usize) -> u64 {
+    PERCPU_IDLE_NS
+        .get(cpu)
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 fn idle_wait(next_deadline: Option<u64>) {
+    let t0 = narf_time::now_cycles();
+    idle_wait_inner(next_deadline);
+    let dt_cycles = narf_time::now_cycles().wrapping_sub(t0);
+    let ns = dt_cycles / (narf_time::cycles_per_ns().max(1) as u64);
+    let cpu = narf_lib::percpu::current_cpu();
+    if let Some(slot) = PERCPU_IDLE_NS.get(cpu) {
+        slot.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn idle_wait_inner(next_deadline: Option<u64>) {
     if narf_time::tick_reliable() {
         if let Some(deadline) = next_deadline {
             if narf_time::now_cycles() >= deadline {
