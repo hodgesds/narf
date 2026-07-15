@@ -365,6 +365,17 @@ pub trait FileOps: Send + Sync {
     /// cheaply.
     fn stat(&self) -> Stat;
 
+    /// Set the file's access/modification times, in wall-clock
+    /// nanoseconds since the epoch (`None` = leave unchanged — the
+    /// utimensat UTIME_OMIT slot). Backing for utime/utimes/utimensat.
+    /// The default `Unsupported` keeps synthetic filesystems
+    /// (procfs/devfs/sysfs) on their pre-mtime behavior; the syscall
+    /// layer treats that as a lenient no-op success, like the old
+    /// validate-only stubs, so `touch` on /dev nodes keeps working.
+    fn set_times(&self, _atime_ns: Option<u64>, _mtime_ns: Option<u64>) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Stable inode identity for this file, unique within its filesystem.
     /// Disk-backed filesystems return the real on-disk inode number;
     /// synthetic filesystems leave the default `0` (meaning "no stable

@@ -27,7 +27,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -52,6 +52,12 @@ struct MemFile {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
+    /// Modification time as wall-clock nanoseconds since the epoch; 0 =
+    /// "never stamped" (stat then reports mtime_cycles 0, the pre-mtime
+    /// behavior). One more 8-byte atomic per node — deliberately NOT a
+    /// lock, per the heap-margin note above. Stamped by `write` and set
+    /// explicitly through `FileOps::set_times` (utimensat/utime/utimes).
+    mtime_ns: AtomicU64,
     /// True when this node is a bound AF_UNIX socket (created by `bind()`
     /// on a pathname address). `stat`/`enumerate` then report S_IFSOCK so
     /// `stat`/`[ -S ]`/`ls -l`/`unlink` on the socket path behave like
@@ -69,6 +75,7 @@ impl MemFile {
             perms: AtomicU32::new(DEFAULT_PERMS as u32),
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
+            mtime_ns: AtomicU64::new(0),
             sock: false,
         }
     }
@@ -81,6 +88,7 @@ impl MemFile {
             perms: AtomicU32::new((perms & 0o777) as u32),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
+            mtime_ns: AtomicU64::new(0),
             sock: false,
         }
     }
@@ -92,8 +100,18 @@ impl MemFile {
             perms: AtomicU32::new((perms & 0o777) as u32),
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
+            mtime_ns: AtomicU64::new(0),
             sock: true,
         }
+    }
+
+    /// Stamp mtime = wall-now. Called on every successful write so
+    /// `make`-style newer-than comparisons see fresh build outputs as
+    /// newer than their sources.
+    fn touch_mtime_now(&self) {
+        let w = narf_time::now_wall();
+        let ns = (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64;
+        self.mtime_ns.store(ns, Ordering::Relaxed);
     }
 }
 
@@ -144,16 +162,28 @@ impl FileOps for MemFile {
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let mut g = self.bytes.lock();
-            let off = offset as usize;
-            // Grow the buffer to fit the write — POSIX semantics for
-            // a write past EOF on a regular file.
-            if off + buf.len() > g.len() {
-                g.resize(off + buf.len(), 0);
+            {
+                let mut g = self.bytes.lock();
+                let off = offset as usize;
+                // Grow the buffer to fit the write — POSIX semantics for
+                // a write past EOF on a regular file.
+                if off + buf.len() > g.len() {
+                    g.resize(off + buf.len(), 0);
+                }
+                g[off..off + buf.len()].copy_from_slice(buf);
             }
-            g[off..off + buf.len()].copy_from_slice(buf);
+            self.touch_mtime_now();
             Ok(buf.len())
         })
+    }
+
+    fn set_times(&self, _atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
+        // atime is accepted and dropped (NARF tracks no access times —
+        // the relatime spirit); mtime round-trips through `stat`.
+        if let Some(ns) = mtime_ns {
+            self.mtime_ns.store(ns, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn stat(&self) -> Stat {
@@ -169,7 +199,15 @@ impl FileOps for MemFile {
                 },
                 perms: (self.perms.load(Ordering::Relaxed) & 0o777) as u16,
             },
-            mtime_cycles: 0,
+            // Report wall-ns as cycles so the stat ABI's cycles→ns
+            // division (`stat_linux`: mtime_cycles / cycles_per_ns)
+            // hands userspace back the exact epoch-ns that utimensat /
+            // the last write stored — the tar -x / cp -p / make
+            // round-trip. 0 (never stamped) stays 0.
+            mtime_cycles: self
+                .mtime_ns
+                .load(Ordering::Relaxed)
+                .saturating_mul(narf_time::cycles_per_ns().max(1) as u64),
         }
     }
 
