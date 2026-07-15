@@ -681,3 +681,143 @@ fn smoke_abi_path_fchdir_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_fchdir_neg);
+
+// ── utime / utimes / utimensat: real mtime round-trip ──
+//
+// FileOps::set_times landed (MemFs stores wall-ns, stat reports it back
+// through the cycles→ns ABI conversion), so these assert the actual
+// round-trip that tar -x / cp -p / make depend on — not just the old
+// validate-the-path behavior.
+
+/// st_mtim offsets in the x86_64/aarch64 `struct stat` (144 bytes):
+/// dev8+ino8+nlink8+mode4+uid4+gid4+pad4+rdev8+size8+blksize8+blocks8
+/// = 72 (st_atim), 88 (st_mtim.tv_sec), 96 (st_mtim.tv_nsec).
+fn stat_mtime(path: &[u8]) -> Result<(i64, i64), &'static str> {
+    let mut sb = [0u8; 144];
+    if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+        return Err("stat on the target should succeed");
+    }
+    Ok((
+        i64::from_ne_bytes(sb[88..96].try_into().unwrap()),
+        i64::from_ne_bytes(sb[96..104].try_into().unwrap()),
+    ))
+}
+
+fn smoke_abi_path_utimes_sets_mtime() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        // timeval[2]: atime {111 s, 0 µs}, mtime {222 s, 333 µs}.
+        let tv: [i64; 4] = [111, 0, 222, 333];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(path.as_ptr() as u64, tv.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("utimes should return 0");
+        }
+        let (sec, nsec) = stat_mtime(path)?;
+        if sec != 222 || nsec != 333_000 {
+            return Err("stat must read back the utimes mtime (222 s, 333 µs)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_utimes_sets_mtime);
+
+fn smoke_abi_path_utime_sets_mtime_seconds() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        // utimbuf { actime = 5, modtime = 7 } — seconds.
+        let ub: [i64; 2] = [5, 7];
+        if call(
+            Syscall::Utime.raw(),
+            a1(path.as_ptr() as u64, ub.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("utime should return 0");
+        }
+        let (sec, nsec) = stat_mtime(path)?;
+        if sec != 7 || nsec != 0 {
+            return Err("stat must read back the utime modtime (7 s)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_utime_sets_mtime_seconds);
+
+fn smoke_abi_path_utimensat_omit_and_invalid() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        // Seed a known mtime via utimes.
+        let tv: [i64; 4] = [0, 0, 42, 0];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(path.as_ptr() as u64, tv.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("seeding utimes should return 0");
+        }
+        // utimensat with atime = UTIME_NOW, mtime = UTIME_OMIT must
+        // leave the seeded mtime alone.
+        const UTIME_NOW: i64 = 0x3FFF_FFFF;
+        const UTIME_OMIT: i64 = 0x3FFF_FFFE;
+        let ts: [i64; 4] = [0, UTIME_NOW, 0, UTIME_OMIT];
+        const AT_FDCWD_I: u64 = (-100i64) as u64;
+        if call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD_I, path.as_ptr() as u64, ts.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("utimensat(NOW, OMIT) should return 0");
+        }
+        let (sec, _) = stat_mtime(path)?;
+        if sec != 42 {
+            return Err("UTIME_OMIT must leave the seeded mtime unchanged");
+        }
+        // Out-of-range tv_nsec (not NOW/OMIT) → -EINVAL.
+        let bad: [i64; 4] = [0, 0, 0, 2_000_000_000];
+        if call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD_I, path.as_ptr() as u64, bad.as_ptr() as u64, 0),
+        ) != Some(-22)
+        {
+            return Err("utimensat with tv_nsec out of range should return -EINVAL");
+        }
+        // Missing path → -ENOENT (times NULL = now).
+        let ghost = b"/p/ghost\0";
+        if call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD_I, ghost.as_ptr() as u64, 0, 0),
+        ) != Some(-2)
+        {
+            return Err("utimensat on a missing path should return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_utimensat_omit_and_invalid);
+
+fn smoke_abi_path_write_stamps_mtime() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let path = b"/p/f\0";
+        // O_WRONLY = 1. Write through the fd, then stat: the MemFs write
+        // path stamps wall-now, so mtime must be non-zero afterwards
+        // (fresh MemFs nodes start at the 0 = never-stamped sentinel).
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 1, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p/f, O_WRONLY) should succeed"),
+        };
+        if call(Syscall::Write.raw(), a2(fd, b"zz".as_ptr() as u64, 2)) != Some(2) {
+            return Err("write should return 2");
+        }
+        let (sec, nsec) = stat_mtime(path)?;
+        if sec == 0 && nsec == 0 {
+            return Err("a write must stamp a non-zero mtime");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_write_stamps_mtime);

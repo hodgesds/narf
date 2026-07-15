@@ -2064,6 +2064,10 @@ pub enum Syscall {
     /// (x86_64=280, aarch64=88).
     Utimensat,
 
+    /// `futimesat(dirfd, path, timeval[2])` — legacy glibc compat form
+    /// of utimensat. Linux (x86_64=261; aarch64 has none).
+    Futimesat,
+
     /// `geteuid()` — effective uid (== real uid in NARF).
     /// Linux (x86_64=107, aarch64=175).
     Geteuid,
@@ -2393,6 +2397,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Lchown, 94),
     (Syscall::Utime, 132),
     (Syscall::Utimes, 235),
+    (Syscall::Futimesat, 261),
     (Syscall::Utimensat, 280),
     (Syscall::Geteuid, 107),
     (Syscall::Getegid, 108),

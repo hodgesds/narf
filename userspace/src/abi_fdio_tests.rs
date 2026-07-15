@@ -994,3 +994,85 @@ fn smoke_abi_fdio_vmsplice_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_neg);
+
+// ── F_SETLKW: EINTR + harness-degrade + exit-sweep release ──
+//
+// The blocking half of the record-lock TODO(wave-69): a conflicting
+// F_SETLKW now parks-and-retries in real runs. In the harness (no
+// executor) it degrades to the EAGAIN answer, which is also what this
+// smoke pins — plus the two liveness edges around the block: a pending
+// signal must break the wait (-EINTR), and a dead holder's locks must
+// vanish (locks::release_owner in the exit sweep) so a retry succeeds.
+
+fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        const F_SETLK: u64 = 6;
+        const F_SETLKW: u64 = 7;
+        // flock { l_type: i16, l_whence: i16, pad, l_start: i64, l_len: i64, l_pid: i32 }
+        // F_WRLCK = 1, SEEK_SET = 0. Whole file (len 0).
+        let fl_wr: [i64; 4] = [1, 0, 0, 0]; // type+whence packed in word 0 (LE)
+        let path = b"/p/f\0";
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 2, 0), // O_RDWR
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p/f, O_RDWR) should succeed"),
+        };
+        // Own lock: SETLK succeeds.
+        if call(Syscall::Fcntl.raw(), a2(fd, F_SETLK, fl_wr.as_ptr() as u64)) != Some(0) {
+            return Err("F_SETLK(WRLCK) on an uncontended file should return 0");
+        }
+        // A FOREIGN owner's conflicting write lock: install directly in
+        // the lock table (the harness has one task id, so the syscall
+        // path can't create a second owner).
+        let key = crate::fd::with_table(crate::handlers::current_task_id(), |t| {
+            t.get(fd as u32)
+                .map(|e| alloc::sync::Arc::as_ptr(&e.ops) as *const () as usize)
+        })
+        .flatten()
+        .ok_or("fd should resolve to an ops key")?;
+        crate::fd::locks::__test_reset();
+        let foreign = crate::fd::locks::Lock {
+            owner: 0xF0E1,
+            ty: crate::fd::locks::F_WRLCK,
+            start: 0,
+            len: 0,
+        };
+        if crate::fd::locks::try_set(key, foreign).is_err() {
+            return Err("installing the foreign holder should succeed");
+        }
+        // F_SETLKW against the foreign holder: no executor in the
+        // harness → the degrade path answers -EAGAIN (-11).
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_SETLKW, fl_wr.as_ptr() as u64),
+        ) != Some(-11)
+        {
+            return Err("blocked F_SETLKW must degrade to -EAGAIN without an executor");
+        }
+        // Pending signal breaks the wait BEFORE parking: -EINTR.
+        crate::handlers::raise_signal_pending(crate::handlers::current_task_id(), 10);
+        let r = call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_SETLKW, fl_wr.as_ptr() as u64),
+        );
+        crate::handlers::clear_signal_pending(crate::handlers::current_task_id(), 10);
+        if r != Some(-4) {
+            return Err("blocked F_SETLKW with a pending signal must return -EINTR");
+        }
+        // Holder "exits": the exit sweep's release_owner clears its
+        // locks, and the same F_SETLKW now succeeds.
+        crate::fd::locks::release_owner(0xF0E1);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_SETLKW, fl_wr.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_SETLKW must succeed once the dead holder's locks are released");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_setlkw_conflict_paths);

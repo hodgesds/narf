@@ -2100,12 +2100,60 @@ fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 return;
             }
             // F_SETLK / F_SETLKW.
-            // TODO(wave-69): F_SETLKW should block on a per-inode
-            // waker; today we treat it like F_SETLK and return
-            // EAGAIN on conflict. Surface to the caller so they can
-            // retry, or fall back to fcntl-managed sleep.
             match crate::fd::locks::try_set(key, req) {
                 Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(_) if cmd == F_SETLKW => {
+                    // Blocking acquire. Linux F_SETLKW is signal-
+                    // interruptible (EINTR) — check before parking so a
+                    // pending signal breaks the wait instead of being
+                    // starved by the retry loop.
+                    if is_signal_pending(task) {
+                        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+                        return;
+                    }
+                    // Park ~1ms with RIP rewound so the WHOLE fcntl
+                    // re-executes on resume and retries try_set — the
+                    // same re-execute shape as the blocking console
+                    // read; the holder's unlock (or exit — see
+                    // `locks::release_owner` in the exit sweep) makes a
+                    // later retry succeed. No executor wired (the
+                    // kernel-test harness) → degrade to the
+                    // non-blocking EAGAIN answer, like flock's
+                    // no-executor tail.
+                    if let (Some(uctx), Some(hook)) = (
+                        crate::user_task::current_user_task(),
+                        crate::user_task::yield_hook(),
+                    ) {
+                        let resume_rip = ctx.rip().wrapping_sub(2);
+                        ctx.set_rip(resume_rip);
+                        let dl =
+                            narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+                        // SAFETY: `uctx` is the live per-task UserTaskCtx from
+                        // current_user_task(); we hold the only reference while
+                        // setting the deadline and saving the RIP-rewound CPU
+                        // state before the yield hook hands the task over.
+                        // SAFETY: Valid memory or trusted environment
+                        unsafe {
+                            let uc = &*uctx;
+                            // Clear a stale futex_uaddr so the park can't
+                            // mis-route into the futex branch (same guard
+                            // as the blocking pipe-read park).
+                            uc.futex_uaddr
+                                .store(0, core::sync::atomic::Ordering::Release);
+                            uc.sleep_deadline_ns
+                                .store(dl, core::sync::atomic::Ordering::Release);
+                            ctx.save_user_state(uc.state.get() as *mut u8);
+                            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                            if narf_scheduler::stackful::user_own_stack_enabled() {
+                                own_stack_block(ctx);
+                                return;
+                            }
+                            hook(uctx);
+                        }
+                        // unreachable when parked
+                    }
+                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                }
                 Err(_) => {
                     ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
                 }
@@ -6306,53 +6354,229 @@ fn sys_creat(ctx: &mut dyn TrapContext) {
     sys_open(&mut proxy);
 }
 
-/// `utime(path, times)` / `utimes(path, times)` — set a file's access and
-/// modification times. NARF's in-memory FSes don't track precise file
-/// times yet, so this validates the path and accepts (no-op).
-fn sys_utime_noop(ctx: &mut dyn TrapContext) {
-    // NARF doesn't track file mtimes, so the timestamp update is a no-op —
-    // but Linux still validates the path: a name that resolves succeeds (0),
-    // a name that resolves to nothing is -ENOENT, a bad pointer is -EFAULT.
-    let raw = match copy_user_cstr(ctx.args().arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-            return;
+// ── utime / utimes / futimesat / utimensat — real mtime updates ─────
+//
+// Backed by `FileOps::set_times` (wall-ns since epoch; MemFs stores and
+// round-trips it through stat). Filesystems without the method — the
+// synthetic ones — keep the old lenient behavior: the path is validated
+// and the timestamp silently accepted, so `touch /dev/null`-style
+// scripts don't regress. tar -x, cp -p, and make's newer-than checks
+// are the consumers that need the real store.
+
+/// Wall-clock now as ns since the epoch (the UTIME_NOW value).
+fn wall_now_ns() -> u64 {
+    let w = narf_scheduler::narf_time::now_wall();
+    (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64
+}
+
+/// Apply `set_times` to an absolute (already cwd/chroot-resolved) path.
+/// Returns the Linux result: 0, -ENOENT, or 0 for a resolvable node
+/// whose FS doesn't track times (lenient legacy behavior, incl. dirs —
+/// resolve_async only yields files, so directories take the
+/// stat-dir-aware fallback).
+fn set_path_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> i64 {
+    let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
+        poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
+    });
+    match ops {
+        Some(Some(Ok(o))) => {
+            // Unsupported → lenient 0 (see module comment above).
+            let _ = o.set_times(atime_ns, mtime_ns);
+            0
         }
-    };
-    let path = resolve_cwd_path(current_task_id(), &raw);
-    if stat_path_dir_aware(&path).is_some() {
-        ctx.set_return(SyscallReturn::ok(0));
-    } else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        _ => {
+            // Not a plain file — a directory still validates (0), a
+            // missing path is -ENOENT, matching the old stubs.
+            if stat_path_dir_aware(path).is_some() {
+                0
+            } else {
+                -2
+            }
+        }
     }
 }
 
-/// `utimensat(dirfd, path, times, flags)` — modern entry that musl routes
-/// utime/utimes/futimens through. `path` (arg1) may be NULL (the
-/// futimens-on-dirfd form), which we accept; otherwise validate it.
-/// Accept (no-op) since file times aren't tracked yet.
-fn sys_utimensat(ctx: &mut dyn TrapContext) {
-    let path_ptr = ctx.args().arg1;
-    if path_ptr == 0 {
-        ctx.set_return(SyscallReturn::ok(0)); // futimens(dirfd) form — operates on the fd
-        return;
-    }
-    // No-op on the timestamps, but validate the path like Linux: resolves → 0,
-    // missing → -ENOENT, bad pointer → -EFAULT.
-    let raw = match copy_user_cstr(path_ptr, 4096) {
+/// `utime(path, utimbuf*)` — x86_64 132. `utimbuf { actime, modtime }`
+/// in SECONDS; NULL times = both now.
+fn sys_utime(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let raw = match copy_user_cstr(a.arg0, 4096) {
         Some(s) => s,
         None => {
             ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     };
-    let path = resolve_cwd_path(current_task_id(), &raw);
-    if stat_path_dir_aware(&path).is_some() {
-        ctx.set_return(SyscallReturn::ok(0));
+    let (at, mt) = if a.arg1 == 0 {
+        let now = wall_now_ns();
+        (now, now)
     } else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        let mut buf = [0u8; 16];
+        // SAFETY: non-zero user utimbuf pointer; copy_from_user
+        // range-validates and SMAP-brackets the 16-byte read.
+        if unsafe { copy_from_user(&mut buf, a.arg1) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            return;
+        }
+        let actime = i64::from_ne_bytes(buf[..8].try_into().unwrap());
+        let modtime = i64::from_ne_bytes(buf[8..].try_into().unwrap());
+        (
+            (actime.max(0) as u64).saturating_mul(1_000_000_000),
+            (modtime.max(0) as u64).saturating_mul(1_000_000_000),
+        )
+    };
+    let path = resolve_cwd_path(current_task_id(), &raw);
+    let r = set_path_times(&path, Some(at), Some(mt));
+    ctx.set_return(SyscallReturn::ok(r as u64));
+}
+
+/// Shared utimes body: `timeval[2]` (sec + USEC) at `tv_ptr`, NULL =
+/// both now. Used by utimes(235) and futimesat(261).
+fn utimes_common(ctx: &mut dyn TrapContext, raw_path: &str, tv_ptr: u64) {
+    let (at, mt) = if tv_ptr == 0 {
+        let now = wall_now_ns();
+        (now, now)
+    } else {
+        let mut buf = [0u8; 32];
+        // SAFETY: non-zero user timeval[2] pointer; copy_from_user
+        // range-validates and SMAP-brackets the 32-byte read.
+        if unsafe { copy_from_user(&mut buf, tv_ptr) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            return;
+        }
+        let tv = |o: usize| -> u64 {
+            let sec = i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+            let usec = i64::from_ne_bytes(buf[o + 8..o + 16].try_into().unwrap());
+            (sec.max(0) as u64).saturating_mul(1_000_000_000) + (usec.max(0) as u64) * 1_000
+        };
+        (tv(0), tv(16))
+    };
+    let path = resolve_cwd_path(current_task_id(), raw_path);
+    let r = set_path_times(&path, Some(at), Some(mt));
+    ctx.set_return(SyscallReturn::ok(r as u64));
+}
+
+/// `utimes(path, timeval[2])` — x86_64 235.
+fn sys_utimes(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let raw = match copy_user_cstr(a.arg0, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            return;
+        }
+    };
+    utimes_common(ctx, &raw, a.arg1);
+}
+
+/// `futimesat(dirfd, path, timeval[2])` — x86_64 261 (legacy; glibc's
+/// pre-utimensat compat path). Relative paths resolve against the
+/// dirfd's recorded open path, same prepend as sys_readlinkat/linkat.
+fn sys_futimesat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    let raw = match copy_user_cstr(a.arg1, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            return;
+        }
+    };
+    const AT_FDCWD: i64 = -100;
+    let dirfd = a.arg0 as i64;
+    let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
+        raw
+    } else {
+        match fd_path_of(current_task_id(), dirfd as u32) {
+            Some(dir) if dir.starts_with('/') => {
+                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
+            }
+            _ => raw,
+        }
+    };
+    utimes_common(ctx, &eff, a.arg2);
+}
+
+/// `utimensat(dirfd, path, timespec[2], flags)` — the modern entry musl
+/// routes utime/utimes/futimens through. `times` NULL = both now;
+/// tv_nsec may be UTIME_NOW / UTIME_OMIT per slot. `path` NULL is the
+/// futimens form: operate on `dirfd` itself through the fd table.
+fn sys_utimensat(ctx: &mut dyn TrapContext) {
+    let a = *ctx.args();
+    const UTIME_NOW: i64 = 0x3FFF_FFFF;
+    const UTIME_OMIT: i64 = 0x3FFF_FFFE;
+
+    // Decode the two timespec slots into Option<ns> (None = OMIT).
+    let (at, mt) = if a.arg2 == 0 {
+        let now = wall_now_ns();
+        (Some(now), Some(now))
+    } else {
+        let mut buf = [0u8; 32];
+        // SAFETY: non-zero user timespec[2] pointer; copy_from_user
+        // range-validates and SMAP-brackets the 32-byte read.
+        if unsafe { copy_from_user(&mut buf, a.arg2) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            return;
+        }
+        let slot = |o: usize| -> Result<Option<u64>, ()> {
+            let sec = i64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+            let nsec = i64::from_ne_bytes(buf[o + 8..o + 16].try_into().unwrap());
+            match nsec {
+                UTIME_OMIT => Ok(None),
+                UTIME_NOW => Ok(Some(wall_now_ns())),
+                n if (0..1_000_000_000).contains(&n) => Ok(Some(
+                    (sec.max(0) as u64).saturating_mul(1_000_000_000) + n as u64,
+                )),
+                _ => Err(()), // Linux: EINVAL for an out-of-range tv_nsec
+            }
+        };
+        match (slot(0), slot(16)) {
+            (Ok(at), Ok(mt)) => (at, mt),
+            _ => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                return;
+            }
+        }
+    };
+
+    let task = current_task_id();
+    if a.arg1 == 0 {
+        // futimens(fd) form — set times through the open fd's FileOps.
+        let fd = a.arg0 as u32;
+        let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+        match ops {
+            Some(o) => {
+                let _ = o.set_times(at, mt); // Unsupported → lenient 0
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // -EBADF
+        }
+        return;
     }
+
+    let raw = match copy_user_cstr(a.arg1, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            return;
+        }
+    };
+    // Relative path against a real directory fd (AT_FDCWD / absolute
+    // pass through) — same prepend as sys_readlinkat / sys_linkat.
+    const AT_FDCWD: i64 = -100;
+    let dirfd = a.arg0 as i64;
+    let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
+        raw
+    } else {
+        match fd_path_of(task, dirfd as u32) {
+            Some(dir) if dir.starts_with('/') => {
+                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
+            }
+            _ => raw,
+        }
+    };
+    let path = resolve_cwd_path(task, &eff);
+    let r = set_path_times(&path, at, mt);
+    ctx.set_return(SyscallReturn::ok(r as u64));
 }
 
 /// `readahead(fd, offset, count)` — page-cache populate hint. NARF's
@@ -8537,6 +8761,8 @@ pub(crate) fn terminate_current_task(
     // own trap context (its user AS is still active for the user-memory
     // reads/writes), before any teardown.
     robust_list_exit_walk(task);
+    // wait4 rusage snapshot — same in-context requirement (EXIT_RUSAGE).
+    record_exit_rusage(task, pid);
     // A fatal (default Terminate/CoreDump) signal kills the ENTIRE thread
     // group in Linux (get_signal -> do_group_exit), not just the faulting
     // thread. Zap every live sibling so a fault in ONE worker thread of a
@@ -8653,6 +8879,9 @@ fn sys_exit_task(ctx: &mut dyn TrapContext) {
     // Robust-futex owner-died walk — in-task context, before teardown
     // (see terminate_current_task).
     robust_list_exit_walk(tid);
+    // wait4 rusage snapshot — must run here, while OUR address space is
+    // still the active one (see EXIT_RUSAGE).
+    record_exit_rusage(tid, pid);
 
     // Polling-future path: if a UserTaskCtx is installed AND an
     // exit hook is registered, save the user state, mark the
@@ -10538,6 +10767,16 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
 /// returns 0. Called from the poll routine (which owns the saved
 /// register frame) for the blocking path.
 pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, status: i32) -> u64 {
+    // Blocking wait4's rusage out-param: this runs AS THE PARENT on both
+    // reap routes (the UserTaskFuture poll and own_stack_wait_child), so
+    // the staged pointer + the child's exit-time snapshot meet here.
+    // Both are consumed unconditionally so nothing goes stale.
+    let rusage_ptr = take_wait_rusage_ptr(current_task_id());
+    let snap = take_exit_rusage(reaped as u64);
+    if !is_waitid && rusage_ptr != 0 {
+        let (ns, kb) = snap.unwrap_or((0, 0));
+        write_rusage_utime(rusage_ptr, ns, kb);
+    }
     if status_ptr != 0 {
         if is_waitid {
             let si = encode_waitid_siginfo(reaped, status);
@@ -10609,6 +10848,8 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
                 // `own_stack_block` sent a later `pause(2)` down this wait4
                 // path, where this arm overwrote pause's baked -EINTR with 0.
                 // Every real-executor exit from this loop already clears it.
+                // Drop the staged rusage pointer too (same staleness class).
+                let _ = take_wait_rusage_ptr(parent);
                 uc.wait_child_pending
                     .store(false, core::sync::atomic::Ordering::Release);
                 ctx.set_return(SyscallReturn::ok(0));
@@ -10642,6 +10883,9 @@ fn own_stack_wait_child(ctx: &mut dyn TrapContext) {
         // returns -EINTR; musl's waitpid loop then re-issues the wait.
         if is_signal_pending(parent) {
             crate::user_task::drop_wait_child_waker(parent);
+            // Abandoning the wait — drop the staged rusage pointer so a
+            // later wait4/pause can't consume a stale one.
+            let _ = take_wait_rusage_ptr(parent);
             uc.wait_child_pending
                 .store(false, core::sync::atomic::Ordering::Release);
             // Deliver the pending signal NOW. The own-stack syscall return
@@ -10825,6 +11069,10 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
         // state before the yield hook hands the task to the executor.
         unsafe {
             let uc = &*uctx;
+            // Invalidate any stale wait4 rusage pointer — waitid's
+            // rusage arg isn't wired, but a leftover slot from an
+            // aborted wait4 must never be written through here.
+            set_wait_rusage_ptr(current_task_id(), 0);
             uc.wait_child_is_waitid
                 .store(true, core::sync::atomic::Ordering::Release);
             uc.wait_child_want_pid
@@ -11070,6 +11318,10 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = PROC_EXE.lock().as_mut() {
         m.remove(&tid);
     }
+    // POSIX record locks: drop everything this task still holds, or a
+    // crashed holder pins every F_SETLKW waiter forever (the blocking
+    // retry loop only ends when the conflict clears).
+    crate::fd::locks::release_owner(tid);
     if let Some(m) = PROC_ENVIRON.lock().as_mut() {
         m.remove(&tid);
     }
@@ -11584,8 +11836,12 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         // accumulator (RUSAGE_CHILDREN / tms.cutime) and, if the caller
         // passed a `struct rusage*`, fill ru_utime with it.
         let child_cpu_ns = account_reaped_child(parent, reaped);
+        // Consume the child's exit-time snapshot even when the caller
+        // passed no rusage* — the entry must not outlive the reap.
+        let snap = take_exit_rusage(reaped);
         if rusage_ptr != 0 {
-            write_rusage_utime(rusage_ptr, child_cpu_ns);
+            let (ns, kb) = snap.unwrap_or((child_cpu_ns, 0));
+            write_rusage_utime(rusage_ptr, ns, kb);
         }
         // Reaped — release the refcounted Task, then return the PID to
         // the free pool.
@@ -11646,6 +11902,9 @@ fn sys_wait4(ctx: &mut dyn TrapContext) {
         // SAFETY: Valid memory or trusted environment
         unsafe {
             let uc = &*uctx;
+            // Stage the rusage out-pointer for finish_wait_child (it
+            // runs as this task on the reap side — see WAIT_RUSAGE_PTR).
+            set_wait_rusage_ptr(parent, rusage_ptr);
             uc.wait_child_pending
                 .store(true, core::sync::atomic::Ordering::Release);
             uc.wait_child_want_pid
@@ -13160,12 +13419,21 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
     };
     let utime_sec = (ns / 1_000_000_000) as i64;
     let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    // ru_maxrss: the caller's own VM footprint for RUSAGE_SELF; 0 for
+    // RUSAGE_CHILDREN (no accumulated per-child peak — wait4 reports
+    // each child's footprint at reap instead).
+    let maxrss_kb: i64 = if who == RUSAGE_CHILDREN {
+        0
+    } else {
+        (task_vm_bytes(task) / 1024) as i64
+    };
     // Build the rusage struct (RUSAGE_TOTAL_I64S i64s) in kernel
     // memory, then copy to user under the SMAP bracket.
     let mut kbuf = [0u8; RUSAGE_TOTAL_I64S * 8];
     kbuf[..8].copy_from_slice(&utime_sec.to_ne_bytes()); // ru_utime.tv_sec
     kbuf[8..16].copy_from_slice(&utime_usec.to_ne_bytes()); // ru_utime.tv_usec
-                                                            // ru_stime + 14 tail fields already zero.
+                                                            // ru_stime (16..32) stays 0 — no kernel-time split.
+    kbuf[32..40].copy_from_slice(&maxrss_kb.to_ne_bytes()); // ru_maxrss (KB)
                                                             // SAFETY: `out` is the user `struct rusage` pointer (non-zero, checked above);
                                                             // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
                                                             // SAFETY: Valid memory or trusted environment
@@ -16493,6 +16761,54 @@ fn child_cpu_time_ns_of(task: u64) -> u64 {
         .unwrap_or(0)
 }
 
+// Exit-time rusage snapshot: `(cpu_ns, vm_kb)` captured in the DYING
+// task's own context — the only point where its address space is still
+// resolvable (`current_address_space`); by reap time the scheduler slot
+// that owned the AS Arc is long dropped, so a reap-time
+// `task_vm_bytes(child)` reads 0. Consumed (removed) at reap by both
+// the synchronous wait4 path and `finish_wait_child`; an orphan that is
+// never reaped leaks one small entry, same lifetime class as its
+// PENDING_EXITS record.
+static EXIT_RUSAGE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, (u64, u64)>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Snapshot the current (dying) task's rusage numbers for its parent's
+/// wait4. MUST run in the exiting task's own trap context. Keyed by the
+/// VISIBLE pid — the key wait4 reaps with — while the CPU tables are
+/// read by tid (fork mints ProcessId and TaskId separately).
+pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
+    let cpu = cpu_time_ns_of(tid).saturating_add(child_cpu_time_ns_of(tid));
+    let vm_kb = task_vm_bytes(tid) / 1024;
+    let mut g = EXIT_RUSAGE.lock();
+    g.get_or_insert_with(BTreeMap::new)
+        .insert(pid, (cpu, vm_kb));
+}
+
+fn take_exit_rusage(tid: u64) -> Option<(u64, u64)> {
+    let mut g = EXIT_RUSAGE.lock();
+    g.as_mut().and_then(|m| m.remove(&tid))
+}
+
+// The user `struct rusage*` of the parent's IN-FLIGHT blocking wait4,
+// keyed by parent tid. `finish_wait_child` runs as the parent (both the
+// poll route and own_stack_wait_child) but only receives the status
+// pointer, so the rusage pointer travels through this table. Every
+// blocking wait entry (wait4 AND waitid) overwrites its slot — waitid
+// with 0 — so a stale pointer from an aborted wait can never be written
+// through by a later one.
+static WAIT_RUSAGE_PTR: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn set_wait_rusage_ptr(parent: u64, ptr: u64) {
+    let mut g = WAIT_RUSAGE_PTR.lock();
+    g.get_or_insert_with(BTreeMap::new).insert(parent, ptr);
+}
+
+fn take_wait_rusage_ptr(parent: u64) -> u64 {
+    let mut g = WAIT_RUSAGE_PTR.lock();
+    g.as_mut().and_then(|m| m.remove(&parent)).unwrap_or(0)
+}
+
 /// Reaping `child` from `parent`: charge the child's total CPU time (its
 /// own + whatever it had already accumulated from its own reaped
 /// grandchildren, per POSIX) to the parent's child-time accumulator, then
@@ -16520,16 +16836,37 @@ pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
 /// with `ru_utime` set from `ns` and every other field zero. Best-effort
 /// (a failed copy is swallowed — wait4 still succeeds). Shared by wait4's
 /// rusage out-param.
-fn write_rusage_utime(out_ptr: u64, ns: u64) {
+fn write_rusage_utime(out_ptr: u64, ns: u64, maxrss_kb: u64) {
     let mut kbuf = [0u8; 18 * 8];
     let sec = (ns / 1_000_000_000) as i64;
     let usec = ((ns % 1_000_000_000) / 1_000) as i64;
     kbuf[..8].copy_from_slice(&sec.to_ne_bytes()); // ru_utime.tv_sec
     kbuf[8..16].copy_from_slice(&usec.to_ne_bytes()); // ru_utime.tv_usec
-                                                      // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
-                                                      // checked by the caller); copy_to_user range-validates and
-                                                      // SMAP-brackets the 144-byte write.
+                                                      // ru_stime (16..32) stays 0 — NARF doesn't split kernel time out.
+    kbuf[32..40].copy_from_slice(&(maxrss_kb as i64).to_ne_bytes()); // ru_maxrss (KB)
+                                                                     // SAFETY: `out_ptr` is the user `struct rusage` pointer (non-zero,
+                                                                     // checked by the caller); copy_to_user range-validates and
+                                                                     // SMAP-brackets the 144-byte write.
     let _ = unsafe { copy_to_user(out_ptr, &kbuf) };
+}
+
+/// Total mapped bytes of `pid`'s address space (region-span sum) —
+/// the `ru_maxrss` source. NARF has no per-page RSS or peak tracking,
+/// so this reports the CURRENT (for a zombie: final) VM footprint,
+/// an honest lower-noise stand-in for "peak resident" that gives
+/// `time -v`-style consumers a real number instead of 0.
+fn task_vm_bytes(pid: u64) -> u64 {
+    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).or_else(|| {
+        if pid == current_task_id() {
+            narf_scheduler::current_address_space()
+        } else {
+            None
+        }
+    });
+    match as_arc {
+        Some(a) => a.regions_snapshot().iter().map(|r| r.len).sum(),
+        None => 0,
+    }
 }
 
 /// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
@@ -23152,8 +23489,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "lchown",
         RawFnHandler(sys_access_chmod_chown),
     );
-    table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime_noop));
-    table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utime_noop));
+    table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime));
+    table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utimes));
+    table.install_raw(Syscall::Futimesat, "futimesat", RawFnHandler(sys_futimesat));
     table.install_raw(Syscall::Utimensat, "utimensat", RawFnHandler(sys_utimensat));
     // Batch 15: credential gaps (real/effective/fs uid+gid).
     table.install_raw(Syscall::Geteuid, "geteuid", RawFnHandler(sys_geteuid));
