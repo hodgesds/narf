@@ -789,11 +789,32 @@ pub fn populate_input_class() {
 }
 
 /// Populate `/sys/kernel/` with standard kernel-global files.
+///
+/// Entries:
+/// - `uevent_seqnum`              — current netlink uevent sequence number.
+/// - `mm/transparent_hugepage/enabled` — THP policy string; NARF has no THP,
+///   so the active value is always `[never]`. redis probes this at startup to
+///   issue its THP warning; jemalloc reads it to tune huge-page hinting.
+///   Linux ref: `mm/huge_memory.c` `enabled_show` (6.9).
+/// - `mm/transparent_hugepage/defrag` — THP defrag policy; also `[never]` here.
+///   Linux ref: `mm/huge_memory.c` `defrag_show` (6.9).
+///
 /// Linux ref: `kernel_kobj` (lib/kobject.c:817).
 pub fn populate_kernel_dir() {
     let root = get_root();
     let kernel = get_or_create_child(&root, "kernel");
     kobject_add_attr(&kernel, "uevent_seqnum", crate::uevent::gen_uevent_seqnum);
+
+    // /sys/kernel/mm/transparent_hugepage/ — THP policy knobs.
+    // NARF implements no huge-page promotion; `[never]` is permanently active.
+    // The bracket notation mirrors Linux: `enabled_show` prints the active
+    // policy token in brackets alongside the available options.
+    let mm = get_or_create_child(&kernel, "mm");
+    let thp = get_or_create_child(&mm, "transparent_hugepage");
+    kobject_add_attr(&thp, "enabled", || "always madvise [never]\n".to_string());
+    kobject_add_attr(&thp, "defrag", || {
+        "always defer madvise [never]\n".to_string()
+    });
 }
 
 /// Build a Linux-style CPU bitmap string (comma-separated 32-bit

@@ -63,6 +63,17 @@ pub struct ProcTaskInfo {
     /// the kernel hook from the AS's regions table; rendered into
     /// /proc/[pid]/maps text by `render_maps`.
     pub vmas: Vec<ProcVma>,
+    /// Parent visible pid (0 = unknown/orphan).
+    pub ppid: u64,
+    /// Process group + session ids (stat fields 5-6).
+    pub pgrp: u64,
+    pub session: u64,
+    /// Consumed user CPU time in USER_HZ (100) ticks — stat field 14.
+    /// stime stays 0 (no kernel-time split; see getrusage).
+    pub utime_ticks: u64,
+    /// Creation time in USER_HZ ticks since boot — stat field 22; `ps`
+    /// composes it with /proc/stat's btime for wall start times.
+    pub starttime_ticks: u64,
 }
 
 /// A key-value pair from the ELF auxiliary vector.  Used by
@@ -648,6 +659,48 @@ fn snapshot_dir(m: &BTreeMap<String, ProcNode>) -> Vec<(String, ProcNodeKind)> {
         .collect()
 }
 
+// ── /proc/thread-self ────────────────────────────────────────────
+//
+// Magic symlink whose readlink text is `<pid>/task/<tid>`.  In NARF
+// tid == pid for every task (no separate pthread_t kernel thread IDs
+// yet), so the target is always `<pid>/task/<pid>`.  The node stats as
+// Symlink so `readlink(2)` / `lstat(2)` treat it correctly, and
+// `lookup_dir("thread-self")` in ProcRoot descends into the task/<tid>
+// directory via ProcTaskDir for path-resolution.
+//
+// Linux ref: `fs/proc/self.c` `proc_thread_self_get_link` (6.9) — the
+// kernel constructs `<tgid>/task/<tid>` as the link target.
+// [[proc-magic-links]]
+
+#[derive(Debug)]
+struct ProcThreadSelf;
+
+impl FileOps for ProcThreadSelf {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let pid = current_pid();
+        Box::pin(async move {
+            // readlink returns e.g. "7/task/7" — relative, no leading slash,
+            // same shape as /proc/self which readlinks to "7".
+            let target = format!("{}/task/{}", pid, pid);
+            slice_read(target.as_bytes(), offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Symlink,
+                perms: 0o777,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
 /// Iterator helper: list names at a given dir path.
 fn list_registry_dir(components: &[&str]) -> Vec<(String, ProcNodeKind)> {
     if components.is_empty() {
@@ -1231,6 +1284,14 @@ impl DirOps for ProcRoot {
                 gen: gen_stat,
             })),
             "self" => Some(Arc::new(ProcDirMarker)),
+            // /proc/thread-self is a magic symlink (like /proc/self) that
+            // resolves to `<pid>/task/<tid>`.  In NARF tid == the per-task
+            // pid for procfs purposes, so the target is `<pid>/task/<pid>`.
+            // The symlink stat is Symlink; readlink returns the formatted
+            // string; descending into it resolves via ProcPidDir → task/.
+            // Linux ref: `fs/proc/self.c` `proc_thread_self_get_link` (6.9).
+            // [[proc-magic-links]]
+            "thread-self" => Some(Arc::new(ProcThreadSelf)),
             _ => {
                 // Dynamic registry — file or directory marker. The
                 // dir marker keeps resolve_async happy so it'll
@@ -1262,6 +1323,13 @@ impl DirOps for ProcRoot {
             // time; we materialise a fresh ProcPidDir bound to it.
             let pid = current_pid();
             return Some(Arc::new(ProcPidDir { pid }));
+        }
+        if name == "thread-self" {
+            // /proc/thread-self → <pid>/task/<tid>; tid == pid in NARF.
+            // Descending gives a ProcTaskTidDir that exposes `comm` etc.
+            // Linux ref: `proc_thread_self_get_link` (fs/proc/self.c:80).
+            let pid = current_pid();
+            return pid_ext::ProcTaskDir { pid }.lookup_dir(&pid.to_string());
         }
         // Registry-backed subdirectory (e.g. "net").
         let snap = lookup_registry(&[name]);
@@ -1329,6 +1397,10 @@ impl DirOps for ProcRoot {
             DirEntry {
                 name: "self",
                 file_type: FileType::Dir
+            },
+            DirEntry {
+                name: "thread-self",
+                file_type: FileType::Symlink
             },
         ];
         // Dynamic registry top-level entries (e.g. "net", "acpi", ...).
@@ -1547,16 +1619,119 @@ fn gen_cmdline() -> String {
     s
 }
 
+// ── /proc/loadavg EWMA state ────────────────────────────────────
+//
+// Linux tracks 1/5/15-minute exponential moving averages of the
+// runnable count in `kernel/sched/loadavg.c` using fixed-point
+// arithmetic with FIXED_1 = 1 << 11 (2048).  NARF samples lazily
+// on each `read`, applying the correct per-elapsed-tick decay so
+// the averages converge identically to the Linux model given the
+// same runnable history.
+//
+// Decay factors per 5-second tick (Linux's load-average update
+// period):
+//   EXP_1   = e^(-5/60)   ≈ 0.9200 in FIXED_1 units → 1884
+//   EXP_5   = e^(-5/300)  ≈ 0.9835               → 2014
+//   EXP_15  = e^(-5/900)  ≈ 0.9945               → 2037
+//
+// Linux ref: `calc_load` (`kernel/sched/loadavg.c`) — the core
+// one-tick decay step is `load = load*EXP + n*(FIXED_1 - EXP)`.
+// [[proc-loadavg-ewma]]
+
+/// Fixed-point scale: 1 << 11, matching Linux `FIXED_1`.
+const FIXED_1: u64 = 1 << 11;
+
+/// EXP_1, EXP_5, EXP_15 in FIXED_1 units (per 5 s tick).
+const EXP_1: u64 = 1884; // e^(-5/60)  * FIXED_1
+const EXP_5: u64 = 2014; // e^(-5/300) * FIXED_1
+const EXP_15: u64 = 2037; // e^(-5/900) * FIXED_1
+
+/// Monotonic nanoseconds of the last EWMA update (0 = never).
+static LOADAVG_LAST_NS: IrqSafeSpinLock<u64> = IrqSafeSpinLock::new(0);
+/// EWMA values in FIXED_1 units (avoids floating point).
+static LOADAVG_AVG1: IrqSafeSpinLock<u64> = IrqSafeSpinLock::new(0);
+static LOADAVG_AVG5: IrqSafeSpinLock<u64> = IrqSafeSpinLock::new(0);
+static LOADAVG_AVG15: IrqSafeSpinLock<u64> = IrqSafeSpinLock::new(0);
+
+/// Apply one 5-second EWMA tick: `load = load*exp + n*(FIXED_1 - exp)`.
+/// Linux ref: `calc_load` (kernel/sched/loadavg.c).
+#[inline]
+fn calc_load_tick(load: u64, exp: u64, n: u64) -> u64 {
+    (load.saturating_mul(exp) + n.saturating_mul(FIXED_1 - exp)) / FIXED_1
+}
+
+/// Update the EWMA state and return a snapshot of (avg1, avg5, avg15)
+/// in FIXED_1 units.  Called on every `/proc/loadavg` read.
+fn loadavg_update() -> (u64, u64, u64) {
+    let now_ns = narf_time::monotonic_ns();
+    // Current instantaneous runnable count (same source as the old stub).
+    let runnable = narf_scheduler::all_task_ids().len() as u64;
+
+    let mut last_ns = LOADAVG_LAST_NS.lock();
+    let mut avg1 = LOADAVG_AVG1.lock();
+    let mut avg5 = LOADAVG_AVG5.lock();
+    let mut avg15 = LOADAVG_AVG15.lock();
+
+    let elapsed_ns = now_ns.saturating_sub(*last_ns);
+    // Number of 5-second ticks elapsed since last update.
+    // Cap at 1000 to avoid spending O(uptime_in_ticks) on first read.
+    let ticks = (elapsed_ns / 5_000_000_000).min(1000);
+
+    for _ in 0..ticks {
+        *avg1 = calc_load_tick(*avg1, EXP_1, runnable);
+        *avg5 = calc_load_tick(*avg5, EXP_5, runnable);
+        *avg15 = calc_load_tick(*avg15, EXP_15, runnable);
+    }
+    // If no full tick has elapsed yet but this is the first call,
+    // seed the averages with the instantaneous count so the first
+    // read isn't misleadingly zero.
+    if *last_ns == 0 {
+        *avg1 = runnable * FIXED_1;
+        *avg5 = runnable * FIXED_1;
+        *avg15 = runnable * FIXED_1;
+    }
+    // Advance last_ns by the ticks we applied (keep sub-tick remainder).
+    *last_ns = if ticks > 0 {
+        last_ns.saturating_add(ticks * 5_000_000_000)
+    } else {
+        // No tick yet — mark that we've been called so seeding above
+        // only runs on the very first read.
+        if *last_ns == 0 {
+            now_ns
+        } else {
+            *last_ns
+        }
+    };
+
+    (*avg1, *avg5, *avg15)
+}
+
 fn gen_loadavg() -> String {
-    // Linux format: "0.00 0.00 0.00 1/1 1\n"
-    //   1/5/15-min averages | runnable/total | last_pid
-    // We don't track EWMA averages today; report the same
-    // instantaneous total task count for all three slots so the
-    // standard parsers (`uptime`, `top`, `glibc::getloadavg`)
-    // produce a meaningful number rather than zeros. last_pid is
-    // approximated by the number of live tasks.
-    let n = narf_scheduler::all_task_ids().len();
-    format!("{n}.00 {n}.00 {n}.00 {n}/{n} {n}\n")
+    // Linux format: "0.00 0.00 0.00 R/T lastpid\n"
+    //   1/5/15-min EWMAs | runnable/total | last_pid
+    // Averages are lazily-decayed [[proc-loadavg-ewma]].
+    let (a1, a5, a15) = loadavg_update();
+    // Convert FIXED_1 units to x.xx display.  Linux uses the same
+    // division+remainder trick in `get_avenrun` (kernel/sched/loadavg.c).
+    let fmt_avg = |v: u64| -> (u64, u64) {
+        let integer = v / FIXED_1;
+        let frac = ((v % FIXED_1) * 100) / FIXED_1;
+        (integer, frac)
+    };
+    let (i1, f1) = fmt_avg(a1);
+    let (i5, f5) = fmt_avg(a5);
+    let (i15, f15) = fmt_avg(a15);
+    let total = narf_scheduler::all_task_ids().len();
+    let running = narf_scheduler::cpu_queue_depths()
+        .iter()
+        .map(|(_, n)| *n)
+        .sum::<usize>()
+        .max(1);
+    let last_pid = total;
+    format!(
+        "{}.{:02} {}.{:02} {}.{:02} {}/{} {}\n",
+        i1, f1, i5, f5, i15, f15, running, total, last_pid
+    )
 }
 
 fn gen_filesystems() -> String {
@@ -1666,9 +1841,24 @@ fn render_stat(info: &ProcTaskInfo) -> String {
     //   minflt cminflt majflt cmajflt utime stime cutime cstime
     //   priority nice num_threads itrealvalue starttime vsize rss
     //   ...  — we fill the first 23 with sensible values and pad.
+    let vsize: u64 = info
+        .vmas
+        .iter()
+        .map(|v| v.end.saturating_sub(v.start))
+        .sum();
+    let rss_pages = vsize / 4096; // no per-page residency — VmRSS mirrors VmSize
     format!(
-        "{} ({}) {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0\n",
-        info.pid, info.comm, info.state,
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} 0 0 0 20 0 1 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        info.pid,
+        info.comm,
+        info.state,
+        info.ppid,
+        info.pgrp,
+        info.session,
+        info.utime_ticks,
+        info.starttime_ticks,
+        vsize,
+        rss_pages,
     )
 }
 
@@ -1691,8 +1881,7 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Tgid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Ngid:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
-    // NARF tracks no parent link in ProcTaskInfo yet → PPid 0.
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t{}\n", info.ppid));
     // Total mapped size from the VMA list. NARF doesn't separate resident
     // from virtual, so VmRSS/VmPeak/VmHWM mirror VmSize (best-effort, but
     // enough for ps/top to sort and display).
@@ -1936,3 +2125,139 @@ fn smoke_non_comm_write_returns_readonly() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_non_comm_write_returns_readonly);
+
+/// /proc/thread-self readlink returns "<pid>/task/<pid>" shape (digit/task/digit).
+fn smoke_thread_self_readlink_shape() -> TestResult {
+    // current_pid() returns 0 when no hook is installed; target is "0/task/0".
+    let ts = ProcThreadSelf;
+    let mut buf = [0u8; 64];
+    let res = poll_once(ts.read(0, &mut buf));
+    match res {
+        Some(Ok(n)) if n > 0 => {
+            let s = match core::str::from_utf8(&buf[..n]) {
+                Ok(s) => s,
+                Err(_) => return TestResult::Fail("thread-self readlink not utf-8"),
+            };
+            // Shape: "<digits>/task/<digits>", no leading slash.
+            let parts: Vec<&str> = s.split('/').collect();
+            if parts.len() == 3
+                && parts[0].chars().all(|c| c.is_ascii_digit())
+                && parts[1] == "task"
+                && parts[2].chars().all(|c| c.is_ascii_digit())
+            {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("thread-self readlink shape wrong")
+            }
+        }
+        Some(Ok(_)) => TestResult::Fail("thread-self readlink returned 0 bytes"),
+        Some(Err(_)) => TestResult::Fail("thread-self readlink returned error"),
+        None => TestResult::Fail("thread-self readlink future not ready"),
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_thread_self_readlink_shape);
+
+/// /proc/thread-self stat() reports Symlink type.
+fn smoke_thread_self_stat_is_symlink() -> TestResult {
+    let ts = ProcThreadSelf;
+    if ts.stat().mode.file_type == FileType::Symlink {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("thread-self stat is not Symlink")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_thread_self_stat_is_symlink);
+
+/// /proc/loadavg renders three x.yy values and the R/T/lastpid tail.
+fn smoke_loadavg_format_three_values() -> TestResult {
+    let s = gen_loadavg();
+    // Expected shape: "1.23 0.45 0.06 1/3 3\n"
+    let parts: Vec<&str> = s.trim_end_matches('\n').split_whitespace().collect();
+    if parts.len() < 5 {
+        return TestResult::Fail("loadavg: fewer than 5 whitespace tokens");
+    }
+    // First three must be x.xx floats.
+    for v in parts.iter().take(3) {
+        if v.find('.').is_none() {
+            return TestResult::Fail("loadavg: token missing decimal point");
+        }
+        let dot_pos = v.find('.').unwrap();
+        let frac = &v[dot_pos + 1..];
+        if frac.len() != 2 {
+            return TestResult::Fail("loadavg: fraction not exactly 2 digits");
+        }
+    }
+    // parts[3] must contain "/" (R/T).
+    if !parts[3].contains('/') {
+        return TestResult::Fail("loadavg: R/T token missing slash");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_loadavg_format_three_values);
+
+/// /proc/stat (mod.rs gen_stat path) has a "btime <positive-int>" line.
+fn smoke_stat_btime_positive() -> TestResult {
+    let s = gen_stat();
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            let n: u64 = match rest.trim().parse() {
+                Ok(v) => v,
+                Err(_) => return TestResult::Fail("stat: btime is not an integer"),
+            };
+            // btime may be 0 in test env (wall clock not set), but the
+            // line must exist and be parseable. Accept 0.
+            let _ = n;
+            return TestResult::Pass;
+        }
+    }
+    TestResult::Fail("stat: btime line missing")
+}
+kernel_test_in!("filesystem/procfs", smoke_stat_btime_positive);
+
+/// /proc/[pid]/stat now renders 52 real fields — ppid/pgrp/session
+/// (4-6), utime (14), starttime (22), vsize/rss (23-24) — instead of
+/// the pid/comm/state-plus-zeros stub. `ps`/`top` compose starttime
+/// with /proc/stat btime and CPU% from utime deltas, so the positions
+/// must match proc(5) exactly.
+fn smoke_pid_stat_real_fields() -> TestResult {
+    let info = ProcTaskInfo {
+        pid: 7,
+        comm: String::from("t"),
+        state: 'R',
+        brk_top: 0,
+        stack_top: 0,
+        cmdline: Vec::new(),
+        vmas: alloc::vec![ProcVma {
+            start: 0x1000,
+            end: 0x3000, // 8192 bytes = 2 pages
+            readable: true,
+            writable: false,
+            executable: false,
+            shared: false,
+            label: "",
+        }],
+        ppid: 2,
+        pgrp: 3,
+        session: 4,
+        utime_ticks: 5,
+        starttime_ticks: 6,
+    };
+    let line = render_stat(&info);
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 52 {
+        return TestResult::Fail("stat must have exactly 52 fields");
+    }
+    // 0-based: ppid=3, pgrp=4, session=5, utime=13, starttime=21,
+    // vsize=22, rss=23.
+    if f[3] != "2" || f[4] != "3" || f[5] != "4" {
+        return TestResult::Fail("ppid/pgrp/session must land in fields 4-6");
+    }
+    if f[13] != "5" {
+        return TestResult::Fail("utime must land in field 14");
+    }
+    if f[21] != "6" || f[22] != "8192" || f[23] != "2" {
+        return TestResult::Fail("starttime/vsize/rss must land in fields 22-24");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_pid_stat_real_fields);

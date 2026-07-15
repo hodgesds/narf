@@ -788,3 +788,55 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
+
+// ── Test 14: THP `enabled` attr renders with [never] active ──────────
+
+/// `/sys/kernel/mm/transparent_hugepage/enabled` must contain
+/// `[never]` as the active (bracketed) value. redis and jemalloc
+/// probe this file at startup. NARF has no THP; `[never]` is the
+/// only valid active token here.
+/// Linux ref: `mm/huge_memory.c` `enabled_show` (6.9).
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_thp_enabled_contains_never() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_kernel_dir();
+    let root = crate::sysfs::sysfs_root();
+    let thp = root
+        .get_child("kernel")
+        .and_then(|k| k.get_child("mm"))
+        .and_then(|m| m.get_child("transparent_hugepage"));
+    let kobj = match thp {
+        Some(k) => k,
+        None => return TestResult::Fail("kernel/mm/transparent_hugepage dir missing"),
+    };
+    match kobj.attr_show("enabled") {
+        Some(ref s) if s.contains("[never]") => TestResult::Pass,
+        Some(_) => TestResult::Fail("enabled attr missing [never] token"),
+        None => TestResult::Fail("enabled attr not registered"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_thp_enabled_contains_never);
+
+/// `/sys/kernel/mm/transparent_hugepage/defrag` renders with [never] active.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_thp_defrag_contains_never() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_kernel_dir();
+    let root = crate::sysfs::sysfs_root();
+    let kobj = match root
+        .get_child("kernel")
+        .and_then(|k| k.get_child("mm"))
+        .and_then(|m| m.get_child("transparent_hugepage"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("transparent_hugepage dir missing"),
+    };
+    match kobj.attr_show("defrag") {
+        Some(ref s) if s.contains("[never]") => TestResult::Pass,
+        Some(_) => TestResult::Fail("defrag attr missing [never] token"),
+        None => TestResult::Fail("defrag attr not registered"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_thp_defrag_contains_never);
