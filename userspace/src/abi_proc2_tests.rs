@@ -338,3 +338,95 @@ fn smoke_abi_proc2_unshare_newns() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_unshare_newns);
+
+// ── prctl PR_SET/GET_PDEATHSIG + PR_SET/GET_CHILD_SUBREAPER ──
+
+fn smoke_abi_proc2_prctl_pdeathsig_roundtrip() -> TestResult {
+    with_setup(|| {
+        // set(SIGUSR1=10) → get reads 10 back through the int pointer.
+        if call(Syscall::Prctl.raw(), a1(1, 10)) != Some(0) {
+            return Err("PR_SET_PDEATHSIG(10) should return 0");
+        }
+        let mut out: i32 = -1;
+        if call(Syscall::Prctl.raw(), a1(2, &mut out as *mut i32 as u64)) != Some(0) || out != 10 {
+            return Err("PR_GET_PDEATHSIG must read back 10");
+        }
+        // 0 clears; out-of-range (64: no bit in the u64 signal maps) → EINVAL.
+        if call(Syscall::Prctl.raw(), a1(1, 0)) != Some(0) {
+            return Err("PR_SET_PDEATHSIG(0) should clear and return 0");
+        }
+        if call(Syscall::Prctl.raw(), a1(1, 64)) != Some(-22) {
+            return Err("PR_SET_PDEATHSIG(64) should return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_pdeathsig_roundtrip);
+
+fn smoke_abi_proc2_prctl_subreaper_roundtrip() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Prctl.raw(), a1(36, 1)) != Some(0) {
+            return Err("PR_SET_CHILD_SUBREAPER(1) should return 0");
+        }
+        let mut out: i32 = 0;
+        if call(Syscall::Prctl.raw(), a1(37, &mut out as *mut i32 as u64)) != Some(0) || out != 1 {
+            return Err("PR_GET_CHILD_SUBREAPER must read back 1");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_subreaper_roundtrip);
+
+// ── pdeathsig delivery + subreaper reparenting on parent exit ──
+//
+// Three synthetic tasks: SUB (subreaper) ← MID ← KID(pdeathsig=10).
+// Orphanizing MID must (a) deliver KID's death signal and (b) retarget
+// KID's parent row to SUB instead of dropping it.
+fn smoke_abi_proc2_pdeathsig_and_subreaper_on_exit() -> TestResult {
+    with_setup(|| {
+        const SUB: u64 = 0x7A00;
+        const MID: u64 = 0x7A01;
+        const KID: u64 = 0x7A02;
+        for t in [SUB, MID, KID] {
+            crate::handlers::register_task_to_pid(t, t);
+            crate::handlers::register_pid_task_mapping(t, t);
+            if crate::task::task_get(t).is_none() {
+                let _ = crate::task::Task::new_registered(t, t);
+            }
+        }
+        crate::handlers::__test_inject_parent_of(KID, MID);
+        crate::handlers::__test_inject_parent_of(MID, SUB);
+        // Switch identity to configure per-task prctl state through the
+        // real syscall: SUB volunteers as subreaper, KID arms pdeathsig.
+        set_task(SUB);
+        if call(Syscall::Prctl.raw(), a1(36, 1)) != Some(0) {
+            return Err("subreaper prctl on SUB failed");
+        }
+        set_task(KID);
+        if call(Syscall::Prctl.raw(), a1(1, 10)) != Some(0) {
+            return Err("pdeathsig prctl on KID failed");
+        }
+        set_task(FAKE_TASK);
+        // MID dies.
+        crate::handlers::__test_orphanize_children_of(MID);
+        if crate::handlers::signal_pending_of(KID) & (1u64 << 10) == 0 {
+            return Err("KID must receive its pdeathsig when MID exits");
+        }
+        let reparented = crate::handlers::parent_of_get(KID);
+        // Release the synthetic tasks — the refcounted TASKS registry is
+        // NOT swept by setup()/teardown(), and stale entries are exactly
+        // the persistent-state class behind the pause_neg ordering saga
+        // (see the kernel-test-suite pitfalls note).
+        for t in [SUB, MID, KID] {
+            crate::handlers::release_reaped_task(t);
+        }
+        if reparented != Some(SUB) {
+            return Err("KID must be reparented to the subreaper SUB");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_pdeathsig_and_subreaper_on_exit
+);

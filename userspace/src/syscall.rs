@@ -2068,6 +2068,12 @@ pub enum Syscall {
     /// of utimensat. Linux (x86_64=261; aarch64 has none).
     Futimesat,
 
+    /// `reboot(magic1, magic2, cmd, arg)` — restart / power off /
+    /// halt the machine. Linux (x86_64=169, aarch64=142). Magic pair
+    /// validated; RESTART routes to narf-power's FADT/CF9 reset,
+    /// POWER_OFF and HALT to the ACPI S5 path.
+    Reboot,
+
     /// `geteuid()` — effective uid (== real uid in NARF).
     /// Linux (x86_64=107, aarch64=175).
     Geteuid,
@@ -2514,6 +2520,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::PivotRoot, 155),
     (Syscall::Mount, 165),
     (Syscall::Umount2, 166),
+    (Syscall::Reboot, 169),
     (Syscall::SetHostname, 170),
     (Syscall::Gettid, 186),
     (Syscall::Tkill, 200),
@@ -2922,6 +2929,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::FinitModule, 273),
     // Wave-72 — UTS/IPC syscalls (gated `container`).
     (Syscall::Uname, 160),
+    (Syscall::Reboot, 142),
     (Syscall::Setdomainname, 162),
     #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 194),

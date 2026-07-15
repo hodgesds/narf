@@ -1991,6 +1991,7 @@ dependencies = [
  "narf-memory",
  "narf-modules",
  "narf-net",
+ "narf-power",
  "narf-scheduler",
  "narf-time",
 ]

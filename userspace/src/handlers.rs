@@ -11151,7 +11151,7 @@ fn parent_of_remove(child: u64) {
 /// and the orphan auto-release). Resolves pid→tid through the fork-time
 /// mapping — still intact at reap time because nothing removes it before
 /// this point.
-fn release_reaped_task(child_pid: u64) {
+pub(crate) fn release_reaped_task(child_pid: u64) {
     if let Some(tid) = pid_to_task_raw(child_pid) {
         // Only release a task that actually ran its exit path. A
         // CLONE_THREAD sibling's exit stages a reap entry under the
@@ -11318,6 +11318,9 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = PROC_EXE.lock().as_mut() {
         m.remove(&tid);
     }
+    if let Some(m) = TASK_START_NS.lock().as_mut() {
+        m.remove(&tid);
+    }
     // POSIX record locks: drop everything this task still holds, or a
     // crashed holder pins every F_SETLKW waiter forever (the blocking
     // retry loop only ends when the conflict clears).
@@ -11382,27 +11385,102 @@ fn release_task_tables(tid: u64) {
 /// sit unreaped in the dying parent's PENDING_EXITS queue are released
 /// here — before this existed they leaked their pid + Task forever and
 /// a parent-of-a-dead-parent chain could strand a wait4 sleeper.
+/// Nearest live ancestor of `dying` that volunteered as a child
+/// subreaper (PR_SET_CHILD_SUBREAPER) — the process that inherits the
+/// dying task's orphans, Linux `find_new_reaper` minus the init
+/// fallback (NARF has no reaping init; no subreaper = auto-release,
+/// the pre-subreaper behavior). Bounded walk: PARENT_OF chains are
+/// fork-depth, but a corrupt cycle must not wedge the exit path.
+fn find_child_subreaper(dying: u64) -> Option<u64> {
+    let mut cur_pid = task_to_pid_raw(dying).unwrap_or(dying);
+    for _ in 0..64 {
+        let parent = parent_of_get(cur_pid)?;
+        let parent_tid = pid_to_task_raw(parent).unwrap_or(parent);
+        if read_prctl(parent_tid).child_subreaper && signal_target_exists(parent_tid) {
+            return Some(parent_tid);
+        }
+        cur_pid = task_to_pid_raw(parent_tid).unwrap_or(parent_tid);
+    }
+    None
+}
+
+/// Test hook: run the orphanize pass for a synthetic parent without
+/// going through a real task exit.
+#[doc(hidden)]
+pub fn __test_orphanize_children_of(parent_tid: u64) {
+    orphanize_children_of(parent_tid);
+}
+
 fn orphanize_children_of(parent_tid: u64) {
-    // Already-exited, never-reaped children: release now.
+    let reaper = find_child_subreaper(parent_tid);
+    // Already-exited, never-reaped children: hand them to the subreaper
+    // (it can wait4 them like its own) or release when there is none.
     let stale: alloc::vec::Vec<(u64, i32)> = {
         let mut g = PENDING_EXITS.lock();
         g.as_mut()
             .and_then(|m| m.remove(&parent_tid))
             .unwrap_or_default()
     };
-    for (child_pid, _status) in stale {
-        release_reaped_task(child_pid);
-        crate::release_pid(crate::ProcessId(child_pid));
-        parent_of_remove(child_pid);
+    match reaper {
+        Some(r) if !stale.is_empty() => {
+            {
+                let mut g = PENDING_EXITS.lock();
+                if let Some(m) = g.as_mut() {
+                    m.entry(r).or_default().extend(stale.iter().copied());
+                }
+            }
+            for (child_pid, _) in &stale {
+                parent_of_set(*child_pid, r);
+            }
+            // The subreaper learns about its inherited zombies the same
+            // way a real parent would: SIGCHLD + a wait4 wake.
+            raise_signal_pending(r, 17);
+            crate::user_task::wake_wait_child(r);
+        }
+        _ => {
+            for (child_pid, _status) in stale {
+                release_reaped_task(child_pid);
+                crate::release_pid(crate::ProcessId(child_pid));
+                parent_of_remove(child_pid);
+            }
+        }
     }
     // Queued stop/continue job-control reports die with the waiter.
     if let Some(m) = PENDING_STOPCONT.lock().as_mut() {
         m.remove(&parent_tid);
     }
-    // Still-running children: orphanize so their eventual exit takes
-    // the auto-release branch instead of notifying a corpse.
+    // Still-running children: deliver each one's PR_SET_PDEATHSIG (the
+    // runc/supervisor "kill me when my parent dies" contract) BEFORE the
+    // rows move, then reparent to the subreaper or drop the rows so an
+    // orphan's eventual exit takes the auto-release branch.
+    let children: alloc::vec::Vec<u64> = {
+        let g = PARENT_OF.lock();
+        g.as_ref()
+            .map(|m| {
+                m.iter()
+                    .filter(|&(_, p)| *p == parent_tid)
+                    .map(|(&c, _)| c)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for child_pid in &children {
+        let child_tid = pid_to_task_raw(*child_pid).unwrap_or(*child_pid);
+        let sig = read_prctl(child_tid).pdeathsig;
+        if sig != 0 {
+            // raise_signal_pending wakes a parked target itself.
+            raise_signal_pending(child_tid, sig);
+        }
+    }
     if let Some(m) = PARENT_OF.lock().as_mut() {
-        m.retain(|_, parent| *parent != parent_tid);
+        match reaper {
+            Some(r) => {
+                for (_, parent) in m.iter_mut().filter(|(_, p)| **p == parent_tid) {
+                    *parent = r;
+                }
+            }
+            None => m.retain(|_, parent| *parent != parent_tid),
+        }
     }
 }
 
@@ -12890,6 +12968,10 @@ const PR_SET_DUMPABLE: u64 = 4;
 const PR_GET_DUMPABLE: u64 = 3;
 const PR_SET_NO_NEW_PRIVS: u64 = 38;
 const PR_GET_NO_NEW_PRIVS: u64 = 39;
+const PR_SET_PDEATHSIG: u64 = 1;
+const PR_GET_PDEATHSIG: u64 = 2;
+const PR_SET_CHILD_SUBREAPER: u64 = 36;
+const PR_GET_CHILD_SUBREAPER: u64 = 37;
 const TASK_COMM_LEN: usize = 16;
 
 #[derive(Copy, Clone)]
@@ -12897,6 +12979,13 @@ struct PrctlState {
     name: [u8; TASK_COMM_LEN],
     dumpable: bool,
     no_new_privs: bool,
+    /// PR_SET_PDEATHSIG: signal delivered to THIS task when its parent
+    /// dies (0 = none). Not inherited by fork children — PRCTL_TABLE
+    /// entries aren't fork-copied, which matches Linux's clear-on-fork.
+    pdeathsig: u32,
+    /// PR_SET_CHILD_SUBREAPER: this task volunteers to absorb the
+    /// orphans of its descendants (instead of them going unreaped).
+    child_subreaper: bool,
 }
 
 impl Default for PrctlState {
@@ -12905,6 +12994,8 @@ impl Default for PrctlState {
             name: [0; TASK_COMM_LEN],
             dumpable: true, // Linux default
             no_new_privs: false,
+            pdeathsig: 0,
+            child_subreaper: false,
         }
     }
 }
@@ -12986,6 +13077,51 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             // copy_to_user range-validates it and SMAP-brackets the write of `s.name`.
             // SAFETY: Valid memory or trusted environment
             if unsafe { copy_to_user(arg_a, &s.name) }.is_err() {
+                ctx.set_return(fail);
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_SET_PDEATHSIG => {
+            // arg is the signal number; 0 clears. Same 1..=63 range as
+            // every send path (see SIGNAL_PENDING's bit-N convention).
+            if arg_a > 63 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            modify_prctl(task, |s| s.pdeathsig = arg_a as u32);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_GET_PDEATHSIG => {
+            // Writes an int through the arg2 pointer (Linux ABI).
+            if arg_a == 0 {
+                ctx.set_return(fail);
+                return;
+            }
+            let sig = read_prctl(task).pdeathsig as i32;
+            // SAFETY: `arg_a` is the user int pointer (non-zero, checked);
+            // copy_to_user range-validates and SMAP-brackets the 4-byte write.
+            // SAFETY: Valid memory or trusted environment
+            if unsafe { copy_to_user(arg_a, &sig.to_ne_bytes()) }.is_err() {
+                ctx.set_return(fail);
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_SET_CHILD_SUBREAPER => {
+            modify_prctl(task, |s| s.child_subreaper = arg_a != 0);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            if arg_a == 0 {
+                ctx.set_return(fail);
+                return;
+            }
+            let v = read_prctl(task).child_subreaper as i32;
+            // SAFETY: `arg_a` is the user int pointer (non-zero, checked);
+            // copy_to_user range-validates and SMAP-brackets the 4-byte write.
+            // SAFETY: Valid memory or trusted environment
+            if unsafe { copy_to_user(arg_a, &v.to_ne_bytes()) }.is_err() {
                 ctx.set_return(fail);
                 return;
             }
@@ -16710,6 +16846,29 @@ pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMa
 // not at exit).
 static TASK_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Task creation timestamp (monotonic ns) — /proc/[pid]/stat field 22
+/// (starttime, in USER_HZ ticks since boot). Recorded by
+/// `Task::new_registered`, swept with the other per-task tables.
+static TASK_START_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Record `tid`'s creation time. Called from `Task::new_registered`.
+pub(crate) fn record_task_start_ns(tid: u64) {
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    let mut g = TASK_START_NS.lock();
+    g.get_or_insert_with(BTreeMap::new)
+        .entry(tid)
+        .or_insert(now);
+}
+
+fn task_start_ns(tid: u64) -> u64 {
+    TASK_START_NS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&tid).copied())
+        .unwrap_or(0)
+}
 static TASK_CHILD_CPU_NS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -17378,6 +17537,11 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
             });
         }
     }
+    // stat fields 4-6, 14, 22: parentage + CPU + start time. The tid
+    // resolves the accounting tables (they key on TaskId); PARENT_OF
+    // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
+    let tid = pid_to_task_raw(pid).unwrap_or(pid);
+    const NS_PER_TICK: u64 = 10_000_000;
     Some(ProcTaskInfo {
         pid,
         comm,
@@ -17386,6 +17550,11 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         stack_top,
         cmdline,
         vmas,
+        ppid: parent_of_get(pid).unwrap_or(0),
+        pgrp: read_pgid(tid),
+        session: read_sid(tid),
+        utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
+        starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
     })
 }
 
@@ -21259,6 +21428,51 @@ fn flock_try(file_ptr: usize, op: u32, task: u64) -> Result<(), ()> {
     Err(())
 }
 
+/// `reboot(magic1, magic2, cmd, arg)` — Linux reboot(2). The magic
+/// pair guards against a stray syscall with garbage args landing on
+/// the power-off path (Linux's rationale exactly). No capability
+/// check — everything runs root today, matching the rest of the
+/// surface. RESTART goes through narf-power's FADT/CF9 reset,
+/// POWER_OFF and HALT both enter ACPI S5 (NARF has no "halted but
+/// powered" CPU parking state worth distinguishing). The
+/// Ctrl-Alt-Del toggles are accepted no-ops.
+fn sys_reboot(ctx: &mut dyn TrapContext) {
+    const LINUX_REBOOT_MAGIC1: u64 = 0xfee1_dead;
+    const MAGIC2: u64 = 672_274_793; // 0x28121969
+    const MAGIC2A: u64 = 0x0512_1996;
+    const MAGIC2B: u64 = 0x1604_1998;
+    const MAGIC2C: u64 = 0x2011_2000;
+    const CMD_RESTART: u64 = 0x0123_4567;
+    const CMD_HALT: u64 = 0xcdef_0123;
+    const CMD_POWER_OFF: u64 = 0x4321_fedc;
+    const CMD_CAD_ON: u64 = 0x89ab_cdef;
+    const CMD_CAD_OFF: u64 = 0;
+
+    let a = *ctx.args();
+    // Linux truncates the magics to 32 bits before comparing (glibc
+    // sign-extends LINUX_REBOOT_MAGIC1 through the int prototype).
+    let magic1 = a.arg0 as u32 as u64;
+    let magic2 = a.arg1 as u32 as u64;
+    if magic1 != LINUX_REBOOT_MAGIC1 || !matches!(magic2, MAGIC2 | MAGIC2A | MAGIC2B | MAGIC2C) {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    match a.arg2 as u32 as u64 {
+        CMD_CAD_ON | CMD_CAD_OFF => ctx.set_return(SyscallReturn::ok(0)),
+        CMD_RESTART => {
+            use core::fmt::Write;
+            let _ = writeln!(narf_console::Writer, "reboot: Restarting system");
+            narf_power::system::reboot();
+        }
+        CMD_POWER_OFF | CMD_HALT => {
+            use core::fmt::Write;
+            let _ = writeln!(narf_console::Writer, "reboot: Power down");
+            narf_power::system::power_off();
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+    }
+}
+
 fn sys_flock(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -23492,6 +23706,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime));
     table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utimes));
     table.install_raw(Syscall::Futimesat, "futimesat", RawFnHandler(sys_futimesat));
+    table.install_raw(Syscall::Reboot, "reboot", RawFnHandler(sys_reboot));
     table.install_raw(Syscall::Utimensat, "utimensat", RawFnHandler(sys_utimensat));
     // Batch 15: credential gaps (real/effective/fs uid+gid).
     table.install_raw(Syscall::Geteuid, "geteuid", RawFnHandler(sys_geteuid));

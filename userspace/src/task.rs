@@ -79,6 +79,11 @@ impl Task {
             uctx: UserTaskCtx::new(),
         });
         TASKS.lock().insert(tid, t.clone());
+        // /proc/[pid]/stat starttime source — every task (spawn, fork,
+        // clone, the abi-test harness) registers exactly once, so this
+        // is THE creation timestamp. Swept with the other per-task
+        // tables at exit.
+        crate::handlers::record_task_start_ns(tid);
         t
     }
 }

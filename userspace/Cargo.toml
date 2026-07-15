@@ -29,6 +29,7 @@ narf-initramfs    = { path = "../initramfs" }
 narf-input        = { path = "../input" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 narf-modules      = { path = "../modules" }
+narf-power        = { path = "../power" }
 
 [features]
 # Default-on so the workspace's `cargo xtask kernel-test` driver

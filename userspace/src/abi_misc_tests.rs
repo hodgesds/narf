@@ -648,3 +648,31 @@ fn smoke_abi_misc_delete_module_absent() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_delete_module_absent);
+
+// ── reboot(2): magic validation only ──
+//
+// The VALID-magic arms restart/power off the machine — never call them
+// from the suite (they would kill the QEMU boot mid-run). The EINVAL
+// guards are the testable surface.
+fn smoke_abi_misc_reboot_bad_magic_einval() -> TestResult {
+    with_setup(|| {
+        // Wrong magic1.
+        if call(Syscall::Reboot.raw(), a2(0xdead, 672274793, 0)) != Some(-22) {
+            return Err("reboot with bad magic1 must return -EINVAL");
+        }
+        // Right magic1, wrong magic2.
+        if call(Syscall::Reboot.raw(), a2(0xfee1dead, 0x1111, 0)) != Some(-22) {
+            return Err("reboot with bad magic2 must return -EINVAL");
+        }
+        // Valid magics + unknown cmd → EINVAL (and must NOT power off).
+        if call(Syscall::Reboot.raw(), a2(0xfee1dead, 672274793, 0x7777)) != Some(-22) {
+            return Err("reboot with unknown cmd must return -EINVAL");
+        }
+        // Valid magics + CAD_OFF (cmd 0) → accepted no-op.
+        if call(Syscall::Reboot.raw(), a2(0xfee1dead, 672274793, 0)) != Some(0) {
+            return Err("reboot(CAD_OFF) should return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_reboot_bad_magic_einval);
