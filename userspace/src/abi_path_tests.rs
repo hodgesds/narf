@@ -560,3 +560,124 @@ fn smoke_abi_path_open_missing_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_open_missing_neg);
+
+// ── link / linkat: hard links (same-parent; cross-dir → -EXDEV) ──
+
+fn smoke_abi_path_link_pos() -> TestResult {
+    with_memfs("/p", "p", &[("old", b"hi")], || {
+        let old = b"/p/old\0";
+        let new = b"/p/new\0";
+        if call(
+            Syscall::Link.raw(),
+            a1(old.as_ptr() as u64, new.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("link(old, new) should return 0");
+        }
+        // The new name must open and read the SAME bytes — the alias
+        // shares the backing node (hard-link semantics, not a copy).
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, new.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p/new) after link should succeed"),
+        };
+        let mut buf = [0u8; 2];
+        if call(Syscall::Read.raw(), a2(fd, buf.as_mut_ptr() as u64, 2)) != Some(2) || &buf != b"hi"
+        {
+            return Err("read through the link must see the original bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_link_pos);
+
+fn smoke_abi_path_link_neg() -> TestResult {
+    with_memfs("/p", "p", &[("old", b"hi"), ("taken", b"x")], || {
+        let missing = b"/p/ghost\0";
+        let new = b"/p/n1\0";
+        // Missing source → -ENOENT.
+        if call(
+            Syscall::Link.raw(),
+            a1(missing.as_ptr() as u64, new.as_ptr() as u64),
+        ) != Some(-2)
+        {
+            return Err("link(missing, ..) should return -ENOENT");
+        }
+        // Existing destination → -EEXIST (link never replaces).
+        let old = b"/p/old\0";
+        let taken = b"/p/taken\0";
+        if call(
+            Syscall::Link.raw(),
+            a1(old.as_ptr() as u64, taken.as_ptr() as u64),
+        ) != Some(-17)
+        {
+            return Err("link(.., existing) should return -EEXIST");
+        }
+        // Cross-directory → -EXDEV (same-parent restriction, like rename).
+        let elsewhere = b"/q/new\0";
+        if call(
+            Syscall::Link.raw(),
+            a1(old.as_ptr() as u64, elsewhere.as_ptr() as u64),
+        ) != Some(-18)
+        {
+            return Err("cross-directory link should return -EXDEV");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_link_neg);
+
+fn smoke_abi_path_linkat_pos() -> TestResult {
+    with_memfs("/p", "p", &[("old", b"hi")], || {
+        let old = b"/p/old\0";
+        let new = b"/p/n2\0";
+        // AT_FDCWD + absolute paths, flags = 0 (a3 zeroes arg4).
+        match call(
+            Syscall::Linkat.raw(),
+            a3(AT_FDCWD, old.as_ptr() as u64, AT_FDCWD, new.as_ptr() as u64),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("linkat(AT_FDCWD, old, AT_FDCWD, new, 0) should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_linkat_pos);
+
+// ── fchdir: directory fd → cwd ──
+
+fn smoke_abi_path_fchdir_pos() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"hi")], || {
+        let dirp = b"/p\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dirp.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening /p as a directory fd failed"),
+        };
+        if call(Syscall::Fchdir.raw(), a0(dfd)) != Some(0) {
+            return Err("fchdir(dirfd) should return 0");
+        }
+        // getcwd must now report /p.
+        let mut buf = [0u8; 16];
+        let n = call(Syscall::Getcwd.raw(), a1(buf.as_mut_ptr() as u64, 16));
+        if n.is_none() || !buf.starts_with(b"/p\0") {
+            return Err("getcwd after fchdir should report /p");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_fchdir_pos);
+
+fn smoke_abi_path_fchdir_neg() -> TestResult {
+    with_setup(|| {
+        // Dead fd → -EBADF.
+        match call(Syscall::Fchdir.raw(), a0(9999)) {
+            Some(-9) => Ok(()),
+            _ => Err("fchdir(dead fd) should return -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_fchdir_neg);

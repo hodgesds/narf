@@ -26,6 +26,8 @@ pub fn install_all_hooks() {
     #[cfg(feature = "linux-compat")]
     install_proc_ext_hooks();
     #[cfg(feature = "linux-compat")]
+    install_proc_path_hooks();
+    #[cfg(feature = "linux-compat")]
     install_proc_write_hooks();
     install_net_stack();
     #[cfg(feature = "linux-compat")]
@@ -84,6 +86,17 @@ fn install_proc_ext_hooks() {
         narf_userspace::handlers::nice_of,
         narf_userspace::handlers::proc_environ_of,
         narf_userspace::handlers::proc_auxv_of,
+    );
+}
+
+#[cfg(feature = "linux-compat")]
+fn install_proc_path_hooks() {
+    // /proc/[pid]/{exe,cwd,root} magic-link targets: exec'd image path
+    // (published by sys_execve), per-task cwd, and the chroot prefix.
+    narf_filesystem::procfs::install_proc_path_hooks(
+        narf_userspace::handlers::proc_exe_path,
+        narf_userspace::handlers::proc_cwd_path,
+        narf_userspace::handlers::proc_root_path,
     );
 }
 

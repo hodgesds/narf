@@ -11031,7 +11031,7 @@ fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
         return TestResult::Fail("rt_sigtimedwait must pick the lowest matching signum");
     }
     // 5 cleared; 10 + 15 still pending.
-    let want = (1u32 << 10) | (1u32 << 15);
+    let want = (1u64 << 10) | (1u64 << 15);
     if pending_after != want {
         return TestResult::Fail("rt_sigtimedwait must clear only the returned signum");
     }
@@ -11432,11 +11432,13 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // signum = 32 (NSIG) must be rejected.
+    // signum = 64 must be rejected: the u64 bit-N-=-signal-N bitmaps
+    // represent signals 1..=63, so 64 (SIGRTMAX) is the first
+    // out-of-range value now that RT signals 32..=63 are valid.
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
             arg0: 0xBEEF,
-            arg1: 32,
+            arg1: 64,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -11452,7 +11454,7 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     if r == SyscallReturn::ok((-22i64) as u64) {
         TestResult::Pass
     } else {
-        TestResult::Fail("signum 32 must be rejected with -EINVAL")
+        TestResult::Fail("signum 64 must be rejected with -EINVAL")
     }
 }
 kernel_test_in!(
@@ -14495,7 +14497,7 @@ fn smoke_console_ctrlc_signals_foreground_pgrp() -> TestResult {
     narf_filesystem::console_tty::__test_reset_cooked();
     __test_reset_task_id_lookup();
 
-    let sigint = 1u32 << 2; // SIGINT = 2 (NARF pending convention: bit == signum)
+    let sigint = 1u64 << 2; // SIGINT = 2 (NARF pending convention: bit == signum)
     if n != 0 {
         return TestResult::Fail("^C should be consumed as a signal, not returned by read");
     }
@@ -14633,7 +14635,7 @@ fn smoke_tty_background_read_raises_sigttin() -> TestResult {
     __test_pgid_reset();
     __test_reset_task_id_lookup();
 
-    let sigttin = 1u32 << 21;
+    let sigttin = 1u64 << 21;
     if pending & sigttin == 0 {
         return TestResult::Fail("background console read did not raise SIGTTIN");
     }
@@ -15446,7 +15448,7 @@ fn smoke_sys_kill_sigterm_marks_pending() -> TestResult {
     if !kill_ok {
         return TestResult::Fail("kill(SIGTERM) did not return Ok(0)");
     }
-    if pending & (1u32 << 15) == 0 {
+    if pending & (1u64 << 15) == 0 {
         return TestResult::Fail("SIGTERM did not land in SIGNAL_PENDING");
     }
     TestResult::Pass
@@ -15527,7 +15529,7 @@ fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
     __test_signal_reset();
     __test_clear_global();
 
-    let want = (1u32 << 1) | (1u32 << 2) | (1u32 << 6);
+    let want = (1u64 << 1) | (1u64 << 2) | (1u64 << 6);
     if pending & want == want {
         TestResult::Pass
     } else {
@@ -17125,7 +17127,7 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
     __test_signal_reset();
     __test_clear_global();
 
-    if pending & (1u32 << 10) != 0 {
+    if pending & (1u64 << 10) != 0 {
         TestResult::Pass
     } else {
         TestResult::Fail("SIGUSR1 not in pending after timer pump")

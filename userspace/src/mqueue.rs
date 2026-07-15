@@ -743,6 +743,18 @@ const IN_CLOEXEC: u64 = 0o2000000;
 /// `inotify_init1(flags)`.
 pub fn sys_inotify_init1(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0;
+    inotify_init_common(ctx, flags)
+}
+
+/// Legacy `inotify_init(void)` — x86_64 253. The ABI has NO flags
+/// argument, so arg0 is whatever the caller left in the register and
+/// must not be read: a stale IN_NONBLOCK bit would make every read on
+/// the new fd spuriously EAGAIN.
+pub fn sys_inotify_init_no_flags(ctx: &mut dyn TrapContext) {
+    inotify_init_common(ctx, 0)
+}
+
+fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
     let id = INOTIFY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     with_inotify(|m| {
         m.insert(

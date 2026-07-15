@@ -640,7 +640,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
         // SAFETY: sigsetsize == 8 checked above; copy_from_user range-validates
         // `sigmask_ptr` and SMAP-brackets the read into `buf`.
         if unsafe { crate::handlers::copy_from_user(&mut buf, sigmask_ptr) }.is_ok() {
-            let mask = (u64::from_ne_bytes(buf) << 1) as u32;
+            let mask = u64::from_ne_bytes(buf) << 1;
             old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
         } else {
             ctx.set_return(fail);

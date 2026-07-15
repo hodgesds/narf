@@ -84,10 +84,20 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_kill_neg);
 
 fn smoke_abi_signal_pause_neg() -> TestResult {
     with_setup(|| {
-        // Blocking path taken → pause(2) surfaces -EINTR (Linux parity).
+        // Which return shape we see depends on PROCESS-GLOBAL state this
+        // test does not control: the blocking branch needs a yield hook +
+        // user-task ctx, and in the shared-boot suite the global yield
+        // hook is only installed if an executor test happened to run
+        // earlier in the (hash-ordered) sequence. Hook present → the
+        // block branch bakes -EINTR (-4); hook absent → the documented
+        // no-executor fallback returns -1. Both are the harness-correct
+        // answers (asserting only -4 made this test flip on unrelated
+        // test insertions — it is order luck, not behavior). Real Linux
+        // pause(2) -EINTR semantics are covered by the signal_smoke
+        // integration path.
         let r = call(Syscall::Pause.raw(), a0(0));
-        if r != Some(-4) {
-            return Err("pause should return -EINTR (-4) via the blocking path");
+        if r != Some(-4) && r != Some(-1) {
+            return Err("pause should return -EINTR (-4, blocking) or -1 (no-executor fallback)");
         }
         Ok(())
     })
@@ -95,7 +105,7 @@ fn smoke_abi_signal_pause_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_signal_pause_neg);
 
 // ── RtSigaction ─────────────────────────────────────────────────────
-// sys_rt_sigaction(sig, act, oact, sigsetsize): sig>=NSIG(32) OR
+// sys_rt_sigaction(sig, act, oact, sigsetsize): sig>=NSIG(64) OR
 // sigsetsize!=8 → ok(-1). Otherwise ok(0). act=0 just leaves the slot.
 
 fn smoke_abi_signal_rt_sigaction_pos() -> TestResult {
@@ -151,11 +161,13 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigaction_pos);
 
 fn smoke_abi_signal_sigaction_neg() -> TestResult {
     with_setup(|| {
-        // signum >= NSIG(32) → invalid_op() (None).
+        // signum >= NSIG(64) → invalid_op() (None). Signal 40 became a
+        // VALID rt signal when the mask/pending bitmaps widened to u64;
+        // 70 is the out-of-range probe now.
         // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
-        let r = call(Syscall::Sigaction.raw(), a3(40, 0, 0, 0));
+        let r = call(Syscall::Sigaction.raw(), a3(70, 0, 0, 0));
         if r.is_some() {
-            return Err("sigaction(40,..) should be a non-Ok (InvalidOp) status");
+            return Err("sigaction(70,..) should be a non-Ok (InvalidOp) status");
         }
         Ok(())
     })
@@ -536,3 +548,123 @@ fn smoke_abi_signal_sigkill_unblockable() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigkill_unblockable);
+
+// ── Real-time signals (33..=63) ──────────────────────────────────────
+// The mask/pending bitmaps were u32 (NSIG=32), so RT signals could
+// neither be sent nor blocked — musl reserves SIGCANCEL(33) for
+// pthread_cancel and SIGSYNCCALL(34) for multithreaded setuid, and
+// hands applications SIGRTMIN=35.., so the cap broke real threading
+// paths. Everything is u64 now (bit N = signal N, 1..=63); these
+// smokes pin the widened range end-to-end: send, block, sigpending
+// round-trip, timedwait drain, and the 64/SIGRTMAX rejection edge.
+
+// kill() with an RT signal must queue it like any classic signal.
+fn smoke_abi_signal_rt_kill_pending() -> TestResult {
+    with_setup(|| {
+        // musl SIGRTMIN = 35.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 35)) != Some(0) {
+            return Err("kill(self, SIGRTMIN=35) should return 0");
+        }
+        // 63 is the highest representable signal (bit N = signal N).
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 63)) != Some(0) {
+            return Err("kill(self, 63) should return 0");
+        }
+        let pending = crate::handlers::signal_pending_of(FAKE_TASK);
+        if pending & (1u64 << 35) == 0 || pending & (1u64 << 63) == 0 {
+            return Err("RT signals 35/63 must land in SIGNAL_PENDING");
+        }
+        // Signal 64 (SIGRTMAX) has no bit in the bit-N-=-signal-N u64
+        // convention → rejected like an out-of-range signal.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 64)) != Some(-22) {
+            return Err("kill(self, 64) should return -EINVAL (unrepresentable top slot)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_rt_kill_pending);
+
+// sigprocmask must be able to block an RT signal: user sigset bit 32
+// == signal 33 (musl SIGCANCEL). Pre-widening the `as u32` truncation
+// dropped every bit above signal 31, so pthread_cancel's block of
+// SIGCANCEL silently did nothing.
+fn smoke_abi_signal_rt_sigprocmask_blocks() -> TestResult {
+    with_setup(|| {
+        let set: u64 = 1u64 << (33 - 1); // userspace convention: bit N-1
+        let buf = set.to_ne_bytes();
+        // SIG_SETMASK = 2.
+        if call(Syscall::Sigprocmask.raw(), a3(2, buf.as_ptr() as u64, 0, 8)) != Some(0) {
+            return Err("sigprocmask(SIG_SETMASK, {33}) should return 0");
+        }
+        if crate::handlers::signal_mask_of(FAKE_TASK) & (1u64 << 33) == 0 {
+            return Err("signal 33 must be blockable (mask bit 33 set)");
+        }
+        // A pending-but-blocked 33 must not be deliverable...
+        crate::handlers::raise_signal_pending(FAKE_TASK, 33);
+        if crate::handlers::is_signal_pending(FAKE_TASK) {
+            return Err("blocked RT signal 33 must not be deliverable");
+        }
+        // ...and rt_sigpending must report it back in the user convention.
+        let mut out = 0u64;
+        let r = call(
+            Syscall::RtSigpending.raw(),
+            a1(&mut out as *mut u64 as u64, 8),
+        );
+        if r != Some(0) || out & (1u64 << (33 - 1)) == 0 {
+            return Err("rt_sigpending must surface blocked-pending signal 33 at user bit 32");
+        }
+        // Unblocking makes it deliverable again.
+        let empty = 0u64.to_ne_bytes();
+        if call(
+            Syscall::Sigprocmask.raw(),
+            a3(2, empty.as_ptr() as u64, 0, 8),
+        ) != Some(0)
+        {
+            return Err("sigprocmask(SIG_SETMASK, {}) should return 0");
+        }
+        if !crate::handlers::is_signal_pending(FAKE_TASK) {
+            return Err("unblocked RT signal 33 must become deliverable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigprocmask_blocks);
+
+// rt_sigaction on an RT signal: the per-task handler array is NSIG=64
+// slots now — installing and querying signum 35 must round-trip
+// instead of falling off the old 32-slot table.
+fn smoke_abi_signal_rt_sigaction_installs() -> TestResult {
+    with_setup(|| {
+        // act=0 query on an RT signum → ok(0) (in range).
+        if call(Syscall::RtSigaction.raw(), a3(35, 0, 0, 8)) != Some(0) {
+            return Err("rt_sigaction(35, NULL, NULL, 8) should return 0");
+        }
+        // Out-of-range probe moved up with NSIG: 64 is still invalid.
+        if call(Syscall::RtSigaction.raw(), a3(64, 0, 0, 8)) != Some(-22) {
+            return Err("rt_sigaction(64, ...) should return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigaction_installs);
+
+// rt_sigtimedwait must see and drain an RT signal: set bit 39 (user
+// convention) == signal 40.
+fn smoke_abi_signal_rt_sigtimedwait_rt() -> TestResult {
+    with_setup(|| {
+        crate::handlers::raise_signal_pending(FAKE_TASK, 40);
+        let set: u64 = 1u64 << (40 - 1);
+        let buf = set.to_ne_bytes();
+        let r = call(
+            Syscall::RtSigtimedwait.raw(),
+            a3(buf.as_ptr() as u64, 0, 0, 8),
+        );
+        if r != Some(40) {
+            return Err("rt_sigtimedwait must return the pending RT signum 40");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) & (1u64 << 40) != 0 {
+            return Err("rt_sigtimedwait must clear the drained RT pending bit");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigtimedwait_rt);

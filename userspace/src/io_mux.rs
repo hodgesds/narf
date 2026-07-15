@@ -288,8 +288,8 @@ impl SignalFd {
     /// Test whether any pending signal in the mask is set for the
     /// owner. Looked up against the existing per-task signal pending
     /// table via the public accessor.
-    fn pending_in_mask(&self) -> u32 {
-        let mask = self.mask.load(Ordering::Acquire) as u32;
+    fn pending_in_mask(&self) -> u64 {
+        let mask = self.mask.load(Ordering::Acquire);
         let pending = crate::handlers::signal_pending_of(self.owner_task);
         pending & mask
     }

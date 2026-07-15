@@ -70,8 +70,8 @@ impl SignalFdFile {
     }
 
     /// In-mask pending bitmap for the owner.
-    fn pending(&self) -> u32 {
-        let m = self.mask.load(Ordering::Acquire) as u32;
+    fn pending(&self) -> u64 {
+        let m = self.mask.load(Ordering::Acquire);
         crate::handlers::signal_pending_of(self.owner_task) & m
     }
 }

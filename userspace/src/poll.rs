@@ -269,7 +269,7 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
         // SAFETY: arg4 (sigsetsize) == 8 checked above; copy_from_user
         // range-validates `args.arg3` and SMAP-brackets the read into `buf`.
         if unsafe { crate::handlers::copy_from_user(&mut buf, args.arg3) }.is_ok() {
-            let mask = (u64::from_ne_bytes(buf) << 1) as u32;
+            let mask = u64::from_ne_bytes(buf) << 1;
             let task = current_task_id();
             old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
         } else {

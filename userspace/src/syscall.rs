@@ -1279,6 +1279,44 @@ pub enum Syscall {
     /// (CLOCK_MONOTONIC = 1, CLOCK_BOOTTIME, ...) return -1.
     ClockSetTime,
 
+    /// `gettimeofday(timeval*, timezone*)` — get wall-clock time.
+    /// arg0 = `struct timeval*` out-pointer (may be null),
+    /// arg1 = timezone* (ignored, matching Linux). Writes
+    /// `{ tv_sec: i64, tv_usec: i64 }` (in microseconds, not nanoseconds).
+    /// Returns 0 on success.
+    /// Linux `gettimeofday` (x86_64=96, aarch64=169).
+    Gettimeofday,
+
+    /// `settimeofday(timeval*, timezone*)` — set wall-clock time.
+    /// arg0 = `struct timeval*` in-pointer (may be null → no-op),
+    /// arg1 = timezone* (ignored). Reads `{ tv_sec: i64, tv_usec: i64 }`
+    /// and sets the wall clock. Returns 0 on success.
+    /// Linux `settimeofday` (x86_64=164, aarch64=170).
+    Settimeofday,
+
+    /// `time(time_t*)` — get wall-clock seconds.
+    /// arg0 = optional `time_t*` out-pointer (may be null).
+    /// Returns seconds since epoch; if arg0 non-null, also stores it there.
+    /// Linux `time` (x86_64=201 only; aarch64 generic ABI has no number).
+    Time,
+
+    /// `inotify_init(void)` — initialize an inotify instance (no flags).
+    /// Alias of inotify_init1 with flags=0. Returns an fd ≥ 0 on success.
+    /// Linux `inotify_init` (x86_64=253 only; aarch64 has no number).
+    InotifyInit,
+
+    /// `ioprio_set(which, who, ioprio)` — set I/O priority.
+    /// arg0 = which (IOPRIO_WHO_PROCESS=1), arg1 = who (pid),
+    /// arg2 = ioprio. Stores in a static map; returns 0 on success.
+    /// Linux `ioprio_set` (x86_64=251, aarch64=30).
+    IoprioSet,
+
+    /// `ioprio_get(which, who)` — get I/O priority.
+    /// arg0 = which (IOPRIO_WHO_PROCESS=1), arg1 = who (pid).
+    /// Returns stored priority or default `(IOPRIO_CLASS_BE=2 << 13) | 4`.
+    /// Linux `ioprio_get` (x86_64=252, aarch64=31).
+    IoprioGet,
+
     /// Install a signal-handler stub. `arg0 = signum`,
     /// `arg1 = handler-vaddr` (0 to clear), `arg2 = old-out-ptr`
     /// (may be null). The recorded handler is fired on the
@@ -1408,6 +1446,24 @@ pub enum Syscall {
     /// resolve to the same parent directory or the syscall returns
     /// failure.
     Rename,
+
+    /// `arg0 = old_path cstr`, `arg1 = new_path cstr`. Hard-link
+    /// `new` to `old`'s backing node. Linux link(2) (x86_64=86;
+    /// aarch64 has linkat only). Same-parent restriction as
+    /// [`Syscall::Rename`]; cross-directory returns -EXDEV.
+    Link,
+
+    /// `arg0 = olddirfd`, `arg1 = old_path cstr`, `arg2 = newdirfd`,
+    /// `arg3 = new_path cstr`, `arg4 = flags`. Linux linkat(2)
+    /// (x86_64=265, aarch64=37). Relative paths resolve against
+    /// their dirfd's recorded open path; AT_SYMLINK_FOLLOW is
+    /// accepted and ignored (the symlink entry itself is linked).
+    Linkat,
+
+    /// `arg0 = fd`. Chdir to the directory `fd` was opened on.
+    /// Linux fchdir(2) (x86_64=81, aarch64=50). ENOTDIR for a
+    /// pathless / non-directory fd, EBADF for a dead one.
+    Fchdir,
 
     /// `arg0 = path_ptr`, `arg1 = path_len`, `arg2 = buf_ptr`,
     /// `arg3 = buf_len`. Path-based symlink read / create over MemFs
@@ -2404,7 +2460,9 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Ftruncate, 77),
     (Syscall::Getcwd, 79),
     (Syscall::Chdir, 80),
+    (Syscall::Fchdir, 81),
     (Syscall::Rename, 82),
+    (Syscall::Link, 86),
     (Syscall::Mkdir, 83),
     (Syscall::Rmdir, 84),
     (Syscall::Unlink, 87),
@@ -2461,6 +2519,18 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getdents64, 217),
     (Syscall::ClockSetTime, 227),
     (Syscall::ClockGetTime, 228),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Gettimeofday, 96),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Settimeofday, 164),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Time, 201),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::InotifyInit, 253),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::IoprioSet, 251),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::IoprioGet, 252),
     (Syscall::Tgkill, 234),
     (Syscall::Openat, 257),
     (Syscall::Mkdirat, 258),
@@ -2471,6 +2541,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Newfstatat, 262),
     (Syscall::Unlinkat, 263),
     (Syscall::Renameat, 264),
+    (Syscall::Linkat, 265),
     (Syscall::Symlinkat, 266),
     (Syscall::Readlinkat, 267),
     (Syscall::Fchmodat, 268),
@@ -2565,10 +2636,15 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Dup3, 24),
     (Syscall::Fcntl, 25),
     (Syscall::Ioctl, 29),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::IoprioSet, 30),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::IoprioGet, 31),
     (Syscall::Flock, 32),
     (Syscall::Mkdirat, 34),
     (Syscall::Mknodat, 33),
     (Syscall::Unlinkat, 35),
+    (Syscall::Linkat, 37),
     (Syscall::Symlinkat, 36),
     (Syscall::Renameat, 38),
     (Syscall::Umount2, 39),
@@ -2582,6 +2658,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fallocate, 47),
     (Syscall::Faccessat, 48),
     (Syscall::Chdir, 49),
+    (Syscall::Fchdir, 50),
     (Syscall::Fchmod, 52),
     (Syscall::Fchmodat, 53),
     (Syscall::Fchownat, 54),
@@ -2618,6 +2695,10 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Nanosleep, 101), // nanosleep (timespec* ABI, not native Sleep)
     (Syscall::ClockSetTime, 112),
     (Syscall::ClockGetTime, 113),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Gettimeofday, 169),
+    #[cfg(feature = "linux-compat")]
+    (Syscall::Settimeofday, 170),
     (Syscall::Ptrace, 117),
     (Syscall::SchedSetparam, 118),
     (Syscall::SchedGetparam, 121),

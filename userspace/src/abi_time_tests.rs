@@ -685,3 +685,137 @@ fn smoke_abi_time_timerfd_gettime_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_gettime_neg);
+
+// ── gettimeofday(timeval, timezone) ───────────────────────────────────
+// Valid timeval* → ok(0) with non-zero tv_sec and tv_usec < 1_000_000.
+// timezone* is ignored (NARF follows Linux).
+
+fn smoke_abi_time_gettimeofday_pos() -> TestResult {
+    with_setup(|| {
+        let mut tv = [0i64; 2];
+        match call(Syscall::Gettimeofday.raw(), a1(tv.as_mut_ptr() as u64, 0)) {
+            Some(0) => {
+                // Verify tv_sec is plausible (non-zero) and tv_usec is in range.
+                let tv_sec = tv[0];
+                let tv_usec = tv[1];
+                if tv_sec == 0 {
+                    return Err("gettimeofday tv_sec should be non-zero");
+                }
+                if !(0..1_000_000).contains(&tv_usec) {
+                    return Err("gettimeofday tv_usec must be in [0, 1_000_000)");
+                }
+                Ok(())
+            }
+            _ => Err("gettimeofday with a valid buffer should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_gettimeofday_pos);
+
+fn smoke_abi_time_gettimeofday_null() -> TestResult {
+    with_setup(|| {
+        // NULL timeval* is allowed; just return 0.
+        match call(Syscall::Gettimeofday.raw(), a1(0, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("gettimeofday(NULL, NULL) should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_gettimeofday_null);
+
+// ── settimeofday(timeval, timezone) ───────────────────────────────────
+// Valid timeval* → ok(0). NULL timeval* → ok(0) (no-op).
+
+fn smoke_abi_time_settimeofday_pos() -> TestResult {
+    with_setup(|| {
+        // First read the current time.
+        let mut tv_get = [0i64; 2];
+        call(
+            Syscall::Gettimeofday.raw(),
+            a1(tv_get.as_mut_ptr() as u64, 0),
+        )
+        .ok_or("gettimeofday failed")?;
+        // Set the same time back.
+        let tv_set = tv_get;
+        match call(Syscall::Settimeofday.raw(), a1(tv_set.as_ptr() as u64, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("settimeofday with a valid buffer should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_settimeofday_pos);
+
+fn smoke_abi_time_settimeofday_null() -> TestResult {
+    with_setup(|| {
+        // NULL timeval* → no-op, return 0.
+        match call(Syscall::Settimeofday.raw(), a1(0, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("settimeofday(NULL, NULL) should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_settimeofday_null);
+
+// ── time(time_t*) ────────────────────────────────────────────────────────
+// Returns seconds; if arg0 non-null, also stores there.
+
+fn smoke_abi_time_time_pos() -> TestResult {
+    with_setup(|| {
+        let mut time_buf = [0i64; 1];
+        let ret =
+            call(Syscall::Time.raw(), a0(time_buf.as_mut_ptr() as u64)).ok_or("time() failed")?;
+        // Return value should match what was stored.
+        if ret as i64 != time_buf[0] {
+            return Err("time() return value should match stored value");
+        }
+        // Seconds should be non-zero and reasonable (after 1970).
+        if ret == 0 {
+            return Err("time() should return non-zero seconds since epoch");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_time_pos);
+
+fn smoke_abi_time_time_null() -> TestResult {
+    with_setup(|| {
+        // NULL pointer is allowed; just return seconds.
+        let ret = call(Syscall::Time.raw(), a0(0)).ok_or("time(NULL) failed")?;
+        if ret == 0 {
+            return Err("time(NULL) should return non-zero seconds");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_time_null);
+
+// ── ioprio_set / ioprio_get ──────────────────────────────────────────────
+// ioprio_set stores a value; ioprio_get retrieves it or returns the default.
+
+fn smoke_abi_time_ioprio_roundtrip() -> TestResult {
+    with_setup(|| {
+        // ioprio_set(1, 0, 0x1234) → stores 0x1234
+        call(Syscall::IoprioSet.raw(), a2(1, 0, 0x1234)).ok_or("ioprio_set failed")?;
+        // ioprio_get(1, 0) → returns 0x1234
+        let val = call(Syscall::IoprioGet.raw(), a1(1, 0)).ok_or("ioprio_get failed")?;
+        if val != 0x1234 {
+            return Err("ioprio_get should return the set value");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_ioprio_roundtrip);
+
+fn smoke_abi_time_ioprio_default() -> TestResult {
+    with_setup(|| {
+        // ioprio_get on an unset (which, who) returns the default.
+        // Default is (IOPRIO_CLASS_BE=2 << 13) | 4 = 0x4004.
+        let val = call(Syscall::IoprioGet.raw(), a1(1, 9999)).ok_or("ioprio_get failed")?;
+        let default = (2i64 << 13) | 4;
+        if val != default {
+            return Err("ioprio_get on unset entry should return default (0x4004)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_ioprio_default);
