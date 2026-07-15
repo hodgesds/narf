@@ -55,6 +55,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use narf_lib::smp;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::uevent::UeventAction;
@@ -924,6 +925,167 @@ pub fn populate_numa_nodes() {
     }
 }
 
+// ── CPU topology helpers ──────────────────────────────────────────────
+
+/// Build a Linux-style CPU range string for a contiguous range [0, n).
+/// Returns "0" for n==1, "0-{n-1}" for n>1.
+/// Linux ref: `cpumap.h` / `lib/cpumask.c` `cpumask_scnprintf`.
+fn cpu_range_string(n: u32) -> String {
+    if n <= 1 {
+        "0\n".to_string()
+    } else {
+        format!("0-{}\n", n - 1)
+    }
+}
+
+/// Build a Linux-style comma-grouped 32-bit hex mask for a single CPU `cpu`
+/// in the same format as [[node_cpumap_string]] (four 32-bit words, high
+/// word first, zero-padded). This is what Linux emits for
+/// `topology/core_cpus` / `thread_siblings`.
+/// Linux ref: `drivers/base/cpu.c` `show_cpumap`.
+fn single_cpu_mask_string(cpu: u32) -> String {
+    // 128-bit wide mask (matches the NUMA cpumap helper): bit `cpu` set.
+    let mask: u128 = 1u128 << (cpu & 127);
+    let w3 = (mask >> 96) as u32;
+    let w2 = (mask >> 64) as u32;
+    let w1 = (mask >> 32) as u32;
+    let w0 = mask as u32;
+    format!("{:08x},{:08x},{:08x},{:08x}\n", w3, w2, w1, w0)
+}
+
+/// Build a Linux-style comma-grouped 32-bit hex mask for all CPUs in [0, n).
+/// Used for `topology/package_cpus`.
+/// Linux ref: `drivers/base/cpu.c` `show_cpumap`.
+fn all_cpus_mask_string(n: u32) -> String {
+    // Build mask with bits 0..n-1 set (capped at 127 for the 128-bit field).
+    let n_capped = n.min(128);
+    let mask: u128 = if n_capped == 128 {
+        u128::MAX
+    } else {
+        (1u128 << n_capped) - 1
+    };
+    let w3 = (mask >> 96) as u32;
+    let w2 = (mask >> 64) as u32;
+    let w1 = (mask >> 32) as u32;
+    let w0 = mask as u32;
+    format!("{:08x},{:08x},{:08x},{:08x}\n", w3, w2, w1, w0)
+}
+
+/// Populate `/sys/devices/system/cpu/` with the Linux CPU topology subtree.
+///
+/// Entries created:
+/// - `online`, `possible`, `present` — range strings ("0" or "0-{N-1}").
+/// - `kernel_max`                     — "{N-1}" (maximum addressable cpu id).
+/// - `cpu<N>/` for each possible CPU, each with:
+///   - `online` (omitted for cpu0 following Linux convention)
+///   - `topology/core_id`             — `N` (no SMT info available)
+///   - `topology/physical_package_id` — `0`
+///   - `topology/core_cpus`           — hex mask of just bit N
+///   - `topology/core_cpus_list`      — `"N"`
+///   - `topology/thread_siblings`     — same as `core_cpus`
+///   - `topology/thread_siblings_list`— `"N"`
+///   - `topology/package_cpus`        — mask of all possible CPUs
+///   - `topology/package_cpus_list`   — `"0"` or `"0-{max}"`
+///
+/// Data source: `narf_lib::smp::cpu_count()` (same source
+/// [[/proc/cpuinfo]] and `/sys/devices/system/node/` use).
+///
+/// Cache/index* directories are **not** populated: there is no
+/// clean cross-arch cache-topology API reachable from this crate
+/// today (CPUID leaf 4 / 0x1F are x86-only, aarch64 uses CCSIDR —
+/// neither is abstracted behind a `narf-arch` or `narf-lib` surface).
+///
+/// Linux ref: `drivers/base/cpu.c` (`register_cpu`, `cpu_add_dev_symlinks`),
+/// `arch/x86/kernel/topology.c`, `Documentation/ABI/stable/sysfs-devices-system-cpu`.
+pub fn populate_cpu_devices() {
+    let root = get_root();
+    let devices = get_or_create_child(&root, "devices");
+    let system = get_or_create_child(&devices, "system");
+    let cpu_dir = get_or_create_child(&system, "cpu");
+
+    let n = smp::cpu_count().max(1);
+
+    // ── /sys/devices/system/cpu/online|possible|present ──────────────
+    // "possible" == "present" == "online" when only a static count
+    // is available (no hot-plug model yet).
+    let range = cpu_range_string(n);
+    {
+        let r = range.clone();
+        kobject_add_attr(&cpu_dir, "online", move || r.clone());
+    }
+    {
+        let r = range.clone();
+        kobject_add_attr(&cpu_dir, "possible", move || r.clone());
+    }
+    {
+        let r = range.clone();
+        kobject_add_attr(&cpu_dir, "present", move || r.clone());
+    }
+
+    // ── /sys/devices/system/cpu/kernel_max ───────────────────────────
+    // "Maximum index of a possible CPU (0-indexed)."
+    // Linux writes the max from CONFIG_NR_CPUS-1; we use n-1.
+    let kmax = format!("{}\n", n - 1);
+    kobject_add_attr(&cpu_dir, "kernel_max", move || kmax.clone());
+
+    // ── /sys/devices/system/cpu/cpu<N>/ ──────────────────────────────
+    let pkg_mask = all_cpus_mask_string(n);
+    let pkg_list = cpu_range_string(n);
+
+    for cpu in 0..n {
+        let cpu_name = format!("cpu{}", cpu);
+        let cpu_kobj = get_or_create_child(&cpu_dir, &cpu_name);
+
+        // `online` — read-only "1".  Linux omits it for cpu0 (the boot CPU
+        // is always online and has no hotplug sysfs interface).
+        // Linux ref: `drivers/base/cpu.c` `register_cpu(hotpluggable=false)`
+        // for cpu0 on most arches.
+        if cpu != 0 {
+            kobject_add_attr(&cpu_kobj, "online", || "1\n".to_string());
+        }
+
+        // ── topology/ ────────────────────────────────────────────────
+        let topo = get_or_create_child(&cpu_kobj, "topology");
+
+        // core_id: logical cpu index (no SMT disambiguation available).
+        kobject_add_attr(&topo, "core_id", move || format!("{}\n", cpu));
+
+        // physical_package_id: always 0 (single-socket model).
+        kobject_add_attr(&topo, "physical_package_id", || "0\n".to_string());
+
+        // core_cpus / thread_siblings: mask with only this CPU's bit set.
+        let this_mask = single_cpu_mask_string(cpu);
+        let this_list = format!("{}\n", cpu);
+        {
+            let m = this_mask.clone();
+            kobject_add_attr(&topo, "core_cpus", move || m.clone());
+        }
+        {
+            let l = this_list.clone();
+            kobject_add_attr(&topo, "core_cpus_list", move || l.clone());
+        }
+        {
+            let m = this_mask.clone();
+            kobject_add_attr(&topo, "thread_siblings", move || m.clone());
+        }
+        {
+            let l = this_list.clone();
+            kobject_add_attr(&topo, "thread_siblings_list", move || l.clone());
+        }
+
+        // package_cpus / package_cpus_list: all possible CPUs
+        // (single-socket, so the package contains every CPU).
+        {
+            let m = pkg_mask.clone();
+            kobject_add_attr(&topo, "package_cpus", move || m.clone());
+        }
+        {
+            let l = pkg_list.clone();
+            kobject_add_attr(&topo, "package_cpus_list", move || l.clone());
+        }
+    }
+}
+
 /// Call all `populate_*` functions.  Invoked from the sysfs initcall.
 pub fn populate_all() {
     populate_block_class();
@@ -931,6 +1093,7 @@ pub fn populate_all() {
     populate_input_class();
     populate_kernel_dir();
     populate_numa_nodes();
+    populate_cpu_devices();
     // Stub class directories expected by userspace tooling.
     let root = get_root();
     let class_dir = get_or_create_child(&root, "class");

@@ -516,3 +516,275 @@ fn smoke_sysfs_kobject_emit_uevent() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_emit_uevent);
+
+// ── Tests 10-13: /sys/devices/system/cpu/ ─────────────────────────────
+//
+// Covers:
+//   10. online/possible/present render valid range strings
+//   11. cpu0 and cpuN dirs exist per count; cpu0 has no `online` attr
+//   12. topology attrs render correct values
+//   13. hex mask format matches the NUMA cpumap style (comma-grouped 32-bit words)
+
+/// Test 10: online/possible/present render valid range strings.
+///
+/// With the default CPU count of 1, all three should render "0\n".
+/// With a bumped count of 4, they should render "0-3\n".
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_cpu_range_attrs() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    narf_lib::smp::__reset_for_test();
+
+    // Default: 1 CPU → "0\n"
+    crate::sysfs::populate_cpu_devices();
+    let root = crate::sysfs::sysfs_root();
+    let cpu_dir = match root
+        .get_child("devices")
+        .and_then(|d| d.get_child("system"))
+        .and_then(|s| s.get_child("cpu"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("/sys/devices/system/cpu dir missing"),
+    };
+
+    for attr in &["online", "possible", "present"] {
+        match cpu_dir.attr_show(attr) {
+            Some(ref s) if s == "0\n" => {}
+            Some(ref s) => {
+                let _ = s;
+                return TestResult::Fail("single-cpu range attr not '0'");
+            }
+            None => return TestResult::Fail("cpu range attr missing"),
+        }
+    }
+
+    // kernel_max for 1 CPU → "0\n"
+    match cpu_dir.attr_show("kernel_max") {
+        Some(ref s) if s == "0\n" => {}
+        _ => return TestResult::Fail("kernel_max wrong for 1 cpu"),
+    }
+
+    // Bump to 4 CPUs and re-populate.
+    crate::sysfs::__reset_for_test();
+    narf_lib::smp::set_cpu_count(4);
+    crate::sysfs::populate_cpu_devices();
+
+    let root = crate::sysfs::sysfs_root();
+    let cpu_dir = match root
+        .get_child("devices")
+        .and_then(|d| d.get_child("system"))
+        .and_then(|s| s.get_child("cpu"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("/sys/devices/system/cpu dir missing (4-cpu)"),
+    };
+
+    for attr in &["online", "possible", "present"] {
+        match cpu_dir.attr_show(attr) {
+            Some(ref s) if s == "0-3\n" => {}
+            Some(ref s) => {
+                let _ = s;
+                return TestResult::Fail("4-cpu range attr not '0-3'");
+            }
+            None => return TestResult::Fail("cpu range attr missing (4-cpu)"),
+        }
+    }
+
+    match cpu_dir.attr_show("kernel_max") {
+        Some(ref s) if s == "3\n" => {}
+        _ => return TestResult::Fail("kernel_max wrong for 4 cpus"),
+    }
+
+    narf_lib::smp::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_cpu_range_attrs);
+
+/// Test 11: cpu0 dir exists; cpu0 has no `online` attr (Linux convention);
+/// cpuN dirs exist for all CPUs in the possible set.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    narf_lib::smp::__reset_for_test();
+    narf_lib::smp::set_cpu_count(3);
+    crate::sysfs::populate_cpu_devices();
+
+    let root = crate::sysfs::sysfs_root();
+    let cpu_dir = match root
+        .get_child("devices")
+        .and_then(|d| d.get_child("system"))
+        .and_then(|s| s.get_child("cpu"))
+    {
+        Some(k) => k,
+        None => {
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("/sys/devices/system/cpu missing");
+        }
+    };
+
+    // cpu0, cpu1, cpu2 must all exist.
+    for i in 0..3u32 {
+        let name = alloc::format!("cpu{}", i);
+        if cpu_dir.get_child(&name).is_none() {
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("cpuN dir missing");
+        }
+    }
+    // cpu3 must not exist (only 3 CPUs).
+    if cpu_dir.get_child("cpu3").is_some() {
+        narf_lib::smp::__reset_for_test();
+        return TestResult::Fail("cpu3 dir unexpectedly present");
+    }
+
+    // cpu0 must not have an `online` attribute (Linux omits it for cpu0).
+    let cpu0 = cpu_dir.get_child("cpu0").unwrap();
+    if cpu0.attr_show("online").is_some() {
+        narf_lib::smp::__reset_for_test();
+        return TestResult::Fail("cpu0 has online attr (should be absent)");
+    }
+
+    // cpu1 must have `online` = "1\n".
+    let cpu1 = cpu_dir.get_child("cpu1").unwrap();
+    match cpu1.attr_show("online") {
+        Some(ref s) if s == "1\n" => {}
+        _ => {
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("cpu1/online not '1'");
+        }
+    }
+
+    narf_lib::smp::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_cpu_dirs_and_online_attr);
+
+/// Test 12: topology attrs render correct values for cpu2 with 4 CPUs.
+///
+/// - `core_id` == "2"
+/// - `physical_package_id` == "0"
+/// - `core_cpus_list` == "2"
+/// - `thread_siblings_list` == "2"
+/// - `package_cpus_list` == "0-3"
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    narf_lib::smp::__reset_for_test();
+    narf_lib::smp::set_cpu_count(4);
+    crate::sysfs::populate_cpu_devices();
+
+    let root = crate::sysfs::sysfs_root();
+    let cpu2_topo = match root
+        .get_child("devices")
+        .and_then(|d| d.get_child("system"))
+        .and_then(|s| s.get_child("cpu"))
+        .and_then(|c| c.get_child("cpu2"))
+        .and_then(|c| c.get_child("topology"))
+    {
+        Some(k) => k,
+        None => {
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("cpu2/topology dir missing");
+        }
+    };
+
+    let checks: &[(&str, &str)] = &[
+        ("core_id", "2\n"),
+        ("physical_package_id", "0\n"),
+        ("core_cpus_list", "2\n"),
+        ("thread_siblings_list", "2\n"),
+        ("package_cpus_list", "0-3\n"),
+    ];
+    for (attr, expected) in checks {
+        match cpu2_topo.attr_show(attr) {
+            Some(ref got) if got == expected => {}
+            Some(ref got) => {
+                let _ = got;
+                narf_lib::smp::__reset_for_test();
+                return TestResult::Fail("topology attr value mismatch");
+            }
+            None => {
+                narf_lib::smp::__reset_for_test();
+                return TestResult::Fail("topology attr missing");
+            }
+        }
+    }
+
+    narf_lib::smp::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_cpu_topology_attrs);
+
+/// Test 13: hex mask format matches NUMA cpumap style (comma-grouped 32-bit words).
+///
+/// For cpu2 (bit 2 set): `core_cpus` == "00000000,00000000,00000000,00000004\n".
+/// For 4 CPUs total:  `package_cpus` == "00000000,00000000,00000000,0000000f\n".
+/// Linux ref: `node_read_cpumap` (drivers/base/node.c).
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    narf_lib::smp::__reset_for_test();
+    narf_lib::smp::set_cpu_count(4);
+    crate::sysfs::populate_cpu_devices();
+
+    let root = crate::sysfs::sysfs_root();
+    let cpu2_topo = match root
+        .get_child("devices")
+        .and_then(|d| d.get_child("system"))
+        .and_then(|s| s.get_child("cpu"))
+        .and_then(|c| c.get_child("cpu2"))
+        .and_then(|c| c.get_child("topology"))
+    {
+        Some(k) => k,
+        None => {
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("cpu2/topology missing for hex mask test");
+        }
+    };
+
+    // cpu2 → bit 2 set → word 0 = 0x4.
+    let expected_core = "00000000,00000000,00000000,00000004\n";
+    for attr in &["core_cpus", "thread_siblings"] {
+        match cpu2_topo.attr_show(attr) {
+            Some(ref s) if s == expected_core => {}
+            Some(ref s) => {
+                let _ = s;
+                narf_lib::smp::__reset_for_test();
+                return TestResult::Fail("core_cpus/thread_siblings hex mask wrong");
+            }
+            None => {
+                narf_lib::smp::__reset_for_test();
+                return TestResult::Fail("core_cpus/thread_siblings missing");
+            }
+        }
+    }
+
+    // 4 CPUs → bits 0-3 set → word 0 = 0xf.
+    let expected_pkg = "00000000,00000000,00000000,0000000f\n";
+    match cpu2_topo.attr_show("package_cpus") {
+        Some(ref s) if s == expected_pkg => {}
+        Some(ref s) => {
+            let _ = s;
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("package_cpus hex mask wrong");
+        }
+        None => {
+            narf_lib::smp::__reset_for_test();
+            return TestResult::Fail("package_cpus missing");
+        }
+    }
+
+    // Also verify the format is the 4-word comma-separated format
+    // (not a bare integer): must contain exactly 3 commas.
+    let comma_count = expected_core.chars().filter(|&c| c == ',').count();
+    if comma_count != 3 {
+        narf_lib::smp::__reset_for_test();
+        return TestResult::Fail("cpumap format: expected 3 commas (4 words)");
+    }
+
+    narf_lib::smp::__reset_for_test();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
