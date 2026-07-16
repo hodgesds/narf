@@ -676,3 +676,20 @@ fn smoke_abi_misc_reboot_bad_magic_einval() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_reboot_bad_magic_einval);
+// ── restart_syscall — kernel-injected syscall continuation ─────────
+//
+// NARF has no per-task restart_block (SA_RESTART is a pure user-RIP
+// rewind), so restart_syscall with nothing pending returns -EINTR,
+// exactly like Linux's do_no_restart_syscall.
+
+fn smoke_abi_misc_restart_syscall_eintr() -> TestResult {
+    with_setup(|| {
+        // restart_syscall() takes no arguments; with no restart_block set
+        // it must return -EINTR.
+        match call(Syscall::RestartSyscall.raw(), a0(0)) {
+            Some(v) if v == EINTR => Ok(()),
+            _ => Err("restart_syscall with nothing pending should return -EINTR"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_restart_syscall_eintr);

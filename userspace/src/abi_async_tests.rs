@@ -287,6 +287,88 @@ fn smoke_abi_async_epoll_pwait_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait_neg);
 
 // ════════════════════════════════════════════════════════════════════
+// epoll_pwait2(2) — sys_epoll_pwait2. Like epoll_pwait but arg3 is a
+// `const struct timespec *timeout` instead of an int ms. A NULL timeout
+// means block-forever; in the in-kernel harness (no user task to park)
+// the wait falls back to a single non-blocking readiness poll, so an
+// empty set returns 0 regardless of the timeout.
+// ════════════════════════════════════════════════════════════════════
+
+fn smoke_abi_async_epoll_pwait2_null_timeout() -> TestResult {
+    with_setup(|| {
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create1 failed"),
+        };
+        let mut evbuf = [0u8; 12];
+        // epoll_pwait2(epfd, events, 1, NULL timeout, NULL sigmask, 0):
+        // NULL timeout → block forever, but the empty set is immediately
+        // "ready with nothing" → 0 events.
+        let args = SyscallArgs {
+            arg0: epfd,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0, // NULL timespec*
+            arg4: 0,
+            arg5: 0,
+        };
+        match call(Syscall::EpollPwait2.raw(), args) {
+            Some(0) => Ok(()),
+            _ => Err("epoll_pwait2(NULL timeout) on empty set should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait2_null_timeout);
+
+fn smoke_abi_async_epoll_pwait2_timespec() -> TestResult {
+    with_setup(|| {
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create1 failed"),
+        };
+        let mut evbuf = [0u8; 12];
+        // A {0 sec, 1 ns} timeout: the ns remainder must round UP to a
+        // 1 ms wait, not truncate to a 0-ms poll. On an empty set the
+        // harness still returns 0 immediately.
+        let ts: [i64; 2] = [0, 1];
+        let args = SyscallArgs {
+            arg0: epfd,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: ts.as_ptr() as u64,
+            arg4: 0,
+            arg5: 0,
+        };
+        match call(Syscall::EpollPwait2.raw(), args) {
+            Some(0) => Ok(()),
+            _ => Err("epoll_pwait2(1ns timeout) on empty set should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait2_timespec);
+
+fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
+    with_setup(|| {
+        // Bad epfd (never created) with a valid events buffer → fail.
+        // LINUX-GAP: Linux returns -EBADF; NARF returns the -1 sentinel.
+        let mut evbuf = [0u8; 12];
+        let args = SyscallArgs {
+            arg0: 999,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0, // NULL timeout
+            arg4: 0,
+            arg5: 0,
+        };
+        match call(Syscall::EpollPwait2.raw(), args) {
+            Some(v) if v < 0 => Ok(()),
+            _ => Err("epoll_pwait2 on bad epfd must fail"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_epoll_pwait2_neg);
+
+// ════════════════════════════════════════════════════════════════════
 // futex(2) — sys_futex(uaddr, op, val, timeout)
 //
 // FUTEX_WAKE (op=1) bumps the per-uaddr counter and wakes up to `val`

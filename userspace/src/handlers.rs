@@ -5085,6 +5085,124 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(written as u64));
 }
 
+// ── Getdents — legacy fd-based directory read (linux_dirent) ───────
+//
+// Linux ABI: `getdents(unsigned int fd, void *dirp, unsigned int
+// count)` — x86_64 78. The aarch64 / generic ABI does NOT expose the
+// legacy `getdents` (only `getdents64`, 61), so there is no aarch64
+// wire number for it; libc on that arch always issues getdents64.
+//
+// This is the pre-largefile twin of [[sys_getdents64]] — same
+// directory-resolution + enumerate + cursor logic, only the per-record
+// serialisation differs. The legacy `struct linux_dirent`:
+//   d_ino:    unsigned long (u64 on LP64)
+//   d_off:    unsigned long (u64) — cursor of the *next* entry
+//   d_reclen: unsigned short (u16) — total record length, 8-byte aligned
+//   d_name:  [u8]                  — NUL-terminated
+//   <zero pad>
+//   d_type:   u8                   — stored at the LAST byte (reclen-1)
+//
+// Note the d_type placement: unlike getdents64 (which has an explicit
+// d_type field at offset 18), the legacy record hides d_type in the pad
+// byte at `buf[offset + d_reclen - 1]`, and there is always a NUL after
+// the name before that pad/d_type byte. Total record size therefore
+// rounds up `18 (header) + name_len + 1 (NUL) + 1 (d_type)` to 8.
+//
+// EBADF / ENOTDIR / return-bytes semantics match sys_getdents64.
+fn sys_getdents(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let out_ptr = args.arg1 as *mut u8;
+    let out_len = args.arg2 as usize;
+    let fail = SyscallReturn::ok((-1i64) as u64);
+
+    if out_ptr.is_null() || out_len < 32 {
+        ctx.set_return(fail);
+        return;
+    }
+    let task = current_task_id();
+
+    // EBADF: the fd isn't open at all (distinct from "open but not a dir").
+    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
+    // Pull the DirOps + current cursor off the fd. `as_dir()` is `Some`
+    // only for a DirFdFile (an opened directory); the fd exists (checked
+    // above) so a `None` here means it's a non-directory → -ENOTDIR.
+    // The fd-table lock is released before we touch the FS
+    // (enumerate_async), per the no-reentrancy rule.
+    let dir_and_cursor = fd::with_table(task, |t| {
+        t.get(fd)
+            .and_then(|e| e.ops.as_dir().map(|d| (d, e.offset as usize)))
+    })
+    .flatten();
+    let (dir, mut cursor) = match dir_and_cursor {
+        Some(x) => x,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+            return;
+        }
+    };
+
+    let mut written = 0usize;
+    loop {
+        let mut entries = match poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok()) {
+            Some(v) if !v.is_empty() => v,
+            _ => break,
+        };
+        let (name, ftype) = entries.pop().unwrap();
+        let name_bytes = name.as_bytes();
+        // 18-byte fixed header + name + NUL + d_type byte, padded to 8.
+        let raw_len = 18 + name_bytes.len() + 2;
+        let reclen = (raw_len + 7) & !7;
+        if written + reclen > out_len {
+            // Record won't fit — stop here without advancing the
+            // cursor for this entry. Linux returns whatever fit.
+            break;
+        }
+        let next_cursor = cursor + 1;
+        let dt = match ftype {
+            narf_filesystem::FileType::File => 8,     // DT_REG
+            narf_filesystem::FileType::Dir => 4,      // DT_DIR
+            narf_filesystem::FileType::Symlink => 10, // DT_LNK
+            narf_filesystem::FileType::Special => 2,  // DT_CHR
+            narf_filesystem::FileType::Socket => 12,  // DT_SOCK
+        };
+        // Build the legacy dirent record in kernel memory, then copy it
+        // into user space under the SMAP bracket.
+        let mut rec = alloc::vec![0u8; reclen];
+        rec[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_ino
+        rec[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_off
+        rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes()); // d_reclen
+        rec[18..18 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
+                                                                    // NUL after the name + interior zero-pad already zeroed by vec init.
+        rec[reclen - 1] = dt; // legacy d_type: last byte of the record
+                              // SAFETY: `out_ptr` is the user buffer base; `written < out_len` so the
+                              // offset stays inside the user-supplied region. Forms a user vaddr only.
+                              // SAFETY: Valid memory or trusted environment
+        let dest = unsafe { out_ptr.add(written) } as u64;
+        // SAFETY: `dest` is in-bounds of the user buffer (checked above); copy_to_user
+        // range-validates it and SMAP-brackets the write of the `reclen`-byte `rec`.
+        // SAFETY: Valid memory or trusted environment
+        if unsafe { copy_to_user(dest, &rec) }.is_err() {
+            break;
+        }
+        written += reclen;
+        cursor = next_cursor;
+    }
+
+    // Persist the advanced cursor so the next getdents on this fd
+    // resumes where we stopped (mid-directory if the buffer filled).
+    fd::with_table(task, |t| {
+        if let Some(e) = t.get_mut(fd) {
+            e.offset = cursor as u64;
+        }
+    });
+
+    ctx.set_return(SyscallReturn::ok(written as u64));
+}
+
 // ── Close — arg0=fd ────────────────────────────────────────────────
 
 fn sys_close(ctx: &mut dyn TrapContext) {
@@ -9070,6 +9188,40 @@ fn sys_yield(ctx: &mut dyn TrapContext) {
     // forever because nothing else runs.
     sleep_pumps::run();
     ctx.set_return(SyscallReturn::ok(0));
+}
+
+// ── restart_syscall — kernel-injected syscall continuation ─────────
+//
+// Linux ABI: `restart_syscall(void)` — x86_64 219 / aarch64 128. It is
+// NOT meant to be called by userspace directly; the kernel injects it
+// (rewriting the trap's syscall number) to resume a blocking syscall
+// that was interrupted by a signal whose handler ran, when that syscall
+// needs an *absolute* rearm point that a plain SA_RESTART RIP-rewind
+// would corrupt (e.g. a relative `nanosleep` that must resume with the
+// remaining, not the original, timeout). Linux backs this with a
+// per-task `restart_block` (`current->restart_block.fn`) that points at
+// the specific resume routine; when nothing set one, the block points
+// at `do_no_restart_syscall`, which simply returns -EINTR.
+//
+// NARF's restart model has NO per-task restart_block. SA_RESTART is
+// implemented purely by REWINDING the user RIP by 2 (the `syscall`
+// instruction width) in `deliver_signal_into_state`
+// (`state.rip.wrapping_sub(2)` — see syscall.rs), so an interrupted
+// restartable syscall simply re-executes its original trap from scratch;
+// the blocking syscalls that must not re-arm from scratch (nanosleep,
+// clock_nanosleep, ...) are excluded from the restartable set in
+// `is_restartable_syscall` and instead surface -EINTR / an abbreviated
+// result to userspace. There is therefore no saved syscall to
+// re-invoke here.
+//
+// We faithfully mirror Linux's no-restart-block case: `restart_syscall`
+// with nothing pending returns -EINTR (errno 4), exactly as
+// `do_no_restart_syscall` does. This keeps the wire number dispatchable
+// (so a libc that emits it, or a trace replay, sees the canonical
+// result) without inventing a restart-block subsystem that NARF's
+// RIP-rewind model does not need.
+fn sys_restart_syscall(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
 }
 
 fn sys_pause(ctx: &mut dyn TrapContext) {
@@ -23992,6 +24144,14 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "rt_sigtimedwait",
         RawFnHandler(sys_rt_sigtimedwait),
     );
+    // restart_syscall — kernel-injected continuation. NARF has no
+    // restart_block, so (like Linux's do_no_restart_syscall) it returns
+    // -EINTR. See sys_restart_syscall's comment for the restart model.
+    table.install_raw(
+        Syscall::RestartSyscall,
+        "restart_syscall",
+        RawFnHandler(sys_restart_syscall),
+    );
 
     // Tier-2 fd-table breadth + path-resolution + pipe(2).
     table.install_raw(Syscall::Dup, "dup", RawFnHandler(sys_dup));
@@ -24115,6 +24275,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "getdents64",
         RawFnHandler(sys_getdents64),
     );
+    // Legacy 32-bit-offset getdents (x86_64 78; no aarch64 wire number).
+    table.install_raw(Syscall::Getdents, "getdents", RawFnHandler(sys_getdents));
 
     // Tier-3z entropy.
     table.install_raw(Syscall::GetRandom, "getrandom", RawFnHandler(sys_getrandom));
@@ -24354,6 +24516,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::EpollPwait,
         "epoll_pwait",
         RawFnHandler(crate::epoll::sys_epoll_wait),
+    );
+    table.install_raw(
+        Syscall::EpollPwait2,
+        "epoll_pwait2",
+        RawFnHandler(crate::epoll::sys_epoll_pwait2),
     );
     #[cfg(feature = "linux-compat")]
     table.install_raw(

@@ -753,6 +753,68 @@ fn smoke_abi_pathx_getdents64_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents64_neg);
 
+// ── getdents (legacy 32-bit-offset dirfd, buf, count) → bytes / -1 ──
+//
+// Same directory-fd resolution as getdents64, but the LEGACY
+// `struct linux_dirent { d_ino: u64; d_off: u64; d_reclen: u16;
+// d_name[]; }` wire format: the d_type byte lives at the LAST byte of
+// each record (buf[off + d_reclen - 1]), with a NUL after the name.
+
+fn smoke_abi_pathx_getdents_pos() -> TestResult {
+    with_memfs("/p2", "p2", &[("a", b"x"), ("b", b"y")], || {
+        let dfd = open_fd(b"/p2\0")?;
+        let mut buf = [0u8; 256];
+        let n = match call(
+            Syscall::Getdents.raw(),
+            a2(dfd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("getdents(dir fd) should return > 0 bytes"),
+        };
+        // Parse the first legacy linux_dirent record.
+        if n < 18 {
+            return Err("getdents record too short");
+        }
+        let d_ino = u64::from_ne_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
+        if d_ino == 0 {
+            return Err("getdents d_ino must be non-zero");
+        }
+        let reclen = u16::from_ne_bytes([buf[16], buf[17]]) as usize;
+        if reclen == 0 || reclen > n || reclen % 8 != 0 {
+            return Err("getdents d_reclen must be a non-zero 8-aligned length");
+        }
+        // Name starts at offset 18 and is NUL-terminated; the first seed
+        // enumerated is "a" (single byte name).
+        if buf[18] != b'a' || buf[19] != 0 {
+            return Err("getdents first entry name should be \"a\\0\"");
+        }
+        // Legacy d_type is the LAST byte of the record — DT_REG (8) for a
+        // regular file seed.
+        if buf[reclen - 1] != 8 {
+            return Err("getdents d_type (at reclen-1) should be DT_REG (8)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents_pos);
+
+fn smoke_abi_pathx_getdents_neg() -> TestResult {
+    with_setup(|| {
+        let mut buf = [0u8; 256];
+        // bad fd (not open) → -EBADF, same as getdents64.
+        match call(
+            Syscall::Getdents.raw(),
+            a2(9292, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("expected -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_getdents_neg);
+
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
 //
 // Path-based readdir: serialises the cursor-th entry as

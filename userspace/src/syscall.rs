@@ -834,6 +834,15 @@ pub enum Syscall {
     /// Linux `epoll_pwait`.
     EpollPwait,
 
+    /// Linux `epoll_pwait2(epfd, events, maxevents, timeout, sigmask,
+    /// sigsetsize)` — x86_64 441, aarch64 441. Identical to
+    /// `epoll_pwait` except arg3 is a `const struct timespec *timeout`
+    /// (nanosecond resolution, NULL = block forever) instead of an
+    /// `int` millisecond count. The handler converts the timespec to a
+    /// clamped ms (rounding any sub-ms remainder up) and forwards into
+    /// the shared `epoll_wait_common` path with the sigmask.
+    EpollPwait2,
+
     /// `eventfd2(initval, flags)` — semaphore-shaped fd.
     /// arg0 = initial counter value, arg1 = flags.
     Eventfd,
@@ -1525,6 +1534,18 @@ pub enum Syscall {
     /// bytes written on success, 0 on end-of-directory, -1 on error.
     Getdents64,
 
+    /// `getdents(fd, dirp, count)` — the legacy 32-bit-offset directory
+    /// read. Linux x86_64=78; the aarch64 / generic ABI has NO legacy
+    /// `getdents` (only `getdents64`, 61), so there is no aarch64 wire
+    /// number. Same args as `getdents64` (arg0 = dir fd, arg1 = user
+    /// buffer, arg2 = buffer size) but serialises the LEGACY
+    /// `struct linux_dirent { unsigned long d_ino; unsigned long d_off;
+    /// unsigned short d_reclen; char d_name[]; }` — the `d_type` byte is
+    /// stored at the LAST byte of each record (`buf[off + d_reclen - 1]`),
+    /// with a NUL after the name before that pad/d_type byte. Records are
+    /// 8-byte aligned. Returns total bytes written; 0 on end-of-directory.
+    Getdents,
+
     // ── Tier-3z entropy ────────────────────────────────────────────
     //
     // Slot 200 sits above the directory-mutation block to leave room
@@ -1557,6 +1578,16 @@ pub enum Syscall {
     /// timeout / bad input. Linux `rt_sigtimedwait` (x86_64=128,
     /// aarch64=137).
     RtSigtimedwait,
+
+    /// `restart_syscall(void)` — the kernel-injected continuation of a
+    /// syscall interrupted by a signal. Linux x86_64=219, aarch64=128.
+    /// It is not called by userspace directly; Linux injects it to
+    /// resume a blocking syscall via `current->restart_block.fn`. NARF
+    /// has NO restart_block — SA_RESTART is a pure user-RIP rewind (see
+    /// `deliver_signal_into_state`) — so there is no saved syscall to
+    /// re-invoke; like Linux's `do_no_restart_syscall` (the block's
+    /// value when nothing set one) the handler returns -EINTR.
+    RestartSyscall,
 
     /// `tkill(tid, sig)` — thread-targeted kill. arg0 = tid, arg1 =
     /// signum. Returns 0 on success, -1 on unknown tid. Linux
@@ -2499,6 +2530,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getsid, 124),
     (Syscall::RtSigpending, 127),
     (Syscall::RtSigtimedwait, 128),
+    (Syscall::RestartSyscall, 219), // do_no_restart_syscall → -EINTR (no restart_block)
     (Syscall::RtSigsuspend, 130),
     (Syscall::Sigaltstack, 131),
     (Syscall::Statfs, 137),
@@ -2529,6 +2561,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::SchedGetaffinity, 204),
     (Syscall::EpollCreate, 213),
     (Syscall::Getdents64, 217),
+    (Syscall::Getdents, 78), // legacy 32-bit-offset getdents (x86_64-only)
     (Syscall::ClockSetTime, 227),
     (Syscall::ClockGetTime, 228),
     #[cfg(feature = "linux-compat")]
@@ -2574,6 +2607,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerfdGettime, 287),
     (Syscall::EpollWait, 232), // epoll_wait
     (Syscall::EpollPwait, 281),
+    (Syscall::EpollPwait2, 441), // epoll_pwait2 (timespec* timeout)
     (Syscall::EpollCtl, 233),
     (Syscall::ArchPrctl, 158),   // arch_prctl (x86_64 only)
     (Syscall::EpollCreate, 291), // epoll_create1
@@ -2644,6 +2678,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::EpollCtl, 21),
     (Syscall::EpollWait, 22), // epoll_pwait
     (Syscall::EpollPwait, 22),
+    (Syscall::EpollPwait2, 441), // epoll_pwait2 (timespec* timeout)
     (Syscall::Dup, 23),
     (Syscall::Dup3, 24),
     (Syscall::Fcntl, 25),
@@ -2728,7 +2763,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Sigprocmask, 135), // rt_sigprocmask
     (Syscall::RtSigpending, 136),
     (Syscall::RtSigtimedwait, 137),
-    (Syscall::Sigreturn, 139), // rt_sigreturn
+    (Syscall::RestartSyscall, 128), // do_no_restart_syscall → -EINTR (no restart_block)
+    (Syscall::Sigreturn, 139),      // rt_sigreturn
     (Syscall::Setpriority, 140),
     (Syscall::Getpriority, 141),
     (Syscall::SetGid, 144),

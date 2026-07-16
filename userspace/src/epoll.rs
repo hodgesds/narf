@@ -614,21 +614,77 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
 }
 
 pub fn sys_epoll_pwait(ctx: &mut dyn TrapContext) {
-    epoll_wait_common(ctx, true);
+    epoll_wait_common(ctx, true, None);
 }
 
 #[allow(clippy::never_loop)]
 pub fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
-    epoll_wait_common(ctx, false);
+    epoll_wait_common(ctx, false, None);
 }
 
+/// `epoll_pwait2(epfd, events, maxevents, const timespec *timeout, sigmask,
+/// sigsetsize)` — Linux x86_64 441 / aarch64 441.
+///
+/// The Linux-5.11-era nanosecond-resolution twin of [[sys_epoll_pwait]]. The
+/// only wire difference is arg3: instead of an `int timeout_ms`, it is a
+/// `const struct timespec *` (16 bytes, `{ i64 tv_sec; i64 tv_nsec }`). A
+/// NULL pointer means "block indefinitely" — the `epoll_wait` core takes
+/// `-1` ms for that; a non-NULL timespec is converted to a clamped `i32` ms.
+///
+/// We ROUND ANY SUB-MS REMAINDER UP so a `{0, 1}` (1 ns) timeout does not
+/// truncate to `0` ms (which the core would treat as a non-blocking poll) —
+/// mirroring Linux's `ep_timeout_to_timespec`/`schedule_hrtimeout` behaviour
+/// where a tiny but non-zero timeout still yields a real (bounded) wait
+/// rather than a zero-timeout return. The value saturates to `i32::MAX` ms.
+///
+/// Everything else — the sigmask save/restore, the readiness/park loop — is
+/// the SAME common path as `epoll_pwait`; this is a thin timeout adapter that
+/// hands the computed ms into [[epoll_wait_common]] as an override.
 #[allow(clippy::never_loop)]
-fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool) {
+pub fn sys_epoll_pwait2(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let ts_ptr = args.arg3;
+    let timeout_ms: i32 = if ts_ptr == 0 {
+        // NULL timeout → block forever (the core takes -1 ms for that).
+        -1
+    } else {
+        // SAFETY: `ts_ptr` is a user `timespec*` in-pointer; copy_from_user_vec
+        // range-validates the 16-byte read and SMAP-brackets it.
+        match unsafe { crate::handlers::copy_from_user_vec(ts_ptr, 16) } {
+            Ok(b) => {
+                let secs = u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                let nsec =
+                    u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+                // sec*1000 + ceil(nsec / 1e6): round the sub-ms remainder UP so a
+                // 1 ns timeout stays a (tiny) blocking wait, not a 0-ms poll.
+                let sub_ms = nsec / 1_000_000;
+                let round_up = u64::from(nsec % 1_000_000 != 0);
+                let ms = secs
+                    .saturating_mul(1000)
+                    .saturating_add(sub_ms)
+                    .saturating_add(round_up);
+                ms.min(i32::MAX as u64) as i32
+            }
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+                return;
+            }
+        }
+    };
+    epoll_wait_common(ctx, true, Some(timeout_ms));
+}
+
+/// `is_pwait` selects the sigmask save/restore (epoll_pwait / epoll_pwait2).
+/// `timeout_override` supplies a pre-computed ms timeout for callers whose
+/// arg3 is NOT already an `int` ms (epoll_pwait2's `timespec*`); `None` reads
+/// the ms directly from arg3 (epoll_wait / epoll_pwait).
+#[allow(clippy::never_loop)]
+fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override: Option<i32>) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
     let events_ptr = args.arg1 as *mut u8;
     let maxevents = args.arg2 as usize;
-    let timeout_ms = args.arg3 as i32;
+    let timeout_ms = timeout_override.unwrap_or(args.arg3 as i32);
     let sigmask_ptr = args.arg4;
     let sigsetsize = args.arg5;
     let fail = SyscallReturn::ok((-1i64) as u64);
