@@ -20224,6 +20224,10 @@ fn is_restartable_syscall(raw: u32) -> bool {
 /// syscall_no)`. Consults the per-task altstack registry + the
 /// restartable-syscall table so the arch `deliver_signal` impl
 /// has every signal-delivery decision pre-computed.
+// A siginfo carries several independent scalars (code/addr/value/pid) plus the
+// delivery context; bundling them would just move the same fields behind a
+// struct the two call sites fill inline.
+#[allow(clippy::too_many_arguments)]
 fn build_delivery_params(
     task: u64,
     action: SigAction,
