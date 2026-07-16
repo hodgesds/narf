@@ -3178,7 +3178,8 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             let a = ctx.args();
             let _ = writeln!(
                 narf_console::Writer,
-                "SYSC {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+                crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
                 a.arg0,
                 a.arg1,
@@ -3259,6 +3260,20 @@ pub fn kernel_syscall_entry_plain_with_state(
     // installed, so the `&SyscallTable` is valid for this dispatch.
     // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
+    #[cfg(feature = "syscall-trace")]
+    if syscall_trace_relevant(n) {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+            crate::handlers::current_task_id(),
+            table.name_of(n).unwrap_or("?"),
+            args.arg0,
+            args.arg1,
+            args.arg2,
+            args.arg3,
+        );
+    }
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
     table.dispatch(n, &mut ctx);
     // Linux-compatible signal delivery on the `syscall`-instruction return
