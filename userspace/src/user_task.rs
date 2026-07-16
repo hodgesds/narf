@@ -211,6 +211,19 @@ pub struct UserTaskCtx {
     /// exit path and by the re-executed handler's return paths.
     pub sigwait_set: AtomicU64,
 
+    /// Set by the signal-delivery path when it delivers an out-of-set
+    /// (handler-bound) signal to a task parked in `rt_sigtimedwait`
+    /// (`sigwait_set != 0`). Because the park RIP-rewinds and re-executes,
+    /// the interrupting signal is DELIVERED on the resume's return-to-user
+    /// (handler runs, pending bit cleared) BEFORE the re-executed syscall
+    /// re-checks `pending & !mask & !set` — which then reads 0 and would
+    /// re-park forever (the stress-ng --sigrt hang: SIGALRM never breaks
+    /// sigwaitinfo). This flag survives that window so the re-execution
+    /// returns -EINTR regardless of whether the bit was already consumed.
+    /// Cleared with the other sigwait routing on every rt_sigtimedwait
+    /// exit.
+    pub sigwait_interrupted: core::sync::atomic::AtomicBool,
+
     /// Distinguishes `waitid(2)` from `wait4(2)` for the blocking
     /// path: when set, the reap writes a `siginfo_t` to
     /// `wait_child_status_ptr` and the syscall returns 0 rather than
@@ -284,6 +297,7 @@ impl UserTaskCtx {
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
+            sigwait_interrupted: core::sync::atomic::AtomicBool::new(false),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),

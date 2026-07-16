@@ -17555,8 +17555,22 @@ static SIGNAL_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> 
 pub(crate) fn signal_mask_fork(parent: u64, child: u64) {
     let mut g = SIGNAL_MASK.lock();
     if let Some(m) = g.as_mut() {
-        if let Some(mask) = m.get(&parent).copied() {
-            m.insert(child, mask);
+        // Fork-ordering hazard: `do_clone3`/`sys_fork` spawn the child (making
+        // it runnable) BEFORE this inheritance runs. musl always calls fork/
+        // clone from inside its `__block_all_sigs` window, so `parent`'s LIVE
+        // mask here is the transient all-blocked value — NOT the process's real
+        // mask. The child's own `__restore_sigs` (which runs the instant it is
+        // scheduled) sets the correct pre-fork mask. If we unconditionally
+        // copied `parent`'s mask we would clobber that restore with all-blocked,
+        // leaving the exec'd image with every application signal masked (SIGALRM
+        // handlers never fire — the stress-ng --sigrt hang). So only SEED a
+        // child that has not yet established a mask of its own: a raw clone that
+        // never restores still inherits correctly, while a musl child that has
+        // already restored keeps its authoritative value.
+        if !m.contains_key(&child) {
+            if let Some(mask) = m.get(&parent).copied() {
+                m.insert(child, mask);
+            }
         }
     }
 }
@@ -19984,6 +19998,7 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
             // atomics only.
             unsafe {
                 (*u).sigwait_set.store(0, Ordering::Release);
+                (*u).sigwait_interrupted.store(false, Ordering::Release);
                 (*u).blocking_deadline_ns.store(0, Ordering::Release);
             }
         }
@@ -20024,6 +20039,20 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         clear_routing(uctx_opt);
         ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
         return;
+    }
+
+    // A prior park was interrupted by an out-of-set signal that has ALREADY
+    // been delivered (its handler ran on the resume's return-to-user, so
+    // the pending check above reads 0). The delivery path flagged it —
+    // honour the -EINTR now instead of re-parking forever. This is the
+    // stress-ng --sigrt fix: SIGALRM breaks the sigwaitinfo loop.
+    if let Some(u) = uctx_opt {
+        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomics only.
+        if unsafe { (*u).sigwait_interrupted.load(Ordering::Acquire) } {
+            clear_routing(uctx_opt);
+            ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+            return;
+        }
     }
 
     // Timeout. NULL → block indefinitely (u64::MAX park). A finite
@@ -20367,6 +20396,22 @@ pub(crate) fn default_signal_delivery_restricted(
     let params = build_delivery_params(task, action, signum, syscall_no, si_code, 0, si_value);
     if !ctx.deliver_signal(&params) {
         return false;
+    }
+    // If this task is parked in rt_sigtimedwait, this handler-bound signal
+    // (necessarily OUT of the sigwait set — in-set signals are blocked and
+    // consumed by sigwait_consume, never delivered here) is interrupting
+    // the wait. Mark it so the re-executed rt_sigtimedwait returns -EINTR
+    // even though this delivery is about to clear the pending bit before
+    // the re-execution can observe it. Without this a SIGALRM (stress-ng
+    // --sigrt's timeout) is delivered but the syscall re-parks forever.
+    if let Some(u) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomics only.
+        unsafe {
+            let sw = (*u).sigwait_set.load(Ordering::Acquire);
+            if sw != 0 && (sw & sig_bit(signum)) == 0 {
+                (*u).sigwait_interrupted.store(true, Ordering::Release);
+            }
+        }
     }
     // Remember whether this frame is the restorer-based Linux
     // rt_sigframe so `sys_sigreturn` resolves it from RSP.
