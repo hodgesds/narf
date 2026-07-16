@@ -16,6 +16,9 @@ const IO_EVENT_SIZE: usize = 32;
 const IOCB_CMD_PREAD: u16 = 0;
 const IOCB_CMD_PWRITE: u16 = 1;
 const IOCB_CMD_NOOP: u16 = 6;
+const IOCB_CMD_PREADV: u16 = 7;
+const IOCB_CMD_PWRITEV: u16 = 8;
+const IOCB_FLAG_RESFD: u32 = 1 << 0;
 
 /// Build a 64-byte iocb with the fields we test set.
 fn make_iocb(
@@ -332,3 +335,147 @@ fn smoke_abi_aio_submit_unknown_ctx() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_aio_submit_unknown_ctx);
+
+// ── PREADV / PWRITEV (iovec opcodes) ────────────────────────────────
+//
+// aio_buf carries the iovec-array pointer and aio_nbytes the iovcnt (the
+// PREADV/PWRITEV arms of execute_iocb). Two segments prove the gather/
+// scatter accumulates across iov entries.
+fn smoke_abi_aio_pwritev_preadv_roundtrip() -> TestResult {
+    with_memfs("/aiov", "aiov", &[("f", b"")], || {
+        let fd = open_fd(b"/aiov/f\0")?;
+        let ctx = io_setup(8)?;
+
+        // PWRITEV of "ab" + "cde" = 5 bytes at offset 0.
+        let seg0 = *b"ab";
+        let seg1 = *b"cde";
+        // struct iovec { void *iov_base; size_t iov_len; } — 16 bytes each.
+        let mut iov = [0u8; 32];
+        iov[0..8].copy_from_slice(&(seg0.as_ptr() as u64).to_le_bytes());
+        iov[8..16].copy_from_slice(&(seg0.len() as u64).to_le_bytes());
+        iov[16..24].copy_from_slice(&(seg1.as_ptr() as u64).to_le_bytes());
+        iov[24..32].copy_from_slice(&(seg1.len() as u64).to_le_bytes());
+        let wv = make_iocb(0xA1, IOCB_CMD_PWRITEV, fd, iov.as_ptr() as u64, 2, 0);
+        let wv_arr = [(&wv as *const u8) as u64];
+        if call(Syscall::IoSubmit.raw(), a2(ctx, 1, wv_arr.as_ptr() as u64)) != Some(1) {
+            return Err("io_submit(PWRITEV) should return 1");
+        }
+        let mut ev = [0u8; IO_EVENT_SIZE];
+        if call(
+            Syscall::IoGetevents.raw(),
+            a3(ctx, 1, 1, ev.as_mut_ptr() as u64),
+        ) != Some(1)
+        {
+            return Err("io_getevents after PWRITEV should return 1");
+        }
+        let (data, _obj, res, _) = decode_event(&ev);
+        if data != 0xA1 || res != 5 {
+            return Err("PWRITEV must report 5 bytes across both iov segments");
+        }
+
+        // PREADV back into two segments (3 + 2) — scatter across iovs.
+        let mut r0 = [0u8; 3];
+        let mut r1 = [0u8; 2];
+        let mut riov = [0u8; 32];
+        riov[0..8].copy_from_slice(&(r0.as_mut_ptr() as u64).to_le_bytes());
+        riov[8..16].copy_from_slice(&(r0.len() as u64).to_le_bytes());
+        riov[16..24].copy_from_slice(&(r1.as_mut_ptr() as u64).to_le_bytes());
+        riov[24..32].copy_from_slice(&(r1.len() as u64).to_le_bytes());
+        let rv = make_iocb(0xA2, IOCB_CMD_PREADV, fd, riov.as_ptr() as u64, 2, 0);
+        let rv_arr = [(&rv as *const u8) as u64];
+        if call(Syscall::IoSubmit.raw(), a2(ctx, 1, rv_arr.as_ptr() as u64)) != Some(1) {
+            return Err("io_submit(PREADV) should return 1");
+        }
+        let mut ev2 = [0u8; IO_EVENT_SIZE];
+        if call(
+            Syscall::IoGetevents.raw(),
+            a3(ctx, 1, 1, ev2.as_mut_ptr() as u64),
+        ) != Some(1)
+        {
+            return Err("io_getevents after PREADV should return 1");
+        }
+        let (data, _obj, res, _) = decode_event(&ev2);
+        if data != 0xA2 || res != 5 || &r0 != b"abc" || &r1 != b"de" {
+            return Err("PREADV must scatter 'abcde' across the two iov segments");
+        }
+        let _ = call(Syscall::IoDestroy.raw(), a0(ctx));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_aio_pwritev_preadv_roundtrip);
+
+// ── IOCB_FLAG_RESFD → completion bumps the eventfd ──────────────────
+//
+// A submitted iocb with IOCB_FLAG_RESFD names an eventfd in aio_resfd;
+// its synchronous completion must bump that eventfd by 1 (signal_resfd),
+// so a userspace read(efd, .., 8) sees the count.
+fn smoke_abi_aio_resfd_bumps_eventfd() -> TestResult {
+    with_memfs("/aird", "aird", &[("f", b"")], || {
+        // eventfd(0, 0) → fd. (Syscall::Eventfd, legacy 1-arg initval form.)
+        let efd = match call(Syscall::Eventfd.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("eventfd(0) should return a fd"),
+        };
+        let fd = open_fd(b"/aird/f\0")?;
+        let ctx = io_setup(8)?;
+
+        // PWRITE with RESFD set → aio_flags@56 = IOCB_FLAG_RESFD,
+        // aio_resfd@60 = efd.
+        let payload = *b"z";
+        let mut iocb = make_iocb(0xF1, IOCB_CMD_PWRITE, fd, payload.as_ptr() as u64, 1, 0);
+        iocb[56..60].copy_from_slice(&IOCB_FLAG_RESFD.to_le_bytes());
+        iocb[60..64].copy_from_slice(&efd.to_le_bytes());
+        let arr = [(&iocb as *const u8) as u64];
+        if call(Syscall::IoSubmit.raw(), a2(ctx, 1, arr.as_ptr() as u64)) != Some(1) {
+            return Err("io_submit(RESFD) should return 1");
+        }
+        // The completion bumped the eventfd during io_submit (sync backend),
+        // so read returns the count (1) without blocking.
+        let mut cnt = [0u8; 8];
+        let n = call(
+            Syscall::Read.raw(),
+            a2(efd as u64, cnt.as_mut_ptr() as u64, 8),
+        );
+        if n != Some(8) {
+            return Err("read(eventfd, .., 8) should return 8 bytes");
+        }
+        if u64::from_le_bytes(cnt) != 1 {
+            return Err("RESFD completion must bump the eventfd count to 1");
+        }
+        let _ = call(Syscall::IoDestroy.raw(), a0(ctx));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_aio_resfd_bumps_eventfd);
+
+// ── task-exit sweep reclaims contexts (release_task_aio) ────────────
+//
+// A process that skips io_destroy must not leak: the release_task_tables
+// exit path drops its AIO contexts. After the sweep the ctx is unknown
+// → io_getevents(-EINVAL).
+fn smoke_abi_aio_exit_sweep_reclaims() -> TestResult {
+    with_setup(|| {
+        let ctx = io_setup(8)?;
+        // Live: getevents on the empty ctx returns 0, not EINVAL.
+        let mut ev = [0u8; IO_EVENT_SIZE];
+        if call(
+            Syscall::IoGetevents.raw(),
+            a3(ctx, 0, 1, ev.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("io_getevents on a live empty ctx should return 0");
+        }
+        // Run the exit sweep for this task (what a real exit triggers).
+        crate::handlers::__test_release_task_aio(crate::handlers::current_task_id());
+        // Swept: the ctx is now unknown.
+        if call(
+            Syscall::IoGetevents.raw(),
+            a3(ctx, 0, 1, ev.as_mut_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("io_getevents after the exit sweep should be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_aio_exit_sweep_reclaims);

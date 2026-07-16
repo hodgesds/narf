@@ -11767,6 +11767,14 @@ fn task_tables_exit_observer(_pid: u64, tid: u64) {
     orphanize_children_of(tid);
 }
 
+/// Test-only: run the AIO-context exit sweep for `tid` (the
+/// `release_task_tables` path a real task exit triggers), so a smoke can
+/// verify a process that skips `io_destroy` has its contexts reclaimed.
+#[doc(hidden)]
+pub fn __test_release_task_aio(tid: u64) {
+    aio::release_task_aio(tid);
+}
+
 /// Test-only: bitmask of per-task tables still holding rows for `tid`.
 /// Bit assignments documented inline; 0 = fully swept.
 #[doc(hidden)]
