@@ -198,6 +198,19 @@ pub struct UserTaskCtx {
     /// wheel backstop.
     pub flock_key: core::sync::atomic::AtomicUsize,
 
+    /// Non-zero while this task is parked in a blocking `rt_sigtimedwait`:
+    /// the userspace `sigset_t` it is waiting on (bit N-1 = signal N — the
+    /// same layout as `SIGNAL_PENDING`). Routes the park to the signal
+    /// waker registry exactly like `flock_key` routes to the flock waiter
+    /// queue: `park_should_block` registers the task in `SIGNAL_WAKERS`
+    /// (so `wake_signal` from any raise path fires it promptly) and breaks
+    /// the park when `handlers::sigwait_should_wake` reports a signal in
+    /// the set pending (mask ignored — sigwait consumes blocked signals,
+    /// the normal calling convention) or any other deliverable signal
+    /// (→ the re-executed syscall returns -EINTR). Cleared on every park
+    /// exit path and by the re-executed handler's return paths.
+    pub sigwait_set: AtomicU64,
+
     /// Distinguishes `waitid(2)` from `wait4(2)` for the blocking
     /// path: when set, the reap writes a `siginfo_t` to
     /// `wait_child_status_ptr` and the syscall returns 0 rather than
@@ -270,6 +283,7 @@ impl UserTaskCtx {
             wait_child_status_ptr: AtomicU64::new(0),
             parked_in_syscall: core::sync::atomic::AtomicBool::new(false),
             flock_key: core::sync::atomic::AtomicUsize::new(0),
+            sigwait_set: AtomicU64::new(0),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
@@ -499,6 +513,25 @@ fn park_should_block(
         let now = narf_scheduler::narf_time::monotonic_ns();
         let signal_pending = deadline == u64::MAX && crate::handlers::is_signal_pending(task_id);
         if now < deadline && !signal_pending {
+            // rt_sigtimedwait park: register in SIGNAL_WAKERS FIRST (every
+            // raise path calls `wake_signal`, which fires this entry), THEN
+            // re-check the wake condition — a signal raised in the
+            // check→register window is caught by the re-check, a later one
+            // by the waker; no lost-wake window either way. The `set`
+            // intersection deliberately ignores the block mask (sigwait
+            // consumes blocked signals); a deliverable signal OUTSIDE the
+            // set also breaks the park so the re-executed syscall can
+            // return -EINTR (Linux rt_sigtimedwait(2)).
+            let sw = uc.sigwait_set.load(Ordering::Acquire);
+            if sw != 0 {
+                crate::handlers::register_signal_waker(task_id, waker.clone());
+                if crate::handlers::sigwait_should_wake(task_id, sw) {
+                    crate::handlers::drop_signal_waker(task_id);
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    uc.sigwait_set.store(0, Ordering::Release);
+                    return false; // signal arrived → re-execute the syscall
+                }
+            }
             // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
             if uc.net_io_wait.load(Ordering::Acquire) {
                 crate::handlers::register_io_waiter(task_id, waker.clone());
@@ -592,11 +625,12 @@ fn park_should_block(
                         // (it frees as other sleepers fire). Bounded busy-poll
                         // under transient pressure, never a permanent wedge.
                         uc.sleep_deadline_ns.store(0, Ordering::Release);
-                        // Clear the flock routing too — this exit skips the
-                        // proceed-branch cleanup below, and a stale key would
-                        // make the task's NEXT unrelated park register on the
-                        // flock waiter queue.
+                        // Clear the flock/sigwait routing too — this exit
+                        // skips the proceed-branch cleanup below, and a stale
+                        // key would make the task's NEXT unrelated park
+                        // register on the wrong waiter queue.
                         uc.flock_key.store(0, Ordering::Release);
+                        uc.sigwait_set.store(0, Ordering::Release);
                         return false;
                     }
                 }
@@ -610,6 +644,9 @@ fn park_should_block(
         // The waiter-queue entry (if any) is dropped by the re-executed
         // fcntl's exit paths, which know the key; just clear the routing.
         uc.flock_key.store(0, Ordering::Release);
+        // Sigwait routing: the re-executed rt_sigtimedwait re-arms it if it
+        // parks again (timeout expiry is detected via blocking_deadline_ns).
+        uc.sigwait_set.store(0, Ordering::Release);
         if let Some(h) = sleep_handle.take() {
             narf_scheduler::narf_time::timer_wheel::cancel(h);
         }
@@ -1407,6 +1444,24 @@ impl core::future::Future for UserTaskFuture {
             let signal_pending = deadline == u64::MAX
                 && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
             if now < deadline && !signal_pending {
+                // rt_sigtimedwait park: same register-then-re-check shape as
+                // the own-stack `park_should_block` sigwait arm — register in
+                // SIGNAL_WAKERS (every raise path fires it via `wake_signal`)
+                // and break the park when a signal in the waited set (mask
+                // ignored) or any deliverable signal is pending; the rewound
+                // syscall re-executes and consumes / returns -EINTR.
+                let sw = this.task.uctx.sigwait_set.load(Ordering::Acquire);
+                if sw != 0 {
+                    let tid = crate::handlers::current_task_id();
+                    crate::handlers::register_signal_waker(tid, cx.waker().clone());
+                    if crate::handlers::sigwait_should_wake(tid, sw) {
+                        crate::handlers::drop_signal_waker(tid);
+                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        this.task.uctx.sigwait_set.store(0, Ordering::Release);
+                        cx.waker().wake_by_ref();
+                        return core::task::Poll::Pending;
+                    }
+                }
                 // Parking on a blocking wait. If `sys_epoll_wait`/
                 // `sys_poll` flagged this as a net I/O wait, register
                 // our waker so inbound TCP data wakes us immediately
@@ -1548,6 +1603,7 @@ impl core::future::Future for UserTaskFuture {
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
             this.task.uctx.futex_uaddr.store(0, Ordering::Release);
+            this.task.uctx.sigwait_set.store(0, Ordering::Release);
             if let Some(h) = this.sleep_handle.take() {
                 narf_scheduler::narf_time::timer_wheel::cancel(h);
             }
@@ -2188,9 +2244,14 @@ impl core::future::Future for UserTaskFuture {
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
             // Break an infinite park on an async pending signal — see the
-            // sibling poll body for the rationale.
-            let signal_pending = deadline == u64::MAX
-                && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
+            // sibling poll body for the rationale. A sigwait park (non-zero
+            // `sigwait_set`, finite deadline or not) additionally breaks on
+            // a pending signal in its waited set (mask ignored) so the
+            // rewound rt_sigtimedwait re-executes and consumes it.
+            let tid = crate::handlers::current_task_id();
+            let sw = this.task.uctx.sigwait_set.load(Ordering::Acquire);
+            let signal_pending = (deadline == u64::MAX && crate::handlers::is_signal_pending(tid))
+                || (sw != 0 && crate::handlers::sigwait_should_wake(tid, sw));
             if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;
                 let chunk_end = now.saturating_add(PARK_CHUNK_NS).min(deadline);
@@ -2202,6 +2263,7 @@ impl core::future::Future for UserTaskFuture {
                 return core::task::Poll::Pending;
             }
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+            this.task.uctx.sigwait_set.store(0, Ordering::Release);
         }
 
         // sys_wait4 cooperative parking (mirrors x86_64 poll body).

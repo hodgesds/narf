@@ -11330,6 +11330,9 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = SIGRETURN_SAVED_MASK.lock().as_mut() {
         m.remove(&tid);
     }
+    if let Some(m) = SUSPEND_SAVED_MASK.lock().as_mut() {
+        m.remove(&tid);
+    }
 
     // Parked-waker registrations. All wakers are Arc<WakeCell>, so a
     // stale entry is "only" a leak + a spurious wake — but under task
@@ -17244,28 +17247,127 @@ fn task_vm_bytes(pid: u64) -> u64 {
     }
 }
 
-/// Queued-siginfo payload for a signal raised via rt_sigqueueinfo /
-/// sigqueue: `(task, signum) -> (si_code, si_value)`. The pending bitmask
-/// in `SIGNAL_PENDING` collapses duplicates, so standard signals coalesce
-/// (the latest queued payload wins); realtime-signal queue depth is not
-/// modeled. Drained on delivery (`default_signal_delivery`) or by a
-/// `signalfd` read so a stale payload never attaches to a later instance.
-/// `(task, signum) -> (si_code, si_value)`.
-type SigqueueMap = BTreeMap<(u64, u32), (i32, u64)>;
+/// Queued-siginfo payloads for signals raised via rt_sigqueueinfo /
+/// sigqueue: `(task, signum) -> FIFO of (si_code, si_value)`.
+///
+/// Linux semantics (signal(7)): STANDARD signals (1..=31) do not queue —
+/// duplicates coalesce, so their slot holds at most ONE payload (the
+/// latest wins, matching the collapsed pending bit). REALTIME signals
+/// (32..=64) DO queue: each sigqueue(2) is an independent delivery with
+/// its own `si_value`, delivered in FIFO order. The pending bitmask in
+/// `SIGNAL_PENDING` still carries one bit per signum; consumers re-arm
+/// the bit after draining one instance while more remain queued
+/// (`rearm_pending_if_queued`), so N queued RT signals produce N
+/// deliveries instead of collapsing to one.
+///
+/// Drained on delivery (`default_signal_delivery`), by `rt_sigtimedwait`,
+/// or by a `signalfd` read so a stale payload never attaches to a later
+/// instance.
+type SigqueueMap = BTreeMap<(u64, u32), alloc::collections::VecDeque<(i32, u64, u32)>>;
 static SIGQUEUE_INFO: narf_lib::sync::IrqSafeSpinLock<Option<SigqueueMap>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// Record the `si_code` + `si_value` carried by a queued signal.
-pub(crate) fn store_sigqueue_info(task: u64, signum: u32, si_code: i32, si_value: u64) {
+/// First realtime signal at the KERNEL level (libc reserves the first few
+/// for its own use, but queueing is a property of the kernel range).
+const SIGRT_QUEUE_MIN: u32 = 32;
+
+/// Per-task cap on TOTAL queued signal payloads — the RLIMIT_SIGPENDING
+/// analogue (Linux defaults to a few thousand). Without a cap, a
+/// CPU-bound sigqueue(2) loop against a slower consumer (exactly
+/// stress-ng --sigrt's parent hammering 30 parked children) grows the
+/// kernel-heap FIFOs without bound; Linux callers already handle the
+/// EAGAIN this overflow produces.
+const SIGQUEUE_MAX_PER_TASK: usize = 4096;
+
+/// Record the `si_code` + `si_value` + sender `si_pid` carried by a
+/// queued signal. RT signals append (true queueing); standard signals
+/// replace (coalesce, latest payload wins — their pending bit collapses
+/// anyway). Returns `false` when the target's queue is at
+/// `SIGQUEUE_MAX_PER_TASK` (→ the sender surfaces -EAGAIN, Linux
+/// RLIMIT_SIGPENDING semantics); coalescing standard signals never fail.
+pub(crate) fn store_sigqueue_info(
+    task: u64,
+    signum: u32,
+    si_code: i32,
+    si_value: u64,
+    si_pid: u32,
+) -> bool {
     let mut g = SIGQUEUE_INFO.lock();
-    g.get_or_insert_with(BTreeMap::new)
-        .insert((task, signum), (si_code, si_value));
+    let m = g.get_or_insert_with(BTreeMap::new);
+    if signum >= SIGRT_QUEUE_MIN {
+        // Cap check across ALL of the target's queues (the per-process
+        // pending budget, like Linux's ucounts sigpending charge).
+        let queued: usize = m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum();
+        if queued >= SIGQUEUE_MAX_PER_TASK {
+            return false;
+        }
+    }
+    let q = m.entry((task, signum)).or_default();
+    if signum < SIGRT_QUEUE_MIN {
+        q.clear();
+    }
+    q.push_back((si_code, si_value, si_pid));
+    true
 }
 
-/// Remove and return a queued signal's `(si_code, si_value)`, if any.
-pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64)> {
+/// Pop and return the OLDEST queued `(si_code, si_value, si_pid)` for
+/// `(task, signum)`, if any. FIFO order preserves rt_sigqueueinfo
+/// submission order for RT signals; standard signals hold at most one.
+pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64, u32)> {
     let mut g = SIGQUEUE_INFO.lock();
-    g.as_mut().and_then(|m| m.remove(&(task, signum)))
+    let m = g.as_mut()?;
+    let q = m.get_mut(&(task, signum))?;
+    let v = q.pop_front();
+    if q.is_empty() {
+        m.remove(&(task, signum));
+    }
+    v
+}
+
+/// True when more queued instances of `(task, signum)` remain after a
+/// `take_sigqueue_info` pop.
+pub(crate) fn sigqueue_more_queued(task: u64, signum: u32) -> bool {
+    SIGQUEUE_INFO
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()))
+}
+
+/// Re-set the pending bit for `signum` when more queued instances remain
+/// — the RT-queue drain step every consumer (handler delivery,
+/// rt_sigtimedwait, signalfd) runs after clearing the bit, so the NEXT
+/// return-to-user / wait delivers the next instance with its own payload.
+pub(crate) fn rearm_pending_if_queued(task: u64, signum: u32) {
+    if !sigqueue_more_queued(task, signum) {
+        return;
+    }
+    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
+        if let Some(slot) = map.get_mut(&task) {
+            *slot |= sig_bit(signum);
+        }
+    }
+}
+
+/// Drop every queued payload for `(task, signum)` — used when the signal
+/// is consumed by an ignoring disposition (SIG_IGN / default-Ignore):
+/// Linux "delivers" each queued ignored instance by discarding it, which
+/// collapses to discarding the whole queue.
+pub(crate) fn purge_sigqueue(task: u64, signum: u32) {
+    if let Some(m) = SIGQUEUE_INFO.lock().as_mut() {
+        m.remove(&(task, signum));
+    }
+}
+
+/// Wake condition for a task parked in `rt_sigtimedwait` on userspace
+/// sigset `set` (bit N-1 = signal N — identical to `SIGNAL_PENDING`'s
+/// layout). True when a signal IN the set is pending (block mask
+/// deliberately ignored: sigwait consumes blocked signals — callers
+/// block the set first, per sigwaitinfo(2)) or any OTHER deliverable
+/// signal is pending (the re-executed syscall returns -EINTR and the
+/// return-to-user hook delivers it).
+pub(crate) fn sigwait_should_wake(task: u64, set: u64) -> bool {
+    let pending = signal_pending_of(task);
+    (pending & set) != 0 || (pending & !signal_mask_of(task)) != 0
 }
 
 pub fn is_signal_pending(task_id: u64) -> bool {
@@ -17378,6 +17480,29 @@ fn take_sigreturn_saved_mask(task: u64) -> Option<u64> {
     g.as_mut().and_then(|m| m.remove(&task))
 }
 
+// Pre-`rt_sigsuspend` signal mask, saved when sigsuspend installs its
+// temporary wait mask. POSIX (and Linux's TIF_RESTORE_SIGMASK): the mask
+// restored by the interrupting handler's sigreturn must be the mask in
+// effect BEFORE sigsuspend replaced it — NOT the temporary suspend mask.
+// Without this record, `default_signal_delivery` captured the live (=
+// suspend) mask into SIGRETURN_SAVED_MASK, so the temporary mask survived
+// the handler return and the process ran on the suspend mask forever.
+// Consumed (take) by the first delivery after the suspend; a record left
+// by an aborted suspend is dropped by the next explicit sigprocmask
+// install (the user retook control of the mask) and swept on task exit.
+static SUSPEND_SAVED_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn set_suspend_saved_mask(task: u64, mask: u64) {
+    let mut g = SUSPEND_SAVED_MASK.lock();
+    g.get_or_insert_with(BTreeMap::new).insert(task, mask);
+}
+
+fn take_suspend_saved_mask(task: u64) -> Option<u64> {
+    let mut g = SUSPEND_SAVED_MASK.lock();
+    g.as_mut().and_then(|m| m.remove(&task))
+}
+
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
@@ -17392,6 +17517,8 @@ pub fn __test_signal_reset() {
     *SIGNAL_PENDING.lock() = Some(BTreeMap::new());
     *SIGNAL_MASK.lock() = Some(BTreeMap::new());
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
+    *SIGQUEUE_INFO.lock() = Some(BTreeMap::new());
+    *SUSPEND_SAVED_MASK.lock() = Some(BTreeMap::new());
 }
 
 /// Diagnostic: peek the pending bitmap for `task`.
@@ -18402,24 +18529,38 @@ fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-3i64) as u64));
         return;
     }
-    capture_queued_siginfo(target, sig, a.arg2);
+    if !capture_queued_siginfo(target, sig, a.arg2) {
+        // Target's queued-signal budget exhausted (RLIMIT_SIGPENDING
+        // analogue): deliver nothing, tell the sender to back off.
+        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+        return;
+    }
     raise_signal_pending(target, sig); // ORs the pending bit + wakes
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// Copy `si_code` (offset 8) and `si_value` (the sigval union, offset 24)
-/// out of a user `siginfo_t` and stash them for delivery / signalfd.
-fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) {
+/// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
+/// sigval union, offset 24) out of a user `siginfo_t` and stash them for
+/// delivery / sigtimedwait / signalfd. Returns `false` only when the
+/// target's queue is full (RLIMIT_SIGPENDING shape → sender returns
+/// -EAGAIN); a NULL/unreadable info queues nothing but "succeeds" (the
+/// bare signal still delivers, like a payload-less kill).
+fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) -> bool {
     if info_ptr == 0 {
-        return;
+        return true;
     }
     // SAFETY: info_ptr is non-zero; copy_from_user_vec range-validates the
     // 32-byte read covering si_signo..si_value.
     if let Ok(b) = unsafe { copy_from_user_vec(info_ptr, 32) } {
         let si_code = i32::from_le_bytes(b[8..12].try_into().unwrap());
+        // si_pid (offset 16 in the rt union) — musl/glibc `sigqueue` fill
+        // getpid() here, and consumers reply to it (stress-ng --sigrt's
+        // child does `sigqueue(info.si_pid, ...)`).
+        let si_pid = u32::from_le_bytes(b[16..20].try_into().unwrap());
         let si_value = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        store_sigqueue_info(target, sig, si_code, si_value);
+        return store_sigqueue_info(target, sig, si_code, si_value, si_pid);
     }
+    true
 }
 
 /// `rt_tgsigqueueinfo(tgid, tid, sig, info)` — queue `sig` to thread
@@ -18439,7 +18580,10 @@ fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-3i64) as u64));
         return;
     }
-    capture_queued_siginfo(target, sig, a.arg3);
+    if !capture_queued_siginfo(target, sig, a.arg3) {
+        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
+        return;
+    }
     raise_signal_pending(target, sig);
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -19291,14 +19435,12 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             .as_ref()
             .and_then(|m| m.get(&task).copied())
             .unwrap_or(0);
-        // NARF stores the mask with signal N at bit N (lined up with
-        // SIGNAL_PENDING); a userspace `sigset_t` puts signal N at bit N-1.
-        // Shift back so the caller sees the Linux convention (mirrors the
-        // `<<1` on the way in, and the same shift `signalfd` uses).
-        let user_mask = mask; // N-1 convention == user sigset_t
-                              // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
-                              // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
-                              // SAFETY: Valid memory or trusted environment
+        // NARF's internal mask layout is bit N-1 = signal N — identical to a
+        // userspace `sigset_t` — so the mask copies out verbatim.
+        let user_mask = mask;
+        // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
+        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
+        // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(old_ptr, &user_mask.to_ne_bytes()) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -19314,11 +19456,9 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
             ctx.set_return(fail);
             return;
         }
-        // Userspace `sigset_t` bit N-1 == signal N; NARF's mask uses bit N to
-        // line up with SIGNAL_PENDING. Shift `<<1` (same as `signalfd`), or a
-        // block of e.g. SIGUSR1 (10) would set bit 9 and fail to mask the
-        // pending bit 10 — the signal would be delivered despite being blocked.
-        let set = u64::from_ne_bytes(buf); // user sigset_t == NARF layout
+        // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout
+        // (see SIGNAL_PENDING), so the new mask installs verbatim.
+        let set = u64::from_ne_bytes(buf);
         let mut g = SIGNAL_MASK.lock();
         let map = match g.as_mut() {
             Some(m) => m,
@@ -19340,6 +19480,12 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // Linux strips SIGKILL/SIGSTOP from every installed mask —
         // a task must never be able to block its own fatal kill.
         *slot &= !UNBLOCKABLE_MASK;
+        drop(g);
+        // An explicit mask install means the user retook control of the
+        // mask — drop any suspend-saved record a signal-less (aborted)
+        // rt_sigsuspend left behind, so a much-later delivery can't
+        // "restore" a stale pre-suspend mask over this one.
+        let _ = take_suspend_saved_mask(task);
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -19541,12 +19687,13 @@ fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
 /// mask. Always returns -1 (after delivery); errno = EINTR per
 /// POSIX.
 ///
-/// NARF round 1 implementation: install the new mask, return
-/// success-shaped as -1. The next signal delivery hook firing
-/// against this task will see the new mask, deliver outside-mask
-/// signals, and the user's libc trampoline calls rt_sigprocmask
-/// itself to restore. A future tighter implementation parks the
-/// task in a dedicated wait state.
+/// The wait itself is `sys_pause`'s park (u64::MAX deadline, broken by
+/// `is_signal_pending` + `wake_signal`), which truly blocks under an
+/// executor and degrades to a one-shot -1 in the kernel-test harness.
+/// The prior mask is recorded in `SUSPEND_SAVED_MASK` so the
+/// interrupting handler's `sys_sigreturn` restores the PRE-SUSPEND mask
+/// instead of re-installing the temporary wait mask (Linux
+/// TIF_RESTORE_SIGMASK — see `default_signal_delivery_restricted`).
 ///
 /// arg0 = set in ptr, arg1 = sigsetsize (must be 8).
 fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
@@ -19568,38 +19715,70 @@ fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    // Userspace `sigset_t` bit N-1 == signal N; NARF's mask uses bit N (see
-    // sys_sigprocmask / signalfd). Shift `<<1` so an unblocked signal here
-    // actually becomes deliverable while suspended.
+    // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout
+    // (see SIGNAL_PENDING), so the suspend mask installs verbatim.
     // SIGKILL/SIGSTOP can never be blocked, in a suspend mask either.
     let mask = u64::from_ne_bytes(buf) & !UNBLOCKABLE_MASK;
     let task = current_task_id();
 
-    // Temporarily install the new mask.
+    // Temporarily install the new mask, remembering the prior one so the
+    // interrupting delivery's sigreturn restores IT (not the temp mask).
     {
         let mut g = SIGNAL_MASK.lock();
         let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-        map.insert(task, mask);
+        let prior = map.insert(task, mask).unwrap_or(0);
+        set_suspend_saved_mask(task, prior);
     }
 
     // Pause until signal.
     sys_pause(ctx);
 }
 
+/// Atomically consume the LOWEST pending signal in `set` for `task`:
+/// clear its bit under the `SIGNAL_PENDING` lock and return the signum,
+/// or `None` when nothing in `set` is pending. The single-lock
+/// check-and-clear is what makes two racing consumers (e.g. the
+/// return-to-user delivery hook vs a re-executed `rt_sigtimedwait`)
+/// unable to both take the same instance.
+fn sigwait_consume(task: u64, set: u64) -> Option<u32> {
+    let mut g = SIGNAL_PENDING.lock();
+    let slot = g.as_mut()?.get_mut(&task)?;
+    let candidates = *slot & set;
+    if candidates == 0 {
+        return None;
+    }
+    let signum = sig_from_bit(candidates);
+    *slot &= !(sig_bit(signum));
+    Some(signum)
+}
+
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — Linux
-/// `rt_sigtimedwait(2)`. Synchronously wait for one of the
-/// signals in `set` to be delivered to the calling task (or
-/// timeout). Returns the delivered signum on success, -1 on
-/// timeout / bad input.
+/// `rt_sigtimedwait(2)`. Synchronously wait for one of the signals in
+/// `set` to become pending for the calling task, consume it WITHOUT
+/// running its handler, and return its signum (+ its `siginfo_t` payload
+/// through `info`). The `set` intersection deliberately ignores the block
+/// mask: callers block the waited signals first (sigwaitinfo(2)) and this
+/// wait dequeues them anyway — that IS the calling convention.
 ///
-/// NARF round 1: implement the non-blocking inspection variant.
-/// If any signal in `set` is already pending for the task,
-/// clear it from pending, fill the siginfo struct (if `info` is
-/// non-null), and return the signum. If `timeout` is null, this
-/// would block — we surface -1 (EAGAIN-shaped) for the
-/// not-yet-pending case. The tight loop is delegated to userspace
-/// via a libc retry shim. Full park-and-wait lands alongside the
-/// signal pump.
+/// Blocking model: when nothing in `set` is pending, PARK — route the
+/// park through `uctx.sigwait_set` (exactly like `flock_key` /
+/// `futex_uaddr` route theirs), rewind RIP so the syscall RE-EXECUTES on
+/// wake, and let `park_should_block` / `UserTaskFuture::poll` register
+/// this task in `SIGNAL_WAKERS` so any raise path's `wake_signal` fires
+/// it promptly (the ~1-tick wheel deadline is only the lost-wake
+/// backstop). This is what lets stress-ng --sigrt's round-trip work: the
+/// peer parks in sigwaitinfo until the sibling's sigqueue arrives,
+/// instead of the old one-shot -1 return that deadlocked the pair.
+///
+/// Returns:
+///   - the signum, when a signal in `set` was consumed (each queued RT
+///     instance is an independent delivery — see `SIGQUEUE_INFO`),
+///   - -EINTR, when a deliverable signal OUTSIDE `set` is pending (its
+///     handler runs via the return-to-user hook),
+///   - -EAGAIN, when the (finite) timeout expired — persisted across
+///     re-executions in `blocking_deadline_ns`, same as poll/epoll,
+///   - -EINVAL for a malformed timespec, -1 for the legacy bad-input
+///     shape (sigsetsize != 8 / NULL set) the ABI tests pin.
 ///
 /// arg0 = set ptr (in), arg1 = info ptr (out, may be 0),
 /// arg2 = timeout timespec ptr (may be 0 = block indefinitely),
@@ -19608,7 +19787,7 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let set_in = args.arg0;
     let info_out = args.arg1;
-    let _timeout_in = args.arg2;
+    let timeout_in = args.arg2;
     let sigsetsize = args.arg3;
     if sigsetsize != 8 || set_in == 0 {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64));
@@ -19628,38 +19807,145 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     }
     let set = u64::from_ne_bytes(set_buf);
     let task = current_task_id();
-    let pending = signal_pending_of(task);
-    let candidates = pending & set;
-    if candidates == 0 {
-        // Linux returns -1 / EAGAIN when timeout = 0 and nothing
-        // is pending. For non-zero timeout we'd block; today we
-        // return the same shape — the libc loop will re-call us.
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    let uctx_opt = crate::user_task::current_user_task();
+
+    // Every return path below must tear the park routing down: the
+    // sigwait routing + the persisted timeout deadline + the waker
+    // registration (a stale SIGNAL_WAKERS entry only costs one spurious
+    // re-poll, but a stale `sigwait_set`/`blocking_deadline_ns` would
+    // mis-route the task's NEXT unrelated park / inherit a dead deadline).
+    let clear_routing = |uctx_opt: Option<*mut crate::user_task::UserTaskCtx>| {
+        if let Some(u) = uctx_opt {
+            // SAFETY: the in-flight task's poller-pinned UserTaskCtx;
+            // atomics only.
+            unsafe {
+                (*u).sigwait_set.store(0, Ordering::Release);
+                (*u).blocking_deadline_ns.store(0, Ordering::Release);
+            }
+        }
+        drop_signal_waker(task);
+    };
+
+    // A signal in `set` is pending → consume ONE instance and return it.
+    if let Some(signum) = sigwait_consume(task, set) {
+        // Attach the oldest queued payload (rt_sigqueueinfo/sigqueue), and
+        // re-arm the bit when more instances remain queued behind it.
+        let queued = take_sigqueue_info(task, signum);
+        rearm_pending_if_queued(task, signum);
+        clear_routing(uctx_opt);
+        if info_out != 0 {
+            // Build the 128-byte siginfo_t in kernel memory, then copy it
+            // out through the SMAP bracket. si_signo/si_errno/si_code are
+            // the union-discriminating prefix; si_pid (offset 16) + si_value
+            // (the sigval union, offset 24) carry the queued sender payload
+            // (stress-ng --sigrt's child replies to si_pid). Rest stays zero.
+            let mut si = [0u8; 128];
+            let (si_code, si_value, si_pid) = queued.unwrap_or((0, 0, 0)); // SI_USER shape
+            si[..4].copy_from_slice(&(signum as i32).to_ne_bytes()); // si_signo
+            si[8..12].copy_from_slice(&si_code.to_ne_bytes()); // si_code
+            si[16..20].copy_from_slice(&si_pid.to_ne_bytes()); // si_pid
+            si[24..32].copy_from_slice(&si_value.to_ne_bytes()); // si_value
+                                                                 // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
+            let _ = unsafe { copy_to_user(info_out, &si) };
+        }
+        ctx.set_return(SyscallReturn::ok(signum as u64));
         return;
     }
-    let signum = sig_from_bit(candidates);
-    // Clear the bit.
-    if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
-        if let Some(slot) = map.get_mut(&task) {
-            *slot &= !(sig_bit(signum));
+
+    // A deliverable signal OUTSIDE `set` interrupts the wait: return
+    // -EINTR and let the return-to-user hook run its handler (Linux
+    // rt_sigtimedwait(2) — never auto-restarted, see
+    // `is_restartable_syscall`).
+    if (signal_pending_of(task) & !signal_mask_of(task) & !set) != 0 {
+        clear_routing(uctx_opt);
+        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+        return;
+    }
+
+    // Timeout. NULL → block indefinitely (u64::MAX park). A finite
+    // timespec maps to an absolute wheel deadline persisted in
+    // `blocking_deadline_ns` — the RIP-rewind re-executions must detect
+    // expiry instead of re-arming now+timeout forever (the scheduler
+    // clears `sleep_deadline_ns` on every wake; see poll/epoll).
+    let mut deadline = u64::MAX;
+    if timeout_in != 0 {
+        let mut ts = [0u8; 16];
+        // SAFETY: timeout_in != 0; copy_from_user range-validates and
+        // SMAP-brackets the 16-byte timespec read.
+        if unsafe { copy_from_user(&mut ts, timeout_in) }.is_err() {
+            clear_routing(uctx_opt);
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            return;
+        }
+        let sec = i64::from_ne_bytes(ts[..8].try_into().unwrap());
+        let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            clear_routing(uctx_opt);
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            return;
+        }
+        let dur_ns = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64);
+        if dur_ns == 0 {
+            // {0,0} = pure poll; nothing was pending above.
+            clear_routing(uctx_opt);
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+            return;
+        }
+        if let Some(u) = uctx_opt {
+            // SAFETY: as in clear_routing — atomics on the live uctx.
+            let persisted = unsafe { (*u).blocking_deadline_ns.load(Ordering::Acquire) };
+            deadline = if persisted != 0 {
+                persisted
+            } else {
+                let d = narf_scheduler::narf_time::monotonic_ns().saturating_add(dur_ns);
+                // SAFETY: as above.
+                unsafe { (*u).blocking_deadline_ns.store(d, Ordering::Release) };
+                d
+            };
+            if narf_scheduler::narf_time::monotonic_ns() >= deadline {
+                clear_routing(uctx_opt);
+                ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
+                return;
+            }
         }
     }
-    // Fill siginfo if requested. Linux siginfo_t is ~128 bytes;
-    // we write just the first three fields (si_signo, si_errno,
-    // si_code) which is the union-discriminating prefix every
-    // libc inspects. Leaving the rest zero matches `SI_USER`.
-    if info_out != 0 {
-        // Build the 128-byte siginfo_t in kernel memory, then copy it out
-        // through the SMAP bracket (a raw write_bytes/write_unaligned to
-        // the user pointer #PF'd under SMAP). si_signo/si_errno/si_code
-        // are the union-discriminating prefix; the rest stays zero (SI_USER).
-        let mut si = [0u8; 128];
-        si[..4].copy_from_slice(&(signum as i32).to_ne_bytes()); // si_signo
-                                                                 // si_errno (4..8) + si_code (8..12) stay 0 (SI_USER).
-                                                                 // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
-        let _ = unsafe { copy_to_user(info_out, &si) };
+
+    // Park until a signal (or the deadline). Same shape as the blocking
+    // F_SETLKW: rewind RIP over the 2-byte syscall so the WHOLE
+    // rt_sigtimedwait re-executes on wake and re-runs the consume above.
+    if let (Some(uctx), Some(hook)) = (uctx_opt, crate::user_task::yield_hook()) {
+        ctx.set_rip(ctx.rip().wrapping_sub(2));
+        // SAFETY: `uctx` is the live per-task UserTaskCtx from
+        // current_user_task(); we hold the only reference while setting the
+        // park routing and saving the RIP-rewound CPU state before the
+        // yield hook / own-stack switch hands the task over.
+        unsafe {
+            let uc = &*uctx;
+            // Clear stale routings so the park can't mis-register on the
+            // futex / flock / io queues (same guard as the F_SETLKW park).
+            uc.futex_uaddr.store(0, Ordering::Release);
+            uc.flock_key.store(0, core::sync::atomic::Ordering::Release);
+            uc.net_io_wait.store(false, Ordering::Release);
+            uc.sigwait_set.store(set, Ordering::Release);
+            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
+            hook(uctx);
+        }
+        // unreachable when parked
     }
-    ctx.set_return(SyscallReturn::ok(signum as u64));
+
+    // No executor wired (the in-kernel test harness): there is nothing to
+    // park on — degrade to the historical one-shot -1 answer the ABI
+    // tests pin, exactly like pause's no-executor tail.
+    clear_routing(uctx_opt);
+    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
 }
 
 // Function-pointer hook: arch trap dispatcher invokes this on
@@ -19863,7 +20149,10 @@ pub(crate) fn default_signal_delivery_restricted(
             }
             match default_signal_action(signum) {
                 DefaultAction::Ignore => {
-                    // Silently consumed (existing behaviour).
+                    // Silently consumed (existing behaviour). Discard any
+                    // queued RT payloads too — each queued ignored instance
+                    // is "delivered" by being dropped (signal(7)).
+                    purge_sigqueue(task, signum);
                 }
                 DefaultAction::Terminate => {
                     terminate_current_task(ctx, task, signum, false);
@@ -19903,12 +20192,14 @@ pub(crate) fn default_signal_delivery_restricted(
                 *slot &= !(sig_bit(signum));
             }
         }
+        // SIG_IGN consumes every queued RT instance with the bit.
+        purge_sigqueue(task, signum);
         return true;
     }
     // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
     // instance was queued by rt_sigqueueinfo/sigqueue, in which case
     // honour its si_code (SI_QUEUE) + si_value (the sigval payload).
-    let (si_code, si_value) = take_sigqueue_info(task, signum).unwrap_or((0, 0));
+    let (si_code, si_value, _si_pid) = take_sigqueue_info(task, signum).unwrap_or((0, 0, 0));
     let params = build_delivery_params(task, action, signum, syscall_no, si_code, 0, si_value);
     if !ctx.deliver_signal(&params) {
         return false;
@@ -19928,15 +20219,24 @@ pub(crate) fn default_signal_delivery_restricted(
             *slot &= !(sig_bit(signum));
         }
     }
+    // RT queueing: this delivery drained ONE queued instance (the take
+    // above); if more remain, re-arm the bit so the next return-to-user
+    // delivers the next instance with its own si_value.
+    rearm_pending_if_queued(task, signum);
     // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
     // undoing the auto-block below. Captured BEFORE the SA_NODEFER OR so the
     // restored value is the mask in effect when the handler was entered.
+    // A pending `rt_sigsuspend` record takes precedence: the mask this
+    // handler's sigreturn must restore is the PRE-SUSPEND mask, not the
+    // temporary suspend mask the wait installed (Linux TIF_RESTORE_SIGMASK).
     {
-        let cur = SIGNAL_MASK
-            .lock()
-            .as_ref()
-            .and_then(|m| m.get(&task).copied())
-            .unwrap_or(0);
+        let cur = take_suspend_saved_mask(task).unwrap_or_else(|| {
+            SIGNAL_MASK
+                .lock()
+                .as_ref()
+                .and_then(|m| m.get(&task).copied())
+                .unwrap_or(0)
+        });
         set_sigreturn_saved_mask(task, cur);
     }
     // SA_NODEFER: skip the auto-block. Default: add the delivered
@@ -22545,11 +22845,10 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
         // SAFETY: Valid memory or trusted environment
         if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_ok() {
-            // A userspace sigset_t puts signal N at bit (N-1), but NARF's
-            // internal SIGNAL_PENDING bitmap uses bit N (raise_signal_pending
-            // ORs `1<<signum`). Shift so the signalfd mask lines up with the
-            // pending bits it is intersected against.
-            mask = u64::from_le_bytes(bytes); // signalfd: user==NARF layout
+            // A userspace sigset_t puts signal N at bit N-1 — identical to
+            // NARF's SIGNAL_PENDING layout — so the signalfd mask lines up
+            // with the pending bits it is intersected against verbatim.
+            mask = u64::from_le_bytes(bytes);
         }
     }
     let task = current_task_id();
