@@ -89,6 +89,7 @@ pub mod user_task;
 pub mod vdso;
 pub mod xdp_socket;
 
+mod abi_aio_tests;
 mod abi_async_tests;
 mod abi_creds_tests;
 mod abi_fdio2_tests;

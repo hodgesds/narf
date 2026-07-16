@@ -11637,6 +11637,10 @@ fn release_task_tables(tid: u64) {
     #[cfg(feature = "linux-compat")]
     crate::posix_timer::release_task_timers(tid);
 
+    // Linux kernel-AIO contexts: drop any io_setup'd contexts the task
+    // never io_destroy'd, so a forgetful process doesn't leak them.
+    aio::release_task_aio(tid);
+
     // Console signal routing: if the dying task was the recorded
     // foreground reader, ^C/^Z must stop resolving to its corpse.
     let _ = FOREGROUND_TASK.compare_exchange(
@@ -24546,9 +24550,581 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_delete_module),
     );
 
+    // Linux kernel-AIO (libaio) — synchronous backend. See the `aio`
+    // module below and [[narf-libaio-sync-backend]].
+    table.install_raw(
+        Syscall::IoSetup,
+        "io_setup",
+        RawFnHandler(aio::sys_io_setup),
+    );
+    table.install_raw(
+        Syscall::IoDestroy,
+        "io_destroy",
+        RawFnHandler(aio::sys_io_destroy),
+    );
+    table.install_raw(
+        Syscall::IoSubmit,
+        "io_submit",
+        RawFnHandler(aio::sys_io_submit),
+    );
+    table.install_raw(
+        Syscall::IoGetevents,
+        "io_getevents",
+        RawFnHandler(aio::sys_io_getevents),
+    );
+    table.install_raw(
+        Syscall::IoCancel,
+        "io_cancel",
+        RawFnHandler(aio::sys_io_cancel),
+    );
+
     // Auto-wire both delivery hooks so any kernel that uses
     // `install_core_syscalls` gets the async + sync signal paths
     // on for free. Idempotent.
     install_signal_delivery_hook(default_signal_delivery);
     install_sync_signal_hook(default_sync_signal_delivery);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Linux kernel-AIO (libaio) — synchronous backend
+// See [[narf-libaio-sync-backend]].
+//
+// NARF's filesystems are in-memory/fast and the executor is cooperative,
+// so a real async DMA/threadpool engine buys nothing. Instead each
+// submitted `iocb` is executed *synchronously* at `io_submit` time and
+// its `io_event` is queued immediately; `io_getevents` just drains the
+// queue. glibc/libaio callers (submit → reap) are correct against this
+// backend: they never observe an in-flight request.
+//
+// The per-task `io_context` table mirrors the shape of the other
+// tid-keyed tables in this file (an `IrqSafeSpinLock<Option<BTreeMap>>`
+// installed lazily, swept in `release_task_tables`).
+//
+// SMAP RIGOUR: every user-pointer access here — the `iocb *` array, each
+// 64-byte `iocb` body, the `io_event` output array, the `aio_context_t`
+// out/in words — goes through `copy_from_user` / `copy_to_user`, which
+// bracket the transfer with STAC/CLAC. A raw deref of a user VA #PFs
+// under SMAP; there are deliberately no raw user derefs below.
+// ══════════════════════════════════════════════════════════════════════
+mod aio {
+    use super::{
+        copy_from_user, copy_to_user, current_task_id, fd, poll_blocking, validate_user_range,
+        SyscallReturn, TrapContext,
+    };
+    use alloc::collections::{BTreeMap, VecDeque};
+    use alloc::vec::Vec;
+    use narf_lib::sync::IrqSafeSpinLock;
+
+    // ── errno constants (negated on return, Linux convention) ────────
+    const EINVAL: i64 = -22;
+    const EBADF: i64 = -9;
+    const EFAULT: i64 = -14;
+
+    // ── Linux <uapi/linux/aio_abi.h> opcodes ─────────────────────────
+    const IOCB_CMD_PREAD: u16 = 0;
+    const IOCB_CMD_PWRITE: u16 = 1;
+    const IOCB_CMD_FSYNC: u16 = 2;
+    const IOCB_CMD_FDSYNC: u16 = 3;
+    const IOCB_CMD_NOOP: u16 = 6;
+    const IOCB_CMD_PREADV: u16 = 7;
+    const IOCB_CMD_PWRITEV: u16 = 8;
+
+    // aio_flags bits.
+    const IOCB_FLAG_RESFD: u32 = 1 << 0;
+
+    // Struct sizes (repr(C), LP64) — verified against aio_abi.h.
+    const IOCB_SIZE: usize = 64;
+    const IO_EVENT_SIZE: usize = 32;
+
+    // Cap a single io_submit batch so a bogus `nr` can't drive an
+    // unbounded loop / allocation.
+    const AIO_RING_MAX: i64 = 65536;
+
+    /// A decoded `struct iocb` (Linux <uapi/linux/aio_abi.h>, 64 bytes).
+    /// Field order + offsets are load-bearing; see `decode_iocb`.
+    struct Iocb {
+        aio_data: u64,       // off 0  — echoed into io_event.data
+        aio_lio_opcode: u16, // off 16
+        aio_fildes: u32,     // off 20
+        aio_buf: u64,        // off 24
+        aio_nbytes: u64,     // off 32
+        aio_offset: i64,     // off 40
+        aio_flags: u32,      // off 56
+        aio_resfd: u32,      // off 60
+    }
+
+    /// Decode a 64-byte `iocb` from a kernel buffer previously filled by
+    /// `copy_from_user`. Offsets per aio_abi.h:
+    ///   0  u64 aio_data
+    ///   8  u32 aio_key
+    ///   12 u32 aio_rw_flags
+    ///   16 u16 aio_lio_opcode
+    ///   18 s16 aio_reqprio
+    ///   20 u32 aio_fildes
+    ///   24 u64 aio_buf
+    ///   32 u64 aio_nbytes
+    ///   40 s64 aio_offset
+    ///   48 u64 aio_reserved2
+    ///   56 u32 aio_flags
+    ///   60 u32 aio_resfd
+    fn decode_iocb(b: &[u8; IOCB_SIZE]) -> Iocb {
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        Iocb {
+            aio_data: u64_at(0),
+            aio_lio_opcode: u16::from_le_bytes(b[16..18].try_into().unwrap()),
+            aio_fildes: u32_at(20),
+            aio_buf: u64_at(24),
+            aio_nbytes: u64_at(32),
+            aio_offset: i64::from_le_bytes(b[40..48].try_into().unwrap()),
+            aio_flags: u32_at(56),
+            aio_resfd: u32_at(60),
+        }
+    }
+
+    /// Encode a `struct io_event` (32 bytes): data, obj, res, res2.
+    fn encode_event(data: u64, obj: u64, res: i64, res2: i64) -> [u8; IO_EVENT_SIZE] {
+        let mut out = [0u8; IO_EVENT_SIZE];
+        out[0..8].copy_from_slice(&data.to_le_bytes());
+        out[8..16].copy_from_slice(&obj.to_le_bytes());
+        out[16..24].copy_from_slice(&res.to_le_bytes());
+        out[24..32].copy_from_slice(&res2.to_le_bytes());
+        out
+    }
+
+    /// A completed AIO request, staged for `io_getevents`.
+    #[derive(Clone, Copy)]
+    struct Completion {
+        data: u64, // echoes iocb.aio_data
+        obj: u64,  // the user `iocb *` pointer
+        res: i64,  // bytes transferred, or -errno
+    }
+
+    /// One AIO context: a bounded completion queue. `nr_events` is the
+    /// caller's sizing hint (Linux uses it to size the mmap ring; we only
+    /// keep it for bookkeeping / validation).
+    struct AioContext {
+        _nr_events: u32,
+        completions: VecDeque<Completion>,
+    }
+
+    /// Per-task context table: tid → (ctx_id → AioContext). Context ids
+    /// are minted from a global monotonic counter so they never alias
+    /// across tasks (Linux hands back an opaque `aio_context_t`; callers
+    /// only round-trip it, so any unique non-zero token is valid).
+    static AIO_CONTEXTS: IrqSafeSpinLock<Option<BTreeMap<u64, BTreeMap<u64, AioContext>>>> =
+        IrqSafeSpinLock::new(None);
+
+    /// Monotonic context-id source. Starts at 1 so a freshly minted id is
+    /// always non-zero (Linux requires the caller's `*ctx_idp` to be zero
+    /// on entry and writes a non-zero id).
+    static NEXT_CTX_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+    fn mint_ctx_id() -> u64 {
+        NEXT_CTX_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run `f` with the calling task's context map, creating the outer
+    /// table + per-task entry lazily.
+    fn with_task_ctxs<R>(tid: u64, f: impl FnOnce(&mut BTreeMap<u64, AioContext>) -> R) -> R {
+        let mut g = AIO_CONTEXTS.lock();
+        let outer = g.get_or_insert_with(BTreeMap::new);
+        let inner = outer.entry(tid).or_default();
+        f(inner)
+    }
+
+    /// Exit-time sweep: drop every context (and its queued completions)
+    /// owned by `tid`. Called from `release_task_tables` so a process that
+    /// forgets `io_destroy` doesn't leak. See [[narf-libaio-sync-backend]].
+    pub(super) fn release_task_aio(tid: u64) {
+        if let Some(outer) = AIO_CONTEXTS.lock().as_mut() {
+            outer.remove(&tid);
+        }
+    }
+
+    // ── io_setup(nr_events, aio_context_t *ctx_idp) ──────────────────
+    pub(super) fn sys_io_setup(ctx: &mut dyn TrapContext) {
+        let args = *ctx.args();
+        let nr_events = args.arg0 as u32;
+        let ctx_idp = args.arg1;
+
+        // Linux rejects nr_events == 0 and requires *ctx_idp be zero on
+        // entry. We validate the out-pointer and mint an id.
+        if ctx_idp == 0 || validate_user_range(ctx_idp, 8).is_err() {
+            ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+            return;
+        }
+        if nr_events == 0 {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+            return;
+        }
+
+        let id = mint_ctx_id();
+        let tid = current_task_id();
+        with_task_ctxs(tid, |m| {
+            m.insert(
+                id,
+                AioContext {
+                    _nr_events: nr_events,
+                    completions: VecDeque::new(),
+                },
+            );
+        });
+
+        // SAFETY: `ctx_idp` range-validated above; copy_to_user brackets
+        // the 8-byte write with STAC/CLAC.
+        if unsafe { copy_to_user(ctx_idp, &id.to_le_bytes()) }.is_err() {
+            // Roll back the context we just minted so it doesn't leak.
+            with_task_ctxs(tid, |m| {
+                m.remove(&id);
+            });
+            ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+            return;
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+    }
+
+    // ── io_destroy(aio_context_t ctx) ────────────────────────────────
+    pub(super) fn sys_io_destroy(ctx: &mut dyn TrapContext) {
+        let ctx_id = ctx.args().arg0;
+        let tid = current_task_id();
+        let removed = with_task_ctxs(tid, |m| m.remove(&ctx_id).is_some());
+        if removed {
+            ctx.set_return(SyscallReturn::ok(0));
+        } else {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        }
+    }
+
+    // ── io_cancel(ctx, iocb *, io_event *result) ─────────────────────
+    // Synchronous completions are already done → never cancellable.
+    pub(super) fn sys_io_cancel(ctx: &mut dyn TrapContext) {
+        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+    }
+
+    /// Positioned read: resolve `fd`, read `len` bytes at `offset` into a
+    /// kernel buffer, then copy them to the user `buf`. Reuses the same
+    /// fd-resolution + `FileOps::read` path as `sys_pread64`. Returns
+    /// bytes read or -errno.
+    fn do_pread(tid: u64, fd_no: u32, buf: u64, len: usize, offset: u64) -> i64 {
+        if len == 0 {
+            return 0;
+        }
+        if validate_user_range(buf, len).is_err() {
+            return EFAULT;
+        }
+        if !fd::with_table(tid, |t| t.get(fd_no).is_some()).unwrap_or(false) {
+            return EBADF;
+        }
+        let mut kbuf = alloc::vec![0u8; len];
+        let outcome = fd::with_table(tid, |t| {
+            let entry = t.get(fd_no)?;
+            let ops = entry.ops.clone();
+            poll_blocking(ops.read(offset, &mut kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+                .ok()
+        });
+        match outcome {
+            Some(Some(n)) => {
+                // SAFETY: `buf` range-validated above; copy_to_user brackets it.
+                if unsafe { copy_to_user(buf, &kbuf[..n]) }.is_err() {
+                    EFAULT
+                } else {
+                    n as i64
+                }
+            }
+            _ => EINVAL,
+        }
+    }
+
+    /// Positioned write: reuses the `sys_pwrite64` fd-resolution +
+    /// `FileOps::write` path. Returns bytes written or -errno.
+    fn do_pwrite(tid: u64, fd_no: u32, buf: u64, len: usize, offset: u64) -> i64 {
+        if len == 0 {
+            return 0;
+        }
+        // SAFETY: single-threaded syscall; AS active. copy_from_user_vec
+        // range-validates + brackets the read of the user source buffer.
+        let kbuf = match unsafe { super::copy_from_user_vec(buf, len) } {
+            Ok(b) => b,
+            Err(_) => return EFAULT,
+        };
+        if !fd::with_table(tid, |t| t.get(fd_no).is_some()).unwrap_or(false) {
+            return EBADF;
+        }
+        let outcome = fd::with_table(tid, |t| {
+            let entry = t.get(fd_no)?;
+            let ops = entry.ops.clone();
+            poll_blocking(ops.write(offset, &kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+                .ok()
+        });
+        match outcome {
+            Some(Some(n)) => n as i64,
+            _ => EINVAL,
+        }
+    }
+
+    /// Vectored positioned read/write over a user iovec array. Mirrors the
+    /// `preadv_pwritev` loop but drives it off explicit args (the AIO iocb
+    /// carries the iovec base in `aio_buf` and the count in `aio_nbytes`).
+    fn do_preadv_pwritev(
+        tid: u64,
+        fd_no: u32,
+        iov_ptr: u64,
+        iovcnt: usize,
+        mut off: u64,
+        is_write: bool,
+    ) -> i64 {
+        const IOV_MAX: usize = 1024;
+        if iovcnt > IOV_MAX {
+            return EINVAL;
+        }
+        if iovcnt == 0 {
+            return 0;
+        }
+        if !fd::with_table(tid, |t| t.get(fd_no).is_some()).unwrap_or(false) {
+            return EBADF;
+        }
+        // SAFETY: single-threaded syscall; copy_from_user_vec validates
+        // + brackets the iovec array (16 bytes each).
+        let iov_buf = match unsafe { super::copy_from_user_vec(iov_ptr, iovcnt.saturating_mul(16)) }
+        {
+            Ok(b) => b,
+            Err(_) => return EFAULT,
+        };
+        let mut total: usize = 0;
+        for i in 0..iovcnt {
+            let o = i * 16;
+            let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap());
+            let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap()) as usize;
+            if len == 0 {
+                continue;
+            }
+            let done = if is_write {
+                do_pwrite(tid, fd_no, base, len, off)
+            } else {
+                do_pread(tid, fd_no, base, len, off)
+            };
+            if done < 0 {
+                if total == 0 {
+                    return done;
+                }
+                break;
+            }
+            let n = done as usize;
+            total = total.saturating_add(n);
+            off = off.saturating_add(n as u64);
+            if n < len {
+                break; // short transfer / EOF
+            }
+        }
+        total as i64
+    }
+
+    /// If the iocb requested eventfd completion notification
+    /// (`IOCB_FLAG_RESFD`), bump the `aio_resfd` eventfd by 1 by writing an
+    /// 8-byte counter increment through its `FileOps::write` — the same
+    /// path a userspace `write(efd, &1u64, 8)` takes. Silently ignored if
+    /// the fd isn't open.
+    fn signal_resfd(tid: u64, iocb: &Iocb) {
+        if iocb.aio_flags & IOCB_FLAG_RESFD == 0 {
+            return;
+        }
+        let one = 1u64.to_le_bytes();
+        let _ = fd::with_table(tid, |t| {
+            let entry = t.get(iocb.aio_resfd)?;
+            let ops = entry.ops.clone();
+            poll_blocking(ops.write(0, &one))
+        });
+    }
+
+    /// Execute one decoded iocb synchronously; return its `res` (bytes or
+    /// -errno). NOOP/FSYNC/FDSYNC succeed (in-memory FS has nothing to
+    /// flush; the fd is still validated for FSYNC/FDSYNC).
+    fn execute_iocb(tid: u64, iocb: &Iocb) -> i64 {
+        match iocb.aio_lio_opcode {
+            IOCB_CMD_PREAD => do_pread(
+                tid,
+                iocb.aio_fildes,
+                iocb.aio_buf,
+                iocb.aio_nbytes as usize,
+                iocb.aio_offset as u64,
+            ),
+            IOCB_CMD_PWRITE => do_pwrite(
+                tid,
+                iocb.aio_fildes,
+                iocb.aio_buf,
+                iocb.aio_nbytes as usize,
+                iocb.aio_offset as u64,
+            ),
+            IOCB_CMD_PREADV => do_preadv_pwritev(
+                tid,
+                iocb.aio_fildes,
+                iocb.aio_buf,
+                iocb.aio_nbytes as usize,
+                iocb.aio_offset as u64,
+                false,
+            ),
+            IOCB_CMD_PWRITEV => do_preadv_pwritev(
+                tid,
+                iocb.aio_fildes,
+                iocb.aio_buf,
+                iocb.aio_nbytes as usize,
+                iocb.aio_offset as u64,
+                true,
+            ),
+            IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => {
+                // In-memory FS: nothing to flush. Success for a valid fd,
+                // -EBADF otherwise (matches sys_fsync).
+                if fd::with_table(tid, |t| t.get(iocb.aio_fildes).is_some()).unwrap_or(false) {
+                    0
+                } else {
+                    EBADF
+                }
+            }
+            IOCB_CMD_NOOP => 0,
+            _ => EINVAL,
+        }
+    }
+
+    // ── io_submit(ctx, long nr, iocb **iocbpp) ───────────────────────
+    pub(super) fn sys_io_submit(ctx: &mut dyn TrapContext) {
+        let args = *ctx.args();
+        let ctx_id = args.arg0;
+        let nr = args.arg1 as i64;
+        let iocbpp = args.arg2;
+        let tid = current_task_id();
+
+        // Unknown context → -EINVAL.
+        let known = with_task_ctxs(tid, |m| m.contains_key(&ctx_id));
+        if !known {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+            return;
+        }
+        if !(0..=AIO_RING_MAX).contains(&nr) {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+            return;
+        }
+        if nr == 0 {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+
+        // The user pointer array is `nr` little-endian u64 pointers.
+        // SAFETY: copy_from_user_vec validates + brackets the array read.
+        let ptr_bytes = match unsafe { super::copy_from_user_vec(iocbpp, (nr as usize) * 8) } {
+            Ok(b) => b,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+                return;
+            }
+        };
+
+        let mut submitted: i64 = 0;
+        let mut pending: Vec<Completion> = Vec::new();
+        for i in 0..(nr as usize) {
+            let uptr = u64::from_le_bytes(ptr_bytes[i * 8..i * 8 + 8].try_into().unwrap());
+
+            // Read the 64-byte iocb body.
+            let mut iocb_bytes = [0u8; IOCB_SIZE];
+            // SAFETY: copy_from_user range-validates `uptr` + brackets the read.
+            if unsafe { copy_from_user(&mut iocb_bytes, uptr) }.is_err() {
+                // Linux: return the count submitted so far, or -errno if
+                // the very first iocb fails.
+                if submitted == 0 {
+                    ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+                    return;
+                }
+                break;
+            }
+            let iocb = decode_iocb(&iocb_bytes);
+
+            // Execute synchronously; a bad fd is NOT a syscall error — it
+            // surfaces as io_event.res = -EBADF.
+            let res = execute_iocb(tid, &iocb);
+            signal_resfd(tid, &iocb);
+
+            pending.push(Completion {
+                data: iocb.aio_data,
+                obj: uptr,
+                res,
+            });
+            submitted += 1;
+        }
+
+        // Stage all completions on the context queue.
+        with_task_ctxs(tid, |m| {
+            if let Some(c) = m.get_mut(&ctx_id) {
+                for comp in pending {
+                    c.completions.push_back(comp);
+                }
+            }
+        });
+
+        ctx.set_return(SyscallReturn::ok(submitted as u64));
+    }
+
+    // ── io_getevents(ctx, min_nr, nr, io_event *events, timespec *) ──
+    pub(super) fn sys_io_getevents(ctx: &mut dyn TrapContext) {
+        let args = *ctx.args();
+        let ctx_id = args.arg0;
+        let _min_nr = args.arg1 as i64;
+        let nr = args.arg2 as i64;
+        let events_ptr = args.arg3;
+        // arg4 = timespec* timeout — ignored: completions are synchronous
+        // so events are already queued; we never need to block. This is the
+        // documented cooperative simplification (return available count).
+        let tid = current_task_id();
+
+        // Unknown context → -EINVAL.
+        let known = with_task_ctxs(tid, |m| m.contains_key(&ctx_id));
+        if !known {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+            return;
+        }
+        if nr < 0 {
+            ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+            return;
+        }
+        if nr == 0 {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        if events_ptr == 0
+            || validate_user_range(events_ptr, (nr as usize) * IO_EVENT_SIZE).is_err()
+        {
+            ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+            return;
+        }
+
+        // Drain up to `nr` completions. We copy each 32-byte io_event out
+        // individually so a mid-array EFAULT only loses that event.
+        let mut count: i64 = 0;
+        for slot in 0..(nr as usize) {
+            let comp = with_task_ctxs(tid, |m| {
+                m.get_mut(&ctx_id).and_then(|c| c.completions.pop_front())
+            });
+            let comp = match comp {
+                Some(c) => c,
+                None => break, // queue drained
+            };
+            let ev = encode_event(comp.data, comp.obj, comp.res, 0);
+            let dst = events_ptr + (slot as u64) * IO_EVENT_SIZE as u64;
+            // SAFETY: `events_ptr` range-validated above for the whole
+            // array; copy_to_user brackets each 32-byte write.
+            if unsafe { copy_to_user(dst, &ev) }.is_err() {
+                // Re-queue the popped completion at the front so it isn't
+                // lost, then stop.
+                with_task_ctxs(tid, |m| {
+                    if let Some(c) = m.get_mut(&ctx_id) {
+                        c.completions.push_front(comp);
+                    }
+                });
+                break;
+            }
+            count += 1;
+        }
+        ctx.set_return(SyscallReturn::ok(count as u64));
+    }
 }

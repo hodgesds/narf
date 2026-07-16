@@ -2287,6 +2287,41 @@ pub enum Syscall {
     /// `mount_setattr(dfd, path, flags, attr, size)` — change mount attrs.
     /// Linux (x86_64=442, aarch64=442).
     MountSetattr,
+
+    // ── Linux kernel-AIO (libaio) family ────────────────────────────
+    //
+    // See [[narf-libaio-sync-backend]]. NARF's filesystems are in-memory
+    // and the executor is cooperative, so the AIO backend executes each
+    // submitted iocb *synchronously* at `io_submit` time and stages the
+    // completion for `io_getevents` to reap immediately. This is the
+    // legitimate minimal libaio impl: glibc/libaio callers submit-then-
+    // reap and work correctly against a synchronous backend.
+    /// `io_setup(nr_events, aio_context_t *ctx_idp)` — allocate an AIO
+    /// context and write its opaque id to `*ctx_idp`. Returns 0.
+    /// Linux (x86_64=206, aarch64=0).
+    IoSetup,
+
+    /// `io_destroy(aio_context_t ctx)` — free an AIO context and drop its
+    /// completion queue. `-EINVAL` on an unknown ctx.
+    /// Linux (x86_64=207, aarch64=1).
+    IoDestroy,
+
+    /// `io_getevents(ctx, min_nr, nr, io_event *events, timespec *timeout)`
+    /// — reap up to `nr` (at least `min_nr`, best-effort) completed events.
+    /// Since completions are synchronous they are already queued; we return
+    /// the available count without real blocking. Linux (x86_64=208, aarch64=4).
+    IoGetevents,
+
+    /// `io_submit(ctx, long nr, iocb **iocbpp)` — execute `nr` iocbs
+    /// synchronously and queue an `io_event` for each. Returns the number
+    /// submitted, or `-errno` if the first iocb fails. Linux (x86_64=209,
+    /// aarch64=2).
+    IoSubmit,
+
+    /// `io_cancel(ctx, iocb *, io_event *result)` — synchronous completions
+    /// cannot be cancelled (already done) → `-EINVAL`. Linux (x86_64=210,
+    /// aarch64=3).
+    IoCancel,
 }
 
 // ── Per-arch + NARF-extension number tables ─────────────────────────
@@ -2481,6 +2516,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Fsmount, 432),
     (Syscall::Fspick, 433),
     (Syscall::MountSetattr, 442),
+    // Linux kernel-AIO (libaio). Core (not linux-compat gated), like the
+    // pread/pwrite family the synchronous backend reuses.
+    (Syscall::IoSetup, 206),
+    (Syscall::IoDestroy, 207),
+    (Syscall::IoGetevents, 208),
+    (Syscall::IoSubmit, 209),
+    (Syscall::IoCancel, 210),
     // musl's signalfd() wrapper issues signalfd4 (289), like eventfd2;
     // map it to the same handler so signalfd is reachable on x86_64.
     (Syscall::Signalfd, 289),
@@ -2673,6 +2715,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
 #[cfg(target_arch = "aarch64")]
 const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getcwd, 17),
+    // Linux kernel-AIO (libaio) — generic-ABI numbers 0..4.
+    (Syscall::IoSetup, 0),
+    (Syscall::IoDestroy, 1),
+    (Syscall::IoSubmit, 2),
+    (Syscall::IoCancel, 3),
+    (Syscall::IoGetevents, 4),
     (Syscall::Eventfd, 19),     // eventfd2
     (Syscall::EpollCreate, 20), // epoll_create1
     (Syscall::EpollCtl, 21),
