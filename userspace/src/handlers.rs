@@ -1974,6 +1974,7 @@ fn flock_size() -> usize {
 /// Clear the current task's F_SETLKW park routing (uctx.flock_key).
 /// Every fcntl lock-path exit calls this so a stale key can't make a
 /// later unrelated park register on the flock waiter queue.
+#[cfg(feature = "linux-compat")]
 fn clear_flock_routing() {
     if let Some(u) = crate::user_task::current_user_task() {
         // SAFETY: in-flight task's poller-pinned UserTaskCtx.
@@ -4992,8 +4993,43 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
     };
 
     let mut written = 0usize;
+    // iter()-only DirOps — the procfs trees (/proc root, /proc/<pid>,
+    // fd/, task/, ns/) — keep the Unsupported default for
+    // enumerate_async. Bridge them through the sync iterator, or ps/
+    // top/ls see an EMPTY /proc (opens worked, listing didn't: the
+    // alpine-probe "no process info in /proc" failure). Snapshot the
+    // remainder ONCE per getdents call: iter() rebuilds (and, for
+    // ProcRoot, Box::leaks names on) every invocation, so a per-entry
+    // re-iter would cost O(entries²) and multiply that leak by the
+    // directory size on every ps/top refresh.
+    let mut iter_snapshot: Option<
+        alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>,
+    > = None;
+    let mut snapshot_pos = 0usize;
     loop {
-        let mut entries = match poll_blocking(dir.enumerate_async(cursor, 1)).and_then(|r| r.ok()) {
+        let batch: Option<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>> =
+            if let Some(snap) = iter_snapshot.as_ref() {
+                let e = snap.get(snapshot_pos).cloned();
+                snapshot_pos += 1;
+                Some(e.into_iter().collect())
+            } else {
+                match poll_blocking(dir.enumerate_async(cursor, 1)) {
+                    Some(Ok(v)) => Some(v),
+                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
+                        let snap: alloc::vec::Vec<_> = dir
+                            .iter()
+                            .skip(cursor)
+                            .map(|e| (alloc::string::String::from(e.name), e.file_type))
+                            .collect();
+                        let first = snap.first().cloned();
+                        iter_snapshot = Some(snap);
+                        snapshot_pos = 1;
+                        Some(first.into_iter().collect())
+                    }
+                    _ => None,
+                }
+            };
+        let mut entries = match batch {
             Some(v) if !v.is_empty() => v,
             _ => break,
         };
@@ -5556,9 +5592,21 @@ fn sys_sysinfo(ctx: &mut dyn TrapContext) {
     // the caller left it.
     let mut si = [0u8; 112];
     si[0..8].copy_from_slice(&uptime_secs.to_ne_bytes());
+    // loads[3]: same EWMA /proc/loadavg renders, in the SI_LOAD_SHIFT=16
+    // fixed point — busybox uptime reads sysinfo(2), not the proc file,
+    // and previously showed a flat 0.00. procfs (and its EWMA) only
+    // exists under linux-compat; other builds keep zeroed loads.
+    #[cfg(feature = "linux-compat")]
+    {
+        let (l1, l5, l15) = narf_filesystem::procfs::loadavg_sysinfo_fixed16();
+        si[8..16].copy_from_slice(&l1.to_ne_bytes());
+        si[16..24].copy_from_slice(&l5.to_ne_bytes());
+        si[24..32].copy_from_slice(&l15.to_ne_bytes());
+    }
     si[32..40].copy_from_slice(&total_bytes.to_ne_bytes());
     si[40..48].copy_from_slice(&free_bytes.to_ne_bytes());
-    si[80..82].copy_from_slice(&1u16.to_ne_bytes()); // procs
+    let procs = narf_scheduler::all_task_ids().len().min(u16::MAX as usize) as u16;
+    si[80..82].copy_from_slice(&procs.to_ne_bytes()); // procs
     si[104..108].copy_from_slice(&1u32.to_ne_bytes()); // mem_unit = 1 byte
                                                        // SAFETY: `buf` is the user `struct sysinfo*` (non-zero); copy_to_user
                                                        // range-validates the 112-byte write.
@@ -11384,12 +11432,15 @@ fn release_task_tables(tid: u64) {
     // pass is the backstop for any path that tears down tables without
     // detaching fds. Also retire this task's own waiter entries (it
     // may die while parked on someone else's lock).
-    for key in crate::fd::locks::release_owner(tid) {
-        for (waiter, w) in crate::fd::locks::drain_waiters(key) {
-            wake_one(waiter, w);
+    #[cfg(feature = "linux-compat")]
+    {
+        for key in crate::fd::locks::release_owner(tid) {
+            for (waiter, w) in crate::fd::locks::drain_waiters(key) {
+                wake_one(waiter, w);
+            }
         }
+        crate::fd::locks::drop_waiter_owner(tid);
     }
-    crate::fd::locks::drop_waiter_owner(tid);
     if let Some(m) = PROC_ENVIRON.lock().as_mut() {
         m.remove(&tid);
     }
@@ -13560,7 +13611,9 @@ fn sys_times(ctx: &mut dyn TrapContext) {
     let ns_per_tick: u64 = 1_000_000_000 / CLK_TCK_HZ;
     let uptime_ticks: i64 = (narf_scheduler::narf_time::monotonic_ns() / ns_per_tick) as i64;
     let task = current_task_id();
-    let utime_ticks: i64 = (cpu_time_ns_of(task) / ns_per_tick) as i64;
+    let utime_ticks: i64 = (cpu_time_ns_of(task)
+        .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns())
+        / ns_per_tick) as i64;
     let stime_ticks: i64 = (kern_time_ns_of(task) / ns_per_tick) as i64;
     let cutime_ticks: i64 = (child_cpu_time_ns_of(task) / ns_per_tick) as i64;
     if out_ptr != 0 {
@@ -13617,7 +13670,9 @@ fn sys_getrusage(ctx: &mut dyn TrapContext) {
     let ns: u64 = if who == RUSAGE_CHILDREN {
         child_cpu_time_ns_of(task)
     } else {
-        cpu_time_ns_of(task)
+        // Folded slices + the in-flight one (own-stack folds only at
+        // yield-out, so a busy task's own reads would otherwise lag).
+        cpu_time_ns_of(task).saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns())
     };
     let utime_sec = (ns / 1_000_000_000) as i64;
     let utime_usec = ((ns % 1_000_000_000) / 1_000) as i64;
@@ -14519,16 +14574,7 @@ fn normalize_abs(p: &str) -> alloc::string::String {
 /// into a normalized absolute path. Relative paths are joined onto the
 /// task's current working directory; `.`/`..` are collapsed.
 pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
-    let normalized = if path.starts_with('/') {
-        normalize_abs(path)
-    } else {
-        let mut joined = cwd_of(task);
-        if !joined.ends_with('/') {
-            joined.push('/');
-        }
-        joined.push_str(path);
-        normalize_abs(&joined)
-    };
+    let normalized = resolve_cwd_path_user(task, path);
     // Re-root under the task's chroot (if any) so a chrooted process —
     // e.g. a container — resolves paths against the chrooted rootfs, not
     // the host root. No-op for tasks without a chroot.
@@ -14539,6 +14585,26 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     #[cfg(not(feature = "linux-compat"))]
     {
         normalized
+    }
+}
+
+/// The join-and-normalize half of [`resolve_cwd_path`] — the USER-VIEW
+/// absolute path, before the chroot prefix. This is what CWD_TABLE must
+/// store: chdir used to store the post-chroot result, so a chrooted
+/// task's next RELATIVE open re-applied the prefix (`cd /proc` in the
+/// alpine chroot → cwd "/mnt/proc" → open("stat") resolved
+/// "/mnt/mnt/proc/stat" → busybox top's "can't open 'stat'"), and
+/// getcwd leaked the host-side prefix into the container.
+pub(crate) fn resolve_cwd_path_user(task: u64, path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        normalize_abs(path)
+    } else {
+        let mut joined = cwd_of(task);
+        if !joined.ends_with('/') {
+            joined.push('/');
+        }
+        joined.push_str(path);
+        normalize_abs(&joined)
     }
 }
 
@@ -14705,6 +14771,10 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
+    // Validate against the chroot-resolved path, but STORE the user
+    // view — chroot is applied exactly once, at resolution time (see
+    // resolve_cwd_path_user).
+    let user_abs = resolve_cwd_path_user(task, &path);
     let abs = resolve_cwd_path(task, &path);
     // Reject cd into a path that isn't a directory (ENOENT/ENOTDIR).
     if resolve_dir_absolute(&abs).is_none() {
@@ -14719,7 +14789,7 @@ fn sys_chdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    map.insert(task, abs);
+    map.insert(task, user_abs);
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -14747,6 +14817,9 @@ fn sys_fchdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Validate chroot-resolved; store the USER view (chroot applies
+    // exactly once at resolution — see resolve_cwd_path_user).
+    let user_abs = resolve_cwd_path_user(task, &path);
     let abs = resolve_cwd_path(task, &path);
     if resolve_dir_absolute(&abs).is_none() {
         ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // ENOTDIR
@@ -14755,7 +14828,7 @@ fn sys_fchdir(ctx: &mut dyn TrapContext) {
     let mut g = CWD_TABLE.lock();
     match g.as_mut() {
         Some(m) => {
-            m.insert(task, abs);
+            m.insert(task, user_abs);
             ctx.set_return(SyscallReturn::ok(0));
         }
         None => ctx.set_return(SyscallReturn::ok((-1i64) as u64)),
@@ -17044,7 +17117,12 @@ static EXIT_RUSAGE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, (u64, u
 /// VISIBLE pid — the key wait4 reaps with — while the CPU tables are
 /// read by tid (fork mints ProcessId and TaskId separately).
 pub(crate) fn record_exit_rusage(tid: u64, pid: u64) {
-    let cpu = cpu_time_ns_of(tid).saturating_add(child_cpu_time_ns_of(tid));
+    // Include the CURRENT (never-to-be-yielded) slice: the dying task is
+    // mid-slice right now and exit_current_stackful switches away without
+    // folding it.
+    let cpu = cpu_time_ns_of(tid)
+        .saturating_add(child_cpu_time_ns_of(tid))
+        .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
     let vm_kb = task_vm_bytes(tid) / 1024;
     let mut g = EXIT_RUSAGE.lock();
     g.get_or_insert_with(BTreeMap::new)
@@ -17083,7 +17161,13 @@ fn take_wait_rusage_ptr(parent: u64) -> u64 {
 /// also fill its `struct rusage` out-param. Idempotent-safe: a second
 /// reap of an already-dropped child contributes 0.
 pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
-    let child_total = cpu_time_ns_of(child).saturating_add(child_cpu_time_ns_of(child));
+    // `child` is the VISIBLE pid (wait4's reap key); the CPU tables key
+    // on TaskId (folds run under current_task_id()). Fork mints the two
+    // separately, so an untranslated lookup read 0 for every forked
+    // child — `time`'s user column showed 0.00 for a 5 s burn (alpine
+    // probe). Translate first, like proc_task_info does.
+    let child_tid = pid_to_task_raw(child).unwrap_or(child);
+    let child_total = cpu_time_ns_of(child_tid).saturating_add(child_cpu_time_ns_of(child_tid));
     if parent != 0 {
         let mut g = TASK_CHILD_CPU_NS.lock();
         let m = g.get_or_insert_with(BTreeMap::new);
@@ -17091,10 +17175,10 @@ pub fn account_reaped_child(parent: u64, child: u64) -> u64 {
         *e = e.saturating_add(child_total);
     }
     if let Some(m) = TASK_CPU_NS.lock().as_mut() {
-        m.remove(&child);
+        m.remove(&child_tid);
     }
     if let Some(m) = TASK_CHILD_CPU_NS.lock().as_mut() {
-        m.remove(&child);
+        m.remove(&child_tid);
     }
     child_total
 }
@@ -17660,7 +17744,11 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         stack_top,
         cmdline,
         vmas,
-        ppid: parent_of_get(pid).unwrap_or(0),
+        // PARENT_OF values are parent TaskIds — translate to the visible
+        // pid exactly like sys_getppid, or ps shows raw tids (or 0).
+        ppid: parent_of_get(pid)
+            .map(|t| task_to_pid_raw(t).unwrap_or(t))
+            .unwrap_or(0),
         pgrp: read_pgid(tid),
         session: read_sid(tid),
         utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,

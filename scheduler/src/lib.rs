@@ -2587,6 +2587,30 @@ pub fn cpu_queue_depths() -> alloc::vec::Vec<(u32, usize)> {
     out
 }
 
+/// Count of RUNNABLE tasks across online CPUs — ready-queue slots whose
+/// awake flag is set (parked sleepers stay queued but not awake). The
+/// /proc/loadavg sample source: Linux's calc_load counts running +
+/// uninterruptible, and awake-in-queue is NARF's equivalent. try_lock
+/// like the stall watchdog — a contended queue is skipped for one
+/// sample rather than deadlocking a procfs read against the executor.
+pub fn runnable_task_count() -> usize {
+    let mut n = 0;
+    for (cpu, ready) in READY.iter().enumerate().take(narf_lib::percpu::MAX_CPUS) {
+        if !narf_lib::smp::is_online(cpu as u32) {
+            continue;
+        }
+        if let Some(g) = ready.try_lock() {
+            if let Some(d) = g.as_ref() {
+                n += d
+                    .iter()
+                    .filter(|s| s.awake.flag.load(Ordering::Acquire))
+                    .count();
+            }
+        }
+    }
+    n
+}
+
 /// Stall-watchdog diagnostic for one CPU: `(ready_depth, awake_count,
 /// halted, locked)`.
 ///

@@ -1223,6 +1223,62 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
 /// per-task-own-stack replacement for the longjmp-based voluntary yield / park
 /// (sys_yield, futex/wait/console park). No-op if no stackful task is current.
 ///
+/// User-slice accounting hook: called with the elapsed ns of the slice
+/// ending at every own-stack yield-out (the hook resolves the task id
+/// itself via the current-task lookup, which is still this task here).
+/// Installed by the userspace crate (`account_user_cpu_ns`) — under the
+/// own-stack model, slices end HERE via kernel_switch instead of
+/// returning through `UserTaskFuture::poll`'s fold, so without this
+/// hook a CPU-bound own-stack task accumulates ZERO utime (the alpine
+/// probe's `time` showed user 0.00 for a 5 s busy loop).
+static SLICE_ACCOUNT_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_user_slice_account_hook(hook: fn(u64)) {
+    SLICE_ACCOUNT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn fold_current_slice(p: *mut KernelTask) {
+    let h = SLICE_ACCOUNT_HOOK.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: caller guarantees `p` is the live current task.
+    let started = unsafe { (*p).tsc_started.load(Ordering::Acquire) };
+    if started == 0 {
+        return;
+    }
+    let delta = narf_time::now_cycles().saturating_sub(started);
+    // SAFETY: `h` was stored by set_user_slice_account_hook as a fn(u64).
+    let f: fn(u64) = unsafe { core::mem::transmute(h) };
+    f(narf_time::cycles_to_ns(delta));
+}
+
+/// Elapsed ns of the CURRENT (un-folded) slice — lets getrusage/times/
+/// the exit-time rusage snapshot include the in-flight slice a running
+/// task hasn't yielded out of yet. 0 when no stackful task is current.
+#[cfg(target_arch = "x86_64")]
+pub fn current_slice_elapsed_ns() -> u64 {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return 0;
+    }
+    // SAFETY: in-flight task on this CPU (poll_to_yield holds it alive).
+    let started = unsafe { (*p).tsc_started.load(Ordering::Acquire) };
+    if started == 0 {
+        return 0;
+    }
+    narf_time::cycles_to_ns(narf_time::now_cycles().saturating_sub(started))
+}
+
+/// Non-x86_64: no own-stack model, no in-flight slice.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn current_slice_elapsed_ns() -> u64 {
+    0
+}
+
 /// # Safety
 /// Called at CPL=0 from a syscall handler running on the current task's own
 /// kernel stack, with a stackful task current on this CPU.
@@ -1238,6 +1294,9 @@ pub unsafe fn yield_current_stackful() {
     if exec_ctx.is_null() {
         return;
     }
+    // Slice ends here — fold it before the switch (the resume side
+    // restamps tsc_started below).
+    fold_current_slice(p);
     user_fpu_save();
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     // SAFETY: p is a valid non-null pointer to the active user task.

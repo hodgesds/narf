@@ -545,9 +545,12 @@ fn park_should_block(
             // carried in the ctx; an unlock that raced the registration is
             // caught by the 1 ms wheel backstop below, so the race costs one
             // backstop period, never a wedge.
-            let fk = uc.flock_key.load(Ordering::Acquire);
-            if fk != 0 {
-                crate::fd::locks::register_waiter(fk, task_id, waker.clone());
+            #[cfg(feature = "linux-compat")]
+            {
+                let fk = uc.flock_key.load(Ordering::Acquire);
+                if fk != 0 {
+                    crate::fd::locks::register_waiter(fk, task_id, waker.clone());
+                }
             }
             // Park on the timer wheel. Infinite parks (u64::MAX) use a ~1-tick
             // fallback so a lost external wake can't wedge; finite sleeps use
@@ -1128,6 +1131,11 @@ pub fn install_user_task_hooks() {
     install_yield_hook(user_task_yield_hook);
     install_exit_hook(user_task_exit_hook);
     install_execve_hook(user_task_execve_hook);
+    // Own-stack user-CPU accounting: slices end at kernel_switch yields
+    // (yield_current_stackful), never through this poll's fold — without
+    // the hook every own-stack task reports utime 0 (getrusage / times /
+    // ps TIME / `time`'s user column, per the alpine probe).
+    narf_scheduler::stackful::set_user_slice_account_hook(crate::handlers::account_user_cpu_ns);
     // Per-task-own-stack model: flips a trap/syscall from a user task onto that
     // task's OWN kernel stack with preemption via a clean kernel_switch
     // (try_preempt_user), retiring the longjmp-out-of-trap-handler path.

@@ -690,8 +690,12 @@ impl FileOps for ProcThreadSelf {
         Box::pin(async move { Err(FsError::ReadOnly) })
     }
     fn stat(&self) -> Stat {
+        // size MUST equal the readlink target length — sys_readlink sizes
+        // its staging buffer from st.size, so 0 returns an empty string
+        // (the same trap the per-pid `root` link hit).
+        let pid = current_pid();
         Stat {
-            size: 0,
+            size: format!("{}/task/{}", pid, pid).len() as u64,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Symlink,
@@ -1661,12 +1665,25 @@ fn calc_load_tick(load: u64, exp: u64, n: u64) -> u64 {
     (load.saturating_mul(exp) + n.saturating_mul(FIXED_1 - exp)) / FIXED_1
 }
 
+/// Sysinfo-shaped loadavg snapshot: (avg1, avg5, avg15) in the Linux
+/// `sysinfo.loads[]` fixed point (SI_LOAD_SHIFT = 16). Our EWMA runs in
+/// FIXED_1 = 2048 (11-bit) units, so the conversion is a << 5. Lets
+/// `sys_sysinfo` (and busybox uptime, which reads sysinfo(2), not
+/// /proc/loadavg) report the same numbers the proc file renders.
+pub fn loadavg_sysinfo_fixed16() -> (u64, u64, u64) {
+    let (a1, a5, a15) = loadavg_update();
+    (a1 << 5, a5 << 5, a15 << 5)
+}
+
 /// Update the EWMA state and return a snapshot of (avg1, avg5, avg15)
 /// in FIXED_1 units.  Called on every `/proc/loadavg` read.
 fn loadavg_update() -> (u64, u64, u64) {
     let now_ns = narf_time::monotonic_ns();
-    // Current instantaneous runnable count (same source as the old stub).
-    let runnable = narf_scheduler::all_task_ids().len() as u64;
+    // Instantaneous RUNNABLE count — awake ready-queue slots, NOT the
+    // full live-task list (which counts every parked getty/daemon and
+    // pinned the rendered load at the task count — the alpine probe
+    // read a flat "14.00 14.00 14.00").
+    let runnable = narf_scheduler::runnable_task_count() as u64;
 
     let mut last_ns = LOADAVG_LAST_NS.lock();
     let mut avg1 = LOADAVG_AVG1.lock();
@@ -1723,11 +1740,10 @@ fn gen_loadavg() -> String {
     let (i5, f5) = fmt_avg(a5);
     let (i15, f15) = fmt_avg(a15);
     let total = narf_scheduler::all_task_ids().len();
-    let running = narf_scheduler::cpu_queue_depths()
-        .iter()
-        .map(|(_, n)| *n)
-        .sum::<usize>()
-        .max(1);
+    // Floor at 1 — the reading process itself is running (Linux never
+    // renders 0/T), and a momentarily all-contended try_lock sample
+    // would otherwise show 0.
+    let running = narf_scheduler::runnable_task_count().max(1);
     let last_pid = total;
     format!(
         "{}.{:02} {}.{:02} {}.{:02} {}/{} {}\n",
