@@ -7446,7 +7446,7 @@ fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let pidfd = a.arg0 as u32;
     let signum = a.arg1 as u32;
-    if signum > 63 {
+    if signum > 64 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
@@ -7476,7 +7476,7 @@ fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     {
         let mut g = SIGNAL_PENDING.lock();
         match g.as_mut() {
-            Some(map) => *map.entry(target).or_insert(0) |= 1u64 << signum,
+            Some(map) => *map.entry(target).or_insert(0) |= sig_bit(signum),
             None => {
                 ctx.set_return(SyscallReturn::ok((-1i64) as u64));
                 return;
@@ -10488,7 +10488,7 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
     {
         let mut g = SIGNAL_PENDING.lock();
         if let Some(m) = g.as_mut() {
-            *m.entry(parent).or_insert(0) |= 1u64 << 17;
+            *m.entry(parent).or_insert(0) |= sig_bit(17); // SIGCHLD
         }
     }
     crate::user_task::wake_wait_child(parent);
@@ -10524,7 +10524,7 @@ fn signal_stopcont_interaction(task: u64, signum: u32) {
     match signum {
         18 => {
             // SIGCONT cancels pending stops (19..=22).
-            clear_pending_signal_bits(task, 0b1111u64 << 19);
+            clear_pending_signal_bits(task, 0b1111u64 << 18); // stop signals 19-22
             let was_stopped = TASK_STOPPED
                 .lock()
                 .as_mut()
@@ -10541,7 +10541,7 @@ fn signal_stopcont_interaction(task: u64, signum: u32) {
         }
         19..=22 => {
             // A stop signal cancels a pending SIGCONT.
-            clear_pending_signal_bits(task, 1u64 << 18);
+            clear_pending_signal_bits(task, sig_bit(18)); // SIGCONT
         }
         _ => {}
     }
@@ -10557,11 +10557,11 @@ fn signal_stopcont_interaction(task: u64, signum: u32) {
 /// returning 0. With no executor wired (kernel-test context) it returns
 /// without parking so the caller can consume the signal.
 fn enter_stopped(ctx: &mut dyn TrapContext, task: u64, signum: u32) {
-    clear_pending_signal_bits(task, 1u64 << signum);
+    clear_pending_signal_bits(task, sig_bit(signum));
     if let Some(m) = TASK_STOPPED.lock().as_mut() {
         m.insert(task, signum);
     }
-    clear_pending_signal_bits(task, 1u64 << 18);
+    clear_pending_signal_bits(task, sig_bit(18)); // SIGCONT
     push_stopcont_report(task, stopped_wstatus(signum), false);
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -10606,11 +10606,11 @@ pub fn deliver_pending_stop(ctx: &mut dyn TrapContext, _syscall_no: u32) -> bool
     }
     let task = current_task_id();
     let mask = signal_mask_of(task);
-    let stop_bits = (0b1111u64 << 19) & signal_pending_bits(task) & !mask;
+    let stop_bits = (0b1111u64 << 18) & signal_pending_bits(task) & !mask;
     if stop_bits == 0 {
         return false;
     }
-    let signum = stop_bits.trailing_zeros();
+    let signum = sig_from_bit(stop_bits);
     // SIGSTOP can never be caught, but SIGTSTP/SIGTTIN/SIGTTOU can — if a
     // user handler is installed, leave delivery to the normal lazy path.
     if sigaction_lookup_full(task, signum as usize).is_some() {
@@ -11960,7 +11960,7 @@ fn on_child_exit(child_pid: u64, _child_tid: u64) {
         let mut g = SIGNAL_PENDING.lock();
         if let Some(m) = g.as_mut() {
             let slot = m.entry(parent).or_insert(0);
-            *slot |= 1u64 << SIGCHLD;
+            *slot |= sig_bit(SIGCHLD);
         }
     }
     // (3) Wake any parent task parked in a blocking wait4.  The waker
@@ -13199,9 +13199,9 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         PR_SET_PDEATHSIG => {
-            // arg is the signal number; 0 clears. Same 1..=63 range as
-            // every send path (see SIGNAL_PENDING's bit-N convention).
-            if arg_a > 63 {
+            // arg is the signal number; 0 clears. Same 1..=64 range as
+            // every send path (SIGRTMAX=64 included).
+            if arg_a > 64 {
                 ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
                 return;
             }
@@ -16962,15 +16962,39 @@ fn sys_ioprio_get(ctx: &mut dyn TrapContext) {
 // is in `rdi` (SysV first integer arg), and a `ret` pops the
 // saved_rip we pushed and resumes the trapped code.
 //
-// Storage shape mirrors SIGACTION_TABLE: BTreeMap<task_id, u32
+// Storage shape mirrors SIGACTION_TABLE: BTreeMap<task_id, u64
 // bitmask>. Two tables: pending signals (set by `kill`) and the
-// per-task block mask (modified by `sigprocmask`). Linux _NSIG = 64;
-// NARF stores signal N at bit N (one above the userspace `sigset_t`
-// bit N-1 convention — see the `<<1` at every ABI boundary), so a u64
-// holds signals 1..=63. Signal 64 (SIGRTMAX) has no bit in this
-// convention and is rejected/dropped — musl reserves 32/33/34 for
-// itself and hands applications SIGRTMIN=35.., so the top slot is
-// essentially never used.
+// per-task block mask (modified by `sigprocmask`). Linux _NSIG = 64.
+// NARF stores signal N at bit N-1 — IDENTICAL to the userspace
+// `sigset_t` convention — so a u64 holds the full valid range 1..=64
+// (SIGRTMAX = 64 included, which stress-ng --sigrt installs handlers
+// for). Because the internal and ABI layouts match, the sigset ABI
+// boundaries copy the mask through verbatim: no `<<1`/`>>1` shim, and
+// no "bit 0 is the null signal" hazard — signal 0 simply has no bit.
+// Use `sig_bit`/`sig_from_bit` at every conversion so the mapping
+// lives in exactly one place.
+
+/// Bit mask for `signum` in the NARF pending/mask u64 (signal N → bit
+/// N-1). `signum` must be in 1..=64; out-of-range yields 0 (no bit).
+#[inline]
+pub(crate) fn sig_bit(signum: u32) -> u64 {
+    if signum == 0 || signum > 64 {
+        0
+    } else {
+        1u64 << (signum - 1)
+    }
+}
+
+/// Signal number of the lowest set bit in `bits` (bit N-1 → signal N),
+/// or 0 when `bits` is empty. Inverse of `sig_bit` for the low bit.
+#[inline]
+pub(crate) fn sig_from_bit(bits: u64) -> u32 {
+    if bits == 0 {
+        0
+    } else {
+        bits.trailing_zeros() + 1
+    }
+}
 
 pub(crate) static SIGNAL_PENDING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -17274,7 +17298,8 @@ pub(crate) fn signal_mask_fork(parent: u64, child: u64) {
 /// SIGKILL(9)/SIGSTOP(19) can never be blocked — Linux silently strips
 /// them from every mask install (`sigdelsetmask(&blocked, sigmask(
 /// SIGKILL) | sigmask(SIGSTOP))`). NARF masks store signal N at bit N.
-const UNBLOCKABLE_MASK: u64 = (1 << 9) | (1 << 19);
+// SIGKILL(9)=bit 8, SIGSTOP(19)=bit 18 in the N-1 convention.
+const UNBLOCKABLE_MASK: u64 = (1 << 8) | (1 << 18);
 
 // Per-task flag recording whether the most recently delivered signal
 // frame is the Linux `rt_sigframe` (restorer-based) layout. The Linux
@@ -17893,7 +17918,7 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // real signal. Setting pending bit 0 would later be taken by the delivery
     // loop as a Terminate-default "signal 0". Bit-N-=-signal-N caps the
     // representable range at 63 (see SIGNAL_PENDING).
-    if signum == 0 || signum > 63 {
+    if signum == 0 || signum > 64 {
         return;
     }
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
@@ -17905,7 +17930,7 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
         None => return,
     };
     let slot = map.entry(task).or_insert(0);
-    *slot |= 1u64 << signum;
+    *slot |= sig_bit(signum);
     drop(g);
     // Wake the task if it is parked (sleep/pause) so an asynchronously
     // raised signal — e.g. SIGALRM from an interval timer — is taken
@@ -17920,7 +17945,7 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
 /// has no divergent mapping. Returns true if at least one task was
 /// targeted. Syscall context only (allocates).
 pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
-    if pgrp == 0 || signum > 63 {
+    if pgrp == 0 || signum > 64 {
         return false;
     }
     let mut targets: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
@@ -17990,7 +18015,7 @@ fn tty_background_access(task: u64, fd: u32, is_write: bool) -> Option<i64> {
     }
 
     let signum: u32 = if is_write { 22 } else { 21 }; // SIGTTOU / SIGTTIN
-    let blocked = (signal_mask_of(task) & (1u64 << signum)) != 0;
+    let blocked = (signal_mask_of(task) & (sig_bit(signum))) != 0;
     let ignored = sigaction_lookup_full(task, signum as usize).is_some_and(|sa| sa.handler == 1);
     if blocked || ignored {
         return Some(-5); // -EIO: signal can't stop the process
@@ -18022,13 +18047,13 @@ pub fn ensure_signal_pending_slot(task: u64) {
 /// return-to-user via the preemptive delivery hook.
 pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     // Signal 0 is the null signal — never deliverable (see raise_signal_pending).
-    if signum == 0 || signum > 63 {
+    if signum == 0 || signum > 64 {
         return false;
     }
     let mut g = SIGNAL_PENDING.lock();
     if let Some(map) = g.as_mut() {
         if let Some(slot) = map.get_mut(&task) {
-            *slot |= 1u64 << signum;
+            *slot |= sig_bit(signum);
             return true;
         }
     }
@@ -18143,13 +18168,13 @@ pub fn timer_preempt_user_task(ctx: &mut dyn TrapContext) {
 /// Clear the pending bit for `signum` on `task`. Used by signalfd
 /// after delivering the signal through the fd path.
 pub fn clear_signal_pending(task: u64, signum: u32) {
-    if signum > 63 {
+    if signum > 64 {
         return;
     }
     let mut g = SIGNAL_PENDING.lock();
     if let Some(map) = g.as_mut() {
         if let Some(slot) = map.get_mut(&task) {
-            *slot &= !(1u64 << signum);
+            *slot &= !(sig_bit(signum));
         }
     }
 }
@@ -18261,7 +18286,7 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
     // Linux _NSIG = 64; NARF's bit-N bitmap represents 1..=63 (see
     // SIGNAL_PENDING) — signal 64 (SIGRTMAX) is rejected like an
     // out-of-range signal.
-    if signum > 63 {
+    if signum > 64 {
         ctx.set_return(einval);
         return;
     }
@@ -18367,7 +18392,7 @@ fn sys_kill(ctx: &mut dyn TrapContext) {
 fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let sig = a.arg1 as u32;
-    if sig > 63 {
+    if sig > 64 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -18402,7 +18427,7 @@ fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) {
 fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let sig = a.arg2 as u32;
-    if sig > 63 {
+    if sig > 64 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -19212,7 +19237,7 @@ fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let tid = args.arg1;
     let signum = args.arg2 as u32;
     let esrch = SyscallReturn::ok((-3i64) as u64);
-    if signum > 63 {
+    if signum > 64 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
@@ -19270,10 +19295,10 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // SIGNAL_PENDING); a userspace `sigset_t` puts signal N at bit N-1.
         // Shift back so the caller sees the Linux convention (mirrors the
         // `<<1` on the way in, and the same shift `signalfd` uses).
-        let user_mask = mask >> 1;
-        // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
-        // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
-        // SAFETY: Valid memory or trusted environment
+        let user_mask = mask; // N-1 convention == user sigset_t
+                              // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
+                              // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
+                              // SAFETY: Valid memory or trusted environment
         if unsafe { copy_to_user(old_ptr, &user_mask.to_ne_bytes()) }.is_err() {
             ctx.set_return(fail);
             return;
@@ -19293,7 +19318,7 @@ fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // line up with SIGNAL_PENDING. Shift `<<1` (same as `signalfd`), or a
         // block of e.g. SIGUSR1 (10) would set bit 9 and fail to mask the
         // pending bit 10 — the signal would be delivered despite being blocked.
-        let set = u64::from_ne_bytes(buf) << 1;
+        let set = u64::from_ne_bytes(buf); // user sigset_t == NARF layout
         let mut g = SIGNAL_MASK.lock();
         let map = match g.as_mut() {
             Some(m) => m,
@@ -19445,7 +19470,7 @@ fn sys_tkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let tid = args.arg0;
     let signum = args.arg1 as u32;
-    if signum > 63 {
+    if signum > 64 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
@@ -19497,13 +19522,15 @@ fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let pending = signal_pending_of(task);
     let mask = signal_mask_of(task);
-    let pending_and_blocked = pending & mask;
-    // NARF stores signal N at bit N; a userspace `sigset_t` puts it at bit
-    // N-1. Shift `>>1` so the caller reads the Linux convention.
-    let user_bits = pending_and_blocked >> 1;
-    // SAFETY: caller pointer; user-ABI trust same as sigaltstack.
-    unsafe {
-        (set_out as *mut u64).write_unaligned(user_bits);
+    // NARF's pending layout == userspace sigset_t (both bit N-1), so the
+    // set copies out verbatim — through the SMAP bracket (a raw
+    // write_unaligned to the user pointer #PF's under SMAP).
+    let user_bits = pending & mask;
+    // SAFETY: set_out != 0 checked above; copy_to_user range-validates and
+    // SMAP-brackets the 8-byte write.
+    if unsafe { copy_to_user(set_out, &user_bits.to_ne_bytes()) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
@@ -19545,7 +19572,7 @@ fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     // sys_sigprocmask / signalfd). Shift `<<1` so an unblocked signal here
     // actually becomes deliverable while suspended.
     // SIGKILL/SIGSTOP can never be blocked, in a suspend mask either.
-    let mask = (u64::from_ne_bytes(buf) << 1) & !UNBLOCKABLE_MASK;
+    let mask = u64::from_ne_bytes(buf) & !UNBLOCKABLE_MASK;
     let task = current_task_id();
 
     // Temporarily install the new mask.
@@ -19587,9 +19614,19 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64));
         return;
     }
-    // SAFETY: caller-supplied pointer. `<<1`: userspace sigset bit N-1 ==
-    // signal N, NARF's pending bitmap uses bit N — align before intersecting.
-    let set = unsafe { (set_in as *const u64).read_unaligned() << 1 };
+    // Read the user sigset through the SMAP-bracketed helper (a raw
+    // read_unaligned here #PF'd under SMAP — kernel read of a user page —
+    // the moment stress-ng --sigrt actually reached rt_sigtimedwait). The
+    // set is already in NARF's bit-N-1 layout (== userspace sigset_t), so
+    // it intersects `pending` directly with no shift.
+    let mut set_buf = [0u8; 8];
+    // SAFETY: set_in != 0 + sigsetsize == 8 checked above; copy_from_user
+    // range-validates and SMAP-brackets the 8-byte read.
+    if unsafe { copy_from_user(&mut set_buf, set_in) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        return;
+    }
+    let set = u64::from_ne_bytes(set_buf);
     let task = current_task_id();
     let pending = signal_pending_of(task);
     let candidates = pending & set;
@@ -19600,11 +19637,11 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64));
         return;
     }
-    let signum = candidates.trailing_zeros();
+    let signum = sig_from_bit(candidates);
     // Clear the bit.
     if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
         if let Some(slot) = map.get_mut(&task) {
-            *slot &= !(1u64 << signum);
+            *slot &= !(sig_bit(signum));
         }
     }
     // Fill siginfo if requested. Linux siginfo_t is ~128 bytes;
@@ -19612,14 +19649,15 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     // si_code) which is the union-discriminating prefix every
     // libc inspects. Leaving the rest zero matches `SI_USER`.
     if info_out != 0 {
-        // SAFETY: caller pointer.
-        unsafe {
-            let p = info_out as *mut u8;
-            core::ptr::write_bytes(p, 0, 128);
-            (p as *mut i32).write_unaligned(signum as i32); // si_signo
-            (p.add(4) as *mut i32).write_unaligned(0); // si_errno
-            (p.add(8) as *mut i32).write_unaligned(0); // si_code = SI_USER
-        }
+        // Build the 128-byte siginfo_t in kernel memory, then copy it out
+        // through the SMAP bracket (a raw write_bytes/write_unaligned to
+        // the user pointer #PF'd under SMAP). si_signo/si_errno/si_code
+        // are the union-discriminating prefix; the rest stays zero (SI_USER).
+        let mut si = [0u8; 128];
+        si[..4].copy_from_slice(&(signum as i32).to_ne_bytes()); // si_signo
+                                                                 // si_errno (4..8) + si_code (8..12) stay 0 (SI_USER).
+                                                                 // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
+        let _ = unsafe { copy_to_user(info_out, &si) };
     }
     ctx.set_return(SyscallReturn::ok(signum as u64));
 }
@@ -19800,11 +19838,13 @@ pub(crate) fn default_signal_delivery_restricted(
     // paths already refuse to set it (kill/tkill/tgkill/sigqueue treat sig 0
     // as an existence probe), but mask it here too so a stray bit-0 raise can
     // never be taken as "signal 0" → default-action Terminate.
-    let deliverable = pending & !mask & restrict & !1u64;
+    // No null-signal bit in the N-1 convention (signal 0 has no bit),
+    // so no `& !1` guard is needed — every set bit is a real signal.
+    let deliverable = pending & !mask & restrict;
     if deliverable == 0 {
         return false;
     }
-    let signum = deliverable.trailing_zeros();
+    let signum = sig_from_bit(deliverable);
     #[cfg(feature = "linux-compat")]
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
         return true;
@@ -19818,7 +19858,7 @@ pub(crate) fn default_signal_delivery_restricted(
             // retry trap doesn't re-fire the same signal.
             if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
                 if let Some(slot) = map.get_mut(&task) {
-                    *slot &= !(1u64 << signum);
+                    *slot &= !(sig_bit(signum));
                 }
             }
             match default_signal_action(signum) {
@@ -19860,7 +19900,7 @@ pub(crate) fn default_signal_delivery_restricted(
     if action.handler <= 1 {
         if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
             if let Some(slot) = map.get_mut(&task) {
-                *slot &= !(1u64 << signum);
+                *slot &= !(sig_bit(signum));
             }
         }
         return true;
@@ -19885,7 +19925,7 @@ pub(crate) fn default_signal_delivery_restricted(
     // alone so the next trap retries.
     if let Some(map) = SIGNAL_PENDING.lock().as_mut() {
         if let Some(slot) = map.get_mut(&task) {
-            *slot &= !(1u64 << signum);
+            *slot &= !(sig_bit(signum));
         }
     }
     // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
@@ -19904,7 +19944,7 @@ pub(crate) fn default_signal_delivery_restricted(
     if (action.flags & SA_NODEFER) == 0 {
         if let Some(map) = SIGNAL_MASK.lock().as_mut() {
             let slot = map.entry(task).or_insert(0);
-            *slot |= 1u64 << signum;
+            *slot |= sig_bit(signum);
         }
     }
     // SA_RESETHAND: one-shot — clear the handler so the next
@@ -20184,7 +20224,10 @@ pub fn default_sync_signal_delivery(
 // directly (bit-N-=-signal-N, like SIGNAL_PENDING), so slot 0 is the
 // never-deliverable null signal and 1..=63 are real signals — RT
 // signals (musl SIGRTMIN=35..) included.
-const NSIG: usize = 64;
+// _NSIG = 64 real signals; the handler array is indexed by signum
+// directly (slot 0 = the never-delivered null signal), so it needs
+// 65 slots to address signal 64.
+const NSIG: usize = 65;
 
 /// Linux `sa_flags` bits NARF honours.
 pub const SA_NODEFER: u32 = 0x40_00_00_00;
@@ -22506,7 +22549,7 @@ fn sys_signalfd(ctx: &mut dyn TrapContext) {
             // internal SIGNAL_PENDING bitmap uses bit N (raise_signal_pending
             // ORs `1<<signum`). Shift so the signalfd mask lines up with the
             // pending bits it is intersected against.
-            mask = u64::from_le_bytes(bytes) << 1;
+            mask = u64::from_le_bytes(bytes); // signalfd: user==NARF layout
         }
     }
     let task = current_task_id();

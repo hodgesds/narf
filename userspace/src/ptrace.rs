@@ -149,7 +149,11 @@ pub fn is_ptrace_signal_bypass(child_pid: u64, signum: u32) -> bool {
     let g = PTRACE_STATE.lock();
     if let Some(r) = g.as_ref() {
         if let Some(&mask) = r.signal_bypass.get(&child_pid) {
-            return (mask & (1 << signum)) != 0;
+            // The bypass map is a u32; the setter only stores standard
+            // signals (data < 32), so a >= 32 signum can never have an
+            // entry — return false instead of a `1u32 << 64` shift UB
+            // (now reachable since RT signals raise signum up to 64).
+            return signum < 32 && (mask & (1u32 << signum)) != 0;
         }
     }
     false
@@ -159,7 +163,9 @@ pub fn clear_ptrace_signal_bypass(child_pid: u64, signum: u32) {
     let mut g = PTRACE_STATE.lock();
     if let Some(r) = g.as_mut() {
         if let Some(mask) = r.signal_bypass.get_mut(&child_pid) {
-            *mask &= !(1 << signum);
+            if signum < 32 {
+                *mask &= !(1u32 << signum);
+            }
         }
     }
 }
@@ -182,7 +188,7 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
         }
 
         // Clear the pending bit so we don't process it again (it's intercepted)
-        clear_pending_signal_bits(task, 1 << signum);
+        clear_pending_signal_bits(task, crate::handlers::sig_bit(signum));
 
         let tracer_tid = pid_to_tid(tracer_pid);
         // Put the task into ptrace stop!

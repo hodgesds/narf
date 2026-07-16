@@ -450,10 +450,11 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_send_signal_pos);
 
 fn smoke_abi_proc_pidfd_send_signal_neg() -> TestResult {
     with_setup(|| {
-        // signum >= 32 → EINVAL (checked before any fd resolution).
-        match call(Syscall::PidfdSendSignal.raw(), a3(3, 64, 0, 0)) {
+        // signum > 64 → EINVAL (checked before any fd resolution). 64 is
+        // valid now (SIGRTMAX), so 65 is the out-of-range probe.
+        match call(Syscall::PidfdSendSignal.raw(), a3(3, 65, 0, 0)) {
             Some(v) if v == EINVAL => Ok(()),
-            _ => Err("pidfd_send_signal with sig 64 did not return -EINVAL"),
+            _ => Err("pidfd_send_signal with sig 65 did not return -EINVAL"),
         }
     })
 }

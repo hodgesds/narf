@@ -57,9 +57,9 @@ fn smoke_abi_signal_kill_neg() -> TestResult {
     with_setup(|| {
         // signum >= 32 → -EINVAL (Linux parity; was a non-Ok InvalidOp
         // shape before the signal-parity pass).
-        let r = call(Syscall::Kill.raw(), a1(FAKE_TASK, 64));
+        let r = call(Syscall::Kill.raw(), a1(FAKE_TASK, 65));
         if r != Some(-22) {
-            return Err("kill(self, 64) should return -EINVAL");
+            return Err("kill(self, 65) should return -EINVAL");
         }
         // A nonexistent target → -ESRCH (was ok(0) before parity).
         let r = call(Syscall::Kill.raw(), a1(0xDEAD_BEEF, 10));
@@ -228,7 +228,7 @@ fn smoke_abi_signal_rt_sigqueueinfo_neg() -> TestResult {
     with_setup(|| {
         // sig >= 32 → invalid_op() (None).
         // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
-        let r = call(Syscall::RtSigqueueinfo.raw(), a2(FAKE_TASK, 64, 0));
+        let r = call(Syscall::RtSigqueueinfo.raw(), a2(FAKE_TASK, 65, 0));
         if r.is_some() {
             return Err("rt_sigqueueinfo(self, 64, ..) should be a non-Ok status");
         }
@@ -470,9 +470,9 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_tgkill_pos);
 fn smoke_abi_signal_tgkill_neg() -> TestResult {
     with_setup(|| {
         // sig (arg2) >= 32 → -EINVAL (Linux parity; was InvalidOp before).
-        let r = call(Syscall::Tgkill.raw(), a2(FAKE_TASK, FAKE_TASK, 64));
+        let r = call(Syscall::Tgkill.raw(), a2(FAKE_TASK, FAKE_TASK, 65));
         if r != Some(-22) {
-            return Err("tgkill(.., 64) should return -EINVAL");
+            return Err("tgkill(.., 65) should return -EINVAL");
         }
         // Dead tid → -ESRCH (was silently ok before parity).
         let r = call(Syscall::Tgkill.raw(), a2(FAKE_TASK, 0xDEAD, 10));
@@ -508,9 +508,9 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_tkill_pos);
 fn smoke_abi_signal_tkill_neg() -> TestResult {
     with_setup(|| {
         // sig >= 32 → -EINVAL (Linux parity; was InvalidOp before).
-        let r = call(Syscall::Tkill.raw(), a1(FAKE_TASK, 64));
+        let r = call(Syscall::Tkill.raw(), a1(FAKE_TASK, 65));
         if r != Some(-22) {
-            return Err("tkill(self, 64) should return -EINVAL");
+            return Err("tkill(self, 65) should return -EINVAL");
         }
         // Dead tid → -ESRCH.
         let r = call(Syscall::Tkill.raw(), a1(0xDEAD, 10));
@@ -538,10 +538,10 @@ fn smoke_abi_signal_sigkill_unblockable() -> TestResult {
         if call(Syscall::Sigprocmask.raw(), a3(0, set_ptr, 0, 8)) != Some(0) {
             return Err("sigprocmask(SIG_BLOCK, {SIGKILL,SIGSTOP}) should return 0");
         }
-        // The stored mask (NARF keys signal N at bit N) must have
+        // The stored mask (NARF keys signal N at bit N-1) must have
         // neither SIGKILL nor SIGSTOP set.
         let stored = crate::handlers::signal_mask_of(FAKE_TASK);
-        if stored & ((1 << 9) | (1 << 19)) != 0 {
+        if stored & (crate::handlers::sig_bit(9) | crate::handlers::sig_bit(19)) != 0 {
             return Err("SIGKILL/SIGSTOP must be stripped from the installed block mask");
         }
         Ok(())
@@ -554,7 +554,7 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigkill_unblockable);
 // neither be sent nor blocked — musl reserves SIGCANCEL(33) for
 // pthread_cancel and SIGSYNCCALL(34) for multithreaded setuid, and
 // hands applications SIGRTMIN=35.., so the cap broke real threading
-// paths. Everything is u64 now (bit N = signal N, 1..=63); these
+// paths. Everything is u64 now (bit N-1 = signal N, full 1..=64);
 // smokes pin the widened range end-to-end: send, block, sigpending
 // round-trip, timedwait drain, and the 64/SIGRTMAX rejection edge.
 
@@ -565,18 +565,20 @@ fn smoke_abi_signal_rt_kill_pending() -> TestResult {
         if call(Syscall::Kill.raw(), a1(FAKE_TASK, 35)) != Some(0) {
             return Err("kill(self, SIGRTMIN=35) should return 0");
         }
-        // 63 is the highest representable signal (bit N = signal N).
-        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 63)) != Some(0) {
-            return Err("kill(self, 63) should return 0");
+        // 64 = SIGRTMAX is the highest valid signal (bit 63, the top
+        // u64 slot) — stress-ng --sigrt installs a handler for it.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 64)) != Some(0) {
+            return Err("kill(self, 64=SIGRTMAX) should return 0");
         }
         let pending = crate::handlers::signal_pending_of(FAKE_TASK);
-        if pending & (1u64 << 35) == 0 || pending & (1u64 << 63) == 0 {
-            return Err("RT signals 35/63 must land in SIGNAL_PENDING");
+        if pending & crate::handlers::sig_bit(35) == 0
+            || pending & crate::handlers::sig_bit(64) == 0
+        {
+            return Err("RT signals 35/64 must land in SIGNAL_PENDING");
         }
-        // Signal 64 (SIGRTMAX) has no bit in the bit-N-=-signal-N u64
-        // convention → rejected like an out-of-range signal.
-        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 64)) != Some(-22) {
-            return Err("kill(self, 64) should return -EINVAL (unrepresentable top slot)");
+        // 65 is past _NSIG → rejected like any out-of-range signal.
+        if call(Syscall::Kill.raw(), a1(FAKE_TASK, 65)) != Some(-22) {
+            return Err("kill(self, 65) should return -EINVAL (past _NSIG)");
         }
         Ok(())
     })
@@ -595,8 +597,8 @@ fn smoke_abi_signal_rt_sigprocmask_blocks() -> TestResult {
         if call(Syscall::Sigprocmask.raw(), a3(2, buf.as_ptr() as u64, 0, 8)) != Some(0) {
             return Err("sigprocmask(SIG_SETMASK, {33}) should return 0");
         }
-        if crate::handlers::signal_mask_of(FAKE_TASK) & (1u64 << 33) == 0 {
-            return Err("signal 33 must be blockable (mask bit 33 set)");
+        if crate::handlers::signal_mask_of(FAKE_TASK) & crate::handlers::sig_bit(33) == 0 {
+            return Err("signal 33 must be blockable (mask bit 32 set)");
         }
         // A pending-but-blocked 33 must not be deliverable...
         crate::handlers::raise_signal_pending(FAKE_TASK, 33);
@@ -638,9 +640,13 @@ fn smoke_abi_signal_rt_sigaction_installs() -> TestResult {
         if call(Syscall::RtSigaction.raw(), a3(35, 0, 0, 8)) != Some(0) {
             return Err("rt_sigaction(35, NULL, NULL, 8) should return 0");
         }
-        // Out-of-range probe moved up with NSIG: 64 is still invalid.
-        if call(Syscall::RtSigaction.raw(), a3(64, 0, 0, 8)) != Some(-22) {
-            return Err("rt_sigaction(64, ...) should return -EINVAL");
+        // 64 = SIGRTMAX is VALID now (the stress-ng --sigrt case that
+        // motivated the bit-N-1 convention); 65 is the out-of-range edge.
+        if call(Syscall::RtSigaction.raw(), a3(64, 0, 0, 8)) != Some(0) {
+            return Err("rt_sigaction(64=SIGRTMAX, NULL, NULL, 8) should return 0");
+        }
+        if call(Syscall::RtSigaction.raw(), a3(65, 0, 0, 8)) != Some(-22) {
+            return Err("rt_sigaction(65, ...) should return -EINVAL");
         }
         Ok(())
     })
@@ -661,7 +667,7 @@ fn smoke_abi_signal_rt_sigtimedwait_rt() -> TestResult {
         if r != Some(40) {
             return Err("rt_sigtimedwait must return the pending RT signum 40");
         }
-        if crate::handlers::signal_pending_of(FAKE_TASK) & (1u64 << 40) != 0 {
+        if crate::handlers::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(40) != 0 {
             return Err("rt_sigtimedwait must clear the drained RT pending bit");
         }
         Ok(())

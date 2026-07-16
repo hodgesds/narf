@@ -543,7 +543,7 @@ fn smoke_process_sigchld_on_child_exit() -> TestResult {
 
     // SIGCHLD bit (17) should be pending on the parent.
     let pending = signal_pending_of(PARENT);
-    if pending & (1 << SIGCHLD) == 0 {
+    if pending & crate::handlers::sig_bit(SIGCHLD) == 0 {
         teardown_process_state();
         return TestResult::Fail("SIGCHLD not set in parent's pending bitmap after child exit");
     }
@@ -610,7 +610,7 @@ fn smoke_process_kill_sigusr1_delivery() -> TestResult {
         teardown_process_state();
         return TestResult::Fail("kill(self, SIGUSR1) failed");
     }
-    if signal_pending_of(TASK) & (1 << SIGUSR1) == 0 {
+    if signal_pending_of(TASK) & crate::handlers::sig_bit(SIGUSR1) == 0 {
         teardown_process_state();
         return TestResult::Fail("kill did not set SIGUSR1 pending bit");
     }
@@ -636,7 +636,7 @@ fn smoke_process_kill_sigusr1_delivery() -> TestResult {
             )
         }
     }
-    if pending_after & (1 << SIGUSR1) != 0 {
+    if pending_after & crate::handlers::sig_bit(SIGUSR1) != 0 {
         return TestResult::Fail("delivery did not clear the pending bit");
     }
     TestResult::Pass
@@ -709,7 +709,7 @@ fn smoke_process_sigign_consumed_not_delivered() -> TestResult {
         return TestResult::Fail("SIG_IGN signal was delivered to a handler — must be consumed");
     }
     // And it must not linger pending.
-    if pending_after & (1 << SIGUSR1) != 0 {
+    if pending_after & crate::handlers::sig_bit(SIGUSR1) != 0 {
         return TestResult::Fail("SIG_IGN signal left pending after the delivery hook");
     }
     TestResult::Pass
@@ -1055,7 +1055,7 @@ fn smoke_process_sigkill_sets_pending() -> TestResult {
     }
 
     let pending = signal_pending_of(CHILD);
-    if pending & (1 << SIGKILL) == 0 {
+    if pending & crate::handlers::sig_bit(SIGKILL) == 0 {
         teardown_process_state();
         return TestResult::Fail("SIGKILL not set in child's pending bitmap");
     }
@@ -1104,7 +1104,7 @@ fn smoke_fatal_signal_zaps_thread_group() -> TestResult {
     crate::task::release_task(SIB);
     teardown_process_state();
 
-    if sib_pending & (1 << SIGKILL) == 0 {
+    if sib_pending & crate::handlers::sig_bit(SIGKILL) == 0 {
         return TestResult::Fail("sibling thread not SIGKILL-zapped by group teardown");
     }
     if !group_exiting {
@@ -1185,7 +1185,7 @@ fn smoke_process_sa_mask_blocks_reentry() -> TestResult {
 
     // After delivery, SIGUSR1 should be in the mask (auto-blocked).
     let mask_after = signal_mask_of(TASK);
-    if mask_after & (1 << SIGUSR1) == 0 {
+    if mask_after & crate::handlers::sig_bit(SIGUSR1) == 0 {
         teardown_process_state();
         return TestResult::Fail(
             "SIGUSR1 should be auto-blocked in mask after delivery (SA_NODEFER absent)",
@@ -1329,7 +1329,7 @@ fn smoke_process_sigprocmask_block_unblock() -> TestResult {
     }
 
     // Pending bit still set.
-    if signal_pending_of(TASK) & (1 << SIGUSR2) == 0 {
+    if signal_pending_of(TASK) & crate::handlers::sig_bit(SIGUSR2) == 0 {
         teardown_process_state();
         return TestResult::Fail("pending bit must remain after blocked delivery attempt");
     }
@@ -2597,7 +2597,7 @@ fn smoke_wave38_on_child_exit_with_mismatched_ids() -> TestResult {
     // PENDING_EXITS[PARENT_TASK] and set SIGCHLD pending on PARENT_TASK.
     let sigchld_pending = signal_pending_of(PARENT_TASK);
     const SIGCHLD: u32 = 17;
-    if sigchld_pending & (1 << SIGCHLD) == 0 {
+    if sigchld_pending & crate::handlers::sig_bit(SIGCHLD) == 0 {
         crate::handlers::__test_wait_reset();
         crate::handlers::__test_sigaction_reset();
         crate::syscall::__test_clear_global();
@@ -3024,7 +3024,7 @@ fn smoke_wave55_self_sighup_default_terminate_sets_wifsignaled() -> TestResult {
     // Pending bit should have been cleared by default_signal_delivery
     // (it consumes the bit before applying the default action).
     let pending = signal_pending_of(CHILD);
-    if pending & (1 << SIGHUP) != 0 {
+    if pending & crate::handlers::sig_bit(SIGHUP) != 0 {
         teardown_process_state();
         return TestResult::Fail("SIGHUP pending bit not cleared after default terminate");
     }

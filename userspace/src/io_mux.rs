@@ -306,7 +306,7 @@ impl FileOps for SignalFd {
             // 128 bytes; we fill only the first 4 (ssi_signo) and
             // zero the rest. Real consumers read the signo and
             // dispatch.
-            let signum = pending.trailing_zeros();
+            let signum = crate::handlers::sig_from_bit(pending);
             const SI_LEN: usize = 128;
             if buf.len() < SI_LEN {
                 return Err(FsError::InvalidPath);

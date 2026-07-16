@@ -351,12 +351,16 @@ fn smoke_abi_proc2_prctl_pdeathsig_roundtrip() -> TestResult {
         if call(Syscall::Prctl.raw(), a1(2, &mut out as *mut i32 as u64)) != Some(0) || out != 10 {
             return Err("PR_GET_PDEATHSIG must read back 10");
         }
-        // 0 clears; out-of-range (64: no bit in the u64 signal maps) → EINVAL.
+        // 0 clears. 64 (SIGRTMAX) is a VALID signal now (bit-N-1 fits
+        // 1..=64); 65 is the out-of-range probe.
         if call(Syscall::Prctl.raw(), a1(1, 0)) != Some(0) {
             return Err("PR_SET_PDEATHSIG(0) should clear and return 0");
         }
-        if call(Syscall::Prctl.raw(), a1(1, 64)) != Some(-22) {
-            return Err("PR_SET_PDEATHSIG(64) should return -EINVAL");
+        if call(Syscall::Prctl.raw(), a1(1, 64)) != Some(0) {
+            return Err("PR_SET_PDEATHSIG(64=SIGRTMAX) should return 0");
+        }
+        if call(Syscall::Prctl.raw(), a1(1, 65)) != Some(-22) {
+            return Err("PR_SET_PDEATHSIG(65) should return -EINVAL");
         }
         Ok(())
     })
@@ -409,7 +413,7 @@ fn smoke_abi_proc2_pdeathsig_and_subreaper_on_exit() -> TestResult {
         set_task(FAKE_TASK);
         // MID dies.
         crate::handlers::__test_orphanize_children_of(MID);
-        if crate::handlers::signal_pending_of(KID) & (1u64 << 10) == 0 {
+        if crate::handlers::signal_pending_of(KID) & crate::handlers::sig_bit(10) == 0 {
             return Err("KID must receive its pdeathsig when MID exits");
         }
         let reparented = crate::handlers::parent_of_get(KID);

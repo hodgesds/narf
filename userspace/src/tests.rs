@@ -1166,7 +1166,7 @@ fn smoke_userspace_signal_delivery() -> TestResult {
         crate::handlers::__test_signal_reset();
         return TestResult::Fail("Kill did not Ok");
     }
-    if signal_pending_of(FAKE_TASK.load(Ordering::Relaxed)) & (1 << 10) == 0 {
+    if signal_pending_of(FAKE_TASK.load(Ordering::Relaxed)) & crate::handlers::sig_bit(10) == 0 {
         __test_clear_global();
         crate::handlers::__test_sigaction_reset();
         crate::handlers::__test_signal_reset();
@@ -1199,7 +1199,7 @@ fn smoke_userspace_signal_delivery() -> TestResult {
             )
         }
     }
-    if pending_after & (1 << 10) != 0 {
+    if pending_after & crate::handlers::sig_bit(10) != 0 {
         return TestResult::Fail("delivery did not clear the pending bit");
     }
 
@@ -1242,7 +1242,7 @@ fn smoke_userspace_raise_signal_pending_irq_is_allocfree_and_gated() -> TestResu
         __test_signal_reset();
         return TestResult::Fail("raise_signal_pending_irq returned false after slot pre-created");
     }
-    if signal_pending_of(task) & (1 << 14) == 0 {
+    if signal_pending_of(task) & crate::handlers::sig_bit(14) == 0 {
         __test_signal_reset();
         return TestResult::Fail("SIGALRM pending bit not set");
     }
@@ -1445,22 +1445,24 @@ fn smoke_userspace_signal_delivery_lowest_first_multiple_pending() -> TestResult
 
     cleanup();
 
-    if pending_before & (1 << 10) == 0 || pending_before & (1 << 12) == 0 {
+    if pending_before & crate::handlers::sig_bit(10) == 0
+        || pending_before & crate::handlers::sig_bit(12) == 0
+    {
         return TestResult::Fail("both signals 10 and 12 should be pending before delivery");
     }
     if !matches!(first, Some((h, s)) if h == H10 && s == 10) {
         return TestResult::Fail("first delivery must be the lowest signum (10) with its handler");
     }
-    if pending_mid & (1 << 10) != 0 {
+    if pending_mid & crate::handlers::sig_bit(10) != 0 {
         return TestResult::Fail("first delivery must clear only the delivered bit (10)");
     }
-    if pending_mid & (1 << 12) == 0 {
+    if pending_mid & crate::handlers::sig_bit(12) == 0 {
         return TestResult::Fail("first delivery must leave the higher signal (12) pending");
     }
     if !matches!(second, Some((h, s)) if h == H12 && s == 12) {
         return TestResult::Fail("second delivery must be signum 12 with its handler");
     }
-    if pending_after & (1 << 12) != 0 {
+    if pending_after & crate::handlers::sig_bit(12) != 0 {
         return TestResult::Fail("second delivery must clear the remaining bit (12)");
     }
 
@@ -10673,7 +10675,7 @@ fn smoke_userspace_tkill_targets_specific_tid() -> TestResult {
     let pending_caller = crate::handlers::signal_pending_of(0xAAAA);
     __test_clear_global();
     crate::handlers::__test_signal_reset();
-    if pending_target & (1 << 10) == 0 {
+    if pending_target & crate::handlers::sig_bit(10) == 0 {
         return TestResult::Fail("tkill did not set target's pending bit");
     }
     if pending_caller != 0 {
@@ -10726,7 +10728,7 @@ fn smoke_userspace_tgkill_routes_via_tid() -> TestResult {
     let pending_tgid = crate::handlers::signal_pending_of(0xCCCC);
     __test_clear_global();
     crate::handlers::__test_signal_reset();
-    if pending_tid & (1 << 15) == 0 {
+    if pending_tid & crate::handlers::sig_bit(15) == 0 {
         return TestResult::Fail("tgkill did not set TID's pending bit");
     }
     if pending_tgid != 0 {
@@ -10845,8 +10847,8 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
     kernel_syscall_entry(Syscall::Sigprocmask.raw(), &mut m);
 
     // rt_sigsuspend with set = 0xF0 (userspace sigset). NARF stores the
-    // mask shifted `<<1` to align signal N with bit N, so the internal mask
-    // becomes 0xF0 << 1 = 0x1E0.
+    // mask in the SAME bit-N-1 layout as the user sigset now, so the
+    // internal mask equals 0xF0 verbatim (no `<<1` shim).
     let new_set: u64 = 0xF0;
     let mut s = SigGapCtx {
         args: SyscallArgs {
@@ -10866,7 +10868,7 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
     if !returned_minus_one {
         return TestResult::Fail("rt_sigsuspend must return -1 (EINTR)");
     }
-    if mask_after != 0x1E0 {
+    if mask_after != 0xF0 {
         return TestResult::Fail("rt_sigsuspend did not replace mask");
     }
     TestResult::Pass
@@ -10925,7 +10927,7 @@ fn smoke_userspace_rt_sigtimedwait_returns_pending_signal() -> TestResult {
     if r.status != SyscallReturn::OK || r.value != 12 {
         return TestResult::Fail("rt_sigtimedwait should return the signum");
     }
-    if pending_after & (1 << 12) != 0 {
+    if pending_after & crate::handlers::sig_bit(12) != 0 {
         return TestResult::Fail("rt_sigtimedwait must clear the pending bit");
     }
     if signo_in_info != 12 {
@@ -11035,7 +11037,7 @@ fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
         return TestResult::Fail("rt_sigtimedwait must pick the lowest matching signum");
     }
     // 5 cleared; 10 + 15 still pending.
-    let want = (1u64 << 10) | (1u64 << 15);
+    let want = crate::handlers::sig_bit(10) | crate::handlers::sig_bit(15);
     if pending_after != want {
         return TestResult::Fail("rt_sigtimedwait must clear only the returned signum");
     }
@@ -11316,7 +11318,7 @@ fn smoke_userspace_sa_nodefer_skips_auto_block() -> TestResult {
     if delivered != 10 {
         return TestResult::Fail("delivery hook did not fire");
     }
-    if mask_after & (1 << 10) != 0 {
+    if mask_after & crate::handlers::sig_bit(10) != 0 {
         return TestResult::Fail("SA_NODEFER should NOT auto-block the signal");
     }
     TestResult::Pass
@@ -11408,7 +11410,7 @@ fn smoke_userspace_default_delivery_auto_blocks_without_nodefer() -> TestResult 
     if delivered != 11 {
         return TestResult::Fail("delivery hook did not fire");
     }
-    if mask_after & (1 << 11) == 0 {
+    if mask_after & crate::handlers::sig_bit(11) == 0 {
         return TestResult::Fail("default delivery should auto-block the signal");
     }
     TestResult::Pass
@@ -11436,13 +11438,13 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // signum = 64 must be rejected: the u64 bit-N-=-signal-N bitmaps
-    // represent signals 1..=63, so 64 (SIGRTMAX) is the first
-    // out-of-range value now that RT signals 32..=63 are valid.
+    // signum = 65 must be rejected: the bit-N-1 bitmaps represent the
+    // full valid range 1..=64 (SIGRTMAX = 64 is now valid), so 65 is
+    // the first out-of-range value.
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
             arg0: 0xBEEF,
-            arg1: 64,
+            arg1: 65,
             ..SyscallArgs::default()
         },
         ret: None,
@@ -11458,7 +11460,7 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     if r == SyscallReturn::ok((-22i64) as u64) {
         TestResult::Pass
     } else {
-        TestResult::Fail("signum 64 must be rejected with -EINVAL")
+        TestResult::Fail("signum 65 must be rejected with -EINVAL")
     }
 }
 kernel_test_in!(
@@ -14501,7 +14503,7 @@ fn smoke_console_ctrlc_signals_foreground_pgrp() -> TestResult {
     narf_filesystem::console_tty::__test_reset_cooked();
     __test_reset_task_id_lookup();
 
-    let sigint = 1u64 << 2; // SIGINT = 2 (NARF pending convention: bit == signum)
+    let sigint = crate::handlers::sig_bit(2); // SIGINT = 2
     if n != 0 {
         return TestResult::Fail("^C should be consumed as a signal, not returned by read");
     }
@@ -14639,7 +14641,7 @@ fn smoke_tty_background_read_raises_sigttin() -> TestResult {
     __test_pgid_reset();
     __test_reset_task_id_lookup();
 
-    let sigttin = 1u64 << 21;
+    let sigttin = crate::handlers::sig_bit(21); // SIGTTIN
     if pending & sigttin == 0 {
         return TestResult::Fail("background console read did not raise SIGTTIN");
     }
@@ -15452,7 +15454,7 @@ fn smoke_sys_kill_sigterm_marks_pending() -> TestResult {
     if !kill_ok {
         return TestResult::Fail("kill(SIGTERM) did not return Ok(0)");
     }
-    if pending & (1u64 << 15) == 0 {
+    if pending & crate::handlers::sig_bit(15) == 0 {
         return TestResult::Fail("SIGTERM did not land in SIGNAL_PENDING");
     }
     TestResult::Pass
@@ -15533,7 +15535,8 @@ fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
     __test_signal_reset();
     __test_clear_global();
 
-    let want = (1u64 << 1) | (1u64 << 2) | (1u64 << 6);
+    let want =
+        crate::handlers::sig_bit(1) | crate::handlers::sig_bit(2) | crate::handlers::sig_bit(6);
     if pending & want == want {
         TestResult::Pass
     } else {
@@ -15712,9 +15715,9 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
     // the kill(pid=0) target; drop any lookup an earlier test leaked.
     crate::handlers::__test_reset_task_id_lookup();
 
-    // Mask = SIGUSR1 only. A userspace sigset_t puts signal N at bit
-    // (N-1) — sys_signalfd shifts `<< 1` to align with NARF's internal
-    // bit-N pending convention. So SIGUSR1 (10) is bit 9 here.
+    // Mask = SIGUSR1 only. NARF's internal pending layout now matches
+    // the userspace sigset_t (signal N at bit N-1), so SIGUSR1 (10) is
+    // bit 9 both in the user mask and internally.
     let mask: u64 = 1u64 << 9;
     let mask_bytes = mask.to_le_bytes();
     let mut ctx = FakeCtx {
@@ -15821,9 +15824,9 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     // the kill(pid=0) target; drop any lookup an earlier test leaked.
     crate::handlers::__test_reset_task_id_lookup();
 
-    // Create signalfd watching SIGUSR2 (signum 12). Userspace sigset_t
-    // puts signal N at bit (N-1); sys_signalfd shifts `<< 1` to align
-    // with NARF's internal bit-N pending convention. So SIGUSR2 is bit 11.
+    // Create signalfd watching SIGUSR2 (signum 12). NARF's internal
+    // pending layout now matches the userspace sigset_t (signal N at bit
+    // N-1), so SIGUSR2 is bit 11 both in the user mask and internally.
     let mask: u64 = 1u64 << 11;
     let mask_bytes = mask.to_le_bytes();
     let mut ctx = FakeCtx {
@@ -17131,7 +17134,7 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
     __test_signal_reset();
     __test_clear_global();
 
-    if pending & (1u64 << 10) != 0 {
+    if pending & crate::handlers::sig_bit(10) != 0 {
         TestResult::Pass
     } else {
         TestResult::Fail("SIGUSR1 not in pending after timer pump")

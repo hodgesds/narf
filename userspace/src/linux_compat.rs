@@ -88,7 +88,7 @@ impl FileOps for SignalFdFile {
                 return Err(FsError::InvalidData);
             }
             // Drain lowest pending bit.
-            let signum = pending.trailing_zeros();
+            let signum = crate::handlers::sig_from_bit(pending);
             buf[..SIGNALFD_SIGINFO_LEN].fill(0);
             // ssi_signo: u32 at offset 0.
             buf[..4].copy_from_slice(&signum.to_le_bytes());
