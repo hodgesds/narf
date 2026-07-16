@@ -274,6 +274,12 @@ pub struct SigDeliveryParams {
     /// 0 for async signals where it has no meaning. The arch
     /// only writes this when `SA_SIGINFO` is set.
     pub si_addr: u64,
+    /// `si_pid` (sender pid) for user/queue-origin signals
+    /// (`kill`/`tgkill`/`sigqueue`, i.e. `si_code <= 0`). The
+    /// `si_addr` and `si_pid` unions OVERLAP at siginfo offset 16:
+    /// the arch writes `si_pid` there for `si_code <= 0` and
+    /// `si_addr` for fault codes (`si_code > 0`). 0 when unknown.
+    pub si_pid: u32,
     /// `si_value` (the `sigval` union) for queued signals
     /// (`rt_sigqueueinfo` / `sigqueue`). 0 for everything else. The arch
     /// writes it at the `_sifields._rt.si_sigval` offset (24) of the
@@ -3614,7 +3620,20 @@ mod sigframe {
             let mut siginfo = [0u8; 128];
             siginfo[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
             siginfo[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
-            siginfo[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
+            // Offset 16 is a union: for user/queue-origin signals (SI_USER=0,
+            // SI_QUEUE=-1, SI_TKILL=-6, ... — all si_code <= 0) it is
+            // `_sifields._kill.si_pid` (u32) + `si_uid` (u32 @ 20); for
+            // fault-origin signals (si_code > 0: SEGV_MAPERR, BUS_*, ...) it is
+            // `_sifields._sigfault.si_addr` (u64). Writing si_addr for a queued
+            // signal left the handler's `si->si_pid` at 0 — stress-ng --sigrt's
+            // child replies with `sigqueue(si->si_pid, ...)` and lost the target.
+            if params.si_code <= 0 {
+                siginfo[16..20].copy_from_slice(&params.si_pid.to_ne_bytes());
+                // si_uid @ 20 left 0 (NARF has no per-process uid distinction
+                // that sigqueue callers depend on here).
+            } else {
+                siginfo[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
+            }
             // _sifields._rt.si_sigval (sigqueue payload) at offset 24.
             siginfo[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
 

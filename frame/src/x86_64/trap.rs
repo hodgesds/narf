@@ -1968,6 +1968,7 @@ fn smoke_x86_64_sa_restart_rewinds_saved_rip() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -2039,6 +2040,7 @@ fn smoke_x86_64_deliver_signal_refuses_unbacked_user_stack() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
     let mut ctx = X86TrapContext::from_int80(&mut frame);
     let refused = !ctx.deliver_signal(&params);
@@ -2083,6 +2085,7 @@ fn smoke_x86_64_sa_restart_clear_does_not_rewind() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -2121,6 +2124,7 @@ fn smoke_x86_64_sa_restart_non_restartable_syscall() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -2160,6 +2164,7 @@ fn smoke_x86_64_sa_onstack_uses_altstack_top() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -2203,6 +2208,7 @@ fn smoke_x86_64_sa_onstack_no_altstack_falls_back() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);
@@ -2242,6 +2248,7 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
         si_code: 2, // SEGV_ACCERR
         si_addr: 0xBAD_AAAA,
         si_value: 0,
+        si_pid: 0,
     };
 
     let mut ctx = X86TrapContext::from_int80(&mut frame);

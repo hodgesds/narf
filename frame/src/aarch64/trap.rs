@@ -950,6 +950,7 @@ fn smoke_aarch64_sa_restart_rewinds_elr() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     // Set SP_EL0 to the scratch buffer top so deliver_signal has a
@@ -1031,6 +1032,7 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
         si_code: 0,
         si_addr: 0,
         si_value: 0,
+        si_pid: 0,
     };
 
     let prior_sp: u64;
@@ -1103,6 +1105,7 @@ fn smoke_aarch64_sa_siginfo_sets_three_args() -> TestResult {
         si_code: 1, // SEGV_MAPERR
         si_addr: 0xDEAD_AAAA,
         si_value: 0,
+        si_pid: 0,
     };
 
     let prior_sp: u64;

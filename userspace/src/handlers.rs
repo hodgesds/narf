@@ -20232,6 +20232,7 @@ fn build_delivery_params(
     si_code: i32,
     si_addr: u64,
     si_value: u64,
+    si_pid: u32,
 ) -> SigDeliveryParams {
     // Altstack: only honour if SA_ONSTACK is set AND the slot is
     // installed AND it's not SS_DISABLE. A misconfigured altstack
@@ -20253,6 +20254,7 @@ fn build_delivery_params(
         si_code,
         si_addr,
         si_value,
+        si_pid,
     }
 }
 
@@ -20392,8 +20394,10 @@ pub(crate) fn default_signal_delivery_restricted(
     // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
     // instance was queued by rt_sigqueueinfo/sigqueue, in which case
     // honour its si_code (SI_QUEUE) + si_value (the sigval payload).
-    let (si_code, si_value, _si_pid) = take_sigqueue_info(task, signum).unwrap_or((0, 0, 0));
-    let params = build_delivery_params(task, action, signum, syscall_no, si_code, 0, si_value);
+    let (si_code, si_value, si_pid) = take_sigqueue_info(task, signum).unwrap_or((0, 0, 0));
+    let params = build_delivery_params(
+        task, action, signum, syscall_no, si_code, 0, si_value, si_pid,
+    );
     if !ctx.deliver_signal(&params) {
         return false;
     }
@@ -20693,12 +20697,24 @@ pub fn default_sync_signal_delivery(
         0 => (1 /* FPE_INTDIV */, info.addr),
         4 => (2 /* FPE_INTOVF */, info.addr),
         3 => (1 /* TRAP_BRKPT */, info.addr),
-        _ => (0, info.addr),
+        // SI_KERNEL (0x80), not 0: a fault must keep a POSITIVE si_code so the
+        // arch siginfo builder writes `si_addr` at the union offset 16 (a
+        // non-positive code there means "user/queue-origin" → si_pid instead).
+        _ => (0x80, info.addr),
     };
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
     // Synchronous faults carry si_addr, not a sigqueue sigval.
-    let params = build_delivery_params(task, action, signum, SYSCALL_NUM_NONE, si_code, si_addr, 0);
+    let params = build_delivery_params(
+        task,
+        action,
+        signum,
+        SYSCALL_NUM_NONE,
+        si_code,
+        si_addr,
+        0,
+        0,
+    );
     let delivered = ctx.deliver_signal(&params);
     if delivered {
         set_sigreturn_use_rsp(task, params.restorer != 0);
