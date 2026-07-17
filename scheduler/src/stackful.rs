@@ -1319,6 +1319,61 @@ pub unsafe fn yield_current_stackful() {
     user_fpu_restore();
 }
 
+/// Linux `TIF_NEED_RESCHED`-at-syscall-exit analogue. The scheduler tick only
+/// preempts a task it interrupts at CPL=3 (`try_preempt_user`'s CPL gate), so a
+/// *syscall-dense* task — one whose user-mode gaps between syscalls are far
+/// shorter than the syscall bodies — is essentially never sliced and starves
+/// every sibling on its CPU until it voluntarily blocks. Linux re-checks the
+/// spent time slice on the way out of every syscall; this restores that.
+///
+/// Called at the tail of the `syscall`-instruction dispatch (a real user frame
+/// is returning to CPL=3). If this task's slice is spent it yields NOW — staying
+/// Ready by re-arming its slot waker first (same as `try_preempt_user`), so the
+/// executor re-polls it after servicing its siblings. Cheap when the slice is
+/// not yet spent (a few atomic loads + one TSC read); only the spent-slice case
+/// pays a context switch. No-op unless own-stack scheduling is live and a
+/// stackful task is current.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn maybe_resched_syscall_exit() {
+    if !USE_OWN_STACK.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
+    // its Box alive across the user round-trip); all reads are atomics.
+    unsafe {
+        // NOTE: deliberately NOT gated on `no_preempt`. User tasks set
+        // `no_preempt = true` to opt out of ASYNC timer-IRQ preemption (they
+        // "yield cooperatively"), but this is precisely a cooperative yield —
+        // a SYNCHRONOUS slice check at syscall exit, about to return to CPL=3,
+        // outside any kernel critical section. Honouring `no_preempt` here is
+        // what left a syscall-dense task (stress-ng --sigrt's sigqueue loop)
+        // never yielding and starving its CPU's siblings.
+        let started = (*p).tsc_started.load(Ordering::Acquire);
+        let slice = (*p).slice_cycles.load(Ordering::Acquire);
+        // `started == 0` → slice clock not stamped yet (never yield blindly).
+        if started == 0 || narf_time::now_cycles().saturating_sub(started) < slice {
+            return;
+        }
+        // Re-arm the slot waker so the executor keeps us Ready and re-polls us
+        // after the siblings run (mirrors try_preempt_user's pre-yield re-arm).
+        {
+            let g = (*p).current_waker.lock();
+            if let Some(w) = g.as_ref() {
+                w.wake_by_ref();
+            }
+        }
+        // Yields via kernel_switch to the executor; returns here (with a fresh
+        // tsc_started) when re-polled. Proven safe from syscall context — the
+        // own-stack park paths (own_stack_park / wait4) switch out the same way.
+        yield_current_stackful();
+    }
+}
+
 /// Clone the executor slot-`Waker` of the CURRENT stackful task on this CPU
 /// (the one `poll_to_yield` stashed). The own-stack park path registers THIS
 /// waker with the relevant event source (timer wheel / futex queue / serial

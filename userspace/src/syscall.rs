@@ -3217,23 +3217,14 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     }
 }
 
-/// Trace filter: the process-lifecycle syscalls worth logging (spawn/exit/
-/// wait + execve). Deliberately excludes the high-frequency work syscalls so
-/// the `syscall-trace` feature stays usable during a stress workload.
+/// Trace filter for the `syscall-trace` feature. Traces EVERY syscall — a
+/// proper `strace`-style firehose (the feature is opt-in at build time, so the
+/// volume is the caller's choice; grep the serial log by `t=<tid>` / name).
+/// The trace line is written straight to the serial console (not via the
+/// syscall path), so tracing `write`/`writev` cannot recurse.
 #[cfg(feature = "syscall-trace")]
-fn syscall_trace_relevant(v: Syscall) -> bool {
-    matches!(
-        v,
-        Syscall::Clone
-            | Syscall::Clone3
-            | Syscall::Fork
-            | Syscall::Vfork
-            | Syscall::Execve
-            | Syscall::Execveat
-            | Syscall::ExitTask
-            | Syscall::ExitGroup
-            | Syscall::Wait4
-    )
+fn syscall_trace_relevant(_v: Syscall) -> bool {
+    true
 }
 
 #[inline]
@@ -3297,6 +3288,18 @@ pub fn kernel_syscall_entry_plain_with_state(
     // exactly as Linux preserves it across a handler.
     if !user_state.is_null() {
         crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
+        // TIF_NEED_RESCHED-at-syscall-exit: the tick only preempts at CPL=3, so
+        // a syscall-dense task (e.g. stress-ng --sigrt's tight sigqueue loop)
+        // never yields and starves its CPU's siblings — the forked RT waiters
+        // never run to consume the signals. Yield here if the slice is spent.
+        // Runs only on the real-user-frame path; no-op unless the slice is up.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a real user frame is returning to CPL=3 (user_state non-null);
+        // the helper self-checks own-stack liveness and only switches out via the
+        // same executor kernel_switch the own-stack park paths use.
+        unsafe {
+            narf_scheduler::stackful::maybe_resched_syscall_exit();
+        }
     }
     ctx.ret
 }

@@ -20325,7 +20325,21 @@ pub(crate) fn default_signal_delivery_restricted(
     // never be taken as "signal 0" → default-action Terminate.
     // No null-signal bit in the N-1 convention (signal 0 has no bit),
     // so no `& !1` guard is needed — every set bit is a real signal.
-    let deliverable = pending & !mask & restrict;
+    // Linux `do_sigtimedwait` `real_blocked` semantics: while this task is
+    // parked in / re-executing `rt_sigtimedwait` (`sigwait_set` armed), signals
+    // in the waited set belong to the WAITER — `sigwait_consume` dequeues them
+    // on the re-execution — and must NOT be delivered to a handler here even
+    // when they are unblocked. stress-ng --sigrt waits on RT signals it leaves
+    // UNBLOCKED with nop handlers installed; without this reservation the nop
+    // handler steals the graceful-shutdown `sigqueue(sival=0)` and the child
+    // parks in `sigwaitinfo` forever (the --sigrt hang).
+    let sigwait_reserved = crate::user_task::current_user_task()
+        .map(|u| {
+            // SAFETY: in-flight task's poller-pinned UserTaskCtx; atomic load only.
+            unsafe { (*u).sigwait_set.load(Ordering::Acquire) }
+        })
+        .unwrap_or(0);
+    let deliverable = pending & !mask & restrict & !sigwait_reserved;
     if deliverable == 0 {
         return false;
     }
