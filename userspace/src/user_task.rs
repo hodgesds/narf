@@ -224,6 +224,22 @@ pub struct UserTaskCtx {
     /// exit.
     pub sigwait_interrupted: core::sync::atomic::AtomicBool,
 
+    /// STICKY sigwait reservation: the most recent `rt_sigtimedwait` set,
+    /// kept armed ACROSS the gap between consecutive sigtimedwaits (unlike
+    /// `sigwait_set`, which doubles as park routing and is cleared on every
+    /// exit path). While non-zero, signals in the set are reserved for the
+    /// waiter — `default_signal_delivery_restricted` won't hand them to a
+    /// handler even in the window where the task is processing the previous
+    /// wait's result (stress-ng --sigrt's relay window). Without this, a
+    /// child with a queued backlog loses its graceful-shutdown `sival=0`
+    /// marker to the nop-handler sigreturn chain in that window — a race
+    /// Linux only wins by speed (its window is ~µs; NARF's, under a 16-vCPU
+    /// TCG storm, is ms). Cleared whenever the task blocks in any OTHER
+    /// wait (`park_should_block`'s non-sigwait branches) — the signal that
+    /// it left the sigwaitinfo loop — so a program that stops sigwaiting
+    /// gets normal handler delivery back at its next blocking point.
+    pub sigwait_reserve: AtomicU64,
+
     /// Distinguishes `waitid(2)` from `wait4(2)` for the blocking
     /// path: when set, the reap writes a `siginfo_t` to
     /// `wait_child_status_ptr` and the syscall returns 0 rather than
@@ -298,6 +314,7 @@ impl UserTaskCtx {
             flock_key: core::sync::atomic::AtomicUsize::new(0),
             sigwait_set: AtomicU64::new(0),
             sigwait_interrupted: core::sync::atomic::AtomicBool::new(false),
+            sigwait_reserve: AtomicU64::new(0),
             wait_child_is_waitid: AtomicBool::new(false),
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
@@ -545,6 +562,11 @@ fn park_should_block(
                     uc.sigwait_set.store(0, Ordering::Release);
                     return false; // signal arrived → re-execute the syscall
                 }
+            } else {
+                // Non-sigwait park: the task left its sigwaitinfo loop —
+                // release the sticky waiter reservation so signals it was
+                // waiting on resume normal handler delivery.
+                uc.sigwait_reserve.store(0, Ordering::Release);
             }
             // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
             if uc.net_io_wait.load(Ordering::Acquire) {
@@ -669,6 +691,8 @@ fn park_should_block(
 
     // Console blocking-read: register on the serial/keyboard IRQ byte-waker.
     if uc.console_read_pending.load(Ordering::Acquire) {
+        // Non-sigwait park — release the sticky waiter reservation (see above).
+        uc.sigwait_reserve.store(0, Ordering::Release);
         narf_input::register_byte_waker(waker);
         if narf_input::pending_input() > 0 {
             uc.console_read_pending.store(false, Ordering::Release);
@@ -1475,6 +1499,10 @@ impl core::future::Future for UserTaskFuture {
                         cx.waker().wake_by_ref();
                         return core::task::Poll::Pending;
                     }
+                } else {
+                    // Non-sigwait park — release the sticky waiter
+                    // reservation (see `UserTaskCtx::sigwait_reserve`).
+                    this.task.uctx.sigwait_reserve.store(0, Ordering::Release);
                 }
                 // Parking on a blocking wait. If `sys_epoll_wait`/
                 // `sys_poll` flagged this as a net I/O wait, register

@@ -495,6 +495,57 @@ pub unsafe fn invlpg_global_range(va_base: VirtAddr, pages: u64) {
     }
 }
 
+/// Optional cross-CPU FULL non-global TLB-flush hook, the batch
+/// counterpart of the per-VA / range hooks above. Installed at boot
+/// alongside them; when present, [`flush_user_tlb_all_cpus`]
+/// broadcasts one "reload your TLB" IPI instead of N per-page ones.
+static FULL_SHOOTDOWN_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Hook signature for the full-flush broadcast: flush every
+/// non-global TLB entry on every peer CPU (all PCIDs).
+pub type TlbFullShootdownHook = fn();
+
+pub fn set_full_shootdown_hook(hook: TlbFullShootdownHook) {
+    FULL_SHOOTDOWN_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Flush EVERY non-global TLB entry — locally and (when the hook is
+/// installed) on every peer CPU with a single broadcast IPI. User
+/// PTEs are never GLOBAL, so this covers any stale user-half entry
+/// regardless of which address space / PCID it belongs to. This is
+/// the Linux `flush_tlb_mm` analogue used by whole-AS batch
+/// operations (fork's COW WRITE-strip `rematerialize`, exit-path
+/// region teardown) after a `*_local` PTE walk.
+///
+/// # Safety
+/// CPL=0 only. Callers relying on this for frame-reuse safety must
+/// call it BEFORE freeing the frames the walk unmapped.
+pub unsafe fn flush_user_tlb_all_cpus() {
+    // Local flush first: INVPCID type-3 (all contexts, non-global)
+    // when available — a plain CR3 reload only drops the CURRENT
+    // PCID's entries when CR4.PCIDE=1, which would leave stale
+    // entries under other PCID tags.
+    if narf_arch::x86_64::pcid::invpcid_supported() && narf_arch::x86_64::pcid::pcide_enabled() {
+        // SAFETY: INVPCID gated on support + PCIDE.
+        unsafe { narf_arch::x86_64::pcid::invpcid_all_without_globals() };
+    } else {
+        // SAFETY: rewriting the current CR3 at CPL=0 is always legal and
+        // flushes all non-global entries (PCIDE=0 ⇒ single context).
+        unsafe {
+            let c: u64;
+            core::arch::asm!("mov {0}, cr3", out(reg) c, options(nomem, nostack, preserves_flags));
+            core::arch::asm!("mov cr3, {0}", in(reg) c, options(nomem, nostack, preserves_flags));
+        }
+    }
+    let h = FULL_SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `TlbFullShootdownHook as usize`.
+        let f: TlbFullShootdownHook = unsafe { core::mem::transmute(h) };
+        f();
+    }
+}
+
 /// Invalidate the TLB for a single virtual address via `INVLPG`.
 ///
 /// # Safety
@@ -703,6 +754,34 @@ pub unsafe fn map_4kb(
 /// # Safety
 /// Same identity-mapping precondition as `map_4kb`.
 pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { unmap_4kb_impl(pml4_phys, virt, true) }
+}
+
+/// [`unmap_4kb`] WITHOUT the cross-CPU shootdown broadcast — the leaf PTE is
+/// cleared and INVLPG'd **locally only**. For batched whole-AS operations
+/// (fork's parent `rematerialize`, exit-path region teardown) that issue ONE
+/// cross-CPU flush after the whole walk — the Linux `flush_tlb_mm` /
+/// `mmu_gather` shape — instead of a per-page IPI-broadcast + ack-wait round
+/// trip. A ~thousand-page address space paid ~1000 broadcast round-trips per
+/// fork through the plain `unmap_4kb`, which is what made `stress-ng --sigrt`
+/// forks take ~0.5 s each (and unboundedly worse when one AP acked slowly).
+///
+/// # Safety
+/// Same contract as [`unmap_4kb`], PLUS: the caller MUST broadcast a
+/// cross-CPU invalidation covering `virt` (range shootdown or a full
+/// non-global flush) before any freed frame can be reused — peer CPUs may
+/// hold a stale TLB entry until then.
+pub unsafe fn unmap_4kb_local(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
+    // SAFETY: forwarded caller contract.
+    unsafe { unmap_4kb_impl(pml4_phys, virt, false) }
+}
+
+unsafe fn unmap_4kb_impl(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    broadcast: bool,
+) -> Result<PhysAddr, MapError> {
     if !is_canonical(virt) {
         return Err(MapError::NonCanonical);
     }
@@ -751,10 +830,15 @@ pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
 
     // Unmap is the canonical "stale-TLB" case: peer CPUs may have
     // cached the prior PA. Use the cross-CPU invalidator so any
-    // installed shootdown hook fires.
+    // installed shootdown hook fires — unless the caller asked for
+    // the local-only variant and owns the deferred batch broadcast.
     // SAFETY: INVLPG always safe; hook call is gated by atomic load.
     unsafe {
-        invlpg_global(virt);
+        if broadcast {
+            invlpg_global(virt);
+        } else {
+            invlpg(virt);
+        }
     }
 
     Ok(removed.addr())

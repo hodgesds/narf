@@ -163,7 +163,23 @@ pub unsafe fn on_shootdown_irq() {
     // Spec: `memory/specification/asid-pcid-isolation.md` §4.1.
     // INVPCID encoding per Intel SDM Vol 2 INVPCID instruction
     // reference; type semantics per SDM Vol 3 §4.10.4.
-    if tag != 0 {
+    if va == SHOOTDOWN_FULL_SENTINEL {
+        // Full non-global flush (see `shoot_full`). INVPCID type-3 drops
+        // every non-global entry across all PCIDs; without usable
+        // INVPCID/PCIDE a CR3 reload covers the same ground (PCIDE=0 ⇒
+        // everything lives in context 0).
+        if narf_arch::x86_64::pcid::invpcid_supported() && narf_arch::x86_64::pcid::pcide_enabled()
+        {
+            // SAFETY: INVPCID gated on support + PCIDE.
+            unsafe { narf_arch::x86_64::pcid::invpcid_all_without_globals() };
+        } else {
+            // SAFETY: CR3 reload at CPL=0 is always legal.
+            unsafe {
+                let c = narf_arch::x86_64::cr::read_cr3();
+                narf_arch::x86_64::cr::write_cr3(c);
+            }
+        }
+    } else if tag != 0 {
         // INVPCID with a NON-ZERO PCID descriptor requires BOTH the INVPCID
         // instruction AND CR4.PCIDE=1 — otherwise it #GP(0). A hypervisor can
         // expose INVPCID-the-instruction on a vCPU while NOT advertising PCID
@@ -308,6 +324,26 @@ pub unsafe fn shoot_va(va: u64, tag: u16) {
     // SAFETY: see shoot_range.
     unsafe {
         shoot_range(va, 1, tag);
+    }
+}
+
+/// Published-VA sentinel requesting a FULL non-global TLB flush on the
+/// receiver (INVPCID type-3 when available, CR3 reload otherwise).
+/// `u64::MAX` is non-canonical, so it can never collide with a real
+/// per-VA request.
+pub const SHOOTDOWN_FULL_SENTINEL: u64 = u64::MAX;
+
+/// Broadcast a FULL non-global TLB flush to every peer CPU — ONE IPI +
+/// ack-wait for an arbitrarily large invalidation, the batch tail of a
+/// whole-address-space PTE walk (fork COW WRITE-strip, exit teardown).
+/// The caller is responsible for its own LOCAL flush.
+///
+/// # Safety
+/// Same preconditions as `shoot_va`.
+pub unsafe fn shoot_full() {
+    // SAFETY: caller contract; the sentinel is routed by the handler.
+    unsafe {
+        shoot_range(SHOOTDOWN_FULL_SENTINEL, 1, 0);
     }
 }
 

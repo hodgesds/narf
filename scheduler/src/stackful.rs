@@ -1319,6 +1319,43 @@ pub unsafe fn yield_current_stackful() {
     user_fpu_restore();
 }
 
+/// Per-CPU "yield at the next syscall exit" request, set by syscall handlers
+/// that detect producer/consumer back-pressure (e.g. `rt_sigqueueinfo` onto a
+/// target whose signal queue is already backlogged — stress-ng --sigrt's
+/// parent outrunning its children). Consumed by `maybe_resched_syscall_exit`,
+/// which then yields REGARDLESS of the time slice: the flooding sender
+/// donates its CPU so the consumers drain, the cooperative-scheduler
+/// analogue of CFS preempting a producer that has outrun its consumers.
+/// A rare mis-attribution (the requesting task is preempted before its own
+/// syscall tail runs, so ANOTHER task's tail consumes the flag) costs one
+/// spurious-but-harmless yield.
+#[cfg(target_arch = "x86_64")]
+struct PerCpuBackpressure {
+    inner: [core::sync::atomic::AtomicBool; narf_lib::percpu::MAX_CPUS],
+}
+#[cfg(target_arch = "x86_64")]
+static BACKPRESSURE_YIELD: PerCpuBackpressure = PerCpuBackpressure {
+    inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+};
+
+/// Request a cooperative yield at the current task's next syscall exit
+/// (see [`BACKPRESSURE_YIELD`]). Callable from any syscall handler body;
+/// no-op when own-stack scheduling isn't live.
+#[cfg(target_arch = "x86_64")]
+pub fn request_syscall_backpressure_yield() {
+    if !USE_OWN_STACK.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = this_cpu();
+    if CURRENT_STACKFUL_TASK.inner[cpu]
+        .load(Ordering::Acquire)
+        .is_null()
+    {
+        return;
+    }
+    BACKPRESSURE_YIELD.inner[cpu].store(true, Ordering::Release);
+}
+
 /// Linux `TIF_NEED_RESCHED`-at-syscall-exit analogue. The scheduler tick only
 /// preempts a task it interrupts at CPL=3 (`try_preempt_user`'s CPL gate), so a
 /// *syscall-dense* task — one whose user-mode gaps between syscalls are far
@@ -1333,6 +1370,12 @@ pub unsafe fn yield_current_stackful() {
 /// not yet spent (a few atomic loads + one TSC read); only the spent-slice case
 /// pays a context switch. No-op unless own-stack scheduling is live and a
 /// stackful task is current.
+///
+/// # Safety
+/// Must be called at the tail of the `syscall` dispatch on the current task's
+/// own kernel stack, with a real user frame about to return to CPL=3 and no
+/// kernel locks held — the yield switches to the executor via the same
+/// `kernel_switch` the own-stack park paths use.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn maybe_resched_syscall_exit() {
     if !USE_OWN_STACK.load(Ordering::Acquire) {
@@ -1343,6 +1386,7 @@ pub unsafe fn maybe_resched_syscall_exit() {
     if p.is_null() {
         return;
     }
+    let backpressure = BACKPRESSURE_YIELD.inner[cpu].swap(false, Ordering::AcqRel);
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
     // its Box alive across the user round-trip); all reads are atomics.
     unsafe {
@@ -1356,7 +1400,11 @@ pub unsafe fn maybe_resched_syscall_exit() {
         let started = (*p).tsc_started.load(Ordering::Acquire);
         let slice = (*p).slice_cycles.load(Ordering::Acquire);
         // `started == 0` → slice clock not stamped yet (never yield blindly).
-        if started == 0 || narf_time::now_cycles().saturating_sub(started) < slice {
+        // A back-pressure request (see `request_syscall_backpressure_yield`)
+        // yields regardless of the remaining slice.
+        if !backpressure
+            && (started == 0 || narf_time::now_cycles().saturating_sub(started) < slice)
+        {
             return;
         }
         // Re-arm the slot waker so the executor keeps us Ready and re-polls us

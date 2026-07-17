@@ -774,6 +774,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_interrupts::x86_64::ipi::shoot_range(va, pages, 0);
                 }
             });
+            // Full-flush hook: one IPI for a whole-address-space batch
+            // invalidation (fork COW WRITE-strip, exit teardown) — the
+            // Linux flush_tlb_mm shape. Without it those paths paid a
+            // per-page broadcast + ack-wait, which made every fork of a
+            // large process take ~0.5 s (stress-ng --sigrt's "hang").
+            narf_memory::paging::set_full_shootdown_hook(|| {
+                // SAFETY: x2APIC online, IPI handler installed.
+                unsafe {
+                    narf_interrupts::x86_64::ipi::shoot_full();
+                }
+            });
             // Install the unified `narf_memory::tlb_shootdown::shootdown`
             // → IPI fan-out hook so the asid/pcid-isolation surface
             // also benefits from cross-CPU dispatch.

@@ -9788,6 +9788,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // CLONE_VM produces a process, not a thread, and TLS / tid
     // pointers are still honoured but in a separate AS).
     let child_as = if share_vm {
+        // The AS is now (potentially) resident on several CPUs at once —
+        // PTE mutations must broadcast cross-CPU TLB shootdowns from here
+        // on (single-threaded ASes skip them; see `vm_shared`'s docs).
+        parent_as.mark_vm_shared();
         parent_as.clone()
     } else {
         // SAFETY: paging is live and `parent_as` is the caller's current
@@ -17474,6 +17478,25 @@ pub(crate) fn store_sigqueue_info(
     true
 }
 
+/// Total queued rt_sigqueueinfo payloads pending for `task` across every
+/// signum — the sender-side back-pressure probe (see `sys_rt_sigqueueinfo`).
+pub(crate) fn sigqueue_depth(task: u64) -> usize {
+    let g = SIGQUEUE_INFO.lock();
+    g.as_ref()
+        .map(|m| m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum())
+        .unwrap_or(0)
+}
+
+/// Threshold above which a signal sender is asked to yield at syscall exit:
+/// the target is this many payloads behind, so the producer has outrun the
+/// consumer and should donate its CPU (stress-ng --sigrt's parent flooding
+/// its 30 sigwaitinfo children; the graceful-shutdown `sival=0` marker must
+/// find the children DRAINED and parked, or the nop-handler sigreturn chain
+/// can consume it and the run never terminates). Linux gets the equivalent
+/// pacing from preemptive multi-CPU scheduling; this is the cooperative
+/// analogue, and it only triggers on genuinely backlogged floods.
+pub(crate) const SIGQUEUE_BACKPRESSURE_DEPTH: usize = 4;
+
 /// Pop and return the OLDEST queued `(si_code, si_value, si_pid)` for
 /// `(task, signum)`, if any. FIFO order preserves rt_sigqueueinfo
 /// submission order for RT signals; standard signals hold at most one.
@@ -18714,6 +18737,13 @@ fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         return;
     }
     raise_signal_pending(target, sig); // ORs the pending bit + wakes
+                                       // Producer/consumer back-pressure: the target is falling behind —
+                                       // yield this sender at syscall exit so the consumer(s) drain (see
+                                       // SIGQUEUE_BACKPRESSURE_DEPTH).
+    #[cfg(target_arch = "x86_64")]
+    if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
+        narf_scheduler::stackful::request_syscall_backpressure_yield();
+    }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -18763,6 +18793,11 @@ fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         return;
     }
     raise_signal_pending(target, sig);
+    // Back-pressure — see sys_rt_sigqueueinfo.
+    #[cfg(target_arch = "x86_64")]
+    if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
+        narf_scheduler::stackful::request_syscall_backpressure_yield();
+    }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
@@ -19987,6 +20022,20 @@ fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let uctx_opt = crate::user_task::current_user_task();
 
+    // Arm the STICKY waiter reservation for this set — it survives the
+    // return-to-user gap between consecutive sigtimedwaits so a queued
+    // backlog (including stress-ng --sigrt's graceful-shutdown sival=0
+    // marker) can only be consumed HERE, never leak to a handler in the
+    // processing window. Released by any non-sigwait park (see
+    // `UserTaskCtx::sigwait_reserve`).
+    if let Some(u) = uctx_opt {
+        // SIGKILL(9)/SIGSTOP(19) can never be handler-delivered anyway and
+        // must never be maskable from their eager paths — strip them.
+        let reserve = set & !(1u64 << 8) & !(1u64 << 18);
+        // SAFETY: the in-flight task's poller-pinned UserTaskCtx; atomic only.
+        unsafe { (*u).sigwait_reserve.store(reserve, Ordering::Release) };
+    }
+
     // Every return path below must tear the park routing down: the
     // sigwait routing + the persisted timeout deadline + the waker
     // registration (a stale SIGNAL_WAKERS entry only costs one spurious
@@ -20333,10 +20382,19 @@ pub(crate) fn default_signal_delivery_restricted(
     // UNBLOCKED with nop handlers installed; without this reservation the nop
     // handler steals the graceful-shutdown `sigqueue(sival=0)` and the child
     // parks in `sigwaitinfo` forever (the --sigrt hang).
+    // Both the live park routing (`sigwait_set`) AND the sticky reservation
+    // (`sigwait_reserve`, armed by every rt_sigtimedwait and released at the
+    // task's next non-sigwait park) — the latter covers the processing gap
+    // BETWEEN consecutive sigtimedwaits, where the nop-handler sigreturn
+    // chain would otherwise drain the waiter's queue (and eat stress-ng
+    // --sigrt's shutdown marker).
     let sigwait_reserved = crate::user_task::current_user_task()
         .map(|u| {
             // SAFETY: in-flight task's poller-pinned UserTaskCtx; atomic load only.
-            unsafe { (*u).sigwait_set.load(Ordering::Acquire) }
+            unsafe {
+                (*u).sigwait_set.load(Ordering::Acquire)
+                    | (*u).sigwait_reserve.load(Ordering::Acquire)
+            }
         })
         .unwrap_or(0);
     let deliverable = pending & !mask & restrict & !sigwait_reserved;
