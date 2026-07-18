@@ -3266,7 +3266,37 @@ pub fn kernel_syscall_entry_plain_with_state(
         );
     }
     let mut ctx = ArgsOnlyCtx::new(*args, user_state);
+    // PTRACE_SYSCALL entry-stop: if this task is traced and armed, stop it
+    // BEFORE the syscall runs so the tracer can inspect orig_rax + args.
+    // Only meaningful on the live musl path (a real user frame to park).
+    // `raw_num` is the original syscall number = orig_rax at entry; it may
+    // differ from `n.raw()` after version-decoding, so pass what the user
+    // put in rax. On the own-stack path the tracee parks here and this call
+    // returns when the tracer resumes it; then the syscall dispatches.
+    #[cfg(feature = "linux-compat")]
+    if !user_state.is_null() {
+        crate::ptrace::ptrace_syscall_stop(&mut ctx, true, num as u64);
+    }
+    // Entry RIP, to detect a handler that parked to RE-EXECUTE (rewinds RIP
+    // by the 2-byte `syscall` width). Such a syscall has not completed, so it
+    // must NOT fire an exit-stop — the re-issued syscall will trace again.
+    #[cfg(feature = "linux-compat")]
+    let entry_rip = ctx.rip();
     table.dispatch(n, &mut ctx);
+    // PTRACE_SYSCALL exit-stop: after the syscall body, before returning to
+    // user, stop again so the tracer can read the return value (rax). The
+    // stop machinery re-uses the job-control park path, which mirrors 0 into
+    // the ret/rax slots while parked; snapshot the real return here and
+    // restore it after the tracee is resumed so the exit `sysretq` returns
+    // the syscall's actual value. Skip it when the handler rewound RIP for
+    // re-execution (an interrupted/blocking syscall that will re-run) so an
+    // exit-stop only ever pairs with a truly completed syscall.
+    #[cfg(feature = "linux-compat")]
+    if !user_state.is_null() && ctx.rip() == entry_rip {
+        let saved_ret = ctx.ret;
+        crate::ptrace::ptrace_syscall_stop(&mut ctx, false, num as u64);
+        ctx.set_return(saved_ret);
+    }
     // Linux-compatible signal delivery on the `syscall`-instruction return
     // path. Musl tasks issue `syscall`, never `int 0x80`; Linux delivers
     // any pending, unblocked signal at EVERY kernel→user return (see

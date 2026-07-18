@@ -10657,13 +10657,25 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
 fn reap_stopcont(parent: u64, want: i64, options: u32) -> Option<(u64, i32)> {
     let want_stop = options & WUNTRACED != 0;
     let want_cont = options & WCONTINUED != 0;
-    if !want_stop && !want_cont {
-        return None;
-    }
     let mut g = PENDING_STOPCONT.lock();
     let q = g.as_mut()?.get_mut(&parent)?;
     let idx = q.iter().position(|&(p, _w, cont)| {
-        (want <= 0 || p == want as u64) && ((cont && want_cont) || (!cont && want_stop))
+        if want > 0 && p != want as u64 {
+            return false;
+        }
+        if cont {
+            return want_cont;
+        }
+        // A ptrace-stop is reported to the tracer's wait4 unconditionally;
+        // a job-control stop of a non-traced child needs WUNTRACED.
+        #[cfg(feature = "linux-compat")]
+        {
+            want_stop || crate::ptrace::is_ptrace_stop_recipient(parent, p)
+        }
+        #[cfg(not(feature = "linux-compat"))]
+        {
+            want_stop
+        }
     })?;
     let (pid, w, _) = q.remove(idx);
     Some((pid, w))

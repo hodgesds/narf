@@ -27,6 +27,33 @@ pub const PTRACE_GETREGS: u64 = 12;
 pub const PTRACE_SETREGS: u64 = 13;
 pub const PTRACE_ATTACH: u64 = 16;
 pub const PTRACE_DETACH: u64 = 17;
+pub const PTRACE_SYSCALL: u64 = 24;
+pub const PTRACE_SETOPTIONS: u64 = 0x4200;
+pub const PTRACE_GETREGSET: u64 = 0x4204;
+pub const PTRACE_SETREGSET: u64 = 0x4205;
+
+/// `NT_PRSTATUS` regset id used with PTRACE_GETREGSET/SETREGSET; the
+/// payload is a `user_regs_struct`.
+pub const NT_PRSTATUS: u64 = 1;
+
+/// PTRACE_O_TRACESYSGOOD: OR 0x80 into the SIGTRAP stop signal at a
+/// syscall-stop so the tracer can distinguish it from an ordinary
+/// SIGTRAP.
+pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
+
+/// Per-tracee syscall-stop phase. A PTRACE_SYSCALL resume arms the
+/// tracee to stop at the *next* syscall boundary; the boundary toggles
+/// entry → exit → (disarmed).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum SyscallStopPhase {
+    /// Not tracing syscalls (PTRACE_CONT or never armed).
+    #[default]
+    None,
+    /// Armed by PTRACE_SYSCALL — stop at the next syscall ENTRY.
+    Entry,
+    /// Stopped at entry (or resumed past it) — stop at the matching EXIT.
+    Exit,
+}
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
@@ -91,6 +118,14 @@ pub struct PtraceRegistry {
     pub stop_signal: BTreeMap<u64, u32>,
     /// Maps tracee Process ID -> signal bypass mask (signal number -> bypass)
     pub signal_bypass: BTreeMap<u64, u32>,
+    /// Maps tracee Process ID -> next syscall-stop phase (PTRACE_SYSCALL).
+    pub syscall_stop: BTreeMap<u64, SyscallStopPhase>,
+    /// Maps tracee Process ID -> PTRACE_SETOPTIONS bitset (TRACESYSGOOD, ...).
+    pub options: BTreeMap<u64, u64>,
+    /// Maps tracee Process ID -> orig_rax captured at the last syscall
+    /// ENTRY-stop, so the matching EXIT-stop reports the syscall number
+    /// (state.rax holds the return value by then, not the number).
+    pub orig_rax: BTreeMap<u64, u64>,
 }
 
 pub static PTRACE_STATE: IrqSafeSpinLock<Option<PtraceRegistry>> = IrqSafeSpinLock::new(None);
@@ -138,11 +173,23 @@ pub fn is_tracer_of_any(tracer_pid: u64, want: i64) -> bool {
 }
 
 pub fn get_wait_recipient(child_pid: u64) -> Option<u64> {
-    if let Some(tracer) = get_task_tracer(child_pid) {
-        Some(tracer)
+    if let Some(tracer_pid) = get_task_tracer(child_pid) {
+        // The `tracers` map is visible-pid → visible-pid (the ptrace ABI
+        // namespace), but the wait path (push_stopcont_report / sys_wait4)
+        // keys by TASK id — so hand back the tracer's task id, matching the
+        // `parent_of_get` (also a task id) fallback below.
+        Some(pid_to_tid(tracer_pid))
     } else {
         crate::handlers::parent_of_get(child_pid)
     }
+}
+
+/// True when a STOP of `child_pid` (visible pid) is a ptrace-stop owned by
+/// `parent_task` (task id) — such stops are reported to the tracer's `wait4`
+/// unconditionally (Linux reports ptrace-stops regardless of `WUNTRACED`;
+/// `WUNTRACED` only gates job-control stops of NON-traced children).
+pub fn is_ptrace_stop_recipient(parent_task: u64, child_pid: u64) -> bool {
+    get_task_tracer(child_pid).map(pid_to_tid) == Some(parent_task)
 }
 
 pub fn is_ptrace_signal_bypass(child_pid: u64, signum: u32) -> bool {
@@ -178,7 +225,139 @@ pub fn set_ptrace_signal_bypass(child_pid: u64, signum: u32) {
     }
 }
 
+/// Current syscall-stop phase for `pid`, or `None` if not syscall-tracing.
+pub fn syscall_stop_phase(pid: u64) -> SyscallStopPhase {
+    let g = PTRACE_STATE.lock();
+    g.as_ref()
+        .and_then(|r| r.syscall_stop.get(&pid).copied())
+        .unwrap_or(SyscallStopPhase::None)
+}
+
+fn set_syscall_stop_phase(pid: u64, phase: SyscallStopPhase) {
+    let mut g = PTRACE_STATE.lock();
+    if let Some(r) = g.as_mut() {
+        if phase == SyscallStopPhase::None {
+            r.syscall_stop.remove(&pid);
+        } else {
+            r.syscall_stop.insert(pid, phase);
+        }
+    }
+}
+
+fn ptrace_options(pid: u64) -> u64 {
+    let g = PTRACE_STATE.lock();
+    g.as_ref()
+        .and_then(|r| r.options.get(&pid).copied())
+        .unwrap_or(0)
+}
+
+/// The stop signal delivered to the tracer at a syscall-stop: SIGTRAP,
+/// or SIGTRAP|0x80 when PTRACE_O_TRACESYSGOOD is set.
+fn syscall_stop_signal(pid: u64) -> u32 {
+    const SIGTRAP: u32 = 5;
+    if ptrace_options(pid) & PTRACE_O_TRACESYSGOOD != 0 {
+        SIGTRAP | 0x80
+    } else {
+        SIGTRAP
+    }
+}
+
+fn save_orig_rax(pid: u64, orig: u64) {
+    let mut g = PTRACE_STATE.lock();
+    if let Some(r) = g.as_mut() {
+        r.orig_rax.insert(pid, orig);
+    }
+}
+
+/// True if `pid`'s reported orig_rax should be pinned (used by the exit
+/// stop so GETREGS shows the syscall number, not the return value).
+/// Consulted only by the x86_64 GETREGS path.
+#[cfg(target_arch = "x86_64")]
+fn pinned_orig_rax(pid: u64) -> Option<u64> {
+    let g = PTRACE_STATE.lock();
+    g.as_ref().and_then(|r| r.orig_rax.get(&pid).copied())
+}
+
+/// Syscall-entry/exit stop hook. Called from the live musl syscall
+/// dispatch (`kernel_syscall_entry_plain_with_state`) around the actual
+/// syscall body. `at_entry` selects the entry-stop (before the syscall
+/// runs) vs the exit-stop (after). Returns immediately (a no-op) unless
+/// the current task is traced AND armed for a syscall-stop of the
+/// requested kind; otherwise it reports a SIGTRAP-stop to the tracer and
+/// parks the tracee until PTRACE_SYSCALL/PTRACE_CONT resumes it.
+///
+/// `orig_rax` is the syscall number (state.rax at entry). At the exit
+/// stop we pin it in the tracee's reported registers so a tracer that
+/// reads orig_rax sees the syscall number rather than the return value.
+pub fn ptrace_syscall_stop(ctx: &mut dyn TrapContext, at_entry: bool, orig_rax: u64) {
+    let task = current_task_id();
+    let pid = tid_to_pid(task);
+    if get_task_tracer(pid).is_none() {
+        return;
+    }
+    let phase = syscall_stop_phase(pid);
+    if at_entry {
+        if phase != SyscallStopPhase::Entry {
+            return;
+        }
+        // Remember the syscall number so the exit-stop can report it.
+        save_orig_rax(pid, orig_rax);
+        // Advance to the exit phase; PTRACE_SYSCALL from the tracer
+        // re-arms whichever phase comes next when it resumes us.
+        set_syscall_stop_phase(pid, SyscallStopPhase::Exit);
+    } else {
+        if phase != SyscallStopPhase::Exit {
+            return;
+        }
+        // Pin the syscall number so the tracer's GETREGS at the exit-stop
+        // reports orig_rax as the nr (state.rax now holds the return value).
+        // Cleared by the resume path (PTRACE_SYSCALL/CONT).
+        save_orig_rax(pid, orig_rax);
+        // Consumed on this exit stop.
+        set_syscall_stop_phase(pid, SyscallStopPhase::None);
+    }
+    let sig = syscall_stop_signal(pid);
+    let tracer_tid = pid_to_tid(get_task_tracer(pid).unwrap_or(pid));
+    // At the exit-stop the dispatcher already mirrored the syscall's real
+    // return value into the live user-state's rax slot; capture it so the
+    // stop park preserves it (rather than clobbering rax with 0) — the
+    // tracer's GETREGS must observe the real return value.
+    let preserve_rax = if at_entry {
+        // Entry stop: keep the syscall number visible in rax (Linux shows
+        // the nr / -ENOSYS at entry) rather than clobbering it with 0.
+        Some(orig_rax)
+    } else {
+        // Syscall-stop is x86_64-only (orig_rax/rax ABI); aarch64 UserState has
+        // no `rax` and never reaches here (the syscall.rs hooks are x86_64).
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::user_task::current_user_task().map(|uctx| {
+                // SAFETY: uctx is the current, poller-pinned task ctx (single-CPU
+                // cooperative execution), and its `state` points at the live
+                // UserState the dispatcher just wrote the return value into.
+                unsafe { (*(*uctx).state.get()).rax }
+            })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
+    };
+    // The orig_rax pin persists across the stop so the tracer's GETREGS
+    // (issued WHILE the tracee is parked here) reports the syscall number.
+    // It is cleared by the resume path (PTRACE_SYSCALL/CONT), not here.
+    enter_ptrace_stopped_inner(ctx, task, tracer_tid, sig, preserve_rax);
+}
+
 pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
+    // SIGKILL (9) is never interceptable — it must always terminate, even a
+    // traced (and ptrace-stopped, just-woken) tracee. Letting it be turned
+    // into a ptrace signal-delivery-stop would make a tracee unkillable and
+    // hang the tracer's waitpid. (Linux: SIGKILL is not reported to the
+    // tracer and cannot be suppressed/redirected.)
+    if signum == 9 {
+        return false;
+    }
     let task = current_task_id();
     let pid = tid_to_pid(task);
     if let Some(tracer_pid) = get_task_tracer(pid) {
@@ -199,7 +378,22 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
     }
 }
 
-pub fn enter_ptrace_stopped(ctx: &mut dyn TrapContext, task: u64, _tracer: u64, signum: u32) {
+pub fn enter_ptrace_stopped(ctx: &mut dyn TrapContext, task: u64, tracer: u64, signum: u32) {
+    enter_ptrace_stopped_inner(ctx, task, tracer, signum, None);
+}
+
+/// Core ptrace-stop park. `preserve_rax`, when set, is written into the
+/// saved user-state's rax slot INSTEAD of 0 — the syscall-stop path uses
+/// this so a tracer's GETREGS at the exit-stop sees the syscall's real
+/// return value (a signal-stop, which restarts the interrupted syscall
+/// on resume, keeps the 0-into-rax default and never sets this).
+fn enter_ptrace_stopped_inner(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    _tracer: u64,
+    signum: u32,
+    preserve_rax: Option<u64>,
+) {
     {
         let mut g = PTRACE_STATE.lock();
         if let Some(r) = g.as_mut() {
@@ -220,7 +414,7 @@ pub fn enter_ptrace_stopped(ctx: &mut dyn TrapContext, task: u64, _tracer: u64, 
         // SAFETY: uctx is current task, yield hook never returns
         unsafe {
             let uc = &*uctx;
-            ctx.set_return(SyscallReturn::ok(0));
+            ctx.set_return(SyscallReturn::ok(preserve_rax.unwrap_or(0)));
             uc.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -235,6 +429,11 @@ pub fn enter_ptrace_stopped(ctx: &mut dyn TrapContext, task: u64, _tracer: u64, 
 
 fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
     let tid = pid_to_tid(pid);
+    // At a syscall-EXIT stop, state.rax holds the return value; report the
+    // pinned syscall number as orig_rax (Linux orig_ax semantics). Absent a
+    // pin (entry-stop / signal-stop) orig_rax == the current rax.
+    #[cfg(target_arch = "x86_64")]
+    let orig_rax_pin = pinned_orig_rax(pid);
     crate::user_task::with_user_task_ctx(tid, |uctx| {
         // SAFETY: tracee is registered and stopped, so its state pointer is valid and stable.
         let state = unsafe { *uctx.state.get() };
@@ -242,6 +441,7 @@ fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
         #[cfg(target_arch = "x86_64")]
         {
             let fs_base = uctx.pending_fs_base.load(Ordering::Acquire);
+            let orig_rax = orig_rax_pin.unwrap_or(state.rax);
             user_regs_struct {
                 r15: state.r15,
                 r14: state.r14,
@@ -258,7 +458,7 @@ fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
                 rdx: state.rdx,
                 rsi: state.rsi,
                 rdi: state.rdi,
-                orig_rax: state.rax,
+                orig_rax,
                 rip: state.rip,
                 cs: 0x2b,
                 eflags: state.rflags,
@@ -358,6 +558,16 @@ fn enable_tracee_singlestep(pid: u64) {
     });
 }
 
+fn bytes_of<T>(val: &T) -> &[u8] {
+    // SAFETY: val is a valid reference; reinterpret its bytes read-only.
+    unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
+}
+
+fn bytes_of_mut<T>(val: &mut T) -> &mut [u8] {
+    // SAFETY: val is a valid mutable reference; reinterpret its bytes.
+    unsafe { core::slice::from_raw_parts_mut(val as *mut T as *mut u8, core::mem::size_of::<T>()) }
+}
+
 unsafe fn slice_from_ref<T>(val: &T) -> &[u8] {
     // SAFETY: val is a valid reference, and size matches.
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
@@ -380,8 +590,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
 
     match request {
         PTRACE_TRACEME => {
+            // `parent_of` stores the parent's TASK id, but the `tracers` map is
+            // visible-pid → visible-pid (matching PTRACE_ATTACH's
+            // `insert(pid, caller_pid)` and every ownership check, which use
+            // `tid_to_pid` visible pids). Storing the raw task id here made all
+            // the ownership checks fail with EPERM for a self-traced child.
             let parent_pid = match crate::handlers::parent_of_get(caller_pid) {
-                Some(p) => p,
+                Some(p) => tid_to_pid(p),
                 None => {
                     ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
                     return;
@@ -389,6 +604,11 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             };
             let mut g = PTRACE_STATE.lock();
             if let Some(r) = g.as_mut() {
+                // One tracer per process (Linux: EPERM if already traced).
+                if r.tracers.contains_key(&caller_pid) {
+                    ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                    return;
+                }
                 r.tracers.insert(caller_pid, parent_pid);
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
@@ -409,6 +629,12 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
+                    // A process can have only ONE tracer (Linux: EPERM to
+                    // attach to an already-traced tracee).
+                    if r.tracers.contains_key(&pid) {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
                     r.tracers.insert(pid, caller_pid);
                 } else {
                     ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // ENOSYS
@@ -429,6 +655,9 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 r.stopped.remove(&pid);
                 r.stop_signal.remove(&pid);
                 r.signal_bypass.remove(&pid);
+                r.syscall_stop.remove(&pid);
+                r.options.remove(&pid);
+                r.orig_rax.remove(&pid);
             }
             let tid = pid_to_tid(pid);
             crate::handlers::wake_signal(tid);
@@ -549,7 +778,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
             }
         }
-        PTRACE_CONT | PTRACE_SINGLESTEP => {
+        PTRACE_CONT | PTRACE_SINGLESTEP | PTRACE_SYSCALL => {
             {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
@@ -559,6 +788,32 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     }
                     r.stopped.remove(&pid);
                     r.stop_signal.remove(&pid);
+                    // The tracee is leaving the stop: the exit-stop's pinned
+                    // orig_rax was there only for the tracer's GETREGS while
+                    // stopped, so drop it now (state.rax resumes as truth).
+                    r.orig_rax.remove(&pid);
+                    // PTRACE_SYSCALL arms a stop at the next syscall boundary.
+                    // The syscall-stop hook (ptrace_syscall_stop) toggles this
+                    // Entry → Exit → None; whichever phase is pending now is
+                    // re-armed here so the tracee stops at that boundary next.
+                    // PTRACE_CONT/SINGLESTEP clear syscall tracing entirely.
+                    if request == PTRACE_SYSCALL {
+                        let next = match r
+                            .syscall_stop
+                            .get(&pid)
+                            .copied()
+                            .unwrap_or(SyscallStopPhase::None)
+                        {
+                            // Mid-syscall (stopped at entry) → stop at the exit.
+                            SyscallStopPhase::Exit => SyscallStopPhase::Exit,
+                            // At an exit stop or freshly resumed → stop at the
+                            // next entry.
+                            _ => SyscallStopPhase::Entry,
+                        };
+                        r.syscall_stop.insert(pid, next);
+                    } else {
+                        r.syscall_stop.remove(&pid);
+                    }
                 }
             }
             if request == PTRACE_SINGLESTEP {
@@ -572,9 +827,184 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             crate::handlers::wake_signal(tid);
             ctx.set_return(SyscallReturn::ok(0));
         }
+        PTRACE_SETOPTIONS => {
+            {
+                let mut g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_mut() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
+                    r.options.insert(pid, data);
+                }
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PTRACE_GETREGSET => {
+            // addr = regset id (NT_PRSTATUS); data = iovec* {base, len}.
+            {
+                let g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_ref() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
+                }
+            }
+            if addr != NT_PRSTATUS {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            // Read the caller's iovec (two u64s: iov_base, iov_len).
+            let mut iov = [0u64; 2];
+            // SAFETY: `data` is a user pointer, range-checked by copy_from_user.
+            if unsafe { copy_from_user(bytes_of_mut(&mut iov), data) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            let regs = match get_tracee_regs(pid) {
+                Some(r) => r,
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    return;
+                }
+            };
+            let full = core::mem::size_of::<user_regs_struct>();
+            let n = core::cmp::min(iov[1] as usize, full);
+            // SAFETY: regs is a valid stack value; slice its first `n` bytes.
+            let src = unsafe { slice_from_ref(&regs) };
+            // SAFETY: iov[0] is a user pointer, range-checked by copy_to_user.
+            if iov[0] != 0 && unsafe { copy_to_user(iov[0], &src[..n]) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            // Report the number of bytes actually written back in iov_len.
+            iov[1] = n as u64;
+            // SAFETY: `data` is a user pointer, range-checked by copy_to_user.
+            let _ = unsafe { copy_to_user(data, bytes_of(&iov)) };
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        PTRACE_SETREGSET => {
+            {
+                let g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_ref() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
+                }
+            }
+            if addr != NT_PRSTATUS {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            let mut iov = [0u64; 2];
+            // SAFETY: `data` is a user pointer, range-checked by copy_from_user.
+            if unsafe { copy_from_user(bytes_of_mut(&mut iov), data) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            let full = core::mem::size_of::<user_regs_struct>();
+            if (iov[1] as usize) < full {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            let mut regs = user_regs_struct::default();
+            // SAFETY: iov[0] is a user pointer, range-checked by copy_from_user.
+            if unsafe { copy_from_user(slice_from_ref_mut(&mut regs), iov[0]) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            if set_tracee_regs(pid, regs) {
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            }
+        }
+        PTRACE_PEEKUSER => {
+            // addr = byte offset into user_regs_struct (index*8).
+            {
+                let g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_ref() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
+                }
+            }
+            let regs = match get_tracee_regs(pid) {
+                Some(r) => r,
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    return;
+                }
+            };
+            let nregs = core::mem::size_of::<user_regs_struct>() / 8;
+            let idx = (addr as usize) / 8;
+            if addr % 8 != 0 || idx >= nregs {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            // SAFETY: idx is in bounds of the [u64; nregs]-shaped regs struct.
+            let val = unsafe { *(&regs as *const user_regs_struct as *const u64).add(idx) };
+            // PEEKUSER returns the word as the syscall value; glibc/musl also
+            // accept it written to `data` (PTRACE_PEEK* variant), so mirror it.
+            // SAFETY: `data` is a user pointer, range-checked by copy_to_user.
+            if data != 0 && unsafe { copy_to_user(data, &val.to_ne_bytes()) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(val));
+        }
+        PTRACE_POKEUSER => {
+            {
+                let g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_ref() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
+                }
+            }
+            let mut regs = match get_tracee_regs(pid) {
+                Some(r) => r,
+                None => {
+                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    return;
+                }
+            };
+            let nregs = core::mem::size_of::<user_regs_struct>() / 8;
+            let idx = (addr as usize) / 8;
+            if addr % 8 != 0 || idx >= nregs {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            // SAFETY: idx is in bounds of the [u64; nregs]-shaped regs struct.
+            unsafe { *(&mut regs as *mut user_regs_struct as *mut u64).add(idx) = data };
+            if set_tracee_regs(pid, regs) {
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+            }
+        }
         PTRACE_KILL => {
             let tid = pid_to_tid(pid);
+            // Clear the ptrace-stop so the parked tracee actually RESUMES (as
+            // PTRACE_CONT does) and then terminates on the pending SIGKILL it
+            // wakes into. Without dropping the stop + waking, the tracee stays
+            // parked in own_stack_block forever and the tracer's waitpid never
+            // reaps it.
+            {
+                let mut g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_mut() {
+                    r.stopped.remove(&pid);
+                    r.stop_signal.remove(&pid);
+                    r.syscall_stop.remove(&pid);
+                    r.orig_rax.remove(&pid);
+                }
+            }
             raise_signal_pending(tid, 9); // SIGKILL
+            crate::handlers::wake_signal(tid);
             ctx.set_return(SyscallReturn::ok(0));
         }
         _ => {

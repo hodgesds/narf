@@ -1804,6 +1804,8 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // and rt_sigtimedwait reserving an UNBLOCKED in-set signal for the
         // waiter instead of a nop handler. See sigrt_smoke_x86_64.c.
         ("sigrt_smoke", "sigrt-ok"),
+        // Live PTRACE_SYSCALL strace loop (TRACEME + syscall-stops + GETREGS).
+        ("strace_smoke", "strace-ok"),
         // OCI container end-to-end: the `oci_smoke` runtime reads the
         // /oci bundle, unshares namespaces, sets the container hostname,
         // chroots into the bundle rootfs, and execs the contained

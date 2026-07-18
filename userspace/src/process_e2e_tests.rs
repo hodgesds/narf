@@ -4011,6 +4011,325 @@ fn smoke_process_ptrace_e2e() -> TestResult {
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("userspace/process", smoke_process_ptrace_e2e);
 
+// ── PTRACE_SYSCALL: syscall-entry/exit stops (strace core) ──────────
+//
+// Linux ref: kernel/ptrace.c (PTRACE_SYSCALL) + arch/x86/kernel/
+// ptrace.c syscall_trace_enter/leave. A tracer arms PTRACE_SYSCALL, the
+// tracee stops at the next syscall ENTRY (before it runs) and again at
+// the matching EXIT (after), each reported as a SIGTRAP-stop. The tracer
+// reads orig_rax (the syscall number) at entry and rax (the return
+// value) at exit via GETREGS/GETREGSET/PEEKUSER.
+//
+// This drives the state machine directly (the live musl entry hook needs
+// a real user frame + executor, which the kernel-test harness has not):
+// it verifies the Entry→Exit→None phase transitions, the SIGTRAP|0x80
+// stop signal under PTRACE_O_TRACESYSGOOD, orig_rax pinning at the exit
+// stop, and PEEKUSER/GETREGSET reads. With no executor wired the stop
+// records state and returns instead of parking, so we can assert on it.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_process_ptrace_syscall_stop() -> TestResult {
+    use crate::ptrace::*;
+    use narf_memory::AddressSpace;
+
+    const PARENT: u64 = 0xF0_07;
+    // getpid syscall number on x86_64 Linux ABI (orig_rax at the stops).
+    const SYS_GETPID: u64 = 39;
+    const SIGTRAP: u32 = 5;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+
+    // SAFETY: new_for_user only requires paging to be enabled.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Fork a child (the tracee).
+    let mut ctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+    let child_pid = match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+        _ => {
+            teardown_process_state();
+            *PROC_PARENT_AS.lock() = None;
+            return TestResult::Fail("fork did not return child pid");
+        }
+    };
+    let child_task_raw = crate::handlers::pid_to_task_raw(child_pid).unwrap();
+
+    // Small helper to bail out cleanly.
+    let cleanup = || {
+        crate::task::release_task(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+    };
+
+    // Attach.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut a = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_ATTACH,
+            arg1: child_pid,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut a);
+    if !matches!(a.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("PTRACE_ATTACH failed");
+    }
+
+    // Set PTRACE_O_TRACESYSGOOD so syscall-stops use SIGTRAP|0x80.
+    let mut so = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_SETOPTIONS,
+            arg1: child_pid,
+            arg3: PTRACE_O_TRACESYSGOOD,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut so);
+    if !matches!(so.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("PTRACE_SETOPTIONS failed");
+    }
+
+    // Arm PTRACE_SYSCALL: the next boundary must be an ENTRY stop.
+    let arm = |val: u64| StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_SYSCALL,
+            arg1: child_pid,
+            arg3: val,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    let mut s1 = arm(0);
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut s1);
+    if syscall_stop_phase(child_pid) != SyscallStopPhase::Entry {
+        cleanup();
+        return TestResult::Fail("PTRACE_SYSCALL did not arm entry phase");
+    }
+
+    // Simulate the tracee about to execute getpid: rax = SYS_GETPID.
+    crate::user_task::with_user_task_ctx(child_task_raw, |uctx| {
+        // SAFETY: single-CPU test; child registered.
+        unsafe { (*uctx.state.get()).rax = SYS_GETPID };
+    });
+
+    // Drive the ENTRY stop as the child. No executor is wired, so the stop
+    // records state (stopped=true, orig_rax pinned, phase→Exit) and returns.
+    LOOKUP_TASK.store(child_task_raw, Ordering::Relaxed);
+    let mut cctx = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    ptrace_syscall_stop(&mut cctx, true, SYS_GETPID);
+    if !is_task_ptrace_stopped(child_task_raw) {
+        cleanup();
+        return TestResult::Fail("child not ptrace-stopped at syscall entry");
+    }
+    if syscall_stop_phase(child_pid) != SyscallStopPhase::Exit {
+        cleanup();
+        return TestResult::Fail("entry stop did not advance to exit phase");
+    }
+
+    // Tracer reaps the stop; wstatus WSTOPSIG must be SIGTRAP|0x80.
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut status: i32 = -1;
+    let mut w = StubCtx {
+        args: SyscallArgs {
+            arg0: child_pid,
+            arg1: &mut status as *mut i32 as u64,
+            arg2: 2, // WUNTRACED
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Wait4.raw(), &mut w);
+    if !matches!(w.ret, Some(r) if r.status == SyscallReturn::OK && r.value == child_pid) {
+        cleanup();
+        return TestResult::Fail("wait4 did not reap entry syscall-stop");
+    }
+    let expected = (((SIGTRAP | 0x80) as i32) << 8) | 0x7f;
+    if status != expected {
+        cleanup();
+        return TestResult::Fail("entry stop wstatus not SIGTRAP|0x80");
+    }
+
+    // GETREGS at the ENTRY stop must show orig_rax == SYS_GETPID.
+    let mut regs = user_regs_struct::default();
+    let mut gr = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_GETREGS,
+            arg1: child_pid,
+            arg3: &mut regs as *mut user_regs_struct as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut gr);
+    if !matches!(gr.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("PTRACE_GETREGS at entry failed");
+    }
+    if regs.orig_rax != SYS_GETPID {
+        cleanup();
+        return TestResult::Fail("orig_rax at entry stop != getpid nr");
+    }
+
+    // PEEKUSER of orig_rax (offset 15*8 = 120) must also read the nr.
+    let mut pk = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_PEEKUSER,
+            arg1: child_pid,
+            arg2: 15 * 8,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut pk);
+    if !matches!(pk.ret, Some(r) if r.status == SyscallReturn::OK && r.value == SYS_GETPID) {
+        cleanup();
+        return TestResult::Fail("PTRACE_PEEKUSER orig_rax != getpid nr");
+    }
+
+    // Resume toward the EXIT stop: PTRACE_SYSCALL re-arms the exit phase.
+    let mut s2 = arm(0);
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut s2);
+    if is_task_ptrace_stopped(child_task_raw) {
+        cleanup();
+        return TestResult::Fail("child still stopped after PTRACE_SYSCALL resume");
+    }
+    if syscall_stop_phase(child_pid) != SyscallStopPhase::Exit {
+        cleanup();
+        return TestResult::Fail("PTRACE_SYSCALL did not keep exit phase");
+    }
+
+    // Simulate the completed syscall: rax now holds the return value
+    // (getpid → child_pid). Drive the EXIT stop as the child.
+    let ret_val = child_pid;
+    crate::user_task::with_user_task_ctx(child_task_raw, |uctx| {
+        // SAFETY: single-CPU test; child registered.
+        unsafe { (*uctx.state.get()).rax = ret_val };
+    });
+    LOOKUP_TASK.store(child_task_raw, Ordering::Relaxed);
+    let mut cctx2 = StubCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    ptrace_syscall_stop(&mut cctx2, false, SYS_GETPID);
+    if !is_task_ptrace_stopped(child_task_raw) {
+        cleanup();
+        return TestResult::Fail("child not stopped at syscall exit");
+    }
+    if syscall_stop_phase(child_pid) != SyscallStopPhase::None {
+        cleanup();
+        return TestResult::Fail("exit stop did not disarm syscall tracing");
+    }
+
+    // At the EXIT stop GETREGS must show rax == return value AND orig_rax
+    // == the syscall number (Linux orig_ax preserves the nr across exit).
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    let mut regs2 = user_regs_struct::default();
+    let mut gr2 = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_GETREGS,
+            arg1: child_pid,
+            arg3: &mut regs2 as *mut user_regs_struct as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut gr2);
+    if !matches!(gr2.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("PTRACE_GETREGS at exit failed");
+    }
+    if regs2.rax != ret_val {
+        cleanup();
+        return TestResult::Fail("rax at exit stop != return value");
+    }
+    if regs2.orig_rax != SYS_GETPID {
+        cleanup();
+        return TestResult::Fail("orig_rax at exit stop != getpid nr");
+    }
+
+    // GETREGSET (NT_PRSTATUS) must return the same registers via an iovec.
+    let mut rs = user_regs_struct::default();
+    let mut iov = [
+        &mut rs as *mut user_regs_struct as u64,
+        core::mem::size_of::<user_regs_struct>() as u64,
+    ];
+    let mut grs = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_GETREGSET,
+            arg1: child_pid,
+            arg2: NT_PRSTATUS,
+            arg3: &mut iov as *mut [u64; 2] as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut grs);
+    if !matches!(grs.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("PTRACE_GETREGSET failed");
+    }
+    if rs.rax != ret_val || rs.orig_rax != SYS_GETPID {
+        cleanup();
+        return TestResult::Fail("GETREGSET registers mismatch");
+    }
+    if iov[1] != core::mem::size_of::<user_regs_struct>() as u64 {
+        cleanup();
+        return TestResult::Fail("GETREGSET did not report full regset length");
+    }
+
+    // Resume with PTRACE_CONT: syscall tracing must be fully disarmed.
+    let mut cont = StubCtx {
+        args: SyscallArgs {
+            arg0: PTRACE_CONT,
+            arg1: child_pid,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ptrace.raw(), &mut cont);
+    if !matches!(cont.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
+        cleanup();
+        return TestResult::Fail("PTRACE_CONT failed");
+    }
+    if syscall_stop_phase(child_pid) != SyscallStopPhase::None {
+        cleanup();
+        return TestResult::Fail("PTRACE_CONT did not disarm syscall tracing");
+    }
+
+    crate::task::release_task(child_task_raw);
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    narf_memory::frame::cow::__test_clear();
+    TestResult::Pass
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("userspace/process", smoke_process_ptrace_syscall_stop);
+
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 fn smoke_process_coredump_e2e() -> TestResult {
     use narf_memory::AddressSpace;
