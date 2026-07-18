@@ -251,6 +251,30 @@ pub unsafe extern "C" fn enter_user_mode(rip: u64, rsp: u64) -> ! {
         "push {rflags}",                  // rflags (IF=1)
         "push {ucode}",                   // cs
         "push rdi",                       // rip
+        // Scrub every GPR before dropping to CPL=3. Linux zeroes the
+        // whole register file at ELF entry (ELF_PLAT_INIT), and the
+        // SysV/glibc startup contract makes this LOAD-BEARING: glibc's
+        // `_start` treats a non-zero entry %rdx as the "rtld_fini"
+        // function pointer and registers it with __cxa_atexit — a stale
+        // kernel value here becomes a wild jump into kernel VA space
+        // when exit(3) runs the handler list (#PF rip==cr2 at a
+        // kernel-layout address). Also stops leaking kernel pointers
+        // (stack tops, Box addresses) to user code in general.
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
         udata  = const UDATA_SEL,
         ucode  = const UCODE_SEL,
@@ -281,6 +305,24 @@ pub unsafe extern "C" fn enter_user_mode_with_arg(rip: u64, rsp: u64, arg: u64) 
         // first SysV integer arg. rdx is caller-saved per SysV
         // and we're about to iretq, so clobbering it is fine.
         "mov rdi, rdx",
+        // Scrub the remaining GPRs (see `enter_user_mode`): only RDI
+        // (the delivered arg) is part of the entry contract; everything
+        // else must be zero so no kernel value leaks to CPL=3 and
+        // glibc's `_start` doesn't mistake a stale %rdx for rtld_fini.
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
         udata  = const UDATA_SEL,
         ucode  = const UCODE_SEL,
@@ -361,6 +403,26 @@ pub unsafe extern "C" fn enter_user_mode_at_top(rip: u64, user_rsp: u64, stack_t
         "push {rflags}",                  // rflags (IF=1)
         "push {ucode}",                   // cs
         "push rdi",                       // rip
+        // Scrub every GPR before the iretq (see `enter_user_mode`).
+        // This variant is the worst leak of the family: RDX literally
+        // holds this task's page-aligned KERNEL STACK TOP here, which
+        // glibc's `_start` would register as rtld_fini and call at
+        // exit(3) — the observed glibc static-PIE exit #PF.
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
         udata  = const UDATA_SEL,
         ucode  = const UCODE_SEL,
@@ -393,6 +455,23 @@ pub unsafe extern "C" fn enter_user_mode_with_arg_at_top(
         "push {ucode}",                   // cs
         "push rdi",                       // rip
         "mov rdi, rdx",                   // arg → first SysV integer arg (RDI)
+        // Scrub the remaining GPRs (see `enter_user_mode_at_top`): RCX
+        // holds the kernel stack top and RDX the (already-delivered)
+        // arg; nothing but RDI may reach CPL=3.
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
         udata  = const UDATA_SEL,
         ucode  = const UCODE_SEL,
