@@ -1578,14 +1578,22 @@ fn smoke_smp_mark_online_offline() -> TestResult {
     if smp::is_online(TEST_SLOT) {
         return TestResult::Fail("offline didn't clear initial state");
     }
-    // SAFETY: not actually running on CPU TEST_SLOT; this is a
-    // bookkeeping surface test, not real bring-up.
-    // SAFETY: Valid memory or trusted environment
-    unsafe {
-        smp::mark_online(TEST_SLOT);
-    }
+    // Fake setter, NOT `mark_online`: the real marker's unsafe contract is
+    // "calling CPU only", and it also stamps the monotonic ever-online
+    // record — polluting that from a fake slot would make the scheduler
+    // remote-kick smoke (which skips whenever any CPU besides the BSP was
+    // ever genuinely online) skip forever on real SMP=1 boots.
+    smp::__test_fake_online(TEST_SLOT);
     if !smp::is_online(TEST_SLOT) {
-        return TestResult::Fail("mark_online didn't set bit");
+        return TestResult::Fail("fake online didn't set bit");
+    }
+    // The fake must NOT register in the ever-genuinely-online record.
+    if smp::ever_online_bitmap() & (1u64 << TEST_SLOT) != 0 {
+        return TestResult::Fail("fake online leaked into ever-online record");
+    }
+    // The BSP's boot bring-up must.
+    if smp::ever_online_bitmap() & 1 == 0 {
+        return TestResult::Fail("BSP missing from ever-online record");
     }
     smp::mark_offline(TEST_SLOT);
     if smp::is_online(TEST_SLOT) {

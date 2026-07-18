@@ -532,7 +532,11 @@ kernel_test_in!("filesystem", smoke_sysfs_kobject_emit_uevent);
 #[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_range_attrs() -> TestResult {
     crate::sysfs::__reset_for_test();
-    narf_lib::smp::__reset_for_test();
+    // Scoped: restores the REAL cpu count + online bitmap on every exit
+    // path. The unscoped reset left a falsified BSP-only topology behind
+    // for the rest of the shared kernel-test boot, defeating the
+    // scheduler remote-kick smoke's "SMP=1 only" guard (its flake).
+    let _topo = narf_lib::smp::__reset_for_test_scoped();
 
     // Default: 1 CPU → "0\n"
     crate::sysfs::populate_cpu_devices();
@@ -594,7 +598,6 @@ fn smoke_sysfs_cpu_range_attrs() -> TestResult {
         _ => return TestResult::Fail("kernel_max wrong for 4 cpus"),
     }
 
-    narf_lib::smp::__reset_for_test();
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
@@ -605,7 +608,8 @@ kernel_test_in!("filesystem", smoke_sysfs_cpu_range_attrs);
 #[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
     crate::sysfs::__reset_for_test();
-    narf_lib::smp::__reset_for_test();
+    // Scoped — see smoke_sysfs_cpu_range_attrs.
+    let _topo = narf_lib::smp::__reset_for_test_scoped();
     narf_lib::smp::set_cpu_count(3);
     crate::sysfs::populate_cpu_devices();
 
@@ -616,30 +620,24 @@ fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
         .and_then(|s| s.get_child("cpu"))
     {
         Some(k) => k,
-        None => {
-            narf_lib::smp::__reset_for_test();
-            return TestResult::Fail("/sys/devices/system/cpu missing");
-        }
+        None => return TestResult::Fail("/sys/devices/system/cpu missing"),
     };
 
     // cpu0, cpu1, cpu2 must all exist.
     for i in 0..3u32 {
         let name = alloc::format!("cpu{}", i);
         if cpu_dir.get_child(&name).is_none() {
-            narf_lib::smp::__reset_for_test();
             return TestResult::Fail("cpuN dir missing");
         }
     }
     // cpu3 must not exist (only 3 CPUs).
     if cpu_dir.get_child("cpu3").is_some() {
-        narf_lib::smp::__reset_for_test();
         return TestResult::Fail("cpu3 dir unexpectedly present");
     }
 
     // cpu0 must not have an `online` attribute (Linux omits it for cpu0).
     let cpu0 = cpu_dir.get_child("cpu0").unwrap();
     if cpu0.attr_show("online").is_some() {
-        narf_lib::smp::__reset_for_test();
         return TestResult::Fail("cpu0 has online attr (should be absent)");
     }
 
@@ -647,13 +645,9 @@ fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
     let cpu1 = cpu_dir.get_child("cpu1").unwrap();
     match cpu1.attr_show("online") {
         Some(ref s) if s == "1\n" => {}
-        _ => {
-            narf_lib::smp::__reset_for_test();
-            return TestResult::Fail("cpu1/online not '1'");
-        }
+        _ => return TestResult::Fail("cpu1/online not '1'"),
     }
 
-    narf_lib::smp::__reset_for_test();
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
@@ -669,7 +663,8 @@ kernel_test_in!("filesystem", smoke_sysfs_cpu_dirs_and_online_attr);
 #[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
     crate::sysfs::__reset_for_test();
-    narf_lib::smp::__reset_for_test();
+    // Scoped — see smoke_sysfs_cpu_range_attrs.
+    let _topo = narf_lib::smp::__reset_for_test_scoped();
     narf_lib::smp::set_cpu_count(4);
     crate::sysfs::populate_cpu_devices();
 
@@ -682,10 +677,7 @@ fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
         .and_then(|c| c.get_child("topology"))
     {
         Some(k) => k,
-        None => {
-            narf_lib::smp::__reset_for_test();
-            return TestResult::Fail("cpu2/topology dir missing");
-        }
+        None => return TestResult::Fail("cpu2/topology dir missing"),
     };
 
     let checks: &[(&str, &str)] = &[
@@ -700,17 +692,12 @@ fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
             Some(ref got) if got == expected => {}
             Some(ref got) => {
                 let _ = got;
-                narf_lib::smp::__reset_for_test();
                 return TestResult::Fail("topology attr value mismatch");
             }
-            None => {
-                narf_lib::smp::__reset_for_test();
-                return TestResult::Fail("topology attr missing");
-            }
+            None => return TestResult::Fail("topology attr missing"),
         }
     }
 
-    narf_lib::smp::__reset_for_test();
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]
@@ -724,7 +711,8 @@ kernel_test_in!("filesystem", smoke_sysfs_cpu_topology_attrs);
 #[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     crate::sysfs::__reset_for_test();
-    narf_lib::smp::__reset_for_test();
+    // Scoped — see smoke_sysfs_cpu_range_attrs.
+    let _topo = narf_lib::smp::__reset_for_test_scoped();
     narf_lib::smp::set_cpu_count(4);
     crate::sysfs::populate_cpu_devices();
 
@@ -737,10 +725,7 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
         .and_then(|c| c.get_child("topology"))
     {
         Some(k) => k,
-        None => {
-            narf_lib::smp::__reset_for_test();
-            return TestResult::Fail("cpu2/topology missing for hex mask test");
-        }
+        None => return TestResult::Fail("cpu2/topology missing for hex mask test"),
     };
 
     // cpu2 → bit 2 set → word 0 = 0x4.
@@ -750,13 +735,9 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
             Some(ref s) if s == expected_core => {}
             Some(ref s) => {
                 let _ = s;
-                narf_lib::smp::__reset_for_test();
                 return TestResult::Fail("core_cpus/thread_siblings hex mask wrong");
             }
-            None => {
-                narf_lib::smp::__reset_for_test();
-                return TestResult::Fail("core_cpus/thread_siblings missing");
-            }
+            None => return TestResult::Fail("core_cpus/thread_siblings missing"),
         }
     }
 
@@ -766,24 +747,18 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
         Some(ref s) if s == expected_pkg => {}
         Some(ref s) => {
             let _ = s;
-            narf_lib::smp::__reset_for_test();
             return TestResult::Fail("package_cpus hex mask wrong");
         }
-        None => {
-            narf_lib::smp::__reset_for_test();
-            return TestResult::Fail("package_cpus missing");
-        }
+        None => return TestResult::Fail("package_cpus missing"),
     }
 
     // Also verify the format is the 4-word comma-separated format
     // (not a bare integer): must contain exactly 3 commas.
     let comma_count = expected_core.chars().filter(|&c| c == ',').count();
     if comma_count != 3 {
-        narf_lib::smp::__reset_for_test();
         return TestResult::Fail("cpumap format: expected 3 commas (4 words)");
     }
 
-    narf_lib::smp::__reset_for_test();
     TestResult::Pass
 }
 #[cfg(feature = "linux-compat")]

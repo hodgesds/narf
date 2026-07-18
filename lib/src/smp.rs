@@ -26,6 +26,17 @@ static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 /// kernel code). The BSP (id 0) sets its bit at static-init time.
 static ONLINE_BITMAP: AtomicU64 = AtomicU64::new(0x0000_0000_0000_0001);
 
+/// Bit i = 1 → logical CPU i has EVER been genuinely online this boot
+/// (Linux `cpu_present_mask` analogue). Monotonic: set by [`mark_online`]
+/// and never cleared — not by [`mark_offline`], not by
+/// [`__reset_for_test`]. A really-started AP stays parked in the
+/// scheduler's `run_forever` idle loop (owning its `CPU_HALTED` slot,
+/// polling its queue) even when a hotplug/sysfs test rewrites the online
+/// bitmap, so tests that need exclusive control of a CPU's scheduler
+/// state must consult THIS record, which the test-only topology fakes
+/// ([`__test_fake_online`], [`__reset_for_test`]) cannot falsify.
+static EVER_ONLINE_BITMAP: AtomicU64 = AtomicU64::new(0x0000_0000_0000_0001);
+
 /// Mark this CPU as online. Called once per CPU during its
 /// per-CPU bring-up path.
 ///
@@ -33,10 +44,12 @@ static ONLINE_BITMAP: AtomicU64 = AtomicU64::new(0x0000_0000_0000_0001);
 /// `logical_id` must match the calling CPU. AP bring-up writes
 /// `IA32_TSC_AUX` (x86_64) or registers in the MPIDR table
 /// (aarch64) before calling this so `arch::current_cpu_id()`
-/// agrees.
+/// agrees. Tests faking a topology must use [`__test_fake_online`]
+/// instead, so the monotonic ever-online record stays truthful.
 pub unsafe fn mark_online(logical_id: u32) {
     if (logical_id as usize) < MAX_CPUS {
         ONLINE_BITMAP.fetch_or(1u64 << logical_id, Ordering::Release);
+        EVER_ONLINE_BITMAP.fetch_or(1u64 << logical_id, Ordering::Release);
     }
 }
 
@@ -79,10 +92,68 @@ pub fn is_online(logical_id: u32) -> bool {
     online_bitmap() & (1u64 << logical_id) != 0
 }
 
+/// Snapshot of the monotonic ever-online bitmap (see
+/// [`EVER_ONLINE_BITMAP`]). `!= 1` ⇒ at least one AP genuinely came up
+/// this boot, whatever the (fakeable) online bitmap currently claims.
+pub fn ever_online_bitmap() -> u64 {
+    EVER_ONLINE_BITMAP.load(Ordering::Acquire)
+}
+
+/// Test-only: force `logical_id`'s bit in the ONLINE bitmap without
+/// recording it as ever-genuinely-online. For smokes that fake a
+/// topology (scheduler remote-kick, bitmap surface tests); pair with
+/// [`mark_offline`] to undo. Real bring-up must use [`mark_online`].
+#[doc(hidden)]
+pub fn __test_fake_online(logical_id: u32) {
+    if (logical_id as usize) < MAX_CPUS {
+        ONLINE_BITMAP.fetch_or(1u64 << logical_id, Ordering::Release);
+    }
+}
+
+/// Test-only: force the published topology to single-CPU (BSP only).
+///
+/// PREFER [`__reset_for_test_scoped`]: this variant does NOT restore the
+/// real topology, so on an SMP boot every later test in the run sees a
+/// falsified `online_count()`/`cpu_count()` while the really-started APs
+/// keep running — that defeated the scheduler remote-kick smoke's
+/// "SMP=1 only" guard and made it flake against a live AP.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     CPU_COUNT.store(1, Ordering::Release);
     ONLINE_BITMAP.store(1, Ordering::Release);
+}
+
+/// RAII restore for [`__reset_for_test_scoped`]: puts back the CPU count
+/// and online bitmap captured before the fake, on every exit path.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct TestTopologyReset {
+    count: u32,
+    bitmap: u64,
+}
+
+impl Drop for TestTopologyReset {
+    fn drop(&mut self) {
+        CPU_COUNT.store(self.count, Ordering::Release);
+        ONLINE_BITMAP.store(self.bitmap, Ordering::Release);
+    }
+}
+
+/// Test-only: force the published topology to single-CPU (BSP only) for
+/// the lifetime of the returned guard, then RESTORE the real topology.
+/// Use this (not [`__reset_for_test`]) from smokes that fake a CPU
+/// count/bitmap — the kernel-test suite shares one boot, and a
+/// left-falsified topology corrupts every later test's view of the
+/// really-online CPUs.
+#[doc(hidden)]
+#[must_use = "the guard's Drop restores the real topology"]
+pub fn __reset_for_test_scoped() -> TestTopologyReset {
+    let snap = TestTopologyReset {
+        count: CPU_COUNT.load(Ordering::Acquire),
+        bitmap: ONLINE_BITMAP.load(Ordering::Acquire),
+    };
+    __reset_for_test();
+    snap
 }
 
 /// Read CPUID leaf 1 EBX[23:16] for the logical-processor count

@@ -472,29 +472,46 @@ kernel_test_in!("scheduler", smoke_scheduler_per_cpu_pin_to_bsp);
 fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
     use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
 
-    // This test commandeers CPU 1 as a FAKE idle-halted AP (`mark_online` +
-    // `__test_set_cpu_halted`) and asserts against the GLOBAL resched
-    // counters. Both only hold when no REAL AP is live: at SMP>1 CPU 1 is a
-    // genuine core that manages its own `CPU_HALTED` bit and issues its own
-    // reschedules, and every other AP bumps the shared `RESCHED_SENT`/`SKIP`
-    // counters concurrently — so the faked state and the counter deltas are
-    // both polluted (the negative "running target sent no IPI" assertion
-    // false-fails). The kick logic itself is exercised for real by the
-    // condbcast/futex_contend cases at the full 16-vCPU topology; here we
-    // pin the decision deterministically, which is only possible at SMP=1.
+    // This test commandeers CPU 1 as a FAKE idle-halted AP
+    // (`__test_fake_online` + `__test_set_cpu_halted`) and asserts against
+    // the GLOBAL resched counters. Both only hold when no REAL AP is live:
+    // at SMP>1 CPU 1 is a genuine core that manages its own `CPU_HALTED`
+    // bit and issues its own reschedules, and every other AP bumps the
+    // shared `RESCHED_SENT`/`SKIP` counters concurrently — so the faked
+    // state and the counter deltas are both polluted (the negative
+    // "running target sent no IPI" assertion false-fails). The kick logic
+    // itself is exercised for real by the condbcast/futex_contend cases at
+    // the full 16-vCPU topology; here we pin the decision
+    // deterministically, which is only possible at SMP=1.
     if narf_lib::smp::online_count() > 1 {
         return TestResult::Skip(
             "needs SMP=1 — a live AP pollutes CPU_HALTED[1] and the global resched counters",
         );
     }
+    // The online bitmap alone is NOT a sound guard: it is fakeable test
+    // state, and earlier smokes in the shared kernel-test boot falsify it
+    // (the sysfs cpu-device smokes used to leave `smp::__reset_for_test`'s
+    // BSP-only bitmap behind on a 16-vCPU boot). A really-started AP keeps
+    // running `run_forever` regardless of the bitmap, flipping
+    // `CPU_HALTED[1]` around every idle HLT and draining `READY[1]` when
+    // our spawn's (real) resched IPI wakes it — which raced this test's
+    // halted-flag writes in BOTH directions (the historical flake: "did
+    // not send a resched kick" when AP 1's post-wake clear landed before
+    // the first spawn's check, "spurious resched IPI" when its re-halt
+    // publish landed after our not-halted store). The monotonic
+    // ever-online record can't be falsified: any AP that ever came up
+    // this boot means CPU 1's scheduler state isn't ours to script.
+    if narf_lib::smp::ever_online_bitmap() != 1 {
+        return TestResult::Skip(
+            "an AP really came up this boot — run_forever owns CPU_HALTED[1], not the test",
+        );
+    }
 
     crate::__reset_queues_for_test();
 
-    // Pretend CPU 1 is an online, idle-halted AP. Restored below.
-    // SAFETY: test-scoped bookkeeping bit; no CPU actually runs on it.
-    unsafe {
-        narf_lib::smp::mark_online(1);
-    }
+    // Pretend CPU 1 is an online, idle-halted AP. Restored below. The
+    // fake setter keeps the ever-online record truthful for later tests.
+    narf_lib::smp::__test_fake_online(1);
     crate::__test_set_cpu_halted(1, true);
 
     let spec = TaskSpec {
