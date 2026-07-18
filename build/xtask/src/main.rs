@@ -1799,6 +1799,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
         ("signal_smoke", "signal-ok"),
+        // RT-signal regression for the stress-ng --sigrt fixes: si_pid on
+        // SA_SIGINFO for a queued signal, a forked child's clean signal mask,
+        // and rt_sigtimedwait reserving an UNBLOCKED in-set signal for the
+        // waiter instead of a nop handler. See sigrt_smoke_x86_64.c.
+        ("sigrt_smoke", "sigrt-ok"),
         // OCI container end-to-end: the `oci_smoke` runtime reads the
         // /oci bundle, unshares namespaces, sets the container hostname,
         // chroots into the bundle rootfs, and execs the contained

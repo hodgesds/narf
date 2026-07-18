@@ -592,6 +592,7 @@ fn main() {
         "tfd_epoll_smoke",
         "unix_epoll_smoke",
         "shmfork_smoke",
+        "sigrt_smoke",
     ] {
         let src = manifest_dir.join(format!("data/musl-demo/{test}_x86_64.c"));
         println!("cargo:rerun-if-changed={}", src.display());

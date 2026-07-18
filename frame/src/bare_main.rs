@@ -3554,6 +3554,7 @@ fn boot_userspace_init() {
                 ),
                 ("epoll_smoke", narf_verification::NARF_EPOLL_SMOKE_ELF),
                 ("signal_smoke", narf_verification::NARF_SIGNAL_SMOKE_ELF),
+                ("sigrt_smoke", narf_verification::NARF_SIGRT_SMOKE_ELF),
                 ("fs_smoke", narf_verification::NARF_FS_SMOKE_ELF),
                 // Linux-compat round: eventfd2 / getrandom / socketpair
                 // / accept4 exercised end-to-end by real musl binaries.
