@@ -242,8 +242,7 @@ pub const FPU_AREA_SIZE: usize = 4096;
 /// wouldn't fit) ⇒ use the `FXSAVE`/`FXRSTOR` fallback. Non-zero ⇒ the
 /// `XCR0` subset to `XSAVE`/`XRSTOR` (only the enabled components). Set once
 /// on the BSP at boot; the value is identical on every (homogeneous) CPU.
-static FPU_XSAVE_MASK: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+static FPU_XSAVE_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Decide the per-task FPU save method. Call ONCE at boot AFTER
 /// [`enable_default`] (which sets `XCR0`) and with `CR4.OSXSAVE` set. Selects
