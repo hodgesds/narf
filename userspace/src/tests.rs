@@ -6357,6 +6357,13 @@ fn smoke_userspace_times_writes_tms_struct() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
+    // The kernel-test harness runs every test as one shared task, so prior
+    // tests' kernel_syscall_entry brackets accumulated in-syscall CPU time
+    // against it. Clear it so this test measures a FRESH task's stime (== 0)
+    // rather than the suite's cumulative kernel time — which under slow TCG
+    // execution exceeds one tick and flaps the stime==0 assertion below.
+    crate::handlers::__test_reset_kernel_time();
+
     let mut buf = [0i64; 4];
     let mut ctx = FakeCtx {
         args: SyscallArgs {

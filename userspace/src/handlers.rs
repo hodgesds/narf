@@ -17267,6 +17267,20 @@ pub fn kern_time_ns_of(task: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// Test hook: clear the current task's accumulated in-syscall (kernel) CPU
+/// time. The kernel-test harness runs every test as ONE shared task, so every
+/// prior test's `kernel_syscall_entry` bracket accumulates here; under slow
+/// (TCG) execution that cumulative time crosses one tick and flaps the `times`
+/// stime==0 assertion. The times test resets it first so it measures a fresh
+/// task, which is what the assertion means.
+#[doc(hidden)]
+pub fn __test_reset_kernel_time() {
+    let task = current_task_id();
+    if let Some(m) = TASK_KERN_NS.lock().as_mut() {
+        m.remove(&task);
+    }
+}
+
 /// Test hook: account `delta_ns` to an arbitrary task (the production
 /// path only ever charges the currently-running task). Lets the ABI test
 /// seed a stand-in child's CPU time to exercise the RUSAGE_CHILDREN fold.
@@ -17480,6 +17494,8 @@ pub(crate) fn store_sigqueue_info(
 
 /// Total queued rt_sigqueueinfo payloads pending for `task` across every
 /// signum — the sender-side back-pressure probe (see `sys_rt_sigqueueinfo`).
+/// Only consulted on the x86_64 own-stack resched path.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn sigqueue_depth(task: u64) -> usize {
     let g = SIGQUEUE_INFO.lock();
     g.as_ref()
@@ -17495,6 +17511,7 @@ pub(crate) fn sigqueue_depth(task: u64) -> usize {
 /// can consume it and the run never terminates). Linux gets the equivalent
 /// pacing from preemptive multi-CPU scheduling; this is the cooperative
 /// analogue, and it only triggers on genuinely backlogged floods.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const SIGQUEUE_BACKPRESSURE_DEPTH: usize = 4;
 
 /// Pop and return the OLDEST queued `(si_code, si_value, si_pid)` for
