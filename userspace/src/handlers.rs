@@ -5321,6 +5321,27 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
+        // The fixed hint is fully user-controlled — bound it to the
+        // user-mappable window [USER_FIXED_FLOOR, USER_HALF_END) before
+        // touching the region table. Above the ceiling the VA is
+        // non-canonical / kernel-half (x86_64 map_4kb returns
+        // NonCanonical — pre-check, materialize() PANICKED on it, which
+        // is how stress-ng --mmapfixed wedged the whole VM: it walks
+        // MAP_FIXED|MAP_SHARED hints down from 1 << 63). Below the
+        // floor lies PML4[0], the kernel low-identity window every user
+        // PML4 shares — mapping there would plant user PTEs in
+        // kernel-shared page tables (visible to every process) or trip
+        // its huge pages. Linux answers an out-of-range MAP_FIXED addr
+        // with -ENOMEM; do the same.
+        let fixed_ok = hint
+            .checked_add(len)
+            .map(|end| hint >= AddressSpace::USER_FIXED_FLOOR && end <= AddressSpace::USER_HALF_END)
+            .unwrap_or(false);
+        if !fixed_ok {
+            const ENOMEM: i64 = 12;
+            ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
+            return;
+        }
         // Punch out exactly [hint, hint+len), splitting (not destroying)
         // any region it overlaps so the non-replaced pages survive — the
         // dynamic linker overlays DSO segments onto its whole-file mapping
@@ -5382,6 +5403,10 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // root); the region was just registered via map_region, so
                 // materialize installs only its PTEs over borrowed frames.
                 if unsafe { as_ref.materialize() }.is_err() {
+                    // Roll back so the failed region can't poison later
+                    // materialize() calls (SHARED → PTE-clear only, the
+                    // device keeps its frames).
+                    let _ = as_ref.unmap_region(VirtAddr::new(base));
                     ctx.set_return(SyscallReturn::invalid_op());
                     return;
                 }
@@ -5430,10 +5455,16 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
                             ctx.set_return(SyscallReturn::ok(base));
                             return;
                         }
-                        // Mapped but materialize failed: the region already
-                        // references the registry frames, so leave the segment
-                        // owned by narf-shmem (the exit observer reaps it) and
-                        // report failure rather than risk a dangling region.
+                        // Mapped but materialize failed (e.g. the fixed hint
+                        // hits a kernel huge page): ROLL BACK. Leaving the
+                        // region registered poisons the AS — every later
+                        // materialize() re-walks it, hits the same error, and
+                        // every subsequent mmap in the process fails. The
+                        // region is SHARED so unmap_region only clears PTEs
+                        // (frames stay registry-owned), then destroy reaps
+                        // the now-unreferenced segment.
+                        let _ = as_ref.unmap_region(VirtAddr::new(base));
+                        (v.destroy)(handle);
                         ctx.set_return(SyscallReturn::invalid_op());
                         return;
                     }
@@ -5536,6 +5567,12 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
     // was just registered via `map_region`, so materialize installs only its PTEs.
     // SAFETY: Valid memory or trusted environment
     if unsafe { as_ref.materialize() }.is_err() {
+        // Roll the region back — leaving it registered poisons every
+        // later materialize() in this AS (each re-walks the region,
+        // hits the same map error, and the whole mmap surface goes
+        // dark for the process). unmap_region frees any file-read
+        // frames via the region's own phys list.
+        let _ = as_ref.unmap_region(VirtAddr::new(base));
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
@@ -5549,13 +5586,18 @@ fn sys_mmap(ctx: &mut dyn TrapContext) {
 /// lazily backed (demand-paged) like a fresh mmap, so contents are
 /// preserved with no copy. Shrink / no-op returns `old_addr`
 /// unchanged; a grow that would collide with another region returns
-/// `-ENOMEM` (we don't relocate even with MREMAP_MAYMOVE today).
+/// `-ENOMEM` (we don't relocate even with MREMAP_MAYMOVE today), and
+/// `MREMAP_FIXED` — an explicit move to a caller-chosen address — is
+/// refused with `-ENOMEM` up front rather than "succeeding" in place.
 fn sys_mremap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let old_addr = args.arg0;
     let old_len = (args.arg1 + 0xFFF) & !0xFFFu64;
     let new_len = (args.arg2 + 0xFFF) & !0xFFFu64;
-    let _flags = args.arg3 as u32;
+    let flags = args.arg3 as u32;
+    const MREMAP_MAYMOVE: u32 = 1;
+    const MREMAP_FIXED: u32 = 2;
+    const MREMAP_DONTUNMAP: u32 = 4;
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -5563,8 +5605,21 @@ fn sys_mremap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    if old_addr & 0xFFF != 0 || new_len == 0 {
+    if old_addr & 0xFFF != 0
+        || new_len == 0
+        || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+    {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // MREMAP_FIXED asks for relocation to arg4's exact address —
+    // which we don't implement. Fail with -ENOMEM (the Linux "cannot
+    // move" answer) instead of returning old_addr as a fake success:
+    // a caller believing the move happened would touch the requested
+    // new address and SEGV (stress-ng --mmapfixed hammers exactly
+    // this shape with arbitrary 64-bit targets).
+    if flags & MREMAP_FIXED != 0 {
+        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
         return;
     }
     if new_len <= old_len {

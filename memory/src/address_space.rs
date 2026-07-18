@@ -181,6 +181,31 @@ impl AddressSpace {
     /// multithreaded process that spawned a second thread.
     pub const MMAP_WINDOW_TOP: u64 = 0x0000_7F00_0000_0000;
 
+    /// End of the mappable user half: 1 << 47 is the first
+    /// non-canonical low address on x86_64, and NARF's user layout
+    /// (binary / interp / mmap arena / stack) tops out below it on
+    /// both arches. `map_region` / `grow_region` reject anything
+    /// crossing this so a user-controlled base (MAP_FIXED hint,
+    /// shmat addr, mremap grow) can never register a region the
+    /// paging layer can't legally install — x86_64 `map_4kb` returns
+    /// `NonCanonical` for such a VA, which `materialize` treats as a
+    /// can't-happen invariant violation and panics on.
+    pub const USER_HALF_END: u64 = 0x0000_8000_0000_0000;
+
+    /// Floor of the window where a *user-directed* fixed mapping may
+    /// land. Everything below 512 GiB decodes to PML4[0], which every
+    /// x86_64 user PML4 shares with the kernel (the low-identity
+    /// window bulk-copied by `new_user_pml4`): a user mapping there
+    /// would either hit a kernel huge page (`EncounteredHugePage`) or
+    /// plant user PTEs inside KERNEL-SHARED page tables, leaking the
+    /// mapping into every address space. NARF's own user layout
+    /// starts at PML4[1] (binary base 0x0000_0080_0000_1000), so no
+    /// legitimate fixed mapping lives below this. Policy is enforced
+    /// at the syscall boundary (`sys_mmap` MAP_FIXED), not in
+    /// `map_region` — kernel-internal callers and unit tests still
+    /// place structural regions at low VAs.
+    pub const USER_FIXED_FLOOR: u64 = 0x0000_0080_0000_0000;
+
     /// Fresh address space with no regions. Stage-4 arch backend
     /// must assign `root` to a freshly-allocated page-table frame.
     pub const fn empty() -> Self {
@@ -342,6 +367,15 @@ impl AddressSpace {
             .as_u64()
             .checked_add(region.len)
             .ok_or(AddressSpaceError::OutOfRange)?;
+        // Reject regions crossing out of the user half. A base at or
+        // past 1 << 47 is non-canonical (or kernel-half) — `map_4kb`
+        // can never install its PTEs, and on x86_64 `materialize`
+        // panics on the resulting `NonCanonical` error. stress-ng
+        // --mmapfixed feeds exactly such bases as MAP_FIXED hints
+        // (walking down from 1 << 63); fail typed instead.
+        if end > Self::USER_HALF_END {
+            return Err(AddressSpaceError::OutOfRange);
+        }
         let mut regions = self.regions.lock();
         for r in regions.iter() {
             let r_end = r.base.as_u64() + r.len;
@@ -411,6 +445,11 @@ impl AddressSpace {
             .as_u64()
             .checked_add(new_len)
             .ok_or(AddressSpaceError::OutOfRange)?;
+        // Same user-half ceiling as `map_region`: a grow must not
+        // push the region into non-canonical / kernel-half space.
+        if new_end > Self::USER_HALF_END {
+            return Err(AddressSpaceError::OutOfRange);
+        }
         // The grown tail [base+old_len, base+new_len) must not collide
         // with any OTHER region.
         let grow_lo = base.as_u64() + old_len;
@@ -1772,6 +1811,14 @@ impl AddressSpace {
                     // returns an error instead of taking the whole system out.
                     Err(MapError::EncounteredHugePage) => {
                         return Err(AddressSpaceError::Overlap);
+                    }
+                    // A non-canonical VA can only come from a region whose
+                    // base the caller failed to validate (map_region now
+                    // rejects those, but stay graceful for any path that
+                    // predates the check — a user-supplied MAP_FIXED hint
+                    // must never panic the kernel).
+                    Err(MapError::NonCanonical) => {
+                        return Err(AddressSpaceError::OutOfRange);
                     }
                     Err(e) => {
                         panic!(
