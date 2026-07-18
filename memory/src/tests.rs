@@ -6420,3 +6420,73 @@ fn smoke_mmap_scale_overlay_pattern_stays_consistent() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_mmap_scale_overlay_pattern_stays_consistent);
+
+// ── demand-fault self-heal: "backed bookkeeping over an absent leaf PTE"
+//    must install the PTE, not retry forever ──────────────────────────────
+//
+// A raced VMA op on a CLONE_VM-shared AS (MAP_FIXED punch / munmap overlap /
+// the map_region→materialize gap in sys_mmap) can leave a region slot backed
+// (`phys[i] != 0`) while the leaf PTE is genuinely ABSENT. The old
+// demand_alloc_page treated EVERY already-backed not-present fault as a
+// spurious stale-TLB fault — INVLPG + Ok — so the faulting instruction
+// retried against a still-absent PTE forever: a silent, unkillable
+// infinite-#PF loop (the stress-ng --vma SMP wedge). The fixed path consults
+// translate(): present leaf → spurious (invlpg+retry); absent leaf →
+// re-install the region's own frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_demand_fault_heals_absent_leaf_pte() -> TestResult {
+    use crate::x86_64::paging;
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: test context; the AS is built + probed but never activated.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(x) => x,
+        Err(_) => return TestResult::Skip("AS alloc failed"),
+    };
+    let va = VirtAddr::new(0x0000_4080_2000_0000u64);
+    let frame = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    if a.map_region(Region {
+        base: va,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frame],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // Deliberately DO NOT materialize: the slot is backed, the leaf is
+    // absent — exactly the raced state a #PF then observes.
+    // SAFETY: a.root is a live user PML4 from new_for_user; translate reads.
+    if unsafe { paging::translate(a.root, va) }.is_some() {
+        return TestResult::Fail("leaf unexpectedly present before the heal");
+    }
+    // SAFETY: identity map live; root valid; frame allocator initialised.
+    if unsafe { a.demand_alloc_page(va) }.is_err() {
+        return TestResult::Fail("demand_alloc_page rejected a backed-but-unmapped page");
+    }
+    // SAFETY: as above.
+    match unsafe { paging::translate(a.root, va) } {
+        Some(p) if p == frame => {}
+        Some(_) => return TestResult::Fail("healed PTE points at the WRONG frame"),
+        None => {
+            return TestResult::Fail("demand_alloc_page returned Ok without installing the leaf")
+        }
+    }
+    // Present-leaf spurious path still works: a second fault on the (now
+    // mapped) page must succeed without disturbing the translation.
+    // SAFETY: as above.
+    if unsafe { a.demand_alloc_page(va) }.is_err() {
+        return TestResult::Fail("spurious-fault path regressed on a present leaf");
+    }
+    // SAFETY: as above.
+    match unsafe { paging::translate(a.root, va) } {
+        Some(p) if p == frame => TestResult::Pass,
+        _ => TestResult::Fail("spurious-fault path disturbed the translation"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_demand_fault_heals_absent_leaf_pte);

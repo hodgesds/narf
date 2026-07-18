@@ -496,18 +496,40 @@ impl AddressSpace {
     /// (below) which calls into the same primitive for every
     /// surviving region plus the page-table pages themselves.
     pub fn unmap_region(&self, base: VirtAddr) -> Result<Region, AddressSpaceError> {
-        let mut regions = self.regions.lock();
-        let idx = regions
-            .iter()
-            .position(|r| r.base == base)
-            .ok_or(AddressSpaceError::Unmapped)?;
-        let region = regions.swap_remove(idx);
-        // Drop the lock before walking PTEs so a Drop-time recursive
-        // tear-down (or a parallel materialise on a different region)
-        // doesn't reentrant-deadlock.
-        drop(regions);
-        // SAFETY: the operation upholds its documented invariant (see surrounding context).
-        unsafe { self.unmap_region_pages(&region) };
+        let region = {
+            let mut regions = self.regions.lock();
+            let idx = regions
+                .iter()
+                .position(|r| r.base == base)
+                .ok_or(AddressSpaceError::Unmapped)?;
+            let region = regions.swap_remove(idx);
+            // Tear down the leaf PTEs BEFORE dropping the lock (local
+            // invalidation only; the batched cross-CPU flush + the frame
+            // frees run below, outside the lock). Deferring the whole walk
+            // past the lock drop — the previous shape — left a window where
+            // the table said "unmapped" while live PTEs lingered: a racing
+            // MAP_FIXED mmap re-registered the range, its materialize() saw
+            // the stale PTE (AlreadyMapped) and skipped installing its own,
+            // and the deferred teardown then stripped the page out from
+            // under the new region — leaving "backed" bookkeeping over an
+            // absent PTE (stress-ng --vma's concurrent mmap/munmap churn).
+            // The walk is allocation-free and bounded, so holding the
+            // IrqSafeSpinLock across it is safe; frame frees (buddy locks)
+            // stay outside.
+            if self.root.as_u64() != 0 {
+                // SAFETY: same identity-mapping precondition as
+                // `materialize`; the pages lie inside `region`, which this
+                // AS owned until the `swap_remove` above.
+                unsafe { self.unmap_region_leaves_local(&region) };
+            }
+            region
+        };
+        // ONE cross-CPU invalidation BEFORE any frame is freed for reuse
+        // (no-op unless the AS is CLONE_VM-shared — see vm_shared docs).
+        self.flush_region_broadcast(region.base, (region.len + 0xFFF) >> 12);
+        if self.root.as_u64() != 0 {
+            self.free_region_frames(&region);
+        }
         Ok(region)
     }
 
@@ -528,7 +550,22 @@ impl AddressSpace {
         let lo = base.as_u64();
         let hi = lo.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
 
-        let mut middle: Vec<(VirtAddr, bool)> = Vec::new();
+        // Frames to free once the punched window's PTEs are gone from every
+        // CPU. Snapshotted from each region's AUTHORITATIVE backing list
+        // (`old.phys[pg]`) under the lock — NEVER read back from the PTE
+        // walk. The previous shape deferred the PTE walk until AFTER the
+        // lock was dropped and freed whatever frame the leaf pointed at BY
+        // THEN: a sibling thread's racing MAP_FIXED mmap (punch → map_region
+        // → materialize/demand-fault) could repopulate the window inside
+        // that gap, and the deferred walk then tore down the NEW mapping's
+        // PTE and freed ITS frame while the new region still owned it —
+        // a double-free / use-after-free of a live frame, plus a region
+        // whose bookkeeping says "backed" over a genuinely absent PTE
+        // (an infinite-#PF trap for the old spurious-fault heuristic).
+        // stress-ng --vma's concurrent mmap/munmap threads (CLONE_VM AS on
+        // SMP) hit this window continuously.
+        let mut to_free: Vec<PhysAddr> = Vec::new();
+        let mut punched_pages: u64 = 0;
         {
             let mut regions = self.regions.lock();
             let old_regions = core::mem::take(&mut *regions);
@@ -544,8 +581,38 @@ impl AddressSpace {
                 let total = (old.len >> 12) as usize;
                 for pg in 0..total {
                     let pv = rb + (pg as u64) * 4096;
-                    if pv >= lo && pv < hi {
-                        middle.push((VirtAddr::new(pv), shared));
+                    if pv < lo || pv >= hi {
+                        continue;
+                    }
+                    punched_pages += 1;
+                    // Tear the leaf PTE down NOW, under the lock, with
+                    // LOCAL invalidation only (one batched cross-CPU flush
+                    // below). Doing it here — atomically with the table
+                    // update — means no window ever exists where the table
+                    // says "free" while a stale PTE lingers for a racing
+                    // map_region+materialize to swallow via AlreadyMapped.
+                    if self.root.as_u64() != 0 {
+                        #[cfg(target_arch = "x86_64")]
+                        // SAFETY: same identity-mapping precondition as
+                        // `materialize`; `pv` was covered by the region
+                        // being punched. Err (already absent) is benign.
+                        let _ = unsafe {
+                            crate::x86_64::paging::unmap_4kb_local(self.root, VirtAddr::new(pv))
+                        };
+                        #[cfg(target_arch = "aarch64")]
+                        // SAFETY: see the x86_64 arm.
+                        let _ = unsafe {
+                            crate::aarch64::paging::unmap_4kb(self.root, VirtAddr::new(pv))
+                        };
+                    }
+                    // Borrowed (SHARED) frames belong to an external
+                    // registry — unmap the PTE but never free the phys.
+                    if !shared {
+                        if let Some(p) = old.phys.get(pg) {
+                            if p.raw() != 0 {
+                                to_free.push(*p);
+                            }
+                        }
                     }
                 }
                 // Prefix [rb, lo) keeps its frames + already-installed PTEs.
@@ -571,55 +638,54 @@ impl AddressSpace {
             }
             *regions = kept;
         }
-        // Unmap + free only the punched-out middle pages (lock released).
-        for (v, shared) in middle {
-            // SAFETY: `v` was covered by a region we just removed from the
-            // table; its PTE is ours to clear, its frame ours to free
-            // (unless SHARED — borrowed from a registry).
-            unsafe { self.unmap_free_page(v, shared) };
+        // ONE cross-CPU invalidation covering the punched window, BEFORE any
+        // frame is freed for reuse (same mmu_gather shape + vm_shared gating
+        // as `unmap_region_pages`). This also replaces the previous PER-PAGE
+        // broadcast+ack-wait (`unmap_4kb`) a CLONE_VM AS paid here — an IPI
+        // round-trip per punched page under MAP_FIXED churn.
+        if punched_pages > 0 {
+            self.flush_region_broadcast(base, (hi - lo) >> 12);
+        }
+        if self.root.as_u64() != 0 {
+            for p in to_free {
+                if crate::frame::__pagetable_is_registered(p.raw()) {
+                    continue;
+                }
+                crate::frame::free_frame(crate::frame::PhysFrame::new(p));
+            }
         }
         Ok(())
     }
 
-    /// Clear one page's PTE and return its frame to the allocator (unless
-    /// SHARED or a registered page-table frame). Used by `punch_fixed`.
-    #[cfg(target_arch = "x86_64")]
-    unsafe fn unmap_free_page(&self, v: VirtAddr, shared: bool) {
-        use crate::frame::{free_frame, PhysFrame};
-        use crate::x86_64::paging::{unmap_4kb, unmap_4kb_local};
-        if self.root.as_u64() == 0 {
-            return;
-        }
-        // Broadcast only for a CLONE_VM-shared AS (see `vm_shared` docs).
-        // SAFETY: same identity-mapping precondition as `materialize`.
-        if let Ok(phys) = unsafe {
-            if self.is_vm_shared() {
-                unmap_4kb(self.root, v)
+    /// One batched cross-CPU TLB invalidation for `pages` pages starting at
+    /// `base`, issued only when this AS can be TLB-resident on another CPU
+    /// (CLONE_VM-shared — see the `vm_shared` field docs). Ranged broadcast
+    /// for small spans; one full non-global flush past the ceiling (mirrors
+    /// Linux's tlb_single_page_flush_ceiling). Callers MUST have already
+    /// torn down / rewritten the covered leaf PTEs, and must call this
+    /// BEFORE freeing any of the covered frames for reuse.
+    fn flush_region_broadcast(&self, base: VirtAddr, pages: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+            if pages == 0 || !self.is_vm_shared() {
+                return;
+            }
+            if pages > FULL_FLUSH_PAGE_CEILING {
+                // SAFETY: CPL=0; flushes non-global entries — user PTEs are
+                // never GLOBAL so the span's stale entries are covered.
+                unsafe { crate::x86_64::paging::flush_user_tlb_all_cpus() };
             } else {
-                unmap_4kb_local(self.root, v)
+                // SAFETY: every page in the range was already unmapped /
+                // rewritten by the caller; invlpg is unconditionally safe.
+                unsafe { crate::x86_64::paging::invlpg_global_range(base, pages) };
             }
-        } {
-            if shared || crate::frame::__pagetable_is_registered(phys.raw()) {
-                return;
-            }
-            free_frame(PhysFrame::new(phys));
         }
-    }
-
-    /// aarch64 counterpart of `unmap_free_page`.
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn unmap_free_page(&self, v: VirtAddr, shared: bool) {
-        use crate::aarch64::paging::unmap_4kb;
-        use crate::frame::{free_frame, PhysFrame};
-        if self.root.as_u64() == 0 {
-            return;
-        }
-        // SAFETY: same identity-mapping precondition as `materialize`.
-        if let Ok(phys) = unsafe { unmap_4kb(self.root, v) } {
-            if shared || crate::frame::__pagetable_is_registered(phys.raw()) {
-                return;
-            }
-            free_frame(PhysFrame::new(phys));
+        // aarch64: `unmap_4kb`'s TLBI already covers the shareability
+        // domain in hardware — no software broadcast needed.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (base, pages);
         }
     }
 
@@ -633,68 +699,89 @@ impl AddressSpace {
     /// `materialize`. Concurrent access to the same region from
     /// another thread is the caller's problem (`unmap_region` holds
     /// no lock during this walk on purpose — see its comment).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     unsafe fn unmap_region_pages(&self, region: &Region) {
-        use crate::frame::{free_frame, PhysFrame};
-        use crate::x86_64::paging::{
-            flush_user_tlb_all_cpus, invlpg_global_range, unmap_4kb_local,
-        };
         if self.root.as_u64() == 0 {
             return;
         }
-        let pages = (region.len + 0xFFF) >> 12;
         // Pass 1: tear down every leaf PTE with LOCAL invalidation only.
-        // The cross-CPU shootdown is batched into ONE broadcast below
-        // (Linux mmu_gather shape) — the previous per-page `unmap_4kb`
-        // broadcast + ack-wait cost thousands of IPI round-trips for a
-        // large region's teardown, seconds per exiting process.
+        // SAFETY: caller's contract (see the doc comment above).
+        unsafe { self.unmap_region_leaves_local(region) };
+        // Pass 2: ONE cross-CPU invalidation covering the whole region.
+        // MUST land BEFORE any frame is freed for reuse — a peer CPU may
+        // hold a stale TLB entry until this completes (`unmap_4kb_local`'s
+        // contract). No-op unless the AS is CLONE_VM-shared: a single-
+        // threaded process's stale entries can only live HERE, and the
+        // per-page local INVLPGs above already dropped them.
+        self.flush_region_broadcast(region.base, (region.len + 0xFFF) >> 12);
+        // Pass 3: free the frames this region owns.
+        self.free_region_frames(region);
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe fn unmap_region_pages(&self, _region: &Region) {}
+
+    /// Tear down every leaf PTE of `region` with LOCAL invalidation only
+    /// (x86_64; aarch64's TLBI broadcasts in hardware). The cross-CPU
+    /// shootdown is batched into ONE broadcast by the caller
+    /// (`flush_region_broadcast`) — the historical per-page `unmap_4kb`
+    /// broadcast + ack-wait cost thousands of IPI round-trips for a large
+    /// region's teardown, seconds per exiting process.
+    ///
+    /// Allocation-free and bounded, so callers may hold the regions
+    /// IrqSafeSpinLock across this walk (unmap_region does, to close the
+    /// stale-PTE-after-table-update race).
+    ///
+    /// # Safety
+    /// Same identity-mapping precondition as `materialize`; `self.root`
+    /// must be a valid root and `region`'s pages were installed via it.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn unmap_region_leaves_local(&self, region: &Region) {
+        use crate::x86_64::paging::unmap_4kb_local;
+        let pages = (region.len + 0xFFF) >> 12;
         for i in 0..pages {
             let v = VirtAddr::new(region.base.as_u64() + (i << 12));
-            // SAFETY: same identity-mapping precondition as `materialize`;
-            // `v` lies inside `region`. An `Err` (already unmapped) is
-            // benign — we still consult region.phys below.
-            // SAFETY: Valid memory or trusted environment
+            // SAFETY: contract documented on the function; an `Err`
+            // (already unmapped) is benign — frames are freed from
+            // region.phys, not the PTE walk.
             let _ = unsafe { unmap_4kb_local(self.root, v) };
         }
-        // ONE cross-CPU invalidation covering the whole region. MUST land
-        // BEFORE any frame is freed for reuse — a peer CPU may hold a
-        // stale TLB entry until this completes (`unmap_4kb_local`'s
-        // contract). Ranged broadcast for small regions; a single full
-        // non-global flush is cheaper for the receivers past the ceiling
-        // (mirrors Linux's tlb_single_page_flush_ceiling logic).
-        //
-        // Only a CLONE_VM-shared AS can be resident on another CPU (see
-        // the `vm_shared` field docs); a single-threaded process's stale
-        // entries can only live HERE, and the per-page local INVLPGs
-        // above already dropped them — no broadcast needed.
-        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
-        if self.is_vm_shared() {
-            if pages > FULL_FLUSH_PAGE_CEILING {
-                // SAFETY: CPL=0; flushes non-global entries — user PTEs are
-                // never GLOBAL so the region's stale entries are covered.
-                unsafe { flush_user_tlb_all_cpus() };
-            } else if pages > 0 {
-                // SAFETY: every page in the range was just unmapped above.
-                unsafe { invlpg_global_range(region.base, pages) };
-            }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn unmap_region_leaves_local(&self, region: &Region) {
+        use crate::aarch64::paging::unmap_4kb;
+        let pages = (region.len + 0xFFF) >> 12;
+        for i in 0..pages {
+            let v = VirtAddr::new(region.base.as_u64() + (i << 12));
+            // SAFETY: see the x86_64 variant.
+            let _ = unsafe { unmap_4kb(self.root, v) };
         }
-        // Pass 2: free the frames this region owns. We deliberately
-        // IGNORE the phys the PTE walk returned and free `region.phys[i]`
-        // instead — the region's own backing list is authoritative, the
-        // PTE can lag it. `cow_split_on_write` repoints `region.phys[i]`
-        // to the fresh private frame, but the PTE is only rewritten by
-        // the SEPARATE `remap_page` (the #PF handler calls both; any
-        // caller that splits without remapping leaves the PTE pointing at
-        // the OLD, already-freed frame). Freeing the PTE target there
-        // would double-free the old frame — the root of the
-        // "marginal-buddy" corruption. Freeing `region.phys[i]` frees
-        // exactly the frame this region owns, regardless of PTE drift.
-        //
-        // Borrowed (SHARED) frames belong to an external registry —
-        // unmap the PTE but never free the phys.
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe fn unmap_region_leaves_local(&self, _region: &Region) {}
+
+    /// Free the frames `region` owns, consulting the region's OWN backing
+    /// list. We deliberately IGNORE what the PTE walk returned and free
+    /// `region.phys[i]` instead — the region's backing list is
+    /// authoritative, the PTE can lag it. `cow_split_on_write` repoints
+    /// `region.phys[i]` to the fresh private frame, but the PTE is only
+    /// rewritten by the SEPARATE `remap_page` (the #PF handler calls both;
+    /// any caller that splits without remapping leaves the PTE pointing at
+    /// the OLD, already-freed frame). Freeing the PTE target there would
+    /// double-free the old frame — the root of the "marginal-buddy"
+    /// corruption. Freeing `region.phys[i]` frees exactly the frame this
+    /// region owns, regardless of PTE drift.
+    ///
+    /// Borrowed (SHARED) frames belong to an external registry — never
+    /// freed here. Callers must have completed the cross-CPU flush first.
+    fn free_region_frames(&self, region: &Region) {
+        use crate::frame::{free_frame, PhysFrame};
         if region.perms.contains(RegionPerms::SHARED) {
             return;
         }
+        let pages = (region.len + 0xFFF) >> 12;
         for i in 0..pages {
             let phys = match region.phys.get(i as usize) {
                 Some(p) if p.raw() != 0 => *p,
@@ -710,39 +797,6 @@ impl AddressSpace {
             free_frame(PhysFrame::new(phys));
         }
     }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn unmap_region_pages(&self, region: &Region) {
-        use crate::aarch64::paging::unmap_4kb;
-        use crate::frame::{free_frame, PhysFrame};
-        if self.root.as_u64() == 0 {
-            return;
-        }
-        let pages = (region.len + 0xFFF) >> 12;
-        for i in 0..pages {
-            let v = VirtAddr::new(region.base.as_u64() + (i << 12));
-            // Tear down the PTE but free `region.phys[i]`, not the PTE
-            // target — the backing list is authoritative and the PTE can
-            // lag it (see the x86_64 variant for the full rationale).
-            // SAFETY: see x86_64 variant.
-            let _ = unsafe { unmap_4kb(self.root, v) };
-            // Borrowed (SHARED) frames belong to an external registry
-            // — unmap the PTE but never free the phys.
-            if region.perms.contains(RegionPerms::SHARED) {
-                continue;
-            }
-            let phys = match region.phys.get(i as usize) {
-                Some(p) if p.raw() != 0 => *p,
-                _ => continue,
-            };
-            // No is_registered guard — region.phys only holds data frames
-            // (see the x86_64 variant).
-            free_frame(PhysFrame::new(phys));
-        }
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    unsafe fn unmap_region_pages(&self, _region: &Region) {}
 
     /// Number of mapped regions.
     #[inline]
@@ -794,28 +848,56 @@ impl AddressSpace {
             }
             if r.phys[i].raw() != 0 {
                 // Already backed, yet this CPU took a not-present #PF for it.
-                // The leaf PTE in memory is valid (a peer CPU demand-faulted
-                // this page and, installing its leaf, allocated a fresh
-                // intermediate page-table page) — but THIS CPU's paging-
-                // structure cache still holds the pre-fault "not present"
-                // intermediate entry. x86 issues no shootdown for a
-                // not-present→present transition, so the stale entry lingers
-                // and the page-walk keeps missing. INVLPG for the faulting VA
-                // flushes this CPU's TLB + paging-structure caches for it;
-                // reporting success lets the faulting instruction re-walk and
-                // observe the present PTE.
+                // Two distinct causes, distinguished by whether the leaf PTE
+                // in memory is actually present:
                 //
-                // Before this fix the spurious fault fell through to
-                // try_grow_stack → fatal — the SMP-only mallocng heap crash:
-                // two threads demand-fault the same fresh group page
-                // concurrently, and the one that loses the regions-lock race
-                // looped-faulted forever on a page that was actually mapped.
-                // SAFETY: INVLPG is always safe; `v` is the page-aligned
-                // faulting VA whose leaf PTE this AS owns.
-                unsafe {
-                    crate::x86_64::paging::invlpg(VirtAddr::new(v));
+                // (a) Leaf PRESENT — a peer CPU demand-faulted this page
+                //     and, installing its leaf, allocated a fresh
+                //     intermediate page-table page; THIS CPU's paging-
+                //     structure cache still holds the pre-fault "not
+                //     present" intermediate entry (x86 issues no shootdown
+                //     for a not-present→present transition). INVLPG flushes
+                //     this CPU's TLB + walk caches; the retry re-walks and
+                //     observes the present PTE. (Before this branch existed
+                //     the spurious fault fell through to try_grow_stack →
+                //     fatal — the SMP-only mallocng heap crash.)
+                //
+                // (b) Leaf ABSENT — the bookkeeping says "backed" but the
+                //     page table genuinely has no entry. Reachable when a
+                //     racing VMA op strips the leaf after this region (or a
+                //     replacement mapping) was registered — e.g. the
+                //     map_region→materialize gap in sys_mmap, or a sibling
+                //     thread's munmap/MAP_FIXED overlapping teardown.
+                //     Blindly returning Ok here (the old shape) made the
+                //     faulting instruction retry against a still-absent PTE
+                //     forever: an unkillable, silent infinite-#PF loop —
+                //     the stress-ng --vma SMP wedge. Self-heal instead:
+                //     install the leaf for the frame the region owns.
+                let va = VirtAddr::new(v);
+                // SAFETY: `self.root` is this AS's valid live root; translate
+                // only reads the tables through the identity map.
+                if unsafe { crate::x86_64::paging::translate(self.root, va) }.is_some() {
+                    // SAFETY: INVLPG is always safe; `v` is the page-aligned
+                    // faulting VA whose leaf PTE this AS owns.
+                    unsafe {
+                        crate::x86_64::paging::invlpg(va);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                let phys = r.phys[i];
+                let mut flags = PtFlags::USER;
+                if r.perms.contains(RegionPerms::WRITE) {
+                    flags |= PtFlags::WRITABLE;
+                }
+                if !r.perms.contains(RegionPerms::EXEC) {
+                    flags |= PtFlags::NO_EXEC;
+                }
+                // SAFETY: identity map + AS live (active CR3's #PF handler);
+                // `phys` is the frame this region owns for the page.
+                match unsafe { map_4kb(self.root, va, phys, flags) } {
+                    Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
+                    Err(_) => return Err(AddressSpaceError::NotImplemented),
+                }
             }
             // Allocate + zero the fresh frame, honoring the faulting
             // task's NUMA mempolicy (set_mempolicy/mbind). DEFAULT
@@ -875,18 +957,35 @@ impl AddressSpace {
                 return Err(AddressSpaceError::OutOfRange);
             }
             if r.phys[i].raw() != 0 {
-                // Already backed, yet this CPU faulted: a peer installed the
-                // leaf (allocating a fresh table page) while this CPU's TLB /
-                // walk caches still held the pre-fault miss. Invalidate the
-                // stale entry locally and report success so the faulting
-                // instruction re-walks and sees the present descriptor. See
-                // the x86_64 twin for the full SMP-mallocng rationale.
-                // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
-                // page-aligned faulting VA owned by this AS.
-                unsafe {
-                    crate::aarch64::paging::tlb_invalidate_vae1(VirtAddr::new(v));
+                // Already backed, yet this CPU faulted. Present leaf → a
+                // peer installed it while this CPU's TLB / walk caches still
+                // held the pre-fault miss: invalidate locally and retry.
+                // ABSENT leaf → a racing VMA op stripped it after the
+                // backing was registered; re-install the region's own frame
+                // instead of retrying forever. See the x86_64 twin for the
+                // full spurious-vs-raced rationale.
+                let va = VirtAddr::new(v);
+                // SAFETY: `self.root` is this AS's valid TTBR0 root;
+                // translate only reads the tables.
+                if unsafe { crate::aarch64::paging::translate(self.root, va) }.is_some() {
+                    // SAFETY: TLBI VAE1 at EL1 is always legal; `v` is the
+                    // page-aligned faulting VA owned by this AS.
+                    unsafe {
+                        crate::aarch64::paging::tlb_invalidate_vae1(va);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                let phys = r.phys[i];
+                let mut flags = PtFlags::AP_RW_EL1;
+                if !r.perms.contains(RegionPerms::EXEC) {
+                    flags = flags | PtFlags::UXN | PtFlags::PXN;
+                }
+                // SAFETY: root valid + frame owned by this region (same
+                // contract as the fresh-allocation path below).
+                match unsafe { map_4kb(self.root, va, phys, flags) } {
+                    Ok(()) | Err(MapError::AlreadyMapped) => return Ok(()),
+                    Err(_) => return Err(AddressSpaceError::NotImplemented),
+                }
             }
             let phys = crate::mempolicy::alloc_frame_policied(crate::frame::local_node())
                 .map_err(|_| AddressSpaceError::OutOfRange)?
@@ -1138,26 +1237,31 @@ impl AddressSpace {
         let hi = lo.saturating_add(len);
         // Force-back any zero phys entries first; do this with
         // the lock dropped so frame allocation doesn't recurse
-        // on an IRQ-safe lock. Snapshot the region indices.
+        // on an IRQ-safe lock. Snapshot the pages that need backing BY
+        // VIRTUAL ADDRESS, not by (region index, slot index): a sibling
+        // thread's mmap/munmap/mprotect between the two lock holds
+        // reshuffles/splits the region list, so a saved index can point at
+        // a DIFFERENT (possibly shorter) region on re-acquire — the old
+        // index-keyed restamp then indexed `phys` out of bounds (kernel
+        // panic with the regions lock held → every sibling VMA op spins
+        // IRQs-off forever, wedging the whole machine under stress-ng
+        // --vma's mlock-vs-mprotect churn) or stamped a frame into the
+        // wrong region. VAs stay meaningful across any reshuffle.
         let mut touched_any = false;
-        let mut backings: alloc::vec::Vec<(usize, alloc::vec::Vec<usize>)> = alloc::vec::Vec::new();
+        let mut needed_vas: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
         {
             let g = self.regions.lock();
-            for (idx, r) in g.iter().enumerate() {
+            for r in g.iter() {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
                 if rb >= hi || re <= lo {
                     continue;
                 }
                 touched_any = true;
-                let mut needed = alloc::vec::Vec::new();
                 for (i, p) in r.phys.iter().enumerate() {
                     if p.raw() == 0 {
-                        needed.push(i);
+                        needed_vas.push(rb + ((i as u64) << 12));
                     }
-                }
-                if !needed.is_empty() {
-                    backings.push((idx, needed));
                 }
             }
         }
@@ -1165,63 +1269,72 @@ impl AddressSpace {
             return Err(AddressSpaceError::Unmapped);
         }
         // Allocate frames outside the lock.
-        let mut allocations: alloc::vec::Vec<(usize, alloc::vec::Vec<(usize, PhysAddr)>)> =
-            alloc::vec::Vec::with_capacity(backings.len());
-        for (idx, slots) in backings {
-            let mut filled = alloc::vec::Vec::with_capacity(slots.len());
-            for slot in slots {
-                let phys = crate::frame::alloc_frame()
-                    .map_err(|_| AddressSpaceError::OutOfRange)?
-                    .start_address();
-                // SAFETY: identity-mapped on x86_64; aarch64
-                // uses kernel_mut_ptr for the same purpose.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    #[cfg(target_arch = "x86_64")]
-                    core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
-                    #[cfg(target_arch = "aarch64")]
-                    core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
-                }
-                filled.push((slot, phys));
+        let mut allocations: alloc::vec::Vec<(u64, PhysAddr)> =
+            alloc::vec::Vec::with_capacity(needed_vas.len());
+        for va in needed_vas {
+            let phys = crate::frame::alloc_frame()
+                .map_err(|_| AddressSpaceError::OutOfRange)?
+                .start_address();
+            // SAFETY: identity-mapped on x86_64; aarch64
+            // uses kernel_mut_ptr for the same purpose.
+            // SAFETY: Valid memory or trusted environment
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+                #[cfg(target_arch = "aarch64")]
+                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
             }
-            allocations.push((idx, filled));
+            allocations.push((va, phys));
         }
-        // Re-acquire the lock and stamp the new frames + flag.
-        // Then re-materialise so PTEs land for the freshly-backed
-        // pages.
-        let mut to_materialise = alloc::vec::Vec::new();
-        {
-            let mut g = self.regions.lock();
-            for (idx, slots) in allocations {
-                if let Some(r) = g.get_mut(idx) {
-                    for (slot, phys) in slots {
-                        if r.phys[slot].raw() == 0 {
-                            r.phys[slot] = phys;
-                        } else {
-                            // Raced with a demand fault that beat
-                            // us to it — give the frame back.
-                            crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
-                        }
-                    }
-                    r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
-                    to_materialise.push(r.clone());
-                }
-            }
-            // Also flag any region we touched but didn't have to
-            // back (already-fully-backed mlock'd region).
+        // Re-acquire the lock, stamp the new frames by VA + set the
+        // LOCKED flag, then re-materialise (still under the lock — see
+        // `change_perms_range` for why the rewrite must not run after the
+        // lock drop) so PTEs land for the freshly-backed pages.
+        let mut g = self.regions.lock();
+        let mut stamped_bases: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        for (va, phys) in allocations {
+            let mut consumed = false;
             for r in g.iter_mut() {
                 let rb = r.base.as_u64();
                 let re = rb.saturating_add(r.len);
-                if rb >= hi || re <= lo {
+                if va < rb || va >= re {
                     continue;
                 }
-                r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
+                let i = ((va - rb) >> 12) as usize;
+                if i < r.phys.len() && r.phys[i].raw() == 0 {
+                    r.phys[i] = phys;
+                    consumed = true;
+                    if !stamped_bases.contains(&rb) {
+                        stamped_bases.push(rb);
+                    }
+                }
+                break;
+            }
+            if !consumed {
+                // Raced with a demand fault (or an unmap) that beat us to
+                // this page — give the frame back.
+                crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
+            }
+        }
+        // Flag every intersecting region LOCKED; collect the ones that
+        // received fresh backing for the PTE rewrite.
+        let mut to_materialise = alloc::vec::Vec::new();
+        for r in g.iter_mut() {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if rb >= hi || re <= lo {
+                continue;
+            }
+            r.perms = RegionPerms(r.perms.0 | RegionPerms::LOCKED.0);
+            if stamped_bases.contains(&rb) {
+                to_materialise.push(r.clone());
             }
         }
         // SAFETY: same identity-map invariant; touched regions
         // are valid bookkeeping entries.
         // SAFETY: Valid memory or trusted environment
         unsafe { self.rewrite_perms_pages(&to_materialise) };
+        drop(g);
         Ok(())
     }
 
@@ -1271,24 +1384,32 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let lo = base.as_u64();
         let hi = lo.saturating_add(len);
-        // Snapshot + mutate the bookkeeping under the lock; do
-        // the PTE walk after dropping the lock so a concurrent
-        // map_region on a non-overlapping region doesn't block.
-        let touched: Vec<Region> = {
-            let mut g = self.regions.lock();
-            let mut hits = Vec::new();
-            for r in g.iter_mut() {
-                let rb = r.base.as_u64();
-                let re = rb.saturating_add(r.len);
-                if rb >= hi || re <= lo {
-                    continue;
-                }
-                r.perms = new_perms;
-                hits.push(r.clone());
+        // Mutate the bookkeeping AND rewrite the PTEs under one hold of
+        // the regions lock. Rewriting after dropping the lock (the
+        // previous shape) let a racing munmap/MAP_FIXED overlap complete
+        // in the gap and FREE the snapshot's frames — the deferred
+        // rewrite then re-installed PTEs over frames the buddy had
+        // already re-handed out (use-after-free / cross-AS aliasing;
+        // stress-ng --vma's concurrent mprotect+munmap threads).
+        // The rewrite is allocation-light (map_4kb may allocate an
+        // intermediate table page — regions→buddy lock order, same as
+        // demand_alloc_page) and its batched cross-CPU flush is
+        // deadlock-safe under an IrqSafeSpinLock: peers spinning on this
+        // lock drain pending shootdowns via the spin hook, and the
+        // ack-wait itself services peer shootdowns (see `remap_page`,
+        // which has always broadcast under this lock).
+        let mut g = self.regions.lock();
+        let mut hits = Vec::new();
+        for r in g.iter_mut() {
+            let rb = r.base.as_u64();
+            let re = rb.saturating_add(r.len);
+            if rb >= hi || re <= lo {
+                continue;
             }
-            hits
-        };
-        if touched.is_empty() {
+            r.perms = new_perms;
+            hits.push(r.clone());
+        }
+        if hits.is_empty() {
             return Err(AddressSpaceError::Unmapped);
         }
         // SAFETY: same identity-mapping precondition as
@@ -1300,7 +1421,8 @@ impl AddressSpace {
         // page (cheaper than adding a per-arch in-place mutate
         // helper, since map_4kb already handles the leaf rewrite).
         // SAFETY: Valid memory or trusted environment
-        unsafe { self.rewrite_perms_pages(&touched) };
+        unsafe { self.rewrite_perms_pages(&hits) };
+        drop(g);
         Ok(())
     }
 
@@ -1366,14 +1488,15 @@ impl AddressSpace {
         let lo = base.as_u64();
         let hi = lo.saturating_add(len);
 
-        // Snapshot the region list under the lock, compute the
-        // new layout, then swap it in. The PTE rewrite happens
-        // after the lock is dropped so the post-split rebuild
-        // can't deadlock against concurrent map_region work on
-        // an unrelated region.
+        // Compute + swap in the new (split) layout AND rewrite the
+        // affected PTEs under one hold of the regions lock. The rewrite
+        // used to run after the lock drop; a racing munmap of the same
+        // range could then free the middle fragments' frames before the
+        // deferred rewrite re-installed PTEs over them (use-after-free —
+        // see `change_perms_range` for the full rationale + why the
+        // under-lock broadcast is deadlock-safe).
+        let mut g = self.regions.lock();
         let touched: Vec<Region> = {
-            let mut g = self.regions.lock();
-
             // Collect indices that intersect [lo, hi). Walk forward
             // and split in place — we drain the original Vec into
             // `new_list` so the bookkeeping stays consistent even
@@ -1456,9 +1579,11 @@ impl AddressSpace {
         // phys frames with the pre-split region; rewriting the PTE
         // flags is safe because we hold the only reference to each
         // post-split phys slot (the Drop path consults the new
-        // region table, not the old one).
+        // region table, not the old one) — and the regions lock is
+        // still held, so no racing unmap can free them mid-rewrite.
         // SAFETY: Valid memory or trusted environment
         unsafe { self.rewrite_perms_pages(&touched) };
+        drop(g);
         Ok(())
     }
 
@@ -1504,11 +1629,17 @@ impl AddressSpace {
         let lo = base.as_u64();
         let hi = lo.saturating_add(len);
 
-        // Collect (vaddr, phys) pairs to free outside the lock. We
-        // also stamp `phys[i] = 0` while we hold it so a concurrent
-        // demand-fault sees the slot as unbacked rather than racing
-        // a half-freed frame.
-        let mut to_release: Vec<(VirtAddr, PhysAddr)> = Vec::new();
+        // Collect the frames to free outside the lock. We stamp
+        // `phys[i] = 0` AND tear down the leaf PTE while we hold the
+        // lock, so a concurrent demand-fault observes a consistent
+        // (unbacked, unmapped) page. The previous shape deferred the
+        // PTE teardown past the lock drop, where the deferred walk
+        // could strip a leaf a racing thread had just re-installed —
+        // the same stale-walk family as the old `punch_fixed`, with
+        // the same "backed bookkeeping over an absent PTE" terminal
+        // state (an infinite-#PF loop before `demand_alloc_page`
+        // learned to self-heal it).
+        let mut to_release: Vec<PhysAddr> = Vec::new();
         let mut touched = false;
         {
             let mut g = self.regions.lock();
@@ -1527,14 +1658,13 @@ impl AddressSpace {
                 // SHARED region (vDSO / vvar / SysV shmem) — its frames
                 // are BORROWED from a global singleton / external
                 // registry, not allocated by this AS. Freeing them here
-                // (as the bookkeeping below would, then
-                // `madvise_release_pages`) returns a live, externally-
-                // owned frame to the buddy, which re-hands it out as
-                // another task's page table → the cross-AS double-free
-                // behind the "marginal-buddy" corruption. Every sibling
-                // teardown path (`unmap_region_pages`, `unmap_free_page`)
-                // skips SHARED for exactly this reason; MADV_DONTNEED must
-                // too — treat it as a no-op over a borrowed mapping.
+                // returns a live, externally-owned frame to the buddy,
+                // which re-hands it out as another task's page table →
+                // the cross-AS double-free behind the "marginal-buddy"
+                // corruption. Every sibling teardown path
+                // (`unmap_region_pages`, `punch_fixed`) skips SHARED for
+                // exactly this reason; MADV_DONTNEED must too — treat it
+                // as a no-op over a borrowed mapping.
                 if r.perms.contains(RegionPerms::SHARED) {
                     continue;
                 }
@@ -1547,8 +1677,22 @@ impl AddressSpace {
                     if p.raw() == 0 {
                         continue;
                     }
-                    let v = VirtAddr::new(rb + ((i as u64) << 12));
-                    to_release.push((v, p));
+                    let v = rb + ((i as u64) << 12);
+                    if self.root.as_u64() != 0 {
+                        #[cfg(target_arch = "x86_64")]
+                        // SAFETY: identity-mapped; `v` lies in a bookkept
+                        // region of this AS. LOCAL invalidation only —
+                        // one batched cross-CPU flush below.
+                        let _ = unsafe {
+                            crate::x86_64::paging::unmap_4kb_local(self.root, VirtAddr::new(v))
+                        };
+                        #[cfg(target_arch = "aarch64")]
+                        // SAFETY: see the x86_64 arm.
+                        let _ = unsafe {
+                            crate::aarch64::paging::unmap_4kb(self.root, VirtAddr::new(v))
+                        };
+                    }
+                    to_release.push(p);
                     r.phys[i] = PhysAddr::new(0);
                 }
             }
@@ -1556,72 +1700,24 @@ impl AddressSpace {
         if !touched {
             return Err(AddressSpaceError::Unmapped);
         }
-        // SAFETY: same identity-map invariant as change_perms_range
-        // and unmap_region_pages — the kernel runs with a high-half
-        // mapping and the user AS's leaf PTEs walk through self.root.
-        // SAFETY: Valid memory or trusted environment
-        unsafe { self.madvise_release_pages(&to_release) };
+        // ONE cross-CPU invalidation over the advised span BEFORE any
+        // frame is freed for reuse (no-op unless CLONE_VM-shared).
+        if !to_release.is_empty() {
+            self.flush_region_broadcast(base, (hi - lo) >> 12);
+        }
+        if self.root.as_u64() != 0 {
+            for p in to_release {
+                if crate::frame::__pagetable_is_registered(p.raw()) {
+                    continue;
+                }
+                // `free_frame` consults the COW refcount table, so a frame
+                // still shared with another AS stays live until its last
+                // owner releases it.
+                crate::frame::free_frame(crate::frame::PhysFrame::new(p));
+            }
+        }
         Ok(())
     }
-
-    /// PTE-walk helper for [`madvise_dontneed`]. Tear down the leaf
-    /// PTE for each `(vaddr, phys)` pair and return the frame to the
-    /// allocator. `free_frame` consults the COW refcount table, so a
-    /// frame still shared with another AS stays live until its last
-    /// owner releases it.
-    ///
-    /// # Safety
-    /// Identity-map invariant identical to `unmap_region_pages`.
-    /// Each `phys` must match the leaf the page table currently
-    /// resolves to — `madvise_dontneed` snapshots the per-page phys
-    /// list under the region lock so this contract holds.
-    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-    unsafe fn madvise_release_pages(&self, pages: &[(VirtAddr, PhysAddr)]) {
-        use crate::frame::{free_frame, PhysFrame};
-        use crate::x86_64::paging::{flush_user_tlb_all_cpus, unmap_4kb_local};
-        if self.root.as_u64() == 0 {
-            return;
-        }
-        // Batched-shootdown shape (see `unmap_region_pages`): local
-        // per-page teardown, then — only for a CLONE_VM-shared AS — one
-        // cross-CPU flush BEFORE the frames are freed for reuse.
-        for (v, _) in pages {
-            // SAFETY: identity-mapped; `v` came from a known
-            // bookkept region.
-            // SAFETY: Valid memory or trusted environment
-            let _ = unsafe { unmap_4kb_local(self.root, *v) };
-        }
-        if self.is_vm_shared() && !pages.is_empty() {
-            // SAFETY: CPL=0; user PTEs are never GLOBAL.
-            unsafe { flush_user_tlb_all_cpus() };
-        }
-        for (_, p) in pages {
-            if crate::frame::__pagetable_is_registered(p.raw()) {
-                continue;
-            }
-            free_frame(PhysFrame::new(*p));
-        }
-    }
-
-    #[cfg(all(feature = "linux-compat", target_arch = "aarch64"))]
-    unsafe fn madvise_release_pages(&self, pages: &[(VirtAddr, PhysAddr)]) {
-        use crate::aarch64::paging::unmap_4kb;
-        use crate::frame::{free_frame, PhysFrame};
-        if self.root.as_u64() == 0 {
-            return;
-        }
-        for (v, p) in pages {
-            // SAFETY: see x86_64 variant.
-            let _ = unsafe { unmap_4kb(self.root, *v) };
-            free_frame(PhysFrame::new(*p));
-        }
-    }
-
-    #[cfg(all(
-        feature = "linux-compat",
-        not(any(target_arch = "x86_64", target_arch = "aarch64"))
-    ))]
-    unsafe fn madvise_release_pages(&self, _pages: &[(VirtAddr, PhysAddr)]) {}
 
     /// PTE-walk helper for `change_perms_range`. For each page in
     /// each region: unmap_4kb to recover the phys + clear the
@@ -1915,9 +2011,16 @@ impl AddressSpace {
     ///   Single-CPU Stage-4 BSP-only.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn rematerialize(&self) -> Result<(), AddressSpaceError> {
-        let regions = self.regions.lock().clone();
+        // Hold the regions lock across the rewrite: cloning a snapshot and
+        // rewriting after the drop (the previous shape) let a racing
+        // munmap/MAP_FIXED overlap from a sibling thread free a frame and
+        // then have the deferred rewrite re-install a PTE over it. See
+        // `change_perms_range` for why the under-lock batched flush is
+        // deadlock-safe.
+        let g = self.regions.lock();
         // SAFETY: identity-map live; `root` valid from `new_for_user`.
-        unsafe { self.rewrite_perms_pages(&regions) };
+        unsafe { self.rewrite_perms_pages(g.as_slice()) };
+        drop(g);
         Ok(())
     }
 
