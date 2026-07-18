@@ -219,3 +219,88 @@ pub unsafe fn xrstor(buf: *const u8, mask: u64) {
         );
     }
 }
+
+// ── Per-task FPU context save/restore ───────────────────────────────
+//
+// Every user task carries a fixed-size FPU save area (see the userspace
+// `FpuArea`). The kernel `FXSAVE`s it on every trap-return and `FXRSTOR`s
+// it before every user entry so a task's SIMD state survives preemption +
+// migration. `FXSAVE` only covers x87 + SSE (the first 512 bytes) — so an
+// AVX / AVX-512 program (e.g. glibc, which uses `zmm` in startup) loses its
+// upper-register state across a context switch, corrupting in-flight
+// computation. `XSAVE`/`XRSTOR` with the boot-enabled `XCR0` mask covers the
+// full enabled state instead.
+
+/// Fixed per-task FPU save-area size. Must be ≥ the standard `XSAVE` area
+/// for the boot-enabled `XCR0` (CPUID leaf 0xD sub-leaf 0 ECX — ~2696 bytes
+/// for x87+SSE+AVX+AVX-512+PKRU) AND ≥ 512 for the `FXSAVE` fallback. 4096 is
+/// comfortably above any enabled-state area we advertise and keeps the area a
+/// single page-friendly, 64-byte-aligned block.
+pub const FPU_AREA_SIZE: usize = 4096;
+
+/// Boot-selected save mask. `0` ⇒ `XSAVE` unusable (no XSAVE CPU, or the area
+/// wouldn't fit) ⇒ use the `FXSAVE`/`FXRSTOR` fallback. Non-zero ⇒ the
+/// `XCR0` subset to `XSAVE`/`XRSTOR` (only the enabled components). Set once
+/// on the BSP at boot; the value is identical on every (homogeneous) CPU.
+static FPU_XSAVE_MASK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Decide the per-task FPU save method. Call ONCE at boot AFTER
+/// [`enable_default`] (which sets `XCR0`) and with `CR4.OSXSAVE` set. Selects
+/// `XSAVE` (recording the enabled-component mask) when the CPU supports it and
+/// the standard area fits [`FPU_AREA_SIZE`]; otherwise leaves the `FXSAVE`
+/// fallback in place.
+///
+/// # Safety
+/// `CR4.OSXSAVE = 1` (so `XGETBV` won't `#GP`).
+pub unsafe fn init_task_fpu() {
+    let c = caps();
+    if c.xcr0_supported != 0 && (c.area_size_xcr0 as usize) <= FPU_AREA_SIZE {
+        // Save/restore only the components actually enabled in XCR0.
+        // SAFETY: caller asserts CR4.OSXSAVE=1.
+        let mask = unsafe { read_xcr0() };
+        FPU_XSAVE_MASK.store(mask, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Save the current CPU's FPU state into `buf` (≥ [`FPU_AREA_SIZE`] bytes,
+/// 64-byte aligned). Uses `XSAVE` when [`init_task_fpu`] selected it, else
+/// `FXSAVE`. The two are never mixed for a given buffer because the method is
+/// a single global decision, so a matching [`fpu_restore`] reads back the same
+/// format.
+///
+/// # Safety
+/// `buf` is a valid, correctly-sized, 64-byte-aligned FPU area.
+#[inline]
+pub unsafe fn fpu_save(buf: *mut u8) {
+    let mask = FPU_XSAVE_MASK.load(core::sync::atomic::Ordering::Acquire);
+    if mask != 0 {
+        // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0.
+        unsafe { xsave(buf, mask) };
+    } else {
+        // SAFETY: buf ≥ 512 bytes, 16-byte aligned (64 ⊇ 16); CR4.OSFXSR set.
+        unsafe {
+            core::arch::asm!("fxsave [{p}]", p = in(reg) buf, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Restore the current CPU's FPU state from `buf`. Mirror of [`fpu_save`].
+///
+/// # Safety
+/// `buf` was produced by a matching [`fpu_save`] (or is a reset image with a
+/// zeroed `XSAVE` header + seeded legacy FCW/MXCSR).
+#[inline]
+pub unsafe fn fpu_restore(buf: *const u8) {
+    let mask = FPU_XSAVE_MASK.load(core::sync::atomic::Ordering::Acquire);
+    if mask != 0 {
+        // SAFETY: buf produced by a matching xsave (standard format, header 0
+        // for a reset image); mask ⊆ enabled XCR0.
+        unsafe { xrstor(buf, mask) };
+    } else {
+        // SAFETY: buf is a valid FXSAVE image; CR4.OSFXSR set.
+        unsafe {
+            core::arch::asm!("fxrstor [{p}]", p = in(reg) buf, options(nostack, preserves_flags));
+        }
+    }
+}

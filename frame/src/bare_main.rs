@@ -519,6 +519,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             cr4 |= narf_arch::x86_64::cr::CR4_OSXSAVE;
             narf_arch::x86_64::cr::write_cr4(cr4);
             narf_arch::x86_64::xsave::enable_default();
+            // Select the per-task FPU save method now that XCR0 is set:
+            // XSAVE/XRSTOR of the full enabled state (AVX/AVX-512) when the
+            // CPU supports it, else the FXSAVE fallback. Without this, AVX-512
+            // (zmm) state is lost across a context switch — glibc, which uses
+            // zmm in startup, then faults on a corrupted pointer.
+            narf_arch::x86_64::xsave::init_task_fpu();
 
             let c = narf_arch::x86_64::xsave::caps();
             let _ = core::fmt::Write::write_fmt(

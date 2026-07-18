@@ -251,10 +251,10 @@ fn current_user_fpu() -> *mut u8 {
 fn user_fpu_save() {
     let area = current_user_fpu();
     if !area.is_null() {
-        // SAFETY: `area` is the in-flight task's 512-byte 16-aligned FXSAVE
-        // area (set by the userspace poll); CR4.OSFXSR is on.
+        // SAFETY: `area` is the in-flight task's FpuArea (≥FPU_AREA_SIZE,
+        // 64-aligned; set by the userspace poll); CR4.OSFXSR/OSXSAVE is on.
         unsafe {
-            core::arch::asm!("fxsave [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            narf_arch::x86_64::xsave::fpu_save(area);
         }
     }
 }
@@ -269,7 +269,7 @@ fn user_fpu_restore() {
     if !area.is_null() {
         // SAFETY: as `user_fpu_save`.
         unsafe {
-            core::arch::asm!("fxrstor [{a}]", a = in(reg) area, options(nostack, preserves_flags));
+            narf_arch::x86_64::xsave::fpu_restore(area);
         }
     }
 }

@@ -421,11 +421,11 @@ fn publish_current_fpu(p: *mut FpuArea) {
 pub fn user_fpu_save_current() {
     let p = fpu_slot().load(Ordering::Acquire);
     if !p.is_null() {
-        // SAFETY: `p` is the in-flight task's 512-byte 16-aligned FpuArea on
-        // this CPU; CR4.OSFXSR is set; the kernel is soft-float so the user
-        // XMM/x87 is still live in hardware at the preempt/park point.
+        // SAFETY: `p` is the in-flight task's FpuArea on this CPU (≥
+        // FPU_AREA_SIZE, 64-aligned); CR4.OSFXSR/OSXSAVE set; the kernel is
+        // soft-float so user XMM/x87/AVX is still live at the preempt/park point.
         unsafe {
-            core::arch::asm!("fxsave [{p}]", p = in(reg) p, options(nostack, preserves_flags));
+            narf_arch::x86_64::xsave::fpu_save(p as *mut u8);
         }
     }
 }
@@ -438,7 +438,7 @@ pub fn user_fpu_restore_current() {
     if !p.is_null() {
         // SAFETY: as `user_fpu_save_current`.
         unsafe {
-            core::arch::asm!("fxrstor [{p}]", p = in(reg) p, options(nostack, preserves_flags));
+            narf_arch::x86_64::xsave::fpu_restore(p as *const u8);
         }
     }
 }
@@ -1289,23 +1289,29 @@ pub fn install_user_task_hooks() {
 /// cause of the busybox-pipe flake. `FXSAVE` on the way out of user
 /// mode and `FXRSTOR` on the way back in preserves it per task.
 ///
-/// 512 bytes, 16-byte aligned per the `FXSAVE`/`FXRSTOR` memory-operand
-/// alignment requirement.
+/// [`FPU_AREA_SIZE`](narf_arch::x86_64::xsave::FPU_AREA_SIZE) bytes, 64-byte
+/// aligned per the `XSAVE`/`XRSTOR` memory-operand alignment requirement (also
+/// satisfies `FXSAVE`'s 16-byte requirement for the fallback path). Sized for
+/// the full boot-enabled state (x87+SSE+AVX+AVX-512+PKRU), not just the
+/// 512-byte `FXSAVE` legacy region — so AVX/AVX-512 (`zmm`) register state is
+/// preserved across preemption + migration.
 #[cfg(target_arch = "x86_64")]
-#[repr(C, align(16))]
-struct FpuArea([u8; 512]);
+#[repr(C, align(64))]
+struct FpuArea([u8; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
 
 #[cfg(target_arch = "x86_64")]
 impl FpuArea {
     /// A canonical reset FPU image used for a task's first entry:
     /// `FCW = 0x037F` (all x87 exceptions masked, 64-bit precision),
     /// `MXCSR = 0x1F80` (all SSE exceptions masked). Everything else
-    /// zero. An all-zero buffer would `FXRSTOR` `MXCSR = 0` — SSE
-    /// exceptions UNmasked, so the first denormal/inexact in user SSE
-    /// would raise a spurious `#XF` — so the two control words are
-    /// seeded explicitly.
+    /// zero — including the `XSAVE` header at offset 512 (`XSTATE_BV = 0`,
+    /// `XCOMP_BV = 0`), so a standard `XRSTOR` re-inits every component and
+    /// still loads `MXCSR`/`FCW` from the legacy region. An all-zero legacy
+    /// area would restore `MXCSR = 0` (SSE exceptions UNmasked), so the first
+    /// denormal/inexact in user SSE would raise a spurious `#XF` — hence the
+    /// two control words are seeded explicitly.
     fn reset() -> Self {
-        let mut a = [0u8; 512];
+        let mut a = [0u8; narf_arch::x86_64::xsave::FPU_AREA_SIZE];
         a[0] = 0x7F; // FCW byte 0
         a[1] = 0x03; // FCW byte 1  → 0x037F
         a[24] = 0x80; // MXCSR byte 0
@@ -2001,13 +2007,9 @@ impl core::future::Future for UserTaskFuture {
             // Publish the FPU area so the scheduler's preempt/park can
             // FXSAVE/FXRSTOR it across a kernel_switch, then restore it now.
             narf_scheduler::stackful::set_current_user_fpu(&this.fpu as *const FpuArea as *mut u8);
-            // SAFETY: live 512-byte 16-aligned FXSAVE image; CR4.OSFXSR set.
+            // SAFETY: live FpuArea (≥FPU_AREA_SIZE, 64-aligned); CR4.OSFXSR/OSXSAVE set.
             unsafe {
-                core::arch::asm!(
-                    "fxrstor [{p}]",
-                    p = in(reg) &this.fpu as *const FpuArea,
-                    options(nostack, preserves_flags),
-                );
+                narf_arch::x86_64::xsave::fpu_restore(&this.fpu as *const FpuArea as *const u8);
             }
             let top = narf_scheduler::stackful::current_stackful_stack_top();
             let _ = slice_start_ns; // CPU accounting on the own-stack path TODO
@@ -2062,16 +2064,12 @@ impl core::future::Future for UserTaskFuture {
             // behind — corrupting an in-flight `memcpy`/`memset`. The
             // kernel is `+soft-float` so nothing has touched the FPU since
             // the matching `FXSAVE` on the last trap-return.
-            // SAFETY: `fpu` is a live 512-byte 16-byte-aligned FXSAVE image
-            // (Pin keeps the future's address stable); CR4.OSFXSR is set on
+            // SAFETY: `fpu` is a live FpuArea (≥FPU_AREA_SIZE, 64-aligned; Pin
+            // keeps the future's address stable); CR4.OSFXSR/OSXSAVE is set on
             // every CPU; the buffer lives in kernel memory mapped in the
             // active (user) AS's kernel half.
             unsafe {
-                core::arch::asm!(
-                    "fxrstor [{p}]",
-                    p = in(reg) &this.fpu as *const FpuArea,
-                    options(nostack, preserves_flags),
-                );
+                narf_arch::x86_64::xsave::fpu_restore(&this.fpu as *const FpuArea as *const u8);
             }
             match this.state {
                 TaskState::Initial => {
@@ -2132,16 +2130,12 @@ impl core::future::Future for UserTaskFuture {
         // snapshots them so the next resume's FXRSTOR restores exactly
         // this task's FPU state — the crux of preserving an in-flight
         // user `memcpy` across preemption + migration.
-        // SAFETY: `fpu` is a live 512-byte 16-byte-aligned buffer; the
+        // SAFETY: `fpu` is a live FpuArea (≥FPU_AREA_SIZE, 64-aligned); the
         // user AS is still active here (CR3 restore is below) and `fpu`
-        // is in its kernel half; CR4.OSFXSR is set.
+        // is in its kernel half; CR4.OSFXSR/OSXSAVE is set.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::asm!(
-                "fxsave [{p}]",
-                p = in(reg) &mut this.fpu as *mut FpuArea,
-                options(nostack, preserves_flags),
-            );
+            narf_arch::x86_64::xsave::fpu_save(&mut this.fpu as *mut FpuArea as *mut u8);
         }
 
         // Longjmp path: a hook fired, control is back on the
