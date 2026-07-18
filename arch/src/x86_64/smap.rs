@@ -163,6 +163,123 @@ pub unsafe fn with_user_access<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Fault-guarded kernel↔user byte copy — the transfer tail of NARF's
+/// `copy_from_user` / `copy_to_user` (Linux analogue:
+/// `arch/x86/lib/copy_user_64.S` plus its exception-table fixups).
+///
+/// Runs `rep movsb` inside a STAC/CLAC window with the per-CPU
+/// recoverable probe (`crate::x86_64::probe`) armed. Faults the trap
+/// handler can heal transparently — demand-paging a fresh mmap page,
+/// stack growth, COW split — run FIRST on the #PF path and `iretq`
+/// back to the faulting `rep movsb`, which resumes cleanly (its whole
+/// state lives in RCX/RSI/RDI); the probe never fires for those. Only
+/// faults with no recovery reach `probe::consume` and redirect to the
+/// local label past the copy:
+///
+///   * `#GP` — non-canonical linear address, the only #GP a 64-bit
+///     data access can raise. Reachable when a *validated* base is
+///     canonical but a mid-copy address is not; `validate_user_range`
+///     pre-rejects these now, this is defence-in-depth.
+///   * `#PF` the demand pager refused — the address lies in no region
+///     of the active AS, e.g. a sibling thread `munmap`ed the buffer
+///     between syscall-entry validation and the copy (the TOCTOU
+///     stress-ng --vma hits constantly). Linux returns -EFAULT via
+///     the extable; so do we now, instead of a kernel panic.
+///
+/// Returns `Ok(())` on a complete copy, `Err(bytes_remaining)` when a
+/// fault was caught (`bytes_remaining` counts the not-copied tail of
+/// the whole `len`; always > 0 on `Err`).
+///
+/// The transfer is chunked (64 KiB) and each chunk runs with IRQs
+/// disabled: the probe slot is per-CPU and single-depth, so an
+/// IRQ-driven context switch while armed would let another task on
+/// this CPU clobber the armed probe (the same latent constraint
+/// `msr::rdmsr_or_gp` has, but a bulk copy is a much longer window
+/// than one `rdmsr`). 64 KiB bounds each IRQ-off window to a few µs
+/// on ERMSB parts; the 16 MiB `MAX_USER_COPY` worst case is 256 short
+/// windows, not one 16 MiB blackout.
+///
+/// # Safety
+/// - CPL = 0, not IRQ context.
+/// - The *kernel* side (`dst` for a from-user copy, `src` for a
+///   to-user copy) must be valid for `len` bytes. The *other* side
+///   may be an arbitrary (even hostile) user pointer — surviving it
+///   is the point of this helper.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Result<(), usize> {
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    use crate::x86_64::probe;
+
+    const CHUNK: usize = 64 * 1024;
+    let mut done = 0usize;
+    while done < len {
+        let n = core::cmp::min(CHUNK, len - done);
+        // Save IF, then CLI: no context switch may run while the
+        // probe is armed (single per-CPU slot).
+        let saved_rflags: u64;
+        // SAFETY: pushfq/pop/cli are always legal at CPL=0. Not
+        // `nostack` (pushfq uses the stack); not `preserves_flags`
+        // (cli clears IF).
+        unsafe {
+            asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_rflags);
+        }
+        let recovery: u64;
+        // SAFETY: LEA of a local label. `98f` resolves forward into
+        // the copy block below — GAS numeric labels span asm blocks
+        // emitted in order; same pattern as `msr::rdmsr_or_gp`.
+        unsafe {
+            asm!(
+                "lea {r}, [98f + rip]",
+                r = out(reg) recovery,
+                options(nostack, preserves_flags),
+            );
+        }
+        probe::arm(recovery);
+        // SAFETY: open the user-access window; the matching `clac`
+        // below runs on both the fall-through and the recovery path
+        // (label 98 sits before it).
+        unsafe {
+            stac();
+        }
+        let remaining: usize;
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: on an unrecoverable fault the trap handler rewrites
+        // the frame RIP to label 98 with RCX = bytes not yet copied,
+        // RSI/RDI at the fault point — `rep movsb` is restartable and
+        // abandonable by design. On a healed #PF the iretq re-executes
+        // `rep movsb` with the same registers and the copy continues.
+        unsafe {
+            asm!(
+                "rep movsb",
+                "98:",
+                inout("rcx") n => remaining,
+                inout("rsi") src.add(done) => _,
+                inout("rdi") dst.add(done) => _,
+                options(nostack),
+            );
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: close the user-access window before anything else.
+        unsafe {
+            clac();
+        }
+        let caught = probe::disarm();
+        // Restore IF exactly as found.
+        if saved_rflags & (1 << 9) != 0 {
+            // SAFETY: re-enabling interrupts we disabled above.
+            unsafe {
+                asm!("sti", options(nostack));
+            }
+        }
+        if caught.vector.is_some() {
+            return Err(len - done - (n - remaining));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
 /// Clear CR4.SMAP. Reserved for unit-test reset paths only.
 ///
 /// **DO NOT call this from production code.**

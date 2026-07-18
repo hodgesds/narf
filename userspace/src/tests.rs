@@ -18054,3 +18054,68 @@ fn smoke_net_ns_dual_bind_same_port() -> TestResult {
 }
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_net_ns_dual_bind_same_port);
+
+// ── uaccess: canonical-hole validation + fault-guarded user copy ────
+//
+// stress-ng --vma regression cluster. The old validate_user_range
+// masked bit 63 out of the canonicality check and never examined the
+// END of the range, so two classes of non-canonical access reached
+// the raw kernel copy and #GP'd (non-canonical linear addresses are
+// the one data-access fault x86_64 reports as #GP, not #PF):
+//   - bases like 0x8000_0000_0000_0000 / 0x7FFF_8000_0000_0000
+//   - a canonical user-half base + len crossing 0x0000_8000_0000_0000
+
+fn smoke_uaccess_validate_canonical_holes() -> TestResult {
+    use crate::handlers::validate_user_range;
+    // Bit-63 escapes of the old bits-48..=62 check: both are
+    // non-canonical and must be EFAULT-rejected up front.
+    if validate_user_range(0x8000_0000_0000_0000, 8).is_ok() {
+        return TestResult::Fail("bit-63-set non-canonical base passed validation");
+    }
+    if validate_user_range(0x7FFF_8000_0000_0000, 8).is_ok() {
+        return TestResult::Fail("mid-bits-set non-canonical base passed validation");
+    }
+    // Range whose base is canonical but whose last byte crosses into
+    // the canonical hole.
+    if validate_user_range(0x0000_7FFF_FFFF_F000, 0x2000).is_ok() {
+        return TestResult::Fail("range crossing the canonical hole passed validation");
+    }
+    // Flush-to-the-edge stays legal (last byte 0x0000_7FFF_FFFF_FFFF).
+    if validate_user_range(0x0000_7FFF_FFFF_F000, 0x1000).is_err() {
+        return TestResult::Fail("range ending exactly at the canonical edge rejected");
+    }
+    // Canonical kernel pointers stay allowed — kernel-test code
+    // legitimately passes kernel buffers through this path.
+    let k_buf = 0u64;
+    let k = &k_buf as *const u64 as u64;
+    if validate_user_range(k, 8).is_err() {
+        return TestResult::Fail("canonical kernel pointer rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_uaccess_validate_canonical_holes);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_uaccess_guarded_copy_faults_to_efault() -> TestResult {
+    // 512 GiB: canonical, and deliberately unmapped in the kernel
+    // PML4 (PML4[1] is present but its PDPT[0] — the user-reserved
+    // 512..513 GiB slot — is skipped; same address
+    // memory::tests::smoke_probe_catches_page_fault relies on).
+    // validate_user_range passes it, so this exercises the
+    // copy_user_guarded probe path end-to-end: the #PF has no
+    // demand-paging recovery, must redirect to the recovery label,
+    // and copy_from_user must surface EFAULT — the old
+    // with_user_access + copy_nonoverlapping path panicked the
+    // kernel here.
+    let mut buf = [0u8; 32];
+    // SAFETY: dst is a live kernel buffer; surviving the bad src is
+    // the guarded copy's contract.
+    let r = unsafe { crate::handlers::copy_from_user(&mut buf, 0x0000_0080_0000_0000) };
+    match r {
+        Err(14) => TestResult::Pass,
+        Err(_) => TestResult::Fail("guarded copy failed with a non-EFAULT errno"),
+        Ok(()) => TestResult::Fail("copy from unmapped 512 GiB unexpectedly succeeded"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_uaccess_guarded_copy_faults_to_efault);

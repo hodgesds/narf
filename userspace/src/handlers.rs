@@ -15768,10 +15768,16 @@ fn copy_user_path_raw(ptr: u64, len: usize) -> Option<alloc::string::String> {
 // / `copy_to_user`, which open a `user_access_begin` / `user_access_end`
 // (STAC/CLAC) window around the actual memory transfer.
 //
-// NARF stance: `narf_arch::x86_64::smap::with_user_access` is the
-// single sanctioned bracket.  On non-x86_64 targets the helper
-// degrades to a plain volatile copy because those architectures have
-// no SMAP equivalent.
+// NARF stance: the bulk transfers below go through
+// `narf_arch::x86_64::smap::copy_user_guarded`, which brackets the
+// copy with STAC/CLAC *and* arms the per-CPU recoverable probe so an
+// unrecoverable fault mid-copy (#GP on a non-canonical address, #PF
+// on a range a sibling thread munmap'd after validation) returns
+// -EFAULT instead of panicking the kernel — Linux's exception-table
+// fixup semantics. `smap::with_user_access` remains the sanctioned
+// bracket for the small fixed-size accesses elsewhere. On non-x86_64
+// targets the helpers degrade to a plain volatile copy because those
+// architectures have no SMAP equivalent (and no probe wiring yet).
 //
 // Maximum single-call transfer: 16 MiB.  Larger requests are rejected
 // with EINVAL (-22) so a malicious/buggy userspace cannot force a
@@ -15789,9 +15795,16 @@ const MAX_USER_COPY: usize = 16 * 1024 * 1024;
 /// Rejects:
 /// - `ptr == 0` (null) → EFAULT
 /// - `len > MAX_USER_COPY` → EINVAL
-/// - Non-canonical addresses (bits 48–62 are partial — neither
-///   all-zero for user-space nor all-one for kernel-space) → EFAULT
 /// - Integer overflow of `ptr + len` → EFAULT
+/// - A non-canonical FIRST or LAST byte address (bits 47–63 partial —
+///   neither all-zero for user-space nor all-one for kernel-space),
+///   or a range whose ends sit in different halves → EFAULT.
+///   Checking the last byte matters: a canonical user-half base whose
+///   `len` pushes the range across 0x0000_8000_0000_0000 would walk
+///   the kernel copy into the canonical hole — a mid-`rep movsb`
+///   **#GP**, not #PF, because non-canonical linear addresses are the
+///   one data-access fault x86_64 reports as #GP (stress-ng --vma's
+///   randomized write() buffers hit exactly this).
 ///
 /// Note: canonical kernel-half addresses (≥ 0xFFFF_8000_0000_0000)
 /// are intentionally *not* rejected here.  In production the hardware
@@ -15813,22 +15826,39 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if ptr == 0 {
         return Err(EFAULT);
     }
-    // Reject non-canonical addresses (x86_64/aarch64 require bits 48–63 to
-    // be the sign-extension of bit 47). An address like
-    // 0x0001_0000_0000_0000 has bit-48 set but bits 49–63 clear,
-    // which the CPU would fault on any memory access.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        // Bits 48..=62 must all be 0 (user) or all 1 (kernel).
-        // Mask out bit 63 (top-level sign) and check the middle range.
-        let bits_48_62 = (ptr >> 48) & 0x7FFF;
-        if bits_48_62 != 0 && bits_48_62 != 0x7FFF {
-            return Err(EFAULT);
-        }
-    }
     // Reject integer overflow of the range end.
     if ptr.checked_add(len as u64).is_none() {
         return Err(EFAULT);
+    }
+    // Reject non-canonical addresses (x86_64/aarch64 require bits 48–63
+    // to be the sign-extension of bit 47).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        // Canonical 48-bit VA: bits 47..=63 all-zero (user half) or
+        // all-one (kernel half). Bit 63 and bit 47 are PART of the
+        // rule — a previous version of this check masked bit 63 out
+        // and only examined bits 48..=62, so the non-canonical shapes
+        //   0x8000_0000_0000_0000 (bit 63 set, middle bits clear) and
+        //   0x7FFF_8000_0000_0000 (bit 63 clear, middle bits set)
+        // slipped through and the copy took a kernel #GP.
+        #[inline]
+        fn canonical(a: u64) -> bool {
+            let top = a >> 47; // bits 47..=63, 17 bits
+            top == 0 || top == 0x1_FFFF
+        }
+        if !canonical(ptr) {
+            return Err(EFAULT);
+        }
+        // The LAST byte must be canonical too, and in the same half:
+        // a range must not span the canonical hole (see the doc
+        // comment). `ptr + len` can't overflow — checked above — so
+        // `ptr + len - 1` can't either for len > 0.
+        if len > 0 {
+            let last = ptr + (len as u64 - 1);
+            if !canonical(last) || (last >> 63) != (ptr >> 63) {
+                return Err(EFAULT);
+            }
+        }
     }
     Ok(())
 }
@@ -15849,13 +15879,16 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
 pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(), u64> {
     validate_user_range(src_uptr, dst.len())?;
     let src = src_uptr as *const u8;
-    // SAFETY: range-validated above; SMAP bracket guards the access.
+    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // guarded copy opens the SMAP bracket itself and catches any
+    // unrecoverable fault (#GP non-canonical, #PF on an address a
+    // racing munmap just removed from the AS) as Err instead of a
+    // kernel panic — Linux's extable-fixup -EFAULT semantics.
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len());
-        });
+        narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+            .map_err(|_remaining| EFAULT)?;
     }
     // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
     // volatile read of each in-range user byte is the access path.
@@ -15902,13 +15935,14 @@ pub(crate) unsafe fn copy_from_user_vec(
 pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> {
     validate_user_range(dst_uptr, src.len())?;
     let dst = dst_uptr as *mut u8;
-    // SAFETY: range-validated above; SMAP bracket guards the access.
+    // SAFETY: src is a live kernel slice; dst is range-validated; the
+    // guarded copy opens the SMAP bracket itself and catches any
+    // unrecoverable fault as Err — see copy_from_user.
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
-        });
+        narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
+            .map_err(|_remaining| EFAULT)?;
     }
     // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
     // volatile write of each in-range user byte is the access path.
