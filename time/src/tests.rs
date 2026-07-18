@@ -695,6 +695,54 @@ fn smoke_wheel_refresh_waker_updates_live_slot() -> TestResult {
 }
 kernel_test_in!("time/wheel", smoke_wheel_refresh_waker_updates_live_slot);
 
+fn smoke_wheel_refresh_waker_at_updates_deadline() -> TestResult {
+    // `refresh_waker_at` must move the slot's DEADLINE too — a handle
+    // reused across parks with different deadlines (own-stack
+    // park_should_block / UserTaskFuture::poll) would otherwise pin the
+    // fallback wake to the stale first deadline (the stress-ng --futex
+    // strand residue). Register far out, refresh near, and the sleeper
+    // fires at the NEW deadline.
+    use crate::timer_wheel;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    timer_wheel::__reset_for_test();
+    struct W(AtomicU32);
+    impl Wake for W {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let w = Arc::new(W(AtomicU32::new(0)));
+
+    let h = timer_wheel::register(1_000_000, w.clone().into()).unwrap();
+    // fire_due before the (old) deadline: nothing fires.
+    if timer_wheel::fire_due(500) != 0 {
+        return TestResult::Fail("fired before either deadline");
+    }
+    // Pull the deadline IN (1_000_000 → 400).
+    if !timer_wheel::refresh_waker_at(h, 400, w.clone().into()) {
+        return TestResult::Fail("refresh_waker_at on live slot returned false");
+    }
+    if timer_wheel::next_deadline_cycles() != Some(400) {
+        return TestResult::Fail("refresh_waker_at didn't update the deadline");
+    }
+    if timer_wheel::fire_due(500) != 1 || w.0.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("sleeper didn't fire at the refreshed deadline");
+    }
+    // Slot is spent — a stale handle must be rejected.
+    if timer_wheel::refresh_waker_at(h, 900, w.clone().into()) {
+        return TestResult::Fail("refresh_waker_at accepted a fired slot's stale handle");
+    }
+    timer_wheel::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("time/wheel", smoke_wheel_refresh_waker_at_updates_deadline);
+
 fn smoke_wheel_refresh_waker_rejects_recycled_handle() -> TestResult {
     // After fire_due reclaims the slot, the original handle's gen
     // is stale; refresh_waker against it must return false even if

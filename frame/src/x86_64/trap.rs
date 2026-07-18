@@ -181,6 +181,27 @@ mod stall_wd {
                 "STALL-WD cpu={cpu} depth={depth} awake={awake} halted={halted} locked={locked} cpl={cpl} rip={rip:#x} -> {verdict}"
             );
         }
+        // Wheel + per-task park states: shows a task parked with an expired
+        // (or absurdly far) deadline and whether a deliverable signal is
+        // pending — the signature that root-caused the stress-ng --futex
+        // SMP strand (finite futex park deaf to the parent's SIGALRM).
+        let now_ns = narf_scheduler::narf_time::monotonic_ns();
+        let now_cyc = narf_scheduler::narf_time::now_cycles();
+        let nd = narf_scheduler::narf_time::timer_wheel::next_deadline_cycles();
+        let _ = writeln!(
+            TrapWriter,
+            "STALL-WD wheel: occ={} next={:?} now_cyc={now_cyc} now_ns={now_ns}",
+            narf_scheduler::narf_time::timer_wheel::occupied(),
+            nd
+        );
+        for (tid, pid, st, dl, fu, parked) in narf_userspace::task::dbg_park_snapshot() {
+            let sig = narf_userspace::handlers::signal_pending_bits(tid);
+            let _ = writeln!(
+                TrapWriter,
+                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} parked={parked} sigpend={sig:#x}",
+                dl != 0 && dl != u64::MAX && now_ns > dl
+            );
+        }
     }
 }
 

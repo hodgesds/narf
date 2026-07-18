@@ -98,6 +98,29 @@ pub fn push_pending_iter<I: IntoIterator<Item = Waker>>(wakers: I) {
     }
 }
 
+/// Push ONE waker; on a full queue return it to the caller instead of
+/// dropping it. IRQ-safe (bounded array, no allocation). The caller owns
+/// the recovery — e.g. `timer_wheel::drain_due_to_deferred` re-registers
+/// the sleeper on the wheel so its wake is deferred one tick, never lost
+/// (a dropped WHEEL waker has no re-fire source: the wheel slot was
+/// already vacated, so the module-doc overflow rationale doesn't apply).
+pub fn try_push_one(w: Waker) -> Result<(), Waker> {
+    let cpu = crate::percpu::current_cpu();
+    let cpu = if cpu < N_CPUS { cpu } else { 0 };
+    let mut q = QUEUES[cpu].lock();
+    for slot in q.slots.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(w);
+            QUEUED_WAKERS.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+    }
+    // Full: counted as an overflow EVENT (the waker itself is handed back
+    // to the caller, which may recover it — unlike `push_pending`'s drop).
+    OVERFLOWED_WAKERS.fetch_add(1, Ordering::Relaxed);
+    Err(w)
+}
+
 /// Non-destructive, LOCK-FREE: are there wakers queued but not yet drained?
 /// Two relaxed atomic loads — cheap enough for the 1000 Hz timer-preempt hot
 /// path to ask "would yielding to the executor service pending work?". The

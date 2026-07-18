@@ -19240,6 +19240,20 @@ fn sys_futex(ctx: &mut dyn TrapContext) {
     let uaddr = args.arg0;
     let op = args.arg1 & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
+    // KNOWN ABI DIVERGENCE: Linux futex(2)'s 4th argument is a `struct
+    // timespec *`, but this handler consumes it as a raw nanosecond count —
+    // a stack-allocated timespec pointer (~0x7ffc_xxxx_xxxx) becomes a
+    // ~39-hour relative timeout, i.e. every real timed FUTEX_WAIT is
+    // effectively untimed and relies on the futex wake / signal wake alone.
+    // (Observed directly in the stress-ng --futex SMP strand: the child's
+    // "5 µs" wait parked with sleep_deadline_ns ≈ now + 0x7ffc_c8dd_03bd.)
+    // Harmless for musl's dominant untimed waits (timeout == NULL == 0) and
+    // for waiters that are reliably woken, and NARF's park already treats
+    // the deadline only as a backstop — but timed waits never ETIMEDOUT on
+    // schedule. Fixing this means copy_from_user of the timespec (+ the
+    // WAIT_BITSET absolute-clock variant) and updating the NARF-native
+    // callers that pass raw ns; tracked as follow-up, deliberately not
+    // folded into the signal-interruptible-park fix.
     let timeout_ns = args.arg3; // 0 = no timeout
     let fail = SyscallReturn::ok((-1i64) as u64);
     // Start each futex op from clean park state so a stale `futex_uaddr` left

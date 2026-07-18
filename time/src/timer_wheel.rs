@@ -247,6 +247,49 @@ pub fn refresh_waker(handle: SleepHandle, waker: Waker) -> bool {
     false
 }
 
+/// Like [`refresh_waker`] but also updates the slot's DEADLINE. Park paths
+/// that reuse one `SleepHandle` across successive parks with different
+/// deadlines (the own-stack `park_should_block`, `UserTaskFuture::poll`)
+/// must use this: plain `refresh_waker` keeps the ORIGINAL deadline, so a
+/// handle that outlives its first park (e.g. a futex park broken by the
+/// wake-generation guard, which clears the park state but leaves the wheel
+/// slot live) silently pins every LATER park's fallback wake to the stale
+/// first deadline — a far-out stale deadline turns the lost-wake backstop
+/// into a strand.
+///
+/// If the new deadline becomes the wheel's earliest, the arm callback is
+/// invoked (same as [`register`]). Returns `false` if the slot was already
+/// fired/recycled (caller should re-register).
+pub fn refresh_waker_at(handle: SleepHandle, deadline_cycles: u64, waker: Waker) -> bool {
+    let arm = {
+        let mut w = WHEEL.lock();
+        let idx = handle.index as usize;
+        if idx >= MAX_SLEEPERS {
+            return false;
+        }
+        let prev_min = w.min_deadline();
+        match w.slots[idx].as_mut() {
+            Some(s) if s.gen == handle.gen => {
+                s.deadline_cycles = deadline_cycles;
+                if !s.waker.will_wake(&waker) {
+                    s.waker = waker;
+                }
+            }
+            _ => return false,
+        }
+        let new_min = w.min_deadline().expect("slot present");
+        match prev_min {
+            Some(p) if new_min < p => Some(new_min),
+            None => Some(new_min),
+            _ => None,
+        }
+    };
+    if let Some(d) = arm {
+        invoke_arm(d);
+    }
+    true
+}
+
 /// Wake every sleeper whose deadline has passed. Returns the
 /// number woken. Safe to call from non-IRQ context only —
 /// calls wake() on each expired Waker, which consumes it and
@@ -354,17 +397,50 @@ pub fn take_due_into(now_cycles: u64, out: &mut [Option<Waker>; MAX_SLEEPERS]) -
 /// lower slot is deferred to the next tick, never re-drained this call.
 pub fn drain_due_to_deferred(now_cycles: u64) {
     for i in 0..MAX_SLEEPERS {
-        // Take this slot's due waker under the wheel lock, then release it
+        // Take this slot's due entry under the wheel lock, then release it
         // before pushing (the wheel + deferred-queue locks never nest).
-        let waker = {
+        let taken = {
             let mut w = WHEEL.lock();
             match w.slots[i].as_ref() {
-                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take().map(|s| s.waker),
+                Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take(),
                 _ => None,
             }
         };
-        if let Some(wk) = waker {
-            narf_lib::deferred_wake::push_pending_iter(core::iter::once(wk));
+        let Some(slot) = taken else { continue };
+        let deadline = slot.deadline_cycles;
+        if let Err(waker) = narf_lib::deferred_wake::try_push_one(slot.waker) {
+            // Deferred queue FULL. The old path dropped the waker here — but
+            // this slot is already vacated, so that drop was a PERMANENT
+            // lost wake (the module doc's "the next timer tick re-fires the
+            // still-pending wheel slot" recovery doesn't apply: the slot is
+            // gone). Put the sleeper back instead — still due, so it is
+            // re-drained on a later tick (or by the executor's non-IRQ
+            // `fire_due`) once the queue has room: bounded latency, never a
+            // loss. Prefer the just-vacated index; fall back to any free
+            // slot if a concurrent `register` grabbed it.
+            let mut w = WHEEL.lock();
+            let idx = if w.slots[i].is_none() {
+                Some(i)
+            } else {
+                w.slots.iter().position(|s| s.is_none())
+            };
+            match idx {
+                Some(j) => {
+                    let gen = w.next_gen;
+                    w.next_gen = w.next_gen.wrapping_add(1).max(1);
+                    w.slots[j] = Some(Slot {
+                        deadline_cycles: deadline,
+                        waker,
+                        gen,
+                    });
+                }
+                None => {
+                    // Deferred queue full AND the wheel refilled to full in
+                    // the take→push window: nowhere to stash the wake. Drop
+                    // it (the pre-existing worst case, now doubly-guarded).
+                    drop(waker);
+                }
+            }
         }
     }
 }

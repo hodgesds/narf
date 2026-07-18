@@ -542,7 +542,18 @@ fn park_should_block(
     let deadline = uc.sleep_deadline_ns.load(Ordering::Acquire);
     if deadline != 0 {
         let now = narf_scheduler::narf_time::monotonic_ns();
-        let signal_pending = deadline == u64::MAX && crate::handlers::is_signal_pending(task_id);
+        // Linux interruptible-sleep semantics: a deliverable pending signal
+        // breaks ANY deadline park — finite ones included. nanosleep/futex/
+        // poll are all signal-interruptible on Linux (-EINTR); restricting
+        // this to infinite (u64::MAX) parks left a finite-deadline sleeper
+        // deaf to signals until its deadline — with a long deadline that is
+        // a de-facto permanent strand (stress-ng --futex: the SIGKILL'd/
+        // SIGALRM'd fork child parked in a timed FUTEX_WAIT never woke, the
+        // parent spun in kill→wait4 forever). Ignored-signal safety: the
+        // return-to-user delivery path CONSUMES pending SIG_IGN/default-
+        // Ignore bits (see `deliver_one_signal`), so breaking the park can't
+        // busy-spin on a bit nobody clears.
+        let signal_pending = crate::handlers::is_signal_pending(task_id);
         if now < deadline && !signal_pending {
             // rt_sigtimedwait park: register in SIGNAL_WAKERS FIRST (every
             // raise path calls `wake_signal`, which fires this entry), THEN
@@ -567,6 +578,22 @@ fn park_should_block(
                 // release the sticky waiter reservation so signals it was
                 // waiting on resume normal handler delivery.
                 uc.sigwait_reserve.store(0, Ordering::Release);
+                // Signal-interruptible park: register in SIGNAL_WAKERS FIRST
+                // (every raise path — kill, itimer expiry, child exit — fires
+                // this entry via `wake_signal`), THEN re-check the pending
+                // set. A signal raised in the gate-check→register window is
+                // caught by the re-check; a later one fires the waker. This
+                // is the wake channel that lets a cross-CPU `kill()` unpark a
+                // finite-deadline sleeper immediately instead of relying on
+                // the timer wheel alone (whose wake can be arbitrarily far
+                // out — the stress-ng --futex SMP strand).
+                crate::handlers::register_signal_waker(task_id, waker.clone());
+                if crate::handlers::is_signal_pending(task_id) {
+                    crate::handlers::drop_signal_waker(task_id);
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    uc.flock_key.store(0, Ordering::Release);
+                    return false; // deliver on the re-executed syscall's return
+                }
             }
             // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
             if uc.net_io_wait.load(Ordering::Acquire) {
@@ -638,8 +665,17 @@ fn park_should_block(
             let fire_ns =
                 park_fire_deadline_ns(deadline, now, uc.net_io_wait.load(Ordering::Acquire));
             let fire_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
+            // `refresh_waker_at`, NOT `refresh_waker`: the handle can outlive
+            // an earlier park with a DIFFERENT deadline (a futex park broken
+            // by its gen guard re-parks through here with a fresh deadline);
+            // refreshing only the waker would leave the slot pinned to the
+            // stale fire time and this park's backstop never fires.
             let refreshed = sleep_handle.is_some_and(|h| {
-                narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
+                narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
+                    h,
+                    fire_cycles,
+                    waker.clone(),
+                )
             });
             if !refreshed {
                 match narf_scheduler::narf_time::timer_wheel::register(fire_cycles, waker.clone()) {
@@ -674,6 +710,9 @@ fn park_should_block(
             return true;
         }
         // Deadline reached / signal pending → clear and proceed (re-execute).
+        // Drop any signal-waker entry this park registered (no-op if
+        // `wake_signal` already consumed it when it fired us).
+        crate::handlers::drop_signal_waker(task_id);
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
         uc.futex_uaddr.store(0, Ordering::Release);
@@ -708,8 +747,10 @@ fn park_should_block(
         let now = narf_scheduler::narf_time::monotonic_ns();
         const FALLBACK_NS: u64 = 10_000_000; // ~1 tick @ 100 Hz
         let fire = narf_scheduler::narf_time::ns_to_cycles(now.saturating_add(FALLBACK_NS));
+        // `refresh_waker_at` — keep the slot's deadline current across
+        // repeated parks through one handle (see the deadline-park note).
         let refreshed = sleep_handle.is_some_and(|h| {
-            narf_scheduler::narf_time::timer_wheel::refresh_waker(h, waker.clone())
+            narf_scheduler::narf_time::timer_wheel::refresh_waker_at(h, fire, waker.clone())
         });
         if !refreshed {
             *sleep_handle =
@@ -1471,16 +1512,18 @@ impl core::future::Future for UserTaskFuture {
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
             // An asynchronously-raised signal (e.g. SIGALRM from an
-            // interval timer that fired via a sleep-pump) must break an
-            // *infinite* park — pause(2), or a blocking poll/epoll/futex
-            // wait — so the task takes delivery on its next yield-point
-            // syscall. We restrict this to `deadline == u64::MAX`: a
-            // finite sleep(2) already wakes at its own deadline, and
-            // un-parking it on a pending *ignored* signal (which no
-            // syscall would then clear) would busy-spin. The pump still
-            // runs at least once below before the signal becomes pending.
-            let signal_pending = deadline == u64::MAX
-                && crate::handlers::is_signal_pending(crate::handlers::current_task_id());
+            // interval timer, a cross-process kill) must break ANY park —
+            // finite deadlines included: nanosleep/futex/poll are signal-
+            // interruptible on Linux (-EINTR). The old `deadline ==
+            // u64::MAX` restriction (guarding against a busy-spin on a
+            // pending *ignored* signal) is obsolete: the return-to-user
+            // delivery path consumes SIG_IGN/default-Ignore pending bits,
+            // so the break costs one spurious re-execution at most. A
+            // finite-deadline park that ignored signals was a de-facto
+            // permanent strand when the deadline was far out (the
+            // stress-ng --futex SMP hang).
+            let signal_pending =
+                crate::handlers::is_signal_pending(crate::handlers::current_task_id());
             if now < deadline && !signal_pending {
                 // rt_sigtimedwait park: same register-then-re-check shape as
                 // the own-stack `park_should_block` sigwait arm — register in
@@ -1503,6 +1546,21 @@ impl core::future::Future for UserTaskFuture {
                     // Non-sigwait park — release the sticky waiter
                     // reservation (see `UserTaskCtx::sigwait_reserve`).
                     this.task.uctx.sigwait_reserve.store(0, Ordering::Release);
+                    // Signal-interruptible park: register in SIGNAL_WAKERS
+                    // FIRST (every raise path fires it via `wake_signal`),
+                    // then RE-CHECK pending — closes the check→register
+                    // window; see the own-stack `park_should_block` twin.
+                    let tid = crate::handlers::current_task_id();
+                    crate::handlers::register_signal_waker(tid, cx.waker().clone());
+                    if crate::handlers::is_signal_pending(tid) {
+                        crate::handlers::drop_signal_waker(tid);
+                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        if let Some(h) = this.sleep_handle.take() {
+                            narf_scheduler::narf_time::timer_wheel::cancel(h);
+                        }
+                        cx.waker().wake_by_ref();
+                        return core::task::Poll::Pending;
+                    }
                 }
                 // Parking on a blocking wait. If `sys_epoll_wait`/
                 // `sys_poll` flagged this as a net I/O wait, register
@@ -1585,8 +1643,15 @@ impl core::future::Future for UserTaskFuture {
                     const FALLBACK_NS: u64 = 10_000_000; // ~1 tick (100 Hz)
                     let cpns = narf_scheduler::narf_time::cycles_per_ns().max(1) as u64;
                     let fallback_cycles = now.saturating_add(FALLBACK_NS).saturating_mul(cpns);
+                    // `refresh_waker_at` — keep the slot's fire time current
+                    // across parks that reuse this handle (a stale earlier
+                    // deadline would pin the backstop; see park_should_block).
                     let refreshed = this.sleep_handle.is_some_and(|h| {
-                        narf_scheduler::narf_time::timer_wheel::refresh_waker(h, cx.waker().clone())
+                        narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
+                            h,
+                            fallback_cycles,
+                            cx.waker().clone(),
+                        )
                     });
                     if !refreshed {
                         this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
@@ -1620,8 +1685,13 @@ impl core::future::Future for UserTaskFuture {
                     this.task.uctx.net_io_wait.load(Ordering::Acquire),
                 );
                 let deadline_cycles = fire_ns.saturating_mul(cpns);
+                // `refresh_waker_at` — see the infinite-park note above.
                 let refreshed = this.sleep_handle.is_some_and(|h| {
-                    narf_scheduler::narf_time::timer_wheel::refresh_waker(h, cx.waker().clone())
+                    narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
+                        h,
+                        deadline_cycles,
+                        cx.waker().clone(),
+                    )
                 });
                 if !refreshed {
                     this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
@@ -1642,6 +1712,9 @@ impl core::future::Future for UserTaskFuture {
             // sys_sleep call doesn't see stale state, cancel any wheel slot,
             // then fall through to the normal resume path (which re-enters
             // user mode; a pending signal is delivered on the next return).
+            // Drop any signal-waker entry this park registered (no-op if
+            // `wake_signal` already consumed it when it fired us).
+            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
             this.task.uctx.futex_uaddr.store(0, Ordering::Release);
@@ -2285,14 +2358,15 @@ impl core::future::Future for UserTaskFuture {
         let deadline = this.task.uctx.sleep_deadline_ns.load(Ordering::Acquire);
         if deadline != 0 {
             let now = narf_scheduler::narf_time::monotonic_ns();
-            // Break an infinite park on an async pending signal — see the
-            // sibling poll body for the rationale. A sigwait park (non-zero
+            // Break ANY park (finite deadlines included — Linux
+            // interruptible-sleep semantics; see the x86_64 sibling) on an
+            // async deliverable pending signal. A sigwait park (non-zero
             // `sigwait_set`, finite deadline or not) additionally breaks on
             // a pending signal in its waited set (mask ignored) so the
             // rewound rt_sigtimedwait re-executes and consumes it.
             let tid = crate::handlers::current_task_id();
             let sw = this.task.uctx.sigwait_set.load(Ordering::Acquire);
-            let signal_pending = (deadline == u64::MAX && crate::handlers::is_signal_pending(tid))
+            let signal_pending = crate::handlers::is_signal_pending(tid)
                 || (sw != 0 && crate::handlers::sigwait_should_wake(tid, sw));
             if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;

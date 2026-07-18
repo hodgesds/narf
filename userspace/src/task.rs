@@ -109,6 +109,27 @@ pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().get(&tid).cloned()
 }
 
+/// Diagnostic snapshot for the stall watchdog: one entry per registered
+/// task — `(tid, pid, state, sleep_deadline_ns, futex_uaddr,
+/// parked_in_syscall)`. Clones the Arcs out under the lock, reads the
+/// atomics lock-free after.
+pub fn dbg_park_snapshot() -> alloc::vec::Vec<(u64, u64, u32, u64, u64, bool)> {
+    let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
+    tasks
+        .iter()
+        .map(|t| {
+            (
+                t.tid,
+                t.pid.load(Ordering::Relaxed),
+                t.state.load(Ordering::Relaxed),
+                t.uctx.sleep_deadline_ns.load(Ordering::Relaxed),
+                t.uctx.futex_uaddr.load(Ordering::Relaxed),
+                t.uctx.parked_in_syscall.load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
 /// The task currently executing on this CPU, if the scheduler has one
 /// published. `None` in kernel-test harness contexts.
 pub fn current_task() -> Option<Arc<Task>> {
