@@ -15134,7 +15134,14 @@ fn sys_getcwd(ctx: &mut dyn TrapContext) {
 /// Default per-task heap base. Far enough from the mmap cursor and
 /// the user stack to leave room for both to grow without colliding
 /// with the brk arena.
+///
+/// INVARIANT: must stay clear of `crate::vdso::VDSO_MAP_BASE` (and every
+/// other fixed per-process mapping) — the vdso used to live at exactly
+/// this address, which made the FIRST `brk` grow fail with
+/// `AddressSpaceError::Overlap` whenever a vdso image was registered
+/// (glibc allocates its static TLS via `sbrk` at the default break).
 const BRK_DEFAULT_BASE: u64 = 0x0000_5000_0000_0000;
+const _: () = assert!(BRK_DEFAULT_BASE != crate::vdso::VDSO_MAP_BASE);
 
 static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
