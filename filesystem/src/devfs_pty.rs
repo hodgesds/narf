@@ -155,10 +155,19 @@ impl<const N: usize> core::fmt::Debug for ByteRing<N> {
 
 // ── Termios ───────────────────────────────────────────────────────────────────
 
-/// Wire length of the userspace `struct termios` exchanged by
-/// TCGETS/TCSETS on x86_64 (glibc/musl: 4 flag words + c_line + c_cc[32] +
-/// 2 speeds, padded to 60).
+/// Wire length of libc's userspace `struct termios` on x86_64 (glibc/musl:
+/// 4 flag words + c_line + c_cc[32] + 2 speeds, padded to 60). This is the
+/// size of NARF's INTERNAL termios image, NOT the ioctl wire size.
 pub const TERMIOS_WIRE_LEN: usize = 60;
+
+/// The KERNEL-ABI `struct termios` is 36 bytes (`NCCS = 19`): 4 flag words
+/// (16) + c_line (1) + c_cc[19] (19). TCGETS/TCSETS exchange exactly this
+/// with userspace — glibc's tcgetattr/tcsetattr pass a 36-byte
+/// `__kernel_termios` and convert. Writing the full 60-byte image overruns
+/// that buffer by 24 bytes (clobbering the caller's stack canary → SIGABRT
+/// in glibc's isatty during systemd's open_terminal). The first 36 bytes of
+/// the 60-byte image are exactly the kernel struct (speeds live at 52+).
+pub const KERNEL_TERMIOS_LEN: usize = 36;
 
 // `c_lflag` bits we honour (asm-generic termbits).
 const L_ISIG: u32 = 0x0000_0001;
@@ -606,13 +615,15 @@ pub(crate) unsafe fn write_user_termios(
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
-    let v = *src;
+    // Kernel ABI: write only the first 36 bytes (kernel struct termios).
+    let mut k = [0u8; KERNEL_TERMIOS_LEN];
+    k.copy_from_slice(&src[..KERNEL_TERMIOS_LEN]);
     // SAFETY: caller guarantees uptr is a valid user pointer; with_user_access
     // brackets the access with SMAP and write_unaligned emits inline stores
     // (a copy_nonoverlapping memcpy libcall escapes the STAC/CLAC window).
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::write_unaligned(uptr as *mut [u8; TERMIOS_WIRE_LEN], v);
+            core::ptr::write_unaligned(uptr as *mut [u8; KERNEL_TERMIOS_LEN], k);
         });
     }
     Ok(())
@@ -626,9 +637,10 @@ pub(crate) unsafe fn write_user_termios(
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // Kernel ABI: write only the first 36 bytes (kernel struct termios).
     // SAFETY: caller guarantees uptr is a valid user pointer; src and uptr
-    // are non-overlapping 60-byte regions.
-    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), uptr as *mut u8, TERMIOS_WIRE_LEN) };
+    // are non-overlapping and 36 <= 60.
+    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), uptr as *mut u8, KERNEL_TERMIOS_LEN) };
     Ok(())
 }
 
@@ -639,16 +651,20 @@ pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // Kernel ABI: read only the first 36 bytes (kernel struct termios),
+    // zero-extended into the 60-byte internal image.
     // SAFETY: caller guarantees uptr is a valid user pointer; with_user_access
     // brackets the access with SMAP and read_unaligned emits inline loads (a
     // copy_nonoverlapping memcpy libcall escapes the STAC/CLAC window and
     // faults supervisor-reading the user page).
-    let v = unsafe {
+    let k = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::read_unaligned(uptr as *const [u8; TERMIOS_WIRE_LEN])
+            core::ptr::read_unaligned(uptr as *const [u8; KERNEL_TERMIOS_LEN])
         })
     };
-    Ok(v)
+    let mut out = [0u8; TERMIOS_WIRE_LEN];
+    out[..KERNEL_TERMIOS_LEN].copy_from_slice(&k);
+    Ok(out)
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
@@ -656,11 +672,12 @@ pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
+    // Kernel ABI: read only the first 36 bytes (kernel struct termios).
     let mut out = [0u8; TERMIOS_WIRE_LEN];
     // SAFETY: caller guarantees uptr is a valid user pointer; out and uptr
-    // are non-overlapping 60-byte regions.
+    // are non-overlapping and 36 <= 60.
     unsafe {
-        core::ptr::copy_nonoverlapping(uptr as *const u8, out.as_mut_ptr(), TERMIOS_WIRE_LEN)
+        core::ptr::copy_nonoverlapping(uptr as *const u8, out.as_mut_ptr(), KERNEL_TERMIOS_LEN)
     };
     Ok(out)
 }

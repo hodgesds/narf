@@ -283,46 +283,62 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
 /// shares fg_pgrp across the three slots — that matches POSIX: stdio
 /// inherits from the controlling tty, so tcsetpgrp on fd 0 is visible
 /// on fd 1/2 of the same shell.
-/// SMAP-safe read of a 60-byte `struct termios` from a user pointer.
-/// Uses `read_unaligned` inside the SMAP window deliberately: a
-/// `copy_nonoverlapping`/memcpy (what `copy_from_user` inlines to for a
-/// const-size buffer) escapes the STAC/CLAC bracket and faults the
-/// kernel supervisor-reading the user page.
+/// The kernel-ABI `struct termios` is 36 bytes (`NCCS = 19`): four 32-bit
+/// flags (16) + `c_line` (1) + `c_cc[19]` (19). This is what the TCGETS/
+/// TCSETS ioctls read/write — NOT libc's userspace `struct termios` (60
+/// bytes, `NCCS = 32` + `c_ispeed`/`c_ospeed`). glibc's tcgetattr/tcsetattr
+/// pass a 36-byte `__kernel_termios` and convert; writing 60 bytes to that
+/// buffer overruns the caller's stack by 24 bytes (clobbering its stack
+/// canary → SIGABRT in systemd's isatty() during log setup). musl happens
+/// to pass a 60-byte buffer so it tolerated the old behaviour. NARF's
+/// internal termios is a 60-byte buffer in the libc layout; its first 36
+/// bytes are exactly the kernel struct (the speeds live at offset 52+).
+const KERNEL_TERMIOS_LEN: usize = 36;
+
+/// SMAP-safe read of a kernel `struct termios` (36 bytes) from a user
+/// pointer, zero-extended into NARF's 60-byte internal buffer. Uses
+/// `read_unaligned` inside the SMAP window deliberately: a memcpy escapes
+/// the STAC/CLAC bracket and faults the kernel reading the user page.
 unsafe fn read_user_termios(uptr: u64) -> Result<[u8; 60], FsError> {
-    if uptr == 0 || crate::handlers::validate_user_range(uptr, 60).is_err() {
+    if uptr == 0 || crate::handlers::validate_user_range(uptr, KERNEL_TERMIOS_LEN).is_err() {
         return Err(FsError::InvalidData);
     }
     #[cfg(target_arch = "x86_64")]
     // SAFETY: range-validated; with_user_access brackets SMAP and
     // read_unaligned emits inline loads.
-    let v = unsafe {
+    let k = unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::read_unaligned(uptr as *const [u8; 60])
+            core::ptr::read_unaligned(uptr as *const [u8; KERNEL_TERMIOS_LEN])
         })
     };
     #[cfg(not(target_arch = "x86_64"))]
     // SAFETY: range-validated; no SMAP off x86_64.
-    let v = unsafe { core::ptr::read_unaligned(uptr as *const [u8; 60]) };
-    Ok(v)
+    let k = unsafe { core::ptr::read_unaligned(uptr as *const [u8; KERNEL_TERMIOS_LEN]) };
+    let mut out = [0u8; 60];
+    out[..KERNEL_TERMIOS_LEN].copy_from_slice(&k);
+    Ok(out)
 }
 
-/// SMAP-safe write of a 60-byte `struct termios` to a user pointer.
+/// SMAP-safe write of a kernel `struct termios` (the first 36 bytes of
+/// NARF's 60-byte internal buffer) to a user pointer.
 unsafe fn write_user_termios(uptr: u64, src: [u8; 60]) -> Result<(), FsError> {
-    if uptr == 0 || crate::handlers::validate_user_range(uptr, 60).is_err() {
+    if uptr == 0 || crate::handlers::validate_user_range(uptr, KERNEL_TERMIOS_LEN).is_err() {
         return Err(FsError::InvalidData);
     }
+    let mut k = [0u8; KERNEL_TERMIOS_LEN];
+    k.copy_from_slice(&src[..KERNEL_TERMIOS_LEN]);
     #[cfg(target_arch = "x86_64")]
     // SAFETY: range-validated; with_user_access brackets SMAP and
     // write_unaligned emits inline stores.
     unsafe {
         narf_arch::x86_64::smap::with_user_access(|| {
-            core::ptr::write_unaligned(uptr as *mut [u8; 60], src)
+            core::ptr::write_unaligned(uptr as *mut [u8; KERNEL_TERMIOS_LEN], k)
         });
     }
     #[cfg(not(target_arch = "x86_64"))]
     // SAFETY: range-validated; no SMAP off x86_64.
     unsafe {
-        core::ptr::write_unaligned(uptr as *mut [u8; 60], src);
+        core::ptr::write_unaligned(uptr as *mut [u8; KERNEL_TERMIOS_LEN], k);
     }
     Ok(())
 }
