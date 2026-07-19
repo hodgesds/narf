@@ -83,12 +83,22 @@ pub fn register_vdso_image(bytes: &[u8], cycles_per_ns: u32) {
         zero_frame(frame);
         let off = i * 4096;
         let chunk = core::cmp::min(4096, bytes.len() - off);
-        // SAFETY: freshly-allocated frame, identity-mapped in low RAM;
-        // chunk <= 4096.
+        // SAFETY: freshly-allocated frame, identity-mapped in low RAM; chunk <= 4096.
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr().add(off), frame.raw() as *mut u8, chunk);
         }
         frames.push(frame);
+    }
+
+    // Hold a PERMANENT COW reference on every master frame. The vDSO is
+    // mapped into each process as a private copy-on-write region backed
+    // by these masters (see `map_into`); this baseline ref keeps the
+    // master count > 1 so a write-fault always SPLITS (giving the writer
+    // a private page) instead of taking cow_split's sole-owner shortcut
+    // that would write through to the shared master — and it guarantees
+    // the global masters are never freed by a process teardown.
+    for &f in &frames {
+        let _ = narf_memory::frame::cow::inc_ref(f);
     }
 
     write_vvar(vvar, cycles_per_ns.max(1), 0);
@@ -121,12 +131,25 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
             phys: alloc::vec![img.vvar_frame],
         })
         .ok()?;
+    // Map the vDSO code+dynamic as a PRIVATE copy-on-write region backed
+    // by the shared master frames — NOT MAP_SHARED. glibc's ld.so writes
+    // the vDSO's dynamic section in-place (adjusting `d_un` by the load
+    // bias); if that were shared, one process's write would corrupt every
+    // other's (a later ld.so would double the bias into a non-canonical
+    // pointer). As a COW region the write faults, cow_split hands the
+    // writer a private page, and the master stays pristine (0-based
+    // `d_un`) for the next process. `inc_ref` per mapping keeps the
+    // master's refcount > 1 so the split path (not the sole-owner
+    // shortcut) is taken; the teardown's `free_frame` dec_refs it back.
     let vdso_len = (img.vdso_frames.len() as u64) << 12;
+    for &f in &img.vdso_frames {
+        let _ = narf_memory::frame::cow::inc_ref(f);
+    }
     addr_space
         .map_region(Region {
             base: VirtAddr::new(VDSO_VADDR),
             len: vdso_len,
-            perms: RegionPerms::READ | RegionPerms::EXEC | RegionPerms::SHARED,
+            perms: RegionPerms::READ | RegionPerms::EXEC,
             phys: img.vdso_frames.clone(),
         })
         .ok()?;

@@ -9884,11 +9884,22 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // the top and `ca.stack_size` is 0 — `stack + 0` recovers
     // the top. The combined check is therefore just "stack
     // pointer is non-zero".
-    if ca.stack == 0 {
+    // A THREAD (CLONE_VM: shares the parent's address space) must bring
+    // its own stack — reusing the parent's would collide. A fork-shaped
+    // clone (no CLONE_VM) instead COW-copies the whole AS, so `stack == 0`
+    // is valid and means "resume the child on the (COW) parent stack at
+    // the parent's RSP" — exactly what glibc's fork() passes
+    // (`clone(SIGCHLD|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID, stack=0)`).
+    if share_vm && ca.stack == 0 {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
     }
-    let rsp = ca.stack.saturating_add(ca.stack_size);
+    let rsp = if ca.stack != 0 {
+        ca.stack.saturating_add(ca.stack_size)
+    } else {
+        // Fork: inherit the parent's user RSP (child runs on its COW copy).
+        ctx.user_rsp()
+    };
 
     // Entry: clone3 doesn't carry an explicit entry RIP in
     // clone_args. The child resumes at the parent's saved trap-

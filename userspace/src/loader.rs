@@ -389,6 +389,14 @@ const DT_RELAENT: i64 = 9;
 const DT_STRSZ: i64 = 10;
 const DT_PLTREL: i64 = 20;
 const DT_JMPREL: i64 = 23;
+// DT_RELR / DT_RELRSZ / DT_RELRENT — the packed relative-relocation
+// table (SysV gABI, "-z pack-relative-relocs"). Modern toolchains
+// (Debian 13 glibc/ld-linux) emit RELATIVE relocations here in a
+// bitmap-compressed form instead of full 24-byte RELA entries; an
+// object using RELR is broken unless its relocator applies them.
+const DT_RELR: i64 = 0x24;
+const DT_RELRSZ: i64 = 0x23;
+const DT_RELRENT: i64 = 0x25;
 #[allow(dead_code)]
 const DT_RELACOUNT: i64 = 0x6FFFFFF9;
 
@@ -679,6 +687,15 @@ fn tls_block_size(image: &ExecImage) -> u64 {
 /// to R_X86_64_RELATIVE addends — `0` for an ET_EXEC program,
 /// non-zero for an ET_DYN interpreter loaded at a chosen base.
 ///
+/// `apply_relr` gates the DT_RELR pass. A self-relocating object — an
+/// ELF interpreter (ld.so / ld-musl) loaded with a correct AT_BASE, or
+/// a static-PIE via rcrt1 — applies its OWN packed relative relocations
+/// in its bootstrap. RELR is read-modify-write (`*slot += bias`), so if
+/// the kernel ALSO applies it the bias lands twice and every RELR-fixed
+/// pointer goes non-canonical. The interpreter path therefore passes
+/// `false` (RELATIVE via DT_RELA is still applied — idempotent absolute
+/// writes musl's ld relies on — but RELR is left to the self-relocator).
+///
 /// # Safety
 /// - `addr_space` must already be `materialize()`-d so each
 ///   relocated `r_offset` is reachable through the AS.
@@ -690,6 +707,7 @@ pub unsafe fn apply_relocations(
     image: &ExecImage,
     addr_space: &AddressSpace,
     vaddr_bias: u64,
+    apply_relr: bool,
 ) -> Result<(), LoadBytesError> {
     if image.dynamic.is_empty() {
         return Ok(());
@@ -769,7 +787,87 @@ pub unsafe fn apply_relocations(
         }
     }
 
+    // DT_RELR — packed relative relocations. Each slot the table names
+    // holds a link-time-relative value that needs `vaddr_bias` added:
+    // an implicit R_X86_64_RELATIVE whose addend is the slot's own
+    // current contents (read-modify-write), NOT a RELA addend. Modern
+    // glibc/ld-linux (Debian 13) put most RELATIVE relocs here, so an
+    // interpreter loaded without this pass runs with wild pointers.
+    if let Some(relr_addr) = dt_lookup(&image.dynamic, DT_RELR).filter(|_| apply_relr) {
+        let relrsz = dt_lookup(&image.dynamic, DT_RELRSZ).unwrap_or(0);
+        let relrent = dt_lookup(&image.dynamic, DT_RELRENT).unwrap_or(8);
+        if relrsz > 0 {
+            // The gABI fixes RELR entries at 8 bytes; anything else is
+            // a malformed table we won't guess at.
+            if relrent != 8 {
+                return Err(LoadBytesError::UnsupportedRelocation);
+            }
+            let slice = resolve_dt_pointer(bytes, image, relr_addr, relrsz)
+                .ok_or(LoadBytesError::RelaOutOfBounds)?;
+            // `for_each_relr_target` is a pure decoder; the closure does
+            // the per-slot read-modify-write. A closure can't return an
+            // error mid-walk, so the first unmapped slot latches into
+            // `err` and later slots short-circuit.
+            let mut err: Result<(), LoadBytesError> = Ok(());
+            for_each_relr_target(slice, |slot_va| {
+                if err.is_err() {
+                    return;
+                }
+                let target_va = slot_va.wrapping_add(vaddr_bias);
+                match user_vaddr_to_kernel_ptr(addr_space, target_va) {
+                    // SAFETY: `dst` points into an identity-mapped phys
+                    // frame backing the user's mapped page; the slot is
+                    // 8 bytes wide and RELR r_offsets are 8-aligned by
+                    // construction. Read the link-time value, add the
+                    // load bias, write it back.
+                    // SAFETY: Valid memory or trusted environment
+                    Some(dst) => unsafe {
+                        let cur = core::ptr::read_unaligned(dst as *const u64);
+                        core::ptr::write_unaligned(dst as *mut u64, cur.wrapping_add(vaddr_bias));
+                    },
+                    None => err = Err(LoadBytesError::RelocTargetUnmapped),
+                }
+            });
+            err?;
+        }
+    }
+
     Ok(())
+}
+
+/// Decode a DT_RELR table, invoking `visit(link_time_vaddr)` once for
+/// each relocated slot's *un-biased* r_offset, in table order. Pure
+/// decoding with no memory access, so the bitmap walk is unit-testable.
+///
+/// RELR encoding (SysV gABI): the table is a stream of 8-byte words.
+/// An even word is an *address* — the link-time vaddr of the first
+/// relocated slot; it relocates that slot and sets the cursor to the
+/// next 8-byte word. An odd word is a *bitmap*: bits 1..=63 mark which
+/// of the 63 slots starting at the cursor are relocated (bit 0 is the
+/// tag). A bitmap always advances the cursor by 63 slots regardless of
+/// which bits were set, so runs of bitmaps chain contiguously.
+pub(crate) fn for_each_relr_target(relr: &[u8], mut visit: impl FnMut(u64)) {
+    let n = relr.len() / 8;
+    let mut cursor: u64 = 0;
+    for i in 0..n {
+        let e = read_u64_le(&relr[i * 8..i * 8 + 8]);
+        if e & 1 == 0 {
+            cursor = e;
+            visit(cursor);
+            cursor = cursor.wrapping_add(8);
+        } else {
+            let mut bits = e >> 1;
+            let mut slot = cursor;
+            while bits != 0 {
+                if bits & 1 != 0 {
+                    visit(slot);
+                }
+                slot = slot.wrapping_add(8);
+                bits >>= 1;
+            }
+            cursor = cursor.wrapping_add(63 * 8);
+        }
+    }
 }
 
 /// Iterate `Elf64_Rela { r_offset, r_info, r_addend }` entries and

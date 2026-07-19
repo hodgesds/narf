@@ -251,7 +251,18 @@ pub unsafe fn load_user_process_with(
                 // walkable; INTERP_BIAS is the matching load offset to apply.
                 // SAFETY: Valid memory or trusted environment
                 unsafe {
-                    apply_relocations(interp_bytes, &interp_image, &address_space, INTERP_BIAS)
+                    // apply_relr = false: the interpreter self-relocates its
+                    // own DT_RELR in bootstrap (it has a correct AT_BASE). The
+                    // kernel applying it too would double the bias (RELR is
+                    // read-modify-write) and corrupt ld.so into a non-canonical
+                    // call target. RELATIVE (DT_RELA) is still applied.
+                    apply_relocations(
+                        interp_bytes,
+                        &interp_image,
+                        &address_space,
+                        INTERP_BIAS,
+                        false,
+                    )
                 }?;
             }
 

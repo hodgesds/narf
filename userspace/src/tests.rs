@@ -4163,7 +4163,9 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0).unwrap() };
+    unsafe {
+        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false).unwrap()
+    };
 
     // Read back the slot through the AS — same translate-and-cast
     // pattern the other smokes use.
@@ -4194,6 +4196,209 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_apply_relative_relocations);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_relr_decode() -> TestResult {
+    // DT_RELR bitmap decode + read-modify-write semantics. Modern
+    // glibc/ld-linux (Debian 13, "-z pack-relative-relocs") emit their
+    // RELATIVE relocations here; the loader was blind to the table, so
+    // an interpreter loaded that way ran with un-biased pointers and
+    // #GP'd. This exercises the pure `for_each_relr_target` decoder:
+    //   entry 0 (even)  → address 0x1000: relocate the slot there.
+    //   entry 1 (odd)   → bitmap over the 63 slots after 0x1008; bits
+    //                     1, 3, 63 set → slots 0, 2, 62.
+    //   entry 2 (even)  → address 0x2000: relocate that slot.
+    // The bitmap word: bit 0 is the tag, bit N (N≥1) marks the slot at
+    // cursor + (N−1)*8.
+    use crate::loader::for_each_relr_target;
+
+    const BITMAP: u64 = 1 | (1u64 << 1) | (1u64 << 3) | (1u64 << 63);
+    let mut table = alloc::vec::Vec::<u8>::new();
+    table.extend_from_slice(&0x1000u64.to_le_bytes()); // address entry
+    table.extend_from_slice(&BITMAP.to_le_bytes()); // bitmap entry
+    table.extend_from_slice(&0x2000u64.to_le_bytes()); // address entry
+
+    // Expected relocated slots, in table order.
+    let expected: [u64; 5] = [
+        0x1000,          // entry 0
+        0x1008,          // bitmap bit 1 → slot 0
+        0x1018,          // bitmap bit 3 → slot 2
+        0x1008 + 62 * 8, // bitmap bit 63 → slot 62 (0x11F8)
+        0x2000,          // entry 2
+    ];
+
+    let mut visited = alloc::vec::Vec::<u64>::new();
+    for_each_relr_target(&table, |va| visited.push(va));
+    if visited.as_slice() != expected {
+        return TestResult::Fail("RELR decode visited the wrong slot sequence");
+    }
+
+    // Read-modify-write check: each named slot holds a link-time value;
+    // applying bias must add it exactly once. Model memory as a map
+    // from slot vaddr → value and replay the walk with a bias.
+    const BIAS: u64 = 0x0000_0080_0000_0000;
+    let seeds: [(u64, u64); 5] = [
+        (0x1000, 0x11),
+        (0x1008, 0x22),
+        (0x1018, 0x33),
+        (0x1008 + 62 * 8, 0x44),
+        (0x2000, 0x55),
+    ];
+    let mut mem = alloc::vec::Vec::<(u64, u64)>::from(seeds);
+    for_each_relr_target(&table, |va| {
+        if let Some(slot) = mem.iter_mut().find(|(a, _)| *a == va) {
+            slot.1 = slot.1.wrapping_add(BIAS);
+        }
+    });
+    for (i, (_, v)) in mem.iter().enumerate() {
+        if *v != seeds[i].1.wrapping_add(BIAS) {
+            return TestResult::Fail("RELR RMW didn't add bias exactly once per slot");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_relr_decode);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_apply_relr_relocations() -> TestResult {
+    // End-to-end DT_RELR: build an ET_DYN with a PT_LOAD, a PT_DYNAMIC
+    // naming a RELR table, and seeded slots; load it (bias =
+    // PROGRAM_DYN_BASE), run `apply_relocations`, and read the slots
+    // back. Each RELR-covered slot must hold `link_time_value + bias`
+    // EXACTLY ONCE (RELR is read-modify-write, so a double-apply would
+    // show `+ 2*bias` — the non-canonical corruption that broke glibc
+    // ld.so). A slot the bitmap does NOT mark must be untouched.
+    use crate::load_user_process_with;
+    use narf_memory::x86_64::paging;
+    use narf_memory::VirtAddr;
+
+    const BIAS: u64 = 0x0000_0080_0000_0000; // PROGRAM_DYN_BASE (ET_DYN load bias)
+    const SEG_VA: u64 = 0x1000; // link-time p_vaddr (small — ET_DYN)
+    const SEG_FOFF: u64 = 0x1000;
+    // Seeded slots (link-time vaddrs) + their pre-relocation values.
+    const A_VA: u64 = SEG_VA + 0x80; // via RELR address entry
+    const B_VA: u64 = SEG_VA + 0x88; // via bitmap bit 1 (slot 0)
+    const C_VA: u64 = SEG_VA + 0x98; // via bitmap bit 3 (slot 2)
+    const U_VA: u64 = SEG_VA + 0x90; // between B and C, bit 2 unset → untouched
+    const A_VAL: u64 = 0x1111;
+    const B_VAL: u64 = 0x2222;
+    const C_VAL: u64 = 0x3333;
+    const U_VAL: u64 = 0x4444;
+    const RELR_VA: u64 = SEG_VA + 0x100;
+    const DYN_VA: u64 = SEG_VA + 0x200;
+
+    fn build() -> alloc::vec::Vec<u8> {
+        const FSIZE: usize = 0x2000;
+        let mut b = alloc::vec![0u8; FSIZE];
+        b[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b[0x10..0x12].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        b[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        b[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
+        b[0x18..0x20].copy_from_slice(&(SEG_VA + 0x111).to_le_bytes()); // entry inside seg
+        b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+                                                            // Phdr 0 — PT_LOAD (R+W) at SEG_VA, file page 0x1000.
+        let mut ph = 64usize;
+        b[ph..ph + 0x04].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&6u32.to_le_bytes()); // PF_R|PF_W
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&SEG_FOFF.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&SEG_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&0x1000u64.to_le_bytes()); // filesz
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&0x1000u64.to_le_bytes()); // memsz
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&0x1000u64.to_le_bytes()); // align
+                                                                           // Phdr 1 — PT_DYNAMIC over the dynamic array (4 × 16 = 64).
+        ph = 64 + 56;
+        let dyn_foff = SEG_FOFF + (DYN_VA - SEG_VA);
+        b[ph..ph + 0x04].copy_from_slice(&2u32.to_le_bytes()); // PT_DYNAMIC
+        b[ph + 0x04..ph + 0x08].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        b[ph + 0x08..ph + 0x10].copy_from_slice(&dyn_foff.to_le_bytes());
+        b[ph + 0x10..ph + 0x18].copy_from_slice(&DYN_VA.to_le_bytes());
+        b[ph + 0x18..ph + 0x20].copy_from_slice(&DYN_VA.to_le_bytes());
+        b[ph + 0x20..ph + 0x28].copy_from_slice(&64u64.to_le_bytes());
+        b[ph + 0x28..ph + 0x30].copy_from_slice(&64u64.to_le_bytes());
+        b[ph + 0x30..ph + 0x38].copy_from_slice(&8u64.to_le_bytes());
+
+        // Seed the four slots with their link-time values.
+        let put = |b: &mut [u8], va: u64, val: u64| {
+            let off = (SEG_FOFF + (va - SEG_VA)) as usize;
+            b[off..off + 8].copy_from_slice(&val.to_le_bytes());
+        };
+        put(&mut b, A_VA, A_VAL);
+        put(&mut b, B_VA, B_VAL);
+        put(&mut b, C_VA, C_VAL);
+        put(&mut b, U_VA, U_VAL);
+
+        // RELR table: [address(A_VA), bitmap]. After the address entry
+        // the cursor sits at A_VA+8 == B_VA; bitmap bit 1 → B_VA (slot 0),
+        // bit 3 → C_VA (slot 2). Bit 2 (U_VA) is left unset.
+        let relr_foff = (SEG_FOFF + (RELR_VA - SEG_VA)) as usize;
+        b[relr_foff..relr_foff + 8].copy_from_slice(&A_VA.to_le_bytes());
+        let bitmap: u64 = 1 | (1u64 << 1) | (1u64 << 3);
+        b[relr_foff + 8..relr_foff + 16].copy_from_slice(&bitmap.to_le_bytes());
+
+        // Dynamic array: DT_RELR=0x24, DT_RELRSZ=0x23, DT_RELRENT=0x25, DT_NULL.
+        let mut p = dyn_foff as usize;
+        let ent = |b: &mut [u8], p: &mut usize, tag: i64, val: u64| {
+            b[*p..*p + 8].copy_from_slice(&tag.to_le_bytes());
+            b[*p + 8..*p + 16].copy_from_slice(&val.to_le_bytes());
+            *p += 16;
+        };
+        ent(&mut b, &mut p, 0x24, RELR_VA); // DT_RELR
+        ent(&mut b, &mut p, 0x23, 16); // DT_RELRSZ (2 entries)
+        ent(&mut b, &mut p, 0x25, 8); // DT_RELRENT
+        ent(&mut b, &mut p, 0, 0); // DT_NULL
+        b
+    }
+
+    let bytes = build();
+    // SAFETY: harness keeps the low 4 GiB identity-mapped + frame allocator up;
+    // `bytes` lives for the whole call.
+    // SAFETY: Valid memory or trusted environment
+    let proc = match unsafe { load_user_process_with(&bytes, &[], &[], &[]) } {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("load_user_process_with failed"),
+    };
+    let image = crate::parse_elf(&bytes).unwrap();
+    // SAFETY: `proc` was just built from `bytes`; its AS is mapped and matches
+    // `image`. BIAS is the ET_DYN load bias the loader applied.
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, BIAS, true).unwrap()
+    };
+
+    let read_u64 = |vaddr: u64| -> Option<u64> {
+        let p =
+            // SAFETY: `proc.address_space.root` is this test process's live page-table
+            // root; the walk reads table entries for the page-aligned `vaddr`.
+            // SAFETY: Valid memory or trusted environment
+            unsafe { paging::translate(proc.address_space.root, VirtAddr::new(vaddr & !0xFFF)) }?;
+        // SAFETY: `p` is the phys frame just resolved; OR-ing the in-page offset
+        // stays within it and the `u64` read is 8-aligned by construction.
+        // SAFETY: Valid memory or trusted environment
+        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+    };
+
+    // Each covered slot must be link_time_value + BIAS, applied once.
+    for (va, val) in [(A_VA, A_VAL), (B_VA, B_VAL), (C_VA, C_VAL)] {
+        match read_u64(va + BIAS) {
+            Some(got) if got == val.wrapping_add(BIAS) => {}
+            Some(_) => return TestResult::Fail("RELR slot not link_time+bias (double-apply?)"),
+            None => return TestResult::Fail("RELR slot not materialised"),
+        }
+    }
+    // The unmarked slot must be untouched.
+    match read_u64(U_VA + BIAS) {
+        Some(got) if got == U_VAL => TestResult::Pass,
+        Some(_) => TestResult::Fail("RELR relocated a slot the bitmap did not mark"),
+        None => TestResult::Fail("RELR untouched-slot not materialised"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_apply_relr_relocations);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_apply_symbol_relocations() -> TestResult {
@@ -4317,7 +4522,9 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0).unwrap() };
+    unsafe {
+        crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false).unwrap()
+    };
 
     let read_u64 = |vaddr: u64| -> Option<u64> {
         let p =
@@ -4446,7 +4653,8 @@ fn smoke_userspace_unresolved_symbol_errors() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
+    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false) }
+    {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // No DT_STRTAB + st_name=0 → name buffer must be empty.
             if name == [0u8; 32] {
@@ -4486,7 +4694,8 @@ fn smoke_userspace_unresolved_symbol_carries_name() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
+    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false) }
+    {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             if &name[..6] != b"printf" {
                 return TestResult::Fail("name buffer doesn't start with \"printf\"");
@@ -4535,7 +4744,8 @@ fn smoke_userspace_unresolved_symbol_name_truncates() -> TestResult {
     // `bytes`, so its `address_space` is mapped and matches `image` (parsed from
     // those bytes); `bytes`/`image` outlive the call. The test harness keeps the
     // low 4 GiB identity-mapped, satisfying the loader's `# Safety` contract.
-    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0) } {
+    match unsafe { crate::loader::apply_relocations(&bytes, &image, &proc.address_space, 0, false) }
+    {
         Err(LoadBytesError::UnresolvedSymbol { idx: 1, name }) => {
             // First 32 bytes must equal the source's first 32 bytes,
             // and *all* 32 must be non-zero (we truncated mid-name,
