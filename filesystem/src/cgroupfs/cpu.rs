@@ -164,6 +164,13 @@ fn usage_usec(_members: &[u64]) -> u64 {
     0
 }
 
+/// Aggregate scheduler usage for an arbitrary pid set — the data
+/// source for the core base `cpu.stat` (present on cgroups where the
+/// cpu controller is not enabled; see `render_cpu_stat_base`).
+pub(super) fn members_usage_usec(pids: &[u64]) -> u64 {
+    usage_usec(pids)
+}
+
 impl ControllerState for CpuState {
     fn files(&self) -> &'static [&'static str] {
         FILES

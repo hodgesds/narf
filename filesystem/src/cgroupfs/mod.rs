@@ -134,6 +134,11 @@ pub struct Cgroup {
     /// `cgroup.max.depth` / `cgroup.max.descendants` (`None` = "max").
     max_depth: IrqSafeSpinLock<Option<u64>>,
     max_descendants: IrqSafeSpinLock<Option<u64>>,
+    /// `cgroup.pressure`: PSI accounting enabled for this cgroup
+    /// (Linux 6.1+; default on). NARF's PSI is scaffold-zeroes, so this
+    /// is a stored toggle only — kept so systemd's
+    /// `MemoryPressureWatch=` probe writes round-trip.
+    psi_enabled: AtomicBool,
     /// `cgroup.events` change generation. Bumped on every transition of
     /// a field reported by `cgroup.events` (`populated`, `frozen`). An
     /// open `cgroup.events` file (`CgroupAttrFile`) captures this value
@@ -173,6 +178,7 @@ impl Cgroup {
             ctrl_state: IrqSafeSpinLock::new(BTreeMap::new()),
             max_depth: IrqSafeSpinLock::new(None),
             max_descendants: IrqSafeSpinLock::new(None),
+            psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
         })
@@ -207,6 +213,7 @@ impl Cgroup {
             ctrl_state: IrqSafeSpinLock::new(state),
             max_depth: IrqSafeSpinLock::new(None),
             max_descendants: IrqSafeSpinLock::new(None),
+            psi_enabled: AtomicBool::new(true),
             events_gen: AtomicU64::new(0),
             last_populated: AtomicBool::new(false),
         })
@@ -215,6 +222,17 @@ impl Cgroup {
     #[inline]
     fn is_root(&self) -> bool {
         self.parent.is_none()
+    }
+
+    /// Effective frozen state: a cgroup is frozen if it *or any
+    /// ancestor* has `cgroup.freeze` set (v2: freezing propagates down
+    /// the subtree). `cgroup.events` reports this; `cgroup.freeze`
+    /// reads back only the self-requested bit.
+    fn effective_frozen(&self) -> bool {
+        if self.frozen.load(Ordering::Acquire) {
+            return true;
+        }
+        self.parent.as_ref().is_some_and(|p| p.effective_frozen())
     }
 
     /// `true` if this cgroup or any descendant has a member process.
@@ -292,6 +310,21 @@ fn root() -> Arc<Cgroup> {
 /// Resolve the cgroup a pid currently belongs to (root if unplaced).
 fn cgroup_of(pid: u64) -> Arc<Cgroup> {
     TASK_CGROUP.lock().get(&pid).cloned().unwrap_or_else(root)
+}
+
+/// Pid of the process performing the current cgroupfs write, for the
+/// Linux "write 0 into cgroup.procs = move yourself" form. Resolved
+/// through procfs's current-pid hook (installed at boot); `None` when
+/// the hook is absent (pre-boot, or a build without linux-compat).
+fn caller_pid() -> Option<u64> {
+    #[cfg(feature = "linux-compat")]
+    {
+        let pid = crate::procfs::current_pid();
+        if pid != 0 {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 /// Invoke `f` with each active `ControllerState` named `name` along the
@@ -548,6 +581,11 @@ enum CoreFile {
     Kill,
     MaxDepth,
     MaxDescendants,
+    /// `cgroup.pressure` — per-cgroup PSI-accounting toggle (Linux
+    /// 6.1+, present on every cgroup including the root). NARF stores
+    /// the bit so probe writes round-trip; the pressure numbers
+    /// themselves are the psi module's scaffold zeroes.
+    Pressure,
 }
 
 impl CoreFile {
@@ -564,6 +602,7 @@ impl CoreFile {
             CoreFile::Kill => "cgroup.kill",
             CoreFile::MaxDepth => "cgroup.max.depth",
             CoreFile::MaxDescendants => "cgroup.max.descendants",
+            CoreFile::Pressure => "cgroup.pressure",
         }
     }
 
@@ -580,6 +619,7 @@ impl CoreFile {
             "cgroup.kill" => CoreFile::Kill,
             "cgroup.max.depth" => CoreFile::MaxDepth,
             "cgroup.max.descendants" => CoreFile::MaxDescendants,
+            "cgroup.pressure" => CoreFile::Pressure,
             _ => return None,
         })
     }
@@ -595,6 +635,7 @@ impl CoreFile {
                 | CoreFile::Kill
                 | CoreFile::MaxDepth
                 | CoreFile::MaxDescendants
+                | CoreFile::Pressure
         )
     }
 }
@@ -612,6 +653,7 @@ fn core_files_for(cg: &Cgroup) -> &'static [CoreFile] {
             CoreFile::Stat,
             CoreFile::MaxDepth,
             CoreFile::MaxDescendants,
+            CoreFile::Pressure,
         ]
     } else {
         &[
@@ -626,6 +668,7 @@ fn core_files_for(cg: &Cgroup) -> &'static [CoreFile] {
             CoreFile::Stat,
             CoreFile::MaxDepth,
             CoreFile::MaxDescendants,
+            CoreFile::Pressure,
         ]
     }
 }
@@ -696,8 +739,10 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
             s
         }
         CoreFile::Events => {
+            // `frozen` is the EFFECTIVE state (self or any ancestor
+            // frozen) — what systemd's freezer watches for.
             let populated = u8::from(cg.populated());
-            let frozen = u8::from(cg.frozen.load(Ordering::Acquire));
+            let frozen = u8::from(cg.effective_frozen());
             format!("populated {populated}\nfrozen {frozen}\n")
         }
         CoreFile::Type => cg.cg_type.lock().as_str().to_string(),
@@ -711,6 +756,9 @@ fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {
         CoreFile::Kill => "0\n".to_string(),
         CoreFile::MaxDepth => max_str(&cg.max_depth.lock()),
         CoreFile::MaxDescendants => max_str(&cg.max_descendants.lock()),
+        CoreFile::Pressure => {
+            format!("{}\n", u8::from(cg.psi_enabled.load(Ordering::Acquire)))
+        }
     }
 }
 
@@ -718,7 +766,12 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
     let text = core::str::from_utf8(buf).map_err(|_| FsError::InvalidData)?;
     match f {
         CoreFile::Procs | CoreFile::Threads => {
-            let pid: u64 = text.trim().parse().map_err(|_| FsError::InvalidData)?;
+            let mut pid: u64 = text.trim().parse().map_err(|_| FsError::InvalidData)?;
+            // Linux: writing "0" moves the writing process itself —
+            // the form systemd's cg_attach uses to place PID 1.
+            if pid == 0 {
+                pid = caller_pid().ok_or(FsError::InvalidData)?;
+            }
             place(pid, cg)?;
             Ok(buf.len())
         }
@@ -758,6 +811,15 @@ fn store_core(cg: &Arc<Cgroup>, f: CoreFile, buf: &[u8]) -> Result<usize, FsErro
         }
         CoreFile::MaxDescendants => {
             *cg.max_descendants.lock() = parse_max(text)?;
+            Ok(buf.len())
+        }
+        CoreFile::Pressure => {
+            let want = match text.trim() {
+                "0" => false,
+                "1" => true,
+                _ => return Err(FsError::InvalidData),
+            };
+            cg.psi_enabled.store(want, Ordering::Release);
             Ok(buf.len())
         }
         CoreFile::Controllers | CoreFile::Events | CoreFile::Stat => Err(FsError::ReadOnly),
@@ -858,6 +920,17 @@ fn subtree_pids(cg: &Arc<Cgroup>, out: &mut Vec<u64>) {
     }
 }
 
+/// Bump `cgroup.events` generations across a whole subtree. Used when
+/// a freeze/thaw changes the *effective* frozen state of every
+/// descendant, each of which may have its own `cgroup.events` watcher.
+fn bump_events_subtree(cg: &Arc<Cgroup>) {
+    cg.bump_events();
+    let children: Vec<Arc<Cgroup>> = cg.children.lock().values().cloned().collect();
+    for child in children {
+        bump_events_subtree(&child);
+    }
+}
+
 /// `cgroup.freeze` — freeze or thaw every process in the subtree.
 fn set_frozen(cg: &Arc<Cgroup>, freeze: bool) {
     let changed = cg.frozen.swap(freeze, Ordering::AcqRel) != freeze;
@@ -869,10 +942,12 @@ fn set_frozen(cg: &Arc<Cgroup>, freeze: bool) {
             h(pid, freeze);
         }
     }
-    // The `frozen` field of `cgroup.events` flipped: signal pollers.
-    // `notify_events` covers `populated`, which a freeze does not move.
+    // The `frozen` field of `cgroup.events` flipped — for this cgroup
+    // AND every descendant (their effective state follows the
+    // ancestor): signal all their pollers. `notify_events` covers
+    // `populated`, which a freeze does not move.
     if changed {
-        cg.bump_events();
+        bump_events_subtree(cg);
     }
     cg.notify_events();
 }
@@ -897,6 +972,33 @@ fn kill_subtree(cg: &Arc<Cgroup>) {
 enum FileKind {
     Core(CoreFile),
     Ctrl(&'static str, &'static str),
+    /// The base `cpu.stat` — a core v2 file present in EVERY cgroup
+    /// (root included) even when the cpu controller is not enabled
+    /// there (Linux `cgroup_base_files`). systemd reads it for
+    /// `CPUUsageNSec=` on any unit cgroup. When the cpu controller IS
+    /// active on the cgroup, its richer `cpu.stat` takes precedence
+    /// (see `CgroupDir::lookup`).
+    CpuStatBase,
+}
+
+/// Render the base `cpu.stat` (no cpu controller on this cgroup):
+/// aggregate usage of every member process in the subtree. Without the
+/// `cgroup-cpu` feature there is no scheduler accounting seam, so the
+/// well-formed zero shape is reported.
+fn render_cpu_stat_base(cg: &Arc<Cgroup>) -> String {
+    let usage: u64;
+    #[cfg(feature = "cgroup-cpu")]
+    {
+        let mut pids = Vec::new();
+        subtree_pids(cg, &mut pids);
+        usage = cpu::members_usage_usec(&pids);
+    }
+    #[cfg(not(feature = "cgroup-cpu"))]
+    {
+        let _ = cg;
+        usage = 0;
+    }
+    format!("usage_usec {usage}\nuser_usec 0\nsystem_usec 0\n")
 }
 
 struct CgroupAttrFile {
@@ -935,6 +1037,7 @@ impl CgroupAttrFile {
                 .get(*ctrl)
                 .map(|s| s.read(file))
                 .unwrap_or_default(),
+            FileKind::CpuStatBase => render_cpu_stat_base(&self.cg),
         }
     }
 
@@ -948,6 +1051,7 @@ impl CgroupAttrFile {
                 .get(*ctrl)
                 .map(|s| s.writable(file))
                 .unwrap_or(false),
+            FileKind::CpuStatBase => false,
         }
     }
 }
@@ -988,6 +1092,7 @@ impl FileOps for CgroupAttrFile {
                     None => Err(FsError::NotFound),
                 }
             }
+            FileKind::CpuStatBase => Err(FsError::ReadOnly),
         };
         Box::pin(async move { r })
     }
@@ -1069,19 +1174,26 @@ impl DirOps for CgroupDir {
             }
             return None;
         }
-        // PSI pressure files are present in every non-root cgroup,
-        // independent of subtree_control.
+        // PSI pressure files are present in every cgroup — root
+        // included (Linux mirrors /proc/pressure there) — independent
+        // of subtree_control.
         #[cfg(feature = "cgroup-psi")]
-        if !self.cg.is_root() {
-            if let Some(f) = psi::pressure_file(name) {
-                return Some(f);
-            }
+        if let Some(f) = psi::pressure_file(name) {
+            return Some(f);
         }
-        let (ctrl, file) = self.ctrl_file(name)?;
-        Some(CgroupAttrFile::open(
-            self.cg.clone(),
-            FileKind::Ctrl(ctrl, file),
-        ))
+        if let Some((ctrl, file)) = self.ctrl_file(name) {
+            return Some(CgroupAttrFile::open(
+                self.cg.clone(),
+                FileKind::Ctrl(ctrl, file),
+            ));
+        }
+        // Base cpu.stat: present everywhere the cpu controller isn't
+        // (when it is, `ctrl_file` above already matched its richer
+        // rendering).
+        if name == "cpu.stat" {
+            return Some(CgroupAttrFile::open(self.cg.clone(), FileKind::CpuStatBase));
+        }
+        None
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
@@ -1100,16 +1212,21 @@ impl DirOps for CgroupDir {
         for f in core_files_for(&self.cg) {
             out.push((f.file_name().to_string(), FileType::File));
         }
-        for state in self.cg.ctrl_state.lock().values() {
-            for f in state.files() {
-                out.push((f.to_string(), FileType::File));
+        {
+            let states = self.cg.ctrl_state.lock();
+            for state in states.values() {
+                for f in state.files() {
+                    out.push((f.to_string(), FileType::File));
+                }
+            }
+            // Base cpu.stat when the cpu controller isn't active here.
+            if !states.contains_key("cpu") {
+                out.push(("cpu.stat".to_string(), FileType::File));
             }
         }
         #[cfg(feature = "cgroup-psi")]
-        if !self.cg.is_root() {
-            for f in psi::file_names() {
-                out.push((f.to_string(), FileType::File));
-            }
+        for f in psi::file_names() {
+            out.push((f.to_string(), FileType::File));
         }
         for name in self.cg.children.lock().keys() {
             out.push((name.clone(), FileType::Dir));
@@ -1121,6 +1238,11 @@ impl DirOps for CgroupDir {
         Box::pin(async move {
             if !valid_cgroup_name(name) {
                 return Err(FsError::InvalidPath);
+            }
+            // kernfs semantics: a directory can't shadow an existing
+            // interface file (base cpu.stat, psi, controller files).
+            if self.lookup(name).is_some() {
+                return Err(FsError::Busy);
             }
             // Enforce cgroup.max.depth / cgroup.max.descendants up the
             // ancestor chain.

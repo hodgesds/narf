@@ -116,7 +116,7 @@ pub fn install_proc_hooks(current: CurrentPidFn, list: ListPidsFn, info: TaskInf
     TASK_INFO_HOOK.store(info as usize, Ordering::Release);
 }
 
-fn current_pid() -> u64 {
+pub(crate) fn current_pid() -> u64 {
     let v = CURRENT_PID_HOOK.load(Ordering::Acquire);
     if v == 0 {
         return 0;

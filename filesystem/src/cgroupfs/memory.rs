@@ -63,6 +63,8 @@ const FILES: &[&str] = &[
     "memory.events",
     "memory.events.local",
     "memory.stat",
+    "memory.oom.group",
+    "memory.reclaim",
     "memory.swap.current",
     "memory.swap.max",
 ];
@@ -172,6 +174,7 @@ impl Controller for MemoryController {
             events_max: AtomicU64::new(0),
             events_oom: AtomicU64::new(0),
             events_oom_kill: AtomicU64::new(0),
+            oom_group: AtomicBool::new(false),
         })
     }
 }
@@ -195,6 +198,10 @@ pub struct MemoryState {
     events_max: AtomicU64,
     events_oom: AtomicU64,
     events_oom_kill: AtomicU64,
+    /// `memory.oom.group` — kill the cgroup as a unit on OOM. systemd
+    /// writes this for units with `OOMPolicy=kill`; NARF has no OOM
+    /// killer, so the bit is stored + reported, never acted on.
+    oom_group: AtomicBool,
 }
 
 fn max_line(v: &Option<u64>) -> String {
@@ -321,6 +328,10 @@ impl ControllerState for MemoryState {
             "memory.max" => max_line(&self.max.lock()),
             "memory.swap.current" => format!("{}\n", self.swap_current.load(Ordering::Acquire)),
             "memory.swap.max" => max_line(&self.swap_max.lock()),
+            "memory.oom.group" => format!("{}\n", u8::from(self.oom_group.load(Ordering::Acquire))),
+            // memory.reclaim is write-only on Linux (0200); render
+            // empty for a read that slips through.
+            "memory.reclaim" => String::new(),
             // We charge each level directly, so this cgroup's own
             // counters ARE its local counters: events == events.local.
             "memory.events" | "memory.events.local" => self.events_block(),
@@ -356,6 +367,35 @@ impl ControllerState for MemoryState {
                 *self.swap_max.lock() = parse_limit(buf)?;
                 Ok(())
             }
+            "memory.oom.group" => {
+                match core::str::from_utf8(buf)
+                    .map_err(|_| FsError::InvalidData)?
+                    .trim()
+                {
+                    "0" => self.oom_group.store(false, Ordering::Release),
+                    "1" => self.oom_group.store(true, Ordering::Release),
+                    _ => return Err(FsError::InvalidData),
+                }
+                Ok(())
+            }
+            "memory.reclaim" => {
+                // "<bytes>[ swappiness=<n>]". Parsed for validity;
+                // NARF has no reclaim path, so accepting the request
+                // is a no-op (the charged pages stay). Linux returns
+                // success for whatever it managed to reclaim.
+                let text = core::str::from_utf8(buf).map_err(|_| FsError::InvalidData)?;
+                let mut it = text.split_whitespace();
+                let amount = it.next().ok_or(FsError::InvalidData)?;
+                amount.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                for tok in it {
+                    let (key, val) = tok.split_once('=').ok_or(FsError::InvalidData)?;
+                    if key != "swappiness" {
+                        return Err(FsError::InvalidData);
+                    }
+                    val.parse::<u64>().map_err(|_| FsError::InvalidData)?;
+                }
+                Ok(())
+            }
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -363,7 +403,13 @@ impl ControllerState for MemoryState {
     fn writable(&self, file: &str) -> bool {
         matches!(
             file,
-            "memory.min" | "memory.low" | "memory.high" | "memory.max" | "memory.swap.max"
+            "memory.min"
+                | "memory.low"
+                | "memory.high"
+                | "memory.max"
+                | "memory.swap.max"
+                | "memory.oom.group"
+                | "memory.reclaim"
         )
     }
 

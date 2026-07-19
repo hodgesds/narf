@@ -45,7 +45,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use super::controller::{Controller, ControllerState};
 use crate::FsError;
 
-const FILES: &[&str] = &["io.stat", "io.max", "io.weight"];
+const FILES: &[&str] = &["io.stat", "io.max", "io.weight", "io.latency"];
 
 /// Default `io.weight` for a fresh cgroup (cgroup-v2 default is 100).
 const DEFAULT_WEIGHT: u64 = 100;
@@ -96,6 +96,7 @@ impl Controller for IoController {
             weight: IrqSafeSpinLock::new(DEFAULT_WEIGHT),
             stats: IrqSafeSpinLock::new(BTreeMap::new()),
             limits: IrqSafeSpinLock::new(BTreeMap::new()),
+            latency: IrqSafeSpinLock::new(BTreeMap::new()),
         })
     }
 }
@@ -108,6 +109,10 @@ pub struct IoState {
     stats: IrqSafeSpinLock<BTreeMap<u64, DevStats>>,
     /// Per-device `io.max` limits (accounting-only).
     limits: IrqSafeSpinLock<BTreeMap<u64, DevLimits>>,
+    /// Per-device `io.latency` targets in µs (systemd
+    /// `IODeviceLatencyTargetSec=`). Stored + reported, not enforced —
+    /// same standing as `io.max` (no block-layer QoS seam).
+    latency: IrqSafeSpinLock<BTreeMap<u64, u64>>,
 }
 
 impl IoState {
@@ -136,6 +141,14 @@ impl ControllerState for IoState {
             "io.stat" => render_stat(&self.stats.lock()),
             "io.max" => render_max(&self.limits.lock()),
             "io.weight" => format!("default {}\n", *self.weight.lock()),
+            "io.latency" => {
+                let mut out = String::new();
+                for (&dev, &target) in self.latency.lock().iter() {
+                    let (maj, min) = split_dev(dev);
+                    let _ = writeln!(out, "{maj}:{min} target={target}");
+                }
+                out
+            }
             _ => String::new(),
         }
     }
@@ -183,12 +196,30 @@ impl ControllerState for IoState {
                 }
                 Ok(())
             }
+            "io.latency" => {
+                // "MAJ:MIN target=<usec>"; target=0 clears the entry.
+                let mut it = text.split_whitespace();
+                let dev = parse_dev(it.next().ok_or(FsError::InvalidData)?)?;
+                let tok = it.next().ok_or(FsError::InvalidData)?;
+                let (key, val) = tok.split_once('=').ok_or(FsError::InvalidData)?;
+                if key != "target" || it.next().is_some() {
+                    return Err(FsError::InvalidData);
+                }
+                let target: u64 = val.parse().map_err(|_| FsError::InvalidData)?;
+                let mut map = self.latency.lock();
+                if target == 0 {
+                    map.remove(&dev);
+                } else {
+                    map.insert(dev, target);
+                }
+                Ok(())
+            }
             _ => Err(FsError::ReadOnly),
         }
     }
 
     fn writable(&self, file: &str) -> bool {
-        matches!(file, "io.max" | "io.weight")
+        matches!(file, "io.max" | "io.weight" | "io.latency")
     }
 
     fn as_any(&self) -> &dyn Any {
