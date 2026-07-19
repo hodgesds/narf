@@ -9952,6 +9952,19 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         crate::alloc_pid().raw()
     };
 
+    // Parent-of bookkeeping MUST be published BEFORE the child is spawned (a
+    // new *process*; threads are not waitpid-reapable). `spawn_user_process*`
+    // makes the child runnable, and under SMP it can run `ptrace(TRACEME)` on
+    // another CPU before this handler finishes — TRACEME reads this same
+    // PARENT_OF map and returns EINVAL (registering no tracer) if the row is
+    // absent, degrading the child's `raise(SIGSTOP)` to a job-control stop that
+    // a plain waitpid never reaps (the SMP strace_smoke flake). Publishing here
+    // closes the window (was previously set only after all the inheritance work
+    // below, well past the point the spawned child could already be running).
+    if !share_thread {
+        parent_of_set(child_visible_pid, parent_pid);
+    }
+
     let proc = crate::UserProcess {
         pid: crate::ProcessId(child_visible_pid),
         address_space: child_as.clone(),
@@ -10177,12 +10190,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         set_clear_child_tid_with_as(child_tid.raw(), ca.child_tid, child_as_root);
     }
 
-    // Parent-of bookkeeping for wait4 — process-style only. A
-    // thread (CLONE_THREAD) is not waitpid-reapable; pthread_join
-    // uses the futex on clear_child_tid instead.
-    if !share_thread {
-        parent_of_set(child_visible_pid, parent_pid);
-    }
+    // Parent-of bookkeeping for wait4 was published above, BEFORE the spawn,
+    // to close the SMP TRACEME race (see the comment at that call site). A
+    // thread (CLONE_THREAD) is not waitpid-reapable; pthread_join uses the
+    // futex on clear_child_tid instead — so nothing to publish for it.
 
     // Return: parent sees child TID (== visible-pid for !THREAD,
     // == TaskId.raw() for THREAD where TID and PID diverge).
@@ -10462,6 +10473,21 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
 
     let parent_pid = current_task_id();
     let child_pid = crate::alloc_pid();
+    // Parent-of bookkeeping MUST be published BEFORE the child is spawned:
+    // `spawn_user_process*` makes the child immediately runnable, and under SMP
+    // it can begin executing on ANOTHER CPU before this handler finishes. A
+    // child that runs `ptrace(PTRACE_TRACEME)` in that window reads this same
+    // PARENT_OF map (`parent_of_get` in the TRACEME handler) — if the row is not
+    // yet present it returns EINVAL and registers no tracer, so the child's
+    // `raise(SIGSTOP)` degrades to a plain job-control stop that a PLAIN (non-
+    // WUNTRACED) waitpid never reaps → the tracer's wait hangs (the SMP
+    // strace_smoke flake). Publishing it here, before the spawn, closes the
+    // race (was previously set only after all the inheritance work below, well
+    // past the point the spawned child could already be running). Keyed by the
+    // child's ProcessId so `on_child_exit(child_pid)` can resolve the parent —
+    // `notify_task_exited` passes `this.process.pid.raw()` (ProcessId), so the
+    // key here must be ProcessId, not TaskId.
+    parent_of_set(child_pid.raw(), parent_pid);
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),
@@ -10553,12 +10579,8 @@ fn sys_fork(ctx: &mut dyn TrapContext) {
     // Inherit the parent's cgroup-namespace root (if any).
     #[cfg(all(feature = "cgroup", feature = "container"))]
     narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
-    // Parent-of bookkeeping for waitpid: keyed by the child's
-    // ProcessId so `on_child_exit(child_pid)` can resolve the
-    // parent. `notify_task_exited` uses `this.process.pid.raw()`
-    // (ProcessId) as the argument to the exit observer, so the
-    // key here must also be ProcessId — not TaskId.
-    parent_of_set(child_pid.raw(), parent_pid);
+    // Parent-of bookkeeping was published above, BEFORE the spawn, to close
+    // the SMP TRACEME race (see the comment at the `parent_of_set` call site).
     // Return the child's user-visible ProcessId (POSIX fork(2)
     // contract). The parent's waitpid() call passes this same
     // value back to us as `want_pid`.
