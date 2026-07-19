@@ -538,25 +538,45 @@ pub unsafe fn load_user_process_with_root(
     // program's relocations. Without them ld-musl loads an
     // uninitialised pointer from the auxv block, dereferences
     // it, and SIGSEGVs at vaddr 0 before reaching its symbol
-    // resolver. Computed from the ELF header + the first
-    // PT_LOAD segment: the phdr table sits at file-offset
-    // e_phoff, which the first PT_LOAD maps into memory at
-    // (first_load.vaddr - first_load.file_off + e_phoff).
+    // resolver.
+    //
+    // A self-relocating ET_DYN (static-PIE glibc via `rcrt1.o` /
+    // `_dl_relocate_static_pie`, or musl's `rcrt1`) derives its
+    // *load bias* from AT_PHDR as `l_addr = AT_PHDR - PT_PHDR.p_vaddr`
+    // and then applies every R_X86_64_RELATIVE / _IRELATIVE with that
+    // bias. If AT_PHDR is off by even one page the whole self-relocation
+    // is skewed: internal pointers (IFUNC-resolved memcpy, malloc hooks,
+    // the exit-handler list) point into unmapped/wrong VA and the first
+    // indirect call/return through one lands mid-instruction in garbage
+    // → #GP. So AT_PHDR must be *exactly* the runtime address of the
+    // phdr table.
+    //
+    // Prefer the binary's own `PT_PHDR` header (`p_vaddr + bias`): it is
+    // the authoritative, PT_LOAD-order-independent value the loader is
+    // supposed to publish (Linux `create_elf_tables` does the same), and
+    // it agrees with the `l_addr = AT_PHDR - PT_PHDR.p_vaddr` arithmetic
+    // the self-relocator runs. Fall back to deriving it from the first
+    // PT_LOAD segment (the phdrs sit at file-offset `e_phoff`, which that
+    // segment maps at `vaddr - file_off + e_phoff`) only when the ELF
+    // omits PT_PHDR (rare: some hand-written / fully-static objects).
     let e_phoff = u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap_or([0; 8]));
     let e_phentsize = u16::from_le_bytes(bytes[0x36..0x38].try_into().unwrap_or([0; 2]));
     let e_phnum = u16::from_le_bytes(bytes[0x38..0x3a].try_into().unwrap_or([0; 2]));
     let first_load = image.segments.first();
-    // ET_DYN binaries' PT_LOAD vaddrs are 0-relative; bias them
-    // by `program_bias` so AT_PHDR points at the actual
-    // runtime mapping. ET_EXEC stays at the declared vaddr.
-    let at_phdr = first_load
-        .map(|s| {
-            s.vaddr
-                .wrapping_sub(s.file_off)
-                .wrapping_add(e_phoff)
-                .wrapping_add(program_bias)
-        })
-        .unwrap_or(0);
+    // ET_DYN binaries' PT_PHDR / PT_LOAD vaddrs are 0-relative; bias
+    // them by `program_bias` so AT_PHDR points at the actual runtime
+    // mapping. ET_EXEC (bias 0) keeps the declared vaddr.
+    let at_phdr = match image.phdr_vaddr {
+        Some(pv) => pv.wrapping_add(program_bias),
+        None => first_load
+            .map(|s| {
+                s.vaddr
+                    .wrapping_sub(s.file_off)
+                    .wrapping_add(e_phoff)
+                    .wrapping_add(program_bias)
+            })
+            .unwrap_or(0),
+    };
 
     let mut final_aux = aux.to_vec();
     if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
