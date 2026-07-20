@@ -150,6 +150,9 @@ pub(crate) fn task_info(pid: u64) -> Option<ProcTaskInfo> {
 // ── Extended + writable per-pid hook types ──────────────────────
 
 type FdPathFn = fn(u64, u32) -> Option<String>;
+/// Returns the fd numbers currently open for a pid — an exact snapshot of
+/// the fd table, ascending. Backs `/proc/<pid>/fd` enumeration.
+type FdListFn = fn(u64) -> Vec<u32>;
 type RlimitsFn = fn(u64) -> [(u64, u64); 16];
 type NiceFn = fn(u64) -> i32;
 type EnvironFn = fn(u64) -> Vec<u8>;
@@ -236,6 +239,7 @@ pub(crate) fn hook_root_path(pid: u64) -> Option<String> {
 }
 
 static FD_PATH_HOOK: AtomicUsize = AtomicUsize::new(0);
+static FD_LIST_HOOK: AtomicUsize = AtomicUsize::new(0);
 static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
 static ENVIRON_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -280,6 +284,24 @@ pub fn install_proc_write_hooks(
     COREDUMP_GET_HOOK.store(coredump_get as usize, Ordering::Release);
     COREDUMP_SET_HOOK.store(coredump_set as usize, Ordering::Release);
     OOM_SCORE_HOOK.store(oom_score as usize, Ordering::Release);
+}
+
+/// Wire the `/proc/<pid>/fd` enumeration hook. Separate from
+/// `install_proc_ext_hooks` so callers can install it independently.
+pub fn set_fd_list_hook(f: FdListFn) {
+    FD_LIST_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// The open fd numbers for `pid` via the installed hook, or `None` if no
+/// hook is wired (callers then fall back to per-fd probing).
+pub(crate) fn hook_fd_list(pid: u64) -> Option<Vec<u32>> {
+    let v = FD_LIST_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: v was stored by set_fd_list_hook as a FdListFn fn-pointer; non-zero confirms it.
+    let f: FdListFn = unsafe { core::mem::transmute(v) };
+    Some(f(pid))
 }
 
 pub(crate) fn hook_fd_path(pid: u64, fd: u32) -> Option<String> {

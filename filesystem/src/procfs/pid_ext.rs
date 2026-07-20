@@ -26,8 +26,8 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
 
 use super::{
     hook_auxv, hook_coredump_get, hook_coredump_set, hook_cwd_path, hook_environ, hook_exe_path,
-    hook_fd_path, hook_nice, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score, hook_rlimits,
-    hook_root_path, slice_read, task_info, ProcDirMarker,
+    hook_fd_list, hook_fd_path, hook_nice, hook_oom_adj_get, hook_oom_adj_set, hook_oom_score,
+    hook_rlimits, hook_root_path, slice_read, task_info, ProcDirMarker,
 };
 
 // ── Extended flat-file enum ─────────────────────────────────────────
@@ -658,17 +658,14 @@ impl DirOps for ProcFdDir {
         Some(Arc::new(ProcFdFile { pid: self.pid, fd }))
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        // Walk up to 256 fds; emit a DirEntry for each valid fd.
-        // TODO: expose a proper fd-table enumerator from narf_userspace::fd
-        // once that crate has a snapshot-of-pid API.
-        let mut entries: Vec<DirEntry> = Vec::new();
-        for n in 0u32..256 {
-            if hook_fd_path(self.pid, n).is_none() {
-                if n > 0 {
-                    break;
-                }
-                continue;
-            }
+        // Enumerate the exact open fd set from the fd-table snapshot hook, so
+        // the listing covers every open fd regardless of count and skips
+        // closed slots. The hook returns fd numbers ascending; each becomes a
+        // symlink entry whose target is resolved on lookup via the fd-path
+        // hook.
+        let fds = hook_fd_list(self.pid).unwrap_or_default();
+        let mut entries: Vec<DirEntry> = Vec::with_capacity(fds.len());
+        for n in fds {
             let s = n.to_string();
             let leaked: &'static str = Box::leak(s.into_boxed_str());
             entries.push(DirEntry {
@@ -739,14 +736,10 @@ impl DirOps for ProcFdInfoDir {
         Some(Arc::new(ProcFdInfoFile { pid: self.pid, fd }))
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        let mut entries: Vec<DirEntry> = Vec::new();
-        for n in 0u32..256 {
-            if hook_fd_path(self.pid, n).is_none() {
-                if n > 0 {
-                    break;
-                }
-                continue;
-            }
+        // Exact open fd set from the snapshot hook (mirrors ProcFdDir::iter).
+        let fds = hook_fd_list(self.pid).unwrap_or_default();
+        let mut entries: Vec<DirEntry> = Vec::with_capacity(fds.len());
+        for n in fds {
             let s = n.to_string();
             let leaked: &'static str = Box::leak(s.into_boxed_str());
             entries.push(DirEntry {

@@ -960,6 +960,17 @@ fn open_impl(
     };
     let path: &str = &path_owned;
 
+    // RLIMIT_NOFILE enforcement: a task may not exceed its soft limit of
+    // open descriptors. Linux returns EMFILE from the fd-creating call.
+    // RLIMIT_NOFILE is index 7; `.0` is the soft (current) limit.
+    {
+        let nofile_cur = rlimits_of(task)[7].0;
+        if crate::fd::open_fds(task).len() as u64 >= nofile_cur {
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            return;
+        }
+    }
+
     // O_NOFOLLOW: don't follow a final-component symlink. With O_PATH this
     // opens the symlink node ITSELF (the caller then readlink()s it); without
     // O_PATH, POSIX open(O_NOFOLLOW) on a symlink is -ELOOP. sd-device's
@@ -1031,11 +1042,22 @@ fn open_impl(
             .flatten()
     };
 
-    // Directory open: if the path didn't resolve to a FileOps but does
-    // name a directory, hand back a directory fd (DirFdFile carrying the
-    // DirOps). This is what `opendir`/`getdents64` and `ls` rely on.
-    // Done before the O_CREAT branch so `open(dir, O_RDONLY)` succeeds.
-    if ops.is_none() && mnt_len == 0 {
+    // Directory open: hand back a directory fd (a `DirFdFile` carrying the
+    // `DirOps`) when the path names a directory, either because it didn't
+    // resolve to a `FileOps` at all or because it resolved to a
+    // directory-typed node. `opendir`/`getdents64`/`ls` depend on this, and
+    // it runs before the O_CREAT branch so `open(dir, O_RDONLY)` succeeds.
+    //
+    // `resolved_is_dir` covers a synthetic FS that returns a subdirectory
+    // (e.g. `/proc/<pid>/fd`) from `lookup()` as a directory-typed `FileOps`
+    // marker so the path resolver can descend into it: route it through
+    // `resolve_dir_absolute` to get a real `DirFdFile` whose `as_dir()` is
+    // `Some`, rather than opening the marker as a plain file.
+    let resolved_is_dir = ops
+        .as_ref()
+        .map(|o| o.stat().mode.file_type == narf_filesystem::FileType::Dir)
+        .unwrap_or(false);
+    if (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
             let new_fd = fd::with_table(task, |t| {
                 t.open(crate::fd::FdEntry {
@@ -13138,12 +13160,11 @@ fn sys_setgroups(ctx: &mut dyn TrapContext) {
 // ── Per-task rlimit table ──────────────────────────────────────────
 //
 // POSIX getrlimit / setrlimit query and update per-resource soft
-// (`rlim_cur`) and hard (`rlim_max`) limits. NARF doesn't enforce
-// these — capabilities replace authority, and task-bound resource
-// budgets live in the scheduler's BudgetAccount path. The table
-// here is structural state only so a libc consumer that
-// round-trips `setrlimit(RLIMIT_NOFILE, &r)` followed by
-// `getrlimit(RLIMIT_NOFILE, &r2)` sees `r2 == r`.
+// (`rlim_cur`) and hard (`rlim_max`) limits, stored per task. Most limits
+// are structural state that round-trips through get/setrlimit; RLIMIT_NOFILE
+// is additionally enforced — the open path returns EMFILE once a task holds
+// its soft limit of descriptors. (Other authority is capability-based, and
+// task resource budgets live in the scheduler's BudgetAccount path.)
 //
 // Defaults match what real Linux distros surface to a normal user:
 //   RLIMIT_CPU     = INFINITY
@@ -13151,7 +13172,7 @@ fn sys_setgroups(ctx: &mut dyn TrapContext) {
 //   RLIMIT_DATA    = INFINITY
 //   RLIMIT_STACK   = (8 MiB cur, INFINITY max)
 //   RLIMIT_CORE    = (0 cur, INFINITY max)
-//   RLIMIT_NOFILE  = (256 cur, 4096 max) — matches our actual fd-table cap
+//   RLIMIT_NOFILE  = (1024 cur, 4096 max)
 //   RLIMIT_AS      = INFINITY
 
 const RLIMIT_COUNT: usize = 16;
@@ -13182,9 +13203,11 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
         cur: 0,
         max: RLIM_INFINITY,
     };
-    // RLIMIT_NOFILE = 7.
+    // RLIMIT_NOFILE = 7. Soft 1024 / hard 4096, matching a typical Linux
+    // default; the soft limit is enforced by the open path (EMFILE) and a
+    // process raises it via setrlimit up to the hard cap.
     t[7] = RLimitPair {
-        cur: 256,
+        cur: 1024,
         max: 4096,
     };
     t
@@ -16108,18 +16131,14 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     let _ =
         flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
 
-    // Idempotent pseudo-filesystem mount. An init system (systemd) mounts
-    // the API filesystems (/proc, /sys, /dev, /run, ...) unconditionally at
-    // startup — even when a chroot/namespace already provides them. NARF's
-    // Stage::Late `mnt-dev-bind` binds procfs/sysfs/devfs + tmpfs /run,/tmp
-    // into the chroot before PID 1 runs, so systemd's first mounts land on
-    // already-mounted targets. NARF has no mount stacking, and `mount_arc`
-    // over an existing mount returns Err → our -1 return → glibc reads EPERM
-    // → systemd aborts with "Failed to mount early API filesystems. Freezing
-    // execution." Linux stacks the mount and succeeds; mirror that by
-    // reporting success when a pseudo-fs target is already a mount point.
-    // Scoped to pseudo-fs types so bind / block-device mounts keep their
-    // real handling (a bind onto an existing path is a distinct operation).
+    // Idempotent pseudo-filesystem mount. An init system mounts the API
+    // filesystems (/proc, /sys, /dev, /run, ...) unconditionally at startup,
+    // and NARF's Stage::Late `mnt-dev-bind` already binds procfs/sysfs/devfs
+    // + tmpfs /run,/tmp into the chroot before PID 1 runs. NARF has no mount
+    // stacking, so a re-mount of an already-provided pseudo-fs target reports
+    // success (matching Linux, which stacks and succeeds) rather than
+    // erroring. Scoped to pseudo-fs types so bind / block-device mounts keep
+    // their real handling (a bind onto an existing path is a distinct op).
     let is_pseudo_fs = matches!(
         fstype.as_str(),
         "proc"
@@ -16374,15 +16393,10 @@ fn sys_umount2(ctx: &mut dyn TrapContext) {
     // Protect the core API pseudo-filesystems from destructive unmount.
     // NARF has no mount stacking: /proc, /sys, /dev (and cgroup2) are single
     // shared instances that the chroot's Stage::Late `mnt-dev-bind` provides
-    // and everything depends on. An init (systemd) pairs an early temporary
-    // `mount(proc,/proc)` with a later `umount("/proc")` expecting the stack
-    // to reveal an underlying /proc — but here that umount would delete the
-    // ONLY procfs, and the very next /proc/cmdline read then ENOENTs
-    // ("Failed to fix up PID1 environment. Freezing execution."). Since
-    // NARF's earlier mount of these was already an idempotent no-op (see
-    // sys_mount), the balancing umount is a no-op too: report success but
-    // keep the singleton mounted. tmpfs / bind / real mounts unmount as
-    // normal, so systemd's per-service runtime tmpfs teardown still works.
+    // and everything depends on. Because NARF mounts these idempotently (see
+    // sys_mount), the balancing umount of one is also a no-op: report success
+    // but keep the singleton mounted. tmpfs / bind / real mounts unmount as
+    // normal.
     let protected = narf_filesystem::registry()
         .list_with_names()
         .into_iter()
@@ -18427,12 +18441,9 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     let current = current_task_id();
     // Visible PID → scheduler TaskId. NARF allocates process ids and
     // scheduler task ids from separate spaces (a process's pid is NOT its
-    // tid), so every liveness / address-space probe below must go through
-    // the pid→tid map — using `TaskId(pid)` directly only works when the
-    // two happen to coincide. systemd as PID 1 has tid ≠ 1, so the old
-    // `TaskId(pid)` checks reported PID 1 as dead → `/proc/1` was "Not a
-    // directory" → systemd's container-mode `proc_cmdline()` read of
-    // `/proc/1/cmdline` got ENOENT ("Failed to fix up PID1 environment").
+    // tid), so every liveness / address-space probe below goes through the
+    // pid→tid map rather than using `TaskId(pid)` directly (which is only
+    // correct when the two coincide).
     let tid = pid_to_task_raw(pid).unwrap_or(pid);
     // A task is live if it is the caller (the running task is popped off its
     // ready queue while polling, so it wouldn't match the queue scan), is on
@@ -18610,6 +18621,13 @@ pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
 /// Return the backing description for fd `n` of `pid`.  Shaped like
 /// a Linux `/proc/[pid]/fd/<n>` symlink target.  Returns `None` when
 /// the fd or task doesn't exist.
+/// The open fd numbers for `pid`, ascending — backs `/proc/<pid>/fd`
+/// enumeration. Keyed the same way as [`fd_path_of`] so a per-fd lookup
+/// and the directory listing agree.
+pub fn proc_fd_list(pid: u64) -> alloc::vec::Vec<u32> {
+    crate::fd::open_fds(pid)
+}
+
 pub fn fd_path_of(pid: u64, n: u32) -> Option<alloc::string::String> {
     // Preferred: the real backing path recorded at open() time (the same
     // fd→path table inotify/landlock use). This is what /proc/<pid>/fd/<n>

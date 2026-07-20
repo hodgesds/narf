@@ -120,16 +120,16 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setpriority_out_of_range_neg);
 fn smoke_abi_sched_getrlimit_pos() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 16];
-        // RLIMIT_NOFILE (7): default {cur=256, max=4096}.
+        // RLIMIT_NOFILE (7): default {cur=1024, max=4096}.
         let args = a1(7, buf.as_mut_ptr() as u64);
         match call(Syscall::Getrlimit.raw(), args) {
             Some(0) => {
                 let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
                 let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
-                if cur == 256 && max == 4096 {
+                if cur == 1024 && max == 4096 {
                     Ok(())
                 } else {
-                    Err("getrlimit RLIMIT_NOFILE not the default {256,4096}")
+                    Err("getrlimit RLIMIT_NOFILE not the default {1024,4096}")
                 }
             }
             _ => Err("getrlimit(RLIMIT_NOFILE) should return 0"),
@@ -218,13 +218,13 @@ fn smoke_abi_sched_prlimit64_pos() -> TestResult {
         let args = a3(0, 7, newbuf.as_ptr() as u64, oldbuf.as_mut_ptr() as u64);
         match call(Syscall::Prlimit64.raw(), args) {
             Some(0) => {
-                // old* must hold the prior default {256, 4096}.
+                // old* must hold the prior default {1024, 4096}.
                 let ocur = u64::from_ne_bytes(oldbuf[..8].try_into().unwrap());
                 let omax = u64::from_ne_bytes(oldbuf[8..].try_into().unwrap());
-                if ocur == 256 && omax == 4096 {
+                if ocur == 1024 && omax == 4096 {
                     Ok(())
                 } else {
-                    Err("prlimit64 old value not the prior default {256,4096}")
+                    Err("prlimit64 old value not the prior default {1024,4096}")
                 }
             }
             _ => Err("prlimit64 set+get should return 0"),

@@ -95,6 +95,17 @@ impl FdTable {
     /// error`, asserting the reopened fd is exactly 0. Skipping 0..=2
     /// unconditionally made every `cmd &` in the distro fail with
     /// "can't open '/dev/null'".
+    /// The fd numbers currently open in this table, ascending. Backs
+    /// `/proc/<pid>/fd` enumeration (an exact snapshot of the open set,
+    /// not a probe of a fixed range).
+    pub fn open_fd_numbers(&self) -> Vec<u32> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.as_ref().map(|_| i as u32))
+            .collect()
+    }
+
     pub fn open(&mut self, entry: FdEntry) -> u32 {
         for (i, s) in self.slots.iter_mut().enumerate() {
             if s.is_none() {
@@ -272,6 +283,12 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
     };
     let mut table = arc.lock();
     Some(op(&mut table))
+}
+
+/// The fd numbers currently open for `task_id`, ascending. Returns an
+/// empty vec if the task has no table yet. Backs `/proc/<pid>/fd`.
+pub fn open_fds(task_id: u64) -> Vec<u32> {
+    with_table(task_id, |t| t.open_fd_numbers()).unwrap_or_default()
 }
 
 /// Per-tty backing. Reads drain the input ring; writes go to the

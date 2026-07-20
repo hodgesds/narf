@@ -87,6 +87,8 @@ fn install_proc_ext_hooks() {
         narf_userspace::handlers::proc_environ_of,
         narf_userspace::handlers::proc_auxv_of,
     );
+    // /proc/<pid>/fd enumeration: the exact open fd set from the fd table.
+    narf_filesystem::procfs::set_fd_list_hook(narf_userspace::handlers::proc_fd_list);
 }
 
 #[cfg(feature = "linux-compat")]

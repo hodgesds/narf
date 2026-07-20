@@ -886,12 +886,10 @@ impl FileOps for DevSymlink {
 
 /// An empty directory node used purely as a **mountpoint stub** under
 /// `/dev` (e.g. `/dev/shm`, `/dev/mqueue`, `/dev/hugepages`). An init
-/// system (systemd) `open()`s these O_PATH|O_DIRECTORY to get a target fd
-/// and then mounts tmpfs / mqueue / hugetlbfs over them; the mount is
-/// tracked by the registry at that path, so this stub's (empty) contents
-/// are shadowed and never observed once mounted. Without the stub the
-/// O_PATH open ENOENTs and systemd aborts ("Failed to mount API
-/// filesystems. Freezing execution.").
+/// system `open()`s these O_PATH|O_DIRECTORY to get a target fd and then
+/// mounts tmpfs / mqueue / hugetlbfs over them; the mount is tracked by the
+/// registry at that path, so this stub's (empty) contents are shadowed and
+/// never observed once mounted.
 struct DevEmptyDir;
 
 impl DirOps for DevEmptyDir {
@@ -1264,9 +1262,8 @@ fn smoke_dev_fd_is_symlink() -> TestResult {
 kernel_test_in!("filesystem/devfs", smoke_dev_fd_is_symlink);
 
 /// Smoke: /dev/{shm,mqueue,hugepages} exist as (empty) mountpoint-stub
-/// directories. An init (systemd) O_PATH-opens these to mount tmpfs /
-/// mqueue / hugetlbfs over them; missing them aborts PID-1 boot ("Failed
-/// to mount API filesystems").
+/// directories that an init O_PATH-opens to mount tmpfs / mqueue /
+/// hugetlbfs over.
 fn smoke_dev_mountpoint_stub_dirs() -> TestResult {
     let dir = DevDir;
     for name in ["shm", "mqueue", "hugepages"] {

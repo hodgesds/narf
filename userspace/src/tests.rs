@@ -6350,7 +6350,7 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     crate::handlers::__test_rlimit_reset();
     rlimit_init();
 
-    // Default RLIMIT_NOFILE (resource 7) is (256, 4096).
+    // Default RLIMIT_NOFILE (resource 7) is (1024, 4096).
     let mut out = [0u64; 2];
     let mut ctx = FakeCtx {
         args: SyscallArgs {
@@ -6364,8 +6364,8 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
         return TestResult::Fail("getrlimit(NOFILE) did not return OK");
     }
-    if out != [256, 4096] {
-        return TestResult::Fail("default RLIMIT_NOFILE not (256, 4096)");
+    if out != [1024, 4096] {
+        return TestResult::Fail("default RLIMIT_NOFILE not (1024, 4096)");
     }
 
     // Default RLIMIT_STACK (resource 3) is (8 MiB, INFINITY).
@@ -6433,6 +6433,47 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_userspace_rlimit_round_trip);
+
+/// `fd::open_fds` returns the exact set of open fd numbers, ascending, and
+/// skips closed slots (holes). This backs `/proc/<pid>/fd` enumeration.
+fn smoke_userspace_open_fds_enumerates_with_gaps() -> TestResult {
+    let task = 0x0FD5_9001u64;
+    // A fresh table pre-populates stdio at 0,1,2.
+    let base = crate::fd::open_fds(task);
+    if base != [0, 1, 2] {
+        return TestResult::Fail("fresh table did not list stdio 0,1,2");
+    }
+    // Open three anon files → fds 3,4,5.
+    let mut opened = [0u32; 3];
+    for slot in opened.iter_mut() {
+        let n = crate::fd::with_table(task, |t| {
+            t.open(crate::fd::FdEntry {
+                ops: narf_filesystem::memfs::new_anon_file(),
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            })
+        });
+        match n {
+            Some(fd) => *slot = fd,
+            None => return TestResult::Fail("with_table open failed"),
+        }
+    }
+    if opened != [3, 4, 5] || crate::fd::open_fds(task) != [0, 1, 2, 3, 4, 5] {
+        return TestResult::Fail("open_fds did not list the newly opened fds");
+    }
+    // Close fd 4 → a hole; enumeration must skip it, not truncate at it.
+    let closed = crate::fd::with_table(task, |t| t.close(4)).unwrap_or(false);
+    if !closed {
+        return TestResult::Fail("close(4) failed");
+    }
+    if crate::fd::open_fds(task) != [0, 1, 2, 3, 5] {
+        return TestResult::Fail("open_fds did not skip the closed slot");
+    }
+    crate::fd::__test_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_open_fds_enumerates_with_gaps);
 
 fn smoke_userspace_priority_round_trip() -> TestResult {
     use crate::{
