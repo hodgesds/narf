@@ -389,15 +389,46 @@ async fn pump_task(
     let ptp = narf_hid::ptp::detect(&parsed);
     let touchscreen = narf_hid::touchscreen::detect(&parsed);
     let pen = narf_hid::pen::detect(&parsed);
+    // Keyboard + Fn/media collections. A laptop's built-in keyboard
+    // attaches over this same i2c-HID transport; a 2-in-1 device may
+    // present BOTH a keyboard and a touch collection on one PNP0C50
+    // node, so detection is additive and independent of the touch
+    // routing above.
+    let keyboard = narf_hid::keyboard::detect(&parsed);
+    let consumer = narf_hid::keyboard::detect_consumer(&parsed);
     let _ = writeln!(
         narf_console::Writer,
-        "  i2c-hid-pump: {}: descriptor parsed, fields={}, ptp={}, touchscreen={}, pen={}",
+        "  i2c-hid-pump: {}: descriptor parsed, fields={}, ptp={}, touchscreen={}, pen={}, keyboard={}, consumer={}",
         path,
         parsed.fields.len(),
         ptp.is_some(),
         touchscreen.is_some(),
         pen.is_some(),
+        keyboard.is_some(),
+        consumer.is_some(),
     );
+
+    // Register an evdev device node for the keyboard (and, if present,
+    // the consumer row) so EV_KEY events reach `/dev/input/event*`
+    // consumers — the same path the i8042 PS/2 driver uses.
+    let kbd_node = if keyboard.is_some() || consumer.is_some() {
+        let mut caps = crate::i2c_hid_keyboard::build_keyboard_caps();
+        if consumer.is_some() {
+            crate::i2c_hid_keyboard::add_consumer_caps(&mut caps);
+        }
+        let (_id, node) = narf_input::evdev::ROUTER.register_device(caps);
+        if let Some(kp) = &keyboard {
+            crate::i2c_hid_keyboard::log_boot_summary(
+                &path,
+                kp.keys.report_count,
+                kp.modifiers.is_some(),
+                consumer.is_some(),
+            );
+        }
+        Some(node)
+    } else {
+        None
+    };
 
     if let Some(profile) = &ptp {
         log_ptp_mode_set_result(&path, set_ptp_multi_touch_mode(&driver, profile).await);
@@ -432,6 +463,9 @@ async fn pump_task(
     let mut touch_state = crate::i2c_hid_touch::TouchPumpState::new();
     // Per-device pen/stylus state tracker.
     let mut pen_state = crate::i2c_hid_touch::PenPumpState::default();
+    // Per-device keyboard + consumer report-diff trackers.
+    let mut kbd_state = crate::i2c_hid_keyboard::KeyboardPumpState::new();
+    let mut consumer_state = crate::i2c_hid_keyboard::ConsumerPumpState::new();
 
     loop {
         if irq_wired {
@@ -464,10 +498,35 @@ async fn pump_task(
         }
 
         let payload = &buf[..n];
-        // Route by report id when the descriptor uses them. PTP
-        // and Touch Screen are normally distinct top-level
-        // collections with distinct report ids, so the two
-        // branches are mutually exclusive per report.
+        // Route by report id when the descriptor uses them. Keyboard,
+        // consumer, PTP, Touch Screen and pen are distinct top-level
+        // collections with distinct report ids, so the branches are
+        // mutually exclusive per report.
+        //
+        // Keyboard first: a laptop's built-in keyboard shares this
+        // transport, and a 2-in-1 may present keyboard + touch on one
+        // node — routing the keyboard report here doesn't disturb the
+        // touch branches below.
+        if let (Some(profile), Some(node)) = (&keyboard, &kbd_node) {
+            if profile.input_report_id == 0 || payload.first() == Some(&profile.input_report_id) {
+                if let Ok(decoded) = narf_hid::keyboard::decode_input(profile, payload) {
+                    crate::i2c_hid_keyboard::pump_report(node, &mut kbd_state, &decoded);
+                    continue;
+                }
+            }
+        }
+        if let (Some(profile), Some(node)) = (&consumer, &kbd_node) {
+            if payload.first() == Some(&profile.input_report_id) {
+                if let Ok(active) = narf_hid::keyboard::decode_consumer(profile, payload) {
+                    crate::i2c_hid_keyboard::pump_consumer_report(
+                        node,
+                        &mut consumer_state,
+                        &active,
+                    );
+                    continue;
+                }
+            }
+        }
         if let Some(profile) = &ptp {
             if payload.first() == Some(&profile.input_report_id) {
                 if let Ok(decoded) = narf_hid::ptp::decode_input(profile, payload) {

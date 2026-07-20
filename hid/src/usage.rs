@@ -71,8 +71,15 @@ pub mod digitizer {
 /// volume.
 pub mod consumer {
     pub const PAGE: u16 = 0x0C;
+    /// Consumer Control top-level Application Collection usage — the
+    /// TLC a laptop's Fn/media row lives under.
+    pub const CONSUMER_CONTROL: u16 = 0x01;
     pub const VOLUME_UP: u16 = 0xE9;
     pub const VOLUME_DOWN: u16 = 0xEA;
     pub const MUTE: u16 = 0xE2;
     pub const PLAY_PAUSE: u16 = 0xCD;
+    /// Display brightness up/down (HID Usage Tables 1.4 §15). Laptop
+    /// Fn-brightness keys route through these consumer usages.
+    pub const BRIGHTNESS_UP: u16 = 0x6F;
+    pub const BRIGHTNESS_DOWN: u16 = 0x70;
 }

@@ -300,6 +300,153 @@ fn smoke_hid_array_active_usages_dedup_zeros() -> TestResult {
 }
 kernel_test_in!("hid", smoke_hid_array_active_usages_dedup_zeros);
 
+// ── Keyboard profile detect + decode + usage→KEY_* ────────────────
+
+fn smoke_hid_keyboard_detect_locates_collection() -> TestResult {
+    use crate::keyboard;
+    let blob = keyboard::__boot_keyboard_descriptor_blob();
+    let d = parse(blob).expect("parse");
+    let profile = match keyboard::detect(&d) {
+        Some(p) => p,
+        None => return TestResult::Fail("boot keyboard collection not detected"),
+    };
+    // No report ids in the boot descriptor.
+    if profile.input_report_id != 0 {
+        return TestResult::Fail("boot keyboard uses no report id");
+    }
+    // Key array: 6 slots of 8 bits at bit offset 16 (after the 8-bit
+    // modifier byte + 8-bit reserved byte).
+    if profile.keys.report_count != 6 || profile.keys.report_size != 8 {
+        return TestResult::Fail("key array shape wrong");
+    }
+    if profile.keys.bit_offset != 16 {
+        return TestResult::Fail("key array must follow modifier+reserved bytes");
+    }
+    // Modifier bitmap must have been located.
+    let mods = match &profile.modifiers {
+        Some(m) => m,
+        None => return TestResult::Fail("modifier field not located"),
+    };
+    if mods.report_count != 8 || mods.bit_offset != 0 {
+        return TestResult::Fail("modifier field shape wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_keyboard_detect_locates_collection);
+
+fn smoke_hid_keyboard_usage_to_keycode_spot_checks() -> TestResult {
+    use crate::keyboard::{hid_usage_to_keycode, modifier_bit_to_keycode};
+    // (HID usage, expected Linux KEY_* code) — cross-checked against
+    // include/uapi/linux/input-event-codes.h.
+    let cases: &[(u16, u16)] = &[
+        (0x04, 30),  // a  → KEY_A
+        (0x05, 48),  // b  → KEY_B
+        (0x1D, 44),  // z  → KEY_Z
+        (0x1E, 2),   // 1  → KEY_1
+        (0x27, 11),  // 0  → KEY_0
+        (0x28, 28),  // Enter
+        (0x29, 1),   // Esc
+        (0x2A, 14),  // Backspace
+        (0x2B, 15),  // Tab
+        (0x2C, 57),  // Space
+        (0x3A, 59),  // F1
+        (0x45, 88),  // F12
+        (0x4F, 106), // Right arrow
+        (0x50, 105), // Left arrow
+        (0x51, 108), // Down arrow
+        (0x52, 103), // Up arrow
+        (0x4A, 102), // Home
+        (0x4D, 107), // End
+        (0x53, 69),  // NumLock
+        (0x62, 82),  // KP0
+        (0xE0, 29),  // LeftCtrl
+        (0xE1, 42),  // LeftShift
+        (0xE3, 125), // LeftMeta / GUI
+        (0xE7, 126), // RightMeta / GUI
+    ];
+    for &(usage, want) in cases {
+        match hid_usage_to_keycode(usage) {
+            Some(got) if got == want => {}
+            other => {
+                let _ = other;
+                return TestResult::Fail("usage→KEY_* mismatch");
+            }
+        }
+    }
+    // Reserved / rollover-error usages have no keycode.
+    if hid_usage_to_keycode(0x00).is_some() || hid_usage_to_keycode(0x01).is_some() {
+        return TestResult::Fail("reserved usages must map to None");
+    }
+    // Modifier bit helper mirrors the 0xE0+bit usages.
+    if modifier_bit_to_keycode(0) != Some(29) || modifier_bit_to_keycode(1) != Some(42) {
+        return TestResult::Fail("modifier bit→KEY_* wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_keyboard_usage_to_keycode_spot_checks);
+
+fn smoke_hid_keyboard_decode_report() -> TestResult {
+    use crate::keyboard::{self, modbit};
+    let blob = keyboard::__boot_keyboard_descriptor_blob();
+    let d = parse(blob).expect("parse");
+    let profile = keyboard::detect(&d).expect("detect");
+    // Report: LeftShift held (modifier bit 1), keys 'a'(0x04) + 'b'(0x05).
+    // Wire: [modifiers, reserved, k0, k1, k2, k3, k4, k5].
+    let report = [modbit::LEFT_SHIFT, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00];
+    let decoded = keyboard::decode_input(&profile, &report).expect("decode");
+    if decoded.modifiers != modbit::LEFT_SHIFT {
+        return TestResult::Fail("modifier bitmap decode wrong");
+    }
+    if decoded.keys != alloc::vec![0x04u16, 0x05] {
+        return TestResult::Fail("held keys decode wrong");
+    }
+    if !decoded.holds(0x04) || decoded.holds(0x06) {
+        return TestResult::Fail("holds() query wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_keyboard_decode_report);
+
+fn smoke_hid_keyboard_not_detected_on_touchscreen() -> TestResult {
+    // A pure touchscreen descriptor must NOT be claimed as a keyboard.
+    use crate::{keyboard, touchscreen};
+    let blob = touchscreen::__touchscreen_descriptor_blob();
+    let d = parse(blob).expect("parse");
+    if keyboard::detect(&d).is_some() {
+        return TestResult::Fail("touchscreen wrongly detected as keyboard");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_keyboard_not_detected_on_touchscreen);
+
+fn smoke_hid_consumer_detect_and_decode() -> TestResult {
+    use crate::keyboard::{self, consumer_usage_to_keycode};
+    use crate::usage::consumer;
+    let blob = keyboard::__consumer_descriptor_blob();
+    let d = parse(blob).expect("parse");
+    let profile = match keyboard::detect_consumer(&d) {
+        Some(p) => p,
+        None => return TestResult::Fail("consumer collection not detected"),
+    };
+    if profile.input_report_id != 3 {
+        return TestResult::Fail("consumer report id wrong");
+    }
+    // Report id 3, one active usage = Volume Up (0xE9), second slot 0.
+    let report = [3u8, 0xE9, 0x00, 0x00, 0x00];
+    let active = keyboard::decode_consumer(&profile, &report).expect("decode");
+    if active != alloc::vec![consumer::VOLUME_UP] {
+        return TestResult::Fail("active consumer usage decode wrong");
+    }
+    if consumer_usage_to_keycode(consumer::VOLUME_UP) != Some(115) {
+        return TestResult::Fail("VOLUME_UP → KEY_VOLUMEUP(115) wrong");
+    }
+    if consumer_usage_to_keycode(consumer::BRIGHTNESS_UP) != Some(225) {
+        return TestResult::Fail("BRIGHTNESS_UP → KEY_BRIGHTNESSUP(225) wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("hid", smoke_hid_consumer_detect_and_decode);
+
 // ── Digitizer / PTP shape ─────────────────────────────────────────
 //
 // Minimal slice of a Microsoft Precision Touchpad: one TouchPad

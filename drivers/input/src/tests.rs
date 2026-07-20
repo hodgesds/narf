@@ -2981,3 +2981,178 @@ kernel_test_in!(
     "drivers/input/hid-elan",
     smoke_hid_elan_usb_single_finger_report
 );
+
+// ── i2c-hid keyboard pump ─────────────────────────────────────────
+//
+// Smokes for the HID keyboard decode → EV_KEY translation path. The
+// descriptor parse + usage→KEY_* mapping is covered in narf-hid; here
+// we exercise the report-diff (press/release/autorepeat + modifier
+// state) and the EV_KEY dispatch onto an evdev DeviceNode that the
+// bind layer adds on top of the decoder.
+
+mod i2c_hid_keyboard_smokes {
+    use narf_hid::keyboard::modbit;
+    use narf_input::evdev::{EventType, ROUTER};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use crate::i2c_hid_keyboard::{
+        __build_boot_report, __new_consumer_state_for_test, __new_state_for_test,
+        build_keyboard_caps, diff_consumer, diff_report, pump_report, KeyEmit,
+    };
+
+    fn make_profile() -> narf_hid::keyboard::KeyboardProfile {
+        let blob = narf_hid::keyboard::__boot_keyboard_descriptor_blob();
+        let parsed = narf_hid::parse(blob).expect("parse");
+        narf_hid::keyboard::detect(&parsed).expect("detect")
+    }
+
+    fn decode(
+        p: &narf_hid::keyboard::KeyboardProfile,
+        modifiers: u8,
+        keys: &[u16],
+    ) -> narf_hid::keyboard::DecodedKeyboardReport {
+        let report = __build_boot_report(modifiers, keys);
+        narf_hid::keyboard::decode_input(p, &report).expect("decode")
+    }
+
+    // Press a, add b, release a, release all — assert the exact EV_KEY
+    // stream incl. modifiers and autorepeat.
+    fn smoke_keyboard_press_add_release_stream() -> TestResult {
+        let p = make_profile();
+        let mut st = __new_state_for_test();
+
+        // Frame 1: press 'a' (usage 0x04 → KEY_A 30).
+        let e = diff_report(&mut st, &decode(&p, 0, &[0x04]));
+        if e != alloc::vec![KeyEmit { code: 30, value: 1 }] {
+            return TestResult::Fail("frame1: expected KEY_A press");
+        }
+
+        // Frame 2: add 'b' (0x05 → KEY_B 48). 'a' still held → repeat.
+        let e = diff_report(&mut st, &decode(&p, 0, &[0x04, 0x05]));
+        if e != alloc::vec![
+            KeyEmit { code: 30, value: 2 }, // a autorepeat
+            KeyEmit { code: 48, value: 1 }, // b press
+        ] {
+            return TestResult::Fail("frame2: expected KEY_A repeat + KEY_B press");
+        }
+
+        // Frame 3: release 'a', 'b' still held → b repeat.
+        let e = diff_report(&mut st, &decode(&p, 0, &[0x05]));
+        if e != alloc::vec![
+            KeyEmit { code: 30, value: 0 }, // a release
+            KeyEmit { code: 48, value: 2 }, // b autorepeat
+        ] {
+            return TestResult::Fail("frame3: expected KEY_A release + KEY_B repeat");
+        }
+
+        // Frame 4: release all.
+        let e = diff_report(&mut st, &decode(&p, 0, &[]));
+        if e != alloc::vec![KeyEmit { code: 48, value: 0 }] {
+            return TestResult::Fail("frame4: expected KEY_B release");
+        }
+
+        // Frame 5: nothing held, nothing changed → empty.
+        let e = diff_report(&mut st, &decode(&p, 0, &[]));
+        if !e.is_empty() {
+            return TestResult::Fail("idle frame must emit nothing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid-kbd",
+        smoke_keyboard_press_add_release_stream
+    );
+
+    // Modifier press/release emits its own EV_KEY (KEY_LEFTSHIFT 42),
+    // and the shift state rides alongside the key press.
+    fn smoke_keyboard_modifier_transitions() -> TestResult {
+        let p = make_profile();
+        let mut st = __new_state_for_test();
+
+        // Press shift + 'a' in one frame: shift modifier (bit1→KEY_LEFTSHIFT 42)
+        // then the 'a' press.
+        let e = diff_report(&mut st, &decode(&p, modbit::LEFT_SHIFT, &[0x04]));
+        if e != alloc::vec![
+            KeyEmit { code: 42, value: 1 }, // LeftShift press
+            KeyEmit { code: 30, value: 1 }, // A press
+        ] {
+            return TestResult::Fail("expected LeftShift + A press");
+        }
+
+        // Release shift, keep 'a' → shift release + A repeat.
+        let e = diff_report(&mut st, &decode(&p, 0, &[0x04]));
+        if e != alloc::vec![
+            KeyEmit { code: 42, value: 0 }, // LeftShift release
+            KeyEmit { code: 30, value: 2 }, // A repeat
+        ] {
+            return TestResult::Fail("expected LeftShift release + A repeat");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid-kbd",
+        smoke_keyboard_modifier_transitions
+    );
+
+    // EV_KEY events + a closing EV_SYN land on an evdev DeviceNode ring.
+    fn smoke_keyboard_events_reach_evdev_node() -> TestResult {
+        let p = make_profile();
+        let mut st = __new_state_for_test();
+        let (id, node) = ROUTER.register_device(build_keyboard_caps());
+        let reader = ROUTER.open_reader(id).expect("reader");
+
+        // Press 'a' → expect one EV_KEY(30,1) then EV_SYN.
+        let n = pump_report(&node, &mut st, &decode(&p, 0, &[0x04]));
+        if n != 1 {
+            return TestResult::Fail("expected one key event dispatched");
+        }
+        let key = match reader.poll_event() {
+            Some(ev) => ev,
+            None => return TestResult::Fail("no EV_KEY on ring"),
+        };
+        if key.type_ != EventType::Key || key.code != 30 || key.value != 1 {
+            return TestResult::Fail("first event must be KEY_A press");
+        }
+        let syn = match reader.poll_event() {
+            Some(ev) => ev,
+            None => return TestResult::Fail("no EV_SYN after key"),
+        };
+        if syn.type_ != EventType::Syn {
+            return TestResult::Fail("frame must end with SYN_REPORT");
+        }
+        // Device caps must advertise KEY_A.
+        if !ROUTER.caps(id).expect("caps").has(EventType::Key, 30) {
+            return TestResult::Fail("keyboard caps must advertise KEY_A");
+        }
+        ROUTER.unregister_device(id);
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/input/i2c-hid-kbd",
+        smoke_keyboard_events_reach_evdev_node
+    );
+
+    // Consumer (Fn/media) press/release diff → KEY_VOLUMEUP etc.
+    fn smoke_keyboard_consumer_diff() -> TestResult {
+        use narf_hid::usage::consumer;
+        let mut st = __new_consumer_state_for_test();
+        // Press Volume Up.
+        let e = diff_consumer(&mut st, &[consumer::VOLUME_UP]);
+        if e != alloc::vec![KeyEmit {
+            code: 115,
+            value: 1
+        }] {
+            return TestResult::Fail("expected KEY_VOLUMEUP press");
+        }
+        // Release (empty report).
+        let e = diff_consumer(&mut st, &[]);
+        if e != alloc::vec![KeyEmit {
+            code: 115,
+            value: 0
+        }] {
+            return TestResult::Fail("expected KEY_VOLUMEUP release");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/input/i2c-hid-kbd", smoke_keyboard_consumer_diff);
+}
