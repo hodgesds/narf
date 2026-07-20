@@ -33,6 +33,7 @@ pub mod reclaim;
 pub mod ro_after_init;
 pub mod slab;
 pub mod spd5;
+pub mod swap;
 pub mod tlb_shootdown;
 pub mod vmalloc;
 pub mod wx;
@@ -105,3 +106,10 @@ pub use pager::{
     current_pager_name, install_pager, NoopPager, Pager, PagerAuthority, PagerError, SwapSlot,
     ZpoolPager,
 };
+pub use swap::{
+    backend_name as swap_backend_name, install_backend as install_swap_backend,
+    set_swap_batch_pages, swap_batch_pages, swap_discard, swap_stats, SwapBackend, SwapError,
+    SwapPte, SwapStats, ZramBackend, SWAP_BATCH_PAGES_DEFAULT, SWAP_BATCH_PAGES_MAX,
+};
+#[cfg(target_arch = "x86_64")]
+pub use swap::{swap_in_pte, swap_out_batch, SwapVictim};

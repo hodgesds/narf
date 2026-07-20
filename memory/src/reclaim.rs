@@ -134,6 +134,16 @@ pub enum ReclaimOutcome {
     /// or maintain a `(owner, phys) → SwapSlot` side-table. Full
     /// integration (frame-free on success + side-table for
     /// `page_in` discovery) is a Wave C+1 follow-up.
+    ///
+    /// The **live**, batched swap path now lives in `crate::swap`:
+    /// `swap::swap_out_batch(&[SwapVictim])` writes a run of victims
+    /// out in one backend call, installs swap-entry PTEs, and frees the
+    /// frames; `swap::swap_in_pte` faults them back on demand. A caller
+    /// that knows a victim's *virtual* address (the mmap / address-space
+    /// layer) drives that path directly. This per-`phys` `ReclaimFn`
+    /// seam can't reach it because it lacks the reverse mapping
+    /// (`phys → (pml4, virt)`); wiring an rmap so the LRU scan itself
+    /// can batch-evict is the follow-up.
     DeferToPager,
 }
 
