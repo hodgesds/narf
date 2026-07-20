@@ -35,6 +35,32 @@ crate. The subsystems this reference covers:
 > `research/`; no `src/`). The runtime security code lives in `security/`
 > and is covered by [capabilities.md](capabilities.md).
 
+## Drivers & peripheral subsystems
+
+Writing an **out-of-tree driver** (a new crate that adds a device driver or
+extends a peripheral subsystem without editing a core crate) is documented
+separately. Start with [drivers.md](drivers.md) — the initcall registry
+(`narf-init`: `Stage`, `register`, `InitResult`) and the bus/device match
+model (PCIe / virtio / I2C / USB / platform) — then the per-subsystem guides:
+
+| Subsystem      | Extension doc | Seam |
+| -------------- | ------------- | ---- |
+| Driver model / buses | [drivers.md](drivers.md) | `narf_init::register(Stage, …)` + bus match |
+| Block devices  | [block.md](block.md)      | `narf-block` + `root_mount` FS factory |
+| Network        | [net.md](net.md)          | `narf_net::Interface` |
+| Input / HID    | [input.md](input.md)      | evdev `ROUTER.register_device` + `hid` parser |
+| Graphics / DRM | [graphics.md](graphics.md)| `FbScanout` / `DrmCard` / EDID |
+| Sound          | [sound.md](sound.md)      | `AudioStream` + HDA registration |
+| Char devices   | [chardev.md](chardev.md)  | `FileOps` + devfs publication hooks |
+
+Places where clean out-of-tree extension is **not** possible today are
+flagged in the relevant doc: the initcall wiring line (a kernel-side
+aggregator must call your `register_initcalls()`), platform (non-discoverable)
+devices (no unified `platform_driver` trait), the crypto algorithm registry,
+and the framebuffer / audio backend pickers (`fb::select_active` /
+`audio::select_active_playback` are hard-coded over a fixed backend set). See
+[drivers.md](drivers.md) for the details and the clean paths around them.
+
 ## The two extension patterns
 
 NARF exposes extension seams in two shapes. Knowing which one a subsystem
