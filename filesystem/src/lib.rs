@@ -70,6 +70,7 @@ pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
+pub mod fs_registry;
 pub mod fuse;
 pub mod memfs;
 pub mod ntty;
@@ -101,6 +102,7 @@ pub use devfs::{
     unregister_tpm, DevFs,
 };
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
+pub use fs_registry::{lookup_fstype, register_fstype, FsBuilder};
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,
     FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,

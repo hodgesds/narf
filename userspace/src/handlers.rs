@@ -16204,6 +16204,22 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // Extensibility fallback: an out-of-tree crate may have registered
+    // a constructor for this fstype via `register_fstype`. Built-in arms
+    // above keep priority; this is consulted only for otherwise-unknown
+    // types, before the block-device fallthrough. NARF passes mount
+    // options via the source/data arg, so hand the builder the resolved
+    // source as both the source and the data string.
+    if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
+        return match builder(source_resolved.as_str(), source_resolved.as_str()) {
+            Ok(fs) => match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
+                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(_) => ctx.set_return(fail),
+            },
+            Err(_) => ctx.set_return(fail),
+        };
+    }
+
     // Block-device-backed mounts: resolve `source` as a registered
     // block-device name. Strip a leading "/dev/" so callers can
     // pass either form.

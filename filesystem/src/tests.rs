@@ -2181,3 +2181,62 @@ kernel_test_in!(
     "filesystem",
     smoke_fs_resolve_nofollow_follows_intermediate_symlink
 );
+// ── fstype registry (fs_registry) ──────────────────────────────────
+//
+// A third-party crate can register a mountable fstype via
+// `register_fstype`, after which `sys_mount` builds it through
+// `lookup_fstype`. We can't drive the full `sys_mount` syscall from a
+// kernel test, so exercise the registry API directly: register a
+// trivial custom fstype (returns a seeded `MemFs`), look it up, build,
+// `mount_arc` it, and resolve the seeded file through the mount.
+fn smoke_fs_registry_custom_fstype_mounts() -> TestResult {
+    use crate::{
+        bootstrap_mount_authority, lookup_fstype, register_fstype, registry, resolve, FsError,
+        FsInstance, MemFs,
+    };
+    use alloc::sync::Arc;
+
+    // A builder for a custom "smokefs" type. Seeds one file so a
+    // resolve() through the mount can confirm a working FsInstance.
+    fn build_smokefs(_source: &str, _data: &str) -> Result<Arc<dyn FsInstance>, FsError> {
+        let fs = MemFs::with_seeds("smokefs", &[("greeting", b"hi")]);
+        Ok(Arc::new(fs) as Arc<dyn FsInstance>)
+    }
+
+    register_fstype("smokefs", build_smokefs);
+
+    // An unregistered type must not resolve.
+    if lookup_fstype("definitely-not-registered").is_some() {
+        return TestResult::Fail("lookup_fstype returned Some for an unregistered type");
+    }
+
+    let builder = match lookup_fstype("smokefs") {
+        Some(b) => b,
+        None => return TestResult::Fail("lookup_fstype(smokefs) returned None after register"),
+    };
+
+    let fs = match builder("some-source", "some-data") {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("smokefs builder returned Err"),
+    };
+
+    let authority = bootstrap_mount_authority();
+    let _handle = match registry().mount_arc(&authority, "/smoke-registry", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount_arc refused a live authority"),
+    };
+
+    let stat_opt = registry()
+        .with_mount("/smoke-registry", |fs| {
+            let file = resolve(fs.root(), "greeting").ok()?;
+            Some(file.stat())
+        })
+        .flatten();
+
+    match stat_opt {
+        Some(s) if s.size == 2 => TestResult::Pass,
+        Some(_) => TestResult::Fail("seeded file resolved with wrong size"),
+        None => TestResult::Fail("resolve(greeting) failed through the registered mount"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_registry_custom_fstype_mounts);
