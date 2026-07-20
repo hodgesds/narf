@@ -1983,3 +1983,137 @@ fn smoke_filesystem_memfs_link_aliases_node() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_filesystem_memfs_link_aliases_node);
+
+// ── resolve_async NoFollow (readlink / lstat) semantics ────────────
+//
+// These exercise the `follow_final` param threaded through the VFS
+// walker: readlink / lstat / *_NOFOLLOW must operate on a final
+// symlink itself, while intermediate symlinks are always followed and
+// the FOLLOW path keeps resolving the target.
+
+fn poll_once_resolve<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::pin::pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    unsafe fn no_clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    unsafe fn no_op(_: *const ()) {}
+    const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+    // SAFETY: `VTAB`'s callbacks are all no-ops over a null data pointer,
+    // satisfying the Waker::from_raw contract.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTAB)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+// Build a MemFs shaped like:
+//   /link    -> "target"   (final symlink under test)
+//   /target  = regular file "hello"
+//   /dir     = directory containing /dir/leaf = "inside"
+//   /dsym    -> "dir"       (symlink-to-directory, an intermediate hop)
+fn build_symlink_fs() -> alloc::sync::Arc<crate::MemFs> {
+    use crate::FsInstance;
+    let fs = alloc::sync::Arc::new(crate::MemFs::new("symlink-resolve-test"));
+    let root = fs.root();
+    poll_once_resolve(root.symlink("link", "target"))
+        .and_then(|r| r.ok())
+        .expect("mint /link");
+    let target = poll_once_resolve(root.create("target"))
+        .and_then(|r| r.ok())
+        .expect("mint /target");
+    poll_once_resolve(target.write(0, b"hello"))
+        .and_then(|r| r.ok())
+        .expect("write /target");
+    let dir = poll_once_resolve(root.mkdir("dir"))
+        .and_then(|r| r.ok())
+        .expect("mkdir /dir");
+    let leaf = poll_once_resolve(dir.create("leaf"))
+        .and_then(|r| r.ok())
+        .expect("mint /dir/leaf");
+    poll_once_resolve(leaf.write(0, b"inside"))
+        .and_then(|r| r.ok())
+        .expect("write /dir/leaf");
+    poll_once_resolve(root.symlink("dsym", "dir"))
+        .and_then(|r| r.ok())
+        .expect("mint /dsym");
+    fs
+}
+
+fn ftype_of(f: &alloc::sync::Arc<dyn crate::FileOps>) -> crate::FileType {
+    poll_once_resolve(f.stat_async())
+        .and_then(|r| r.ok())
+        .map(|s| s.mode.file_type)
+        .unwrap_or(crate::FileType::File)
+}
+
+// (1) NoFollow of a final symlink returns the Symlink node itself; its
+//     read yields the target string ("target") — this is what readlink
+//     copies to the user buffer.
+fn smoke_fs_resolve_nofollow_returns_symlink() -> TestResult {
+    let fs = build_symlink_fs();
+    let node = match poll_once_resolve(crate::resolve_async_nofollow(
+        crate::FsInstance::root(&*fs),
+        "link",
+    )) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("resolve_async_nofollow(link) failed"),
+    };
+    if ftype_of(&node) != crate::FileType::Symlink {
+        return TestResult::Fail("NoFollow final symlink did not return a Symlink node");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once_resolve(node.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"target" => TestResult::Pass,
+        _ => TestResult::Fail("symlink node did not read back its target bytes"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_resolve_nofollow_returns_symlink);
+
+// (2) Follow of the same final symlink resolves to the TARGET's node
+//     (a regular file whose contents are "hello").
+fn smoke_fs_resolve_follow_reaches_target() -> TestResult {
+    let fs = build_symlink_fs();
+    let node = match poll_once_resolve(crate::resolve_async(crate::FsInstance::root(&*fs), "link"))
+    {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("resolve_async(link) failed"),
+    };
+    if ftype_of(&node) != crate::FileType::File {
+        return TestResult::Fail("Follow of final symlink did not reach the target file");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once_resolve(node.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"hello" => TestResult::Pass,
+        _ => TestResult::Fail("followed target did not read back its file contents"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_resolve_follow_reaches_target);
+
+// (3) Under NoFollow, an INTERMEDIATE symlink-to-directory is still
+//     followed: /dsym/leaf (dsym -> dir) resolves to /dir/leaf.
+fn smoke_fs_resolve_nofollow_follows_intermediate_symlink() -> TestResult {
+    let fs = build_symlink_fs();
+    let node = match poll_once_resolve(crate::resolve_async_nofollow(
+        crate::FsInstance::root(&*fs),
+        "dsym/leaf",
+    )) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("resolve_async_nofollow(dsym/leaf) failed"),
+    };
+    if ftype_of(&node) != crate::FileType::File {
+        return TestResult::Fail("intermediate symlink-to-dir was not followed under NoFollow");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once_resolve(node.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"inside" => TestResult::Pass,
+        _ => TestResult::Fail("dsym/leaf did not read back /dir/leaf contents"),
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_fs_resolve_nofollow_follows_intermediate_symlink
+);

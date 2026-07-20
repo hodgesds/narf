@@ -932,6 +932,34 @@ pub fn resolve(root: Arc<dyn DirOps>, path: &str) -> Result<Arc<dyn FileOps>, Fs
 ///   `FsError::InvalidPath` (POSIX would name this `ELOOP`).
 /// - An absolute symlink target restarts the walk from `root`.
 pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+    resolve_async_ext(root, path, true)
+}
+
+/// Like [`resolve_async`] but returns the *final* path component as-is
+/// when it is a symlink, instead of following it. Intermediate symlink
+/// components are STILL followed (a symlink-to-directory mid-path is
+/// normal). This is the resolution mode POSIX `readlink(2)`,
+/// `lstat(2)` / `fstatat(AT_SYMLINK_NOFOLLOW)` and `open(O_NOFOLLOW)`
+/// require: they must operate on the link itself, not its target.
+pub fn resolve_async_nofollow<'a>(
+    root: Arc<dyn DirOps>,
+    path: &'a str,
+) -> FsFuture<'a, Arc<dyn FileOps>> {
+    resolve_async_ext(root, path, false)
+}
+
+/// Shared resolver body for [`resolve_async`] / [`resolve_async_nofollow`].
+///
+/// `follow_final` selects whether the last path component is followed
+/// when it is a symlink: `true` is the classic follow-everything walk
+/// (open / stat); `false` stops at and returns the final symlink node
+/// itself (readlink / `*_NOFOLLOW`). Intermediate symlinks are followed
+/// in both modes, and the SYMLOOP_MAX guard applies uniformly.
+pub fn resolve_async_ext<'a>(
+    root: Arc<dyn DirOps>,
+    path: &'a str,
+    follow_final: bool,
+) -> FsFuture<'a, Arc<dyn FileOps>> {
     let initial = alloc::string::String::from(path);
     Box::pin(async move {
         if initial.is_empty() {
@@ -1007,6 +1035,15 @@ pub fn resolve_async<'a>(root: Arc<dyn DirOps>, path: &'a str) -> FsFuture<'a, A
                 Err(e) => return Err(e),
             };
             let kind = f.stat_async().await?.mode.file_type;
+
+            // A final symlink in NoFollow mode is the target of the walk:
+            // hand back the link node itself so readlink / lstat /
+            // *_NOFOLLOW operate on the link, not its target. Intermediate
+            // symlinks are always followed (the branch below), so a
+            // symlink-to-directory mid-path still resolves normally.
+            if kind == FileType::Symlink && is_final && !follow_final {
+                return Ok(f);
+            }
 
             if kind == FileType::Symlink {
                 if symlinks_followed >= SYMLOOP_MAX {

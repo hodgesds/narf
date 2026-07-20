@@ -3607,17 +3607,31 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64, ino: u64) -> linux_co
 #[cfg(feature = "linux-compat")]
 fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`
-    // — two args, path is NUL-terminated. The previous shape
-    // matched NARF's `(path_ptr, path_len, out_ptr)` triplet which
-    // is unreachable from musl: musl passes the statbuf in arg1,
-    // we read it as `path_len`, copy_from_user bails on the
-    // "huge length", every stat returns -1, errno = EPERM,
-    // busybox sh prints "Operation not permitted" for every
-    // PATH-search candidate, and every pipeline that touches an
-    // exec dies.
-    let path_ptr = args.arg0;
-    let out_ptr = args.arg1 as *mut linux_compat::Stat;
+    // Linux ABI: `int stat(const char *pathname, struct stat *statbuf)`.
+    // Plain stat always follows a trailing symlink.
+    stat_linux_common(ctx, args.arg0, args.arg1, true);
+}
+
+#[cfg(feature = "linux-compat")]
+fn sys_lstat_linux(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    // Linux ABI: `int lstat(const char *pathname, struct stat *statbuf)`.
+    // lstat is stat-that-does-not-follow: describe the symlink itself.
+    stat_linux_common(ctx, args.arg0, args.arg1, false);
+}
+
+/// Shared body for the Linux path-stat family. `follow_final` selects
+/// whether a trailing symlink is followed (plain `stat`/`fstatat`) or
+/// stat'd as the link itself (`lstat` / `fstatat(AT_SYMLINK_NOFOLLOW)`).
+#[cfg(feature = "linux-compat")]
+fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, follow_final: bool) {
+    // The previous shape matched NARF's `(path_ptr, path_len, out_ptr)`
+    // triplet which is unreachable from musl: musl passes the statbuf in
+    // arg1, we read it as `path_len`, copy_from_user bails on the "huge
+    // length", every stat returns -1, errno = EPERM, busybox sh prints
+    // "Operation not permitted" for every PATH-search candidate, and
+    // every pipeline that touches an exec dies.
+    let out_ptr = out_arg as *mut linux_compat::Stat;
     let fail = SyscallReturn::ok((-1i64) as u64);
     if out_ptr.is_null() {
         ctx.set_return(fail);
@@ -3643,7 +3657,7 @@ fn sys_stat_linux(ctx: &mut dyn TrapContext) {
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
-    let (s, ino, rdev) = match stat_ino_path_dir_aware(path) {
+    let (s, ino, rdev) = match stat_ino_path_dir_aware_ext(path, follow_final) {
         Some(triple) => triple,
         None => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
@@ -3728,41 +3742,12 @@ fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
     let _dirfd = args.arg0;
     let path_uptr = args.arg1;
     let stat_out = args.arg2;
-    let _flags = args.arg3;
-    struct Reshape<'a> {
-        inner: &'a mut dyn TrapContext,
-        args: SyscallArgs,
-    }
-    impl<'a> TrapContext for Reshape<'a> {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, ret: SyscallReturn) {
-            self.inner.set_return(ret);
-        }
-        fn user_rsp(&self) -> u64 {
-            self.inner.user_rsp()
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, rip: u64, rsp: u64) -> bool {
-            self.inner.redirect_to_kernel(rip, rsp)
-        }
-    }
-    let mut proxy = Reshape {
-        inner: ctx,
-        args: SyscallArgs {
-            arg0: path_uptr,
-            arg1: stat_out,
-            arg2: 0,
-            arg3: 0,
-            arg4: 0,
-            arg5: 0,
-        },
-    };
-    sys_stat_linux(&mut proxy);
+    let flags = args.arg3 as u32;
+    // AT_SYMLINK_NOFOLLOW (lstat's shape via fstatat) means "describe the
+    // symlink itself" — don't follow the final component. Without it,
+    // fstatat follows like plain stat.
+    let follow_final = flags & linux_compat::AT_SYMLINK_NOFOLLOW == 0;
+    stat_linux_common(ctx, path_uptr, stat_out, follow_final);
 }
 
 #[cfg(feature = "linux-compat")]
@@ -3827,7 +3812,10 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         // resolve_cwd_path resolves against the cwd AND re-roots under
         // the task's chroot — applying apply_chroot again double-composes.
         let path_owned = resolve_cwd_path(current_task_id(), &raw);
-        stat_ino_path_dir_aware(&path_owned)
+        // AT_SYMLINK_NOFOLLOW → describe the symlink itself (S_IFLNK),
+        // not its target; otherwise follow like plain stat.
+        let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+        stat_ino_path_dir_aware_ext(&path_owned, follow_final)
     };
 
     let (s, ino, rdev) = match fs_stat {
@@ -4729,13 +4717,24 @@ fn readlink_impl(
     // resolve_cwd_path already re-roots under the task's chroot — do
     // not apply_chroot again or the prefix is composed twice.
     let path = resolve_cwd_path(current_task_id(), &raw);
-    // resolve_parent_absolute returns Option<Option<Arc<dyn FileOps>>>:
-    // outer None = no mount covers the path, inner None = parent walk
-    // hit a missing component or the leaf is absent. Flatten both
-    // failure modes to `fail`.
-    let file = narf_filesystem::registry()
-        .resolve_parent_absolute(&path, |_fs, parent, leaf| parent.lookup(leaf))
-        .flatten();
+    // Resolve the leaf via the ASYNC path in NoFollow mode. The sync
+    // `DirOps::lookup` returns None for ext2 (lookups are async there),
+    // so the old resolve_parent_absolute(lookup) path reported EINVAL for
+    // every ext2-backed symlink; the async walker returns the real node.
+    // NoFollow so we obtain the symlink itself and can read its target,
+    // rather than following it to (a copy of) the target's contents.
+    let root_rel = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
+        (fs.root(), alloc::string::String::from(rel))
+    });
+    let file = match root_rel {
+        Some((root, rel)) => {
+            match poll_blocking(narf_filesystem::resolve_async_nofollow(root, &rel)) {
+                Some(Ok(o)) => Some(o),
+                _ => None,
+            }
+        }
+        None => None,
+    };
     // POSIX errno discipline matters here: musl's realpath() walks a path by
     // readlink()-ing each prefix and treats any failure other than EINVAL as
     // fatal (`if (errno != EINVAL) return 0;`). A non-symlink that exists must
@@ -14916,6 +14915,18 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 // the stat/statx handlers so the Linux `st_ino` is a stable per-file id
 // rather than a size-derived hash that aliases same-size DSOs.
 fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64)> {
+    stat_ino_path_dir_aware_ext(path, true)
+}
+
+/// Like [`stat_ino_path_dir_aware`] but `follow_final` selects whether a
+/// trailing symlink is followed. `lstat(2)` /
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` pass `false` so the returned stat
+/// describes the symlink itself (S_IFLNK, st_size = target length)
+/// rather than its target; plain `stat`/`fstatat` pass `true`.
+fn stat_ino_path_dir_aware_ext(
+    path: &str,
+    follow_final: bool,
+) -> Option<(narf_filesystem::Stat, u64, u64)> {
     let file = narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
             if rel.is_empty() {
@@ -14929,13 +14940,17 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u6
                 // `open`/`execve` of the same path succeeded. That made every
                 // PATH probe (busybox/ash search applets via stat) report
                 // "not found" inside a mounted distro rootfs.
-                poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
-                    .and_then(|r| r.ok())
-                    // rdev() is needed by seatd/libudev, which validate a
-                    // device node's type via the MAJOR:MINOR from a PATH
-                    // stat (not just fstat) — a 0 rdev reads as "not an
-                    // evdev/drm device" and they refuse to open it.
-                    .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
+                poll_blocking(narf_filesystem::resolve_async_ext(
+                    fs.root(),
+                    rel,
+                    follow_final,
+                ))
+                .and_then(|r| r.ok())
+                // rdev() is needed by seatd/libudev, which validate a
+                // device node's type via the MAJOR:MINOR from a PATH
+                // stat (not just fstat) — a 0 rdev reads as "not an
+                // evdev/drm device" and they refuse to open it.
+                .map(|ops| (ops.stat(), ops.ino(), ops.rdev()))
             }
         })
         .flatten();
@@ -24542,7 +24557,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     #[cfg(feature = "linux-compat")]
     {
         table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat_linux));
-        table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat_linux));
+        table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_lstat_linux));
         table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat_linux));
         table.install_raw(Syscall::OpenFile, "open", RawFnHandler(sys_open_linux));
     }
