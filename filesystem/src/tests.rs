@@ -2645,3 +2645,277 @@ fn unmount_for_test_fuse(path: &str) -> Result<(), crate::FsError> {
         Cap::<crate::MountPoint, narf_capabilities::Write>::bootstrap();
     crate::registry().unmount(&handle, path)
 }
+
+// ── overlayfs (union filesystem) smokes ─────────────────────────────
+
+/// Synchronously drive a single-poll future to completion for the
+/// overlay tests. Every overlay op resolves in one poll (all the
+/// backing MemFs ops are ready immediately), so a no-op waker suffices.
+/// Duplicated per convention with the other tests in this module.
+fn poll_once_overlay<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn raw_waker() -> RawWaker {
+        unsafe fn no_clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
+        unsafe fn no_op(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    // SAFETY: the no-op vtable is sound for a single-threaded test poll;
+    // the RawWaker is not used after this scope.
+    let waker = unsafe { Waker::from_raw(raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is a local mut binding that outlives this block and
+    // is never moved out.
+    let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    match pinned.poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+/// Build a two-layer overlay (lower: `a`,`shared`; upper: `b`,`shared`)
+/// and assert union + shadowing semantics on lookup and enumerate.
+fn smoke_overlay_union_shadow() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds(
+        "ov-lower",
+        &[("a", b"lower-a"), ("shared", b"LOWER-shared")],
+    ));
+    let upper = Arc::new(MemFs::with_seeds(
+        "ov-upper",
+        &[("b", b"upper-b"), ("shared", b"UPPER-shared")],
+    ));
+
+    let ov = OverlayFs::new("ov", upper.root(), vec![lower.root() as Arc<dyn DirOps>]);
+    let root = ov.root();
+
+    // lookup `a` → present only in lower.
+    let fa = match root.lookup("a") {
+        Some(f) => f,
+        None => return TestResult::Fail("overlay lookup(a) missed the lower-only file"),
+    };
+    let mut buf = [0u8; 32];
+    let n = match poll_once_overlay(fa.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read(a) did not complete"),
+    };
+    if &buf[..n] != b"lower-a" {
+        return TestResult::Fail("lookup(a) returned wrong (non-lower) content");
+    }
+
+    // lookup `b` → present only in upper.
+    let fb = match root.lookup("b") {
+        Some(f) => f,
+        None => return TestResult::Fail("overlay lookup(b) missed the upper-only file"),
+    };
+    let n = match poll_once_overlay(fb.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read(b) did not complete"),
+    };
+    if &buf[..n] != b"upper-b" {
+        return TestResult::Fail("lookup(b) returned wrong (non-upper) content");
+    }
+
+    // lookup `shared` → upper shadows lower.
+    let fs = match root.lookup("shared") {
+        Some(f) => f,
+        None => return TestResult::Fail("overlay lookup(shared) missed"),
+    };
+    let n = match poll_once_overlay(fs.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read(shared) did not complete"),
+    };
+    if &buf[..n] != b"UPPER-shared" {
+        return TestResult::Fail("lookup(shared) did not shadow lower with upper");
+    }
+
+    // enumerate → deduped union {a, b, shared}.
+    let names = root.enumerate(0, 64);
+    let has = |n: &str| names.iter().any(|(name, _)| name == n);
+    if names.len() != 3 || !has("a") || !has("b") || !has("shared") {
+        return TestResult::Fail("enumerate did not produce the deduped union {a,b,shared}");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_union_shadow);
+
+/// A file created through the overlay lands in the upper layer and is
+/// invisible in the lower layer.
+fn smoke_overlay_create_lands_in_upper() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov2-lower", &[("base", b"x")]));
+    let upper = Arc::new(MemFs::new("ov2-upper"));
+    let lower_root = lower.root();
+    let upper_root = upper.root();
+
+    let ov = OverlayFs::new("ov2", upper.root(), vec![lower.root() as Arc<dyn DirOps>]);
+    let root = ov.root();
+
+    // Create `fresh` via the overlay.
+    let created = poll_once_overlay(root.create("fresh"));
+    if !matches!(created, Some(Ok(_))) {
+        return TestResult::Fail("overlay create(fresh) failed");
+    }
+    // Write into it and read back through the union.
+    if let Some(Ok(f)) = created {
+        let w = poll_once_overlay(f.write(0, b"hello"));
+        if !matches!(w, Some(Ok(5))) {
+            return TestResult::Fail("write to created file failed");
+        }
+    }
+
+    // Visible in the union.
+    if root.lookup("fresh").is_none() {
+        return TestResult::Fail("created file not visible in the union");
+    }
+    // Present in the raw upper layer.
+    if upper_root.lookup("fresh").is_none() {
+        return TestResult::Fail("created file did not land in upper layer");
+    }
+    // Absent from the raw lower layer.
+    if lower_root.lookup("fresh").is_some() {
+        return TestResult::Fail("created file leaked into the read-only lower layer");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_create_lands_in_upper);
+
+/// Unlinking a lower-only file records a whiteout in upper: the file
+/// vanishes from the union while the lower layer itself is untouched.
+fn smoke_overlay_whiteout_unlink() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs, WHITEOUT_PREFIX};
+    use alloc::string::String;
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds(
+        "ov3-lower",
+        &[("keep", b"k"), ("gone", b"g")],
+    ));
+    let upper = Arc::new(MemFs::new("ov3-upper"));
+    let lower_root = lower.root();
+    let upper_root = upper.root();
+
+    let ov = OverlayFs::new("ov3", upper.root(), vec![lower.root() as Arc<dyn DirOps>]);
+    let root = ov.root();
+
+    // Precondition: both visible in the union.
+    if root.lookup("gone").is_none() || root.lookup("keep").is_none() {
+        return TestResult::Fail("lower files not visible in the union pre-unlink");
+    }
+
+    // Unlink the lower-only file `gone`.
+    let r = poll_once_overlay(root.unlink("gone"));
+    if !matches!(r, Some(Ok(()))) {
+        return TestResult::Fail("overlay unlink(gone) failed");
+    }
+
+    // `gone` now invisible in the union; `keep` still visible.
+    if root.lookup("gone").is_some() {
+        return TestResult::Fail("whited-out file still visible in the union");
+    }
+    if root.lookup("keep").is_none() {
+        return TestResult::Fail("unrelated lower file vanished from the union");
+    }
+
+    // The whiteout marker exists in upper; it is itself never enumerated.
+    let wh = {
+        let mut s = String::from(WHITEOUT_PREFIX);
+        s.push_str("gone");
+        s
+    };
+    if upper_root.lookup(&wh).is_none() {
+        return TestResult::Fail("no whiteout marker recorded in upper");
+    }
+    let names = root.enumerate(0, 64);
+    if names
+        .iter()
+        .any(|(n, _)| n == "gone" || n.starts_with(WHITEOUT_PREFIX))
+    {
+        return TestResult::Fail("enumerate surfaced a whited-out entry or the marker itself");
+    }
+
+    // The lower layer itself is untouched — `gone` still there raw.
+    if lower_root.lookup("gone").is_none() {
+        return TestResult::Fail("read-only lower layer was mutated by the whiteout");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_whiteout_unlink);
+
+/// Copy-up on write: writing to a lower-only file copies it into upper
+/// and directs the write there; the lower stays unmodified.
+fn smoke_overlay_copy_up_on_write() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let lower = Arc::new(MemFs::with_seeds("ov4-lower", &[("doc", b"original")]));
+    let upper = Arc::new(MemFs::new("ov4-upper"));
+    let lower_root = lower.root();
+    let upper_root = upper.root();
+
+    let ov = OverlayFs::new("ov4", upper.root(), vec![lower.root() as Arc<dyn DirOps>]);
+    let root = ov.root();
+
+    // Open the lower-only file through the overlay and overwrite byte 0.
+    let f = match root.lookup("doc") {
+        Some(f) => f,
+        None => return TestResult::Fail("lookup(doc) missed the lower file"),
+    };
+    let w = poll_once_overlay(f.write(0, b"X"));
+    if !matches!(w, Some(Ok(1))) {
+        return TestResult::Fail("write to lower-only file did not complete");
+    }
+
+    // The union now sees the modified content ("Xriginal").
+    let mut buf = [0u8; 16];
+    let n = match poll_once_overlay(f.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read-back after copy-up did not complete"),
+    };
+    if &buf[..n] != b"Xriginal" {
+        return TestResult::Fail("copy-up write not reflected on read-back");
+    }
+
+    // The copy landed in upper.
+    let uf = match upper_root.lookup("doc") {
+        Some(f) => f,
+        None => return TestResult::Fail("copy-up did not create the upper copy"),
+    };
+    let n = match poll_once_overlay(uf.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of upper copy did not complete"),
+    };
+    if &buf[..n] != b"Xriginal" {
+        return TestResult::Fail("upper copy has wrong content after copy-up");
+    }
+
+    // The lower layer is untouched — still "original".
+    let lf = match lower_root.lookup("doc") {
+        Some(f) => f,
+        None => return TestResult::Fail("lower file vanished"),
+    };
+    let n = match poll_once_overlay(lf.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of lower did not complete"),
+    };
+    if &buf[..n] != b"original" {
+        return TestResult::Fail("copy-up mutated the read-only lower file");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_copy_up_on_write);

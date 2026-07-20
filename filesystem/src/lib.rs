@@ -75,6 +75,7 @@ pub mod fuse;
 pub mod fuse_conn;
 pub mod memfs;
 pub mod ntty;
+pub mod overlayfs;
 pub mod page_cache;
 #[cfg(feature = "linux-compat")]
 pub mod procfs;
@@ -112,6 +113,7 @@ pub use memfs::{
     new_anon_file as new_anon_memfile, new_file_with_perms_owner as new_memfile_with_perms_owner,
     MemFs,
 };
+pub use overlayfs::{OverlayFs, WHITEOUT_PREFIX};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
 pub use sysfs::{

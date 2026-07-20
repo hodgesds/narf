@@ -16204,31 +16204,66 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // Extensibility fallback: an out-of-tree crate may have registered
-    // a constructor for this fstype via `register_fstype`. Built-in arms
-    // above keep priority; this is consulted only for otherwise-unknown
-    // types, before the block-device fallthrough. NARF passes mount
-    // options via the source/data arg, so hand the builder the resolved
-    // source as both the source and the data string.
-    if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
-        return match builder(source_resolved.as_str(), source_resolved.as_str()) {
-            Ok(fs) => match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
-                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-                Err(_) => ctx.set_return(fail),
-            },
+    // overlayfs (union mount). Linux passes the layer paths in the mount(2)
+    // `data` string (lowerdir=/a:/b,upperdir=/u,workdir=/w). NARF's mount ABI
+    // has no register left for a `data` pointer, so the options string is
+    // accepted via `source` instead (the conventional overlay source is the
+    // information-free literal "overlay"). `workdir` is parsed but ignored —
+    // copy-up/whiteout ops act directly on the upper dir.
+    if fstype == "overlay" || fstype == "overlayfs" {
+        let opts = source.as_str();
+        let mut lowerdirs: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+        let mut upperdir: Option<&str> = None;
+        for kv in opts.split(',') {
+            let kv = kv.trim();
+            if let Some(v) = kv.strip_prefix("lowerdir=") {
+                // Colon-separated, highest-priority first (Linux order).
+                lowerdirs = v.split(':').filter(|s| !s.is_empty()).collect();
+            } else if let Some(v) = kv.strip_prefix("upperdir=") {
+                upperdir = Some(v);
+            } else if kv.starts_with("workdir=") {
+                // Accepted-and-ignored (documented above).
+            }
+        }
+        let upper_path = match upperdir {
+            Some(p) => apply_chroot(p),
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        let upper = match resolve_dir_absolute(upper_path.as_str()) {
+            Some(d) => d,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        let mut lowers: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::DirOps>> =
+            alloc::vec::Vec::new();
+        for lp in &lowerdirs {
+            let abs = apply_chroot(lp);
+            match resolve_dir_absolute(abs.as_str()) {
+                Some(d) => lowers.push(d),
+                None => {
+                    ctx.set_return(fail);
+                    return;
+                }
+            }
+        }
+        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::OverlayFs::new("overlay", upper, lowers));
+        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
+            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),
         };
     }
 
-    // FUSE mounts: `fstype == "fuse"` or `"fuse.<subtype>"`. The mount
-    // options carry `fd=N` naming the open `/dev/fuse` connection the
-    // daemon obtained. NARF's mount ABI has no separate `data` argument,
-    // so the `fd=N,rootmode=...,user_id=...,group_id=...` option string is
-    // passed as `source`. We parse `fd=N`, recover the connection from the
-    // caller's fd table, build a `FuseFs` over it, and drive FUSE_INIT.
-    // Linux ref: `fs/fuse/inode.c::fuse_fill_super` + `parse_fuse_opt`.
+    // FUSE mounts: `fstype == "fuse"` or `"fuse.<subtype>"`. Options carry
+    // `fd=N` naming the open `/dev/fuse` connection (passed via `source`
+    // since NARF's mount ABI has no `data` register). Parse fd, recover the
+    // connection, build a FuseFs, drive FUSE_INIT. Linux: fuse_fill_super.
     if fstype == "fuse" || fstype.starts_with("fuse.") {
-        // Parse `fd=N` out of the comma-separated option string.
         let fd_opt = source
             .split(',')
             .find_map(|kv| kv.strip_prefix("fd="))
@@ -16240,14 +16275,12 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
-        // Recover the /dev/fuse connection from the caller's fd.
         let task = current_task_id();
         let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
         let conn = match ops {
             Some(Some(o)) => match narf_filesystem::fuse_conn::DevFuse::connection_of(&o) {
                 Some(c) => c,
                 None => {
-                    // fd is open but not a /dev/fuse device.
                     ctx.set_return(fail);
                     return;
                 }
@@ -16259,13 +16292,24 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
         };
         let subtype = fstype.strip_prefix("fuse.").unwrap_or("fuse");
         let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
-        // Drive the FUSE_INIT handshake before serving. The daemon (a
-        // separate task blocked on read(/dev/fuse)) answers it; poll the
-        // init future to completion cooperatively.
         let _ = poll_blocking(fs.init());
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
         return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs_dyn) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(fail),
+        };
+    }
+
+    // Extensibility fallback: an out-of-tree crate may have registered a
+    // constructor for this fstype via `register_fstype`. Built-in arms above
+    // keep priority; consulted only for otherwise-unknown types, before the
+    // block-device fallthrough. Options are passed via source/data.
+    if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
+        return match builder(source_resolved.as_str(), source_resolved.as_str()) {
+            Ok(fs) => match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
+                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(_) => ctx.set_return(fail),
+            },
             Err(_) => ctx.set_return(fail),
         };
     }
