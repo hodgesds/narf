@@ -2217,6 +2217,15 @@ pub fn register_initcalls() {
         let _ = registry().mount(&auth, "/proc", procfs::ProcFs);
         let _ = registry().mount(&auth, "/sys", sysfs::SysFs::new());
         sysfs::populate_all();
+        // Populate the system-wide `/proc/sys/{fs,kernel,vm}/*` sysctl
+        // keys and the `/proc/{stat,vmstat,…}` aggregate views. Without
+        // this a reader of e.g. `/proc/sys/fs/file-max` sees ENOENT.
+        // (`/proc/sys/net/*` is registered separately by the net crate's
+        // cross-crate init, which also installs its snapshot hooks.)
+        procfs::sys_fs::register_all();
+        procfs::sys_kernel::register_all();
+        procfs::sys_vm::register_all();
+        procfs::aggregate::register_all();
         InitResult::Ok
     });
 

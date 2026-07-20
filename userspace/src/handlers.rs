@@ -4480,8 +4480,31 @@ fn sys_unlink(ctx: &mut dyn TrapContext) {
         // The address was freed even if no filesystem node backed the path
         // (e.g. the bind's fs couldn't hold a socket inode) — still success.
         _ if was_socket => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
+        // The filesystem resolved the parent but reported an error. Map the
+        // common shapes to their Linux errno so a caller can tell an absent
+        // name (ENOENT) from a permission or type error — a bare -1 → musl
+        // EPERM otherwise (systemd's `rm` of a missing /run path would then
+        // look like a spurious permission failure).
+        Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(unlink_errno(e))),
+        // The parent path/filesystem didn't resolve at all → the target
+        // can't exist. Linux returns ENOENT when a path component is absent.
+        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
     }
+}
+
+/// Map an `FsError` from a delete-family op to the Linux errno userspace
+/// expects. `NotFound` → ENOENT (the missing-name case), a directory
+/// target → EISDIR (MemFs flags that as `InvalidPath`), a read-only mount
+/// → EROFS; everything else keeps the generic -1 sentinel (musl EPERM).
+fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
+    use narf_filesystem::FsError;
+    let code: i64 = match e {
+        FsError::NotFound => -2,     // -ENOENT
+        FsError::InvalidPath => -21, // -EISDIR
+        FsError::ReadOnly => -30,    // -EROFS
+        _ => -1,
+    };
+    code as u64
 }
 
 // ── Mkdir / Rmdir / Rename — Tier-3b directory mutation ────────────
@@ -13469,6 +13492,19 @@ const PR_SET_PDEATHSIG: u64 = 1;
 const PR_GET_PDEATHSIG: u64 = 2;
 const PR_SET_CHILD_SUBREAPER: u64 = 36;
 const PR_GET_CHILD_SUBREAPER: u64 = 37;
+// PR_CAP_AMBIENT reads/mutates the per-task ambient capability set. The
+// operation is selected by arg_a; arg_b names the capability (0..=63)
+// for RAISE/LOWER/IS_SET. NARF's authority is capability-object based,
+// so the ambient set is POSIX surface state (like the uid/gid table):
+// tracked so a libc consumer round-trips, not consulted for enforcement.
+const PR_CAP_AMBIENT: u64 = 47;
+const PR_CAP_AMBIENT_IS_SET: u64 = 1;
+const PR_CAP_AMBIENT_RAISE: u64 = 2;
+const PR_CAP_AMBIENT_LOWER: u64 = 3;
+const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+// Highest capability number Linux defines today (CAP_CHECKPOINT_RESTORE
+// = 40). RAISE/LOWER/IS_SET of a larger value is EINVAL.
+const CAP_LAST_CAP: u64 = 40;
 const TASK_COMM_LEN: usize = 16;
 
 #[derive(Copy, Clone)]
@@ -13483,6 +13519,8 @@ struct PrctlState {
     /// PR_SET_CHILD_SUBREAPER: this task volunteers to absorb the
     /// orphans of its descendants (instead of them going unreaped).
     child_subreaper: bool,
+    /// Ambient capability set as a bitmask (bit N ⇒ capability N raised).
+    ambient_caps: u64,
 }
 
 impl Default for PrctlState {
@@ -13493,6 +13531,7 @@ impl Default for PrctlState {
             no_new_privs: false,
             pdeathsig: 0,
             child_subreaper: false,
+            ambient_caps: 0, // empty ambient set at exec, per Linux
         }
     }
 }
@@ -13530,7 +13569,7 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let op = args.arg0;
     let arg_a = args.arg1;
-    let _arg_b = args.arg2;
+    let arg_b = args.arg2;
     let fail = SyscallReturn::ok((-1i64) as u64);
     let task = current_task_id();
 
@@ -13639,6 +13678,44 @@ fn sys_prctl(ctx: &mut dyn TrapContext) {
         PR_GET_NO_NEW_PRIVS => {
             let s = read_prctl(task);
             ctx.set_return(SyscallReturn::ok(s.no_new_privs as u64));
+        }
+        PR_CAP_AMBIENT => {
+            // arg_a selects the sub-operation; arg_b is the capability
+            // number for RAISE / LOWER / IS_SET (unused by CLEAR_ALL,
+            // which Linux requires to be called with cap==0).
+            match arg_a {
+                PR_CAP_AMBIENT_CLEAR_ALL => {
+                    if arg_b != 0 {
+                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        return;
+                    }
+                    modify_prctl(task, |s| s.ambient_caps = 0);
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+                PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER | PR_CAP_AMBIENT_IS_SET => {
+                    if arg_b > CAP_LAST_CAP {
+                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        return;
+                    }
+                    let bit = 1u64 << arg_b;
+                    match arg_a {
+                        PR_CAP_AMBIENT_RAISE => {
+                            modify_prctl(task, |s| s.ambient_caps |= bit);
+                            ctx.set_return(SyscallReturn::ok(0));
+                        }
+                        PR_CAP_AMBIENT_LOWER => {
+                            modify_prctl(task, |s| s.ambient_caps &= !bit);
+                            ctx.set_return(SyscallReturn::ok(0));
+                        }
+                        // IS_SET: 1 if raised, 0 otherwise.
+                        _ => {
+                            let set = read_prctl(task).ambient_caps & bit != 0;
+                            ctx.set_return(SyscallReturn::ok(set as u64));
+                        }
+                    }
+                }
+                _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            }
         }
         _ => ctx.set_return(fail),
     }

@@ -213,6 +213,68 @@ fn smoke_abi_proc_prctl_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_neg);
 
+// ── prctl(PR_CAP_AMBIENT) — ambient capability set round-trip ──
+
+fn smoke_abi_proc_prctl_cap_ambient() -> TestResult {
+    with_setup(|| {
+        // systemd's early init drives CLEAR_ALL, then RAISE/LOWER/IS_SET.
+        const PR_CAP_AMBIENT: u64 = 47;
+        const PR_CAP_AMBIENT_IS_SET: u64 = 1;
+        const PR_CAP_AMBIENT_RAISE: u64 = 2;
+        const PR_CAP_AMBIENT_LOWER: u64 = 3;
+        const PR_CAP_AMBIENT_CLEAR_ALL: u64 = 4;
+        const CAP_NET_ADMIN: u64 = 12;
+
+        // CLEAR_ALL succeeds and empties the set.
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0),
+        ) {
+            Some(0) => {}
+            _ => return Err("PR_CAP_AMBIENT_CLEAR_ALL did not return 0"),
+        }
+        // IS_SET on the just-cleared cap reads back 0.
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN),
+        ) {
+            Some(0) => {}
+            _ => return Err("PR_CAP_AMBIENT_IS_SET after clear did not read 0"),
+        }
+        // RAISE then IS_SET reads back 1.
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN),
+        ) {
+            Some(0) => {}
+            _ => return Err("PR_CAP_AMBIENT_RAISE did not return 0"),
+        }
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN),
+        ) {
+            Some(1) => {}
+            _ => return Err("PR_CAP_AMBIENT_IS_SET after raise did not read 1"),
+        }
+        // LOWER then IS_SET reads back 0 again.
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_LOWER, CAP_NET_ADMIN),
+        ) {
+            Some(0) => {}
+            _ => return Err("PR_CAP_AMBIENT_LOWER did not return 0"),
+        }
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_NET_ADMIN),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("PR_CAP_AMBIENT_IS_SET after lower did not read 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_cap_ambient);
+
 // ── arch_prctl(2) — x86_64 thread-pointer install ──
 
 #[cfg(target_arch = "x86_64")]

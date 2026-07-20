@@ -42,8 +42,14 @@ use crate::FsError;
 
 // ── Per-key storage cells ────────────────────────────────────────
 
-static FILE_MAX: AtomicU64 = AtomicU64::new(4096);
-static NR_OPEN: AtomicU64 = AtomicU64::new(1024);
+// file-max: global open-file ceiling. Linux derives a memory-scaled
+// default; systemd (and other bring-up code) then bumps it toward the
+// i64 max via `/proc/sys/fs/file-max`. NARF doesn't enforce the ceiling
+// yet, so seed it at the effective-unlimited value systemd expects to
+// read back so its "bump fs.file-max" step is a no-op success.
+static FILE_MAX: AtomicU64 = AtomicU64::new(9_223_372_036_854_775_807);
+// nr_open: per-process fd-table ceiling. Linux default is 1024*1024.
+static NR_OPEN: AtomicU64 = AtomicU64::new(1_048_576);
 static PIPE_MAX_SIZE: AtomicU64 = AtomicU64::new(1_048_576);
 static PIPE_USER_PAGES_HARD: AtomicU64 = AtomicU64::new(0);
 static INOTIFY_MAX_USER_WATCHES: AtomicU64 = AtomicU64::new(8192);
@@ -99,7 +105,8 @@ fn gen_dentry_state() -> String {
 /// Register every `/proc/sys/fs/*` sysctl. Called once at boot.
 /// Idempotent — repeated calls replace the existing entries.
 pub fn register_all() {
-    // file-max: global open-file ceiling; default 4096.
+    // file-max: global open-file ceiling; seeded at the i64-max
+    // effective-unlimited value systemd expects to read back.
     register_sysctl(SysctlEntry {
         path: "fs/file-max",
         read: || read_u64(&FILE_MAX),
@@ -120,7 +127,7 @@ pub fn register_all() {
         perms: 0o444,
     });
 
-    // nr_open: per-process fd table ceiling; default 1024.
+    // nr_open: per-process fd table ceiling; Linux default 1024*1024.
     register_sysctl(SysctlEntry {
         path: "fs/nr_open",
         read: || read_u64(&NR_OPEN),
@@ -289,10 +296,10 @@ fn ensure_registered() {
 
 fn smoke_fs_file_max_read() -> TestResult {
     ensure_registered();
-    FILE_MAX.store(4096, Ordering::Relaxed);
+    FILE_MAX.store(9_223_372_036_854_775_807, Ordering::Relaxed);
     match sysctl_read(&["sys", "fs", "file-max"]) {
-        Some(s) if s == "4096\n" => TestResult::Pass,
-        _ => TestResult::Fail("fs/file-max default read did not return '4096\\n'"),
+        Some(s) if s == "9223372036854775807\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/file-max default read did not return the i64-max ceiling"),
     }
 }
 kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_file_max_read);
@@ -305,7 +312,7 @@ fn smoke_fs_file_max_write_roundtrip() -> TestResult {
     }
     match sysctl_read(&["sys", "fs", "file-max"]) {
         Some(s) if s == "8192\n" => {
-            FILE_MAX.store(4096, Ordering::Relaxed); // restore
+            FILE_MAX.store(9_223_372_036_854_775_807, Ordering::Relaxed); // restore
             TestResult::Pass
         }
         _ => TestResult::Fail("fs/file-max read after write did not round-trip"),
@@ -399,13 +406,32 @@ kernel_test_in!(
 
 fn smoke_fs_nr_open_default() -> TestResult {
     ensure_registered();
-    NR_OPEN.store(1024, Ordering::Relaxed);
+    NR_OPEN.store(1_048_576, Ordering::Relaxed);
     match sysctl_read(&["sys", "fs", "nr_open"]) {
-        Some(s) if s == "1024\n" => TestResult::Pass,
-        _ => TestResult::Fail("fs/nr_open default should be '1024\\n'"),
+        Some(s) if s == "1048576\n" => TestResult::Pass,
+        _ => TestResult::Fail("fs/nr_open default should be '1048576\\n'"),
     }
 }
 kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_nr_open_default);
+
+// systemd's early init bumps `/proc/sys/fs/nr_open` toward its ceiling.
+// Verify the write parses and round-trips (a write failure surfaces as
+// "Failed to bump fs.nr_open" in the boot log).
+fn smoke_fs_nr_open_write_roundtrip() -> TestResult {
+    ensure_registered();
+    let w = sysctl_write(&["sys", "fs", "nr_open"], b"1073741816\n");
+    if !matches!(w, Some(Ok(_))) {
+        return TestResult::Fail("fs/nr_open write failed");
+    }
+    match sysctl_read(&["sys", "fs", "nr_open"]) {
+        Some(s) if s == "1073741816\n" => {
+            NR_OPEN.store(1_048_576, Ordering::Relaxed); // restore
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("fs/nr_open read after write did not round-trip"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_fs", smoke_fs_nr_open_write_roundtrip);
 
 fn smoke_fs_pipe_user_pages_hard_default() -> TestResult {
     ensure_registered();

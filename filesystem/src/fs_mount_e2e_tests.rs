@@ -637,6 +637,45 @@ kernel_test_in!(
     smoke_vfs_writable_fs_create_write_read
 );
 
+// ── Smoke 6b: MemFs unlink of a missing name → NotFound ──────────────
+//
+// A writable MemFs (the /run, /tmp, /dev/shm backing) must report
+// `FsError::NotFound` when unlinking a name that doesn't exist — that
+// is what `sys_unlink` maps to ENOENT. Returning any other error would
+// surface to userspace as EPERM (systemd's `rm` of an absent /run path).
+
+fn smoke_vfs_memfs_unlink_missing_returns_not_found() -> TestResult {
+    const PATH: &str = "/fme6b";
+
+    let auth = bootstrap_mount_authority();
+    let handle = match registry().mount(&auth, PATH, MemFs::new("fme6b")) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount() failed"),
+    };
+
+    let root = match registry().with_mount(PATH, |fs| fs.root()) {
+        Some(r) => r,
+        None => {
+            let _ = registry().unmount(&handle, PATH);
+            return TestResult::Fail("with_mount returned None");
+        }
+    };
+
+    let result = poll_once(root.unlink("does-not-exist"));
+    let _ = registry().unmount(&handle, PATH);
+
+    match result {
+        Some(Err(FsError::NotFound)) => TestResult::Pass,
+        Some(Err(_)) => TestResult::Fail("unlink of missing name returned wrong error"),
+        Some(Ok(())) => TestResult::Fail("unlink of missing name unexpectedly succeeded"),
+        None => TestResult::Fail("unlink future returned Pending (should be Ready)"),
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_memfs_unlink_missing_returns_not_found
+);
+
 // ── Smoke 7: flat FS with multiple files ─────────────────────────────
 //
 // Image has three files at the root level: a.txt, b.txt, c.txt.

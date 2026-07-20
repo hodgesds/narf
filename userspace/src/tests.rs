@@ -15586,6 +15586,78 @@ fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_unknown_cmd_returns_enotty);
 
+// KDSIGACCEPT (0x4B4E) — systemd-PID-1 arms the console kbrequest signal
+// during early init. NARF accepts it as a no-op success so the boot log
+// doesn't carry "Failed to enable kbrequest handling".
+fn smoke_console_ioctl_kdsigaccept_ok() -> TestResult {
+    use crate::{
+        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static TASK_ID: AtomicU64 = AtomicU64::new(0xC5_1006);
+    fn task_lookup() -> u64 {
+        TASK_ID.load(Ordering::Relaxed)
+    }
+    let task = TASK_ID.load(Ordering::Relaxed);
+
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    fd::init();
+    install_task_id_lookup(task_lookup);
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    let _ = fd::with_table(task, |_t| ());
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+    }
+    // arg1 = KDSIGACCEPT; arg2 carries the requested signal number (ignored).
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 0, // /dev/console (fd 0)
+            arg1: fd::KDSIGACCEPT as u64,
+            arg2: 10, // SIGUSR1 — accepted and ignored
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+    fd::__test_reset();
+    fd::__test_reset_tty();
+    __test_clear_global();
+
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => TestResult::Pass,
+        _ => TestResult::Fail("KDSIGACCEPT ioctl did not return success"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_console_ioctl_kdsigaccept_ok);
+
 // ── Wave-51: async-signal default-action lookup ────────────────────
 //
 // POSIX signal(7) assigns a default action per signal. Pre-fix, NARF

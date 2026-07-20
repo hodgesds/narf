@@ -87,14 +87,6 @@ impl FdTable {
         Self { slots: Vec::new() }
     }
 
-    /// Insert `entry` at the lowest free fd. POSIX `open(2)` returns the
-    /// lowest-numbered descriptor not currently open — so when stdio
-    /// occupies 0..=2 this lands at 3+, but a program that closes a low
-    /// fd gets that slot back. busybox ash relies on this: to redirect an
-    /// async job's stdin it does `close(0); if (open("/dev/null") != 0)
-    /// error`, asserting the reopened fd is exactly 0. Skipping 0..=2
-    /// unconditionally made every `cmd &` in the distro fail with
-    /// "can't open '/dev/null'".
     /// The fd numbers currently open in this table, ascending. Backs
     /// `/proc/<pid>/fd` enumeration (an exact snapshot of the open set,
     /// not a probe of a fixed range).
@@ -106,6 +98,14 @@ impl FdTable {
             .collect()
     }
 
+    /// Insert `entry` at the lowest free fd. POSIX `open(2)` returns the
+    /// lowest-numbered descriptor not currently open — so when stdio
+    /// occupies 0..=2 this lands at 3+, but a program that closes a low
+    /// fd gets that slot back. busybox ash relies on this: to redirect an
+    /// async job's stdin it does `close(0); if (open("/dev/null") != 0)
+    /// error`, asserting the reopened fd is exactly 0. Skipping 0..=2
+    /// unconditionally made every `cmd &` in the distro fail with
+    /// "can't open '/dev/null'".
     pub fn open(&mut self, entry: FdEntry) -> u32 {
         for (i, s) in self.slots.iter_mut().enumerate() {
             if s.is_none() {
@@ -419,6 +419,18 @@ pub const FIONREAD: u32 = 0x541B;
 pub const TIOCGPGRP: u32 = 0x540F;
 /// `ioctl(fd, TIOCSPGRP, &pid_t)` — set foreground process group.
 pub const TIOCSPGRP: u32 = 0x5410;
+/// `ioctl(fd, KDGKBMODE, &int)` — query the keyboard translation mode.
+/// VT-console keyboard control; NARF has no VT, so it reports the
+/// default `K_XLATE` (0) so the query succeeds.
+pub const KDGKBMODE: u32 = 0x4B44;
+/// `ioctl(fd, KDSKBMODE, int)` — set the keyboard translation mode.
+/// Accepted and ignored (no VT keyboard state to change).
+pub const KDSKBMODE: u32 = 0x4B45;
+/// `ioctl(fd, KDSIGACCEPT, int)` — nominate the signal delivered on the
+/// magic "keyboard request" (kbrequest) SysRq. systemd-PID-1 arms this
+/// on `/dev/console` during early init; accepted and ignored (NARF has
+/// no VT kbrequest source to route through it).
+pub const KDSIGACCEPT: u32 = 0x4B4E;
 
 /// POSIX `struct winsize` — row/col + pixel hints. Pixel fields
 /// stay zero (we don't model a pixel-aware terminal).
@@ -665,6 +677,27 @@ impl FileOps for ConsoleFile {
                 // check), so translate before storing.
                 let pgrp = crate::handlers::pgid_from_user(pgrp as u64);
                 narf_filesystem::console_tty::set_fg_pgrp(pgrp);
+                Ok(0)
+            }
+            KDSIGACCEPT | KDSKBMODE => {
+                // VT keyboard/kbrequest control. NARF drives a single serial
+                // console with no VT layer, so there is no kbrequest source
+                // or keyboard-translation state to change — accept and no-op
+                // so systemd's early-init arming step succeeds instead of
+                // logging "Inappropriate ioctl for device".
+                Ok(0)
+            }
+            KDGKBMODE => {
+                // Report the default keyboard mode `K_XLATE` (0). `arg` is an
+                // `int *` out-parameter.
+                let bytes = 0i32.to_le_bytes();
+                // SAFETY: `copy_to_user` validates `arg` as a user address
+                // through the SMAP window; the length is the fixed 4-byte
+                // little-endian encoding of the `int` keyboard mode.
+                // SAFETY: Valid memory or trusted environment
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
                 Ok(0)
             }
             _ => Err(FsError::Unsupported),
