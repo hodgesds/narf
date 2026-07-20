@@ -671,6 +671,262 @@ kernel_test_in!(
     smoke_microcode_amd_resolve_misses_wrong_cpu
 );
 
+// ---- new logic: revision compare, container iteration, ext-sig,
+//      AMD best-patch pick, and the apply-path DECISION ----
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_needs_update_revision_compare() -> TestResult {
+    use crate::x86_64::microcode::needs_update;
+    // Strictly-newer is the whole rule.
+    if !needs_update(0x10, 0x11) {
+        return TestResult::Fail("newer candidate should update");
+    }
+    if needs_update(0x11, 0x11) {
+        return TestResult::Fail("equal revision must not update");
+    }
+    if needs_update(0x11, 0x10) {
+        return TestResult::Fail("older candidate must not update");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_needs_update_revision_compare
+);
+
+// Build one valid Intel update (48-byte header + `body_words`
+// dword body) into `out`, with the given signature/flags/revision,
+// fixing the checksum so the dword-sum over the whole update is 0.
+// Returns the update length. `total_size == body area + 48`.
+#[cfg(target_arch = "x86_64")]
+fn build_intel_update(out: &mut [u8], sig: u32, flags: u32, rev: u32, body_words: usize) -> usize {
+    let data_size = (body_words * 4) as u32;
+    let total = crate::x86_64::microcode::INTEL_HEADER_LEN + data_size as usize;
+    for b in out[..total].iter_mut() {
+        *b = 0;
+    }
+    out[0..4].copy_from_slice(&1u32.to_le_bytes()); // header_version
+    out[4..8].copy_from_slice(&rev.to_le_bytes()); // update_revision
+    out[12..16].copy_from_slice(&sig.to_le_bytes()); // processor_signature
+    out[20..24].copy_from_slice(&1u32.to_le_bytes()); // loader_revision
+    out[24..28].copy_from_slice(&flags.to_le_bytes()); // processor_flags
+    out[28..32].copy_from_slice(&data_size.to_le_bytes()); // data_size
+    out[32..36].copy_from_slice(&(total as u32).to_le_bytes()); // total_size
+                                                                // checksum so the dword sum is zero.
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 4 <= total {
+        sum = sum.wrapping_add(u32::from_le_bytes([
+            out[i],
+            out[i + 1],
+            out[i + 2],
+            out[i + 3],
+        ]));
+        i += 4;
+    }
+    let cksum = 0u32.wrapping_sub(sum);
+    out[16..20].copy_from_slice(&cksum.to_le_bytes());
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_container_best_match() -> TestResult {
+    use crate::x86_64::microcode::intel_select_update;
+    // Three concatenated updates: two for our sig (revs 5 and 9,
+    // flags 0 = match any platform), one for a different sig.
+    let sig: u32 = 0x000A_0661;
+    let other: u32 = 0x0008_06C1;
+    let mut blob = [0u8; 4096];
+    let mut off = 0;
+    off += build_intel_update(&mut blob[off..], sig, 0, 5, 4);
+    off += build_intel_update(&mut blob[off..], other, 0, 99, 4);
+    off += build_intel_update(&mut blob[off..], sig, 0, 9, 4);
+    let file = &blob[..off];
+
+    // With platform mask 1: pick the highest revision for `sig` (9).
+    match intel_select_update(file, sig, 1) {
+        Some((_, 9)) => {}
+        Some(_) => return TestResult::Fail("picked wrong Intel revision"),
+        None => return TestResult::Fail("Intel container select found no match"),
+    }
+    // A sig not in the file → no match.
+    if intel_select_update(file, 0xDEAD_BEEF, 1).is_some() {
+        return TestResult::Fail("Intel select matched a foreign sig");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_intel_container_best_match);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_intel_ext_sig_multi_platform() -> TestResult {
+    use crate::x86_64::microcode::{
+        intel_update_matches, INTEL_EXT_HEADER_LEN, INTEL_EXT_SIG_LEN, INTEL_HEADER_LEN,
+    };
+    // One update whose primary sig is `primary` but which also
+    // carries an extended-signature table matching `alt` (platform
+    // flag bit 2). Layout: header(48) + body(16) + ext-hdr(20) +
+    // 1 ext entry(12).
+    let primary: u32 = 0x000A_0661;
+    let alt: u32 = 0x0005_0654;
+    let alt_flags: u32 = 0b100; // platform-id bit 2
+    let body = 16usize;
+    let primary_span = INTEL_HEADER_LEN + body;
+    let total = primary_span + INTEL_EXT_HEADER_LEN + INTEL_EXT_SIG_LEN;
+    let mut blob = [0u8; 128];
+    blob[0..4].copy_from_slice(&1u32.to_le_bytes()); // header_version
+    blob[4..8].copy_from_slice(&7u32.to_le_bytes()); // update_revision
+    blob[12..16].copy_from_slice(&primary.to_le_bytes()); // processor_signature
+    blob[20..24].copy_from_slice(&1u32.to_le_bytes()); // loader_revision
+    blob[24..28].copy_from_slice(&1u32.to_le_bytes()); // primary processor_flags (bit0)
+    blob[28..32].copy_from_slice(&(body as u32).to_le_bytes()); // data_size
+    blob[32..36].copy_from_slice(&(total as u32).to_le_bytes()); // total_size
+                                                                 // ext-table header: count = 1.
+    blob[primary_span..primary_span + 4].copy_from_slice(&1u32.to_le_bytes());
+    // ext entry: sig=alt, flags=alt_flags.
+    let eoff = primary_span + INTEL_EXT_HEADER_LEN;
+    blob[eoff..eoff + 4].copy_from_slice(&alt.to_le_bytes());
+    blob[eoff + 4..eoff + 8].copy_from_slice(&alt_flags.to_le_bytes());
+    // Fix the primary checksum so the whole update dword-sums to 0.
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 4 <= total {
+        sum = sum.wrapping_add(u32::from_le_bytes([
+            blob[i],
+            blob[i + 1],
+            blob[i + 2],
+            blob[i + 3],
+        ]));
+        i += 4;
+    }
+    let cksum = 0u32.wrapping_sub(sum);
+    blob[16..20].copy_from_slice(&cksum.to_le_bytes());
+    let update = &blob[..total];
+
+    // Primary sig matches on platform bit 0.
+    if !intel_update_matches(update, primary, 1) {
+        return TestResult::Fail("primary sig should match");
+    }
+    // The extended sig matches only on its platform bit (2).
+    if !intel_update_matches(update, alt, alt_flags) {
+        return TestResult::Fail("ext sig should match on its platform flag");
+    }
+    // Same alt sig but wrong platform mask → no match (flags gate).
+    if intel_update_matches(update, alt, 0b1) {
+        return TestResult::Fail("ext sig matched despite platform-flag mismatch");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_intel_ext_sig_multi_platform
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_amd_equiv_and_best_patch() -> TestResult {
+    use crate::x86_64::microcode::{
+        amd_find_equiv, amd_find_patch, AmdPatchHeader, AMD_CONTAINER_MAGIC, AMD_EQUIV_TYPE,
+        AMD_PATCH_HDR_LEN, AMD_PATCH_SECTION_TYPE,
+    };
+    // Container: one equiv entry (installed_cpu → equiv 0x8310) then
+    // two patch sections for that equiv with patch_id 0x100 and
+    // 0x200 — the walker must return the higher (0x200).
+    let installed: u32 = 0x0086_0F01;
+    let equiv_code: u16 = 0x8310;
+    // 12 hdr + 32 equiv-table + 2*(8 + 64) sections.
+    let mut blob = [0u8; 12 + 32 + 2 * (8 + AMD_PATCH_HDR_LEN)];
+    blob[0..4].copy_from_slice(&AMD_CONTAINER_MAGIC.to_le_bytes());
+    blob[4..8].copy_from_slice(&AMD_EQUIV_TYPE.to_le_bytes());
+    blob[8..12].copy_from_slice(&32u32.to_le_bytes());
+    blob[12..16].copy_from_slice(&installed.to_le_bytes());
+    blob[24..26].copy_from_slice(&equiv_code.to_le_bytes());
+    // (entry #2 = zero terminator)
+    let mut off = 12 + 32;
+    for (patch_id, rev_id) in [(0x100u32, equiv_code), (0x200u32, equiv_code)] {
+        blob[off..off + 4].copy_from_slice(&AMD_PATCH_SECTION_TYPE.to_le_bytes());
+        blob[off + 4..off + 8].copy_from_slice(&(AMD_PATCH_HDR_LEN as u32).to_le_bytes());
+        let body = off + 8;
+        blob[body + 4..body + 8].copy_from_slice(&patch_id.to_le_bytes()); // patch_id @4
+        blob[body + 24..body + 26].copy_from_slice(&rev_id.to_le_bytes()); // processor_rev_id @24
+        off = body + AMD_PATCH_HDR_LEN;
+    }
+
+    let equiv = match amd_find_equiv(&blob, installed) {
+        Some(e) => e,
+        None => return TestResult::Fail("equiv lookup missed installed_cpu"),
+    };
+    if equiv != equiv_code {
+        return TestResult::Fail("equiv code mismatch");
+    }
+    let patch = match amd_find_patch(&blob, equiv) {
+        Some(p) => p,
+        None => return TestResult::Fail("patch lookup found nothing"),
+    };
+    let ph = match AmdPatchHeader::decode(patch) {
+        Some(h) => h,
+        None => return TestResult::Fail("patch header decode failed"),
+    };
+    if ph.patch_id != 0x200 {
+        return TestResult::Fail("amd_find_patch did not pick the highest patch_id");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_amd_equiv_and_best_patch);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_load_and_apply_already_current() -> TestResult {
+    use crate::x86_64::microcode::{self, Outcome};
+    // Intel-only: a container whose one matching update carries a
+    // revision <= the running CPU's must return AlreadyCurrent
+    // without ever writing the loader MSR. Revision 0 is <= any
+    // real running revision, so the decision short-circuits.
+    if microcode::vendor() != microcode::Vendor::Intel {
+        return TestResult::Skip("Intel-only decision test");
+    }
+    let sig = microcode::cpu_signature();
+    let pf = microcode::intel_platform_flag_mask();
+    let mut blob = [0u8; 512];
+    // Flags = the CPU's platform mask so it matches; rev = 0.
+    let n = build_intel_update(&mut blob, sig, pf, 0, 4);
+    // SAFETY: kernel test runs at CPL=0 on the BSP; rev 0 forces the
+    // AlreadyCurrent short-circuit before any loader-MSR write.
+    match unsafe { microcode::load_and_apply(&blob[..n]) } {
+        Outcome::AlreadyCurrent { candidate, .. } => {
+            if candidate != 0 {
+                return TestResult::Fail("candidate revision wrong");
+            }
+            TestResult::Pass
+        }
+        Outcome::Virtualized { .. } => TestResult::Pass, // MSR handshake trapped: still no apply
+        _ => TestResult::Fail("expected AlreadyCurrent/Virtualized"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "arch/microcode",
+    smoke_microcode_load_and_apply_already_current
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_microcode_load_and_apply_no_match() -> TestResult {
+    use crate::x86_64::microcode::{self, Outcome};
+    // A container that carries no update for this silicon must
+    // return NoMatch (no MSR write). Works on either vendor: feed
+    // the wrong-vendor magic so resolve rejects it as NoMatch.
+    let blob = [0x11u8; 256]; // not a valid Intel header nor AMD magic
+                              // SAFETY: kernel test runs at CPL=0 on the BSP; the container
+                              // matches no update so resolve returns before any MSR write.
+    match unsafe { microcode::load_and_apply(&blob) } {
+        Outcome::NoMatch | Outcome::Unsupported => TestResult::Pass,
+        _ => TestResult::Fail("expected NoMatch/Unsupported"),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/microcode", smoke_microcode_load_and_apply_no_match);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_errata_table_has_patched_in_field() -> TestResult {
     use crate::x86_64::errata;

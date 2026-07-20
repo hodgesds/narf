@@ -407,12 +407,162 @@ impl IntelUcodeHeader {
     }
 
     /// `true` if this header's `processor_signature` matches the
-    /// given CPUID(1).EAX. Intel also gates per `processor_flags`
-    /// (a bitmask the CPU advertises in MSR 0x17 platform-id); for
-    /// our use case (one blob per CPU-id directory) the signature
-    /// match alone is sufficient — Intel ships disambiguated blobs.
+    /// given CPUID(1).EAX. Signature-only match, ignoring the
+    /// platform-flags bitmask — used where the caller already knows
+    /// the blob is for the right platform-id or doesn't care.
+    ///
+    /// For a full match that honors both the signature *and* the
+    /// platform-id bitmask (including the extended-signature table),
+    /// use [`intel_update_matches`].
     pub fn matches_signature(&self, sig: u32) -> bool {
         self.processor_signature == sig
+    }
+
+    /// Byte length of the primary data section (`data_size`
+    /// effective), i.e. header + payload without the optional
+    /// extended-signature table. Linux calls this `MC_HEADER_SIZE +
+    /// data_size` (`get_datasize`).
+    pub fn primary_span(&self) -> usize {
+        INTEL_HEADER_LEN + self.effective_data_size() as usize
+    }
+}
+
+/// One entry in the Intel extended-signature table. A single update
+/// can carry several of these so it applies to more than one
+/// (`processor_signature`, `processor_flags`) pair. Linux:
+/// `struct extended_sigtable` / `struct extended_signature` in
+/// `arch/x86/kernel/cpu/microcode/intel.c`.
+///
+/// The extended-signature table, when present, follows the data
+/// section: an 8-byte `count`/`checksum`/`reserved` header (20 bytes
+/// total) then `count` × 12-byte entries.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct IntelExtSig {
+    pub processor_signature: u32,
+    pub processor_flags: u32,
+    pub checksum: u32,
+}
+
+/// Fixed size of the extended-signature table header (Linux
+/// `EXT_HEADER_SIZE`): `count` u32 + `checksum` u32 + 3× reserved u32.
+pub const INTEL_EXT_HEADER_LEN: usize = 20;
+/// Fixed size of one extended-signature entry (Linux
+/// `EXT_SIGNATURE_SIZE`): three u32s.
+pub const INTEL_EXT_SIG_LEN: usize = 12;
+
+/// `true` when the running platform-id bit is set in an update's
+/// `processor_flags` bitmask. Intel gates a signature-matched update
+/// on the CPU's platform-id (`(1 << platform_id_bits)` from MSR 0x17
+/// bits 52..50). `platform_flags == 0` (no platform gating) matches
+/// any CPU. Linux: `find_matching_signature`.
+#[inline]
+fn platform_flags_match(update_flags: u32, cpu_pf_mask: u32) -> bool {
+    update_flags == 0 || (update_flags & cpu_pf_mask) != 0
+}
+
+/// Read the running CPU's platform-id flag mask — `1 << platform_id`
+/// where `platform_id` is MSR 0x17 (`IA32_PLATFORM_ID`) bits 52..50.
+/// This is the value Intel compares against a header's
+/// `processor_flags` bitmask. Returns `1` (platform-id 0) if the MSR
+/// read faults, which is the widest single-bit mask Intel ships.
+///
+/// # Safety
+/// CPL = 0. `IA32_PLATFORM_ID` is architectural on all Intel parts
+/// that support microcode updates; the read is #GP-guarded anyway.
+pub fn intel_platform_flag_mask() -> u32 {
+    match crate::x86_64::msr::rdmsr_or_gp(MSR_INTEL_PLATFORM_ID) {
+        Ok(v) => 1u32 << ((v >> 50) & 0x7),
+        Err(_) => 1,
+    }
+}
+
+/// `IA32_PLATFORM_ID` — bits 52..50 hold the platform-id used to
+/// select among microcode updates that share a `processor_signature`.
+pub const MSR_INTEL_PLATFORM_ID: u32 = 0x17;
+
+/// Full Intel match check for a single update `blob` (already sliced
+/// to its `total_size`): the primary (`processor_signature`,
+/// `processor_flags`) pair, then every entry in the optional
+/// extended-signature table. Returns `true` on the first pair that
+/// matches both `sig` (CPUID(1).EAX) and `cpu_pf_mask` (platform-id
+/// flag mask). Linux: `find_matching_signature`.
+pub fn intel_update_matches(blob: &[u8], sig: u32, cpu_pf_mask: u32) -> bool {
+    let hdr = match IntelUcodeHeader::decode(blob) {
+        Some(h) => h,
+        None => return false,
+    };
+    if hdr.matches_signature(sig) && platform_flags_match(hdr.processor_flags, cpu_pf_mask) {
+        return true;
+    }
+    // Extended-signature table (if any) lives after the primary data
+    // section and runs to `total_size`.
+    for ext in intel_ext_sigs(blob) {
+        if ext.processor_signature == sig && platform_flags_match(ext.processor_flags, cpu_pf_mask)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Iterator over an Intel update's extended-signature entries. Empty
+/// when the update has no extended table (the common case). `blob`
+/// must be sliced to exactly this update's `total_size`.
+pub fn intel_ext_sigs(blob: &[u8]) -> IntelExtSigIter<'_> {
+    let (start, count) = match IntelUcodeHeader::decode(blob) {
+        Some(hdr) => {
+            let total = hdr.effective_total_size() as usize;
+            let primary = hdr.primary_span();
+            // No room for even the ext-table header → no entries.
+            if total < primary + INTEL_EXT_HEADER_LEN || blob.len() < total {
+                (0, 0)
+            } else {
+                let count = u32::from_le_bytes([
+                    blob[primary],
+                    blob[primary + 1],
+                    blob[primary + 2],
+                    blob[primary + 3],
+                ]) as usize;
+                // Clamp `count` to what actually fits in the slice so a
+                // corrupt header can't over-read.
+                let room = (total - primary - INTEL_EXT_HEADER_LEN) / INTEL_EXT_SIG_LEN;
+                (primary + INTEL_EXT_HEADER_LEN, count.min(room))
+            }
+        }
+        None => (0, 0),
+    };
+    IntelExtSigIter {
+        blob,
+        pos: start,
+        remaining: count,
+    }
+}
+
+/// Iterator returned by [`intel_ext_sigs`].
+#[derive(Debug)]
+pub struct IntelExtSigIter<'a> {
+    blob: &'a [u8],
+    pos: usize,
+    remaining: usize,
+}
+
+impl Iterator for IntelExtSigIter<'_> {
+    type Item = IntelExtSig;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 || self.pos + INTEL_EXT_SIG_LEN > self.blob.len() {
+            return None;
+        }
+        let b = self.blob;
+        let o = self.pos;
+        let r32 = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let ext = IntelExtSig {
+            processor_signature: r32(o),
+            processor_flags: r32(o + 4),
+            checksum: r32(o + 8),
+        };
+        self.pos += INTEL_EXT_SIG_LEN;
+        self.remaining -= 1;
+        Some(ext)
     }
 }
 
@@ -598,9 +748,14 @@ pub fn amd_find_equiv(blob: &[u8], cpuid_eax: u32) -> Option<u16> {
 }
 
 /// Walk an AMD container blob's patch sections looking for the
-/// patch whose `processor_rev_id` matches `equiv`. Returns the
-/// patch's body slice (header + body — what
-/// `MSR_AMD_PATCH_LOADER` wants the linear address of).
+/// best patch whose `processor_rev_id` matches `equiv` — the one
+/// with the highest `patch_id`. Returns that patch's body slice
+/// (header + body — what `MSR_AMD_PATCH_LOADER` wants the linear
+/// address of).
+///
+/// AMD containers can list several sections for the same equiv-CPU
+/// code; the loader picks the newest by `patch_id`. Linux:
+/// `verify_and_add_patch` / `find_patch` keep the highest level.
 ///
 /// Each patch section is laid out as:
 ///   `section_type: u32`  (must be `AMD_PATCH_SECTION_TYPE = 1`)
@@ -610,6 +765,7 @@ pub fn amd_find_patch(blob: &[u8], equiv: u16) -> Option<&[u8]> {
     let hdr = AmdContainerHeader::decode(blob)?;
     hdr.validate().ok()?;
     let mut off = 12 + hdr.equiv_table_len as usize;
+    let mut best: Option<(&[u8], u32)> = None;
     while off + AMD_PATCH_SECTION_HDR_LEN <= blob.len() {
         let section_type =
             u32::from_le_bytes([blob[off], blob[off + 1], blob[off + 2], blob[off + 3]]);
@@ -617,22 +773,75 @@ pub fn amd_find_patch(blob: &[u8], equiv: u16) -> Option<&[u8]> {
             u32::from_le_bytes([blob[off + 4], blob[off + 5], blob[off + 6], blob[off + 7]])
                 as usize;
         if section_type != AMD_PATCH_SECTION_TYPE {
-            // Unknown section type — bail rather than guess at
+            // Unknown section type — stop rather than guess at
             // length; the container is malformed or a newer rev.
-            return None;
+            break;
         }
         let body_off = off + AMD_PATCH_SECTION_HDR_LEN;
         if body_off + section_size > blob.len() {
-            return None;
+            break;
         }
         let body = &blob[body_off..body_off + section_size];
         let ph = AmdPatchHeader::decode(body)?;
         if ph.matches_equiv(equiv) {
-            return Some(body);
+            let take = match best {
+                None => true,
+                Some((_, best_id)) => ph.patch_id > best_id,
+            };
+            if take {
+                best = Some((body, ph.patch_id));
+            }
         }
         off = body_off + section_size;
     }
-    None
+    best.map(|(b, _)| b)
+}
+
+/// `true` when `candidate` is a strictly newer microcode revision
+/// than `current` — the only case in which applying a patch makes
+/// sense. Intel `update_revision` and AMD `patch_id` are both
+/// monotonic per silicon, so a plain `>` is the whole decision.
+/// Linux gates every apply on `rev > uci->cpu_sig.rev`.
+#[inline]
+pub fn needs_update(current: u32, candidate: u32) -> bool {
+    candidate > current
+}
+
+/// Iterate an Intel microcode *file* (a concatenation of many
+/// per-CPU updates, each self-describing via `total_size`) and
+/// return the highest-revision update that matches the running
+/// CPU's `sig` (CPUID(1).EAX) and `cpu_pf_mask` (platform-id flag
+/// mask), honoring each update's extended-signature table.
+///
+/// Returns the matching update sliced to its own `total_size`, plus
+/// its `update_revision`, or `None` when the file carries no update
+/// for this silicon. Linux: `scan_microcode` walks the blob the same
+/// way, keeping the newest matching patch.
+pub fn intel_select_update(blob: &[u8], sig: u32, cpu_pf_mask: u32) -> Option<(&[u8], u32)> {
+    let mut off = 0usize;
+    let mut best: Option<(usize, usize, u32)> = None; // (start, len, rev)
+    while off + INTEL_HEADER_LEN <= blob.len() {
+        let hdr = IntelUcodeHeader::decode(&blob[off..])?;
+        // A plausible header must have version 1; otherwise we've run
+        // off the end into padding or a different section.
+        if hdr.header_version != INTEL_HEADER_VERSION {
+            break;
+        }
+        let total = hdr.effective_total_size() as usize;
+        if total < INTEL_HEADER_LEN || off + total > blob.len() {
+            break;
+        }
+        let update = &blob[off..off + total];
+        // Validate before trusting the match — reject bad checksums.
+        if hdr.validate(update).is_ok()
+            && intel_update_matches(update, sig, cpu_pf_mask)
+            && best.is_none_or(|(_, _, rev)| hdr.update_revision > rev)
+        {
+            best = Some((off, total, hdr.update_revision));
+        }
+        off += total;
+    }
+    best.map(|(start, len, rev)| (&blob[start..start + len], rev))
 }
 
 /// Latest revision applied by this loader on the running CPU. The
@@ -772,4 +981,99 @@ pub unsafe fn apply_for_current_cpu(container: &[u8]) -> Result<u32, UcodeError>
     // confirmed the patch matches our silicon.
     // SAFETY: Valid memory or trusted environment
     unsafe { apply(patch) }
+}
+
+/// Candidate revision carried by the update `resolve_for_current_cpu`
+/// picked out of `container` for the running CPU — Intel
+/// `update_revision`, AMD `patch_id`. Used by [`load_and_apply`] to
+/// decide (against the running revision) whether an apply is even
+/// worth attempting, without touching a loader MSR. Returns `None`
+/// when the container carries nothing for this silicon.
+pub fn candidate_revision(container: &[u8]) -> Option<u32> {
+    match vendor() {
+        Vendor::Intel => {
+            let hdr = IntelUcodeHeader::decode(container)?;
+            Some(hdr.update_revision)
+        }
+        Vendor::Amd => {
+            let sig = cpu_signature();
+            let equiv = amd_find_equiv(container, sig)?;
+            let patch = amd_find_patch(container, equiv)?;
+            let ph = AmdPatchHeader::decode(patch)?;
+            Some(ph.patch_id)
+        }
+        Vendor::Unknown => None,
+    }
+}
+
+/// Result of [`load_and_apply`]. The boot path logs this; a
+/// non-`Applied` outcome is never fatal — the CPU keeps running at
+/// its firmware-supplied revision.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Patch applied; revision moved `old → new`.
+    Applied { old: u32, new: u32 },
+    /// The container carries a patch for this CPU but its revision is
+    /// not newer than what's already running — nothing to do.
+    AlreadyCurrent { running: u32, candidate: u32 },
+    /// The container has no update for this silicon.
+    NoMatch,
+    /// Non-Intel/AMD CPU, or malformed container bytes.
+    Unsupported,
+    /// The loader MSR is unavailable — most commonly a hypervisor
+    /// that virtualizes microcode MSRs to `#GP` or a firmware lock.
+    /// The decision logic ran; the write couldn't complete. Treated
+    /// as benign: the platform manages microcode itself.
+    Virtualized { running: u32 },
+}
+
+/// Top-level microcode entry point: detect vendor, select the
+/// matching update out of `container`, compare revisions, and apply
+/// only if strictly newer.
+///
+/// This is the seam a boot initcall calls once the firmware blob is
+/// in hand. There is no in-tree call site yet: boot-init would fetch
+/// the container from the firmware registry (see
+/// [`blob_filename_for_current_cpu`]) and hand the bytes here on the
+/// BSP, then again on each AP as it comes up. Wiring that fetch is a
+/// cross-crate change kept out of this module deliberately.
+///
+/// The apply path can `#GP` under a hypervisor that traps microcode
+/// MSRs; that surfaces as [`Outcome::Virtualized`] rather than a
+/// fault, so a VM guest degrades cleanly instead of panicking.
+///
+/// # Safety
+/// CPL = 0, and the calling CPU is the one the patch targets (the
+/// loader MSR is per-core — never apply on another core's behalf).
+pub unsafe fn load_and_apply(container: &[u8]) -> Outcome {
+    let patch = match resolve_for_current_cpu(container) {
+        Ok(p) => p,
+        Err(UcodeError::UnknownVendor) | Err(UcodeError::BadHeader) => return Outcome::Unsupported,
+        Err(_) => return Outcome::NoMatch,
+    };
+    // Read the running revision up front so the decision is made
+    // before any loader-MSR write. A #GP here means the RDMSR
+    // handshake itself is virtualized away.
+    // SAFETY: caller-asserted CPL=0; MSR 0x8B is architectural.
+    let running = unsafe { read_revision() };
+    let candidate = match candidate_revision(container) {
+        Some(c) => c,
+        None => return Outcome::NoMatch,
+    };
+    if !needs_update(running, candidate) {
+        return Outcome::AlreadyCurrent { running, candidate };
+    }
+    // SAFETY: caller-asserted CPL=0; `resolve_for_current_cpu`
+    // confirmed the patch matches this silicon.
+    match unsafe { apply(patch) } {
+        Ok(new) => Outcome::Applied { old: running, new },
+        // Loader MSR trapped (#GP): hypervisor/firmware owns
+        // microcode. Degrade rather than fault.
+        Err(UcodeError::LoaderLocked) => Outcome::Virtualized { running },
+        // Write went through but the revision didn't advance — the
+        // CPU judged the patch inapplicable (already-current from its
+        // point of view, or a sub-spec mismatch we can't see).
+        Err(UcodeError::NoRevisionChange) => Outcome::AlreadyCurrent { running, candidate },
+        Err(_) => Outcome::Unsupported,
+    }
 }
