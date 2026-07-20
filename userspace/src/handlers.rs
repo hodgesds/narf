@@ -14137,9 +14137,12 @@ fn sys_uname(ctx: &mut dyn TrapContext) {
     off += UTSNAME_FIELD_LEN;
     pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], &hostname);
     off += UTSNAME_FIELD_LEN;
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "0.1");
+    // `release` must parse as a modern kernel version: software (systemd,
+    // glibc, ...) gates features on `uname -r >= X.Y`. systemd warns and
+    // disables features below 5.4. Report a 6.x base with a narf suffix.
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "6.1.0-narf");
     off += UTSNAME_FIELD_LEN;
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "narf");
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "#1 SMP NARF");
     off += UTSNAME_FIELD_LEN;
     #[cfg(target_arch = "x86_64")]
     let machine = "x86_64";
@@ -16008,6 +16011,19 @@ const MS_NOEXEC: u64 = 1 << 3;
 const MS_REMOUNT: u64 = 1 << 5;
 const MS_BIND: u64 = 1 << 12;
 const MS_REC: u64 = 1 << 14;
+// Mount-propagation flags. When any of these is set, Linux `mount(2)` ONLY
+// changes the propagation type of the mount already at `target` — source,
+// fstype and data are ignored and nothing new is mounted. NARF does not model
+// propagation (all mounts are effectively private), so honouring these as a
+// no-op success is the correct behaviour. systemd's generator/service sandbox
+// does `mount(NULL, "/", NULL, MS_SLAVE|MS_REC, NULL)` right after
+// `clone(CLONE_NEWNS)`; failing it aborted the sandbox fork ("Protocol error")
+// and left an empty generator dir that tripped systemd's rm_rf root-guard.
+const MS_UNBINDABLE: u64 = 1 << 17;
+const MS_PRIVATE: u64 = 1 << 18;
+const MS_SLAVE: u64 = 1 << 19;
+const MS_SHARED: u64 = 1 << 20;
+const MS_PROPAGATION: u64 = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
 const MS_RELATIME: u64 = 1 << 21;
 
 fn sys_mount(ctx: &mut dyn TrapContext) {
@@ -16040,6 +16056,16 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     let flags = args.arg3;
     // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=…"); accepted but
     // not parsed — NARF's MemFs has no per-mount options yet.
+
+    // Propagation-only change (MS_SLAVE/MS_SHARED/MS_PRIVATE/MS_UNBINDABLE,
+    // optionally |MS_REC): change the propagation type of the mount at
+    // `target` and nothing else. NARF has no propagation model, so this is a
+    // no-op success. Handled BEFORE bind/tmpfs/API dispatch because these calls
+    // carry a NULL source and NULL fstype (see the MS_PROPAGATION comment).
+    if flags & MS_PROPAGATION != 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
 
     // Resolve target under the calling task's chroot.
     let target = apply_chroot(target_raw.as_str());
@@ -16080,6 +16106,30 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(_) => ctx.set_return(fail),
         };
+    }
+
+    // API pseudo-filesystems that an init system (systemd, sysvinit) mounts
+    // itself: proc / sysfs / cgroup2 / devtmpfs. These are global singletons
+    // in NARF — mounting attaches the same content at the caller's target
+    // (e.g. a chroot's /proc, or /sys/fs/cgroup for cgroup2). Without this an
+    // init in a fresh mount namespace / chroot can't set up the API mounts and
+    // (for systemd) `statfs(/sys/fs/cgroup)` never reports CGROUP2_SUPER_MAGIC.
+    {
+        let api: Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> = match fstype.as_str() {
+            #[cfg(feature = "linux-compat")]
+            "proc" => Some(alloc::sync::Arc::new(narf_filesystem::procfs::ProcFs)),
+            #[cfg(feature = "linux-compat")]
+            "sysfs" => Some(alloc::sync::Arc::new(narf_filesystem::SysFs::new())),
+            #[cfg(feature = "cgroup")]
+            "cgroup2" => Some(alloc::sync::Arc::new(narf_filesystem::CgroupFs::new())),
+            _ => None,
+        };
+        if let Some(fs) = api {
+            return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
+                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(_) => ctx.set_return(fail),
+            };
+        }
     }
 
     // Block-device-backed mounts: resolve `source` as a registered
@@ -23306,7 +23356,10 @@ fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_
 
 fn sys_signalfd(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fd_arg = args.arg0 as i64; // -1 = create new; else replace mask
+    // `fd` is an int: sign-extend from 32 bits so a -1 passed as 0xffffffff
+    // (glibc's signalfd(-1, ...)) is recognised as "create new" rather than
+    // a bogus positive fd 0xffffffff. (`args.arg0 as i64` would read +4G.)
+    let fd_arg = args.arg0 as i32 as i64; // -1 = create new; else replace mask
     let mask_ptr = args.arg1;
     let _sizemask = args.arg2;
     let flags = args.arg3 as u32;

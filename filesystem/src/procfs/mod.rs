@@ -36,6 +36,7 @@ pub mod aggregate;
 pub mod bus;
 pub mod net;
 pub mod pid_ext;
+pub mod pressure;
 pub mod stubs;
 pub mod sys;
 pub mod sys_fs;
@@ -1239,7 +1240,7 @@ impl FileOps for ProcIdMapFile {
 // ── /proc root ──────────────────────────────────────────────────
 
 #[derive(Debug)]
-struct ProcRoot;
+pub(crate) struct ProcRoot;
 
 impl DirOps for ProcRoot {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
@@ -1288,6 +1289,12 @@ impl DirOps for ProcRoot {
                 name: "stat",
                 gen: gen_stat,
             })),
+            // /proc/pressure — PSI directory. Returns the dir marker so
+            // resolve_async accepts it as a directory and then descends
+            // via lookup_dir("pressure"). Static (no feature gate) so
+            // it is always present, like meminfo — systemd's
+            // memory-pressure event source needs it to exist.
+            "pressure" => Some(Arc::new(ProcDirMarker)),
             "self" => Some(Arc::new(ProcDirMarker)),
             // /proc/thread-self is a magic symlink (like /proc/self) that
             // resolves to `<pid>/task/<tid>`.  In NARF tid == the per-task
@@ -1323,6 +1330,10 @@ impl DirOps for ProcRoot {
         }
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
+        if name == "pressure" {
+            // /proc/pressure — the PSI directory (cpu/memory/io).
+            return Some(Arc::new(pressure::ProcPressureDir));
+        }
         if name == "self" {
             // /proc/self resolves to the calling task's pid each
             // time; we materialise a fresh ProcPidDir bound to it.
@@ -1398,6 +1409,10 @@ impl DirOps for ProcRoot {
             DirEntry {
                 name: "sched",
                 file_type: FileType::File
+            },
+            DirEntry {
+                name: "pressure",
+                file_type: FileType::Dir
             },
             DirEntry {
                 name: "self",

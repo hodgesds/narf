@@ -69,6 +69,7 @@ pub mod devfs_block;
 pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
+pub mod devfs_rtc;
 pub mod fuse;
 pub mod memfs;
 pub mod ntty;

@@ -815,3 +815,242 @@ fn smoke_sysfs_thp_defrag_contains_never() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_thp_defrag_contains_never);
+
+// ── Tests: desktop/laptop device classes ─────────────────────────────
+//
+// LED / power_supply / thermal / hwmon: udev, upower, lm-sensors and the
+// desktop compositors enumerate these classes and read specific attrs.
+// Each test populates the class, resolves an attr via the kobject tree, and
+// checks the value + that the class enumerates its device(s).
+
+/// Read+trim a kobject attr, or None if absent.
+#[cfg(feature = "linux-compat")]
+fn attr_trimmed(kobj: &Arc<crate::sysfs::Kobject>, name: &str) -> Option<String> {
+    kobj.attr_show(name).map(|s| s.trim().to_string())
+}
+
+/// Resolve `/sys/class/<class>` and return its enumerated child device names.
+#[cfg(feature = "linux-compat")]
+fn class_device_names(class: &str) -> Vec<String> {
+    let root = crate::sysfs::sysfs_root();
+    match root.get_child("class").and_then(|c| c.get_child(class)) {
+        Some(k) => k.child_names(),
+        None => Vec::new(),
+    }
+}
+
+/// LED class — both devices enumerate; a brightness write is accepted+clamped.
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_leds_class() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_leds();
+
+    let names = class_device_names("leds");
+    if !names.iter().any(|n| n == "input0::capslock") {
+        return TestResult::Fail("input0::capslock not in /sys/class/leds");
+    }
+    if !names.iter().any(|n| n == "platform::kbd_backlight") {
+        return TestResult::Fail("platform::kbd_backlight not in /sys/class/leds");
+    }
+
+    let root = crate::sysfs::sysfs_root();
+    let kbd = match root
+        .get_child("class")
+        .and_then(|c| c.get_child("leds"))
+        .and_then(|l| l.get_child("platform::kbd_backlight"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("kbd_backlight kobject missing"),
+    };
+    if attr_trimmed(&kbd, "max_brightness").as_deref() != Some("255") {
+        return TestResult::Fail("kbd_backlight max_brightness != 255");
+    }
+    if attr_trimmed(&kbd, "brightness").as_deref() != Some("0") {
+        return TestResult::Fail("kbd_backlight brightness != 0 initially");
+    }
+    // Write is accepted and clamped to max (255).
+    match kbd.attr_store("brightness", b"128") {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("brightness store(128) failed"),
+    }
+    if attr_trimmed(&kbd, "brightness").as_deref() != Some("128") {
+        return TestResult::Fail("brightness not 128 after write");
+    }
+    // trigger is writable and defaults to "none".
+    if attr_trimmed(&kbd, "trigger").as_deref() != Some("none") {
+        return TestResult::Fail("trigger != none initially");
+    }
+    if kbd.attr_store("trigger", b"timer").is_none() {
+        return TestResult::Fail("trigger not writable");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_leds_class);
+
+/// power_supply class — AC + BAT0 enumerate; BAT0/capacity == "100".
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_power_supply_class() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_power_supply();
+
+    let names = class_device_names("power_supply");
+    if !names.iter().any(|n| n == "AC") {
+        return TestResult::Fail("AC not in /sys/class/power_supply");
+    }
+    if !names.iter().any(|n| n == "BAT0") {
+        return TestResult::Fail("BAT0 not in /sys/class/power_supply");
+    }
+
+    let root = crate::sysfs::sysfs_root();
+    let bat = match root
+        .get_child("class")
+        .and_then(|c| c.get_child("power_supply"))
+        .and_then(|p| p.get_child("BAT0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("BAT0 kobject missing"),
+    };
+    if attr_trimmed(&bat, "capacity").as_deref() != Some("100") {
+        return TestResult::Fail("BAT0/capacity != 100");
+    }
+    if attr_trimmed(&bat, "type").as_deref() != Some("Battery") {
+        return TestResult::Fail("BAT0/type != Battery");
+    }
+    if attr_trimmed(&bat, "voltage_now").as_deref() != Some("12000000") {
+        return TestResult::Fail("BAT0/voltage_now != 12000000");
+    }
+    // subsystem symlink points at the class dir.
+    match bat.get_symlink("subsystem") {
+        Some(ref t) if t.ends_with("class/power_supply") => {}
+        _ => return TestResult::Fail("BAT0 subsystem symlink wrong/missing"),
+    }
+    // AC/online == "1".
+    let ac = root
+        .get_child("class")
+        .and_then(|c| c.get_child("power_supply"))
+        .and_then(|p| p.get_child("AC"))
+        .unwrap();
+    if attr_trimmed(&ac, "online").as_deref() != Some("1") {
+        return TestResult::Fail("AC/online != 1");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_power_supply_class);
+
+/// thermal class — thermal_zone0 enumerates; temp == "42000".
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_thermal_class() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_thermal();
+
+    let names = class_device_names("thermal");
+    if !names.iter().any(|n| n == "thermal_zone0") {
+        return TestResult::Fail("thermal_zone0 not in /sys/class/thermal");
+    }
+
+    let root = crate::sysfs::sysfs_root();
+    let zone = match root
+        .get_child("class")
+        .and_then(|c| c.get_child("thermal"))
+        .and_then(|t| t.get_child("thermal_zone0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("thermal_zone0 kobject missing"),
+    };
+    if attr_trimmed(&zone, "temp").as_deref() != Some("42000") {
+        return TestResult::Fail("thermal_zone0/temp != 42000");
+    }
+    if attr_trimmed(&zone, "type").as_deref() != Some("acpitz") {
+        return TestResult::Fail("thermal_zone0/type != acpitz");
+    }
+    if attr_trimmed(&zone, "policy").as_deref() != Some("step_wise") {
+        return TestResult::Fail("thermal_zone0/policy != step_wise");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_thermal_class);
+
+/// hwmon class — hwmon0 enumerates; temp1_input == "42000".
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_hwmon_class() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_hwmon();
+
+    let names = class_device_names("hwmon");
+    if !names.iter().any(|n| n == "hwmon0") {
+        return TestResult::Fail("hwmon0 not in /sys/class/hwmon");
+    }
+
+    let root = crate::sysfs::sysfs_root();
+    let hwmon0 = match root
+        .get_child("class")
+        .and_then(|c| c.get_child("hwmon"))
+        .and_then(|h| h.get_child("hwmon0"))
+    {
+        Some(k) => k,
+        None => return TestResult::Fail("hwmon0 kobject missing"),
+    };
+    if attr_trimmed(&hwmon0, "name").as_deref() != Some("acpitz") {
+        return TestResult::Fail("hwmon0/name != acpitz");
+    }
+    if attr_trimmed(&hwmon0, "temp1_input").as_deref() != Some("42000") {
+        return TestResult::Fail("hwmon0/temp1_input != 42000");
+    }
+    if attr_trimmed(&hwmon0, "temp1_label").as_deref() != Some("CPU") {
+        return TestResult::Fail("hwmon0/temp1_label != CPU");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_hwmon_class);
+
+/// End-to-end VFS read of /sys/class/power_supply/BAT0/capacity.
+/// Mounts sysfs, resolves the attr path, reads it back == "100\n".
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_power_supply_vfs_read() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    crate::sysfs::populate_power_supply();
+
+    let auth = crate::bootstrap_mount_authority();
+    let mnt = crate::registry().mount(&auth, "/smoke-sysfs-psu", SysFs::new());
+    let handle = match mnt {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("SysFs mount failed"),
+    };
+
+    let result = crate::registry()
+        .resolve_absolute(
+            "/smoke-sysfs-psu/class/power_supply/BAT0/capacity",
+            |fs, rel| crate::resolve(fs.root(), rel).ok(),
+        )
+        .flatten();
+
+    let ops = match result {
+        Some(o) => o,
+        None => {
+            let _ = crate::registry().unmount(&handle, "/smoke-sysfs-psu");
+            return TestResult::Fail("resolve BAT0/capacity failed");
+        }
+    };
+
+    let mut buf = [0u8; 16];
+    let n = poll_once(ops.read(0, &mut buf));
+    let _ = crate::registry().unmount(&handle, "/smoke-sysfs-psu");
+
+    match n {
+        Some(Ok(n)) if n > 0 => {
+            if core::str::from_utf8(&buf[..n]).unwrap_or("") == "100\n" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("BAT0/capacity VFS read != 100")
+            }
+        }
+        _ => TestResult::Fail("read capacity returned 0 or error"),
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_power_supply_vfs_read);

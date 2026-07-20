@@ -1107,6 +1107,256 @@ pub fn populate_cpu_devices() {
     }
 }
 
+// ── Desktop/laptop device classes (LED / power_supply / thermal / hwmon) ──
+//
+// These four classes expose the static, plausible values a real laptop would
+// report so that udev, upower, lm-sensors and GNOME/KDE can enumerate them.
+// NARF is a VM with no real hardware, so the values are fixed (no live
+// accounting subsystem). Each device carries a writable `uevent` attr so that
+// `udevadm trigger --action=add` (coldplug) broadcasts an ADD netlink event —
+// mirroring the input class, where every kobject's uevent attr is writable
+// (Linux `uevent_store`, drivers/base/core.c). A weak ref in the store closure
+// avoids a closure↔kobject refcount cycle.
+
+/// Attach a writable `uevent` attr to `kobj` whose show-fn returns `text` and
+/// whose store-fn re-broadcasts the device's uevent (coldplug trigger). The
+/// weak upgrade breaks the closure↔kobject Arc cycle.
+fn add_writable_uevent(kobj: &Arc<Kobject>, text: String) {
+    let weak = Arc::downgrade(kobj);
+    kobject_add_writable_attr(
+        kobj,
+        "uevent",
+        move || text.clone(),
+        move |data: &[u8]| {
+            if let Some(k) = weak.upgrade() {
+                kobject_emit_uevent(&k, uevent_action_from_write(data));
+            }
+            Ok(())
+        },
+    );
+}
+
+/// Populate `/sys/class/leds/<name>/` with `brightness` (rw),
+/// `max_brightness` (ro) and `trigger` (rw).
+///
+/// Registers `input0::capslock` and `platform::kbd_backlight`. Brightness and
+/// trigger writes are accepted and stored in-memory (a real sysfs write returns
+/// the byte count). Linux ref: `led_class_attrs` (drivers/leds/led-class.c),
+/// Documentation/ABI/testing/sysfs-class-led.
+pub fn populate_leds() {
+    let class = class_register("leds");
+    for (name, max) in [
+        ("input0::capslock", 1u32),
+        ("platform::kbd_backlight", 255u32),
+    ] {
+        let kobj = class_device_register(class.clone(), name);
+
+        // brightness (rw) — starts at 0, clamped to max_brightness on write.
+        {
+            let cur = Arc::new(AtomicUsize::new(0));
+            let show = cur.clone();
+            let store = cur.clone();
+            kobject_add_writable_attr(
+                &kobj,
+                "brightness",
+                move || format!("{}\n", show.load(Ordering::Acquire)),
+                move |data: &[u8]| {
+                    let s = core::str::from_utf8(data)
+                        .map_err(|_| crate::FsError::InvalidData)?
+                        .trim();
+                    let v: usize = s.parse().map_err(|_| crate::FsError::InvalidData)?;
+                    store.store(v.min(max as usize), Ordering::Release);
+                    Ok(())
+                },
+            );
+        }
+
+        // max_brightness (ro).
+        kobject_add_attr(&kobj, "max_brightness", move || format!("{}\n", max));
+
+        // trigger (rw) — a real kernel lists available triggers with the active
+        // one in [brackets]; we accept any write and store the trimmed verb.
+        {
+            let cur: Arc<IrqSafeSpinLock<String>> =
+                Arc::new(IrqSafeSpinLock::new("none".to_string()));
+            let show = cur.clone();
+            let store = cur.clone();
+            kobject_add_writable_attr(
+                &kobj,
+                "trigger",
+                move || format!("{}\n", *show.lock()),
+                move |data: &[u8]| {
+                    let s = core::str::from_utf8(data)
+                        .map_err(|_| crate::FsError::InvalidData)?
+                        .trim();
+                    *store.lock() = s.to_string();
+                    Ok(())
+                },
+            );
+        }
+
+        add_writable_uevent(&kobj, format!("DEVNAME=leds/{}\n", name));
+    }
+}
+
+/// Populate `/sys/class/power_supply/<name>/` for a mains adapter (`AC`) and a
+/// battery (`BAT0`). upower reads exactly these attrs.
+///
+/// Values are realistic fixed laptop readings (microvolt / microwatt-hour).
+/// Each device gets a `subsystem` symlink → `../../../class/power_supply`
+/// (mirroring the input/drm class wiring). Linux ref:
+/// `power_supply_sysfs.c`, Documentation/ABI/testing/sysfs-class-power-supply.
+pub fn populate_power_supply() {
+    let class = class_register("power_supply");
+
+    // ── AC / mains adapter ────────────────────────────────────────────────
+    {
+        let ac = class_device_register(class.clone(), "AC");
+        kobject_add_attr(&ac, "type", || "Mains\n".to_string());
+        kobject_add_attr(&ac, "online", || "1\n".to_string());
+        // subsystem → /sys/class/power_supply (three levels up from the device).
+        ac.add_symlink("subsystem", "../../../class/power_supply");
+        add_writable_uevent(
+            &ac,
+            "POWER_SUPPLY_NAME=AC\n\
+             POWER_SUPPLY_TYPE=Mains\n\
+             POWER_SUPPLY_ONLINE=1\n"
+                .to_string(),
+        );
+    }
+
+    // ── BAT0 / battery ────────────────────────────────────────────────────
+    {
+        let bat = class_device_register(class.clone(), "BAT0");
+        kobject_add_attr(&bat, "type", || "Battery\n".to_string());
+        kobject_add_attr(&bat, "status", || "Full\n".to_string());
+        kobject_add_attr(&bat, "present", || "1\n".to_string());
+        kobject_add_attr(&bat, "capacity", || "100\n".to_string());
+        kobject_add_attr(&bat, "capacity_level", || "Full\n".to_string());
+        kobject_add_attr(&bat, "technology", || "Li-ion\n".to_string());
+        // Realistic microwatt-hour / microvolt integer readings.
+        kobject_add_attr(&bat, "energy_full", || "50000000\n".to_string());
+        kobject_add_attr(&bat, "energy_now", || "50000000\n".to_string());
+        kobject_add_attr(&bat, "voltage_now", || "12000000\n".to_string());
+        bat.add_symlink("subsystem", "../../../class/power_supply");
+        add_writable_uevent(
+            &bat,
+            "POWER_SUPPLY_NAME=BAT0\n\
+             POWER_SUPPLY_TYPE=Battery\n\
+             POWER_SUPPLY_STATUS=Full\n\
+             POWER_SUPPLY_PRESENT=1\n\
+             POWER_SUPPLY_CAPACITY=100\n\
+             POWER_SUPPLY_CAPACITY_LEVEL=Full\n\
+             POWER_SUPPLY_TECHNOLOGY=Li-ion\n\
+             POWER_SUPPLY_ENERGY_FULL=50000000\n\
+             POWER_SUPPLY_ENERGY_NOW=50000000\n\
+             POWER_SUPPLY_VOLTAGE_NOW=12000000\n"
+                .to_string(),
+        );
+    }
+}
+
+/// Populate `/sys/class/thermal/thermal_zone0/` with `type`, `temp`
+/// (millidegrees C), `mode` and `policy`, plus a `cooling_device0`.
+///
+/// Linux ref: `drivers/thermal/thermal_sysfs.c`,
+/// Documentation/ABI/testing/sysfs-class-thermal.
+pub fn populate_thermal() {
+    let class = class_register("thermal");
+
+    let zone = class_device_register(class.clone(), "thermal_zone0");
+    kobject_add_attr(&zone, "type", || "acpitz\n".to_string());
+    kobject_add_attr(&zone, "temp", || "42000\n".to_string());
+    kobject_add_attr(&zone, "mode", || "enabled\n".to_string());
+    kobject_add_attr(&zone, "policy", || "step_wise\n".to_string());
+    add_writable_uevent(&zone, "DEVNAME=thermal/thermal_zone0\n".to_string());
+
+    let cdev = class_device_register(class.clone(), "cooling_device0");
+    kobject_add_attr(&cdev, "type", || "Processor\n".to_string());
+    kobject_add_attr(&cdev, "cur_state", || "0\n".to_string());
+    kobject_add_attr(&cdev, "max_state", || "10\n".to_string());
+    add_writable_uevent(&cdev, "DEVNAME=thermal/cooling_device0\n".to_string());
+}
+
+/// Populate `/sys/class/hwmon/hwmon0/` with `name`, `temp1_input`
+/// (millidegrees C) and `temp1_label`. lm-sensors enumerates `hwmonN` then
+/// reads `tempN_input`. Linux ref: `drivers/hwmon/hwmon.c`,
+/// Documentation/ABI/testing/sysfs-class-hwmon.
+pub fn populate_hwmon() {
+    let class = class_register("hwmon");
+
+    let hwmon0 = class_device_register(class.clone(), "hwmon0");
+    kobject_add_attr(&hwmon0, "name", || "acpitz\n".to_string());
+    kobject_add_attr(&hwmon0, "temp1_input", || "42000\n".to_string());
+    kobject_add_attr(&hwmon0, "temp1_label", || "CPU\n".to_string());
+    add_writable_uevent(&hwmon0, "DEVNAME=hwmon/hwmon0\n".to_string());
+}
+
+/// Populate `/sys/class/rtc/rtc0/` — the real-time clock class node.
+///
+/// Attrs udev / util-linux (`hwclock`) / systemd-timesyncd read:
+/// `name`, `date`, `time`, `since_epoch`, `hctosys`, `dev`, plus a
+/// writable `uevent`. Also links `/sys/dev/char/254:0` → the class dir
+/// (udev's by-devnum lookup). The backing char device is `/dev/rtc0`
+/// (`crate::devfs_rtc::DevRtc`).
+///
+/// Linux ref: `drivers/rtc/sysfs.c` (`rtc_attr_group`) +
+/// `drivers/rtc/class.c::rtc_device_register`.
+pub fn populate_rtc_class() {
+    use crate::devfs_rtc::{RTC_MAJOR, RTC_MINOR};
+
+    let root = get_root();
+    let class_rtc = class_register("rtc");
+    let rtc0 = class_device_register(class_rtc, "rtc0");
+
+    // Static identity. util-linux keys `/dev/rtc0` off this class dir.
+    kobject_add_attr(&rtc0, "name", || "rtc0\n".into());
+    let dev = format!("{}:{}\n", RTC_MAJOR, RTC_MINOR);
+    kobject_add_attr(&rtc0, "dev", move || dev.clone());
+    // hctosys=1: this RTC seeded the system clock at boot.
+    kobject_add_attr(&rtc0, "hctosys", || "1\n".into());
+
+    // Live time attrs — recomputed on every read from the wall clock.
+    kobject_add_attr(
+        &rtc0,
+        "since_epoch",
+        crate::devfs_rtc::sysfs_since_epoch_string,
+    );
+    kobject_add_attr(&rtc0, "date", crate::devfs_rtc::sysfs_date_string);
+    kobject_add_attr(&rtc0, "time", crate::devfs_rtc::sysfs_time_string);
+
+    // Writable `uevent` (mirrors Linux `uevent_store`): `udevadm trigger`
+    // writes "add"/"change" here → the kernel broadcasts a netlink uevent
+    // carrying MAJOR/MINOR/DEVNAME so udevd creates /dev/rtc0. Weak ref
+    // avoids a closure↔kobject refcount cycle.
+    let uevent = format!("MAJOR={}\nMINOR={}\nDEVNAME=rtc0\n", RTC_MAJOR, RTC_MINOR);
+    let weak = alloc::sync::Arc::downgrade(&rtc0);
+    kobject_add_writable_attr(
+        &rtc0,
+        "uevent",
+        move || uevent.clone(),
+        move |data: &[u8]| {
+            if let Some(k) = weak.upgrade() {
+                kobject_emit_uevent(&k, uevent_action_from_write(data));
+            }
+            Ok(())
+        },
+    );
+    rtc0.add_symlink("subsystem", "../../class/rtc");
+
+    // /sys/dev/char/254:0 → the canonical class dir (udev by-devnum).
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_char = get_or_create_child(&dev_dir, "char");
+    let _dev_block = get_or_create_child(&dev_dir, "block");
+    dev_char.add_symlink(
+        format!("{}:{}", RTC_MAJOR, RTC_MINOR),
+        "../../class/rtc/rtc0",
+    );
+
+    // Broadcast the initial ADD so a listening udevd creates /dev/rtc0.
+    kobject_emit_uevent(&rtc0, crate::uevent::UeventAction::Add);
+}
+
 /// Call all `populate_*` functions.  Invoked from the sysfs initcall.
 pub fn populate_all() {
     populate_block_class();
@@ -1115,6 +1365,15 @@ pub fn populate_all() {
     populate_kernel_dir();
     populate_numa_nodes();
     populate_cpu_devices();
+    // ── Desktop/laptop device classes (single merge-friendly block) ──
+    // /sys/class/{leds,power_supply,thermal,hwmon,rtc} for udev / upower /
+    // lm-sensors / GNOME / KDE enumeration and util-linux / hwclock /
+    // systemd-timesyncd. The RTC's backing chardev is /dev/rtc0.
+    populate_leds();
+    populate_power_supply();
+    populate_thermal();
+    populate_hwmon();
+    populate_rtc_class();
     // Stub class directories expected by userspace tooling.
     let root = get_root();
     let class_dir = get_or_create_child(&root, "class");

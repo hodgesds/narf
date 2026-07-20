@@ -922,6 +922,14 @@ impl DirOps for DevDir {
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
             "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
             "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
+            // Real-time clock char device. `hwclock --show` reads it via
+            // ioctl(RTC_RD_TIME). Linux ref: `drivers/rtc/dev.c`. `/dev/rtc`
+            // is the conventional first-RTC alias — a symlink to rtc0 (this
+            // devfs has a DevSymlink node type [[devfs-symlinks]]).
+            "rtc0" => Some(Arc::new(crate::devfs_rtc::DevRtc) as Arc<dyn FileOps>),
+            "rtc" => Some(Arc::new(DevSymlink {
+                target: "/dev/rtc0",
+            }) as Arc<dyn FileOps>),
             // Dynamic: ttyUSB<N> USB-to-serial ports.
             // Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
             name if name.starts_with("ttyUSB") && name[6..].chars().all(|c| c.is_ascii_digit()) => {
@@ -1052,6 +1060,14 @@ impl DirOps for DevDir {
                 file_type: FileType::Special,
             },
             DirEntry {
+                name: "rtc0",
+                file_type: FileType::Special,
+            },
+            DirEntry {
+                name: "rtc",
+                file_type: FileType::Symlink,
+            },
+            DirEntry {
                 name: "pts",
                 file_type: FileType::Dir,
             },
@@ -1099,6 +1115,8 @@ impl DirOps for DevDir {
             ("fp0", FileType::Special),
             ("tpm0", FileType::Special),
             ("tpmrm0", FileType::Special),
+            ("rtc0", FileType::Special),
+            ("rtc", FileType::Symlink),
             ("pts", FileType::Dir),
             ("disk", FileType::Dir),
             ("input", FileType::Dir),
