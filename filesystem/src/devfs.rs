@@ -884,6 +884,28 @@ impl FileOps for DevSymlink {
     }
 }
 
+/// An empty directory node used purely as a **mountpoint stub** under
+/// `/dev` (e.g. `/dev/shm`, `/dev/mqueue`, `/dev/hugepages`). An init
+/// system (systemd) `open()`s these O_PATH|O_DIRECTORY to get a target fd
+/// and then mounts tmpfs / mqueue / hugetlbfs over them; the mount is
+/// tracked by the registry at that path, so this stub's (empty) contents
+/// are shadowed and never observed once mounted. Without the stub the
+/// O_PATH open ENOENTs and systemd aborts ("Failed to mount API
+/// filesystems. Freezing execution.").
+struct DevEmptyDir;
+
+impl DirOps for DevEmptyDir {
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+        None
+    }
+    fn iter(&self) -> Box<dyn Iterator<Item = crate::DirEntry> + '_> {
+        Box::new(core::iter::empty())
+    }
+    fn enumerate(&self, _cursor: usize, _max: usize) -> Vec<(String, FileType)> {
+        Vec::new()
+    }
+}
+
 /// `DevFs` root directory — exposes `null` and `zero` as fixed
 /// children. No mutation surface (the trait defaults return
 /// `Unsupported` on every override-able method).
@@ -958,6 +980,9 @@ impl DirOps for DevDir {
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         match name {
             "pts" => Some(Arc::new(crate::devfs_pty::DevPts) as Arc<dyn DirOps>),
+            // Mountpoint stubs: an init mounts tmpfs/mqueue/hugetlbfs over
+            // these; they only need to exist so the O_PATH target open works.
+            "shm" | "mqueue" | "hugepages" => Some(Arc::new(DevEmptyDir) as Arc<dyn DirOps>),
             "disk" => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
             "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
             // Sound subsystem — delegate installed by narf-drivers-sound.
@@ -1118,6 +1143,9 @@ impl DirOps for DevDir {
             ("rtc0", FileType::Special),
             ("rtc", FileType::Symlink),
             ("pts", FileType::Dir),
+            ("shm", FileType::Dir),
+            ("mqueue", FileType::Dir),
+            ("hugepages", FileType::Dir),
             ("disk", FileType::Dir),
             ("input", FileType::Dir),
             ("snd", FileType::Dir),
@@ -1226,6 +1254,33 @@ fn smoke_dev_fd_is_symlink() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_fd_is_symlink);
+
+/// Smoke: /dev/{shm,mqueue,hugepages} exist as (empty) mountpoint-stub
+/// directories. An init (systemd) O_PATH-opens these to mount tmpfs /
+/// mqueue / hugetlbfs over them; missing them aborts PID-1 boot ("Failed
+/// to mount API filesystems").
+fn smoke_dev_mountpoint_stub_dirs() -> TestResult {
+    let dir = DevDir;
+    for name in ["shm", "mqueue", "hugepages"] {
+        match dir.lookup_dir(name) {
+            Some(d) => {
+                if !d.enumerate(0, 8).is_empty() {
+                    return TestResult::Fail("mountpoint stub dir should be empty");
+                }
+            }
+            None => return TestResult::Fail("/dev mountpoint stub dir missing"),
+        }
+    }
+    // And they must appear in the /dev enumeration so `ls /dev` shows them.
+    let listed = DevDir.enumerate(0, 256);
+    for name in ["shm", "mqueue", "hugepages"] {
+        if !listed.iter().any(|(n, t)| n == name && *t == FileType::Dir) {
+            return TestResult::Fail("mountpoint stub dir not enumerated");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_mountpoint_stub_dirs);
 
 /// Smoke: /dev/stdin resolves to /proc/self/fd/0.
 fn smoke_dev_stdin_target() -> TestResult {

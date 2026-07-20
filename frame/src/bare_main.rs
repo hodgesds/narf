@@ -3874,6 +3874,38 @@ fn boot_userspace_init() {
         }
     }
 
+    // `systemd_pid1` cmdline flag: boot the mounted /mnt rootfs's
+    // `/lib/systemd/systemd` as REAL PID 1 instead of the NARF
+    // init/getty/shell stack. The chroot launcher (NARF_CHROOT_RUN_ELF)
+    // is spawned as the FIRST user task, so `alloc_pid()` hands it PID 1;
+    // it chroots to /mnt and exec's `/probe.sh`, which `exec`s systemd —
+    // and execve preserves the PID down the whole chain, so systemd ends
+    // up as PID 1 (which it requires for `--system` outside `--test`).
+    // The Stage::Late `mnt-dev-bind`/`root-mount-auto` initcalls have
+    // already run synchronously above (see the run_stage loop in
+    // `_start_rust`), so /mnt + /mnt/{dev,run,tmp,sys,proc} + the chroot
+    // cgroup2 mount are live before this task ever runs. init/getty are
+    // skipped: there is no NARF login shell in this mode.
+    let systemd_pid1 = narf_boot::cmdline()
+        .split_ascii_whitespace()
+        .any(|t| t == "systemd_pid1");
+    if systemd_pid1 {
+        if narf_verification::NARF_CHROOT_RUN_ELF.is_empty() {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: systemd_pid1 requested but chroot_run ELF is empty — skipping"
+            );
+        } else {
+            let _ = writeln!(
+                console::Writer,
+                "  boot-init: systemd_pid1 — booting /mnt systemd as PID 1 (init/getty skipped)"
+            );
+            spawn_one("systemd", narf_verification::NARF_CHROOT_RUN_ELF);
+        }
+        let _ = baked_shell;
+        return;
+    }
+
     spawn_one("init", baked_init);
     // Spawn getty in place of the shell: it sets up a login session
     // (setsid → controlling tty → foreground pgrp) and then execs

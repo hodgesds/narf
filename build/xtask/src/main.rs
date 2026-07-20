@@ -14,6 +14,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -39,6 +40,15 @@ enum Cmd {
     /// tests miss because smokes exercise modules in isolation
     /// rather than the full boot flow.
     BootSmoke(BuildArgs),
+    /// Cross-compile and boot the mounted /mnt rootfs's
+    /// `/lib/systemd/systemd` as REAL PID 1 (sets the `systemd_pid1`
+    /// kernel cmdline flag, which makes boot-init spawn the chroot
+    /// launcher as the first user task instead of NARF init/getty).
+    /// Streams + captures serial for a timeout, then kills QEMU and
+    /// prints a digest of systemd's output. Requires a systemd rootfs
+    /// disk at `target/narf-vblk.img`. Timeout via
+    /// `XTASK_SYSTEMD_PID1_TIMEOUT_SECS` (default 120).
+    SystemdPid1(BuildArgs),
     /// Cross-compile and boot under QEMU with `boot-init` on, drive
     /// the serial port programmatically by typing `echo hello world`
     /// into QEMU's stdin, and assert that `hello world\n` appears on
@@ -1700,6 +1710,164 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
     println!("xtask boot-smoke: kernel cleanly exited, no panic markers");
+    Ok(())
+}
+
+/// Boot the mounted /mnt rootfs's `/lib/systemd/systemd` as REAL PID 1.
+/// Sets the `systemd_pid1` kernel cmdline flag (boot-init then spawns the
+/// chroot launcher as the first user task, so systemd inherits PID 1 down
+/// the execve chain) and captures serial for a bounded window before
+/// killing QEMU — systemd as PID 1 never exits, so unlike `boot-smoke`
+/// there is no clean-shutdown to wait on. Requires a systemd rootfs disk
+/// at `target/narf-vblk.img` (built out-of-band; not committed).
+fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
+    if !matches!(args.arch, Arch::X86_64) {
+        bail!("xtask systemd-pid1: only x86_64 is wired (aarch64 boot-init is a stub)");
+    }
+    let mut args = args.clone();
+    // boot-init compiles boot_userspace_init (which honours systemd_pid1);
+    // cgroup-all makes /sys/fs/cgroup a real cgroup2fs (systemd's hard
+    // gate); firmware-allow-unsigned mirrors the run-interactive boot.
+    ensure_feature(&mut args.features, "boot-init");
+    ensure_feature(&mut args.features, "cgroup-all");
+    ensure_feature(&mut args.features, "firmware-allow-unsigned");
+
+    let root = workspace_root()?;
+    let disk = virtio_blk_image_path();
+    if !disk.exists() {
+        bail!(
+            "xtask systemd-pid1: no rootfs disk at {} — build a systemd rootfs image first",
+            disk.display()
+        );
+    }
+
+    // Thread `systemd_pid1` onto the kernel cmdline (multiboot2 -append),
+    // preserving any caller-provided XTASK_QEMU_APPEND. Set BEFORE
+    // qemu_args() runs — it reads XTASK_QEMU_APPEND.
+    let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+    let combined = if existing
+        .split_ascii_whitespace()
+        .any(|t| t == "systemd_pid1")
+    {
+        existing
+    } else if existing.is_empty() {
+        "systemd_pid1".to_string()
+    } else {
+        format!("{existing} systemd_pid1")
+    };
+    std::env::set_var("XTASK_QEMU_APPEND", combined);
+
+    let out_dir = cargo_build(&args, &root)?;
+    let kernel = out_dir.join(&args.package);
+    if !kernel.exists() {
+        bail!(
+            "expected kernel binary at {} — did `cargo build` succeed?",
+            kernel.display()
+        );
+    }
+
+    let qemu = args.arch.qemu_bin();
+    let mut cmd = Command::new(qemu);
+    cmd.args(args.arch.qemu_args(&kernel, &args.display, args.hw_profile));
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let secs = std::env::var("XTASK_SYSTEMD_PID1_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120);
+
+    println!(
+        "xtask systemd-pid1: launching {} {} (capturing serial for {}s)",
+        qemu,
+        kernel.display(),
+        secs
+    );
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {qemu}"))?;
+
+    let panic_markers: &[&str] = &[
+        "*** KERNEL PANIC ***",
+        "panicked at",
+        "double fault",
+        "general protection",
+        "kernel page fault",
+        "unsafe precondition",
+    ];
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap2 = captured.clone();
+    let reader_handle = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            println!("{line}");
+            if let Ok(mut g) = cap2.lock() {
+                g.push(line);
+            }
+        }
+    });
+
+    // Bounded capture window, then kill — systemd PID 1 does not exit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            break; // kernel died / exited early
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.wait();
+    let _ = reader_handle.join();
+
+    // Digest: surface the systemd-relevant lines + any panic marker.
+    let lines = captured.lock().map(|g| g.clone()).unwrap_or_default();
+    let panic_hit = lines
+        .iter()
+        .find(|l| panic_markers.iter().any(|m| l.contains(m)))
+        .cloned();
+    let needles = [
+        "systemd",
+        "Reached target",
+        "Queued start job",
+        "Started ",
+        "Failed to",
+        "PID 1",
+        "Freezing",
+        "entire root",
+        "Welcome to",
+        "default target",
+    ];
+    let hits: Vec<&String> = lines
+        .iter()
+        .filter(|l| needles.iter().any(|n| l.contains(n)))
+        .collect();
+    println!(
+        "\nxtask systemd-pid1: ==== digest ({} systemd-relevant lines) ====",
+        hits.len()
+    );
+    for l in &hits {
+        println!("  {l}");
+    }
+    if let Some(p) = panic_hit {
+        bail!("xtask systemd-pid1: kernel panic during boot — {p}");
+    }
+    println!(
+        "xtask systemd-pid1: capture window elapsed ({} total serial lines)",
+        lines.len()
+    );
     Ok(())
 }
 
@@ -6652,6 +6820,7 @@ fn main() -> Result<()> {
             boot_smoke_cmd(&args)
         }
         Cmd::BootSmoke(args) => boot_smoke_cmd(&args),
+        Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),

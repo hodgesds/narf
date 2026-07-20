@@ -16108,6 +16108,46 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     let _ =
         flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
 
+    // Idempotent pseudo-filesystem mount. An init system (systemd) mounts
+    // the API filesystems (/proc, /sys, /dev, /run, ...) unconditionally at
+    // startup — even when a chroot/namespace already provides them. NARF's
+    // Stage::Late `mnt-dev-bind` binds procfs/sysfs/devfs + tmpfs /run,/tmp
+    // into the chroot before PID 1 runs, so systemd's first mounts land on
+    // already-mounted targets. NARF has no mount stacking, and `mount_arc`
+    // over an existing mount returns Err → our -1 return → glibc reads EPERM
+    // → systemd aborts with "Failed to mount early API filesystems. Freezing
+    // execution." Linux stacks the mount and succeeds; mirror that by
+    // reporting success when a pseudo-fs target is already a mount point.
+    // Scoped to pseudo-fs types so bind / block-device mounts keep their
+    // real handling (a bind onto an existing path is a distinct operation).
+    let is_pseudo_fs = matches!(
+        fstype.as_str(),
+        "proc"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2"
+            | "devtmpfs"
+            | "devpts"
+            | "tmpfs"
+            | "ramfs"
+            | "mqueue"
+            | "debugfs"
+            | "tracefs"
+            | "securityfs"
+            | "configfs"
+            | "fusectl"
+            | "bpf"
+    );
+    if is_pseudo_fs
+        && narf_filesystem::registry()
+            .list()
+            .iter()
+            .any(|m| m == &target)
+    {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
     let auth = narf_filesystem::bootstrap_mount_authority();
     let domain = narf_lib::id::DomainId::DRIVER_0;
 
@@ -16148,6 +16188,12 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             "sysfs" => Some(alloc::sync::Arc::new(narf_filesystem::SysFs::new())),
             #[cfg(feature = "cgroup")]
             "cgroup2" => Some(alloc::sync::Arc::new(narf_filesystem::CgroupFs::new())),
+            // devtmpfs: an init (systemd) mounts /dev as devtmpfs at a fresh
+            // target. NARF's /dev is a DevFs singleton; hand back a DevFs so
+            // the mounted /dev exposes the null/zero/console/pty device nodes.
+            // (When /dev is already bound in a chroot, the idempotent guard
+            // above short-circuits before we get here.)
+            "devtmpfs" => Some(alloc::sync::Arc::new(narf_filesystem::DevFs::new())),
             _ => None,
         };
         if let Some(fs) = api {
@@ -16214,6 +16260,34 @@ fn sys_umount2(ctx: &mut dyn TrapContext) {
     // mount, so the pop-by-path is unconditional. The flag word is
     // recorded for diagnostic symmetry only.
     let _ = flags & (MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW);
+
+    // Protect the core API pseudo-filesystems from destructive unmount.
+    // NARF has no mount stacking: /proc, /sys, /dev (and cgroup2) are single
+    // shared instances that the chroot's Stage::Late `mnt-dev-bind` provides
+    // and everything depends on. An init (systemd) pairs an early temporary
+    // `mount(proc,/proc)` with a later `umount("/proc")` expecting the stack
+    // to reveal an underlying /proc — but here that umount would delete the
+    // ONLY procfs, and the very next /proc/cmdline read then ENOENTs
+    // ("Failed to fix up PID1 environment. Freezing execution."). Since
+    // NARF's earlier mount of these was already an idempotent no-op (see
+    // sys_mount), the balancing umount is a no-op too: report success but
+    // keep the singleton mounted. tmpfs / bind / real mounts unmount as
+    // normal, so systemd's per-service runtime tmpfs teardown still works.
+    let protected = narf_filesystem::registry()
+        .list_with_names()
+        .into_iter()
+        .any(|(path, name)| {
+            path == target
+                && matches!(
+                    name.as_str(),
+                    "procfs" | "sysfs" | "devfs" | "cgroup2" | "cgroupfs"
+                )
+        });
+    if protected {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
     let auth = narf_filesystem::bootstrap_mount_authority();
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
     // the registry uses internally to mint the per-mount handle.
@@ -18241,13 +18315,22 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // fail that check while it's the very task asking. Treat any
     // pid that matches the caller OR a queued task as live.
     let current = current_task_id();
+    // Visible PID → scheduler TaskId. NARF allocates process ids and
+    // scheduler task ids from separate spaces (a process's pid is NOT its
+    // tid), so every liveness / address-space probe below must go through
+    // the pid→tid map — using `TaskId(pid)` directly only works when the
+    // two happen to coincide. systemd as PID 1 has tid ≠ 1, so the old
+    // `TaskId(pid)` checks reported PID 1 as dead → `/proc/1` was "Not a
+    // directory" → systemd's container-mode `proc_cmdline()` read of
+    // `/proc/1/cmdline` got ENOENT ("Failed to fix up PID1 environment").
+    let tid = pid_to_task_raw(pid).unwrap_or(pid);
     // A task is live if it is the caller (the running task is popped off its
     // ready queue while polling, so it wouldn't match the queue scan), is on
     // a ready queue, or simply has an address space registered (covers
     // parked/sleeping processes like init).
-    let live = pid == current
-        || narf_scheduler::all_task_ids().iter().any(|t| t.0 == pid)
-        || narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).is_some();
+    let live = tid == current
+        || narf_scheduler::all_task_ids().iter().any(|t| t.0 == tid)
+        || narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).is_some();
     if !live {
         return None;
     }
@@ -18280,10 +18363,10 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     use narf_memory::RegionPerms;
     let mut vmas = alloc::vec::Vec::new();
     if let Some(as_arc) =
-        narf_scheduler::address_space_of(narf_scheduler::TaskId(pid)).or_else(|| {
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).or_else(|| {
             // Currently-polling task isn't in the queue scan;
             // fall back to the active-AS slot.
-            if pid == current_task_id() {
+            if tid == current_task_id() {
                 narf_scheduler::current_address_space()
             } else {
                 None
@@ -18318,10 +18401,9 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
             });
         }
     }
-    // stat fields 4-6, 14, 22: parentage + CPU + start time. The tid
-    // resolves the accounting tables (they key on TaskId); PARENT_OF
+    // stat fields 4-6, 14, 22: parentage + CPU + start time. `tid` (hoisted
+    // above) resolves the accounting tables (they key on TaskId); PARENT_OF
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
-    let tid = pid_to_task_raw(pid).unwrap_or(pid);
     const NS_PER_TICK: u64 = 10_000_000;
     Some(ProcTaskInfo {
         pid,
