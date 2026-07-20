@@ -508,6 +508,70 @@ fn smoke_filesystem_memfs_socket_node() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_memfs_socket_node);
 
+/// Every in-memory directory must carry a unique, stable, nonzero inode so
+/// it is distinguishable from its parent. systemd's `rm_rf` refuses to
+/// descend when a directory and its parent share `(st_dev, st_ino)` (its
+/// "you've hit a filesystem root" guard) — and NARF reports `st_dev = 0`
+/// everywhere, so a colliding `st_ino` made every `mkdir`-created temp
+/// subdir look like `/` ("Attempted to remove entire root file system").
+/// Regression: mkdir a nested chain and assert all inodes differ.
+fn smoke_filesystem_memfs_dir_inodes_distinct() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, DirOps, MemFs, MountPoint};
+    use alloc::sync::Arc;
+    use narf_capabilities::{Cap, Grant};
+
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VT)
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        // SAFETY: no-op vtable over a null data pointer — trivially valid.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` outlives this block and is never moved after pinning.
+        let fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
+        match fut.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("test-dirino", &[]);
+    let mount_handle = match registry().mount(&auth, "/test_dirino", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    // Grab the mount root, then mkdir a nested chain /a -> /a/b.
+    let root: Option<Arc<dyn DirOps>> = registry()
+        .resolve_absolute("/test_dirino", |fs, _rel| Some(fs.root()))
+        .flatten();
+    let result = (|| {
+        let root = root?;
+        let a = poll_once(root.mkdir("a"))?.ok()?;
+        let b = poll_once(a.mkdir("b"))?.ok()?;
+        Some((root.ino(), a.ino(), b.ino()))
+    })();
+
+    let _ = registry().unmount(&mount_handle, "/test_dirino");
+
+    let (root_ino, ia, ib) = match result {
+        Some(t) => t,
+        None => return TestResult::Fail("mkdir chain on memfs failed"),
+    };
+    if root_ino == 0 || ia == 0 || ib == 0 {
+        return TestResult::Fail("a MemFs directory reported inode 0");
+    }
+    if root_ino == ia || root_ino == ib || ia == ib {
+        return TestResult::Fail("MemFs directory inodes collided (parent==child)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_memfs_dir_inodes_distinct);
+
 fn smoke_filesystem_devfs_null_zero() -> TestResult {
     use crate::{bootstrap_mount_authority, registry, DevFs};
     use core::pin::Pin;

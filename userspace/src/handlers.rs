@@ -14961,6 +14961,10 @@ fn stat_ino_path_dir_aware_ext(
         // Report the directory's real (chmod-settable) mode, not a
         // hardcoded 0o777 — dbus/systemd reject XDG_RUNTIME_DIR unless
         // it is not group/other-writable, so `chmod 0700` must show.
+        // Thread the directory's real inode (0 for filesystems with no
+        // stable id) so a dir is distinguishable from its parent —
+        // systemd's rm_rf root-guard aborts ("Attempted to remove entire
+        // root file system") when a dir and its parent share st_ino.
         return Some((
             narf_filesystem::Stat {
                 size: 0,
@@ -14971,7 +14975,7 @@ fn stat_ino_path_dir_aware_ext(
                 },
                 mtime_cycles: 0,
             },
-            0,
+            dir.ino(),
             0,
         ));
     }
@@ -14988,6 +14992,13 @@ struct DirFdFile {
 }
 
 impl narf_filesystem::FileOps for DirFdFile {
+    fn ino(&self) -> u64 {
+        // Forward the backing directory's real inode so fstat(2) on an
+        // open dir fd matches a path-based stat of the same directory —
+        // and stays distinct from the parent (systemd's rm_rf root-guard).
+        self.dir.ino()
+    }
+
     fn read<'a>(
         &'a self,
         _offset: u64,

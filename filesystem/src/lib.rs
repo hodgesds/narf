@@ -714,6 +714,17 @@ pub const POLL_NVAL: u32 = 0x0020;
 /// in-memory map; Stage 4 backing-store directories will need an
 /// async variant — `lookup_async` will land alongside virtiofs.
 pub trait DirOps: Send + Sync {
+    /// Real inode number of this directory, or 0 if the filesystem has no
+    /// stable per-directory id (the synthetic default). The stat/statx
+    /// handlers thread this into the Linux `st_ino` so a directory is
+    /// distinguishable from its parent — systemd's `rm_rf` refuses to
+    /// descend when a directory and its parent share `(st_dev, st_ino)`
+    /// (its "you've hit a filesystem root" guard), so a constant 0 makes
+    /// every temp subdir look like `/`. Mirrors [`FileOps::ino`].
+    fn ino(&self) -> u64 {
+        0
+    }
+
     /// Resolve a single name component. Returns `None` if absent.
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>>;
 

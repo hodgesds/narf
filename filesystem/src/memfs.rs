@@ -39,9 +39,31 @@ use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, 
 /// only bites when a file is explicitly minted with tighter perms.
 const DEFAULT_PERMS: u16 = 0o666;
 
+/// Monotonic inode allocator for in-memory nodes. Every `MemFile` /
+/// `MemDir` / `MemSymlink` claims a unique, stable `st_ino` at
+/// construction so distinct nodes never alias. This is load-bearing for
+/// more than musl's DSO dedup: systemd's `rm_rf` refuses to descend when
+/// a directory and its parent share `(st_dev, st_ino)` (its "you've hit a
+/// filesystem root" guard). Previously every tmpfs node reported `ino 0`
+/// (the size-0/mtime-0 synthetic fallback for directories), so every
+/// `mkdir`-created temp subdir looked like `/` and systemd aborted with
+/// "Attempted to remove entire root file system". The base is deliberately
+/// high because NARF reports `st_dev = 0` for every mount, so a low base
+/// would collide with ext2's small inode numbers (root = 2).
+static NEXT_INO: AtomicU64 = AtomicU64::new(0x1000_0000);
+
+/// Claim the next unique in-memory inode number.
+fn alloc_ino() -> u64 {
+    NEXT_INO.fetch_add(1, Ordering::Relaxed)
+}
+
 /// In-memory file: a length-tracked byte buffer behind a lock, plus
 /// per-node DAC metadata (low-9 permission bits + owner uid/gid).
 struct MemFile {
+    /// Unique, stable inode number (see [`NEXT_INO`]). Immutable after
+    /// construction — a plain `u64`, not an atomic, per the per-node
+    /// heap-cost note on the metadata fields below.
+    ino: u64,
     bytes: IrqSafeSpinLock<Vec<u8>>,
     /// DAC metadata as lock-free atomics — kept deliberately small: a
     /// MemFs node is created for every file in the kernel-test suite, so
@@ -71,6 +93,7 @@ impl MemFile {
     /// Mint a `MemFile` with default perms (0o666) and owner (0, 0).
     fn new(bytes: Vec<u8>) -> Self {
         MemFile {
+            ino: alloc_ino(),
             bytes: IrqSafeSpinLock::new(bytes),
             perms: AtomicU32::new(DEFAULT_PERMS as u32),
             uid: AtomicU32::new(0),
@@ -84,6 +107,7 @@ impl MemFile {
     /// that must enforce a real DAC boundary (e.g. /etc/shadow 0600).
     fn with_perms_owner(bytes: Vec<u8>, perms: u16, uid: u32, gid: u32) -> Self {
         MemFile {
+            ino: alloc_ino(),
             bytes: IrqSafeSpinLock::new(bytes),
             perms: AtomicU32::new((perms & 0o777) as u32),
             uid: AtomicU32::new(uid),
@@ -96,6 +120,7 @@ impl MemFile {
     /// Mint a pathname-AF_UNIX-socket node (S_IFSOCK) with the given perms.
     fn new_socket(perms: u16) -> Self {
         MemFile {
+            ino: alloc_ino(),
             bytes: IrqSafeSpinLock::new(Vec::new()),
             perms: AtomicU32::new((perms & 0o777) as u32),
             uid: AtomicU32::new(0),
@@ -147,6 +172,10 @@ impl fmt::Debug for MemFile {
 }
 
 impl FileOps for MemFile {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let g = self.bytes.lock();
@@ -253,6 +282,8 @@ impl FileOps for MemFile {
 /// `ReadOnly` (POSIX symlink targets are immutable — `symlink(2)`
 /// creates and `readlink(2)` reads, but there is no `writelink(2)`).
 struct MemSymlink {
+    /// Unique, stable inode number (see [`NEXT_INO`]).
+    ino: u64,
     target: String,
 }
 
@@ -265,6 +296,10 @@ impl fmt::Debug for MemSymlink {
 }
 
 impl FileOps for MemSymlink {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let bytes = self.target.as_bytes();
@@ -310,6 +345,10 @@ enum Entry {
 /// `MemDir` is the unit of recursion — both the root and every
 /// subdirectory created via `mkdir` are `MemDir`s.
 struct MemDir {
+    /// Unique, stable inode number (see [`NEXT_INO`]). Distinguishes a
+    /// directory from its parent so systemd's `rm_rf` root-guard doesn't
+    /// mistake a `mkdir`-created temp dir for the filesystem root.
+    ino: u64,
     entries: IrqSafeSpinLock<BTreeMap<String, Entry>>,
     /// Directory permission bits (low 12). Defaults to 0o777; `chmod(2)`
     /// on the directory updates it so `stat` reflects the real mode —
@@ -327,6 +366,10 @@ impl fmt::Debug for MemDir {
 }
 
 impl DirOps for MemDir {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let g = self.entries.lock();
         match g.get(name)? {
@@ -441,6 +484,7 @@ impl DirOps for MemDir {
                 return Err(FsError::Busy);
             }
             let d = Arc::new(MemDir {
+                ino: alloc_ino(),
                 entries: IrqSafeSpinLock::new(BTreeMap::new()),
                 perms: AtomicU32::new(0o755),
             });
@@ -482,6 +526,7 @@ impl DirOps for MemDir {
                 return Err(FsError::Busy);
             }
             let s = Arc::new(MemSymlink {
+                ino: alloc_ino(),
                 target: target.to_string(),
             });
             g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
@@ -557,6 +602,7 @@ impl MemFs {
         Self {
             name,
             root: Arc::new(MemDir {
+                ino: alloc_ino(),
                 entries: IrqSafeSpinLock::new(BTreeMap::new()),
                 perms: AtomicU32::new(0o755),
             }),
