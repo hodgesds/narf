@@ -16220,6 +16220,56 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
         };
     }
 
+    // FUSE mounts: `fstype == "fuse"` or `"fuse.<subtype>"`. The mount
+    // options carry `fd=N` naming the open `/dev/fuse` connection the
+    // daemon obtained. NARF's mount ABI has no separate `data` argument,
+    // so the `fd=N,rootmode=...,user_id=...,group_id=...` option string is
+    // passed as `source`. We parse `fd=N`, recover the connection from the
+    // caller's fd table, build a `FuseFs` over it, and drive FUSE_INIT.
+    // Linux ref: `fs/fuse/inode.c::fuse_fill_super` + `parse_fuse_opt`.
+    if fstype == "fuse" || fstype.starts_with("fuse.") {
+        // Parse `fd=N` out of the comma-separated option string.
+        let fd_opt = source
+            .split(',')
+            .find_map(|kv| kv.strip_prefix("fd="))
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        let fd = match fd_opt {
+            Some(fd) => fd,
+            None => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        // Recover the /dev/fuse connection from the caller's fd.
+        let task = current_task_id();
+        let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
+        let conn = match ops {
+            Some(Some(o)) => match narf_filesystem::fuse_conn::DevFuse::connection_of(&o) {
+                Some(c) => c,
+                None => {
+                    // fd is open but not a /dev/fuse device.
+                    ctx.set_return(fail);
+                    return;
+                }
+            },
+            _ => {
+                ctx.set_return(fail);
+                return;
+            }
+        };
+        let subtype = fstype.strip_prefix("fuse.").unwrap_or("fuse");
+        let fs = alloc::sync::Arc::new(narf_filesystem::fuse_conn::FuseFs::new(subtype, conn));
+        // Drive the FUSE_INIT handshake before serving. The daemon (a
+        // separate task blocked on read(/dev/fuse)) answers it; poll the
+        // init future to completion cooperatively.
+        let _ = poll_blocking(fs.init());
+        let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
+        return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs_dyn) {
+            Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(fail),
+        };
+    }
+
     // Block-device-backed mounts: resolve `source` as a registered
     // block-device name. Strip a leading "/dev/" so callers can
     // pass either form.

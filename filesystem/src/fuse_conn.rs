@@ -1,0 +1,760 @@
+//! FUSE connection + `/dev/fuse` transport + `FuseFs` VFS bridge.
+//!
+//! This is the client half of a FUSE filesystem: the kernel VFS turns
+//! `lookup`/`getattr`/`open`/`read`/`write`/`readdir`/`release`/`forget`
+//! into FUSE requests, ships them over a [`FuseConnection`] to a userspace
+//! daemon (virtiofsd / a libfuse program), and awaits the reply.
+//!
+//! Data flow (Linux `fs/fuse/dev.c` is the reference):
+//!
+//! ```text
+//!   VFS op ──enqueue(req)──▶ FuseConnection.pending  ──read(/dev/fuse)──▶ daemon
+//!                                                                            │
+//!   VFS op ◀──await reply──  FuseConnection.replies  ◀─write(/dev/fuse)──────┘
+//! ```
+//!
+//! - The daemon opens `/dev/fuse` (an fd), reads a request (a
+//!   [`FuseInHeader`] + body), services it, and writes back a
+//!   [`FuseOutHeader`] + body keyed by the request's `unique` id.
+//! - `read(/dev/fuse)` blocks (parks) until a request is queued; `write`
+//!   parses the reply and wakes the parked VFS caller.
+//!
+//! The whole thing is transport-agnostic: the in-kernel tests drive both
+//! ends with the cooperative scheduler and no real daemon, and a real
+//! daemon over a virtqueue would plug into the exact same
+//! [`FuseConnection`].
+
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use narf_lib::sync::IrqSafeSpinLock;
+
+use crate::fuse::*;
+use crate::{
+    DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_IN,
+    POLL_OUT,
+};
+
+/// A completed reply from the daemon: the `error` field of the
+/// `fuse_out_header` (0 = success, negative errno on failure) plus the
+/// reply body bytes (everything after the header).
+#[derive(Clone, Debug)]
+struct FuseReply {
+    error: i32,
+    body: Vec<u8>,
+}
+
+/// Shared queue object connecting the kernel VFS to a userspace FUSE
+/// daemon. One is minted per `open("/dev/fuse")`.
+///
+/// - `pending`: FIFO of fully-encoded requests (`fuse_in_header` + body)
+///   waiting for the daemon to `read()` them.
+/// - `replies`: `unique` → reply slot map. A VFS caller inserts an empty
+///   slot when it enqueues, then awaits until the daemon's `write()` fills
+///   it.
+/// - `connected`: cleared when the daemon closes `/dev/fuse` so parked
+///   callers can fail with `ENOTCONN`/`Unsupported` instead of hanging.
+pub struct FuseConnection {
+    pending: IrqSafeSpinLock<VecDeque<Vec<u8>>>,
+    replies: IrqSafeSpinLock<BTreeMap<u64, Option<FuseReply>>>,
+    next_unique: AtomicU64,
+    connected: core::sync::atomic::AtomicBool,
+    /// True once FUSE_INIT has completed successfully.
+    initialized: core::sync::atomic::AtomicBool,
+}
+
+impl core::fmt::Debug for FuseConnection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuseConnection")
+            .field("pending", &self.pending.lock().len())
+            .field("in_flight", &self.replies.lock().len())
+            .field("connected", &self.connected.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl Default for FuseConnection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FuseConnection {
+    pub fn new() -> Self {
+        FuseConnection {
+            pending: IrqSafeSpinLock::new(VecDeque::new()),
+            replies: IrqSafeSpinLock::new(BTreeMap::new()),
+            // Linux starts `unique` at 1 and only ever uses even values in
+            // some versions; any monotone non-zero sequence is spec-legal.
+            next_unique: AtomicU64::new(1),
+            connected: core::sync::atomic::AtomicBool::new(true),
+            initialized: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn alloc_unique(&self) -> u64 {
+        self.next_unique.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// True until the daemon closes its `/dev/fuse` fd.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// Mark the connection dead (daemon closed `/dev/fuse`). Any in-flight
+    /// requests are failed so parked callers unwind.
+    pub fn disconnect(&self) {
+        self.connected.store(false, Ordering::Release);
+        // Fail every outstanding request with -ENOTCONN so awaiters wake.
+        let mut g = self.replies.lock();
+        for slot in g.values_mut() {
+            if slot.is_none() {
+                *slot = Some(FuseReply {
+                    error: -(ENOTCONN as i32),
+                    body: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// Encode `fuse_in_header` + `body` for `opcode`/`nodeid`, enqueue it,
+    /// and register an empty reply slot. Returns the request's `unique`.
+    fn submit(&self, opcode: FuseOpcode, nodeid: u64, body: &[u8]) -> u64 {
+        let unique = self.alloc_unique();
+        let total = core::mem::size_of::<FuseInHeader>() + body.len();
+        let hdr = FuseInHeader {
+            len: total as u32,
+            opcode: opcode as u32,
+            unique,
+            nodeid,
+            uid: 0,
+            gid: 0,
+            pid: 0,
+            _padding: 0,
+        };
+        let mut msg = pod_as_bytes(&hdr);
+        msg.extend_from_slice(body);
+        self.replies.lock().insert(unique, None);
+        self.pending.lock().push_back(msg);
+        unique
+    }
+
+    /// Daemon side: dequeue the next request bytes, if any. Non-blocking.
+    pub fn dequeue_request(&self) -> Option<Vec<u8>> {
+        self.pending.lock().pop_front()
+    }
+
+    /// True when a request is queued for the daemon to read.
+    pub fn has_request(&self) -> bool {
+        !self.pending.lock().is_empty()
+    }
+
+    /// Daemon side: complete the request identified by the reply's
+    /// `fuse_out_header.unique`. `reply` is the full daemon write
+    /// (`fuse_out_header` + body). Returns the number of bytes consumed on
+    /// success, or `None` if the buffer is malformed / unknown `unique`.
+    pub fn complete_reply(&self, reply: &[u8]) -> Option<usize> {
+        let hdr: FuseOutHeader = pod_from_bytes(reply)?;
+        let hdr_len = core::mem::size_of::<FuseOutHeader>();
+        // `len` counts the header + body; clamp to what was actually
+        // supplied so a lying daemon can't make us read OOB.
+        let claimed = hdr.len as usize;
+        if claimed < hdr_len || claimed > reply.len() {
+            return None;
+        }
+        let body = reply[hdr_len..claimed].to_vec();
+        let mut g = self.replies.lock();
+        match g.get_mut(&hdr.unique) {
+            Some(slot @ None) => {
+                *slot = Some(FuseReply {
+                    error: hdr.error,
+                    body,
+                });
+                Some(claimed)
+            }
+            // Unknown or already-completed unique: drop it (a duplicate
+            // reply is not fatal), still report bytes consumed so the
+            // daemon's write loop advances.
+            _ => Some(claimed),
+        }
+    }
+
+    /// Take the completed reply for `unique`, if it has landed.
+    fn take_reply(&self, unique: u64) -> Option<FuseReply> {
+        let mut g = self.replies.lock();
+        match g.get(&unique) {
+            Some(Some(_)) => g.remove(&unique).flatten(),
+            _ => None,
+        }
+    }
+
+    /// Submit a request and await its reply. On success returns the reply
+    /// body bytes; a negative `error` becomes an [`FsError`].
+    async fn request(
+        self: &Arc<Self>,
+        opcode: FuseOpcode,
+        nodeid: u64,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, FsError> {
+        if !self.is_connected() {
+            return Err(FsError::Unsupported);
+        }
+        let unique = self.submit(opcode, nodeid, &body);
+        let reply = ReplyFuture {
+            conn: Arc::clone(self),
+            unique,
+        }
+        .await;
+        match reply.error {
+            0 => Ok(reply.body),
+            e => Err(errno_to_fs_error(e)),
+        }
+    }
+}
+
+/// Future that parks a VFS caller until its FUSE reply lands. Each poll
+/// checks the reply map; while pending it re-arms its own waker so the
+/// cooperative scheduler re-polls it (the daemon task, driven on the same
+/// executor, fills the slot between polls). On a dead connection it
+/// resolves to an `-ENOTCONN` reply so callers never park forever.
+struct ReplyFuture {
+    conn: Arc<FuseConnection>,
+    unique: u64,
+}
+
+impl core::future::Future for ReplyFuture {
+    type Output = FuseReply;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        if let Some(reply) = self.conn.take_reply(self.unique) {
+            return core::task::Poll::Ready(reply);
+        }
+        if !self.conn.is_connected() {
+            // Connection died with no reply — synthesize ENOTCONN.
+            return core::task::Poll::Ready(FuseReply {
+                error: -(ENOTCONN as i32),
+                body: Vec::new(),
+            });
+        }
+        // Re-arm: the daemon completes the reply on another task, so we
+        // must be re-polled. `wake_by_ref` schedules exactly that on the
+        // cooperative executor (and is a no-op-safe re-poll under the
+        // test's manual poll loop too).
+        cx.waker().wake_by_ref();
+        core::task::Poll::Pending
+    }
+}
+
+/// Linux `ENOTCONN` — daemon went away mid-request.
+const ENOTCONN: u32 = 107;
+
+/// Translate a FUSE `-errno` reply into an [`FsError`].
+fn errno_to_fs_error(neg_errno: i32) -> FsError {
+    match -neg_errno {
+        2 => FsError::NotFound,          // ENOENT
+        13 => FsError::PermissionDenied, // EACCES
+        22 => FsError::InvalidData,      // EINVAL
+        28 => FsError::NoSpace,          // ENOSPC
+        30 => FsError::ReadOnly,         // EROFS
+        _ => FsError::Unsupported,
+    }
+}
+
+// ── /dev/fuse char device ─────────────────────────────────────────────
+
+/// The `/dev/fuse` file node. Each `open()` (via [`DevFuse::open_new`])
+/// mints a fresh [`FuseConnection`]; reads pull queued requests toward the
+/// daemon and writes push replies back.
+#[derive(Debug)]
+pub struct DevFuse {
+    conn: Arc<FuseConnection>,
+}
+
+impl DevFuse {
+    /// Mint a new `/dev/fuse` connection. Returned as a `FileOps` for the
+    /// caller's fd table; the mount path later recovers the connection via
+    /// [`DevFuse::connection_of`].
+    pub fn open_new() -> Arc<dyn FileOps> {
+        Arc::new(DevFuse {
+            conn: Arc::new(FuseConnection::new()),
+        })
+    }
+
+    /// The connection this device fd owns.
+    pub fn connection(&self) -> Arc<FuseConnection> {
+        Arc::clone(&self.conn)
+    }
+
+    /// Recover the [`FuseConnection`] from an `Arc<dyn FileOps>` that is a
+    /// `/dev/fuse` node (used by `sys_mount` to bind `fd=N`). Returns
+    /// `None` if the fd is not a `/dev/fuse` device.
+    pub fn connection_of(ops: &Arc<dyn FileOps>) -> Option<Arc<FuseConnection>> {
+        ops.as_any()
+            .and_then(|a| a.downcast_ref::<DevFuse>())
+            .map(|d| d.connection())
+    }
+}
+
+impl FileOps for DevFuse {
+    /// Daemon read: hand back the next queued request. If nothing is
+    /// queued, return 0 (the daemon polls; a real blocking daemon parks on
+    /// `poll_readiness`). A short user buffer truncates the request, which
+    /// a conformant daemon avoids by supplying `max_write`-sized buffers.
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            match self.conn.dequeue_request() {
+                Some(req) => {
+                    let n = core::cmp::min(buf.len(), req.len());
+                    buf[..n].copy_from_slice(&req[..n]);
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        })
+    }
+
+    /// Daemon write: parse a reply (`fuse_out_header` + body) and complete
+    /// the matching in-flight request, waking its parked VFS caller.
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            match self.conn.complete_reply(buf) {
+                Some(_consumed) => Ok(buf.len()),
+                None => Err(FsError::InvalidData),
+            }
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::Special,
+                perms: 0o600,
+            },
+            mtime_cycles: 0,
+        }
+    }
+
+    /// Readable whenever a request is queued for the daemon; always
+    /// writable (replies are accepted at once).
+    fn poll_readiness(&self) -> u32 {
+        let mut ev = POLL_OUT;
+        if self.conn.has_request() {
+            ev |= POLL_IN;
+        }
+        ev
+    }
+
+    fn read_should_block(&self) -> bool {
+        // A daemon read with no queued request should park, not EOF.
+        !self.conn.has_request()
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+
+// ── FuseFs: VFS ⇒ FUSE translation ────────────────────────────────────
+
+/// Attributes decoded from a daemon reply, cached on the node handle.
+#[derive(Copy, Clone, Debug)]
+struct NodeAttr {
+    nodeid: u64,
+    size: u64,
+    mode: u32,
+}
+
+impl NodeAttr {
+    fn file_type(&self) -> FileType {
+        match self.mode & S_IFMT {
+            S_IFDIR => FileType::Dir,
+            S_IFLNK => FileType::Symlink,
+            S_IFREG => FileType::File,
+            _ => FileType::File,
+        }
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            size: self.size,
+            blocks: self.size.div_ceil(512),
+            mode: Mode {
+                file_type: self.file_type(),
+                perms: (self.mode & 0o777) as u16,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
+/// A file node in a FUSE filesystem: a `nodeid` on a shared connection.
+/// Lazily opens (obtaining a daemon `fh`) on first read; drops (RELEASE +
+/// FORGET) when the last handle disappears.
+pub struct FuseFile {
+    conn: Arc<FuseConnection>,
+    attr: NodeAttr,
+    /// Daemon file handle from FUSE_OPEN, if opened. Guarded because
+    /// `open` happens lazily inside an async read.
+    fh: IrqSafeSpinLock<Option<u64>>,
+}
+
+impl core::fmt::Debug for FuseFile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuseFile")
+            .field("nodeid", &self.attr.nodeid)
+            .field("size", &self.attr.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FuseFile {
+    async fn ensure_open(&self) -> Result<u64, FsError> {
+        if let Some(fh) = *self.fh.lock() {
+            return Ok(fh);
+        }
+        // FUSE_OPEN: O_RDONLY (0). The daemon returns a file handle.
+        let body = pod_as_bytes(&FuseOpenIn {
+            flags: 0,
+            open_flags: 0,
+        });
+        let reply = self
+            .conn
+            .request(FuseOpcode::Open, self.attr.nodeid, body)
+            .await?;
+        let out: FuseOpenOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        *self.fh.lock() = Some(out.fh);
+        Ok(out.fh)
+    }
+}
+
+impl FileOps for FuseFile {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let body = pod_as_bytes(&FuseReadIn {
+                fh,
+                offset,
+                size: buf.len() as u32,
+                read_flags: 0,
+                lock_owner: 0,
+                flags: 0,
+                padding: 0,
+            });
+            let data = self
+                .conn
+                .request(FuseOpcode::Read, self.attr.nodeid, body)
+                .await?;
+            let n = core::cmp::min(buf.len(), data.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            Ok(n)
+        })
+    }
+
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move {
+            let fh = self.ensure_open().await?;
+            let header = FuseWriteIn {
+                fh,
+                offset,
+                size: buf.len() as u32,
+                write_flags: 0,
+                lock_owner: 0,
+                flags: 0,
+                padding: 0,
+            };
+            let mut body = pod_as_bytes(&header);
+            body.extend_from_slice(buf);
+            let reply = self
+                .conn
+                .request(FuseOpcode::Write, self.attr.nodeid, body)
+                .await?;
+            let out: FuseWriteOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(out.size as usize)
+        })
+    }
+
+    fn stat(&self) -> Stat {
+        self.attr.stat()
+    }
+
+    fn ino(&self) -> u64 {
+        self.attr.nodeid
+    }
+
+    fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
+        Box::pin(async move {
+            // Refresh via FUSE_GETATTR so size reflects daemon-side writes.
+            let body = pod_as_bytes(&FuseGetattrIn::default());
+            let reply = self
+                .conn
+                .request(FuseOpcode::Getattr, self.attr.nodeid, body)
+                .await?;
+            let out: FuseAttrOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+            Ok(NodeAttr {
+                nodeid: self.attr.nodeid,
+                size: out.attr.size,
+                mode: out.attr.mode,
+            }
+            .stat())
+        })
+    }
+}
+
+impl Drop for FuseFile {
+    fn drop(&mut self) {
+        // Best-effort RELEASE + FORGET. We can't await in `Drop`, so we
+        // just enqueue the requests (fire-and-forget); the daemon drains
+        // them on its next read. A dead connection drops them harmlessly.
+        if !self.conn.is_connected() {
+            return;
+        }
+        if let Some(fh) = *self.fh.lock() {
+            let body = pod_as_bytes(&FuseReleaseIn {
+                fh,
+                flags: 0,
+                release_flags: 0,
+                lock_owner: 0,
+            });
+            self.conn
+                .submit(FuseOpcode::Release, self.attr.nodeid, &body);
+        }
+        // Never forget the root (nodeid 1) — Linux keeps it pinned.
+        if self.attr.nodeid != FUSE_ROOT_ID {
+            let body = pod_as_bytes(&FuseForgetIn { nlookup: 1 });
+            self.conn
+                .submit(FuseOpcode::Forget, self.attr.nodeid, &body);
+        }
+    }
+}
+
+/// A directory node in a FUSE filesystem.
+pub struct FuseDir {
+    conn: Arc<FuseConnection>,
+    nodeid: u64,
+}
+
+impl core::fmt::Debug for FuseDir {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuseDir")
+            .field("nodeid", &self.nodeid)
+            .finish()
+    }
+}
+
+impl FuseDir {
+    /// FUSE_LOOKUP: resolve `name` under this directory into a
+    /// [`NodeAttr`].
+    async fn lookup_attr(&self, name: &str) -> Result<NodeAttr, FsError> {
+        // LOOKUP body is the NUL-terminated child name.
+        let mut body = Vec::with_capacity(name.len() + 1);
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        let reply = self
+            .conn
+            .request(FuseOpcode::Lookup, self.nodeid, body)
+            .await?;
+        let out: FuseEntryOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        Ok(NodeAttr {
+            nodeid: out.nodeid,
+            size: out.attr.size,
+            mode: out.attr.mode,
+        })
+    }
+}
+
+impl DirOps for FuseDir {
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+        // Synchronous lookup can't drive the async transport; callers use
+        // `lookup_async`. Returning None here forces the async path.
+        None
+    }
+
+    fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let attr = self.lookup_attr(name).await?;
+            if attr.file_type() == FileType::Dir {
+                return Err(FsError::InvalidPath);
+            }
+            Ok(Arc::new(FuseFile {
+                conn: Arc::clone(&self.conn),
+                attr,
+                fh: IrqSafeSpinLock::new(None),
+            }) as Arc<dyn FileOps>)
+        })
+    }
+
+    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
+        None
+    }
+
+    fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
+        Box::pin(async move {
+            let attr = self.lookup_attr(name).await?;
+            if attr.file_type() != FileType::Dir {
+                return Err(FsError::NotFound);
+            }
+            Ok(Arc::new(FuseDir {
+                conn: Arc::clone(&self.conn),
+                nodeid: attr.nodeid,
+            }) as Arc<dyn DirOps>)
+        })
+    }
+
+    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+        // Names live in daemon replies (owned), not `&'static str`; readdir
+        // goes through `enumerate_async`.
+        Box::new(core::iter::empty())
+    }
+
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> FsFuture<'a, Vec<(String, FileType)>> {
+        Box::pin(async move {
+            // FUSE_READDIR needs a directory `fh` from FUSE_OPENDIR. We
+            // (re)open per enumerate — cheap and stateless for the client.
+            let openbody = pod_as_bytes(&FuseOpenIn {
+                flags: 0,
+                open_flags: 0,
+            });
+            let oreply = self
+                .conn
+                .request(FuseOpcode::Open, self.nodeid, openbody)
+                .await?;
+            let oout: FuseOpenOut = pod_from_bytes(&oreply).ok_or(FsError::InvalidData)?;
+            let fh = oout.fh;
+
+            // READDIR: the daemon streams `fuse_dirent` records. We ask for
+            // a generous buffer and parse them all, then apply cursor/max.
+            let readbody = pod_as_bytes(&FuseReadIn {
+                fh,
+                offset: 0,
+                size: 4096,
+                read_flags: 0,
+                lock_owner: 0,
+                flags: 0,
+                padding: 0,
+            });
+            let data = self
+                .conn
+                .request(FuseOpcode::ReadDir, self.nodeid, readbody)
+                .await?;
+
+            let mut out: Vec<(String, FileType)> = Vec::new();
+            let mut pos = 0usize;
+            while pos + FUSE_DIRENT_HEADER_LEN <= data.len() {
+                let de: FuseDirent = match pod_from_bytes(&data[pos..]) {
+                    Some(d) => d,
+                    None => break,
+                };
+                let namelen = de.namelen as usize;
+                let name_start = pos + FUSE_DIRENT_HEADER_LEN;
+                let name_end = name_start + namelen;
+                if name_end > data.len() {
+                    break; // truncated / malformed record
+                }
+                let name = String::from_utf8_lossy(&data[name_start..name_end]).into_owned();
+                let ft = match de.type_ {
+                    // fuse_dirent.type is the high bits of st_mode >> 12
+                    // (DT_DIR=4, DT_REG=8, DT_LNK=10).
+                    4 => FileType::Dir,
+                    10 => FileType::Symlink,
+                    _ => FileType::File,
+                };
+                if name != "." && name != ".." {
+                    out.push((name, ft));
+                }
+                pos = name_end;
+                // Records are 8-byte aligned on the wire.
+                pos = fuse_dirent_align(pos);
+            }
+
+            // Release the directory handle.
+            let rel = pod_as_bytes(&FuseReleaseIn {
+                fh,
+                flags: 0,
+                release_flags: 0,
+                lock_owner: 0,
+            });
+            let _ = self
+                .conn
+                .request(FuseOpcode::Release, self.nodeid, rel)
+                .await;
+
+            Ok(out.into_iter().skip(cursor).take(max).collect())
+        })
+    }
+}
+
+/// A mounted FUSE filesystem. Holds the shared connection; its root is the
+/// well-known nodeid 1.
+pub struct FuseFs {
+    name: String,
+    conn: Arc<FuseConnection>,
+}
+
+impl core::fmt::Debug for FuseFs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuseFs")
+            .field("name", &self.name)
+            .field("conn", &self.conn)
+            .finish()
+    }
+}
+
+impl FuseFs {
+    /// Build a `FuseFs` over an existing connection (recovered from the
+    /// mount's `fd=N`). The FUSE_INIT handshake must be driven separately
+    /// via [`FuseFs::init`] before the FS is usable.
+    pub fn new(name: impl Into<String>, conn: Arc<FuseConnection>) -> Self {
+        FuseFs {
+            name: name.into(),
+            conn,
+        }
+    }
+
+    /// The shared connection, e.g. so a caller can drive the daemon side.
+    pub fn connection(&self) -> Arc<FuseConnection> {
+        Arc::clone(&self.conn)
+    }
+
+    /// Drive the FUSE_INIT handshake: send our version + feature flags and
+    /// accept the daemon's negotiated reply. Must be awaited (concurrently
+    /// with the daemon) before the mount serves traffic.
+    pub async fn init(&self) -> Result<FuseInitOut, FsError> {
+        let body = pod_as_bytes(&FuseInitIn {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 0,
+            flags: 0,
+        });
+        // FUSE_INIT is addressed to nodeid 0.
+        let reply = self.conn.request(FuseOpcode::Init, 0, body).await?;
+        let out: FuseInitOut = pod_from_bytes(&reply).ok_or(FsError::InvalidData)?;
+        self.conn.initialized.store(true, Ordering::Release);
+        Ok(out)
+    }
+}
+
+impl FsInstance for FuseFs {
+    fn root(&self) -> Arc<dyn DirOps> {
+        Arc::new(FuseDir {
+            conn: Arc::clone(&self.conn),
+            nodeid: FUSE_ROOT_ID,
+        }) as Arc<dyn DirOps>
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}

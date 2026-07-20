@@ -72,6 +72,7 @@ pub mod devfs_pty;
 pub mod devfs_rtc;
 pub mod fs_registry;
 pub mod fuse;
+pub mod fuse_conn;
 pub mod memfs;
 pub mod ntty;
 pub mod page_cache;

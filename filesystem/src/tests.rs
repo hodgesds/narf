@@ -2240,3 +2240,408 @@ fn smoke_fs_registry_custom_fstype_mounts() -> TestResult {
     }
 }
 kernel_test_in!("filesystem", smoke_fs_registry_custom_fstype_mounts);
+// ── FUSE subsystem smokes ──────────────────────────────────────────
+//
+// These exercise the full FUSE client path — connection transport,
+// `/dev/fuse` device, `FuseFs` VFS bridge — against a tiny in-kernel
+// emulated daemon (no real userspace program). The daemon and the VFS
+// client run as two cooperative tasks on the test scheduler; the client's
+// reply-futures self-wake so `run_until_empty` interleaves both until the
+// exchange completes.
+
+/// Assert the wire-struct sizes match Linux `include/uapi/linux/fuse.h`
+/// so ABI drift against a real virtiofsd/libfuse daemon is caught.
+fn smoke_fs_fuse_struct_sizes() -> TestResult {
+    use crate::fuse::*;
+    use core::mem::size_of;
+    if size_of::<FuseInHeader>() != 40 {
+        return TestResult::Fail("fuse_in_header != 40");
+    }
+    if size_of::<FuseOutHeader>() != 16 {
+        return TestResult::Fail("fuse_out_header != 16");
+    }
+    if size_of::<FuseAttr>() != 88 {
+        return TestResult::Fail("fuse_attr != 88");
+    }
+    if size_of::<FuseEntryOut>() != 128 {
+        return TestResult::Fail("fuse_entry_out != 128");
+    }
+    if size_of::<FuseAttrOut>() != 104 {
+        return TestResult::Fail("fuse_attr_out != 104");
+    }
+    if size_of::<FuseGetattrIn>() != 16 {
+        return TestResult::Fail("fuse_getattr_in != 16");
+    }
+    if size_of::<FuseOpenIn>() != 8 {
+        return TestResult::Fail("fuse_open_in != 8");
+    }
+    if size_of::<FuseOpenOut>() != 16 {
+        return TestResult::Fail("fuse_open_out != 16");
+    }
+    if size_of::<FuseReadIn>() != 40 {
+        return TestResult::Fail("fuse_read_in != 40");
+    }
+    if size_of::<FuseWriteIn>() != 40 {
+        return TestResult::Fail("fuse_write_in != 40");
+    }
+    if size_of::<FuseWriteOut>() != 8 {
+        return TestResult::Fail("fuse_write_out != 8");
+    }
+    if size_of::<FuseReleaseIn>() != 24 {
+        return TestResult::Fail("fuse_release_in != 24");
+    }
+    if size_of::<FuseForgetIn>() != 8 {
+        return TestResult::Fail("fuse_forget_in != 8");
+    }
+    if size_of::<FuseDirent>() != 24 {
+        return TestResult::Fail("fuse_dirent header != 24");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_struct_sizes);
+
+/// Encode a `fuse_out_header` + `body` reply for `unique`.
+fn fuse_reply(unique: u64, error: i32, body: &[u8]) -> alloc::vec::Vec<u8> {
+    use crate::fuse::*;
+    let total = core::mem::size_of::<FuseOutHeader>() + body.len();
+    let hdr = FuseOutHeader {
+        len: total as u32,
+        error,
+        unique,
+    };
+    let mut msg = pod_as_bytes(&hdr);
+    msg.extend_from_slice(body);
+    msg
+}
+
+/// Service a single FUSE request the emulated daemon dequeued. Models a
+/// filesystem with one regular file "hello" (nodeid 2, contents "world")
+/// directly under the root (nodeid 1). Returns the encoded reply, or
+/// `None` for an opcode it doesn't model (which fails the request).
+fn fuse_daemon_answer(req: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    use crate::fuse::*;
+    let hdr: FuseInHeader = pod_from_bytes(req)?;
+    let unique = hdr.unique;
+    let body = &req[core::mem::size_of::<FuseInHeader>()..hdr.len as usize];
+    let opcode = hdr.opcode;
+
+    // Attributes for the file "hello": regular, 0644, 5 bytes.
+    let file_attr = FuseAttr {
+        ino: 2,
+        size: 5,
+        blocks: 1,
+        mode: S_IFREG | 0o644,
+        nlink: 1,
+        blksize: 512,
+        ..Default::default()
+    };
+    // Attributes for the root dir.
+    let dir_attr = FuseAttr {
+        ino: FUSE_ROOT_ID,
+        size: 0,
+        blocks: 0,
+        mode: S_IFDIR | 0o755,
+        nlink: 2,
+        blksize: 512,
+        ..Default::default()
+    };
+
+    match opcode {
+        // FUSE_INIT (26): echo version + a plausible negotiated reply.
+        26 => {
+            let out = FuseInitOut {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: 0,
+                max_background: 0,
+                congestion_threshold: 0,
+                max_write: 4096,
+                time_gran: 1,
+                _reserved: [0; 9],
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+        }
+        // FUSE_LOOKUP (1): resolve a name under `hdr.nodeid`.
+        1 => {
+            let name_len = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+            let name = core::str::from_utf8(&body[..name_len]).unwrap_or("");
+            if hdr.nodeid == FUSE_ROOT_ID && name == "hello" {
+                let out = FuseEntryOut {
+                    nodeid: 2,
+                    generation: 1,
+                    attr: file_attr,
+                    ..Default::default()
+                };
+                Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+            } else {
+                // -ENOENT
+                Some(fuse_reply(unique, -2, &[]))
+            }
+        }
+        // FUSE_GETATTR (3).
+        3 => {
+            let attr = if hdr.nodeid == 2 { file_attr } else { dir_attr };
+            let out = FuseAttrOut {
+                attr_valid: 0,
+                attr_valid_nsec: 0,
+                dummy: 0,
+                attr,
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+        }
+        // FUSE_OPEN (14) / FUSE_OPENDIR: hand back a fixed file handle.
+        14 => {
+            let out = FuseOpenOut {
+                fh: 0x42,
+                open_flags: 0,
+                padding: 0,
+            };
+            Some(fuse_reply(unique, 0, &pod_as_bytes(&out)))
+        }
+        // FUSE_READ (15): return the file bytes at the requested range.
+        15 => {
+            let rin: FuseReadIn = pod_from_bytes(body)?;
+            let contents = b"world";
+            let off = rin.offset as usize;
+            let end = core::cmp::min(contents.len(), off + rin.size as usize);
+            let slice = if off < contents.len() {
+                &contents[off..end]
+            } else {
+                &[][..]
+            };
+            Some(fuse_reply(unique, 0, slice))
+        }
+        // FUSE_READDIR (28): one entry, "hello".
+        28 => {
+            let mut out = alloc::vec::Vec::new();
+            let de = FuseDirent {
+                ino: 2,
+                off: 1,
+                namelen: 5,
+                type_: 8, // DT_REG
+            };
+            out.extend_from_slice(&pod_as_bytes(&de));
+            out.extend_from_slice(b"hello");
+            while out.len() % FUSE_DIRENT_ALIGN != 0 {
+                out.push(0);
+            }
+            Some(fuse_reply(unique, 0, &out))
+        }
+        // FUSE_RELEASE (18): ack with empty body.
+        18 => Some(fuse_reply(unique, 0, &[])),
+        // FUSE_FORGET (2): has no reply; drop it.
+        2 => None,
+        // Anything else → -ENOSYS.
+        _ => Some(fuse_reply(unique, -38, &[])),
+    }
+}
+
+/// Spawn the emulated FUSE daemon: drain + answer requests until the
+/// client sets `done != 0` or a generous iteration cap is hit (bounding
+/// `run_until_empty`).
+fn spawn_fuse_daemon(
+    conn: alloc::sync::Arc<crate::fuse_conn::FuseConnection>,
+    done: &'static core::sync::atomic::AtomicU8,
+) {
+    use core::sync::atomic::Ordering;
+    narf_scheduler::spawn(async move {
+        for _ in 0..100_000usize {
+            if let Some(req) = conn.dequeue_request() {
+                if let Some(reply) = fuse_daemon_answer(&req) {
+                    let _ = conn.complete_reply(&reply);
+                }
+                continue;
+            }
+            if done.load(Ordering::Relaxed) != 0 {
+                break;
+            }
+            narf_scheduler::yield_now().await;
+        }
+    });
+}
+
+/// End-to-end: mount a `FuseFs` over an emulated daemon, resolve
+/// "hello" through the mount registry, and read it back.
+fn smoke_fs_fuse_end_to_end() -> TestResult {
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::{bootstrap_mount_authority, registry, FsInstance};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    static GOT: AtomicUsize = AtomicUsize::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+    GOT.store(0, Ordering::Relaxed);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-test", Arc::clone(&conn)));
+
+    // Mount the FuseFs so resolution goes through the real registry path.
+    let auth = bootstrap_mount_authority();
+    let fs_dyn: Arc<dyn FsInstance> = Arc::clone(&fs) as Arc<dyn FsInstance>;
+    let _handle = match registry().mount_arc(&auth, "/fuse_e2e", fs_dyn) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("FuseFs mount failed"),
+    };
+
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &OUTCOME);
+
+    // Client task: INIT handshake, then resolve+read "hello".
+    let cfs = Arc::clone(&fs);
+    narf_scheduler::spawn(async move {
+        if cfs.init().await.is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let root = cfs.root();
+        let file = match root.lookup_async("hello").await {
+            Ok(f) => f,
+            Err(_) => {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        let mut buf = [0u8; 16];
+        let n = match file.read(0, &mut buf).await {
+            Ok(n) => n,
+            Err(_) => {
+                OUTCOME.store(4, Ordering::Relaxed);
+                return;
+            }
+        };
+        GOT.store(n, Ordering::Relaxed);
+        if n == 5 && &buf[..5] == b"world" {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(5, Ordering::Relaxed);
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+
+    let _ = unmount_for_test_fuse("/fuse_e2e");
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("FUSE_INIT handshake failed"),
+        3 => TestResult::Fail("FUSE_LOOKUP hello failed"),
+        4 => TestResult::Fail("FUSE_READ hello failed"),
+        5 => TestResult::Fail("read returned wrong bytes"),
+        _ => TestResult::Fail("client task never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_end_to_end);
+
+/// Readdir + getattr through the FUSE bridge.
+fn smoke_fs_fuse_readdir_getattr() -> TestResult {
+    use crate::fuse_conn::{FuseConnection, FuseFs};
+    use crate::{FileType, FsInstance};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static OUTCOME: AtomicU8 = AtomicU8::new(0);
+    OUTCOME.store(0, Ordering::Relaxed);
+
+    let conn = Arc::new(FuseConnection::new());
+    let fs = Arc::new(FuseFs::new("fuse-rd", Arc::clone(&conn)));
+
+    narf_scheduler::__reset_queues_for_test();
+    spawn_fuse_daemon(Arc::clone(&conn), &OUTCOME);
+
+    let cfs = Arc::clone(&fs);
+    narf_scheduler::spawn(async move {
+        if cfs.init().await.is_err() {
+            OUTCOME.store(2, Ordering::Relaxed);
+            return;
+        }
+        let root = cfs.root();
+        // readdir should list exactly ["hello" (File)].
+        let entries = match root.enumerate_async(0, 32).await {
+            Ok(e) => e,
+            Err(_) => {
+                OUTCOME.store(3, Ordering::Relaxed);
+                return;
+            }
+        };
+        if entries.len() != 1 || entries[0].0 != "hello" || entries[0].1 != FileType::File {
+            OUTCOME.store(4, Ordering::Relaxed);
+            return;
+        }
+        // getattr on the file via stat_async → size 5.
+        let file = match root.lookup_async("hello").await {
+            Ok(f) => f,
+            Err(_) => {
+                OUTCOME.store(5, Ordering::Relaxed);
+                return;
+            }
+        };
+        let st = match file.stat_async().await {
+            Ok(s) => s,
+            Err(_) => {
+                OUTCOME.store(6, Ordering::Relaxed);
+                return;
+            }
+        };
+        if st.size == 5 && st.mode.file_type == FileType::File {
+            OUTCOME.store(1, Ordering::Relaxed);
+        } else {
+            OUTCOME.store(7, Ordering::Relaxed);
+        }
+    });
+
+    narf_scheduler::run_until_empty();
+
+    match OUTCOME.load(Ordering::Relaxed) {
+        1 => TestResult::Pass,
+        2 => TestResult::Fail("FUSE_INIT failed"),
+        3 => TestResult::Fail("readdir failed"),
+        4 => TestResult::Fail("readdir wrong entries"),
+        5 => TestResult::Fail("lookup failed"),
+        6 => TestResult::Fail("getattr failed"),
+        7 => TestResult::Fail("getattr wrong attrs"),
+        _ => TestResult::Fail("client never completed"),
+    }
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_readdir_getattr);
+
+/// `/dev/fuse` device wiring: opening the node yields a DevFuse whose
+/// connection is recoverable (the mount path's `fd=N` → connection step).
+fn smoke_fs_fuse_dev_node() -> TestResult {
+    use crate::fuse_conn::DevFuse;
+    use crate::{FileOps, FsInstance};
+    use alloc::sync::Arc;
+
+    // The devfs root must expose "fuse".
+    let devfs = crate::devfs::DevFs::new();
+    let root = devfs.root();
+    let node: Arc<dyn FileOps> = match root.lookup("fuse") {
+        Some(n) => n,
+        None => return TestResult::Fail("/dev/fuse not found in devfs"),
+    };
+    // The node must be recoverable as a DevFuse connection.
+    let conn = match DevFuse::connection_of(&node) {
+        Some(c) => c,
+        None => return TestResult::Fail("/dev/fuse node is not a DevFuse"),
+    };
+    if !conn.is_connected() {
+        return TestResult::Fail("fresh connection reports disconnected");
+    }
+    // Each open() mints a *distinct* connection (Linux clones per-open).
+    let node2 = root.lookup("fuse").unwrap();
+    let conn2 = DevFuse::connection_of(&node2).unwrap();
+    if Arc::ptr_eq(&conn, &conn2) {
+        return TestResult::Fail("two opens shared one connection");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_fs_fuse_dev_node);
+
+/// Test-only unmount helper for the FUSE e2e mounts.
+fn unmount_for_test_fuse(path: &str) -> Result<(), crate::FsError> {
+    use narf_capabilities::Cap;
+    let handle: Cap<crate::MountPoint, narf_capabilities::Write> =
+        Cap::<crate::MountPoint, narf_capabilities::Write>::bootstrap();
+    crate::registry().unmount(&handle, path)
+}

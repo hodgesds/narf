@@ -941,6 +941,9 @@ impl DirOps for DevDir {
             "uinput" => {
                 Some(Arc::new(crate::devfs_input::UinputControlFile::new()) as Arc<dyn FileOps>)
             }
+            // FUSE control device: each open mints a fresh connection.
+            // Linux ref: `fs/fuse/dev.c` — /dev/fuse (misc char, minor 229).
+            "fuse" => Some(crate::fuse_conn::DevFuse::open_new()),
             "fp0" => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
             "tpm0" => Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>),
             "tpmrm0" => Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>),
@@ -1073,6 +1076,10 @@ impl DirOps for DevDir {
                 file_type: FileType::Special,
             },
             DirEntry {
+                name: "fuse",
+                file_type: FileType::Special,
+            },
+            DirEntry {
                 name: "fp0",
                 file_type: FileType::Special,
             },
@@ -1137,6 +1144,7 @@ impl DirOps for DevDir {
             ("ptmx", FileType::Special),
             ("fb0", FileType::Special),
             ("uinput", FileType::Special),
+            ("fuse", FileType::Special),
             ("fp0", FileType::Special),
             ("tpm0", FileType::Special),
             ("tpmrm0", FileType::Special),
