@@ -755,6 +755,59 @@ fn smoke_cgroup_memory() -> TestResult {
 #[cfg(feature = "cgroup-memory")]
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_memory);
 
+// Regression: every `memory.*` limit file systemd 257 reads back during
+// `cgroup_context_dump` must return its string content with NO read error.
+// `read_attr` returns `None` if any `FileOps::read` yields an `Err` — the
+// exact path `sys_read` drives — so a non-`None`, correctly-valued result
+// proves the cgroupfs read surface is clean. (The "Owner died"/EOWNERDEAD
+// lines seen from real systemd come from systemd's own internal
+// `-EOWNERDEAD` sentinel when a unit has no cgroup_path under `--test`; NO
+// NARF syscall on these files is involved. This test pins the NARF side so
+// a genuine leak here would be caught.) `memory.zswap.max`/`.current` are
+// included so systemd reads them back rather than hitting ENOENT.
+#[cfg(feature = "cgroup-memory")]
+fn smoke_cgroup_memory_limit_files_read_clean() -> TestResult {
+    crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::memory::MemoryController));
+    with_root_controller("memory", "t_mem_read", |cg| {
+        // Unset limits read back as "max\n"; the two "current" counters as
+        // "0\n"; min/low as "0\n". None of these reads may error.
+        let cases: &[(&str, &str)] = &[
+            ("memory.max", "max"),
+            ("memory.high", "max"),
+            ("memory.swap.max", "max"),
+            ("memory.zswap.max", "max"),
+            ("memory.zswap.current", "0"),
+            ("memory.min", "0"),
+            ("memory.low", "0"),
+        ];
+        for (file, want) in cases {
+            match read_attr(cg, file) {
+                Some(body) if body.trim() == *want => {}
+                Some(body) => {
+                    let _ = body;
+                    return TestResult::Fail("memory limit file read wrong content");
+                }
+                None => return TestResult::Fail("memory limit file read errored"),
+            }
+        }
+        // The writable limit knobs round-trip a real value (systemd both
+        // reads and, when applying, writes these).
+        if write_attr(cg, "memory.zswap.max", b"8192").is_err() {
+            return TestResult::Fail("set memory.zswap.max failed");
+        }
+        match read_attr(cg, "memory.zswap.max") {
+            Some(body) if body.trim() == "8192" => TestResult::Pass,
+            Some(_) => TestResult::Fail("memory.zswap.max round-trip wrong"),
+            None => TestResult::Fail("memory.zswap.max re-read errored"),
+        }
+    })
+}
+#[cfg(feature = "cgroup-memory")]
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_cgroup_memory_limit_files_read_clean
+);
+
 #[cfg(feature = "cgroup-io")]
 fn smoke_cgroup_io() -> TestResult {
     crate::cgroupfs::register_controller(Arc::new(crate::cgroupfs::io::IoController));

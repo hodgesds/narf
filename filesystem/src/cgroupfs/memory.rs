@@ -34,9 +34,12 @@
 //!   kernel at the frame allocator, so the total lands in `anon` and
 //!   the categories we can't back are reported as `0` rather than
 //!   invented.
-//! * **swap — accounting-only zero.** No swap accounting seam exists in
-//!   the allocator; `memory.swap.current` stays `0` and `memory.swap.max`
-//!   stores its limit without effect.
+//! * **swap / zswap — accounting-only zero.** No swap/zswap accounting
+//!   seam exists in the allocator; `memory.swap.current` /
+//!   `memory.zswap.current` stay `0` and `memory.swap.max` /
+//!   `memory.zswap.max` store their limits without effect. (`zswap.*` is
+//!   present so systemd can read the knobs back rather than seeing
+//!   ENOENT.)
 //!
 //! Linux ref: `mm/memcontrol.c`,
 //! `Documentation/admin-guide/cgroup-v2.rst` §"Memory".
@@ -67,6 +70,8 @@ const FILES: &[&str] = &[
     "memory.reclaim",
     "memory.swap.current",
     "memory.swap.max",
+    "memory.zswap.current",
+    "memory.zswap.max",
 ];
 
 /// Guards the one-time install of the allocator charge hook. Set the
@@ -164,11 +169,13 @@ impl Controller for MemoryController {
             current: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             swap_current: AtomicU64::new(0),
+            zswap_current: AtomicU64::new(0),
             min: IrqSafeSpinLock::new(0),
             low: IrqSafeSpinLock::new(0),
             high: IrqSafeSpinLock::new(None),
             max: IrqSafeSpinLock::new(None),
             swap_max: IrqSafeSpinLock::new(None),
+            zswap_max: IrqSafeSpinLock::new(None),
             events_low: AtomicU64::new(0),
             events_high: AtomicU64::new(0),
             events_max: AtomicU64::new(0),
@@ -186,12 +193,19 @@ pub struct MemoryState {
     /// `memory.peak` — high-water mark of `current`.
     peak: AtomicU64,
     swap_current: AtomicU64,
+    /// `memory.zswap.current` — accounting-only (no zswap seam in the
+    /// allocator), so this stays 0 like `swap_current`.
+    zswap_current: AtomicU64,
     min: IrqSafeSpinLock<u64>,
     low: IrqSafeSpinLock<u64>,
     /// `None` = "max".
     high: IrqSafeSpinLock<Option<u64>>,
     max: IrqSafeSpinLock<Option<u64>>,
     swap_max: IrqSafeSpinLock<Option<u64>>,
+    /// `memory.zswap.max` — stored limit, accounting-only (no effect),
+    /// mirroring `swap_max`. Present so systemd can read it back rather
+    /// than seeing ENOENT and logging a spurious debug error.
+    zswap_max: IrqSafeSpinLock<Option<u64>>,
     /// `memory.events` counters (this cgroup's own — i.e. `.local`).
     events_low: AtomicU64,
     events_high: AtomicU64,
@@ -332,6 +346,8 @@ impl ControllerState for MemoryState {
             // memory.reclaim is write-only on Linux (0200); render
             // empty for a read that slips through.
             "memory.reclaim" => String::new(),
+            "memory.zswap.current" => format!("{}\n", self.zswap_current.load(Ordering::Acquire)),
+            "memory.zswap.max" => max_line(&self.zswap_max.lock()),
             // We charge each level directly, so this cgroup's own
             // counters ARE its local counters: events == events.local.
             "memory.events" | "memory.events.local" => self.events_block(),
@@ -396,6 +412,10 @@ impl ControllerState for MemoryState {
                 }
                 Ok(())
             }
+            "memory.zswap.max" => {
+                *self.zswap_max.lock() = parse_limit(buf)?;
+                Ok(())
+            }
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -410,6 +430,7 @@ impl ControllerState for MemoryState {
                 | "memory.swap.max"
                 | "memory.oom.group"
                 | "memory.reclaim"
+                | "memory.zswap.max"
         )
     }
 
