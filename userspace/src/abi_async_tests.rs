@@ -659,6 +659,247 @@ fn smoke_abi_async_inotify_rm_watch_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_async_inotify_rm_watch_neg);
 
 // ════════════════════════════════════════════════════════════════════
+// inotify event delivery — a filesystem mutation on a watched directory
+// (or file) queues a `struct inotify_event` that read(2) returns and
+// poll(2) reports readable. These drive the real syscall handlers, so
+// the notify hooks in the mutation paths fire exactly as they do for a
+// userspace program (systemd/udev watching /run, /etc, cgroup dirs).
+// ════════════════════════════════════════════════════════════════════
+
+// inotify mask + open flag constants used by the delivery tests.
+const IN_MODIFY: u64 = 0x0000_0002;
+const IN_MOVED_FROM: u64 = 0x0000_0040;
+const IN_MOVED_TO: u64 = 0x0000_0080;
+const IN_CREATE: u64 = 0x0000_0100;
+const IN_DELETE: u64 = 0x0000_0200;
+const O_CREAT: u64 = 0o100;
+const O_WRONLY: u64 = 0o1;
+
+/// One decoded `struct inotify_event` header (16 bytes) plus its name.
+struct Event {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    name: alloc::string::String,
+}
+
+/// Decode the queued records in `buf[..n]` into events. Mirrors the
+/// serialization in `mqueue::serialize_event`: 16-byte header
+/// (wd,mask,cookie,len) followed by `len` NUL-padded name bytes.
+fn decode_events(buf: &[u8], n: usize) -> alloc::vec::Vec<Event> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let wd = i32::from_ne_bytes(buf[i..i + 4].try_into().unwrap());
+        let mask = u32::from_ne_bytes(buf[i + 4..i + 8].try_into().unwrap());
+        let cookie = u32::from_ne_bytes(buf[i + 8..i + 12].try_into().unwrap());
+        let len = u32::from_ne_bytes(buf[i + 12..i + 16].try_into().unwrap()) as usize;
+        i += 16;
+        if i + len > n {
+            break;
+        }
+        let name_bytes = &buf[i..i + len];
+        let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(len);
+        let name = alloc::string::String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+        out.push(Event {
+            wd,
+            mask,
+            cookie,
+            name,
+        });
+        i += len;
+    }
+    out
+}
+
+/// Init an inotify instance and add a watch on `path` for `mask`; returns
+/// (inotify_fd, wd).
+fn watch(path: &[u8], mask: u64) -> Result<(u64, i32), &'static str> {
+    let ifd = match call(Syscall::InotifyInit1.raw(), a0(0)) {
+        Some(fd) if fd >= 0 => fd as u64,
+        _ => return Err("inotify_init1 failed"),
+    };
+    match call(
+        Syscall::InotifyAddWatch.raw(),
+        a2(ifd, path.as_ptr() as u64, mask),
+    ) {
+        Some(wd) if wd >= 1 => Ok((ifd, wd as i32)),
+        _ => Err("inotify_add_watch failed"),
+    }
+}
+
+/// Drain the inotify fd once into a fresh buffer and decode the records.
+fn read_events(ifd: u64) -> alloc::vec::Vec<Event> {
+    let mut buf = [0u8; 512];
+    let n = match call(
+        Syscall::Read.raw(),
+        a2(ifd, buf.as_mut_ptr() as u64, buf.len() as u64),
+    ) {
+        Some(n) if n > 0 => n as usize,
+        _ => 0,
+    };
+    decode_events(&buf, n)
+}
+
+// (a) create a file in a watched dir → IN_CREATE with the child's name.
+fn smoke_abi_async_inotify_fire_create() -> TestResult {
+    with_memfs("/ino", "ino", &[], || {
+        let (ifd, wd) = watch(b"/ino\0", IN_CREATE)?;
+        // open(O_CREAT) a new child → the notify_create hook fires.
+        let path = b"/ino/newf\0";
+        if call(
+            Syscall::OpenFile.raw(),
+            a1(path.as_ptr() as u64, O_CREAT | O_WRONLY),
+        )
+        .is_none()
+        {
+            return Err("create open failed");
+        }
+        let evs = read_events(ifd);
+        match evs.first() {
+            Some(e) if e.wd == wd && e.mask & IN_CREATE as u32 != 0 && e.name == "newf" => Ok(()),
+            _ => Err("expected IN_CREATE with name=newf"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_create);
+
+// (b) modify a watched file → IN_MODIFY on the watched file (no name).
+fn smoke_abi_async_inotify_fire_modify() -> TestResult {
+    with_memfs("/ino", "ino", &[("f", b"....")], || {
+        let (ifd, wd) = watch(b"/ino/f\0", IN_MODIFY)?;
+        // Open the file for writing and write → notify_modify_fd fires.
+        let path = b"/ino/f\0";
+        let fd = match call(Syscall::OpenFile.raw(), a1(path.as_ptr() as u64, O_WRONLY)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open for write failed"),
+        };
+        let data = *b"XY";
+        if call(Syscall::Write.raw(), a2(fd, data.as_ptr() as u64, 2)) != Some(2) {
+            return Err("write failed");
+        }
+        let evs = read_events(ifd);
+        match evs.iter().find(|e| e.mask & IN_MODIFY as u32 != 0) {
+            Some(e) if e.wd == wd && e.name.is_empty() => Ok(()),
+            _ => Err("expected IN_MODIFY on the watched file"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_modify);
+
+// (c) delete a file in a watched dir → IN_DELETE with the child's name.
+fn smoke_abi_async_inotify_fire_delete() -> TestResult {
+    with_memfs("/ino", "ino", &[("gone", b"x")], || {
+        let (ifd, wd) = watch(b"/ino\0", IN_DELETE)?;
+        let path = b"/ino/gone\0";
+        if call(Syscall::Unlink.raw(), a0(path.as_ptr() as u64)).unwrap_or(-1) < 0 {
+            return Err("unlink failed");
+        }
+        let evs = read_events(ifd);
+        match evs.iter().find(|e| e.mask & IN_DELETE as u32 != 0) {
+            Some(e) if e.wd == wd && e.name == "gone" => Ok(()),
+            _ => Err("expected IN_DELETE with name=gone"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_delete);
+
+// (d) rename within a watched dir → paired IN_MOVED_FROM / IN_MOVED_TO
+// carrying the SAME cookie and the old/new leaf names.
+fn smoke_abi_async_inotify_fire_rename() -> TestResult {
+    with_memfs("/ino", "ino", &[("old", b"x")], || {
+        let (ifd, wd) = watch(b"/ino\0", IN_MOVED_FROM | IN_MOVED_TO)?;
+        let old = b"/ino/old\0";
+        let new = b"/ino/new\0";
+        if call(
+            Syscall::Rename.raw(),
+            a1(old.as_ptr() as u64, new.as_ptr() as u64),
+        )
+        .unwrap_or(-1)
+            < 0
+        {
+            return Err("rename failed");
+        }
+        let evs = read_events(ifd);
+        let from = evs.iter().find(|e| e.mask & IN_MOVED_FROM as u32 != 0);
+        let to = evs.iter().find(|e| e.mask & IN_MOVED_TO as u32 != 0);
+        match (from, to) {
+            (Some(f), Some(t))
+                if f.wd == wd
+                    && t.wd == wd
+                    && f.name == "old"
+                    && t.name == "new"
+                    && f.cookie != 0
+                    && f.cookie == t.cookie =>
+            {
+                Ok(())
+            }
+            _ => Err("expected paired IN_MOVED_FROM/IN_MOVED_TO with a shared cookie"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_rename);
+
+// (e) poll(2) on the inotify fd is NOT readable while the queue is empty
+// and BECOMES readable after a watched mutation queues an event.
+fn smoke_abi_async_inotify_poll_readiness() -> TestResult {
+    with_memfs("/ino", "ino", &[], || {
+        let (ifd, _wd) = watch(b"/ino\0", IN_CREATE)?;
+        // pollfd { fd: ifd, events: POLLIN(0x1), revents: 0 } — 8 bytes.
+        let mut pfd = [0u8; 8];
+        pfd[0..4].copy_from_slice(&(ifd as i32).to_ne_bytes());
+        pfd[4..6].copy_from_slice(&0x1u16.to_ne_bytes());
+        // Empty queue → poll(timeout=0) reports 0 ready.
+        if call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("empty inotify fd should not be readable");
+        }
+        // Queue an event, then poll must report 1 ready with POLLIN set.
+        let path = b"/ino/x\0";
+        if call(
+            Syscall::OpenFile.raw(),
+            a1(path.as_ptr() as u64, O_CREAT | O_WRONLY),
+        )
+        .is_none()
+        {
+            return Err("create open failed");
+        }
+        pfd[6..8].copy_from_slice(&0u16.to_ne_bytes()); // clear revents
+        match call(Syscall::Poll.raw(), a2(pfd.as_mut_ptr() as u64, 1, 0)) {
+            Some(1) if u16::from_ne_bytes(pfd[6..8].try_into().unwrap()) & 0x1 != 0 => Ok(()),
+            _ => Err("queued inotify fd should be POLLIN-readable"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_inotify_poll_readiness);
+
+// (f) IN_ATTRIB — a chmod on a watched file queues an attribute event.
+fn smoke_abi_async_inotify_fire_attrib() -> TestResult {
+    with_memfs("/ino", "ino", &[("f", b"x")], || {
+        const IN_ATTRIB: u64 = 0x0000_0004;
+        const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+        let (ifd, wd) = watch(b"/ino/f\0", IN_ATTRIB)?;
+        let path = b"/ino/f\0";
+        // fchmodat(AT_FDCWD, path, 0o600, 0) routes to sys_fchmodat, whose
+        // success branch fires notify_attrib on the file.
+        if call(
+            Syscall::Fchmodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o600, 0),
+        )
+        .unwrap_or(-1)
+            < 0
+        {
+            return Err("fchmodat failed");
+        }
+        let evs = read_events(ifd);
+        match evs.iter().find(|e| e.mask & IN_ATTRIB as u32 != 0) {
+            Some(e) if e.wd == wd => Ok(()),
+            _ => Err("expected IN_ATTRIB on the watched file"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_async_inotify_fire_attrib);
+
+// ════════════════════════════════════════════════════════════════════
 // fanotify_init(2) — sys_fanotify_init(flags, event_f_flags)
 //
 // Creates a group + installs an fd. No reachable error path in the

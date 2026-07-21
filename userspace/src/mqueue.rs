@@ -8,9 +8,10 @@
 //! Message queues are named priority FIFOs held in a global side table
 //! keyed by an opaque queue id; `mq_open` maps a name to an id and
 //! installs a `MqFile` carrying the id. inotify instances each own a
-//! watch-descriptor table; events are not generated yet (NARF's
-//! in-memory FSes have no change-notification source), so a watch is a
-//! structural add/remove that round-trips faithfully.
+//! watch-descriptor table plus a queue of serialized `struct
+//! inotify_event` records; the syscall handlers call the `notify_*`
+//! entry points here after a successful filesystem mutation, which fan
+//! the matching events out to every watching instance for read(2)/poll.
 //!
 //! Gated under `#[cfg(feature = "linux-compat")]` via the `pub mod`
 //! line in `lib.rs`.
@@ -423,6 +424,7 @@ pub fn sys_mq_getsetattr(ctx: &mut dyn TrapContext) {
 
 // inotify event mask bits (subset; see <sys/inotify.h>).
 pub(crate) const IN_MODIFY: u32 = 0x0000_0002;
+pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 pub(crate) const IN_OPEN: u32 = 0x0000_0020;
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
@@ -581,6 +583,27 @@ pub(crate) fn notify_delete(abs_path: &str, is_dir: bool) {
 /// IN_OPEN on `abs_path`.
 pub(crate) fn notify_open(abs_path: &str) {
     fs_notify(abs_path, IN_OPEN, false);
+}
+
+/// IN_ATTRIB on `abs_path` — metadata changed (chmod/chown/utimes). Used
+/// for a path we can name directly (not via an fd).
+pub(crate) fn notify_attrib(abs_path: &str, is_dir: bool) {
+    fs_notify(abs_path, IN_ATTRIB, is_dir);
+}
+
+/// IN_ATTRIB for the file behind `fd` (fchmod/fchown/futimens), looked up
+/// via the fd → path table.
+pub(crate) fn notify_attrib_fd(task: u64, fd: u32) {
+    let path = with_fd_paths(|m| m.get(&(task, fd)).cloned());
+    if let Some(p) = path {
+        fs_notify(&p, IN_ATTRIB, false);
+    }
+}
+
+/// IN_MODIFY on `abs_path` — content changed via a path-keyed call
+/// (truncate(2)) with no fd to consult.
+pub(crate) fn notify_modify_path(abs_path: &str) {
+    fs_notify(abs_path, IN_MODIFY, false);
 }
 
 /// IN_MODIFY for the file behind `fd`, looked up via the fd → path table.

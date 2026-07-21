@@ -2707,7 +2707,12 @@ fn sys_ftruncate(ctx: &mut dyn TrapContext) {
         Some(poll_blocking(entry.ops.truncate(len)))
     });
     match outcome {
-        Some(Some(Some(Ok(())))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Some(Ok(())))) => {
+            // inotify: truncate changes file content → IN_MODIFY.
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_modify_fd(task, fd);
+            ctx.set_return(SyscallReturn::ok(0))
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -2997,7 +3002,12 @@ fn sys_truncate(ctx: &mut dyn TrapContext) {
         .flatten();
     match ops {
         Some(o) => match poll_blocking(o.truncate(new_size)) {
-            Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
+            Some(Ok(())) => {
+                // inotify: truncate changes file content → IN_MODIFY.
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::notify_modify_path(&path);
+                ctx.set_return(SyscallReturn::ok(0))
+            }
             _ => ctx.set_return(fail),
         },
         None => ctx.set_return(fail),
@@ -4153,10 +4163,16 @@ fn sys_fchmodat(ctx: &mut dyn TrapContext) {
     let path = resolve_cwd_path(current_task_id(), &raw);
     if let Some(dir) = resolve_dir_absolute(&path) {
         dir.set_dir_mode((args.arg2 as u32 & 0o7777) as u16);
+        // inotify: a mode change is IN_ATTRIB on the affected directory.
+        #[cfg(feature = "linux-compat")]
+        crate::mqueue::notify_attrib(&path, true);
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
     if stat_path_dir_aware(&path).is_some() {
+        // inotify: IN_ATTRIB for a chmod on an existing file.
+        #[cfg(feature = "linux-compat")]
+        crate::mqueue::notify_attrib(&path, false);
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(fail);
@@ -4175,6 +4191,9 @@ fn sys_fchmod_or_fchown(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let known = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
     if known {
+        // inotify: fchmod/fchown is IN_ATTRIB on the fd's file, if watched.
+        #[cfg(feature = "linux-compat")]
+        crate::mqueue::notify_attrib_fd(task, fd);
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         // fd isn't open → -EBADF (was the -1 sentinel musl maps to EPERM).
@@ -4973,7 +4992,12 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
             poll_blocking(parent.symlink(leaf, &target_str))
         });
     match outcome {
-        Some(Some(Ok(_))) => ctx.set_return(SyscallReturn::ok(0)),
+        Some(Some(Ok(_))) => {
+            // inotify: a new symlink is IN_CREATE on the link path.
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_create(&link_path, false);
+            ctx.set_return(SyscallReturn::ok(0))
+        }
         _ => ctx.set_return(fail),
     }
 }
@@ -6966,7 +6990,11 @@ fn sys_utimensat(ctx: &mut dyn TrapContext) {
         let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
         match ops {
             Some(o) => {
-                let _ = o.set_times(at, mt); // Unsupported → lenient 0
+                // set_times is lenient — unsupported FileOps → 0.
+                let _ = o.set_times(at, mt);
+                // inotify: a timestamp change is IN_ATTRIB on the fd's file.
+                #[cfg(feature = "linux-compat")]
+                crate::mqueue::notify_attrib_fd(task, fd);
                 ctx.set_return(SyscallReturn::ok(0));
             }
             None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // -EBADF
@@ -6997,6 +7025,12 @@ fn sys_utimensat(ctx: &mut dyn TrapContext) {
     };
     let path = resolve_cwd_path(task, &eff);
     let r = set_path_times(&path, at, mt);
+    // inotify: a successful timestamp change is IN_ATTRIB on the path.
+    #[cfg(feature = "linux-compat")]
+    if r == 0 {
+        let is_dir = resolve_dir_absolute(&path).is_some();
+        crate::mqueue::notify_attrib(&path, is_dir);
+    }
     ctx.set_return(SyscallReturn::ok(r as u64));
 }
 
