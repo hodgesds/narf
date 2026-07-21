@@ -406,6 +406,39 @@ fn smoke_abi_fsx2_name_to_handle_at_overflow_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_name_to_handle_at_overflow_neg);
 
+// ── name_to_handle_at: 8-byte inode handle when capacity is exactly 8 ──
+//
+// A caller advertising an exactly-8-byte f_handle (e.g. systemd's
+// cg_path_get_cgroupid) gets the object's inode in a single u64, as Linux
+// returns, rather than the path-carrying handle form.
+
+fn smoke_abi_fsx2_name_to_handle_at_inode_form() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        let path = b"/abi/f\0";
+        let mut hbuf = [0u8; 64];
+        let cap: u32 = 8;
+        hbuf[0..4].copy_from_slice(&cap.to_ne_bytes());
+        let args = a3(0, path.as_ptr() as u64, hbuf.as_mut_ptr() as u64, 0);
+        match call(Syscall::NameToHandleAt.raw(), args) {
+            Some(0) => {
+                // handle_bytes must read back as exactly 8, and the 8-byte
+                // f_handle (the inode) must be nonzero.
+                let hb = u32::from_ne_bytes(hbuf[0..4].try_into().unwrap());
+                let ino = u64::from_ne_bytes(hbuf[8..16].try_into().unwrap());
+                if hb != 8 {
+                    Err("cap==8 handle_bytes not 8")
+                } else if ino == 0 {
+                    Err("cap==8 inode handle is zero")
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err("name_to_handle_at cap==8 did not succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_name_to_handle_at_inode_form);
+
 // ── name_to_handle_at: EFAULT on an unreadable handle buffer ──────────
 //
 // Existing path, but arg2 (the handle buffer whose first u32 is read) is

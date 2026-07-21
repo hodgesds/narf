@@ -108,7 +108,21 @@ impl CgroupType {
 
 /// One node in the cgroup-v2 hierarchy. The root has an empty `name`
 /// and no parent; children are created by userspace `mkdir`.
+/// Monotonic inode allocator for cgroups. Each cgroup gets a unique,
+/// stable id, surfaced as its `st_ino` and as the cgroup id an init reads
+/// via `name_to_handle_at`. The base is high (and distinct from MemFs's)
+/// so it never aliases another filesystem's inodes under NARF's single
+/// `st_dev` space.
+static NEXT_CGROUP_INO: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x2000_0000);
+
+fn alloc_cgroup_ino() -> u64 {
+    NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Cgroup {
+    /// Unique, stable inode / cgroup id (see [`NEXT_CGROUP_INO`]).
+    ino: u64,
     /// Directory name (`""` for the root).
     name: String,
     /// Parent cgroup; `None` only for the root. Strong `Arc` — the tree
@@ -166,6 +180,7 @@ impl core::fmt::Debug for Cgroup {
 impl Cgroup {
     fn new_root() -> Arc<Self> {
         Arc::new(Cgroup {
+            ino: alloc_cgroup_ino(),
             name: String::new(),
             parent: None,
             depth: 0,
@@ -201,6 +216,7 @@ impl Cgroup {
             }
         }
         Arc::new(Cgroup {
+            ino: alloc_cgroup_ino(),
             name,
             parent: Some(parent),
             depth,
@@ -1167,6 +1183,10 @@ fn valid_cgroup_name(name: &str) -> bool {
 }
 
 impl DirOps for CgroupDir {
+    fn ino(&self) -> u64 {
+        self.cg.ino
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         if let Some(f) = CoreFile::from_name(name) {
             if core_files_for(&self.cg).contains(&f) {

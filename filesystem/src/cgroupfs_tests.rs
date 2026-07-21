@@ -123,6 +123,38 @@ fn smoke_cgroup_mkdir_creates_child() -> TestResult {
 }
 kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_mkdir_creates_child);
 
+/// Each cgroup carries a unique, stable, nonzero inode (surfaced as its
+/// `DirOps::ino()` and the cgroup id an init reads via `name_to_handle_at`).
+/// Distinct cgroups must never share an id.
+fn smoke_cgroup_inodes_distinct() -> TestResult {
+    let root = root_dir();
+    let a = match poll_once(root.mkdir("t_ino_a")) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir a failed"),
+    };
+    let b = match poll_once(root.mkdir("t_ino_b")) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir b failed"),
+    };
+    // A nested child too, to exercise deeper allocation.
+    let a2 = match poll_once(a.mkdir("t_ino_a2")) {
+        Some(Ok(c)) => c,
+        _ => return TestResult::Fail("mkdir a/a2 failed"),
+    };
+    let (ir, ia, ib, ia2) = (root.ino(), a.ino(), b.ino(), a2.ino());
+    let _ = (poll_once(a.rmdir("t_ino_a2")),);
+    let _ = poll_once(root.rmdir("t_ino_a"));
+    let _ = poll_once(root.rmdir("t_ino_b"));
+    if ir == 0 || ia == 0 || ib == 0 || ia2 == 0 {
+        return TestResult::Fail("a cgroup reported inode 0");
+    }
+    if ia == ib || ia == ir || ia == ia2 || ib == ia2 || ib == ir {
+        return TestResult::Fail("cgroup inodes collided");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/cgroupfs", smoke_cgroup_inodes_distinct);
+
 // ── 2. Control-file set differs root vs child ───────────────────────
 
 fn smoke_cgroup_control_files() -> TestResult {

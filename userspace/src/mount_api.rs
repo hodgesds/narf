@@ -36,6 +36,7 @@ const EBADF: i64 = 9;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const ENODEV: i64 = 19;
+const EOPNOTSUPP: i64 = 95;
 
 fn err(e: i64) -> SyscallReturn {
     SyscallReturn::ok((-e) as u64)
@@ -45,6 +46,7 @@ fn ok(v: u64) -> SyscallReturn {
 }
 
 // fsconfig(2) commands.
+const FSCONFIG_SET_FLAG: u64 = 0;
 const FSCONFIG_SET_STRING: u64 = 1;
 const FSCONFIG_CMD_CREATE: u64 = 6;
 // fsopen / fsmount / open_tree CLOEXEC bits.
@@ -194,15 +196,21 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                 None => ctx.set_return(err(EBADF)),
             }
         }
-        // Configuration options are accepted; NARF's in-memory FSes have
-        // none that change behaviour (source/size/mode are no-ops). We
-        // still validate that the strings are readable.
+        // Flag/string options are accepted; NARF's in-memory FSes have none
+        // that change behaviour (source/size/mode/nsdelegate are no-ops). The
+        // string form still validates that the buffers are readable.
+        FSCONFIG_SET_FLAG => ctx.set_return(ok(0)),
         FSCONFIG_SET_STRING => {
             let _key = copy_user_cstr(a.arg2, 256);
             let _val = copy_user_cstr(a.arg3, 4096);
             ctx.set_return(ok(0));
         }
-        _ => ctx.set_return(ok(0)),
+        // Parameter forms NARF's pseudo-filesystems don't consume — binary
+        // blobs, path/path-empty references, and fd parameters. Report
+        // EOPNOTSUPP so a caller's capability probe (which sets one of these
+        // expecting a rejection) reads the honest answer instead of a false
+        // "supported". CMD_RECONFIGURE / CMD_CREATE_EXCL land here too.
+        _ => ctx.set_return(err(EOPNOTSUPP)),
     }
 }
 

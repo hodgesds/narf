@@ -1746,16 +1746,77 @@ fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     const ENOENT: i64 = 2;
     const EFAULT: i64 = 14;
     const EOVERFLOW: i64 = 75;
+    const AT_EMPTY_PATH: u64 = 0x1000;
     let a = *ctx.args();
-    // dirfd (arg0) is honoured only as AT_FDCWD — NARF resolves absolute
-    // paths; relative paths resolve under the task's cwd/chroot.
-    let path = match copy_user_cstr(a.arg1, 4096) {
-        Some(p) if !p.is_empty() => apply_chroot(&p),
-        _ => {
+    let raw = copy_user_cstr(a.arg1, 4096).unwrap_or_default();
+    // AT_EMPTY_PATH form: name_to_handle_at(fd, "", &handle, &mnt_id,
+    // AT_EMPTY_PATH) requests a handle for the fd itself. Callers such as
+    // systemd's cg_fd_get_cgroupid read this to obtain a cgroup's id — an
+    // 8-byte f_handle whose value is a stable per-object identifier. Return
+    // an exactly-8-byte handle: the fd's inode if the backing FS exposes one,
+    // else a stable hash of the fd's path.
+    if raw.is_empty() {
+        if a.arg4 & AT_EMPTY_PATH == 0 {
             ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
             return;
         }
-    };
+        let task = current_task_id();
+        let dirfd = a.arg0 as u32;
+        let id: Option<u64> = fd::with_table(task, |t| t.get(dirfd).map(|e| e.ops.ino()))
+            .flatten()
+            .filter(|&i| i != 0)
+            .or_else(|| {
+                fd_path_of(task, dirfd).map(|p| {
+                    // FNV-1a over the fd's backing path — stable per object.
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for b in p.as_bytes() {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    h
+                })
+            });
+        let id = match id {
+            Some(i) => i,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
+                return;
+            }
+        };
+        // handle->handle_bytes capacity check (first u32 of the caller's buf).
+        let mut cap = [0u8; 4];
+        // SAFETY: copy_from_user validates the 4-byte read.
+        if unsafe { copy_from_user(&mut cap, a.arg2) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        }
+        if (u32::from_ne_bytes(cap) as usize) < 8 {
+            // SAFETY: copy_to_user validates the 4-byte destination.
+            let _ = unsafe { copy_to_user(a.arg2, &8u32.to_ne_bytes()) };
+            ctx.set_return(SyscallReturn::ok((-EOVERFLOW) as u64));
+            return;
+        }
+        let mut hdr = [0u8; 8];
+        hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
+        // SAFETY: copy_to_user validates the 8-byte header destination.
+        let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
+        // SAFETY: copy_to_user validates the 8-byte id destination.
+        let h2 = unsafe { copy_to_user(a.arg2 + 8, &id.to_ne_bytes()) };
+        if h1.is_err() || h2.is_err() {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        }
+        if a.arg3 != 0 {
+            // SAFETY: copy_to_user validates the 4-byte destination.
+            let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // dirfd (arg0) is honoured only as AT_FDCWD — NARF resolves absolute
+    // paths; relative paths resolve under the task's cwd/chroot.
+    let path = apply_chroot(&raw);
     if !path_exists(&path) {
         ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
         return;
@@ -1768,6 +1829,33 @@ fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
         return;
     }
     let cap = u32::from_ne_bytes(cap) as usize;
+    // Inode-form handle: a caller advertising an exactly-8-byte f_handle
+    // (e.g. systemd's cg_path_get_cgroupid, which reads a cgroup's id from a
+    // single u64) expects the object's id, as Linux returns. Resolve the
+    // path's inode and emit an 8-byte handle. Larger capacities keep the
+    // path-carrying handle form that open_by_handle_at round-trips.
+    if cap == 8 {
+        let ino = stat_ino_path_dir_aware(&path)
+            .map(|(_, ino, _)| ino)
+            .unwrap_or(0);
+        let mut hdr = [0u8; 8];
+        hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
+        // SAFETY: copy_to_user validates the 8-byte header destination.
+        let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
+        // SAFETY: copy_to_user validates the 8-byte id destination.
+        let h2 = unsafe { copy_to_user(a.arg2 + 8, &ino.to_ne_bytes()) };
+        if h1.is_err() || h2.is_err() {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        }
+        if a.arg3 != 0 {
+            // SAFETY: copy_to_user validates the 4-byte destination.
+            let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     let needed = path.len();
     if cap < needed {
         // Report the required size and fail — the caller retries bigger.
