@@ -2505,6 +2505,150 @@ fn smoke_arch_xsave_xcr0_and_xss_disjoint() -> TestResult {
 kernel_test_in!("arch/xsave", smoke_arch_xsave_xcr0_and_xss_disjoint);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_avx512_group_all_or_none() -> TestResult {
+    // The three AVX-512 state components (opmask, ZMM_Hi256, Hi16_ZMM) must be
+    // advertised together or not at all — the OS enables them as a group and
+    // `caps().avx512` reflects exactly that all-or-none condition.
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    let present = c.xcr0_supported & xsave::XSAVE_AVX512_GROUP;
+    let all = present == xsave::XSAVE_AVX512_GROUP;
+    let none = present == 0;
+    if !all && !none {
+        return TestResult::Fail("AVX-512 XCR0 group is partially advertised");
+    }
+    if c.avx512 != all {
+        return TestResult::Fail("caps().avx512 disagrees with the group bits");
+    }
+    // AVX-512 cannot be advertised without AVX (ZMM extends YMM).
+    if c.avx512 && !c.avx {
+        return TestResult::Fail("AVX-512 advertised without AVX");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_avx512_group_all_or_none);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_area_size_covers_avx512() -> TestResult {
+    // The standard XSAVE area (leaf 0xD sub-leaf 0 ECX) must cover the legacy
+    // FXSAVE region (512) whenever XSAVE exists, and grow past ~2KiB once the
+    // AVX-512 group is enabled (opmask 64B + ZMM_Hi256 512B + Hi16_ZMM 1024B on
+    // top of the 512B legacy + 64B header + 256B YMM_Hi128).
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    if c.xcr0_supported == 0 {
+        return TestResult::Skip("no XSAVE support (FXSAVE fallback host)");
+    }
+    if c.area_size_xcr0 < 512 {
+        return TestResult::Fail("XSAVE area smaller than the FXSAVE minimum");
+    }
+    if c.avx512 && c.area_size_xcr0 < 2048 {
+        return TestResult::Fail("AVX-512 enabled but XSAVE area < 2KiB");
+    }
+    // The per-task FPU buffer must be large enough for the advertised area.
+    if (c.area_size_xcr0 as usize) > xsave::FPU_AREA_SIZE {
+        return TestResult::Fail("XSAVE area exceeds FPU_AREA_SIZE");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_area_size_covers_avx512);
+
+/// 64-byte-aligned scratch FPU area for the save/restore round-trip smokes.
+/// XSAVE/XRSTOR require a 64-byte-aligned operand; a plain `[u8; N]` on the
+/// stack has no such guarantee, so wrap it.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(64))]
+struct AlignedFpuArea([u8; crate::x86_64::xsave::FPU_AREA_SIZE]);
+
+/// Seed a reset FPU image (FCW=0x037F, MXCSR=0x1F80, zeroed XSAVE header),
+/// mirroring the userspace `FpuArea::reset` used for a task's first entry.
+#[cfg(target_arch = "x86_64")]
+fn init_reset_fpu_area(a: &mut AlignedFpuArea) {
+    a.0.fill(0);
+    a.0[0] = 0x7F; // FCW byte 0
+    a.0[1] = 0x03; // FCW byte 1  → 0x037F
+    a.0[24] = 0x80; // MXCSR byte 0
+    a.0[25] = 0x1F; // MXCSR byte 1 → 0x1F80
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_fpu_reset_round_trip() -> TestResult {
+    // init_area → fpu_restore → fpu_save must preserve the seeded FCW/MXCSR
+    // control words through the CPU's FPU register file. Non-destructive: the
+    // caller's live FPU state is saved first and restored last, so running this
+    // smoke never corrupts the surrounding task's x87/SSE/AVX state.
+    use crate::x86_64::xsave;
+
+    let mut live = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
+    let mut reset = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
+    let mut readback = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
+    init_reset_fpu_area(&mut reset);
+
+    // SAFETY: buffers are FPU_AREA_SIZE, 64-byte aligned; CR4.OSFXSR/OSXSAVE
+    // are set at boot. We save the live state before clobbering the CPU FPU and
+    // restore it before returning.
+    let (fcw, mxcsr) = unsafe {
+        xsave::fpu_save(live.0.as_mut_ptr());
+        xsave::fpu_restore(reset.0.as_ptr());
+        xsave::fpu_save(readback.0.as_mut_ptr());
+        xsave::fpu_restore(live.0.as_ptr());
+        let fcw = u16::from_le_bytes([readback.0[0], readback.0[1]]);
+        let mxcsr = u32::from_le_bytes([
+            readback.0[24],
+            readback.0[25],
+            readback.0[26],
+            readback.0[27],
+        ]);
+        (fcw, mxcsr)
+    };
+
+    if fcw != 0x037F {
+        return TestResult::Fail("FCW not preserved through restore/save");
+    }
+    // Only the defined MXCSR bits are meaningful; mask off the reserved high
+    // half before comparing (hardware zeroes them but be explicit).
+    if mxcsr & 0xFFFF != 0x1F80 {
+        return TestResult::Fail("MXCSR not preserved through restore/save");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_fpu_reset_round_trip);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_arch_xsave_avx512_evex_no_ud() -> TestResult {
+    // When the AVX-512 XCR0 group is enabled, an EVEX-encoded instruction must
+    // execute without #UD. TCG hosts that lack AVX-512 report caps().avx512 ==
+    // false and skip. Non-destructive: the live FPU is saved around the zmm
+    // clobber and restored afterward.
+    use crate::x86_64::xsave;
+    let c = xsave::caps();
+    if !c.avx512 {
+        return TestResult::Skip("AVX-512 not enabled on this host");
+    }
+
+    let mut live = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
+    // SAFETY: buffer sized/aligned; CR4.OSXSAVE set. `vpxorq zmm0,zmm0,zmm0`
+    // is EVEX-encoded and would #UD if AVX-512 were not enabled in XCR0 — the
+    // caps().avx512 gate above guarantees it is. zmm0 is clobbered; the live
+    // FPU is saved before and restored after so no surrounding state is lost.
+    unsafe {
+        xsave::fpu_save(live.0.as_mut_ptr());
+        core::arch::asm!(
+            "vpxorq zmm0, zmm0, zmm0",
+            out("zmm0") _,
+            options(nomem, nostack, preserves_flags),
+        );
+        xsave::fpu_restore(live.0.as_ptr());
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_arch_xsave_avx512_evex_no_ud);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_arch_pmu_version_implies_counters() -> TestResult {
     // Architectural PMU version >= 1 implies a non-zero number of
     // general-purpose counters per logical processor.

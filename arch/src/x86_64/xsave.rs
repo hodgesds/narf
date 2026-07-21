@@ -200,6 +200,29 @@ pub unsafe fn xsave(buf: *mut u8, mask: u64) {
     }
 }
 
+/// Save the components selected by `mask` into `buf` using the compacted
+/// format (`XSAVEC`). The compacted format packs only the enabled components
+/// (no gaps for disabled ones) and stamps `XCOMP_BV` bit 63 in the header, so a
+/// plain `XRSTOR` auto-detects the layout.
+///
+/// # Safety
+/// `caps().xsavec == true`. `buf` is at least `caps().area_size_xcr0` bytes,
+/// 64-byte aligned. `mask` ⊆ XCR0.
+pub unsafe fn xsavec(buf: *mut u8, mask: u64) {
+    let lo = mask as u32;
+    let hi = (mask >> 32) as u32;
+    // SAFETY: caller-asserted.
+    unsafe {
+        core::arch::asm!(
+            "xsavec [{p}]",
+            p = in(reg) buf,
+            in("eax") lo,
+            in("edx") hi,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Restore the components selected by `mask` from `buf`.
 ///
 /// # Safety
@@ -244,6 +267,13 @@ pub const FPU_AREA_SIZE: usize = 4096;
 /// on the BSP at boot; the value is identical on every (homogeneous) CPU.
 static FPU_XSAVE_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// When [`FPU_XSAVE_MASK`] is non-zero, prefer `XSAVEC` (compacted) over plain
+/// `XSAVE` if the CPU advertises it. The compacted image is smaller and its
+/// `XCOMP_BV` bit-63 marker lets a single `XRSTOR` read either layout back, so
+/// this is safe to toggle without touching [`fpu_restore`]. Ignored in the
+/// `FXSAVE` fallback (mask == 0).
+static FPU_USE_XSAVEC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Decide the per-task FPU save method. Call ONCE at boot AFTER
 /// [`enable_default`] (which sets `XCR0`) and with `CR4.OSXSAVE` set. Selects
 /// `XSAVE` (recording the enabled-component mask) when the CPU supports it and
@@ -259,14 +289,17 @@ pub unsafe fn init_task_fpu() {
         // SAFETY: caller asserts CR4.OSXSAVE=1.
         let mask = unsafe { read_xcr0() };
         FPU_XSAVE_MASK.store(mask, core::sync::atomic::Ordering::Release);
+        // Prefer the compacted format when available (smaller image; XRSTOR
+        // auto-detects it via XCOMP_BV bit 63).
+        FPU_USE_XSAVEC.store(c.xsavec, core::sync::atomic::Ordering::Release);
     }
 }
 
 /// Save the current CPU's FPU state into `buf` (≥ [`FPU_AREA_SIZE`] bytes,
-/// 64-byte aligned). Uses `XSAVE` when [`init_task_fpu`] selected it, else
-/// `FXSAVE`. The two are never mixed for a given buffer because the method is
-/// a single global decision, so a matching [`fpu_restore`] reads back the same
-/// format.
+/// 64-byte aligned). Uses `XSAVEC` (compacted) when available, else plain
+/// `XSAVE`, when [`init_task_fpu`] selected an XSAVE mask; otherwise `FXSAVE`.
+/// [`fpu_restore`]'s `XRSTOR` auto-detects the compacted vs standard layout via
+/// the header's `XCOMP_BV` bit 63, so save and restore never disagree.
 ///
 /// # Safety
 /// `buf` is a valid, correctly-sized, 64-byte-aligned FPU area.
@@ -274,8 +307,14 @@ pub unsafe fn init_task_fpu() {
 pub unsafe fn fpu_save(buf: *mut u8) {
     let mask = FPU_XSAVE_MASK.load(core::sync::atomic::Ordering::Acquire);
     if mask != 0 {
-        // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0.
-        unsafe { xsave(buf, mask) };
+        if FPU_USE_XSAVEC.load(core::sync::atomic::Ordering::Acquire) {
+            // SAFETY: xsavec advertised (else the flag is false); buf
+            // sized/aligned per caller; mask ⊆ enabled XCR0.
+            unsafe { xsavec(buf, mask) };
+        } else {
+            // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0.
+            unsafe { xsave(buf, mask) };
+        }
     } else {
         // SAFETY: buf ≥ 512 bytes, 16-byte aligned (64 ⊇ 16); CR4.OSFXSR set.
         unsafe {
