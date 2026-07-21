@@ -463,6 +463,30 @@ fn smoke_abi_fsx2_open_wronly_fgetfl_access_mode() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_open_wronly_fgetfl_access_mode);
 
+// ── memfd_create returns an O_RDWR fd (F_GETFL access mode) ────────────
+//
+// Linux memfd_create(2) always hands back a read+write fd. glibc/musl
+// fdopen(fd, "w+") reads F_GETFL and rejects the stream with EINVAL
+// unless the access mode is O_RDWR. systemd 257 serializes sd-executor
+// state to a memfd it then fdopens "w+", so the fd must report O_RDWR.
+fn smoke_abi_fsx2_memfd_create_fgetfl_rdwr() -> TestResult {
+    with_setup(|| {
+        const F_GETFL: u64 = 3;
+        const O_ACCMODE: u64 = 3;
+        const O_RDWR: u64 = 2;
+        let name = b"abi-memfd\0";
+        let fd = match call(Syscall::MemfdCreate.raw(), a1(name.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("memfd_create failed"),
+        };
+        match call(Syscall::Fcntl.raw(), a2(fd, F_GETFL, 0)) {
+            Some(fl) if (fl as u64 & O_ACCMODE) == O_RDWR => Ok(()),
+            _ => Err("memfd_create fd did not report the O_RDWR access mode"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_memfd_create_fgetfl_rdwr);
+
 // ── name_to_handle_at: EFAULT on an unreadable handle buffer ──────────
 //
 // Existing path, but arg2 (the handle buffer whose first u32 is read) is

@@ -4213,7 +4213,10 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
                 ops: mfd,
                 offset: 0,
                 flags: install_flags,
-                status_flags: 0,
+                // Linux memfd_create(2) always returns an O_RDWR fd. glibc/musl
+                // fdopen(fd, "w+") reads F_GETFL and rejects the fd with EINVAL if
+                // the access mode isn't read+write (systemd's serialization memfd).
+                status_flags: crate::fd::O_RDWR,
             })
         });
         match fd {
@@ -4229,7 +4232,8 @@ fn sys_memfd_create(ctx: &mut dyn TrapContext) {
                 ops,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                // Linux memfd_create(2) always returns an O_RDWR fd (see above).
+                status_flags: crate::fd::O_RDWR,
             })
         });
         match fd {
@@ -4597,6 +4601,26 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
     // missing parent. A bare -1 → musl EPERM aborts the whole -p chain.
     if path_ref == "/" {
         ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST (root)
+        return;
+    }
+    // A path that already resolves to a directory exists → EEXIST, matching
+    // Linux. This mount-aware check catches a mount root whose parent fs does
+    // not expose it as a child entry (e.g. the cgroup2 mount at
+    // /sys/fs/cgroup, whose parent /sys/fs is sysfs): the parent-lookup
+    // existence check below can't see a mounted-over entry, so mkdir would
+    // otherwise try to create it in the parent fs and fail.
+    //
+    // The second arm treats a path that is an ANCESTOR of an existing
+    // mountpoint as an existing directory. In NARF's flat mount model a
+    // mount registered at /sys/fs/cgroup has no real intermediate /sys/fs
+    // node in sysfs, so `mkdir("/sys/fs")` would try to create it on the
+    // read-only sysfs and return a bare -1. systemd's cg_create walks the
+    // cgroup hierarchy root via mkdir_parents (mkdir /sys, /sys/fs, …) and
+    // treats EEXIST as success; a -1 (→ EPERM) at any component aborts every
+    // service's cgroup setup ("Failed to create cgroup /: Operation not
+    // permitted").
+    if resolve_dir_absolute(path_ref).is_some() || path_is_mount_ancestor(path_ref) {
+        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
         return;
     }
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
@@ -8888,7 +8912,8 @@ fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
                 ops: mfd,
                 offset: 0,
                 flags: install_flags,
-                status_flags: 0,
+                // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
+                status_flags: crate::fd::O_RDWR,
             })
         });
         match fd {
@@ -8905,7 +8930,8 @@ fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
                 ops,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
+                status_flags: crate::fd::O_RDWR,
             })
         }) {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
@@ -15076,6 +15102,26 @@ pub(crate) fn resolve_cwd_path_user(task: u64, path: &str) -> alloc::string::Str
 /// directory. Mirrors the segment-walk in `sys_getdents64` /
 /// `sys_readdir`: pick the longest-matching mount, then descend by
 /// `lookup_dir_async` per path component.
+/// True if `path` is a proper ancestor directory of an existing mount
+/// point (e.g. `/sys/fs` when `/sys/fs/cgroup` is mounted). In NARF's flat
+/// mount model such an intermediate component has no real node in the
+/// underlying filesystem, but it must resolve and stat as a directory:
+/// systemd's `mkdir_parents_safe` mkdir()s each path component then
+/// `newfstatat()`s it to confirm it is a directory, and cg_create fails
+/// (ENOENT/EEXIST mismatch) if mkdir and stat disagree. Both `sys_mkdir`
+/// (→ EEXIST) and the dir-aware stat resolver (→ synthetic S_IFDIR) use
+/// this so the two views stay consistent.
+fn path_is_mount_ancestor(path: &str) -> bool {
+    let p = path.trim_end_matches('/');
+    if p.is_empty() {
+        return false;
+    }
+    narf_filesystem::registry()
+        .list()
+        .iter()
+        .any(|m| m.len() > p.len() && m.starts_with(p) && m.as_bytes()[p.len()] == b'/')
+}
+
 fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
     narf_filesystem::registry()
         .resolve_absolute(path, |fs, rel| {
@@ -15167,6 +15213,30 @@ fn stat_ino_path_dir_aware_ext(
                 mtime_cycles: 0,
             },
             dir.ino(),
+            0,
+        ));
+    }
+    // A path that is an ancestor of a mount point (e.g. /sys/fs when
+    // /sys/fs/cgroup is mounted) has no real node in the underlying fs but
+    // is logically a directory — synthesize an S_IFDIR stat so it agrees
+    // with mkdir's EEXIST (see `path_is_mount_ancestor`). A path-derived
+    // pseudo-inode keeps it distinct from its parent (rm_rf root-guard).
+    if path_is_mount_ancestor(path) {
+        let mut ino: u64 = 0xcabb_a6e0_0000_0000;
+        for b in path.trim_end_matches('/').bytes() {
+            ino = ino.wrapping_mul(1099511628211).wrapping_add(b as u64);
+        }
+        return Some((
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode {
+                    file_type: narf_filesystem::FileType::Dir,
+                    perms: 0o755,
+                },
+                mtime_cycles: 0,
+            },
+            ino,
             0,
         ));
     }

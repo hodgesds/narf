@@ -532,6 +532,55 @@ fn smoke_abi_path_mkdirat_errnos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mkdirat_errnos);
 
+// mkdir on an existing MOUNT ROOT must return -EEXIST, not a bare -1.
+// A mount root's parent fs does not expose it as a child entry, so the
+// parent-lookup existence check can't see it; the full-path mount-aware
+// check does. systemd's cg_create mkdir()s the cgroup2 hierarchy root
+// (/sys/fs/cgroup, whose parent /sys/fs is sysfs) and treats EEXIST as
+// success — a bare -1 (→ EPERM) there aborted every service's cgroup
+// setup ("Failed to create cgroup /: Operation not permitted").
+fn smoke_abi_path_mkdir_over_mount_root_eexists() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        let root = b"/p\0";
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, root.as_ptr() as u64, 0o755, 0),
+        ) {
+            Some(-17) => Ok(()), // -EEXIST
+            other => {
+                let _ = other;
+                Err("mkdir over an existing mount root should return -EEXIST (-17), not -1")
+            }
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mkdir_over_mount_root_eexists);
+
+// stat on an ANCESTOR of a mount point must report a directory, not
+// ENOENT. In NARF's flat mount model the intermediate component has no
+// real node in the parent fs, but it is logically a directory. systemd's
+// mkdir_parents_safe mkdir()s each component then newfstatat()s it to
+// confirm S_IFDIR — if stat and mkdir disagree, cg_create fails and no
+// service cgroup can be realized. Mount at /anc/sub/leaf and stat /anc/sub.
+fn smoke_abi_path_stat_mount_ancestor_is_dir() -> TestResult {
+    with_memfs("/anc/sub/leaf", "leaf", &[("f", b"x")], || {
+        let path = b"/anc/sub\0";
+        let mut sb = [0u8; 256];
+        if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat on a mount-ancestor dir should return 0, not ENOENT");
+        }
+        // st_mode is at offset 24 in the x86_64/aarch64 struct stat;
+        // S_IFMT=0o170000, S_IFDIR=0o40000.
+        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        if mode & 0o170000 == 0o40000 {
+            Ok(())
+        } else {
+            Err("mount-ancestor stat st_mode must be S_IFDIR")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_stat_mount_ancestor_is_dir);
+
 // ── open (OpenFile): NARF-native (ptr,len) with a NUL-term fallback ──
 //
 // sys_open reads arg0=path_ptr, arg1=path_LEN. Crucially it treats len==0 as
