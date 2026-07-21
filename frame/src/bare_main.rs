@@ -3753,7 +3753,30 @@ fn boot_userspace_init() {
         const ETC_PASSWD: &[u8] = b"root:x:0:0:root:/root:/bin/shell\n";
         const ETC_SHADOW: &[u8] =
             b"root:$n1$n4rf$366fcdb3a40735e32d92d92d11fe1b9593d98d7e7546262e66cfeb72bd07ddec:0:0:99999:7:::\n";
-        let etc_fs = MemFs::with_seeds("etc", &[("passwd", ETC_PASSWD), ("shadow", ETC_SHADOW)]);
+        // /etc/os-release — the freedesktop os-release(5) identity file.
+        // systemd (booting as PID 1) reads it at startup to name the OS in
+        // its logs; a missing file makes `read_os_release_at` fail. VERSION_ID
+        // tracks the kernel's `uname -r` release (sys_uname reports 6.1.0-narf).
+        // Linux convention makes /etc/os-release a symlink to
+        // ../usr/lib/os-release; NARF has no symlink-across-mount support here,
+        // so it's a plain file at /etc/os-release and mirrored at
+        // /usr/lib/os-release (below) for readers that consult that path.
+        const ETC_OS_RELEASE: &[u8] = b"NAME=\"NARF\"\n\
+PRETTY_NAME=\"NARF 6.1.0-narf\"\n\
+ID=narf\n\
+VERSION_ID=6.1.0\n\
+VERSION=\"6.1.0-narf\"\n\
+ANSI_COLOR=\"0;36\"\n\
+HOME_URL=\"https://github.com/dhodges-daniel/narf\"\n\
+BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
+        let etc_fs = MemFs::with_seeds(
+            "etc",
+            &[
+                ("passwd", ETC_PASSWD),
+                ("shadow", ETC_SHADOW),
+                ("os-release", ETC_OS_RELEASE),
+            ],
+        );
         // DAC: /etc/shadow holds password hashes and must be a real
         // root-only secret — 0600 owned by (0, 0). getty reads it as
         // uid 0 at boot (it setsid's but never setuid's before the
@@ -3769,7 +3792,18 @@ fn boot_userspace_init() {
         let _ = registry().mount(&auth, "/etc", etc_fs);
         let _ = writeln!(
             console::Writer,
-            "  boot-init: mounted /etc (memfs) with passwd + shadow"
+            "  boot-init: mounted /etc (memfs) with passwd + shadow + os-release"
+        );
+
+        // /usr/lib/os-release — the canonical location os-release(5) lives at
+        // on a stock Linux (with /etc/os-release a symlink to it). systemd and
+        // other readers fall back to this path, so mirror the same content
+        // here as a real file.
+        let usrlib_fs = MemFs::with_seeds("usrlib", &[("os-release", ETC_OS_RELEASE)]);
+        let _ = registry().mount(&auth, "/usr/lib", usrlib_fs);
+        let _ = writeln!(
+            console::Writer,
+            "  boot-init: mounted /usr/lib (memfs) with os-release"
         );
 
         // Wave-78 follow-up 3: /lib MemFs carrying the ld-musl

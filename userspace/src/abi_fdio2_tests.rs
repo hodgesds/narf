@@ -544,3 +544,79 @@ fn smoke_abi_fdio2_tee_with_data_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_tee_with_data_pos);
+
+// ── os-release: open + read a MemFs identity file without EBADF ────────
+//
+// systemd (PID 1) reads /etc/os-release at startup. boot-init seeds it into
+// the /etc MemFs (see bare_main.rs). These pins reproduce that here with a
+// MemFs mount: a plain O_RDONLY open of the seeded file must yield a valid
+// fd and read() must return its bytes — never -EBADF, which sys_read emits
+// only for an fd that is not open. The content must parse as os-release(5)
+// (carry ID= and PRETTY_NAME=), matching what systemd expects to find.
+
+/// The exact os-release payload boot-init installs at /etc/os-release and
+/// /usr/lib/os-release. Kept in the test so a content change trips this pin.
+const OS_RELEASE: &[u8] = b"NAME=\"NARF\"\n\
+PRETTY_NAME=\"NARF 6.1.0-narf\"\n\
+ID=narf\n\
+VERSION_ID=6.1.0\n\
+VERSION=\"6.1.0-narf\"\n\
+ANSI_COLOR=\"0;36\"\n\
+HOME_URL=\"https://github.com/dhodges-daniel/narf\"\n\
+BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
+
+fn smoke_abi_fdio2_os_release_open_read_no_ebadf() -> TestResult {
+    with_memfs("/etc", "etc", &[("os-release", OS_RELEASE)], || {
+        let fd = match call_open(c"/etc/os-release".as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u32,
+            // A negative open result here would be a missing-file (ENOENT) or
+            // sentinel failure — the very condition that leaves systemd with
+            // no valid fd. Fail loudly so a regression is unambiguous.
+            _ => return Err("open(/etc/os-release, O_RDONLY) did not yield a fd"),
+        };
+        let mut buf = [0u8; 256];
+        let n = match call(
+            Syscall::Read.raw(),
+            a2(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            // -EBADF (-9) is the exact failure systemd logged; assert it never
+            // surfaces on a valid open fd to a seeded MemFs file.
+            Some(v) if v == EBADF => return Err("read of os-release returned -EBADF"),
+            Some(v) if v > 0 => v as usize,
+            _ => return Err("read of os-release returned no bytes"),
+        };
+        if &buf[..n] != OS_RELEASE {
+            return Err("os-release read-back did not match the seeded content");
+        }
+        // Parses as os-release(5): the two keys systemd's identity read needs.
+        let has = |needle: &[u8]| buf[..n].windows(needle.len()).any(|w| w == needle);
+        if !has(b"ID=narf") {
+            return Err("os-release content lacks ID=");
+        }
+        if !has(b"PRETTY_NAME=") {
+            return Err("os-release content lacks PRETTY_NAME=");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio2_os_release_open_read_no_ebadf);
+
+fn smoke_abi_fdio2_os_release_missing_is_enoent_not_ebadf() -> TestResult {
+    // The other half of the diagnosis: when os-release is ABSENT, the open
+    // itself fails with -ENOENT (-2) — it never hands back a fd that a later
+    // read would EBADF. This pins the "file-missing vs read-path bug" split.
+    with_memfs(
+        "/etc",
+        "etc",
+        &[("passwd", b"root:x:0:0::/root:/bin/sh\n")],
+        || match call_open(c"/etc/os-release".as_ptr() as u64, 0) {
+            Some(-2) => Ok(()),
+            Some(v) if v == EBADF => Err("missing os-release open returned -EBADF"),
+            _ => Err("missing os-release open should be -ENOENT"),
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio2_os_release_missing_is_enoent_not_ebadf
+);
