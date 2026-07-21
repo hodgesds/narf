@@ -157,6 +157,33 @@ kernel_test_in!(
     smoke_userspace_vfork_wait_release_clears_pending
 );
 
+// execve's /proc/self/fd/N magic-symlink parse: glibc fexecve and systemd
+// 257's sd-executor spawn execve("/proc/self/fd/<N>") after opening the
+// binary O_PATH; execve must recognize that path and resolve the fd. Only a
+// bare fd (no trailing sub-path) under /proc/self/fd or /proc/<pid>/fd counts.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_userspace_parse_proc_self_fd() -> TestResult {
+    use crate::handlers::parse_proc_self_fd as p;
+    if p("/proc/self/fd/3") != Some(3) {
+        return TestResult::Fail("/proc/self/fd/3 should parse to 3");
+    }
+    if p("/proc/1234/fd/7") != Some(7) {
+        return TestResult::Fail("/proc/<pid>/fd/7 should parse to 7");
+    }
+    if p("/proc/self/fd/3/foo").is_some() {
+        return TestResult::Fail("a trailing sub-path must not parse");
+    }
+    if p("/proc/self/fd/").is_some() || p("/proc/self/fd/x").is_some() {
+        return TestResult::Fail("empty/non-numeric fd must not parse");
+    }
+    if p("/usr/lib/systemd/systemd-executor").is_some() {
+        return TestResult::Fail("an ordinary path must not parse as a proc-fd");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("userspace", smoke_userspace_parse_proc_self_fd);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
     // Defence-in-depth on the handler — entry==0 or stack==0 is

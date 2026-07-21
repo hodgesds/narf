@@ -15794,6 +15794,38 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    do_execve_resolved(ctx, path_owned, argv_uptr, envp_uptr, None);
+}
+
+/// Shared execve body: `path_owned` is the already-resolved (kernel-side)
+/// pathname of the image; `argv_uptr`/`envp_uptr` are the user vectors.
+/// `image_override`, when `Some`, supplies the ELF bytes directly (skipping
+/// path resolution + shebang) — used by `execveat(fd,"",AT_EMPTY_PATH)` on a
+/// pathless fd (a memfd; systemd fexecve's its sd-executor from a sealed
+/// memfd copy). `path_owned` is then just the /proc/self/exe label.
+/// `sys_execve` (path from user) and `sys_execveat` (dirfd/AT_EMPTY_PATH)
+/// funnel through here.
+fn do_execve_resolved(
+    ctx: &mut dyn TrapContext,
+    mut path_owned: alloc::string::String,
+    argv_uptr: u64,
+    envp_uptr: u64,
+    mut image_override: Option<alloc::vec::Vec<u8>>,
+) {
+    // fexecve via the /proc/self/fd/N (or /proc/<pid>/fd/N) magic symlink:
+    // glibc's fexecve and systemd 257's sd-executor spawn open the binary
+    // O_PATH then execve("/proc/self/fd/<N>"). Resolve N to the fd's real
+    // filesystem path (on-disk binary) or, failing that, its bytes (memfd).
+    if image_override.is_none() {
+        if let Some(n) = parse_proc_self_fd(&path_owned) {
+            let t = current_task_id();
+            if let Some(real) = fd_path_of(t, n) {
+                path_owned = real;
+            } else if let Some(bytes) = read_fd_image(t, n) {
+                image_override = Some(bytes);
+            }
+        }
+    }
     let path: &str = &path_owned;
 
     #[cfg(feature = "syscall-trace")]
@@ -15869,54 +15901,65 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     let mut cur_path = alloc::string::String::from(path);
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
     let elf_buf;
-    let mut depth = 0u32;
-    loop {
-        let buf = match read_exec(&cur_path) {
-            Ok(b) => b,
-            Err(code) => {
-                ctx.set_return(SyscallReturn::ok(code as u64));
-                return;
-            }
-        };
-        if buf.len() >= 2 && &buf[..2] == b"#!" {
-            if depth >= 4 {
-                ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
-                return;
-            }
-            depth += 1;
-            let line_end = buf.iter().position(|&c| c == b'\n').unwrap_or(buf.len());
-            let line = core::str::from_utf8(&buf[2..line_end]).unwrap_or("").trim();
-            // interpreter = first whitespace-delimited token; the remainder
-            // (trimmed) is a SINGLE optional argument (Linux semantics).
-            let (interp, optarg) = match line.find([' ', '\t']) {
-                Some(i) => {
-                    let rest = line[i..].trim();
-                    (&line[..i], if rest.is_empty() { None } else { Some(rest) })
-                }
-                None => (line, None),
-            };
-            if interp.is_empty() {
-                ctx.set_return(SyscallReturn::invalid_op());
-                return;
-            }
-            let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-            new_argv.push(interp.into());
-            if let Some(a) = optarg {
-                new_argv.push(a.into());
-            }
-            new_argv.push(cur_path.clone());
-            new_argv.extend(cur_argv.iter().skip(1).cloned());
-            cur_path = interp.into();
-            cur_argv = new_argv;
-            continue;
-        }
-        if buf.len() < 64 {
-            // Too small for a valid ELF and not a shebang.
+    // fexecve fast path: the bytes are already in hand (a memfd fd with no
+    // filesystem path). Skip path resolution + shebang — a fexecve'd image is
+    // a real binary, and argv[0] is whatever the caller passed.
+    if let Some(bytes) = image_override {
+        if bytes.len() < 64 {
             ctx.set_return(SyscallReturn::invalid_op());
             return;
         }
-        elf_buf = buf;
-        break;
+        elf_buf = bytes;
+    } else {
+        let mut depth = 0u32;
+        loop {
+            let buf = match read_exec(&cur_path) {
+                Ok(b) => b,
+                Err(code) => {
+                    ctx.set_return(SyscallReturn::ok(code as u64));
+                    return;
+                }
+            };
+            if buf.len() >= 2 && &buf[..2] == b"#!" {
+                if depth >= 4 {
+                    ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+                    return;
+                }
+                depth += 1;
+                let line_end = buf.iter().position(|&c| c == b'\n').unwrap_or(buf.len());
+                let line = core::str::from_utf8(&buf[2..line_end]).unwrap_or("").trim();
+                // interpreter = first whitespace-delimited token; the remainder
+                // (trimmed) is a SINGLE optional argument (Linux semantics).
+                let (interp, optarg) = match line.find([' ', '\t']) {
+                    Some(i) => {
+                        let rest = line[i..].trim();
+                        (&line[..i], if rest.is_empty() { None } else { Some(rest) })
+                    }
+                    None => (line, None),
+                };
+                if interp.is_empty() {
+                    ctx.set_return(SyscallReturn::invalid_op());
+                    return;
+                }
+                let mut new_argv: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+                new_argv.push(interp.into());
+                if let Some(a) = optarg {
+                    new_argv.push(a.into());
+                }
+                new_argv.push(cur_path.clone());
+                new_argv.extend(cur_argv.iter().skip(1).cloned());
+                cur_path = interp.into();
+                cur_argv = new_argv;
+                continue;
+            }
+            if buf.len() < 64 {
+                // Too small for a valid ELF and not a shebang.
+                ctx.set_return(SyscallReturn::invalid_op());
+                return;
+            }
+            elf_buf = buf;
+            break;
+        }
     }
     let argv_refs: alloc::vec::Vec<&str> = cur_argv.iter().map(|s| s.as_str()).collect();
 
@@ -16105,20 +16148,110 @@ impl<'a> TrapContext for ArgReshape<'a> {
 /// and flags are dropped and the call is forwarded to `sys_execve` with
 /// the `(path, argv, envp)` layout it expects.
 fn sys_execveat(ctx: &mut dyn TrapContext) {
+    // Linux: execveat(dirfd, path, argv, envp, flags).
     let a = *ctx.args();
-    let proxy_args = SyscallArgs {
-        arg0: a.arg1, // path
-        arg1: a.arg2, // argv
-        arg2: a.arg3, // envp
-        arg3: 0,
-        arg4: 0,
-        arg5: 0,
+    let dirfd = a.arg0 as i32;
+    // A NULL path POINTER is invalid (fexecve passes a valid pointer to an
+    // empty string, never NULL). Empty-string handling is below.
+    if a.arg1 == 0 {
+        ctx.set_return(SyscallReturn::invalid_op());
+        return;
+    }
+    let path_str = copy_user_cstr(a.arg1, 4096).unwrap_or_default();
+    let path_empty = path_str.is_empty();
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let task = current_task_id();
+
+    // Resolve the image path:
+    //   - empty path + AT_EMPTY_PATH → the binary the dirfd itself refers to
+    //     (fexecve(3): open the executable, then execveat(fd,"",…,AT_EMPTY_PATH).
+    //     systemd 257 spawns its sd-executor and every service exactly this way).
+    //   - absolute path → used as-is (dirfd ignored, like Linux).
+    //   - relative path → resolved against the dirfd's recorded open path.
+    let resolved: Option<alloc::string::String> = if path_str.is_empty() {
+        if (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+            fd_path_of(task, dirfd as u32)
+        } else {
+            None
+        }
+    } else if path_str.starts_with('/') {
+        Some(path_str)
+    } else if dirfd >= 0 {
+        fd_path_of(task, dirfd as u32).map(|mut d| {
+            if !d.ends_with('/') {
+                d.push('/');
+            }
+            d.push_str(&path_str);
+            d
+        })
+    } else {
+        // AT_FDCWD (or no dir): treat as a plain (cwd-relative) execve path.
+        Some(path_str)
     };
-    let mut proxy = ArgReshape {
-        inner: ctx,
-        args: proxy_args,
+
+    if let Some(p) = resolved {
+        do_execve_resolved(ctx, p, a.arg2, a.arg3, None);
+        return;
+    }
+
+    // No filesystem path for the fd. For an AT_EMPTY_PATH fexecve this is the
+    // memfd case (systemd seals its sd-executor into a memfd and fexecve's it):
+    // read the ELF straight out of the fd's FileOps and exec those bytes.
+    if path_empty && (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+        if let Some(bytes) = read_fd_image(task, dirfd as u32) {
+            let label = alloc::format!("/proc/self/fd/{}", dirfd);
+            do_execve_resolved(ctx, label, a.arg2, a.arg3, Some(bytes));
+            return;
+        }
+    }
+    // Bad dirfd / unreadable fd — ENOENT.
+    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+}
+
+/// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
+/// These are the magic symlinks glibc's fexecve / systemd's spawn execve.
+pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
+    let rest = if let Some(r) = path.strip_prefix("/proc/self/fd/") {
+        r
+    } else {
+        let r = path.strip_prefix("/proc/")?;
+        let (pid, tail) = r.split_once("/fd/")?;
+        if pid.parse::<u64>().is_err() {
+            return None;
+        }
+        tail
     };
-    sys_execve(&mut proxy);
+    // Reject a trailing sub-path (e.g. /proc/self/fd/3/foo) — only the bare fd.
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    rest.parse::<u32>().ok()
+}
+
+/// Read an entire open fd's contents into a Vec (for `execveat(fd,"",
+/// AT_EMPTY_PATH)` on a pathless fd such as a memfd). Returns None if the fd
+/// isn't open, isn't readable, or is empty.
+fn read_fd_image(task: u64, fd: u32) -> Option<alloc::vec::Vec<u8>> {
+    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
+    let size = ops.stat().size as usize;
+    if size == 0 || size > 64 * 1024 * 1024 {
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; size];
+    let mut off = 0usize;
+    while off < size {
+        match poll_blocking(ops.read(off as u64, &mut buf[off..])) {
+            Some(Ok(0)) => break,
+            Some(Ok(n)) => off += n,
+            _ => return None,
+        }
+    }
+    buf.truncate(off);
+    if buf.len() < 64 {
+        None
+    } else {
+        Some(buf)
+    }
 }
 
 /// `faccessat2(dirfd, path, mode, flags)` / `fchmodat2(dirfd, path, mode,
