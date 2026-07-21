@@ -589,11 +589,11 @@ fn smoke_abi_fsx2_mount_bind_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_bind_pos);
 
-// ── mount: -1 sentinel on an unreadable target pointer ────────────────
+// ── mount: -EFAULT on an unreadable target pointer ────────────────────
 //
-// copy_user_str(arg2=bad, ...) fails → the handler's `fail` (-1) sentinel.
-// The first file's negative pins an unknown-device path, not the EFAULT-ish
-// copy-failure branch.
+// copy_user_cstr(arg1=bad, ...) fails → the handler's copy-failure branch,
+// which returns -EFAULT. The first file's negative pins an unknown-fstype
+// path (-ENODEV), a different failure branch.
 
 fn smoke_abi_fsx2_mount_badtarget_neg() -> TestResult {
     with_setup(|| {
@@ -607,11 +607,10 @@ fn smoke_abi_fsx2_mount_badtarget_neg() -> TestResult {
             arg4: 0,
             ..Default::default()
         };
-        // LINUX-GAP: Linux returns -EFAULT for a bad target pointer; NARF
-        // collapses every mount copy-failure into the bare -1 sentinel.
+        // A bad target pointer fails copy-in → -EFAULT (matching Linux).
         match call(Syscall::Mount.raw(), args) {
-            Some(-1) => Ok(()),
-            _ => Err("mount with an unreadable target must return the -1 sentinel"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("mount with an unreadable target must return -EFAULT"),
         }
     })
 }
@@ -770,3 +769,161 @@ fn smoke_abi_fsx2_mount_setattr_oversize_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_setattr_oversize_neg);
+
+// ── mount: fstype breadth for systemd's early-boot pseudo-filesystems ──
+//
+// systemd mounts many pseudo-filesystems (proc, sysfs, tmpfs, securityfs,
+// debugfs, cgroup2, mqueue, …). The shared dispatch (mount_api::build_fs)
+// backs the ones NARF can with a real FsInstance and the rest with an empty
+// in-memory directory; either way the mount succeeds and the mountpoint is
+// statable as a directory. Linux mount(2) ABI: (source, target, fstype,
+// flags, data), all NUL-terminated.
+
+fn mount_fstype(target: &[u8], fstype: &[u8]) -> Option<i64> {
+    let source = b"none\0";
+    let args = SyscallArgs {
+        arg0: source.as_ptr() as u64,
+        arg1: target.as_ptr() as u64,
+        arg2: fstype.as_ptr() as u64,
+        arg3: 0, // flags
+        arg4: 0, // data
+        ..Default::default()
+    };
+    call(Syscall::Mount.raw(), args)
+}
+
+fn smoke_abi_fsx2_mount_tmpfs_statable_pos() -> TestResult {
+    with_setup(|| {
+        let target = b"/abi-tmpfs-stat\0";
+        let fstype = b"tmpfs\0";
+        if mount_fstype(target, fstype) != Some(0) {
+            return Err("mount of tmpfs at a fresh target should return 0");
+        }
+        // The mountpoint must now be statable as a directory.
+        let mut sb = [0u8; 256];
+        match call_stat(target.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(0) => Ok(()),
+            _ => Err("a mounted tmpfs root must be statable"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_tmpfs_statable_pos);
+
+fn smoke_abi_fsx2_mount_securityfs_pseudo_pos() -> TestResult {
+    with_setup(|| {
+        // securityfs has no NARF semantics; it mounts an empty directory so
+        // systemd's sys-kernel-security.mount unit succeeds.
+        let target = b"/abi-securityfs\0";
+        let fstype = b"securityfs\0";
+        if mount_fstype(target, fstype) != Some(0) {
+            return Err("mount of securityfs (empty-dir pseudo) should return 0");
+        }
+        let mut sb = [0u8; 256];
+        match call_stat(target.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(0) => Ok(()),
+            _ => Err("a mounted securityfs root must be statable"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_securityfs_pseudo_pos);
+
+// ── mount: propagation-only change is an accepted no-op ────────────────
+//
+// systemd marks the mount tree private/slave with
+// mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL). NARF's flat mount model
+// has no propagation state, so this succeeds without touching the registry.
+
+fn smoke_abi_fsx2_mount_propagation_noop_pos() -> TestResult {
+    with_setup(|| {
+        const MS_PRIVATE: u64 = 1 << 18;
+        const MS_REC: u64 = 1 << 14;
+        let source = b"none\0";
+        let target = b"/\0";
+        // NULL fstype (arg2=0) + propagation flags only.
+        let args = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: 0, // NULL fstype
+            arg3: MS_PRIVATE | MS_REC,
+            arg4: 0,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), args) {
+            Some(0) => Ok(()),
+            _ => Err("a propagation-only mount (MS_PRIVATE|MS_REC) must be a no-op success"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_propagation_noop_pos);
+
+// ── mount: a genuinely-unknown fstype is -ENODEV, never the -1 sentinel ─
+
+fn smoke_abi_fsx2_mount_garbage_fstype_neg() -> TestResult {
+    with_setup(|| {
+        let target = b"/abi-garbage\0";
+        let fstype = b"notarealfs\0";
+        match mount_fstype(target, fstype) {
+            Some(v) if v == ENODEV => Ok(()),
+            _ => Err("mount of a garbage fstype must return -ENODEV"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mount_garbage_fstype_neg);
+
+// ── new-mount-API: full fsopen→fsconfig(CREATE)→fsmount→move_mount chain ─
+//
+// The decomposed mount path must register a mount equivalent to the classic
+// path. Drive the whole chain and assert the destination appears in
+// registry().list().
+
+fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
+    with_setup(|| {
+        let dest = "/abi-newapi-chain";
+        // fsopen("tmpfs").
+        let fsname = b"tmpfs\0";
+        let fd = match call(Syscall::Fsopen.raw(), a1(fsname.as_ptr() as u64, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsopen(tmpfs) should return a context fd"),
+        };
+        // fsconfig(fd, CMD_CREATE) — materialize the backend.
+        let cargs = SyscallArgs {
+            arg0: fd,
+            arg1: FSCONFIG_CMD_CREATE,
+            ..Default::default()
+        };
+        if call(Syscall::Fsconfig.raw(), cargs) != Some(0) {
+            return Err("fsconfig(CMD_CREATE) should return 0");
+        }
+        // fsmount(fd, 0, 0) — detached mount fd.
+        let mfd = match call(Syscall::Fsmount.raw(), a2(fd, 0, 0)) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("fsmount on a created context should return a mount fd"),
+        };
+        // move_mount(mfd, "", AT_FDCWD, dest, 0).
+        let empty = b"\0";
+        let mut dest_c = [0u8; 32];
+        dest_c[..dest.len()].copy_from_slice(dest.as_bytes());
+        let mvargs = SyscallArgs {
+            arg0: mfd,
+            arg1: empty.as_ptr() as u64,
+            arg2: 0xffffffffffffff9c, // AT_FDCWD
+            arg3: dest_c.as_ptr() as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::MoveMount.raw(), mvargs) != Some(0) {
+            return Err("move_mount of the detached mount should return 0");
+        }
+        // The destination must now appear in the mount registry.
+        let mounted = narf_filesystem::registry()
+            .list()
+            .iter()
+            .any(|p| p.as_str() == dest);
+        if mounted {
+            Ok(())
+        } else {
+            Err("the new-mount-API chain must register the mount in registry().list()")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_new_mount_api_chain_registers_pos);

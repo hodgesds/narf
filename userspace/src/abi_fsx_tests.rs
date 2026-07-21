@@ -624,7 +624,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_pos);
 
 fn smoke_abi_fsx_mount_neg() -> TestResult {
     with_setup(|| {
-        // Unknown block-device source + unknown fstype → -1 sentinel.
+        // Unknown block-device source + genuinely unknown fstype → -ENODEV,
+        // matching Linux (never the bare -1 = EPERM sentinel).
         let source = b"nodevhere\0";
         let target = b"/abi-bad\0";
         let fstype = b"ext9\0";
@@ -636,11 +637,9 @@ fn smoke_abi_fsx_mount_neg() -> TestResult {
             arg4: 0,
             ..Default::default()
         };
-        // LINUX-GAP: Linux returns -ENODEV/-ENOENT here; NARF uses a bare
-        // -1 sentinel for every mount failure.
         match call(Syscall::Mount.raw(), args) {
-            Some(-1) => Ok(()),
-            _ => Err("mount with an unknown device/fstype must return the -1 sentinel"),
+            Some(v) if v == ENODEV => Ok(()),
+            _ => Err("mount with an unknown device/fstype must return -ENODEV"),
         }
     })
 }

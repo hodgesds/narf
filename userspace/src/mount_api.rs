@@ -3,8 +3,9 @@
 //! `fspick` / `mount_setattr`.
 //!
 //! These decompose `mount(2)` into fd-addressed steps. NARF layers them on
-//! the existing VFS registry (the same `mount_arc` + `MemFs` machinery
-//! `sys_mount` uses):
+//! the existing VFS registry, reusing the same fstype→backend dispatch
+//! (`build_fs`) `sys_mount` uses, so the classic and new-API paths recognize
+//! exactly the same filesystems:
 //!
 //! ```text
 //!   fsopen("tmpfs")            → fs-context fd
@@ -36,7 +37,6 @@ const EBADF: i64 = 9;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const ENODEV: i64 = 19;
-const EOPNOTSUPP: i64 = 95;
 
 fn err(e: i64) -> SyscallReturn {
     SyscallReturn::ok((-e) as u64)
@@ -48,7 +48,12 @@ fn ok(v: u64) -> SyscallReturn {
 // fsconfig(2) commands.
 const FSCONFIG_SET_FLAG: u64 = 0;
 const FSCONFIG_SET_STRING: u64 = 1;
+const FSCONFIG_SET_BINARY: u64 = 2;
+const FSCONFIG_SET_PATH: u64 = 3;
+const FSCONFIG_SET_PATH_EMPTY: u64 = 4;
+const FSCONFIG_SET_FD: u64 = 5;
 const FSCONFIG_CMD_CREATE: u64 = 6;
+const FSCONFIG_CMD_RECONFIGURE: u64 = 7;
 // fsopen / fsmount / open_tree CLOEXEC bits.
 const FSOPEN_CLOEXEC: u64 = 0x0000_0001;
 const FSMOUNT_CLOEXEC: u64 = 0x0000_0001;
@@ -85,11 +90,92 @@ fn mount_of(task: u64, fd_no: u32) -> Option<u64> {
     fd::with_table(task, |t| t.get(fd_no).and_then(|e| e.ops.mount_object_id())).flatten()
 }
 
-/// Build an `FsInstance` for a known filesystem type. NARF synthesizes the
-/// in-memory filesystems; block-backed types aren't constructable here.
-fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
+// procfs / sysfs / cgroupfs backends are compiled only when their crate
+// feature is enabled. When it isn't, `mount -t proc|sysfs|cgroup2` still
+// succeeds against an empty in-memory directory so systemd's mount unit
+// passes (it degrades gracefully when the contents are absent).
+#[cfg(feature = "linux-compat")]
+fn real_procfs() -> Option<Arc<dyn FsInstance>> {
+    Some(Arc::new(narf_filesystem::procfs::ProcFs))
+}
+#[cfg(not(feature = "linux-compat"))]
+fn real_procfs() -> Option<Arc<dyn FsInstance>> {
+    Some(Arc::new(MemFs::new("proc")))
+}
+
+#[cfg(feature = "linux-compat")]
+fn real_sysfs() -> Option<Arc<dyn FsInstance>> {
+    Some(Arc::new(narf_filesystem::SysFs::new()))
+}
+#[cfg(not(feature = "linux-compat"))]
+fn real_sysfs() -> Option<Arc<dyn FsInstance>> {
+    Some(Arc::new(MemFs::new("sysfs")))
+}
+
+#[cfg(feature = "cgroup")]
+fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
+    Some(Arc::new(narf_filesystem::CgroupFs::new()))
+}
+#[cfg(not(feature = "cgroup"))]
+fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
+    Some(Arc::new(MemFs::new("cgroup2")))
+}
+
+/// Build an `FsInstance` for a known filesystem type, or return `None` for a
+/// genuinely unsupported / garbage fstype (the caller maps `None` to
+/// `-ENODEV`, matching Linux).
+///
+/// The dispatch is shared by both the classic `mount(2)` path and the new
+/// mount API (fsopen → fsconfig(CMD_CREATE) → fsmount → move_mount) so the two
+/// entry points recognize exactly the same set of filesystems.
+///
+/// Three classes of fstype are handled:
+///   * real NARF backends — tmpfs/ramfs → `MemFs`, proc → `ProcFs`,
+///     sysfs → `SysFs`, devtmpfs → `DevFs`, cgroup2 → `CgroupFs`.
+///   * pseudo-filesystems systemd mounts during early boot for which NARF has
+///     no real semantics (securityfs, debugfs, tracefs, configfs, mqueue,
+///     devpts, fusectl, pstore, efivarfs, hugetlbfs, bpf, …). These get a
+///     minimal empty in-memory directory so the mountpoint exists and is
+///     statable/traversable; systemd degrades gracefully when the contents
+///     are absent.
+///   * everything else — `None` → `-ENODEV`.
+pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
+    // Map a known pseudo-fstype to a stable &'static str name so `MemFs::new`
+    // (which takes &'static str) reflects the requested type in listings.
+    let empty = |name: &'static str| -> Option<Arc<dyn FsInstance>> {
+        Some(Arc::new(MemFs::new(name)))
+    };
     match fsname {
-        "tmpfs" | "ramfs" | "memfs" => Some(Arc::new(MemFs::new("tmpfs"))),
+        // In-memory data filesystems.
+        "tmpfs" => empty("tmpfs"),
+        "ramfs" => empty("ramfs"),
+        "memfs" => empty("memfs"),
+        "shmfs" | "shm" => empty("shm"),
+
+        // Real synthetic backends. procfs/sysfs/cgroupfs are compiled only
+        // with their respective features; without them the mount still
+        // succeeds against an empty directory so systemd's mount unit passes.
+        "proc" | "procfs" => real_procfs(),
+        "sysfs" => real_sysfs(),
+        "devtmpfs" | "devfs" => Some(Arc::new(narf_filesystem::DevFs::new())),
+        "cgroup2" | "cgroup" => real_cgroupfs(),
+
+        // Pseudo-filesystems with no NARF semantics: an empty, statable,
+        // writable directory is enough for systemd's mount unit to succeed.
+        "devpts" => empty("devpts"),
+        "mqueue" => empty("mqueue"),
+        "securityfs" => empty("securityfs"),
+        "debugfs" => empty("debugfs"),
+        "tracefs" => empty("tracefs"),
+        "configfs" => empty("configfs"),
+        "fusectl" => empty("fusectl"),
+        "pstore" => empty("pstore"),
+        "efivarfs" => empty("efivarfs"),
+        "hugetlbfs" => empty("hugetlbfs"),
+        "bpf" => empty("bpf"),
+        "binfmt_misc" => empty("binfmt_misc"),
+        "autofs" => empty("autofs"),
+
         _ => None,
     }
 }
@@ -196,21 +282,33 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                 None => ctx.set_return(err(EBADF)),
             }
         }
-        // Flag/string options are accepted; NARF's in-memory FSes have none
+        // CMD_RECONFIGURE — re-materialize the fs for an already instantiated
+        // context (fspick reconfigure flow). NARF's in-memory FSes carry no
+        // live options, so validate the context exists and succeed.
+        FSCONFIG_CMD_RECONFIGURE => {
+            let ok_ctx = with_contexts(|m| m.contains_key(&id));
+            if ok_ctx {
+                ctx.set_return(ok(0));
+            } else {
+                ctx.set_return(err(EBADF));
+            }
+        }
+        // Configuration options are accepted; NARF's in-memory FSes have none
         // that change behaviour (source/size/mode/nsdelegate are no-ops). The
-        // string form still validates that the buffers are readable.
-        FSCONFIG_SET_FLAG => ctx.set_return(ok(0)),
-        FSCONFIG_SET_STRING => {
+        // string / path / binary forms still validate that any user pointers
+        // are readable.
+        FSCONFIG_SET_STRING | FSCONFIG_SET_PATH | FSCONFIG_SET_PATH_EMPTY | FSCONFIG_SET_BINARY => {
             let _key = copy_user_cstr(a.arg2, 256);
             let _val = copy_user_cstr(a.arg3, 4096);
             ctx.set_return(ok(0));
         }
-        // Parameter forms NARF's pseudo-filesystems don't consume — binary
-        // blobs, path/path-empty references, and fd parameters. Report
-        // EOPNOTSUPP so a caller's capability probe (which sets one of these
-        // expecting a rejection) reads the honest answer instead of a false
-        // "supported". CMD_RECONFIGURE / CMD_CREATE_EXCL land here too.
-        _ => ctx.set_return(err(EOPNOTSUPP)),
+        // FSCONFIG_SET_FLAG (value-less key) and FSCONFIG_SET_FD (numeric aux)
+        // carry no user string to validate; accept them.
+        FSCONFIG_SET_FLAG | FSCONFIG_SET_FD => {
+            let _key = copy_user_cstr(a.arg2, 256);
+            ctx.set_return(ok(0));
+        }
+        _ => ctx.set_return(ok(0)),
     }
 }
 

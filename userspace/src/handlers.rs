@@ -16515,6 +16515,7 @@ const MS_NODEV: u64 = 1 << 2;
 const MS_NOEXEC: u64 = 1 << 3;
 const MS_REMOUNT: u64 = 1 << 5;
 const MS_BIND: u64 = 1 << 12;
+const MS_MOVE: u64 = 1 << 13;
 const MS_REC: u64 = 1 << 14;
 // Mount-propagation flags. When any of these is set, Linux `mount(2)` ONLY
 // changes the propagation type of the mount already at `target` — source,
@@ -16533,7 +16534,15 @@ const MS_RELATIME: u64 = 1 << 21;
 
 fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fail = SyscallReturn::ok(!0u64);
+    // errno replies (negated-long convention). Every failure carries a
+    // specific errno (a bare -1 would map to EPERM), matching Linux mount(2).
+    let einval = SyscallReturn::ok((-22i64) as u64); // EINVAL — bad argument
+    let enodev = SyscallReturn::ok((-19i64) as u64); // ENODEV — unknown fstype
+    let ebusy = SyscallReturn::ok((-16i64) as u64); // EBUSY — target in use
+    let enoent = SyscallReturn::ok((-2i64) as u64); // ENOENT — missing source
+    let efault = SyscallReturn::ok((-14i64) as u64); // EFAULT — bad user pointer
+    // A copy-in failure means an unreadable user pointer → EFAULT.
+    let fail = efault;
 
     // Linux `mount(2)`: (const char *source, const char *target,
     // const char *filesystemtype, unsigned long mountflags, const void *data).
@@ -16565,9 +16574,15 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     // Propagation-only change (MS_SLAVE/MS_SHARED/MS_PRIVATE/MS_UNBINDABLE,
     // optionally |MS_REC): change the propagation type of the mount at
     // `target` and nothing else. NARF has no propagation model, so this is a
-    // no-op success. Handled BEFORE bind/tmpfs/API dispatch because these calls
-    // carry a NULL source and NULL fstype (see the MS_PROPAGATION comment).
-    if flags & MS_PROPAGATION != 0 {
+    // no-op success. Gated to "a propagation bit is set and no fstype / bind /
+    // move / remount work is requested" so a legitimate mount that also passes
+    // a propagation bit still falls through to the real dispatch below. Handled
+    // BEFORE bind/tmpfs/API dispatch because these calls carry a NULL source
+    // and NULL fstype (see the MS_PROPAGATION comment).
+    if (flags & MS_PROPAGATION) != 0
+        && (flags & (MS_BIND | MS_MOVE | MS_REMOUNT)) == 0
+        && (fstype.is_empty() || fstype == "none")
+    {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -16593,26 +16608,10 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     // + tmpfs /run,/tmp into the chroot before PID 1 runs. NARF has no mount
     // stacking, so a re-mount of an already-provided pseudo-fs target reports
     // success (matching Linux, which stacks and succeeds) rather than
-    // erroring. Scoped to pseudo-fs types so bind / block-device mounts keep
+    // erroring. Scoped to the fstypes `mount_api::build_fs` recognizes (the
+    // in-memory / synthetic filesystems) so bind / block-device mounts keep
     // their real handling (a bind onto an existing path is a distinct op).
-    let is_pseudo_fs = matches!(
-        fstype.as_str(),
-        "proc"
-            | "sysfs"
-            | "cgroup"
-            | "cgroup2"
-            | "devtmpfs"
-            | "devpts"
-            | "tmpfs"
-            | "ramfs"
-            | "mqueue"
-            | "debugfs"
-            | "tracefs"
-            | "securityfs"
-            | "configfs"
-            | "fusectl"
-            | "bpf"
-    );
+    let is_pseudo_fs = crate::mount_api::build_fs(fstype.as_str()).is_some();
     if is_pseudo_fs
         && narf_filesystem::registry()
             .list()
@@ -16635,48 +16634,31 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             target.as_str(),
         ) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
+            Err(narf_filesystem::FsError::NotFound) => ctx.set_return(enoent),
+            Err(narf_filesystem::FsError::Busy) => ctx.set_return(ebusy),
+            Err(_) => ctx.set_return(einval),
         };
     }
 
-    // Wave-71: tmpfs / memfs — synthesize an empty in-memory FS.
-    if fstype == "tmpfs" || fstype == "ramfs" {
-        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
-            alloc::sync::Arc::new(narf_filesystem::MemFs::new("tmpfs"));
+    // Pseudo / in-memory filesystems: tmpfs, proc, sysfs, devtmpfs, cgroup2,
+    // devpts, mqueue, securityfs, debugfs, … The shared dispatch
+    // (mount_api::build_fs) returns a real backend where NARF has one
+    // (proc/sysfs/cgroup2 are global singletons whose content attaches at the
+    // caller's target, e.g. a chroot's /proc or /sys/fs/cgroup) and a minimal
+    // empty directory for the rest; only a genuinely unknown fstype returns
+    // None. This is the same dispatch the new mount API (fsopen → fsconfig)
+    // uses, so both entry points recognize identical filesystems. Block-device
+    // fstypes (fat/vfat/ext…) fall through below because build_fs can't
+    // synthesize them without a device.
+    if let Some(fs) = crate::mount_api::build_fs(fstype.as_str()) {
         return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
+            // Something is already mounted at this path. systemd re-mounts the
+            // API filesystems (proc/sys/…) that boot already provided; treat an
+            // existing mount at the same path as success so those units pass.
+            Err(narf_filesystem::FsError::Busy) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(_) => ctx.set_return(einval),
         };
-    }
-
-    // API pseudo-filesystems that an init system (systemd, sysvinit) mounts
-    // itself: proc / sysfs / cgroup2 / devtmpfs. These are global singletons
-    // in NARF — mounting attaches the same content at the caller's target
-    // (e.g. a chroot's /proc, or /sys/fs/cgroup for cgroup2). Without this an
-    // init in a fresh mount namespace / chroot can't set up the API mounts and
-    // (for systemd) `statfs(/sys/fs/cgroup)` never reports CGROUP2_SUPER_MAGIC.
-    {
-        let api: Option<alloc::sync::Arc<dyn narf_filesystem::FsInstance>> = match fstype.as_str() {
-            #[cfg(feature = "linux-compat")]
-            "proc" => Some(alloc::sync::Arc::new(narf_filesystem::procfs::ProcFs)),
-            #[cfg(feature = "linux-compat")]
-            "sysfs" => Some(alloc::sync::Arc::new(narf_filesystem::SysFs::new())),
-            #[cfg(feature = "cgroup")]
-            "cgroup2" => Some(alloc::sync::Arc::new(narf_filesystem::CgroupFs::new())),
-            // devtmpfs: an init (systemd) mounts /dev as devtmpfs at a fresh
-            // target. NARF's /dev is a DevFs singleton; hand back a DevFs so
-            // the mounted /dev exposes the null/zero/console/pty device nodes.
-            // (When /dev is already bound in a chroot, the idempotent guard
-            // above short-circuits before we get here.)
-            "devtmpfs" => Some(alloc::sync::Arc::new(narf_filesystem::DevFs::new())),
-            _ => None,
-        };
-        if let Some(fs) = api {
-            return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
-                Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-                Err(_) => ctx.set_return(fail),
-            };
-        }
     }
 
     // overlayfs (union mount). Linux passes the layer paths in the mount(2)
@@ -16799,7 +16781,14 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     {
         Some(e) => e,
         None => {
-            ctx.set_return(fail);
+            // No backend, no register_fstype builder, and no such device: a
+            // known block fstype with a missing device is ENOENT; a genuinely
+            // unknown fstype is ENODEV (matching Linux, never a bare -1).
+            match fstype.as_str() {
+                "fat" | "vfat" | "fat16" | "fat32" | "ext2" | "ext3" | "ext4" | "xfs"
+                | "btrfs" | "iso9660" | "9p" | "virtiofs" => ctx.set_return(enoent),
+                _ => ctx.set_return(enodev),
+            }
             return;
         }
     };
@@ -16810,12 +16799,16 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             let fut = narf_drivers_fs_fat::mount_fat(&auth, target.as_str(), dev, domain);
             poll_blocking(fut)
         }
-        _ => None,
+        _ => {
+            // A registered device but an unrecognized fstype for it.
+            ctx.set_return(enodev);
+            return;
+        }
     };
 
     match result {
         Some(Ok(_handle)) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(einval),
     }
 }
 
