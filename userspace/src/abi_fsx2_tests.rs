@@ -439,6 +439,30 @@ fn smoke_abi_fsx2_name_to_handle_at_inode_form() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_name_to_handle_at_inode_form);
 
+// ── open(O_WRONLY) then fcntl(F_GETFL) reports the access mode ─────────
+//
+// glibc's fdopen(fd, "w") reads the fd's access mode via F_GETFL and
+// rejects the stream with EINVAL unless it matches the requested mode.
+// systemd fdopens a cgroup.procs it opened O_WRONLY, so the fd must
+// report O_WRONLY (not just the settable status-flag bits).
+fn smoke_abi_fsx2_open_wronly_fgetfl_access_mode() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"hi")], || {
+        const O_WRONLY: u64 = 1;
+        const F_GETFL: u64 = 3;
+        const O_ACCMODE: u64 = 3;
+        let path = b"/abi/f\0";
+        let fd = match call_open(path.as_ptr() as u64, O_WRONLY) {
+            Some(v) if v >= 0 => v as u64,
+            _ => return Err("open O_WRONLY of a seeded MemFs file failed"),
+        };
+        match call(Syscall::Fcntl.raw(), a2(fd, F_GETFL, 0)) {
+            Some(fl) if (fl as u64 & O_ACCMODE) == O_WRONLY => Ok(()),
+            _ => Err("F_GETFL did not report the O_WRONLY access mode"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_open_wronly_fgetfl_access_mode);
+
 // ── name_to_handle_at: EFAULT on an unreadable handle buffer ──────────
 //
 // Existing path, but arg2 (the handle buffer whose first u32 is read) is

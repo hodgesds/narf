@@ -106,8 +106,6 @@ impl CgroupType {
 
 // ── The cgroup node ─────────────────────────────────────────────────
 
-/// One node in the cgroup-v2 hierarchy. The root has an empty `name`
-/// and no parent; children are created by userspace `mkdir`.
 /// Monotonic inode allocator for cgroups. Each cgroup gets a unique,
 /// stable id, surfaced as its `st_ino` and as the cgroup id an init reads
 /// via `name_to_handle_at`. The base is high (and distinct from MemFs's)
@@ -120,6 +118,8 @@ fn alloc_cgroup_ino() -> u64 {
     NEXT_CGROUP_INO.fetch_add(1, Ordering::Relaxed)
 }
 
+/// One node in the cgroup-v2 hierarchy. The root has an empty `name`
+/// and no parent; children are created by userspace `mkdir`.
 pub struct Cgroup {
     /// Unique, stable inode / cgroup id (see [`NEXT_CGROUP_INO`]).
     ino: u64,

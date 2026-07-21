@@ -937,12 +937,15 @@ fn open_impl(
         ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
         return;
     }
-    // Preserve the settable open flags (O_NONBLOCK | O_APPEND | O_DIRECT)
-    // into the fd's status flags. Historically `open()` dropped these and
-    // only `fcntl(F_SETFL)` could set them, so a file opened `O_NONBLOCK`
-    // (as libinput opens evdev nodes) read as a blocking fd — see
-    // `InputEventFile::nonblock_read_eagain`.
-    let open_status_flags = (flags as u32) & crate::fd::O_SETFL_MASK;
+    // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR) plus the settable
+    // status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
+    // `fcntl(F_GETFL)` reports both. glibc's `fdopen(fd, "w")` reads the
+    // access mode via F_GETFL and rejects the stream with EINVAL if it
+    // doesn't match the requested mode — systemd fdopens a `cgroup.procs`
+    // it opened O_WRONLY, so a dropped access mode failed that check.
+    // (O_NONBLOCK matters on its own for libinput's evdev nodes — see
+    // `InputEventFile::nonblock_read_eagain`.)
+    let open_status_flags = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
     // user-runtime's `open` wrapper checks `r == !0u64` for failure
     // (the asm wrapper observes only the value register, not the
     // status word), so the kernel must mirror that sentinel rather
