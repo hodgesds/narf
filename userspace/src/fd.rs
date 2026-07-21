@@ -409,6 +409,22 @@ pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 /// `ioctl(fd, TIOCSCTTY, 0)` — make this the caller's controlling tty.
 pub const TIOCSCTTY: u32 = 0x540E;
+/// `ioctl(fd, TIOCNOTTY, 0)` — give up this controlling tty. `login`
+/// drops a leftover session's ctty before claiming the console itself.
+pub const TIOCNOTTY: u32 = 0x5422;
+/// `ioctl(fd, TIOCGSID, &pid_t)` — session id of the tty's session leader
+/// (`tcgetsid(3)`). getty/login read it back to confirm the ctty is theirs.
+pub const TIOCGSID: u32 = 0x5429;
+/// `ioctl(fd, TCSBRK, int)` — drain output, optionally send a BREAK.
+/// The console has no hardware BREAK; drain is a no-op, so this succeeds.
+pub const TCSBRK: u32 = 0x5409;
+/// `ioctl(fd, TCXONC, int)` — suspend/resume output (tcflow). No flow
+/// control on the singleton console — accepted as a no-op.
+pub const TCXONC: u32 = 0x540A;
+/// `ioctl(fd, TCFLSH, int)` — flush pending input/output (tcflush).
+/// Best-effort: input is drained through the shared discipline; output
+/// is unbuffered, so this succeeds without further work.
+pub const TCFLSH: u32 = 0x540B;
 /// `ioctl(fd, TIOCGWINSZ, &winsize)` — query window dimensions.
 pub const TIOCGWINSZ: u32 = 0x5413;
 /// `ioctl(fd, TIOCSWINSZ, &winsize)` — set window dimensions.
@@ -431,6 +447,20 @@ pub const KDSKBMODE: u32 = 0x4B45;
 /// on `/dev/console` during early init; accepted and ignored (NARF has
 /// no VT kbrequest source to route through it).
 pub const KDSIGACCEPT: u32 = 0x4B4E;
+/// `ioctl(fd, KDGETMODE, &int)` — query the VT graphics/text mode. agetty
+/// on a Linux VT probes this; NARF has no VT, so it reports `KD_TEXT` (0).
+pub const KDGETMODE: u32 = 0x4B3B;
+/// `ioctl(fd, VT_OPENQRY, &int)` — first free VT index. NARF has no VT
+/// layer; report ENOTTY so a VT-aware getty degrades to serial mode.
+pub const VT_OPENQRY: u32 = 0x5600;
+/// `ioctl(fd, VT_GETMODE, &vt_mode)` — current VT switching mode.
+pub const VT_GETMODE: u32 = 0x5601;
+/// `ioctl(fd, VT_GETSTATE, &vt_stat)` — active-VT state.
+pub const VT_GETSTATE: u32 = 0x5603;
+/// `ioctl(fd, VT_ACTIVATE, vtnum)` — switch to VT `vtnum`.
+pub const VT_ACTIVATE: u32 = 0x5606;
+/// `ioctl(fd, VT_WAITACTIVE, vtnum)` — block until VT `vtnum` is active.
+pub const VT_WAITACTIVE: u32 = 0x5607;
 
 /// POSIX `struct winsize` — row/col + pixel hints. Pixel fields
 /// stay zero (we don't model a pixel-aware terminal).
@@ -579,6 +609,35 @@ impl FileOps for ConsoleFile {
                 crate::handlers::set_controlling_tty_console(crate::handlers::current_task_id());
                 Ok(0)
             }
+            TIOCNOTTY => {
+                // Give up the controlling terminal (tcsetsid teardown /
+                // login's pre-claim reset). Mark the caller detached so a
+                // later open/TIOCSCTTY re-acquires cleanly.
+                #[cfg(feature = "linux-compat")]
+                crate::handlers::detach_controlling_tty(crate::handlers::current_task_id());
+                Ok(0)
+            }
+            #[cfg(feature = "linux-compat")]
+            TIOCGSID => {
+                // tcgetsid(3): session id of the tty's session. NARF's
+                // console is the session leader's ctty, so report the
+                // caller's session id (visible-pid space).
+                let sid = crate::handlers::current_task_sid_user() as i32;
+                let bytes = sid.to_le_bytes();
+                // SAFETY: `copy_to_user` validates `arg` through the SMAP
+                // window; the length is the fixed 4-byte `pid_t` encoding.
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            TCSBRK | TCXONC | TCFLSH => {
+                // Output is unbuffered and there is no hardware BREAK or
+                // flow control on the singleton console, so drain/flush/
+                // flow requests have nothing to do — succeed so a program
+                // that flushes on mode changes (readline, agetty) proceeds.
+                Ok(0)
+            }
             TIOCGWINSZ => {
                 let ws = console_winsize();
                 // SAFETY: `Winsize` is a `repr(C)` POD of four `u16` (8 bytes)
@@ -699,6 +758,25 @@ impl FileOps for ConsoleFile {
                     return Err(FsError::InvalidData);
                 }
                 Ok(0)
+            }
+            KDGETMODE => {
+                // VT graphics/text mode. No VT layer → always text (`KD_TEXT`
+                // = 0). `arg` is an `int *` out-parameter.
+                let bytes = 0i32.to_le_bytes();
+                // SAFETY: `copy_to_user` validates `arg` through the SMAP
+                // window; the length is the fixed 4-byte `int` encoding.
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                Ok(0)
+            }
+            VT_OPENQRY | VT_GETMODE | VT_GETSTATE | VT_ACTIVATE | VT_WAITACTIVE => {
+                // Virtual-terminal control. NARF drives a serial/dumb console
+                // with no VT layer, so report ENOTTY (via Unsupported): a
+                // VT-aware agetty treats this as "not a VT" and degrades to
+                // plain serial operation rather than aborting. Distinct from
+                // a bare -1 — the errno is what lets getty branch correctly.
+                Err(FsError::Unsupported)
             }
             _ => Err(FsError::Unsupported),
         }

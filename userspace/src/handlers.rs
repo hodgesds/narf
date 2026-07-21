@@ -615,6 +615,15 @@ pub fn init_per_task_state() {
         // CTTY table. Hook is global; filesystem crate calls back through
         // a fn pointer to avoid a userspace→filesystem dep cycle.
         narf_filesystem::devfs_pty::set_controlling_tty_hook(set_controlling_tty);
+        // Route /dev/console TIOCSCTTY / TIOCNOTTY / TIOCGSID into the same
+        // per-task CTTY + session tables so getty/login can claim the console
+        // as their session's controlling terminal via /dev/console (or
+        // /dev/tty1), not only via a PTY slave.
+        narf_filesystem::console_tty::install_ctty_hooks(
+            console_tiocsctty,
+            console_tiocnotty,
+            console_tiocgsid,
+        );
     }
 }
 
@@ -12908,6 +12917,14 @@ fn read_sid(target: u64) -> u64 {
         .unwrap_or(target) // default: sid == pid
 }
 
+/// The session id of the current task, in the visible-pid space userspace
+/// sees. Backs the `TIOCGSID` console ioctl (`tcgetsid(3)`), which getty
+/// and login use to confirm they own the tty's session after `TIOCSCTTY`.
+#[cfg(feature = "linux-compat")]
+pub fn current_task_sid_user() -> u64 {
+    pgid_to_user(read_sid(current_task_id()))
+}
+
 /// Child inherits the parent's process-group id (POSIX fork semantics).
 /// Without this a forked child defaults to pgid == its own pid, which
 /// would place a shell-launched foreground job in a *different* group than
@@ -12968,6 +12985,16 @@ fn sys_setsid(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(pgid_to_user(task)));
 }
 
+/// `vhangup(2)`: simulate a controlling-terminal hangup. On Linux this
+/// revokes every *other* process's open of the terminal (used by
+/// `/bin/login` and getty to drop a prior session's grip before taking
+/// over the tty). NARF drives a singleton console with no per-open revoke
+/// path, so there is nothing to tear down — the caller keeps its own open
+/// fds. Return 0 so login proceeds instead of aborting on a bare -1.
+fn sys_vhangup(ctx: &mut dyn TrapContext) {
+    ctx.set_return(SyscallReturn::ok(0));
+}
+
 // ── Per-task controlling-tty table (Wave-76) ───────────────────────
 //
 // `TIOCSCTTY` on a PTY slave records the slave's PTY index here.
@@ -13020,6 +13047,18 @@ pub fn set_controlling_tty_console(task: u64) {
     }
 }
 
+/// Detach `task` from its controlling terminal — the `TIOCNOTTY` path.
+/// Marks the slot `CTTY_DETACHED` (a distinct state from the boot-console
+/// default) so `task_ctty` resolves to "no controlling terminal", matching
+/// what `setsid()` does. A subsequent `open` without `O_NOCTTY` or an
+/// explicit `TIOCSCTTY` re-acquires one.
+#[cfg(feature = "linux-compat")]
+pub fn detach_controlling_tty(task: u64) {
+    if let Some(m) = CTTY_TABLE.lock().as_mut() {
+        m.insert(task, CTTY_DETACHED);
+    }
+}
+
 /// Child inherits the parent's controlling terminal (POSIX fork). Only an
 /// explicit entry needs copying — absence already resolves to the console
 /// default for both parent and child.
@@ -13066,6 +13105,25 @@ pub fn set_controlling_tty(pty_index: u32) {
     if let Some(m) = g.as_mut() {
         m.insert(task, pty_index);
     }
+}
+
+/// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
+/// console as the calling task's controlling terminal.
+#[cfg(feature = "linux-compat")]
+fn console_tiocsctty() {
+    set_controlling_tty_console(current_task_id());
+}
+
+/// `TIOCNOTTY`-on-console hook: detach the calling task's controlling tty.
+#[cfg(feature = "linux-compat")]
+fn console_tiocnotty() {
+    detach_controlling_tty(current_task_id());
+}
+
+/// `TIOCGSID`-on-console hook: the caller's session id (visible-pid space).
+#[cfg(feature = "linux-compat")]
+fn console_tiocgsid() -> u64 {
+    current_task_sid_user()
 }
 
 // ── Per-task uid/gid table ─────────────────────────────────────────
@@ -24738,6 +24796,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Setpgid, "setpgid", RawFnHandler(sys_setpgid));
     table.install_raw(Syscall::Getsid, "getsid", RawFnHandler(sys_getsid));
     table.install_raw(Syscall::Setsid, "setsid", RawFnHandler(sys_setsid));
+    table.install_raw(Syscall::Vhangup, "vhangup", RawFnHandler(sys_vhangup));
     table.install_raw(
         Syscall::GetHostname,
         "gethostname",

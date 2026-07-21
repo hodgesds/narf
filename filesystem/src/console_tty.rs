@@ -87,6 +87,58 @@ pub fn install_signal_hook(hook: fn(u8) -> bool) {
     SIGNAL_HOOK.store(hook as usize, Ordering::Release);
 }
 
+/// Controlling-tty hooks for `/dev/console` (`DevConsole::ioctl`), mirroring
+/// the PTY-slave `set_controlling_tty_hook`. The per-task session/ctty tables
+/// live in the userspace crate; the console front-end reaches them through
+/// these fn-pointer hooks installed at boot, avoiding a filesystem→userspace
+/// dependency. Stored as raw `usize` (0 = uninstalled) like `SIGNAL_HOOK`.
+static CTTY_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static CTTY_DETACH_HOOK: AtomicUsize = AtomicUsize::new(0);
+static SID_QUERY_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the console controlling-tty hooks (`TIOCSCTTY` acquire,
+/// `TIOCNOTTY` detach, `TIOCGSID` session-id query). Called once at boot.
+pub fn install_ctty_hooks(set: fn(), detach: fn(), sid: fn() -> u64) {
+    CTTY_SET_HOOK.store(set as usize, Ordering::Release);
+    CTTY_DETACH_HOOK.store(detach as usize, Ordering::Release);
+    SID_QUERY_HOOK.store(sid as usize, Ordering::Release);
+}
+
+/// `TIOCSCTTY` on `/dev/console`: record the console as the caller's
+/// controlling terminal via the installed hook (no-op if uninstalled).
+pub fn tiocsctty() {
+    let raw = CTTY_SET_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: `raw` was stored from a `fn()` by `install_ctty_hooks`;
+        // fn pointers and usize share size/alignment.
+        let hook: fn() = unsafe { core::mem::transmute(raw) };
+        hook();
+    }
+}
+
+/// `TIOCNOTTY` on `/dev/console`: detach the caller from its controlling
+/// terminal via the installed hook (no-op if uninstalled).
+pub fn tiocnotty() {
+    let raw = CTTY_DETACH_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: see `tiocsctty`.
+        let hook: fn() = unsafe { core::mem::transmute(raw) };
+        hook();
+    }
+}
+
+/// `TIOCGSID` on `/dev/console`: the caller's session id in visible-pid
+/// space (0 when no hook is installed — the caller then reports 0).
+pub fn tiocgsid() -> u64 {
+    let raw = SID_QUERY_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return 0;
+    }
+    // SAFETY: `raw` was stored from a `fn() -> u64` by `install_ctty_hooks`.
+    let hook: fn() -> u64 = unsafe { core::mem::transmute(raw) };
+    hook()
+}
+
 /// Snapshot the current termios wire image (cooked default until a
 /// program `TCSETS`es its own).
 pub fn termios() -> [u8; 60] {

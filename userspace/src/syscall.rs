@@ -1011,6 +1011,13 @@ pub enum Syscall {
     /// pgid = pid in their respective tables; returns pid.
     Setsid,
 
+    /// No args. `vhangup(2)`: on Linux this simulates a hangup on the
+    /// current controlling terminal, revoking every other open of it.
+    /// NARF's console is a singleton without a revoke path, so this is
+    /// a safe no-op that returns 0 — `/bin/login` calls it to drop any
+    /// prior session's grip on the tty before it takes over.
+    Vhangup,
+
     /// `arg0 = buf_ptr`, `arg1 = buf_len`. Copy the kernel-wide
     /// hostname (NUL-terminated UTF-8) into the user buffer.
     /// Returns the byte length excluding the NUL on success, -1 on
@@ -2574,6 +2581,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Setpgid, 109),
     (Syscall::GetPpid, 110),
     (Syscall::Setsid, 112),
+    (Syscall::Vhangup, 153),
     (Syscall::Getpgid, 121),
     (Syscall::Getsid, 124),
     (Syscall::RtSigpending, 127),
@@ -2828,6 +2836,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getpgid, 155),
     (Syscall::Getsid, 156),
     (Syscall::Setsid, 157),
+    (Syscall::Vhangup, 58),
     (Syscall::SetHostname, 161),
     (Syscall::Getrlimit, 163),
     (Syscall::Setrlimit, 164),

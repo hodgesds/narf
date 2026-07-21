@@ -2919,3 +2919,153 @@ fn smoke_overlay_copy_up_on_write() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_overlay_copy_up_on_write);
+
+// ── /dev/console + /dev/tty1 terminal ioctls (getty/agetty path) ────────
+//
+// A distro getty/agetty on the console opens `/dev/tty1` (or /dev/console),
+// probes it with a battery of tty/VT/keyboard ioctls, then sets the fg
+// pgrp. These smokes pin the DevConsole ioctl surface those probes hit:
+// the winsize + fg-pgrp round-trips, and — crucially — that the VT/KD
+// probes return a *sane* result (0 or ENOTTY) rather than a bare failure
+// that would abort getty. All args are stack pointers accessed through the
+// same `write_user_*` helpers the syscall path uses (kernel stack pages are
+// supervisor memory, so the SMAP bracket permits access here).
+
+/// Resolve a fresh `/dev/tty1` FileOps (a `DevConsole`) for ioctl tests.
+#[cfg(feature = "linux-compat")]
+fn open_dev_tty1_for_test() -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
+    use crate::{bootstrap_mount_authority, registry, DevFs};
+    let auth = bootstrap_mount_authority();
+    // Idempotent: a prior smoke may already own this mountpoint.
+    let _ = registry().mount(&auth, "/dev/tty-ioctl-test-mount", DevFs::new());
+    registry()
+        .resolve_absolute("/dev/tty-ioctl-test-mount/tty1", |fs, rel| {
+            crate::resolve(fs.root(), rel).ok()
+        })
+        .flatten()
+}
+
+// /dev/tty1 exists and is the singleton console tty (same tty id as
+// /dev/console) — getty@tty1 opens it. Also exercises TIOCGWINSZ + the
+// TIOCSWINSZ→TIOCGWINSZ round-trip glibc's `TIOCGWINSZ`/`resize` use.
+#[cfg(feature = "linux-compat")]
+fn smoke_devfs_tty1_is_console_and_winsize_roundtrip() -> TestResult {
+    use crate::devfs_pty::{TIOCGWINSZ, TIOCSWINSZ};
+    crate::console_tty::__test_reset_cooked();
+    let tty1 = match open_dev_tty1_for_test() {
+        Some(t) => t,
+        None => return TestResult::Fail("resolve /dev/tty1 failed"),
+    };
+    if tty1.tty_id() != Some(crate::TTY_ID_CONSOLE) {
+        return TestResult::Fail("/dev/tty1 is not the console tty");
+    }
+    // Default TIOCGWINSZ is plausible (non-zero rows/cols).
+    let mut ws: [u16; 4] = [0; 4];
+    if tty1.ioctl(TIOCGWINSZ, ws.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("TIOCGWINSZ failed");
+    }
+    if ws[0] == 0 || ws[1] == 0 {
+        return TestResult::Fail("TIOCGWINSZ returned an implausible 0x0 winsize");
+    }
+    // Set → get round-trip.
+    let mut set_ws: [u16; 4] = [40, 100, 0, 0];
+    if tty1.ioctl(TIOCSWINSZ, set_ws.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("TIOCSWINSZ failed");
+    }
+    let mut got: [u16; 4] = [0; 4];
+    if tty1.ioctl(TIOCGWINSZ, got.as_mut_ptr() as usize) != Ok(0) {
+        return TestResult::Fail("TIOCGWINSZ (post-set) failed");
+    }
+    if got[0] != 40 || got[1] != 100 {
+        return TestResult::Fail("winsize did not round-trip on /dev/tty1");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "filesystem",
+    smoke_devfs_tty1_is_console_and_winsize_roundtrip
+);
+
+// TIOCSPGRP → TIOCGPGRP round-trip on /dev/console: getty sets the
+// foreground pgrp for the login session; login reads it back.
+#[cfg(feature = "linux-compat")]
+fn smoke_devfs_console_fg_pgrp_roundtrip() -> TestResult {
+    use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
+    crate::console_tty::__test_reset_cooked();
+    let tty1 = match open_dev_tty1_for_test() {
+        Some(t) => t,
+        None => return TestResult::Fail("resolve /dev/tty1 failed"),
+    };
+    let mut set_pgrp: i32 = 4242;
+    if tty1.ioctl(TIOCSPGRP, &mut set_pgrp as *mut i32 as usize) != Ok(0) {
+        return TestResult::Fail("TIOCSPGRP failed");
+    }
+    let mut got: i32 = 0;
+    if tty1.ioctl(TIOCGPGRP, &mut got as *mut i32 as usize) != Ok(0) {
+        return TestResult::Fail("TIOCGPGRP failed");
+    }
+    if got != 4242 {
+        return TestResult::Fail("fg pgrp did not round-trip on /dev/console");
+    }
+    // A negative pgrp is rejected with EINVAL, not stored.
+    let mut bad: i32 = -1;
+    if tty1.ioctl(TIOCSPGRP, &mut bad as *mut i32 as usize).is_ok() {
+        return TestResult::Fail("TIOCSPGRP accepted a negative pgrp");
+    }
+    crate::console_tty::__test_reset_cooked();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_devfs_console_fg_pgrp_roundtrip);
+
+// The VT / keyboard probes agetty fires must degrade gracefully: KDGKBMODE
+// and KDGETMODE succeed reporting the default text mode (0); the VT_*
+// switching ioctls return ENOTTY (Unsupported) so a VT-aware agetty falls
+// back to serial mode instead of aborting on a bare failure; TCFLSH/TCSBRK
+// succeed as no-ops. None of these may be a bare error the caller can't
+// interpret.
+#[cfg(feature = "linux-compat")]
+fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
+    use crate::devfs_pty::{
+        KDGETMODE, KDGKBMODE, TCFLSH, TCSBRK, VT_ACTIVATE, VT_GETMODE, VT_GETSTATE, VT_OPENQRY,
+        VT_WAITACTIVE,
+    };
+    crate::console_tty::__test_reset_cooked();
+    let tty1 = match open_dev_tty1_for_test() {
+        Some(t) => t,
+        None => return TestResult::Fail("resolve /dev/tty1 failed"),
+    };
+    // KDGKBMODE / KDGETMODE succeed and report the default (0).
+    for &(cmd, name) in &[(KDGKBMODE, "KDGKBMODE"), (KDGETMODE, "KDGETMODE")] {
+        let mut mode: i32 = -7;
+        if tty1.ioctl(cmd, &mut mode as *mut i32 as usize) != Ok(0) {
+            return TestResult::Fail(name);
+        }
+        if mode != 0 {
+            return TestResult::Fail("KD probe did not report default mode 0");
+        }
+    }
+    // VT switching ioctls are ENOTTY (Unsupported), not a bare -1.
+    let mut scratch: i32 = 0;
+    let sp = &mut scratch as *mut i32 as usize;
+    for &(cmd, name) in &[
+        (VT_OPENQRY, "VT_OPENQRY"),
+        (VT_GETMODE, "VT_GETMODE"),
+        (VT_GETSTATE, "VT_GETSTATE"),
+        (VT_ACTIVATE, "VT_ACTIVATE"),
+        (VT_WAITACTIVE, "VT_WAITACTIVE"),
+    ] {
+        match tty1.ioctl(cmd, sp) {
+            Err(crate::FsError::Unsupported) => {}
+            _ => return TestResult::Fail(name),
+        }
+    }
+    // TCFLSH / TCSBRK succeed as no-ops.
+    if tty1.ioctl(TCFLSH, 0) != Ok(0) || tty1.ioctl(TCSBRK, 0) != Ok(0) {
+        return TestResult::Fail("TCFLSH/TCSBRK did not succeed as no-ops");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);

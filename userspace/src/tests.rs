@@ -18031,6 +18031,112 @@ kernel_test_in!(
     smoke_userspace_ctty_hook_roundtrip_and_setsid_clears
 );
 
+// getty/login controlling-terminal acquisition over the *console*: after
+// setsid() detaches, `set_controlling_tty_console` (the /dev/console
+// TIOCSCTTY hook) re-acquires the boot console so `task_ctty` resolves to
+// CONSOLE and TIOCGSID (`current_task_sid_user`) reports the new session.
+// `detach_controlling_tty` (TIOCNOTTY) then drops it again. This is the
+// exact sequence agetty runs: setsid → open(/dev/tty1) → TIOCSCTTY.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_console_ctty_acquire_release_and_sid() -> TestResult {
+    use crate::handlers::{
+        __test_ctty_reset, __test_pgid_reset, __test_sid_reset, current_task_id,
+        current_task_sid_user, detach_controlling_tty, set_controlling_tty_console, task_ctty,
+    };
+    use crate::{
+        init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
+        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
+        TrapContext,
+    };
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+    __test_pgid_reset();
+    __test_sid_reset();
+    __test_ctty_reset();
+    init_per_task_state();
+
+    let task = current_task_id();
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    // setsid() starts a new session and detaches any ctty.
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Setsid.raw(), &mut ctx);
+    if task_ctty(task).is_some() {
+        __test_clear_global();
+        return TestResult::Fail("setsid did not detach the ctty");
+    }
+
+    // open(/dev/tty1) + ioctl(TIOCSCTTY) → the console-hook body.
+    set_controlling_tty_console(task);
+    if task_ctty(task) != Some(crate::handlers::CTTY_CONSOLE) {
+        __test_clear_global();
+        return TestResult::Fail("TIOCSCTTY did not make the console the ctty");
+    }
+
+    // tcgetsid(3) via TIOCGSID reports this session's id (== leader pid).
+    if current_task_sid_user() != crate::handlers::pgid_to_user(task) {
+        __test_clear_global();
+        return TestResult::Fail("TIOCGSID did not report the setsid session");
+    }
+
+    // TIOCNOTTY drops it again.
+    detach_controlling_tty(task);
+    if task_ctty(task).is_some() {
+        __test_clear_global();
+        return TestResult::Fail("TIOCNOTTY did not detach the ctty");
+    }
+
+    // vhangup(2) is registered and returns 0 (safe no-op on the console).
+    let mut vctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Vhangup.raw(), &mut vctx);
+    match vctx.ret {
+        Some(r) if r.value == 0 => {}
+        _ => {
+            __test_clear_global();
+            return TestResult::Fail("vhangup did not return 0");
+        }
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_console_ctty_acquire_release_and_sid
+);
+
 // DAC boundary (placed at end of file deliberately: this suite is at the
 // margin and inserting a test *earlier* shifts the fragile
 // `smoke_userspace_execve_with_envp_pack_accepts` and tips it — see the

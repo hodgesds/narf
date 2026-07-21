@@ -85,6 +85,34 @@ pub const TCSETSW: u32 = 0x5403;
 pub const TCSETSF: u32 = 0x5404;
 /// `ioctl(fd, FIONREAD, &i32)` — bytes immediately readable.
 pub const FIONREAD: u32 = 0x541B;
+/// `ioctl(fd, TIOCNOTTY, 0)` — give up the controlling terminal.
+pub const TIOCNOTTY: u32 = 0x5422;
+/// `ioctl(fd, TIOCGSID, &pid_t)` — session id of the tty's session leader.
+pub const TIOCGSID: u32 = 0x5429;
+/// `ioctl(fd, TCSBRK, int)` — drain output, optionally send BREAK.
+pub const TCSBRK: u32 = 0x5409;
+/// `ioctl(fd, TCXONC, int)` — suspend/resume output (tcflow).
+pub const TCXONC: u32 = 0x540A;
+/// `ioctl(fd, TCFLSH, int)` — flush pending input/output (tcflush).
+pub const TCFLSH: u32 = 0x540B;
+/// `ioctl(fd, KDGKBMODE, &int)` — query the VT keyboard translation mode.
+pub const KDGKBMODE: u32 = 0x4B44;
+/// `ioctl(fd, KDSKBMODE, int)` — set the VT keyboard translation mode.
+pub const KDSKBMODE: u32 = 0x4B45;
+/// `ioctl(fd, KDGETMODE, &int)` — query the VT graphics/text mode.
+pub const KDGETMODE: u32 = 0x4B3B;
+/// `ioctl(fd, KDSIGACCEPT, int)` — nominate the SysRq kbrequest signal.
+pub const KDSIGACCEPT: u32 = 0x4B4E;
+/// `ioctl(fd, VT_OPENQRY, &int)` — first free VT index.
+pub const VT_OPENQRY: u32 = 0x5600;
+/// `ioctl(fd, VT_GETMODE, &vt_mode)` — current VT switching mode.
+pub const VT_GETMODE: u32 = 0x5601;
+/// `ioctl(fd, VT_GETSTATE, &vt_stat)` — active-VT state.
+pub const VT_GETSTATE: u32 = 0x5603;
+/// `ioctl(fd, VT_ACTIVATE, vtnum)` — switch to VT `vtnum`.
+pub const VT_ACTIVATE: u32 = 0x5606;
+/// `ioctl(fd, VT_WAITACTIVE, vtnum)` — block until VT `vtnum` is active.
+pub const VT_WAITACTIVE: u32 = 0x5607;
 
 // ── Ring buffer ───────────────────────────────────────────────────────────────
 
@@ -546,7 +574,7 @@ pub(crate) struct WireWinsize {
 }
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
+pub(crate) unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }
@@ -578,7 +606,7 @@ pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
-unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
+pub(crate) unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
     }

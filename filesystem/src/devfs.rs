@@ -767,9 +767,11 @@ impl FileOps for DevConsole {
     #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
         use crate::devfs_pty::{
-            read_user_i32, read_user_termios, write_user_i32, write_user_termios,
-            write_user_winsize, WireWinsize, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP,
-            TIOCGWINSZ, TIOCSPGRP,
+            read_user_i32, read_user_termios, read_user_winsize, write_user_i32,
+            write_user_termios, write_user_winsize, WireWinsize, FIONREAD, KDGETMODE, KDGKBMODE,
+            KDSIGACCEPT, KDSKBMODE, TCFLSH, TCGETS, TCSBRK, TCSETS, TCSETSF, TCSETSW, TCXONC,
+            TIOCGPGRP, TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
+            VT_ACTIVATE, VT_GETMODE, VT_GETSTATE, VT_OPENQRY, VT_WAITACTIVE,
         };
         // Termios + winsize + foreground pgrp are owned by the unified
         // `console_tty` so a TCSETS / tcsetpgrp on /dev/console is visible
@@ -800,6 +802,12 @@ impl FileOps for DevConsole {
                 unsafe { write_user_winsize(arg, ws)? };
                 Ok(0)
             }
+            TIOCSWINSZ => {
+                // SAFETY: `arg` is the validated user `struct winsize *`.
+                let ws = unsafe { read_user_winsize(arg)? };
+                crate::console_tty::set_winsize(ws.ws_row, ws.ws_col);
+                Ok(0)
+            }
             TIOCGPGRP => {
                 // tcgetpgrp on /dev/console — the singleton fg pgrp. No
                 // auto-install here (the caller's pgrp isn't reachable from
@@ -818,6 +826,53 @@ impl FileOps for DevConsole {
                 }
                 crate::console_tty::set_fg_pgrp(pgrp as u64);
                 Ok(0)
+            }
+            TIOCSCTTY => {
+                // Make /dev/console the caller's controlling terminal. The
+                // per-task ctty table lives in userspace; reach it via the
+                // hook installed at boot (see `install_ctty_hooks`).
+                let _ = arg;
+                crate::console_tty::tiocsctty();
+                Ok(0)
+            }
+            TIOCNOTTY => {
+                // Give up the controlling terminal (login's pre-claim reset).
+                let _ = arg;
+                crate::console_tty::tiocnotty();
+                Ok(0)
+            }
+            TIOCGSID => {
+                // tcgetsid(3): the tty session's leader sid (visible-pid).
+                let sid = crate::console_tty::tiocgsid() as i32;
+                // SAFETY: `arg` is the validated user `pid_t *`.
+                unsafe { write_user_i32(arg, sid)? };
+                Ok(0)
+            }
+            FIONREAD => {
+                let n = crate::console_tty::readable_bytes() as i32;
+                // SAFETY: `arg` is the validated user `int *`.
+                unsafe { write_user_i32(arg, n)? };
+                Ok(0)
+            }
+            TCSBRK | TCXONC | TCFLSH => {
+                // Unbuffered output, no hardware BREAK / flow control on the
+                // singleton console — drain/flush/flow have nothing to do.
+                Ok(0)
+            }
+            KDGKBMODE | KDGETMODE => {
+                // No VT layer: report the default (`K_XLATE` / `KD_TEXT` = 0).
+                // SAFETY: `arg` is the validated user `int *`.
+                unsafe { write_user_i32(arg, 0)? };
+                Ok(0)
+            }
+            KDSKBMODE | KDSIGACCEPT => {
+                // No VT keyboard/kbrequest state to change — accept + no-op.
+                Ok(0)
+            }
+            VT_OPENQRY | VT_GETMODE | VT_GETSTATE | VT_ACTIVATE | VT_WAITACTIVE => {
+                // No VT layer; ENOTTY lets a VT-aware agetty degrade to a
+                // plain serial console instead of aborting.
+                Err(crate::FsError::Unsupported)
             }
             _ => Err(crate::FsError::Unsupported),
         }
@@ -931,7 +986,10 @@ impl DirOps for DevDir {
             "random" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
             "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
-            "console" | "tty" | "tty0" => Some(Arc::new(DevConsole) as Arc<dyn FileOps>),
+            // `tty1` is the conventional first VT node — `getty@tty1.service`
+            // (and login on it) opens it. NARF has one console, so it and the
+            // `tty0`/`console` aliases all resolve to the same singleton tty.
+            "console" | "tty" | "tty0" | "tty1" => Some(Arc::new(DevConsole) as Arc<dyn FileOps>),
             "ptmx" => Some(Arc::new(crate::devfs_pty::DevPtmx) as Arc<dyn FileOps>),
             "fb0" => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
             // Userspace input-injection control device.
@@ -1062,6 +1120,10 @@ impl DirOps for DevDir {
                 file_type: FileType::Special,
             },
             DirEntry {
+                name: "tty1",
+                file_type: FileType::Special,
+            },
+            DirEntry {
                 name: "ptmx",
                 file_type: FileType::Special,
             },
@@ -1139,6 +1201,7 @@ impl DirOps for DevDir {
             ("console", FileType::Special),
             ("tty", FileType::Special),
             ("tty0", FileType::Special),
+            ("tty1", FileType::Special),
             ("ptmx", FileType::Special),
             ("fb0", FileType::Special),
             ("uinput", FileType::Special),
