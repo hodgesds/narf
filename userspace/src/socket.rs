@@ -98,6 +98,9 @@ pub const SO_RCVBUF: u32 = 8;
 pub const SO_KEEPALIVE: u32 = 9;
 pub const SO_LINGER: u32 = 13;
 pub const SO_REUSEPORT: u32 = 15;
+/// `SO_PASSCRED` — when set, `recvmsg` attaches an `SCM_CREDENTIALS`
+/// ancillary message naming the sending peer's (pid, uid, gid).
+pub const SO_PASSCRED: u32 = 16;
 pub const SO_PEERCRED: u32 = 17;
 pub const SO_BINDTODEVICE: u32 = 25;
 pub const SO_ACCEPTCONN: u32 = 30;
@@ -134,6 +137,75 @@ pub const O_NONBLOCK: u32 = 0o4000;
 pub struct SockAddr {
     pub family: u16,
     pub body: Vec<u8>,
+}
+
+/// Peer/local credentials attached to a socket end. Mirrors Linux
+/// `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`. Stamped at
+/// socket() creation from the creating task and copied to the peer
+/// end on connect/accept so `SO_PEERCRED` and `SCM_CREDENTIALS`
+/// report the real identity of the process on the other side.
+// The all-zero default (pid 0 / root) is the identity an unstamped socket
+// reads back — matching the synthetic ucred NARF reported before per-socket
+// credential tracking.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Ucred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// A parsed AF_UNIX destination. Linux keys three distinct address
+/// shapes off the `sockaddr_un` layout:
+/// - `Path` — a NUL-terminated pathname in `sun_path`; a filesystem
+///   node backs it.
+/// - `Abstract` — `sun_path[0] == '\0'`; the key is the bytes after
+///   the leading NUL up to `addrlen`, living ONLY in the in-kernel
+///   abstract-namespace registry (no filesystem node).
+/// - `Unnamed` — `addrlen == sizeof(sa_family_t)` (2); an autobind
+///   request that mints a fresh abstract name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnixAddr {
+    Path(String),
+    Abstract(Vec<u8>),
+    Unnamed,
+}
+
+impl UnixAddr {
+    /// Parse the `body` bytes of an AF_UNIX `SockAddr` (everything after
+    /// the 2-byte family). `body.len()` equals `addrlen - 2`, so an empty
+    /// body is the autobind (`Unnamed`) case. A leading NUL selects the
+    /// abstract namespace; otherwise the pathname is NUL-trimmed.
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        if body.is_empty() {
+            return Some(UnixAddr::Unnamed);
+        }
+        if body[0] == 0 {
+            // Abstract: the name is the raw bytes after the leading NUL,
+            // NOT NUL-trimmed (abstract names may embed NULs).
+            return Some(UnixAddr::Abstract(body[1..].to_vec()));
+        }
+        let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+        let s = core::str::from_utf8(&body[..end]).ok()?;
+        if s.is_empty() {
+            return None;
+        }
+        Some(UnixAddr::Path(String::from(s)))
+    }
+
+    /// Encode back into `SockAddr` body bytes (abstract keeps the leading
+    /// NUL; pathname is the raw bytes; unnamed is empty).
+    fn to_body(&self) -> Vec<u8> {
+        match self {
+            UnixAddr::Path(p) => p.as_bytes().to_vec(),
+            UnixAddr::Abstract(name) => {
+                let mut b = Vec::with_capacity(name.len() + 1);
+                b.push(0u8);
+                b.extend_from_slice(name);
+                b
+            }
+            UnixAddr::Unnamed => Vec::new(),
+        }
+    }
 }
 
 // ── Socket op dispatcher ────────────────────────────────────────
@@ -262,6 +334,20 @@ pub struct SocketFile {
     /// two processes in different net-ns can both bind the same
     /// (addr, port); the per-packet NIC path is untouched.
     net_ns_id: core::sync::atomic::AtomicU64,
+    /// Credentials of the process that owns this socket end. Stamped by
+    /// `sys_socket`/`sys_socketpair` at creation; surfaced to the peer via
+    /// `SO_PEERCRED` and to a `SO_PASSCRED` recvmsg via `SCM_CREDENTIALS`.
+    local_cred: IrqSafeSpinLock<Ucred>,
+    /// Credentials of the connected peer. Filled in at connect()/accept()
+    /// time (each end copies the other's `local_cred`). Read by
+    /// `getsockopt(SO_PEERCRED)`.
+    peer_cred: IrqSafeSpinLock<Ucred>,
+    /// `SO_PASSCRED` — recvmsg attaches an `SCM_CREDENTIALS` cmsg when set.
+    passcred: AtomicBool,
+    /// Credentials of the sender of the most recently received datagram.
+    /// A `SO_PASSCRED` recvmsg on a DGRAM socket reports THESE (per-message
+    /// identity), whereas a stream recvmsg reports the fixed `peer_cred`.
+    last_recv_cred: IrqSafeSpinLock<Ucred>,
 }
 
 /// Faithful per-socket storage for set/getsockopt values. Defaults
@@ -332,9 +418,9 @@ impl Default for SockOptions {
 enum SocketState {
     /// Freshly-created, no bind/connect yet.
     Fresh,
-    /// AF_UNIX bound listener at the named path.
+    /// AF_UNIX bound listener at the named address (pathname or abstract).
     UnixListener {
-        path: String,
+        addr: UnixAddr,
         backlog: u32,
         /// Connections that have been initiated by `connect()` but
         /// haven't yet been picked up by `accept()`. The other
@@ -393,12 +479,12 @@ enum SocketState {
         /// without an explicit destination addr.
         peer: Option<(u32, u16)>,
     },
-    /// AF_UNIX SOCK_DGRAM endpoint. Same shape as InetDgram but
-    /// keyed by path string.
+    /// AF_UNIX SOCK_DGRAM endpoint. Same shape as InetDgram but keyed by
+    /// a unix address (pathname or abstract name).
     UnixDgram {
-        path: Option<String>,
+        addr: Option<UnixAddr>,
         inbox: VecDeque<DgramPacket>,
-        peer: Option<String>,
+        peer: Option<UnixAddr>,
     },
     /// AF_INET6 SOCK_STREAM — same ring shape as InetConnected,
     /// addressed by 16-byte IPv6 addr instead of u32 IPv4.
@@ -445,7 +531,12 @@ enum SocketState {
 /// packet, padded or truncated to the user buffer size).
 #[derive(Debug)]
 pub struct DgramPacket {
-    pub peer_unix: Option<String>,
+    /// Source AF_UNIX address (pathname or abstract), if the sender was
+    /// bound. `None` for an unbound sender or an AF_INET datagram.
+    pub peer_unix: Option<UnixAddr>,
+    /// Sender credentials, attached to recvmsg as SCM_CREDENTIALS when the
+    /// receiver set SO_PASSCRED. Enables sd_notify's per-message identity.
+    pub sender_cred: Ucred,
     pub peer_addr: u32,
     pub peer_port: u16,
     pub payload: Vec<u8>,
@@ -506,7 +597,48 @@ impl SocketFile {
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
+            local_cred: IrqSafeSpinLock::new(Ucred::default()),
+            peer_cred: IrqSafeSpinLock::new(Ucred::default()),
+            passcred: AtomicBool::new(false),
+            last_recv_cred: IrqSafeSpinLock::new(Ucred::default()),
         })
+    }
+
+    /// Stamp this socket end's owning credentials (see `local_cred`).
+    /// Called by `sys_socket`/`sys_socketpair` right after creation.
+    pub fn set_local_cred(&self, cred: Ucred) {
+        *self.local_cred.lock() = cred;
+    }
+
+    /// This socket end's owning credentials.
+    pub fn local_cred(&self) -> Ucred {
+        *self.local_cred.lock()
+    }
+
+    /// The connected peer's credentials (SO_PEERCRED source).
+    pub fn peer_cred(&self) -> Ucred {
+        *self.peer_cred.lock()
+    }
+
+    fn set_peer_cred(&self, cred: Ucred) {
+        *self.peer_cred.lock() = cred;
+    }
+
+    /// Whether `SO_PASSCRED` is enabled — recvmsg attaches SCM_CREDENTIALS.
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Acquire)
+    }
+
+    /// Credentials to attach to the current recvmsg's `SCM_CREDENTIALS`
+    /// ancillary message. DGRAM sockets report the sender of the most
+    /// recently received datagram; connected (stream) sockets report the
+    /// fixed peer credentials.
+    pub fn recvmsg_cred(&self) -> Ucred {
+        if self.kind == SOCK_DGRAM {
+            *self.last_recv_cred.lock()
+        } else {
+            *self.peer_cred.lock()
+        }
     }
 
     /// Stamp this socket's network-namespace id (see field docs).
@@ -539,6 +671,17 @@ impl SocketFile {
             rx: a_to_b,
         };
         (a, b)
+    }
+
+    /// Cross-wire two connected ends' peer credentials. Both ends of a
+    /// `socketpair` (and the two halves of a `connect`/`accept`) belong to
+    /// the same or cooperating processes; each end's `SO_PEERCRED` should
+    /// report the OTHER end's owning identity.
+    pub fn cross_peer_creds(a: &Arc<Self>, b: &Arc<Self>) {
+        let ca = a.local_cred();
+        let cb = b.local_cred();
+        a.set_peer_cred(cb);
+        b.set_peer_cred(ca);
     }
 
     /// Toggle the O_NONBLOCK flag (fcntl F_SETFL path).
@@ -589,13 +732,13 @@ impl SocketFile {
                 ..
             } => Some(make_sockaddr_in(*local_addr, *local_port)),
             SocketState::InetRaw { local_addr, .. } => Some(make_sockaddr_in(*local_addr, 0)),
-            SocketState::UnixListener { path, .. } => Some(SockAddr {
+            SocketState::UnixListener { addr, .. } => Some(SockAddr {
                 family: AF_UNIX,
-                body: path.as_bytes().to_vec(),
+                body: addr.to_body(),
             }),
-            SocketState::UnixDgram { path: Some(p), .. } => Some(SockAddr {
+            SocketState::UnixDgram { addr: Some(a), .. } => Some(SockAddr {
                 family: AF_UNIX,
-                body: p.as_bytes().to_vec(),
+                body: a.to_body(),
             }),
             SocketState::Inet6Listener { addr, port, .. } => Some(make_sockaddr_in6(*addr, *port)),
             SocketState::Inet6Connected {
@@ -632,7 +775,7 @@ impl SocketFile {
             } => Some(make_sockaddr_in(*a, *p)),
             SocketState::UnixDgram { peer: Some(p), .. } => Some(SockAddr {
                 family: AF_UNIX,
-                body: p.as_bytes().to_vec(),
+                body: p.to_body(),
             }),
             SocketState::Inet6Connected {
                 peer_addr,
@@ -650,9 +793,11 @@ impl SocketFile {
     pub fn unregister(&self) {
         enum Reg {
             Unix(String),
+            AbstractStream(Vec<u8>),
             Inet(u32, u16),
             Inet6([u8; 16], u16),
             UnixDgram(String),
+            AbstractDgram(Vec<u8>),
             InetDgram(u32, u16),
             Tcb(u32),
             None,
@@ -660,7 +805,11 @@ impl SocketFile {
         let reg = {
             let state = self.state.lock();
             match &*state {
-                SocketState::UnixListener { path, .. } => Reg::Unix(path.clone()),
+                SocketState::UnixListener { addr, .. } => match addr {
+                    UnixAddr::Path(p) => Reg::Unix(p.clone()),
+                    UnixAddr::Abstract(n) => Reg::AbstractStream(n.clone()),
+                    UnixAddr::Unnamed => Reg::None,
+                },
                 SocketState::InetListener {
                     addr,
                     port,
@@ -677,7 +826,11 @@ impl SocketFile {
                     Reg::Inet(*addr, *port)
                 }
                 SocketState::Inet6Listener { addr, port, .. } => Reg::Inet6(*addr, *port),
-                SocketState::UnixDgram { path: Some(p), .. } => Reg::UnixDgram(p.clone()),
+                SocketState::UnixDgram { addr: Some(a), .. } => match a {
+                    UnixAddr::Path(p) => Reg::UnixDgram(p.clone()),
+                    UnixAddr::Abstract(n) => Reg::AbstractDgram(n.clone()),
+                    UnixAddr::Unnamed => Reg::None,
+                },
                 SocketState::InetDgram {
                     local_addr,
                     local_port,
@@ -691,6 +844,16 @@ impl SocketFile {
             Reg::Unix(p) => {
                 if let Some(map) = LISTENERS.lock().as_mut() {
                     map.remove(&p);
+                }
+            }
+            Reg::AbstractStream(n) => {
+                if let Some(map) = ABSTRACT_STREAM.lock().as_mut() {
+                    map.remove(&n);
+                }
+            }
+            Reg::AbstractDgram(n) => {
+                if let Some(map) = ABSTRACT_DGRAM.lock().as_mut() {
+                    map.remove(&n);
                 }
             }
             Reg::Inet(a, p) => {
@@ -1232,6 +1395,13 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
+            (SOL_SOCKET, SO_PASSCRED) => match read_u32(value) {
+                Ok(v) => {
+                    self.passcred.store(v != 0, Ordering::Release);
+                    SocketOpResult::Ok(0)
+                }
+                Err(e) => SocketOpResult::Err(e),
+            },
             (SOL_SOCKET, SO_LINGER) => {
                 if value.len() < 8 {
                     return SocketOpResult::Err(SockError::InvalidArg);
@@ -1450,18 +1620,19 @@ impl SocketFile {
                 SocketOpResult::OptValue { n }
             }
             (SOL_SOCKET, SO_TYPE) => write_u32(buf, self.kind),
+            (SOL_SOCKET, SO_PASSCRED) => write_bool(buf, self.passcred.load(Ordering::Acquire)),
             // SO_PEERCRED → struct ucred { pid_t pid; uid_t uid; gid_t gid; }
-            // (12 bytes). NARF has no real user model and doesn't track per-
-            // socket peer credentials yet, so report a synthetic root ucred.
-            // libwayland's wl_client_create queries this for client identity
-            // and only stores it (no validation) — enough for the handshake.
+            // (12 bytes). Reports the connected peer's real credentials,
+            // captured at connect()/accept()/socketpair() time. systemd's
+            // Varlink / D-Bus / logind identify peers via SO_PEERCRED.
             (SOL_SOCKET, SO_PEERCRED) => {
                 if buf.len() < 12 {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                buf[0..4].copy_from_slice(&1u32.to_ne_bytes()); // pid
-                buf[4..8].copy_from_slice(&0u32.to_ne_bytes()); // uid (root)
-                buf[8..12].copy_from_slice(&0u32.to_ne_bytes()); // gid (root)
+                let c = self.peer_cred();
+                buf[0..4].copy_from_slice(&c.pid.to_ne_bytes());
+                buf[4..8].copy_from_slice(&c.uid.to_ne_bytes());
+                buf[8..12].copy_from_slice(&c.gid.to_ne_bytes());
                 SocketOpResult::OptValue { n: 12 }
             }
             (SOL_SOCKET, SO_DOMAIN) => write_u32(buf, self.domain as u32),
@@ -1580,6 +1751,7 @@ impl SocketFile {
         if let SocketState::InetRaw { inbox, .. } = &mut *state {
             inbox.push_back(DgramPacket {
                 peer_unix: None,
+                sender_cred: Ucred::default(),
                 peer_addr: dest.0,
                 peer_port: dest.1,
                 payload: buf.to_vec(),
@@ -1595,49 +1767,66 @@ impl SocketFile {
                 if addr.family != AF_UNIX {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                let path = match core::str::from_utf8(&addr.body) {
-                    Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
-                    Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                // Autobind (`Unnamed`) mints a fresh abstract name; a leading
+                // NUL selects the abstract namespace; otherwise it's a path.
+                let uaddr = match UnixAddr::parse(&addr.body) {
+                    Some(UnixAddr::Unnamed) => UnixAddr::Abstract(autobind_name(true)),
+                    Some(a) => a,
+                    None => return SocketOpResult::Err(SockError::InvalidArg),
                 };
-                if path.is_empty() {
+                let mut state = self.state.lock();
+                if !matches!(&*state, SocketState::Fresh) {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                let mut state = self.state.lock();
-                match &*state {
-                    SocketState::Fresh => {
-                        let mut listeners = LISTENERS.lock();
-                        let map = listeners.get_or_insert_with(BTreeMap::new);
-                        if map.contains_key(&path) {
-                            return SocketOpResult::Err(SockError::AddrInUse);
-                        }
-                        // We can't put the listener in the map yet
-                        // (we only have &Arc here) — record the
-                        // path in our state, and have Listen() do
-                        // the actual map insert. POSIX bind+listen
-                        // are always called in sequence on stream
-                        // sockets so this is fine.
-                        *state = SocketState::UnixListener {
-                            path,
-                            backlog: 0,
-                            pending: VecDeque::new(),
-                        };
-                        SocketOpResult::Ok(0)
-                    }
-                    _ => SocketOpResult::Err(SockError::InvalidArg),
+                // Address-in-use check up front against the right registry.
+                let in_use = match &uaddr {
+                    UnixAddr::Path(p) => LISTENERS
+                        .lock()
+                        .as_ref()
+                        .map(|m| m.contains_key(p))
+                        .unwrap_or(false),
+                    UnixAddr::Abstract(n) => ABSTRACT_STREAM
+                        .lock()
+                        .as_ref()
+                        .map(|m| m.contains_key(n))
+                        .unwrap_or(false),
+                    UnixAddr::Unnamed => false,
+                };
+                if in_use {
+                    return SocketOpResult::Err(SockError::AddrInUse);
                 }
+                // Abstract binds are complete at bind() (no separate listen
+                // insert needed): register the socket now. Pathname binds keep
+                // the historical bind-records-path / listen-inserts sequence.
+                if let UnixAddr::Abstract(n) = &uaddr {
+                    let mut reg = ABSTRACT_STREAM.lock();
+                    reg.get_or_insert_with(BTreeMap::new)
+                        .insert(n.clone(), self.clone());
+                }
+                *state = SocketState::UnixListener {
+                    addr: uaddr,
+                    backlog: 0,
+                    pending: VecDeque::new(),
+                };
+                SocketOpResult::Ok(0)
             }
             SocketOp::Listen { backlog } => {
                 let mut state = self.state.lock();
                 match &mut *state {
                     SocketState::UnixListener {
-                        path, backlog: b, ..
+                        addr, backlog: b, ..
                     } => {
                         *b = backlog;
-                        let path = path.clone();
-                        drop(state);
-                        let mut listeners = LISTENERS.lock();
-                        let map = listeners.get_or_insert_with(BTreeMap::new);
-                        map.insert(path, self.clone());
+                        // Pathname listeners insert into LISTENERS here (bind
+                        // only recorded the path). Abstract listeners already
+                        // registered at bind(), so this is a no-op for them.
+                        if let UnixAddr::Path(p) = addr {
+                            let p = p.clone();
+                            drop(state);
+                            let mut listeners = LISTENERS.lock();
+                            let map = listeners.get_or_insert_with(BTreeMap::new);
+                            map.insert(p, self.clone());
+                        }
                         SocketOpResult::Ok(0)
                     }
                     _ => SocketOpResult::Err(SockError::InvalidArg),
@@ -1665,13 +1854,17 @@ impl SocketFile {
                 if addr.family != AF_UNIX {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                let path = match core::str::from_utf8(&addr.body) {
-                    Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
-                    Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                let uaddr = match UnixAddr::parse(&addr.body) {
+                    Some(a @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => a,
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
-                let listener = {
-                    let listeners = LISTENERS.lock();
-                    listeners.as_ref().and_then(|m| m.get(&path).cloned())
+                let listener = match &uaddr {
+                    UnixAddr::Path(p) => LISTENERS.lock().as_ref().and_then(|m| m.get(p).cloned()),
+                    UnixAddr::Abstract(n) => ABSTRACT_STREAM
+                        .lock()
+                        .as_ref()
+                        .and_then(|m| m.get(n).cloned()),
+                    UnixAddr::Unnamed => None,
                 };
                 let listener = match listener {
                     Some(l) => l,
@@ -1691,6 +1884,14 @@ impl SocketFile {
                         rx: a_to_b.clone(),
                     };
                 }
+                // Credentials: the accepted server end owns the listener's
+                // identity, and each end's SO_PEERCRED reports the other's.
+                // (The listener process typically inherits/re-owns the
+                // accepted fd, so the server end's local_cred = listener's.)
+                let listener_cred = listener.local_cred();
+                let client_cred = self.local_cred();
+                server_end.set_local_cred(listener_cred);
+                server_end.set_peer_cred(client_cred);
                 {
                     let mut lst = listener.state.lock();
                     if let SocketState::UnixListener { pending, .. } = &mut *lst {
@@ -1716,6 +1917,8 @@ impl SocketFile {
                             tx: a_to_b,
                             rx: b_to_a,
                         };
+                        drop(state);
+                        self.set_peer_cred(listener_cred);
                         SocketOpResult::Ok(0)
                     }
                     _ => SocketOpResult::Err(SockError::AlreadyConnected),
@@ -2137,6 +2340,7 @@ impl SocketFile {
                 };
                 let pkt = DgramPacket {
                     peer_unix: None,
+                    sender_cred: Ucred::default(),
                     peer_addr: local_addr,
                     peer_port: local_port,
                     payload: buf.to_vec(),
@@ -2188,53 +2392,69 @@ impl SocketFile {
         }
     }
 
-    /// AF_UNIX SOCK_DGRAM. Same shape as InetDgram but path-keyed.
+    /// AF_UNIX SOCK_DGRAM. Same shape as InetDgram but keyed by unix
+    /// address (pathname or abstract name — sd_notify's $NOTIFY_SOCKET
+    /// is an abstract datagram socket).
     fn dispatch_unix_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
                 if addr.family != AF_UNIX {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                let path = match core::str::from_utf8(&addr.body) {
-                    Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
-                    Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                let uaddr = match UnixAddr::parse(&addr.body) {
+                    Some(UnixAddr::Unnamed) => UnixAddr::Abstract(autobind_name(false)),
+                    Some(a) => a,
+                    None => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 let mut state = self.state.lock();
-                if matches!(&*state, SocketState::Fresh) {
-                    let mut bound = UNIX_DGRAM_BOUND.lock();
-                    let map = bound.get_or_insert_with(BTreeMap::new);
-                    if map.contains_key(&path) {
-                        return SocketOpResult::Err(SockError::AddrInUse);
-                    }
-                    *state = SocketState::UnixDgram {
-                        path: Some(path.clone()),
-                        inbox: VecDeque::new(),
-                        peer: None,
-                    };
-                    map.insert(path, self.clone());
-                    return SocketOpResult::Ok(0);
+                if !matches!(&*state, SocketState::Fresh) {
+                    return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                SocketOpResult::Err(SockError::InvalidArg)
+                match &uaddr {
+                    UnixAddr::Path(p) => {
+                        let mut bound = UNIX_DGRAM_BOUND.lock();
+                        let map = bound.get_or_insert_with(BTreeMap::new);
+                        if map.contains_key(p) {
+                            return SocketOpResult::Err(SockError::AddrInUse);
+                        }
+                        map.insert(p.clone(), self.clone());
+                    }
+                    UnixAddr::Abstract(n) => {
+                        let mut bound = ABSTRACT_DGRAM.lock();
+                        let map = bound.get_or_insert_with(BTreeMap::new);
+                        if map.contains_key(n) {
+                            return SocketOpResult::Err(SockError::AddrInUse);
+                        }
+                        map.insert(n.clone(), self.clone());
+                    }
+                    UnixAddr::Unnamed => return SocketOpResult::Err(SockError::InvalidArg),
+                }
+                *state = SocketState::UnixDgram {
+                    addr: Some(uaddr),
+                    inbox: VecDeque::new(),
+                    peer: None,
+                };
+                SocketOpResult::Ok(0)
             }
             SocketOp::Connect { addr } => {
                 if addr.family != AF_UNIX {
                     return SocketOpResult::Err(SockError::InvalidArg);
                 }
-                let path = match core::str::from_utf8(&addr.body) {
-                    Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
-                    Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                let uaddr = match UnixAddr::parse(&addr.body) {
+                    Some(a @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => a,
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
                 let mut state = self.state.lock();
                 if matches!(&*state, SocketState::Fresh) {
                     *state = SocketState::UnixDgram {
-                        path: None,
+                        addr: None,
                         inbox: VecDeque::new(),
-                        peer: Some(path),
+                        peer: Some(uaddr),
                     };
                     return SocketOpResult::Ok(0);
                 }
                 if let SocketState::UnixDgram { peer, .. } = &mut *state {
-                    *peer = Some(path);
+                    *peer = Some(uaddr);
                     SocketOpResult::Ok(0)
                 } else {
                     SocketOpResult::Err(SockError::InvalidArg)
@@ -2246,33 +2466,44 @@ impl SocketFile {
                 addr,
             } => {
                 let state = self.state.lock();
-                let (local_path, dest_path) = match &*state {
-                    SocketState::UnixDgram { path, peer, .. } => {
+                let (local_addr, dest_addr) = match &*state {
+                    SocketState::UnixDgram { addr: la, peer, .. } => {
                         let dest = if let Some(a) = addr {
-                            match core::str::from_utf8(&a.body) {
-                                Ok(s) => alloc::string::String::from(s.trim_end_matches('\0')),
-                                Err(_) => return SocketOpResult::Err(SockError::InvalidArg),
+                            match UnixAddr::parse(&a.body) {
+                                Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
+                                _ => return SocketOpResult::Err(SockError::InvalidArg),
                             }
                         } else if let Some(p) = peer {
                             p.clone()
                         } else {
                             return SocketOpResult::Err(SockError::InvalidArg);
                         };
-                        (path.clone(), dest)
+                        (la.clone(), dest)
                     }
                     _ => return SocketOpResult::Err(SockError::NotConnected),
                 };
+                let sender_cred = self.local_cred();
                 drop(state);
-                let dest_sock = {
-                    let bound = UNIX_DGRAM_BOUND.lock();
-                    bound.as_ref().and_then(|m| m.get(&dest_path).cloned())
+                let dest_sock = match &dest_addr {
+                    UnixAddr::Path(p) => UNIX_DGRAM_BOUND
+                        .lock()
+                        .as_ref()
+                        .and_then(|m| m.get(p).cloned()),
+                    UnixAddr::Abstract(n) => ABSTRACT_DGRAM
+                        .lock()
+                        .as_ref()
+                        .and_then(|m| m.get(n).cloned()),
+                    UnixAddr::Unnamed => None,
                 };
                 let dest_sock = match dest_sock {
                     Some(s) => s,
-                    None => return SocketOpResult::Ok(buf.len() as u64),
+                    // No bound receiver. Linux returns ECONNREFUSED for a
+                    // datagram sent to a missing named socket.
+                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
                 };
                 let pkt = DgramPacket {
-                    peer_unix: local_path,
+                    peer_unix: local_addr,
+                    sender_cred,
                     peer_addr: 0,
                     peer_port: 0,
                     payload: buf.to_vec(),
@@ -2281,6 +2512,10 @@ impl SocketFile {
                 if let SocketState::UnixDgram { inbox, .. } = &mut *ds {
                     inbox.push_back(pkt);
                 }
+                drop(ds);
+                // Wake a receiver parked in recv/recvmsg/poll on the dest —
+                // sd_notify sends one datagram and PID 1 blocks reading it.
+                narf_net::readiness::notify(0);
                 SocketOpResult::Ok(buf.len() as u64)
             }
             SocketOp::Recv { buf, flags: _ } => {
@@ -2289,7 +2524,10 @@ impl SocketFile {
                     if let Some(pkt) = inbox.pop_front() {
                         let n = core::cmp::min(buf.len(), pkt.payload.len());
                         buf[..n].copy_from_slice(&pkt.payload[..n]);
-                        let body = pkt.peer_unix.unwrap_or_default().into_bytes();
+                        let body = pkt.peer_unix.map(|a| a.to_body()).unwrap_or_default();
+                        // Stash the sender's creds so a SO_PASSCRED recvmsg can
+                        // attach them as SCM_CREDENTIALS.
+                        *self.last_recv_cred.lock() = pkt.sender_cred;
                         return SocketOpResult::Received {
                             n,
                             peer: Some(SockAddr {
@@ -2719,6 +2957,47 @@ static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::ne
 /// AF_UNIX datagram-bound registry: path → socket.
 static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<String, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
+
+// ── Abstract-namespace registries (sun_path[0] == '\0') ─────────
+//
+// Abstract AF_UNIX sockets have NO filesystem presence. The key is the
+// raw name bytes after the leading NUL (may embed NULs / non-UTF-8), so
+// these maps are keyed by `Vec<u8>` rather than the `String` path maps
+// above. systemd's $NOTIFY_SOCKET (sd_notify datagram) and the private
+// D-Bus stream socket both live here.
+
+/// Abstract-namespace SOCK_STREAM / SOCK_SEQPACKET listeners: name → socket.
+static ABSTRACT_STREAM: IrqSafeSpinLock<Option<BTreeMap<Vec<u8>, Arc<SocketFile>>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Abstract-namespace SOCK_DGRAM bound sockets: name → socket.
+static ABSTRACT_DGRAM: IrqSafeSpinLock<Option<BTreeMap<Vec<u8>, Arc<SocketFile>>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Monotonic counter for autobind (`Unnamed`) addresses. Linux assigns a
+/// 5-hex-digit abstract name; we mint `\0<hex>` names from this counter.
+static AUTOBIND_NEXT: AtomicU32 = AtomicU32::new(1);
+
+/// Mint a fresh, unused abstract name for an autobind (`bind` with
+/// `addrlen == sizeof(sa_family_t)`). Linux uses `[0-9a-f]{5}`; we do the
+/// same, retrying on the (vanishingly unlikely) collision.
+fn autobind_name(stream: bool) -> Vec<u8> {
+    loop {
+        let n = AUTOBIND_NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = alloc::format!("{:05x}", n & 0xf_ffff).into_bytes();
+        let taken = {
+            let reg = if stream {
+                ABSTRACT_STREAM.lock()
+            } else {
+                ABSTRACT_DGRAM.lock()
+            };
+            reg.as_ref().map(|m| m.contains_key(&name)).unwrap_or(false)
+        };
+        if !taken {
+            return name;
+        }
+    }
+}
 
 // ── ZC fast-path: registered buffer pool ────────────────────────
 

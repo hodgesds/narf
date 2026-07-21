@@ -13192,6 +13192,19 @@ fn read_uidgid(task: u64) -> UidGid {
         .unwrap_or_default()
 }
 
+/// The calling task's socket credentials (`struct ucred` shape): its
+/// visible pid plus effective uid/gid. Stamped onto every socket end at
+/// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.
+pub fn current_ucred() -> crate::socket::Ucred {
+    let task = current_task_id();
+    let ids = read_uidgid(task);
+    crate::socket::Ucred {
+        pid: task_to_pid_raw(task).unwrap_or(task) as u32,
+        uid: ids.euid,
+        gid: ids.egid,
+    }
+}
+
 /// SECURITY-CRITICAL single funnel for every filesystem `Accessor`.
 ///
 /// `posix_access_ok` treats `uid == 0` as omnipotent host-root. With
@@ -22051,6 +22064,9 @@ fn sys_socket(ctx: &mut dyn TrapContext) {
         return;
     }
     let sock = crate::socket::SocketFile::with_protocol(domain, kind, proto);
+    // Stamp the creator's credentials so SO_PEERCRED / SCM_CREDENTIALS on
+    // the peer end report this process's real (pid, uid, gid).
+    sock.set_local_cred(current_ucred());
     // Net-namespace scoping: stamp the creator's net-ns id so the
     // AF_INET bind/port tables are keyed per-ns (two processes in
     // different net-ns can both bind the same addr:port). 0 = host ns.
@@ -22117,6 +22133,12 @@ fn sys_socketpair(ctx: &mut dyn TrapContext) {
         a.set_nonblock(true);
         b.set_nonblock(true);
     }
+    // Both ends belong to this process; each end's SO_PEERCRED reports the
+    // other's owning identity (same process here).
+    let cred = current_ucred();
+    a.set_local_cred(cred);
+    b.set_local_cred(cred);
+    crate::socket::SocketFile::cross_peer_creds(&a, &b);
     socket_arc_register(&a);
     socket_arc_register(&b);
     let fd_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
@@ -22859,19 +22881,23 @@ fn install_netlink_creds(msg_ptr: u64) {
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(cmsg_len as u64).to_le_bytes()) };
 }
 
-/// Install received SCM_RIGHTS file objects into the calling task's fd
-/// table and write an SOL_SOCKET/SCM_RIGHTS control message (with the new
-/// fd numbers) back into `msg_control`. Sets `msg_controllen` to the bytes
-/// written (0 when there are no fds or the user control buffer is absent).
-fn install_scm_rights_fds(
+/// Install received AF_UNIX ancillary data into the calling task's
+/// `msg_control` buffer: an `SCM_RIGHTS` control message (any passed fds,
+/// each dup'd into a fresh fd in this task's table) and, when
+/// `cred` is `Some` (SO_PASSCRED set), an `SCM_CREDENTIALS` control message
+/// naming the message sender. Sets `msg_controllen` to the bytes written
+/// (0 when there's no ancillary data or the user control buffer is absent).
+fn install_recv_ancillary(
     msg_ptr: u64,
     fds: alloc::vec::Vec<alloc::sync::Arc<dyn narf_filesystem::FileOps>>,
+    cred: Option<crate::socket::Ucred>,
 ) {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
+    const SCM_CREDENTIALS: i32 = 2;
     let ctrl_ptr = read_user_u64(msg_ptr + 32);
     let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
-    if fds.is_empty() {
+    if fds.is_empty() && cred.is_none() {
         // No ancillary data — report an empty control buffer.
         // SAFETY: writing 8 bytes to the `msg_controllen` field at `msg_ptr + 40`;
         // `copy_to_user` range-validates the user address and SMAP-brackets the
@@ -22879,7 +22905,8 @@ fn install_scm_rights_fds(
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return;
     }
-    // Install each file object at a fresh fd.
+    // Install each received file object at a fresh fd (SCM_RIGHTS semantics:
+    // the fds are consumed even if the control buffer can't report them).
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
     for ops in fds {
@@ -22893,30 +22920,47 @@ fn install_scm_rights_fds(
             new_fds.push(newfd as i32);
         }
     }
-    // struct cmsghdr (16 B) + the int fd array.
-    let data_len = new_fds.len() * 4;
-    let cmsg_len = 16 + data_len;
-    if ctrl_ptr == 0 || ctrl_len < cmsg_len {
-        // No room for the control message — the fds are installed but the
+    // Build the control buffer: each cmsg is cmsghdr(16) + data, padded to
+    // an 8-byte (CMSG_ALIGN) boundary before the next record.
+    let mut ctrl: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let push_cmsg = |ctrl: &mut alloc::vec::Vec<u8>, ctype: i32, data: &[u8]| {
+        let cmsg_len = 16 + data.len();
+        let mut hdr = [0u8; 16];
+        hdr[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+        hdr[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+        hdr[12..16].copy_from_slice(&ctype.to_le_bytes());
+        ctrl.extend_from_slice(&hdr);
+        ctrl.extend_from_slice(data);
+        // CMSG_ALIGN the running length to the next 8-byte boundary.
+        while ctrl.len() % 8 != 0 {
+            ctrl.push(0);
+        }
+    };
+    if !new_fds.is_empty() {
+        let mut data = alloc::vec::Vec::with_capacity(new_fds.len() * 4);
+        for &nfd in &new_fds {
+            data.extend_from_slice(&nfd.to_le_bytes());
+        }
+        push_cmsg(&mut ctrl, SCM_RIGHTS, &data);
+    }
+    if let Some(c) = cred {
+        let mut data = [0u8; 12];
+        data[0..4].copy_from_slice(&c.pid.to_le_bytes());
+        data[4..8].copy_from_slice(&c.uid.to_le_bytes());
+        data[8..12].copy_from_slice(&c.gid.to_le_bytes());
+        push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data);
+    }
+    if ctrl_ptr == 0 || ctrl_len < ctrl.len() {
+        // No room for the control data — any fds are still installed but the
         // numbers can't be reported (Linux would set MSG_CTRUNC here).
-        // SAFETY: writing 8 bytes to the `msg_controllen` field at `msg_ptr + 40`;
-        // `copy_to_user` range-validates the user address and SMAP-brackets the
-        // write, so a bad pointer returns Err rather than faulting the kernel.
+        // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return;
     }
-    let mut cmsg = alloc::vec![0u8; cmsg_len];
-    cmsg[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-    cmsg[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
-    cmsg[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
-    for (i, &nfd) in new_fds.iter().enumerate() {
-        cmsg[16 + i * 4..20 + i * 4].copy_from_slice(&nfd.to_le_bytes());
-    }
     // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
-    let _ = unsafe { copy_to_user(ctrl_ptr, &cmsg) };
-    // SAFETY: writing 8 bytes to the `msg_controllen` field at `msg_ptr + 40`;
-    // `copy_to_user` range-validates the user address and SMAP-brackets the write.
-    let _ = unsafe { copy_to_user(msg_ptr + 40, &(cmsg_len as u64).to_le_bytes()) };
+    let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
+    // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
 }
 
 /// `recvmsg(fd, msghdr, flags)`. Reverse of sendmsg.
@@ -23002,9 +23046,17 @@ fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             } else {
                 // SCM_RIGHTS: install any passed file objects into this task's
                 // fd table and report the new fd numbers in an SOL_SOCKET/
-                // SCM_RIGHTS control message. Mirror of parse_scm_rights_fds.
+                // SCM_RIGHTS control message. When SO_PASSCRED is set, also
+                // attach an SCM_CREDENTIALS cmsg naming the message sender —
+                // sd_notify's PID 1 reads $NOTIFY_SOCKET with SO_PASSCRED to
+                // learn which service reported READY=1.
                 let recv_fds = sock.unix_take_recv_fds();
-                install_scm_rights_fds(msg_ptr, recv_fds);
+                let cred = if sock.passcred() {
+                    Some(sock.recvmsg_cred())
+                } else {
+                    None
+                };
+                install_recv_ancillary(msg_ptr, recv_fds, cred);
             }
 
             // `msg_flags` (msghdr offset 48) is a kernel OUTPUT field — Linux

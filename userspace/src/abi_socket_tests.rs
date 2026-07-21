@@ -6,11 +6,17 @@ use crate::abi_test_support::*;
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;
+const SOCK_DGRAM: u64 = 2;
 const SOL_SOCKET: u64 = 1;
 const SO_REUSEADDR: u64 = 2;
 const SO_TYPE: u64 = 3;
+const SO_PASSCRED: u64 = 16;
+const SO_PEERCRED: u64 = 17;
 const SO_ACCEPTCONN: u64 = 30;
 const SHUT_RDWR: u64 = 2;
+/// SCM control-message types (SOL_SOCKET level).
+const SCM_RIGHTS: i32 = 1;
+const SCM_CREDENTIALS: i32 = 2;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
 const BAD_FD: u64 = 4096;
@@ -1030,3 +1036,441 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_sock_send_zc_neg);
+
+// ─────────────────── AF_UNIX abstract namespace ───────────────────
+
+/// Build a `sockaddr_un` for the ABSTRACT namespace: family + a leading
+/// NUL + the abstract name. `addrlen` counts the leading NUL, matching
+/// how systemd forms `$NOTIFY_SOCKET`.
+fn abstract_sockaddr(name: &[u8]) -> ([u8; 128], u64) {
+    let mut buf = [0u8; 128];
+    buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+    // buf[2] is the leading NUL (already zero); name follows.
+    let n = core::cmp::min(name.len(), 100);
+    buf[3..3 + n].copy_from_slice(&name[..n]);
+    // addrlen = 2 (family) + 1 (leading NUL) + name length.
+    let len = (2 + 1 + n) as u64;
+    (buf, len)
+}
+
+/// Open an AF_UNIX socket of the given `kind`, returning its fd.
+fn open_unix(kind: u64) -> Result<u64, &'static str> {
+    match call(Syscall::SocketOpen.raw(), a2(AF_UNIX, kind, 0)) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("socket(AF_UNIX) did not return a valid fd"),
+    }
+}
+
+/// Abstract datagram roundtrip: bind a receiver to an abstract name, then
+/// `sendto` a payload from a second socket and read it back.
+fn smoke_abi_socket_abstract_dgram_roundtrip() -> TestResult {
+    with_setup(|| {
+        let rx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-abstract-dgram");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(rx, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind() to an abstract datagram name did not return 0");
+        }
+
+        let tx = open_unix(SOCK_DGRAM)?;
+        let payload = b"READY=1\n";
+        // sendto(fd, buf, len, flags, dest_addr, dest_len) — dest in arg4/arg5.
+        let send_args = SyscallArgs {
+            arg0: tx,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            arg3: 0,
+            arg4: addr.as_ptr() as u64,
+            arg5: alen,
+        };
+        let sent = call(Syscall::SocketSend.raw(), send_args).ok_or("send status")?;
+        if sent != payload.len() as i64 {
+            return Err("sendto() to an abstract name did not return the byte count");
+        }
+
+        let mut rbuf = [0u8; 32];
+        let got = call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, rbuf.as_mut_ptr() as u64, rbuf.len() as u64, 0),
+        )
+        .ok_or("recv status")?;
+        if got != payload.len() as i64 {
+            return Err("recvfrom() on the abstract socket returned the wrong count");
+        }
+        if &rbuf[..payload.len()] != payload {
+            return Err("recvfrom() delivered the wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_dgram_roundtrip);
+
+/// connect()/sendto to an unbound abstract name is ECONNREFUSED (-111),
+/// never the bare -1 sentinel.
+fn smoke_abi_socket_abstract_dgram_refused() -> TestResult {
+    with_setup(|| {
+        let tx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-abstract-nobody");
+        let payload = b"x";
+        let send_args = SyscallArgs {
+            arg0: tx,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            arg3: 0,
+            arg4: addr.as_ptr() as u64,
+            arg5: alen,
+        };
+        let r = call(Syscall::SocketSend.raw(), send_args).ok_or("send status")?;
+        if r != -111 {
+            return Err("sendto() to an unbound abstract name was not ECONNREFUSED (-111)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_dgram_refused);
+
+/// A second bind to a live abstract name is EADDRINUSE (-98 via the
+/// dispatcher's AddrInUse → the handler's -1 sentinel is NOT used here
+/// because bind maps the SockError through; assert the address is taken).
+fn smoke_abi_socket_abstract_stream_inuse() -> TestResult {
+    with_setup(|| {
+        let a = open_unix(SOCK_STREAM)?;
+        let (addr, alen) = abstract_sockaddr(b"narf-abstract-stream");
+        if call(Syscall::SocketBind.raw(), a2(a, addr.as_ptr() as u64, alen))
+            .ok_or("bind status")?
+            != 0
+        {
+            return Err("first bind() to an abstract stream name failed");
+        }
+        // Second socket binding the SAME abstract name must fail.
+        let b = open_unix(SOCK_STREAM)?;
+        let r = call(Syscall::SocketBind.raw(), a2(b, addr.as_ptr() as u64, alen));
+        // bind()'s handler maps a non-Ok dispatcher result to the -1 sentinel.
+        if r != Some(-1) {
+            return Err("second bind() to a live abstract name did not fail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_abstract_stream_inuse);
+
+/// Autobind: bind with `addrlen == sizeof(sa_family_t)` (2) assigns a
+/// fresh abstract name; getsockname reports a usable abstract address
+/// (leading NUL, non-empty).
+fn smoke_abi_socket_autobind() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix(SOCK_DGRAM)?;
+        // sockaddr with ONLY the family — addrlen 2 → autobind.
+        let mut addr = [0u8; 128];
+        addr[0..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+        if call(Syscall::SocketBind.raw(), a2(fd, addr.as_ptr() as u64, 2)).ok_or("bind status")?
+            != 0
+        {
+            return Err("autobind bind() did not return 0");
+        }
+        // getsockname must report an abstract address: family + leading NUL.
+        let mut out = [0u8; 128];
+        let mut outlen = [0u8; 4];
+        outlen[0..4].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        let r = call(
+            Syscall::SocketGetSockName.raw(),
+            a2(fd, out.as_mut_ptr() as u64, outlen.as_mut_ptr() as u64),
+        )
+        .ok_or("getsockname status")?;
+        if r != 0 {
+            return Err("getsockname() on an autobound socket failed");
+        }
+        let reported = u32::from_ne_bytes(outlen);
+        // family(2) + leading NUL(1) + at least one name byte.
+        if reported < 4 {
+            return Err("autobind produced no abstract name");
+        }
+        if out[2] != 0 {
+            return Err("autobind name is not in the abstract namespace (no leading NUL)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_autobind);
+
+// ─────────────────── SO_PASSCRED / SO_PEERCRED / SCM ───────────────────
+
+/// SO_PEERCRED on a connected socketpair reports the peer's ucred (12
+/// bytes: pid, uid, gid). The two ends share this process's identity.
+fn smoke_abi_socket_so_peercred() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let mut cred = [0u8; 12];
+        let mut clen = (cred.len() as u32).to_ne_bytes();
+        let r = call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd0,
+                arg1: SOL_SOCKET,
+                arg2: SO_PEERCRED,
+                arg3: cred.as_mut_ptr() as u64,
+                arg4: clen.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("getsockopt status")?;
+        if r != 0 {
+            return Err("getsockopt(SO_PEERCRED) did not succeed");
+        }
+        if u32::from_ne_bytes(clen) != 12 {
+            return Err("SO_PEERCRED did not return a 12-byte ucred");
+        }
+        // The peer's pid must match this task's pid (both ends are ours).
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        let peer_pid = u32::from_ne_bytes([cred[0], cred[1], cred[2], cred[3]]);
+        if peer_pid != my_pid {
+            return Err("SO_PEERCRED pid did not match the connecting process pid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_so_peercred);
+
+/// SO_PASSCRED round-trips through set/getsockopt.
+fn smoke_abi_socket_so_passcred_roundtrip() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix(SOCK_STREAM)?;
+        let on = 1u32.to_ne_bytes();
+        let r = call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("setsockopt status")?;
+        if r != 0 {
+            return Err("setsockopt(SO_PASSCRED, 1) did not succeed");
+        }
+        let mut out = [0u8; 4];
+        let mut olen = (out.len() as u32).to_ne_bytes();
+        call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: out.as_mut_ptr() as u64,
+                arg4: olen.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("getsockopt status")?;
+        let _ = &mut olen;
+        if u32::from_ne_bytes(out) != 1 {
+            return Err("getsockopt(SO_PASSCRED) did not read back 1");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_so_passcred_roundtrip);
+
+/// SO_PASSCRED + recvmsg attaches an SCM_CREDENTIALS control message
+/// naming the sender. Send over a socketpair, then recvmsg the other end
+/// with SO_PASSCRED set and a control buffer.
+fn smoke_abi_socket_recvmsg_scm_credentials() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
+        // Enable SO_PASSCRED on the receiving end.
+        let on = 1u32.to_ne_bytes();
+        call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd1,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: on.as_ptr() as u64,
+                arg4: on.len() as u64,
+                arg5: 0,
+            },
+        )
+        .ok_or("setsockopt status")?;
+
+        let payload = b"hi";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, payload.as_ptr() as u64, payload.len() as u64, 0),
+        )
+        .ok_or("send status")?
+            != payload.len() as i64
+        {
+            return Err("priming send failed");
+        }
+
+        // recvmsg with a control buffer for the SCM_CREDENTIALS cmsg.
+        let mut dst = [0u8; 16];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 64];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes()); // iov
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes()); // iovlen
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes()); // ctrl
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes()); // ctrllen
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd1, msg.as_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 {
+            return Err("recvmsg() did not return the sent byte count");
+        }
+        // msg_controllen (offset 40) is the bytes the kernel wrote.
+        let ctrllen = u64::from_ne_bytes([
+            msg[40], msg[41], msg[42], msg[43], msg[44], msg[45], msg[46], msg[47],
+        ]) as usize;
+        if ctrllen < 16 + 12 {
+            return Err("recvmsg() did not attach an SCM_CREDENTIALS cmsg");
+        }
+        // cmsghdr { u64 len; i32 level; i32 type; } then struct ucred.
+        let level = i32::from_le_bytes([ctrl[8], ctrl[9], ctrl[10], ctrl[11]]);
+        let ctype = i32::from_le_bytes([ctrl[12], ctrl[13], ctrl[14], ctrl[15]]);
+        if level != SOL_SOCKET as i32 || ctype != SCM_CREDENTIALS {
+            return Err("recvmsg cmsg was not SOL_SOCKET/SCM_CREDENTIALS");
+        }
+        let cred_pid = u32::from_le_bytes([ctrl[16], ctrl[17], ctrl[18], ctrl[19]]);
+        let my_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
+        if cred_pid != my_pid {
+            return Err("SCM_CREDENTIALS pid did not name the sender");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_recvmsg_scm_credentials);
+
+/// SCM_RIGHTS: sendmsg an fd over one socketpair half, recvmsg the other
+/// half, and confirm a NEW fd (different number, usable) was installed.
+fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
+        // The fd we pass: a second, independent socketpair end.
+        let mut sv2 = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv2.as_mut_ptr() as u64),
+        )
+        .ok_or("pair2 status")?
+            != 0
+        {
+            return Err("second socketpair setup failed");
+        }
+        let passed_fd = i32::from_ne_bytes([sv2[0], sv2[1], sv2[2], sv2[3]]);
+
+        // sendmsg with an SCM_RIGHTS cmsg carrying `passed_fd`.
+        let payload = b"fd";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        // cmsghdr(16) + one int fd(4), padded to 8 → 24 bytes of control.
+        let mut ctrl = [0u8; 24];
+        let cmsg_len = (16 + 4) as u64;
+        ctrl[0..8].copy_from_slice(&cmsg_len.to_le_bytes());
+        ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+        ctrl[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+        ctrl[16..20].copy_from_slice(&passed_fd.to_le_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&(24u64).to_le_bytes());
+        let sent = call(
+            Syscall::SocketSendMsg.raw(),
+            a2(fd0, smsg.as_ptr() as u64, 0),
+        )
+        .ok_or("sendmsg status")?;
+        if sent != payload.len() as i64 {
+            return Err("sendmsg(SCM_RIGHTS) did not return the payload byte count");
+        }
+
+        // recvmsg the other half with a control buffer.
+        let mut dst = [0u8; 16];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut rctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd1, rmsg.as_ptr() as u64, 0),
+        )
+        .ok_or("recvmsg status")?;
+        if n != payload.len() as i64 {
+            return Err("recvmsg() did not return the sent byte count");
+        }
+        let ctrllen = u64::from_ne_bytes([
+            rmsg[40], rmsg[41], rmsg[42], rmsg[43], rmsg[44], rmsg[45], rmsg[46], rmsg[47],
+        ]) as usize;
+        if ctrllen < 16 + 4 {
+            return Err("recvmsg() did not attach an SCM_RIGHTS cmsg");
+        }
+        let level = i32::from_le_bytes([rctrl[8], rctrl[9], rctrl[10], rctrl[11]]);
+        let ctype = i32::from_le_bytes([rctrl[12], rctrl[13], rctrl[14], rctrl[15]]);
+        if level != SOL_SOCKET as i32 || ctype != SCM_RIGHTS {
+            return Err("recvmsg cmsg was not SOL_SOCKET/SCM_RIGHTS");
+        }
+        let new_fd = i32::from_le_bytes([rctrl[16], rctrl[17], rctrl[18], rctrl[19]]);
+        if new_fd < 0 {
+            return Err("SCM_RIGHTS did not install a valid fd");
+        }
+        // The received fd is a distinct number, and closeable.
+        if new_fd as u64 == fd1 {
+            return Err("SCM_RIGHTS installed fd collided with the receiving fd");
+        }
+        let _ = call(Syscall::Close.raw(), a0(new_fd as u64));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_socket_scm_rights_fd_passing);
