@@ -15589,6 +15589,7 @@ kernel_test_in!("userspace", smoke_console_ioctl_unknown_cmd_returns_enotty);
 // KDSIGACCEPT (0x4B4E) — systemd-PID-1 arms the console kbrequest signal
 // during early init. NARF accepts it as a no-op success so the boot log
 // doesn't carry "Failed to enable kbrequest handling".
+#[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_kdsigaccept_ok() -> TestResult {
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
@@ -15655,6 +15656,7 @@ fn smoke_console_ioctl_kdsigaccept_ok() -> TestResult {
         _ => TestResult::Fail("KDSIGACCEPT ioctl did not return success"),
     }
 }
+#[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_console_ioctl_kdsigaccept_ok);
 
