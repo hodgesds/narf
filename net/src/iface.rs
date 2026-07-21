@@ -115,6 +115,28 @@ pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
         .collect()
 }
 
+/// Snapshot EVERY registered interface, by value. Used by the rtnetlink
+/// dump responder (RTM_GETLINK / RTM_GETADDR) to enumerate the NICs it
+/// describes to systemd-udevd / `ip link`. Order matches registration
+/// order, which the dump maps to synthetic ifindex 2, 3, … (ifindex 1 is
+/// the synthetic loopback the responder always prepends).
+pub fn snapshot_all() -> Vec<NetIfaceSnapshot> {
+    let g = IFACES.lock();
+    let v = match g.as_ref() {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    v.iter()
+        .map(|e| NetIfaceSnapshot {
+            name: e.name.clone(),
+            mac: e.mac,
+            send: e.send,
+            ipv4: e.ipv4,
+            gateway: e.gateway,
+        })
+        .collect()
+}
+
 /// Find the first registered interface (Stage-1: there's at most
 /// one; multi-iface routing wants the destination IP to pick).
 pub fn primary() -> Option<NetIfaceSnapshot> {

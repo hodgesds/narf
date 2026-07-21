@@ -59,6 +59,7 @@ pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
 pub mod netfilter;
+pub mod netlink_route;
 pub mod pkt;
 pub mod pkt_coap;
 pub mod pkt_dhcp;

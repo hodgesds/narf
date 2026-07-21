@@ -1474,3 +1474,250 @@ fn smoke_abi_socket_scm_rights_fd_passing() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_socket_scm_rights_fd_passing);
+
+// ───────────────────────────── AF_NETLINK ─────────────────────────────
+//
+// systemd-udevd / systemd-networkd open AF_NETLINK sockets: NETLINK_ROUTE
+// (protocol 0) for the RTM_GETLINK / RTM_GETADDR interface+address dump, and
+// NETLINK_KOBJECT_UEVENT (protocol 15) to monitor device hotplug uevents.
+
+const AF_NETLINK: u64 = 16;
+const SOCK_RAW: u64 = 3;
+const NETLINK_ROUTE: u64 = 0;
+const NETLINK_KOBJECT_UEVENT: u64 = 15;
+/// rtnetlink message types (rtnetlink.h).
+const RTM_NEWLINK: u16 = 16;
+const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_GETADDR: u16 = 22;
+/// netlink control message types (netlink.h).
+const NLMSG_DONE: u16 = 3;
+const NLMSG_HDRLEN: usize = 16;
+/// `NLM_F_REQUEST | NLM_F_DUMP` — the flags a dump request carries.
+const NLM_F_REQUEST_DUMP: u16 = 0x01 | (0x100 | 0x200);
+
+/// Open an `AF_NETLINK` socket of the given protocol, returning its fd.
+fn open_netlink(protocol: u64) -> Result<u64, &'static str> {
+    match call(
+        Syscall::SocketOpen.raw(),
+        a2(AF_NETLINK, SOCK_RAW, protocol),
+    ) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("socket(AF_NETLINK) did not return a valid fd"),
+    }
+}
+
+/// Build a `sockaddr_nl`: family(u16) pad(u16) pid(u32) groups(u32) = 12 bytes.
+fn netlink_sockaddr(groups: u32) -> ([u8; 12], u64) {
+    let mut buf = [0u8; 12];
+    buf[0..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
+    buf[8..12].copy_from_slice(&groups.to_le_bytes());
+    (buf, 12)
+}
+
+/// Build a `struct nlmsghdr` dump request: len(16) type flags(REQUEST|DUMP)
+/// seq pid.
+fn nlmsg_request(msg_type: u16, seq: u32) -> [u8; NLMSG_HDRLEN] {
+    let mut b = [0u8; NLMSG_HDRLEN];
+    b[0..4].copy_from_slice(&(NLMSG_HDRLEN as u32).to_le_bytes());
+    b[4..6].copy_from_slice(&msg_type.to_le_bytes());
+    b[6..8].copy_from_slice(&NLM_F_REQUEST_DUMP.to_le_bytes());
+    b[8..12].copy_from_slice(&seq.to_le_bytes());
+    // pid = 0 (unbound); the kernel echoes it back.
+    b
+}
+
+/// Read the `nlmsg_type` field (offset 4) of a framed netlink message.
+fn nlmsg_type_of(msg: &[u8]) -> u16 {
+    u16::from_le_bytes([msg[4], msg[5]])
+}
+
+/// sendto(fd, buf, len, 0, NULL, 0).
+fn netlink_send(fd: u64, buf: &[u8]) -> Option<i64> {
+    let mut args = a3(fd, buf.as_ptr() as u64, buf.len() as u64, 0);
+    args.arg4 = 0;
+    args.arg5 = 0;
+    call(Syscall::SocketSend.raw(), args)
+}
+
+/// recvfrom(fd, buf, len, MSG_DONTWAIT, NULL, NULL).
+fn netlink_recv(fd: u64, buf: &mut [u8]) -> Option<i64> {
+    call(
+        Syscall::SocketRecv.raw(),
+        a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, MSG_DONTWAIT),
+    )
+}
+
+fn smoke_abi_netlink_route_socket_bind() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        let r = call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?;
+        if r != 0 {
+            return Err("bind(NETLINK_ROUTE) did not return 0");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_socket_bind);
+
+fn smoke_abi_netlink_uevent_socket_bind() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        // group 1 = the kernel uevent broadcast group.
+        let (addr, alen) = netlink_sockaddr(1);
+        let r = call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?;
+        if r != 0 {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) did not return 0");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_socket_bind);
+
+fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETLINK, 42);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETLINK) did not echo the request length");
+        }
+        // First reply must be a well-formed RTM_NEWLINK naming `lo`.
+        let mut buf = [0u8; 512];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n < NLMSG_HDRLEN as i64 {
+            return Err("recv did not return a full RTM_NEWLINK message");
+        }
+        let n = n as usize;
+        if nlmsg_type_of(&buf) != RTM_NEWLINK {
+            return Err("first dump message was not RTM_NEWLINK");
+        }
+        // The nlmsg_len field must match the returned byte count.
+        let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len != n {
+            return Err("RTM_NEWLINK nlmsg_len disagrees with recv byte count");
+        }
+        // The loopback link carries an IFLA_IFNAME rtattr with "lo".
+        if !window_contains(&buf[..n], b"lo\0") {
+            return Err("RTM_NEWLINK dump did not contain the `lo` interface name");
+        }
+        // Drain remaining links until NLMSG_DONE terminates the dump.
+        let mut saw_done = false;
+        for _ in 0..16 {
+            let mut b2 = [0u8; 512];
+            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
+            if m < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            if nlmsg_type_of(&b2) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETLINK dump did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getlink_dump);
+
+fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
+    with_setup(|| {
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let req = nlmsg_request(RTM_GETADDR, 7);
+        if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
+            return Err("send(RTM_GETADDR) did not echo the request length");
+        }
+        let mut buf = [0u8; 512];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n < NLMSG_HDRLEN as i64 {
+            return Err("recv did not return a full RTM_NEWADDR message");
+        }
+        if nlmsg_type_of(&buf) != RTM_NEWADDR {
+            return Err("first addr-dump message was not RTM_NEWADDR");
+        }
+        // ifaddrmsg.ifa_family (offset 16) must be AF_INET (2).
+        if buf[NLMSG_HDRLEN] != AF_INET as u8 {
+            return Err("RTM_NEWADDR ifa_family was not AF_INET");
+        }
+        // Terminates with NLMSG_DONE.
+        let mut saw_done = false;
+        for _ in 0..16 {
+            let mut b2 = [0u8; 512];
+            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
+            if m < NLMSG_HDRLEN as i64 {
+                break;
+            }
+            if nlmsg_type_of(&b2) == NLMSG_DONE {
+                saw_done = true;
+                break;
+            }
+        }
+        if !saw_done {
+            return Err("RTM_GETADDR dump did not terminate with NLMSG_DONE");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_route_getaddr_dump);
+
+fn smoke_abi_netlink_uevent_recv() -> TestResult {
+    with_setup(|| {
+        // The uevent monitor starts at the ring tail, so create the socket
+        // FIRST, then emit — a tail-started reader only sees future events.
+        let fd = open_netlink(NETLINK_KOBJECT_UEVENT)?;
+        let (addr, alen) = netlink_sockaddr(1);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
+        }
+        // Emit a synthetic hotplug event via the kernel uevent API.
+        narf_filesystem::uevent::emit(
+            narf_filesystem::uevent::UeventAction::Add,
+            alloc::string::String::from("/devices/abi-netlink-test"),
+            alloc::string::String::from("net"),
+        );
+        // recv the event; the netlink wire text begins "add@<devpath>".
+        let mut buf = [0u8; 512];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n <= 0 {
+            return Err("uevent recv returned no bytes after emit");
+        }
+        let n = n as usize;
+        if !window_contains(&buf[..n], b"add@/devices/abi-netlink-test") {
+            return Err("uevent recv did not carry the emitted action@devpath header");
+        }
+        if !window_contains(&buf[..n], b"SUBSYSTEM=net") {
+            return Err("uevent recv did not carry the emitted SUBSYSTEM");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
+
+/// True iff `needle` appears as a contiguous byte window in `hay`.
+fn window_contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w == needle)
+}

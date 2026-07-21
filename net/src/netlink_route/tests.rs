@@ -1,0 +1,122 @@
+//! Wire-format smokes for the rtnetlink dump responder.
+
+use super::*;
+extern crate alloc;
+use alloc::vec::Vec;
+
+/// Build a `struct nlmsghdr` request buffer: len is filled to header size,
+/// type/flags/seq/pid as given.
+fn req(msg_type: u16, seq: u32, pid: u32) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(NLMSG_HDRLEN as u32).to_le_bytes());
+    b.extend_from_slice(&msg_type.to_le_bytes());
+    b.extend_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_le_bytes());
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pid.to_le_bytes());
+    b
+}
+
+/// Read the `nlmsghdr` fields off the front of a framed message.
+fn hdr_of(msg: &[u8]) -> (u32, u16, u16, u32, u32) {
+    let h = parse_hdr(msg).expect("message shorter than a header");
+    (h.len, h.msg_type, h.flags, h.seq, h.pid)
+}
+
+/// Walk a message's rtattrs (starting after `ifhdr_len` bytes of fixed
+/// header) and return the payload of the first attribute of `want_type`.
+fn find_rtattr(msg: &[u8], ifhdr_len: usize, want_type: u16) -> Option<Vec<u8>> {
+    let mut off = NLMSG_HDRLEN + ifhdr_len;
+    let end = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]) as usize;
+    while off + 4 <= end {
+        let rta_len = u16::from_le_bytes([msg[off], msg[off + 1]]) as usize;
+        let rta_type = u16::from_le_bytes([msg[off + 2], msg[off + 3]]);
+        if rta_len < 4 || off + rta_len > end {
+            break;
+        }
+        if rta_type == want_type {
+            return Some(msg[off + 4..off + rta_len].to_vec());
+        }
+        off += rta_align(rta_len);
+    }
+    None
+}
+
+#[test]
+fn align_helpers_round_to_four() {
+    assert_eq!(nlmsg_align(0), 0);
+    assert_eq!(nlmsg_align(1), 4);
+    assert_eq!(nlmsg_align(4), 4);
+    assert_eq!(nlmsg_align(5), 8);
+    assert_eq!(rta_align(6), 8);
+    // Every framed message length is 4-byte aligned.
+    let msgs = build_dump(&req(RTM_GETLINK, 7, 99));
+    for m in &msgs {
+        assert_eq!(m.len() % NLMSG_ALIGNTO, 0, "message not NLMSG_ALIGN-padded");
+    }
+}
+
+#[test]
+fn getlink_dump_has_loopback_and_terminates() {
+    let msgs = build_dump(&req(RTM_GETLINK, 42, 1234));
+    assert!(msgs.len() >= 2, "expected >=1 NEWLINK + a DONE");
+
+    // First message is an RTM_NEWLINK with echoed seq/pid and NLM_F_MULTI.
+    let (_len, mtype, flags, seq, pid) = hdr_of(&msgs[0]);
+    assert_eq!(mtype, RTM_NEWLINK);
+    assert_eq!(seq, 42);
+    assert_eq!(pid, 1234);
+    assert_ne!(
+        flags & NLM_F_MULTI,
+        0,
+        "dump entries must carry NLM_F_MULTI"
+    );
+
+    // The loopback entry names itself "lo" via IFLA_IFNAME. ifinfomsg is
+    // 16 bytes: family/pad/type(2)/index(4)/flags(4)/change(4).
+    let name = find_rtattr(&msgs[0], 16, IFLA_IFNAME).expect("first link has IFLA_IFNAME");
+    assert_eq!(&name, b"lo\0", "ifindex-1 link is the loopback");
+
+    // Last message is NLMSG_DONE.
+    let (_l, dtype, _f, dseq, _p) = hdr_of(msgs.last().unwrap());
+    assert_eq!(dtype, NLMSG_DONE);
+    assert_eq!(dseq, 42, "DONE echoes the request seq");
+}
+
+#[test]
+fn getaddr_dump_is_well_formed() {
+    let msgs = build_dump(&req(RTM_GETADDR, 5, 77));
+    assert!(msgs.len() >= 2, "expected >=1 NEWADDR + a DONE");
+
+    // First address is loopback 127.0.0.1/8 with an IFA_LOCAL attribute.
+    let (_len, mtype, _flags, seq, _pid) = hdr_of(&msgs[0]);
+    assert_eq!(mtype, RTM_NEWADDR);
+    assert_eq!(seq, 5);
+    // ifaddrmsg is 8 bytes: family/prefixlen/flags/scope/index(4).
+    assert_eq!(msgs[0][NLMSG_HDRLEN], AF_INET, "ifa_family = AF_INET");
+    assert_eq!(msgs[0][NLMSG_HDRLEN + 1], 8, "loopback prefixlen /8");
+    let local = find_rtattr(&msgs[0], 8, IFA_LOCAL).expect("addr has IFA_LOCAL");
+    assert_eq!(&local, &[127, 0, 0, 1], "first addr is 127.0.0.1");
+
+    let (_l, dtype, _f, _s, _p) = hdr_of(msgs.last().unwrap());
+    assert_eq!(dtype, NLMSG_DONE);
+}
+
+#[test]
+fn unsupported_request_yields_eopnotsupp_error() {
+    // RTM_GETLINK is 18; use a bogus type the responder doesn't handle.
+    let bogus: u16 = 999;
+    let msgs = build_dump(&req(bogus, 8, 55));
+    assert_eq!(msgs.len(), 1, "error dump is a single message");
+    let (_len, mtype, _flags, seq, pid) = hdr_of(&msgs[0]);
+    assert_eq!(mtype, NLMSG_ERROR);
+    assert_eq!(seq, 8);
+    assert_eq!(pid, 55);
+    // nlmsgerr.error is the first i32 of the payload: -EOPNOTSUPP.
+    let err = i32::from_le_bytes([
+        msgs[0][NLMSG_HDRLEN],
+        msgs[0][NLMSG_HDRLEN + 1],
+        msgs[0][NLMSG_HDRLEN + 2],
+        msgs[0][NLMSG_HDRLEN + 3],
+    ]);
+    assert_eq!(err, -EOPNOTSUPP, "error payload carries -EOPNOTSUPP");
+}

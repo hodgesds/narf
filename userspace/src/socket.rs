@@ -41,8 +41,13 @@ pub const AF_INET6: u16 = 10;
 /// Picks 45 because Linux's number is taken; carries our four-ring
 /// model rather than mmap'd shared pages.
 pub const AF_BYPASS: u16 = 45;
-/// Linux `AF_NETLINK`. We implement exactly one protocol below.
+/// Linux `AF_NETLINK`. We implement two protocols below (route + uevent).
 pub const AF_NETLINK: u16 = 16;
+/// `NETLINK_ROUTE` (rtnetlink) — the interface/address/route dump protocol.
+/// systemd-udevd, systemd-networkd, and `ip link`/`ip addr` open
+/// `socket(AF_NETLINK, SOCK_RAW, 0)` and send RTM_GETLINK/RTM_GETADDR dump
+/// requests; we answer them from `narf_net::netlink_route::build_dump`.
+pub const NETLINK_ROUTE: u32 = 0;
 /// `NETLINK_KOBJECT_UEVENT` — the udev hotplug-monitor netlink protocol.
 /// libudev opens `socket(AF_NETLINK, SOCK_DGRAM|SOCK_RAW, 15)` and reads
 /// device-uevent messages off it; we bridge it to the kernel uevent ring.
@@ -524,6 +529,12 @@ enum SocketState {
     NetlinkUevent {
         reader: narf_filesystem::uevent::UeventReader,
     },
+    /// `AF_NETLINK` / `NETLINK_ROUTE` (rtnetlink) dump socket. A `send` of an
+    /// RTM_GET* dump request builds the reply message stream via
+    /// `narf_net::netlink_route::build_dump` and queues each message here;
+    /// `recv` dequeues one message per call (the kernel dumps stream over
+    /// netlink as one datagram per message, terminated by NLMSG_DONE).
+    NetlinkRoute { replies: VecDeque<Vec<u8>> },
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -566,11 +577,18 @@ impl SocketFile {
             SocketState::Bypass {
                 state: Arc::new(crate::xdp_socket::XdpSocketState::new()),
             }
+        } else if domain == AF_NETLINK && protocol == NETLINK_ROUTE {
+            // rtnetlink dump socket: replies are built on-demand from a
+            // send(RTM_GET*) request, so start with an empty reply queue.
+            SocketState::NetlinkRoute {
+                replies: VecDeque::new(),
+            }
         } else if domain == AF_NETLINK {
-            // Wire the post-emit wake so a uevent emitted while this monitor
-            // is parked in poll/epoll wakes it (the ring lives in the fs
-            // crate, which can't reach the net readiness layer directly).
-            // Idempotent — a plain atomic store.
+            // NETLINK_KOBJECT_UEVENT (and any other AF_NETLINK protocol) → the
+            // udev hotplug monitor. Wire the post-emit wake so a uevent emitted
+            // while this monitor is parked in poll/epoll wakes it (the ring
+            // lives in the fs crate, which can't reach the net readiness layer
+            // directly). Idempotent — a plain atomic store.
             narf_filesystem::uevent::set_wake_hook(uevent_wake_hook);
             // Start at the ring TAIL — a netlink uevent monitor only receives
             // events broadcast *after* it binds (Linux `NETLINK_KOBJECT_UEVENT`
@@ -1123,6 +1141,15 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
+            SocketState::NetlinkRoute { replies } => {
+                // Always writable (a dump request is sendable); readable when
+                // a built dump has queued reply messages waiting.
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
         }
     }
 }
@@ -1192,7 +1219,67 @@ impl SocketFile {
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
+            (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
             (AF_NETLINK, _) => self.dispatch_netlink(op),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// `AF_NETLINK` / `NETLINK_ROUTE` (rtnetlink) dispatcher. A `send` of an
+    /// RTM_GET* dump request builds the reply stream via
+    /// `narf_net::netlink_route::build_dump`, queues each message, and notifies
+    /// readiness so a caller parked in poll/epoll wakes to read the replies.
+    /// `recv` dequeues one queued message per call with a kernel `sockaddr_nl`
+    /// peer (pid 0); an empty queue → WouldBlock (EAGAIN). Callers that
+    /// send-then-recv on the same fd (sd-netlink, libnl) get their dump back.
+    fn dispatch_netlink_route(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            // bind(sockaddr_nl{family=16, pid, groups}) — accept any.
+            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            SocketOp::Send { buf, .. } => {
+                let sent = buf.len() as u64;
+                let msgs = narf_net::netlink_route::build_dump(buf);
+                {
+                    let mut g = self.state.lock();
+                    match &mut *g {
+                        SocketState::NetlinkRoute { replies } => {
+                            for m in msgs {
+                                replies.push_back(m);
+                            }
+                        }
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                }
+                // Wake a reader parked in poll/epoll on the reply queue.
+                narf_net::readiness::notify(0);
+                SocketOpResult::Ok(sent)
+            }
+            SocketOp::Recv { buf, flags: _ } => {
+                let msg = {
+                    let mut g = self.state.lock();
+                    match &mut *g {
+                        SocketState::NetlinkRoute { replies } => replies.pop_front(),
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                };
+                match msg {
+                    Some(bytes) => {
+                        let n = core::cmp::min(buf.len(), bytes.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        // Sender is the kernel: sockaddr_nl{family, pid=0, groups=0}.
+                        let peer = SockAddr {
+                            family: AF_NETLINK,
+                            body: alloc::vec![0u8; 10],
+                        };
+                        SocketOpResult::Received {
+                            n,
+                            peer: Some(peer),
+                        }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
