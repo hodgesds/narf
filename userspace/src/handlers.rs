@@ -16625,7 +16625,13 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     // erroring. Scoped to the fstypes `mount_api::build_fs` recognizes (the
     // in-memory / synthetic filesystems) so bind / block-device mounts keep
     // their real handling (a bind onto an existing path is a distinct op).
+    // The fstype→backend dispatch lives in the linux-compat-only mount_api;
+    // the mount(2) syscall itself is only wired under linux-compat, so the
+    // non-linux-compat build just needs this to compile (no pseudo-fs there).
+    #[cfg(feature = "linux-compat")]
     let is_pseudo_fs = crate::mount_api::build_fs(fstype.as_str()).is_some();
+    #[cfg(not(feature = "linux-compat"))]
+    let is_pseudo_fs = false;
     if is_pseudo_fs
         && narf_filesystem::registry()
             .list()
@@ -16664,6 +16670,7 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     // uses, so both entry points recognize identical filesystems. Block-device
     // fstypes (fat/vfat/ext…) fall through below because build_fs can't
     // synthesize them without a device.
+    #[cfg(feature = "linux-compat")]
     if let Some(fs) = crate::mount_api::build_fs(fstype.as_str()) {
         return match narf_filesystem::registry().mount_arc(&auth, target.as_str(), fs) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
