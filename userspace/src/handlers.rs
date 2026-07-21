@@ -10027,7 +10027,8 @@ static VFORK_WAIT: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 pub(crate) fn vfork_wait_register(child_pid: u64, parent_task: u64) {
     let mut g = VFORK_WAIT.lock();
-    g.get_or_insert_with(BTreeMap::new).insert(child_pid, parent_task);
+    g.get_or_insert_with(BTreeMap::new)
+        .insert(child_pid, parent_task);
 }
 
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
@@ -16554,7 +16555,7 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
     let ebusy = SyscallReturn::ok((-16i64) as u64); // EBUSY — target in use
     let enoent = SyscallReturn::ok((-2i64) as u64); // ENOENT — missing source
     let efault = SyscallReturn::ok((-14i64) as u64); // EFAULT — bad user pointer
-    // A copy-in failure means an unreadable user pointer → EFAULT.
+                                                     // A copy-in failure means an unreadable user pointer → EFAULT.
     let fail = efault;
 
     // Linux `mount(2)`: (const char *source, const char *target,
@@ -16798,8 +16799,8 @@ fn sys_mount(ctx: &mut dyn TrapContext) {
             // known block fstype with a missing device is ENOENT; a genuinely
             // unknown fstype is ENODEV (matching Linux, never a bare -1).
             match fstype.as_str() {
-                "fat" | "vfat" | "fat16" | "fat32" | "ext2" | "ext3" | "ext4" | "xfs"
-                | "btrfs" | "iso9660" | "9p" | "virtiofs" => ctx.set_return(enoent),
+                "fat" | "vfat" | "fat16" | "fat32" | "ext2" | "ext3" | "ext4" | "xfs" | "btrfs"
+                | "iso9660" | "9p" | "virtiofs" => ctx.set_return(enoent),
                 _ => ctx.set_return(enodev),
             }
             return;
@@ -22454,6 +22455,12 @@ fn sys_socket_send(ctx: &mut dyn TrapContext) {
             // Yield + retry from libc.
             ctx.set_return(SyscallReturn::ok(0));
         }
+        // Surface the real errno (ECONNREFUSED for a datagram to a missing
+        // name, ENOTCONN, EINVAL, …) rather than a bare -1/EPERM.
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
+        }
+        // Send never yields Accepted/Received/Addr; keep the match total.
         _ => ctx.set_return(fail),
     }
 }

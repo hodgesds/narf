@@ -2480,6 +2480,20 @@ impl SocketFile {
                         };
                         (la.clone(), dest)
                     }
+                    // Unbound datagram sendto: Linux auto-binds an unnamed
+                    // local address and delivers to the explicit destination.
+                    // (We're inside dispatch_unix_dgram, so Fresh here is a
+                    // SOCK_DGRAM socket — sd_notify sends from such a socket.)
+                    SocketState::Fresh => {
+                        let dest = match addr {
+                            Some(a) => match UnixAddr::parse(&a.body) {
+                                Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
+                                _ => return SocketOpResult::Err(SockError::InvalidArg),
+                            },
+                            None => return SocketOpResult::Err(SockError::InvalidArg),
+                        };
+                        (None, dest)
+                    }
                     _ => return SocketOpResult::Err(SockError::NotConnected),
                 };
                 let sender_cred = self.local_cred();

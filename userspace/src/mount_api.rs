@@ -142,9 +142,8 @@ fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
 pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
     // Map a known pseudo-fstype to a stable &'static str name so `MemFs::new`
     // (which takes &'static str) reflects the requested type in listings.
-    let empty = |name: &'static str| -> Option<Arc<dyn FsInstance>> {
-        Some(Arc::new(MemFs::new(name)))
-    };
+    let empty =
+        |name: &'static str| -> Option<Arc<dyn FsInstance>> { Some(Arc::new(MemFs::new(name))) };
     match fsname {
         // In-memory data filesystems.
         "tmpfs" => empty("tmpfs"),

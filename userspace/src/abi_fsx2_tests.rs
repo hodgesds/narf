@@ -926,4 +926,7 @@ fn smoke_abi_fsx2_new_mount_api_chain_registers_pos() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fsx2_new_mount_api_chain_registers_pos);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_new_mount_api_chain_registers_pos
+);

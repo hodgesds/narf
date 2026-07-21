@@ -152,7 +152,10 @@ fn smoke_userspace_vfork_wait_release_clears_pending() -> TestResult {
     TestResult::Pass
 }
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
-kernel_test_in!("userspace", smoke_userspace_vfork_wait_release_clears_pending);
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_vfork_wait_release_clears_pending
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
