@@ -9662,6 +9662,15 @@ fn sys_gettid(ctx: &mut dyn TrapContext) {
 #[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_VM: u64 = 0x0000_0100;
+/// `CLONE_VFORK`: the parent is suspended until the child `execve`s or exits.
+/// glibc/musl `posix_spawn` and `vfork()` set this (with CLONE_VM) and run the
+/// child on a caller-provided stack while sharing the parent's address space;
+/// the parent MUST NOT resume — and thus must not mutate/free that shared AS
+/// (e.g. munmap the child's stack) — until the child releases the mm. Linux
+/// keeps the parent in TASK_KILLABLE across this window. Consumed only by the
+/// x86_64 `do_clone3`; other arches stub clone until the EL0 user-task pipeline.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+const CLONE_VFORK: u64 = 0x0000_4000;
 #[cfg(feature = "linux-compat")]
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FS: u64 = 0x0000_0200;
@@ -9959,6 +9968,47 @@ fn sys_clone(ctx: &mut dyn TrapContext) {
     do_clone3(ctx, ca);
 }
 
+// ── CLONE_VFORK: parent suspended until the child execs or exits ──────
+//
+// Maps a live vfork child's visible pid → the parent task id parked in the
+// clone syscall. The parent installs an entry before parking; the child's
+// `execve`/exit path calls `vfork_child_release`, which drops the entry and
+// wakes the parent. While an entry is present the parent stays parked, so it
+// cannot resume and mutate the shared address space (e.g. munmap the child's
+// stack) out from under a still-running CLONE_VM child — the race that SIGSEGV'd
+// every glibc `posix_spawn` service child under systemd.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+static VFORK_WAIT: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+pub(crate) fn vfork_wait_register(child_pid: u64, parent_task: u64) {
+    let mut g = VFORK_WAIT.lock();
+    g.get_or_insert_with(BTreeMap::new).insert(child_pid, parent_task);
+}
+
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+pub(crate) fn vfork_is_pending(child_pid: u64) -> bool {
+    VFORK_WAIT
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&child_pid))
+}
+
+/// Called from the child's `execve` and exit paths: if this child had a vfork
+/// parent parked on it, drop the entry and wake the parent. `child_pid` is the
+/// child's visible pid. Idempotent (only the first exec/exit releases).
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+pub(crate) fn vfork_child_release(child_pid: u64) {
+    let parent = {
+        let mut g = VFORK_WAIT.lock();
+        g.as_mut().and_then(|m| m.remove(&child_pid))
+    };
+    if let Some(parent_task) = parent {
+        wake_signal(parent_task);
+    }
+}
+
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     use crate::process::DEFAULT_USER_STACK_BYTES;
@@ -10124,6 +10174,16 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
     // below, well past the point the spawned child could already be running).
     if !share_thread {
         parent_of_set(child_visible_pid, parent_pid);
+    }
+
+    // CLONE_VFORK: register the parent as suspended on this child BEFORE the
+    // child is spawned/made runnable. Under SMP (or an immediate exec) the
+    // child can run and release before this handler reaches the park below;
+    // publishing here means the park's `vfork_is_pending` check either finds
+    // the entry (child not yet done → park) or finds it already dropped (child
+    // released → proceed) — no lost-wake window either way.
+    if flags & CLONE_VFORK != 0 {
+        vfork_wait_register(child_visible_pid, parent_pid);
     }
 
     let proc = crate::UserProcess {
@@ -10364,6 +10424,46 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs) {
         child_visible_pid
     };
     ctx.set_return(SyscallReturn::ok(ret_val));
+
+    // CLONE_VFORK: suspend the parent here until the child execs or exits
+    // (Linux TASK_KILLABLE). The child holds the shared address space; letting
+    // the parent resume now would let it mutate/free that AS (e.g. munmap the
+    // child's stack) out from under the still-running child. The entry was
+    // registered pre-spawn, so if the child already released we fall straight
+    // through. Own-stack park: infinite deadline, woken by `vfork_child_release`
+    // → `wake_signal`; SIGKILL (pending bit 9) still breaks the wait.
+    if flags & CLONE_VFORK != 0 {
+        if let Some(uctx) = crate::user_task::current_user_task() {
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                // SAFETY: the in-flight parent task's poller-pinned UserTaskCtx;
+                // single-CPU cooperative execution — no concurrent &mut.
+                let uc = unsafe { &*uctx };
+                // SAFETY: `uc.state` is this task's poller-pinned save area and
+                // `uc.exit_reason` its resume-disposition cell; single-CPU
+                // cooperative execution means no concurrent access.
+                unsafe {
+                    ctx.save_user_state(uc.state.get() as *mut u8);
+                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                }
+                while vfork_is_pending(child_visible_pid) {
+                    if (signal_pending_bits(parent_pid) & (1 << 9)) != 0 {
+                        // SIGKILL pending: abandon the wait; drop the stale entry
+                        // so a later reuse of this pid can't wake a dead parent.
+                        VFORK_WAIT
+                            .lock()
+                            .as_mut()
+                            .map(|m| m.remove(&child_visible_pid));
+                        break;
+                    }
+                    uc.sleep_deadline_ns
+                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                    crate::user_task::own_stack_park();
+                }
+                uc.sleep_deadline_ns
+                    .store(0, core::sync::atomic::Ordering::Release);
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
@@ -11176,6 +11276,13 @@ pub fn encode_signaled_status(signum: u32, core_dumped: bool) -> i32 {
 /// first one wins — that's the signal that actually killed the
 /// task.
 pub fn stage_pending_termination(task: u64, status: i32) {
+    // A CLONE_VFORK child that exits WITHOUT exec'ing (e.g. posix_spawn's child
+    // _exit on exec failure, or a kill) must still release the parent suspended
+    // in do_clone3's vfork park — otherwise the parent waits forever. `task` is
+    // the visible pid here (every caller passes a pid). Idempotent with the
+    // execve release. No-op when the pid isn't a vfork child.
+    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    vfork_child_release(task);
     let mut g = PENDING_TERMINATION.lock();
     if let Some(m) = g.as_mut() {
         m.entry(task).or_insert(status);
@@ -15454,17 +15561,30 @@ fn sys_getcwd(ctx: &mut dyn TrapContext) {
 // case there is handled by `__split_vma` which NARF will add when a
 // real workload demands it.
 
-/// Default per-task heap base. Far enough from the mmap cursor and
-/// the user stack to leave room for both to grow without colliding
-/// with the brk arena.
+/// Default per-task heap base. Lives in the gap between the program image
+/// (`PROGRAM_DYN_BASE = 0x0000_0080_…`) and the interpreter bias
+/// (`INTERP_BIAS = 0x0000_4000_…`), and grows UP toward `BRK_ARENA_TOP`.
 ///
-/// INVARIANT: must stay clear of `crate::vdso::VDSO_MAP_BASE` (and every
-/// other fixed per-process mapping) — the vdso used to live at exactly
-/// this address, which made the FIRST `brk` grow fail with
-/// `AddressSpaceError::Overlap` whenever a vdso image was registered
-/// (glibc allocates its static TLS via `sbrk` at the default break).
-const BRK_DEFAULT_BASE: u64 = 0x0000_5000_0000_0000;
+/// INVARIANT (load-bearing): the brk arena `[BRK_DEFAULT_BASE, BRK_ARENA_TOP)`
+/// is DISJOINT from the anonymous mmap window
+/// `[MMAP_CURSOR_BASE, MMAP_WINDOW_TOP) = [0x4080_…, 0x7F00_…)`. When brk
+/// overlapped that window (the old base `0x0000_5000_…` sat inside it), a
+/// `brk` grow dragged the shared `mmap_cursor` up to the heap top, so a
+/// subsequent anonymous `mmap` (e.g. glibc's per-child `posix_spawn` stack)
+/// was handed a VA just above the heap; its region collided with / was never
+/// registered against the brk arena, and the cloned child faulted on a stack
+/// with no VMA (unserviceable #PF → SIGSEGV). Keeping the arenas disjoint is
+/// what Linux does (brk follows the executable, never inside the mmap region).
+/// Must also stay clear of `crate::vdso::VDSO_MAP_BASE`.
+const BRK_DEFAULT_BASE: u64 = 0x0000_1000_0000_0000;
+/// Hard ceiling for brk growth — keeps the heap below the interpreter bias so
+/// the arena can never climb into the interpreter or the mmap window.
+const BRK_ARENA_TOP: u64 = 0x0000_4000_0000_0000;
 const _: () = assert!(BRK_DEFAULT_BASE != crate::vdso::VDSO_MAP_BASE);
+const _: () = assert!(BRK_DEFAULT_BASE < BRK_ARENA_TOP);
+// The whole arena must sit below the anon mmap window so brk and mmap can
+// never alias (the bug this base was moved to fix).
+const _: () = assert!(BRK_ARENA_TOP <= narf_memory::AddressSpace::MMAP_CURSOR_BASE);
 
 static BRK_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -15709,6 +15829,12 @@ fn sys_execve(ctx: &mut dyn TrapContext) {
     };
 
     let task = current_task_id();
+
+    // CLONE_VFORK release: this child is now replacing its image, so it no
+    // longer needs the shared address space — wake a parent suspended in
+    // do_clone3's vfork park. (Load succeeded above, so the exec is committed.)
+    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    vfork_child_release(task_to_pid_raw(task).unwrap_or(task));
 
     // POSIX execve: reset caught signal handlers to SIG_DFL — their code
     // addresses belong to the old image. (Inherited e.g. via fork from a shell
@@ -17412,6 +17538,15 @@ fn sys_brk(ctx: &mut dyn TrapContext) {
 
     // Query path: arg0 == 0 just returns the current break.
     if new_break == 0 {
+        ctx.set_return(SyscallReturn::ok(cur));
+        return;
+    }
+
+    // Ceiling: never let the heap climb past the arena top (which keeps it
+    // below the interpreter bias and the anonymous mmap window). A request
+    // above the ceiling fails per POSIX brk's contract — return the unchanged
+    // break so glibc/musl fall back to mmap.
+    if new_break > BRK_ARENA_TOP {
         ctx.set_return(SyscallReturn::ok(cur));
         return;
     }

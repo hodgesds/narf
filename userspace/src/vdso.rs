@@ -28,12 +28,13 @@ use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{alloc_frame, AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
 /// Base of the [vvar][vdso] mapping in every process. Chosen well clear of
-/// the program (0x0000_0080_…), interpreter (0x0000_4000_…), the anonymous
-/// mmap window (`[0x4080…, 0x7F00…)`), the brk arena (`BRK_DEFAULT_BASE =
-/// 0x5000_0000_0000` — the OLD vdso base collided with it exactly: glibc's
-/// `sbrk` grow at the default break then failed `map_region` with `Overlap`
-/// whenever the vdso was registered) and the stack region (0x7FFF_FF…).
-/// Linux likewise parks the vdso just below the stack.
+/// the program (0x0000_0080_…), the brk arena (`[BRK_DEFAULT_BASE = 0x1000_…,
+/// BRK_ARENA_TOP = 0x4000_…)`), the interpreter (0x0000_4000_…), the anonymous
+/// mmap window (`[0x4080…, 0x7F00…)`) and the stack region (0x7FFF_FF…). An old
+/// vdso base of 0x5000_0000_0000 collided with the (then) brk arena exactly:
+/// glibc's `sbrk` grow at the default break failed `map_region` with `Overlap`
+/// whenever the vdso was registered. Linux likewise parks the vdso just below
+/// the stack.
 pub const VDSO_MAP_BASE: u64 = 0x0000_7FFF_0000_0000;
 const VVAR_VADDR: u64 = VDSO_MAP_BASE;
 /// The vDSO ELF base — the value placed in `AT_SYSINFO_EHDR`.

@@ -126,6 +126,34 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_clone_shares_address_space);
 
+// CLONE_VFORK wait-table state machine: a parent registered on a child is
+// "pending" until the child's execve/exit calls `vfork_child_release`, which
+// drops the entry (and wakes the parent). Registering BEFORE the child can run
+// is what closes the lost-wake window; releasing must clear the entry so the
+// parent's `while vfork_is_pending` park loop terminates. `vfork_child_release`
+// also fires `wake_signal`, which is a no-op here (no live task ctx for the
+// synthetic parent id) — this exercises the entry lifecycle in isolation.
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+fn smoke_userspace_vfork_wait_release_clears_pending() -> TestResult {
+    let child = 0xF001u64; // arbitrary synthetic child pid (unused by any task)
+    crate::handlers::vfork_wait_register(child, 0xF002);
+    if !crate::handlers::vfork_is_pending(child) {
+        return TestResult::Fail("child not pending after vfork_wait_register");
+    }
+    crate::handlers::vfork_child_release(child);
+    if crate::handlers::vfork_is_pending(child) {
+        return TestResult::Fail("child still pending after vfork_child_release");
+    }
+    // A second release is idempotent (no panic, stays not-pending).
+    crate::handlers::vfork_child_release(child);
+    if crate::handlers::vfork_is_pending(child) {
+        return TestResult::Fail("child pending after redundant release");
+    }
+    TestResult::Pass
+}
+#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+kernel_test_in!("userspace", smoke_userspace_vfork_wait_release_clears_pending);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_clone_rejects_zero_entry_or_stack() -> TestResult {
     // Defence-in-depth on the handler — entry==0 or stack==0 is
