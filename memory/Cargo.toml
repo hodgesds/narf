@@ -48,6 +48,15 @@ cgroup = []
 frame-zero-on-free = []
 frame-poison-on-free = []
 
+# Slab free-site audit: on the free-block canary trip (write-after-free
+# / double-free of a slab block), name WHAT the clobbered object was.
+# A ring records each freed block's first two words — for a 16-byte
+# {data, vtable} object (Box<dyn>, Arc, RawWaker) word 1 is the vtable
+# pointer, so `addr2line` of the captured value resolves the concrete
+# Rust type. The tool for the long-standing rip=0x3 vtable-UAF. Off by
+# default — adds a ~384 KiB static ring and three stores per free.
+slab-free-audit = []
+
 # Per-frame allocation audit: a global 1-bit-per-frame map, marked on
 # every buddy alloc and cleared on every buddy free. Panics at the
 # SOURCE on a double-alloc (the buddy handing out an already-allocated

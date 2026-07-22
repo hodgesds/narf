@@ -164,11 +164,18 @@ unsafe fn canary_on_free(blk: NonNull<FreeBlock>, class_idx: usize) {
     // SAFETY: caller owns the block being freed; see `canary_word`.
     unsafe {
         let w = canary_word(blk);
-        if w.read() == free_canary_value(blk) {
+        let w1 = w.read();
+        // Capture the block's live shape BEFORE overwriting word 1 with
+        // the canary: for a `{data, vtable}` object word 1 is the vtable
+        // pointer that names the type if this block is later clobbered.
+        #[cfg(feature = "slab-free-audit")]
+        free_audit::note_free(blk, blk.as_ptr().cast::<u64>().read(), w1);
+        if w1 == free_canary_value(blk) {
             panic!(
-                "slab: double free of block {:p} (class {} B) — the block is already on a free list",
+                "slab: double free of block {:p} (class {} B) — the block is already on a free list{}",
                 blk.as_ptr(),
                 class_size(class_idx),
+                free_site_note(blk),
             );
         }
         w.write(free_canary_value(blk));
@@ -190,11 +197,12 @@ unsafe fn canary_on_alloc(blk: NonNull<FreeBlock>, class_idx: usize) {
         if got != free_canary_value(blk) {
             panic!(
                 "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
-                 write-after-free while the block sat on a free list",
+                 write-after-free while the block sat on a free list{}",
                 blk.as_ptr(),
                 class_size(class_idx),
                 got,
                 free_canary_value(blk),
+                free_site_note(blk),
             );
         }
         w.write(0);
@@ -215,11 +223,12 @@ unsafe fn canary_check_free(blk: NonNull<FreeBlock>, class_idx: usize) {
         if got != free_canary_value(blk) {
             panic!(
                 "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
-                 write-after-free while the block sat on a free list",
+                 write-after-free while the block sat on a free list{}",
                 blk.as_ptr(),
                 class_size(class_idx),
                 got,
                 free_canary_value(blk),
+                free_site_note(blk),
             );
         }
     }
@@ -250,6 +259,132 @@ unsafe fn canary_clear_fresh(blk: NonNull<FreeBlock>) {
     // SAFETY: the grow path owns the whole fresh frame.
     unsafe {
         canary_word(blk).write(0);
+    }
+}
+
+// ── Free-site audit ─────────────────────────────────────────────────
+//
+// When the canary trips (write-after-free / double-free of a slab
+// block), the block address alone doesn't say WHAT was corrupted. For
+// the long-standing rip=0x3 crash the offending object is 16 bytes
+// shaped {data_ptr@0, vtable@8} — a `Box<dyn Trait>`, `Arc<T>` inner,
+// or `RawWaker`. The vtable pointer at offset 8 uniquely identifies
+// the concrete Rust type, but `canary_on_free` overwrites offset 8
+// with the canary before the trip is detected.
+//
+// This ring captures each freed block's first two words at the moment
+// of free, BEFORE the canary write, keyed by block address. On a trip
+// the tripping block's captured words are recalled and printed; the
+// operator runs `addr2line` on the word-1 value to name the type. A
+// ring (not a direct map) survives collisions: an entry lives until
+// `RING` later frees scroll it out, and the trip normally follows the
+// bad free closely.
+#[cfg(feature = "slab-free-audit")]
+mod free_audit {
+    use super::FreeBlock;
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    // Direct-mapped free-site table, indexed by `(block_addr >> 4) %
+    // SLOTS`. Unlike a ring (which retains only the last N frees
+    // globally), a direct-mapped slot survives until a DIFFERENT block
+    // that hashes to the same slot is freed. That is what the rip=0x3
+    // UAF needs: the offending object is long-lived — freed once,
+    // never freed again (a dangling reference writes it) — so its free
+    // must be retained across the millions of unrelated frees between
+    // then and the eventual canary trip. 1 Mi slots × 3 words = 24 MiB
+    // static; affordable for an off-by-default diagnostic build.
+    const SLOTS: usize = 1 << 20;
+    const SLOT_MASK: usize = SLOTS - 1;
+
+    #[inline]
+    fn idx(addr: u64) -> usize {
+        ((addr >> 4) as usize) & SLOT_MASK
+    }
+
+    static SLOT_ADDR: [AtomicU64; SLOTS] = {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        [Z; SLOTS]
+    };
+    static SLOT_W0: [AtomicU64; SLOTS] = {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        [Z; SLOTS]
+    };
+    static SLOT_W1: [AtomicU64; SLOTS] = {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        [Z; SLOTS]
+    };
+
+    /// Record a block's first two words at free time. `w0`/`w1` are
+    /// read by the caller BEFORE the canary overwrites word 1, so `w1`
+    /// still holds the freed object's live bytes (its vtable, for a
+    /// `{data, vtable}` fat pointer).
+    #[inline]
+    pub(super) fn note_free(blk: NonNull<FreeBlock>, w0: u64, w1: u64) {
+        let addr = blk.as_ptr() as u64;
+        let i = idx(addr);
+        SLOT_ADDR[i].store(addr, Ordering::Relaxed);
+        SLOT_W0[i].store(w0, Ordering::Relaxed);
+        SLOT_W1[i].store(w1, Ordering::Relaxed);
+    }
+
+    /// Recall the captured `(word0, word1)` for `blk`, or `None` if a
+    /// colliding free evicted it. Only runs on the (rare) canary-trip
+    /// panic path.
+    #[inline]
+    pub(super) fn recall(blk: NonNull<FreeBlock>) -> Option<(u64, u64)> {
+        let addr = blk.as_ptr() as u64;
+        let i = idx(addr);
+        if SLOT_ADDR[i].load(Ordering::Relaxed) == addr {
+            Some((
+                SLOT_W0[i].load(Ordering::Relaxed),
+                SLOT_W1[i].load(Ordering::Relaxed),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// On a canary trip, format the freed block's captured shape (a
+/// `{data, vtable}` fat pointer's word 1 is a vtable pointer —
+/// `addr2line` it to name the concrete type). Empty when the audit
+/// feature is off or the block scrolled out of the ring.
+#[inline]
+fn free_site_note(blk: NonNull<FreeBlock>) -> FreeSiteNote {
+    #[cfg(feature = "slab-free-audit")]
+    {
+        match free_audit::recall(blk) {
+            Some((w0, w1)) => FreeSiteNote { words: Some((w0, w1)) },
+            None => FreeSiteNote { words: None },
+        }
+    }
+    #[cfg(not(feature = "slab-free-audit"))]
+    {
+        let _ = blk;
+        FreeSiteNote {}
+    }
+}
+
+/// Displays as ` [freed as data=.. vtable=.. (addr2line vtable → type)]`
+/// when the audit feature captured the block, otherwise empty.
+struct FreeSiteNote {
+    #[cfg(feature = "slab-free-audit")]
+    words: Option<(u64, u64)>,
+}
+
+impl core::fmt::Display for FreeSiteNote {
+    #[cfg_attr(not(feature = "slab-free-audit"), allow(unused_variables))]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        #[cfg(feature = "slab-free-audit")]
+        if let Some((w0, w1)) = self.words {
+            return write!(
+                f,
+                " [freed as data={:#x} vtable={:#x} — addr2line vtable → concrete type]",
+                w0, w1
+            );
+        }
+        Ok(())
     }
 }
 

@@ -124,6 +124,10 @@ frame-zero-on-free   = ["narf-memory/frame-zero-on-free"]
 frame-poison-on-free = ["narf-memory/frame-poison-on-free"]
 # Per-frame double-alloc/double-free audit (panics at the bad caller).
 frame-alloc-audit    = ["narf-memory/frame-alloc-audit"]
+# Slab free-site audit: on the free-block canary trip, print the freed
+# 16-byte block's captured {data, vtable} words so `addr2line` of the
+# vtable names the concrete type (the rip=0x3 vtable-UAF hunt).
+slab-free-audit      = ["narf-memory/slab-free-audit"]
 
 # Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
 container = ["narf-userspace/container"]
