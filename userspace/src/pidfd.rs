@@ -98,11 +98,16 @@ pub fn notify_exit(pid: u64) {
     };
     if let Some(st) = st {
         st.exited.store(true, Ordering::Release);
-        // Future: also fire any registered Waker for fd-level
-        // epoll_wait integration. Today pidfd_open's primary
-        // consumer is the synchronous poll/read path, which
-        // re-queries on each invocation.
     }
+    // Wake any task parked in epoll_wait/poll on a pidfd: systemd 257 tracks
+    // every service child by epolling its pidfd for POLLIN-on-exit, and blocks
+    // in epoll_wait until then. Flipping `exited` above only makes a fresh
+    // poll_readiness return POLLIN — without this wake the parked epoll_wait
+    // never re-scans, so every service job hangs "running" forever. Fire the
+    // readiness bridge (wake-all; the woken tasks re-query poll_readiness).
+    // Unconditional so a pidfd minted AFTER this exit still races correctly via
+    // its own already-exited state.
+    narf_net::readiness::notify(0);
 }
 
 /// `FileOps` impl for the fd handed back by `sys_pidfd_open`.
