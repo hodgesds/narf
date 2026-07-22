@@ -92,6 +92,33 @@ pub enum ModuleSyscallError {
 }
 
 impl ModuleSyscallError {
+    /// Whether this failure means "the image is not a NARF-loadable
+    /// module" — a foreign Linux `.ko`, a builtin driver's stub, or
+    /// anything lacking NARF's `.modinfo` / `narf_module_init`
+    /// contract. NARF is monolithic: the drivers `modprobe(8)` and
+    /// `systemd-modules-load` ask for (drm, etc.) are either compiled
+    /// in or genuinely absent, never side-loadable. Linux answers a
+    /// builtin `finit_module` with `EEXIST`, which libkmod/modprobe
+    /// treat as success; the userspace shim maps this class to a
+    /// success no-op so those units complete instead of failing the
+    /// job (which would block dependents past the timeout).
+    ///
+    /// Genuine NARF modules that fail *after* being recognised as ours
+    /// (`InitFailed`, `AlreadyLoaded`, a relocation fault) are NOT in
+    /// this class — those surface a real errno.
+    pub fn is_foreign_image(&self) -> bool {
+        matches!(
+            self,
+            ModuleSyscallError::Load(LoadError::Header(_))
+                | ModuleSyscallError::Load(LoadError::Manifest(_))
+                | ModuleSyscallError::Load(LoadError::Domain(_))
+                | ModuleSyscallError::Load(LoadError::NoSymbols)
+                | ModuleSyscallError::Load(LoadError::BadSection(_))
+                | ModuleSyscallError::Load(LoadError::MissingInit)
+                | ModuleSyscallError::Load(LoadError::SignatureRejected(_))
+        )
+    }
+
     /// Convert to a negative errno suitable for the syscall return
     /// register. The wire numbers match Linux:
     ///   * `-EBUSY = -16` — refcount > 0 in delete_module.

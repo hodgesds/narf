@@ -174,6 +174,42 @@ impl FileOps for DevRandom {
         Box::pin(async move { Ok(len) })
     }
 
+    /// RNG-pool management ioctls. NARF's CSPRNG is always seeded (see
+    /// the struct doc), so there is no entropy pool to fill or drain:
+    /// the count ioctls report a full pool and the mutating ioctls are
+    /// accepted no-ops. `systemd-random-seed` credits saved seed bytes
+    /// via `RNDADDENTROPY` on shutdown/boot; answering 0 (instead of the
+    /// default `ENOTTY`) lets that unit complete cleanly.
+    ///
+    /// Linux ref: `drivers/char/random.c::random_ioctl`.
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        // _IOC(dir, 'R', nr, size) — the RNG ioctls all use type 'R'
+        // (0x52). Match on the type+nr and ignore dir/size so a 32- vs
+        // 64-bit caller (RNDADDENTROPY size differs) hits the same arm.
+        const RND_TYPE: u32 = 0x52;
+        let ioc_type = (cmd >> 8) & 0xFF;
+        let nr = cmd & 0xFF;
+        if ioc_type != RND_TYPE {
+            return Err(FsError::Unsupported);
+        }
+        match nr {
+            // RNDGETENTCNT — bits of entropy available. Report a full
+            // pool (4096 bits, Linux's `POOL_BITS`) so callers that gate
+            // on a threshold proceed.
+            0x00 => {
+                // SAFETY: `arg` is the caller's `int*`; write_user_i32
+                // range-checks and SMAP-brackets the store.
+                unsafe { crate::devfs_pty::write_user_i32(arg, 4096)? };
+                Ok(0)
+            }
+            // RNDADDTOENTCNT (0x01), RNDADDENTROPY (0x03),
+            // RNDZAPENTCNT (0x04), RNDCLEARPOOL (0x06),
+            // RNDRESEEDCRNG (0x07) — accepted no-ops.
+            0x01 | 0x03 | 0x04 | 0x06 | 0x07 => Ok(0),
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
     fn stat(&self) -> Stat {
         Stat {
             size: 0,
@@ -1623,3 +1659,34 @@ fn smoke_dev_dir_iter_contains_symlinks() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_dir_iter_contains_symlinks);
+
+/// Smoke: the RNG-pool credit ioctls on /dev/urandom succeed (0)
+/// instead of the default `ENOTTY`, so `systemd-random-seed`'s
+/// `RNDADDENTROPY` completes cleanly. The arg-free arms are exercised
+/// here (RNDGETENTCNT needs a live user pointer, covered at boot).
+fn smoke_dev_random_rnd_ioctls_ok() -> TestResult {
+    let dev = DevRandom;
+    // RNDADDTOENTCNT (_IOW('R', 0x01, int)) = 0x40045201.
+    if dev.ioctl(0x4004_5201, 0) != Ok(0) {
+        return TestResult::Fail("RNDADDTOENTCNT should be an accepted no-op (0)");
+    }
+    // RNDADDENTROPY (_IOW('R', 0x03, ...)) = 0x40085203 — the one
+    // systemd-random-seed issues to credit the saved seed.
+    if dev.ioctl(0x4008_5203, 0) != Ok(0) {
+        return TestResult::Fail("RNDADDENTROPY should be an accepted no-op (0)");
+    }
+    // RNDRESEEDCRNG (_IO('R', 0x07)) = 0x5207.
+    if dev.ioctl(0x0000_5207, 0) != Ok(0) {
+        return TestResult::Fail("RNDRESEEDCRNG should be an accepted no-op (0)");
+    }
+    // A non-'R' ioctl still falls through to Unsupported (→ ENOTTY).
+    if dev.ioctl(0x0000_1234, 0) != Err(FsError::Unsupported) {
+        return TestResult::Fail("non-RNG ioctl should stay Unsupported");
+    }
+    // An unknown 'R' nr is also Unsupported.
+    if dev.ioctl(0x0000_5299, 0) != Err(FsError::Unsupported) {
+        return TestResult::Fail("unknown RNG ioctl nr should stay Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_random_rnd_ioctls_ok);

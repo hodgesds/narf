@@ -25157,9 +25157,27 @@ fn sys_init_module(ctx: &mut dyn TrapContext) {
     // Copy to kernel heap so the user can't mutate the buffer during
     // parsing.
     let owned: alloc::vec::Vec<u8> = bytes_user.to_vec();
-    match narf_modules::syscalls::sys_init_module(&owned) {
-        Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(e) => ctx.set_return(SyscallReturn::ok((e.to_errno() as i64) as u64)),
+    ctx.set_return(SyscallReturn::ok(init_module_result(
+        narf_modules::syscalls::sys_init_module(&owned),
+    )));
+}
+
+/// Map a module-loader outcome to a Linux return value. A foreign
+/// image (a real Linux `.ko`, or anything lacking NARF's module
+/// contract) becomes a success no-op: NARF is monolithic, so the
+/// drivers `modprobe`/`systemd-modules-load` ask for are already
+/// built in or genuinely absent — Linux answers builtin loads with
+/// `EEXIST`, which modprobe treats as success. Returning 0 lets those
+/// oneshot units complete instead of failing (and blocking dependents
+/// past the systemd job timeout). Genuine NARF-module failures and
+/// argument errors keep their real errno.
+fn init_module_result(
+    r: Result<alloc::sync::Arc<narf_modules::Module>, narf_modules::syscalls::ModuleSyscallError>,
+) -> u64 {
+    match r {
+        Ok(_) => 0,
+        Err(e) if e.is_foreign_image() => 0,
+        Err(e) => (e.to_errno() as i64) as u64,
     }
 }
 
@@ -25190,10 +25208,9 @@ fn sys_finit_module(ctx: &mut dyn TrapContext) {
         Ok(accum)
     });
     match outcome {
-        Some(Ok(bytes)) => match narf_modules::syscalls::sys_finit_module(&bytes) {
-            Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(e) => ctx.set_return(SyscallReturn::ok((e.to_errno() as i64) as u64)),
-        },
+        Some(Ok(bytes)) => ctx.set_return(SyscallReturn::ok(init_module_result(
+            narf_modules::syscalls::sys_finit_module(&bytes),
+        ))),
         _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
     }
 }

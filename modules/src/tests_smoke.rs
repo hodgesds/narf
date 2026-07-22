@@ -872,3 +872,84 @@ fn _force_elf_imports(_h: Elf64Header) {
     let _ = parse_section;
     let _ = section_name;
 }
+
+// ── Foreign-image classification (systemd modprobe fast-succeed) ─────
+//
+// A foreign Linux `.ko` (or any non-NARF ELF) that reaches
+// `finit_module`/`init_module` must be classified as "not one of ours"
+// so the userspace shim can answer with a success no-op. That keeps
+// `systemd-modules-load` and `modprobe@.service` from failing the unit
+// (and blocking dependents) on a kernel that is monolithic by design.
+
+fn smoke_foreign_image_missing_modinfo_is_foreign() -> TestResult {
+    use crate::loader::LoadError;
+    use crate::manifest::ManifestError;
+    use crate::syscalls::ModuleSyscallError;
+    // A Linux `.ko` lacks NARF's `.modinfo` → Manifest(Missing).
+    let e = ModuleSyscallError::Load(LoadError::Manifest(ManifestError::Missing));
+    if e.is_foreign_image() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("missing-modinfo image must classify as foreign")
+    }
+}
+kernel_test_in!(
+    "modules/compat",
+    smoke_foreign_image_missing_modinfo_is_foreign
+);
+
+fn smoke_foreign_image_no_symbols_is_foreign() -> TestResult {
+    use crate::loader::LoadError;
+    use crate::syscalls::ModuleSyscallError;
+    let e = ModuleSyscallError::Load(LoadError::NoSymbols);
+    if e.is_foreign_image() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("no-symbols image must classify as foreign")
+    }
+}
+kernel_test_in!("modules/compat", smoke_foreign_image_no_symbols_is_foreign);
+
+fn smoke_real_module_failures_are_not_foreign() -> TestResult {
+    use crate::loader::LoadError;
+    use crate::syscalls::ModuleSyscallError;
+    // Failures that happen only *after* an image is recognised as a
+    // NARF module must NOT be swallowed as success.
+    let already = ModuleSyscallError::Load(LoadError::AlreadyLoaded(String::from("dup")));
+    let not_found = ModuleSyscallError::NotFound;
+    if already.is_foreign_image() {
+        return TestResult::Fail("AlreadyLoaded must not classify as foreign");
+    }
+    if not_found.is_foreign_image() {
+        return TestResult::Fail("NotFound must not classify as foreign");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/compat", smoke_real_module_failures_are_not_foreign);
+
+fn smoke_load_foreign_ko_shape_is_foreign() -> TestResult {
+    use crate::syscalls::{sys_init_module, ModuleSyscallError};
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    crate::symbols::set_kernel_abi(0);
+    // Well-formed Elf64 REL shell with no `.modinfo` — the shape a
+    // stripped Linux `.ko` presents to `finit_module`.
+    let bytes = ElfBuilder::new_x86_64()
+        .modinfo(b"")
+        .text(&[0xC3u8])
+        .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
+        .build();
+    match sys_init_module(&bytes) {
+        Err(ref e) if e.is_foreign_image() => TestResult::Pass,
+        Err(_) => {
+            TestResult::Fail("foreign .ko shell should classify as foreign, not a hard error")
+        }
+        Ok(_) => {
+            let _ = ModuleSyscallError::NotFound; // keep the import used
+            TestResult::Fail("foreign .ko shell must not load as a NARF module")
+        }
+    }
+}
+kernel_test_in!("modules/compat", smoke_load_foreign_ko_shape_is_foreign);

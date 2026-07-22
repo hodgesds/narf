@@ -622,6 +622,26 @@ fn smoke_abi_misc_finit_module_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_finit_module_neg);
 
+fn smoke_abi_misc_init_module_foreign_noop() -> TestResult {
+    with_setup(|| {
+        // A non-NULL, non-empty buffer that is not a NARF module ELF
+        // (here: raw bytes that fail the ELF header parse) is a foreign
+        // image. NARF is monolithic, so `finit_module`/`init_module`
+        // answer these with a success no-op (0) — this is what stops
+        // `systemd-modules-load` / `modprobe@.service` from hanging the
+        // boot on a driver that is built in or genuinely absent.
+        let img = [0x7Fu8, b'E', b'L', b'F', 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        match call(
+            Syscall::InitModule.raw(),
+            a3(img.as_ptr() as u64, img.len() as u64, 0, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("init_module of a foreign image should be a success no-op (0)"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_init_module_foreign_noop);
+
 fn smoke_abi_misc_delete_module_neg() -> TestResult {
     with_setup(|| {
         // Null name / zero length → -EINVAL.
