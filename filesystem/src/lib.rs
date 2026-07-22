@@ -70,6 +70,7 @@ pub mod devfs_input;
 pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
+pub mod fifo;
 pub mod fs_registry;
 pub mod fuse;
 pub mod fuse_conn;
@@ -192,6 +193,13 @@ pub enum FileType {
     /// socket `fstat`s as a char device and elogind refuses to pass the
     /// session-controller fd in its CreateSession reply ("Not supported").
     Socket,
+    /// Named pipe (S_IFIFO). Created by `mkfifo`/`mknod(S_IFIFO)`; the node
+    /// is a filesystem inode that, when opened, connects every opener to ONE
+    /// shared pipe buffer keyed by the node's identity (see the `fifo`
+    /// module). Reported as `S_IFIFO` so `S_ISFIFO(st_mode)` consumers
+    /// recognise it — systemd's `systemd-initctl.socket` opens `/run/initctl`
+    /// as a FIFO and stat()s it to confirm.
+    Fifo,
 }
 
 /// Stat result. `mode` is a stub: Stage 3 reports `(FileType, perms)`
@@ -317,6 +325,10 @@ pub enum FsError {
     /// Data supplied by userspace was not parseable or out of range.
     /// Maps to POSIX `EINVAL`. Used by sysfs store callbacks.
     InvalidData,
+    /// A write whose read side has gone away — a FIFO / pipe with no
+    /// remaining readers. Maps to POSIX `EPIPE`; the syscall layer also
+    /// raises SIGPIPE on the writer.
+    BrokenPipe,
 }
 
 impl From<CapError> for FsError {
@@ -631,6 +643,19 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// If this file is a named-pipe (FIFO) inode — created by
+    /// `mkfifo`/`mknod(S_IFIFO)` — return its shared pipe buffer. Every
+    /// `open()` of the same path resolves to the same FIFO node and thus
+    /// the same `FifoShared`, so all openers rendezvous on one buffer keyed
+    /// by node identity. `sys_open` uses this to build a per-open
+    /// [`fifo::FifoHandle`] (which carries the O_RDONLY/O_WRONLY/O_RDWR
+    /// direction and the peer-open blocking semantics) rather than
+    /// installing the bare node — mirroring the `is_ptmx_clone` pattern.
+    /// Default: not a FIFO.
+    fn fifo_shared(&self) -> Option<Arc<fifo::FifoShared>> {
+        None
+    }
+
     /// If this file is a POSIX message-queue descriptor (from
     /// `mq_open`), return its queue id. Used by the `mq_*` syscalls to
     /// resolve the mqd to a queue without a downcast. Default: `None`.
@@ -876,6 +901,31 @@ pub trait DirOps: Send + Sync {
     /// (POSIX: `link(2)` on such an fs → EPERM).
     fn link<'a>(&'a self, _old_name: &'a str, _new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Link an already-existing file node into this directory under
+    /// `name`, aliasing the passed `Arc` (the inode gains a name; the
+    /// caller's fd keeps its own reference to the same node). This is the
+    /// materialisation step for `O_TMPFILE` + `linkat(AT_EMPTY_PATH)`:
+    /// `open(dir, O_TMPFILE)` mints a nameless inode, the process writes
+    /// to it, then `linkat` gives it a path. The default rejects it (a
+    /// filesystem that can't hold an externally-minted node → EOPNOTSUPP,
+    /// so the caller falls back to a named temp + rename); tmpfs/memfs
+    /// override it to insert the node into its directory map. `Busy` if
+    /// `name` already exists (linkat never replaces an existing name).
+    fn link_node<'a>(&'a self, _name: &'a str, _node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Whether this directory can hold an anonymous `O_TMPFILE` inode and
+    /// later materialise it via [`DirOps::link_node`]. The open handler
+    /// checks this before minting the nameless inode so a directory on a
+    /// read-only / non-tmpfs backing (which can't `link_node`) reports
+    /// `O_TMPFILE` unsupported up front (Linux: EOPNOTSUPP) instead of
+    /// handing back an fd that can never be linked. Default `false`;
+    /// tmpfs/memfs overrides to `true`.
+    fn supports_tmpfile(&self) -> bool {
+        false
     }
 }
 

@@ -277,6 +277,23 @@ pub struct UserTaskCtx {
     /// cleared on return. The scheduler never touches it, so a fresh call
     /// after an unrelated `sleep(2)` can't inherit a stale deadline.
     pub blocking_deadline_ns: AtomicU64,
+
+    /// Fd (+1) of a FIFO `open()` that has installed its per-open
+    /// [`crate::fifo` handle] and is now BLOCKED waiting for the peer
+    /// direction to open (O_RDONLY without a writer, or O_WRONLY without a
+    /// reader). `0` = no such open in flight.
+    ///
+    /// A FIFO open's peer-rendezvous is Linux-blocking, and the park (like
+    /// `read`'s) RIP-rewinds and RE-EXECUTES the `open` syscall. Re-running
+    /// the whole open would resolve the path and install a SECOND fd on every
+    /// wake — and, worse, drop the first handle's open count (so the peer it
+    /// is waiting for could never observe it). This slot makes the re-entry
+    /// idempotent: the handle is installed ONCE on the first entry (its open
+    /// count then persists across the park, which is exactly what the peer
+    /// waits on), the fd is stashed here, and each re-execution merely
+    /// re-checks the peer count against the already-installed fd rather than
+    /// re-opening. Cleared (and the fd returned) once the peer appears.
+    pub fifo_open_pending_fd: AtomicU64,
 }
 
 // SAFETY: cells are accessed only from the polling routine and
@@ -319,6 +336,7 @@ impl UserTaskCtx {
             wait_child_options: AtomicU32::new(0),
             console_read_pending: AtomicBool::new(false),
             blocking_deadline_ns: AtomicU64::new(0),
+            fifo_open_pending_fd: AtomicU64::new(0),
         }
     }
 }

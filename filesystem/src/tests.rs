@@ -508,6 +508,210 @@ fn smoke_filesystem_memfs_socket_node() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_memfs_socket_node);
 
+/// Shared no-op-waker poll driver for the FIFO smokes below — the FIFO
+/// `read`/`write`/`mknod` futures resolve synchronously (VecDeque + atomics),
+/// so a single poll to completion is enough.
+fn fifo_poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VT)
+    }
+    static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: no-op vtable over a null data pointer — trivially valid.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` outlives this block and is never moved after pinning.
+    let fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
+    match fut.poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+/// `mkfifo`/`mknod(S_IFIFO)` on tmpfs must create a real FIFO inode that
+/// `stat`s as `FileType::Fifo` (S_IFIFO), NOT a regular file. A fresh mknod on
+/// a not-yet-existing path must SUCCEED — this is the systemd
+/// `systemd-initctl.socket` "Failed to open FIFO '/run/initctl': File exists"
+/// regression (the FIFO was previously created as a plain file, so the later
+/// open-as-FIFO mismatched).
+fn smoke_filesystem_fifo_mknod_stat() -> TestResult {
+    use crate::{bootstrap_mount_authority, registry, FileType, MemFs, MountPoint};
+    use narf_capabilities::{Cap, Grant};
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("test-fifo-mknod", &[]);
+    let mount_handle = match registry().mount(&auth, "/test_fifo_mknod", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    // Fresh mknod(S_IFIFO) on a non-existent path SUCCEEDS.
+    let created = registry().resolve_parent_absolute("/test_fifo_mknod/f", |_fs, parent, leaf| {
+        fifo_poll_once(parent.mknod(leaf, FileType::Fifo, 0))
+    });
+    if !matches!(created, Some(Some(Ok(_)))) {
+        let _ = registry().unmount(&mount_handle, "/test_fifo_mknod");
+        return TestResult::Fail("fresh mknod(S_IFIFO) did not succeed");
+    }
+
+    // stat() reports S_IFIFO, not S_IFREG.
+    let is_fifo = registry().resolve_absolute("/test_fifo_mknod/f", |fs, rel| {
+        crate::resolve(fs.root(), rel)
+            .map(|f| f.stat().mode.file_type == FileType::Fifo)
+            .unwrap_or(false)
+    });
+
+    let _ = registry().unmount(&mount_handle, "/test_fifo_mknod");
+    if is_fifo != Some(true) {
+        return TestResult::Fail("FIFO path did not stat as S_IFIFO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_mknod_stat);
+
+/// O_RDWR-style round-trip: a read/write handle pair on one shared FIFO node
+/// carries bytes through the shared buffer and reads them back in order.
+fn smoke_filesystem_fifo_rdwr_round_trip() -> TestResult {
+    use crate::fifo::{FifoNode, FifoShared};
+    use crate::FileOps;
+    use alloc::sync::Arc;
+
+    let node = FifoNode::new(0x1234, 0o666);
+    let shared: Arc<FifoShared> = node.fifo_shared().expect("node exposes shared");
+    // One read-capable and one write-capable handle (as O_RDWR would give,
+    // modelled here as a reader handle + a writer handle over one buffer).
+    let writer = crate::fifo::FifoHandle::open(
+        shared.clone(),
+        0x1234,
+        0o666,
+        /*r*/ false,
+        /*w*/ true,
+    );
+    let reader = crate::fifo::FifoHandle::open(
+        shared.clone(),
+        0x1234,
+        0o666,
+        /*r*/ true,
+        /*w*/ false,
+    );
+
+    let msg = b"fifo-hello";
+    let n = match fifo_poll_once(writer.write(0, msg)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("FIFO write did not complete"),
+    };
+    if n != msg.len() {
+        return TestResult::Fail("FIFO short write");
+    }
+
+    let mut buf = [0u8; 16];
+    let r = match fifo_poll_once(reader.read(0, &mut buf)) {
+        Some(Ok(r)) => r,
+        _ => return TestResult::Fail("FIFO read did not complete"),
+    };
+    if r != msg.len() || &buf[..r] != msg {
+        return TestResult::Fail("FIFO read-back mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_rdwr_round_trip);
+
+/// EOF: once the last writer handle is dropped, a reader at an empty buffer
+/// reads 0 (end-of-file), and `read_should_block` reports false (don't park).
+fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::FileOps;
+    use alloc::sync::Arc;
+
+    let node = FifoNode::new(0x2000, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x2000, 0o666, true, false);
+    let writer = Arc::new(crate::fifo::FifoHandle::open(
+        shared.clone(),
+        0x2000,
+        0o666,
+        false,
+        true,
+    ));
+
+    // Writer open + empty buffer ⇒ the read must PARK (block), not EOF.
+    if !reader.read_should_block() {
+        return TestResult::Fail("empty FIFO with open writer should block");
+    }
+
+    // Drop the last writer: now an empty read is genuine EOF.
+    drop(writer);
+    if reader.read_should_block() {
+        return TestResult::Fail("empty FIFO with no writer must not block (EOF)");
+    }
+    let mut buf = [0u8; 8];
+    match fifo_poll_once(reader.read(0, &mut buf)) {
+        Some(Ok(0)) => TestResult::Pass,
+        _ => TestResult::Fail("closed-writer FIFO read did not report EOF (0)"),
+    }
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_eof_on_writer_close);
+
+/// A write with NO readers left is a broken pipe (`FsError::BrokenPipe`), which
+/// the syscall layer turns into SIGPIPE + -EPIPE.
+fn smoke_filesystem_fifo_broken_pipe_no_readers() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::{FileOps, FsError};
+
+    let node = FifoNode::new(0x3000, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    // A writer with zero readers (never opened a read end).
+    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x3000, 0o666, false, true);
+    match fifo_poll_once(writer.write(0, b"x")) {
+        Some(Err(FsError::BrokenPipe)) => TestResult::Pass,
+        _ => TestResult::Fail("write to reader-less FIFO did not report BrokenPipe"),
+    }
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_broken_pipe_no_readers);
+
+/// Peer open-count bookkeeping — the signal the syscall layer's fifo(7)
+/// rendezvous reads: O_WRONLY|O_NONBLOCK with `reader_count() == 0` is
+/// -ENXIO; once a reader opens (count > 0), the writer's open would proceed.
+/// Handle Drop must decrement, so a closed peer stops being observable.
+fn smoke_filesystem_fifo_peer_counts() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::FileOps;
+
+    let node = FifoNode::new(0x4000, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+
+    // No openers yet: an O_WRONLY|O_NONBLOCK open would see no reader → ENXIO.
+    if shared.reader_count() != 0 || shared.writer_count() != 0 {
+        return TestResult::Fail("fresh FIFO reported nonzero open counts");
+    }
+
+    // A reader opens: now a writer's peer (reader) is present.
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x4000, 0o666, true, false);
+    if shared.reader_count() != 1 {
+        return TestResult::Fail("reader open did not bump reader_count");
+    }
+
+    // A writer opens: the reader's peer (writer) is now present too.
+    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x4000, 0o666, false, true);
+    if shared.writer_count() != 1 {
+        return TestResult::Fail("writer open did not bump writer_count");
+    }
+
+    // Dropping the writer clears the writer count (reader would then EOF).
+    drop(writer);
+    if shared.writer_count() != 0 {
+        return TestResult::Fail("writer close did not decrement writer_count");
+    }
+    // Dropping the reader clears the reader count (writer would then EPIPE).
+    drop(reader);
+    if shared.reader_count() != 0 {
+        return TestResult::Fail("reader close did not decrement reader_count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_peer_counts);
+
 /// Every in-memory directory must carry a unique, stable, nonzero inode so
 /// it is distinguishable from its parent. systemd's `rm_rf` refuses to
 /// descend when a directory and its parent share `(st_dev, st_ino)` (its
@@ -2047,6 +2251,154 @@ fn smoke_filesystem_memfs_link_aliases_node() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_filesystem_memfs_link_aliases_node);
+
+/// O_TMPFILE end-to-end at the VFS layer: mint an anonymous (nameless)
+/// inode with `new_anon_memfile`, write bytes, read them back, stat the
+/// size — the fd-facing operations the open handler installs — then
+/// materialise it via `DirOps::link_node` (the `linkat(AT_EMPTY_PATH)`
+/// step) and confirm the named path now resolves to the SAME inode with
+/// the written contents. Also checks `supports_tmpfile()` is true for
+/// memfs and false (with `link_node` → Unsupported) for a directory whose
+/// filesystem can't hold an externally-minted node, which is the
+/// EOPNOTSUPP fall-back the open handler reports.
+fn smoke_filesystem_o_tmpfile_link_node() -> TestResult {
+    fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
+        use core::pin::Pin;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw_waker() -> RawWaker {
+            unsafe fn no_clone(_: *const ()) -> RawWaker {
+                raw_waker()
+            }
+            unsafe fn no_op(_: *const ()) {}
+            const VTAB: RawWakerVTable = RawWakerVTable::new(no_clone, no_op, no_op, no_op);
+            RawWaker::new(core::ptr::null(), &VTAB)
+        }
+        // SAFETY: the no-op/no-clone waker vtable is sound for a single
+        // synchronous poll; the RawWaker does not escape this scope.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: `fut` is a local mut binding that outlives this block and
+        // is never moved after being pinned.
+        let pinned = unsafe { Pin::new_unchecked(&mut fut) };
+        match pinned.poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    use crate::{
+        bootstrap_mount_authority, new_anon_memfile, registry, DirEntry, DirOps, FileOps, FsError,
+        FsInstance, MemFs, MountPoint,
+    };
+    use alloc::sync::Arc;
+    use narf_capabilities::{Cap, Grant};
+
+    // The anonymous inode the open handler mints for O_TMPFILE.
+    let node = new_anon_memfile();
+
+    // Directory backing memfs must advertise tmpfile support.
+    let dir_fs = MemFs::new("tmpfile-support-probe");
+    if !dir_fs.root().supports_tmpfile() {
+        return TestResult::Fail("memfs directory must support O_TMPFILE");
+    }
+
+    // Write + read-back + stat through the nameless inode (the fd path).
+    if !matches!(poll_once(node.write(0, b"tmpfile-bytes")), Some(Ok(13))) {
+        return TestResult::Fail("write to anon O_TMPFILE inode failed");
+    }
+    let mut rb = [0u8; 13];
+    if !matches!(poll_once(node.read(0, &mut rb)), Some(Ok(13))) || &rb != b"tmpfile-bytes" {
+        return TestResult::Fail("read-back from anon O_TMPFILE inode wrong");
+    }
+    if node.stat().size != 13 {
+        return TestResult::Fail("stat size on anon O_TMPFILE inode wrong");
+    }
+    // ftruncate then re-stat (fstat/ftruncate ride the same FileOps).
+    if poll_once(node.truncate(5)).is_none() || node.stat().size != 5 {
+        return TestResult::Fail("ftruncate on anon O_TMPFILE inode wrong");
+    }
+
+    // Materialise: linkat(AT_EMPTY_PATH) → link_node into a mounted dir.
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::new("tmpfile-mat");
+    let mount_handle = match registry().mount(&auth, "/tmpfile_mat", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+    let r = registry().resolve_absolute("/tmpfile_mat", |fs, _rel| {
+        poll_once(fs.root().link_node("published", Arc::clone(&node)))
+    });
+    if !matches!(r, Some(Some(Ok(())))) {
+        let _ = registry().unmount(&mount_handle, "/tmpfile_mat");
+        return TestResult::Fail("link_node materialisation should succeed");
+    }
+
+    // The named path now resolves to the SAME inode: it reads the exact
+    // (truncated) bytes and any subsequent write through the fd is visible.
+    let read_named = registry().resolve_absolute("/tmpfile_mat/published", |fs, rel| {
+        let mut buf = [0u8; 5];
+        crate::resolve(fs.root(), rel)
+            .ok()
+            .and_then(|ops| poll_once(ops.read(0, &mut buf)))
+            .is_some_and(|r| r.is_ok())
+            .then_some(buf)
+    });
+    if read_named != Some(Some(*b"tmpfi")) {
+        let _ = registry().unmount(&mount_handle, "/tmpfile_mat");
+        return TestResult::Fail("materialised name doesn't read the inode's bytes");
+    }
+    // Aliasing: write through the original fd handle, see it under the name.
+    if !matches!(poll_once(node.write(0, b"ALIAS")), Some(Ok(5))) {
+        let _ = registry().unmount(&mount_handle, "/tmpfile_mat");
+        return TestResult::Fail("write via fd after link failed");
+    }
+    let alias_seen = registry().resolve_absolute("/tmpfile_mat/published", |fs, rel| {
+        let mut buf = [0u8; 5];
+        crate::resolve(fs.root(), rel)
+            .ok()
+            .and_then(|ops| poll_once(ops.read(0, &mut buf)))
+            .is_some_and(|r| r.is_ok())
+            .then_some(buf)
+    });
+    if alias_seen != Some(Some(*b"ALIAS")) {
+        let _ = registry().unmount(&mount_handle, "/tmpfile_mat");
+        return TestResult::Fail("fd write not visible via materialised name (not one inode)");
+    }
+
+    // link_node onto an existing name → Busy (linkat never replaces).
+    let again = registry().resolve_absolute("/tmpfile_mat", |fs, _rel| {
+        poll_once(fs.root().link_node("published", new_anon_memfile()))
+    });
+    if !matches!(again, Some(Some(Err(FsError::Busy)))) {
+        let _ = registry().unmount(&mount_handle, "/tmpfile_mat");
+        return TestResult::Fail("link_node onto an existing name must be Busy");
+    }
+    let _ = registry().unmount(&mount_handle, "/tmpfile_mat");
+
+    // EOPNOTSUPP fall-back: a directory whose FS can't hold an
+    // externally-minted node reports it unsupported and rejects link_node.
+    struct RoDir;
+    impl DirOps for RoDir {
+        fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+            None
+        }
+        fn iter<'a>(&'a self) -> alloc::boxed::Box<dyn Iterator<Item = DirEntry> + 'a> {
+            alloc::boxed::Box::new(core::iter::empty())
+        }
+    }
+    let ro = RoDir;
+    if ro.supports_tmpfile() {
+        return TestResult::Fail("a non-tmpfs directory must report no O_TMPFILE support");
+    }
+    if !matches!(
+        poll_once(ro.link_node("x", new_anon_memfile())),
+        Some(Err(FsError::Unsupported))
+    ) {
+        return TestResult::Fail("link_node on a non-supporting dir must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_filesystem_o_tmpfile_link_node);
 
 // ── resolve_async NoFollow (readlink / lstat) semantics ────────────
 //

@@ -331,14 +331,40 @@ impl FileOps for MemSymlink {
 }
 
 /// One directory entry. The discriminant carries either an `Arc`-
-/// owned file, an `Arc`-owned subdirectory, or an `Arc`-owned
-/// symlink; all kinds drop their underlying storage when the last
-/// reference disappears.
-#[derive(Debug)]
+/// owned file, an `Arc`-owned subdirectory, an `Arc`-owned symlink,
+/// an externally-minted node filed in via `link_node` (the O_TMPFILE
+/// materialisation target), or an `Arc`-owned named-pipe (FIFO) node;
+/// all kinds drop their underlying storage when the last reference
+/// disappears.
 enum Entry {
     File(Arc<MemFile>),
     Dir(Arc<MemDir>),
     Symlink(Arc<MemSymlink>),
+    /// A file node minted outside this directory and later filed into it
+    /// by `DirOps::link_node` — the materialisation target of an
+    /// `O_TMPFILE` fd's `linkat(AT_EMPTY_PATH)`. Held as a trait object
+    /// so the fd and the name alias the exact same inode (a write through
+    /// either is visible via the other). Its file type comes from
+    /// `stat()` rather than a discriminant.
+    Node(Arc<dyn FileOps>),
+    /// A named pipe. The `FifoNode` owns the shared pipe buffer; every
+    /// `open()` of this entry resolves to the same node (and thus the same
+    /// buffer), so all openers rendezvous — see `crate::fifo`.
+    Fifo(Arc<crate::fifo::FifoNode>),
+}
+
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Arc<dyn FileOps>` isn't `Debug`, so a derive can't cover the
+        // `Node` arm; render each variant by name.
+        match self {
+            Entry::File(file) => f.debug_tuple("File").field(file).finish(),
+            Entry::Dir(dir) => f.debug_tuple("Dir").field(dir).finish(),
+            Entry::Symlink(link) => f.debug_tuple("Symlink").field(link).finish(),
+            Entry::Node(_) => f.debug_tuple("Node").finish(),
+            Entry::Fifo(_) => f.debug_tuple("Fifo").finish(),
+        }
+    }
 }
 
 /// A directory node: owns the `BTreeMap` of children behind a lock.
@@ -375,6 +401,8 @@ impl DirOps for MemDir {
         match g.get(name)? {
             Entry::File(f) => Some(Arc::clone(f) as Arc<dyn FileOps>),
             Entry::Symlink(s) => Some(Arc::clone(s) as Arc<dyn FileOps>),
+            Entry::Node(n) => Some(Arc::clone(n)),
+            Entry::Fifo(p) => Some(Arc::clone(p) as Arc<dyn FileOps>),
             Entry::Dir(_) => None,
         }
     }
@@ -387,12 +415,14 @@ impl DirOps for MemDir {
         let g = self.entries.lock();
         match g.get(name)? {
             Entry::Dir(d) => Some(Arc::clone(d) as Arc<dyn DirOps>),
-            Entry::File(_) => None,
+            Entry::File(_) | Entry::Node(_) => None,
             // Symlinks are never auto-traversed: `readlink`-style
             // callers want the target bytes via `lookup`, not a
             // resolved DirOps. Path resolution that wants to follow
             // a symlink chain must do so explicitly.
             Entry::Symlink(_) => None,
+            // A FIFO is a file, not a directory — never descendable.
+            Entry::Fifo(_) => None,
         }
     }
 
@@ -419,6 +449,10 @@ impl DirOps for MemDir {
                     Entry::File(_) => FileType::File,
                     Entry::Dir(_) => FileType::Dir,
                     Entry::Symlink(_) => FileType::Symlink,
+                    // A linked-in node reports whatever type it stats as
+                    // (an O_TMPFILE materialisation is a regular file).
+                    Entry::Node(n) => n.stat().mode.file_type,
+                    Entry::Fifo(_) => FileType::Fifo,
                 };
                 (name.clone(), ft)
             })
@@ -439,7 +473,10 @@ impl DirOps for MemDir {
             match g.get(name) {
                 None => Err(FsError::NotFound),
                 Some(Entry::Dir(_)) => Err(FsError::InvalidPath),
-                Some(Entry::File(_)) | Some(Entry::Symlink(_)) => {
+                Some(Entry::File(_))
+                | Some(Entry::Symlink(_))
+                | Some(Entry::Node(_))
+                | Some(Entry::Fifo(_)) => {
                     g.remove(name);
                     Ok(())
                 }
@@ -477,6 +514,34 @@ impl DirOps for MemDir {
         })
     }
 
+    /// Materialise a special node. Only `FileType::Fifo` is honoured on
+    /// tmpfs — `mkfifo`/`mknod(S_IFIFO)` on `/run`, `/tmp`, `/etc`. The FIFO
+    /// node owns a fresh shared pipe buffer; every later `open()` of this
+    /// path resolves to the same node (`lookup` above), so all openers
+    /// rendezvous on that one buffer. Device / block nodes aren't backed by
+    /// tmpfs (return `Unsupported` so the syscall layer falls back to a
+    /// plain file, matching the pre-FIFO behaviour); the `rdev` argument is
+    /// unused for a FIFO.
+    fn mknod<'a>(
+        &'a self,
+        name: &'a str,
+        file_type: FileType,
+        _rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            if file_type != FileType::Fifo {
+                return Err(FsError::Unsupported);
+            }
+            let mut g = self.entries.lock();
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            let node = Arc::new(crate::fifo::FifoNode::new(alloc_ino(), DEFAULT_PERMS));
+            g.insert(name.to_string(), Entry::Fifo(Arc::clone(&node)));
+            Ok(node as Arc<dyn FileOps>)
+        })
+    }
+
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
             let mut g = self.entries.lock();
@@ -506,8 +571,9 @@ impl DirOps for MemDir {
             let mut g = self.entries.lock();
             match g.get(name) {
                 None => Err(FsError::NotFound),
-                Some(Entry::File(_)) => Err(FsError::InvalidPath),
+                Some(Entry::File(_)) | Some(Entry::Node(_)) => Err(FsError::InvalidPath),
                 Some(Entry::Symlink(_)) => Err(FsError::InvalidPath),
+                Some(Entry::Fifo(_)) => Err(FsError::InvalidPath),
                 Some(Entry::Dir(d)) => {
                     if !d.entries.lock().is_empty() {
                         return Err(FsError::Busy);
@@ -572,10 +638,32 @@ impl DirOps for MemDir {
                 Some(Entry::Dir(_)) => return Err(FsError::InvalidPath),
                 Some(Entry::File(f)) => Entry::File(Arc::clone(f)),
                 Some(Entry::Symlink(s)) => Entry::Symlink(Arc::clone(s)),
+                Some(Entry::Node(n)) => Entry::Node(Arc::clone(n)),
+                Some(Entry::Fifo(p)) => Entry::Fifo(Arc::clone(p)),
             };
             g.insert(new_name.to_string(), aliased);
             Ok(())
         })
+    }
+
+    fn link_node<'a>(&'a self, name: &'a str, node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            // linkat NEVER replaces an existing name (like `link` above).
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            // Store the passed trait object verbatim: the caller's
+            // O_TMPFILE fd and this new name now alias the one inode, so
+            // the bytes already written through the fd are visible under
+            // the name the instant it appears.
+            g.insert(name.to_string(), Entry::Node(node));
+            Ok(())
+        })
+    }
+
+    fn supports_tmpfile(&self) -> bool {
+        true
     }
 }
 

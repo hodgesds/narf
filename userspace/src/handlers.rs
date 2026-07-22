@@ -935,16 +935,22 @@ fn open_impl(
     mnt_ptr: u64,
     mnt_len: usize,
 ) {
-    // O_TMPFILE (open an unnamed temp inode inside a directory): NARF's VFS
-    // has no unnamed-inode support, so honouring the flag as-written opens
-    // the DIRECTORY itself and a later write() to that fd EINVALs. Return
-    // -EOPNOTSUPP so Qt's QSaveFile (and libc tmpfile) fall back to a named
-    // temp + rename, which NARF supports. Without this EVERY KDE ksycoca /
-    // kconfig write fails with "Invalid argument" and startplasma stalls.
-    const O_TMPFILE: u64 = 0o20_000_000; // __O_TMPFILE bit (x86_64)
-    if flags & O_TMPFILE != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
-        return;
+    // FIFO open-peer rendezvous re-entry: a blocking FIFO `open()` installed
+    // its fd and parked waiting for the peer direction (see `open_fifo`); the
+    // park RIP-rewound and re-executed this syscall. Resume the peer-check for
+    // the already-installed fd instead of re-resolving the path (which would
+    // install a second fd and drop the first handle's open count).
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: `uctx` is the live per-task ctx; single-threaded syscall.
+        let pending = unsafe {
+            (*uctx)
+                .fifo_open_pending_fd
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+        if pending != 0 {
+            resume_fifo_open(ctx, (pending - 1) as u32);
+            return;
+        }
     }
     // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR) plus the settable
     // status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
@@ -981,6 +987,43 @@ fn open_impl(
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
+    }
+
+    // O_TMPFILE: create an unnamed (nameless) regular inode inside the
+    // directory named by `path`, and hand back a normal read/write fd to
+    // it. The inode has no name until `linkat(fd, "", …, AT_EMPTY_PATH)`
+    // materialises it (see `sys_linkat`). It lives on the SAME tmpfs/memfs
+    // that backs the target directory, so `link_node` can file it in
+    // later. If the directory's filesystem can't hold such a node
+    // (`supports_tmpfile()` is false — ext2 / a read-only backing), report
+    // -EOPNOTSUPP so callers (systemd, Qt QSaveFile, libc tmpfile) fall
+    // back to a named temp + rename. Linux ref: `vfs_tmpfile` →
+    // `shmem_tmpfile`. `__O_TMPFILE` is set with O_DIRECTORY in the full
+    // `O_TMPFILE` value; the directory arg is not itself opened.
+    const O_TMPFILE_BIT: u64 = 0o20_000_000; // __O_TMPFILE (x86_64)
+    if flags & O_TMPFILE_BIT != 0 && mnt_len == 0 {
+        match resolve_dir_absolute(path) {
+            Some(dir) if dir.supports_tmpfile() => {
+                let node = narf_filesystem::new_anon_memfile();
+                let new_fd = fd::with_table(task, |t| {
+                    t.open(crate::fd::FdEntry {
+                        ops: node,
+                        offset: 0,
+                        flags: 0,
+                        status_flags: open_status_flags,
+                    })
+                });
+                match new_fd {
+                    Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                    None => ctx.set_return(fail),
+                }
+            }
+            // Directory resolves but its FS can't hold an anonymous inode,
+            // or the path doesn't name a directory at all: EOPNOTSUPP so
+            // the caller falls back rather than treating it as fatal.
+            _ => ctx.set_return(SyscallReturn::ok((-95i64) as u64)), // -EOPNOTSUPP
+        }
+        return;
     }
 
     // O_NOFOLLOW: don't follow a final-component symlink. With O_PATH this
@@ -1194,6 +1237,19 @@ fn open_impl(
         ops
     };
 
+    // Named pipe (FIFO): the resolved node is a FIFO inode. Build a per-open
+    // directional handle bound to the node's shared buffer (all openers of the
+    // path rendezvous on it), apply the fifo(7) open-peer blocking semantics,
+    // and install THAT — not the bare node. `open_fifo` may park (releasing
+    // every lock first) and set the return itself.
+    if let Some(shared) = ops.fifo_shared() {
+        let node_ino = ops.ino();
+        let perms = stat.mode.perms;
+        let nonblock = flags & (crate::fd::O_NONBLOCK as u64) != 0;
+        open_fifo(ctx, shared, node_ino, perms, access_mode, nonblock, path);
+        return;
+    }
+
     let new_fd = match fd::with_table(task, |t| {
         t.open(crate::fd::FdEntry {
             ops,
@@ -1219,6 +1275,182 @@ fn open_impl(
         crate::mqueue::notify_open(path);
     }
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
+}
+
+/// Open a named pipe (FIFO), applying the fifo(7) peer-rendezvous rules.
+///
+/// `access_mode` is the low-2-bit O_RDONLY/O_WRONLY/O_RDWR selector; `shared`
+/// is the FIFO node's shared buffer (every opener of the path shares one).
+/// A per-open [`narf_filesystem::fifo::FifoHandle`] carrying the direction is
+/// installed as the fd — its open-count registration is what a peer waits on:
+///
+/// * O_RDWR: opens without blocking (Linux extension), counts as both ends.
+/// * O_RDONLY: readable end; if a writer is already open, returns at once.
+///   Otherwise O_NONBLOCK returns the fd immediately; a blocking open PARKS
+///   until a writer appears.
+/// * O_WRONLY: writable end; if a reader is already open, returns at once.
+///   Otherwise O_NONBLOCK returns -ENXIO; a blocking open PARKS until a
+///   reader appears.
+///
+/// The fd is installed BEFORE any park so its open count persists across the
+/// RIP-rewind re-execution (`resume_fifo_open` handles re-entry). All
+/// filesystem/fd-table locks are dropped before the park — a FIFO open that
+/// blocked with a lock held would wedge the kernel.
+#[allow(clippy::too_many_arguments)]
+fn open_fifo(
+    ctx: &mut dyn TrapContext,
+    shared: Arc<narf_filesystem::fifo::FifoShared>,
+    node_ino: u64,
+    perms: u16,
+    access_mode: u64,
+    nonblock: bool,
+    _path: &str,
+) {
+    let task = current_task_id();
+    let can_read = access_mode == 0 || access_mode == 2; // O_RDONLY | O_RDWR
+    let can_write = access_mode == 1 || access_mode == 2; // O_WRONLY | O_RDWR
+    let rdwr = access_mode == 2;
+
+    // O_WRONLY | O_NONBLOCK with no reader present is -ENXIO (fifo(7)) — and
+    // must NOT register a writer (that would be observable to a later reader
+    // as a phantom peer). Checked before building the handle.
+    if can_write && !can_read && nonblock && shared.reader_count() == 0 {
+        ctx.set_return(SyscallReturn::ok((-6i64) as u64)); // -ENXIO
+        return;
+    }
+
+    // Build + install the per-open handle. This registers the direction's
+    // open count, which is exactly what the peer rendezvous observes.
+    let handle = Arc::new(narf_filesystem::fifo::FifoHandle::open(
+        shared.clone(),
+        node_ino,
+        perms,
+        can_read,
+        can_write,
+    )) as Arc<dyn narf_filesystem::FileOps>;
+    let status_flags = access_mode as u32 | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
+    let new_fd = match fd::with_table(task, |t| {
+        t.open(crate::fd::FdEntry {
+            ops: handle,
+            offset: 0,
+            flags: 0,
+            status_flags,
+        })
+    }) {
+        Some(n) => n,
+        None => {
+            ctx.set_return(SyscallReturn::ok(!0u64));
+            return;
+        }
+    };
+
+    // Peer already present (or O_RDWR / O_NONBLOCK) → return the fd now.
+    let peer_ready = rdwr
+        || nonblock
+        || (can_read && shared.writer_count() > 0)
+        || (can_write && shared.reader_count() > 0);
+    if peer_ready {
+        #[cfg(feature = "linux-compat")]
+        crate::mqueue::register_fd_path(task, new_fd, _path);
+        ctx.set_return(SyscallReturn::ok(new_fd as u64));
+        return;
+    }
+
+    // Blocking open with no peer yet: stash the fd and park until the peer
+    // opens (or the ~1ms wheel backstop re-checks). The handle stays installed
+    // so its open count is visible to the peer across the park.
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: live per-task ctx; single-threaded syscall.
+        unsafe {
+            (*uctx)
+                .fifo_open_pending_fd
+                .store(new_fd as u64 + 1, core::sync::atomic::Ordering::Release);
+        }
+    }
+    fifo_park_or_finish(ctx, new_fd);
+}
+
+/// Re-entry after a FIFO-open park: re-check whether the peer has appeared for
+/// the already-installed `fd`. Returns the fd (clearing the pending slot) once
+/// the peer is present, else parks again on the ~1ms backstop.
+fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
+    let task = current_task_id();
+    // Read the handle's direction + peer counts through its shared buffer.
+    let ready = fd::with_table(task, |t| {
+        t.get(fd).and_then(|e| {
+            let am = e.status_flags & crate::fd::O_ACCMODE;
+            e.ops.fifo_shared().map(|shared| {
+                // The pending open was, by construction, a single-direction
+                // blocking open: O_RDONLY waits for a writer, O_WRONLY for a
+                // reader. Its own handle is counted in exactly one of the peer
+                // totals, so "peer present" is "the OTHER side has >= 1".
+                if am == crate::fd::O_WRONLY {
+                    shared.reader_count() > 0
+                } else {
+                    shared.writer_count() > 0
+                }
+            })
+        })
+    })
+    .flatten()
+    .unwrap_or(true); // fd vanished (closed under us) → stop parking.
+
+    if ready {
+        if let Some(uctx) = crate::user_task::current_user_task() {
+            // SAFETY: live per-task ctx; single-threaded syscall.
+            unsafe {
+                (*uctx)
+                    .fifo_open_pending_fd
+                    .store(0, core::sync::atomic::Ordering::Release);
+            }
+        }
+        ctx.set_return(SyscallReturn::ok(fd as u64));
+        return;
+    }
+    fifo_park_or_finish(ctx, fd);
+}
+
+/// Park the current task on the ~1ms timer wheel and RIP-rewind so the `open`
+/// syscall re-executes (and `resume_fifo_open` re-checks the peer). Falls back
+/// to returning the fd in a non-executor (kernel-test) context, where no
+/// scheduler can drive the re-check.
+fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
+    if let (Some(uctx), Some(hook)) = (
+        crate::user_task::current_user_task(),
+        crate::user_task::yield_hook(),
+    ) {
+        let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+        let resume_rip = ctx.rip().wrapping_sub(2);
+        ctx.set_rip(resume_rip);
+        // SAFETY: `uctx` is the live per-task ctx; we hold the only reference
+        // while setting the deadline + saving the RIP-rewound CPU state before
+        // the yield hook hands the task to the executor.
+        unsafe {
+            let uc = &*uctx;
+            uc.sleep_deadline_ns
+                .store(dl, core::sync::atomic::Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
+            hook(uctx);
+        }
+        // unreachable — hook() longjmps to the executor
+    }
+    // No executor (kernel-test): can't park; hand back the fd so the round
+    // trip still completes (the peer-rendezvous blocking is only exercised
+    // under a live scheduler).
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: live per-task ctx.
+        unsafe {
+            (*uctx)
+                .fifo_open_pending_fd
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+    }
+    ctx.set_return(SyscallReturn::ok(fd as u64));
 }
 
 /// Linux ABI variant of `open(2)`: `int open(const char *pathname,
@@ -1322,10 +1554,12 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     }
+    // Closure error channel: `Err(true)` ⇒ broken pipe (raise SIGPIPE +
+    // return -EPIPE), `Err(false)` ⇒ generic write failure / bad fd.
     let outcome = fd::with_table(task, |t| {
         let entry = match t.get_mut(fd) {
             Some(e) => e,
-            None => return Err(()),
+            None => return Err(false),
         };
         let off = entry.offset;
         let res = poll_blocking(entry.ops.write(off, &kbuf))
@@ -1335,7 +1569,9 @@ fn sys_write(ctx: &mut dyn TrapContext) {
                 entry.offset = off.saturating_add(written as u64);
                 Ok(written)
             }
-            Err(_) => Err(()),
+            // A write to a FIFO / pipe with no remaining readers: SIGPIPE + EPIPE.
+            Err(narf_filesystem::FsError::BrokenPipe) => Err(true),
+            Err(_) => Err(false),
         }
     });
     match outcome {
@@ -1344,6 +1580,12 @@ fn sys_write(ctx: &mut dyn TrapContext) {
             #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_modify_fd(task, fd);
             ctx.set_return(SyscallReturn::ok(n as u64));
+        }
+        // Broken pipe: POSIX raises SIGPIPE on the writer (default action
+        // terminates unless it's caught/ignored) AND the write returns -EPIPE.
+        Some(Err(true)) => {
+            raise_signal_pending(task, 13); // SIGPIPE
+            ctx.set_return(SyscallReturn::ok((-32i64) as u64)); // -EPIPE
         }
         // TODO(linux-gap): bad fd should be -EBADF, but this `_` also catches
         // write rejections (e.g. sealed memfd → -EPERM) — needs a split.
@@ -2586,6 +2828,7 @@ impl StatBuf {
             narf_filesystem::FileType::Symlink => 0o120000,
             narf_filesystem::FileType::Special => 0o020000,
             narf_filesystem::FileType::Socket => 0o140000,
+            narf_filesystem::FileType::Fifo => 0o010000,
         };
         Self {
             size: s.size,
@@ -3177,6 +3420,7 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
     const S_IFDIR: u64 = 0o040000;
     const S_IFCHR: u64 = 0o020000;
     const S_IFBLK: u64 = 0o060000;
+    const S_IFIFO: u64 = 0o010000;
     let path = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => return fail,
@@ -3212,6 +3456,16 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
         let ft = narf_filesystem::FileType::Special;
         let mk = poll_blocking(parent.mknod(&leaf, ft, dev)).map(|r| r.is_ok()) == Some(true);
         mk || poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
+    } else if fmt == S_IFIFO {
+        // A named pipe (musl `mkfifo` → `mknodat(S_IFIFO|mode, 0)`). Route to
+        // the directory's `mknod` so a tmpfs parent (`/run`, `/tmp`) creates a
+        // real FIFO inode whose later `open()` connects to a shared pipe
+        // buffer keyed by the node identity — NOT a plain file (which stat'd
+        // as a regular file and made systemd's `/run/initctl` open fail with
+        // "File exists"). No device-node fallback: a FIFO on a filesystem
+        // without FIFO support is a hard failure, not a degraded regular file.
+        poll_blocking(parent.mknod(&leaf, narf_filesystem::FileType::Fifo, 0)).map(|r| r.is_ok())
+            == Some(true)
     } else {
         poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
     };
@@ -3767,6 +4021,7 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64, ino: u64) -> linux_co
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
         narf_filesystem::FileType::Socket => 0o140000,
+        narf_filesystem::FileType::Fifo => 0o010000,
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
     let cpns = narf_time::cycles_per_ns().max(1) as u64;
@@ -4040,6 +4295,7 @@ fn sys_statx(ctx: &mut dyn TrapContext) {
         narf_filesystem::FileType::Symlink => 0o120000,
         narf_filesystem::FileType::Special => 0o020000,
         narf_filesystem::FileType::Socket => 0o140000,
+        narf_filesystem::FileType::Fifo => 0o010000,
     };
     let mode_word: u16 = ftype_bits | (s.mode.perms & 0o7777);
 
@@ -4976,12 +5232,57 @@ fn sys_link(ctx: &mut dyn TrapContext) {
     link_impl(ctx, &old_raw, &new_raw);
 }
 
+/// Materialise the anonymous inode held by `src_fd` at the absolute path
+/// `new_path`, i.e. give an `O_TMPFILE` inode its first name. The fd keeps
+/// its own reference; the new name aliases the same inode via the target
+/// directory's `DirOps::link_node`. Returns the Linux errno / 0 the caller
+/// should hand back. Used for both `linkat(fd,"",…,AT_EMPTY_PATH)` and the
+/// `linkat(AT_FDCWD,"/proc/self/fd/N",…,AT_SYMLINK_FOLLOW)` form systemd
+/// uses to publish its O_TMPFILE-staged files.
+fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
+    // Pull the fd's backing node out of the table (keeping its Arc alive).
+    let node = fd::with_table(task, |t| t.get(src_fd).map(|e| e.ops.clone())).flatten();
+    let Some(node) = node else {
+        return -9; // -EBADF: no such fd
+    };
+    let Some(split) = new_path.rfind('/') else {
+        return -22; // -EINVAL: newpath has no directory component
+    };
+    let new_leaf = alloc::string::String::from(&new_path[split + 1..]);
+    if new_leaf.is_empty() {
+        return -22; // -EINVAL
+    }
+    let dir_path = if split == 0 { "/" } else { &new_path[..split] };
+    let Some(dir) = resolve_dir_absolute(dir_path) else {
+        return -2; // -ENOENT: target directory doesn't exist
+    };
+    match poll_blocking(dir.link_node(&new_leaf, node)) {
+        Some(Ok(())) => {
+            #[cfg(feature = "linux-compat")]
+            crate::mqueue::notify_create(new_path, false);
+            0
+        }
+        // Name already taken — linkat never replaces (EEXIST).
+        Some(Err(narf_filesystem::FsError::Busy)) => -17,
+        // The FS can't hold an externally-minted node (link_node default).
+        Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // -EOPNOTSUPP
+        _ => -1,
+    }
+}
+
 /// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)` — x86_64 265,
 /// aarch64 37. Relative paths resolve against their directory fd's
 /// recorded open path (same prepend as sys_readlinkat); AT_FDCWD /
 /// absolute paths take the cwd route inside `link_impl`.
-/// AT_SYMLINK_FOLLOW is accepted and ignored — NARF's `DirOps::link`
-/// links the symlink entry itself, the no-flags default.
+/// AT_SYMLINK_FOLLOW is accepted and ignored for the path form — NARF's
+/// `DirOps::link` links the symlink entry itself, the no-flags default.
+///
+/// Two `O_TMPFILE` materialisation forms are handled specially (they name
+/// an inode by its open fd, not by a source path):
+///   - `AT_EMPTY_PATH` + empty oldpath: olddirfd IS the O_TMPFILE fd.
+///   - `AT_SYMLINK_FOLLOW` + oldpath = `/proc/self/fd/N`: N names the fd.
+///
+/// Both file the fd's anonymous inode into newpath via `link_node`.
 fn sys_linkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fail = SyscallReturn::ok((-1i64) as u64);
@@ -4993,6 +5294,8 @@ fn sys_linkat(ctx: &mut dyn TrapContext) {
         return;
     };
     const AT_FDCWD: i64 = -100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let flags = args.arg4;
     let task = current_task_id();
     let with_dirfd = |dirfd: i64, path: alloc::string::String| -> alloc::string::String {
         if path.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
@@ -5005,8 +5308,39 @@ fn sys_linkat(ctx: &mut dyn TrapContext) {
             _ => path,
         }
     };
-    let old_eff = with_dirfd(args.arg0 as i64, old_raw);
     let new_eff = with_dirfd(args.arg2 as i64, new_raw);
+
+    // O_TMPFILE materialisation, form 1: AT_EMPTY_PATH + empty oldpath →
+    // olddirfd is the O_TMPFILE fd whose anonymous inode gets named.
+    if flags & AT_EMPTY_PATH != 0 && old_raw.is_empty() {
+        let src_fd = args.arg0 as i64;
+        if src_fd < 0 {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+        let new_abs = resolve_cwd_path(task, &new_eff);
+        let r = link_fd_node_impl(task, src_fd as u32, &new_abs);
+        ctx.set_return(SyscallReturn::ok(r as u64));
+        return;
+    }
+
+    // O_TMPFILE materialisation, form 2: oldpath = /proc/self/fd/N (or
+    // /proc/<pid>/fd/N) — the anonymous inode is named by that magic
+    // symlink. Only take this route when N names a live PATHLESS fd (an
+    // O_TMPFILE / memfd node); a /proc/self/fd/N that points at a real
+    // named file falls through to the ordinary path-based hard link.
+    let old_eff = with_dirfd(args.arg0 as i64, old_raw);
+    if let Some(src_fd) = parse_proc_self_fd(&old_eff) {
+        if fd_path_of(task, src_fd).is_none()
+            && fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false)
+        {
+            let new_abs = resolve_cwd_path(task, &new_eff);
+            let r = link_fd_node_impl(task, src_fd, &new_abs);
+            ctx.set_return(SyscallReturn::ok(r as u64));
+            return;
+        }
+    }
+
     link_impl(ctx, &old_eff, &new_eff);
 }
 
@@ -5265,13 +5599,15 @@ fn sys_listdir(ctx: &mut dyn TrapContext) {
         ctx.set_return(fail);
         return;
     }
-    // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink, 3=Special.
+    // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink,
+    // 3=Special, 4=Socket, 5=Fifo.
     let ftype_wire: u32 = match ftype {
         narf_filesystem::FileType::File => 0,
         narf_filesystem::FileType::Dir => 1,
         narf_filesystem::FileType::Symlink => 2,
         narf_filesystem::FileType::Special => 3,
         narf_filesystem::FileType::Socket => 4,
+        narf_filesystem::FileType::Fifo => 5,
     };
     // Build the 8-byte header in kernel memory, then copy the whole
     // record (header + name) into user space under the SMAP bracket.
@@ -5403,6 +5739,7 @@ fn sys_getdents64(ctx: &mut dyn TrapContext) {
             narf_filesystem::FileType::Symlink => 10, // DT_LNK
             narf_filesystem::FileType::Special => 2,  // DT_CHR
             narf_filesystem::FileType::Socket => 12,  // DT_SOCK
+            narf_filesystem::FileType::Fifo => 1,     // DT_FIFO
         };
         // Build the dirent record in kernel memory, then copy it into
         // user space under the SMAP bracket.
@@ -5521,6 +5858,7 @@ fn sys_getdents(ctx: &mut dyn TrapContext) {
             narf_filesystem::FileType::Symlink => 10, // DT_LNK
             narf_filesystem::FileType::Special => 2,  // DT_CHR
             narf_filesystem::FileType::Socket => 12,  // DT_SOCK
+            narf_filesystem::FileType::Fifo => 1,     // DT_FIFO
         };
         // Build the legacy dirent record in kernel memory, then copy it
         // into user space under the SMAP bracket.
