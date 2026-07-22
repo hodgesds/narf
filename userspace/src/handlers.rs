@@ -12591,7 +12591,12 @@ fn find_child_subreaper(dying: u64) -> Option<u64> {
         }
         cur_pid = task_to_pid_raw(parent_tid).unwrap_or(parent_tid);
     }
-    None
+    // Fall back to PID 1 (init / systemd) if alive and not dying itself
+    if signal_target_exists(1) && dying != 1 {
+        Some(1)
+    } else {
+        None
+    }
 }
 
 /// Test hook: run the orphanize pass for a synthetic parent without
