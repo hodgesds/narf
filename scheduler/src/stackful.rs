@@ -798,6 +798,30 @@ impl KernelTask {
     }
 }
 
+impl Drop for KernelTask {
+    /// Guarantee no per-CPU `CURRENT_STACKFUL_TASK` slot outlives this
+    /// task pointing at it. The set/clear discipline in
+    /// `task_body_rust` / `try_preempt` already keeps a slot armed only
+    /// while the task runs on that CPU, but this is the backstop: if
+    /// any path ever left a slot stranded, `try_preempt` on that CPU
+    /// would write a trap frame through the freed `Box<KernelTask>` (the
+    /// executor-dispatch rip≈0x3 use-after-free). Clearing every slot
+    /// that still names us, immediately before the allocation is freed,
+    /// makes that impossible. O(MAX_CPUS) on the cold drop path.
+    fn drop(&mut self) {
+        let me = self as *mut KernelTask;
+        for slot in CURRENT_STACKFUL_TASK.inner.iter() {
+            // Only clear a slot that names THIS task; leave others.
+            let _ = slot.compare_exchange(
+                me,
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
 // ── Task entry trampoline + Rust-side body ─────────────────────────
 //
 // `trampoline_entry` is the address `KernelContext::fresh` sets
@@ -854,8 +878,19 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         // .store(null) before kernel_switch, the task is on
         // this CPU and preemptable. Outside that window
         // CURRENT[cpu] is null and try_preempt no-ops.
-        let cpu = this_cpu();
-        CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
+        //
+        // `set_cpu` is captured here and used again for the matching
+        // clear before this iteration yields. The clear MUST target
+        // the same slot this store armed — NOT a fresh `this_cpu()`.
+        // A task can be preempted and resumed on a different CPU
+        // (work-stealing), so `this_cpu()` at clear time may differ
+        // from here; clearing the wrong slot would leave THIS slot
+        // pointing at the task after it later completes and its `Box`
+        // is freed, and a timer tick on this CPU would then make
+        // `try_preempt` write through the freed `KernelTask` (a
+        // use-after-free — the executor-dispatch rip≈0x3 corruption).
+        let set_cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[set_cpu].store(task_ptr, Ordering::Release);
 
         let waker_guard = task.current_waker.lock();
         let waker = match waker_guard.as_ref() {
@@ -878,9 +913,11 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         // timer tick landing between this clear and the
         // kernel_switch below (or while we're switched out)
         // doesn't preempt a task that's no longer executing.
-        // Re-read cpu in case the task migrated mid-poll.
-        let cpu = this_cpu();
-        CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
+        // Clear the SAME slot the store above armed (`set_cpu`), not
+        // a re-read `this_cpu()`: a work-steal can resume this task on
+        // another CPU, and clearing that CPU's slot would strand the
+        // origin slot pointing at us (see the `set_cpu` comment above).
+        CURRENT_STACKFUL_TASK.inner[set_cpu].store(core::ptr::null_mut(), Ordering::Release);
         // Yield back to the executor. We pull the exec_ctx pointer
         // out atomically — the executor populated it just before
         // switching us in.
@@ -3762,6 +3799,60 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// Dropping a `KernelTask` must clear every per-CPU
+    /// `CURRENT_STACKFUL_TASK` slot that still points at it. This is the
+    /// backstop against a slot stranded by a work-steal migration
+    /// (set on CPU A, resumed/cleared on CPU B): without it, a timer
+    /// tick on CPU A after the task's `Box` is freed would drive
+    /// `try_preempt` to write through freed memory (the rip≈0x3 UAF).
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_drop_clears_stranded_current_slots() -> TestResult {
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        // Simulate a stranded slot: arm several CPUs' slots at this
+        // task's pointer, as a mid-poll migration would leave behind,
+        // then drop the task and require every slot to be cleared.
+        let task = KernelTask::new(ReadyImmediately);
+        let task_ptr = &*task as *const KernelTask as *mut KernelTask;
+        let n = CURRENT_STACKFUL_TASK.inner.len();
+        // Strand slot 0, the current CPU, and the last slot; leave a
+        // decoy pointer in another slot to prove only matching slots
+        // are cleared.
+        let decoy = 0xdead_beef_usize as *mut KernelTask;
+        CURRENT_STACKFUL_TASK.inner[0].store(task_ptr, Ordering::Release);
+        CURRENT_STACKFUL_TASK.inner[this_cpu() % n].store(task_ptr, Ordering::Release);
+        CURRENT_STACKFUL_TASK.inner[n - 1].store(task_ptr, Ordering::Release);
+        let decoy_idx = if n >= 2 { 1 } else { 0 };
+        if decoy_idx != 0 && decoy_idx != n - 1 && decoy_idx != this_cpu() % n {
+            CURRENT_STACKFUL_TASK.inner[decoy_idx].store(decoy, Ordering::Release);
+        }
+
+        drop(task);
+
+        for (i, slot) in CURRENT_STACKFUL_TASK.inner.iter().enumerate() {
+            let v = slot.load(Ordering::Acquire);
+            if v == task_ptr {
+                return TestResult::Fail(
+                    "Drop left a CURRENT_STACKFUL_TASK slot pointing at the freed task",
+                );
+            }
+            if i == decoy_idx && decoy_idx != 0 && decoy_idx != n - 1 && v != decoy {
+                // Reset before failing to avoid leaking the decoy.
+                slot.store(core::ptr::null_mut(), Ordering::Release);
+                return TestResult::Fail("Drop wrongly cleared a non-matching slot");
+            }
+        }
+        // Clean up the decoy so it can't confuse later tests / a real
+        // preempt tick.
+        CURRENT_STACKFUL_TASK.inner[decoy_idx].store(core::ptr::null_mut(), Ordering::Release);
+        TestResult::Pass
+    }
+
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",
@@ -3825,6 +3916,11 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_current_task_cleared_after_poll);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_drop_clears_stranded_current_slots
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_stackful_adapter_applies_options);
     kernel_test_in!(
