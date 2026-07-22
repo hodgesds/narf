@@ -15992,7 +15992,13 @@ fn do_execve_resolved(
     if image_override.is_none() {
         if let Some(n) = parse_proc_self_fd(&path_owned) {
             let t = current_task_id();
-            if let Some(real) = fd_path_of(t, n) {
+            // Only an ABSOLUTE filesystem path is exec'able by re-reading the FS.
+            // A pathless/anonymous fd (a memfd — systemd seals its sd-executor
+            // into a memfd and fexecve's /proc/self/fd/N — whose recorded "path"
+            // is the "anon_inode:[FileOps]" placeholder) must be exec'd from the
+            // fd's own bytes instead.
+            let fs_path = fd_path_of(t, n).filter(|p| p.starts_with('/'));
+            if let Some(real) = fs_path {
                 path_owned = real;
             } else if let Some(bytes) = read_fd_image(t, n) {
                 image_override = Some(bytes);
