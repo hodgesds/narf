@@ -355,7 +355,9 @@ fn free_site_note(blk: NonNull<FreeBlock>) -> FreeSiteNote {
     #[cfg(feature = "slab-free-audit")]
     {
         match free_audit::recall(blk) {
-            Some((w0, w1)) => FreeSiteNote { words: Some((w0, w1)) },
+            Some((w0, w1)) => FreeSiteNote {
+                words: Some((w0, w1)),
+            },
             None => FreeSiteNote { words: None },
         }
     }

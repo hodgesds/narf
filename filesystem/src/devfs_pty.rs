@@ -488,7 +488,10 @@ pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     Ok(v)
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+// Not linux-compat-gated: /dev/random's RND* ioctls (always present) write an
+// int back to userspace through this helper.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 pub(crate) unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -535,7 +538,8 @@ pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const i32) })
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub(crate) unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);

@@ -328,7 +328,16 @@ pub fn gen_uevent_seqnum() -> String {
 /// ADD uevents emitted. Linux ref: `udev_enumerate_scan_devices` +
 /// `kobject_uevent(KOBJ_ADD)`.
 pub fn coldplug() -> usize {
-    crate::sysfs::coldplug()
+    // The sysfs device tree only exists under `linux-compat`; without it
+    // there are no kobjects to enumerate, so no ADD uevents are emitted.
+    #[cfg(feature = "linux-compat")]
+    {
+        crate::sysfs::coldplug()
+    }
+    #[cfg(not(feature = "linux-compat"))]
+    {
+        0
+    }
 }
 
 /// Reset the ring for testing.  NOT for production use.
