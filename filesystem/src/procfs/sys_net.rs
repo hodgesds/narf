@@ -870,3 +870,22 @@ fn smoke_tcp_syn_retries_default_6() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/sys_net", smoke_tcp_syn_retries_default_6);
+
+fn smoke_unix_max_dgram_qlen_rw() -> TestResult {
+    register_all();
+    let snap = lookup_registry(&["sys", "net", "unix", "max_dgram_qlen"]);
+    match snap {
+        Some(ProcNodeSnapshot::File(f)) => {
+            let _ = f.write(b"1024\n");
+            let v = f.read();
+            let s = core::str::from_utf8(&v).unwrap_or("").trim();
+            if s == "1024" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("max_dgram_qlen readback mismatch")
+            }
+        }
+        _ => TestResult::Fail("max_dgram_qlen not found"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_net", smoke_unix_max_dgram_qlen_rw);

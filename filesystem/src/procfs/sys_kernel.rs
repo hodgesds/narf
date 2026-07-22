@@ -836,3 +836,47 @@ kernel_test_in!(
     "filesystem/procfs/sys_kernel",
     smoke_kernel_entropy_avail_default
 );
+
+fn smoke_kernel_printk_devkmsg_rw() -> TestResult {
+    register_all();
+    let f = match lookup_sys("kernel/printk_devkmsg") {
+        Some(f) => f,
+        None => return TestResult::Fail("printk_devkmsg sysctl not found"),
+    };
+    if f.write(b"off\n").is_err() {
+        return TestResult::Fail("write printk_devkmsg failed");
+    }
+    match read_sys("kernel/printk_devkmsg") {
+        Some(s) if s == "off\n" => TestResult::Pass,
+        _ => TestResult::Fail("printk_devkmsg readback mismatch"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_printk_devkmsg_rw
+);
+
+fn smoke_kernel_cap_last_cap() -> TestResult {
+    register_all();
+    match read_sys("kernel/cap_last_cap") {
+        Some(s) if s == "40\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/cap_last_cap mismatch"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_cap_last_cap);
+
+fn smoke_kernel_core_pattern_rw() -> TestResult {
+    register_all();
+    let f = match lookup_sys("kernel/core_pattern") {
+        Some(f) => f,
+        None => return TestResult::Fail("core_pattern sysctl not found"),
+    };
+    if f.write(b"core.%p\n").is_err() {
+        return TestResult::Fail("write core_pattern failed");
+    }
+    match read_sys("kernel/core_pattern") {
+        Some(s) if s == "core.%p\n" => TestResult::Pass,
+        _ => TestResult::Fail("core_pattern readback mismatch"),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_core_pattern_rw);
