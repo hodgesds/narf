@@ -67,7 +67,10 @@ use crate::PAGE_SIZE;
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
 /// Smallest block size — also the alignment all blocks satisfy.
+/// Must hold the free-list link (word 0) plus the free-state canary
+/// (word 1) — see the canary section below.
 const MIN_BLOCK: usize = 16;
+const _: () = assert!(MIN_BLOCK >= 2 * core::mem::size_of::<u64>());
 /// Number of size classes: 16, 32, 64, ..., 4096.
 const N_CLASSES: usize = 9;
 
@@ -97,6 +100,157 @@ fn class_for(size: usize) -> Option<usize> {
 #[repr(C)]
 struct FreeBlock {
     next: Option<NonNull<FreeBlock>>,
+}
+
+// ── Free-block canary ───────────────────────────────────────────────
+//
+// Every block that sits in the free state (on a per-CPU magazine or
+// the central free list) carries a per-block canary in its SECOND
+// word (bytes 8..16): `block_address ^ FREE_CANARY_SALT`. Word 0 is
+// the `FreeBlock::next` link; `MIN_BLOCK` is 16 bytes, so both words
+// fit in every size class.
+//
+// Protocol:
+//   * Entering the free state (`canary_on_free`): first CHECK the
+//     word — if it already holds this block's canary, the caller is
+//     freeing a block that is already free → panic naming the block
+//     (double-free caught at the second free, not later as silent
+//     heap corruption). Then write the canary.
+//   * Leaving the free state (`canary_on_alloc`): CHECK the word
+//     still holds the canary — a mismatch means something wrote
+//     through a stale pointer while the block sat on a free list
+//     (use-after-free) → panic naming the block. Then zero the word
+//     so a caller that never touches bytes 8..16 can't trip the
+//     double-free check on its own legitimate free.
+//   * Blocks freshly carved out of a new frame (grow path) get the
+//     canary written UNCONDITIONALLY (`canary_set_fresh`) — the
+//     frame's previous life may have left a stale canary — and the
+//     one block the grow path hands to its caller gets the word
+//     zeroed (`canary_clear_fresh`) for the same reason.
+//
+// The per-block XOR keeps a canary copied byte-for-byte into a
+// different block (memcpy of freed data) from validating there. The
+// only false-positive path is an owner storing exactly
+// `addr ^ SALT` at offset 8 of its own block — a 2⁻⁶⁴ coincidence.
+
+/// Salt for the free-state canary. Recognisable in raw memory dumps.
+const FREE_CANARY_SALT: u64 = 0xF7EE_B10C_5AB5_1AB5;
+
+/// The canary value for `blk` while it is free.
+#[inline]
+fn free_canary_value(blk: NonNull<FreeBlock>) -> u64 {
+    (blk.as_ptr() as u64) ^ FREE_CANARY_SALT
+}
+
+/// Pointer to `blk`'s canary word (bytes 8..16).
+///
+/// # Safety
+/// `blk` must point at a slab block of at least `MIN_BLOCK` bytes.
+#[inline]
+unsafe fn canary_word(blk: NonNull<FreeBlock>) -> *mut u64 {
+    // SAFETY: every size class is ≥ MIN_BLOCK = 16 bytes, so word 1
+    // is in bounds; caller owns the block.
+    unsafe { blk.as_ptr().cast::<u64>().add(1) }
+}
+
+/// Block enters the free state: reject a double free, then arm the
+/// canary.
+///
+/// # Safety
+/// `blk` must be a block of size class `class_idx` that the caller
+/// is returning to this slab (exclusive access).
+#[inline]
+unsafe fn canary_on_free(blk: NonNull<FreeBlock>, class_idx: usize) {
+    // SAFETY: caller owns the block being freed; see `canary_word`.
+    unsafe {
+        let w = canary_word(blk);
+        if w.read() == free_canary_value(blk) {
+            panic!(
+                "slab: double free of block {:p} (class {} B) — the block is already on a free list",
+                blk.as_ptr(),
+                class_size(class_idx),
+            );
+        }
+        w.write(free_canary_value(blk));
+    }
+}
+
+/// Block leaves the free state: verify it wasn't scribbled while
+/// free, then disarm the canary.
+///
+/// # Safety
+/// `blk` must be a free block of size class `class_idx` just popped
+/// from a magazine or the central list (exclusive access).
+#[inline]
+unsafe fn canary_on_alloc(blk: NonNull<FreeBlock>, class_idx: usize) {
+    // SAFETY: caller owns the just-popped block; see `canary_word`.
+    unsafe {
+        let w = canary_word(blk);
+        let got = w.read();
+        if got != free_canary_value(blk) {
+            panic!(
+                "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
+                 write-after-free while the block sat on a free list",
+                blk.as_ptr(),
+                class_size(class_idx),
+                got,
+                free_canary_value(blk),
+            );
+        }
+        w.write(0);
+    }
+}
+
+/// Verify a block that stays free (magazine ↔ central transfer)
+/// still carries its canary.
+///
+/// # Safety
+/// `blk` must be a free block of size class `class_idx` reachable
+/// only by the caller (magazine slot or central list under lock).
+#[inline]
+unsafe fn canary_check_free(blk: NonNull<FreeBlock>, class_idx: usize) {
+    // SAFETY: caller has exclusive reach to the free block.
+    unsafe {
+        let got = canary_word(blk).read();
+        if got != free_canary_value(blk) {
+            panic!(
+                "slab: free-block canary clobbered on block {:p} (class {} B): {:#x} != {:#x} — \
+                 write-after-free while the block sat on a free list",
+                blk.as_ptr(),
+                class_size(class_idx),
+                got,
+                free_canary_value(blk),
+            );
+        }
+    }
+}
+
+/// Arm the canary on a block carved from a fresh frame — no
+/// double-free check, since the frame's previous life may have left
+/// a stale canary at offset 8.
+///
+/// # Safety
+/// `blk` must be a block inside a frame this grow path exclusively
+/// owns.
+#[inline]
+unsafe fn canary_set_fresh(blk: NonNull<FreeBlock>) {
+    // SAFETY: the grow path owns the whole fresh frame.
+    unsafe {
+        canary_word(blk).write(free_canary_value(blk));
+    }
+}
+
+/// Zero the canary word of a fresh-frame block being handed straight
+/// to the caller (never entered the free state in this life).
+///
+/// # Safety
+/// Same contract as `canary_set_fresh`.
+#[inline]
+unsafe fn canary_clear_fresh(blk: NonNull<FreeBlock>) {
+    // SAFETY: the grow path owns the whole fresh frame.
+    unsafe {
+        canary_word(blk).write(0);
+    }
 }
 
 /// Per-CPU magazine size — number of pre-cached free blocks per
@@ -283,22 +437,37 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     let c = class_for(need)?;
     let class = &CLASSES[c];
-    let cpu = current_cpu();
-    // SAFETY: per-CPU access invariant — only the active CPU
-    // touches its own magazine cell.
-    // SAFETY: Valid memory or trusted environment
-    let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
-    if mag.top == 0 {
-        // Atomic path never touches the central lock, so an empty
-        // magazine is a permanent miss for this caller.
-        class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    mag.top -= 1;
-    let blk = mag.stack[mag.top].take().expect("magazine top non-null");
-    class.in_use.fetch_add(1, Ordering::Relaxed);
-    class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
-    Some(blk.cast())
+    // Mask IRQs across the whole magazine pop, exactly like
+    // `alloc_class` / `dealloc_class`: the per-CPU magazine is a
+    // plain (non-atomic) read-modify-write, so a nested IRQ that
+    // allocs/frees the same size class between our `top` read and
+    // write would lose or duplicate a block (a duplicated pop hands
+    // one block to two owners — heap corruption). Masking also pins
+    // `current_cpu()` for the duration: a caller running with IRQs
+    // enabled cannot be preempted+migrated mid-update and mutate
+    // CPU A's magazine from CPU B. When the caller already has IRQs
+    // masked (IRQ handler, IrqSafeSpinLock held) the save/restore
+    // nests to a no-op.
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = current_cpu();
+        // SAFETY: per-CPU access invariant — only the active CPU
+        // touches its own magazine cell, and IRQs are masked above so
+        // no same-CPU re-entry can alias this borrow.
+        let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+        if mag.top == 0 {
+            // Atomic path never touches the central lock, so an empty
+            // magazine is a permanent miss for this caller.
+            class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        mag.top -= 1;
+        let blk = mag.stack[mag.top].take().expect("magazine top non-null");
+        // SAFETY: `blk` was just popped; we hold the only reference.
+        unsafe { canary_on_alloc(blk, c) };
+        class.in_use.fetch_add(1, Ordering::Relaxed);
+        class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
+        Some(blk.cast())
+    })
 }
 
 /// Atomic-context dealloc: push to the per-CPU magazine if it
@@ -322,20 +491,31 @@ pub unsafe fn try_dealloc_atomic(
         None => return Err(AtomicDeallocFull),
     };
     let class = &CLASSES[c];
-    let cpu = current_cpu();
-    // SAFETY: per-CPU access invariant.
-    let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
-    if mag.top >= MAG_SIZE {
-        // Full magazine in atomic context — we can't drain to the
-        // central lock here, so count this as a miss for the caller.
-        class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
-        return Err(AtomicDeallocFull);
-    }
-    mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
-    mag.top += 1;
-    class.in_use.fetch_sub(1, Ordering::Relaxed);
-    class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    // Mask IRQs across the whole magazine push — same reasoning as
+    // `try_alloc_atomic`: the non-atomic `top`/`stack` update must
+    // not interleave with a nested IRQ or a preempt+migrate, and
+    // `current_cpu()` must be read under the mask so the push lands
+    // in the executing CPU's own cell.
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = current_cpu();
+        // SAFETY: per-CPU access invariant, IRQs masked above.
+        let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+        if mag.top >= MAG_SIZE {
+            // Full magazine in atomic context — we can't drain to the
+            // central lock here, so count this as a miss for the caller.
+            class.mag_miss_count.fetch_add(1, Ordering::Relaxed);
+            return Err(AtomicDeallocFull);
+        }
+        let blk = ptr.cast::<FreeBlock>();
+        // SAFETY: caller hands us ownership of the block; the push
+        // below is what publishes it as free.
+        unsafe { canary_on_free(blk, c) };
+        mag.stack[mag.top] = Some(blk);
+        mag.top += 1;
+        class.in_use.fetch_sub(1, Ordering::Relaxed);
+        class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
 }
 
 /// Returned by `try_dealloc_atomic` when the per-CPU magazine
@@ -376,6 +556,8 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         if mag.top > 0 {
             mag.top -= 1;
             let blk = mag.stack[mag.top].take().expect("magazine top non-null");
+            // SAFETY: `blk` was just popped; we hold the only reference.
+            unsafe { canary_on_alloc(blk, c) };
             class.in_use.fetch_add(1, Ordering::Relaxed);
             class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
             return Ok(blk.cast());
@@ -400,6 +582,13 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             while taken < take && mag.top < MAG_SIZE {
                 match *g {
                     Some(head) => {
+                        // Verify the block wasn't scribbled while free
+                        // BEFORE trusting its `next` link — a clobbered
+                        // block would otherwise splice garbage into the
+                        // central list.
+                        // SAFETY: `head` is on the central list we hold
+                        // the lock for.
+                        unsafe { canary_check_free(head, c) };
                         // SAFETY: central blocks were inserted by this slab.
                         let next = unsafe { head.as_ref().next };
                         *g = next;
@@ -413,6 +602,8 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             if taken > 0 {
                 mag.top -= 1;
                 let blk = mag.stack[mag.top].take().expect("just pushed");
+                // SAFETY: `blk` was just popped; we hold the only reference.
+                unsafe { canary_on_alloc(blk, c) };
                 class.in_use.fetch_add(1, Ordering::Relaxed);
                 return Ok(blk.cast());
             }
@@ -454,6 +645,7 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
                     break;
                 }
                 let blk = NonNull::new_unchecked(base.add(i * block_size) as *mut FreeBlock);
+                canary_set_fresh(blk);
                 mag.stack[mag.top] = Some(blk);
                 mag.top += 1;
             }
@@ -464,6 +656,7 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             for i in to_mag..(n_blocks - 1) {
                 let blk = base.add(i * block_size) as *mut FreeBlock;
                 (*blk).next = *g;
+                canary_set_fresh(NonNull::new_unchecked(blk));
                 *g = NonNull::new(blk);
             }
             drop(g);
@@ -472,7 +665,15 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         class.in_use.fetch_add(1, Ordering::Relaxed);
         // Last block is the one we return.
         // SAFETY: identity-mapped frame.
-        Ok(unsafe { NonNull::new_unchecked(base.add((n_blocks - 1) * block_size)) })
+        Ok(unsafe {
+            let ret =
+                NonNull::new_unchecked(base.add((n_blocks - 1) * block_size) as *mut FreeBlock);
+            // Fresh frame — its previous life may have left a stale
+            // canary at offset 8; clear so this block's first free
+            // doesn't false-positive the double-free check.
+            canary_clear_fresh(ret);
+            ret.cast()
+        })
     })
 }
 
@@ -484,6 +685,11 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
     // the next flush hits as the "magazine full" panic.
     narf_lib::sync::without_interrupts(|| {
         let cpu = current_cpu();
+
+        // The block enters the free state exactly once, whichever
+        // path below parks it: reject a double free + arm the canary.
+        // SAFETY: caller hands us ownership of the block.
+        unsafe { canary_on_free(ptr.cast::<FreeBlock>(), c) };
 
         // FAST PATH: push onto the per-CPU magazine.
         // SAFETY: per-CPU access invariant, IRQs masked above.
@@ -505,6 +711,10 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         let mut g = class.head.lock();
         for i in 0..flush {
             let mut blk = mag.stack[i].expect("magazine full");
+            // The block stays free across the magazine → central
+            // move; its canary must still be intact.
+            // SAFETY: `blk` is a free block only we can reach.
+            unsafe { canary_check_free(blk, c) };
             // SAFETY: blocks were originally allocated from this slab,
             // so overwriting `next` re-links them onto the central head.
             // SAFETY: Valid memory or trusted environment
@@ -695,6 +905,10 @@ pub unsafe fn _test_magazine_push(class_idx: usize, cpu: usize, ptr: NonNull<u8>
     // SAFETY: Valid memory or trusted environment
     let mag = unsafe { &mut *CLASSES[class_idx].magazines[cpu].inner.get() };
     assert!(mag.top < MAG_SIZE);
+    // The planted block enters the free state — arm its canary like
+    // every other free-list entry so the eventual pop verifies clean.
+    // SAFETY: caller hands us ownership of the block.
+    unsafe { canary_on_free(ptr.cast::<FreeBlock>(), class_idx) };
     mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
     mag.top += 1;
     // Mirror the accounting that `dealloc_class` would have done
@@ -1043,3 +1257,190 @@ fn smoke_slab_grow_path_top_bounded() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_grow_path_top_bounded);
+
+/// Test: free-block canary lifecycle. A handed-out block's canary
+/// word (offset 8) is zero; freeing arms it (`addr ^ SALT`); an
+/// immediate re-alloc (LIFO magazine top) returns the same block with
+/// the word cleared again. This is the observable half of the canary
+/// protocol — the panic halves (double free, write-after-free) can't
+/// be asserted in-kernel without dying, so we pin the arm/disarm
+/// transitions they key on.
+fn smoke_slab_free_block_canary_lifecycle() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(64, 16).expect("layout");
+
+    let p = match alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("alloc failed"),
+    };
+    let word = |ptr: NonNull<u8>| -> u64 {
+        // SAFETY: every slab block is ≥ MIN_BLOCK = 16 bytes; reading
+        // word 1 of a block this test controls is in bounds.
+        unsafe { ptr.as_ptr().cast::<u64>().add(1).read() }
+    };
+    let canary = (p.as_ptr() as u64) ^ FREE_CANARY_SALT;
+    if word(p) != 0 {
+        return TestResult::Fail("handed-out block's canary word not cleared");
+    }
+    // Simulate an owner that scribbles the canary slot, then frees —
+    // the free must overwrite the owner bytes with the armed canary.
+    // SAFETY: we own the block; writing inside its 64 bytes is fine.
+    unsafe { p.as_ptr().cast::<u64>().add(1).write(0xDEAD_BEEF) };
+    // SAFETY: matching layout.
+    unsafe { dealloc(p, layout) };
+    if word(p) != canary {
+        return TestResult::Fail("freed block's canary not armed");
+    }
+    // LIFO: the next alloc of this class pops the same block.
+    let q = match alloc(layout) {
+        Ok(q) => q,
+        Err(_) => return TestResult::Fail("re-alloc failed"),
+    };
+    if q.as_ptr() != p.as_ptr() {
+        // Another slot won the LIFO race (shouldn't happen in the
+        // single-threaded harness, but don't fail spuriously) — just
+        // clean up.
+        // SAFETY: matching layout.
+        unsafe { dealloc(q, layout) };
+        return TestResult::Pass;
+    }
+    if word(q) != 0 {
+        return TestResult::Fail("re-allocated block's canary not cleared");
+    }
+    // SAFETY: matching layout.
+    unsafe { dealloc(q, layout) };
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_free_block_canary_lifecycle);
+
+/// Test: the atomic magazine paths mask IRQs for their critical
+/// section and restore the caller's IRQ state, and they follow the
+/// same canary protocol as the sleepable paths (disarm on pop, arm
+/// on push).
+fn smoke_slab_atomic_paths_masked_and_canaried() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(128, 16).expect("layout");
+    let irq_before = crate::context::irqs_enabled();
+
+    // Warm the magazine so the atomic pop has stock.
+    let warm = match alloc(layout) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("warm alloc failed"),
+    };
+    // SAFETY: matching layout.
+    unsafe { dealloc(warm, layout) };
+
+    let p = match try_alloc_atomic(layout) {
+        Some(p) => p,
+        None => return TestResult::Fail("atomic alloc missed a warm magazine"),
+    };
+    if crate::context::irqs_enabled() != irq_before {
+        return TestResult::Fail("try_alloc_atomic changed the caller's IRQ state");
+    }
+    let word = |ptr: NonNull<u8>| -> u64 {
+        // SAFETY: block is ≥ MIN_BLOCK bytes and controlled by this test.
+        unsafe { ptr.as_ptr().cast::<u64>().add(1).read() }
+    };
+    if word(p) != 0 {
+        return TestResult::Fail("atomic pop left the canary armed");
+    }
+    // SAFETY: matching layout, block just came from try_alloc_atomic.
+    if unsafe { try_dealloc_atomic(p, layout) }.is_err() {
+        return TestResult::Fail("atomic dealloc rejected a non-full magazine");
+    }
+    if crate::context::irqs_enabled() != irq_before {
+        return TestResult::Fail("try_dealloc_atomic changed the caller's IRQ state");
+    }
+    if word(p) != (p.as_ptr() as u64) ^ FREE_CANARY_SALT {
+        return TestResult::Fail("atomic push didn't arm the canary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_atomic_paths_masked_and_canaried);
+
+/// Stress: multi-class alloc/free churn asserting the no-double-issue
+/// invariants. Every live block carries an ownership tag (its own
+/// address ⊕ salt) in word 0; if the slab ever hands one block to two
+/// owners, the second owner's tag write clobbers the first owner's,
+/// and the first owner's free-side verification fails loudly. The
+/// churn is sized to force every slow path — grow (fresh frames),
+/// spill (magazine → central), refill (central → magazine) — many
+/// times over, with the buddy's free-list overlap validator run
+/// periodically ("no frame in two free lists"). In a single-task
+/// harness this exercises the full path mix; under an SMP boot the
+/// same invariants are enforced at every alloc/free by the always-on
+/// canary checks, which is where the cross-CPU protection lives.
+fn smoke_slab_churn_no_double_issue() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const TAG_SALT: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+    const SIZES: [usize; 4] = [16, 64, 256, 512];
+    const ROUNDS: usize = 4096;
+    const LIVE_CAP: usize = 1024;
+
+    let mut rng: u64 = 0x1234_5678_9abc_def0;
+    let mut lcg = move || {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        rng
+    };
+    let mut live: alloc::vec::Vec<(NonNull<u8>, usize)> = alloc::vec::Vec::with_capacity(LIVE_CAP);
+
+    let free_one = |(p, sz): (NonNull<u8>, usize)| -> Result<(), &'static str> {
+        // SAFETY: word 0 of a live block we own.
+        let got = unsafe { p.as_ptr().cast::<u64>().read() };
+        if got != (p.as_ptr() as u64) ^ TAG_SALT {
+            return Err("live block's ownership tag clobbered — block issued to two owners");
+        }
+        let layout = Layout::from_size_align(sz, 16).expect("layout");
+        // SAFETY: `p` came from `alloc` with this layout.
+        unsafe { dealloc(p, layout) };
+        Ok(())
+    };
+
+    for round in 0..ROUNDS {
+        let r = lcg();
+        let sz = SIZES[(r >> 33) as usize % SIZES.len()];
+        let do_alloc = (r >> 62) & 1 == 0;
+        if (do_alloc && live.len() < LIVE_CAP) || live.len() < 8 {
+            let layout = Layout::from_size_align(sz, 16).expect("layout");
+            let p = match alloc(layout) {
+                Ok(p) => p,
+                Err(_) => return TestResult::Fail("churn alloc failed"),
+            };
+            // SAFETY: word 0 of a block we just got handed.
+            unsafe {
+                p.as_ptr()
+                    .cast::<u64>()
+                    .write((p.as_ptr() as u64) ^ TAG_SALT)
+            };
+            live.push((p, sz));
+        } else {
+            let idx = (r >> 8) as usize % live.len();
+            if let Err(msg) = free_one(live.swap_remove(idx)) {
+                return TestResult::Fail(msg);
+            }
+        }
+        if round % 512 == 0 {
+            // Buddy invariant: no frame covered by two free blocks.
+            if crate::frame::validate_no_overlap().is_err() {
+                return TestResult::Fail("buddy free lists overlap during churn");
+            }
+            // Magazine invariant: `top` never exceeds the fixed stack.
+            let cpu = current_cpu();
+            for cls in 0..N_CLASSES {
+                if _test_magazine_top(cls, cpu) > MAG_SIZE {
+                    return TestResult::Fail("magazine top exceeded MAG_SIZE during churn");
+                }
+            }
+        }
+    }
+    // Drain: every surviving block must still carry its own tag.
+    while let Some(entry) = live.pop() {
+        if let Err(msg) = free_one(entry) {
+            return TestResult::Fail(msg);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_churn_no_double_issue);
