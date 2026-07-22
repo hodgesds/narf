@@ -76,6 +76,16 @@ pub struct ProcTaskInfo {
     /// Creation time in USER_HZ ticks since boot — stat field 22; `ps`
     /// composes it with /proc/stat's btime for wall start times.
     pub starttime_ticks: u64,
+    /// Effective uid/gid — surfaced as the `Uid:`/`Gid:` lines of
+    /// /proc/[pid]/status (glibc + systemd parse these to identify a
+    /// process owner). NARF tracks a single id, so the real/effective/
+    /// saved/fs columns all mirror this value.
+    pub uid: u32,
+    pub gid: u32,
+    /// Thread count — stat field 20 (`num_threads`) and the status
+    /// `Threads:` line. 0 is normalised to 1 by the renderers so a task
+    /// that predates per-thread accounting still reports one thread.
+    pub num_threads: u64,
 }
 
 /// A key-value pair from the ELF auxiliary vector.  Used by
@@ -971,7 +981,7 @@ impl DirOps for ProcPidDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
-            "fd" | "fdinfo" | "task" | "ns" => return Some(Arc::new(ProcDirMarker)),
+            "fd" | "fdinfo" | "task" | "ns" | "attr" => return Some(Arc::new(ProcDirMarker)),
             _ => {}
         }
         // user-ns id-map files (read + one-shot write).
@@ -1013,6 +1023,7 @@ impl DirOps for ProcPidDir {
             "fdinfo" => Some(Arc::new(pid_ext::ProcFdInfoDir { pid: self.pid })),
             "task" => Some(Arc::new(pid_ext::ProcTaskDir { pid: self.pid })),
             "ns" => Some(Arc::new(ProcNsDir { pid: self.pid })),
+            "attr" => Some(Arc::new(ProcAttrDir)),
             _ => None,
         }
     }
@@ -1094,7 +1105,23 @@ impl DirOps for ProcPidDir {
                     file_type: FileType::File,
                 },
                 DirEntry {
+                    name: "mounts",
+                    file_type: FileType::File,
+                },
+                DirEntry {
                     name: "mountstats",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "loginuid",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "sessionid",
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "setgroups",
                     file_type: FileType::File,
                 },
                 DirEntry {
@@ -1146,6 +1173,10 @@ impl DirOps for ProcPidDir {
                 },
                 DirEntry {
                     name: "ns",
+                    file_type: FileType::Dir,
+                },
+                DirEntry {
+                    name: "attr",
                     file_type: FileType::Dir,
                 },
             ]
@@ -1222,6 +1253,68 @@ impl FileOps for ProcNsLink {
                 file_type: FileType::Symlink,
                 perms: 0o777,
             },
+            mtime_cycles: 0,
+        }
+    }
+}
+
+// ── /proc/<pid>/attr — LSM (SELinux/AppArmor) security context ───
+//
+// NARF has no MAC layer, so every attr node reads as empty (Linux
+// returns an empty string when no security module is active) and
+// accepts writes as no-ops. systemd probes attr/current to decide
+// whether to relabel; an empty read is the "unconfined" answer.
+//
+// Linux ref: `security/proc.c` / `fs/proc/base.c:proc_pid_attr_operations`.
+
+const ATTR_NAMES: &[&str] = &[
+    "current",
+    "exec",
+    "prev",
+    "fscreate",
+    "keycreate",
+    "sockcreate",
+];
+
+#[derive(Debug)]
+struct ProcAttrDir;
+
+impl DirOps for ProcAttrDir {
+    fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        if ATTR_NAMES.contains(&name) {
+            Some(Arc::new(ProcAttrFile))
+        } else {
+            None
+        }
+    }
+    fn lookup_dir(&self, _name: &str) -> Option<Arc<dyn DirOps>> {
+        None
+    }
+    fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
+        Box::new(ATTR_NAMES.iter().map(|n| DirEntry {
+            name: n,
+            file_type: FileType::File,
+        }))
+    }
+}
+
+/// One `/proc/<pid>/attr/*` node. Reads empty (no active LSM); writes
+/// succeed as no-ops so a relabel attempt does not error.
+#[derive(Debug)]
+struct ProcAttrFile;
+
+impl FileOps for ProcAttrFile {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        Box::pin(async move { Ok(buf.len()) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode::FILE_RW,
             mtime_cycles: 0,
         }
     }
@@ -1913,8 +2006,9 @@ fn render_stat(info: &ProcTaskInfo) -> String {
         .map(|v| v.end.saturating_sub(v.start))
         .sum();
     let rss_pages = vsize / 4096; // no per-page residency — VmRSS mirrors VmSize
+    let num_threads = info.num_threads.max(1); // field 20; 0 → 1
     format!(
-        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 1 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {}          0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         info.pid,
         info.comm,
         info.state,
@@ -1923,6 +2017,7 @@ fn render_stat(info: &ProcTaskInfo) -> String {
         info.session,
         info.utime_ticks,
         info.stime_ticks,
+        num_threads,
         info.starttime_ticks,
         vsize,
         rss_pages,
@@ -1949,6 +2044,26 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Ngid:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t{}\n", info.ppid));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("TracerPid:\t0\n"));
+    // Uid/Gid: real, effective, saved, fs — NARF tracks one id, so all
+    // four columns mirror it. glibc's __libc_setup_tls and systemd's
+    // uid/gid probes parse these tab-separated quads.
+    let _ =
+        core::fmt::Write::write_fmt(&mut s, format_args!("Uid:\t{0}\t{0}\t{0}\t{0}\n", info.uid));
+    let _ =
+        core::fmt::Write::write_fmt(&mut s, format_args!("Gid:\t{0}\t{0}\t{0}\t{0}\n", info.gid));
+    // FDSize/Groups: systemd reads FDSize when sizing its fd copy loop;
+    // an empty supplementary-group set is well-formed.
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("FDSize:\t64\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Groups:\t\n"));
+    // NStgid/NSpid/NSpgid/NSsid: the id as seen from each nested pid
+    // namespace, outermost first. NARF has a single pid namespace, so
+    // each is just the one visible id. systemd-nspawn + nsenter read
+    // NSpid to map a container pid back to the host.
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NStgid:\t{}\n", info.pid));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpid:\t{}\n", info.pid));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSpgid:\t{}\n", info.pgrp));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NSsid:\t{}\n", info.session));
     // Total mapped size from the VMA list. NARF doesn't separate resident
     // from virtual, so VmRSS/VmPeak/VmHWM mirror VmSize (best-effort, but
     // enough for ps/top to sort and display).
@@ -1969,8 +2084,26 @@ fn render_status(info: &ProcTaskInfo) -> String {
         &mut s,
         format_args!("VmStk:\t{} kB\n", info.stack_top / 1024),
     );
-    // Single-threaded processes (NARF threads aren't surfaced per-tid here).
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Threads:\t1\n"));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("Threads:\t{}\n", info.num_threads.max(1)),
+    );
+    // Capability sets — NARF runs everything with full capabilities (no
+    // capability model yet), so the bounding/effective/permitted/inheritable
+    // masks all read as the full 41-bit set. systemd's capability probe
+    // (CapBnd/CapEff) parses these hex bitmaps; an all-set value is the
+    // "unconfined" answer it expects for PID 1.
+    const CAP_FULL: u64 = 0x0000_01ff_ffff_ffff;
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapInh:\t0000000000000000\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapPrm:\t{:016x}\n", CAP_FULL));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapEff:\t{:016x}\n", CAP_FULL));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapBnd:\t{:016x}\n", CAP_FULL));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapAmb:\t0000000000000000\n"));
+    // Seccomp: 0 = disabled (SECCOMP_MODE_DISABLED). systemd reads this to
+    // decide whether a unit is already sandboxed. NoNewPrivs mirrors it.
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NoNewPrivs:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp_filters:\t0\n"));
     s
 }
 
@@ -2309,6 +2442,9 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         utime_ticks: 5,
         stime_ticks: 9,
         starttime_ticks: 6,
+        uid: 0,
+        gid: 0,
+        num_threads: 1,
     };
     let line = render_stat(&info);
     let f: Vec<&str> = line.split_whitespace().collect();
@@ -2370,3 +2506,112 @@ fn smoke_stat_per_cpu_lines_real_idle() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_stat_per_cpu_lines_real_idle);
+
+/// Build a fully-populated `ProcTaskInfo` for the status/stat renderers.
+fn sample_info() -> ProcTaskInfo {
+    ProcTaskInfo {
+        pid: 42,
+        comm: String::from("worker"),
+        state: 'S',
+        brk_top: 0x4000,
+        stack_top: 0x8000,
+        cmdline: alloc::vec![b'a', 0, b'b', 0],
+        vmas: Vec::new(),
+        ppid: 7,
+        pgrp: 3,
+        session: 3,
+        utime_ticks: 1,
+        stime_ticks: 2,
+        starttime_ticks: 9,
+        uid: 1000,
+        gid: 1001,
+        num_threads: 4,
+    }
+}
+
+/// /proc/[pid]/stat field 4 (0-based index 3) is the PPID that systemd's
+/// `pid_is_my_child` parses, and field 20 (index 19) is num_threads.
+fn smoke_pid_stat_ppid_and_nthreads() -> TestResult {
+    let line = render_stat(&sample_info());
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() != 52 {
+        return TestResult::Fail("stat must have exactly 52 fields");
+    }
+    if f[3] != "7" {
+        return TestResult::Fail("stat field 4 (ppid) must be the parent pid");
+    }
+    if f[19] != "4" {
+        return TestResult::Fail("stat field 20 (num_threads) must reflect thread count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_pid_stat_ppid_and_nthreads);
+
+/// A single-threaded task (num_threads 0) still reports one thread in
+/// stat field 20 — the 0→1 normalisation.
+fn smoke_pid_stat_nthreads_min_one() -> TestResult {
+    let mut info = sample_info();
+    info.num_threads = 0;
+    let line = render_stat(&info);
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.get(19) == Some(&"1") {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("num_threads 0 must render as 1")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_pid_stat_nthreads_min_one);
+
+/// /proc/[pid]/status carries the PPid/Uid/Gid/Threads/NSpid/Seccomp/
+/// CapEff lines that glibc + systemd parse.
+fn smoke_pid_status_has_uid_gid_ppid_lines() -> TestResult {
+    let s = render_status(&sample_info());
+    let has = |prefix: &str, val: &str| s.lines().any(|l| l.starts_with(prefix) && l.contains(val));
+    if !has("PPid:", "7") {
+        return TestResult::Fail("status missing PPid line");
+    }
+    // Uid/Gid are tab-separated quads; the first column is what matters.
+    if !s.lines().any(|l| l.starts_with("Uid:\t1000")) {
+        return TestResult::Fail("status missing Uid line");
+    }
+    if !s.lines().any(|l| l.starts_with("Gid:\t1001")) {
+        return TestResult::Fail("status missing Gid line");
+    }
+    if !has("Threads:", "4") {
+        return TestResult::Fail("status Threads must reflect thread count");
+    }
+    if !has("NSpid:", "42") {
+        return TestResult::Fail("status missing NSpid line");
+    }
+    if !s.lines().any(|l| l.starts_with("Seccomp:")) {
+        return TestResult::Fail("status missing Seccomp line");
+    }
+    if !s.lines().any(|l| l.starts_with("CapEff:")) {
+        return TestResult::Fail("status missing CapEff line");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_pid_status_has_uid_gid_ppid_lines);
+
+/// /proc/<pid>/attr/current stat() is a regular RW file that reads
+/// empty (no active LSM) — the "unconfined" answer systemd expects.
+fn smoke_attr_current_empty_and_rw() -> TestResult {
+    let dir = ProcAttrDir;
+    let Some(node) = dir.lookup("current") else {
+        return TestResult::Fail("attr/current must exist");
+    };
+    if node.stat().mode != Mode::FILE_RW {
+        return TestResult::Fail("attr/current must be RW");
+    }
+    let mut buf = [0u8; 8];
+    match poll_once(node.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("attr/current must read 0 bytes"),
+    }
+    // A write must succeed (no-op) rather than error.
+    match poll_once(node.write(0, b"system_u:system_r:init_t")) {
+        Some(Ok(n)) if n > 0 => TestResult::Pass,
+        _ => TestResult::Fail("attr/current write must succeed"),
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_attr_current_empty_and_rw);

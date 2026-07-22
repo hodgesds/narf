@@ -49,8 +49,20 @@ pub enum PidExtField {
     CoredumpFilter,
     Mountinfo,
     Mountstats,
+    /// `/proc/<pid>/mounts` — the per-pid mount table (same shape as
+    /// /proc/mounts). systemd + util-linux read it to enumerate mounts.
+    Mounts,
     Personality,
     Cgroup,
+    /// `/proc/<pid>/loginuid` — the audit login uid. Writable:
+    /// systemd-logind stamps it on session setup.
+    /// Linux ref: `kernel/audit.c:audit_set_loginuid` via `fs/proc/base.c`.
+    Loginuid,
+    /// `/proc/<pid>/sessionid` — the audit session id (read-only).
+    Sessionid,
+    /// `/proc/<pid>/setgroups` — user-ns "allow"/"deny" for setgroups(2)
+    /// inside the namespace. Writable one-shot; defaults to "allow".
+    Setgroups,
     /// `/proc/<pid>/statm` — 7-field page-count memory summary.
     /// Linux ref: `fs/proc/array.c:proc_pid_statm`.
     Statm,
@@ -109,6 +121,27 @@ impl FileOps for PidExtFile {
                     hook_coredump_set(pid, bits).map_err(|_| FsError::InvalidData)?;
                     Ok(buf.len())
                 }
+                PidExtField::Loginuid => {
+                    // systemd-logind writes the session's login uid. Accept and
+                    // record it; u32::MAX clears it back to "unset".
+                    let s = core::str::from_utf8(buf.trim_ascii_end())
+                        .map_err(|_| FsError::InvalidData)?;
+                    let uid: u32 = s.parse().map_err(|_| FsError::InvalidData)?;
+                    loginuid_set(pid, uid);
+                    Ok(buf.len())
+                }
+                PidExtField::Setgroups => {
+                    // user-ns "allow"/"deny". NARF has no per-ns setgroups gate
+                    // yet, so accept a well-formed value as a no-op rather than
+                    // failing the write (systemd/newuidmap expect success).
+                    let s = core::str::from_utf8(buf.trim_ascii_end())
+                        .map_err(|_| FsError::InvalidData)?;
+                    if s == "allow" || s == "deny" {
+                        Ok(buf.len())
+                    } else {
+                        Err(FsError::InvalidData)
+                    }
+                }
                 _ => Err(FsError::ReadOnly),
             }
         })
@@ -162,7 +195,10 @@ impl FileOps for PidExtFile {
         }
         let writable = matches!(
             self.field,
-            PidExtField::OomScoreAdj | PidExtField::CoredumpFilter
+            PidExtField::OomScoreAdj
+                | PidExtField::CoredumpFilter
+                | PidExtField::Loginuid
+                | PidExtField::Setgroups
         );
         Stat {
             size: 0,
@@ -196,9 +232,13 @@ pub fn lookup_pid_ext(pid: u64, name: &str) -> Option<PidExtFile> {
         "coredump_filter" => PidExtField::CoredumpFilter,
         "mountinfo" => PidExtField::Mountinfo,
         "mountstats" => PidExtField::Mountstats,
+        "mounts" => PidExtField::Mounts,
         "personality" => PidExtField::Personality,
         "cgroup" => PidExtField::Cgroup,
         "statm" => PidExtField::Statm,
+        "loginuid" => PidExtField::Loginuid,
+        "sessionid" => PidExtField::Sessionid,
+        "setgroups" => PidExtField::Setgroups,
         // Magic symlinks [[proc-magic-links]].
         "exe" => PidExtField::Exe,
         "cwd" => PidExtField::Cwd,
@@ -235,7 +275,27 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
         }
         PidExtField::Mountinfo => render_mountinfo(pid).into_bytes(),
         PidExtField::Mountstats => render_mountstats(pid).into_bytes(),
+        PidExtField::Mounts => render_mounts(pid).into_bytes(),
         PidExtField::Personality => b"00000000\n".to_vec(),
+        PidExtField::Loginuid => {
+            // Linux emits the raw uid, or the u32 sentinel (4294967295) when
+            // unset. NARF stores per-pid; default = unset.
+            let v = loginuid_get(pid);
+            match v {
+                Some(uid) => format!("{}\n", uid).into_bytes(),
+                None => b"4294967295\n".to_vec(),
+            }
+        }
+        PidExtField::Sessionid => {
+            // Audit session id: the u32 sentinel means "no session", which is
+            // the correct answer until systemd-logind assigns one.
+            b"4294967295\n".to_vec()
+        }
+        PidExtField::Setgroups => {
+            // user-ns setgroups policy. Default "allow" (matches a fresh ns
+            // before anyone writes "deny").
+            b"allow\n".to_vec()
+        }
         PidExtField::Statm => render_statm(pid).into_bytes(),
         // Magic symlinks — read() returns the target path verbatim so
         // that sys_readlink (which calls file.read()) gets the string.
@@ -511,6 +571,45 @@ fn render_mountstats(_pid: u64) -> String {
         let _ = writeln!(s, "device rootfs mounted on / with fstype rootfs");
     }
     s
+}
+
+/// `/proc/<pid>/mounts` — the task's mount table (fstab-style rows).
+///
+/// Linux ref: `fs/proc_namespace.c:show_vfsmnt`. Same content as the
+/// global /proc/mounts; each row is
+///   `device mountpoint fstype options 0 0`.
+fn render_mounts(_pid: u64) -> String {
+    let mut s = String::new();
+    for (path, fs_name) in crate::registry().list_with_names() {
+        let _ = writeln!(s, "{} {} {} rw,relatime 0 0", fs_name, path, fs_name);
+    }
+    if s.is_empty() {
+        let _ = writeln!(s, "rootfs / rootfs rw,relatime 0 0");
+    }
+    s
+}
+
+/// Per-pid audit login uid store. `None` (absent) ⇒ the unset sentinel.
+/// systemd-logind writes this on session setup; NARF records it so a
+/// subsequent read round-trips.
+static LOGINUID_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u32>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn loginuid_get(pid: u64) -> Option<u32> {
+    let g = LOGINUID_TABLE.lock();
+    g.as_ref().and_then(|m| m.get(&pid).copied())
+}
+
+fn loginuid_set(pid: u64, uid: u32) {
+    let mut g = LOGINUID_TABLE.lock();
+    let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+    // The u32 sentinel clears the stored value (Linux treats it as "unset").
+    if uid == u32::MAX {
+        m.remove(&pid);
+    } else {
+        m.insert(pid, uid);
+    }
 }
 
 /// `/proc/<pid>/statm` — seven space-separated page-count fields.
@@ -1266,3 +1365,116 @@ kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_root_link_defaults_to_slash
 );
+
+/// Smoke: /proc/<pid>/loginuid round-trips a written uid (systemd-logind
+/// stamps it) and reports the unset sentinel before any write.
+fn smoke_loginuid_write_round_trips() -> TestResult {
+    use super::poll_once;
+    // A stable per-test pid to avoid colliding with any live task.
+    const PID: u64 = 0x000f_109a_1d01;
+    let f = PidExtFile {
+        pid: PID,
+        field: PidExtField::Loginuid,
+    };
+    // The node must be writable per its stat().
+    if f.stat().mode != Mode::FILE_RW {
+        return TestResult::Fail("loginuid must be RW");
+    }
+    // Fresh pid → unset sentinel 4294967295.
+    let mut buf = [0u8; 16];
+    match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) => {
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+            if s.trim() != "4294967295" {
+                return TestResult::Fail("unset loginuid must read the u32 sentinel");
+            }
+        }
+        _ => return TestResult::Fail("loginuid read failed"),
+    }
+    // Write a uid; a write must succeed (not EPERM).
+    match poll_once(f.write(0, b"1000\n")) {
+        Some(Ok(n)) if n > 0 => {}
+        _ => return TestResult::Fail("loginuid write must succeed"),
+    }
+    // Read back the stored value.
+    let mut buf2 = [0u8; 16];
+    match poll_once(f.read(0, &mut buf2)) {
+        Some(Ok(n)) => {
+            let s = core::str::from_utf8(&buf2[..n]).unwrap_or("");
+            if s.trim() == "1000" {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("loginuid did not round-trip the written uid")
+            }
+        }
+        _ => TestResult::Fail("loginuid read-back failed"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_loginuid_write_round_trips
+);
+
+/// Smoke: /proc/<pid>/setgroups accepts "deny" (systemd/newuidmap write
+/// it) and rejects garbage.
+fn smoke_setgroups_accepts_allow_deny() -> TestResult {
+    use super::poll_once;
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::Setgroups,
+    };
+    if f.stat().mode != Mode::FILE_RW {
+        return TestResult::Fail("setgroups must be RW");
+    }
+    match poll_once(f.write(0, b"deny\n")) {
+        Some(Ok(n)) if n > 0 => {}
+        _ => return TestResult::Fail("setgroups 'deny' must succeed"),
+    }
+    match poll_once(f.write(0, b"garbage")) {
+        Some(Err(_)) => TestResult::Pass,
+        _ => TestResult::Fail("setgroups must reject a non allow/deny value"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_setgroups_accepts_allow_deny
+);
+
+/// Smoke: /proc/<pid>/mounts renders at least one fstab-style row with
+/// the trailing "0 0" dump/pass columns.
+fn smoke_mounts_has_fstab_row() -> TestResult {
+    let out = render_mounts(1);
+    let ok = out.lines().next().map(|l| {
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        toks.len() == 6 && toks[4] == "0" && toks[5] == "0"
+    });
+    if ok == Some(true) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mounts row must be 6 space-separated fields ending '0 0'")
+    }
+}
+kernel_test_in!("filesystem/procfs/pid_ext", smoke_mounts_has_fstab_row);
+
+/// Smoke: /proc/<pid>/cgroup renders the v2 "0::<path>" unified line
+/// (systemd reads this to place a process in its slice).
+fn smoke_cgroup_v2_unified_line() -> TestResult {
+    use super::poll_once;
+    let f = PidExtFile {
+        pid: 1,
+        field: PidExtField::Cgroup,
+    };
+    let mut buf = [0u8; 64];
+    match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) => {
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("");
+            if s.starts_with("0::") {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("cgroup must start with the v2 '0::' prefix")
+            }
+        }
+        _ => TestResult::Fail("cgroup read failed"),
+    }
+}
+kernel_test_in!("filesystem/procfs/pid_ext", smoke_cgroup_v2_unified_line);

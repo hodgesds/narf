@@ -12423,6 +12423,18 @@ pub fn thread_group_live_dec(pid: u64) -> bool {
     }
 }
 
+/// Live-thread count of thread-group `pid`. Single-threaded groups are
+/// never tracked (their implicit count is 1), so an absent entry reads as
+/// 1. Backs /proc/[pid]/status `Threads:` and stat field 20.
+pub fn thread_group_live_count(pid: u64) -> u64 {
+    let g = THREAD_GROUP_LIVE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&pid).copied())
+        .map(|n| n as u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
 /// Test-only: reset the live-thread accounting.
 #[doc(hidden)]
 pub fn __test_thread_group_live_reset() {
@@ -19156,6 +19168,19 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
         utime_ticks: cpu_time_ns_of(tid) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(tid) / NS_PER_TICK,
         starttime_ticks: task_start_ns(tid) / NS_PER_TICK,
+        // Effective uid/gid from the per-task credential table — surfaced as
+        // the status Uid:/Gid: lines. Defaults to 0/0 (root) for tasks that
+        // never called setuid/setgid, matching NARF's default identity.
+        uid: {
+            let c = read_uidgid(tid);
+            c.euid
+        },
+        gid: {
+            let c = read_uidgid(tid);
+            c.egid
+        },
+        // Live thread count of this thread-group (visible pid keys the table).
+        num_threads: thread_group_live_count(pid),
     })
 }
 

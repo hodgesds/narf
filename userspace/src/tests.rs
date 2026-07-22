@@ -7934,6 +7934,32 @@ fn smoke_userspace_exit_observer_group_dead_once() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_exit_observer_group_dead_once);
 
+/// `thread_group_live_count` (backs /proc/[pid]/status `Threads:` and
+/// stat field 20) reports 1 for an untracked single-threaded group and
+/// the tracked count for a multi-threaded one.
+fn smoke_userspace_thread_group_live_count() -> TestResult {
+    use crate::handlers::{
+        __test_thread_group_live_reset, thread_group_live_count, thread_group_live_inc,
+    };
+    __test_thread_group_live_reset();
+    const PID: u64 = 7100;
+    // Untracked group → implicit 1.
+    if thread_group_live_count(PID) != 1 {
+        __test_thread_group_live_reset();
+        return TestResult::Fail("untracked group must count as 1 thread");
+    }
+    // Two CLONE_THREAD siblings join the implicit main → count 3.
+    thread_group_live_inc(PID);
+    thread_group_live_inc(PID);
+    if thread_group_live_count(PID) != 3 {
+        __test_thread_group_live_reset();
+        return TestResult::Fail("tracked group must report its live thread count");
+    }
+    __test_thread_group_live_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_thread_group_live_count);
+
 /// FUTEX_WAKE_OP (op 5) must atomically read-modify-write `*uaddr2` per the
 /// encoded op AND wake (up to `val`) waiters on `uaddr` — Linux
 /// `futex_wake_op`. Regression: op 5 fell through to the `_ => fail` arm
