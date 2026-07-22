@@ -479,6 +479,37 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
             }
             rbp = next_rbp;
         }
+        // Stack-scan fallback: release builds omit frame pointers (rbp==0
+        // above), so also scan the stack from rsp for words that land in the
+        // kernel .text — approximate return addresses to symbolize with
+        // addr2line (`+off` from __text_start). Same technique as the trap
+        // handler; the only backtrace that works after a Rust panic! in a
+        // frame-pointer-less build.
+        extern "C" {
+            static __text_start: u8;
+            static __text_end: u8;
+        }
+        let tstart = core::ptr::addr_of!(__text_start) as u64;
+        let tend = core::ptr::addr_of!(__text_end) as u64;
+        if tend > tstart && rsp != 0 && rsp & 0x7 == 0 {
+            let _ = writeln!(
+                buf,
+                "  backtrace (stack words in kernel .text [{tstart:#x}..{tend:#x}], +off = addr2line):"
+            );
+            let mut printed = 0u32;
+            for i in 0..256u64 {
+                if printed >= 24 {
+                    break;
+                }
+                // SAFETY: rsp is the live (aligned) kernel stack pointer; the
+                // window stays on the current stack. Fatal path — best effort.
+                let v = unsafe { core::ptr::read_volatile((rsp + i * 8) as *const u64) };
+                if v >= tstart && v < tend {
+                    let _ = writeln!(buf, "    [{:#06x}] {v:#018x}  (+{:#x})", i * 8, v - tstart);
+                    printed += 1;
+                }
+            }
+        }
     }
     let msg = &buf.bytes[..buf.len];
 
