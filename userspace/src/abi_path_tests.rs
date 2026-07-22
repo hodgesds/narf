@@ -978,11 +978,61 @@ kernel_test_in!("syscall_abi", smoke_abi_path_rename_missing_is_enoent);
 // op must succeed on a tmpfs path AND the created node must stat with the
 // right type/mode. mkdir+chmod, symlink, and utimensat are covered here.
 
-// NOTE: chmod mode round-trip (file `z`/`Z` + dir `d`/`D` tmpfiles lines) is a
-// follow-up: sys_fchmodat persists file perms via FileOps::set_perms, but the
-// stat path in the mounted-MemFs test harness doesn't yet reflect it and dirs
-// have no DirOps::set_perms. Tracked separately; the chmod→ENOENT-on-missing
-// and errno tests below cover the parts that work today.
+// chmod on a tmpfs FILE persists the mode: a later stat reflects the new
+// low-9 bits. systemd-tmpfiles `z`/`Z` lines chmod a file and then stat it to
+// confirm the mode took. The x86_64 legacy `chmod(2)` and the `fchmodat(2)`
+// both route through sys_fchmodat, which persists via FileOps::set_perms.
+fn smoke_abi_path_chmod_file_mode_roundtrips() -> TestResult {
+    with_memfs("/run", "run", &[("cfg", b"data")], || {
+        let path = b"/run/cfg\0";
+        if call_chmod(path.as_ptr() as u64, 0o640) != Some(0) {
+            return Err("chmod(/run/cfg, 0o640) should return 0");
+        }
+        let mut sb = [0u8; 256];
+        if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat(/run/cfg) should return 0");
+        }
+        // st_mode is at offset 24 in the x86_64/aarch64 struct stat.
+        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        if mode & 0o777 == 0o640 {
+            Ok(())
+        } else {
+            Err("chmod on a file must round-trip the low-9 mode bits through stat")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_chmod_file_mode_roundtrips);
+
+// chmod on a tmpfs DIRECTORY persists the mode: a later stat reports S_IFDIR
+// with the new perms. systemd-tmpfiles `d`/`D` lines chmod a directory, and
+// dbus/systemd reject XDG_RUNTIME_DIR unless it is not group/other-writable —
+// so `chmod 0700` on a tmpfs dir must show through stat.
+fn smoke_abi_path_chmod_dir_mode_roundtrips() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let dir = b"/run/lock\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir(/run/lock, 0o755) should return 0");
+        }
+        if call_chmod(dir.as_ptr() as u64, 0o700) != Some(0) {
+            return Err("chmod(/run/lock, 0o700) should return 0");
+        }
+        let mut sb = [0u8; 256];
+        if call_stat(dir.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat(/run/lock) should return 0");
+        }
+        // st_mode at offset 24: S_IFMT=0o170000, S_IFDIR=0o40000.
+        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        if mode & 0o170000 != 0o40000 {
+            return Err("chmod'd dir must still stat as S_IFDIR");
+        }
+        if mode & 0o777 == 0o700 {
+            Ok(())
+        } else {
+            Err("chmod on a dir must round-trip the low-9 mode bits through stat")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_chmod_dir_mode_roundtrips);
 
 // chmod on a missing tmpfs path returns ENOENT, not the bare -1 → EPERM.
 fn smoke_abi_path_chmod_missing_is_enoent() -> TestResult {
