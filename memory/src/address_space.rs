@@ -1916,13 +1916,15 @@ impl AddressSpace {
                     Err(MapError::NonCanonical) => {
                         return Err(AddressSpaceError::OutOfRange);
                     }
-                    Err(e) => {
-                        panic!(
-                            "materialize map_4kb failed at virt {:x} phys {:x} with {:?}",
-                            v.raw(),
-                            p.raw(),
-                            e
-                        );
+                    // Any other map_4kb failure (frame exhaustion `NoFrame`, an
+                    // unexpected `AlreadyMapped`, a misaligned VA) is caused by a
+                    // user-triggered fork/exec/mmap under resource pressure — it
+                    // must fail the AS build so the caller tears the AS down and
+                    // returns an error, NEVER panic the whole kernel (systemd
+                    // spawns dozens of services concurrently under SMP, so this
+                    // path is hit under heavy allocation load).
+                    Err(_) => {
+                        return Err(AddressSpaceError::Overlap);
                     }
                 }
             }
@@ -1971,13 +1973,15 @@ impl AddressSpace {
                 match unsafe { map_4kb(self.root, v, *p, flags) } {
                     Ok(()) => {}
                     Err(MapError::AlreadyMapped) => {}
-                    Err(e) => {
-                        panic!(
-                            "materialize map_4kb failed at virt {:x} phys {:x} with {:?}",
-                            v.raw(),
-                            p.raw(),
-                            e
-                        );
+                    // Any other map_4kb failure (frame exhaustion `NoFrame`, an
+                    // unexpected `AlreadyMapped`, a misaligned VA) is caused by a
+                    // user-triggered fork/exec/mmap under resource pressure — it
+                    // must fail the AS build so the caller tears the AS down and
+                    // returns an error, NEVER panic the whole kernel (systemd
+                    // spawns dozens of services concurrently under SMP, so this
+                    // path is hit under heavy allocation load).
+                    Err(_) => {
+                        return Err(AddressSpaceError::Overlap);
                     }
                 }
             }
