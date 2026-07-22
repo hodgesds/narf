@@ -1084,6 +1084,9 @@ impl DirOps for DevEmptyDir {
     fn enumerate(&self, _cursor: usize, _max: usize) -> Vec<(String, FileType)> {
         Vec::new()
     }
+    fn symlink<'a>(&'a self, _name: &'a str, _target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::ReadOnly) })
+    }
 }
 
 /// `DevFs` root directory — exposes `null` and `zero` as fixed
@@ -1092,6 +1095,14 @@ impl DirOps for DevEmptyDir {
 struct DevDir;
 
 impl DirOps for DevDir {
+    fn symlink<'a>(&'a self, name: &'a str, _target: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+        if self.lookup(name).is_some() {
+            Box::pin(async move { Err(FsError::Busy) })
+        } else {
+            Box::pin(async move { Err(FsError::ReadOnly) })
+        }
+    }
+
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         match name {
             // Static symlinks [[devfs-symlinks]].

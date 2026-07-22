@@ -72,6 +72,7 @@ const FILES: &[&str] = &[
     "memory.swap.max",
     "memory.zswap.current",
     "memory.zswap.max",
+    "memory.zswap.writeback",
 ];
 
 /// Guards the one-time install of the allocator charge hook. Set the
@@ -182,6 +183,7 @@ impl Controller for MemoryController {
             events_oom: AtomicU64::new(0),
             events_oom_kill: AtomicU64::new(0),
             oom_group: AtomicBool::new(false),
+            zswap_writeback: AtomicBool::new(true),
         })
     }
 }
@@ -206,6 +208,7 @@ pub struct MemoryState {
     /// mirroring `swap_max`. Present so systemd can read it back rather
     /// than seeing ENOENT and logging a spurious debug error.
     zswap_max: IrqSafeSpinLock<Option<u64>>,
+    zswap_writeback: AtomicBool,
     /// `memory.events` counters (this cgroup's own — i.e. `.local`).
     events_low: AtomicU64,
     events_high: AtomicU64,
@@ -348,6 +351,12 @@ impl ControllerState for MemoryState {
             "memory.reclaim" => String::new(),
             "memory.zswap.current" => format!("{}\n", self.zswap_current.load(Ordering::Acquire)),
             "memory.zswap.max" => max_line(&self.zswap_max.lock()),
+            "memory.zswap.writeback" => {
+                format!(
+                    "{}\n",
+                    u8::from(self.zswap_writeback.load(Ordering::Acquire))
+                )
+            }
             // We charge each level directly, so this cgroup's own
             // counters ARE its local counters: events == events.local.
             "memory.events" | "memory.events.local" => self.events_block(),
@@ -416,6 +425,17 @@ impl ControllerState for MemoryState {
                 *self.zswap_max.lock() = parse_limit(buf)?;
                 Ok(())
             }
+            "memory.zswap.writeback" => {
+                match core::str::from_utf8(buf)
+                    .map_err(|_| FsError::InvalidData)?
+                    .trim()
+                {
+                    "0" => self.zswap_writeback.store(false, Ordering::Release),
+                    "1" => self.zswap_writeback.store(true, Ordering::Release),
+                    _ => return Err(FsError::InvalidData),
+                }
+                Ok(())
+            }
             _ => Err(FsError::ReadOnly),
         }
     }
@@ -431,6 +451,7 @@ impl ControllerState for MemoryState {
                 | "memory.oom.group"
                 | "memory.reclaim"
                 | "memory.zswap.max"
+                | "memory.zswap.writeback"
         )
     }
 

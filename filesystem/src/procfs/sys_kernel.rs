@@ -38,6 +38,8 @@ use crate::FsError;
 
 static HOSTNAME: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 static DOMAINNAME: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
+static PRINTK_DEVKMSG: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
+static CORE_PATTERN: IrqSafeSpinLock<String> = IrqSafeSpinLock::new(String::new());
 
 static PID_MAX: AtomicU32 = AtomicU32::new(32768);
 static THREADS_MAX: AtomicU32 = AtomicU32::new(65536);
@@ -110,6 +112,18 @@ fn ensure_defaults() {
         let mut g = DOMAINNAME.lock();
         if g.is_empty() {
             *g = String::from("(none)");
+        }
+    }
+    {
+        let mut g = PRINTK_DEVKMSG.lock();
+        if g.is_empty() {
+            *g = String::from("on");
+        }
+    }
+    {
+        let mut g = CORE_PATTERN.lock();
+        if g.is_empty() {
+            *g = String::from("core");
         }
     }
 }
@@ -278,6 +292,34 @@ fn read_modprobe() -> String {
     String::from("\n")
 }
 
+fn read_printk_devkmsg() -> String {
+    ensure_defaults();
+    format!("{}\n", PRINTK_DEVKMSG.lock().as_str())
+}
+fn write_printk_devkmsg(v: &str) -> Result<(), FsError> {
+    if v.len() > 64 {
+        return Err(FsError::InvalidData);
+    }
+    *PRINTK_DEVKMSG.lock() = v.to_string();
+    Ok(())
+}
+
+fn read_cap_last_cap() -> String {
+    String::from("40\n")
+}
+
+fn read_core_pattern() -> String {
+    ensure_defaults();
+    format!("{}\n", CORE_PATTERN.lock().as_str())
+}
+fn write_core_pattern(v: &str) -> Result<(), FsError> {
+    if v.len() > 128 {
+        return Err(FsError::InvalidData);
+    }
+    *CORE_PATTERN.lock() = v.to_string();
+    Ok(())
+}
+
 // ── kernel/random/* ─────────────────────────────────────────────
 
 // entropy_avail: report a fixed stub. NARF has no entropy pool yet;
@@ -379,6 +421,24 @@ pub fn register_all() {
         path: "kernel/printk",
         read: read_printk,
         write: None,
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/printk_devkmsg",
+        read: read_printk_devkmsg,
+        write: Some(write_printk_devkmsg),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/cap_last_cap",
+        read: read_cap_last_cap,
+        write: None,
+        perms: 0o444,
+    });
+    register_sysctl(SysctlEntry {
+        path: "kernel/core_pattern",
+        read: read_core_pattern,
+        write: Some(write_core_pattern),
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {

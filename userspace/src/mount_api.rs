@@ -171,7 +171,6 @@ pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
         "pstore" => empty("pstore"),
         "efivarfs" => empty("efivarfs"),
         "hugetlbfs" => empty("hugetlbfs"),
-        "bpf" => empty("bpf"),
         "binfmt_misc" => empty("binfmt_misc"),
         "autofs" => empty("autofs"),
 

@@ -87,6 +87,7 @@ static ICMP_RATELIMIT: AtomicU32 = AtomicU32::new(1000);
 // ephemeral port range
 pub static PORT_RANGE_LO: AtomicU32 = AtomicU32::new(32768);
 pub static PORT_RANGE_HI: AtomicU32 = AtomicU32::new(60999);
+static UNIX_MAX_DGRAM_QLEN: AtomicU32 = AtomicU32::new(512);
 
 /// Active congestion-control algorithm name. Defaults to "cubic".
 /// Valid values: "cubic", "reno" (subset of available).
@@ -519,6 +520,12 @@ pub fn register_all() {
             PORT_RANGE_HI.store(hi, Ordering::Relaxed);
             Ok(())
         }),
+        perms: 0o644,
+    });
+    register_sysctl(SysctlEntry {
+        path: "net/unix/max_dgram_qlen",
+        read: || read_atomic(&UNIX_MAX_DGRAM_QLEN),
+        write: Some(|s| write_atomic(&UNIX_MAX_DGRAM_QLEN, s)),
         perms: 0o644,
     });
 

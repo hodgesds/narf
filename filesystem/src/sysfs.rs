@@ -1476,6 +1476,18 @@ pub fn populate_all() {
     get_or_create_child(&pci, "devices");
     let firmware = get_or_create_child(&root, "firmware");
     get_or_create_child(&firmware, "acpi");
+    let efi = get_or_create_child(&firmware, "efi");
+    get_or_create_child(&efi, "efivars");
+    let kernel = get_or_create_child(&root, "kernel");
+    get_or_create_child(&kernel, "security");
+    get_or_create_child(&kernel, "config");
+    get_or_create_child(&kernel, "debug");
+    get_or_create_child(&kernel, "tracing");
+    let fs_dir = get_or_create_child(&root, "fs");
+    get_or_create_child(&fs_dir, "cgroup");
+    get_or_create_child(&fs_dir, "pstore");
+    let fuse_dir = get_or_create_child(&fs_dir, "fuse");
+    get_or_create_child(&fuse_dir, "connections");
 }
 
 // ── SysFs FsInstance ─────────────────────────────────────────────────
