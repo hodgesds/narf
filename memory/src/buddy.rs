@@ -372,16 +372,18 @@ impl BuddyZone {
             // Pessimistic worst-case bound: every frame is its own
             // order-0 block at this order. Caps each order at the
             // natural physical maximum.
-            let physical_max = (self.total_frames >> order).max(64) + 64;
-            // Realistic working bound: current contents + headroom
-            // for split/coalesce churn. The actual peak depends on
-            // workload fragmentation; 16 K entries per order absorbs
-            // bursty splits of MAX_ORDER blocks down to order 0
-            // (each split adds at most NUM_ORDERS-1 entries spread
-            // across lower orders).
-            const HEADROOM: usize = 16 * 1024;
-            let working = self.free_lists[order].len() + HEADROOM;
-            let cap = working.min(physical_max);
+            // Reserve the PESSIMISTIC physical bound (every frame its own
+            // order-N block), NOT a fixed headroom. A `Vec::push` in
+            // alloc()/free() runs under `frame::ALLOC.lock()`, and if it has to
+            // grow it routes to the global slab → `alloc_frame` → the same lock
+            // → a recursive-lock DEADLOCK (observed: under systemd's heavy
+            // fork/exec/exit churn a low-order free list outgrew a fixed 16 K
+            // headroom, and the reallocation hung the CPU spinning on its own
+            // lock). Reserving `physical_max` guarantees the free list can never
+            // reallocate at runtime. Cost is bounded: Σ(total_frames >> order) ≈
+            // 2·total_frames·8 bytes of capacity, reserved once at boot while the
+            // allocator is still bump.
+            let cap = (self.total_frames >> order).max(64) + 64;
             let need = cap.saturating_sub(self.free_lists[order].capacity());
             if need > 0 {
                 self.free_lists[order].reserve_exact(need);
