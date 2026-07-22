@@ -1810,6 +1810,9 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
                 Ok(l) => l,
                 Err(_) => break,
             };
+            if line.contains("Closing set fd ") {
+                continue;
+            }
             println!("{line}");
             if let Ok(mut g) = cap2.lock() {
                 g.push(line);
