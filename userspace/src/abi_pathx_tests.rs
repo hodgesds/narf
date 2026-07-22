@@ -641,12 +641,12 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_symlink_pos);
 
 fn smoke_abi_pathx_symlink_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        // Link parent directory missing → symlink fails (-1).
+        // Link parent directory missing → symlink fails with -ENOENT (Linux).
         let target = b"f\0";
         let link = b"/p2/no_such_dir/sl\0";
         match call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) {
-            Some(-1) => Ok(()),
-            _ => Err("symlink under a missing parent was not -1"),
+            Some(-2) => Ok(()),
+            _ => Err("symlink under a missing parent must return -ENOENT"),
         }
     })
 }
@@ -677,8 +677,8 @@ fn smoke_abi_pathx_symlinkat_neg() -> TestResult {
             Syscall::Symlinkat.raw(),
             a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
         ) {
-            Some(-1) => Ok(()),
-            _ => Err("symlinkat under a missing parent was not -1"),
+            Some(-2) => Ok(()),
+            _ => Err("symlinkat under a missing parent must return -ENOENT"),
         }
     })
 }

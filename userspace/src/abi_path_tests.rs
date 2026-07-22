@@ -870,3 +870,229 @@ fn smoke_abi_path_write_stamps_mtime() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_write_stamps_mtime);
+
+// ── tmpfs directory-mutation errno discipline (systemd mount teardown) ──
+//
+// systemd's mount teardown mkdir()s then rename/rmdir()s propagation dirs
+// under /run/systemd/propagate/<unit> (a tmpfs). A bare -1 → EPERM there
+// logged "Unable to remove propagation dir … Operation not permitted" and
+// aborted run-lock.mount. These pin the precise Linux errno each op must
+// return (never a bare -1 → EPERM).
+
+// rmdir of a freshly-created empty dir in a MemFs returns 0 (not EPERM).
+fn smoke_abi_path_rmdir_fresh_empty_dir_ok() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let dir = b"/run/fresh\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir(/run/fresh) should return 0");
+        }
+        match call_rmdir(dir.as_ptr() as u64) {
+            Some(0) => Ok(()),
+            Some(EPERM) => Err("rmdir(fresh empty dir) must NOT return EPERM (bare -1)"),
+            _ => Err("rmdir(fresh empty dir) should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rmdir_fresh_empty_dir_ok);
+
+// rmdir of a missing dir returns ENOENT, not the bare -1 → EPERM sentinel.
+fn smoke_abi_path_rmdir_missing_is_enoent() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let dir = b"/run/nope\0";
+        match call_rmdir(dir.as_ptr() as u64) {
+            Some(ENOENT) => Ok(()),
+            Some(EPERM) => Err("rmdir(missing) must be ENOENT, not EPERM"),
+            _ => Err("rmdir(missing) should return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rmdir_missing_is_enoent);
+
+// rmdir of a NON-empty dir returns ENOTEMPTY, not the bare -1 → EPERM.
+fn smoke_abi_path_rmdir_nonempty_is_enotempty() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let dir = b"/run/full\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir(/run/full) should return 0");
+        }
+        // Plant a child so the dir is non-empty.
+        let child = b"/run/full/child\0";
+        if call_creat(child.as_ptr() as u64, 0o644).unwrap_or(-1) < 0 {
+            return Err("creat(/run/full/child) should return a fd");
+        }
+        match call_rmdir(dir.as_ptr() as u64) {
+            Some(ENOTEMPTY) => Ok(()),
+            Some(EPERM) => Err("rmdir(non-empty) must be ENOTEMPTY, not EPERM"),
+            _ => Err("rmdir(non-empty dir) should return -ENOTEMPTY"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rmdir_nonempty_is_enotempty);
+
+// rename of a freshly-created dir within a MemFs returns 0.
+fn smoke_abi_path_rename_dir_ok() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let old = b"/run/pdir\0";
+        let new = b"/run/pdir2\0";
+        if call(
+            Syscall::Mkdirat.raw(),
+            a3(AT_FDCWD, old.as_ptr() as u64, 0o755, 0),
+        ) != Some(0)
+        {
+            return Err("mkdir(/run/pdir) should return 0");
+        }
+        match call_rename(old.as_ptr() as u64, new.as_ptr() as u64) {
+            Some(0) => Ok(()),
+            Some(EPERM) => Err("rename(dir) must NOT return EPERM (bare -1)"),
+            _ => Err("rename(dir within a MemFs) should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rename_dir_ok);
+
+// rename of a missing source returns ENOENT, not the bare -1 → EPERM.
+fn smoke_abi_path_rename_missing_is_enoent() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let old = b"/run/ghost\0";
+        let new = b"/run/there\0";
+        match call_rename(old.as_ptr() as u64, new.as_ptr() as u64) {
+            Some(ENOENT) => Ok(()),
+            Some(EPERM) => Err("rename(missing) must be ENOENT, not EPERM"),
+            _ => Err("rename(missing source) should return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rename_missing_is_enoent);
+
+// ── systemd-tmpfiles file-node ops on a tmpfs path ──
+//
+// systemd-tmpfiles creates/adjusts files+dirs per /usr/lib/tmpfiles.d. Each
+// op must succeed on a tmpfs path AND the created node must stat with the
+// right type/mode. mkdir+chmod, symlink, and utimensat are covered here.
+
+// NOTE: chmod mode round-trip (file `z`/`Z` + dir `d`/`D` tmpfiles lines) is a
+// follow-up: sys_fchmodat persists file perms via FileOps::set_perms, but the
+// stat path in the mounted-MemFs test harness doesn't yet reflect it and dirs
+// have no DirOps::set_perms. Tracked separately; the chmod→ENOENT-on-missing
+// and errno tests below cover the parts that work today.
+
+// chmod on a missing tmpfs path returns ENOENT, not the bare -1 → EPERM.
+fn smoke_abi_path_chmod_missing_is_enoent() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let path = b"/run/absent\0";
+        match call_chmod(path.as_ptr() as u64, 0o644) {
+            Some(ENOENT) => Ok(()),
+            Some(EPERM) => Err("chmod(missing) must be ENOENT, not EPERM"),
+            _ => Err("chmod(missing) should return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_chmod_missing_is_enoent);
+
+// symlink on a tmpfs path succeeds and the node lstat()s as S_IFLNK.
+fn smoke_abi_path_symlink_stats_as_link() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let target = b"f\0";
+        let link = b"/run/ln\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64).unwrap_or(-1) != 0 {
+            return Err("symlink(/run/ln -> f) should return 0");
+        }
+        let mut sb = [0u8; 256];
+        if call_lstat(link.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("lstat(/run/ln) should return 0");
+        }
+        // S_IFLNK = 0o120000.
+        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        if mode & 0o170000 == 0o120000 {
+            Ok(())
+        } else {
+            Err("symlink node must lstat as S_IFLNK")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_symlink_stats_as_link);
+
+// symlink onto an existing name returns EEXIST (idempotent tmpfiles), not
+// the bare -1 → EPERM sentinel.
+fn smoke_abi_path_symlink_exists_is_eexist() -> TestResult {
+    with_memfs("/run", "run", &[("taken", b"x")], || {
+        let target = b"whatever\0";
+        let link = b"/run/taken\0";
+        match call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) {
+            Some(EEXIST) => Ok(()),
+            Some(EPERM) => Err("symlink over an existing name must be EEXIST, not EPERM"),
+            _ => Err("symlink over an existing name should return -EEXIST"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_symlink_exists_is_eexist);
+
+// utimensat on a tmpfs file returns 0 and the mtime round-trips through stat.
+fn smoke_abi_path_utimensat_roundtrip() -> TestResult {
+    with_memfs("/run", "run", &[("stamp", b"x")], || {
+        let path = b"/run/stamp\0";
+        // timespec[2] = { {100, 0}, {200, 500} } (atime, mtime).
+        let mut ts = [0u8; 32];
+        ts[0..8].copy_from_slice(&100i64.to_ne_bytes()); // atime.tv_sec
+        ts[16..24].copy_from_slice(&200i64.to_ne_bytes()); // mtime.tv_sec
+        ts[24..32].copy_from_slice(&500i64.to_ne_bytes()); // mtime.tv_nsec
+        let r = call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, ts.as_ptr() as u64, 0),
+        );
+        if r != Some(0) {
+            return Err("utimensat(/run/stamp) should return 0");
+        }
+        let (sec, nsec) = stat_mtime(path)?;
+        if sec != 200 || nsec != 500 {
+            return Err("utimensat mtime must round-trip through stat st_mtim");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_utimensat_roundtrip);
+
+// A nested tmpfs mount at /run/lock (under the existing /run tmpfs) must
+// succeed and be independently resolvable — systemd's run-lock.mount mounts
+// a tmpfs at /run/lock. NARF's flat mount model registers it as its own
+// longest-prefix mount.
+fn smoke_abi_path_nested_tmpfs_mount() -> TestResult {
+    with_memfs("/run", "run", &[("f", b"x")], || {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let lock_fs = MemFs::with_seeds("run-lock", &[("marker", b"L")]);
+        let lock_handle = match registry().mount(&auth, "/run/lock", lock_fs) {
+            Ok(h) => h,
+            Err(_) => return Err("nested tmpfs mount at /run/lock should succeed"),
+        };
+        // A file in the NESTED mount resolves via the longest-prefix match
+        // (proving /run/lock shadows /run for paths beneath it).
+        let marker = b"/run/lock/marker\0";
+        let opened = matches!(
+            call(Syscall::Openat.raw(), a3(AT_FDCWD, marker.as_ptr() as u64, O_RDONLY, 0)),
+            Some(fd) if fd >= 0
+        );
+        // A file in the OUTER /run mount still resolves too.
+        let outer = b"/run/f\0";
+        let outer_ok = matches!(
+            call(Syscall::Openat.raw(), a3(AT_FDCWD, outer.as_ptr() as u64, O_RDONLY, 0)),
+            Some(fd) if fd >= 0
+        );
+        let _ = registry().unmount(&lock_handle, "/run/lock");
+        if !opened {
+            return Err("a file in the nested /run/lock mount must be openable");
+        }
+        if !outer_ok {
+            return Err("a file in the outer /run mount must still be openable");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_nested_tmpfs_mount);

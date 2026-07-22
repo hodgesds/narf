@@ -3469,7 +3469,8 @@ fn sys_access_chmod_chown(ctx: &mut dyn TrapContext) {
     let path_str = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     };
@@ -4161,11 +4162,11 @@ fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
 fn sys_fchmodat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let path_uptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     let raw = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
     };
@@ -4178,13 +4179,29 @@ fn sys_fchmodat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    if stat_path_dir_aware(&path).is_some() {
+    // A regular file: persist the mode through FileOps::set_perms so a later
+    // stat reflects it (systemd-tmpfiles `z`/`Z` lines chmod files and then
+    // verify the mode took). Fall back to accept-and-ignore for synthetic
+    // filesystems whose nodes don't hold perms.
+    let file = narf_filesystem::registry().resolve_absolute(&path, |fs, rel| {
+        narf_filesystem::resolve(fs.root(), rel).ok()
+    });
+    if let Some(Some(file)) = file {
+        let _ = poll_blocking(file.set_perms((args.arg2 as u32 & 0o777) as u16));
         // inotify: IN_ATTRIB for a chmod on an existing file.
         #[cfg(feature = "linux-compat")]
         crate::mqueue::notify_attrib(&path, false);
         ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    if stat_path_dir_aware(&path).is_some() {
+        // inotify: IN_ATTRIB for a chmod on an existing node (synthetic fs).
+        #[cfg(feature = "linux-compat")]
+        crate::mqueue::notify_attrib(&path, false);
+        ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(fail);
+        // Nothing at this path → ENOENT (was a bare -1 → EPERM).
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
     }
 }
 
@@ -4542,6 +4559,44 @@ fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
     code as u64
 }
 
+/// Map an `FsError` from `DirOps::rmdir` to the Linux errno userspace
+/// expects. `NotFound` → ENOENT (no such name), `Busy` → ENOTEMPTY (the
+/// directory still has children — MemFs flags a non-empty rmdir this way),
+/// `InvalidPath` → ENOTDIR (the target is a file/symlink, not a dir),
+/// `ReadOnly` → EROFS, `Unsupported` → EPERM. Never a bare -1 → systemd's
+/// mount-teardown does `rmdir("/run/systemd/propagate/<unit>")` and treats
+/// ENOENT (already gone) as success; a bare -1 → EPERM aborted the teardown
+/// with "Unable to remove propagation dir … Operation not permitted".
+fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
+    use narf_filesystem::FsError;
+    let code: i64 = match e {
+        FsError::NotFound => -2,     // -ENOENT
+        FsError::Busy => -39,        // -ENOTEMPTY
+        FsError::InvalidPath => -20, // -ENOTDIR
+        FsError::ReadOnly => -30,    // -EROFS
+        FsError::Unsupported => -1,  // -EPERM (fs can't rmdir)
+        _ => -1,
+    };
+    code as u64
+}
+
+/// Map an `FsError` from `DirOps::rename` to the Linux errno userspace
+/// expects. `NotFound` → ENOENT (source is gone), `Busy` → EEXIST,
+/// `InvalidPath` → EINVAL, `ReadOnly` → EROFS, everything else → EPERM.
+/// Never a bare -1 → systemd renames propagation dirs during mount
+/// teardown and a spurious EPERM there aborts the whole unit.
+fn rename_errno(e: narf_filesystem::FsError) -> u64 {
+    use narf_filesystem::FsError;
+    let code: i64 = match e {
+        FsError::NotFound => -2,     // -ENOENT
+        FsError::Busy => -17,        // -EEXIST
+        FsError::InvalidPath => -22, // -EINVAL
+        FsError::ReadOnly => -30,    // -EROFS
+        _ => -1,
+    };
+    code as u64
+}
+
 // ── Mkdir / Rmdir / Rename — Tier-3b directory mutation ────────────
 //
 // All three follow the unlink shape: resolve the parent through the
@@ -4677,7 +4732,17 @@ fn sys_mkdir(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_create(&path, true);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        _ => ctx.set_return(fail),
+        // A racing create of the same leaf → EEXIST (matches the exists check
+        // above); a read-only backing fs → EROFS; anything else keeps a
+        // precise errno rather than a bare -1 → EPERM (which aborts busybox
+        // `mkdir -p` and systemd's cgroup/hierarchy setup).
+        Some(Err(narf_filesystem::FsError::Busy)) => {
+            ctx.set_return(SyscallReturn::ok((-17i64) as u64)) // -EEXIST
+        }
+        Some(Err(narf_filesystem::FsError::ReadOnly)) => {
+            ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)), // -EPERM (fs refused)
     }
 }
 
@@ -4701,7 +4766,14 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_delete(&path, true);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        _ => ctx.set_return(fail),
+        // The parent filesystem resolved but rmdir reported an error — map it
+        // to the precise Linux errno (ENOENT / ENOTEMPTY / ENOTDIR / …) so a
+        // bare -1 → EPERM never surfaces (that aborted systemd's mount-
+        // teardown rmdir of /run/systemd/propagate/<unit>).
+        Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rmdir_errno(e))),
+        // The parent path/filesystem didn't resolve, or the async poll never
+        // completed → the target directory can't exist. Linux: ENOENT.
+        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
     }
 }
 
@@ -4709,18 +4781,19 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let old_ptr = args.arg0;
     let new_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // An unreadable user path pointer is EFAULT, not a bare -1 → EPERM.
+    let efault = SyscallReturn::ok((-14i64) as u64);
     let old_path = match copy_user_cstr(old_ptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(efault);
             return;
         }
     };
     let new_path = match copy_user_cstr(new_ptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(efault);
             return;
         }
     };
@@ -4730,22 +4803,26 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
     // Both paths must split into the same parent directory — cross-
     // directory rename isn't supported by the DirOps surface today
     // (would need a registry-aware version that locks both parents).
+    // A relative path with no slash is a malformed absolute path here → EINVAL.
     let old_split = match old_path.rfind('/') {
         Some(i) => i,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
             return;
         }
     };
     let new_split = match new_path.rfind('/') {
         Some(i) => i,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
             return;
         }
     };
     if old_path[..old_split] != new_path[..new_split] {
-        ctx.set_return(fail);
+        // Cross-directory rename is the normal cross-filesystem answer on
+        // Linux (EXDEV); every rename() caller falls back to copy+unlink on
+        // it, whereas a bare -1 → EPERM looks like a permission failure.
+        ctx.set_return(SyscallReturn::ok((-18i64) as u64)); // -EXDEV
         return;
     }
     let new_leaf = &new_path[new_split + 1..];
@@ -4760,7 +4837,13 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_moved(&old_path, &new_path);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        _ => ctx.set_return(fail),
+        // Parent resolved but rename failed → precise errno (ENOENT for a
+        // missing source, …) instead of a bare -1 → EPERM. systemd renames
+        // /run/systemd/propagate/<unit> dirs during mount teardown and a
+        // spurious EPERM there aborts the unit.
+        Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rename_errno(e))),
+        // Parent path/filesystem didn't resolve → source can't exist: ENOENT.
+        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
     }
 }
 
@@ -5007,7 +5090,17 @@ fn sys_symlink(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_create(&link_path, false);
             ctx.set_return(SyscallReturn::ok(0))
         }
-        _ => ctx.set_return(fail),
+        // An existing link name is EEXIST — systemd-tmpfiles creates symlinks
+        // and treats EEXIST as "already present" (idempotent). A read-only
+        // backing fs is EROFS. Never a bare -1 → EPERM.
+        Some(Some(Err(narf_filesystem::FsError::Busy))) => {
+            ctx.set_return(SyscallReturn::ok((-17i64) as u64)) // -EEXIST
+        }
+        Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
+            ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
+        }
+        // Parent path/filesystem didn't resolve → a component is missing.
+        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
     }
 }
 
