@@ -766,7 +766,8 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         // SAFETY: per-CPU access invariant; no other borrow is live and
         // IRQs are masked, so this is the sole reference to the cell.
         let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
-        let room = MAG_SIZE.saturating_sub(mag.top);
+        let mut cur_top = mag.top;
+        let room = MAG_SIZE.saturating_sub(cur_top);
         let to_mag = (MAG_SIZE / 2).min(n_blocks - 1).min(room);
         // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh frame
         // accessed via the per-arch kernel mapping (identity on
@@ -775,17 +776,15 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         // SAFETY: Valid memory or trusted environment
         unsafe {
             for i in 0..to_mag {
-                // Defensive: never index past the fixed stack. `to_mag`
-                // is already clamped to `room`, but re-check so a future
-                // refactor can't reintroduce the off-the-end write.
-                if mag.top >= MAG_SIZE {
+                if cur_top >= MAG_SIZE {
                     break;
                 }
                 let blk = NonNull::new_unchecked(base.add(i * block_size) as *mut FreeBlock);
                 canary_set_fresh(blk);
-                mag.stack[mag.top] = Some(blk);
-                mag.top += 1;
+                mag.stack[cur_top] = Some(blk);
+                cur_top += 1;
             }
+            mag.top = cur_top;
             // Everything not parked in the magazine (including any
             // blocks skipped because the magazine was already full)
             // goes onto the central free list.
