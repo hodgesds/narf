@@ -831,6 +831,21 @@ pub trait DirOps: Send + Sync {
         Box::pin(async move { Err(FsError::Unsupported) })
     }
 
+    /// Create a device node named `name` of the given file type (char or
+    /// block) with the Linux `dev_t` `rdev` (`(major << 8) | minor` in the
+    /// common small-number encoding). Default: unsupported. devfs overrides it
+    /// so `mknod`/`mknodat` from udev create a real `/dev/<name>` char/block
+    /// node that `stat`s as `S_IFCHR`/`S_IFBLK` with the right `st_rdev`.
+    /// Linux ref: `vfs_mknod` → `shmem_mknod` / `devtmpfs` (drivers/base/devtmpfs.c).
+    fn mknod<'a>(
+        &'a self,
+        _name: &'a str,
+        _file_type: FileType,
+        _rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
     /// Create a new empty subdirectory named `name`.
     fn mkdir<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move { Err(FsError::Unsupported) })

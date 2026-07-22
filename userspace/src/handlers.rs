@@ -3152,25 +3152,31 @@ fn sys_mkdirat(ctx: &mut dyn TrapContext) {
 /// request is routed to the directory-create path for correctness.
 fn sys_mknodat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    // mknodat(dirfd, path, mode, dev): path=arg1, mode=arg2.
-    let ret = mknod_common(args.arg1, args.arg2);
+    // mknodat(dirfd, path, mode, dev): path=arg1, mode=arg2, dev=arg3.
+    let ret = mknod_common(args.arg1, args.arg2, args.arg3);
     ctx.set_return(ret);
 }
 
 /// Linux `mknod(path, mode, dev)` — x86_64 syscall 133. musl's `mknod()`
-/// routes here (not through mknodat). path=arg0, mode=arg1.
+/// routes here (not through mknodat). path=arg0, mode=arg1, dev=arg2.
 fn sys_mknod(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let ret = mknod_common(args.arg0, args.arg1);
+    let ret = mknod_common(args.arg0, args.arg1, args.arg2);
     ctx.set_return(ret);
 }
 
-/// Shared node-creation used by both `mknod` and `mknodat`. Creates the node
-/// as a regular file (or a directory for S_IFDIR); see `sys_mknodat` docs.
-fn mknod_common(path_uptr: u64, mode: u64) -> SyscallReturn {
+/// Shared node-creation used by both `mknod` and `mknodat`. `S_IFDIR` creates
+/// a directory; `S_IFCHR`/`S_IFBLK` create a device node via the directory's
+/// `mknod` (devfs materialises a real char/block special with `st_rdev == dev`
+/// — the udev-coldplug `/dev/<name>` path), falling back to a regular file on
+/// filesystems without device-node support; everything else is a regular file
+/// (see `sys_mknodat` docs). Never returns a bare -1 for a supported node type.
+fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
     let fail = SyscallReturn::ok((-1i64) as u64);
     const S_IFMT: u64 = 0o170000;
     const S_IFDIR: u64 = 0o040000;
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFBLK: u64 = 0o060000;
     let path = match copy_user_cstr(path_uptr, 4096) {
         Some(s) => s,
         None => return fail,
@@ -3193,8 +3199,19 @@ fn mknod_common(path_uptr: u64, mode: u64) -> SyscallReturn {
     if poll_blocking(parent.lookup_async(&leaf)).map(|r| r.is_ok()) == Some(true) {
         return SyscallReturn::ok((-17i64) as u64); // -EEXIST
     }
-    let created = if (mode & S_IFMT) == S_IFDIR {
+    let fmt = mode & S_IFMT;
+    let created = if fmt == S_IFDIR {
         poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true)
+    } else if fmt == S_IFCHR || fmt == S_IFBLK {
+        // A char/block device node (udev coldplug creating /dev/<name>). Route
+        // to the directory's `mknod` so a devfs parent materialises a node that
+        // stats as the right special device with st_rdev == dev. Filesystems
+        // that don't support device nodes fall back to a plain file so the node
+        // at least EXISTS (matching the old behaviour for the elogind sandbox
+        // nodes). `dev` is the Linux dev_t as passed by userspace.
+        let ft = narf_filesystem::FileType::Special;
+        let mk = poll_blocking(parent.mknod(&leaf, ft, dev)).map(|r| r.is_ok()) == Some(true);
+        mk || poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
     } else {
         poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
     };

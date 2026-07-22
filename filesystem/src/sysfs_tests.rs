@@ -489,6 +489,71 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
 
+// ── Test 8b: a block device's /sys `uevent` file is readable + carries ──
+// SUBSYSTEM/MAJOR/MINOR, which is what `udevadm info` reads to create the
+// /dev node. Guards the block-class `uevent`-attr wiring the coldplug walker
+// depends on. The synthesised netlink message must fold in the MAJOR/MINOR.
+
+#[cfg(feature = "linux-compat")]
+fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+
+    let snap = narf_block::registry::__snapshot_for_test();
+    let dev = FakeBlock::new(512, 8);
+    narf_block::registry::register_block_device("smoke-uevblk0", dev);
+    crate::sysfs::populate_block_class();
+
+    let result = (|| -> TestResult {
+        let root = crate::sysfs::sysfs_root();
+        let kobj = root
+            .get_child("class")
+            .and_then(|c| c.get_child("block"))
+            .and_then(|b| b.get_child("smoke-uevblk0"));
+        let kobj = match kobj {
+            Some(k) => k,
+            None => return TestResult::Fail("block class device kobject missing"),
+        };
+        // The `uevent` file must be readable (show closure present).
+        let text = match kobj.attr_show("uevent") {
+            Some(t) => t,
+            None => return TestResult::Fail("block device has no readable uevent file"),
+        };
+        if !text.contains("MAJOR=") || !text.contains("MINOR=") {
+            return TestResult::Fail("block uevent file missing MAJOR/MINOR");
+        }
+        if !text.contains("DEVNAME=smoke-uevblk0") {
+            return TestResult::Fail("block uevent file missing DEVNAME");
+        }
+        // subsystem symlink resolves to /sys/class/block → SUBSYSTEM=block.
+        match kobj.get_symlink("subsystem") {
+            Some(t) if t.contains("class/block") => {}
+            _ => return TestResult::Fail("block device subsystem symlink != class/block"),
+        }
+        // Emitting derives SUBSYSTEM=block and folds MAJOR/MINOR into extras.
+        let mut reader = UeventReader::new();
+        kobject_emit_uevent(&kobj, UeventAction::Add);
+        let evs = reader.drain(4);
+        let ev = match evs.iter().find(|e| e.devpath.contains("smoke-uevblk0")) {
+            Some(e) => e,
+            None => return TestResult::Fail("no ADD for block device"),
+        };
+        if ev.subsystem != "block" {
+            return TestResult::Fail("block ADD SUBSYSTEM != block");
+        }
+        let nl = String::from_utf8_lossy(&ev.to_netlink_bytes()).to_string();
+        if !nl.contains("MAJOR=") || !nl.contains("MINOR=") {
+            return TestResult::Fail("block ADD netlink bytes missing MAJOR/MINOR");
+        }
+        TestResult::Pass
+    })();
+
+    narf_block::registry::__restore_for_test(snap);
+    result
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("filesystem", smoke_sysfs_block_uevent_file_readable);
+
 // ── Test 9: kobject_emit_uevent helper ────────────────────────────────
 
 #[cfg(feature = "linux-compat")]

@@ -838,3 +838,111 @@ fn smoke_uevent_e2e_multiple_subsystems() -> TestResult {
 }
 #[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_multiple_subsystems);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 13 — coldplug() broadcasts ≥1 well-formed add@ uevent
+//
+// `narf_filesystem::uevent::coldplug()` is NARF's `udevadm trigger
+// --action=add`: it walks every device kobject in /sys and broadcasts an ADD.
+// A KOBJECT_UEVENT monitor (here a UeventReader, bound BEFORE coldplug so it
+// sees the whole sweep) must receive at least one event carrying ACTION=add,
+// a DEVPATH and a SUBSYSTEM. Linux ref: udev_enumerate_scan_devices +
+// kobject_uevent(KOBJ_ADD).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_e2e_coldplug_broadcasts_add() -> TestResult {
+    reset();
+
+    // Build a small /sys with one device kobject carrying a writable `uevent`
+    // (exactly the shape populate_* produce).
+    let class_rtc = class_register("rtc");
+    let kobj = class_device_register(class_rtc, "coldplug-rtc0");
+    kobj.add_symlink("subsystem", "../../class/rtc");
+    let weak = Arc::downgrade(&kobj);
+    kobject_add_writable_attr(
+        &kobj,
+        "uevent",
+        || "MAJOR=254\nMINOR=0\nDEVNAME=coldplug-rtc0\n".to_string(),
+        move |data: &[u8]| {
+            if let Some(k) = weak.upgrade() {
+                kobject_emit_uevent(&k, uevent_action_from_write(data));
+            }
+            Ok(())
+        },
+    );
+
+    // Bind the monitor BEFORE coldplug so it sees the sweep.
+    let mut reader = UeventReader::new();
+
+    let n = uevent::coldplug();
+    if n == 0 {
+        return TestResult::Fail("coldplug() emitted zero ADD uevents");
+    }
+
+    let evs = reader.drain(256);
+    // Every emitted event must be an ADD with a DEVPATH and a SUBSYSTEM.
+    for ev in &evs {
+        if ev.action != UeventAction::Add {
+            return TestResult::Fail("coldplug emitted a non-Add uevent");
+        }
+        if ev.devpath.is_empty() {
+            return TestResult::Fail("coldplug ADD has empty DEVPATH");
+        }
+        if ev.subsystem.is_empty() {
+            return TestResult::Fail("coldplug ADD has empty SUBSYSTEM");
+        }
+    }
+    // Our device must be among them, with SUBSYSTEM=rtc and MAJOR/MINOR folded
+    // into the netlink extras (self-contained message udevadm info can use).
+    let ours = evs
+        .iter()
+        .find(|e| e.devpath.contains("coldplug-rtc0"))
+        .cloned();
+    let ours = match ours {
+        Some(e) => e,
+        None => return TestResult::Fail("coldplug did not emit ADD for our device"),
+    };
+    if ours.subsystem != "rtc" {
+        return TestResult::Fail("coldplug ADD SUBSYSTEM != rtc");
+    }
+    let bytes = ours.to_netlink_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    if !text.contains("MAJOR=254") || !text.contains("DEVNAME=coldplug-rtc0") {
+        return TestResult::Fail("coldplug ADD netlink bytes missing MAJOR/DEVNAME");
+    }
+
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_broadcasts_add);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Smoke 14 — coldplug only fires for device kobjects (uevent-attr marker)
+//
+// A plain container kobject (no `uevent` attr — e.g. /sys/class itself) must
+// NOT get an ADD; only real devices do. Guards against the walker spamming
+// non-device nodes (which udevd would reject).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "linux-compat")]
+fn smoke_uevent_e2e_coldplug_skips_containers() -> TestResult {
+    reset();
+
+    // A bare class container: no `uevent` attr.
+    let _class = class_register("emptyclass");
+
+    let mut reader = UeventReader::new();
+    let n = uevent::coldplug();
+
+    // No device kobjects → zero ADDs (the container must be skipped).
+    if n != 0 {
+        return TestResult::Fail("coldplug emitted an ADD for a non-device container");
+    }
+    if !reader.drain(16).is_empty() {
+        return TestResult::Fail("coldplug broadcast events with no devices present");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_skips_containers);

@@ -516,6 +516,50 @@ pub fn kobject_emit_uevent(kobj: &Kobject, action: UeventAction) {
     crate::uevent::emit_with_extras(action, devpath, subsystem, extras);
 }
 
+// ── Coldplug ──────────────────────────────────────────────────────────
+
+/// Walk every kobject under the sysfs root and, for each one that models a
+/// *device* (i.e. carries a `uevent` attr — the marker Linux uses to decide a
+/// kobject is a real device rather than a plain container dir), broadcast an
+/// `add@<devpath>` netlink uevent.
+///
+/// This is NARF's equivalent of `udevadm trigger --action=add`: udevd + udevadm
+/// enumerate `/sys`, then re-trigger every device's `uevent` file so a freshly
+/// started udevd (which missed the boot-time ADDs) has devices to process and
+/// creates the matching `/dev` nodes. We reuse the exact `kobject_emit_uevent`
+/// wire path, so each broadcast carries ACTION=add, DEVPATH, SUBSYSTEM, SEQNUM
+/// and — for char/block devices — the MAJOR/MINOR/DEVNAME folded in from the
+/// device's `uevent` attr.
+///
+/// Linux ref: the coldplug loop in `udev_enumerate_scan_devices` +
+/// `udev_device_get_is_initialized` writing "add" to each `uevent` file
+/// (systemd/src/udev), which the kernel turns into `kobject_uevent(KOBJ_ADD)`
+/// (`drivers/base/core.c::uevent_store` → `lib/kobject_uevent.c`).
+///
+/// Returns the number of ADD uevents emitted.
+pub fn coldplug() -> usize {
+    let root = get_root();
+    let mut count = 0usize;
+    coldplug_walk(&root, &mut count);
+    count
+}
+
+/// Depth-first walk emitting an ADD for every device kobject. A kobject is
+/// treated as a device iff it exposes a `uevent` attr (matching Linux's
+/// `dev->kobj` having a `uevent` sysfs file only for registered devices).
+fn coldplug_walk(kobj: &Arc<Kobject>, count: &mut usize) {
+    if kobj.has_attr("uevent") {
+        kobject_emit_uevent(kobj, UeventAction::Add);
+        *count += 1;
+    }
+    // Snapshot children so the emit above (and the recursion below) never runs
+    // while holding this node's children lock.
+    let children: Vec<Arc<Kobject>> = kobj.children.lock().iter().cloned().collect();
+    for child in &children {
+        coldplug_walk(child, count);
+    }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────
 
 fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
@@ -537,11 +581,22 @@ pub fn populate_block_class() {
         get_or_create_child(&class_dir, "block")
     };
     let sys_block = get_or_create_child(&root, "block");
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_block = get_or_create_child(&dev_dir, "block");
+    let _dev_char = get_or_create_child(&dev_dir, "char");
 
-    for dev in narf_block::block_devices() {
+    // Conventional block dev_t: NARF's block devices carry no intrinsic
+    // major/minor, so assign the Linux "block extended" major 259
+    // (BLOCK_EXT_MAJOR) with a per-device minor by enumeration order. udev
+    // only needs a stable, unique <major>:<minor> to key /dev/<name>, its
+    // by-devnum links, and the char/block-node mknod. Linux ref:
+    // `include/linux/major.h` (BLOCK_EXT_MAJOR = 259).
+    const BLOCK_EXT_MAJOR: u32 = 259;
+    for (idx, dev) in narf_block::block_devices().into_iter().enumerate() {
         let name: &'static str = dev.name;
         let capacity = dev.dev.capacity();
         let lba_size = dev.dev.lba_size();
+        let minor = idx as u32;
 
         // /sys/class/block/<name>/
         let kobj = class_device_register(class_block.clone(), name);
@@ -550,6 +605,27 @@ pub fn populate_block_class() {
         });
         kobject_add_attr(&kobj, "removable", || "0\n".to_string());
         kobject_add_attr(&kobj, "queue/scheduler", || "none\n".to_string());
+        // `dev` (<major>:<minor>) + writable `uevent` (MAJOR/MINOR/DEVNAME)
+        // are what `udevadm info` and the coldplug walker read to synthesise
+        // an ADD carrying the block dev_t; without them udev can't create
+        // /dev/<name>. Linux ref: `block/genhd.c` (disk_add) exposes the same
+        // `dev` + `uevent` attrs. `subsystem` → /sys/class/block so the
+        // coldplug walker derives SUBSYSTEM=block.
+        let dev_str = format!("{}:{}\n", BLOCK_EXT_MAJOR, minor);
+        kobject_add_attr(&kobj, "dev", move || dev_str.clone());
+        add_writable_uevent(
+            &kobj,
+            format!(
+                "MAJOR={}\nMINOR={}\nDEVNAME={}\nDEVTYPE=disk\n",
+                BLOCK_EXT_MAJOR, minor, name
+            ),
+        );
+        kobj.add_symlink("subsystem", "../../../class/block");
+        // /sys/dev/block/<major>:<minor> → the class dir (udev by-devnum).
+        dev_block.add_symlink(
+            format!("{}:{}", BLOCK_EXT_MAJOR, minor),
+            format!("../../class/block/{}", name),
+        );
 
         // /sys/block/<name>/ — flat view
         let flat = get_or_create_child(&sys_block, name);
@@ -572,13 +648,18 @@ pub fn populate_net_class() {
         get_or_create_child(&class_dir, "net")
     };
 
-    for info in net_snapshots() {
+    for (idx, info) in net_snapshots().into_iter().enumerate() {
         let name_owned = info.name.clone();
         let kobj = class_device_register(class_net.clone(), &name_owned);
         let mtu = info.mtu;
         let mac = info.mac;
         let link_up = info.link_up;
+        // ifindex: lo is 1 by convention; the rest follow in enumeration
+        // order. udev reads `ifindex` to key the interface. Linux ref:
+        // `net/core/net-sysfs.c` (netdev_group_show et al.).
+        let ifindex = idx + 1;
         kobject_add_attr(&kobj, "mtu", move || format!("{}\n", mtu));
+        kobject_add_attr(&kobj, "ifindex", move || format!("{}\n", ifindex));
         kobject_add_attr(&kobj, "address", move || {
             format!(
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
@@ -592,6 +673,16 @@ pub fn populate_net_class() {
                 "down\n".to_string()
             }
         });
+        // A net interface is not a char/block device (no MAJOR/MINOR), but
+        // udev still needs a walkable `uevent` file + a `subsystem` symlink so
+        // the coldplug walker derives SUBSYSTEM=net and `udevadm info` accepts
+        // the syspath. Linux ref: `net/core/net-sysfs.c` (netdev_register_kobject)
+        // exposes INTERFACE + IFINDEX in the netdev uevent.
+        add_writable_uevent(
+            &kobj,
+            format!("INTERFACE={}\nIFINDEX={}\n", name_owned, ifindex),
+        );
+        kobj.add_symlink("subsystem", "../../../class/net");
     }
 }
 

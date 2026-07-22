@@ -30,6 +30,97 @@ use crate::{
     DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat, POLL_OUT,
 };
 
+// ── mknod-created device nodes ────────────────────────────────────────
+//
+// udev's coldplug creates /dev nodes with `mknod(path, S_IFCHR|mode, dev_t)`
+// (and `mknodat`). NARF's built-in /dev entries are static, but a device udev
+// discovers via a coldplug uevent that has no built-in node still needs one to
+// EXIST and `stat` as the right char/block device with the right `st_rdev`, or
+// `udevadm test` / a driver's open() fails. These dynamically-created nodes
+// live in a small in-memory registry keyed by name; `DevDir::lookup`/
+// `enumerate` surface them alongside the static entries. Linux ref:
+// `drivers/base/devtmpfs.c` (the kernel's own devtmpfs mknod bookkeeping).
+
+/// One `mknod`-created device node: a char/block special with a fixed
+/// `dev_t`. Read/write are no-ops (there is no backing driver — the node
+/// exists so `stat`/`open` behave), which matches how a bare `mknod` node
+/// with no registered driver behaves until a driver claims the major.
+#[derive(Clone)]
+struct MknodEntry {
+    file_type: FileType,
+    rdev: u64,
+    perms: u16,
+}
+
+static MKNOD_NODES: IrqSafeSpinLock<alloc::collections::BTreeMap<String, MknodEntry>> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// FileOps for a `mknod`-created char/block node.
+struct MknodFile {
+    entry: MknodEntry,
+}
+
+impl FileOps for MknodFile {
+    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // No backing driver: read returns EOF (like an unclaimed node).
+        Box::pin(async move { Ok(0) })
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let len = buf.len();
+        Box::pin(async move { Ok(len) })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: self.entry.file_type,
+                perms: self.entry.perms,
+            },
+            mtime_cycles: 0,
+        }
+    }
+    fn rdev(&self) -> u64 {
+        self.entry.rdev
+    }
+}
+
+/// Register a `mknod`-created node. `file_type` is `Special` (char) or
+/// `Socket`/etc; only char/block are meaningful here. Overwrites any prior
+/// dynamic node of the same name (a caller is expected to have unlink'd first,
+/// but tolerating a re-mknod keeps udev's re-trigger idempotent).
+fn mknod_register(name: &str, file_type: FileType, rdev: u64, perms: u16) {
+    MKNOD_NODES.lock().insert(
+        name.into(),
+        MknodEntry {
+            file_type,
+            rdev,
+            perms,
+        },
+    );
+}
+
+/// Look up a `mknod`-created node by name.
+fn mknod_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
+    let entry = MKNOD_NODES.lock().get(name).cloned()?;
+    Some(Arc::new(MknodFile { entry }) as Arc<dyn FileOps>)
+}
+
+/// Snapshot the dynamic-node names for `enumerate`.
+fn mknod_enumerate() -> Vec<(String, FileType)> {
+    MKNOD_NODES
+        .lock()
+        .iter()
+        .map(|(n, e)| (n.clone(), e.file_type))
+        .collect()
+}
+
+/// Reset the dynamic-node registry (test isolation).
+#[doc(hidden)]
+pub fn __reset_mknod_for_test() {
+    MKNOD_NODES.lock().clear();
+}
+
 /// `/dev/null` — read = EOF, write = discard.
 struct DevNull;
 
@@ -1028,7 +1119,9 @@ impl DirOps for DevDir {
             }
             // Dynamic: query the block-device registry after static names miss.
             // Covers registered names like "nvme0", "sata0p1", "vblk0", etc.
-            _ => crate::devfs_block::lookup_block_file(name),
+            _ => crate::devfs_block::lookup_block_file(name)
+                // Then any node udev created via mknod (coldplug /dev nodes).
+                .or_else(|| mknod_lookup(name)),
         }
     }
 
@@ -1059,6 +1152,29 @@ impl DirOps for DevDir {
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
+    }
+
+    /// `mknod(/dev/<name>, S_IFCHR|S_IFBLK, dev_t)` — udev's coldplug node
+    /// creation. Registers a dynamic node that `stat`s as the right special
+    /// device with `st_rdev == rdev`; the node is then visible via `lookup`
+    /// and `enumerate`. A static name of the same basename wins on lookup, so
+    /// a re-mknod of e.g. "null" is inert. Linux ref: `devtmpfs`'s mknod path.
+    fn mknod<'a>(
+        &'a self,
+        name: &'a str,
+        file_type: FileType,
+        rdev: u64,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            // Char/block only — a FIFO/socket/regular mknod under /dev is not a
+            // device node; reject so the caller falls back to a plain file.
+            if !matches!(file_type, FileType::Special) {
+                return Err(FsError::Unsupported);
+            }
+            // 0o660 (root:disk-style) is the conventional device-node mode.
+            mknod_register(name, file_type, rdev, 0o660);
+            mknod_lookup(name).ok_or(FsError::Io(narf_block::BlockError::IOError))
+        })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -1229,6 +1345,11 @@ impl DirOps for DevDir {
         let rfcomm_extras = rfcomm_enumerate();
         let tty_usb_extras = tty_usb_enumerate();
         let video_extras = video_enumerate();
+        // mknod-created nodes that don't collide with a static name.
+        let mknod_extras: Vec<(String, FileType)> = mknod_enumerate()
+            .into_iter()
+            .filter(|(name, _)| !static_names.iter().any(|s| s == name))
+            .collect();
 
         static_entries
             .iter()
@@ -1237,6 +1358,7 @@ impl DirOps for DevDir {
             .chain(rfcomm_extras)
             .chain(tty_usb_extras)
             .chain(video_extras)
+            .chain(mknod_extras)
             .skip(cursor)
             .take(max)
             .collect()
@@ -1349,6 +1471,45 @@ fn smoke_dev_mountpoint_stub_dirs() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_mountpoint_stub_dirs);
+
+/// Smoke: `mknod` of a char node on devfs succeeds and the node then stats
+/// as a char device (`FileType::Special`) with the requested `st_rdev`, and is
+/// enumerated. This is the udev-coldplug `/dev/<name>` creation path. Never a
+/// bare -1: `mknod` returns a usable FileOps.
+fn smoke_dev_mknod_char_node() -> TestResult {
+    __reset_mknod_for_test();
+    let dir = DevDir;
+    // dev_t for a char device, e.g. major 10 / minor 200 → (10<<8)|200.
+    let rdev: u64 = (10u64 << 8) | 200;
+    let node = match poll_once_devfs(dir.mknod("coldplug-char0", FileType::Special, rdev)) {
+        Some(Ok(n)) => n,
+        Some(Err(_)) => return TestResult::Fail("mknod char node returned an error"),
+        None => return TestResult::Fail("mknod char node future did not resolve"),
+    };
+    // The returned node stats as a char device with the right rdev.
+    if node.stat().mode.file_type != FileType::Special {
+        return TestResult::Fail("mknod char node does not stat as Special (S_IFCHR)");
+    }
+    if node.rdev() != rdev {
+        return TestResult::Fail("mknod char node st_rdev != requested dev_t");
+    }
+    // It is now discoverable via lookup and enumerate.
+    match dir.lookup("coldplug-char0") {
+        Some(n) if n.stat().mode.file_type == FileType::Special => {}
+        Some(_) => return TestResult::Fail("looked-up mknod node not a char device"),
+        None => return TestResult::Fail("mknod node not found via lookup"),
+    }
+    let listed = dir.enumerate(0, 512);
+    if !listed
+        .iter()
+        .any(|(n, t)| n == "coldplug-char0" && *t == FileType::Special)
+    {
+        return TestResult::Fail("mknod node not enumerated");
+    }
+    __reset_mknod_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_mknod_char_node);
 
 /// Smoke: /dev/stdin resolves to /proc/self/fd/0.
 fn smoke_dev_stdin_target() -> TestResult {

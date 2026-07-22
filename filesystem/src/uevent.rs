@@ -320,6 +320,17 @@ pub fn gen_uevent_seqnum() -> String {
     alloc::format!("{}\n", next_seqnum().saturating_sub(1))
 }
 
+/// Coldplug: broadcast an `add@<devpath>` uevent for every device kobject in
+/// `/sys`. This is the `udevadm trigger --action=add` entry point — a freshly
+/// started udevd/udevadm receives one ADD per modelled device (block, net,
+/// input, tty/console, the class devices) so it can create the matching /dev
+/// nodes. Thin re-export of [`crate::sysfs::coldplug`]; returns the number of
+/// ADD uevents emitted. Linux ref: `udev_enumerate_scan_devices` +
+/// `kobject_uevent(KOBJ_ADD)`.
+pub fn coldplug() -> usize {
+    crate::sysfs::coldplug()
+}
+
 /// Reset the ring for testing.  NOT for production use.
 #[doc(hidden)]
 pub fn __reset_for_test() {
