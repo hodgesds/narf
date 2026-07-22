@@ -353,6 +353,19 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
     // central free list is separately IrqSafeSpinLock-guarded; the
     // nested save/restore composes (its restore returns to "masked",
     // this call's restore returns to the caller's original IRQ state).
+    //
+    // Reentrancy discipline: a `&mut MagazineInner` is only ever held
+    // across straight-line, non-allocating code. `alloc_frame()` (the
+    // grow path) can re-enter this allocator synchronously on the SAME
+    // CPU — the buddy's free-list `Vec::push` growth, the cgroup charge
+    // hook, and the NUMA rebalance path all route back through the
+    // global slab (`without_interrupts` masks IRQ preemption but does
+    // NOT stop a synchronous nested call). Holding a magazine borrow
+    // across that call would alias a second `&mut` to the same cell
+    // (UB) and let the compiler cache `mag.top` while the nested call
+    // mutates it — the observed `top == MAG_SIZE` index panic and the
+    // garbage-`next` `#GP`. So the frame is pulled with NO borrow live,
+    // then a fresh short-lived borrow does the bounded push.
     narf_lib::sync::without_interrupts(|| {
         let cpu = current_cpu();
 
@@ -374,12 +387,17 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
 
         // SLOW PATH 1: refill the magazine from the central free list.
         // Take up to MAG_SIZE/2 blocks under one lock acquisition so
-        // the lock cost amortises across the next ~8 allocs.
+        // the lock cost amortises across the next ~8 allocs. Locking the
+        // central head doesn't allocate (the buddy isn't touched), so
+        // holding the magazine borrow here is safe.
         {
             let mut g = class.head.lock();
             let take = MAG_SIZE / 2;
             let mut taken = 0;
-            while taken < take {
+            // Bound every push to MAG_SIZE regardless of `taken`: a
+            // slipped invariant (a stale `top`) must flush/return, never
+            // index off the end of the fixed 16-slot stack.
+            while taken < take && mag.top < MAG_SIZE {
                 match *g {
                     Some(head) => {
                         // SAFETY: central blocks were inserted by this slab.
@@ -403,11 +421,25 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         // SLOW PATH 2: grow. Pull a fresh page, slab it into N blocks,
         // push half into the magazine + the rest onto central, return
         // the last block in the page.
+        //
+        // CRITICAL: drop the magazine borrow before `alloc_frame()`.
+        // The call can synchronously re-enter this allocator on this
+        // CPU (see the module-level reentrancy note), so no `&mut` to
+        // the cell may be live across it.
+        let _ = mag;
         let frame: PhysFrame = alloc_frame()?;
         let base = frame.start_address().kernel_mut_ptr::<u8>();
         let block_size = class_size(c);
         let n_blocks = PAGE_SIZE_USIZE / block_size;
-        let to_mag = (MAG_SIZE / 2).min(n_blocks - 1);
+        // Re-borrow the magazine AFTER the (possibly reentrant) frame
+        // allocation. `top` may have moved if a nested alloc/free for
+        // this class ran during `alloc_frame`, so read it fresh and
+        // bound every push to the remaining capacity.
+        // SAFETY: per-CPU access invariant; no other borrow is live and
+        // IRQs are masked, so this is the sole reference to the cell.
+        let mag = unsafe { &mut *class.magazines[cpu].inner.get() };
+        let room = MAG_SIZE.saturating_sub(mag.top);
+        let to_mag = (MAG_SIZE / 2).min(n_blocks - 1).min(room);
         // SAFETY: `base..base+PAGE_SIZE_USIZE` is a fresh frame
         // accessed via the per-arch kernel mapping (identity on
         // x86_64, TTBR1 high-half on aarch64) so the write stays
@@ -415,10 +447,19 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
         // SAFETY: Valid memory or trusted environment
         unsafe {
             for i in 0..to_mag {
+                // Defensive: never index past the fixed stack. `to_mag`
+                // is already clamped to `room`, but re-check so a future
+                // refactor can't reintroduce the off-the-end write.
+                if mag.top >= MAG_SIZE {
+                    break;
+                }
                 let blk = NonNull::new_unchecked(base.add(i * block_size) as *mut FreeBlock);
                 mag.stack[mag.top] = Some(blk);
                 mag.top += 1;
             }
+            // Everything not parked in the magazine (including any
+            // blocks skipped because the magazine was already full)
+            // goes onto the central free list.
             let mut g = class.head.lock();
             for i in to_mag..(n_blocks - 1) {
                 let blk = base.add(i * block_size) as *mut FreeBlock;
@@ -931,3 +972,74 @@ fn smoke_slab_magazine_stats_counters() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_magazine_stats_counters);
+
+/// Test: grow-path magazine invariant under repeated grow events. A
+/// tight alloc/free hammer that keeps forcing the slow (grow / spill)
+/// paths must never drive a magazine `top` past `MAG_SIZE`, and every
+/// returned pointer must be distinct + correctly aligned while live.
+///
+/// This asserts the single-thread invariant the SMP corruption bug
+/// violated: the grow path (`alloc_class` SLOW PATH 2) used to hold a
+/// `&mut MagazineInner` across `alloc_frame()` — a call that can
+/// re-enter the slab on the same CPU — and then push into the
+/// magazine assuming `top` was unchanged, which under load ran `top`
+/// off the end of the 16-slot stack (`index out of bounds: len is 16
+/// but index is 16`). Only SMP + heavy service load reproduces the
+/// reentrancy in the field; here we at least pin the invariant that
+/// no path leaves `top > MAG_SIZE` and no live block aliases another.
+fn smoke_slab_grow_path_top_bounded() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let layout = Layout::from_size_align(64, 16).expect("layout");
+    let class_idx = class_for(64).expect("class");
+
+    // Hold a large batch live so the class is repeatedly forced to
+    // grow fresh frames (magazine + central both drained), exercising
+    // SLOW PATH 2 many times over. 512 * 64 B spans dozens of frames.
+    let n = 512usize;
+    let mut live: alloc::vec::Vec<NonNull<u8>> = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        match alloc(layout) {
+            Ok(p) => live.push(p),
+            Err(_) => {
+                // Clean up whatever we did get before bailing.
+                // SAFETY: matching layout.
+                unsafe {
+                    for q in live.drain(..) {
+                        dealloc(q, layout);
+                    }
+                }
+                return TestResult::Fail("grow-hammer alloc failed");
+            }
+        }
+        // Invariant: no per-CPU magazine slot for this class may ever
+        // exceed MAG_SIZE. `_test_magazine_top` reads the raw `top`.
+        if _test_magazine_top(class_idx, 0) > MAG_SIZE {
+            return TestResult::Fail("magazine top exceeded MAG_SIZE during grow hammer");
+        }
+    }
+
+    // Distinctness: no two live blocks alias. O(n^2) but n is small
+    // and this is a smoke, not a hot path. Aliasing would mean the
+    // grow path handed the same block out twice (the corruption
+    // signature).
+    for i in 0..live.len() {
+        for j in (i + 1)..live.len() {
+            if live[i].as_ptr() == live[j].as_ptr() {
+                return TestResult::Fail("grow path returned an aliased block");
+            }
+        }
+    }
+
+    // Free everything, re-checking the bound as the spill path runs.
+    // SAFETY: matching layout for every entry.
+    unsafe {
+        for p in live.drain(..) {
+            dealloc(p, layout);
+            if _test_magazine_top(class_idx, 0) > MAG_SIZE {
+                return TestResult::Fail("magazine top exceeded MAG_SIZE during free hammer");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_grow_path_top_bounded);
