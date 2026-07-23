@@ -475,6 +475,77 @@ fn smoke_abi_misc_keyctl_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_keyctl_neg);
 
+fn smoke_abi_misc_keyctl_join_session() -> TestResult {
+    with_setup(|| {
+        // KEYCTL_JOIN_SESSION_KEYRING (op 1) — systemd's setup_keyring()
+        // gate. Must return a positive session keyring serial, not
+        // -EOPNOTSUPP.
+        match call(Syscall::Keyctl.raw(), a1(1, 0)) {
+            Some(s) if s > 0 => Ok(()),
+            _ => Err("keyctl(KEYCTL_JOIN_SESSION_KEYRING) should return a serial > 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_keyctl_join_session);
+
+fn smoke_abi_misc_keyctl_describe_roundtrip() -> TestResult {
+    with_setup(|| {
+        crate::keyring::__test_keyring_reset();
+        let ktype = b"user\0";
+        let desc = b"abi:desc\0";
+        let serial = match call(
+            Syscall::AddKey.raw(),
+            a3(ktype.as_ptr() as u64, desc.as_ptr() as u64, 0, 0),
+        ) {
+            Some(s) if s >= 1000 => s,
+            _ => return Err("seed add_key failed"),
+        };
+        // KEYCTL_DESCRIBE (op 6) renders "type;uid;gid;perm;desc\0".
+        let mut buf = [0u8; 64];
+        let n = match call(
+            Syscall::Keyctl.raw(),
+            a3(6, serial as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("keyctl(KEYCTL_DESCRIBE) should return the description length"),
+        };
+        // The rendered summary must start with the type and end with the
+        // NUL-terminated description we seeded.
+        let s = &buf[..n];
+        if s.starts_with(b"user;") && s.ends_with(b"abi:desc\0") {
+            Ok(())
+        } else {
+            Err("keyctl(KEYCTL_DESCRIBE) round-trip mismatch")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_keyctl_describe_roundtrip);
+
+fn smoke_abi_misc_keyctl_set_timeout() -> TestResult {
+    with_setup(|| {
+        crate::keyring::__test_keyring_reset();
+        let ktype = b"user\0";
+        let desc = b"abi:timeout\0";
+        let serial = match call(
+            Syscall::AddKey.raw(),
+            a3(ktype.as_ptr() as u64, desc.as_ptr() as u64, 0, 0),
+        ) {
+            Some(s) if s >= 1000 => s,
+            _ => return Err("seed add_key failed"),
+        };
+        // KEYCTL_SET_TIMEOUT (op 15) on a live key → 0; on an absent key
+        // → -ENOKEY.
+        if call(Syscall::Keyctl.raw(), a2(15, serial as u64, 60)) != Some(0) {
+            return Err("keyctl(KEYCTL_SET_TIMEOUT) on a live key should return 0");
+        }
+        match call(Syscall::Keyctl.raw(), a2(15, 9_999_999, 60)) {
+            Some(v) if v == ENOKEY => Ok(()),
+            _ => Err("keyctl(KEYCTL_SET_TIMEOUT) on an absent key should return -ENOKEY"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_keyctl_set_timeout);
+
 // ── Landlock: CreateRuleset / AddRule / RestrictSelf ──
 
 fn smoke_abi_misc_landlock_create_ruleset_pos() -> TestResult {

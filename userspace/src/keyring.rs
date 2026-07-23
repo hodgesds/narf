@@ -11,13 +11,19 @@
 //!  - `keyctl` operates on a key by serial: `READ` copies the payload back,
 //!    `UPDATE` replaces it, `REVOKE` tombstones it (subsequent reads return
 //!    `-EKEYREVOKED`), `DESCRIBE` renders the `type;uid;gid;perm;desc`
-//!    summary, `SETPERM` sets the permission mask, `UNLINK` removes a key,
-//!    `CLEAR` empties the keyring.
+//!    summary, `SETPERM` sets the permission mask, `SET_TIMEOUT` accepts an
+//!    expiry (keys never expire here), `UNLINK` removes a key, `CLEAR`
+//!    empties the keyring.
 //!
 //! NARF runs a single session, so the special keyring ids (the negative
 //! `KEY_SPEC_*` constants and 0) all resolve to one implicit session
 //! keyring that owns every key — there is no per-thread/-process/-user
-//! keyring split to track.
+//! keyring split to track. `JOIN_SESSION_KEYRING` therefore just hands back
+//! that one keyring's serial, and `LINK` is a no-op.
+//!
+//! This is a compatibility shim (it lets systemd's `setup_keyring()`
+//! succeed), not a security boundary: there is no per-key access control and
+//! the store is process-global.
 //!
 //! Gated under `#[cfg(feature = "linux-compat")]` via `lib.rs`.
 
@@ -48,6 +54,7 @@ fn ok(v: u64) -> SyscallReturn {
 
 // ── keyctl(2) operation selectors ───────────────────────────────────
 const KEYCTL_GET_KEYRING_ID: u64 = 0;
+const KEYCTL_JOIN_SESSION_KEYRING: u64 = 1;
 const KEYCTL_UPDATE: u64 = 2;
 const KEYCTL_REVOKE: u64 = 3;
 const KEYCTL_SETPERM: u64 = 5;
@@ -57,6 +64,7 @@ const KEYCTL_LINK: u64 = 8;
 const KEYCTL_UNLINK: u64 = 9;
 const KEYCTL_SEARCH: u64 = 10;
 const KEYCTL_READ: u64 = 11;
+const KEYCTL_SET_TIMEOUT: u64 = 15;
 
 /// The single implicit session keyring's serial. Every special keyring id
 /// (`KEY_SPEC_*` = -1..=-8, and 0) resolves to this one container.
@@ -191,6 +199,12 @@ pub fn sys_keyctl(ctx: &mut dyn TrapContext) {
     match a.arg0 {
         // Every special keyring resolves to the one session keyring.
         KEYCTL_GET_KEYRING_ID => ctx.set_return(ok(SESSION_KEYRING_ID as u64)),
+
+        // Join (or create) a named session keyring. Under the single-keyring
+        // model there is nothing to allocate: the caller is handed the one
+        // implicit session keyring. The optional name (arg1) is accepted and
+        // ignored — we do not track named session keyrings separately.
+        KEYCTL_JOIN_SESSION_KEYRING => ctx.set_return(ok(SESSION_KEYRING_ID as u64)),
 
         KEYCTL_READ => {
             let serial = a.arg1 as i32;
@@ -345,6 +359,19 @@ pub fn sys_keyctl(ctx: &mut dyn TrapContext) {
         // Linking is a no-op under the single-keyring model: every key is
         // already a member of the only keyring there is.
         KEYCTL_LINK => ctx.set_return(ok(0)),
+
+        // Set a key's expiry (arg2 = seconds; 0 clears it). Keys never expire
+        // in this shim, so we validate the target exists and accept the
+        // request. Callers only check for success/`-ENOKEY`.
+        KEYCTL_SET_TIMEOUT => {
+            let serial = a.arg1 as i32;
+            let exists = with_keys(|m| m.contains_key(&serial));
+            if exists {
+                ctx.set_return(ok(0));
+            } else {
+                ctx.set_return(err(ENOKEY));
+            }
+        }
 
         KEYCTL_CLEAR => {
             with_keys(|m| m.clear());
