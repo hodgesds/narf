@@ -330,6 +330,14 @@ struct BuildArgs {
     ///          --initramfs-firmware "intel-ucode/*"
     #[arg(long, value_name = "GLOB")]
     initramfs_firmware: Vec<String>,
+
+    /// Build with Kernel Address Sanitizer (KASAN) for the freed-slab
+    /// write-after-free hunt: injects `-Zsanitizer=kernel-address` into the
+    /// kernel rustflags and enables the `kasan` cargo feature, so a dangling
+    /// write to a poisoned (freed) slab block trips the compiler-emitted
+    /// inline shadow check and panics IN the corruptor's frame. x86_64 only.
+    #[arg(long, default_value_t = false)]
+    kasan: bool,
 }
 
 /// Wave-49 — args for `xtask run-interactive`. Inherits BuildArgs
@@ -1489,11 +1497,43 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         .arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z")
         .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
+    // KASAN: setting CARGO_ENCODED_RUSTFLAGS overrides `.cargo/config.toml`'s
+    // per-target rustflags, so replicate the x86_64 kernel flags and append
+    // `-Zsanitizer=kernel-address`. Applied to every crate (incl. build-std
+    // core), so there is no sanitizer-ABI mismatch. x86_64 only.
+    if args.kasan {
+        if args.arch.triple() != "x86_64-unknown-none" {
+            bail!("--kasan is x86_64-only (kernel-address sanitizer unsupported on aarch64-unknown-none)");
+        }
+        let flags = [
+            "-C", "relocation-model=static",
+            "-C", "code-model=kernel",
+            "-C", "link-arg=-Tbuild/linker/x86_64.ld",
+            "-C", "link-arg=--gc-sections",
+            "-Z", "plt=no",
+            "--cfg", "curve25519_dalek_backend=\"serial\"",
+            "--cfg", "poly1305_force_soft",
+            "--cfg", "aes_force_soft",
+            "--cfg", "polyval_force_soft",
+            "-Z", "sanitizer=kernel-address",
+        ]
+        .join("\u{1f}");
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+    }
     if !args.debug {
         cmd.arg("--release");
     }
-    if !args.features.is_empty() {
-        cmd.arg("--features").arg(&args.features);
+    let features = if args.kasan {
+        if args.features.is_empty() {
+            "kasan".to_string()
+        } else {
+            format!("{},kasan", args.features)
+        }
+    } else {
+        args.features.clone()
+    };
+    if !features.is_empty() {
+        cmd.arg("--features").arg(&features);
     }
 
     let status = cmd.status().context("failed to invoke cargo build")?;

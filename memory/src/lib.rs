@@ -30,6 +30,8 @@ pub mod mempolicy;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
+#[cfg(feature = "kasan")]
+pub mod kasan;
 pub mod ro_after_init;
 pub mod slab;
 pub mod spd5;

@@ -129,6 +129,11 @@ frame-alloc-audit    = ["narf-memory/frame-alloc-audit"]
 # vtable names the concrete type (the rip=0x3 vtable-UAF hunt).
 slab-free-audit      = ["narf-memory/slab-free-audit"]
 
+# Kernel Address Sanitizer write-catch (freed-slab write-after-free hunt).
+# Forwarded to narf-memory; the build must ALSO pass
+# `-Zsanitizer=kernel-address` (use `cargo xtask <cmd> --kasan`).
+kasan                = ["narf-memory/kasan"]
+
 # Namespace isolation.  Forwarded from narf-userspace.  Stub for Waves 63-67.
 container = ["narf-userspace/container"]
 

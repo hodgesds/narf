@@ -66,6 +66,15 @@ slab-free-audit = []
 # atomic op per alloc/free.
 frame-alloc-audit = []
 
+# Kernel Address Sanitizer (KASAN) write-catch. Compiles the KASAN runtime
+# (src/kasan.rs) — the `__asan_*` callbacks + shadow poison/unpoison hooks —
+# and the slab poisons freed blocks so a dangling cross-CPU write trips the
+# compiler-emitted inline shadow check, panicking IN the corruptor's frame
+# (its RIP appears in the backtrace) instead of blaming the victim. Requires
+# the build to also pass `-Zsanitizer=kernel-address` (via `cargo xtask
+# <cmd> --kasan`, which injects it into the kernel rustflags). Off by default.
+kasan = []
+
 
 [lints]
 workspace = true
