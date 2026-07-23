@@ -3439,11 +3439,18 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
             return SyscallReturn::ok((-2i64) as u64); // -ENOENT
         }
     };
-    // Already exists → -EEXIST (Linux mknod semantics).
-    if poll_blocking(parent.lookup_async(&leaf)).map(|r| r.is_ok()) == Some(true) {
-        return SyscallReturn::ok((-17i64) as u64); // -EEXIST
-    }
     let fmt = mode & S_IFMT;
+    // Already exists → -EEXIST (Linux mknod semantics).
+    if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
+        if (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
+            && entry.stat().mode.file_type == narf_filesystem::FileType::File
+            && entry.stat().size == 0
+        {
+            let _ = poll_blocking(parent.unlink(&leaf));
+        } else {
+            return SyscallReturn::ok((-17i64) as u64); // -EEXIST
+        }
+    }
     let created = if fmt == S_IFDIR {
         poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true)
     } else if fmt == S_IFCHR || fmt == S_IFBLK {
