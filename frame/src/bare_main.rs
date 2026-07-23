@@ -1031,6 +1031,55 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             excludes.push((kstart, kend));
             excludes.extend(huge_excludes.iter().copied());
 
+            // KASAN: reserve a flat shadow byte-array (1 byte / 8 memory
+            // bytes) covering [0, ram_top) out of the buddy, so the software
+            // outline check (memory/src/kasan.rs) can poison freed slab
+            // blocks. Carved from the largest usable region's tail and kept
+            // out of the buddy via `excludes`; it is identity-mapped once the
+            // MMU comes up below, then zeroed + armed. `init`/`arm` run after
+            // `release_early_ceiling` so the mapping is guaranteed live.
+            #[cfg(feature = "kasan")]
+            let kasan_shadow: Option<(u64, u64)> = {
+                let ram_top = regions
+                    .iter()
+                    .map(|r| r.start.raw() + r.len)
+                    .max()
+                    .unwrap_or(0);
+                let ps = narf_memory::PAGE_SIZE;
+                let shadow_len = ((ram_top >> 3) + ps - 1) & !(ps - 1);
+                // Carve from the LOWEST-start region that fits, not the
+                // largest: on a 2-node machine the largest region is the high
+                // NUMA node, and gutting its tail starves that node's local
+                // allocations (SRAT setup then OOMs with GiB still free). The
+                // low region is node 0, which the kernel already lives in.
+                let biggest = regions
+                    .iter()
+                    .filter(|r| r.len >= shadow_len && shadow_len > 0)
+                    .min_by_key(|r| r.start.raw());
+                match biggest {
+                    Some(r) => {
+                        let shadow_phys = (r.start.raw() + r.len - shadow_len) & !(ps - 1);
+                        excludes.push((shadow_phys, shadow_phys + shadow_len));
+                        let _ = writeln!(
+                            console::Writer,
+                            "  kasan: shadow {} MiB reserved @ {:#x} (ram_top {:#x})",
+                            shadow_len / (1024 * 1024),
+                            shadow_phys,
+                            ram_top
+                        );
+                        Some((ram_top, shadow_phys))
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  kasan: DISABLED — no region fits {} MiB shadow",
+                            shadow_len / (1024 * 1024)
+                        );
+                        None
+                    }
+                }
+            };
+
             // SAFETY: first call, BSP, memory map came from parse_raw
             // which validated magic + min-RAM.
             // SAFETY: Valid memory or trusted environment
@@ -1116,6 +1165,20 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  frames: ceiling released, {} MiB free now allocatable",
                             (s.free as u64) * narf_memory::PAGE_SIZE / (1024 * 1024)
                         );
+
+                        // KASAN: the reserved shadow span is now identity-
+                        // mapped (init_mmu covers [0, max_ram_phys)). Zero it
+                        // and arm poisoning so freed slab blocks start being
+                        // tracked from here on.
+                        #[cfg(feature = "kasan")]
+                        if let Some((ram_top, shadow_phys)) = kasan_shadow {
+                            // SAFETY: [shadow_phys, shadow_phys + ram_top/8) was
+                            // reserved out of the buddy above and is identity-
+                            // mapped RW by init_mmu.
+                            unsafe { narf_memory::kasan::init(ram_top, shadow_phys) };
+                            narf_memory::kasan::arm();
+                            let _ = writeln!(console::Writer, "  kasan: armed");
+                        }
 
                         // Real-HW bring-up aid: install the FB
                         // console NOW, not at Stage::Late. Without

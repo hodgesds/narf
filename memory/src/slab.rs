@@ -513,6 +513,23 @@ impl From<crate::FrameAllocError> for SlabError {
 ///
 /// Returns `Err(SlabError::LayoutUnsupported)` when the alignment
 /// exceeds `PAGE_SIZE_USIZE`.
+/// KASAN: mark a size-class block accessible (on alloc) or poisoned (on
+/// free). No-op without the `kasan` feature. Covers the FULL `class_size(c)`
+/// so a write anywhere in the block — the corruptor writes past the caller's
+/// `layout.size()` — trips the check. See `memory/src/kasan.rs`.
+#[cfg(feature = "kasan")]
+#[inline]
+fn kasan_alloc(ptr: NonNull<u8>, c: usize) {
+    // SAFETY: `ptr` is a live block of `class_size(c)` bytes in low RAM.
+    unsafe { crate::kasan::unpoison(ptr.as_ptr() as u64, class_size(c)) };
+}
+#[cfg(feature = "kasan")]
+#[inline]
+fn kasan_free(ptr: NonNull<u8>, c: usize) {
+    // SAFETY: `ptr` is the block transitioning to the free state.
+    unsafe { crate::kasan::poison(ptr.as_ptr() as u64, class_size(c)) };
+}
+
 pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     // Sleepable is the implicit context for `slab::alloc`. In
     // debug builds the assertion panics if we got here from an
@@ -527,7 +544,12 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     let class = class_for(need);
     match class {
-        Some(c) => alloc_class(c),
+        Some(c) => {
+            let p = alloc_class(c)?;
+            #[cfg(feature = "kasan")]
+            kasan_alloc(p, c);
+            Ok(p)
+        }
         None => alloc_large(layout),
     }
 }
@@ -543,7 +565,11 @@ pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     match class_for(need) {
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
-        Some(c) => unsafe { dealloc_class(c, ptr) },
+        Some(c) => {
+            #[cfg(feature = "kasan")]
+            kasan_free(ptr, c);
+            unsafe { dealloc_class(c, ptr) }
+        }
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
         None => unsafe { dealloc_large(ptr, layout) },
     }
@@ -603,7 +629,10 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
         unsafe { canary_on_alloc(blk, c) };
         class.in_use.fetch_add(1, Ordering::Relaxed);
         class.mag_hit_count.fetch_add(1, Ordering::Relaxed);
-        Some(blk.cast())
+        let out: NonNull<u8> = blk.cast();
+        #[cfg(feature = "kasan")]
+        kasan_alloc(out, c);
+        Some(out)
     })
 }
 
@@ -647,6 +676,8 @@ pub unsafe fn try_dealloc_atomic(
         // SAFETY: caller hands us ownership of the block; the push
         // below is what publishes it as free.
         unsafe { canary_on_free(blk, c) };
+        #[cfg(feature = "kasan")]
+        kasan_free(ptr, c);
         mag.stack[mag.top] = Some(blk);
         mag.top += 1;
         class.in_use.fetch_sub(1, Ordering::Relaxed);

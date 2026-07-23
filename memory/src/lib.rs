@@ -7,6 +7,9 @@
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
+// KASAN callbacks + the slab (whose intrusive free-list/canary writes land in
+// freed blocks) opt OUT of instrumentation via `#[sanitize(address = "off")]`.
+#![cfg_attr(feature = "kasan", feature(sanitize))]
 
 extern crate alloc;
 
@@ -25,14 +28,19 @@ pub mod frame;
 pub mod heap;
 pub mod heap_backend;
 pub mod hugepage;
+#[cfg(feature = "kasan")]
+pub mod kasan;
 pub mod kaslr;
 pub mod mempolicy;
 pub mod pager;
 pub mod per_domain_root;
 pub mod reclaim;
-#[cfg(feature = "kasan")]
-pub mod kasan;
 pub mod ro_after_init;
+// The slab writes intrusive free-list links + per-block canaries INTO freed
+// blocks; under KASAN those blocks are poisoned, so the slab's own accesses
+// must not self-report. Exempt the whole module (the corruptor we hunt lives
+// in the scheduler, not here).
+#[cfg_attr(feature = "kasan", sanitize(address = "off"))]
 pub mod slab;
 pub mod spd5;
 pub mod swap;
