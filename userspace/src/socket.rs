@@ -99,6 +99,14 @@ pub const SHUT_RD: u32 = 0;
 pub const SHUT_WR: u32 = 1;
 pub const SHUT_RDWR: u32 = 2;
 
+/// `ioctl(fd, SIOCINQ, &int)` — bytes immediately readable. On Linux the
+/// value is shared with `FIONREAD`/`TIOCINQ` (0x541B). For a datagram
+/// socket it reports the size of the *next* pending datagram (0 when the
+/// queue is empty); for a stream socket, the total buffered bytes. systemd
+/// PID 1 issues this on its `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket to
+/// size the read of a pending notification.
+pub const SIOCINQ: u32 = 0x541B;
+
 // ── Socket-option levels and names ──────────────────────────────
 // Numbers match Linux `<linux/socket.h>` / `<netinet/tcp.h>` /
 // `<linux/in.h>`. Used by both handlers.rs and the dispatcher.
@@ -1079,6 +1087,26 @@ impl FileOps for SocketFile {
         }
     }
 
+    /// `ioctl(fd, SIOCINQ, &int)` — number of bytes immediately readable
+    /// (see `inq_bytes` for the per-state count). Only `SIOCINQ` (==
+    /// `FIONREAD`, 0x541B) is recognised; anything else is an unknown request
+    /// → `ENOTTY` (Linux `sock_ioctl` default). An empty queue reports 0 with
+    /// success (never ENOENT), which is what systemd PID 1 expects when it
+    /// sizes a read of its `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket.
+    fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        if cmd != SIOCINQ {
+            return Err(FsError::Unsupported);
+        }
+        let bytes = (self.inq_bytes() as i32).to_le_bytes();
+        // SAFETY: `copy_to_user` validates `arg` as a user address through
+        // the SMAP window; the length is the fixed 4-byte little-endian
+        // `int` the SIOCINQ contract writes back.
+        if unsafe { crate::handlers::copy_to_user(arg as u64, &bytes) }.is_err() {
+            return Err(FsError::InvalidData);
+        }
+        Ok(0)
+    }
+
     fn poll_readiness(&self) -> u32 {
         let state = self.state.lock();
         match &*state {
@@ -1189,6 +1217,27 @@ impl FileOps for SocketFile {
 }
 
 impl SocketFile {
+    /// Bytes immediately readable — the value the `SIOCINQ`/`FIONREAD` ioctl
+    /// reports. For a datagram socket this is the size of the *next* queued
+    /// datagram (0 when the queue is empty); for a connected stream socket
+    /// it is the total buffered rx bytes. Every other state (fresh, listener,
+    /// off-box kernel-TCP, bypass, uevent) yields 0 — no local byte count is
+    /// tracked and a consumer reads 0 as "fall back to recv/MSG_PEEK".
+    pub(crate) fn inq_bytes(&self) -> usize {
+        let state = self.state.lock();
+        match &*state {
+            SocketState::UnixDgram { inbox, .. }
+            | SocketState::InetDgram { inbox, .. }
+            | SocketState::InetRaw { inbox, .. } => {
+                inbox.front().map(|p| p.payload.len()).unwrap_or(0)
+            }
+            SocketState::UnixConnected { rx, .. }
+            | SocketState::InetConnected { rx, .. }
+            | SocketState::Inet6Connected { rx, .. } => rx.len(),
+            _ => 0,
+        }
+    }
+
     /// Per-op dispatcher. The SocketOp enum carries the operation
     /// shape; the per-family branch executes it. POSIX syscall
     /// shims and ring opcodes both call this.
@@ -3067,6 +3116,11 @@ impl RingBuf {
         self.inner.lock().len > 0
     }
 
+    /// Buffered byte count — backs `SIOCINQ`/`FIONREAD` on a stream socket.
+    fn len(&self) -> usize {
+        self.inner.lock().len
+    }
+
     fn has_space(&self) -> bool {
         self.inner.lock().len < RING_CAP
     }
@@ -3226,3 +3280,83 @@ fn _assert_send_sync() {
 fn _force_pin() -> Pin<Box<dyn core::future::Future<Output = ()> + Send>> {
     Box::pin(async {})
 }
+
+// ── SIOCINQ / FIONREAD queue-length tests ───────────────────────
+//
+// systemd PID 1 issues `ioctl(fd, SIOCINQ, &n)` on its
+// `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket to size a notification
+// read. Exercise the byte-count logic (`inq_bytes`, which the ioctl
+// serialises to user memory) directly so no user pointer is needed.
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// An empty AF_UNIX datagram queue reports 0 bytes with success — never
+/// an error. This is the case systemd hits at steady state (no pending
+/// notification), where an errored ioctl produced the "Failed to read
+/// AF_UNIX datagram queue length, ignoring" log.
+fn smoke_siocinq_unix_dgram_empty_is_zero() -> TestResult {
+    let sock = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    // Bind-equivalent: move to the datagram state with an empty inbox.
+    *sock.state.lock() = SocketState::UnixDgram {
+        addr: None,
+        inbox: VecDeque::new(),
+        peer: None,
+    };
+    if sock.inq_bytes() != 0 {
+        return TestResult::Fail("empty AF_UNIX dgram queue did not report 0 bytes");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/socket", smoke_siocinq_unix_dgram_empty_is_zero);
+
+/// A non-empty AF_UNIX datagram queue reports the size of the NEXT
+/// (head-of-queue) datagram — matching Linux `SIOCINQ` semantics on a
+/// datagram socket (one whole message per recv).
+fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
+    let sock = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    let mut inbox = VecDeque::new();
+    inbox.push_back(DgramPacket {
+        peer_unix: None,
+        sender_cred: Ucred::default(),
+        peer_addr: 0,
+        peer_port: 0,
+        payload: alloc::vec![0u8; 7], // head datagram: 7 bytes
+    });
+    inbox.push_back(DgramPacket {
+        peer_unix: None,
+        sender_cred: Ucred::default(),
+        peer_addr: 0,
+        peer_port: 0,
+        payload: alloc::vec![0u8; 3], // second datagram: ignored by SIOCINQ
+    });
+    *sock.state.lock() = SocketState::UnixDgram {
+        addr: None,
+        inbox,
+        peer: None,
+    };
+    if sock.inq_bytes() != 7 {
+        return TestResult::Fail("SIOCINQ did not report the head datagram's byte count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_siocinq_unix_dgram_reports_head_len
+);
+
+/// The socket ioctl recognises ONLY `SIOCINQ`; any other request is an
+/// unknown ioctl → `FsError::Unsupported` (the syscall layer maps this to
+/// ENOTTY, Linux's `sock_ioctl` default).
+fn smoke_socket_ioctl_unknown_is_unsupported() -> TestResult {
+    let sock = SocketFile::new(AF_UNIX, SOCK_DGRAM);
+    // 0xDEAD is not a request the socket handles; arg is unused because
+    // the unknown-cmd branch returns before touching it.
+    match sock.ioctl(0xDEAD, 0) {
+        Err(FsError::Unsupported) => TestResult::Pass,
+        _ => TestResult::Fail("unknown socket ioctl did not return Unsupported"),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_socket_ioctl_unknown_is_unsupported
+);
