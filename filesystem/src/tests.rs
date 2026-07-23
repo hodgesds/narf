@@ -642,7 +642,8 @@ fn smoke_filesystem_fifo_mknod_eexist_keeps_fifo() -> TestResult {
         Some(Some(s)) => s,
         _ => return finish(TestResult::Fail("FIFO node did not expose a shared buffer")),
     };
-    let rdwr = crate::fifo::FifoHandle::open(shared, 0, 0o600, /*r*/ true, /*w*/ true);
+    let rdwr =
+        crate::fifo::FifoHandle::open(shared, 0, 0o600, 0, 0, /*r*/ true, /*w*/ true);
     let msg = b"initctl";
     if !matches!(fifo_poll_once(rdwr.write(0, msg)), Some(Ok(n)) if n == msg.len()) {
         return finish(TestResult::Fail("O_RDWR FIFO write did not complete"));
@@ -670,6 +671,8 @@ fn smoke_filesystem_fifo_rdwr_round_trip() -> TestResult {
         shared.clone(),
         0x1234,
         0o666,
+        0,
+        0,
         /*r*/ false,
         /*w*/ true,
     );
@@ -677,6 +680,8 @@ fn smoke_filesystem_fifo_rdwr_round_trip() -> TestResult {
         shared.clone(),
         0x1234,
         0o666,
+        0,
+        0,
         /*r*/ true,
         /*w*/ false,
     );
@@ -711,11 +716,13 @@ fn smoke_filesystem_fifo_eof_on_writer_close() -> TestResult {
 
     let node = FifoNode::new(0x2000, 0o666);
     let shared = node.fifo_shared().expect("shared");
-    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x2000, 0o666, true, false);
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x2000, 0o666, 0, 0, true, false);
     let writer = Arc::new(crate::fifo::FifoHandle::open(
         shared.clone(),
         0x2000,
         0o666,
+        0,
+        0,
         false,
         true,
     ));
@@ -747,7 +754,7 @@ fn smoke_filesystem_fifo_broken_pipe_no_readers() -> TestResult {
     let node = FifoNode::new(0x3000, 0o666);
     let shared = node.fifo_shared().expect("shared");
     // A writer with zero readers (never opened a read end).
-    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x3000, 0o666, false, true);
+    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x3000, 0o666, 0, 0, false, true);
     match fifo_poll_once(writer.write(0, b"x")) {
         Some(Err(FsError::BrokenPipe)) => TestResult::Pass,
         _ => TestResult::Fail("write to reader-less FIFO did not report BrokenPipe"),
@@ -772,13 +779,13 @@ fn smoke_filesystem_fifo_peer_counts() -> TestResult {
     }
 
     // A reader opens: now a writer's peer (reader) is present.
-    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x4000, 0o666, true, false);
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x4000, 0o666, 0, 0, true, false);
     if shared.reader_count() != 1 {
         return TestResult::Fail("reader open did not bump reader_count");
     }
 
     // A writer opens: the reader's peer (writer) is now present too.
-    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x4000, 0o666, false, true);
+    let writer = crate::fifo::FifoHandle::open(shared.clone(), 0x4000, 0o666, 0, 0, false, true);
     if shared.writer_count() != 1 {
         return TestResult::Fail("writer open did not bump writer_count");
     }

@@ -465,6 +465,40 @@ fn smoke_abi_path_mknodat_fifo_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_fifo_pos);
 
+// mknod(2)/mkfifo(3): the created node's permission bits must come from the
+// `mode` argument, not a filesystem default. systemd's `fifo_address_create()`
+// creates `/run/initctl` with `mkfifo(path, 0600)` then rejects it with EEXIST
+// unless a follow-up stat reports BOTH S_IFIFO and `(st_mode & 0777) == 0600`.
+// Before the mode was persisted the FIFO stat'd as 0666 and systemd's listen
+// failed with "File exists".
+fn smoke_abi_path_mknodat_fifo_honors_mode() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"x")], || {
+        const S_IFIFO: u64 = 0o010000;
+        let path = b"/p/initctl\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) != Some(0)
+        {
+            return Err("mknodat(FIFO, 0600) at a fresh path should return 0");
+        }
+        let mut sb = [0u8; 256];
+        if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat of the new FIFO should return 0");
+        }
+        // st_mode is at offset 24; S_IFMT=0o170000, S_IFIFO=0o010000.
+        let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        if mode & 0o170000 != 0o010000 {
+            return Err("mknodat(S_IFIFO) node must stat as a FIFO");
+        }
+        if mode & 0o777 != 0o600 {
+            return Err("mknodat must persist the requested mode (0600), not a default");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_fifo_honors_mode);
+
 fn smoke_abi_path_mknodat_eexist() -> TestResult {
     with_memfs("/p", "p", &[("f", b"x")], || {
         // "f" already exists → mknod over it is -EEXIST, not a clobber.

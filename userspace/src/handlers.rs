@@ -1245,8 +1245,19 @@ fn open_impl(
     if let Some(shared) = ops.fifo_shared() {
         let node_ino = ops.ino();
         let perms = stat.mode.perms;
+        let (fifo_uid, fifo_gid) = ops.owners();
         let nonblock = flags & (crate::fd::O_NONBLOCK as u64) != 0;
-        open_fifo(ctx, shared, node_ino, perms, access_mode, nonblock, path);
+        open_fifo(
+            ctx,
+            shared,
+            node_ino,
+            perms,
+            fifo_uid,
+            fifo_gid,
+            access_mode,
+            nonblock,
+            path,
+        );
         return;
     }
 
@@ -1302,6 +1313,8 @@ fn open_fifo(
     shared: Arc<narf_filesystem::fifo::FifoShared>,
     node_ino: u64,
     perms: u16,
+    uid: u32,
+    gid: u32,
     access_mode: u64,
     nonblock: bool,
     _path: &str,
@@ -1325,6 +1338,8 @@ fn open_fifo(
         shared.clone(),
         node_ino,
         perms,
+        uid,
+        gid,
         can_read,
         can_write,
     )) as Arc<dyn narf_filesystem::FileOps>;
@@ -3441,35 +3456,55 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
             return SyscallReturn::ok((-17i64) as u64); // -EEXIST
         }
     }
-    let created = if fmt == S_IFDIR {
-        poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true)
-    } else if fmt == S_IFCHR || fmt == S_IFBLK {
+    // A directory carries its permission bits on the DirOps side; `mkdir` has
+    // no FileOps handle to persist a mode through here.
+    if fmt == S_IFDIR {
+        return if poll_blocking(parent.mkdir(&leaf)).map(|r| r.is_ok()) == Some(true) {
+            SyscallReturn::ok(0)
+        } else {
+            fail
+        };
+    }
+    // The created node handle, so the requested mode can be persisted below.
+    let node: Option<Arc<dyn narf_filesystem::FileOps>> = if fmt == S_IFCHR || fmt == S_IFBLK {
         // A char/block device node (udev coldplug creating /dev/<name>). Route
         // to the directory's `mknod` so a devfs parent materialises a node that
         // stats as the right special device with st_rdev == dev. Filesystems
         // that don't support device nodes fall back to a plain file so the node
         // at least EXISTS (matching the old behaviour for the elogind sandbox
         // nodes). `dev` is the Linux dev_t as passed by userspace.
-        let ft = narf_filesystem::FileType::Special;
-        let mk = poll_blocking(parent.mknod(&leaf, ft, dev)).map(|r| r.is_ok()) == Some(true);
-        mk || poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
+        match poll_blocking(parent.mknod(&leaf, narf_filesystem::FileType::Special, dev)) {
+            Some(Ok(n)) => Some(n),
+            _ => poll_blocking(parent.create(&leaf)).and_then(|r| r.ok()),
+        }
     } else if fmt == S_IFIFO {
         // A named pipe (musl `mkfifo` → `mknodat(S_IFIFO|mode, 0)`). Route to
         // the directory's `mknod` so a tmpfs parent (`/run`, `/tmp`) creates a
         // real FIFO inode whose later `open()` connects to a shared pipe
-        // buffer keyed by the node identity — NOT a plain file (which stat'd
-        // as a regular file and made systemd's `/run/initctl` open fail with
-        // "File exists"). No device-node fallback: a FIFO on a filesystem
-        // without FIFO support is a hard failure, not a degraded regular file.
-        poll_blocking(parent.mknod(&leaf, narf_filesystem::FileType::Fifo, 0)).map(|r| r.is_ok())
-            == Some(true)
+        // buffer keyed by the node identity — NOT a plain file. No device-node
+        // fallback: a FIFO on a filesystem without FIFO support is a hard
+        // failure, not a degraded regular file.
+        poll_blocking(parent.mknod(&leaf, narf_filesystem::FileType::Fifo, 0)).and_then(|r| r.ok())
     } else {
-        poll_blocking(parent.create(&leaf)).map(|r| r.is_ok()) == Some(true)
+        poll_blocking(parent.create(&leaf)).and_then(|r| r.ok())
     };
-    if created {
-        SyscallReturn::ok(0)
-    } else {
-        fail
+    match node {
+        Some(n) => {
+            // Linux mknod(2)/mkfifo(3): the new node is owned by the creating
+            // task's filesystem uid/gid and carries the permission bits from
+            // `mode` (the caller already folded in its umask). Persist both so
+            // a later stat reports them — systemd's `fifo_address_create()`
+            // rejects `/run/initctl` unless the FIFO is BOTH owned by the
+            // caller (`st_uid == getuid()`) AND has the exact `socket_mode`
+            // (`st_mode & 0777 == 0600`) it created it with; and the DAC open
+            // check needs the owner set so the non-root creator can reopen its
+            // own 0600 pipe.
+            let acc = current_accessor(current_task_id());
+            let _ = poll_blocking(n.set_owners(acc.uid, acc.gid));
+            let _ = poll_blocking(n.set_perms((mode & 0o777) as u16));
+            SyscallReturn::ok(0)
+        }
+        None => fail,
     }
 }
 
@@ -4011,7 +4046,13 @@ pub mod linux_compat {
 // Build a Linux-shaped struct stat from a `narf_filesystem::Stat`.
 // Same conventions as sys_statx (uid/gid/atime not tracked).
 #[cfg(feature = "linux-compat")]
-fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64, ino: u64) -> linux_compat::Stat {
+fn linux_stat_from_fs(
+    s: narf_filesystem::Stat,
+    uid: u32,
+    gid: u32,
+    rdev: u64,
+    ino: u64,
+) -> linux_compat::Stat {
     let ftype_bits: u32 = match s.mode.file_type {
         narf_filesystem::FileType::File => 0o100000,
         narf_filesystem::FileType::Dir => 0o040000,
@@ -4040,8 +4081,8 @@ fn linux_stat_from_fs(s: narf_filesystem::Stat, rdev: u64, ino: u64) -> linux_co
         },
         st_nlink: 1,
         st_mode: mode_word,
-        st_uid: 0,
-        st_gid: 0,
+        st_uid: uid,
+        st_gid: gid,
         __pad0: 0,
         st_rdev: rdev,
         st_size: s.size as i64,
@@ -4122,7 +4163,8 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
     // Report the device node's rdev (major:minor) for PATH stat too: seatd /
     // libudev validate a device's type from a path stat before opening it, so
     // a 0 rdev makes them reject evdev nodes (weston input never opens).
-    let out = linux_stat_from_fs(s, rdev, ino);
+    // Path stat has no fd handle to read owners from; owners default to root.
+    let out = linux_stat_from_fs(s, 0, 0, rdev, ino);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment
@@ -4154,16 +4196,17 @@ fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     }
     let task = current_task_id();
     let stat = fd::with_table(task, |t| {
-        t.get(fd).map(|e| (e.ops.stat(), e.ops.rdev(), e.ops.ino()))
+        t.get(fd)
+            .map(|e| (e.ops.stat(), e.ops.owners(), e.ops.rdev(), e.ops.ino()))
     });
-    let (s, rdev, ino) = match stat {
-        Some(Some(triple)) => triple,
+    let (s, (uid, gid), rdev, ino) = match stat {
+        Some(Some(tuple)) => tuple,
         _ => {
             ctx.set_return(fail);
             return;
         }
     };
-    let out = linux_stat_from_fs(s, rdev, ino);
+    let out = linux_stat_from_fs(s, uid, gid, rdev, ino);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment

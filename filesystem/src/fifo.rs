@@ -183,6 +183,8 @@ pub struct FifoHandle {
     shared: Arc<FifoShared>,
     ino: u64,
     perms: u16,
+    uid: u32,
+    gid: u32,
     can_read: bool,
     can_write: bool,
 }
@@ -198,13 +200,15 @@ impl core::fmt::Debug for FifoHandle {
 
 impl FifoHandle {
     /// Build a per-open handle for `shared`, bumping the reader/writer open
-    /// counts to match the requested direction. `ino`/`perms` are copied
-    /// from the node so `stat`/`fstat` on the handle reports the FIFO's
-    /// identity and mode. The corresponding count is dropped in `Drop`.
+    /// counts to match the requested direction. `ino`/`perms`/`uid`/`gid` are
+    /// copied from the node so `stat`/`fstat` on the handle reports the FIFO's
+    /// identity, mode, and owner. The corresponding count is dropped in `Drop`.
     pub fn open(
         shared: Arc<FifoShared>,
         ino: u64,
         perms: u16,
+        uid: u32,
+        gid: u32,
         can_read: bool,
         can_write: bool,
     ) -> Self {
@@ -218,6 +222,8 @@ impl FifoHandle {
             shared,
             ino,
             perms,
+            uid,
+            gid,
             can_read,
             can_write,
         }
@@ -304,6 +310,10 @@ impl FileOps for FifoHandle {
             },
             mtime_cycles: 0,
         }
+    }
+
+    fn owners(&self) -> (u32, u32) {
+        (self.uid, self.gid)
     }
 
     fn poll_readiness(&self) -> u32 {
