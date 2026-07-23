@@ -41,17 +41,33 @@ pub const AF_INET6: u16 = 10;
 /// Picks 45 because Linux's number is taken; carries our four-ring
 /// model rather than mmap'd shared pages.
 pub const AF_BYPASS: u16 = 45;
-/// Linux `AF_NETLINK`. We implement two protocols below (route + uevent).
+/// Linux `AF_NETLINK`. We implement route + uevent as first-class protocols
+/// and back every other family (audit / generic / netfilter / …) with a
+/// coherent no-op sink so a `socket(AF_NETLINK, …)` never fails.
 pub const AF_NETLINK: u16 = 16;
+/// `SOL_NETLINK` — the get/setsockopt level for netlink-specific options
+/// (NETLINK_ADD_MEMBERSHIP, NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …).
+/// sd-netlink sets a handful of these best-effort right after `socket()`.
+pub const SOL_NETLINK: u32 = 270;
 /// `NETLINK_ROUTE` (rtnetlink) — the interface/address/route dump protocol.
 /// systemd-udevd, systemd-networkd, and `ip link`/`ip addr` open
 /// `socket(AF_NETLINK, SOCK_RAW, 0)` and send RTM_GETLINK/RTM_GETADDR dump
 /// requests; we answer them from `narf_net::netlink_route::build_dump`.
 pub const NETLINK_ROUTE: u32 = 0;
+/// `NETLINK_AUDIT` — the kernel audit protocol. systemd PID 1's audit setup
+/// opens `socket(AF_NETLINK, SOCK_RAW, 9)`; we back it with the no-op sink
+/// (audit is disabled — messages are accepted and silently dropped).
+pub const NETLINK_AUDIT: u32 = 9;
+/// `NETLINK_NETFILTER` — nfnetlink (conntrack / nftables). Backed by the sink.
+pub const NETLINK_NETFILTER: u32 = 12;
 /// `NETLINK_KOBJECT_UEVENT` — the udev hotplug-monitor netlink protocol.
 /// libudev opens `socket(AF_NETLINK, SOCK_DGRAM|SOCK_RAW, 15)` and reads
 /// device-uevent messages off it; we bridge it to the kernel uevent ring.
 pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
+/// `NETLINK_GENERIC` (genetlink) — the family-multiplexing protocol used by
+/// nl80211, taskstats, thermal, etc. Backed by the sink. Note the numeric
+/// value coincides with `AF_NETLINK` (16); they occupy different arg slots.
+pub const NETLINK_GENERIC: u32 = 16;
 
 /// `sockaddr_nl` body (the bytes after the 2-byte `nl_family`) identifying
 /// the KERNEL as a uevent's sender: `nl_pad=0`, `nl_pid=0` (kernel),
@@ -535,6 +551,13 @@ enum SocketState {
     /// `recv` dequeues one message per call (the kernel dumps stream over
     /// netlink as one datagram per message, terminated by NLMSG_DONE).
     NetlinkRoute { replies: VecDeque<Vec<u8>> },
+    /// `AF_NETLINK` for a protocol NARF does not model (NETLINK_AUDIT,
+    /// NETLINK_GENERIC, NETLINK_NETFILTER, …). A coherent no-op sink: `bind`,
+    /// `connect`, and `send` succeed (messages are dropped — audit/netfilter
+    /// are disabled), `recv` reports empty (WouldBlock). This lets
+    /// best-effort openers (systemd PID 1's audit setup) get a usable fd and
+    /// proceed instead of failing the socket open with EPERM.
+    NetlinkSink,
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -583,9 +606,17 @@ impl SocketFile {
             SocketState::NetlinkRoute {
                 replies: VecDeque::new(),
             }
+        } else if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
+            // Any AF_NETLINK protocol NARF does not model as route/uevent
+            // (NETLINK_AUDIT=9, NETLINK_NETFILTER=12, NETLINK_GENERIC=16, …) →
+            // a coherent no-op sink. systemd PID 1 opens NETLINK_AUDIT during
+            // manager setup; a hard failure here surfaced to userspace as the
+            // -1 sentinel (glibc errno=EPERM) → "Failed to open netlink,
+            // ignoring: Operation not permitted". The sink returns a usable fd.
+            SocketState::NetlinkSink
         } else if domain == AF_NETLINK {
-            // NETLINK_KOBJECT_UEVENT (and any other AF_NETLINK protocol) → the
-            // udev hotplug monitor. Wire the post-emit wake so a uevent emitted
+            // NETLINK_KOBJECT_UEVENT → the udev hotplug monitor. Wire the
+            // post-emit wake so a uevent emitted
             // while this monitor is parked in poll/epoll wakes it (the ring
             // lives in the fs crate, which can't reach the net readiness layer
             // directly). Idempotent — a plain atomic store.
@@ -1150,6 +1181,9 @@ impl FileOps for SocketFile {
                 }
                 bits
             }
+            // No-op sink (audit/generic/netfilter): always writable (sends are
+            // accepted + dropped), never readable (nothing is ever queued).
+            SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
         }
     }
 }
@@ -1220,6 +1254,9 @@ impl SocketFile {
             (AF_INET6, SOCK_STREAM) => self.dispatch_inet6_stream(op),
             (AF_BYPASS, SOCK_RAW) => self.dispatch_bypass(op),
             (AF_NETLINK, _) if self.protocol == NETLINK_ROUTE => self.dispatch_netlink_route(op),
+            (AF_NETLINK, _) if self.protocol != NETLINK_KOBJECT_UEVENT => {
+                self.dispatch_netlink_sink(op)
+            }
             (AF_NETLINK, _) => self.dispatch_netlink(op),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
@@ -1325,6 +1362,24 @@ impl SocketFile {
                     None => SocketOpResult::Err(SockError::WouldBlock),
                 }
             }
+            SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// `AF_NETLINK` no-op sink for protocols NARF does not model
+    /// (NETLINK_AUDIT, NETLINK_GENERIC, NETLINK_NETFILTER, …). Every op that
+    /// systemd's best-effort netlink open performs succeeds so it gets a
+    /// usable fd: `bind`/`connect` return 0, `send` accepts and drops the
+    /// message (audit/netfilter disabled), `recv` reports empty (WouldBlock →
+    /// EAGAIN, exactly like a quiet socket). Returning a hard error here made
+    /// the socket open surface as EPERM ("Failed to open netlink, ignoring").
+    fn dispatch_netlink_sink(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { .. } => SocketOpResult::Ok(0),
+            SocketOp::Connect { .. } => SocketOpResult::Ok(0),
+            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Recv { .. } => SocketOpResult::Err(SockError::WouldBlock),
             SocketOp::Shutdown { how: _ } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
@@ -1744,6 +1799,11 @@ impl SocketFile {
             (IPPROTO_IP, IP_RECVTTL) => write_bool(buf, opts.ip_recvttl),
             (IPPROTO_IP, IP_MTU) => write_u32(buf, opts.ip_mtu),
             (IPPROTO_IP, IP_MULTICAST_TTL) => write_u32(buf, opts.ip_multicast_ttl),
+            // SOL_NETLINK options (NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, …)
+            // are best-effort probes in sd-netlink; report the feature as off
+            // (0) rather than erroring, since an error becomes the -1 sentinel
+            // (glibc EPERM) and aborts the netlink open.
+            (SOL_NETLINK, _) => write_u32(buf, 0),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }

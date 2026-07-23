@@ -1714,6 +1714,68 @@ fn smoke_abi_netlink_uevent_recv() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_netlink_uevent_recv);
 
+// systemd PID 1's audit setup opens `socket(AF_NETLINK, SOCK_RAW, 9)`. NARF
+// does not model audit/generic/netfilter netlink, but MUST still hand back a
+// usable fd whose bind/send no-op succeed — a socket-open failure surfaced to
+// glibc as the -1 sentinel (errno EPERM) → "Failed to open netlink, ignoring:
+// Operation not permitted". These smokes pin the no-op sink behaviour.
+const NETLINK_AUDIT: u64 = 9;
+const NETLINK_GENERIC: u64 = 16;
+
+fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
+    with_setup(|| {
+        // socket() must return a real fd, never the -1 EPERM sentinel.
+        let fd = open_netlink(NETLINK_AUDIT)?;
+        // bind(sockaddr_nl{groups=0}) must succeed (return 0).
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind(NETLINK_AUDIT) did not return 0");
+        }
+        // A best-effort audit message send is accepted (and dropped): the
+        // return echoes the byte count, matching a quiet-but-open socket.
+        let msg = nlmsg_request(0, 1);
+        if netlink_send(fd, &msg).ok_or("send status")? != msg.len() as i64 {
+            return Err("send(NETLINK_AUDIT) did not accept the message");
+        }
+        // recv on the empty sink is non-blocking EAGAIN (no reply queued).
+        let mut buf = [0u8; 64];
+        let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
+        if n > 0 {
+            return Err("NETLINK_AUDIT sink unexpectedly returned data");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_audit_socket_open_bind_send);
+
+fn smoke_abi_netlink_generic_socket_open() -> TestResult {
+    with_setup(|| {
+        // NETLINK_GENERIC (genetlink) is likewise backed by the sink: open +
+        // bind succeed so callers get a usable fd instead of EPERM.
+        let fd = open_netlink(NETLINK_GENERIC)?;
+        let (addr, alen) = netlink_sockaddr(0);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, alen),
+        )
+        .ok_or("bind status")?
+            != 0
+        {
+            return Err("bind(NETLINK_GENERIC) did not return 0");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_netlink_generic_socket_open);
+
 /// True iff `needle` appears as a contiguous byte window in `hay`.
 fn window_contains(hay: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > hay.len() {
