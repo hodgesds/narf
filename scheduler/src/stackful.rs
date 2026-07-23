@@ -157,6 +157,40 @@ static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
     inner: [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS],
 };
 
+/// Per-CPU flag: the most recent `poll_to_yield` on this CPU returned
+/// `Poll::Pending` because the task was INVOLUNTARILY PREEMPTED (a LAPIC-timer
+/// tick via `try_preempt`), NOT because it cooperatively yielded at an `.await`
+/// boundary. Set at the tail of `poll_to_yield`; read-and-cleared by the
+/// executor via [`take_preempted_return`] before it announces a QSBR quiescent
+/// state.
+///
+/// The distinction is a QSBR-correctness invariant: a cooperative `.await`
+/// yield is a genuine quiescent point (the task holds no RCU references across
+/// it — see rcu/ §3.7), but a preemption is an arbitrary-PC context switch. A
+/// preempted task's continuation — saved in `task.ctx` and re-polled later —
+/// may hold raw references (e.g. into RCU-deferred memory) that never went
+/// through `pin()`, so `report_quiescent`'s `active_readers` gate can't see
+/// them. Announcing quiescence there would let a grace period complete and free
+/// an object the suspended task still points at. The executor therefore
+/// suppresses `report_quiescent` on a preemption return.
+struct PerCpuBool {
+    inner: [AtomicBool; narf_lib::percpu::MAX_CPUS],
+}
+static PREEMPTED_RETURN: PerCpuBool = PerCpuBool {
+    inner: [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+};
+
+/// Read-and-clear this CPU's "last poll_to_yield returned via preemption" flag.
+/// Returns `true` iff the most recent stackful poll on this CPU yielded because
+/// it was involuntarily preempted (not a cooperative `.await`). The executor
+/// calls this immediately after a poll returns to decide whether the poll
+/// boundary was a true QSBR quiescent state. See [`PREEMPTED_RETURN`].
+#[inline]
+pub fn take_preempted_return() -> bool {
+    let cpu = this_cpu();
+    PREEMPTED_RETURN.inner[cpu].swap(false, Ordering::AcqRel)
+}
+
 // ── Per-task-own-stack user execution model (Stage 2-4) ─────────────
 //
 // OFF (default) = legacy longjmp/synthetic-frame user-task path. ON = user
@@ -758,6 +792,17 @@ impl KernelTask {
         }
         self.exec_ctx
             .store(core::ptr::null_mut(), Ordering::Release);
+        // Publish whether this return was an involuntary preemption so the
+        // executor can suppress its QSBR quiescent-state announcement (a
+        // preemption is not a quiescent point — the suspended continuation may
+        // hold raw RCU references). `try_preempt` set `preempted` before
+        // switching out; consume it here so a later cooperative yield of the
+        // same task isn't mis-reported as a preemption. See `PREEMPTED_RETURN`.
+        let was_preempted = self.preempted.swap(false, Ordering::AcqRel);
+        {
+            let cpu = this_cpu();
+            PREEMPTED_RETURN.inner[cpu].store(was_preempted, Ordering::Release);
+        }
         if self.completed.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
@@ -1948,6 +1993,65 @@ pub mod tests {
         let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
         if r != Poll::Ready(()) {
             return TestResult::Fail("expected Ready after flag set");
+        }
+        TestResult::Pass
+    }
+
+    /// The QSBR quiescent-state gate. `poll_to_yield` publishes, per CPU,
+    /// whether a `Poll::Pending` return was an involuntary preemption so the
+    /// executor can suppress `report_quiescent` (a preemption is not a
+    /// quiescent point — the suspended continuation may hold raw RCU
+    /// references). `take_preempted_return` reads-and-clears that signal.
+    /// A cooperative yield leaves it false; the `preempted` flag `try_preempt`
+    /// sets before switching out surfaces as true exactly once, and is
+    /// consumed so a later cooperative yield of the same task isn't
+    /// mis-attributed.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_preempted_return_gate_reflects_preemption() -> TestResult {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static POLLS: AtomicU32 = AtomicU32::new(0);
+        FLAG.store(false, Ordering::Release);
+        POLLS.store(0, Ordering::Release);
+
+        // Drain any stale per-CPU signal left by a prior test on this CPU.
+        let _ = take_preempted_return();
+
+        let mut task = KernelTask::new(WaitOnFlag {
+            flag: &FLAG,
+            polls: &POLLS,
+        });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+
+        // (1) Cooperative Pending yield: `preempted` stays clear → gate false.
+        // SAFETY: Valid memory or trusted environment
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        if r != Poll::Pending {
+            return TestResult::Fail("expected Pending while flag false");
+        }
+        if take_preempted_return() {
+            return TestResult::Fail("cooperative yield mis-reported as preemption");
+        }
+
+        // (2) Simulate the observable effect of `try_preempt` (preempted=true)
+        // ahead of the next yield; `poll_to_yield`'s tail must surface it.
+        task.preempted.store(true, Ordering::Release);
+        // SAFETY: Valid memory or trusted environment
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        if r != Poll::Pending {
+            return TestResult::Fail("expected Pending while flag still false");
+        }
+        if !take_preempted_return() {
+            return TestResult::Fail("preemption not surfaced to the quiescent gate");
+        }
+        // (3) One-shot: the second read is false (read-and-clear).
+        if take_preempted_return() {
+            return TestResult::Fail("preemption signal not cleared on read");
+        }
+        // `poll_to_yield` must have consumed `preempted` so a later cooperative
+        // yield of the same task isn't mis-attributed as a preemption.
+        if task.preempted.load(Ordering::Acquire) {
+            return TestResult::Fail("poll_to_yield did not consume the preempted flag");
         }
         TestResult::Pass
     }
@@ -3886,6 +3990,11 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_pending_round_trips_preserve_state
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_preempted_return_gate_reflects_preemption
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_stackful_runs_on_dedicated_stack);

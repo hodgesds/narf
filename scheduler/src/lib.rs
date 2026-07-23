@@ -1754,7 +1754,14 @@ pub fn poll_one_round() -> usize {
             // SAFETY: see above.
             slot.saved_pkrs = Some(unsafe { narf_arch::x86_64::pks::save() });
         }
-        narf_rcu::report_quiescent();
+        // Announce a QSBR quiescent state — UNLESS the task returned Pending
+        // because it was involuntarily preempted (a preemption is an
+        // arbitrary-PC context switch, not a quiescent point; its suspended
+        // continuation may still hold raw RCU references). `take_preempted_return`
+        // reads-and-clears the per-CPU flag `poll_to_yield` set at switch-back.
+        if !stackful::take_preempted_return() {
+            narf_rcu::report_quiescent();
+        }
         match poll_result {
             Poll::Ready(()) => ready_this_round += 1,
             Poll::Pending => {
@@ -2125,9 +2132,16 @@ pub fn run_until_empty() {
             // Announce a QSBR quiescent state: the task has yielded
             // back to the executor and holds no RCU read-guards across
             // the poll boundary (per rcu/ §3.7, read-guards may not
-            // span awaits). Every poll return is therefore a grace-
-            // period tick for this CPU.
-            narf_rcu::report_quiescent();
+            // span awaits). Every cooperative poll return is therefore
+            // a grace-period tick for this CPU — but a task that
+            // returned Pending because it was involuntarily PREEMPTED
+            // is NOT at a quiescent point (its suspended continuation,
+            // saved in task.ctx and re-polled later, may still hold raw
+            // RCU references that never went through pin()). Suppress
+            // the announcement on a preemption return.
+            if !stackful::take_preempted_return() {
+                narf_rcu::report_quiescent();
+            }
 
             match poll_result {
                 Poll::Ready(()) => { /* completed — drop slot */ }
