@@ -136,6 +136,93 @@ fn smoke_abi_path_openat_nofollow_symlink() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_openat_nofollow_symlink);
 
+// ── os-release-shaped symlink: chase (O_NOFOLLOW|O_PATH) vs follow ──
+//
+// systemd (PID 1) reads /etc/os-release — a symlink to ../usr/lib/os-release —
+// via open_os_release_at → chaseat, which walks each component with
+// openat(…, O_CLOEXEC|O_NOFOLLOW|O_PATH) and readlinkat()s a symlink to get
+// its target. Two invariants that flow must satisfy, or systemd logs
+// "Failed to read os-release file … Bad file descriptor" and
+// "Failed to copy os-release … Is a directory":
+//   (1) O_NOFOLLOW|O_PATH on the symlink hands back the LINK node (S_IFLNK),
+//       not its followed target — otherwise chaseat can't readlinkat it.
+//   (2) A following open of the symlink resolves to the target REGULAR file:
+//       read() returns its bytes (never -EBADF) and fstat reports S_IFREG
+//       (never a directory — copy_file_atomic's fd_verify_regular rejects a
+//       directory source with EISDIR).
+// On a disk-backed rootfs (ext2) the leaf lookup must run through the ASYNC
+// resolver; the sync `lookup` used previously is stubbed there, so every
+// O_NOFOLLOW|O_PATH open silently followed the link. MemFs exercises both
+// resolution modes and pins the resulting fd shapes.
+fn smoke_abi_path_os_release_symlink_chase_and_follow() -> TestResult {
+    const OS_RELEASE: &[u8] = b"ID=narf\nPRETTY_NAME=\"NARF\"\n";
+    with_memfs("/p", "p", &[("os-release", OS_RELEASE)], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        // /p/link -> os-release (relative target, like /etc/os-release).
+        let target = b"os-release\0";
+        let link = b"/p/link\0";
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64).unwrap_or(-1) != 0 {
+            return Err("symlink(/p/link -> os-release) creation failed");
+        }
+
+        // (1) O_NOFOLLOW|O_PATH must open the LINK node itself → fstat S_IFLNK.
+        let lfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, link.as_ptr() as u64, O_NOFOLLOW | O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(link, O_NOFOLLOW|O_PATH) did not open the symlink node"),
+        };
+        let mut sb = [0u8; 256];
+        if call(Syscall::Fstat.raw(), a1(lfd, sb.as_mut_ptr() as u64)) != Some(0) {
+            return Err("fstat of the O_NOFOLLOW|O_PATH fd failed");
+        }
+        // st_mode at offset 24; S_IFMT=0o170000, S_IFLNK=0o120000.
+        let lmode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]);
+        if lmode & 0o170000 != 0o120000 {
+            return Err("O_NOFOLLOW|O_PATH fd must fstat as S_IFLNK (the link, not its target)");
+        }
+
+        // (2) A following open resolves to the target regular file.
+        let ffd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, link.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(link, O_RDONLY) following the symlink did not yield a fd"),
+        };
+        // read() returns the target's bytes — never -EBADF.
+        let mut rbuf = [0u8; 64];
+        let n = match call(
+            Syscall::Read.raw(),
+            a2(ffd, rbuf.as_mut_ptr() as u64, rbuf.len() as u64),
+        ) {
+            Some(v) if v == EBADF => return Err("read of a symlink-followed file returned -EBADF"),
+            Some(v) if v > 0 => v as usize,
+            _ => return Err("read of a symlink-followed file returned no bytes"),
+        };
+        if &rbuf[..n] != OS_RELEASE {
+            return Err("symlink-followed read did not return the target's content");
+        }
+        // fstat of the followed fd reports S_IFREG — a directory here would make
+        // systemd's fd_verify_regular reject the copy source with EISDIR.
+        let mut fsb = [0u8; 256];
+        if call(Syscall::Fstat.raw(), a1(ffd, fsb.as_mut_ptr() as u64)) != Some(0) {
+            return Err("fstat of the followed fd failed");
+        }
+        let fmode = u32::from_ne_bytes([fsb[24], fsb[25], fsb[26], fsb[27]]);
+        if fmode & 0o170000 != 0o100000 {
+            return Err("symlink-followed fd must fstat as S_IFREG, not a directory");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_path_os_release_symlink_chase_and_follow
+);
+
 // ── fstatfs reports the fd's own filesystem magic ──
 //
 // sd-device's fd_is_fs_type(fd, SYSFS_MAGIC) fstatfs()es an opened /sys node

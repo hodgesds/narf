@@ -1037,8 +1037,21 @@ fn open_impl(
     const O_NOFOLLOW: u64 = 0o400000;
     const O_PATH: u64 = 0o10000000;
     if flags & O_NOFOLLOW != 0 && mnt_len == 0 {
+        // Look the leaf up WITHOUT following a trailing symlink, driving the
+        // ASYNC resolver: on a disk-backed rootfs (ext2) the sync `lookup`
+        // is stubbed (block reads can't run synchronously), so a sync
+        // parent-lookup never sees an on-disk symlink and every
+        // O_NOFOLLOW|O_PATH open silently followed it. That broke
+        // `chase_symlinks`/`open_os_release_at` (systemd, sd-device), which
+        // walk a path one `openat(…, O_NOFOLLOW|O_PATH)` per component and
+        // `readlinkat()` each symlink — following the final component here
+        // handed them the target instead of the link. `resolve_async_nofollow`
+        // follows intermediate symlinks but returns a final symlink as-is.
         let leaf = narf_filesystem::registry()
-            .resolve_parent_absolute(path, |_fs, parent, leaf| parent.lookup(leaf))
+            .resolve_absolute(path, |fs, rel| {
+                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                    .and_then(|r| r.ok())
+            })
             .flatten();
         if let Some(lops) = leaf {
             if lops.stat().mode.file_type == narf_filesystem::FileType::Symlink {
