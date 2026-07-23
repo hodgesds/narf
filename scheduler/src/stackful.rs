@@ -366,6 +366,28 @@ static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
     inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
 };
 
+/// Per-CPU save target for the FINAL `kernel_switch` of an exiting task
+/// (`exit_current_stackful`). The exit's abandoned continuation must be
+/// saved SOMEWHERE (the save half is unconditional), but it must NOT be
+/// saved into the dying task's own `ctx`: the executor observes
+/// `completed` and drops the `Box<KernelTask>` immediately after the
+/// switch, so the box must never again be a write target once
+/// `completed` is published. Nothing ever switches into this scratch —
+/// the continuation it captures is dead by construction.
+#[cfg(target_arch = "x86_64")]
+struct PerCpuScratchCtx {
+    inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
+}
+#[cfg(target_arch = "x86_64")]
+// SAFETY: each CPU writes only `inner[its-own-cpu]`, and only from
+// `exit_current_stackful` (one exiting task at a time per CPU); the slot
+// is write-only dead storage, never read or switched into.
+unsafe impl Sync for PerCpuScratchCtx {}
+#[cfg(target_arch = "x86_64")]
+static EXIT_SCRATCH_CTX: PerCpuScratchCtx = PerCpuScratchCtx {
+    inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
+};
+
 #[inline]
 fn this_cpu() -> usize {
     let c = narf_lib::percpu::current_cpu();
@@ -536,15 +558,19 @@ pub struct KernelTask {
     user_fs_base: AtomicU64,
 }
 
-// SAFETY: KernelTask is single-CPU for phase 2 (BSP-only). The
-// UnsafeCell is written by the trap-handler hook which runs in
-// IRQ context on the same CPU as the executor. No cross-CPU
-// access in phase 2.
+// SAFETY: A `KernelTask` runs on one CPU at a time (the executor switches
+// into it, and it yields before another CPU can poll it). Its interior
+// mutability is atomics + a `current_waker` IrqSafeSpinLock. Under SMP a
+// raw `*mut KernelTask` is published in `CURRENT_STACKFUL_TASK` and read
+// cross-CPU (try_preempt, syscall-exit, user-state publish); the lifetime
+// of that raw access is made sound by deferring the task's reclamation
+// through RCU (see `impl Drop for StackfulAdapter`), so the memory outlives
+// any stale cross-CPU pointer. Send: a task's `Box` is moved between per-CPU
+// ready queues by the work-stealer.
 unsafe impl Send for KernelTask {}
-// SAFETY: Same single-CPU (BSP-only) invariant as the Send impl above.
-// The only interior-mutability path is the `current_waker` lock written
-// by the trap-handler hook, which runs in IRQ context on the same CPU as
-// the executor; phase 2 has no cross-CPU sharing of a `KernelTask`.
+// SAFETY: Same as the `Send` impl — one-CPU-at-a-time execution plus atomic /
+// locked interior mutability; cross-CPU raw-pointer reads are kept sound by
+// RCU-deferred reclamation.
 unsafe impl Sync for KernelTask {}
 
 impl core::fmt::Debug for KernelTask {
@@ -655,6 +681,15 @@ impl KernelTask {
         exec_ctx: &mut KernelContext,
         waker: &Waker,
     ) -> Poll<()> {
+        // A completed task's saved `ctx` is a CONSUMED continuation — its
+        // final switch-out already ran (`exit_current_stackful` additionally
+        // poisons `ctx.rip`). Never switch into it: report Ready so the
+        // caller drops the slot. This makes a poll of an already-completed
+        // task (a stale wake racing the exit on another CPU) a clean no-op
+        // instead of a resume of dead state.
+        if self.completed.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
         // Stash the executor's waker so the inner future's
         // `cx.waker().wake_by_ref()` (e.g. from `yield_now()`)
         // re-arms the correct slot — see `task_body_rust`.
@@ -843,18 +878,14 @@ impl KernelTask {
     }
 }
 
-impl Drop for KernelTask {
-    /// Guarantee no per-CPU `CURRENT_STACKFUL_TASK` slot outlives this
-    /// task pointing at it. The set/clear discipline in
-    /// `task_body_rust` / `try_preempt` already keeps a slot armed only
-    /// while the task runs on that CPU, but this is the backstop: if
-    /// any path ever left a slot stranded, `try_preempt` on that CPU
-    /// would write a trap frame through the freed `Box<KernelTask>` (the
-    /// executor-dispatch rip≈0x3 use-after-free). Clearing every slot
-    /// that still names us, immediately before the allocation is freed,
-    /// makes that impossible. O(MAX_CPUS) on the cold drop path.
-    fn drop(&mut self) {
-        let me = self as *mut KernelTask;
+impl KernelTask {
+    /// Clear every per-CPU `CURRENT_STACKFUL_TASK` slot that still names
+    /// this task, so no CPU can newly load a pointer to it (and none can
+    /// try to preempt a task that is done executing). `StackfulAdapter`'s
+    /// reclaim path calls this SYNCHRONOUSLY before handing the box to RCU
+    /// for deferred free; `Drop` calls it again as a backstop. O(MAX_CPUS).
+    fn clear_current_slots(&self) {
+        let me = self as *const KernelTask as *mut KernelTask;
         for slot in CURRENT_STACKFUL_TASK.inner.iter() {
             // Only clear a slot that names THIS task; leave others.
             let _ = slot.compare_exchange(
@@ -864,6 +895,17 @@ impl Drop for KernelTask {
                 Ordering::Relaxed,
             );
         }
+    }
+}
+
+impl Drop for KernelTask {
+    /// Backstop: guarantee no per-CPU `CURRENT_STACKFUL_TASK` slot outlives
+    /// this task pointing at it. The reclaim path (`StackfulAdapter::drop`)
+    /// clears the slots synchronously and defers the memory free through
+    /// RCU, so by the time this runs the slots are already clear; re-clear
+    /// here in case a `KernelTask` is ever freed by some other path.
+    fn drop(&mut self) {
+        self.clear_current_slots();
     }
 }
 
@@ -924,16 +966,13 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         // this CPU and preemptable. Outside that window
         // CURRENT[cpu] is null and try_preempt no-ops.
         //
-        // `set_cpu` is captured here and used again for the matching
-        // clear before this iteration yields. The clear MUST target
-        // the same slot this store armed — NOT a fresh `this_cpu()`.
-        // A task can be preempted and resumed on a different CPU
-        // (work-stealing), so `this_cpu()` at clear time may differ
-        // from here; clearing the wrong slot would leave THIS slot
-        // pointing at the task after it later completes and its `Box`
-        // is freed, and a timer tick on this CPU would then make
-        // `try_preempt` write through the freed `KernelTask` (a
-        // use-after-free — the executor-dispatch rip≈0x3 corruption).
+        // `set_cpu` is captured here for the matching clear at the bottom
+        // of this iteration. A task can be preempted and resumed on a
+        // different CPU (work-stealing) mid-iteration, so by clear time
+        // EITHER this slot OR the current CPU's slot may name us; the
+        // loop-bottom clear compare_exchanges BOTH so no slot outlives
+        // this iteration naming the task, and no other task's arming is
+        // ever nulled by mistake.
         let set_cpu = this_cpu();
         CURRENT_STACKFUL_TASK.inner[set_cpu].store(task_ptr, Ordering::Release);
 
@@ -958,11 +997,29 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         // timer tick landing between this clear and the
         // kernel_switch below (or while we're switched out)
         // doesn't preempt a task that's no longer executing.
-        // Clear the SAME slot the store above armed (`set_cpu`), not
-        // a re-read `this_cpu()`: a work-steal can resume this task on
-        // another CPU, and clearing that CPU's slot would strand the
-        // origin slot pointing at us (see the `set_cpu` comment above).
-        CURRENT_STACKFUL_TASK.inner[set_cpu].store(core::ptr::null_mut(), Ordering::Release);
+        // Both the slot this iteration armed (`set_cpu`) and the slot of
+        // the CPU we now run on can name us: a mid-iteration preempt +
+        // work-steal migrates the task, and the preempt-resume republishes
+        // it on the destination CPU. Clear whichever still names us — and
+        // ONLY if it names us (compare_exchange): an unconditional store
+        // to `set_cpu`'s slot after a migration would null a DIFFERENT
+        // task's arming on the origin CPU, hiding that task from
+        // preemption and from every `current_stackful_*` lookup.
+        let _ = CURRENT_STACKFUL_TASK.inner[set_cpu].compare_exchange(
+            task_ptr,
+            core::ptr::null_mut(),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        let clear_cpu = this_cpu();
+        if clear_cpu != set_cpu {
+            let _ = CURRENT_STACKFUL_TASK.inner[clear_cpu].compare_exchange(
+                task_ptr,
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
         // Yield back to the executor. We pull the exec_ctx pointer
         // out atomically — the executor populated it just before
         // switching us in.
@@ -1534,14 +1591,26 @@ pub unsafe fn exit_current_stackful() -> ! {
     if !p.is_null() {
         // SAFETY: in-flight task on this CPU.
         unsafe {
+            // Poison the saved ctx BEFORE publishing `completed`: the exit
+            // continuation never resumes, so `ctx` must never be switched
+            // into again. `poll_to_yield`'s completed-guard already refuses
+            // to switch into a completed task; the zeroed `rip` makes any
+            // path that slips past it trip `guard_switch_into` with
+            // attribution instead of resuming a consumed continuation.
+            (&raw mut (*p).ctx.rip).write(0);
             (*p).completed.store(true, Ordering::Release);
             let exec_ctx = (*p).exec_ctx.load(Ordering::Acquire);
             CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
             if !exec_ctx.is_null() {
-                let ctx = &raw mut (*p).ctx;
+                // Save the abandoned continuation into this CPU's dead
+                // scratch slot, NOT the dying task's `ctx`: the executor
+                // drops the `Box<KernelTask>` right after observing
+                // `completed`, and the box must never be a save target once
+                // `completed` is published (see EXIT_SCRATCH_CTX).
+                let scratch = EXIT_SCRATCH_CTX.inner[cpu].get();
                 // SAFETY: exec_ctx non-null (checked); executor populated it.
                 guard_switch_into("exit_current_stackful:exec_ctx", &*exec_ctx);
-                kernel_switch(ctx, exec_ctx);
+                kernel_switch(scratch, exec_ctx);
             }
             // A completed task must never be switched back into.
             panic!(
@@ -1594,7 +1663,30 @@ pub unsafe fn exit_current_stackful() -> ! {
 /// executor. Spawned via `spawn_stackful` — `Future` impl below
 /// just calls `poll_to_yield` and forwards the result.
 pub struct StackfulAdapter {
-    inner: Box<KernelTask>,
+    // `ManuallyDrop` so the reclaim path can move the `Box<KernelTask>` out
+    // and hand it to RCU for deferred free instead of dropping it inline —
+    // see `impl Drop for StackfulAdapter`.
+    inner: core::mem::ManuallyDrop<Box<KernelTask>>,
+}
+
+impl Drop for StackfulAdapter {
+    /// Reclaim the inner `KernelTask` through RCU, not synchronously. A raw
+    /// `*mut KernelTask` loaded from a per-CPU `CURRENT_STACKFUL_TASK` slot
+    /// on another CPU (in `try_preempt` / syscall-exit / user-state publish)
+    /// must not be freed until that CPU passes a quiescent point, or it would
+    /// write a `kernel_switch` save / trap frame through freed memory (the
+    /// executor-dispatch rip≈0x3 use-after-free). We clear the slots
+    /// synchronously (so no CPU newly derefs the task), then defer the
+    /// memory free one grace period; the executor's per-round
+    /// `narf_rcu::advance_epoch_if_pending` keeps that grace period
+    /// finite.
+    fn drop(&mut self) {
+        // SAFETY: `inner` is live here and never touched after this take
+        // (the field's own drop glue is a no-op under `ManuallyDrop`).
+        let task = unsafe { core::mem::ManuallyDrop::take(&mut self.inner) };
+        task.clear_current_slots();
+        narf_rcu::retire_box(task);
+    }
 }
 
 impl core::fmt::Debug for StackfulAdapter {
@@ -1611,7 +1703,7 @@ impl StackfulAdapter {
         F: Future<Output = ()> + Send + 'static,
     {
         Self {
-            inner: KernelTask::new(future),
+            inner: core::mem::ManuallyDrop::new(KernelTask::new(future)),
         }
     }
 
@@ -1625,7 +1717,8 @@ impl StackfulAdapter {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let inner = KernelTask::with_stack_size(future, opts.stack_bytes);
+        let inner =
+            core::mem::ManuallyDrop::new(KernelTask::with_stack_size(future, opts.stack_bytes));
         let me = Self { inner };
         // Cache opts on the adapter for `apply_options` — keep
         // a simple atomic-set pattern; opts are tiny.
@@ -3956,6 +4049,141 @@ pub mod tests {
         CURRENT_STACKFUL_TASK.inner[decoy_idx].store(core::ptr::null_mut(), Ordering::Release);
         TestResult::Pass
     }
+
+    /// Dropping a `StackfulAdapter` must (1) clear any per-CPU slot that
+    /// names its `KernelTask` SYNCHRONOUSLY — so no CPU can newly load the
+    /// pointer — and (2) defer the actual memory free through RCU rather
+    /// than freeing inline, so a raw pointer already loaded on another CPU
+    /// keeps pointing at valid memory until a grace period elapses. This is
+    /// the reclaim contract that closes the cross-CPU executor-dispatch
+    /// rip≈0x3 use-after-free.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_adapter_drop_defers_reclaim() -> TestResult {
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let adapter = StackfulAdapter::new(ReadyImmediately);
+        // Address of the inner KernelTask (what CURRENT_STACKFUL_TASK holds).
+        let task_ptr = &**adapter.inner as *const KernelTask as *mut KernelTask;
+        let n = CURRENT_STACKFUL_TASK.inner.len();
+        CURRENT_STACKFUL_TASK.inner[0].store(task_ptr, Ordering::Release);
+        CURRENT_STACKFUL_TASK.inner[this_cpu() % n].store(task_ptr, Ordering::Release);
+
+        drop(adapter);
+
+        // (1) Slots cleared synchronously on drop.
+        for slot in CURRENT_STACKFUL_TASK.inner.iter() {
+            if slot.load(Ordering::Acquire) == task_ptr {
+                return TestResult::Fail(
+                    "StackfulAdapter drop left a CURRENT_STACKFUL_TASK slot set",
+                );
+            }
+        }
+        // (2) Drive a grace period so the RCU-deferred free actually runs
+        // (and this test doesn't leak the KernelTask). No panic / double-free
+        // through the deferred-drop path is itself part of what we're testing.
+        narf_rcu::report_quiescent();
+        narf_rcu::advance_epoch_if_pending();
+        narf_rcu::report_quiescent();
+        TestResult::Pass
+    }
+
+    /// Re-polling an already-completed task must return `Ready` WITHOUT
+    /// switching into its saved ctx: a completed task's ctx is a consumed
+    /// continuation (and `exit_current_stackful` poisons its `rip`), so a
+    /// stale wake that races the exit on another CPU must degrade to a
+    /// clean drop, never a resume of dead state.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_completed_task_repoll_is_ready_without_switch() -> TestResult {
+        struct ReadyImmediately;
+        impl Future for ReadyImmediately {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let mut task = KernelTask::new(ReadyImmediately);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // First poll drives the future to completion.
+        // SAFETY: standard stackful poll, same as the sibling smokes.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Ready(()) {
+            return TestResult::Fail("expected Ready on first poll");
+        }
+        // Poison the resume context the way exit_current_stackful does; a
+        // second poll that (wrongly) switched in would trip the CTXGUARD
+        // panic, so a clean Ready return proves no switch happened.
+        task.ctx.rip = 0;
+        // SAFETY: same as above; the completed-guard must return early.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Ready(()) {
+            return TestResult::Fail("re-poll of a completed task must return Ready");
+        }
+        TestResult::Pass
+    }
+
+    /// `exit_current_stackful` must (1) complete the task and hand control
+    /// back to the executor's context, (2) poison the task's saved `ctx.rip`
+    /// so the consumed exit continuation can never be switched into, and
+    /// (3) leave the per-CPU CURRENT slot clear. The final context save
+    /// goes to the per-CPU scratch slot — the dying task's own `ctx` is
+    /// never a save target once `completed` is published, which is what
+    /// keeps the executor's immediate `Box<KernelTask>` drop sound.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_exit_current_stackful_poisons_ctx_and_completes() -> TestResult {
+        struct ExitsViaPrimitive;
+        impl Future for ExitsViaPrimitive {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                // SAFETY: runs at CPL0 on this stackful task's own stack,
+                // with the task current on this CPU (task_body_rust armed
+                // CURRENT before polling us) — the primitive's contract.
+                unsafe { exit_current_stackful() }
+            }
+        }
+        let mut task = KernelTask::new(ExitsViaPrimitive);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: standard stackful poll; the future diverges into
+        // exit_current_stackful, which switches back to `exec_ctx`.
+        let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        if r != Poll::Ready(()) {
+            return TestResult::Fail("exit_current_stackful must complete the task");
+        }
+        if !task.completed.load(Ordering::Acquire) {
+            return TestResult::Fail("completed flag not set by exit_current_stackful");
+        }
+        if task.ctx.rip != 0 {
+            return TestResult::Fail("exit_current_stackful did not poison ctx.rip");
+        }
+        let cpu = this_cpu();
+        if !CURRENT_STACKFUL_TASK.inner[cpu]
+            .load(Ordering::Acquire)
+            .is_null()
+        {
+            return TestResult::Fail("CURRENT slot not cleared by exit_current_stackful");
+        }
+        TestResult::Pass
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_adapter_drop_defers_reclaim
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_completed_task_repoll_is_ready_without_switch
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_exit_current_stackful_poisons_ctx_and_completes
+    );
 
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(

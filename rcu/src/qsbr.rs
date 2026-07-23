@@ -163,6 +163,37 @@ pub fn report_quiescent() {
     drain_local_bucket(cell);
 }
 
+/// Open the next grace period if this CPU's defer bucket holds entries
+/// the current epoch can never release. An entry retired at epoch `E`
+/// is reclaimed only when `min_last_quiescent > E`, which requires a
+/// LATER epoch to exist and every CPU to report quiescence under it —
+/// but the scheduler's poll-boundary `report_quiescent` calls never bump
+/// `GLOBAL_EPOCH`, so without this hook anything retired outside a
+/// `sync()` would sit in its bucket forever. The executor calls this
+/// once per round.
+///
+/// The bump is gated on this CPU having already reported quiescence for
+/// the current epoch, so at most one new epoch is published per
+/// completed local grace period (the `compare_exchange` loses harmlessly
+/// when a peer CPU publishes first). No quiescent state is reported
+/// here — draining still happens only at the executor's own (correctly
+/// suppressed-on-preemption) `report_quiescent` boundaries.
+pub fn advance_epoch_if_pending() {
+    let cell = this_cpu();
+    // IRQ-masked: `defer_raw` mutates this CPU's bucket from IRQ context.
+    let pending = narf_lib::sync::without_interrupts(|| {
+        // SAFETY: IRQs masked → sole accessor of this CPU's own bucket.
+        unsafe { (*cell.bucket.get()).len }
+    });
+    if pending == 0 {
+        return;
+    }
+    let now = GLOBAL_EPOCH.load(Ordering::Acquire);
+    if cell.last_quiescent.load(Ordering::Acquire) >= now {
+        let _ = GLOBAL_EPOCH.compare_exchange(now, now + 1, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
 /// Declare that this CPU is going idle. Resets `last_quiescent` to
 /// the `u64::MAX` "inactive" sentinel so subsequent `sync()` calls
 /// don't wait on a CPU that may not poll again before its next

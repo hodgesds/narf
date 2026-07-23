@@ -317,6 +317,22 @@ pub fn defer_drop<T: Send + 'static>(owned: Owned<T>, _g: &ReadGuard) {
     enqueue_drop::<T>(raw);
 }
 
+/// Queue an owned `Box<T>` for deferred reclamation: its memory is not
+/// freed (and `T`'s `Drop` does not run) until every CPU has passed a
+/// quiescent point beyond the current epoch. Use when a raw `*mut T`
+/// derived from this box may still be held by another CPU that hasn't
+/// yet reached a quiescent state — freeing synchronously would let that
+/// CPU dereference freed memory. Allocation-free and IRQ-safe (the
+/// enqueue writes into a fixed per-CPU bucket under an IRQ mask).
+///
+/// Reclamation progress: retired entries become reclaimable only once a
+/// LATER global epoch exists and every CPU has reported quiescence under
+/// it. The executor drives that via [`advance_epoch_if_pending`] each
+/// round, so `retire_box` needs no explicit `sync()`.
+pub fn retire_box<T: Send + 'static>(b: alloc::boxed::Box<T>) {
+    enqueue_drop::<T>(alloc::boxed::Box::into_raw(b));
+}
+
 // ── Grace-period machinery ──────────────────────────────────────────
 
 /// Declare a quiescent state on the current CPU. The scheduler is
@@ -326,6 +342,15 @@ pub fn defer_drop<T: Send + 'static>(owned: Owned<T>, _g: &ReadGuard) {
 #[inline]
 pub fn report_quiescent() {
     qsbr::report_quiescent();
+}
+
+/// Executor maintenance hook: open the next grace period when this CPU
+/// holds deferred objects that the current epoch can never release. See
+/// [`qsbr::advance_epoch_if_pending`]. Called once per executor round;
+/// near-free when the local defer bucket is empty.
+#[inline]
+pub fn advance_epoch_if_pending() {
+    qsbr::advance_epoch_if_pending();
 }
 
 /// Declare that the current CPU is going idle (about to halt and

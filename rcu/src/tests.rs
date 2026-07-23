@@ -89,6 +89,48 @@ fn smoke_rcu_qsbr_reclaims() -> TestResult {
 }
 kernel_test_in!("rcu", smoke_rcu_qsbr_reclaims);
 
+fn smoke_rcu_retire_box_advance_epoch_reclaims() -> TestResult {
+    // `retire_box` + the executor's epoch-advance hook: a retired box must
+    // NOT be reclaimed by quiescent reports under the retire epoch alone
+    // (its holder-CPUs may not have passed a boundary yet), and MUST be
+    // reclaimed once `advance_epoch_if_pending` publishes the next epoch
+    // and this CPU reports quiescence under it. This is the progress
+    // contract the scheduler's KernelTask reclaim relies on — without the
+    // advance, retired boxes would leak forever.
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    // Adopt the current epoch so the retire below is stamped against a
+    // reported baseline (a fresh CPU otherwise sits at the MAX sentinel).
+    crate::report_quiescent();
+    crate::retire_box(Box::new(Canary));
+    // Reporting quiescence under the SAME epoch must not reclaim: the
+    // entry's grace period requires a later epoch.
+    crate::report_quiescent();
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("retire_box reclaimed without a new epoch");
+    }
+    // The executor hook publishes the next epoch (bucket non-empty and
+    // this CPU already reported under the current one) …
+    crate::advance_epoch_if_pending();
+    // … and the next quiescent report drains the now-elapsed entry.
+    crate::report_quiescent();
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("retire_box not reclaimed after epoch advance + quiescence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_retire_box_advance_epoch_reclaims);
+
 // ── epoch ──────────────────────────────────────────────────────────
 
 fn smoke_rcu_epoch_pin_cycle() -> TestResult {

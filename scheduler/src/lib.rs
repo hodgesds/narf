@@ -2187,6 +2187,12 @@ pub fn run_until_empty() {
             }
         }
 
+        // RCU maintenance: if this CPU holds deferred reclamations (e.g. a
+        // retired `Box<KernelTask>` from a completed slot's drop), publish
+        // the next grace-period epoch so the per-CPU quiescent reports above
+        // can actually release them. Near-free when nothing is pending.
+        narf_rcu::advance_epoch_if_pending();
+
         // Local queue done for this round. If empty, try to steal one
         // task from another CPU's queue; if that fails, we have
         // nothing to do — return so the caller decides whether to
@@ -2817,6 +2823,10 @@ pub fn run_forever() -> ! {
     };
     loop {
         run_until_empty();
+        // RCU maintenance before idling: open the next grace-period epoch
+        // if this CPU still holds deferred reclamations, so peers' reports
+        // can release them while we halt.
+        narf_rcu::advance_epoch_if_pending();
         // Idle path: declare ourselves out of RCU consideration so
         // `sync()` doesn't block on an asleep CPU. We re-adopt the
         // live epoch on our first `report_quiescent` after wake.
