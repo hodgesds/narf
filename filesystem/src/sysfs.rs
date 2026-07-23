@@ -241,7 +241,12 @@ impl Kobject {
         let mut parts: Vec<String> = Vec::new();
         parts.push(self.name.clone());
         let mut p_opt = self.parent.clone();
+        let mut depth = 0;
         while let Some(par) = p_opt {
+            if depth >= 64 {
+                break;
+            }
+            depth += 1;
             parts.push(par.name.clone());
             p_opt = par.parent.clone();
         }
