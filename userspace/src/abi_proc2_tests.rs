@@ -410,6 +410,75 @@ kernel_test_in!(
     smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie
 );
 
+// ── /proc/<pid> visibility across the whole fork→exit→reap lifecycle ──
+
+fn smoke_abi_proc2_proc_visible_running_and_zombie_child() -> TestResult {
+    with_setup(|| {
+        // systemd PID 1's post-fork child check: right after fork returns
+        // pid N, service_set_main_pidref reads /proc/<N>/stat's PPid
+        // (pid_get_ppid) — while the child is actively RUNNING on another
+        // CPU. A currently-polled task is popped off its per-CPU ready
+        // queue, so proc_task_info must resolve it through the task
+        // registry (spawn→reap window), not the queue scans; a miss maps
+        // to ESRCH ("Can't determine if process N is our child").
+        //
+        // Model the exact shape: a registered RUNNING Task with a real
+        // pid→tid binding (tid != pid, like every forked child) that is
+        // on NO ready queue and is NOT the caller.
+        const P_PID: u64 = 1;
+        const WNOHANG: u64 = 1;
+        const WEXITED: u64 = 4;
+        const CHILD_PID: u64 = 4245;
+        const CHILD_TID: u64 = 4501;
+        crate::handlers::register_pid_task_mapping(CHILD_PID, CHILD_TID);
+        if crate::task::task_get(CHILD_TID).is_none() {
+            let _ = crate::task::Task::new_registered(CHILD_TID, CHILD_PID);
+        }
+        crate::handlers::__test_inject_parent_of(CHILD_PID, FAKE_TASK);
+        // (1) Running child (off-queue, off-CPU-locally): /proc resolves
+        // with state R and the real parent in PPid.
+        let info = crate::handlers::proc_task_info(CHILD_PID)
+            .ok_or("/proc entry missing for a registered RUNNING child (off-queue)")?;
+        if info.state != 'R' {
+            return Err("running child must report /proc state R");
+        }
+        if info.ppid != FAKE_TASK {
+            return Err("running child /proc PPid is not the real parent");
+        }
+        // (2) Instant exit (the modprobe@ shape): the zombie stays
+        // /proc-visible with state Z + PPid until the parent reaps.
+        crate::task::mark_zombie(CHILD_TID);
+        crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD_PID, 0);
+        let info = crate::handlers::proc_task_info(CHILD_PID)
+            .ok_or("/proc entry vanished for an unreaped zombie child")?;
+        if info.state != 'Z' {
+            return Err("unreaped zombie must report /proc state Z");
+        }
+        if info.ppid != FAKE_TASK {
+            return Err("zombie child /proc PPid is not the real parent");
+        }
+        // (3) Reap: waitid(P_PID, WEXITED) consumes the zombie; the pid
+        // drops out of /proc (no stale visibility after release).
+        let mut si = [0u8; 128];
+        let args = a3(P_PID, CHILD_PID, si.as_mut_ptr() as u64, WNOHANG | WEXITED);
+        match call(Syscall::Waitid.raw(), args) {
+            Some(0) => {}
+            _ => return Err("waitid reap of the zombie child did not return 0"),
+        }
+        if i32::from_ne_bytes(si[16..20].try_into().unwrap()) != CHILD_PID as i32 {
+            return Err("waitid did not reap the zombie child");
+        }
+        if crate::handlers::proc_task_info(CHILD_PID).is_some() {
+            return Err("reaped pid must not stay /proc-visible");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_proc_visible_running_and_zombie_child
+);
+
 // ── unshare(2) — mount-namespace arm (CLONE_NEWNS) ──
 
 fn smoke_abi_proc2_unshare_newns() -> TestResult {

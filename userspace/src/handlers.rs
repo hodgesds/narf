@@ -19625,23 +19625,37 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // tid), so every liveness / address-space probe below goes through the
     // pid→tid map rather than using `TaskId(pid)` directly (which is only
     // correct when the two coincide).
-    let tid = pid_to_task_raw(pid).unwrap_or(pid);
-    // Zombie window (Linux semantics): an exited-but-unreaped process
-    // keeps its /proc/<pid> entry, reporting state Z, until the parent
-    // reaps it. The task registry holds the Task through that window, so
-    // a registered TASK_ZOMBIE is /proc-visible even though it is off
-    // every ready queue and its address space is gone. systemd's child
-    // tracking depends on this: it peeks waitid(..., WNOWAIT) and then
-    // reads /proc/<pid>/stat's PPid to decide "is this my child" BEFORE
-    // the real reap.
-    let zombie = crate::task::task_get(tid)
+    let mapped_tid = pid_to_task_raw(pid);
+    let tid = mapped_tid.unwrap_or(pid);
+    // The task registry is the /proc-visibility window (Linux semantics):
+    // it holds every task from spawn registration to reap, so a pid whose
+    // pid→tid binding resolves to a registered Task is /proc-visible in
+    // EVERY state — running on any CPU, parked, or an exited-but-unreaped
+    // zombie (reported as state Z with its real PPid until the parent
+    // reaps). The ready-queue scans below can NOT stand in for this: the
+    // executor pops a slot off its per-CPU queue for the whole time it
+    // polls the task, so a child actively running on another CPU is
+    // invisible to both `all_task_ids` and `address_space_of` — exactly
+    // the window in which systemd PID 1 forks a service and immediately
+    // reads /proc/<child>/stat's PPid ("is process N my child"); a miss
+    // there surfaces as ESRCH. Gating on `mapped_tid` keeps a recycled-
+    // but-unmapped pid from resolving through a numerically-coincident
+    // live tid. systemd's child tracking also depends on the zombie arm:
+    // it peeks waitid(..., WNOWAIT) and then reads /proc/<pid>/stat's
+    // PPid BEFORE the real reap.
+    let task = crate::task::task_get(tid);
+    let zombie = task
+        .as_ref()
         .map(|t| t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE)
         .unwrap_or(false);
-    // A task is live if it is the caller (the running task is popped off its
-    // ready queue while polling, so it wouldn't match the queue scan), is on
-    // a ready queue, or simply has an address space registered (covers
-    // parked/sleeping processes like init).
+    // Liveness: a registered Task under a real pid→tid binding, or (for
+    // contexts that never register a Task — boot init, test harnesses)
+    // the caller itself (the running task is popped off its ready queue
+    // while polling, so it wouldn't match the queue scan), a ready-queue
+    // entry, or a registered address space (covers parked/sleeping
+    // processes like init).
     let live = zombie
+        || (mapped_tid.is_some() && task.is_some())
         || tid == current
         || narf_scheduler::all_task_ids().iter().any(|t| t.0 == tid)
         || narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).is_some();
