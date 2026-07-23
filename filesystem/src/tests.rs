@@ -570,6 +570,91 @@ fn smoke_filesystem_fifo_mknod_stat() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_fifo_mknod_stat);
 
+/// systemd `systemd-initctl.socket` full "File exists" regression. systemd's
+/// `fifo_address_create()` `mkfifo`s `/run/initctl`, tolerates EEXIST if the
+/// node is already there, then `open()`s + `fstat()`s it and REQUIRES
+/// `S_ISFIFO(st_mode)`. So a re-`mknod(S_IFIFO)` on an existing FIFO must
+/// report the "already exists" error (the syscall layer's -EEXIST) WITHOUT
+/// clobbering the node, and the path must still `stat` as a FIFO — else
+/// systemd surfaces the tolerated EEXIST as a fatal "Failed to listen".
+fn smoke_filesystem_fifo_mknod_eexist_keeps_fifo() -> TestResult {
+    use crate::{
+        bootstrap_mount_authority, registry, FileOps, FileType, FsError, MemFs, MountPoint,
+    };
+    use narf_capabilities::{Cap, Grant};
+
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = MemFs::with_seeds("test-fifo-eexist", &[]);
+    let mount_handle = match registry().mount(&auth, "/test_fifo_eexist", fs) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("memfs mount failed"),
+    };
+
+    let finish = |r: TestResult| {
+        let _ = registry().unmount(&mount_handle, "/test_fifo_eexist");
+        r
+    };
+
+    // First mknod(S_IFIFO) creates the node.
+    let created = registry()
+        .resolve_parent_absolute("/test_fifo_eexist/initctl", |_fs, parent, leaf| {
+            fifo_poll_once(parent.mknod(leaf, FileType::Fifo, 0))
+        });
+    if !matches!(created, Some(Some(Ok(_)))) {
+        return finish(TestResult::Fail("fresh mknod(S_IFIFO) did not succeed"));
+    }
+
+    // A SECOND mknod on the same path must fail "already exists" — memfs
+    // reports `Busy`, which the syscall layer maps to -EEXIST — and must NOT
+    // replace the FIFO with a fresh node.
+    let again = registry()
+        .resolve_parent_absolute("/test_fifo_eexist/initctl", |_fs, parent, leaf| {
+            fifo_poll_once(parent.mknod(leaf, FileType::Fifo, 0))
+        });
+    if !matches!(again, Some(Some(Err(FsError::Busy)))) {
+        return finish(TestResult::Fail(
+            "re-mknod of existing FIFO did not report EEXIST",
+        ));
+    }
+
+    // After the tolerated EEXIST the path must still stat as a FIFO so
+    // systemd's `S_ISFIFO(st_mode)` check passes and it opens the fd.
+    let is_fifo = registry().resolve_absolute("/test_fifo_eexist/initctl", |fs, rel| {
+        crate::resolve(fs.root(), rel)
+            .map(|f| f.stat().mode.file_type == FileType::Fifo)
+            .unwrap_or(false)
+    });
+    if is_fifo != Some(true) {
+        return finish(TestResult::Fail(
+            "FIFO path did not stat as S_IFIFO after EEXIST",
+        ));
+    }
+
+    // The open systemd does is O_RDWR|O_NONBLOCK: a read+write handle pair on
+    // the shared buffer must be usable without blocking (both directions
+    // rendezvous on one node).
+    let shared = registry().resolve_absolute("/test_fifo_eexist/initctl", |fs, rel| {
+        crate::resolve(fs.root(), rel)
+            .ok()
+            .and_then(|f| f.fifo_shared())
+    });
+    let shared = match shared {
+        Some(Some(s)) => s,
+        _ => return finish(TestResult::Fail("FIFO node did not expose a shared buffer")),
+    };
+    let rdwr = crate::fifo::FifoHandle::open(shared, 0, 0o600, /*r*/ true, /*w*/ true);
+    let msg = b"initctl";
+    if !matches!(fifo_poll_once(rdwr.write(0, msg)), Some(Ok(n)) if n == msg.len()) {
+        return finish(TestResult::Fail("O_RDWR FIFO write did not complete"));
+    }
+    let mut buf = [0u8; 8];
+    match fifo_poll_once(rdwr.read(0, &mut buf)) {
+        Some(Ok(r)) if &buf[..r] == msg => finish(TestResult::Pass),
+        _ => finish(TestResult::Fail("O_RDWR FIFO read-back mismatch")),
+    }
+}
+kernel_test_in!("filesystem", smoke_filesystem_fifo_mknod_eexist_keeps_fifo);
+
 /// O_RDWR-style round-trip: a read/write handle pair on one shared FIFO node
 /// carries bytes through the shared buffer and reads them back in order.
 fn smoke_filesystem_fifo_rdwr_round_trip() -> TestResult {
