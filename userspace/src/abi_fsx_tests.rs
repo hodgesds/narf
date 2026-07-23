@@ -768,6 +768,83 @@ fn smoke_abi_fsx_name_to_handle_at_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_name_to_handle_at_neg);
 
+/// systemd's `cg_path_get_cgroupid`: mkdir the nested service cgroup
+/// (`<root>/x.slice/y.service`, exactly what cg_create does under
+/// /sys/fs/cgroup), then `name_to_handle_at(path, cap=8)` must return 0
+/// with the cgroup DIRECTORY's inode as the 8-byte handle — that inode is
+/// the cgroup id. Cgroup children are dir-only nodes (no FileOps shape),
+/// so a file-shape-only resolver reports ENOENT here ("Failed to get
+/// cgroup ID of cgroup ...: No such file or directory").
+#[cfg(feature = "cgroup")]
+fn smoke_abi_fsx_name_to_handle_at_cgroup_dir_id() -> TestResult {
+    setup();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let mnt = match registry().mount(&auth, "/abicg", narf_filesystem::cgroupfs::CgroupFs::new()) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("cgroupfs mount failed");
+        }
+    };
+    let slice = b"/abicg/t_nth.slice\0";
+    let svc = b"/abicg/t_nth.slice/t_nth.service\0";
+    let outcome = (|| {
+        // Nested on-demand creation, one component at a time (systemd's
+        // mkdir_parents walk).
+        if call_mkdir(slice.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of the slice cgroup failed");
+        }
+        if call_mkdir(svc.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of the service cgroup failed");
+        }
+        // cap == 8 → the id-form handle (cgroup id).
+        let mut hbuf = [0u8; 16];
+        hbuf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+        let mut mount_id = [0u8; 4];
+        let args = a3(
+            0, // AT_FDCWD-ish (ignored)
+            svc.as_ptr() as u64,
+            hbuf.as_mut_ptr() as u64,
+            mount_id.as_mut_ptr() as u64,
+        );
+        match call(Syscall::NameToHandleAt.raw(), args) {
+            Some(0) => {}
+            Some(v) if v == ENOENT => {
+                return Err("name_to_handle_at on a fresh cgroup dir returned ENOENT")
+            }
+            _ => return Err("name_to_handle_at(cap=8) on a cgroup dir failed"),
+        }
+        if u32::from_ne_bytes(hbuf[0..4].try_into().unwrap()) != 8 {
+            return Err("id-form handle_bytes must be 8");
+        }
+        let cgid = u64::from_ne_bytes(hbuf[8..16].try_into().unwrap());
+        if cgid == 0 {
+            return Err("cgroup id handle must be the nonzero cgroup inode");
+        }
+        // The handle id is the same st_ino stat reports for the dir.
+        let mut sb = [0u8; 144];
+        if call_stat(svc.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat of the service cgroup dir failed");
+        }
+        let st_ino = u64::from_ne_bytes(sb[8..16].try_into().unwrap());
+        if cgid != st_ino {
+            return Err("cgroup id handle differs from the dir's st_ino");
+        }
+        Ok(())
+    })();
+    // The cgroup tree is global — remove the test cgroups, then unmount.
+    let _ = call_rmdir(svc.as_ptr() as u64);
+    let _ = call_rmdir(slice.as_ptr() as u64);
+    let _ = registry().unmount(&mnt, "/abicg");
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
+    }
+}
+#[cfg(feature = "cgroup")]
+kernel_test_in!("syscall_abi", smoke_abi_fsx_name_to_handle_at_cgroup_dir_id);
+
 fn smoke_abi_fsx_open_by_handle_at_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         // First mint a real handle for /abi/f.

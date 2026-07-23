@@ -1977,22 +1977,6 @@ fn fanotify_open_object(task: u64, abs: &str) -> i32 {
 #[cfg(feature = "linux-compat")]
 const NARF_HANDLE_TYPE: i32 = 0x4e41; // "NA"
 
-/// True if `abs` resolves to an existing file/dir.
-#[cfg(feature = "linux-compat")]
-fn path_exists(abs: &str) -> bool {
-    let root_rel = narf_filesystem::registry()
-        .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
-    match root_rel {
-        Some((root, rel)) => {
-            matches!(
-                poll_blocking(narf_filesystem::resolve_async(root, &rel)),
-                Some(Ok(_))
-            )
-        }
-        None => false,
-    }
-}
-
 /// `name_to_handle_at(dirfd, pathname, handle, mount_id, flags)`.
 #[cfg(feature = "linux-compat")]
 fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
@@ -2071,10 +2055,19 @@ fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // dirfd (arg0) is honoured only as AT_FDCWD — NARF resolves absolute
     // paths; relative paths resolve under the task's cwd/chroot.
     let path = apply_chroot(&raw);
-    if !path_exists(&path) {
-        ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
-        return;
-    }
+    // Dir-aware resolution (files, directories, mount roots and mount
+    // ancestors alike), carrying the object's stable inode. A dir-only
+    // node — e.g. a cgroup directory, whose children exist purely as
+    // `lookup_dir` targets — has no FileOps shape, so a file-shape
+    // resolve alone reports ENOENT for exactly the paths systemd's
+    // cg_path_get_cgroupid asks about (/sys/fs/cgroup/.../<svc>.service).
+    let path_ino = match stat_ino_path_dir_aware(&path) {
+        Some((_, ino, _)) => ino,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-ENOENT) as u64));
+            return;
+        }
+    };
     // handle->handle_bytes (the caller's f_handle capacity) is the first u32.
     let mut cap = [0u8; 4];
     // SAFETY: copy_from_user validates the 4-byte read.
@@ -2089,16 +2082,13 @@ fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // path's inode and emit an 8-byte handle. Larger capacities keep the
     // path-carrying handle form that open_by_handle_at round-trips.
     if cap == 8 {
-        let ino = stat_ino_path_dir_aware(&path)
-            .map(|(_, ino, _)| ino)
-            .unwrap_or(0);
         let mut hdr = [0u8; 8];
         hdr[0..4].copy_from_slice(&8u32.to_ne_bytes());
         hdr[4..8].copy_from_slice(&NARF_HANDLE_TYPE.to_ne_bytes());
         // SAFETY: copy_to_user validates the 8-byte header destination.
         let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
         // SAFETY: copy_to_user validates the 8-byte id destination.
-        let h2 = unsafe { copy_to_user(a.arg2 + 8, &ino.to_ne_bytes()) };
+        let h2 = unsafe { copy_to_user(a.arg2 + 8, &path_ino.to_ne_bytes()) };
         if h1.is_err() || h2.is_err() {
             ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
             return;
@@ -11880,7 +11870,11 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
         }
         return child_pid as i64;
     }
-    // Real exit reap (releases the child PID).
+    // Real exit reap (releases the child PID) — unless the parked waitid
+    // asked WNOWAIT, which only PEEKS: the entry stays queued so a later
+    // real wait can reap it (same semantics as the sys_waitid fast path).
+    const WNOWAIT: u32 = 0x0100_0000;
+    let peek = options & WNOWAIT != 0;
     let entry = {
         let mut g = PENDING_EXITS.lock();
         let reaped = g.as_mut().and_then(|m| {
@@ -11893,7 +11887,11 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
                 }
                 0
             };
-            Some(q.remove(idx))
+            if peek {
+                Some(q[idx])
+            } else {
+                Some(q.remove(idx))
+            }
         });
         reaped
     };
@@ -11907,6 +11905,11 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
             unsafe {
                 *out_status = status;
             }
+        }
+        if peek {
+            // WNOWAIT: reported without consuming — no accounting, no
+            // task/pid release; those belong to the eventual real reap.
+            return child_pid as i64;
         }
         // Charge the reaped child's CPU time to the parent (RUSAGE_CHILDREN
         // / tms.cutime). Same fold as the synchronous reap path in sys_wait4;
@@ -12160,6 +12163,12 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
     const P_PID: u32 = 1;
     const P_PGID: u32 = 2;
     const WNOHANG: u32 = 1;
+    // WNOWAIT: report a waitable child WITHOUT reaping it — the zombie
+    // (and its /proc/<pid> entry) stays in place for a later real wait.
+    // systemd's manager_dispatch_sigchld peeks waitid(P_ALL, WEXITED|
+    // WNOHANG|WNOWAIT) precisely so it can still read /proc/$PID (the
+    // "is this my child" PPid check) before reaping with waitid(P_PID).
+    const WNOWAIT: u32 = 0x0100_0000;
 
     // Translate (idtype, id) to the wait4-style want_pid: P_ALL → -1
     // (any child), P_PID → the pid. P_PGID collapses to -1 until
@@ -12190,7 +12199,10 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Real exit reap (releases the child PID).
+    // Real exit reap (releases the child PID) — unless WNOWAIT, which
+    // only PEEKS the entry: the child stays queued (and its Task/pid
+    // tables intact) so a later wait4/waitid can still reap it.
+    let peek = options & WNOWAIT != 0;
     let reaped = {
         let mut g = PENDING_EXITS.lock();
         g.as_mut().and_then(|m| {
@@ -12202,7 +12214,11 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
             } else {
                 0
             };
-            Some(q.remove(idx))
+            if peek {
+                Some(q[idx])
+            } else {
+                Some(q.remove(idx))
+            }
         })
     };
     if let Some((child_pid, status)) = reaped {
@@ -12211,6 +12227,13 @@ fn sys_waitid(ctx: &mut dyn TrapContext) {
             // SAFETY: `infop` is the user `siginfo_t*` (non-zero); copy_to_user
             // range-validates the 128-byte write.
             let _ = unsafe { copy_to_user(infop, &si) };
+        }
+        if peek {
+            // WNOWAIT: status reported, nothing consumed. Accounting,
+            // rusage and the pid/task release all belong to the eventual
+            // real reap.
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
         }
         // Charge the child's CPU to the parent (this path skipped the
         // fold wait4 does — RUSAGE_CHILDREN never saw waitid-reaped
@@ -12295,6 +12318,23 @@ pub fn __test_inject_parent_of(child: u64, parent: u64) {
         if g.is_none() {
             *g = Some(BTreeMap::new());
         }
+    }
+}
+
+/// Test hook: stage an exited-child entry in `parent`'s pending-exits
+/// queue without running a real task exit — what `on_child_exit` does
+/// when a child terminates. Lets waitid/wait4 smokes exercise the reap
+/// (and WNOWAIT peek) paths against a synthetic zombie.
+#[doc(hidden)]
+pub fn __test_stage_pending_exit(parent: u64, child: u64, status: i32) {
+    let mut g = PENDING_EXITS.lock();
+    if g.is_none() {
+        *g = Some(BTreeMap::new());
+    }
+    if let Some(m) = g.as_mut() {
+        m.entry(parent)
+            .or_insert_with(alloc::vec::Vec::new)
+            .push((child, status));
     }
 }
 
@@ -19586,11 +19626,23 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     // pid→tid map rather than using `TaskId(pid)` directly (which is only
     // correct when the two coincide).
     let tid = pid_to_task_raw(pid).unwrap_or(pid);
+    // Zombie window (Linux semantics): an exited-but-unreaped process
+    // keeps its /proc/<pid> entry, reporting state Z, until the parent
+    // reaps it. The task registry holds the Task through that window, so
+    // a registered TASK_ZOMBIE is /proc-visible even though it is off
+    // every ready queue and its address space is gone. systemd's child
+    // tracking depends on this: it peeks waitid(..., WNOWAIT) and then
+    // reads /proc/<pid>/stat's PPid to decide "is this my child" BEFORE
+    // the real reap.
+    let zombie = crate::task::task_get(tid)
+        .map(|t| t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE)
+        .unwrap_or(false);
     // A task is live if it is the caller (the running task is popped off its
     // ready queue while polling, so it wouldn't match the queue scan), is on
     // a ready queue, or simply has an address space registered (covers
     // parked/sleeping processes like init).
-    let live = tid == current
+    let live = zombie
+        || tid == current
         || narf_scheduler::all_task_ids().iter().any(|t| t.0 == tid)
         || narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).is_some();
     if !live {
@@ -19670,7 +19722,7 @@ pub fn proc_task_info(pid: u64) -> Option<narf_filesystem::procfs::ProcTaskInfo>
     Some(ProcTaskInfo {
         pid,
         comm,
-        state: 'R',
+        state: if zombie { 'Z' } else { 'R' },
         brk_top,
         stack_top,
         cmdline,

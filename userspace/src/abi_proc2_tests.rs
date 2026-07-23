@@ -322,6 +322,94 @@ fn smoke_abi_proc2_waitid_blocking_fallback() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_waitid_blocking_fallback);
 
+// ── waitid(2) — WNOWAIT peek leaves the zombie reapable ──
+
+fn smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie() -> TestResult {
+    with_setup(|| {
+        // systemd PID 1's SIGCHLD dispatch: waitid(P_ALL, WEXITED|WNOHANG|
+        // WNOWAIT) peeks the dead child, then reads /proc/<pid>/stat (PPid
+        // — the "is this my child" check), and only afterwards reaps with
+        // waitid(P_PID, ..., WEXITED). The peek must NOT consume the exit
+        // or drop the /proc entry — a consuming peek turns the PPid check
+        // into ESRCH ("Can't determine if process N is our child").
+        const P_PID: u64 = 1;
+        const WNOHANG: u64 = 1;
+        const WEXITED: u64 = 4;
+        const WNOWAIT: u64 = 0x0100_0000;
+        const CHILD: u64 = 4243;
+        // Synthetic exited child: registered zombie task + parent-of row +
+        // a staged pending-exit entry (wstatus: exited, code 3).
+        crate::handlers::register_task_to_pid(CHILD, CHILD);
+        crate::handlers::register_pid_task_mapping(CHILD, CHILD);
+        if crate::task::task_get(CHILD).is_none() {
+            let _ = crate::task::Task::new_registered(CHILD, CHILD);
+        }
+        crate::task::mark_zombie(CHILD);
+        crate::handlers::__test_inject_parent_of(CHILD, FAKE_TASK);
+        crate::handlers::__test_stage_pending_exit(FAKE_TASK, CHILD, 3 << 8);
+        // Peek: reports the child without reaping.
+        let mut si = [0u8; 128];
+        let args = a3(
+            P_PID,
+            CHILD,
+            si.as_mut_ptr() as u64,
+            WNOHANG | WEXITED | WNOWAIT,
+        );
+        match call(Syscall::Waitid.raw(), args) {
+            Some(0) => {}
+            _ => return Err("waitid(WNOWAIT) did not return 0"),
+        }
+        let si_pid = i32::from_ne_bytes(si[16..20].try_into().unwrap());
+        let si_status = i32::from_ne_bytes(si[24..28].try_into().unwrap());
+        if si_pid != CHILD as i32 {
+            return Err("waitid(WNOWAIT) did not report the zombie child");
+        }
+        if si_status != 3 {
+            return Err("waitid(WNOWAIT) si_status is not the exit code");
+        }
+        // Between peek and reap the zombie stays /proc-visible with
+        // state Z and its real parent (what systemd's PPid check reads).
+        let info = crate::handlers::proc_task_info(CHILD)
+            .ok_or("zombie /proc entry vanished after the WNOWAIT peek")?;
+        if info.state != 'Z' {
+            return Err("unreaped zombie must report /proc state Z");
+        }
+        if info.ppid != FAKE_TASK {
+            return Err("zombie /proc PPid is not the real parent");
+        }
+        // The real reap still finds the child — the peek consumed nothing.
+        let mut si2 = [0u8; 128];
+        let args = a3(P_PID, CHILD, si2.as_mut_ptr() as u64, WNOHANG | WEXITED);
+        match call(Syscall::Waitid.raw(), args) {
+            Some(0) => {}
+            _ => return Err("post-peek reap waitid did not return 0"),
+        }
+        if i32::from_ne_bytes(si2[16..20].try_into().unwrap()) != CHILD as i32 {
+            return Err("WNOWAIT peek consumed the exit — child not reapable");
+        }
+        // Fully reaped now: another peek reports nothing (infop untouched).
+        let mut si3 = [0u8; 128];
+        let args = a3(
+            P_PID,
+            CHILD,
+            si3.as_mut_ptr() as u64,
+            WNOHANG | WEXITED | WNOWAIT,
+        );
+        match call(Syscall::Waitid.raw(), args) {
+            Some(0) => {}
+            _ => return Err("post-reap waitid did not return 0"),
+        }
+        if i32::from_ne_bytes(si3[16..20].try_into().unwrap()) != 0 {
+            return Err("post-reap peek still reported the reaped child");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_waitid_wnowait_peek_keeps_zombie
+);
+
 // ── unshare(2) — mount-namespace arm (CLONE_NEWNS) ──
 
 fn smoke_abi_proc2_unshare_newns() -> TestResult {
