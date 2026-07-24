@@ -1518,16 +1518,26 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             bail!("--kasan is x86_64-only (kernel-address sanitizer unsupported on aarch64-unknown-none)");
         }
         let flags = [
-            "-C", "relocation-model=static",
-            "-C", "code-model=kernel",
-            "-C", "link-arg=-Tbuild/linker/x86_64.ld",
-            "-C", "link-arg=--gc-sections",
-            "-Z", "plt=no",
-            "--cfg", "curve25519_dalek_backend=\"serial\"",
-            "--cfg", "poly1305_force_soft",
-            "--cfg", "aes_force_soft",
-            "--cfg", "polyval_force_soft",
-            "-Z", "sanitizer=kernel-address",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "code-model=kernel",
+            "-C",
+            "link-arg=-Tbuild/linker/x86_64.ld",
+            "-C",
+            "link-arg=--gc-sections",
+            "-Z",
+            "plt=no",
+            "--cfg",
+            "curve25519_dalek_backend=\"serial\"",
+            "--cfg",
+            "poly1305_force_soft",
+            "--cfg",
+            "aes_force_soft",
+            "--cfg",
+            "polyval_force_soft",
+            "-Z",
+            "sanitizer=kernel-address",
             // Force OUTLINE instrumentation: every access calls
             // `__asan_{load,store}N` with the raw address instead of an inline
             // `shr|OFFSET` shadow check. NARF accesses data through BOTH the low
@@ -1537,13 +1547,17 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             // high-half addresses. The outline callback does the low/high→phys→
             // shadow lookup in software (see memory/src/kasan.rs), sidestepping
             // the mapping entirely.
-            "-C", "llvm-args=-asan-instrumentation-with-call-threshold=0",
+            "-C",
+            "llvm-args=-asan-instrumentation-with-call-threshold=0",
             // Access checks only — no stack/global/alloca redzone poisoning
             // (those emit `__asan_set_shadow_*` and demand writable shadow over
             // every stack; the freed-block write we hunt is a heap store).
-            "-C", "llvm-args=-asan-stack=0",
-            "-C", "llvm-args=-asan-globals=0",
-            "-C", "llvm-args=-asan-instrument-dynamic-allocas=0",
+            "-C",
+            "llvm-args=-asan-stack=0",
+            "-C",
+            "llvm-args=-asan-globals=0",
+            "-C",
+            "llvm-args=-asan-instrument-dynamic-allocas=0",
         ]
         .join("\u{1f}");
         cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);

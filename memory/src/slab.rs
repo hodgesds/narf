@@ -564,10 +564,10 @@ pub fn alloc(layout: Layout) -> Result<NonNull<u8>, SlabError> {
 pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
     let need = layout.size().max(layout.align()).max(MIN_BLOCK);
     match class_for(need) {
-        // SAFETY: the operation upholds its documented invariant (see surrounding context).
         Some(c) => {
             #[cfg(feature = "kasan")]
             kasan_free(ptr, c);
+            // SAFETY: the operation upholds its documented invariant (see surrounding context).
             unsafe { dealloc_class(c, ptr) }
         }
         // SAFETY: the operation upholds its documented invariant (see surrounding context).
