@@ -1582,19 +1582,33 @@ fn sys_write(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     }
+    // Snapshot ops + offset and drop the fd-table lock before calling into
+    // FileOps — same rule as `sys_read`: a write whose FileOps consults the
+    // fd table would otherwise re-enter the non-reentrant table lock and
+    // spin forever with interrupts masked.
+    let snapshot = fd::with_table(task, |t| {
+        let e = t.get(fd)?;
+        Some((e.ops.clone(), e.offset))
+    });
+    let (ops, off) = match snapshot {
+        Some(Some(v)) => v,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+    };
     // Closure error channel: `Err(true)` ⇒ broken pipe (raise SIGPIPE +
     // return -EPIPE), `Err(false)` ⇒ generic write failure / bad fd.
-    let outcome = fd::with_table(task, |t| {
-        let entry = match t.get_mut(fd) {
-            Some(e) => e,
-            None => return Err(false),
-        };
-        let off = entry.offset;
-        let res = poll_blocking(entry.ops.write(off, &kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
+    let outcome = Some({
+        let res =
+            poll_blocking(ops.write(off, &kbuf)).unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
             Ok(written) => {
-                entry.offset = off.saturating_add(written as u64);
+                let _ = fd::with_table(task, |t| {
+                    if let Some(e) = t.get_mut(fd) {
+                        e.offset = off.saturating_add(written as u64);
+                    }
+                });
                 Ok(written)
             }
             // A write to a FIFO / pipe with no remaining readers: SIGPIPE + EPIPE.
@@ -1766,15 +1780,45 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     }
+    // Snapshot the fd's ops + offset, then DROP the fd-table lock before
+    // calling into FileOps.
+    //
+    // Holding it across `ops.read` self-deadlocks on any file whose read
+    // consults the fd table: `/proc/<pid>/fdinfo/<n>` and `/proc/<pid>/fd/<n>`
+    // render via `fd_path_of`, which re-enters `fd::with_table` on the SAME
+    // task's table — and the table lock is a non-reentrant IrqSafeSpinLock,
+    // so the CPU spins forever with interrupts masked. dbus-daemon does
+    // exactly this (`pidfd_open` then read `/proc/self/fdinfo/<n>`), which
+    // wedged the session bus and with it every KDE Plasma startup. Same
+    // lesson as the nested-epoll fix: never call FileOps under the fd-table
+    // lock.
+    //
+    // The offset is re-taken and advanced after the read. Two threads
+    // sharing one fd can now interleave there; Linux serialises that case
+    // with f_pos_lock, which NARF doesn't model yet.
+    let snapshot = fd::with_table(task, |t| {
+        let e = t.get(fd)?;
+        Some((e.ops.clone(), e.offset, e.status_flags))
+    });
+    let (ops, off, status_flags) = match snapshot {
+        Some(Some(v)) => v,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+    };
+    let advance = |n: usize| {
+        let _ = fd::with_table(task, |t| {
+            if let Some(e) = t.get_mut(fd) {
+                e.offset = off.saturating_add(n as u64);
+            }
+        });
+    };
     // Closure error channel: `Err(true)` ⇒ return EAGAIN, `Err(false)` ⇒
     // invalid-op sentinel (bad fd / read error).
-    let outcome = fd::with_table(task, |t| {
-        let entry = match t.get_mut(fd) {
-            Some(e) => e,
-            None => return Err(false),
-        };
-        let off = entry.offset;
-        let nonblock = entry.status_flags & crate::fd::O_NONBLOCK != 0;
+    let outcome = Some((|| {
+        let entry = &ops;
+        let nonblock = status_flags & crate::fd::O_NONBLOCK != 0;
         // evdev device nodes (`nonblock_read_eagain`) provide EAGAIN-on-empty
         // semantics UNCONDITIONALLY — independent of the fd's O_NONBLOCK bit.
         //
@@ -1791,10 +1835,10 @@ fn sys_read(ctx: &mut dyn TrapContext) {
         // libinput treats the read error as device-removal and `EPOLL_CTL_DEL`s
         // the device, so the pointer goes dead. Surfacing EAGAIN here (what an
         // evdev node is *for*) fixes that and matches how these devices are used.
-        if entry.ops.nonblock_read_eagain() {
-            return match poll_once(entry.ops.read(off, &mut kbuf)) {
+        if entry.nonblock_read_eagain() {
+            return match poll_once(entry.read(off, &mut kbuf)) {
                 Some(Ok(n)) if n > 0 => {
-                    entry.offset = off.saturating_add(n as u64);
+                    advance(n);
                     Ok((n, false, false))
                 }
                 // Empty / would-block ⇒ EAGAIN.
@@ -1802,7 +1846,7 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                 Some(Err(_)) => Err(false),
             };
         }
-        let res = poll_blocking(entry.ops.read(off, &mut kbuf))
+        let res = poll_blocking(entry.read(off, &mut kbuf))
             .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match res {
             Ok(n) => {
@@ -1816,23 +1860,23 @@ fn sys_read(ctx: &mut dyn TrapContext) {
                 // the dbus EXTERNAL auth line-read ("Unexpected lack of content
                 // trying to read a line") killed the KDE session bus. musl's
                 // stdio/recv wrappers likewise expect EAGAIN, never a phantom 0.
-                if n == 0 && nonblock && entry.ops.read_should_block() {
+                if n == 0 && nonblock && entry.read_should_block() {
                     return Err(true); // EAGAIN
                 }
                 // Block decision: a 0-byte read on a pipe/socket whose writer is
                 // still open must wait for data (POSIX), not return a
                 // spurious EOF — unless the fd is O_NONBLOCK (handled above).
-                let should_block = n == 0 && !nonblock && entry.ops.read_should_block();
+                let should_block = n == 0 && !nonblock && entry.read_should_block();
                 // Console fds park on the input waker (serial/keyboard IRQ)
                 // instead of the 1ms re-poll, so an interactive shell truly
                 // sleeps on `read(stdin)` rather than busy-polling.
-                let input_block = n == 0 && !nonblock && entry.ops.block_on_input();
-                entry.offset = off.saturating_add(n as u64);
+                let input_block = n == 0 && !nonblock && entry.block_on_input();
+                advance(n);
                 Ok((n, should_block, input_block))
             }
             Err(_) => Err(false),
         }
-    });
+    })());
     match outcome {
         Some(Ok((0, _, true))) => {
             // Empty console input ring: park on the input waker (woken by
@@ -3647,45 +3691,48 @@ fn sys_renameat2(ctx: &mut dyn TrapContext) {
     let new_uptr = args.arg3;
     let flags = args.arg4 as u32;
     const RENAME_NOREPLACE: u32 = 1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // A bare -1 lands in glibc's [-4095,-1] errno window as EPERM, which
+    // reads as a permission problem; return real errnos instead.
+    let efault = SyscallReturn::ok((-14i64) as u64);
+    let einval = SyscallReturn::ok((-22i64) as u64);
     if flags & !RENAME_NOREPLACE != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(einval);
         return;
     }
     let old_path = match copy_user_cstr(old_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(efault);
             return;
         }
     };
     let new_path = match copy_user_cstr(new_uptr, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(efault);
             return;
         }
     };
-    // Same-parent constraint (cross-directory rename isn't supported
-    // by the DirOps surface yet — mirrors sys_rename).
+    // glibc implements plain `rename(2)` on top of renameat2, so this is
+    // the path a distro's libc actually takes — it has to resolve
+    // relative paths against the cwd exactly like `sys_rename` does.
+    let task = current_task_id();
+    let old_path = resolve_cwd_path(task, &old_path);
+    let new_path = resolve_cwd_path(task, &new_path);
     let old_split = match old_path.rfind('/') {
         Some(i) => i,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(einval);
             return;
         }
     };
     let new_split = match new_path.rfind('/') {
         Some(i) => i,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(einval);
             return;
         }
     };
-    if old_path[..old_split] != new_path[..new_split] {
-        ctx.set_return(fail);
-        return;
-    }
     let new_leaf = &new_path[new_split + 1..];
     if flags & RENAME_NOREPLACE != 0 {
         let exists = narf_filesystem::registry()
@@ -3696,13 +3743,19 @@ fn sys_renameat2(ctx: &mut dyn TrapContext) {
             return;
         }
     }
+    // Different parent directories: a move within one mount, not
+    // automatically EXDEV. See `cross_dir_rename`.
+    if old_path[..old_split] != new_path[..new_split] {
+        ctx.set_return(SyscallReturn::ok(cross_dir_rename(&old_path, &new_path)));
+        return;
+    }
     let outcome = narf_filesystem::registry()
         .resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
             poll_blocking(parent.rename(old_leaf, new_leaf))
         });
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
     }
 }
 
@@ -5181,6 +5234,67 @@ fn sys_rmdir(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// Move `old_abs` to `new_abs` when the two live in DIFFERENT parent
+/// directories. Returns the raw syscall value: `0` on success, or a
+/// negative errno.
+///
+/// `DirOps::rename` is a single-directory operation (it renames a name
+/// within one directory), so a cross-directory move is expressed with
+/// the primitives that do span directories: look the node up in the old
+/// parent, `link_node` it into the new parent, then unlink the old name.
+/// The node `Arc` is aliased, not copied, so open fds and the new name
+/// keep referring to one inode — which is what makes the "write a temp
+/// file, rename it into place" pattern behave.
+///
+/// Restricted to a single mount (`resolve_two_parents_absolute` enforces
+/// it); a move across mounts is a genuine `EXDEV` and every caller falls
+/// back to copy+unlink on it.
+fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
+    const EXDEV: i64 = -18;
+    const ENOENT: i64 = -2;
+    const EISDIR: i64 = -21;
+    let res = narf_filesystem::registry().resolve_two_parents_absolute(
+        old_abs,
+        new_abs,
+        |_fs, old_dir, old_leaf, new_dir, new_leaf| {
+            // Directories would need a DirOps-shaped `link_node` the
+            // trait doesn't have yet; report EXDEV so callers fall back
+            // to a recursive copy rather than silently doing nothing.
+            if old_dir.lookup_dir(old_leaf).is_some() {
+                return EISDIR;
+            }
+            let node = match poll_blocking(old_dir.lookup_async(old_leaf)) {
+                Some(Ok(n)) => n,
+                _ => return ENOENT,
+            };
+            // POSIX rename REPLACES an existing destination; `link_node`
+            // refuses to (linkat never clobbers), so clear the target
+            // first. Best-effort: if it isn't there, the unlink fails
+            // harmlessly and link_node succeeds.
+            let _ = poll_blocking(new_dir.unlink(new_leaf));
+            match poll_blocking(new_dir.link_node(new_leaf, node)) {
+                Some(Ok(())) => {}
+                // A filesystem that can't adopt a foreign node (read-only
+                // or block-backed) still owes the caller EXDEV so it
+                // copy+unlinks instead.
+                _ => return EXDEV,
+            }
+            match poll_blocking(old_dir.unlink(old_leaf)) {
+                Some(Ok(())) => 0,
+                // The new name is live but the old one wouldn't go away.
+                // Undo the link so the move is all-or-nothing rather than
+                // leaving the file visible under both names.
+                _ => {
+                    let _ = poll_blocking(new_dir.unlink(new_leaf));
+                    EXDEV
+                }
+            }
+        },
+    );
+    // `None` ⇒ unresolvable path or genuinely different mounts.
+    res.unwrap_or(EXDEV) as u64
+}
+
 fn sys_rename(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let old_ptr = args.arg0;
@@ -5223,10 +5337,15 @@ fn sys_rename(ctx: &mut dyn TrapContext) {
         }
     };
     if old_path[..old_split] != new_path[..new_split] {
-        // Cross-directory rename is the normal cross-filesystem answer on
-        // Linux (EXDEV); every rename() caller falls back to copy+unlink on
-        // it, whereas a bare -1 → EPERM looks like a permission failure.
-        ctx.set_return(SyscallReturn::ok((-18i64) as u64)); // -EXDEV
+        // Different parent directories. That is only EXDEV when the two
+        // parents are on different MOUNTS — within one filesystem Linux
+        // moves the name, and real software depends on it: Qt's
+        // QSaveFile (so every KDE/KConfig/KSycoca write) stages into a
+        // temp file and renames it onto the target, and when the staging
+        // file lands in a different directory a blanket EXDEV surfaces to
+        // the user as "Invalid cross-device link" / "Disk full?" and the
+        // config or cache is never written.
+        ctx.set_return(SyscallReturn::ok(cross_dir_rename(&old_path, &new_path)));
         return;
     }
     let new_leaf = &new_path[new_split + 1..];

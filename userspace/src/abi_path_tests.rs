@@ -1079,6 +1079,150 @@ fn smoke_abi_path_rename_dir_ok() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_rename_dir_ok);
 
+// ── cross-directory rename ─────────────────────────────────────────
+//
+// `rename(2)` is only EXDEV when the two paths are on different MOUNTS.
+// Moving a name between directories of ONE filesystem must work: Qt's
+// QSaveFile — so every KDE/KConfig/KSycoca write — stages into a temp
+// file and renames it onto the target, and a blanket EXDEV surfaced to
+// the user as "Invalid cross-device link" with the config never written.
+
+/// EXDEV isn't in the shared errno table yet (nothing else returns it).
+const EXDEV: i64 = -18;
+const O_WRONLY_CREAT: u64 = 1 | 0o100;
+
+/// `openat(AT_FDCWD, path, O_WRONLY|O_CREAT, 0644)`, returning the fd.
+fn create_file(path: &[u8]) -> Option<u64> {
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, O_WRONLY_CREAT, 0o644),
+    ) {
+        Some(fd) if fd >= 0 => Some(fd as u64),
+        _ => None,
+    }
+}
+
+fn smoke_abi_path_rename_cross_dir_ok() -> TestResult {
+    with_memfs("/run", "run", &[("seed", b"x")], || {
+        for d in [b"/run/ra\0", b"/run/rb\0"] {
+            if call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("mkdir of the rename test dirs should return 0");
+            }
+        }
+        // Stage a file in ra, write to it, then move it into rb.
+        let src = b"/run/ra/tmp.XXX\0";
+        let dst = b"/run/rb/final\0";
+        let payload = b"cross";
+        let fd = match create_file(src) {
+            Some(f) => f,
+            None => return Err("creating the staging file should succeed"),
+        };
+        if call(
+            Syscall::Write.raw(),
+            a3(fd, payload.as_ptr() as u64, payload.len() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("writing the staging file should succeed");
+        }
+        let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+
+        match call_rename(src.as_ptr() as u64, dst.as_ptr() as u64) {
+            Some(0) => {}
+            Some(EXDEV) => return Err("cross-DIRECTORY rename within one mount must not be EXDEV"),
+            _ => return Err("cross-directory rename should return 0"),
+        }
+        // The old name is gone and the new one carries the bytes — the
+        // node moved, it wasn't copied and left behind.
+        if matches!(
+            call(Syscall::Openat.raw(), a3(AT_FDCWD, src.as_ptr() as u64, O_RDONLY, 0)),
+            Some(fd) if fd >= 0
+        ) {
+            return Err("the source name must be gone after a cross-directory rename");
+        }
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dst.as_ptr() as u64, O_RDONLY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("the destination name must exist after the rename"),
+        };
+        let mut buf = [0u8; 8];
+        let n = call(
+            Syscall::Read.raw(),
+            a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+        );
+        let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+        if n != Some(payload.len() as i64) || &buf[..payload.len()] != payload {
+            return Err("the moved file must still hold its contents");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rename_cross_dir_ok);
+
+/// POSIX `rename` REPLACES an existing destination. `link_node` alone
+/// refuses to clobber (linkat never does), so the handler has to clear
+/// the target first — otherwise the second save of any config file
+/// fails forever.
+fn smoke_abi_path_rename_cross_dir_replaces() -> TestResult {
+    with_memfs("/run", "run", &[("seed", b"x")], || {
+        for d in [b"/run/xa\0", b"/run/xb\0"] {
+            if call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, d.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("mkdir of the rename test dirs should return 0");
+            }
+        }
+        let src = b"/run/xa/new\0";
+        let dst = b"/run/xb/old\0";
+        for p in [src.as_slice(), dst.as_slice()] {
+            match create_file(p) {
+                Some(fd) => {
+                    let _ = call(Syscall::Close.raw(), a3(fd, 0, 0, 0));
+                }
+                None => return Err("creating the rename fixtures should succeed"),
+            }
+        }
+        match call_rename(src.as_ptr() as u64, dst.as_ptr() as u64) {
+            Some(0) => Ok(()),
+            _ => Err("cross-directory rename over an existing name should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rename_cross_dir_replaces);
+
+/// A rename that really does span two MOUNTS is still EXDEV — the case
+/// callers must fall back to copy+unlink on. The second filesystem is
+/// mounted by hand because `with_memfs` owns setup/teardown and so can't
+/// nest.
+fn smoke_abi_path_rename_cross_mount_is_exdev() -> TestResult {
+    with_memfs("/run", "run", &[("src", b"x")], || {
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let other = MemFs::with_seeds("other", &[("keep", b"y" as &[u8])]);
+        let handle = match registry().mount(&auth, "/other", other) {
+            Ok(h) => h,
+            Err(_) => return Err("mounting the second memfs failed"),
+        };
+        let outcome = match call_rename(
+            b"/run/src\0".as_ptr() as u64,
+            b"/other/src\0".as_ptr() as u64,
+        ) {
+            Some(EXDEV) => Ok(()),
+            Some(0) => Err("rename across two mounts must not silently succeed"),
+            _ => Err("rename across two mounts should return -EXDEV"),
+        };
+        let _ = registry().unmount(&handle, "/other");
+        outcome
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_rename_cross_mount_is_exdev);
+
 // rename of a missing source returns ENOENT, not the bare -1 → EPERM.
 fn smoke_abi_path_rename_missing_is_enoent() -> TestResult {
     with_memfs("/run", "run", &[("f", b"x")], || {

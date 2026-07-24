@@ -1682,6 +1682,82 @@ impl VfsRegistry {
         Some(f(&*m.fs, dir, leaf))
     }
 
+    /// Resolve the parent directories of TWO absolute paths at once,
+    /// requiring both to land on the SAME mount, and hand both
+    /// `(dir, leaf)` pairs to `f`.
+    ///
+    /// This is what a cross-*directory* rename needs: `rename(2)` may
+    /// only move a name between directories of one filesystem, so the
+    /// same-mount check is the real `EXDEV` test. Returns `None` when
+    /// either path fails to resolve or the two live on different
+    /// mounts — the caller turns that into `-EXDEV`.
+    ///
+    /// Both walks happen under one registry lock so a concurrent
+    /// mount/unmount can't move one path's mount out from under the
+    /// other between the two resolutions.
+    pub fn resolve_two_parents_absolute<R, F>(&self, a: &str, b: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, Arc<dyn DirOps>, &str, Arc<dyn DirOps>, &str) -> R,
+    {
+        fn split<'p>(abs: &'p str) -> Option<(&'p str, &'p str)> {
+            if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+                return None;
+            }
+            let last = abs.rfind('/')?;
+            let leaf = &abs[last + 1..];
+            if leaf.is_empty() {
+                return None;
+            }
+            let parent = &abs[..last];
+            Some((if parent.is_empty() { "/" } else { parent }, leaf))
+        }
+        let (a_parent, a_leaf) = split(a)?;
+        let (b_parent, b_leaf) = split(b)?;
+
+        let q = self.inner.lock();
+        // Longest matching mount prefix, same rule as
+        // `resolve_parent_absolute`.
+        let best_mount = |parent_path: &str| -> Option<&Mount> {
+            let mut best: Option<&Mount> = None;
+            for m in q.iter() {
+                if (parent_path == m.path
+                    || (parent_path.starts_with(m.path.as_str())
+                        && parent_path.as_bytes().get(m.path.len()) == Some(&b'/')))
+                    && best.map(|x| x.path.len()).unwrap_or(0) < m.path.len()
+                {
+                    best = Some(m);
+                }
+            }
+            best
+        };
+        let ma = best_mount(a_parent)?;
+        let mb = best_mount(b_parent)?;
+        // Different mounts ⇒ a genuine cross-device move. Mount paths
+        // are unique in the registry, so comparing them identifies the
+        // mount.
+        if ma.path != mb.path {
+            return None;
+        }
+        let walk = |m: &Mount, parent_path: &str| -> Option<Arc<dyn DirOps>> {
+            let rel = &parent_path[m.path.len()..];
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            let mut dir = m.fs.root();
+            for seg in rel.split('/') {
+                if seg.is_empty() || seg == "." {
+                    continue;
+                }
+                if seg == ".." {
+                    return None;
+                }
+                dir = dir.lookup_dir(seg)?;
+            }
+            Some(dir)
+        };
+        let a_dir = walk(ma, a_parent)?;
+        let b_dir = walk(mb, b_parent)?;
+        Some(f(&*ma.fs, a_dir, a_leaf, b_dir, b_leaf))
+    }
+
     /// Number of mounts.
     pub fn len(&self) -> usize {
         self.inner.lock().len()

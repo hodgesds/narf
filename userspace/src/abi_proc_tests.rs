@@ -11,6 +11,8 @@
 
 use crate::abi_test_support::*;
 
+const AT_FDCWD: u64 = (-100i64) as u64;
+
 // ── getppid(2) — infallible, returns parent visible pid (0 if none) ──
 
 fn smoke_abi_proc_getppid_pos() -> TestResult {
@@ -840,3 +842,102 @@ fn smoke_abi_proc_setns_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_setns_neg);
+
+// ── /proc/<pid>/fdinfo/<n> — read must not deadlock ────────────────
+//
+// `sys_read` used to hold the fd-table lock across `FileOps::read`.
+// procfs renders `fdinfo`/`fd` entries through `fd_path_of`, which
+// re-enters `fd::with_table` on the SAME task — and the table lock is a
+// non-reentrant IrqSafeSpinLock, so the read spun forever with
+// interrupts masked. dbus-daemon does exactly this (`pidfd_open`, then
+// read `/proc/self/fdinfo/<n>`), which hung the session bus and with it
+// every KDE Plasma startup.
+//
+// A regression here HANGS rather than fails — that is the honest shape
+// for a deadlock pin; the harness's QEMU timeout turns it into a failure.
+fn smoke_abi_proc_fdinfo_read_no_deadlock() -> TestResult {
+    with_memfs("/p", "p", &[("f", b"payload")], || {
+        // procfs has to be mounted, and the fd-path hook installed, for
+        // fdinfo to resolve at all.
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        narf_filesystem::procfs::install_proc_ext_hooks(
+            crate::handlers::fd_path_of,
+            crate::handlers::rlimits_of,
+            crate::handlers::nice_of,
+            crate::handlers::proc_environ_of,
+            crate::handlers::proc_auxv_of,
+        );
+        narf_filesystem::procfs::set_fd_list_hook(crate::handlers::proc_fd_list);
+        let handle = match registry().mount(&auth, "/proc", narf_filesystem::procfs::ProcFs) {
+            Ok(h) => h,
+            Err(_) => return Err("mounting procfs failed"),
+        };
+
+        let outcome = (|| {
+            // An open fd to describe.
+            let target = b"/p/f\0";
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, target.as_ptr() as u64, 0, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd,
+                _ => return Err("opening the fdinfo subject failed"),
+            };
+            // /proc/<FAKE_TASK>/fdinfo/<fd> — the path dbus reads.
+            let mut path = [0u8; 40];
+            let prefix = b"/proc/";
+            path[..prefix.len()].copy_from_slice(prefix);
+            let mut w = prefix.len();
+            let mut push = |v: u64, path: &mut [u8], w: &mut usize| {
+                let mut digits = [0u8; 20];
+                let mut n = 0;
+                let mut v = v;
+                if v == 0 {
+                    digits[0] = b'0';
+                    n = 1;
+                }
+                while v > 0 {
+                    digits[n] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                    n += 1;
+                }
+                for i in (0..n).rev() {
+                    path[*w] = digits[i];
+                    *w += 1;
+                }
+            };
+            push(FAKE_TASK, &mut path, &mut w);
+            let mid = b"/fdinfo/";
+            path[w..w + mid.len()].copy_from_slice(mid);
+            w += mid.len();
+            push(fd as u64, &mut path, &mut w);
+            path[w] = 0;
+
+            let pfd = match call(Syscall::Openat.raw(), a3(AT_FDCWD, path.as_ptr() as u64, 0, 0)) {
+                Some(f) if f >= 0 => f as u64,
+                _ => return Err("opening /proc/<pid>/fdinfo/<n> failed"),
+            };
+            // THE point of the test: this read must return, not spin.
+            let mut buf = [0u8; 256];
+            let n = call(
+                Syscall::Read.raw(),
+                a3(pfd, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+            );
+            let _ = call(Syscall::Close.raw(), a3(pfd, 0, 0, 0));
+            let _ = call(Syscall::Close.raw(), a3(fd as u64, 0, 0, 0));
+            match n {
+                Some(n) if n > 0 => {
+                    if buf[..n as usize].windows(4).any(|w| w == b"pos:") {
+                        Ok(())
+                    } else {
+                        Err("fdinfo content is missing the 'pos:' field")
+                    }
+                }
+                _ => Err("reading /proc/<pid>/fdinfo/<n> returned no data"),
+            }
+        })();
+        let _ = registry().unmount(&handle, "/proc");
+        outcome
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_fdinfo_read_no_deadlock);
