@@ -17,6 +17,13 @@ int main(void) {
     setenv("LD_LIBRARY_PATH", "/usr/lib:/lib", 1);
     char *argv[] = { (char *)"busybox", (char *)"sh", (char *)"/probe.sh", NULL };
     execve("/bin/busybox", argv, environ);
+    /* Rootfs without busybox (e.g. a stock Debian bundle): run the probe
+     * through the distro's own /bin/sh. Never fake a /bin/busybox inside
+     * the rootfs to satisfy the exec above — a shim that re-execs the
+     * probe script turns every later `busybox APPLET` invocation into a
+     * script re-run (looks like execve corruption / a fork bomb). */
+    char *sh_argv[] = { (char *)"sh", (char *)"/probe.sh", NULL };
+    execve("/bin/sh", sh_argv, environ);
     printf("exec-fail errno=%d\n", errno);
     return 1;
 }
