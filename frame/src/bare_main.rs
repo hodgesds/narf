@@ -3644,6 +3644,12 @@ fn boot_userspace_init() {
                     "sockpairfork_smoke",
                     narf_verification::NARF_SOCKPAIRFORK_SMOKE_ELF,
                 ),
+                // Unlinked-but-open file: bash builds EVERY here-document
+                // this way, so losing the data with the name blanks them.
+                (
+                    "unlinkopen_smoke",
+                    narf_verification::NARF_UNLINKOPEN_SMOKE_ELF,
+                ),
                 ("accept4_smoke", narf_verification::NARF_ACCEPT4_SMOKE_ELF),
                 // Linux-compat round 2: mremap / sendfile / creds / waitid.
                 ("mremap_smoke", narf_verification::NARF_MREMAP_SMOKE_ELF),

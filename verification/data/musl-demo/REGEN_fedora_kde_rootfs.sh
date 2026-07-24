@@ -81,6 +81,14 @@ echo "Staging NARF-specific bits..."
 # dbus + Plasma both refuse to start without a machine-id.
 [ -s "$WORK/root/etc/machine-id" ] || \
   head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$WORK/root/etc/machine-id"
+
+# The systemd package ships a D-Bus activation stub for org.freedesktop.systemd1
+# whose Exec is /bin/false. There is no systemd here, and startplasma calls
+# org.freedesktop.systemd1.Manager.SetEnvironment UNCONDITIONALLY (it is not
+# gated on the systemdBoot setting below), so leaving the stub in place makes
+# every such call burn dbus's full 120s service_start_timeout before failing.
+# Drop it and dbus answers "not provided by any .service files" immediately.
+rm -f "$WORK/root/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
 # ld.so.cache: the image is built offline, so make sure it matches the tree.
 "$WORK/enter.sh" 'ldconfig' || true
 
@@ -108,16 +116,36 @@ mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
          "$XDG_DATA_HOME" "$XDG_STATE_HOME"
 chmod 0700 "$XDG_RUNTIME_DIR"
 
+# Qt refuses to run in a non-UTF-8 locale and falls back with a warning.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+# Fedora's Plasma prefers a systemd USER session and asks D-Bus to activate
+# org.freedesktop.systemd1. NARF runs no systemd, so that activation never
+# completes and startplasma sits there forever — take the classic ksmserver
+# startup path instead.
+cat > "$XDG_CONFIG_HOME/startkderc" <<'CFG'
+[General]
+systemdBoot=false
+CFG
+
 unset WAYLAND_DISPLAY            # KWin is the SERVER — it creates the socket.
 export KWIN_DRM_NO_AMS=1         # NARF has no atomic KMS — force legacy modeset.
+# Without logind/udev seat enumeration KWin finds no DRM device on its own
+# ("Failed to create gbm device for \"\"") — name the card explicitly.
+export KWIN_DRM_DEVICES=/dev/dri/card0
 export QT_QPA_PLATFORM=wayland
 export QT_LOGGING_RULES="kwin_*.debug=true"
+export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=KDE
 # No GPU behind NARF's DRM (dumb buffers only) — force the software stack.
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=llvmpipe
 
 echo "=== FED-STAGE2 devices ==="
 ls -l /dev/dri /dev/input 2>&1
+# Build the service database up front: a missing ksycoca leaves every KDE
+# component resolving services against a fake empty stream.
+echo "=== FED-STAGE2 kbuildsycoca6 ==="
+kbuildsycoca6 --noincremental 2>&1 | tail -3
 echo "=== FED-STAGE2 launching startplasma-wayland (root) ==="
 dbus-run-session -- startplasma-wayland 2>&1
 echo "=== FED-STAGE2 startplasma exited rc=$? ==="

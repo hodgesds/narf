@@ -530,6 +530,7 @@ fn main() {
         "getrandom_smoke",
         "sockpair_smoke",
         "sockpairfork_smoke",
+        "unlinkopen_smoke",
         "accept4_smoke",
         "mremap_smoke",
         "sendfile_smoke",
