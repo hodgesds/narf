@@ -2565,20 +2565,51 @@ struct AlignedFpuArea([u8; crate::x86_64::xsave::FPU_AREA_SIZE]);
 /// Seed a reset FPU image (FCW=0x037F, MXCSR=0x1F80, zeroed XSAVE header),
 /// mirroring the userspace `FpuArea::reset` used for a task's first entry.
 #[cfg(target_arch = "x86_64")]
+/// Build a standard-format XSAVE image seeding the x87 FCW and SSE MXCSR
+/// with NON-default control words, and mark both components present in the
+/// header so a subsequent `XRSTOR` actually loads them.
+///
+/// Two subtleties this encodes, both learned the hard way (the values used
+/// to be the *init* defaults 0x037F / 0x1F80 with a zeroed header, which
+/// made the round-trip test pass for the wrong reason on plain-XSAVE hosts
+/// and fail on XSAVEC ones):
+///
+///  1. `XSTATE_BV` (header byte 512) must flag x87 (bit 0) + SSE (bit 1),
+///     or `XRSTOR` restores those components to their INIT state and
+///     ignores the seeded legacy words entirely.
+///  2. The seeded words must DIFFER from the architectural init state
+///     (FCW 0x037F, MXCSR 0x1F80). `XSAVEC` (used on AVX-512 hosts) applies
+///     the init optimization: a component in its init state is neither
+///     written to the legacy region nor flagged in `XSTATE_BV`. Only a
+///     non-init component round-trips real bytes on every save path.
+///
+/// `XCOMP_BV` (byte 520) stays 0 → standard (non-compacted) layout, which
+/// `XRSTOR` accepts regardless of whether the paired save later used XSAVEC.
 fn init_reset_fpu_area(a: &mut AlignedFpuArea) {
     a.0.fill(0);
-    a.0[0] = 0x7F; // FCW byte 0
-    a.0[1] = 0x03; // FCW byte 1  → 0x037F
-    a.0[24] = 0x80; // MXCSR byte 0
-    a.0[25] = 0x1F; // MXCSR byte 1 → 0x1F80
+    // FCW 0x007F: precision-control = single (init is 64-bit, 0x037F).
+    a.0[0] = 0x7F;
+    a.0[1] = 0x00;
+    // MXCSR 0x1F00: invalid-op exception UNmasked (init masks it, 0x1F80).
+    a.0[24] = 0x00;
+    a.0[25] = 0x1F;
+    // XSTATE_BV: x87 (bit 0) + SSE (bit 1) present.
+    a.0[512] = 0x03;
 }
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_arch_xsave_fpu_reset_round_trip() -> TestResult {
-    // init_area → fpu_restore → fpu_save must preserve the seeded FCW/MXCSR
-    // control words through the CPU's FPU register file. Non-destructive: the
-    // caller's live FPU state is saved first and restored last, so running this
-    // smoke never corrupts the surrounding task's x87/SSE/AVX state.
+    // fpu_restore → fpu_save must round-trip the x87 FCW and SSE MXCSR through
+    // the CPU register file. The seeded control words are deliberately NON-init
+    // (see `init_reset_fpu_area`) so the save cannot be elided by XSAVEC's init
+    // optimization — on an AVX-512 host `fpu_save` uses XSAVEC, and an init
+    // component would be neither written nor flagged, leaving the readback
+    // buffer's legacy bytes zero. A non-init component writes real bytes on
+    // every save path (FXSAVE / XSAVE / XSAVEC), so reading them back is valid.
+    //
+    // Non-destructive: the caller's live FPU state is saved first and restored
+    // last, so running this smoke never corrupts the surrounding task's
+    // x87/SSE/AVX state.
     use crate::x86_64::xsave;
 
     let mut live = AlignedFpuArea([0u8; xsave::FPU_AREA_SIZE]);
@@ -2604,12 +2635,12 @@ fn smoke_arch_xsave_fpu_reset_round_trip() -> TestResult {
         (fcw, mxcsr)
     };
 
-    if fcw != 0x037F {
+    if fcw != 0x007F {
         return TestResult::Fail("FCW not preserved through restore/save");
     }
     // Only the defined MXCSR bits are meaningful; mask off the reserved high
     // half before comparing (hardware zeroes them but be explicit).
-    if mxcsr & 0xFFFF != 0x1F80 {
+    if mxcsr & 0xFFFF != 0x1F00 {
         return TestResult::Fail("MXCSR not preserved through restore/save");
     }
     TestResult::Pass
