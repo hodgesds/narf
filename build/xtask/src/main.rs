@@ -531,6 +531,18 @@ impl Arch {
                     "-device".into(),
                     "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
                 ]);
+                // `XTASK_QEMU_SNAPSHOT=1` opens every `-drive` copy-on-write:
+                // writes land in an ephemeral host overlay and the base images
+                // stay read-only-shared, so N VMs can boot the SAME rootfs disk
+                // at once WITHOUT tripping QEMU's image write-lock (the "second
+                // VM emits 0 serial lines" failure). Lets the hunt fan out
+                // across many concurrent 16-CPU VMs to cut time-to-repro. SLIRP
+                // user-net binds no host ports by default, so nothing else
+                // collides; opt-in QMP/hostfwd/COM2 paths must still be
+                // per-instance if used.
+                if std::env::var("XTASK_QEMU_SNAPSHOT").as_deref() == Ok("1") {
+                    args.push("-snapshot".into());
+                }
                 // `NARF_QEMU_COM2_FILE=<path>` routes a *second* serial (COM2,
                 // 0x2F8) to a host file. Appended AFTER `-serial stdio` so QEMU
                 // assigns it COM2 (stdio stays COM1, the console). The kernel's
