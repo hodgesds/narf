@@ -2061,6 +2061,11 @@ fn musl_demo_cmd(args: &BuildArgs) -> Result<()> {
         // `Operation not permitted` (EPERM) wall every time.
         ("busybox sh -c 'echo hi | busybox cat'", "hi"),
         ("signal_smoke", "signal-ok"),
+        // Regression for the SYSRET rcx/r11 clobber on syscall-path
+        // rt_sigreturn: an async SIGALRM interrupts an asm loop holding
+        // sentinels in rcx/r11; the sigreturn must preserve them (full-register
+        // iretq exit). See sigrcx_smoke_x86_64.c.
+        ("sigrcx_smoke", "sigrcx-ok"),
         // RT-signal regression for the stress-ng --sigrt fixes: si_pid on
         // SA_SIGINFO for a queued signal, a forked child's clean signal mask,
         // and rt_sigtimedwait reserving an UNBLOCKED in-set signal for the

@@ -345,7 +345,75 @@ extern "C" fn dispatch_syscall(
     // through the normal user-fault → SIGSEGV path: the process dies cleanly and
     // the kernel survives. The return value is unchanged.
     state.rip = sysret_safe_rip(state.rip);
+
+    // rt_sigreturn resumes an *interrupted* user context whose rcx/r11 are
+    // live registers of the interrupted code — but `sysretq` architecturally
+    // consumes rcx (return RIP) and r11 (RFLAGS), so the sysret tail can
+    // never restore them (observed as stress-ng matrixprod's loop-bound rcx
+    // replaced by the interrupted RIP → infinite loop → SIGSEGV). The
+    // sigreturn handler marks the snapshot (valid=2) to request a
+    // full-register IRETQ exit instead — Linux forces IRET on this exact
+    // path (arch/x86/entry: "SYSRET requires RCX/R11 clobber").
+    if state.valid == 2 {
+        state.valid = 1;
+        // SAFETY: `state` is the live kernel-stack UserState snapshot for
+        // this syscall (built by `syscall_entry_x86_64`); the exit masks
+        // IRQs, restores the full user register file from it and iretq's
+        // to CPL=3. It never returns; the abandoned kernel-stack frames
+        // are reclaimed when the next trap re-enters at the stack top.
+        unsafe { sigreturn_iret_exit_x86_64(state) }
+    }
     ret
+}
+
+/// Full-register return-to-user for `rt_sigreturn` on the `syscall` path.
+///
+/// Restores ALL GPRs (including rcx/r11, which `sysretq` cannot) from the
+/// kernel-stack `UserState` snapshot and enters CPL=3 via `iretq`. The
+/// 5-word iretq frame is built just below the snapshot on the same kernel
+/// stack. `state.rip` has already been canonicalised by `sysret_safe_rip`,
+/// so a crafted non-canonical sigframe RIP faults in USER mode (#PF at 0),
+/// not at the kernel iretq.
+///
+/// # Safety
+/// `state` must be the live kernel-stack snapshot of the current syscall,
+/// entered from `syscall_entry_x86_64` with kernel GS active. Never returns.
+#[unsafe(naked)]
+unsafe extern "C" fn sigreturn_iret_exit_x86_64(
+    state: *mut narf_arch::x86_64::user_mode::UserState,
+) -> ! {
+    naked_asm!(
+        "cli",
+        // Build the iretq frame below the UserState snapshot (rdi). This
+        // region is dead caller-frame stack; this function never returns.
+        "mov rax, [rdi + 136]", // user RSP
+        "mov rcx, [rdi + 128]", // user RFLAGS
+        "mov rdx, [rdi + 120]", // user RIP (sysret_safe_rip-canonicalised)
+        "lea rsp, [rdi - 40]",
+        "mov qword ptr [rsp + 32], 0x2B", // SS = UDATA_SEL (DPL=3)
+        "mov [rsp + 24], rax",
+        "mov [rsp + 16], rcx",
+        "mov qword ptr [rsp + 8], 0x33", // CS = UCODE_SEL (DPL=3)
+        "mov [rsp + 0], rdx",
+        // Full user GPR file from the snapshot; rdi last (it's the base).
+        "mov r15, [rdi + 0]",
+        "mov r14, [rdi + 8]",
+        "mov r13, [rdi + 16]",
+        "mov r12, [rdi + 24]",
+        "mov r11, [rdi + 32]",
+        "mov r10, [rdi + 40]",
+        "mov r9,  [rdi + 48]",
+        "mov r8,  [rdi + 56]",
+        "mov rbp, [rdi + 64]",
+        "mov rsi, [rdi + 80]",
+        "mov rdx, [rdi + 88]",
+        "mov rcx, [rdi + 96]",
+        "mov rbx, [rdi + 104]",
+        "mov rax, [rdi + 112]",
+        "mov rdi, [rdi + 72]",
+        "swapgs",
+        "iretq",
+    )
 }
 
 /// Canonical-address guard for a SYSRET target RIP. Returns `rip` unchanged

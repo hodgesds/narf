@@ -525,6 +525,7 @@ fn main() {
         "fork_pipe_smoke",
         "epoll_smoke",
         "signal_smoke",
+        "sigrcx_smoke",
         "fs_smoke",
         "eventfd_smoke",
         "getrandom_smoke",

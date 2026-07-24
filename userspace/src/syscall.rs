@@ -3528,6 +3528,12 @@ impl TrapContext for ArgsOnlyCtx {
                 // snapshot slot, so surface the restored RAX as the
                 // syscall's "return" too.
                 self.ret = SyscallReturn::ok(restored_rax);
+                // The restored context's rcx/r11 belong to the *interrupted*
+                // code (async delivery saves live registers) — `sysretq`
+                // overwrites rcx=RIP / r11=RFLAGS and can never restore
+                // them. Mark the snapshot so the frame-side dispatcher
+                // exits via the full-register iretq path instead.
+                state.valid = 2;
                 true
             }
             None => false,
