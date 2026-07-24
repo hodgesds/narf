@@ -118,9 +118,10 @@ pub use overlayfs::{OverlayFs, WHITEOUT_PREFIX};
 pub use page_cache::{Page, PageCache, PageKey, PAGE_SIZE};
 #[cfg(feature = "linux-compat")]
 pub use sysfs::{
-    class_device_register, class_register, install_net_snapshot_hook, kobject_add_attr,
-    kobject_add_bin_attr, kobject_add_writable_attr, kobject_emit_uevent, sysfs_root, AttrShow,
-    AttrStore, BinAttrRead, Kobject, NetIfaceInfo, SysFs, SysKobjDir,
+    class_device_register, class_register, get_or_create_child, get_root,
+    install_net_snapshot_hook, kobject_add_attr, kobject_add_bin_attr, kobject_add_uevent_attr,
+    kobject_add_writable_attr, kobject_emit_uevent, sysfs_root, AttrShow, AttrStore, BinAttrRead,
+    Kobject, NetIfaceInfo, SysFs, SysKobjDir,
 };
 pub use uevent::{
     emit as emit_uevent, emit_with_extras as emit_uevent_extras, UeventAction, UeventEnv,

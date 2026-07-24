@@ -1,28 +1,42 @@
-//! DRM sysfs bridge — `/sys/class/drm/card<N>/` + `/sys/class/drm/renderD<N+128>/`.
+//! DRM sysfs bridge — `/sys/devices/platform/narf-drm/{card<N>,renderD<N+128>}`
+//! with `/sys/class/drm/*` and `/sys/dev/char/*` symlinks pointing into it.
 //!
-//! For each card registered in `drm_registry` this module creates the
-//! standard kobject subtree that userspace (libdrm, Mesa, Xorg, Wayland)
-//! expects under `/sys/class/drm/`.
+//! For each card registered in `drm_registry` this module creates the standard
+//! kobject subtree that userspace (libdrm, Mesa, Xorg, Wayland, systemd's
+//! libudev) expects for a DRM device.
+//!
+//! ## Why the device is rooted under `/sys/devices/...`
+//!
+//! On Linux a DRM minor lives at `/sys/devices/.../drm/card<N>` and
+//! `/sys/class/drm/card<N>` is a *symlink* into that tree. systemd's
+//! `sd-device` (Fedora's libudev) only assigns a `devnum` — and therefore a
+//! resolvable `/dev/dri/card<N>` — to a device whose canonical syspath is a
+//! real `/sys/devices/...` node reached through the class symlink. A card
+//! parked directly under `/sys/class/drm/` as a real directory reads back its
+//! `uevent` fine via `cat`, but `udevadm info --name=/dev/dri/card0` returns
+//! "No such device": `devnum` stays 0, `udev_device_get_devnode()` is NULL, and
+//! kwin's DRM backend ends up with an empty device node and never modesets.
+//! Mirroring Linux's topology (real node under `/sys/devices`, class entry as a
+//! symlink) is what makes systemd resolve the GPU. This matches the input-class
+//! layout in `sysfs::populate_input_class`.
 //!
 //! ## Kobject layout per card (index N)
 //!
 //! ```text
-//! /sys/class/drm/
+//! /sys/devices/platform/narf-drm/
 //!   card<N>/
-//!     name                   → "card<N>\n"
-//!     dev                    → "226:<N>\n"          (major 226 = DRM)
-//!     uevent                 → MAJOR/MINOR/DEVNAME + DEVTYPE + DRIVER
-//!     device/
-//!       vendor               → "0x1002\n" / "0x1234\n"
-//!       device               → "0x1636\n" / "0x1111\n"
-//!       subsystem_vendor     → "0x0000\n"
-//!       subsystem_device     → "0x0000\n"
-//!     vbios_version          → "<string>\n"   (if available)
-//!     gpu_busy_percent       → "0\n"          (if available)
-//!     power_dpm_state        → "D0\n"
+//!     name        → "card<N>\n"
+//!     dev         → "226:<N>\n"                        (major 226 = DRM)
+//!     uevent      → MAJOR/MINOR/DEVNAME/DEVTYPE/DRIVER (writable)
+//!     subsystem   → symlink → /sys/class/drm
+//!     device/     → vendor / device / subsystem_vendor / subsystem_device
+//!     power_dpm_state, power_dpm_force_performance_level, [vbios_version], …
 //!   renderD<N+128>/
-//!     name                   → "renderD<N+128>\n"
-//!     dev                    → "226:<N+128>\n"
+//!     name, dev, uevent (writable), subsystem → /sys/class/drm
+//! /sys/class/drm/card<N>       → ../../devices/platform/narf-drm/card<N>
+//! /sys/class/drm/renderD<N+128>→ ../../devices/platform/narf-drm/renderD<N+128>
+//! /sys/dev/char/226:<N>        → ../../devices/platform/narf-drm/card<N>
+//! /sys/dev/char/226:<N+128>    → ../../devices/platform/narf-drm/renderD<N+128>
 //! ```
 //!
 //! ## Linux references
@@ -37,14 +51,17 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+use narf_filesystem::sysfs::{
+    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_uevent_attr,
+    Kobject,
+};
 
 /// DRM major device number.
 ///
 /// Linux: `DRM_MAJOR = 226` (include/uapi/linux/major.h).
 const DRM_MAJOR: u32 = 226;
 
-/// Populate `/sys/class/drm/` for every card in the DRM registry.
+/// Populate the DRM sysfs subtree for every card in the DRM registry.
 ///
 /// Called once from a `Stage::Late` initcall after all `Stage::Subsys`
 /// driver probes have completed.
@@ -69,10 +86,10 @@ pub fn populate_drm_class() {
     }
 }
 
-/// The `/sys/class/drm/card<N>/uevent` body. MAJOR + DEVNAME are
-/// load-bearing for libudev (it derives the device node `/dev/${DEVNAME}`
-/// and devnum from MAJOR:MINOR); weston's `find_primary_gpu` skips any
-/// card with no devnode. Linux ref: drm_sysfs.c + device_add's dev_uevent.
+/// The `/sys/.../card<N>/uevent` body. MAJOR + DEVNAME are load-bearing for
+/// libudev (it derives the device node `/dev/${DEVNAME}` and devnum from
+/// MAJOR:MINOR); weston's `find_primary_gpu` skips any card with no devnode.
+/// Linux ref: drm_sysfs.c + device_add's dev_uevent.
 pub(crate) fn card_uevent(idx: u32, driver: &str) -> String {
     format!(
         "MAJOR={}\nMINOR={}\nDEVNAME=dri/card{}\nDEVTYPE=drm_minor\nDRIVER={}\n",
@@ -80,89 +97,81 @@ pub(crate) fn card_uevent(idx: u32, driver: &str) -> String {
     )
 }
 
+/// The `/sys/.../renderD<M>/uevent` body (M = N+128). A render minor is
+/// `drm_render_minor`; Mesa's render-worker lookup wants its devnode resolvable
+/// too, so it needs MAJOR/MINOR/DEVNAME just like the card node.
+fn render_uevent(render_idx: u32, driver: &str) -> String {
+    format!(
+        "MAJOR={}\nMINOR={}\nDEVNAME=dri/renderD{}\nDEVTYPE=drm_render_minor\nDRIVER={}\n",
+        DRM_MAJOR, render_idx, render_idx, driver
+    )
+}
+
+/// `/sys/dev/char/<major>:<minor>` → `target` (a path relative to
+/// `/sys/dev/char`). udev resolves a device by devnum through here; unlike
+/// `sysfs::register_char_dev_link` (which points at the flat class dir) this
+/// points into `/sys/devices/...` so systemd's `sd_device_new_from_device_id`
+/// lands on the canonical node. Also keeps `/sys/dev/block` present since udev
+/// scandir()s both and fails the whole enumerate if either is missing.
+fn char_dev_link(minor: u32, target: &str) {
+    let root = get_root();
+    let dev_dir = get_or_create_child(&root, "dev");
+    let dev_char = get_or_create_child(&dev_dir, "char");
+    let _dev_block = get_or_create_child(&dev_dir, "block");
+    dev_char.add_symlink(format!("{}:{}", DRM_MAJOR, minor), String::from(target));
+}
+
 /// Build the kobject subtree for one DRM card.
 fn populate_card_node(
-    class_drm: Arc<narf_filesystem::sysfs::Kobject>,
+    class_drm: Arc<Kobject>,
     card: Arc<dyn crate::drm_registry::DrmCard>,
     idx: u32,
 ) {
-    // ── card<N> kobject ─────────────────────────────────────────────
+    let root = get_root();
+    // `/sys/devices/platform/narf-drm/` — the real device parent. Mirrors the
+    // input class's `/sys/devices/platform/narf-input/` container.
+    let devices = get_or_create_child(&root, "devices");
+    let platform = get_or_create_child(&devices, "platform");
+    let narf_drm = get_or_create_child(&platform, "narf-drm");
 
+    let driver = String::from(card.driver());
+
+    // ── card<N> device node under /sys/devices ──────────────────────────
     let card_name = format!("card{}", idx);
-    let kobj = class_device_register(class_drm.clone(), &card_name);
+    let kobj = Kobject::new_child(narf_drm.clone(), card_name.clone());
 
-    // `name` attr — e.g. "card0\n".
-    // Linux ref: drm_sysfs.c::dev_show → dev_name(dev).
     {
         let name = format!("card{}\n", idx);
         kobject_add_attr(&kobj, "name", move || name.clone());
     }
-
-    // `dev` attr — "major:minor\n".
-    // Linux ref: drm_sysfs.c::dev_show → MAJOR(dev->devt):MINOR(dev->devt).
     {
         let dev_str = format!("{}:{}\n", DRM_MAJOR, idx);
         kobject_add_attr(&kobj, "dev", move || dev_str.clone());
     }
+    // Writable uevent so a real udevd's `udevadm trigger` re-broadcasts the ADD.
+    kobject_add_uevent_attr(&kobj, card_uevent(idx, &driver));
 
-    // `uevent` — MAJOR/MINOR/DEVNAME plus DEVTYPE + DRIVER. The
-    // MAJOR + DEVNAME pair is load-bearing: libudev computes a device's
-    // node path as `/dev/${DEVNAME}` and its devnum from MAJOR:MINOR, so
-    // without them `udev_device_get_devnode()` returns NULL. weston's
-    // `find_primary_gpu` skips any DRM device with no devnode, failing
-    // with "no drm device found" even though /dev/dri/card<N> exists.
-    // Linux ref: drm_sysfs.c::drm_class_dev_uevent (adds DEVNAME via
-    // device_add → dev_uevent → add_uevent_var "DEVNAME").
-    {
-        let driver = String::from(card.driver());
-        let idx_copy = idx;
-        kobject_add_attr(&kobj, "uevent", move || card_uevent(idx_copy, &driver));
-    }
+    // `subsystem` → /sys/class/drm. From /sys/devices/platform/narf-drm/card<N>
+    // the class dir is four levels up. elogind only marks a seat graphical when
+    // it can attach a device whose subsystem is "drm".
+    kobj.add_symlink("subsystem", "../../../../class/drm");
 
-    // `subsystem` symlink → the drm class dir. eudev/libudev derive a
-    // device's subsystem from the basename of this link's target; elogind
-    // only marks a seat graphical (`seat_can_graphical`) when it can attach a
-    // device whose subsystem is "drm". Without it the card enumerates with no
-    // subsystem and never makes seat0 graphical. Linux ref: device_add →
-    // sysfs_create_link("subsystem").
-    kobj.add_symlink("subsystem", "../../../class/drm");
-
-    // `/sys/dev/char/226:<N>` → this card. eudev resolves a device by devnum
-    // through here; elogind's `master-of-seat` tag enumeration then does
-    // sd_device_new_from_device_id("c226:<N>") which needs this link. Without
-    // it the DRM card is invisible to udev-based seat attachment, so
-    // seat0.CanGraphical stays false and the compositor's TakeDevice fails.
-    narf_filesystem::sysfs::register_char_dev_link(DRM_MAJOR, idx, "drm", &card_name);
-
-    // ── device/ sub-kobject ──────────────────────────────────────────
-    //
-    // Linux exposes PCI IDs under card<N>/device/ as symlink to the
-    // PCI sysfs node. We synthesise flat attrs directly.
-
-    let dev_kobj = narf_filesystem::sysfs::Kobject::new_child(kobj.clone(), "device");
-
-    // `device/vendor` — "0x1002\n" for AMD, "0x1234\n" for bochs, etc.
-    // Linux ref: /sys/bus/pci/devices/<slot>/vendor.
+    // ── device/ sub-kobject (PCI IDs Mesa reads for driver selection) ────
+    let dev_kobj = Kobject::new_child(kobj.clone(), "device");
     {
         let v = card.vendor_id();
         kobject_add_attr(&dev_kobj, "vendor", move || format!("0x{:04x}\n", v));
     }
-
-    // `device/device`.
     {
         let d = card.device_id();
         kobject_add_attr(&dev_kobj, "device", move || format!("0x{:04x}\n", d));
     }
-
-    // `device/subsystem_vendor`.
     {
         let sv = card.subsystem_vendor();
         kobject_add_attr(&dev_kobj, "subsystem_vendor", move || {
             format!("0x{:04x}\n", sv)
         });
     }
-
-    // `device/subsystem_device`.
     {
         let sd = card.subsystem_device();
         kobject_add_attr(&dev_kobj, "subsystem_device", move || {
@@ -170,42 +179,36 @@ fn populate_card_node(
         });
     }
 
-    // ── Optional AMDGPU-specific attrs ───────────────────────────────
-
-    // `vbios_version` — only emit when the driver provides it.
-    // Linux ref: amdgpu_sysfs.c::amdgpu_sysfs_vbios_version.
+    // ── Optional AMDGPU-specific attrs ───────────────────────────────────
     if let Some(ver) = card.vbios_version() {
         let ver_owned = String::from(ver);
         kobject_add_attr(&kobj, "vbios_version", move || format!("{}\n", ver_owned));
     }
-
-    // `gpu_busy_percent` — 0..100.
-    // Linux ref: amdgpu_pm.c::amdgpu_sysfs_get_gpu_busy_percent.
     if let Some(pct) = card.gpu_busy_percent() {
         kobject_add_attr(&kobj, "gpu_busy_percent", move || format!("{}\n", pct));
     }
-
-    // `power_dpm_state` — stub "D0".
-    // Linux ref: amdgpu_pm.c::amdgpu_get_pm_profile.
     {
         let ps = String::from(card.power_state());
         kobject_add_attr(&kobj, "power_dpm_state", move || format!("{}\n", ps));
     }
-
-    // `power_dpm_force_performance_level` — stub "auto".
-    // Linux ref: amdgpu_pm.c::amdgpu_get_dpm_forced_performance_level.
     kobject_add_attr(&kobj, "power_dpm_force_performance_level", || {
         "auto\n".into()
     });
 
-    // ── renderD<N+128> sibling kobject ───────────────────────────────
-    //
-    // Linux ref: drm_drv.c::drm_dev_register → DRM_MINOR_RENDER = N+128.
+    // ── /sys/class/drm/card<N> + /sys/dev/char/226:<N> symlinks → the node ──
+    class_drm.add_symlink(
+        card_name.clone(),
+        format!("../../devices/platform/narf-drm/{}", card_name),
+    );
+    char_dev_link(
+        idx,
+        &format!("../../devices/platform/narf-drm/{}", card_name),
+    );
 
+    // ── renderD<N+128> sibling device node ───────────────────────────────
     let render_idx = idx + 128;
     let render_name = format!("renderD{}", render_idx);
-    let render_kobj = class_device_register(class_drm, &render_name);
-
+    let render_kobj = Kobject::new_child(narf_drm.clone(), render_name.clone());
     {
         let rn = format!("renderD{}\n", render_idx);
         kobject_add_attr(&render_kobj, "name", move || rn.clone());
@@ -214,8 +217,15 @@ fn populate_card_node(
         let rd = format!("{}:{}\n", DRM_MAJOR, render_idx);
         kobject_add_attr(&render_kobj, "dev", move || rd.clone());
     }
-    render_kobj.add_symlink("subsystem", "../../../class/drm");
-    // Render nodes aren't seat masters, but a `/sys/dev/char` link keeps them
-    // enumerable by devnum (Mesa's render-worker device lookup).
-    narf_filesystem::sysfs::register_char_dev_link(DRM_MAJOR, render_idx, "drm", &render_name);
+    kobject_add_uevent_attr(&render_kobj, render_uevent(render_idx, &driver));
+    render_kobj.add_symlink("subsystem", "../../../../class/drm");
+
+    class_drm.add_symlink(
+        render_name.clone(),
+        format!("../../devices/platform/narf-drm/{}", render_name),
+    );
+    char_dev_link(
+        render_idx,
+        &format!("../../devices/platform/narf-drm/{}", render_name),
+    );
 }

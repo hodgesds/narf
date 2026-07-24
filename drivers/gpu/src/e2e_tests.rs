@@ -838,6 +838,32 @@ fn smoke_drm_registry_register_one_card() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/e2e", smoke_drm_registry_register_one_card);
 
+// Resolve the real DRM device kobject under /sys/devices/platform/narf-drm/.
+// The card lives there (not directly under /sys/class/drm); `/sys/class/drm/*`
+// is a symlink into it. get_child() walks real children only (not symlinks),
+// so tests navigate the /sys/devices tree the compositor's udev lookup lands on.
+#[cfg(feature = "linux-compat")]
+fn drm_device_node(name: &str) -> Option<alloc::sync::Arc<narf_filesystem::sysfs::Kobject>> {
+    narf_filesystem::sysfs::sysfs_root()
+        .get_child("devices")
+        .and_then(|d| d.get_child("platform"))
+        .and_then(|p| p.get_child("narf-drm"))
+        .and_then(|n| n.get_child(name))
+}
+
+// The `/sys/class/drm/<name>` symlink must exist and point into /sys/devices —
+// this is what makes systemd's `sd_device_new_from_syspath` resolve the card's
+// devnum. Returns true iff the class dir carries the symlink.
+#[cfg(feature = "linux-compat")]
+fn drm_class_symlink_ok(name: &str) -> bool {
+    narf_filesystem::sysfs::sysfs_root()
+        .get_child("class")
+        .and_then(|c| c.get_child("drm"))
+        .and_then(|d| d.get_symlink(name))
+        .map(|t| t.contains("devices/platform/narf-drm/"))
+        .unwrap_or(false)
+}
+
 // ── Smoke 12: /sys/class/drm/card0/name → "card0\n" ─────────────────────
 
 #[cfg(feature = "linux-compat")]
@@ -857,18 +883,12 @@ fn smoke_drm_sysfs_name_attr() -> TestResult {
     drm_registry::register_drm_card(card);
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let root = sysfs::sysfs_root();
-    let class = match root.get_child("class") {
+    if !drm_class_symlink_ok("card0") {
+        return TestResult::Fail("/sys/class/drm/card0 symlink missing");
+    }
+    let card0 = match drm_device_node("card0") {
         Some(c) => c,
-        None => return TestResult::Fail("/sys/class missing"),
-    };
-    let drm = match class.get_child("drm") {
-        Some(d) => d,
-        None => return TestResult::Fail("/sys/class/drm missing"),
-    };
-    let card0 = match drm.get_child("card0") {
-        Some(c) => c,
-        None => return TestResult::Fail("/sys/class/drm/card0 missing"),
+        None => return TestResult::Fail("/sys/devices/platform/narf-drm/card0 missing"),
     };
 
     match card0.attr_show("name") {
@@ -902,12 +922,7 @@ fn smoke_drm_sysfs_dev_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let root = sysfs::sysfs_root();
-    let card0 = root
-        .get_child("class")
-        .and_then(|c| c.get_child("drm"))
-        .and_then(|d| d.get_child("card0"));
-    let card0 = match card0 {
+    let card0 = match drm_device_node("card0") {
         Some(k) => k,
         None => return TestResult::Fail("card0 kobject missing"),
     };
@@ -943,12 +958,7 @@ fn smoke_drm_sysfs_device_vendor_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let root = sysfs::sysfs_root();
-    let device_kobj = root
-        .get_child("class")
-        .and_then(|c| c.get_child("drm"))
-        .and_then(|d| d.get_child("card0"))
-        .and_then(|c| c.get_child("device"));
+    let device_kobj = drm_device_node("card0").and_then(|c| c.get_child("device"));
     let device_kobj = match device_kobj {
         Some(k) => k,
         None => return TestResult::Fail("card0/device kobject missing"),
@@ -985,12 +995,7 @@ fn smoke_drm_sysfs_device_id_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let root = sysfs::sysfs_root();
-    let device_kobj = root
-        .get_child("class")
-        .and_then(|c| c.get_child("drm"))
-        .and_then(|d| d.get_child("card0"))
-        .and_then(|c| c.get_child("device"));
+    let device_kobj = drm_device_node("card0").and_then(|c| c.get_child("device"));
     let device_kobj = match device_kobj {
         Some(k) => k,
         None => return TestResult::Fail("card0/device kobject missing"),
@@ -1027,12 +1032,7 @@ fn smoke_drm_sysfs_vbios_version_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let root = sysfs::sysfs_root();
-    let card0 = root
-        .get_child("class")
-        .and_then(|c| c.get_child("drm"))
-        .and_then(|d| d.get_child("card0"));
-    let card0 = match card0 {
+    let card0 = match drm_device_node("card0") {
         Some(k) => k,
         None => return TestResult::Fail("card0 kobject missing"),
     };
@@ -1069,12 +1069,10 @@ fn smoke_drm_sysfs_render_node_dev_attr() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
-    let root = sysfs::sysfs_root();
-    let render128 = root
-        .get_child("class")
-        .and_then(|c| c.get_child("drm"))
-        .and_then(|d| d.get_child("renderD128"));
-    let render128 = match render128 {
+    if !drm_class_symlink_ok("renderD128") {
+        return TestResult::Fail("/sys/class/drm/renderD128 symlink missing");
+    }
+    let render128 = match drm_device_node("renderD128") {
         Some(k) => k,
         None => return TestResult::Fail("renderD128 kobject missing"),
     };

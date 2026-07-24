@@ -354,7 +354,11 @@ fn ensure_root() -> Arc<Kobject> {
     root
 }
 
-fn get_root() -> Arc<Kobject> {
+/// Return the sysfs root kobject, creating it lazily on first call.
+/// Exposed so out-of-crate bridges (e.g. the DRM sysfs bridge) can root
+/// devices under `/sys/devices/...` and hang class symlinks off them,
+/// matching Linux's topology.
+pub fn get_root() -> Arc<Kobject> {
     ensure_root()
 }
 
@@ -463,6 +467,30 @@ where
     kobj.store_attrs.lock().insert(name, Arc::new(store));
 }
 
+/// Install a writable `uevent` attr on `kobj`: `show()` returns `body`, and
+/// `store()` — what `udevadm trigger` / `echo add > uevent` writes — parses
+/// the verb and re-broadcasts a netlink uevent for `kobj`.
+///
+/// In Linux EVERY device kobject's `uevent` attr is writable (`uevent_store`,
+/// drivers/base/core.c); a read-only one silently drops `udevadm trigger`, so
+/// a freshly started udevd never runs its rules against the device and never
+/// writes the `/run/udev/data` entry userspace (libinput, kwin's DRM seat
+/// lookup) depends on. The `Weak` ref avoids a closure↔kobject refcount cycle.
+pub fn kobject_add_uevent_attr(kobj: &Arc<Kobject>, body: String) {
+    let weak = Arc::downgrade(kobj);
+    kobject_add_writable_attr(
+        kobj,
+        "uevent",
+        move || body.clone(),
+        move |data: &[u8]| {
+            if let Some(k) = weak.upgrade() {
+                kobject_emit_uevent(&k, uevent_action_from_write(data));
+            }
+            Ok(())
+        },
+    );
+}
+
 /// Emit a uevent for `kobj` with `action`.
 /// Linux ref: `kobject_uevent` (lib/kobject_uevent.c:639).
 /// Map the string written to a `uevent` file ("add" / "change" / "remove"
@@ -567,7 +595,10 @@ fn coldplug_walk(kobj: &Arc<Kobject>, count: &mut usize) {
 
 // ── Internal helpers ──────────────────────────────────────────────────
 
-fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
+/// Return `parent`'s child named `name`, creating an empty container
+/// kobject if it doesn't exist yet. Exposed so out-of-crate bridges can
+/// build shared paths like `/sys/devices/platform/...` idempotently.
+pub fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
     if let Some(c) = parent.get_child(name) {
         return c;
     }
